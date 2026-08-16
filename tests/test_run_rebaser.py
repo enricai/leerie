@@ -238,3 +238,149 @@ def test_run_rebaser_worker_exception_returns_failed_not_raised(leerie, tmp_path
 
     assert result["status"] == "failed"
     assert "simulated worker crash" in result["diagnosis"]
+
+
+def _seed_state(leerie_root: Path, run_id: str, **data) -> None:
+    run_dir = leerie_root / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "state.json").write_text(json.dumps(data))
+
+
+def test_run_rebaser_wires_strict_output_proxy_when_flag_is_set(
+        leerie, tmp_path, monkeypatch):
+    """Regression test for the host-seam strict-output wiring gap: when
+    the run's own state has dangerously_force_strict_output=True,
+    run_rebaser must start the proxy around its claude_p() call (so
+    ANTHROPIC_BASE_URL actually gets injected downstream) and stop it
+    afterward — not silently run unconstrained regardless of the flag."""
+    repo = _init_repo(tmp_path)
+    leerie_root = tmp_path / "leerie_root"
+    _seed_state(leerie_root, "run-strict-001",
+                dangerously_force_strict_output=True)
+
+    calls = {"started": False, "stopped": False, "init_args": None}
+
+    class _FakeProxy:
+        def __init__(self, max_parallel, verbosity, timeout_sec):
+            calls["init_args"] = (max_parallel, verbosity, timeout_sec)
+
+        async def start(self):
+            calls["started"] = True
+            return 12345
+
+        async def stop(self):
+            calls["stopped"] = True
+
+    monkeypatch.setattr(leerie, "_StrictOutputProxy", _FakeProxy)
+
+    async def fake_claude_p(*args, **kwargs):
+        assert leerie._STRICT_PROXY is not None, (
+            "claude_p must run while the proxy is active")
+        return {
+            "status": "rebased",
+            "final_branch_state": "clean",
+            "resolution_summary": "no conflicts",
+            "diagnosis": "",
+            "confidence": _full_confidence(9.5),
+        }
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    result = leerie.run_rebaser(
+        leerie_root, repo, "run-strict-001", repo,
+        "leerie/runs/run-strict-001", "main", "main")
+
+    assert result["status"] == "rebased"
+    assert calls["started"] is True
+    assert calls["stopped"] is True
+    assert leerie._STRICT_PROXY is None
+
+
+def test_run_rebaser_survives_proxy_teardown_failure(
+        leerie, tmp_path, monkeypatch):
+    """A stop() failure must not turn a successful rebase into a reported
+    'failed' result: a finally-raised exception isn't caught by this same
+    function's own try/except, so an unguarded stop() would propagate past
+    a completed, valid claude_p() return and get caught by the OUTER
+    except at this function's call site instead — discarding real,
+    successful work over a cleanup-only hiccup. Also confirms the global
+    is still reset even though teardown itself failed."""
+    repo = _init_repo(tmp_path)
+    leerie_root = tmp_path / "leerie_root"
+    _seed_state(leerie_root, "run-strict-003",
+                dangerously_force_strict_output=True)
+
+    class _FakeProxy:
+        def __init__(self, max_parallel, verbosity, timeout_sec):
+            pass
+
+        async def start(self):
+            return 12345
+
+        async def stop(self):
+            raise RuntimeError("simulated teardown failure")
+
+    monkeypatch.setattr(leerie, "_StrictOutputProxy", _FakeProxy)
+
+    async def fake_claude_p(*args, **kwargs):
+        return {
+            "status": "rebased",
+            "final_branch_state": "clean",
+            "resolution_summary": "no conflicts",
+            "diagnosis": "",
+            "confidence": _full_confidence(9.5),
+        }
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    result = leerie.run_rebaser(
+        leerie_root, repo, "run-strict-003", repo,
+        "leerie/runs/run-strict-003", "main", "main")
+
+    assert result["status"] == "rebased", (
+        f"a proxy teardown failure must not mask a successful rebase; "
+        f"got {result!r}")
+    assert leerie._STRICT_PROXY is None
+
+
+def test_run_rebaser_skips_strict_output_proxy_when_flag_is_unset(
+        leerie, tmp_path, monkeypatch):
+    """When the flag is false/absent, run_rebaser must NOT instantiate the
+    proxy at all — guards against an always-on regression of the fix
+    above."""
+    repo = _init_repo(tmp_path)
+    leerie_root = tmp_path / "leerie_root"
+    _seed_state(leerie_root, "run-strict-002",
+                dangerously_force_strict_output=False)
+
+    instantiated = {"count": 0}
+
+    class _FakeProxy:
+        def __init__(self, *a, **kw):
+            instantiated["count"] += 1
+
+        async def start(self):
+            return 1
+
+        async def stop(self):
+            pass
+
+    monkeypatch.setattr(leerie, "_StrictOutputProxy", _FakeProxy)
+
+    async def fake_claude_p(*args, **kwargs):
+        return {
+            "status": "rebased",
+            "final_branch_state": "clean",
+            "resolution_summary": "no conflicts",
+            "diagnosis": "",
+            "confidence": _full_confidence(9.5),
+        }
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    result = leerie.run_rebaser(
+        leerie_root, repo, "run-strict-002", repo,
+        "leerie/runs/run-strict-002", "main", "main")
+
+    assert result["status"] == "rebased"
+    assert instantiated["count"] == 0

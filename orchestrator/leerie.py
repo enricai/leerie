@@ -46,7 +46,7 @@ import urllib.request
 import uuid
 import weakref
 from collections import deque
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TextIO
@@ -11860,19 +11860,54 @@ def run_recapture_deps(
             continue
         target_st.load()  # non-fatal if state.json is missing (older runs)
 
+        # Same host-seam wiring gap as run_rebaser (see there): this
+        # entrypoint runs in its own process, never through
+        # _orchestrate()'s CLI-arg resolution or _STRICT_PROXY setup, so
+        # capture_repo_deps's claude_p() call always ran unconstrained
+        # regardless of the flag. Read the per-run value _orchestrate()
+        # already resolved and persisted into THIS run's own state (each
+        # target_run_dir may have been run with a different setting).
+        run_caps = dict(caps)
+        run_caps["force_strict_output"] = (
+            target_st.data["dangerously_force_strict_output"]
+            if "dangerously_force_strict_output" in target_st.data
+            else resolve_dangerously_force_strict_output(repo_root, False))
+
+        async def _capture_with_strict_output() -> bool:
+            async with _strict_output_proxy(run_caps, "recapture"):
+                try:
+                    await capture_repo_deps(
+                        repo_root, target_st,
+                        caps=run_caps, models=models, efforts=efforts,
+                        replace=force,
+                    )
+                    return True
+                # See the backstop guard above: TerminalAuthFailure /
+                # RateLimitedExit are BaseException subclasses that a bare
+                # `except Exception` misses. This must stay the innermost try
+                # DIRECTLY wrapping capture_repo_deps() —
+                # tests/test_capture_swallows_exit_signals.py AST-scans for
+                # exactly that shape and fails loudly if the guard and the
+                # call it guards ever drift apart.
+                except (Exception, TerminalAuthFailure, RateLimitedExit,
+                        ContextOverflow, DiskLowSpace) as exc:
+                    log(f"recapture: error during dep_capture for "
+                        f"{target_run_dir.name}: {exc}")
+                    return False
+
         log(f"recapture: scanning {target_run_dir / 'logs'} ...")
+        # The guard inside the coroutine covers the capture call itself; this
+        # one covers everything around it (proxy construction, a non-OSError
+        # from start(), asyncio.run itself). Without it a setup failure would
+        # abort the whole multi-run consolidation, breaking this function's
+        # "per-run errors are logged and skipped" contract.
         try:
-            asyncio.run(capture_repo_deps(
-                repo_root, target_st,
-                caps=caps, models=models, efforts=efforts,
-                replace=force,
-            ))
-            ran_any = True
-        # See the backstop guard above: TerminalAuthFailure / RateLimitedExit
-        # are BaseException subclasses that a bare `except Exception` misses.
+            if asyncio.run(_capture_with_strict_output()):
+                ran_any = True
         except (Exception, TerminalAuthFailure, RateLimitedExit,
                 ContextOverflow, DiskLowSpace) as exc:
-            log(f"recapture: error during dep_capture for {target_run_dir.name}: {exc}")
+            log(f"recapture: error during dep_capture for "
+                f"{target_run_dir.name}: {exc}")
 
     if not ran_any and not force:
         log("recapture: all eligible runs already captured (use --force to re-run)")
@@ -11950,6 +11985,19 @@ def run_rebaser(
         }
     st.load()
 
+    # This entrypoint runs in its own fresh python3 process
+    # (host-finalize.sh's heredoc), so it never goes through
+    # _orchestrate()'s CLI-arg resolution or _STRICT_PROXY setup — without
+    # this, claude_p() below always ran unconstrained regardless of the
+    # flag. Read the value _orchestrate() already resolved and persisted
+    # into this run's own state as the source of truth (the CLI flag
+    # itself never reaches this process); fall back to a fresh resolve
+    # only for old state.json files that predate this field.
+    caps["force_strict_output"] = (
+        st.data["dangerously_force_strict_output"]
+        if "dangerously_force_strict_output" in st.data
+        else resolve_dangerously_force_strict_output(repo_root, False))
+
     # Worker-budget pre-check (mirrors capture_repo_deps's identical guard
     # above): the run has already spent its budget across the whole
     # _orchestrate loop by the time finalize runs, so a rebaser call must
@@ -11988,22 +12036,27 @@ def run_rebaser(
         f"{working_branch}..{run_branch} — onto the fresh tip of "
         f"{pr_base_branch}. Do not touch any other branch."
     )
+
+    async def _call_with_strict_output() -> dict:
+        async with _strict_output_proxy(caps, "rebaser"):
+            return await claude_p(
+                user_prompt=user_prompt,
+                system_prompt=sys_prompt,
+                schema_key="rebaser",
+                cwd=str(worktree),
+                allowed_tools=ACT_TOOLS,
+                max_turns=60,
+                autonomous=True,
+                caps=caps,
+                st=st,
+                model=models.get("rebaser", MODEL_DEFAULT),
+                effort=efforts.get("rebaser"),
+                sid=f"rebaser-{run_id}",
+            )
+
     try:
         st.bump_workers(caps)
-        result = asyncio.run(claude_p(
-            user_prompt=user_prompt,
-            system_prompt=sys_prompt,
-            schema_key="rebaser",
-            cwd=str(worktree),
-            allowed_tools=ACT_TOOLS,
-            max_turns=60,
-            autonomous=True,
-            caps=caps,
-            st=st,
-            model=models.get("rebaser", MODEL_DEFAULT),
-            effort=efforts.get("rebaser"),
-            sid=f"rebaser-{run_id}",
-        ))
+        result = asyncio.run(_call_with_strict_output())
     # See run_recapture_deps's identical guard above: TerminalAuthFailure /
     # RateLimitedExit are BaseException subclasses a bare `except Exception`
     # would miss, and this call must never propagate past host-finalize.sh's
@@ -14104,6 +14157,80 @@ class _StrictOutputProxy:
             self._writers.discard(writer)
             with contextlib.suppress(Exception):
                 writer.close()
+
+
+@contextlib.asynccontextmanager
+async def _strict_output_proxy(caps: dict, label: str) -> AsyncIterator[None]:
+    """Run the enclosed block with `_STRICT_PROXY` live iff the flag is set.
+
+    `_orchestrate()` starts one proxy per run before its first worker and
+    closes it in its own `finally` (DESIGN §7). Three entrypoints never
+    reach that code and so need their own short-lived instance, or the flag
+    is silently inert for every worker they invoke: `run_rebaser` and
+    `run_recapture_deps` (each a separate host-seam `python3` process, where
+    the module-level global starts fresh at `None` regardless of config) and
+    `main()`'s `--phase heal` branch (which returns before `_orchestrate` is
+    called). `_invoke` gates purely on this global being non-None, so a
+    caller needs nothing beyond wrapping its own worker call in this.
+
+    Fails soft in BOTH directions, because all three callers are best-effort
+    paths that must never block a push or abort a multi-run loop: a `start()`
+    `OSError` logs and proceeds unconstrained (the guarantee is lost, not the
+    run — DESIGN §7 *It fails open*), and a `stop()` failure is logged and
+    swallowed rather than propagated out of the `finally`, where it would
+    escape past an already-successful result and be misreported as a worker
+    failure. The global is reset unconditionally either way, which
+    `run_recapture_deps` relies on per loop iteration: a stale non-None value
+    would silently route the NEXT target run through this run's closed proxy,
+    even a run whose own state has the flag off.
+
+    `label` names the calling path in log lines only — the proxy itself is
+    identical for all three.
+
+    Deliberately NOT reused by `_orchestrate`: that one is scoped to a whole
+    run rather than a single call, reports four aggregate counters at
+    shutdown, and dies rather than continuing when its listener cannot bind
+    (DESIGN §7 *It fails closed at startup*) — the opposite of the fail-soft
+    contract these three need.
+    """
+    global _STRICT_PROXY
+    started = False
+    if caps.get("force_strict_output"):
+        proxy = _StrictOutputProxy(
+            caps["max_parallel"], VERBOSITY_DEFAULT,
+            caps.get("worker_timeout_sec",
+                     DEFAULT_CAPS["worker_timeout_sec"]))
+        try:
+            port = await proxy.start()
+        except OSError as e:
+            log(f"strict output: could not start local proxy for {label} "
+                f"({e}); continuing without constrained decoding")
+        else:
+            # Publish to the global only after a successful bind. Assigning
+            # it first would leave a never-started proxy visible to `_invoke`
+            # whenever `start()` raised anything but OSError: that escapes
+            # before the `finally` below is even entered, so nothing resets
+            # it, and `__init__` leaves `port` at 0 — pointing every later
+            # worker in the process at `127.0.0.1:0`. That is a hard failure
+            # rather than the lost guarantee this is supposed to degrade to,
+            # and in run_recapture_deps's loop it would hit the NEXT run.
+            _STRICT_PROXY = proxy
+            started = True
+            log(f"strict output: rewriting worker API requests via "
+                f"127.0.0.1:{port} — `strict: true` forced on the "
+                f"StructuredOutput tool "
+                f"(--dangerously-force-strict-output, {label})")
+    try:
+        yield
+    finally:
+        if started:
+            try:
+                await _STRICT_PROXY.stop()
+            except Exception as e:  # noqa: BLE001 - see fail-soft note above
+                log(f"strict output: error stopping local proxy for "
+                    f"{label} ({e}); continuing")
+            finally:
+                _STRICT_PROXY = None
 
 
 # Substrings that identify a *schema* rejection of a structured submission, as
@@ -32316,9 +32443,21 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     "max_iterations": args.heal_max_rounds,
                     "success_threshold": args.heal_success_threshold,
                 }
-                asyncio.run(phase_heal(call_type, failing_records, heal_out_dir,
-                                       caps, phase_st, models, efforts,
-                                       config=config))
+
+                # This branch returns without ever reaching _orchestrate(),
+                # which is where the run-scoped proxy is started — so the
+                # heal loop's own replays (via _replay_capture) would run
+                # unconstrained no matter the flag. `caps` already carries
+                # the resolved value from main() above, and _invoke gates on
+                # the global alone, so wrapping here is the whole fix:
+                # neither phase_heal nor _replay_capture needs to change.
+                async def _heal_with_strict_output() -> None:
+                    async with _strict_output_proxy(caps, "heal"):
+                        await phase_heal(
+                            call_type, failing_records, heal_out_dir,
+                            caps, phase_st, models, efforts, config=config)
+
+                asyncio.run(_heal_with_strict_output())
         return
 
     # The fail-closed cgroup containment gate (DESIGN §6 *Memory
