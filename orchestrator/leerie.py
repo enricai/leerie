@@ -2033,7 +2033,13 @@ SCHEMAS: dict[str, dict] = {
             },
             "final_branch_state": {"type": "string"},
             "resolution_summary": {"type": "string"},
-            "diagnosis": {"type": ["string", "null"]},
+            # Plain string (not ["string", "null"]): unconstrained
+            # `claude -p --json-schema` reliably emitted a bare, unparseable
+            # empty token for this field's value on a clean rebase instead
+            # of the literal `null`, causing structured_output_retry_exhausted
+            # on every single rebaser call in production. "" means nothing to
+            # diagnose, per the rebaser prompt's own convention.
+            "diagnosis": {"type": "string"},
             "confidence": _confidence_schema(["resolution"]),
         },
     },
