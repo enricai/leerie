@@ -185,6 +185,97 @@ _host_finalize_is_auth_or_network_push_error() {
   _host_finalize_git_framed_auth_or_network "$1"
 }
 
+# host_prepush_preflight <repo> <branch> — would this host's pre-push hook
+# reject the push this run is going to end with?
+#
+# Everything above turns a hook rejection into a legible message. This turns
+# it into one the operator gets BEFORE the run spends. The prediction is
+# sound by construction rather than by luck: the hook measures the host
+# checkout's working tree, and leerie never modifies that tree during a run
+# (workers run in the container; the finalize rebase uses a disposable
+# worktree), so a probe at t=0 and the real push at t=end see the same
+# inputs. Measured on the run that motivated this: the host's manifests were
+# rewritten at 18:46:10 and the run started at 18:48:14, so the defect that
+# rejected the push 2h19m later was already present — and the same is true
+# of all four earlier `pnpm: not found` rejections.
+#
+# `--dry-run` is what makes this safe AND representative:
+#   - it runs the pre-push hook (verified against real git), and
+#   - it creates no ref, locally or on the remote (verified: the remote's
+#     ref list is unchanged after a dry-run to a brand-new branch name).
+#
+# The refspec is a NEW ref under leerie's own namespace, not the working
+# branch, and that choice is load-bearing. Pushing an already-up-to-date
+# branch still runs the hook but hands it an EMPTY stdin (verified), so a
+# hook that iterates the refs git feeds it does nothing and exits 0 — a
+# false pass. A new ref reproduces exactly the ref line finalize will
+# produce: `<local> <sha> refs/heads/leerie/runs/... 0000…` (all-zero old
+# sha = "new branch").
+#
+# Silent (rc 0) when: no pre-push hook, the dry-run passes, or the failure
+# is git's own auth/network problem — the last of those is not what this
+# probe is for, and the real push reports it properly. Returns 1 and prints
+# a warning when a hook is present and rejected the dry-run. The caller
+# decides whether that is fatal; the launcher treats it as a warning,
+# because a hook can legitimately fail on a tree the run is about to fix.
+host_prepush_preflight() {
+  local repo="$1" branch="$2"
+  [ -n "$repo" ] && [ -n "$branch" ] || return 0
+  _host_finalize_pre_push_hook_present "$repo" || return 0
+
+  local _o _e rc=0 out err
+  _o="$(mktemp 2>/dev/null || true)"
+  _e="$(mktemp 2>/dev/null || true)"
+  if [ -z "$_o" ] || [ -z "$_e" ]; then
+    rm -f "$_o" "$_e" 2>/dev/null || true
+    return 0   # no temp dir: skip the probe rather than lose its output
+  fi
+  # GIT_TERMINAL_PROMPT=0 so an HTTPS remote with no cached credential fails
+  # fast instead of blocking run start on a username prompt — a check meant
+  # to save the operator time must never be the thing that hangs. It needs no
+  # new branch below: git then emits `fatal: could not read Username for
+  # '…': terminal prompts disabled`, and the classifier already carries both
+  # of those alternatives on a `^fatal:` line, so this lands in the
+  # auth/network arm and returns 0 silently. Deliberately not also forcing
+  # ssh's BatchMode: an ssh passphrase prompt moved earlier is arguably an
+  # improvement, and BatchMode would break agent-less setups that work today.
+  GIT_TERMINAL_PROMPT=0 git -C "$repo" push --dry-run origin \
+      "$branch:refs/heads/leerie/runs/preflight-probe" \
+      >"$_o" 2>"$_e" || rc=$?
+  out="$(cat "$_o")"; err="$(cat "$_e")"
+  rm -f "$_o" "$_e" 2>/dev/null || true
+  [ "$rc" -eq 0 ] && return 0
+  # Same split as the push path: classify on stderr only.
+  if _host_finalize_is_auth_or_network_push_error "$err"; then
+    return 0
+  fi
+
+  local combined="$err"
+  [ -n "$out" ] && combined="$err
+--- pre-push hook output (stdout) ---
+$out"
+  echo "leerie: warning: this repository's \`pre-push\` hook already fails on your" >&2
+  echo "  checked-out tree (\`$branch\`), before this run has changed anything." >&2
+  echo "  git runs pre-push against the WORKING TREE, not against the commits being" >&2
+  echo "  pushed, and leerie never checks out the run branch — so unless you fix this," >&2
+  echo "  finalize will reject the push after the run has already been paid for." >&2
+  echo "  Probed with: git push --dry-run (no ref was created, nothing was pushed)." >&2
+  # Say so when the tail is a tail. The push path prints a marker for the
+  # same reason; there is no run.json to point at here, but silently cutting
+  # output and presenting it as complete is the part worth avoiding.
+  local shown
+  shown="$(printf '%s' "$combined" | tail -c 1500)"
+  if [ "$shown" != "$combined" ]; then
+    echo "  Hook output (last 1500 bytes):" >&2
+  else
+    echo "  Hook output:" >&2
+  fi
+  printf '%s\n' "$shown" | sed 's/^/    /' >&2
+  echo "  Fix the hook's complaint, or run with --no-verify to bypass hooks at push time." >&2
+  echo "  Set LEERIE_SKIP_PREPUSH_PREFLIGHT=1 to skip this probe." >&2
+  return 1
+}
+
 host_finalize() {
   local run_dir="$1"
   if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
@@ -545,10 +636,98 @@ $_diagnosis"
   [ "${NO_VERIFY_PUSH:-false}" = "true" ] && push_args+=(--no-verify)
 
   echo "[leerie] finalize: pushing $run_branch to origin$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " (--no-verify)")" >&2
-  local push_stderr
-  if ! push_stderr="$("${push_args[@]}" 2>&1 >/dev/null)"; then
+  # Capture the push's two streams SEPARATELY, because the two
+  # consumers below want different things and merging them breaks one.
+  #
+  # The CLASSIFIER must keep seeing stderr alone. git forwards a pre-push
+  # hook's stdout to git's own stdout, and a hook that refreshes submodules
+  # or runs `git ls-remote` prints git's own `fatal:`/`remote:`-framed lines
+  # there — folding stdout into the classified blob flips a hook failure to
+  # "auth/network" and suppresses the `--no-verify` hint that would have
+  # helped. Measured against this file's own classifier: 3 of 3 adversarial
+  # hook shapes flip, while real `tsc`/`vitest` output does not. Keeping the
+  # streams apart leaves the committed 23-case corpus score unchanged BY
+  # CONSTRUCTION rather than by re-measurement.
+  #
+  # The OPERATOR needs stdout. `tsc` and `biome` write diagnostics there
+  # (jest and vitest use stderr, which is why this went unnoticed), so
+  # discarding it recorded a `push_error` of two pnpm deprecation warnings
+  # for a push whose real cause was 13 lines of TS2307 — undiagnosable from
+  # leerie's own output, three misdiagnoses, on a $57 run (barnacle,
+  # 2026-08-17).
+  #
+  # `push_hook_out` holds the hook's stdout WITHOUT the section marker, and
+  # exists for one reason: the marker text below contains the words
+  # "pre-push" and "hook", so the `_hook_name` grep further down matches the
+  # marker itself and reports the label as the hook's name (measured — the
+  # hint read "(pre-push hook failed)" where husky's own banner further down
+  # the same blob says "pre-push script failed"). Grepping a variable that
+  # never contained leerie's own prose is what keeps a label from being read
+  # as evidence.
+  local push_stderr push_hook_out push_all _po _pe _prc=0
+  push_hook_out=""
+  _po="$(mktemp 2>/dev/null || true)"
+  _pe="$(mktemp 2>/dev/null || true)"
+  if [ -z "$_po" ] || [ -z "$_pe" ]; then
+    # No writable temp dir — the full-`/tmp` case the classifier's own
+    # comment documents (N30). Degrade to the historical stderr-only
+    # capture rather than losing the push output entirely.
+    rm -f "$_po" "$_pe" 2>/dev/null || true
+    push_stderr="$("${push_args[@]}" 2>&1 >/dev/null)" || _prc=$?
+    push_all="$push_stderr"
+  else
+    "${push_args[@]}" >"$_po" 2>"$_pe" || _prc=$?
+    push_stderr="$(cat "$_pe")"
+    push_all="$push_stderr"
+    if [ -s "$_po" ]; then
+      push_hook_out="$(cat "$_po")"
+      push_all="$push_all
+--- pre-push hook output (stdout) ---
+$push_hook_out"
+    fi
+    rm -f "$_po" "$_pe" 2>/dev/null || true
+  fi
+  if [ "$_prc" -ne 0 ]; then
+    # Bound what is PERSISTED, not just what is printed. `push_error` reaches
+    # `run.json` as a single `jq --arg` value, and a single argv element
+    # cannot exceed MAX_ARG_STRLEN (131,072 bytes = 32 * PAGE_SIZE). One real
+    # recorded push_error is already 104,520 bytes of jest output — 80% of
+    # that ceiling on stderr ALONE — so appending hook stdout to the same
+    # value is what makes the ceiling reachable. Past it, `jq` cannot be
+    # exec'd at all, and under the `set -euo pipefail` every caller sets that
+    # aborts host_finalize BEFORE the diagnostic below prints: the operator
+    # would lose the very output this capture exists to preserve. Same
+    # argv-E2BIG class the orchestrator hit on 2026-07-19. 32 KiB leaves ~99
+    # KiB of headroom for the jq filter, the sidecar path and the other
+    # --arg pairs; tail-anchored because the informative end of a compiler or
+    # test-runner report is its tail.
+    #
+    # `tail -c` unconditionally, rather than a `${#push_all} -gt 32768` test,
+    # because `${#var}` counts CHARACTERS while both `tail -c` and the argv
+    # ceiling count BYTES — under a UTF-8 locale a 7-character Japanese
+    # string reports 7 and occupies 21. A character-based guard therefore
+    # under-measures by up to 4x, and 32,768 four-byte characters is 131,072
+    # bytes: exactly MAX_ARG_STRLEN, with the guard not firing. Piping
+    # always is byte-exact and needs no arithmetic; `tail -c` returns a
+    # shorter input unchanged, so the equality test below adds the marker
+    # only when something was really cut. Both sides have been through
+    # `$( )`, so trailing-newline stripping is symmetric and cannot make a
+    # whole-input case look truncated.
+    #
+    # A byte cut can land mid-character in a UTF-8 report. That is fine and
+    # was verified rather than assumed: `jq --arg` substitutes U+FFFD for
+    # the orphaned byte and still writes valid JSON at rc 0, so the worst
+    # case is one replacement character at the cut point — not the aborted
+    # write this bound exists to prevent.
+    local push_persist
+    push_persist="$(printf '%s' "$push_all" | tail -c 32768)"
+    if [ "$push_persist" != "$push_all" ]; then
+      push_persist="…(truncated to the last 32 KiB; a single jq --arg value
+cannot exceed MAX_ARG_STRLEN)…
+$push_persist"
+    fi
     _host_finalize_update_run_json "$run_json" \
-      "pushed_at=" "push_error=${push_stderr:-git push failed}" \
+      "pushed_at=" "push_error=${push_persist:-git push failed}" \
       "pr_url=" "pr_error="
     echo "leerie: error: git push failed for branch \`$run_branch\`." >&2
     echo "  Local state is intact:" >&2
@@ -557,11 +736,26 @@ $_diagnosis"
     echo "    - PR base branch: $pr_base_branch (intended PR base)" >&2
     echo "  Resolve and retry manually:" >&2
     echo "    git push -u origin $run_branch$([ "${NO_VERIFY_PUSH:-false}" = "true" ] && echo " --no-verify")" >&2
-    echo "  Push stderr was:" >&2
-    printf '    %s\n' "$push_stderr" >&2
+    # The terminal gets a much tighter bound than run.json — a pre-push hook
+    # running a test suite reaches megabytes easily, and the same tail-anchor
+    # reasoning applies as above (and as the rebaser's `*)` arm applies to a
+    # malformed JSON payload). `${#}` is fine here where it is not above:
+    # this bound is cosmetic, so counting characters rather than bytes only
+    # changes how much scrollback a multibyte payload occupies, never
+    # whether a later command can be exec'd.
+    local push_display="$push_all"
+    if [ "${#push_all}" -gt 4000 ]; then
+      push_display="…(truncated; more in run.json \`push_error\`)…
+$(printf '%s' "$push_all" | tail -c 4000)"
+    fi
+    echo "  Push output was (stderr, plus any pre-push hook stdout):" >&2
+    # `sed` rather than `printf '    %s\n'`: that form indents only the
+    # FIRST line of a multi-line value, which ran the git error onto the
+    # end of a hook's last line and read as one corrupted sentence.
+    printf '%s\n' "$push_display" | sed 's/^/    /' >&2
     if _host_finalize_pre_push_hook_present "$USER_REPO" \
         && ! _host_finalize_is_auth_or_network_push_error "$push_stderr"; then
-      local _hook_name
+      local _hook_name _checked_out _blt_passed
       # Vendor-text grep kept only as a supplementary "which hook" naming
       # signal, per N24's scope note — never as the classification itself.
       # `|| true` guards against `set -o pipefail`: under the non-branded-
@@ -569,8 +763,43 @@ $_diagnosis"
       # otherwise make that no-match propagate as the pipeline's exit status
       # (even though `head -1` itself succeeds), aborting the whole function
       # under `set -e` before the hint below ever prints.
-      _hook_name="$(printf '%s' "$push_stderr" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1 || true)"
+      #
+      # It reads the hook's stdout as well as stderr, and that is not
+      # cosmetic: husky v9 prints its banner on STDOUT. Measured — a repo
+      # with `core.hooksPath=.husky/_` runs `.husky/_/h`, whose line 20 is
+      # `[ $c != 0 ] && echo "husky - $n script failed (code $c)"`, a bare
+      # `echo` with no `>&2`. So under the historical stderr-only capture
+      # this grep could never match the commonest hook runner in existence,
+      # and the hint always fell back to its generic default. Safe because
+      # this is the naming signal alone — classification stays on
+      # `push_stderr` in the guard above, which is what keeps the corpus
+      # score intact. It reads `push_hook_out` rather than `push_all` so the
+      # section marker's own "pre-push hook" text cannot be matched first.
+      _hook_name="$(printf '%s\n%s' "$push_stderr" "$push_hook_out" | grep -oE '(pre-push|pre-commit|commit-msg|pre-receive) (script|hook)' | head -1 || true)"
       echo "  This looks like a failing git hook (${_hook_name:-pre-push} failed) rather than a push/auth/network problem." >&2
+      # WHICH TREE the hook measured is the fact that ends the confusion,
+      # and nothing used to say it. git runs pre-push in the repo root
+      # against whatever is CHECKED OUT; leerie never checks out the run
+      # branch (the rebase uses a disposable worktree), so a hook that
+      # lints or typechecks the working tree is reporting on the host's
+      # state, not on the commits being pushed. Measured once: the hook
+      # rejected a push over 13 TS2307 errors that existed on the checked-
+      # out base branch because the host's node_modules was three weeks
+      # stale, while the run's own two files were clean.
+      _checked_out="$(git -C "$USER_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+      echo "  Note the hook ran against your checkout's working tree (${_checked_out:-current branch}), NOT the" >&2
+      echo "  commits being pushed — leerie never checks out $run_branch. A hook that lints or" >&2
+      echo "  typechecks the working tree is measuring host state; check that your dependencies" >&2
+      echo "  are installed and up to date before assuming this run is at fault." >&2
+      # `[]?` tolerates an absent/!object blt_results; `|| true` keeps a
+      # missing or unreadable state.json (the fail-open completion-gate
+      # case reaches here) from aborting the hint under `set -e`.
+      _blt_passed="$(jq -r '[.blt_results[]? | select(.passed == true) | .command]
+                            | unique | join(", ")' "$state_json" 2>/dev/null || true)"
+      if [ -n "$_blt_passed" ] && [ "$_blt_passed" != "null" ]; then
+        echo "  leerie already verified the integrated tree in-container; these passed there:" >&2
+        echo "    $(printf '%s' "$_blt_passed" | cut -c1-300)" >&2
+      fi
       echo "  If the hook failure is expected or unrelated to this run's changes, bypass it with:" >&2
       echo "    git push -u origin $run_branch --no-verify" >&2
       echo "  (or set NO_VERIFY_PUSH=true before invoking finalize)." >&2

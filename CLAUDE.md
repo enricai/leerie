@@ -619,6 +619,17 @@ export LEERIE_BAKE_LANGUAGE_DEPS=0
 # `dangerously_force_strict_output = true` in leerie.toml:
 ./leerie "task" --dangerously-force-strict-output
 
+# Skip the run-start pre-push hook probe. Finalize ends in `git push`, and a
+# repo `pre-push` hook gates that push against the HOST CHECKOUT's working
+# tree — which leerie never modifies during a run — so a hook that rejects
+# today still rejects hours later, after the run is paid for. The launcher
+# probes it with `git push --dry-run` (runs the hook, creates no ref) and
+# WARNS; it never refuses to start. Repos with no pre-push hook pay nothing.
+# Set this when the hook is expensive enough that you'd rather not pay it
+# twice. Env-var only — no CLI flag, no leerie.toml key.
+export LEERIE_SKIP_PREPUSH_PREFLIGHT=1
+./leerie "task"
+
 # Pick a PR template when the repo has multiple in PULL_REQUEST_TEMPLATE/.
 # Also LEERIE_PR_TEMPLATE or `pr_template` in leerie.toml.
 ./leerie "task" --pr-template feature
@@ -2506,12 +2517,15 @@ nameref ban was likewise extended to `leerie` itself
 (`test_no_namerefs_in_launcher`).
 
 **Host-only tests are gated on `jq`** (`HAS_JQ` in `tests/conftest.py`,
-mirroring the `HAS_TREESITTER` pattern). Four modules —
-`test_host_finalize_sh.py` (19 tests), `test_decide_teardown_auto_finalize.py`
-(2), `test_launcher_finalize_no_work.py` (1), `test_launcher_no_push_skips.py`
-(1) — source bash the **host** owns: `scripts/host-finalize.sh`,
-`provision.sh`'s `decide_teardown`, and the launcher's `finalize` /
-`no_push` paths. All parse `run.json` with real `jq`. The harnesses stub
+mirroring the `HAS_TREESITTER` pattern). Five modules —
+`test_host_finalize_sh.py` (32 tests), `test_decide_teardown_auto_finalize.py`
+(6), `test_launcher_finalize_no_work.py` (8), `test_launcher_no_push_skips.py`
+(5), `test_push_output_capture.py` (18) — source bash the **host** owns:
+`scripts/host-finalize.sh`, `provision.sh`'s `decide_teardown`, and the
+launcher's `finalize` / `no_push` paths. All parse `run.json` with real `jq`.
+(Those counts read 19/2/1/1 here until 2026-08-17 and were stale in every
+position — each module had grown since. A count in this file is a
+measurement with a date on it, not a constant; re-derive before citing one.) The harnesses stub
 `git` and `gh` onto PATH but not `jq`, so jq is silently inherited from
 whichever machine runs pytest — it passes on a dev host and in CI (both ship
 jq) and failed only inside the leerie image, which deliberately omits it.
@@ -2525,13 +2539,128 @@ reason: Python inside the container preflights for it.
 *Finalization* those scripts can never succeed in-container anyway (gh auth,
 ssh-agent, and Keychain are host-side), so installing jq buys a green tick,
 not working code, and erodes the boundary. Note a `grep jq` does **not**
-reproduce the gated list — two of the four never mention jq and fail only
+reproduce the gated list — two of the five never mention jq and fail only
 because the script under test shells out to it; the list is measured from a
-real in-container run. `tests/test_jq_gate_wiring.py` is the guard-the-guard
+real in-container run. The fifth entry shows a second way in: a module-level
+`skipif` does **not** propagate through an import, so
+`test_push_output_capture.py` reusing `test_host_finalize_sh.py`'s runner
+needs its own. `tests/test_jq_gate_wiring.py` is the guard-the-guard
 (conftest exposes a module-level `HAS_JQ` bool derived from a live
-`shutil.which` probe; each of the four both imports it and carries a
+`shutil.which` probe; each of the five both imports it and carries a
 `skipif` referencing it) — dropping one file's skipif fails it, which is the
 same silent regression the `HAS_TREESITTER` gate exists to prevent.
+
+**The push's two streams are captured separately, and the obvious fix is the
+trap.** `host_finalize` captured the push with `2>&1 >/dev/null` — stderr
+only — while git forwards a pre-push hook's stdout to git's own stdout, where
+`tsc` and `biome` write their diagnostics (jest and vitest use stderr, which
+is why this went unnoticed). Measured: a `push_error` of two pnpm deprecation
+warnings for a push whose real cause was 13 lines of `TS2307`, undiagnosable
+from leerie's own output, three misdiagnoses, at the end of a $57 run. But
+plain `2>&1` is **wrong**, because the captured blob is also the input to
+`_host_finalize_is_auth_or_network_push_error`, whose arm matches a qualified
+phrase on a `^fatal:`/`^remote:` line — and a hook that refreshes submodules
+or runs `git ls-remote` prints exactly that shape on stdout, flipping a hook
+failure to "auth/network" and suppressing the `--no-verify` hint. Measured
+against the real classifier: **3 of 3** adversarial hook shapes flip, while
+real `tsc`/`vitest` output does not. So stderr classifies and stdout+stderr is
+displayed, which leaves the committed 23-case corpus score unchanged **by
+construction** rather than by re-measurement.
+`tests/test_push_output_capture.py` (18) pins both halves; its parametrized
+`test_git_framed_hook_stdout_does_not_suppress_the_hook_hint` is the
+load-bearing one, paired with an anti-vacuity control that a genuine
+credential failure on stderr still classifies as auth (else the guard could
+pass by disabling the classifier). Falsified live: routing `push_all` into the
+classifier fails 4 tests, and the control keeps passing.
+
+**Three further traps in the same change, each caught by a test rather than by
+review.** (1) `push_error` reaches `run.json` as a single `jq --arg` value, so
+it is bounded by `MAX_ARG_STRLEN` (131,072 bytes) — and one real recorded
+`push_error` is already **104,520 bytes on stderr alone**, so folding hook
+stdout into the same value is precisely what makes the ceiling reachable. Past
+it `jq` cannot be exec'd and `set -e` aborts `host_finalize` *before* the
+diagnostic prints, losing the output the capture exists to preserve. The
+persisted copy is therefore tail-bounded at 32 KiB (the printed one at 4000
+bytes — a separate and much tighter bound);
+`test_oversized_push_output_still_writes_the_sidecar` drives ~200 KB through
+it. Same argv-E2BIG class as the 2026-07-19 orchestrator incident.
+(2) Husky v9 prints its banner on **stdout** — a repo with
+`core.hooksPath=.husky/_` runs `.husky/_/h`, whose line 20 is a bare
+`echo "husky - $n script failed (code $c)"` with no `>&2` — so the
+supplementary "which hook" naming grep, reading stderr only, could never match
+the commonest hook runner in existence, and the existing stderr-stub test in
+`test_host_finalize_sh.py` is why that looked covered. It now reads stderr
+plus the hook's stdout; classification is untouched.
+(3) That grep must NOT read `push_all`, because the section marker leerie
+itself inserts (`--- pre-push hook output (stdout) ---`) contains the words
+"pre-push" and "hook" and is matched *first* — measured, the hint read
+"(pre-push hook failed)" while husky's own banner further down the same blob
+said "pre-push script failed". A separate `push_hook_out` variable holds the
+raw stdout so the grep never sees leerie's own prose. This is the same
+label-matching-the-thing-it-describes trap the zombie-reaper guard and the
+`unreviewed_subtasks` scan document above, in a third disguise: a *label* read
+as *evidence*. The test asserts the name is "script", not merely that
+"pre-push" appears — a laxer assertion passes against the bug.
+
+**A harness that strips the locale makes a byte-vs-character bug
+undetectable, and this is the sharpest vacuity trap in the file.** Both push
+bounds are `tail -c`, which cuts BYTES, while `${#var}` counts CHARACTERS —
+but only under a multibyte locale. `test_host_finalize_sh.py`'s runner builds
+a minimal env (`PATH`/`USER_REPO`/`HOME`, no `LANG`, no `LC_ALL`), so bash
+runs in the **C locale, where `${#var}` counts bytes** and a char-based and a
+byte-based implementation are *indistinguishable*. The first version of
+`test_persist_bound_is_measured_in_bytes_not_characters` therefore passed
+against the exact bug it was written for — falsification confirmed it: 35
+passed with the fix reverted. It now resolves a working multibyte locale
+first (`_multibyte_locale()` probes bash's own `${#}` and requires 2, not 6,
+for a two-character Japanese string), passes it through `extra_env`, and
+**skips loudly** when none exists rather than silently proving nothing.
+Generalise the rule: when a test's subject is a locale-, encoding-, or
+timezone-sensitive behaviour, the harness's minimal env is a *variable of the
+experiment*, not neutral scaffolding.
+
+Two further harness traps —
+the degrade test stubs `mktemp` to force the no-temp-dir fallback, and
+stubbing it for **every** form aborts the function at the rebase step's
+`mktemp -d`, several steps earlier, so the test passed on a path that never
+reached the push; the stub must fail only the plain-file form. And the shared
+runner decodes with `errors="replace"`, because a byte-anchored truncation
+can legitimately land mid-character and strict decoding makes the harness
+raise `UnicodeDecodeError` before a single assertion runs — testing the
+harness rather than the code. (`jq` itself is unbothered: verified, it
+substitutes U+FFFD and still writes valid JSON at rc 0, which is why the
+byte cut is safe for `run.json`.)
+
+`tests/test_prepush_preflight.py` (25) covers `host_prepush_preflight`, the
+run-start probe (DESIGN §6 *Finalization*). Real repos, real hooks, no stubs —
+the probe's whole value is running the real gate. Its load-bearing test is
+`test_probe_pushes_a_new_ref_so_the_hook_gets_real_stdin`: probing the
+already-up-to-date working branch still runs the hook but hands it **empty
+stdin** (verified against real git), so a hook that iterates the ref updates
+git feeds it exits 0 — a false pass, the worst possible outcome for a probe
+whose job is predicting a rejection. Pushing a new ref under leerie's own
+namespace reproduces the exact line finalize will produce. Falsified live:
+changing the refspec to `"$branch"` fails exactly that test with rc 0.
+Paired with `test_probe_creates_no_ref_anywhere` (the property that makes
+running a real gate safe) and a launcher-gate parametrization that **extracts**
+the preflight block from `leerie` rather than reproducing it. It also pins the
+**chain** contract: `chain` backgrounds one `./leerie` per job against a single
+shared checkout, so without care every job re-runs the hook — N concurrent
+lint/typecheck runs computing one answer, N identical warnings. The chain arm
+probes once per WAVE (after the checkout that establishes the tree those jobs
+will push from) and hands each child `LEERIE_SKIP_PREPUSH_PREFLIGHT=1`. Both
+halves are pinned, and both are load-bearing: skipping in the children alone
+removes the check from the most expensive kind of run, which is the opposite of
+the point. `group` is deliberately exempt — separate repos, separate questions.
+Two traps in that arm. Its `--no-push` skip must read `_ch_passthrough`, since
+`NO_PUSH` is first assigned *after* the chain arm and so does not exist there —
+the single-run gate's opt-out silently has no counterpart otherwise. And the
+block is **executed** by its tests, not merely string-matched: `bash -n` catches
+syntax, not an unbound variable or a bare `"${arr[@]}"` on an empty array under
+`set -u`, which is the same "scanning is not calling" lesson
+`test_ec2_bash32_portability.py` records — so `_chain_probe_block()` is bounded
+before the fan-out (running the wider extraction would background a real
+`./leerie`) and driven against a real repo.
 
 Three test-side traps in the same area, all of which made a test pass or
 hang while proving nothing:

@@ -2385,6 +2385,37 @@ Two flags control push and PR independently of body composition:
   override called out by the project's "never skip hooks unless asked"
   principle; defaults to off.
 
+**A `pre-push` hook is a gate on the host, not on the run — so it is
+probed at run start.** git runs `pre-push` in the repository root against
+whatever is *checked out*. leerie never checks out the run branch: the
+push happens from the user's own checkout, and the finalize rebase uses a
+disposable worktree. So a hook that lints, typechecks, or tests the
+working tree is measuring the host's state, and it can reject a push for
+reasons no run could have caused or prevented — a stale `node_modules`, a
+tool missing from the hook's `sh` PATH, a half-finished dependency bump.
+This is not hypothetical: every recorded push rejection in one operator's
+state directory was of exactly this shape, and the most expensive one
+arrived after 2h19m and $57 of work.
+
+The design consequence is that leerie does not treat that gate as a
+verdict on the run — it already ran the equivalent checks in-container, on
+the tree that actually holds the changes — but it also cannot ignore it,
+because the push genuinely will not happen. What it can do is move the
+discovery to the cheapest moment. Because the hook reads the host
+checkout, and leerie does not modify the host checkout during a run, a
+probe at run start predicts the finalize outcome *by construction* rather
+than by luck. `git push --dry-run` runs the hook and creates no ref, so
+that probe is free of side effects; the launcher runs it during host
+preflight and warns. It warns rather than refuses: a hook can legitimately
+fail on a tree the run is about to fix, and a preflight must never become a
+new way to decline to start. A chain probes once per *wave* rather than once
+per job — its jobs share a single checkout, so N probes would compute one
+answer N times concurrently — while a group probes per member, because its
+members are separate repositories and so are genuinely separate questions.
+This is the same "fail fast at the cheapest
+moment" reasoning §13 applies to budget feasibility — spend nothing to
+learn something the end of the run would otherwise charge full price for.
+
 **Push and PR are honest about failure.** A push or PR step that fails does
 not pretend the run failed: the local work is intact and reachable on the
 run branch. The orchestrator records what was attempted and what failed in
@@ -2393,8 +2424,10 @@ a per-run sidecar (`run.json` — `pushed_at`, `push_error`, `pr_url`,
 names the run branch (where the work lives), the working branch
 (unchanged from run start — the diff fork-point), and the PR base branch
 (`pr_base_branch`, which defaults to `working_branch` — see
-`docs/IMPLEMENTATION.md` "PR base branch override"), shows the captured
-stderr, and gives the exact retry command. PR-creation failure is treated
+`docs/IMPLEMENTATION.md` "PR base branch override"), shows the captured push
+output — stderr plus any pre-push hook stdout, since git forwards a hook's
+stdout to its own and that is where `tsc` and `biome` report — and gives the
+exact retry command. PR-creation failure is treated
 as non-fatal: the push has already succeeded, so the user receives a
 warning with the GitHub URL of the pushed branch and the exact `gh pr
 create` command to retry. The principle is that the user always knows

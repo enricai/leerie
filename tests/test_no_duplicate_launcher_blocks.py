@@ -59,6 +59,12 @@ _BLOCKS = [
     ("config) case arm", "  config)"),
     ("runtime-mode knob block", "# --- runtime-mode knob ---"),
     ("nerdctl run argv", "  _run_argv=("),
+    ("pre-push preflight block", "# 4. pre-push hook preflight."),
+    # The chain arm's per-wave probe — a second block added by the same
+    # change that registered the row above, and initially unregistered,
+    # which is this guard's whole thesis restated. Matched at its own
+    # 8-space indent, like the two rows above.
+    ("chain per-wave probe", "        # One pre-push hook probe per WAVE"),
 ]
 
 

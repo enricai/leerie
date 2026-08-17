@@ -107,7 +107,14 @@ def _run_host_finalize(tmp_path: Path, run_dir: Path,
     return subprocess.run(
         ["bash", "-c", script],
         env=env,
-        capture_output=True, text=True, check=False,
+        # `errors="replace"` because the code under test can legitimately
+        # emit a byte-truncated multibyte payload: the push-output bounds
+        # are `tail -c`, which cuts by bytes and so can land mid-character
+        # in a UTF-8 hook report. Strict decoding makes the harness raise
+        # UnicodeDecodeError before a single assertion runs — testing the
+        # harness rather than the code. (jq is unbothered: it substitutes
+        # U+FFFD and still writes valid JSON at rc 0, verified.)
+        capture_output=True, text=True, errors="replace", check=False,
     )
 
 
@@ -406,7 +413,13 @@ exit 0
     r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
     assert r.returncode == 1, r.stderr
     assert "--no-verify" not in r.stderr
-    assert "pre-push" not in r.stderr
+    # Assert the absence of the DIAGNOSTIC, not of the string "pre-push".
+    # The push-output label now names the stream it is showing
+    # ("plus any pre-push hook stdout"), so a bare substring test reports a
+    # hook diagnosis that did not happen — co-occurrence is not connection.
+    # Together with the `--no-verify` line above this covers both halves of
+    # the hint block, which is what these tests were really asserting.
+    assert "This looks like a failing git hook" not in r.stderr
 
 
 def test_diagnoses_non_branded_hook_failure_via_mechanical_probe(tmp_path):
@@ -481,7 +494,13 @@ exit 0
     r = _run_host_finalize(tmp_path, run_dir, git_body=git_body)
     assert r.returncode == 1, r.stderr
     assert "--no-verify" not in r.stderr
-    assert "pre-push" not in r.stderr
+    # Assert the absence of the DIAGNOSTIC, not of the string "pre-push".
+    # The push-output label now names the stream it is showing
+    # ("plus any pre-push hook stdout"), so a bare substring test reports a
+    # hook diagnosis that did not happen — co-occurrence is not connection.
+    # Together with the `--no-verify` line above this covers both halves of
+    # the hint block, which is what these tests were really asserting.
+    assert "This looks like a failing git hook" not in r.stderr
 
 
 def test_records_pushed_at_on_success(tmp_path):
