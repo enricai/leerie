@@ -4034,6 +4034,46 @@ except Exception:
         git -C "$USER_REPO" checkout "$_ch_current_base" >/dev/null 2>&1 \
           || { remote_log "chain: failed to checkout $_ch_current_base in $USER_REPO"; exit 1; }
 
+        # One pre-push hook probe per WAVE, not per job. Every child below
+        # is a full `./leerie` invocation against THIS SAME checkout, so
+        # each would otherwise run the probe itself — N concurrent
+        # lint/typecheck runs all computing one answer, and N identical
+        # warnings. The children are handed LEERIE_SKIP_PREPUSH_PREFLIGHT=1
+        # for that reason. Per wave rather than once per chain because the
+        # checkout above changes the working tree between waves, and the
+        # tree the probe reads must be the tree these jobs will push from.
+        #
+        # `--no-push` has to be read out of `_ch_passthrough` rather than
+        # from `NO_PUSH`: that variable is first assigned further down the
+        # launcher, AFTER this arm, so it does not exist here — which is
+        # exactly why the single-run gate's `--no-push` skip has no
+        # counterpart here unless one is written. A forwarded `--no-push`
+        # lands in the passthrough array, and probing a hook for a push that
+        # will never happen is pure noise.
+        _ch_skip_probe=false
+        case "${LEERIE_SKIP_PREPUSH_PREFLIGHT:-}" in
+          1|true|TRUE|yes|YES) _ch_skip_probe=true ;;
+        esac
+        case "${LEERIE_NO_PUSH:-}" in
+          1|true|TRUE|yes|YES) _ch_skip_probe=true ;;
+        esac
+        # `${arr[@]+"${arr[@]}"}` rather than a bare `"${arr[@]}"`: an empty
+        # array under `set -u` is an unbound-variable error on bash 3.2
+        # (macOS's /bin/bash), and a chain with no passthrough flags is the
+        # common case. `if` rather than `[ … ] && …` so the loop's exit
+        # status is never the question.
+        for _ch_arg in ${_ch_passthrough[@]+"${_ch_passthrough[@]}"}; do
+          if [ "$_ch_arg" = "--no-push" ]; then _ch_skip_probe=true; fi
+        done
+        if [ "$_ch_skip_probe" = "false" ]; then
+          # shellcheck source=scripts/host-finalize.sh
+          . "$LEERIE_REPO/scripts/host-finalize.sh"
+          # Advisory, exactly as in the single-run preflight: `set -e`
+          # would otherwise turn a warning into a refusal to launch.
+          host_prepush_preflight "$USER_REPO" "$_ch_current_base" || true
+        fi
+        unset _ch_skip_probe _ch_arg
+
         # Snapshot the launcher_pid->run-id mapping BEFORE fan-out so
         # we can identify which fly-machine.json files belong to this
         # wave. remote/<pid>.json is written by provision.sh post-
@@ -4045,7 +4085,7 @@ except Exception:
           # own full provision → seed → orchestrator → fetch_branch →
           # host_finalize → destroy_machine pipeline on the laptop,
           # and writes its run state under $LEERIE_STATE_HOST_DIR/runs/.
-          LEERIE_WAVE_IDX="$_wave_idx" "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly "${_ch_passthrough[@]}" --chain-id "$_ch_id" &
+          LEERIE_WAVE_IDX="$_wave_idx" LEERIE_SKIP_PREPUSH_PREFLIGHT=1 "${LEERIE_SELF_CMD:-"$0"}" "$_prompt" --runtime fly "${_ch_passthrough[@]}" --chain-id "$_ch_id" &
           _ch_wave_pids+=($!)
           _ch_wave_child_pids+=($!)
         done
@@ -5327,7 +5367,7 @@ _warn_if_log_in_repo() {
 }
 _warn_if_log_in_repo || true
 
-# --- host preflight: git repo + gh + jq ---------------------------------
+# --- host preflight: git repo + gh + jq + pre-push hook -----------------
 # These checks moved out of the orchestrator (DESIGN §6 *Finalization*).
 # The launcher does the host-side push + PR after the container exits,
 # so the auth state needs to be valid on the host BEFORE we spin up the
@@ -5443,6 +5483,38 @@ if [ "$NO_PUSH" = "false" ] && ! command -v jq >/dev/null 2>&1; then
   echo "  Or pass --no-push to skip the host-side finalize." >&2
   exit 1
 fi
+
+# 4. pre-push hook preflight. The host-side finalize ends in
+#    `git push`, and a repository `pre-push` hook gates that push against
+#    the HOST CHECKOUT's working tree — a tree leerie never modifies during
+#    a run. So a hook that already rejects today will still reject at
+#    finalize, hours and one full run's spend later. `host_prepush_preflight`
+#    probes it with `git push --dry-run`, which runs the hook and creates no
+#    ref. Warning, not fatal: a hook can legitimately fail on a tree this
+#    run is about to fix, and this must never be a new way to refuse to
+#    start. Skipped when nothing will be pushed (--no-push), when hooks are
+#    being bypassed anyway (--no-verify), when the repo has no pre-push hook
+#    (the probe returns immediately, so hookless repos pay nothing), and via
+#    LEERIE_SKIP_PREPUSH_PREFLIGHT for repos whose hook is expensive.
+case "${LEERIE_SKIP_PREPUSH_PREFLIGHT:-}" in
+  1|true|TRUE|yes|YES) _skip_prepush_preflight=true ;;
+  *) _skip_prepush_preflight=false ;;
+esac
+if [ "$NO_PUSH" = "false" ] \
+   && [ "${NO_VERIFY_PUSH:-false}" != "true" ] \
+   && [ "$_skip_prepush_preflight" = "false" ]; then
+  # shellcheck source=scripts/host-finalize.sh
+  . "$LEERIE_REPO/scripts/host-finalize.sh"
+  _prepush_branch="$(git -C "$USER_REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  # A detached HEAD has no branch to push from; skip rather than guess.
+  if [ -n "$_prepush_branch" ] && [ "$_prepush_branch" != "HEAD" ]; then
+    # `|| true`: the probe's verdict is advisory, and `set -e` would turn
+    # its rc 1 into a refusal to start.
+    host_prepush_preflight "$USER_REPO" "$_prepush_branch" || true
+  fi
+  unset _prepush_branch
+fi
+unset _skip_prepush_preflight
 
 # --- build image if not present (one-time, ~60-120s) --------------------
 if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
@@ -8673,7 +8745,10 @@ else
   #   - Fly/EC2/remote/chain/wave machinery: consumed launcher-side only.
   #   - LEERIE_NO_PUSH: the orchestrator is always invoked with --no-push and
   #     the host does the push; forwarding it would be redundant/confusing.
+  #   - LEERIE_SKIP_PREPUSH_PREFLIGHT: gates a probe that runs on the host
+  #     before the container starts; nothing inside reads it.
   _leerie_env_denylist=" \
+    LEERIE_SKIP_PREPUSH_PREFLIGHT \
     LEERIE_STATE_DIR LEERIE_INSPECT_DIRS LEERIE_HOME LEERIE_REPO \
     LEERIE_STATE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION LEERIE_TASK_ARG \
     LEERIE_NO_PUSH LEERIE_GENERATED_SENTINEL LEERIE_RECAPTURE_WROTE \

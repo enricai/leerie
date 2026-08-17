@@ -45,6 +45,10 @@ GATED_MODULES = [
     "test_decide_teardown_auto_finalize.py",
     "test_launcher_finalize_no_work.py",
     "test_launcher_no_push_skips.py",
+    # Inherits the gate transitively: it reuses test_host_finalize_sh.py's
+    # runner, so it drives the same jq-parsing script and needs its own
+    # skipif — a module-level skipif does not propagate through an import.
+    "test_push_output_capture.py",
 ]
 
 
