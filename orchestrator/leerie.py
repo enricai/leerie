@@ -15769,11 +15769,17 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # cause. `InputValidationError` (unparseable JSON) already logs its
     # payload; this closes the gap for the parseable-but-invalid case.
     last_structured_payload: str | None = None
+    # Whether the unexpected-tool-surface warning has already fired for this
+    # worker. Latched (not re-checked per event) so a worker whose tools
+    # array is inspected across multiple system/init events (unusual, but
+    # not impossible) only ever warns once — the advisory exists to flag a
+    # drift, not to spam the log per event.
+    unexpected_tools_warned = False
 
     async def _read_stream():
         nonlocal envelope, last_event_at, overage_blocked
         nonlocal pids_events_baseline, last_bash_cmd
-        nonlocal last_structured_payload
+        nonlocal last_structured_payload, unexpected_tools_warned
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -15835,6 +15841,26 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                         if (_rli.get("overageDisabledReason")
                                 in ("out_of_credits", "out_of_overage")):
                             overage_blocked = True
+                    # Tool-surface self-reporting (DESIGN §12 central
+                    # principle applied to the CLI's own tool list): a CLI
+                    # upgrade shipping a new tool name, or any mcp__* tool
+                    # leaking past --strict-mcp-config, should be visible
+                    # rather than silently drifting. Tracked here rather
+                    # than in _summarize_stream_event for the same reason as
+                    # the rate_limit_event latch above — it must fire even
+                    # at quiet verbosity, where the summarizer is never
+                    # consulted. Advisory only: never raises, never blocks.
+                    if (t == "system" and sub == "init"
+                            and not unexpected_tools_warned):
+                        _tools = event.get("tools") or []
+                        _flagged = sorted(
+                            name for name in _tools
+                            if name not in KNOWN_TOOLS
+                            or name.startswith("mcp__"))
+                        if _flagged:
+                            unexpected_tools_warned = True
+                            log(f"  [{sid}] unexpected tool(s) in worker's "
+                                f"tool surface: {', '.join(_flagged)}")
                     # PID-exhaustion detection (DESIGN §6 *Detecting PID
                     # exhaustion*). A worker that has exhausted its cgroup
                     # pids.max fails EVERY shell-spawning tool call with
