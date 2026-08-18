@@ -30093,9 +30093,16 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # Unconditional, and BEFORE the baseline: this fires on resume too (the
     # baseline is sentinel-skipped there) and before any wave spends, which is
     # the only point where the operator can still act on it.
-    _warn_scoped_degraded_once(
-        resolve_blt(st.repo_root), resolve_blt_scoped(st.repo_root),
-        st.data.get("subtask_tests") or "scoped")
+    try:
+        _warn_scoped_degraded_once(
+            resolve_blt(st.repo_root), resolve_blt_scoped(st.repo_root),
+            st.data.get("subtask_tests") or "scoped")
+    except Exception as e:
+        # Advisory output must never be able to abort a run, and this one
+        # reads the filesystem (`.leerie/config.toml`) at phase entry where
+        # nothing did before. Same defence as the baseline call below.
+        log(f"phase 4: scoped-degrade check errored "
+            f"({type(e).__name__}: {e}); continuing")
 
     if not st.data.get("skip_base_baseline"):
         try:

@@ -90,6 +90,24 @@ def test_partial_degrade_reports_only_the_unresolved_axis(leerie, capture):
 # wiring: the helper is inert unless phase_execute calls it, unconditionally
 # --------------------------------------------------------------------------
 
+def test_the_call_cannot_abort_phase_execute(leerie):
+    """REGRESSION (CI, PR #217). The call reads `.leerie/config.toml` via
+    `resolve_blt`/`resolve_blt_scoped` at phase entry, where nothing touched
+    the filesystem before — so `tests/test_disk_preflight.py`, which drives
+    `phase_execute` with a Mock `st`, died on `Mock / str` in `_load_blt_config`
+    and took the disk-preflight coverage with it. An advisory warning must
+    never be able to abort a run; the baseline call three lines below carries
+    the same defence for the same reason."""
+    src = inspect.getsource(leerie.phase_execute)
+    i = src.index("_warn_scoped_degraded_once(")
+    before = src[:i]
+    assert before.rstrip().endswith("try:"), (
+        "the advisory call must sit inside a try/except — it reads the "
+        "filesystem at phase entry and cannot be allowed to raise")
+    after = src[i:i + 700]
+    assert "except Exception" in after
+
+
 def test_phase_execute_calls_it_before_the_baseline(leerie):
     src = inspect.getsource(leerie.phase_execute)
     assert "_warn_scoped_degraded_once(" in src
