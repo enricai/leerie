@@ -2,7 +2,9 @@
 
 Verified when this file was written:
 
-- `.github/workflows/shellcheck.yml` lints `scripts/*.sh` only. The launcher has
+- `.github/workflows/shellcheck.yml` lints `scripts/*.sh` and
+  `scripts/remote/*.sh` (widened 2026-08-18 — it was single-level, so the 19
+  remote scripts fired the trigger and were never linted). The launcher has
   no `.sh` extension and does not live in `scripts/`, so it is not covered.
 - `.github/workflows/syntax.yml` AST-parses `orchestrator/leerie.py` and
   `tests/**/*.py` — Python only.

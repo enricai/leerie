@@ -3519,7 +3519,7 @@ No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 `tests/test_launcher_integrity.py` is the **only** thing that checks the
-`leerie` launcher parses. CI does not: `shellcheck.yml` lints `scripts/*.sh`
+`leerie` launcher parses. CI does not: `shellcheck.yml` lints `scripts/*.sh` and `scripts/remote/*.sh`
 and the launcher has no `.sh` extension nor lives there, while `syntax.yml`
 AST-parses Python only. No test runs shellcheck at all — every occurrence of
 the word under `tests/` is prose describing this gap. So a `bash -n`-level
