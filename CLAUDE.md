@@ -2731,6 +2731,37 @@ harness rather than the code. (`jq` itself is unbothered: verified, it
 substitutes U+FFFD and still writes valid JSON at rc 0, which is why the
 byte cut is safe for `run.json`.)
 
+The per-subtask delta proxy's `{test_files}` tier is covered by
+`tests/test_test_files_proxy.py` (48), `tests/test_scoped_proxy_corpus.py` (5)
+and `tests/test_scoped_degrade_warning.py` (10). Three lessons generalise past
+this feature. **(1) A non-test path is an ERROR to pytest, not a no-op, and one
+of them poisons the whole invocation** — measured, `pytest orchestrator/leerie.py`
+exits 5, `pytest docs/DESIGN.md` exits 4, and `pytest docs/DESIGN.md
+tests/test_blt_semaphore.py` ALSO exits 4. Since a real subtask diff mixes docs
+and source with its tests, a `{files}` template on a runner with no source→test
+impact analysis reports RED on nearly every subtask; the fix is to filter the
+substitution (`{test_files}`), not to abandon the proxy, with the pre-existing
+empty-list rule doing the rest — a diff with no test file renders nothing and
+falls back to canonical. **(2) Scan the author's input, not the rendered
+output.** The unknown-placeholder guard first shipped scanning the SUBSTITUTED
+command, so a changed-file path containing braces (`src/{locale}/page.test.ts`
+— the brace-routing analogue of the `src/app/[locale]/(app)/…` path
+`shlex.quote` exists for in that very function) was read as an unknown
+placeholder: it disabled the proxy *and* emitted a warning misdiagnosing it as
+install skew, sending the operator to re-run install.sh for nothing. Scanning
+the template with `_SCOPED_PLACEHOLDERS` stripped removes the hazard by
+construction rather than by widening the regex. **(3) A planner prediction is
+not a diff.** The ratio the tier rests on was first taken from
+`files_likely_touched` and was badly wrong — 40% test-touching predicted (109
+of 270) against 94% real (34 of 36) — because CLAUDE.md mandates tests and
+implementers add them whether or not the planner predicted it. The frozen
+corpus is 36 REAL per-subtask diffs recovered from leerie's own run branches,
+and each row must be ONE subtask's work: an integration merge's **first-parent**
+diff, since a plain two-dot diff against the run base is cumulative and folds
+in siblings — which is how the first recovery attempt reported 0% source-only
+and nearly shipped a fixture that could not exercise the canonical fallback at
+all.
+
 `tests/test_prepush_preflight.py` (25) covers `host_prepush_preflight`, the
 run-start probe (DESIGN §6 *Finalization*). Real repos, real hooks, no stubs —
 the probe's whole value is running the real gate. Its load-bearing test is

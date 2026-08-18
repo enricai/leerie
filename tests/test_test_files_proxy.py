@@ -17,6 +17,7 @@ always mixes docs/source with its tests.
 """
 from __future__ import annotations
 
+import ast
 import inspect
 import pathlib
 import re
@@ -356,3 +357,33 @@ def test_documented_signature_matches_the_real_one(leerie):
     assert documented == real, (
         f"IMPLEMENTATION.md documents {documented} but the function takes "
         f"{real} — update the spec in the same commit as the signature")
+
+
+def test_substituted_placeholders_match_the_declared_set(leerie):
+    """The probe loop and the substitutions below it are two views of one
+    list. Derive the substituted set from the AST rather than restating it —
+    PRs #180-#183 each replaced an enumeration with a derivation *after* a
+    missed instance shipped, and this is the same shape.
+
+    Both drift directions are harmful: a placeholder missing from
+    `_SCOPED_PLACEHOLDERS` is rejected as unknown (with a warning blaming
+    install skew), and one left in it after the substitution is removed
+    reaches the shell literally — the failure the guard exists to prevent."""
+    src = inspect.getsource(leerie._render_scoped)
+    substituted = {
+        n.value for n in ast.walk(ast.parse(src.lstrip()))
+        if isinstance(n, ast.Constant) and isinstance(n.value, str)
+        and re.fullmatch(r"\{[a-z_]+\}", n.value)
+    }
+    assert substituted, "the AST walk found no placeholder literals at all"
+    assert substituted == set(leerie._SCOPED_PLACEHOLDERS), (
+        f"_render_scoped substitutes {sorted(substituted)} but "
+        f"_SCOPED_PLACEHOLDERS declares {sorted(leerie._SCOPED_PLACEHOLDERS)}")
+
+
+def test_the_declared_set_is_consumed_by_the_probe(leerie):
+    """Anti-vacuity partner: the constant existing is not the fix — the loop
+    has to read it. A restored hand-written tuple would keep the test above
+    passing while reintroducing the duplication."""
+    src = inspect.getsource(leerie._render_scoped)
+    assert "for known in _SCOPED_PLACEHOLDERS:" in src

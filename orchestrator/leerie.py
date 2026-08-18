@@ -26223,6 +26223,16 @@ async def _changed_files(tree: str, base_ref: str) -> list[str]:
 # skew. The author's template is the only thing this guard is about.
 _UNKNOWN_PLACEHOLDER_RE: re.Pattern[str] = re.compile(r"(?<!\$)\{[a-z][a-z0-9_]*\}")
 
+# The placeholders `_render_scoped` knows how to substitute. Named once rather
+# than repeated in the probe loop: the loop and the substitutions below it are
+# two copies of one list, and both drift directions are harmful -- a new
+# placeholder missing from here is rejected as "unknown" with a misleading
+# skew warning, while a retired one left here passes the guard and reaches the
+# shell literally, which is what the guard exists to prevent.
+# `tests/test_test_files_proxy.py` derives the substituted set from the AST and
+# compares, so the two cannot silently disagree.
+_SCOPED_PLACEHOLDERS: tuple[str, ...] = ("{files}", "{test_files}", "{base}")
+
 _unknown_placeholder_warned: bool = False
 
 
@@ -26304,11 +26314,21 @@ def _render_scoped(template: str | None, files: list[str],
     A diff with no test file therefore renders nothing and the caller falls
     back to the canonical command (`_select_subtask_axes`), which is the same
     outcome as an unresolvable proxy and is why the narrowing is never
-    silent."""
+    silent.
+
+    Returns None for a third reason: a template naming a placeholder THIS
+    version cannot substitute. Version skew is the realistic cause --
+    `.leerie/config.toml` is committed to the repo while the orchestrator runs
+    from the install clone -- and the literal brace would otherwise reach the
+    shell, where `pytest '{test_files}'` exits 4 and every subtask goes RED.
+    The scan runs against the template with `_SCOPED_PLACEHOLDERS` stripped,
+    never against the rendered command: a changed-file PATH may legitimately
+    contain braces, and scanning after substitution reads those as unknown
+    placeholders, disabling the proxy AND misdiagnosing the cause."""
     if not template:
         return None
     probe = template
-    for known in ("{files}", "{test_files}", "{base}"):
+    for known in _SCOPED_PLACEHOLDERS:
         probe = probe.replace(known, "")
     leftover = _UNKNOWN_PLACEHOLDER_RE.search(probe)
     if leftover:
