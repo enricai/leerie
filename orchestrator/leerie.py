@@ -740,17 +740,17 @@ INSPECT_TOOLS = (
     "Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
 )
 # NotebookEdit sits here with Write/Edit rather than in DISALLOWED_TOOLS.
-# It was briefly denied on the theory that judgment workers can reach a
-# file writer anyway, but that argument does not survive contact: the
-# deny list is a SINGLE GLOBAL constant, so denying it also strips
-# notebook editing from implementer/integrator/conformer/rebaser running
-# against arbitrary user repos; judgment workers are autonomous=False and
-# so do NOT carry --dangerously-skip-permissions by default (see the
-# skip_perms line in claude_p), which means --allowedTools already keeps
-# it from them; and Bash/Write/Edit — the same class of writer — stay
-# allowed regardless, so the deny never delivered the read-only property
-# it was justified by. Listing it here also keeps it inside KNOWN_TOOLS,
-# so the observed-surface partition stays complete.
+# The tempting argument for denying it — judgment workers can reach a file
+# writer anyway — does not survive contact. DISALLOWED_TOOLS is a SINGLE
+# GLOBAL constant, so a deny also strips notebook editing from
+# implementer/integrator/conformer/rebaser running against arbitrary user
+# repos; judgment workers are autonomous=False and so do NOT carry
+# --dangerously-skip-permissions by default (see the skip_perms line in
+# claude_p), which means --allowedTools already holds them; and
+# Bash/Write/Edit — the same class of writer — stay allowed regardless, so
+# a deny would not deliver the read-only property it appears to buy.
+# Listing it here also keeps it inside KNOWN_TOOLS, so the observed-surface
+# partition stays complete.
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit"
 
 # SATISFIED_PROBE_TOOLS — a deliberately narrow, BASE-TREE-ONLY subset of
@@ -818,8 +818,8 @@ SATISFIED_PROBE_TOOLS = (
 # top-level escape hatch (DESIGN §12) — by default they are autonomous=False
 # and the allowlist holds. Denying a writer globally would therefore buy
 # nothing by default while removing the capability from every acting worker
-# in every user repo. See ACT_TOOLS for NotebookEdit, which was briefly
-# denied on that mistaken reasoning.
+# in every user repo. See ACT_TOOLS, where NotebookEdit is classified for
+# exactly that reason.
 DISALLOWED_TOOLS = (
     "Agent,Task,SendMessage,"
     "ScheduleWakeup,"
@@ -14523,8 +14523,10 @@ def _summarize_tool_use(sid: str, block: dict, verbosity: str) -> str:
     if name in ("Write", "Edit", "NotebookEdit"):
         # NotebookEdit names its target `notebook_path`, not `file_path`, so
         # keying only on the latter logged a bare "?" for every notebook edit.
-        # Latent while NotebookEdit was on the deny list; live again now that
-        # it is an ACT_TOOLS writer.
+        # This was never latent: NotebookEdit has always been in the acting
+        # workers' reported tool surface, and they run with
+        # --dangerously-skip-permissions, so every real notebook edit has
+        # logged "?" for as long as the summarizer has existed.
         path = inp.get("file_path") or inp.get("notebook_path") or "?"
         return f"  [{sid} {name.lower()}] {path}"
     if name == "WebFetch":

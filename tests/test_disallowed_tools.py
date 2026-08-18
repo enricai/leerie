@@ -39,9 +39,9 @@ REQUIRED_DENIALS = {
     "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
 }
 
-# NotebookEdit is deliberately NOT here — see ACT_TOOLS in leerie.py. It was
-# briefly denied and reverted: the deny list is a single global constant, so
-# denying a writer strips notebook editing from every acting worker in every
+# NotebookEdit is deliberately NOT here — see ACT_TOOLS in leerie.py. The deny
+# list is a single global constant, so denying a writer would strip notebook
+# editing from every acting worker in every
 # user repo, while judgment workers (autonomous=False) do not carry
 # --dangerously-skip-permissions by default and so are already held by
 # --allowedTools. Bash/Write/Edit stay allowed regardless, so the deny never

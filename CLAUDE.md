@@ -133,8 +133,9 @@ orchestrator and not used anywhere in this repo.
 
 `DISALLOWED_TOOLS` enforces this mechanically, and it must name **`Task`**,
 not only `Agent`: `Agent` is the retired spelling and current CLI builds ship
-`Task`. Until 2026-08-18 the deny list carried `Agent` and the retired `Task*`
-family (`TaskCreate`…`TaskStop`) but not the bare `Task`, so this invariant
+`Task`. Until 2026-08-18 the deny list carried `Agent` and the `Task*` family
+(`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, retired from current builds,
+plus the live `TaskOutput`/`TaskStop`) but not the bare `Task`, so this invariant
 was enforced against a name the live CLI no longer emits — the shape to watch
 for whenever the CLI renames a tool.
 
