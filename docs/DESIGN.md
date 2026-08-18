@@ -7367,7 +7367,10 @@ removes tools from the model's context entirely — the model cannot see or call
 them regardless of permission mode. The deny list targets tools that spawn
 untracked parallel work or set timers the orchestrator cannot track: `Agent`,
 `SendMessage`, `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList`,
-`RemoteTrigger`, `PushNotification`. This is the §12-correct direction: a
+`RemoteTrigger`, `PushNotification`, plus (corpus measurement) `Workflow`,
+`ReportFindings`, `Skill`, `Monitor`, `TaskCreate`, `TaskGet`, `TaskList`,
+`TaskUpdate`, `TaskOutput`, `TaskStop`, `ListAgents`, `EnterWorktree`,
+`ExitWorktree`, `DesignSync`, and `ToolSearch`. This is the §12-correct direction: a
 mechanical code-side deny that survives the permission escape hatch.
 
 ### Instruction adherence is code-enforced
