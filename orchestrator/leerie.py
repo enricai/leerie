@@ -28,6 +28,7 @@ import copy
 import ctypes
 import errno
 import fcntl
+import fnmatch
 import functools
 import hashlib
 import json
@@ -26273,21 +26274,150 @@ async def _changed_files(tree: str, base_ref: str) -> list[str]:
     return [p for p in r.stdout.split("\0") if p]
 
 
+# A placeholder leerie does not know how to substitute. Anchored to a lowercase
+# identifier in braces, NOT preceded by `$`, so the three brace shapes a real
+# command legitimately carries are all excluded: `${VAR}`/`${var}` (shell
+# expansion), `{1..3}` (brace expansion, digit start), and `{print $1}` (awk,
+# contains a space). The one residual false positive is a bare `awk '{print}'`
+# inside a proxy template -- accepted deliberately, because the two failure
+# directions are not symmetric: a false positive falls back to the canonical
+# command (exactly today's behaviour), while NOT catching an unknown
+# placeholder ships it to the shell literally and `pytest '{test_files}'`
+# exits 4, turning every subtask RED.
+#
+# Matched against the TEMPLATE with the known placeholders stripped, never
+# against the rendered command: a changed-file PATH may legitimately contain
+# braces (`src/{locale}/page.test.ts` is the brace-routing analogue of the
+# `src/app/[locale]/(app)/...` path `shlex.quote` exists for here), and
+# scanning after substitution reads those paths as unknown placeholders --
+# disabling the proxy AND emitting a warning that misdiagnoses it as install
+# skew. The author's template is the only thing this guard is about.
+_UNKNOWN_PLACEHOLDER_RE: re.Pattern[str] = re.compile(r"(?<!\$)\{[a-z][a-z0-9_]*\}")
+
+# The placeholders `_render_scoped` knows how to substitute. Named once rather
+# than repeated in the probe loop: the loop and the substitutions below it are
+# two copies of one list, and both drift directions are harmful -- a new
+# placeholder missing from here is rejected as "unknown" with a misleading
+# skew warning, while a retired one left here passes the guard and reaches the
+# shell literally, which is what the guard exists to prevent.
+# `tests/test_test_files_proxy.py` derives the substituted set from the AST and
+# compares, so the two cannot silently disagree.
+_SCOPED_PLACEHOLDERS: tuple[str, ...] = ("{files}", "{test_files}", "{base}")
+
+_unknown_placeholder_warned: bool = False
+
+
+def _warn_unknown_placeholder_once(template: str, token: str) -> None:
+    """Warn once per process that a proxy template named a placeholder this
+    orchestrator cannot substitute.
+
+    The realistic cause is version skew: `.leerie/config.toml` is committed to
+    the repo while the orchestrator runs from the install clone
+    (`/opt/leerie-image`, updated only by install.sh), so a config declaring a
+    placeholder added after that install reaches an older renderer. Falling
+    back to the canonical command is the safe outcome, but a SILENT fallback
+    is the thing `_warn_scoped_degraded_once` exists to prevent, so say it."""
+    global _unknown_placeholder_warned
+    if _unknown_placeholder_warned:
+        return
+    _unknown_placeholder_warned = True
+    log(f"WARNING: delta-proxy template names {token}, which this leerie does "
+        f"not know how to substitute ({template!r}). Falling back to the "
+        "canonical command for that axis. This usually means the repo's "
+        ".leerie/config.toml is newer than the installed orchestrator — "
+        "re-run install.sh to update it.")
+
+
+# Path shapes that mean "this file is a test" across the ecosystems leerie
+# runs against. Deliberately conventional rather than clever: a repo whose
+# layout these miss declares `test_file_globs` in .leerie/config.toml, which
+# REPLACES this list rather than extending it (a repo that has to override is
+# saying the built-in guess is wrong, not incomplete).
+_TEST_DIR_SEGMENTS: tuple[str, ...] = ("tests", "test", "spec")
+_TEST_BASENAME_GLOBS: tuple[str, ...] = (
+    "test_*.py", "*_test.*", "*.test.*", "*.spec.*")
+
+
+def _is_test_file(path: str, globs: list[str] | None = None) -> bool:
+    """True when `path` looks like a test file.
+
+    Used by `_render_scoped`'s `{test_files}` tier. Over-matching costs a
+    slightly wider proxy run; under-matching drops a test the diff touched out
+    of the only per-subtask signal there is, so the shapes below lean
+    inclusive.
+
+    `globs` (from `test_file_globs`) replaces the built-ins entirely when
+    non-empty, and is matched against the whole path with `fnmatch` so a repo
+    can say `src/**/__tests__/*` as easily as `*.spec.rb`."""
+    norm = path.replace("\\", "/").removeprefix("./")
+    if globs:
+        return any(fnmatch.fnmatch(norm, g) for g in globs)
+    parts = norm.split("/")
+    if any(seg in _TEST_DIR_SEGMENTS for seg in parts[:-1]):
+        return True
+    base = parts[-1]
+    return any(fnmatch.fnmatch(base, g) for g in _TEST_BASENAME_GLOBS)
+
+
 def _render_scoped(template: str | None, files: list[str],
-                   base_ref: str) -> str | None:
-    """Substitute `{files}` and `{base}` into a delta-proxy template.
+                   base_ref: str,
+                   test_globs: list[str] | None = None) -> str | None:
+    """Substitute `{files}`, `{test_files}` and `{base}` into a delta-proxy
+    template.
 
     Returns None when the template wants `{files}` and there are none. That
     case must be a hard skip, not a bare runner invocation: rendering
     `vitest related --run` with an empty file list runs EVERYTHING, which is
-    the exact inversion of the feature."""
+    the exact inversion of the feature.
+
+    `{test_files}` is the same substitution over the test-shaped members only,
+    under the same absence rule, and exists for runners with no source→test
+    impact analysis. `vitest related` / `jest --findRelatedTests` take SOURCE
+    files and resolve dependents through the runner's own module graph, so
+    they want `{files}` whole. pytest instead collects under the paths it is
+    given, where a non-test path is an error rather than a no-op: measured,
+    `pytest orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4,
+    and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4 —
+    one non-test path poisons an otherwise-valid invocation. Since a real
+    subtask diff mixes source and docs with its tests, a `{files}` template on
+    such a repo reports RED on nearly every subtask.
+
+    A diff with no test file therefore renders nothing and the caller falls
+    back to the canonical command (`_select_subtask_axes`), which is the same
+    outcome as an unresolvable proxy and is why the narrowing is never
+    silent.
+
+    Returns None for a third reason: a template naming a placeholder THIS
+    version cannot substitute. Version skew is the realistic cause --
+    `.leerie/config.toml` is committed to the repo while the orchestrator runs
+    from the install clone -- and the literal brace would otherwise reach the
+    shell, where `pytest '{test_files}'` exits 4 and every subtask goes RED.
+    The scan runs against the template with `_SCOPED_PLACEHOLDERS` stripped,
+    never against the rendered command: a changed-file PATH may legitimately
+    contain braces, and scanning after substitution reads those as unknown
+    placeholders, disabling the proxy AND misdiagnosing the cause."""
     if not template:
+        return None
+    probe = template
+    for known in _SCOPED_PLACEHOLDERS:
+        probe = probe.replace(known, "")
+    leftover = _UNKNOWN_PLACEHOLDER_RE.search(probe)
+    if leftover:
+        # Same hard-skip rule as the empty-list cases below, for the same
+        # reason: a command leerie cannot render correctly must not be run.
+        _warn_unknown_placeholder_once(template, leftover.group(0))
         return None
     if "{files}" in template:
         if not files:
             return None
         template = template.replace(
             "{files}", " ".join(shlex.quote(f) for f in files))
+    if "{test_files}" in template:
+        tf = [f for f in files if _is_test_file(f, test_globs)]
+        if not tf:
+            return None
+        template = template.replace(
+            "{test_files}", " ".join(shlex.quote(f) for f in tf))
     return template.replace("{base}", base_ref)
 
 
@@ -26338,9 +26468,62 @@ def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
     return out
 
 
+def resolve_test_file_globs(repo_root: Path) -> list[str]:
+    """`test_file_globs` from `.leerie/config.toml`, whitespace-separated.
+
+    Empty list means "use `_is_test_file`'s built-in shapes". A repo only
+    needs this when its layout is unconventional enough that the built-ins
+    miss a test file — and a miss is the costly direction, since a dropped
+    test file narrows the only per-subtask signal there is."""
+    declared = _load_blt_config(repo_root) or {}
+    return (declared.get("test_file_globs") or "").split()
+
+
+# Module-level so the warning fires once per process rather than once per
+# subtask -- it is a property of the repo's configuration, not of any one
+# subtask, and repeating it 10x per run is how a warning stops being read.
+_scoped_degrade_warned: bool = False
+
+
+def _warn_scoped_degraded_once(blt: dict[str, str], scoped: dict[str, str],
+                               mode: str) -> None:
+    """Warn once when `--subtask-tests scoped` cannot actually narrow anything.
+
+    `scoped` is the default, and an axis whose proxy does not resolve falls
+    back to the canonical command (`_select_subtask_axes`) -- correct, and
+    deliberately not a silent skip, but it means an operator who asked for a
+    cheap per-subtask falsifier is instead paying the full oracle once per
+    subtask with nothing anywhere saying so. Measured across the run corpus:
+    every other repo resolved a proxy on ~99% of subtasks while this one
+    resolved none on 16 of 16, spending 6.9 h in orchestrator-run full suites.
+
+    Only fires for axes that HAVE a canonical command -- an axis the repo does
+    not define at all is not a degrade, it is simply absent."""
+    global _scoped_degrade_warned
+    if _scoped_degrade_warned or mode != "scoped":
+        return
+    degraded = [axis for axis in ("build", "lint", "tests")
+                if (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
+                and not (scoped.get(_AXIS_CMD_KEY[axis]) or "").strip()]
+    if not degraded:
+        return
+    _scoped_degrade_warned = True
+    log(
+        f"WARNING: --subtask-tests is `scoped` but no delta proxy resolved "
+        f"for: {', '.join(degraded)}. Each subtask will run the repo's "
+        "CANONICAL command for those axes, i.e. `scoped` behaves as `full` "
+        "here. Declare `test_scoped` / `build_scoped` in .leerie/config.toml "
+        "(a runner with no source->test impact analysis, e.g. pytest, wants "
+        "the `{test_files}` placeholder rather than `{files}`), or pass "
+        "--subtask-tests off to measure nothing per subtask. The baseline "
+        "and final-tree passes are unaffected either way."
+    )
+
+
 def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
-                         files: list[str], base_ref: str,
-                         mode: str) -> tuple[dict[str, str], str]:
+                         files: list[str], base_ref: str, mode: str,
+                         test_globs: list[str] | None = None
+                         ) -> tuple[dict[str, str], str]:
     """`(axis name -> command, scope label)` for one subtask's conformance
     round, given the resolved canonical commands and proxy templates.
 
@@ -26362,7 +26545,7 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
         # names are the conformer's (`tests`, plural). `_AXIS_CMD_KEY` is
         # the one place that mapping lives.
         rendered = _render_scoped(
-            scoped.get(_AXIS_CMD_KEY[axis]), files, base_ref)
+            scoped.get(_AXIS_CMD_KEY[axis]), files, base_ref, test_globs)
         if rendered:
             axes[axis] = rendered
             used_proxy = True
@@ -26376,8 +26559,10 @@ def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
 
     Returns None when the file does not exist. Otherwise returns a dict
     containing only the keys that are present in the file: the canonical
-    axes (build, lint, test), setup_packages, and the delta-proxy templates
-    (build_scoped, test_scoped — read by `resolve_blt_scoped`, DESIGN §9).
+    axes (build, lint, test), setup_packages, the delta-proxy templates
+    (build_scoped, test_scoped — read by `resolve_blt_scoped`, DESIGN §9),
+    and test_file_globs (read by `resolve_test_file_globs`, which feeds
+    `_render_scoped`'s `{test_files}` tier).
     Missing keys are not defaulted — the caller (`resolve_blt` for the
     canonical axes, `resolve_blt_scoped` for the proxies) decides what to do
     with an absent one.
@@ -26389,7 +26574,7 @@ def _load_blt_config(repo_root: Path) -> dict[str, str] | None:
         return None
     out: dict[str, str] = {}
     for key in ("build", "lint", "test", "setup_packages",
-                "build_scoped", "test_scoped"):
+                "build_scoped", "test_scoped", "test_file_globs"):
         val = _read_toml_key(cfg, key)
         if val is not None:
             out[key] = val
@@ -27840,7 +28025,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     scoped_mode = st.data.get("subtask_tests") or "scoped"
     changed = await _changed_files(worktree, run_branch)
     subtask_axes, blt_scope = _select_subtask_axes(
-        blt, resolve_blt_scoped(repo_root), changed, run_branch, scoped_mode)
+        blt, resolve_blt_scoped(repo_root), changed, run_branch, scoped_mode,
+        resolve_test_file_globs(repo_root))
     conf_log = leerie_dir / "logs" / f"{sid}-conformer.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
 
@@ -29975,6 +30161,20 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     # accurate snapshot. Advisory + idempotent (sentinel-guarded), so it
     # runs once on the fresh path and is skipped on resume. Opt-out via
     # skip_base_baseline (the full-suite-run cost).
+    # Unconditional, and BEFORE the baseline: this fires on resume too (the
+    # baseline is sentinel-skipped there) and before any wave spends, which is
+    # the only point where the operator can still act on it.
+    try:
+        _warn_scoped_degraded_once(
+            resolve_blt(st.repo_root), resolve_blt_scoped(st.repo_root),
+            st.data.get("subtask_tests") or "scoped")
+    except Exception as e:
+        # Advisory output must never be able to abort a run, and this one
+        # reads the filesystem (`.leerie/config.toml`) at phase entry where
+        # nothing did before. Same defence as the baseline call below.
+        log(f"phase 4: scoped-degrade check errored "
+            f"({type(e).__name__}: {e}); continuing")
+
     if not st.data.get("skip_base_baseline"):
         try:
             await _capture_conformance_baseline(leerie_dir, st, caps)

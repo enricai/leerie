@@ -6924,10 +6924,36 @@ canonical command and is not expected to be — `tsc --noEmit` catches a
 different set than `next build`. It is a cheap falsifier run once per subtask,
 backed by an expensive oracle run twice.
 
-Absence is the default in both directions: an axis with no resolvable proxy
-falls back to the canonical command rather than being skipped, and a changed
+**Not every runner can map source to tests, and the ones that cannot need the
+file list filtered.** `vitest related` and `jest --findRelatedTests` take
+*source* files and resolve the tests that import them through the runner's own
+module graph, so `{files}` can be handed to them whole. pytest has no such
+mechanism: it takes paths and collects what is under them. Handing it a source
+or docs path is not merely uninformative — it is an error. Measured against a
+real repo: `pytest orchestrator/leerie.py` exits 5 (nothing collected),
+`pytest docs/DESIGN.md` exits 4 (no collectors), and — the case that decides
+the design — `pytest docs/DESIGN.md tests/test_blt_semaphore.py` also exits 4,
+because **one non-test path poisons an otherwise-valid invocation**. Since a
+real subtask diff almost always mixes source and docs with its tests, a
+`{files}` template on such a repo reports RED on nearly every subtask.
+
+So a template may instead ask for `{test_files}`, which substitutes only the
+test-shaped members of the changed-file set. This is a narrower proxy than the
+import-graph kind — it runs the tests the diff *touched*, not the tests the
+diff *affects* — and that narrowing is the price of working at all on a runner
+with no impact analysis. The absence rule below applies unchanged and is what
+makes it safe: a diff with no test file in it renders nothing and falls back to
+the canonical command. Measured over 36 real subtask diffs on this repo, 34
+carried a test file and 2 did not, so the fallback is the exception rather than
+the common path.
+
+Absence is the default in every direction: an axis with no resolvable proxy
+falls back to the canonical command rather than being skipped; a changed
 file set that is empty skips the axis rather than rendering a bare runner —
-which would run everything, the exact inversion of the feature.
+which would run everything, the exact inversion of the feature; and a template
+naming a placeholder this version cannot substitute is likewise an absence
+rather than a command to run, since shipping the literal brace to a shell is a
+hard error on every subtask.
 `--subtask-tests full|scoped|off` lets an operator force either end.
 
 **The round signal is a regression, not a verdict.** Because a scoped result

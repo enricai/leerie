@@ -1,0 +1,286 @@
+{
+ "note": "Real per-subtask diffs (paths only) recovered from leerie's own run branches and reflog-reachable subtask refs. Each row is ONE subtask's work: a per-subtask commit, or an integration merge's first-parent diff (a plain two-dot diff against the run base is cumulative and silently folds in sibling subtasks). Three runs of two task types: a test-writing run, a bug-fix work order, and the run that prompted this investigation.",
+ "subtasks": [
+  {
+   "run": "3804663c",
+   "sid": "5511165a",
+   "files": [
+    "tests/test_chain_log.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "06e0facd",
+   "files": [
+    "tests/test_blt_script_helpers.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "11950440",
+   "files": [
+    "tests/test_reconciler_collision_helpers.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "8ed4a566",
+   "files": [
+    "tests/test_mise_pin_discovery.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "da6503f9",
+   "files": [
+    "tests/test_pid_still_exists.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "539e9d69",
+   "files": [
+    "tests/test_schema_fingerprint_and_cli_version_probe.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "eb626f54",
+   "files": [
+    "tests/test_checkpoint_noise_helpers.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "07504c8c",
+   "files": [
+    "tests/test_dep_capture_manifest_helpers.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "f23fbee8",
+   "files": [
+    "tests/test_repo_map_render_helpers.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "b86fa69c",
+   "files": [
+    "tests/test_command_tokens.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "67566658",
+   "files": [
+    "tests/test_decompose_child_helpers.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "396e5da9",
+   "files": [
+    "tests/test_worker_memory_admission_token.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "18069946",
+   "files": [
+    "tests/test_resolve_enum_str_prefs.py"
+   ]
+  },
+  {
+   "run": "3804663c",
+   "sid": "849f7d7a",
+   "files": [
+    "tests/test_run_table_helpers.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-001",
+   "files": [
+    "leerie",
+    "tests/test_build_repo_image.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-002",
+   "files": [
+    "docs/IMPLEMENTATION.md",
+    "leerie",
+    "tests/test_log_in_repo_warning.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-004",
+   "files": [
+    "docs/IMPLEMENTATION.md",
+    "orchestrator/leerie.py",
+    "scripts/cgroup-broker.py",
+    "tests/test_slice_aware_memory.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-005",
+   "files": [
+    "orchestrator/leerie.py",
+    "tests/test_budget_feasibility.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-006",
+   "files": [
+    "orchestrator/leerie.py",
+    "tests/test_node_threadpool_cap.py",
+    "tests/test_run_conformance_phase.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-007",
+   "files": [
+    "docs/IMPLEMENTATION.md",
+    "scripts/host-finalize.sh",
+    "tests/test_host_finalize_sh.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-008",
+   "files": [
+    "orchestrator/leerie.py",
+    "tests/test_test_ownership_overlap.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-009",
+   "files": [
+    "orchestrator/leerie.py",
+    "tests/test_malformed_tool_envelope.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-012",
+   "files": [
+    "orchestrator/leerie.py",
+    "scripts/cgroup-broker.py",
+    "tests/test_cgroup_broker.py",
+    "tests/test_cgroup_helpers.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-013",
+   "files": [
+    "docs/IMPLEMENTATION.md",
+    "scripts/new-worktree.sh",
+    "tests/test_new_worktree_concurrency.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-014",
+   "files": [
+    "docs/IMPLEMENTATION.md",
+    "orchestrator/leerie.py",
+    "tests/test_retryable_failure.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-015",
+   "files": [
+    "orchestrator/leerie.py",
+    "tests/test_settle_subtask_completeness_gate.py"
+   ]
+  },
+  {
+   "run": "a3c6cc1a",
+   "sid": "bugfix-016",
+   "files": [
+    "scripts/host-finalize.sh",
+    "tests/test_host_finalize_sh.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "bugfix-001",
+   "files": [
+    "docs/IMPLEMENTATION.md",
+    "orchestrator/leerie.py",
+    "scripts/remote/collect-subtrees.sh",
+    "tests/test_strict_mcp_config.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "bugfix-002",
+   "files": [
+    "docs/DESIGN.md",
+    "docs/IMPLEMENTATION.md",
+    "orchestrator/leerie.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "bugfix-004",
+   "files": [
+    "orchestrator/leerie.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "bugfix-005",
+   "files": [
+    "orchestrator/leerie.py",
+    "tests/test_tool_surface_self_reporting.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "bugfix-006",
+   "files": [
+    "tests/fixtures/observed_tools.json",
+    "tests/test_disallowed_tools.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "bugfix-901",
+   "files": [
+    "tests/test_resolve_worker_memory_max.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "test-001",
+   "files": [
+    "tests/test_disallowed_tools.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "test-003",
+   "files": [
+    "tests/test_disallowed_tools.py"
+   ]
+  },
+  {
+   "run": "7aa46cce",
+   "sid": "test-004",
+   "files": [
+    "tests/test_invoke_streaming.py"
+   ]
+  }
+ ]
+}
