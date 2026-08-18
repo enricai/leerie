@@ -799,6 +799,28 @@ DISALLOWED_TOOLS = (
     "ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch"
 )
 
+# KNOWN_TOOLS is the union of every bare tool name leerie ever names, across
+# INSPECT_TOOLS / ACT_TOOLS / SATISFIED_PROBE_TOOLS / DISALLOWED_TOOLS, plus
+# the literal "StructuredOutput" (injected by the CLI itself for schema-
+# validated output, named nowhere else in this file). INSPECT_TOOLS/ACT_TOOLS/
+# SATISFIED_PROBE_TOOLS entries are comma-separated, and some carry a
+# `Bash(<verb>:*)` allow-pattern suffix rather than a bare CLI tool name — the
+# bare name is everything before an optional "(". This is the single source
+# of truth for "every tool name leerie has ever classified", consumed by the
+# self-reporting latch and the converse partition test so a CLI-shipped name
+# fitting neither this set nor DISALLOWED_TOOLS is visibly uncovered rather
+# than silently ignored.
+def _bare_tool_names(tools_str: str) -> set[str]:
+    return {entry.split("(", 1)[0] for entry in tools_str.split(",")}
+
+KNOWN_TOOLS: frozenset[str] = frozenset(
+    _bare_tool_names(INSPECT_TOOLS)
+    | _bare_tool_names(ACT_TOOLS)
+    | _bare_tool_names(SATISFIED_PROBE_TOOLS)
+    | _bare_tool_names(DISALLOWED_TOOLS)
+    | {"StructuredOutput"}
+)
+
 # --inspect-dir preference: extra directories to grant the inspect-bucket
 # workers (classifier, planner, reconciler, plan_overlap_judge, provision) read access to via the
 # Claude Code CLI's --add-dir flag. Without this, Read/Grep/Glob and the
