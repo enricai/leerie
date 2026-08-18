@@ -19,6 +19,12 @@ REQUIRED_DENIALS = {
     "ScheduleWakeup",
     "CronCreate", "CronDelete", "CronList",
     "RemoteTrigger", "PushNotification",
+    "Workflow", "ReportFindings", "Skill", "Monitor",
+    "TaskCreate", "TaskGet", "TaskList", "TaskUpdate", "TaskOutput", "TaskStop",
+    "ListAgents", "EnterWorktree", "ExitWorktree", "DesignSync",
+    # ToolSearch is a judgment call, not strictly required like the rest —
+    # denied here for consistency with the other autonomy/spawn-shaped tools.
+    "ToolSearch",
 }
 
 
