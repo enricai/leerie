@@ -313,3 +313,66 @@ def test_final_pass_passes_a_snapshot_not_the_run_branch(leerie):
     assert "run_branch" not in call, (
         "the final pass must NOT pass the run branch as base_ref — staging has "
         "it checked out, so base and HEAD collapse:\n" + call)
+
+
+def _single_commit_repo(tmp_path):
+    """A repo with one base commit only. Returns (path, base_sha)."""
+    d = tmp_path
+    _git(d, "init", "-q", "-b", "main")
+    _git(d, "config", "user.email", "t@leerie.local")
+    _git(d, "config", "user.name", "leerie test")
+    (d / "a.py").write_text("base a\n")
+    _git(d, "add", "-A")
+    _git(d, "commit", "-qm", "base")
+    return d, _rev(d)
+
+
+class TestProtectedPathsSince:
+    def test_empty_before_sha_returns_empty(self, leerie, tmp_path):
+        d, _base = _single_commit_repo(tmp_path)
+        r = asyncio.run(leerie._protected_paths_since(str(d), ""))
+        assert r == []
+
+    def test_bad_before_sha_git_failure_returns_empty(self, leerie, tmp_path):
+        d, _base = _single_commit_repo(tmp_path)
+        r = asyncio.run(
+            leerie._protected_paths_since(str(d), "deadbeefdeadbeef"))
+        assert r == []
+
+    def test_clean_diff_returns_empty(self, leerie, tmp_path):
+        d, base = _single_commit_repo(tmp_path)
+        r = asyncio.run(leerie._protected_paths_since(str(d), base))
+        assert r == []
+
+    def test_only_protected_subset_of_diff_returned(self, leerie, tmp_path):
+        d, base = _single_commit_repo(tmp_path)
+        (d / ".leerie").mkdir()
+        (d / ".leerie" / "config.toml").write_text("x = 1\n")
+        (d / "b.py").write_text("ordinary\n")
+        _git(d, "add", "-A")
+        _git(d, "commit", "-qm", "touch protected and ordinary")
+        r = asyncio.run(leerie._protected_paths_since(str(d), base))
+        assert r == [".leerie/config.toml"], r
+
+
+class TestUncommittedPaths:
+    def test_clean_worktree_returns_empty(self, leerie, tmp_path):
+        d, _base = _single_commit_repo(tmp_path)
+        r = asyncio.run(leerie._uncommitted_paths(str(d)))
+        assert r == []
+
+    def test_tracked_modified_kept_untracked_excluded(self, leerie, tmp_path):
+        d, _base = _single_commit_repo(tmp_path)
+        (d / "a.py").write_text("uncommitted edit\n")
+        (d / "new.py").write_text("untracked\n")
+        r = asyncio.run(leerie._uncommitted_paths(str(d)))
+        assert len(r) == 1
+        assert "a.py" in r[0]
+        assert not any(line.startswith("??") for line in r)
+        assert not any("new.py" in line for line in r)
+
+    def test_non_git_directory_returns_empty(self, leerie, tmp_path):
+        d = tmp_path / "not-a-repo"
+        d.mkdir()
+        r = asyncio.run(leerie._uncommitted_paths(str(d)))
+        assert r == []
