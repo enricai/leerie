@@ -445,13 +445,17 @@ entry along one axis:
   unmatched tags; cycle-breaking actions when its mutations close a
   dependency cycle; `unresolvable` as the abort escape hatch).
 - `extent: external` — a real prerequisite the planner is declaring lives
-  outside *this run's* build graph. Two kinds qualify. **Outside the build
+  outside *this run's* build graph. Three kinds qualify. **Outside the build
   graph entirely**: another repo's deploy, an ops runbook, a manual step in
   another team's queue — nothing a code change here could produce.
   **Producible by code, but owned by another run**: the task itself names a
   sibling phase document, an earlier phase, or another run of the same
-  multi-part deck as the owner of that work. In both cases the `reason` field
-  names the owner. The orchestrator filters these out of the matching pass
+  multi-part deck as the owner of that work. **Fenced off by the task
+  itself**: the task declares a surface out of scope ("do not modify `X`",
+  "stay within `Y`"), and the capability's only implementation site lies on
+  that surface. In every case the `reason` field
+  names the owner — for a fence, the fence itself and the task's wording.
+  The orchestrator filters these out of the matching pass
   entirely — they never enter the reconciler's queue — and instead collects
   them into a `preconditions` section of the assembled plan. The human sees
   the insight as a deploy note rather than a hard edge. When leerie is used
@@ -471,6 +475,21 @@ planner with no correct answer available and aborts the run after the full
 planning spend. The run-group carve-out below is the same principle one scope
 wider — a sibling repo's work is producible by code too, and is `external`
 for exactly this reason.
+
+**A task-declared fence removes a surface from this run's graph as surely as
+another run owning it does.** This is the third kind, and it cost a run the
+same way the second one did. Run `2d7527f1` (2026-08-17, 55 workers, $12.46,
+no code written) carried a task that fenced off an application-source
+directory and then listed an acceptance criterion whose only implementation
+site was a constant inside it. Planners run blind, so they split: the domain
+that owned the surface obeyed the fence and recorded a finding, while the
+`testing` domain obeyed the criterion and declared `extent: in_plan` on a
+capability nobody could then provide. The reconciler had no legal resolution
+— the consumer's own prose was unconditional, so `conditional_drop` did not
+apply, and a rename would have wired a test to a documentation artifact —
+and correctly aborted. The fence is what the planner should have keyed on:
+"could a connector subtask produce this?" answers *yes* for a fenced code
+change, which is precisely why that question must not be asked first.
 
 The planner is the right classifier because it just did the research that
 surfaced the prerequisite — it can answer "is this satisfiable by a code
@@ -7184,9 +7203,15 @@ a one-off override of the repo default. The preference is never surfaced as
 an interactive question: any explicit setting overrides the default, and a
 caller who sets nothing has implicitly accepted `both`. A request that
 already names its own source of truth, or a non-feature task where the
-question does not apply, runs without it. Whichever path resolved the
-preference, its value becomes a setting carried to every planner and
-implementer, so the whole run draws from one consistent source of truth.
+question does not apply, runs without the *question* — the classifier does
+not flag it, and nobody is asked. That is a statement about the question,
+never about the setting: whichever path resolved the preference, its value
+becomes a setting carried to every planner and implementer on every run,
+whatever the classifier decided, so the whole run draws from one consistent
+source of truth. There is no state in which a worker receives some other
+value instead; a run that skipped the question still carries the resolved
+preference, because the resolver always yields one of the three real values
+and never an "unset".
 
 Under `both`, planners may legitimately surface prerequisites from research
 that are real but not produced by any code subtask in the plan — the target

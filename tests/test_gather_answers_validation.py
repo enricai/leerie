@@ -13,10 +13,23 @@ import sys
 import pytest
 
 
-@pytest.fixture
-def state(leerie, tmp_path):
-    """A fresh State at a tmp_path/.leerie/runs/<run-id>/, with a feature
-    task that needs source_of_truth and pref='both' (the new default)."""
+@pytest.fixture(params=[True, False], ids=["needs_sot", "no_needs_sot"])
+def state(request, leerie, tmp_path):
+    """A fresh State at a tmp_path/.leerie/runs/<run-id>/, with pref='both'.
+
+    **Parametrized over `needs_source_of_truth` on purpose.** This fixture
+    hardcoded `True`, so every test in this file — including the
+    three-value `test_preference_satisfies_source_of_truth` sweep —
+    exercised only the branch where the classifier flagged the question.
+    The file therefore reported full coverage of a contract the code
+    honoured on one branch: with the flag `False`, `gather_answers` wrote
+    nothing and every consumer fell back to a hardcoded `"codebase"`.
+    Measured across the run corpus, 74 of 196 runs took that branch.
+
+    Parametrizing here is what makes the whole file falsify the defect
+    rather than pass beside it. Do not collapse it back to a single
+    value.
+    """
     leerie_root = tmp_path / ".leerie"
     run_id = "test-run-aaa111"
     (leerie_root / "runs" / run_id).mkdir(parents=True)
@@ -25,7 +38,7 @@ def state(leerie, tmp_path):
         "task": "test task",
         "categories": ["feature-implementation"],
         "classifier_questions": [],
-        "needs_source_of_truth": True,
+        "needs_source_of_truth": request.param,
         "source_of_truth_pref": "both",
     }
     return st
@@ -50,6 +63,11 @@ def test_invalid_value_rejected(leerie, state, capsys, bad_value):
     assert exc.value.code != 0
     err = capsys.readouterr().err
     assert "is not one of" in err
+    # The enum itself, not just the phrase. Dropping the values from the
+    # message — "is not one of the accepted values", with no list — leaves
+    # an operator no way to know what IS accepted, and passed before this.
+    for v in leerie.SOURCE_OF_TRUTH_VALUES:
+        assert v in err, f"the error omits the accepted value {v!r}"
     assert bad_value in err
 
 

@@ -5125,6 +5125,35 @@ def resolve_source_of_truth(repo_root: Path,
         allowed=SOURCE_OF_TRUTH_VALUES, default="both")
 
 
+def _effective_source_of_truth(st: "State") -> str:
+    """The source-of-truth value a worker must be given (DESIGN §11).
+
+    The single reader for every consumer that holds a `State`, so none of
+    them can silently diverge. Two readers deliberately do not route
+    through it and cannot: `compose_pr_body` takes a plain `state: dict`
+    (the deterministic PR-body fallback), and `scripts/host-finalize.sh`
+    reads the same key with `jq`. Both read the recorded answer directly
+    and render "n/a" when it is absent, which is the honest rendering for
+    a fallback path that has no preference to fall back to.
+
+    `gather_answers` writes `answers["source_of_truth"]` on every run that
+    reaches it, so the first branch is the normal one. It is not reached on
+    one live path: a non-TTY run with pending classifier questions exits
+    `EXIT_NEEDS_ANSWERS` before recording anything, and the follow-up
+    `resume --answers` skips the whole pre-`plans_after_classify` block.
+    So the `source_of_truth_pref` fallback is load-bearing on that path, not
+    merely a legacy escape hatch — it also covers a run resumed from a
+    `state.json` written before the write became unconditional. Never falls
+    back to a hardcoded tier — a
+    literal here is how an explicitly-set `research` got silently
+    downgraded to `codebase` for every run whose classifier did not
+    flag the question."""
+    answers = st.data.get("answers") or {}
+    return (answers.get("source_of_truth")
+            or st.data.get("source_of_truth_pref")
+            or "both")
+
+
 def resolve_runtime(repo_root: Path,
                     cli_value: str | None = None) -> str:
     """Resolve the runtime mode. Order:
@@ -9901,10 +9930,20 @@ def _validate_plan(subtasks: dict) -> None:
                               f"{sorted(_VALID_EXTENTS)}")
                 continue
             if extent == "external" and not reason:
+                # Deliberately does NOT ask "why could no in-repo subtask
+                # produce it?" — that was the wording here, and it is the
+                # discriminating test DESIGN §5 forbids. The test is "is it
+                # in THIS RUN's graph?", not "could any code produce it?": a
+                # capability owned by another run, or sitting on a surface
+                # the task fences off, is producible by code and still
+                # external. Demanding the old justification tells a planner
+                # that classified either of those correctly to defend it by
+                # the criterion that causes the abort.
                 errors.append(f"{sid}: requires '{tag}' with extent=external "
                               "must include a non-empty `reason` naming the "
-                              "owner (other repo, ops runbook, manual step) "
-                              "and why no in-repo subtask could produce it")
+                              "owner — another repo/ops runbook/manual step, "
+                              "the run or phase document the task assigns it "
+                              "to, or the surface the task fences off")
                 continue
             if extent == "in_plan" and tag not in all_provides:
                 errors.append(f"{sid}: requires '{tag}' but nothing provides it — "
@@ -18847,7 +18886,6 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
     source-of-truth preference, from a TTY prompt, or (no TTY, no answers)
     defer by writing pending-questions.json and exiting."""
     questions = st.data.get("classifier_questions", [])
-    need_sot = st.data.get("needs_source_of_truth", False)
     sot_pref = st.data.get("source_of_truth_pref", "both")
     answers: dict = dict(supplied or {})
 
@@ -18860,7 +18898,18 @@ def gather_answers(st: State, supplied: dict | None) -> dict:
     # preference (DESIGN §11). The preference always holds a real value
     # — `codebase`, `research`, or `both` (default) — so this never
     # blocks for an interactive answer.
-    if need_sot and "source_of_truth" not in answers:
+    #
+    # Deliberately NOT gated on the classifier's `needs_source_of_truth`
+    # flag. That conjunct was vestigial: the guard was once
+    # `needs_source_of_truth and ... and sot_pref != "ask"`, where the
+    # flag decided whether to *ask*. Removing the `ask` value retired the
+    # asking machinery but left this half standing, so a run whose
+    # classifier set `source_of_truth_question: false` wrote nothing here
+    # and every consumer fell back to a hardcoded `"codebase"` —
+    # silently overriding an explicit `--source-of-truth research`. The
+    # flag now records only whether the question was relevant, which is
+    # what DESIGN §11 describes.
+    if "source_of_truth" not in answers:
         answers["source_of_truth"] = sot_pref
 
     pending = [q for q in questions if q.get("id") not in answers]
@@ -19644,7 +19693,7 @@ async def phase_plan(task: str, st: State, caps: dict,
         log(f"  scoped re-plan: {len(cats)} of "
             f"{len(st.data['categories'])} domain(s) — {', '.join(cats)}")
     answers = st.data.get("answers", {})
-    sot = answers.get("source_of_truth", "codebase")
+    sot = _effective_source_of_truth(st)
     sys_prompt = _load_prompt("planner")
 
     sem = asyncio.Semaphore(caps["max_parallel"])
@@ -20071,6 +20120,73 @@ def _tag_key(tag: str) -> frozenset[str]:
         t[:-1] if len(t) > 3 and t.endswith("s") else t
         for t in toks if t
     )
+
+
+def _unresolvable_die_message(unresolvable: list[dict],
+                              sid_domain: dict[str, str],
+                              source_of_truth: str) -> str:
+    """Render the phase-2½ abort message (DESIGN §5 `requires.extent`).
+
+    Module-level and pure so it can be tested directly. It was inline in a
+    closure, which is why `tests/test_reconciler_cycle_gate.py` reached it
+    by re-synthesizing the closure's body in the test file — a copy that
+    passed whether or not the real code existed.
+
+    **The remediation text is the load-bearing part.** Measured against 5
+    simulated operators given a real failure from this gate, the previous
+    wording sent 5 of 5 to the same repair: widen the fence so the forbidden
+    surface becomes writable. On the run that motivated this, that was the
+    one repair the task's own decision log forbade — the capability was an
+    unanswered product decision, and the correct move was to remove the
+    criterion from the task, which 0 of 5 proposed. So the message names
+    both repairs explicitly rather than leaving the reader to infer one.
+
+    `source_of_truth` gates the last bullet. It addresses a real but
+    different failure — under `both`/`research` a planner can surface a
+    prerequisite from research that no code subtask produces — and is a
+    non-sequitur on a `codebase` run, which is what the aborting run had
+    already set. DESIGN §11 additionally records narrowing the preference as
+    *historically* the only escape hatch, superseded by
+    `requires.extent: external`; the wording no longer presents it as the
+    primary fix.
+    """
+    bullets = "\n".join(
+        f"  • {sid_domain.get(u['sid'], '<unknown>')}/{u['sid']} "
+        f"requires '{u['tag']}': {u['reason']}"
+        for u in unresolvable
+    )
+    parts = [
+        f"reconciler could not resolve {len(unresolvable)} "
+        f"capability-tag dependency/dependencies:\n{bullets}\n"
+        "Each dependency is a planner-coverage gap: the consuming "
+        "planner-domain emitted `requires` for a capability no other "
+        "planner's domain produced. Planners run blind and in parallel, "
+        "so this is usually one of two shapes:\n"
+        "  • The task asks for something its own scope forbids — an "
+        "acceptance criterion whose only implementation site sits on a "
+        "surface the task fences off. One planner obeys the fence, another "
+        "obeys the criterion. Fix it by making the criterion satisfiable "
+        "inside the fence, OR by removing it from this task and giving it "
+        "to whatever owns that surface. Widening the fence is the third "
+        "option and often the wrong one — check first whether the work was "
+        "deliberately placed elsewhere.\n"
+        "  • The work genuinely belongs elsewhere (another run, another "
+        "repo, a pending decision). Say so in the task text, so the planner "
+        "declares `requires.extent: external` and it becomes a precondition "
+        "note rather than a hard graph edge.\n"
+        "If neither shape fits, refine the task description to make the "
+        "disputed scope explicit (e.g. name the missing capability or the "
+        "surface it lives on), and re-run."
+    ]
+    if source_of_truth != "codebase":
+        parts.append(
+            f"\nThis run resolved `source_of_truth = {source_of_truth}`. Under "
+            "that setting a planner can also surface a prerequisite from "
+            "research that no code subtask produces; `--source-of-truth "
+            "codebase` narrows that. It does not affect a scope-fence "
+            "disagreement, which is about which files a planner may touch."
+        )
+    return "".join(parts)
 
 
 def _demote_unresolvable_with_external_twin(
@@ -20718,9 +20834,10 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
     st.save()
 
     # Build the reconciler's input. The worker sees the task, the
-    # categories that contributed subtasks, every subtask's id/title/
-    # intent/provides/requires (omit other fields to keep context small),
-    # and the precomputed unresolved set.
+    # categories that contributed subtasks, a per-subtask view carrying the
+    # fields the reconciler's rules actually name (the rest are omitted to
+    # keep context small — see the per-field notes below), and the
+    # precomputed unresolved set.
     #
     # `requires` is flattened to bare tag strings here, dropping any
     # `extent: external` entries entirely. The reconciler reasons
@@ -20745,6 +20862,18 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 "id": s.get("id", ""),
                 "title": s.get("title", ""),
                 "intent": s.get("intent", ""),
+                # `scope_note` is half of `conditional_drop`'s documented
+                # signal surface — prompts/reconciler.md names
+                # `intent`/`scope_note` together as where the planner's
+                # prose conditionality lives — and it was never shipped, so
+                # the rule was blind to whichever half the planner happened
+                # to use. Measured across 3033 planner subtasks, more
+                # carried conditional phrasing in `scope_note` alone than in
+                # `intent` alone. Shipping the field is the cheaper side of
+                # the disagreement to change: the alternative is narrowing a
+                # documented resolution channel to the half that happens to
+                # arrive.
+                "scope_note": s.get("scope_note", ""),
                 # `depends_on` and `files_likely_touched` are surfaced so the
                 # reconciler can reason about ordering and file-overlap
                 # signals when its first attempt closes a cycle and the
@@ -20814,26 +20943,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         if not unresolvable:
             return
         sid_domain = {u["sid"]: u["domain"] for u in unresolved}
-        bullets = "\n".join(
-            f"  • {sid_domain.get(u['sid'], '<unknown>')}/{u['sid']} "
-            f"requires '{u['tag']}': {u['reason']}"
-            for u in unresolvable
-        )
-        die(
-            f"reconciler could not resolve {len(unresolvable)} "
-            f"capability-tag dependency/dependencies:\n{bullets}\n"
-            "Each dependency is a planner-coverage gap: the consuming "
-            "planner-domain emitted `requires` for a capability no "
-            "other planner's domain produced. A common cause is a "
-            "scope disagreement — two planners reading the task "
-            "differently. To unblock:\n"
-            "  • Refine the task description to make the disputed "
-            "scope explicit (e.g., name the missing capability or the "
-            "surface it lives on), and re-run.\n"
-            "  • Or narrow scope with `--source-of-truth codebase` so "
-            "planners reading repo docs stop treating them as a "
-            "feature checklist."
-        )
+        die(_unresolvable_die_message(
+            unresolvable, sid_domain, _effective_source_of_truth(st)))
 
     def _record_conditional_drops(out: dict) -> None:
         """Persist each conditional_drops entry to
@@ -25453,7 +25564,7 @@ def _write_plan(leerie_dir: Path, task: str, st: State,
                subtasks: dict, waves: list[list[str]]) -> None:
     """Persist the merged plan and per-subtask spec files the implementers read."""
     answers = st.data.get("answers", {})
-    sot = answers.get("source_of_truth", "codebase")
+    sot = _effective_source_of_truth(st)
     # External preconditions are the planner-declared out-of-graph
     # requires entries collected during phase_reconcile (DESIGN §5
     # `requires.extent`). Surfacing them in plan.json gives the
@@ -30386,12 +30497,11 @@ async def _compose_pr_via_llm(st: "State",
             pass
 
         categories = st.data.get("categories") or []
-        answers = st.data.get("answers") or {}
 
         payload = {
             "task": st.data.get("task", ""),
             "categories": categories,
-            "source_of_truth": answers.get("source_of_truth"),
+            "source_of_truth": _effective_source_of_truth(st),
             "working_branch": working_branch,
             "run_branch": run_branch,
             "wave_count": len(st.data.get("waves") or []),
@@ -30924,6 +31034,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # resolved fresh every run — the user can dial up or down on
         # resume without editing state.json.
         st.data["source_of_truth_pref"] = sot_pref
+        # NOT refreshed into st.data["answers"] here, deliberately.
+        # `gather_answers` is reachable only inside the
+        # pre-`plans_after_classify` block, and `_absorb_supplied_answers`
+        # returns immediately when `--answers` is absent — which is how
+        # `resume` is normally invoked. So a refresh here would overwrite an
+        # operator's explicit `--answers` value with the re-resolved default
+        # on every plain resume, silently. `_effective_source_of_truth`
+        # already falls back to `source_of_truth_pref` when `answers` holds
+        # no verdict, which covers the stale-state case a refresh was meant
+        # to solve, without touching a recorded answer.
         st.data["verbosity"] = verbosity
         st.data["inspect_dirs"] = list(getattr(args, "inspect_dirs", []) or [])
         st.data["clarify"] = bool(args.clarify)

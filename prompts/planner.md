@@ -182,7 +182,7 @@ The orchestrator gives you, in your prompt:
      orchestrator wires a graph edge by matching against `provides`. Omit
      `reason` or leave it empty.
    - `extent: "external"` — your research surfaced a real prerequisite that
-     is **not** produced by any code subtask in this plan. Two kinds
+     is **not** produced by any code subtask in this plan. Three kinds
      qualify.
 
      **Outside the build graph entirely**: another repo's deploy, an ops
@@ -198,11 +198,22 @@ The orchestrator gives you, in your prompt:
      run aborts. If the task tells you the work lives elsewhere, believe
      it: that is `external`.
 
-     In both cases `reason` is **required and must name the owner**
+     **Fenced off by the task itself**: the task declares a surface out of
+     scope ("do not modify `<dir>`", "stay within `<dir>`", "report it as a
+     finding rather than fixing it here"), and the capability's only
+     implementation site lies on that surface. A task-declared fence
+     removes that surface from this run's graph as surely as another run
+     owning it does — a fix you are forbidden to make is not a fix this
+     plan can produce, no matter how small it is. Check the fence BEFORE
+     you conclude a connector subtask could produce it.
+
+     In every case `reason` is **required and must name the owner**
      ("Dynamo table provisioned by the API repo's CDK stack", "ops runbook
      `runbooks/cutover.md` step 4", "manual: SRE must enable the feature
      flag in PagerDuty before deploy", "phase document `<name>.md` item
-     A1, which the task states is handled by a separate run"). The
+     A1, which the task states is handled by a separate run", "the only
+     implementation site is under `<dir>`, which this task fences off:
+     'do not modify `<dir>`'"). The
      orchestrator does not try to wire a graph edge — it surfaces these in
      `plan.json`'s `preconditions` section as deploy notes for the human
      running the change.
@@ -214,13 +225,24 @@ The orchestrator gives you, in your prompt:
      acquires an unsatisfiable edge.
 
    `extent: "external"` is not a dumping ground for uncomfortable
-   requirements. Before classifying an entry as `external`, ask: *could a
-   small connector subtask in **this plan** produce this?* If yes, it is
-   `in_plan` and you should let the reconciler wire it. If the capability
-   is fundamentally a runtime or ops state that no code change can
-   produce, or the task explicitly assigns it to another run, it is
-   `external`. The discipline mirrors the reconciler's discipline for
-   `unresolvable`: name the owner concretely, or do not use the channel.
+   requirements. Ask these two questions **in this order**:
+
+   1. *Does the task fence off the surface where this would have to be
+      implemented?* If yes, it is `external` — stop here, and name the
+      fence in `reason`.
+   2. Only if no: *could a small connector subtask in **this plan**
+      produce this?* If yes, it is `in_plan` and you should let the
+      reconciler wire it.
+
+   The order is load-bearing. Question 2 asks what code *could* do, and a
+   fenced fix is usually a small, obviously-producible code change — so
+   asking it first answers `in_plan` for exactly the capability this plan
+   is forbidden to produce, and the run aborts at reconcile with the
+   planning spend already paid. If the capability is fundamentally a
+   runtime or ops state that no code change can produce, or the task
+   explicitly assigns it to another run, it is likewise `external`. The
+   discipline mirrors the reconciler's discipline for `unresolvable`: name
+   the owner concretely, or do not use the channel.
 
    **Examples:**
 
@@ -250,6 +272,15 @@ The orchestrator gives you, in your prompt:
    reconciler match it — do not silently omit the edge. A test scheduled before
    its producer fails; the wiring gate will reject the plan, wasting the whole
    planning spend.
+
+   **The one escape: a producer the task fences off.** If the change your
+   test would assert against can only be made on a surface the task puts out
+   of scope, no subtask in this plan can produce it, and declaring
+   `extent: "in_plan"` aborts the run at reconcile. Declare the entry
+   `extent: "external"` naming the fence instead — or, if the test would then
+   assert nothing that this plan changes, do not emit the subtask at all and
+   record the gap in `investigation_notes`. What remains forbidden is the
+   silent middle: an omitted edge, or an `in_plan` tag nothing can satisfy.
 
    **Chaining to the immediately-preceding subtask is not the same as wiring
    to every producer your assertions actually exercise.** A real, repeated

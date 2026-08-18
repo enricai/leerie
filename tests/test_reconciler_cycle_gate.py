@@ -2574,7 +2574,7 @@ def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(
     assert "email-provider-is-ses" in unaddressed[0]
 
 
-def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(leerie):
+def test_unresolvable_is_reported_even_when_conditional_drops_also_emitted(leerie):
     """When the model emits BOTH `unresolvable` and `conditional_drops`
     in the same output, `_check_unresolvable` must die first — model
     indecision is treated as an abort, not as silently apply one and
@@ -2583,24 +2583,13 @@ def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(leer
     _apply_reconciler_output, so the apply step never sees the mixed
     output.
 
-    We can't easily test `_check_unresolvable` directly (it's a closure
-    inside phase_reconcile). Instead pin the semantic equivalent: an
-    output with non-empty `unresolvable` triggers a SystemExit when
-    fed through the phase's gate path, even if `conditional_drops`
-    contains a valid entry. The closure-construction shape mirrors
-    `phase_reconcile`: `unresolved` is the input set bound at closure
-    time."""
-    # Synthesize the closure-bound `unresolved` and `_check_unresolvable`
-    # body inline (mirrors leerie.py phase_reconcile).
+    This used to synthesize the closure's body inline, with a local stub
+    that called `leerie.die("test-die: ...")` — a copy that passed whether
+    or not the real function existed, and asserted nothing about the
+    message. The message is now a module-level pure function, so this runs
+    against the real code."""
     unresolved = [{"sid": "deps-004", "tag": "email-provider-is-ses",
                    "domain": "deps"}]
-
-    def _check_unresolvable(out):
-        u = out.get("unresolvable", []) or []
-        if not u:
-            return
-        # Match real die() behavior (raises SystemExit via leerie.die()).
-        leerie.die("test-die: unresolvable non-empty")
 
     output = {
         "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
@@ -2612,8 +2601,13 @@ def test_check_unresolvable_still_fires_when_conditional_drops_also_emitted(leer
                           "tag": "email-provider-is-ses",
                           "reason": "model emitted both"}],
     }
-    with pytest.raises(SystemExit):
-        _check_unresolvable(output)
+    sid_domain = {u["sid"]: u["domain"] for u in unresolved}
+    msg = leerie._unresolvable_die_message(
+        output["unresolvable"], sid_domain, "codebase")
+    assert "deps/deps-004" in msg
+    assert "email-provider-is-ses" in msg
+    assert "model emitted both" in msg, (
+        "the abort must surface the unresolvable entry's own reason")
 
 
 def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
@@ -2628,7 +2622,7 @@ def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
     reflects the final plan.
 
     Verified by synthesizing the same closure-bound helper inline
-    (mirrors test_check_unresolvable_still_fires_when_conditional_drops_also_emitted
+    (mirrors test_unresolvable_is_reported_even_when_conditional_drops_also_emitted
     above; the production helper is a closure inside phase_reconcile
     and can't be called directly)."""
     # Fake the State object — just a mutable .data dict + a no-op save().
