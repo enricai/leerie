@@ -2733,7 +2733,7 @@ byte cut is safe for `run.json`.)
 
 The per-subtask delta proxy's `{test_files}` tier is covered by
 `tests/test_test_files_proxy.py` (48), `tests/test_scoped_proxy_corpus.py` (5)
-and `tests/test_scoped_degrade_warning.py` (10). Three lessons generalise past
+and `tests/test_scoped_degrade_warning.py` (11). Three lessons generalise past
 this feature. **(1) A non-test path is an ERROR to pytest, not a no-op, and one
 of them poisons the whole invocation** — measured, `pytest orchestrator/leerie.py`
 exits 5, `pytest docs/DESIGN.md` exits 4, and `pytest docs/DESIGN.md
