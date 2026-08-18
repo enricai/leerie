@@ -263,6 +263,8 @@ resolve_aws_credentials() {
       local sso_out start_url sso_region
       if sso_out="$(_aws_sso_start_url_and_region "$profile")"; then
         start_url="$(sed -n '1p' <<<"$sso_out")"
+        # shellcheck disable=SC2034  # field 2 of the helper's two-line
+        # output; parsed to document the shape, not read on this path
         sso_region="$(sed -n '2p' <<<"$sso_out")"
         local token rc
         token="$(_aws_sso_cache_token "$start_url")"

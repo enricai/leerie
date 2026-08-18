@@ -307,6 +307,8 @@ ec2_seed_repo_clone() {
     _seed_progress_bg "ec2_seed_repo (submodule bundles)" &
     _hb_pid_subs=$!
     if ! (
+      # shellcheck disable=SC2016  # single quotes are REQUIRED: $displaypath
+      # and $bn are expanded by git's own `foreach` shell, never by this one
       cd "$USER_REPO" && \
       LEERIE_EC2_INSTANCE_ID="$LEERIE_EC2_INSTANCE_ID" \
       LEERIE_EC2_SSH_TARGET="$LEERIE_EC2_SSH_TARGET" \
