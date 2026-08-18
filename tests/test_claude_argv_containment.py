@@ -44,7 +44,10 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
+import inspect
 import os
+import shutil
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -274,15 +277,22 @@ def _smoke_argv(leerie, monkeypatch, tmp_path) -> list[str]:
     """The argv `preflight`'s smoke test produces."""
     captured: dict = {}
 
-    async def fake_invoke(cmd, **_kw):
+    async def fake_invoke(cmd, cwd=None, **_kw):
         captured["cmd"] = list(cmd)
+        captured["cwd"] = cwd
         return {"type": "result", "is_error": False, "result": "ok"}
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
     monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
     monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
     monkeypatch.setattr(leerie, "_disk_free_ratio", lambda _p: 0.9)
-    asyncio.run(leerie.preflight(tmp_path, skip_smoke=False, model="sonnet"))
+    # Same reaping as _run_preflight, same `finally` reasoning.
+    try:
+        asyncio.run(leerie.preflight(tmp_path, skip_smoke=False,
+                                     model="sonnet"))
+    finally:
+        with contextlib.suppress(OSError, KeyError):
+            shutil.rmtree(captured["cwd"])
     return captured["cmd"]
 
 
@@ -324,7 +334,7 @@ def test_both_sites_share_the_builder(leerie, monkeypatch, tmp_path):
 
 # --- the smoke test's own argv, cwd, and error path ---
 
-def _run_preflight(leerie, monkeypatch, tmp_path, envelope=None, model="sonnet"):
+def _run_preflight(leerie, monkeypatch, leerie_dir, envelope=None, model="sonnet"):
     captured: dict = {}
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
@@ -340,7 +350,17 @@ def _run_preflight(leerie, monkeypatch, tmp_path, envelope=None, model="sonnet")
     monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
     monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
     monkeypatch.setattr(leerie, "_disk_free_ratio", lambda _p: 0.9)
-    asyncio.run(leerie.preflight(tmp_path, skip_smoke=False, model=model))
+    # Production deliberately leaves this directory (two runs of one state root
+    # share the path, so removing it would unlink a concurrent run's cwd). Tests
+    # get a unique hash per leerie_dir, so nothing else can be using theirs and
+    # leaving them would leak one /tmp entry per invocation. `finally`, because
+    # several callers here drive preflight to a die() or a ContextOverflow and
+    # a cleanup placed after the call would be skipped for exactly those.
+    try:
+        asyncio.run(leerie.preflight(leerie_dir, skip_smoke=False, model=model))
+    finally:
+        with contextlib.suppress(OSError, KeyError):
+            shutil.rmtree(captured["cwd"])
     return captured
 
 
@@ -423,8 +443,16 @@ def test_smoke_cwd_differs_across_state_roots(leerie, monkeypatch, tmp_path):
 def test_smoke_max_turns_exceeds_the_measured_happy_path(leerie):
     """Measured: 3 turns (text answer, the CLI's synthetic
     [structured-output-enforce] turn, the StructuredOutput call). A cap of 2
-    would die() on every healthy preflight."""
-    assert leerie.SMOKE_MAX_TURNS > 3
+    would die() on every healthy preflight.
+
+    Asserted `>= 3`, matching that measurement, plus a separate `> 3` headroom
+    check — the two are different claims and were previously conflated into one
+    `> 3`, which would have failed a legitimate cap of exactly 3.
+    """
+    assert leerie.SMOKE_MAX_TURNS >= 3, "a cap below the measured happy path"
+    assert leerie.SMOKE_MAX_TURNS > 3, (
+        "keep one turn of headroom: the error directions are asymmetric — a "
+        "spare turn costs a few output tokens, too low a cap die()s every run")
 
 
 # The verbatim result envelope from run 7432b2b4's logs/smoke.log.
@@ -494,3 +522,49 @@ def test_call_site_passes_the_resolved_classifier_model():
     assert 'model=models["classifier"]' in call, (
         "preflight must be handed the tier the run's first worker uses; "
         f"got: {call!r}")
+
+
+def test_smoke_refuses_a_symlinked_cwd(leerie, monkeypatch, tmp_path):
+    """The name is deterministic and /tmp is world-writable, so `exist_ok=True`
+    would otherwise accept a planted symlink — and one pointing into a checkout
+    puts the cwd back inside a repository, silently reloading the CLAUDE.md the
+    temp path exists to escape. Fails quietly, which is exactly why the state
+    root was rejected for the same reason."""
+    import tempfile, hashlib
+    state_root = tmp_path / "state"
+    leerie_dir = state_root / "runs" / "run-1"
+    leerie_dir.mkdir(parents=True)
+    target = tmp_path / "repo"
+    target.mkdir()
+    planted = (Path(tempfile.gettempdir())
+               / ("leerie-smoke-" + hashlib.sha256(
+                   str(state_root).encode()).hexdigest()[:12]))
+    if planted.exists() or planted.is_symlink():
+        planted.unlink() if planted.is_symlink() else shutil.rmtree(planted)
+    planted.symlink_to(target)
+    try:
+        with pytest.raises(SystemExit):
+            _run_preflight(leerie, monkeypatch, leerie_dir)
+    finally:
+        planted.unlink()
+
+
+def test_context_overflow_remedy_matches_the_raise_site(leerie):
+    """A worker's prompt carries the task text and the repo's CLAUDE.md; the
+    smoke test carries neither. Telling a preflight operator to shrink them
+    names two things provably absent from the prompt that refused."""
+    assert leerie.ContextOverflow("x").from_worker is True
+    assert leerie.ContextOverflow("x", from_worker=False).from_worker is False
+
+    src = inspect.getsource(leerie.preflight)
+    assert "from_worker=False" in src, (
+        "preflight's raise must mark itself as not-a-worker, or the operator "
+        "gets worker-shaped advice")
+
+    handler = inspect.getsource(leerie.main)
+    handler = handler[handler.index("except ContextOverflow"):]
+    handler = handler[:handler.index("\n    except ")]
+    assert "e.from_worker" in handler, (
+        "main() must branch the remedy on the raise site")
+    assert "carries neither" in handler, (
+        "the non-worker arm must say the worker advice does not apply")

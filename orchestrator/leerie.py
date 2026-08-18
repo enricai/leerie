@@ -740,17 +740,17 @@ INSPECT_TOOLS = (
     "Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
 )
 # NotebookEdit sits here with Write/Edit rather than in DISALLOWED_TOOLS.
-# It was briefly denied on the theory that judgment workers can reach a
-# file writer anyway, but that argument does not survive contact: the
-# deny list is a SINGLE GLOBAL constant, so denying it also strips
-# notebook editing from implementer/integrator/conformer/rebaser running
-# against arbitrary user repos; judgment workers are autonomous=False and
-# so do NOT carry --dangerously-skip-permissions by default (see the
-# skip_perms line in claude_p), which means --allowedTools already keeps
-# it from them; and Bash/Write/Edit — the same class of writer — stay
-# allowed regardless, so the deny never delivered the read-only property
-# it was justified by. Listing it here also keeps it inside KNOWN_TOOLS,
-# so the observed-surface partition stays complete.
+# The tempting argument for denying it — judgment workers can reach a file
+# writer anyway — does not survive contact. DISALLOWED_TOOLS is a SINGLE
+# GLOBAL constant, so a deny also strips notebook editing from
+# implementer/integrator/conformer/rebaser running against arbitrary user
+# repos; judgment workers are autonomous=False and so do NOT carry
+# --dangerously-skip-permissions by default (see the skip_perms line in
+# claude_p), which means --allowedTools already holds them; and
+# Bash/Write/Edit — the same class of writer — stay allowed regardless, so
+# a deny would not deliver the read-only property it appears to buy.
+# Listing it here also keeps it inside KNOWN_TOOLS, so the observed-surface
+# partition stays complete.
 ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit"
 
 # SATISFIED_PROBE_TOOLS — a deliberately narrow, BASE-TREE-ONLY subset of
@@ -818,8 +818,8 @@ SATISFIED_PROBE_TOOLS = (
 # top-level escape hatch (DESIGN §12) — by default they are autonomous=False
 # and the allowlist holds. Denying a writer globally would therefore buy
 # nothing by default while removing the capability from every acting worker
-# in every user repo. See ACT_TOOLS for NotebookEdit, which was briefly
-# denied on that mistaken reasoning.
+# in every user repo. See ACT_TOOLS, where NotebookEdit is classified for
+# exactly that reason.
 DISALLOWED_TOOLS = (
     "Agent,Task,SendMessage,"
     "ScheduleWakeup,"
@@ -832,7 +832,8 @@ DISALLOWED_TOOLS = (
 )
 
 # KNOWN_TOOLS is the union of every bare tool name leerie ever names, across
-# INSPECT_TOOLS / ACT_TOOLS / SATISFIED_PROBE_TOOLS / DISALLOWED_TOOLS, plus
+# INSPECT_TOOLS / ACT_TOOLS / SATISFIED_PROBE_TOOLS / SMOKE_TOOLS /
+# DISALLOWED_TOOLS, plus
 # the literal "StructuredOutput" (injected by the CLI itself for schema-
 # validated output, named nowhere else in this file). INSPECT_TOOLS/ACT_TOOLS/
 # SATISFIED_PROBE_TOOLS entries are comma-separated, and some carry a
@@ -864,6 +865,9 @@ KNOWN_TOOLS: frozenset[str] = frozenset(
     _bare_tool_names(INSPECT_TOOLS)
     | _bare_tool_names(ACT_TOOLS)
     | _bare_tool_names(SATISFIED_PROBE_TOOLS)
+    # Inert today — SMOKE_TOOLS is "Read", which _READ_BASE already supplies —
+    # and kept so that widening SMOKE_TOOLS cannot silently drop a name out of
+    # this set. Measured: with and without this term the union is identical.
     | _bare_tool_names(SMOKE_TOOLS)
     | _bare_tool_names(DISALLOWED_TOOLS)
     | {"StructuredOutput"}
@@ -3180,10 +3184,16 @@ class ContextOverflow(BaseException):
     override is what lowers the ceiling in the first place (see
     `_model_arg`) — after which `leerie resume` picks the run back up.
 
-    Carries only raw_message: str — the verbatim envelope `result`."""
-    def __init__(self, raw_message: str):
+    Carries raw_message: str — the verbatim envelope `result` — and
+    `from_worker: bool`, which selects the remedy main() prints. A worker's
+    prompt carries the task text and the repo's CLAUDE.md; `preflight`'s smoke
+    test carries neither (no --append-system-prompt, and an empty cwd by
+    construction), so telling that operator to shrink them names two things
+    provably absent from the prompt that refused."""
+    def __init__(self, raw_message: str, *, from_worker: bool = True):
         super().__init__(raw_message)
         self.raw_message = raw_message
+        self.from_worker = from_worker
 
 
 # The errnos that all mean "you cannot write any more here" to an operator.
@@ -7151,10 +7161,21 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             / ("leerie-smoke-" + hashlib.sha256(
                 str(leerie_dir.parent.parent).encode()).hexdigest()[:12]))
         try:
-            os.makedirs(smoke_cwd, exist_ok=True)
+            os.makedirs(smoke_cwd, mode=0o700, exist_ok=True)
         except OSError as e:
             die(f"cannot create the smoke-test working directory "
                 f"{smoke_cwd}: {e}")
+        # The name is deterministic and the parent is world-writable, and
+        # `exist_ok=True` accepts whatever is already there — including a
+        # symlink someone else planted. A symlink into a checkout would put
+        # the cwd back inside a repository and silently reload the CLAUDE.md
+        # this whole mechanism exists to escape, which is the same
+        # fails-quietly shape the comment above rejects the state root for.
+        # So verify what we actually got rather than trusting the name.
+        if os.path.realpath(smoke_cwd) != smoke_cwd:
+            die(f"the smoke-test working directory {smoke_cwd} is a symlink "
+                f"(to {os.path.realpath(smoke_cwd)}); refusing to run the "
+                "smoke test in it. Remove it and re-run.")
         try:
             envelope = await _invoke(cmd, cwd=smoke_cwd, timeout=90,
                                      sid="smoke",
@@ -7169,6 +7190,7 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         # two runs sharing one state root share this path — an rmtree here
         # would unlink a concurrent run's live cwd, which surfaces as a
         # spurious smoke-test failure diagnosed as an auth or network problem.
+        #
         # Classify BEFORE the generic arm. A client-side context refusal
         # carries api_error_status=None, so it would otherwise print as the
         # bare string "Prompt is too long" — the wording CLAUDE.md records
@@ -7181,7 +7203,8 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         # recorded task and re-runs the smoke test. That is the right
         # behaviour once the operator has dropped the offending flag.)
         if _is_context_overflow(envelope):
-            raise ContextOverflow(str(envelope.get("result") or ""))
+            raise ContextOverflow(str(envelope.get("result") or ""),
+                                  from_worker=False)
         if envelope.get("is_error"):
             die(f"claude -p smoke test returned an error: "
                 f"{envelope.get('api_error_status') or envelope.get('result')} "
@@ -14523,8 +14546,10 @@ def _summarize_tool_use(sid: str, block: dict, verbosity: str) -> str:
     if name in ("Write", "Edit", "NotebookEdit"):
         # NotebookEdit names its target `notebook_path`, not `file_path`, so
         # keying only on the latter logged a bare "?" for every notebook edit.
-        # Latent while NotebookEdit was on the deny list; live again now that
-        # it is an ACT_TOOLS writer.
+        # This was never latent: NotebookEdit has always been in the acting
+        # workers' reported tool surface, and they run with
+        # --dangerously-skip-permissions, so every real notebook edit has
+        # logged "?" for as long as the summarizer has existed.
         path = inp.get("file_path") or inp.get("notebook_path") or "?"
         return f"  [{sid} {name.lower()}] {path}"
     if name == "WebFetch":
@@ -33052,8 +33077,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             log("  --dangerously-force-strict-output is active: it sets "
                 "ANTHROPIC_BASE_URL, which lowers the CLI's context ceiling. "
                 "Re-running without it is usually enough.")
-        log("  Otherwise shrink what every worker carries: the task text and "
-            "the repo's CLAUDE.md are both loaded into each worker's context.")
+        if e.from_worker:
+            log("  Otherwise shrink what every worker carries: the task text "
+                "and the repo's CLAUDE.md are both loaded into each worker's "
+                "context.")
+        else:
+            log("  This was the preflight smoke test, which carries neither "
+                "the task text nor the repo's CLAUDE.md — so shrinking those "
+                "will not help. Its prompt is the CLI's own system prompt "
+                "plus its built-in tool definitions.")
         log(f"  then resume with: leerie resume {st.run_id}")
         abnormal = False
         try:

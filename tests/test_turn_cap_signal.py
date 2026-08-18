@@ -69,7 +69,7 @@ def _scopes(tree: ast.AST) -> list[ast.AST]:
     `cmd = _contained_claude_argv(..., max_turns=max_turns, ...)`, which taints
     the NAME `cmd` — and `cmd` is assigned in dozens of unrelated functions, so
     within the four fixpoint rounds both the count set and the cap set grew to
-    ~900 names, i.e. every name in the module. The scan then reported garbage
+    1201 names, i.e. every name in the module. The scan then reported garbage
     offenders (`seconds < 0`, `min_age is None`, `found < MIN_CLAUDE_CLI`) and
     failed a correct tree.
 

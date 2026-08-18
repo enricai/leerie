@@ -133,8 +133,9 @@ orchestrator and not used anywhere in this repo.
 
 `DISALLOWED_TOOLS` enforces this mechanically, and it must name **`Task`**,
 not only `Agent`: `Agent` is the retired spelling and current CLI builds ship
-`Task`. Until 2026-08-18 the deny list carried `Agent` and the retired `Task*`
-family (`TaskCreate`…`TaskStop`) but not the bare `Task`, so this invariant
+`Task`. Until 2026-08-18 the deny list carried `Agent` and the `Task*` family
+(`TaskCreate`/`TaskGet`/`TaskList`/`TaskUpdate`, retired from current builds,
+plus the live `TaskOutput`/`TaskStop`) but not the bare `Task`, so this invariant
 was enforced against a name the live CLI no longer emits — the shape to watch
 for whenever the CLI renames a tool.
 
@@ -3519,8 +3520,9 @@ No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 `tests/test_launcher_integrity.py` is the **only** thing that checks the
-`leerie` launcher parses. CI does not: `shellcheck.yml` lints `scripts/*.sh` and `scripts/remote/*.sh`
-and the launcher has no `.sh` extension nor lives there, while `syntax.yml`
+`leerie` launcher parses. CI does not: `shellcheck.yml` lints `scripts/*.sh`
+and `scripts/remote/*.sh`, and the launcher has no `.sh` extension nor lives in
+either, while `syntax.yml`
 AST-parses Python only. No test runs shellcheck at all — every occurrence of
 the word under `tests/` is prose describing this gap. So a `bash -n`-level
 syntax error in a 7k-line launcher would otherwise ship green.

@@ -105,9 +105,10 @@ def test_notebook_edit_reports_its_own_input_key(leerie):
 
     Feeding it a `file_path` (as the loop above does for all three names)
     passes against a branch that only ever reads `file_path`, so every real
-    notebook edit logged a bare "?". Latent while `NotebookEdit` was on the
-    deny list and unreachable; live again now that it is an `ACT_TOOLS`
-    writer.
+    notebook edit logged a bare "?" — and that was never hypothetical:
+    `NotebookEdit` has always appeared in the acting workers' reported tool
+    surface, and those workers run with `--dangerously-skip-permissions`, so
+    the defect was live for as long as the summarizer has existed.
     """
     block = {"type": "tool_use", "name": "NotebookEdit",
              "input": {"notebook_path": "analysis/run.ipynb",
