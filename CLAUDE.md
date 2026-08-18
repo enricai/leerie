@@ -1638,11 +1638,20 @@ where `tests/test_source_of_truth_delivery.py` aims it — its spec-file check
 loops over `research` as well as `codebase`, and its
 `_effective_source_of_truth` table carries a row where `answers` and the
 preference *disagree* (an agreeing-only table passes against a helper that
-ignores `answers`). The delivery file also source-couples all three `State`-holding consumers
-(`phase_plan`, `_write_plan`, `_compose_pr_via_llm`) to
+ignores `answers`). The delivery file also source-couples three of the four `State`-holding
+consumers (`phase_plan`, `_write_plan`, `_compose_pr_via_llm`) to
 `_effective_source_of_truth(st)` — note only the first two ever carried a
 `"codebase"` default, so for the third only the presence assertion can fail;
-it is parametrized anyway as the forward guard. Two further readers cannot use
+it is parametrized anyway as the forward guard. The fourth is
+`phase_reconcile`'s, nested in the `_check_unresolvable` closure and pinned by
+`tests/test_unresolvable_die_message.py` instead, which AST-resolves the
+argument's binding. **That the count here reads "four" at all is the product of
+a guard, not of care**: this sentence said "all three" while the fourth reader
+was added in the same commit, and nothing noticed until
+`tests/test_effective_sot_consumers.py` derived the set from the call sites.
+An enumeration nested inside a closure is invisible to the obvious AST walk —
+one over each module-level `def`'s direct body — so that file's load-bearing
+test is the one asserting `phase_reconcile` is in the derived set. Two further readers cannot use
 the helper and are documented rather than converted: `compose_pr_body` takes a
 plain `state: dict` and `scripts/host-finalize.sh` reads the key with `jq`, because pinning the writer alone leaves the
 value reaching nothing — the **deleted** `test_resolve_aws_prefs.py` trap.
@@ -3373,7 +3382,7 @@ must be paired with one asserting SUBSTANCE.** Structure is a dict key, a source
 substring, an AST node, a phrase in a prompt. Substance is the value that flows
 through it, the result of executing it, or the order it appears in. Structure-only
 assertions are necessary and never sufficient, and the gap is invisible because
-they pass. Four measured instances, all from one change (2026-08-18):
+they pass. Four measured instances, all from one change (2026-08-17):
 
 | structural assertion | what passed it |
 |---|---|
