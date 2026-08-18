@@ -776,12 +776,49 @@ SATISFIED_PROBE_TOOLS = (
 # removes tools from the model's context entirely — the model cannot see
 # or call them regardless of permission mode.  This prevents workers from
 # spawning subagents, setting timers, or sending messages that the
-# orchestrator cannot track.
+# orchestrator cannot track.  Widened (corpus measurement) to also deny
+# Workflow (nested multi-agent orchestration), ReportFindings (would shadow
+# the injected StructuredOutput tool), Skill (loads arbitrary skill
+# instructions outside leerie's own prompts), Monitor (backgrounds
+# untracked long-running watches), the Task* family (TaskCreate, TaskGet,
+# TaskList, TaskUpdate, TaskOutput, TaskStop — untracked parallel work
+# items; the Create/Get/List/Update names are retired from current CLI
+# builds but kept for defense-in-depth), ListAgents (enumerates/targets
+# other sessions), EnterWorktree/ExitWorktree (git worktree mechanics
+# reserved to the orchestrator's own scripts), DesignSync (writes to an
+# external claude.ai project outside worktree/git tracking), and
+# ToolSearch (denied for consistency with the rest of this set even
+# though it only searches for MCP tool schemas, not a distinct bypass).
 DISALLOWED_TOOLS = (
     "Agent,SendMessage,"
     "ScheduleWakeup,"
     "CronCreate,CronDelete,CronList,"
-    "RemoteTrigger,PushNotification"
+    "RemoteTrigger,PushNotification,"
+    "Workflow,ReportFindings,Skill,Monitor,"
+    "TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,TaskStop,"
+    "ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch"
+)
+
+# KNOWN_TOOLS is the union of every bare tool name leerie ever names, across
+# INSPECT_TOOLS / ACT_TOOLS / SATISFIED_PROBE_TOOLS / DISALLOWED_TOOLS, plus
+# the literal "StructuredOutput" (injected by the CLI itself for schema-
+# validated output, named nowhere else in this file). INSPECT_TOOLS/ACT_TOOLS/
+# SATISFIED_PROBE_TOOLS entries are comma-separated, and some carry a
+# `Bash(<verb>:*)` allow-pattern suffix rather than a bare CLI tool name — the
+# bare name is everything before an optional "(". This is the single source
+# of truth for "every tool name leerie has ever classified", consumed by the
+# self-reporting latch and the converse partition test so a CLI-shipped name
+# fitting neither this set nor DISALLOWED_TOOLS is visibly uncovered rather
+# than silently ignored.
+def _bare_tool_names(tools_str: str) -> set[str]:
+    return {entry.split("(", 1)[0] for entry in tools_str.split(",")}
+
+KNOWN_TOOLS: frozenset[str] = frozenset(
+    _bare_tool_names(INSPECT_TOOLS)
+    | _bare_tool_names(ACT_TOOLS)
+    | _bare_tool_names(SATISFIED_PROBE_TOOLS)
+    | _bare_tool_names(DISALLOWED_TOOLS)
+    | {"StructuredOutput"}
 )
 
 # --inspect-dir preference: extra directories to grant the inspect-bucket
@@ -15732,11 +15769,17 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
     # cause. `InputValidationError` (unparseable JSON) already logs its
     # payload; this closes the gap for the parseable-but-invalid case.
     last_structured_payload: str | None = None
+    # Whether the unexpected-tool-surface warning has already fired for this
+    # worker. Latched (not re-checked per event) so a worker whose tools
+    # array is inspected across multiple system/init events (unusual, but
+    # not impossible) only ever warns once — the advisory exists to flag a
+    # drift, not to spam the log per event.
+    unexpected_tools_warned = False
 
     async def _read_stream():
         nonlocal envelope, last_event_at, overage_blocked
         nonlocal pids_events_baseline, last_bash_cmd
-        nonlocal last_structured_payload
+        nonlocal last_structured_payload, unexpected_tools_warned
         # `buffering=1` is line-buffered: every newline flushes to disk.
         # Without this Python text-mode files are fully buffered when not
         # connected to a TTY, so `tail -f <state-root>/logs/<sid>.log` would
@@ -15798,6 +15841,26 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                         if (_rli.get("overageDisabledReason")
                                 in ("out_of_credits", "out_of_overage")):
                             overage_blocked = True
+                    # Tool-surface self-reporting (DESIGN §12 central
+                    # principle applied to the CLI's own tool list): a CLI
+                    # upgrade shipping a new tool name, or any mcp__* tool
+                    # leaking past --strict-mcp-config, should be visible
+                    # rather than silently drifting. Tracked here rather
+                    # than in _summarize_stream_event for the same reason as
+                    # the rate_limit_event latch above — it must fire even
+                    # at quiet verbosity, where the summarizer is never
+                    # consulted. Advisory only: never raises, never blocks.
+                    if (t == "system" and sub == "init"
+                            and not unexpected_tools_warned):
+                        _tools = event.get("tools") or []
+                        _flagged = sorted(
+                            name for name in _tools
+                            if name not in KNOWN_TOOLS
+                            or name.startswith("mcp__"))
+                        if _flagged:
+                            unexpected_tools_warned = True
+                            log(f"  [{sid}] unexpected tool(s) in worker's "
+                                f"tool surface: {', '.join(_flagged)}")
                     # PID-exhaustion detection (DESIGN §6 *Detecting PID
                     # exhaustion*). A worker that has exhausted its cgroup
                     # pids.max fails EVERY shell-spawning tool call with
@@ -16709,6 +16772,14 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 "--disallowedTools", DISALLOWED_TOOLS,
                 "--max-turns", str(max_turns),
                 "--model", _model_arg(model),
+                # Cut MCP tool exposure off at the source: unconditional for
+                # every worker, independent of any mcp__* denylist entry and
+                # of whatever .claude.json seeding copies into the container
+                # (measured: 4 mcp_servers / 46 MCP tools baseline -> 0/0
+                # with this flag, rc 0, CLI 2.1.234). No --mcp-config is ever
+                # passed, so this can't strand a worker with zero server
+                # config but a nonzero tool surface.
+                "--strict-mcp-config",
             ])
             # IMPLEMENTATION.md §2 "Effort selection". When effort is None
             # (e.g. satisfied_probe, or the post-run judge/heal workers) the

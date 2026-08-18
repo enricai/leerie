@@ -77,7 +77,16 @@ def test_parse_memory_size_fractional_rejected(leerie):
 def test_auto_splits_meminfo_across_slots(leerie, monkeypatch, tmp_path):
     """Synthesize a /proc/meminfo with 128 GiB total. With max_parallel=4
     the per-worker share is 128 / 5 = 25.6 GiB; that's above the 8 GiB
-    floor, so the even split wins."""
+    floor, so the even split wins.
+
+    _auto_worker_memory_max tries the shared-slice basis
+    (_cgroup_slice_info) first and only falls back to this
+    /proc/meminfo-derived legacy basis when that's unavailable — force
+    the fallback so this test exercises the legacy path it documents,
+    independent of whether a real cgroup broker happens to be reachable
+    in the host running the suite (e.g. inside a leerie worker
+    container, where /run/leerie-cgroup.sock is live)."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
     meminfo = tmp_path / "meminfo"
     meminfo.write_text(f"MemTotal:       {128 * 1024 * 1024} kB\n")
     import builtins
@@ -98,7 +107,12 @@ def test_auto_floors_at_8gib(leerie, monkeypatch, tmp_path):
     2.67 GiB) is well under the measured 6.3 GiB build+claude peak
     (see docstring on _auto_worker_memory_max), so the 8 GiB floor
     wins — the fix for build-running workers cgroup-OOMing under the
-    old 4 GiB clamp."""
+    old 4 GiB clamp.
+
+    Forces the shared-slice basis unavailable so the legacy
+    /proc/meminfo path under test actually runs — see the comment on
+    test_auto_splits_meminfo_across_slots."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
     meminfo = tmp_path / "meminfo"
     meminfo.write_text(f"MemTotal:       {16 * 1024 * 1024} kB\n")
     import builtins
@@ -114,7 +128,12 @@ def test_auto_floors_at_8gib(leerie, monkeypatch, tmp_path):
 
 def test_auto_fallback_when_meminfo_missing(leerie, monkeypatch):
     """No /proc/meminfo on macOS host (where the test suite usually
-    runs). Auto returns the 2 GiB fallback."""
+    runs). Auto returns the 2 GiB fallback.
+
+    Forces the shared-slice basis unavailable so the legacy
+    /proc/meminfo path under test actually runs — see the comment on
+    test_auto_splits_meminfo_across_slots."""
+    monkeypatch.setattr(leerie, "_cgroup_slice_info", lambda: None)
     import builtins
     real_open = builtins.open
 
