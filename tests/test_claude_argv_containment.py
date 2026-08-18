@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import contextlib
 import inspect
 import os
 import shutil
@@ -276,15 +277,22 @@ def _smoke_argv(leerie, monkeypatch, tmp_path) -> list[str]:
     """The argv `preflight`'s smoke test produces."""
     captured: dict = {}
 
-    async def fake_invoke(cmd, **_kw):
+    async def fake_invoke(cmd, cwd=None, **_kw):
         captured["cmd"] = list(cmd)
+        captured["cwd"] = cwd
         return {"type": "result", "is_error": False, "result": "ok"}
 
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
     monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
     monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
     monkeypatch.setattr(leerie, "_disk_free_ratio", lambda _p: 0.9)
-    asyncio.run(leerie.preflight(tmp_path, skip_smoke=False, model="sonnet"))
+    # Same reaping as _run_preflight, same `finally` reasoning.
+    try:
+        asyncio.run(leerie.preflight(tmp_path, skip_smoke=False,
+                                     model="sonnet"))
+    finally:
+        with contextlib.suppress(OSError, KeyError):
+            shutil.rmtree(captured["cwd"])
     return captured["cmd"]
 
 
@@ -326,7 +334,7 @@ def test_both_sites_share_the_builder(leerie, monkeypatch, tmp_path):
 
 # --- the smoke test's own argv, cwd, and error path ---
 
-def _run_preflight(leerie, monkeypatch, tmp_path, envelope=None, model="sonnet"):
+def _run_preflight(leerie, monkeypatch, leerie_dir, envelope=None, model="sonnet"):
     captured: dict = {}
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
@@ -342,7 +350,17 @@ def _run_preflight(leerie, monkeypatch, tmp_path, envelope=None, model="sonnet")
     monkeypatch.setattr(leerie, "_check_claude_cli_version", lambda: None)
     monkeypatch.setattr(leerie, "_sigchld_is_ignored", lambda: False)
     monkeypatch.setattr(leerie, "_disk_free_ratio", lambda _p: 0.9)
-    asyncio.run(leerie.preflight(tmp_path, skip_smoke=False, model=model))
+    # Production deliberately leaves this directory (two runs of one state root
+    # share the path, so removing it would unlink a concurrent run's cwd). Tests
+    # get a unique hash per leerie_dir, so nothing else can be using theirs and
+    # leaving them would leak one /tmp entry per invocation. `finally`, because
+    # several callers here drive preflight to a die() or a ContextOverflow and
+    # a cleanup placed after the call would be skipped for exactly those.
+    try:
+        asyncio.run(leerie.preflight(leerie_dir, skip_smoke=False, model=model))
+    finally:
+        with contextlib.suppress(OSError, KeyError):
+            shutil.rmtree(captured["cwd"])
     return captured
 
 
@@ -425,8 +443,16 @@ def test_smoke_cwd_differs_across_state_roots(leerie, monkeypatch, tmp_path):
 def test_smoke_max_turns_exceeds_the_measured_happy_path(leerie):
     """Measured: 3 turns (text answer, the CLI's synthetic
     [structured-output-enforce] turn, the StructuredOutput call). A cap of 2
-    would die() on every healthy preflight."""
-    assert leerie.SMOKE_MAX_TURNS > 3
+    would die() on every healthy preflight.
+
+    Asserted `>= 3`, matching that measurement, plus a separate `> 3` headroom
+    check — the two are different claims and were previously conflated into one
+    `> 3`, which would have failed a legitimate cap of exactly 3.
+    """
+    assert leerie.SMOKE_MAX_TURNS >= 3, "a cap below the measured happy path"
+    assert leerie.SMOKE_MAX_TURNS > 3, (
+        "keep one turn of headroom: the error directions are asymmetric — a "
+        "spare turn costs a few output tokens, too low a cap die()s every run")
 
 
 # The verbatim result envelope from run 7432b2b4's logs/smoke.log.

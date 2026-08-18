@@ -832,7 +832,8 @@ DISALLOWED_TOOLS = (
 )
 
 # KNOWN_TOOLS is the union of every bare tool name leerie ever names, across
-# INSPECT_TOOLS / ACT_TOOLS / SATISFIED_PROBE_TOOLS / DISALLOWED_TOOLS, plus
+# INSPECT_TOOLS / ACT_TOOLS / SATISFIED_PROBE_TOOLS / SMOKE_TOOLS /
+# DISALLOWED_TOOLS, plus
 # the literal "StructuredOutput" (injected by the CLI itself for schema-
 # validated output, named nowhere else in this file). INSPECT_TOOLS/ACT_TOOLS/
 # SATISFIED_PROBE_TOOLS entries are comma-separated, and some carry a
@@ -864,6 +865,9 @@ KNOWN_TOOLS: frozenset[str] = frozenset(
     _bare_tool_names(INSPECT_TOOLS)
     | _bare_tool_names(ACT_TOOLS)
     | _bare_tool_names(SATISFIED_PROBE_TOOLS)
+    # Inert today — SMOKE_TOOLS is "Read", which _READ_BASE already supplies —
+    # and kept so that widening SMOKE_TOOLS cannot silently drop a name out of
+    # this set. Measured: with and without this term the union is identical.
     | _bare_tool_names(SMOKE_TOOLS)
     | _bare_tool_names(DISALLOWED_TOOLS)
     | {"StructuredOutput"}
@@ -7186,6 +7190,7 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         # two runs sharing one state root share this path — an rmtree here
         # would unlink a concurrent run's live cwd, which surfaces as a
         # spurious smoke-test failure diagnosed as an auth or network problem.
+        #
         # Classify BEFORE the generic arm. A client-side context refusal
         # carries api_error_status=None, so it would otherwise print as the
         # bare string "Prompt is too long" — the wording CLAUDE.md records

@@ -3,8 +3,10 @@
 
 Unlike --allowedTools (permission-tier, bypassed by
 --dangerously-skip-permissions), --disallowedTools removes tools from
-the model's context entirely.  This test pins the deny list contents
-and confirms the flag is wired into claude_p's command builder.
+the model's context entirely.  This test pins the deny list CONTENTS;
+that the flag reaches every `claude -p` argv is
+`tests/test_claude_argv_containment.py`'s job, derived across both the
+orchestrator module and `scripts/**/*.sh`.
 """
 from __future__ import annotations
 
@@ -13,7 +15,6 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 OBSERVED_TOOLS_FIXTURE = REPO_ROOT / "tests" / "fixtures" / "observed_tools.json"
 
 REQUIRED_DENIALS = {
@@ -46,7 +47,6 @@ REQUIRED_DENIALS = {
 # --dangerously-skip-permissions by default and so are already held by
 # --allowedTools. Bash/Write/Edit stay allowed regardless, so the deny never
 # produced the read-only property it was justified by.
-NOT_DENIED = {"NotebookEdit", "Bash", "Write", "Edit"}
 
 
 def test_disallowed_tools_contains_required_denials(leerie):
@@ -107,17 +107,22 @@ def test_observed_tools_fixture_is_fully_partitioned(leerie):
     )
 
 
-def test_plain_file_writers_are_not_denied(leerie):
-    """A writer on the deny list costs every acting worker in every user repo
-    and buys nothing by default — `--allowedTools` already holds judgment
-    workers, which are `autonomous=False`. Pinned so `NotebookEdit` is not
-    re-added on the reasoning that was tried and reverted."""
+def test_the_two_lists_are_disjoint(leerie):
+    """Nothing an acting worker is allowed may also be denied.
+
+    Derived rather than enumerated: a hand-written list of "writers that must
+    not be denied" covers only the names someone thought of, and needs editing
+    every time ACT_TOOLS grows. The deny list is global, so any overlap
+    silently removes a capability from implementer/integrator/conformer/rebaser
+    against arbitrary user repos.
+    """
+    allowed = leerie._bare_tool_names(leerie.ACT_TOOLS)
     denied = {e.strip() for e in leerie.DISALLOWED_TOOLS.split(",")}
-    wrongly_denied = NOT_DENIED & denied
-    assert not wrongly_denied, (
-        f"{sorted(wrongly_denied)} are plain file writers; denying them "
-        "globally removes the capability from implementer/integrator/"
-        "conformer against arbitrary user repos. See ACT_TOOLS.")
+    overlap = allowed & denied
+    assert not overlap, (
+        f"{sorted(overlap)} are in ACT_TOOLS and also denied; the deny list is "
+        "global, so this strips the capability from every acting worker in "
+        "every user repo")
 
 
 def test_notebook_edit_is_classified_as_an_act_tool(leerie):

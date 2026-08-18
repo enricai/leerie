@@ -2848,8 +2848,9 @@ repo against 17,222 in an empty directory — a difference of 108,800 attributab
 to cwd alone — where the failing run reached 183,485. The trigger's exact
 location was not measured, so this is a size attribution, not a proof that the
 cwd alone crossed it; the tool denies (16,006 tokens) may have sufficed on their
-own. The empty cwd is chosen on the structural ground below regardless. Since `CLAUDE.md` only grows, that margin has to be
-structural rather than a number someone re-tunes; an empty cwd is the only one
+own. The empty cwd is chosen on the structural ground below regardless. Since
+`CLAUDE.md` only grows, that margin has to be structural rather than a number
+someone re-tunes; an empty cwd is the only one
 whose prompt size is bounded by construction. The cost of that choice is
 stated plainly: preflight no longer proves the CLI can start *in this repo*
 (a malformed repo-local `.claude/settings.json`, say), which now surfaces at
@@ -7417,8 +7418,9 @@ A second enforcement layer compensates for the permission bypass:
 invocation that starts a session. (The sole exemption is
 `_append_system_prompt_file_supported`'s capability probe, which passes empty
 stdin and exits before any model call — `tests/test_claude_argv_containment.py`
-encodes it as the one allowed hand-rolled argv.) Unlike `--allowedTools` (permission-tier, bypassed by
-`--dangerously-skip-permissions`), `--disallowedTools` with bare tool names
+encodes it as the one allowed hand-rolled argv.) Unlike `--allowedTools`
+(permission-tier, bypassed by `--dangerously-skip-permissions`),
+`--disallowedTools` with bare tool names
 removes tools from the model's context entirely — the model cannot see or call
 them regardless of permission mode. The deny list targets tools that spawn
 untracked parallel work or set timers the orchestrator cannot track: `Agent`,
@@ -7440,8 +7442,9 @@ it, which makes the entry defense-in-depth rather than a fix for an observed lea
 **A plain file writer does not belong on this list**, which is why `NotebookEdit` is
 classified into `ACT_TOOLS` rather than denied. The tempting argument for denying it —
 that `--allowedTools` is only a permission tier, so a judgment worker can reach a writer
-anyway — holds only under the opt-out described above; by default judgment workers are not autonomous and do not carry
-`--dangerously-skip-permissions`, so the allowlist does hold. Meanwhile the deny list is
+anyway — holds only under the opt-out described above; by default judgment
+workers are not autonomous and do not carry `--dangerously-skip-permissions`,
+so the allowlist does hold. Meanwhile the deny list is
 a single global constant, so denying a writer removes it from every acting worker in
 every repository leerie is pointed at, and `Bash`/`Write`/`Edit` — the same class — stay
 allowed regardless, so the deny never produced the read-only property it was justified
