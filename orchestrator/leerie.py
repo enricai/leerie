@@ -16709,6 +16709,14 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 "--disallowedTools", DISALLOWED_TOOLS,
                 "--max-turns", str(max_turns),
                 "--model", _model_arg(model),
+                # Cut MCP tool exposure off at the source: unconditional for
+                # every worker, independent of any mcp__* denylist entry and
+                # of whatever .claude.json seeding copies into the container
+                # (measured: 4 mcp_servers / 46 MCP tools baseline -> 0/0
+                # with this flag, rc 0, CLI 2.1.234). No --mcp-config is ever
+                # passed, so this can't strand a worker with zero server
+                # config but a nonzero tool surface.
+                "--strict-mcp-config",
             ])
             # IMPLEMENTATION.md §2 "Effort selection". When effort is None
             # (e.g. satisfied_probe, or the post-run judge/heal workers) the
