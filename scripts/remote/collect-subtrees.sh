@@ -195,6 +195,14 @@ leerie_dir="${LEERIE_STATE_DIR}/runs/${run_id}"
 integrator_prompt="${SCRIPTS}/../prompts/integrator.md"
 # Must be kept in sync with SCHEMAS["integrator"] in orchestrator/leerie.py —
 # this script can't import Python, so there's no other guard against drift.
+# Embedded copies of the orchestrator's ACT_TOOLS / DISALLOWED_TOOLS. This
+# script invokes `claude -p` directly on the remote machine and cannot import
+# orchestrator/leerie.py, so the values are duplicated here — exactly like
+# integrator_schema below, and guarded the same way, by
+# tests/test_collect_subtrees_integrator_schema.py. ANY EDIT TO EITHER LIST
+# IN leerie.py MUST BE MIRRORED HERE.
+integrator_allowed_tools='Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit,NotebookEdit'
+integrator_disallowed_tools='Agent,Task,SendMessage,ScheduleWakeup,CronCreate,CronDelete,CronList,RemoteTrigger,PushNotification,Workflow,ReportFindings,Skill,Monitor,TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,TaskStop,ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch,ListMcpResourcesTool,ReadMcpResourceTool,ReadMcpResourceDirTool'
 integrator_schema='{"type":"object","required":["incoming_subtask","status"],"properties":{"incoming_subtask":{"type":"string"},"status":{"type":"string","enum":["resolved","design-conflict","failed"]},"resolution_summary":{"type":"string"},"diagnosis":{"type":["string","null"]},"confidence":{"type":"object","required":["resolution","basis"],"properties":{"resolution":{"type":"number"},"basis":{"type":"string"},"falsifiers_tested":{"type":"array","items":{"type":"string"}},"contradictions_reconciled":{"type":"array","items":{"type":"string"}}}}}}'
 
 integrated_count=0
@@ -241,7 +249,8 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
       --append-system-prompt "$(cat "$integrator_prompt")" \
       --output-format json \
       --json-schema "$integrator_schema" \
-      --allowedTools "Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit" \
+      --allowedTools "$integrator_allowed_tools" \
+      --disallowedTools "$integrator_disallowed_tools" \
       --max-turns 60 \
       --model sonnet \
       --effort high \

@@ -229,7 +229,8 @@ class TestAwsArgsAreNotWordSplit:
     way. Rather than reshape a fixture a dozen other modules depend on, pin
     the defect class at the source, repo-wide.
 
-    Nothing else covers this: CI's shellcheck job lints `scripts/*.sh` but
+    Nothing else covers this: CI's shellcheck job lints `scripts/*.sh` and
+    `scripts/remote/*.sh` but
     **not** the `leerie` launcher, so SC2046 never fires on it either.
     """
 

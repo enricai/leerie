@@ -99,7 +99,11 @@ def test_args_match_capture_fields(leerie, tmp_path, monkeypatch):
     # why the prompt was moved off a positional argv element).
     assert cmd[0] == "claude"
     assert cmd[1] == "-p"
-    assert "--append-system-prompt" == cmd[2], (
+    # A FLAG, not the specific flag: argv order changed when the containment
+    # flags moved into `_contained_claude_argv` (which emits them before
+    # --append-system-prompt). What this line exists to pin is unchanged and
+    # is the general property — no positional prompt element follows -p.
+    assert cmd[2].startswith("--"), (
         "no positional prompt element should follow -p; got: "
         f"{cmd[:4]!r}")
     user_arg = collected_stdin[0]

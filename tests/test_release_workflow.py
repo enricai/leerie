@@ -1,7 +1,7 @@
 """Tests for `.github/workflows/release.yml`.
 
 Nothing in `tests/` previously touched `.github/workflows/`, and
-`shellcheck.yml` lints only `scripts/*.sh` — the embedded `run:` shell in
+`shellcheck.yml` lints `scripts/*.sh` and `scripts/remote/*.sh` — the embedded `run:` shell in
 this workflow was untested, which is how it shipped two silent-skip bugs
 (see CLAUDE.md's central principle: guarantees that matter and can be
 checked mechanically live in code, not in a workflow prompt/comment).

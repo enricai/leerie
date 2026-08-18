@@ -94,13 +94,36 @@ class TestCallSiteIsWired:
     own broad `except` logged a clean degrade), so the wiring gets its own pin.
     """
 
-    def test_claude_p_builds_model_arg_via_the_helper(self):
-        import inspect
-        src = inspect.getsource(leerie.claude_p)
-        assert '"--model", _model_arg(model)' in src, (
-            "claude_p must route --model through _model_arg; a bare "
+    def test_argv_builder_routes_model_through_the_helper(self):
+        """Behavioural, not a source pin.
+
+        This asserted the literal `'"--model", _model_arg(model)'` inside
+        `claude_p`'s source until the argv construction moved into the shared
+        `_contained_claude_argv` builder (so `preflight`'s smoke test could
+        stop hand-rolling its own uncontained argv). A source pin on one
+        function cannot follow that move, and — more to the point — could
+        never have observed the OTHER call site, which is the one that had no
+        `--model` at all. Executing the builder covers both.
+        """
+        argv = leerie._contained_claude_argv(
+            schema="{}", allowed_tools="Read", max_turns=1, model="sonnet")
+        assert argv[argv.index("--model") + 1] == "sonnet"
+
+        prev = leerie._STRICT_PROXY
+        leerie._STRICT_PROXY = object()
+        try:
+            argv = leerie._contained_claude_argv(
+                schema="{}", allowed_tools="Read", max_turns=1,
+                model="sonnet")
+        finally:
+            leerie._STRICT_PROXY = prev
+        assert argv[argv.index("--model") + 1] == "sonnet[1m]", (
+            "the builder must route --model through _model_arg; a bare "
             "`model` re-introduces the lowered context ceiling")
-        assert '"--model", model,' not in src
+
+        import inspect
+        assert '"--model", model,' not in inspect.getsource(
+            leerie._contained_claude_argv)
 
     def test_telemetry_records_the_effective_model(self):
         """`calls.ndjson` must record what the CLI was actually handed.

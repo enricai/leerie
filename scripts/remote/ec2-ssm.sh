@@ -104,6 +104,8 @@ _ec2_ssm_session() {
   local region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
   local marker="__LEERIE_EC2_RC__"
   local wrapper
+  # shellcheck disable=SC2016  # $? and $__rc are evaluated by the REMOTE
+  # shell this string is sent to, so they must survive unexpanded
   wrapper="$(printf '%s; __rc=$?; printf "\n%s:%%d\n" "$__rc"' "$interpreter" "$marker")"
   # Base64-encode the wrapper before it goes into --parameters, exactly
   # like ec2_remote_exec does for its own wrapped command: the wrapper
@@ -216,5 +218,7 @@ _attach_to_live_orchestrator_ec2() {
 $_tail_script"
     printf '%s' "$_tail_invocation" | ec2_attach || true
   fi
+  # shellcheck disable=SC2034  # set in the CALLER's scope on purpose —
+  # see this function's 'Side-effect: sets container_rc=130' header
   container_rc=130
 }

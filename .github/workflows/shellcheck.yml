@@ -1,6 +1,6 @@
-# Lints the worktree mechanics scripts. These are load-bearing
-# (DESIGN §6) but small, so the built-in shellcheck on the runner is
-# sufficient — no third-party action needed.
+# Lints the worktree mechanics scripts and the remote (Fly/EC2) surface.
+# These are load-bearing (DESIGN §6) but small, so the built-in shellcheck
+# on the runner is sufficient — no third-party action needed.
 name: shellcheck
 
 on:
@@ -28,14 +28,20 @@ jobs:
       - name: shellcheck version
         run: shellcheck --version
 
-      - name: Run shellcheck on scripts/
-        run: shellcheck -x scripts/*.sh
+      # Both trees. The glob was `scripts/*.sh` — a single level — while the
+      # trigger above matches `scripts/**/*.sh`, so the 19 scripts under
+      # scripts/remote/ fired the job and were then never linted. That gap hid
+      # the whole remote surface, including the one place `claude -p` is
+      # invoked from shell (collect-subtrees.sh), from the only linter that
+      # catches the backtick-in-a-comment class `bash -n` cannot see.
+      - name: Run shellcheck on scripts/ and scripts/remote/
+        run: shellcheck -x scripts/*.sh scripts/remote/*.sh
 
       - name: Summary
         if: always()
         run: |
           {
             echo "### shellcheck"
-            echo "- Ran \`shellcheck -x scripts/*.sh\`"
+            echo "- Ran \`shellcheck -x scripts/*.sh scripts/remote/*.sh\`"
             echo "- Status: ${{ job.status }}"
           } >> "$GITHUB_STEP_SUMMARY"

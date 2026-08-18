@@ -165,6 +165,8 @@ ec2_remote_exec() {
   # --parameters. Base64 sidesteps all of that — the remote side
   # decodes and executes verbatim, no escaping to get wrong.
   local wrapped_cmd
+  # shellcheck disable=SC2016  # $? and $__rc are evaluated by the REMOTE
+  # shell this string is sent to, so they must survive unexpanded
   wrapped_cmd="$(printf '( %s ); __rc=$?; printf "\n%s:%%d\n" "$__rc"' "$cmd" "$marker")"
   local wrapped_b64
   wrapped_b64="$(printf '%s' "$wrapped_cmd" | base64 | tr -d '\n')"

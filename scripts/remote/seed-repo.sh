@@ -389,6 +389,9 @@ seed_repo_clone() {
     local _hb_pid_subs
     _seed_progress_bg "seed_repo (submodule bundles)" &
     _hb_pid_subs=$!
+    # shellcheck disable=SC2016  # single quotes are REQUIRED: $displaypath and
+    # $bn are expanded by git's own `foreach` shell (and the innermost $bn by
+    # the remote `sh -c`), never by this one
     if ! (
       cd "$USER_REPO" && \
       LEERIE_FLY_APP="$FLY_APP" LEERIE_MACHINE_ID="$LEERIE_MACHINE_ID" \
@@ -600,6 +603,8 @@ seed_repo_dirty() {
   #   (b) repo-local .claude/ files (force-included even if gitignored)
   # The python filter applies to both; .claude/* entries from (b)
   # pass the filter trivially (no .git/ or worktree prefix).
+  # shellcheck disable=SC2016  # the -c body below is Python, not shell — a
+  # $ in it must reach the interpreter unexpanded
   printf '%s\n%s\n' "$dirty_files" "$claude_files" \
     | USER_REPO="$USER_REPO" python3 -c '
 import os, re, sys
@@ -745,6 +750,9 @@ _seed_one_inspect_dir_clone() {
   #    (`/` → `_`) matches the machine-side clone script below so both
   #    sides agree on the filename for nested submodules.
   if [ -f "$host/.gitmodules" ]; then
+    # shellcheck disable=SC2016  # single quotes are REQUIRED: $displaypath and
+    # $bn are expanded by git's own `foreach` shell (and the innermost $bn by
+    # the remote `sh -c`), never by this one
     if ! (
       cd "$host" && \
       LEERIE_FLY_APP="$FLY_APP" \

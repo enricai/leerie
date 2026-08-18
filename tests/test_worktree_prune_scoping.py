@@ -39,7 +39,7 @@ _SCRIPTS_WITH_PRUNE = ("new-worktree.sh", "setup-run.sh", "cleanup.sh")
 
 # Every file that must not contain a repository-global prune, DERIVED rather
 # than named. The first version was a three-filename tuple covering
-# `scripts/*.sh` only, so four bare `git worktree prune` calls in
+# `scripts/*.sh` and `scripts/remote/*.sh`, so four bare `git worktree prune` calls in
 # `orchestrator/leerie.py` — running inside the container against the same
 # shared `.git`, i.e. the identical F19 hazard — were invisible to it, and the
 # commit that claimed to have swept "all four" had counted the shell ones.

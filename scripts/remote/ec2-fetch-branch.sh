@@ -171,7 +171,11 @@ print(best[3])
 
   run_id="$(printf '%s' "$discover_output" | sed -n '1p')"
   run_branch="$(printf '%s' "$discover_output" | sed -n '2p')"
+  # shellcheck disable=SC2034  # parsed to keep the field
+  # indices aligned with the python emitter above; not read here
   working_branch="$(printf '%s' "$discover_output" | sed -n '3p')"
+  # shellcheck disable=SC2034  # deliberately NOT consumed — see
+  # the 'CANNOT trust run.json.no_push as a proxy' note below
   run_no_push="$(printf '%s' "$discover_output" | sed -n '4p')"
 
   if [ -z "$run_id" ] || [ -z "$run_branch" ]; then

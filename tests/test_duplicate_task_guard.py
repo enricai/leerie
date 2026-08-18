@@ -128,9 +128,15 @@ def _drive_to_the_gate(leerie, monkeypatch, tmp_path, *, task="a task",
     monkeypatch.setattr(leerie, "phase_classify", _boom)
 
     try:
+        # A REAL models dict, derived from WORKER_TYPES rather than written
+        # down: `_run_phases` hands `models["classifier"]` to preflight (the
+        # smoke test bills the tier the first worker uses), so an empty dict
+        # raises KeyError before this driver ever reaches the gate it is
+        # testing. Deriving it means a new worker type cannot stale it.
+        models = {w: leerie.MODEL_DEFAULT for w in leerie.WORKER_TYPES}
         asyncio.run(leerie._run_phases(
             _args(resume=False, task=task), _caps(leerie), leerie_root,
-            st, "both", "quiet", {}, {}))
+            st, "both", "quiet", models, {}))
     except _ReachedClassify:
         return True
     return False

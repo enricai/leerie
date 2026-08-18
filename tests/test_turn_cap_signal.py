@@ -60,6 +60,33 @@ def _claude_p_src(leerie) -> str:
 
 
 
+def _scopes(tree: ast.AST) -> list[ast.AST]:
+    """The tree split into independent dataflow scopes.
+
+    `_aliases` is name-keyed and has no notion of scope, so run module-wide it
+    treats `cmd` in one function as the same value as `cmd` in another. That
+    is not hypothetical: `claude_p` assigns
+    `cmd = _contained_claude_argv(..., max_turns=max_turns, ...)`, which taints
+    the NAME `cmd` — and `cmd` is assigned in dozens of unrelated functions, so
+    within the four fixpoint rounds both the count set and the cap set grew to
+    ~900 names, i.e. every name in the module. The scan then reported garbage
+    offenders (`seconds < 0`, `min_age is None`, `found < MIN_CLAUDE_CLI`) and
+    failed a correct tree.
+
+    A top-level function is one scope, nested functions included with their
+    parent (a closure genuinely shares its enclosing locals — `claude_p`'s
+    `build()` is the case that matters here). Everything not inside a
+    top-level function forms one module scope, which is also what the
+    single-snippet canaries below parse as.
+    """
+    fns = [n for n in tree.body
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                             ast.ClassDef))]
+    rest = ast.Module(
+        body=[n for n in tree.body if n not in fns], type_ignores=[])
+    return [*fns, rest]
+
+
 def _aliases(tree: ast.AST, seeds: set[str], keys: tuple[str, ...]) -> set[str]:
     """Names whose value derives from `seeds`, or from a lookup of `keys`.
 
@@ -121,22 +148,22 @@ def _ratio_offenders(src: str) -> list[str]:
     Both operands now go through `_aliases`, and the quote spelling is no
     longer written by hand anywhere.
     """
-    tree = ast.parse(textwrap.dedent(src))
-    counts = _aliases(tree, {"num_turns"}, ("num_turns",))
-    caps = _aliases(tree, {"max_turns"}, ())
     out = []
-    for n in ast.walk(tree):
-        if not isinstance(n, ast.Compare):
-            continue
-        parts = [n.left, *n.comparators]
-        names = [{x.id for x in ast.walk(p) if isinstance(x, ast.Name)}
-                 for p in parts]
-        srcs = [ast.unparse(p) for p in parts]
-        has_cap = any(s & caps for s in names)
-        has_count = any(s & counts for s in names) or any(
-            "'num_turns'" in s or '"num_turns"' in s for s in srcs)
-        if has_cap and has_count:
-            out.append(ast.unparse(n))
+    for scope in _scopes(ast.parse(textwrap.dedent(src))):
+        counts = _aliases(scope, {"num_turns"}, ("num_turns",))
+        caps = _aliases(scope, {"max_turns"}, ())
+        for n in ast.walk(scope):
+            if not isinstance(n, ast.Compare):
+                continue
+            parts = [n.left, *n.comparators]
+            names = [{x.id for x in ast.walk(p) if isinstance(x, ast.Name)}
+                     for p in parts]
+            srcs = [ast.unparse(p) for p in parts]
+            has_cap = any(s & caps for s in names)
+            has_count = any(s & counts for s in names) or any(
+                "'num_turns'" in s or '"num_turns"' in s for s in srcs)
+            if has_cap and has_count:
+                out.append(ast.unparse(n))
     return out
 
 
@@ -243,3 +270,38 @@ def test_the_scan_leaves_legitimate_max_turns_uses_alone(benign):
     """The converse: `max_turns` is a real parameter, passed and forwarded all
     over `claude_p`. Flagging its ordinary uses makes the guard unusable."""
     assert not _ratio_offenders(benign), benign
+
+
+def test_the_taint_does_not_leak_across_functions(leerie):
+    """The cap set must stay local, or the scan reports nonsense.
+
+    `_aliases` is name-keyed, so run over the whole module it treats `cmd` in
+    one function as the same value as `cmd` in another. `claude_p` assigns
+    `cmd = _contained_claude_argv(..., max_turns=max_turns, ...)` — an argv
+    list, not a cap — and `cmd` is assigned in dozens of unrelated functions,
+    so the taint reached every name in the module and the scan failed a
+    correct tree with offenders like `seconds < 0` and `min_age is None`.
+
+    Asserted as a PROPERTY of the real module rather than a synthetic canary:
+    a minimal two-function snippet does not reproduce it (the cascade needs
+    the real module's density to close), so a snippet-based case would pass
+    under both implementations and prove nothing. Measured here: 1201 tainted
+    names module-wide against a largest per-scope set of 2.
+    """
+    tree = ast.parse(_module_src())
+    for scope in _scopes(tree):
+        caps = _aliases(scope, {"max_turns"}, ())
+        # Names from functions with no turn-cap involvement at all. `cmd` is
+        # deliberately NOT here: inside `claude_p`'s own scope it really is
+        # assigned from an expression mentioning `max_turns`, which is the
+        # correct local answer and the source of the cascade rather than
+        # evidence of it. What must never happen is that taint reaching
+        # OTHER functions.
+        leaked = caps & {"seconds", "min_age", "found", "ratio", "mtime"}
+        assert not leaked, (
+            f"names unrelated to the turn cap were tainted as caps: "
+            f"{sorted(leaked)} — the alias walk has lost scope isolation and "
+            "the offender list it produces cannot be trusted")
+        assert len(caps) <= 8, (
+            f"a scope tainted {len(caps)} names as turn caps; the walk has "
+            "started cascading and will report unrelated comparisons")

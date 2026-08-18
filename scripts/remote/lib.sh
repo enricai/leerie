@@ -445,6 +445,8 @@ _attach_to_live_orchestrator() {
     local _shell_payload="cd /work && PS1='leerie@$LEERIE_RUN_ID:\\w\\$ ' exec bash --noprofile --norc -i"
     local _shell_payload_q
     _shell_payload_q="$(printf %s "$_shell_payload" | sed "s/'/'\\\\''/g")"
+    # shellcheck disable=SC2153  # FLY_APP is the exported env var, not a
+    # typo for the local `fly_app`; both exist by design
     flyctl ssh console \
       --app "$FLY_APP" \
       --machine "$LEERIE_MACHINE_ID" \
@@ -460,6 +462,8 @@ _attach_to_live_orchestrator() {
       "$FLY_APP" \
       "$RESUME_AUTO_FINALIZE" || true
   fi
+  # shellcheck disable=SC2034  # set in the CALLER's scope on purpose —
+  # see this function's 'Side-effect: sets container_rc=130' header
   container_rc=130
 }
 

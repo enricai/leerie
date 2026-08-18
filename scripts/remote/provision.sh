@@ -608,7 +608,10 @@ provision_machine() {
     # Volume name: alphanumeric + underscore, ≤30 chars per Fly's volume
     # naming rule. Use a leerie_data_<6hex> shape so collisions are
     # vanishingly unlikely and the name fits comfortably.
-    local vol_name="leerie_data_$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
+    # Declared separately so a failing python3 surfaces as a nonzero rc
+    # rather than being masked by `local`'s own exit status (SC2155).
+    local vol_name
+    vol_name="leerie_data_$(python3 -c 'import secrets; print(secrets.token_hex(3))')"
     remote_log "remote: creating volume $vol_name (${FLY_VM_DISK_GB} GB, region=$FLY_REGION)..."
     local vol_create_output=""
     if ! vol_create_output="$(flyctl volumes create "$vol_name" \
