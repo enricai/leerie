@@ -245,6 +245,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
       --max-turns 60 \
       --model sonnet \
       --effort high \
+      --strict-mcp-config \
       --dangerously-skip-permissions 2>/dev/null) || claude_rc=$?
 
     if [ "$claude_rc" -ne 0 ]; then
