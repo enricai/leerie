@@ -53,6 +53,25 @@ def test_disallowed_tools_wired_into_claude_p():
     )
 
 
+def test_strict_mcp_config_wired_into_claude_p():
+    """claude_p must pass --strict-mcp-config and never --mcp-config, so
+    MCP server exposure (e.g. a claude.ai Gmail/Slack connection) is cut
+    off at the source rather than relying on the DISALLOWED_TOOLS denylist
+    alone.
+    """
+    src = LEERIE_PY.read_text()
+    start = src.index("async def claude_p(")
+    end = src.index("\nasync def ", start + 1)
+    body = src[start:end]
+    assert '"--strict-mcp-config"' in body, (
+        "claude_p must pass --strict-mcp-config to the CLI"
+    )
+    assert '"--mcp-config"' not in body, (
+        "claude_p must never pass --mcp-config — that would reintroduce "
+        "whatever MCP servers the user's own Claude Code config carries"
+    )
+
+
 def test_observed_tools_fixture_is_fully_partitioned(leerie):
     """The converse of REQUIRED_DENIALS: rather than pinning that specific
     names remain denied, assert every tool name leerie has ever observed
