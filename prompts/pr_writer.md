@@ -20,7 +20,7 @@ The orchestrator gives you, in your prompt, a JSON payload:
 {
   "task": "<the verbatim user task description>",
   "categories": ["bug-fixing", ...],
-  "source_of_truth": "codebase" | "research" | "both" | null,
+  "source_of_truth": "codebase" | "research" | "both",
   "working_branch": "main",
   "run_branch": "leerie/runs/<run-id>",
   "wave_count": 3,
@@ -96,8 +96,9 @@ do not downplay failures, do not omit entries.
 `external_preconditions` lists prerequisites the planner declared as
 `requires.extent: external` — work that lives outside this run's build
 graph. That covers another repo's deploy, an ops runbook or manual
-step, and work the task assigns to a separate run (a sibling phase
-document, an earlier phase). The field is **absent** when no such prerequisites
+step, work the task assigns to a separate run (a sibling phase
+document, an earlier phase), and work whose only implementation site
+sits on a surface the task fences off. The field is **absent** when no such prerequisites
 were declared (the common case). When present, render a
 `## ⚠ Deploy-ordering` section in the PR body (or fold it into an
 equivalent section the template defines). For each entry: one bullet

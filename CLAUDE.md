@@ -1620,6 +1620,86 @@ invoking `claude_p`/`phase_plan` at all (0 false positives via
 short-circuit); and a frozen-score separation test
 (`test_incident_vs_legit_judge_scores_are_cleanly_separated`) that catches
 threshold drift even when the fire/silent outcome alone doesn't change.
+**A fixture that pins one branch reports coverage of both.**
+`tests/test_gather_answers_validation.py` asserted the source-of-truth contract
+across all three values and passed, while its `state` fixture hardcoded
+`"needs_source_of_truth": True` — so the file exercised only the branch where
+the classifier flagged the question. On the other branch `gather_answers` wrote
+nothing and its consumers fell back to a **hardcoded `"codebase"` literal**,
+silently overriding an explicit `--source-of-truth research`; measured, 74 of
+196 corpus runs took it. The fixture is now parametrized over both values, which
+is what makes the pre-existing assertions falsify the defect: reintroducing the
+guard fails 6 of them, all on the `no_needs_sot` parametrization — including
+`[no_needs_sot-codebase]`, because under the guard `gather_answers` writes no
+key at all and the lookup raises. **The trap that a `codebase`-only assertion is
+answered by the very literal it exists to remove lives one layer down, in the
+consumers** (`phase_plan` / `_write_plan` / `_compose_pr_via_llm`), which is
+where `tests/test_source_of_truth_delivery.py` aims it — its spec-file check
+loops over `research` as well as `codebase`, and its
+`_effective_source_of_truth` table carries a row where `answers` and the
+preference *disagree* (an agreeing-only table passes against a helper that
+ignores `answers`). The delivery file also source-couples all three `State`-holding consumers
+(`phase_plan`, `_write_plan`, `_compose_pr_via_llm`) to
+`_effective_source_of_truth(st)` — note only the first two ever carried a
+`"codebase"` default, so for the third only the presence assertion can fail;
+it is parametrized anyway as the forward guard. Two further readers cannot use
+the helper and are documented rather than converted: `compose_pr_body` takes a
+plain `state: dict` and `scripts/host-finalize.sh` reads the key with `jq`, because pinning the writer alone leaves the
+value reaching nothing — the **deleted** `test_resolve_aws_prefs.py` trap.
+`tests/test_unresolvable_die_message.py` covers the phase-2½ abort text, which
+is treated as behaviour rather than cosmetics: against 5 simulated operators
+given a real failure, the old wording sent **5 of 5** to widen the scope fence
+and **0 of 5** to remove the offending criterion — the reverse of the correct
+repair on the run that motivated it. The `--source-of-truth` bullet is **demoted and
+conditioned**, not deleted: DESIGN §11 calls narrowing the preference
+*historically* the escape hatch, and the bullet still fires when the effective
+value is not `codebase`, where it addresses a real research-surfaced case.
+Operators ignored it 0/5 in both arms; the *useful* bullet is what moved them,
+and is pinned with an anti-vacuity partner requiring the text to say widening
+is often wrong, plus a guard that the stated shape count matches the bullets
+(the first draft said "two shapes" and printed three). The message was extracted to a module-level
+pure function first: it had been inline in a closure, which is why the previous
+test **re-synthesized the closure body in the test file** with a local stub
+calling `leerie.die("test-die: …")` — a copy that passed whether or not the
+real code existed. `tests/test_reconciler_payload_fields.py` guards a
+prompt↔code drift of the same family: `prompts/reconciler.md` scopes
+`conditional_drop` to signals in `intent`/`scope_note` while the payload shipped
+only `intent`, so half the rule's signal surface was structurally invisible. The
+*shipped-fields* check derives its field list from the prompt text at test
+time; a deliberately enumerated guard-the-guard sits beside it
+(`test_conditional_drop_rule_still_names_both_halves`, pinning the set at
+`{intent, scope_note}`), so adding a third signal field to the prompt fails it and forces the decision to be
+explicit rather than silently widening the requirement. The payload keys are
+read **structurally** off the `subtask_views.append` dict literal — a first draft scanned `ast.unparse` output for
+`"scope_note": s.get(` and failed against correct code, because the unparser
+emits single quotes.
+`tests/test_planner_extent_out_of_scope.py` gained the third `extent: external`
+kind (a surface the task itself fences off). Its load-bearing assertion is an
+**ordering** one — the fence question must precede the connector question,
+since "could a connector subtask produce this?" answers *yes* for a fenced code
+change and routes it to `in_plan`; a test asserting both sentences merely exist
+passes against the unfixed file, which already contains the connector one. Every prose guard in that file — presence, absence and
+ordering alike — normalizes whitespace through `_norm`, so re-wrapping a
+hand-wrapped markdown line is not a false alarm that tempts someone to weaken
+the assertion instead of the matching. The absence guard matters most: an
+un-normalized absence assertion fails silently, passing while the forbidden
+phrase sits in the file across a line break. Because the prompt is advisory, those guards prove
+only that the words are present: the behavioural evidence is a sandbox
+experiment scoring the pre-fix prompt at 1/6 and the as-shipped wording at
+17/18, p = 0.00081. The harness ships as `tests/manual/planner_fence_probe.py`
+— **not** collected by pytest (`python_files = test_*.py`), same arrangement as
+`tests/fixtures/incident_2026_07_19/generate.py`, because it spawns real
+`claude -p` workers. It extracts the rules from the live `prompts/planner.md`
+rather than reproducing them, and must be run against a **sandbox copy** of the
+target repo with its planning docs removed: two earlier attempts were
+contaminated when the model read a task doc that had been corrected *after* the
+failing run, and instructing it not to read them did not work. **Re-run it
+before trusting an edit to that section** — the first re-validation of the
+real text came back 5/6 where the design draft had scored 6/6, so the sample was
+extended rather than the difference assumed away. Related measurement worth
+keeping: `_demote_unresolvable_with_external_twin` has **never fired in 258
+recorded runs**, so every measured improvement in this area has come from the
+prose, not the code backstop.
 The id-vanishing `depends_on` rewrite (DESIGN §5 *Id-vanishing operations* — every op
 that removes a subtask id owes the plan a rewrite of inbound references; the tag
 channel self-heals via inherited `provides`, so only the id channel dangles) is tested
@@ -3286,7 +3366,30 @@ the gap reads as covered. Second, the guard that did exist —
 key was in the dict literal, only its value expression was unevaluatable.
 Presence is not evaluation: a walk that checks a key exists says nothing about
 whether that key's value resolves, which takes either execution or scope
-resolution (the symtable scan below does the latter statically). The new file
+resolution (the symtable scan below does the latter statically).
+
+**The general rule, of which that is one instance: a test asserting STRUCTURE
+must be paired with one asserting SUBSTANCE.** Structure is a dict key, a source
+substring, an AST node, a phrase in a prompt. Substance is the value that flows
+through it, the result of executing it, or the order it appears in. Structure-only
+assertions are necessary and never sufficient, and the gap is invisible because
+they pass. Four measured instances, all from one change (2026-08-18):
+
+| structural assertion | what passed it |
+|---|---|
+| the reconciler payload has key `scope_note` | `"scope_note": ""` — key shipped, planner's text discarded |
+| `phase_plan` calls `_effective_source_of_truth` | ctx reads the preference directly, or omits the key entirely |
+| the abort message contains every remediation phrase | the fallback hoisted back to lead — the wording the A/B measured as misrouting 5/5 operators |
+| `die(_unresolvable_die_message(...))` exists in source | the gate reads `out.get("unresolved")`, never fires, and **140 tests stay green** |
+
+The cheapest discriminating test per shape: **execute the consumer** (not read
+its source); **assert the value** (not the key); **assert the order** (not the
+presence). Where the subject is prose, none of those reach semantic inversion —
+a phrase can be present and negated — so the guard there is a behavioural probe,
+not another substring (`tests/manual/planner_fence_probe.py` is the worked
+example). And when parametrizing a value test, make the inputs **disagree**: a
+row where two sources of a value are equal cannot tell a correct read from a
+bypass. The new file
 executes the branch, stopping at a sentinel on
 `_enforce_and_record_cgroup_containment` (the first call after the seed's
 `st.save()`, so no other stub is needed), and carries the guard-the-guard test

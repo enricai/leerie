@@ -54,8 +54,9 @@ subtask's `provides`. Your job is to decide, for each pair, what to do.
 
 **You only see `in_plan` requires.** The orchestrator filters
 planner-declared `extent: external` entries out before computing this
-list — those are explicitly out-of-graph prerequisites (other repo, ops
-runbook, manual step) that surface in `plan.json` as `preconditions`
+list — those are explicitly out-of-graph prerequisites (another repo, an
+ops runbook or manual step, work the task assigns to another run, or a
+surface the task fences off) that surface in `plan.json` as `preconditions`
 rather than as edges in the build graph. If a planner classified
 something as `external`, it is not in your input and you do not need to
 reason about it. Likewise, the `requires` field shown to you on each
