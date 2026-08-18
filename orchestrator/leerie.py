@@ -3180,10 +3180,16 @@ class ContextOverflow(BaseException):
     override is what lowers the ceiling in the first place (see
     `_model_arg`) — after which `leerie resume` picks the run back up.
 
-    Carries only raw_message: str — the verbatim envelope `result`."""
-    def __init__(self, raw_message: str):
+    Carries raw_message: str — the verbatim envelope `result` — and
+    `from_worker: bool`, which selects the remedy main() prints. A worker's
+    prompt carries the task text and the repo's CLAUDE.md; `preflight`'s smoke
+    test carries neither (no --append-system-prompt, and an empty cwd by
+    construction), so telling that operator to shrink them names two things
+    provably absent from the prompt that refused."""
+    def __init__(self, raw_message: str, *, from_worker: bool = True):
         super().__init__(raw_message)
         self.raw_message = raw_message
+        self.from_worker = from_worker
 
 
 # The errnos that all mean "you cannot write any more here" to an operator.
@@ -7151,10 +7157,21 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             / ("leerie-smoke-" + hashlib.sha256(
                 str(leerie_dir.parent.parent).encode()).hexdigest()[:12]))
         try:
-            os.makedirs(smoke_cwd, exist_ok=True)
+            os.makedirs(smoke_cwd, mode=0o700, exist_ok=True)
         except OSError as e:
             die(f"cannot create the smoke-test working directory "
                 f"{smoke_cwd}: {e}")
+        # The name is deterministic and the parent is world-writable, and
+        # `exist_ok=True` accepts whatever is already there — including a
+        # symlink someone else planted. A symlink into a checkout would put
+        # the cwd back inside a repository and silently reload the CLAUDE.md
+        # this whole mechanism exists to escape, which is the same
+        # fails-quietly shape the comment above rejects the state root for.
+        # So verify what we actually got rather than trusting the name.
+        if os.path.realpath(smoke_cwd) != smoke_cwd:
+            die(f"the smoke-test working directory {smoke_cwd} is a symlink "
+                f"(to {os.path.realpath(smoke_cwd)}); refusing to run the "
+                "smoke test in it. Remove it and re-run.")
         try:
             envelope = await _invoke(cmd, cwd=smoke_cwd, timeout=90,
                                      sid="smoke",
@@ -7181,7 +7198,8 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
         # recorded task and re-runs the smoke test. That is the right
         # behaviour once the operator has dropped the offending flag.)
         if _is_context_overflow(envelope):
-            raise ContextOverflow(str(envelope.get("result") or ""))
+            raise ContextOverflow(str(envelope.get("result") or ""),
+                                  from_worker=False)
         if envelope.get("is_error"):
             die(f"claude -p smoke test returned an error: "
                 f"{envelope.get('api_error_status') or envelope.get('result')} "
@@ -33054,8 +33072,15 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             log("  --dangerously-force-strict-output is active: it sets "
                 "ANTHROPIC_BASE_URL, which lowers the CLI's context ceiling. "
                 "Re-running without it is usually enough.")
-        log("  Otherwise shrink what every worker carries: the task text and "
-            "the repo's CLAUDE.md are both loaded into each worker's context.")
+        if e.from_worker:
+            log("  Otherwise shrink what every worker carries: the task text "
+                "and the repo's CLAUDE.md are both loaded into each worker's "
+                "context.")
+        else:
+            log("  This was the preflight smoke test, which carries neither "
+                "the task text nor the repo's CLAUDE.md — so shrinking those "
+                "will not help. Its prompt is the CLI's own system prompt "
+                "plus its built-in tool definitions.")
         log(f"  then resume with: leerie resume {st.run_id}")
         abnormal = False
         try:

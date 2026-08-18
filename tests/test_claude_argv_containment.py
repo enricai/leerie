@@ -44,7 +44,9 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import inspect
 import os
+import shutil
 import re
 from pathlib import Path
 from types import SimpleNamespace
@@ -494,3 +496,49 @@ def test_call_site_passes_the_resolved_classifier_model():
     assert 'model=models["classifier"]' in call, (
         "preflight must be handed the tier the run's first worker uses; "
         f"got: {call!r}")
+
+
+def test_smoke_refuses_a_symlinked_cwd(leerie, monkeypatch, tmp_path):
+    """The name is deterministic and /tmp is world-writable, so `exist_ok=True`
+    would otherwise accept a planted symlink — and one pointing into a checkout
+    puts the cwd back inside a repository, silently reloading the CLAUDE.md the
+    temp path exists to escape. Fails quietly, which is exactly why the state
+    root was rejected for the same reason."""
+    import tempfile, hashlib
+    state_root = tmp_path / "state"
+    leerie_dir = state_root / "runs" / "run-1"
+    leerie_dir.mkdir(parents=True)
+    target = tmp_path / "repo"
+    target.mkdir()
+    planted = (Path(tempfile.gettempdir())
+               / ("leerie-smoke-" + hashlib.sha256(
+                   str(state_root).encode()).hexdigest()[:12]))
+    if planted.exists() or planted.is_symlink():
+        planted.unlink() if planted.is_symlink() else shutil.rmtree(planted)
+    planted.symlink_to(target)
+    try:
+        with pytest.raises(SystemExit):
+            _run_preflight(leerie, monkeypatch, leerie_dir)
+    finally:
+        planted.unlink()
+
+
+def test_context_overflow_remedy_matches_the_raise_site(leerie):
+    """A worker's prompt carries the task text and the repo's CLAUDE.md; the
+    smoke test carries neither. Telling a preflight operator to shrink them
+    names two things provably absent from the prompt that refused."""
+    assert leerie.ContextOverflow("x").from_worker is True
+    assert leerie.ContextOverflow("x", from_worker=False).from_worker is False
+
+    src = inspect.getsource(leerie.preflight)
+    assert "from_worker=False" in src, (
+        "preflight's raise must mark itself as not-a-worker, or the operator "
+        "gets worker-shaped advice")
+
+    handler = inspect.getsource(leerie.main)
+    handler = handler[handler.index("except ContextOverflow"):]
+    handler = handler[:handler.index("\n    except ")]
+    assert "e.from_worker" in handler, (
+        "main() must branch the remedy on the raise site")
+    assert "carries neither" in handler, (
+        "the non-worker arm must say the worker advice does not apply")
