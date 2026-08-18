@@ -439,6 +439,83 @@ def test_one_aborted_connection_does_not_kill_the_listener(leerie, mock_upstream
     assert b'"saw_strict": true' in asyncio.run(go())
 
 
+# ----- _read_chunked: the chunked-transfer-encoding body decoder ------------
+
+
+class _FakeChunkedReader:
+    """A minimal stand-in for asyncio.StreamReader's `read(n)` coroutine.
+
+    Each call returns the next item off a queue, ignoring `n` (the real
+    _read_chunked only ever uses the return value's length/content, never
+    slices by the requested size) -- so a test can script exactly how the
+    bytes arrive across calls, including splitting a chunk-size line across
+    reads."""
+
+    def __init__(self, chunks: list[bytes]):
+        self._chunks = list(chunks)
+
+    async def read(self, n: int) -> bytes:
+        if not self._chunks:
+            return b""
+        return self._chunks.pop(0)
+
+
+def test_single_chunk_then_terminator(leerie):
+    reader = _FakeChunkedReader([])
+    rest = b"5\r\nhello\r\n0\r\n\r\n"
+    got = asyncio.run(leerie._StrictOutputProxy._read_chunked(reader, rest))
+    assert got == b"hello"
+
+
+def test_multiple_chunks_concatenate(leerie):
+    reader = _FakeChunkedReader([])
+    rest = b"5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"
+    got = asyncio.run(leerie._StrictOutputProxy._read_chunked(reader, rest))
+    assert got == b"hello world"
+
+
+def test_chunk_size_line_split_across_reads(leerie):
+    # The size-line's CRLF terminator arrives in a later read() than its
+    # digits -- `rest` holds only "5\r" and reader.read() supplies the rest.
+    reader = _FakeChunkedReader([b"\nhello\r\n0\r\n\r\n"])
+    rest = b"5\r"
+    got = asyncio.run(leerie._StrictOutputProxy._read_chunked(reader, rest))
+    assert got == b"hello"
+
+
+def test_malformed_chunk_size_returns_bytes_decoded_so_far(leerie):
+    reader = _FakeChunkedReader([])
+    rest = b"5\r\nhello\r\nZZZ\r\nbogus\r\n0\r\n\r\n"
+    got = asyncio.run(leerie._StrictOutputProxy._read_chunked(reader, rest))
+    assert got == b"hello"
+
+
+def test_eof_mid_chunk_body_returns_partial_body(leerie):
+    # A well-formed 10-byte chunk header, but the reader hits EOF (returns
+    # b"") after delivering only 3 of those 10 bytes.
+    reader = _FakeChunkedReader([b""])
+    rest = b"a\r\nabc"
+    got = asyncio.run(leerie._StrictOutputProxy._read_chunked(reader, rest))
+    assert got == b"abc"
+
+
+def test_eof_while_searching_for_the_size_line_terminator(leerie):
+    # No CRLF anywhere yet, and the reader immediately hits EOF.
+    reader = _FakeChunkedReader([b""])
+    rest = b"5"
+    got = asyncio.run(leerie._StrictOutputProxy._read_chunked(reader, rest))
+    assert got == b""
+
+
+def test_chunk_extension_after_semicolon_is_ignored(leerie):
+    # A chunk-size line may carry a `;`-delimited extension per RFC 7230;
+    # the decoder must parse only the hex size before it.
+    reader = _FakeChunkedReader([])
+    rest = b"5;ext=foo\r\nhello\r\n0\r\n\r\n"
+    got = asyncio.run(leerie._StrictOutputProxy._read_chunked(reader, rest))
+    assert got == b"hello"
+
+
 # ----- flag resolution, collision guard, and the numeric bounds --------------
 
 def test_flag_defaults_off(leerie, tmp_path):
