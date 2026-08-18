@@ -3,3 +3,12 @@
 # See: https://leerie.enric.ai/docs/config
 language_installs = '[{"manager":"pip","command":"pip install -r requirements.txt","copy_inputs":["requirements.txt"]}]'
 setup_packages = "python3-pip python3-venv"
+
+# Per-subtask conformance delta proxy (DESIGN §9). `{test_files}` rather than
+# `{files}`: pytest collects under the paths it is given, so handing it a docs
+# or source path is an ERROR that poisons the whole invocation (`pytest
+# docs/DESIGN.md tests/test_x.py` exits 4), and a real subtask diff nearly
+# always mixes both. A diff carrying no test file renders nothing and the axis
+# falls back to the canonical `pytest` — measured over 36 real subtask diffs
+# on this repo, 34 carried a test file and 2 did not.
+test_scoped = "python3 -m pytest {test_files} -q"

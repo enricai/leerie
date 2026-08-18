@@ -566,7 +566,18 @@ export LEERIE_ALLOW_DUPLICATE_TASK=1
 #           .leerie/config.toml, else two narrow inferences apply
 #           (vitest `related`, jest `--findRelatedTests`, `tsc --noEmit`).
 #           An axis with no proxy falls back to the canonical command; it is
-#           never silently skipped.
+#           never silently skipped -- and leerie now WARNS once per run when
+#           that fallback means `scoped` is behaving as `full`.
+#           A template uses `{files}` for runners that map source->tests
+#           themselves (vitest/jest walk their own module graph), or
+#           `{test_files}` for runners that do not (pytest collects under the
+#           paths given, so a docs/source path is an ERROR that poisons the
+#           whole invocation -- verified: `pytest docs/X.md tests/test_y.py`
+#           exits 4). `{test_files}` substitutes only the test-shaped members
+#           and renders nothing when the diff has none, so the axis falls back
+#           to canonical rather than measuring a narrower thing silently.
+#           `test_file_globs` in .leerie/config.toml (space-separated fnmatch
+#           patterns) REPLACES the built-in test-path shapes when set.
 #   full    always the canonical command. Note this restores concurrent
 #           full-suite runs under --max-parallel, which is what the scoped
 #           default exists to avoid.
