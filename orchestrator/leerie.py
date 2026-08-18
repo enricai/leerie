@@ -776,12 +776,27 @@ SATISFIED_PROBE_TOOLS = (
 # removes tools from the model's context entirely — the model cannot see
 # or call them regardless of permission mode.  This prevents workers from
 # spawning subagents, setting timers, or sending messages that the
-# orchestrator cannot track.
+# orchestrator cannot track.  Widened (corpus measurement) to also deny
+# Workflow (nested multi-agent orchestration), ReportFindings (would shadow
+# the injected StructuredOutput tool), Skill (loads arbitrary skill
+# instructions outside leerie's own prompts), Monitor (backgrounds
+# untracked long-running watches), the Task* family (TaskCreate, TaskGet,
+# TaskList, TaskUpdate, TaskOutput, TaskStop — untracked parallel work
+# items; the Create/Get/List/Update names are retired from current CLI
+# builds but kept for defense-in-depth), ListAgents (enumerates/targets
+# other sessions), EnterWorktree/ExitWorktree (git worktree mechanics
+# reserved to the orchestrator's own scripts), DesignSync (writes to an
+# external claude.ai project outside worktree/git tracking), and
+# ToolSearch (denied for consistency with the rest of this set even
+# though it only searches for MCP tool schemas, not a distinct bypass).
 DISALLOWED_TOOLS = (
     "Agent,SendMessage,"
     "ScheduleWakeup,"
     "CronCreate,CronDelete,CronList,"
-    "RemoteTrigger,PushNotification"
+    "RemoteTrigger,PushNotification,"
+    "Workflow,ReportFindings,Skill,Monitor,"
+    "TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,TaskStop,"
+    "ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch"
 )
 
 # --inspect-dir preference: extra directories to grant the inspect-bucket
