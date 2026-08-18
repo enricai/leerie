@@ -53,6 +53,26 @@ def test_empty_tools_array_flags_nothing(leerie):
     assert _flagged(leerie, []) == []
 
 
+# ----- _bare_tool_names parsing (direct, not via KNOWN_TOOLS) ---------------
+
+def test_bare_tool_names_plain_comma_separated_list(leerie):
+    assert leerie._bare_tool_names("Read,Write,Bash") == {"Read", "Write", "Bash"}
+
+
+def test_bare_tool_names_strips_allow_pattern_suffix(leerie):
+    assert leerie._bare_tool_names("Bash(git:*)") == {"Bash"}
+    assert leerie._bare_tool_names("Read,Bash(git:*),Write") == {
+        "Read", "Bash", "Write"}
+
+
+def test_bare_tool_names_single_entry_no_comma(leerie):
+    assert leerie._bare_tool_names("Read") == {"Read"}
+
+
+def test_bare_tool_names_empty_string(leerie):
+    assert leerie._bare_tool_names("") == {""}
+
+
 # ----- wiring (source-coupling, mirrors test_rejected_payload_logging.py) ---
 
 def test_read_stream_latches_the_tool_surface(leerie):
