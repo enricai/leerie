@@ -1034,3 +1034,70 @@ def test_invoke_no_oom_when_oom_kill_zero(leerie, leerie_dir, monkeypatch):
             verbosity="stream",
             worker_memory_max_bytes=8 * 1024**3, worker_pids_max=256))
     assert "OOM-killed" not in str(ei.value)
+
+
+# ----- tool-surface self-reporting latch (system/init `tools`) -------------
+
+def test_unexpected_tool_name_in_init_event_warns(leerie, leerie_dir,
+                                                    monkeypatch, capsys):
+    """A system/init event whose `tools` array carries a name outside
+    KNOWN_TOOLS must produce a warning log line naming it — even at
+    quiet verbosity, since the latch lives in _read_stream itself,
+    not in _summarize_stream_event (which returns early at quiet)."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "m",
+                    "tools": ["Read", "SomeFutureTool"]}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 1, "is_error": False}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="tools-1", leerie_dir=leerie_dir,
+        verbosity="quiet"))
+    out = capsys.readouterr().out
+    assert "unexpected tool" in out
+    assert "SomeFutureTool" in out
+
+
+def test_mcp_tool_name_in_init_event_warns(leerie, leerie_dir,
+                                            monkeypatch, capsys):
+    """A `mcp__*` tool name leaking past --strict-mcp-config must also
+    warn, at quiet verbosity."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "m",
+                    "tools": ["Read",
+                              "mcp__claude_ai_Gmail__search_threads"]}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 1, "is_error": False}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="tools-2", leerie_dir=leerie_dir,
+        verbosity="quiet"))
+    out = capsys.readouterr().out
+    assert "unexpected tool" in out
+    assert "mcp__claude_ai_Gmail__search_threads" in out
+
+
+def test_known_tools_only_init_event_stays_silent(leerie, leerie_dir,
+                                                    monkeypatch, capsys):
+    """A system/init event whose `tools` is exactly the known
+    allowlisted set plus StructuredOutput must produce no warning."""
+    events = [
+        json.dumps({"type": "system", "subtype": "init", "model": "m",
+                    "tools": sorted(leerie.KNOWN_TOOLS)}),
+        json.dumps({"type": "result", "subtype": "success",
+                    "num_turns": 1, "is_error": False}),
+    ]
+    monkeypatch.setattr("asyncio.create_subprocess_exec",
+                        _make_subprocess_exec_mock(events))
+    asyncio.run(leerie._invoke(
+        ["claude", "-p", "x"], cwd=str(leerie_dir.parent),
+        timeout=60, sid="tools-3", leerie_dir=leerie_dir,
+        verbosity="quiet"))
+    out = capsys.readouterr().out
+    assert "unexpected tool" not in out
