@@ -131,6 +131,13 @@ subagents. The orchestrator is an ordinary Python program. (Constraint
 1, DESIGN.md §2.) The Claude Code Agent tool is not available to the
 orchestrator and not used anywhere in this repo.
 
+`DISALLOWED_TOOLS` enforces this mechanically, and it must name **`Task`**,
+not only `Agent`: `Agent` is the retired spelling and current CLI builds ship
+`Task`. Until 2026-08-18 the deny list carried `Agent` and the retired `Task*`
+family (`TaskCreate`…`TaskStop`) but not the bare `Task`, so this invariant
+was enforced against a name the live CLI no longer emits — the shape to watch
+for whenever the CLI renames a tool.
+
 ## Mandatory requirements
 
 - **Worker outputs are JSON-schema-validated.** New worker types must
@@ -411,7 +418,10 @@ export CLAUDE_CODE_OAUTH_TOKENS=sk-ant-oat01-token-a,sk-ant-oat01-token-b
 
 # Pin which model version the `--model <tier>` alias (sonnet/opus/haiku)
 # resolves to on Bedrock. leerie always invokes claude -p with an explicit
-# --model <tier> flag, never a raw model ID — and on Bedrock the Claude
+# --model <tier> flag, never a raw model ID (true of every worker since
+# always, and of the preflight smoke test only since 2026-08-18 — it passed
+# no --model at all and inherited whatever the CLI defaulted to, measured
+# resolving to opus on a run whose every worker was sonnet) — and on Bedrock the Claude
 # CLI's own alias table can lag the Anthropic-API one by a model
 # generation or more (e.g. `sonnet` resolving to Sonnet 4.5 instead of
 # Sonnet 5). These are the Claude CLI's own documented env vars for
@@ -3467,6 +3477,44 @@ positive control beside that table is mandatory — a scan returning `[]`
 unconditionally passes every negative case. Anti-vacuity is a canary injected
 into the **real** module rather than a synthetic snippet, so a refactor that
 quietly stops analysing `leerie.py` fails.
+
+**A test that source-slices one function cannot observe a property it asserts
+repo-wide, and that is how a containment bug shipped.** `tests/test_strict_mcp_config.py`
+opened *"unconditionally for every worker"* while its `_claude_p_body()` helper sliced
+`claude_p`'s source — so it was structurally incapable of seeing `preflight`'s smoke
+test, which hand-rolled its own argv and ran with **78 tools / 4 MCP servers**, 46 of
+them `mcp__claude_ai_*` (`send_message`, `trash_thread`, `slack_send_message`), plus
+every tool the deny list exists to remove. The file passed throughout. Its replacement,
+`tests/test_claude_argv_containment.py`, derives the site list (AST over
+`orchestrator/leerie.py`, text over `scripts/**/*.sh`) instead of slicing one function —
+the same enumeration-to-derivation move PRs #180-#183 record. Two lessons compound: a
+scan that finds nothing certifies everything, so it carries minimum-count and
+known-member anti-vacuity checks plus a planted-reproduction guard; and its first
+shared-owner test was itself **vacuous**, asserting a flag was ABSENT after crippling the
+builder — which the pre-fix argv also satisfied, because missing that flag *was* the bug.
+A negative assertion the defect already satisfies proves nothing; the positive control
+(flag present on both argvs with the builder intact) is the load-bearing half.
+
+**A name-keyed AST taint walk needs scope isolation or it swallows the module.**
+`tests/test_turn_cap_signal.py`'s `_aliases` propagates taint by variable NAME with no
+notion of scope, and was run over the whole module. One new assignment —
+`cmd = _contained_claude_argv(..., max_turns=max_turns, ...)` — tainted the name `cmd`,
+which is assigned in dozens of unrelated functions, and within the four fixpoint rounds
+the cap set grew from a handful to **1201 names**: every name in the module. The scan
+then reported `seconds < 0`, `min_age is None` and `found < MIN_CLAUDE_CLI` as
+turn-ratio comparisons and failed a correct tree. It now analyses one top-level function
+(with its nested defs) at a time; measured largest per-scope set is 2. Note the guard for
+this cannot be a synthetic snippet — a minimal two-function reproduction does **not**
+cascade, so it passes under both implementations; the discriminating assertion is a
+property of the real module (no unrelated name tainted, per-scope set bounded).
+
+**An under-specified fixture hides a producer-side contract.** Two files passed
+`models={}` to `_run_phases`, which was invisible until `preflight` began reading
+`models["classifier"]` and they raised `KeyError` before reaching the behaviour under
+test. The fix is a real dict (derived from `WORKER_TYPES`, or a `defaultdict`), not a
+`.get()` in production code — coercing there would have swallowed the contract violation
+in exactly the way this file warns about elsewhere.
+
 No coverage
 target is set — the suite was introduced from scratch and a number
 now would be arbitrary.

@@ -2829,6 +2829,30 @@ output. It is checked immediately after the terminal-auth classifier and
 before the generic corrective-note retry, and routed to the same resumable
 `EXIT_LOCKED` pause — the remedy is an operator change, not a wait.
 
+The refusal has a *precursor* worth naming, because it decides where the real
+ceiling sits. Before refusing, the CLI attempts reactive compaction — and
+compaction summarises **message groups**, so a conversation with fewer than
+two of them fails `too_few_groups` ("fewer than 2 groups, nothing to
+compact") and the refusal follows immediately. Every worker holds a multi-turn
+conversation and compacts normally. The **preflight smoke test does not**: it
+is a single exchange whose tokens are almost entirely system prompt, tool
+schemas and `CLAUDE.md` — none of which compaction can touch. So for that one
+invocation the CLI's own recovery path cannot work, and the effective limit is
+not the context ceiling but the *compaction trigger* beneath it.
+
+That is why the smoke test runs in an **empty working directory**. It
+validates the CLI — auth, streaming, `--json-schema` — not the repository, and
+loading the repo's own `CLAUDE.md`/skills/commands is what carried it over the
+trigger: measured on this repo with one argv held constant, 126,022 prompt
+tokens in the repo against 17,222 in an empty directory — a difference of
+108,800 attributable to cwd alone — where the failing run reached 183,485. Since `CLAUDE.md` only grows, that margin has to be
+structural rather than a number someone re-tunes; an empty cwd is the only one
+whose prompt size is bounded by construction. The cost of that choice is
+stated plainly: preflight no longer proves the CLI can start *in this repo*
+(a malformed repo-local `.claude/settings.json`, say), which now surfaces at
+the classifier instead — acceptable precisely because the refusal is
+classified rather than printed as a bare string.
+
 Left unclassified this failure was actively misleading rather than merely
 unhandled: the envelope fell through to the two-attempt schema loop and
 surfaced as *"worker failed schema-valid output twice: Prompt is too long,"*
@@ -7396,8 +7420,43 @@ untracked parallel work or set timers the orchestrator cannot track: `Agent`,
 `RemoteTrigger`, `PushNotification`, plus (corpus measurement) `Workflow`,
 `ReportFindings`, `Skill`, `Monitor`, `TaskCreate`, `TaskGet`, `TaskList`,
 `TaskUpdate`, `TaskOutput`, `TaskStop`, `ListAgents`, `EnterWorktree`,
-`ExitWorktree`, `DesignSync`, and `ToolSearch`. This is the §12-correct direction: a
-mechanical code-side deny that survives the permission escape hatch.
+`ExitWorktree`, `DesignSync`, and `ToolSearch`, plus `Task` and the three MCP-resource
+tools (`ListMcpResourcesTool`, `ReadMcpResourceTool`, `ReadMcpResourceDirTool`). This
+is the §12-correct direction: a mechanical code-side deny that survives the permission
+escape hatch.
+
+`Task` is the live CLI's name for subagent spawning; `Agent` is the retired one, so
+until `Task` was added the "no subagent spawning" constraint (§2, Constraint 1) was
+enforced only against a name current builds no longer ship. It was measured in the
+preflight smoke test's own (then uncontained) surface; contained workers never reported
+it, which makes the entry defense-in-depth rather than a fix for an observed leak.
+
+**A plain file writer does not belong on this list**, and `NotebookEdit` was briefly
+added to it in error. The reasoning that put it there — that `--allowedTools` is only a
+permission tier, so a judgment worker can reach a writer anyway — holds only under the
+opt-out described above; by default judgment workers are not autonomous and do not carry
+`--dangerously-skip-permissions`, so the allowlist does hold. Meanwhile the deny list is
+a single global constant, so denying a writer removes it from every acting worker in
+every repository leerie is pointed at, and `Bash`/`Write`/`Edit` — the same class — stay
+allowed regardless, so the deny never produced the read-only property it was justified
+by. `NotebookEdit` is therefore classified into `ACT_TOOLS` alongside `Write` and `Edit`.
+
+**Containment comes from one builder, not from each call site remembering it.** Every
+`claude -p` argv the *orchestrator* constructs is produced by `_contained_claude_argv`,
+so a new call site inherits the deny list and `--strict-mcp-config` by construction. One
+site is necessarily outside that: `scripts/remote/collect-subtrees.sh` invokes the CLI
+directly on a remote machine and cannot import the orchestrator, so it duplicates both
+tool lists as shell constants, guarded for drift by
+`tests/test_collect_subtrees_integrator_schema.py` — the same arrangement the integrator
+schema already uses. This replaces a per-site discipline that had already failed: the
+change that introduced `--strict-mcp-config` audited the invocation sites by hand, fixed
+that shell one and missed the Python one — `preflight`'s smoke test — which then ran with
+the CLI's full default surface. Measured on one such run: 78 tools and 4 MCP servers, of
+which 46 were `mcp__claude_ai_*` (`send_message`, `forward`, `trash_thread`,
+`slack_send_message` among them). The same audit also left `--disallowedTools` off the
+shell integrator entirely. A derived test (`tests/test_claude_argv_containment.py`) now
+enforces the rule across the orchestrator module and `scripts/**/*.sh` rather than naming
+the sites.
 
 ### Instruction adherence is code-enforced
 

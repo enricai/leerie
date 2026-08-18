@@ -18,6 +18,7 @@ tracking, which phases actually ran.
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 from types import SimpleNamespace
 
@@ -81,7 +82,12 @@ def _caps(leerie) -> dict:
     return caps
 
 
-MODELS: dict = {}
+# A resolved-models stand-in. `_run_phases` hands `models["classifier"]`
+# to preflight (the smoke test bills the tier the first worker uses), so
+# a bare {} raises KeyError on the fresh-start path before the behaviour
+# under test is reached. defaultdict keeps every worker key valid without
+# this fixture having to track WORKER_TYPES.
+MODELS: dict = collections.defaultdict(lambda: "sonnet")
 EFFORTS: dict = {}
 
 

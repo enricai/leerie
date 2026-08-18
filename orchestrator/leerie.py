@@ -739,7 +739,19 @@ INSPECT_TOOLS = (
     "Bash(git log:*),Bash(git show:*),Bash(git diff:*),"
     "Bash(git status:*),Bash(git branch:*),Bash(git ls-files:*)"
 )
-ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit"
+# NotebookEdit sits here with Write/Edit rather than in DISALLOWED_TOOLS.
+# It was briefly denied on the theory that judgment workers can reach a
+# file writer anyway, but that argument does not survive contact: the
+# deny list is a SINGLE GLOBAL constant, so denying it also strips
+# notebook editing from implementer/integrator/conformer/rebaser running
+# against arbitrary user repos; judgment workers are autonomous=False and
+# so do NOT carry --dangerously-skip-permissions by default (see the
+# skip_perms line in claude_p), which means --allowedTools already keeps
+# it from them; and Bash/Write/Edit — the same class of writer — stay
+# allowed regardless, so the deny never delivered the read-only property
+# it was justified by. Listing it here also keeps it inside KNOWN_TOOLS,
+# so the observed-surface partition stays complete.
+ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit"
 
 # SATISFIED_PROBE_TOOLS — a deliberately narrow, BASE-TREE-ONLY subset of
 # INSPECT_TOOLS for the phase-3 satisfied-probe (DESIGN §8 *Already-
@@ -790,14 +802,33 @@ SATISFIED_PROBE_TOOLS = (
 # external claude.ai project outside worktree/git tracking), and
 # ToolSearch (denied for consistency with the rest of this set even
 # though it only searches for MCP tool schemas, not a distinct bypass).
+#
+# `Task` is the live CLI's name for subagent spawning; `Agent` above is the
+# retired one, so until it was added here CLAUDE.md's "No subagent spawning"
+# invariant was enforced against a name current builds no longer ship.
+# Measured in the preflight smoke test's (uncontained) surface — contained
+# workers never reported it, which is what makes this defense-in-depth
+# rather than a fix for an observed leak. The three MCP-resource tools are
+# inert once --strict-mcp-config leaves zero servers; denying them costs
+# nothing and keeps the surface enumerable.
+#
+# Note what does NOT belong here: a plain file writer. --allowedTools is
+# permission-tier and is bypassed by --dangerously-skip-permissions, but
+# that flag reaches judgment workers only when the operator passes the
+# top-level escape hatch (DESIGN §12) — by default they are autonomous=False
+# and the allowlist holds. Denying a writer globally would therefore buy
+# nothing by default while removing the capability from every acting worker
+# in every user repo. See ACT_TOOLS for NotebookEdit, which was briefly
+# denied on that mistaken reasoning.
 DISALLOWED_TOOLS = (
-    "Agent,SendMessage,"
+    "Agent,Task,SendMessage,"
     "ScheduleWakeup,"
     "CronCreate,CronDelete,CronList,"
     "RemoteTrigger,PushNotification,"
     "Workflow,ReportFindings,Skill,Monitor,"
     "TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,TaskStop,"
-    "ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch"
+    "ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch,"
+    "ListMcpResourcesTool,ReadMcpResourceTool,ReadMcpResourceDirTool"
 )
 
 # KNOWN_TOOLS is the union of every bare tool name leerie ever names, across
@@ -814,10 +845,26 @@ DISALLOWED_TOOLS = (
 def _bare_tool_names(tools_str: str) -> set[str]:
     return {entry.split("(", 1)[0] for entry in tools_str.split(",")}
 
+# The preflight smoke test (`preflight`, DESIGN §6) is a `claude -p` call like
+# any other and carries the same containment. Its own knobs live here so the
+# argv it hands `_contained_claude_argv` is auditable in one place.
+#
+# SMOKE_MAX_TURNS is 5 against a MEASURED happy path of 3 (the text answer,
+# the CLI's synthetic `[structured-output-enforce]` turn, and the
+# StructuredOutput call `--json-schema` forces). The error directions are not
+# symmetric: a spare turn costs a few output tokens, while too low a cap turns
+# every healthy preflight into a hard die() — which is exactly the max_turns=1
+# failure the smoke block's own comment records.
+SMOKE_TOOLS = "Read"
+SMOKE_MAX_TURNS = 5
+SMOKE_PROMPT = "respond with the single word ok"
+SMOKE_SCHEMA = '{"type":"object"}'
+
 KNOWN_TOOLS: frozenset[str] = frozenset(
     _bare_tool_names(INSPECT_TOOLS)
     | _bare_tool_names(ACT_TOOLS)
     | _bare_tool_names(SATISFIED_PROBE_TOOLS)
+    | _bare_tool_names(SMOKE_TOOLS)
     | _bare_tool_names(DISALLOWED_TOOLS)
     | {"StructuredOutput"}
 )
@@ -7009,7 +7056,8 @@ async def _preflight_repo() -> None:
 
 
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
-                    skip_smoke: bool = False, no_push: bool = False) -> None:
+                    skip_smoke: bool = False, no_push: bool = False,
+                    model: str = MODEL_DEFAULT) -> None:
     """Hard checks before any LLM work. Fails fast rather than wasting workers."""
 
     # 0. subprocess machinery must be able to report exit statuses at all.
@@ -7056,12 +7104,59 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     #    failure was invisible in the non-streaming mode until exit.
     if not skip_smoke:
         log("preflight: smoke-testing claude -p…")
-        cmd = ["claude", "-p", "respond with the single word ok",
-               "--output-format", "stream-json",
-               "--verbose",
-               "--json-schema", '{"type":"object"}']
+        cmd = _contained_claude_argv(
+            schema=SMOKE_SCHEMA, allowed_tools=SMOKE_TOOLS,
+            max_turns=SMOKE_MAX_TURNS, model=model, prompt=SMOKE_PROMPT)
+        # An EMPTY cwd, not the repo. This validates the CLI, not the
+        # repository, and a single-exchange `claude -p` conversation is the
+        # one shape the CLI's own recovery path cannot rescue: when its
+        # prompt crosses the reactive-compaction trigger it tries to compact,
+        # finds fewer than two message groups, fails `too_few_groups`, and
+        # refuses the turn itself with a synthetic "Prompt is too long" and
+        # no API call. Workers compact fine because they are multi-turn.
+        # Measured on this repo with one argv held constant: the repo cwd
+        # costs ~108,800 tokens of CLAUDE.md/skills/commands the smoke test
+        # never reads (126,022 in the repo vs 17,222 in an empty dir), and
+        # CLAUDE.md only grows — so staying an order of magnitude below the
+        # trigger has to be structural, not a margin someone re-tunes later.
+        # Auth resolves from ~/.claude/.credentials.json /
+        # CLAUDE_CODE_OAUTH_TOKEN rather than cwd, so nothing about the
+        # credential path changes.
+        #
+        # Two constraints, and they pull in different directions.
+        #
+        # OUTSIDE ANY REPOSITORY. Claude Code resolves project context by
+        # walking UP from cwd to the project root, so what matters is not that
+        # the directory is empty but that it has no repo ancestor. A path
+        # under the state root looks safe and is not: `resolve_leerie_root`
+        # falls back to `<repo>/.leerie` whenever LEERIE_STATE_DIR is unset
+        # (the direct-Python path its own docstring describes), which would
+        # put the cwd back inside the checkout and reload the very CLAUDE.md
+        # this exists to escape — silently, since the directory would still
+        # be empty and still differ from os.getcwd().
+        #
+        # STABLE ACROSS RUNS. The CLI keys its session store on cwd
+        # (~/.claude/projects/<encoded-cwd>/) and deleting the cwd does not
+        # remove that entry, so a fresh mkdtemp per run leaves one orphan per
+        # run. Harmless on the local runtime (the container's ~/.claude is a
+        # bind mount of the launcher's per-run $STAGE, wiped by its EXIT trap)
+        # but not on a --runtime fly/ec2 machine, which persists across runs.
+        #
+        # The system temp dir satisfies the first; keying the name on the
+        # state root satisfies the second while keeping two repos, and the
+        # test suite, on separate paths.
+        import tempfile  # noqa: PLC0415
+        smoke_cwd = str(
+            Path(tempfile.gettempdir())
+            / ("leerie-smoke-" + hashlib.sha256(
+                str(leerie_dir.parent.parent).encode()).hexdigest()[:12]))
         try:
-            envelope = await _invoke(cmd, cwd=os.getcwd(), timeout=90,
+            os.makedirs(smoke_cwd, exist_ok=True)
+        except OSError as e:
+            die(f"cannot create the smoke-test working directory "
+                f"{smoke_cwd}: {e}")
+        try:
+            envelope = await _invoke(cmd, cwd=smoke_cwd, timeout=90,
                                      sid="smoke",
                                      leerie_dir=leerie_dir,
                                      verbosity=verbosity)
@@ -7069,9 +7164,29 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             die("claude -p smoke test timed out — auth issue or network problem")
         except WorkerError as e:
             die(f"claude -p smoke test failed: {e}")
+        # No cleanup: the directory is empty by construction (SMOKE_TOOLS
+        # allows only Read, and four real probe runs left theirs empty), and
+        # two runs sharing one state root share this path — an rmtree here
+        # would unlink a concurrent run's live cwd, which surfaces as a
+        # spurious smoke-test failure diagnosed as an auth or network problem.
+        # Classify BEFORE the generic arm. A client-side context refusal
+        # carries api_error_status=None, so it would otherwise print as the
+        # bare string "Prompt is too long" — the wording CLAUDE.md records
+        # costing three successive misdiagnoses on 2026-08-06. ContextOverflow
+        # names the remedy and routes to a resumable EXIT_LOCKED pause —
+        # state.json already holds a valid task at this point, so the run is
+        # recoverable rather than lost. (`resume` does NOT skip preflight for
+        # this shape: a run that dies here has no waves/categories, which is
+        # the demotion predicate in _run_phases, so it restarts from its
+        # recorded task and re-runs the smoke test. That is the right
+        # behaviour once the operator has dropped the offending flag.)
+        if _is_context_overflow(envelope):
+            raise ContextOverflow(str(envelope.get("result") or ""))
         if envelope.get("is_error"):
             die(f"claude -p smoke test returned an error: "
-                f"{envelope.get('api_error_status') or envelope.get('result')}")
+                f"{envelope.get('api_error_status') or envelope.get('result')} "
+                f"(terminal_reason={envelope.get('terminal_reason')!r}); "
+                f"full stream: {leerie_dir / 'logs' / 'smoke.log'}")
         log("preflight: ok")
 
 
@@ -14406,7 +14521,12 @@ def _summarize_tool_use(sid: str, block: dict, verbosity: str) -> str:
         # per-worker .log file has the full command.
         return f"  [{sid} bash] {cmd}"
     if name in ("Write", "Edit", "NotebookEdit"):
-        return f"  [{sid} {name.lower()}] {inp.get('file_path', '?')}"
+        # NotebookEdit names its target `notebook_path`, not `file_path`, so
+        # keying only on the latter logged a bare "?" for every notebook edit.
+        # Latent while NotebookEdit was on the deny list; live again now that
+        # it is an ACT_TOOLS writer.
+        path = inp.get("file_path") or inp.get("notebook_path") or "?"
+        return f"  [{sid} {name.lower()}] {path}"
     if name == "WebFetch":
         return f"  [{sid} fetch] {inp.get('url', '?')}"
     if name == "WebSearch":
@@ -16663,6 +16783,47 @@ def _append_system_prompt_file_supported() -> bool:
     return supported
 
 
+def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
+                           model: str, prompt: str | None = None) -> list[str]:
+    """The `claude -p` argv every live invocation shares, containment included.
+
+    Single owner by design. #216 widened `DISALLOWED_TOOLS` and added
+    `--strict-mcp-config`, auditing the invocation sites *by hand*: it found
+    the shell one (`scripts/remote/collect-subtrees.sh`) and missed the Python
+    one (`preflight`'s smoke test), which then ran with 46 `mcp__claude_ai_*`
+    tools — `send_message`, `trash_thread`, `slack_send_message` among them —
+    and every tool the deny list exists to remove. A new call site must
+    inherit containment by construction, not by the next audit remembering it.
+    Pinned by `tests/test_claude_argv_containment.py`.
+
+    `--strict-mcp-config` is what suppresses claude.ai account connectors:
+    measured single-variable on CLI 2.1.234, identical argv otherwise, 27 MCP
+    tools / 4 servers -> 0 / 0. No `--mcp-config` is ever passed, so the flag
+    cannot strand a caller with zero server config but a nonzero tool surface.
+
+    `prompt` MUST stay None for workers. A positional prompt silently wins
+    over stdin with no error, and `claude_p` routes the user prompt over stdin
+    because one argv element cannot exceed Linux's MAX_ARG_STRLEN (131,071
+    bytes, not raisable) — measured, a 150,063-byte reconciler payload crashed
+    with a raw execve E2BIG. Only `preflight`'s smoke test passes one, and
+    only because it is a fixed 31-byte string.
+    """
+    cmd = ["claude", "-p"]
+    if prompt is not None:
+        cmd.append(prompt)
+    cmd.extend([
+        "--output-format", "stream-json",
+        "--verbose",
+        "--json-schema", schema,
+        "--allowedTools", allowed_tools,
+        "--disallowedTools", DISALLOWED_TOOLS,
+        "--max-turns", str(max_turns),
+        "--model", _model_arg(model),
+        "--strict-mcp-config",
+    ])
+    return cmd
+
+
 async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    cwd: str, allowed_tools: str, max_turns: int, autonomous: bool,
                    caps: dict, st: "State", model: str, sid: str,
@@ -16760,28 +16921,17 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # reconciler with a raw execve E2BIG). A positional prompt would
             # also silently win over stdin with no error, so it must be
             # absent, not merely redundant.
-            cmd = ["claude", "-p"]
+            # Containment (tool denies + --strict-mcp-config) comes from the
+            # shared builder so this site and preflight's smoke test cannot
+            # drift apart again — see _contained_claude_argv. `prompt` stays
+            # None: the user prompt goes over stdin (see above).
+            cmd = _contained_claude_argv(
+                schema=schema, allowed_tools=allowed_tools,
+                max_turns=max_turns, model=model)
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
                 cmd.extend(["--append-system-prompt", system_prompt])
-            cmd.extend([
-                "--output-format", "stream-json",
-                "--verbose",
-                "--json-schema", schema,
-                "--allowedTools", allowed_tools,
-                "--disallowedTools", DISALLOWED_TOOLS,
-                "--max-turns", str(max_turns),
-                "--model", _model_arg(model),
-                # Cut MCP tool exposure off at the source: unconditional for
-                # every worker, independent of any mcp__* denylist entry and
-                # of whatever .claude.json seeding copies into the container
-                # (measured: 4 mcp_servers / 46 MCP tools baseline -> 0/0
-                # with this flag, rc 0, CLI 2.1.234). No --mcp-config is ever
-                # passed, so this can't strand a worker with zero server
-                # config but a nonzero tool surface.
-                "--strict-mcp-config",
-            ])
             # IMPLEMENTATION.md §2 "Effort selection". When effort is None
             # (e.g. satisfied_probe, or the post-run judge/heal workers) the
             # CLI invocation is byte-identical to the pre-feature behavior;
@@ -31469,9 +31619,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # recorded key.
         _enforce_and_record_cgroup_containment(
             st, args.dangerously_allow_uncapped)
+        # The smoke test bills the tier the run's FIRST worker actually
+        # spawns with (phase_classify is unconditional), rather than letting
+        # the CLI pick its own default — measured, that default resolved to
+        # opus on a run whose every worker was sonnet. It is also the one
+        # `claude -p` call site with no --model to rewrite, so _model_arg
+        # could not restore the 1M window behind the strict proxy.
         await preflight(leerie_dir, verbosity=verbosity,
                         skip_smoke=args.skip_smoke,
-                        no_push=getattr(args, "no_push", False))
+                        no_push=getattr(args, "no_push", False),
+                        model=models["classifier"])
         # Start-of-run multi-token selection (DESIGN §6 *Multi-token
         # rotation*) — a no-op when CLAUDE_CODE_OAUTH_TOKENS is unset.
         # Fresh-run only: on resume, active_oauth_token (if any) is

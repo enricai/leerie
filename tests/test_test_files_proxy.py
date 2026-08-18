@@ -83,7 +83,13 @@ def test_declared_globs_REPLACE_the_builtins(leerie):
 
 def test_filters_a_mixed_diff_to_tests_only(leerie):
     """The shape of a real recovered subtask diff (bugfix-001 of run
-    7aa46cce): docs + source + script + one test file."""
+    7aa46cce): docs + source + script + one test file.
+
+    `tests/test_strict_mcp_config.py` no longer exists (deleted 2026-08-18 —
+    its claim was source-sliced from `claude_p` and so could not observe the
+    property it asserted). The path is kept verbatim because this fixture is a
+    frozen record of a real diff, and `_render_scoped` only ever treats these
+    as strings — nothing opens them. Rewriting it would falsify the record."""
     out = leerie._render_scoped(
         "python3 -m pytest {test_files} -q",
         ["docs/IMPLEMENTATION.md", "orchestrator/leerie.py",

@@ -103,3 +103,52 @@ def test_confidence_block_in_the_embedded_copy_is_the_flattened_shape(leerie):
     for relaxed in ("falsifiers_tested", "contradictions_reconciled"):
         assert relaxed in conf["properties"]
         assert relaxed not in conf["required"]
+
+
+# --- the same drift hazard, for the two embedded TOOL LISTS -----------------
+#
+# `collect-subtrees.sh` invokes `claude -p` directly on the remote machine and
+# cannot import the orchestrator, so ACT_TOOLS and DISALLOWED_TOOLS are
+# duplicated there exactly as the schema above is. The allowlist had been an
+# unguarded byte-identical copy since the script was written, and the deny
+# list was absent entirely until 2026-08-18 — #216 added --strict-mcp-config
+# to this call site and missed --disallowedTools. Both now carry a guard,
+# because an unguarded copy is precisely how the schema above drifted for
+# months without anything noticing.
+
+_ALLOWED_RE = re.compile(r"^integrator_allowed_tools='([^']*)'\s*$", re.M)
+_DISALLOWED_RE = re.compile(r"^integrator_disallowed_tools='([^']*)'\s*$", re.M)
+
+
+def _embedded_tool_list(pattern: re.Pattern, name: str) -> str:
+    text = COLLECT_SH.read_text()
+    match = pattern.search(text)
+    assert match, (
+        f"could not find the `{name}='...'` assignment in "
+        f"{COLLECT_SH.relative_to(REPO)} — if it moved or changed shape, "
+        "update this guard rather than deleting it; an unparsed assignment "
+        "means the drift check silently stops running")
+    return match.group(1)
+
+
+def test_embedded_allowed_tools_matches_act_tools(leerie):
+    assert _embedded_tool_list(_ALLOWED_RE, "integrator_allowed_tools") == \
+        leerie.ACT_TOOLS
+
+
+def test_embedded_disallowed_tools_matches_the_live_deny_list(leerie):
+    """Set equality, so a reordering is not a spurious failure but a
+    missing or extra NAME is."""
+    embedded = {e.strip() for e in _embedded_tool_list(
+        _DISALLOWED_RE, "integrator_disallowed_tools").split(",")}
+    live = {e.strip() for e in leerie.DISALLOWED_TOOLS.split(",")}
+    assert embedded == live, (
+        f"embedded deny list drifted: missing {sorted(live - embedded)}, "
+        f"extra {sorted(embedded - live)}")
+
+
+def test_the_integrator_call_uses_both_variables():
+    """Assigning the lists but not passing them is the inert-fix shape."""
+    text = COLLECT_SH.read_text()
+    assert '--allowedTools "$integrator_allowed_tools"' in text
+    assert '--disallowedTools "$integrator_disallowed_tools"' in text

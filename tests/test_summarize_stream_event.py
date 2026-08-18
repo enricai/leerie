@@ -100,6 +100,23 @@ def test_write_edit_tools(leerie):
         assert name.lower() in out
 
 
+def test_notebook_edit_reports_its_own_input_key(leerie):
+    """`NotebookEdit` names its target `notebook_path`, not `file_path`.
+
+    Feeding it a `file_path` (as the loop above does for all three names)
+    passes against a branch that only ever reads `file_path`, so every real
+    notebook edit logged a bare "?". Latent while `NotebookEdit` was on the
+    deny list and unreachable; live again now that it is an `ACT_TOOLS`
+    writer.
+    """
+    block = {"type": "tool_use", "name": "NotebookEdit",
+             "input": {"notebook_path": "analysis/run.ipynb",
+                       "cell_id": "c1", "edit_mode": "replace"}}
+    out = leerie._summarize_tool_use("x", block, "stream")
+    assert "analysis/run.ipynb" in out, out
+    assert "?" not in out, out
+
+
 def test_structured_output_tool_stream_suppressed(leerie):
     """The StructuredOutput tool is suppressed at stream — it adds
     noise since `done` follows immediately. At debug it shows the full

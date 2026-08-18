@@ -27,7 +27,26 @@ REQUIRED_DENIALS = {
     # ToolSearch is a judgment call, not strictly required like the rest —
     # denied here for consistency with the other autonomy/spawn-shaped tools.
     "ToolSearch",
+    # `Task` is the LIVE CLI's subagent-spawning tool; `Agent` above is the
+    # retired name. Until this entry existed, CLAUDE.md's "No subagent
+    # spawning" invariant was enforced only against a name current builds no
+    # longer ship. Measured in the preflight smoke test's own then-uncontained
+    # surface; contained workers never reported it, so this is
+    # defense-in-depth rather than a fix for an observed leak.
+    "Task",
+    # Inert once --strict-mcp-config leaves zero servers; denied so the
+    # surface stays enumerable rather than partly unclassified.
+    "ListMcpResourcesTool", "ReadMcpResourceTool", "ReadMcpResourceDirTool",
 }
+
+# NotebookEdit is deliberately NOT here — see ACT_TOOLS in leerie.py. It was
+# briefly denied and reverted: the deny list is a single global constant, so
+# denying a writer strips notebook editing from every acting worker in every
+# user repo, while judgment workers (autonomous=False) do not carry
+# --dangerously-skip-permissions by default and so are already held by
+# --allowedTools. Bash/Write/Edit stay allowed regardless, so the deny never
+# produced the read-only property it was justified by.
+NOT_DENIED = {"NotebookEdit", "Bash", "Write", "Edit"}
 
 
 def test_disallowed_tools_contains_required_denials(leerie):
@@ -36,39 +55,6 @@ def test_disallowed_tools_contains_required_denials(leerie):
     assert not missing, (
         f"DISALLOWED_TOOLS must deny {missing} — these tools spawn "
         "untracked parallel work or set timers the orchestrator cannot track"
-    )
-
-
-def test_disallowed_tools_wired_into_claude_p():
-    """The claude_p command builder must pass --disallowedTools."""
-    src = LEERIE_PY.read_text()
-    start = src.index("async def claude_p(")
-    end = src.index("\nasync def ", start + 1)
-    body = src[start:end]
-    assert '"--disallowedTools"' in body, (
-        "claude_p must pass --disallowedTools to the CLI"
-    )
-    assert "DISALLOWED_TOOLS" in body, (
-        "claude_p must reference the DISALLOWED_TOOLS constant"
-    )
-
-
-def test_strict_mcp_config_wired_into_claude_p():
-    """claude_p must pass --strict-mcp-config and never --mcp-config, so
-    MCP server exposure (e.g. a claude.ai Gmail/Slack connection) is cut
-    off at the source rather than relying on the DISALLOWED_TOOLS denylist
-    alone.
-    """
-    src = LEERIE_PY.read_text()
-    start = src.index("async def claude_p(")
-    end = src.index("\nasync def ", start + 1)
-    body = src[start:end]
-    assert '"--strict-mcp-config"' in body, (
-        "claude_p must pass --strict-mcp-config to the CLI"
-    )
-    assert '"--mcp-config"' not in body, (
-        "claude_p must never pass --mcp-config — that would reintroduce "
-        "whatever MCP servers the user's own Claude Code config carries"
     )
 
 
@@ -90,6 +76,25 @@ def test_observed_tools_fixture_is_fully_partitioned(leerie):
     assert "Read" in observed, (
         "fixture must include 'Read' (a known-allowed name) as a sanity check"
     )
+    # The two names this fixture was blind to until 2026-08-18: both were in
+    # the live surface of every worker while the partition test reported full
+    # coverage, because the fixture itself never listed them. Without these
+    # rows, removing either from DISALLOWED_TOOLS leaves the suite green.
+    assert "Task" in observed, (
+        "fixture must include 'Task' — the live CLI's subagent-spawning tool"
+    )
+    assert "NotebookEdit" in observed, (
+        "fixture must include 'NotebookEdit' — observed in every worker's "
+        "reported surface"
+    )
+    # mcp__* names are deliberately absent: the partition is over BARE tool
+    # names, and MCP exposure is cut off by --strict-mcp-config plus the
+    # latch's own startswith("mcp__") rule. Admitting them here would make
+    # this test permanently unsatisfiable and invite "fixing" it by deleting
+    # names.
+    assert not [t for t in observed if t.startswith("mcp__")], (
+        "observed_tools.json must carry bare tool names only"
+    )
 
     disallowed = {e.strip() for e in leerie.DISALLOWED_TOOLS.split(",")}
     covered = leerie.KNOWN_TOOLS | disallowed
@@ -100,3 +105,25 @@ def test_observed_tools_fixture_is_fully_partitioned(leerie):
         "nor leerie.DISALLOWED_TOOLS — a CLI-shipped tool has gone "
         "unclassified"
     )
+
+
+def test_plain_file_writers_are_not_denied(leerie):
+    """A writer on the deny list costs every acting worker in every user repo
+    and buys nothing by default — `--allowedTools` already holds judgment
+    workers, which are `autonomous=False`. Pinned so `NotebookEdit` is not
+    re-added on the reasoning that was tried and reverted."""
+    denied = {e.strip() for e in leerie.DISALLOWED_TOOLS.split(",")}
+    wrongly_denied = NOT_DENIED & denied
+    assert not wrongly_denied, (
+        f"{sorted(wrongly_denied)} are plain file writers; denying them "
+        "globally removes the capability from implementer/integrator/"
+        "conformer against arbitrary user repos. See ACT_TOOLS.")
+
+
+def test_notebook_edit_is_classified_as_an_act_tool(leerie):
+    """Not denied, but still classified — otherwise it drops out of
+    KNOWN_TOOLS and the observed-surface partition below reports it as an
+    unclassified CLI tool."""
+    assert "NotebookEdit" in {e.split("(", 1)[0]
+                              for e in leerie.ACT_TOOLS.split(",")}
+    assert "NotebookEdit" in leerie.KNOWN_TOOLS
