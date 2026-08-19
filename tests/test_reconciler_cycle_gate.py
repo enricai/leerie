@@ -2705,3 +2705,588 @@ def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
 
     # Sanity: st.save() called on every invocation (3 calls).
     assert st.save_calls == 3
+
+
+# ===========================================================================
+# Coverage-gap tests (test-005-f1-r36): phase_reconcile lines 21008-21639.
+# Targets the dead-subtask elimination log, dangling added_requires log,
+# external-twin demotion, the second-pass promoted/preconditions logs, and
+# two die() paths (worker crashed with no result; size gate exhausted on
+# attempt 2) that the pre-existing tests in this module and
+# tests/test_phase_reconcile.py only pin as source-text assertions, never
+# actually execute.
+# ===========================================================================
+
+def test_dead_subtask_elimination_prunes_and_logs_dangling_requires(
+    leerie, monkeypatch, tmp_path
+):
+    """`dead-001`'s only in_plan requires tag is declared unresolvable by
+    the reconciler, and a sibling domain contributed zero subtasks (the
+    "constant fold" `_prune_dead_subtasks` requires to fire). The dead
+    subtask is pruned before `_check_unresolvable` can die, so
+    `phase_reconcile` returns cleanly with `dead-001` gone and
+    `st.data["speculative_collapse_drops"]` recording it.
+
+    The same attempt-1 output also carries an `added_requires` entry
+    naming a subtask absent from `added_subtasks` — a dangling requires
+    that `_expand_reconciler_output` drops and `_spawn_reconciler` logs
+    (phase_reconcile:21181)."""
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [{
+             "id": "dead-001",
+             "title": "Speculative consumer",
+             "intent": "depends on a capability nothing provides",
+             "provides": [],
+             "requires": [{"tag": "ghost-cap", "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["a.py"],
+             "success_criteria_seed": "n/a",
+             "size": "small"}]},
+        # Zero subtasks — the fold condition _prune_dead_subtasks needs.
+        {"domain": "dependency-migration", "status": "ready",
+         "subtasks": []},
+    ]
+
+    attempt_1_output = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [
+            {"op": "unresolvable", "sid": "dead-001", "tag": "ghost-cap",
+             "reason": "no producer anywhere"},
+        ],
+        "added_subtasks": [],
+        # Dangling: no added_subtasks entry named "phantom-999".
+        "added_requires": [
+            {"sid": "phantom-999", "tag": "whatever", "extent": "in_plan"},
+        ],
+    }
+
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return attempt_1_output
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "test dead-subtask elimination", st, caps, models, efforts))
+
+    assert len(calls) == 1, "no retry expected — the prune clears unresolvable"
+    all_ids = {s["id"] for p in result for s in p.get("subtasks", [])}
+    assert "dead-001" not in all_ids, "the fully-speculative subtask must be pruned"
+    assert st.data.get("speculative_collapse_drops") == ["dead-001"]
+
+
+def test_external_twin_demotion_rescues_unresolvable_and_returns_cleanly(
+    leerie, monkeypatch, tmp_path
+):
+    """`twin-001` requires `special-cap` (in_plan) alongside `other-cap`
+    (in_plan, satisfied by a sibling subtask — so it is NOT eligible for
+    dead-subtask pruning). `twin-002` independently declares
+    `special-cap` as `extent: external`. When the reconciler reports
+    `special-cap`/`twin-001` unresolvable, `_demote_unresolvable_with_
+    external_twin` rescues it by rewriting twin-001's entry to
+    `extent: external` rather than dying — DESIGN §5 *The external
+    twin*, phase_reconcile:21289-21310."""
+    plans = [
+        {"domain": "configuration-build", "status": "ready",
+         "subtasks": [
+             {
+                 "id": "twin-001",
+                 "title": "Consumer with a real AND a phantom producer",
+                 "intent": "needs both capabilities",
+                 "provides": [],
+                 "requires": [
+                     {"tag": "special-cap", "extent": "in_plan"},
+                     {"tag": "other-cap", "extent": "in_plan"},
+                 ],
+                 "depends_on": [],
+                 "files_likely_touched": ["b.py"],
+                 "success_criteria_seed": "n/a",
+                 "size": "small",
+             },
+             {
+                 "id": "twin-002",
+                 "title": "Declares special-cap out-of-graph",
+                 "intent": "another domain owns this",
+                 "provides": ["other-cap"],
+                 "requires": [
+                     {"tag": "special-cap", "extent": "external",
+                      "reason": "provisioned by a separate run"},
+                 ],
+                 "depends_on": [],
+                 "files_likely_touched": ["c.py"],
+                 "success_criteria_seed": "n/a",
+                 "size": "small",
+             },
+         ]},
+    ]
+
+    attempt_1_output = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [
+            {"op": "unresolvable", "sid": "twin-001", "tag": "special-cap",
+             "reason": "no in-plan producer"},
+        ],
+        "added_subtasks": [], "added_requires": [],
+    }
+
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return attempt_1_output
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "test external twin demotion", st, caps, models, efforts))
+
+    assert len(calls) == 1
+    demotions = st.data.get("external_twin_demotions")
+    assert demotions and demotions[0]["sid"] == "twin-001"
+    assert demotions[0]["tag"] == "special-cap"
+    # twin-001's requires entry was rewritten to extent: external, not
+    # left in_plan — the rescue must actually mutate the plan.
+    twin_001 = next(
+        s for p in result for s in p["subtasks"] if s["id"] == "twin-001")
+    special = next(
+        e for e in twin_001["requires"] if e["tag"] == "special-cap")
+    assert special["extent"] == "external"
+
+
+def test_second_pass_promotion_logs_and_shrinks_preconditions(
+    leerie, monkeypatch, tmp_path
+):
+    """`orphan-001` requires `trigger-cap` (in_plan, unresolved — spawns
+    the reconciler) and separately declares `rescue-cap` as `extent:
+    external` (no in-plan producer yet, so it lands in the FIRST
+    `external_preconditions` snapshot). The reconciler's added_subtask
+    provides BOTH `trigger-cap` and `rescue-cap`, so the post-mutation
+    re-run of `_promote_external_collisions` promotes `rescue-cap` back
+    to `in_plan` — exercising both the "promoted N entries" log and the
+    "preconditions count changed" log at phase_reconcile:21486/21490."""
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [{
+             "id": "orphan-001",
+             "title": "Needs a connector and an out-of-graph capability",
+             "intent": "n/a",
+             "provides": [],
+             "requires": [
+                 {"tag": "trigger-cap", "extent": "in_plan"},
+                 {"tag": "rescue-cap", "extent": "external",
+                  "reason": "thought to be provisioned elsewhere"},
+             ],
+             "depends_on": [],
+             "files_likely_touched": ["d.py"],
+             "success_criteria_seed": "n/a",
+             "size": "small"}]},
+    ]
+
+    attempt_1_output = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [], "added_requires": [],
+        "added_subtasks": [{
+            "id": "feat-900",
+            "title": "Connector providing both capabilities",
+            "success_criteria_seed": "n/a",
+            "provides": ["trigger-cap", "rescue-cap"],
+            "depends_on": [],
+            "size": "small",
+        }],
+    }
+
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return attempt_1_output
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    # Pre-reconcile snapshot: rescue-cap has no in-plan producer yet.
+    initial_preconditions = leerie._collect_external_preconditions(plans)
+    assert len(initial_preconditions) == 1
+
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "test second-pass promotion", st, caps, models, efforts))
+
+    assert len(calls) == 1
+    # rescue-cap now has an in-plan producer (feat-900), so the
+    # post-mutation pass demotes it out of the external set entirely.
+    assert st.data["external_preconditions"] == []
+    orphan_001 = next(
+        s for p in result for s in p["subtasks"] if s["id"] == "orphan-001")
+    rescue = next(
+        e for e in orphan_001["requires"] if e["tag"] == "rescue-cap")
+    assert rescue["extent"] == "in_plan"
+
+
+def test_phase_reconcile_dies_when_reconciler_produces_no_result(
+    leerie, monkeypatch, tmp_path
+):
+    """Every round of the CRITIC-pattern check loop crashes with a
+    `WorkerError` (infrastructure failure — PID exhaustion, OOM, a
+    killed session). `_run_checked_loop` exhausts its round budget and
+    returns `(None, warnings)`; `phase_reconcile` must `die()` rather
+    than proceed with a `None` output — phase_reconcile:21262."""
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [{
+             "id": "feat-001",
+             "title": "Consumer",
+             "intent": "n/a",
+             "provides": [],
+             "requires": [{"tag": "cap-a", "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["e.py"],
+             "success_criteria_seed": "n/a",
+             "size": "small"}]},
+    ]
+
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        raise leerie.WorkerError("worker crashed: simulated PID exhaustion")
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    caps["judgment_check_rounds"] = 1
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(leerie.phase_reconcile(
+            plans, "test crashed reconciler", st, caps, models, efforts))
+
+    assert len(calls) == 1
+    assert exc_info.value.code != 0
+
+
+def test_size_gate_dies_after_attempt_2_still_oversized(
+    leerie, monkeypatch, tmp_path
+):
+    """Both attempt 1 and attempt 2's reconciler output carry an
+    `added_subtask` with `size: large` — the size gate fires on attempt
+    1, respawns with the size-resolution retry prompt, and the revised
+    output is STILL oversized. phase_reconcile must die with the
+    attempt-2 exhaustion message (phase_reconcile:21347-21352), never
+    silently accepting an oversized bundle."""
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [{
+             "id": "feat-001",
+             "title": "Consumer",
+             "intent": "n/a",
+             "provides": [],
+             "requires": [{"tag": "cap-a", "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["f.py"],
+             "success_criteria_seed": "n/a",
+             "size": "small"}]},
+    ]
+
+    oversized_subtask = {
+        "id": "feat-900",
+        "title": "Bundles far too much",
+        "success_criteria_seed": "n/a",
+        "provides": ["cap-a"],
+        # Self-dependency: also makes check_reconciler_output emit a
+        # SELF_DEP warning on both attempts, exercising the size-retry
+        # warning-log line (phase_reconcile:21339) alongside the
+        # attempt-2 exhaustion die below.
+        "depends_on": ["feat-900"],
+        "size": "large",
+    }
+    attempt_output = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [], "added_requires": [],
+        "added_subtasks": [dict(oversized_subtask)],
+    }
+
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        # Same oversized shape on both attempt 1 (via the check loop)
+        # and attempt 2 (the direct size-retry respawn).
+        return dict(attempt_output)
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(leerie.phase_reconcile(
+            plans, "test size gate exhaustion", st, caps, models, efforts))
+
+    # The SELF_DEP warning also makes round 0 of the CRITIC-pattern check
+    # loop retry once before the size gate fires, so attempt 1 costs 2
+    # calls; the direct size-retry respawn is the 3rd.
+    assert len(calls) == 3, (
+        f"expected 3 claude_p calls (attempt-1 check-loop retry + size "
+        f"retry); got {len(calls)}")
+    assert exc_info.value.code != 0
+
+
+def test_phase_reconcile_dies_on_plain_unresolvable(leerie, monkeypatch, tmp_path):
+    """A single subtask whose unresolved tag has no external twin and no
+    dead-subtask fold available. `_check_unresolvable` must die
+    directly with the worker's reasoning (phase_reconcile:21192-21193),
+    the ordinary (non-rescuable) unresolvable path."""
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [{
+             "id": "feat-001",
+             "title": "Consumer",
+             "intent": "n/a",
+             "provides": [],
+             "requires": [{"tag": "cap-nowhere", "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["g.py"],
+             "success_criteria_seed": "n/a",
+             "size": "small"}]},
+    ]
+
+    attempt_1_output = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [
+            {"op": "unresolvable", "sid": "feat-001", "tag": "cap-nowhere",
+             "reason": "genuinely no producer, no external twin"},
+        ],
+        "added_subtasks": [], "added_requires": [],
+    }
+
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return attempt_1_output
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    with pytest.raises(SystemExit) as exc_info:
+        asyncio.run(leerie.phase_reconcile(
+            plans, "test plain unresolvable die", st, caps, models, efforts))
+
+    assert len(calls) == 1
+    assert exc_info.value.code != 0
+
+
+def test_reconciler_check_loop_retries_on_bad_prefix_then_succeeds(
+    leerie, monkeypatch, tmp_path
+):
+    """Round 1's `added_subtasks` id fails `check_reconciler_output`'s
+    `BAD_PREFIX` rule, so the CRITIC-pattern check loop
+    (`_run_checked_loop`) feeds the issue back via
+    `make_feedback_prompt` and retries; round 2's corrected output is
+    clean and the loop breaks. Exercises `_on_recon_fb`'s feedback-
+    accumulation branches (phase_reconcile:21244-21248), distinct from
+    the size/cycle/unresolved retry loops which spawn the reconciler
+    directly rather than through this generic loop."""
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [{
+             "id": "feat-001",
+             "title": "Consumer",
+             "intent": "n/a",
+             "provides": [],
+             "requires": [{"tag": "cap-a", "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["h.py"],
+             "success_criteria_seed": "n/a",
+             "size": "small"}]},
+    ]
+
+    bad_output_1 = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [], "added_requires": [],
+        "added_subtasks": [{
+            "id": "totally-not-a-valid-prefix-001",
+            "title": "Provides cap-a with a bad id",
+            "success_criteria_seed": "n/a",
+            "provides": ["cap-a"],
+            "depends_on": [],
+            "size": "small",
+        }],
+    }
+    # Round 2's issue is a DIFFERENT defect (SELF_DEP, not BAD_PREFIX) —
+    # a distinct `_issue_signature`, so `_run_checked_loop`'s oscillation
+    # guard (exact-repeat detection) does not abort early, and this round
+    # exercises `_on_recon_fb`'s `len(recon_up_parts) > 1` branch (the
+    # in-place overwrite, not the initial append).
+    bad_output_2 = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [], "added_requires": [],
+        "added_subtasks": [{
+            "id": "feat-902",
+            "title": "Provides cap-a but depends on itself",
+            "success_criteria_seed": "n/a",
+            "provides": ["cap-a"],
+            "depends_on": ["feat-902"],
+            "size": "small",
+        }],
+    }
+    good_output = {
+        "renames": [], "dependency_edges": [], "merged_subtasks": [],
+        "tag_ops": [], "added_requires": [],
+        "added_subtasks": [{
+            "id": "feat-901",
+            "title": "Provides cap-a with a valid id",
+            "success_criteria_seed": "n/a",
+            "provides": ["cap-a"],
+            "depends_on": [],
+            "size": "small",
+        }],
+    }
+
+    prompts_seen: list[str] = []
+
+    async def fake_claude_p(**kwargs):
+        prompts_seen.append(kwargs["user_prompt"])
+        if len(prompts_seen) == 1:
+            return bad_output_1
+        if len(prompts_seen) == 2:
+            return bad_output_2
+        return good_output
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    caps["judgment_check_rounds"] = 3
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "test check-loop feedback retry", st, caps, models, efforts))
+
+    assert len(prompts_seen) == 3, (
+        "both round 1's BAD_PREFIX and round 2's SELF_DEP issues must "
+        "each trigger a feedback retry")
+    # Round 2 and round 3's prompts are feedback text, distinct from the
+    # original user_prompt AND from each other (a fresh issue each time).
+    assert prompts_seen[1] != prompts_seen[0]
+    assert prompts_seen[2] != prompts_seen[1]
+    all_ids = {s["id"] for p in result for s in p.get("subtasks", [])}
+    assert "feat-901" in all_ids
+    assert "totally-not-a-valid-prefix-001" not in all_ids
+    assert "feat-902" not in all_ids
+
+
+def test_cycle_retry_logs_check_reconciler_output_warnings(
+    leerie, monkeypatch, tmp_path
+):
+    """Same cycle-closing/breaking shape as
+    `test_cycle_retry_loop_integration_with_stubbed_reconciler`, but
+    attempt 2's output ALSO carries a harmless `added_subtask` with a
+    `BAD_PREFIX`-shaped id. `check_reconciler_output`'s warning must be
+    logged (phase_reconcile:21428) without blocking the successful
+    cycle-break — a warning is advisory, not gating."""
+    plans = [
+        {"domain": "feature-implementation", "status": "ready",
+         "subtasks": [{
+             "id": "feat-001",
+             "title": "Node HTTP backend entrypoint",
+             "intent": "Long-lived Node process",
+             "provides": ["backend-http-server"],
+             "requires": [
+                 {"tag": "node-server-runtime-libs-present",
+                  "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["server/index.ts"],
+             "success_criteria_seed": "server starts",
+             "size": "small"}]},
+        {"domain": "configuration-build", "status": "ready",
+         "subtasks": [{
+             "id": "config-005",
+             "title": "Update package.json scripts and deps",
+             "intent": "Pin AWS runtime deps",
+             "provides": ["app-runtime-deps", "app-build-scripts"],
+             "requires": [
+                 {"tag": "app-server-framework-present",
+                  "extent": "in_plan"}],
+             "depends_on": [],
+             "files_likely_touched": ["package.json"],
+             "success_criteria_seed": "package.json exposes build, start",
+             "size": "small"}]},
+    ]
+
+    attempt_1_output = {
+        "renames": [
+            {"sid": "feat-001",
+             "from": "node-server-runtime-libs-present",
+             "to": "app-runtime-deps"},
+            {"sid": "config-005",
+             "from": "app-server-framework-present",
+             "to": "backend-http-server"},
+        ],
+        "added_provides": [], "added_subtasks": [],
+        "dependency_edges": [], "merged_subtasks": [],
+    }
+    attempt_2_output = {
+        "renames": [
+            {"sid": "feat-001",
+             "from": "node-server-runtime-libs-present",
+             "to": "app-runtime-deps"},
+        ],
+        "added_subtasks": [{
+            "id": "not-a-valid-prefix-connector",
+            "title": "Unrelated, wrongly-prefixed connector",
+            "success_criteria_seed": "n/a",
+            "provides": [],
+            "depends_on": [],
+            "size": "small",
+        }],
+        "tag_ops": [
+            {"op": "drop_require", "sid": "config-005",
+             "tag": "app-server-framework-present",
+             "reason": "not a code artifact feat-001 produces"},
+        ],
+        "dependency_edges": [], "merged_subtasks": [],
+    }
+
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return attempt_1_output
+        return attempt_2_output
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    caps = dict(leerie.DEFAULT_CAPS)
+    models = {"reconciler": "opus"}
+    efforts = {"reconciler": "high"}
+
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "migrate to AWS", st, caps, models, efforts))
+
+    assert result is not None
+    assert len(calls) == 2
+    by_id = {s["id"]: s for plan in result for s in plan.get("subtasks", [])}
+    assert "not-a-valid-prefix-connector" in by_id, (
+        "the added_subtask still lands in the plan; check_reconciler_"
+        "output's warning is advisory-only")
