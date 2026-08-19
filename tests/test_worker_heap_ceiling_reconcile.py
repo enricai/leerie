@@ -275,6 +275,19 @@ def test_all_four_flag_spellings_are_matched(leerie, repo_root, flag):
     assert leerie._declared_node_heap_bytes(repo_root) == 8192 * 1024 * 1024
 
 
+def test_second_of_two_flags_in_one_command_smaller_is_not_taken(leerie, repo_root):
+    """`_heap_in`'s inner scan takes the max across every
+    `--max-old-space-size` occurrence WITHIN a single command string, not
+    just across axes/scripts (`test_declared_heap_takes_max_across_axes`
+    covers the latter). A second, smaller match in the same string must
+    not overwrite the first, larger one already found."""
+    _write_node_repo(repo_root, {
+        "test": ("NODE_OPTIONS=--max-old-space-size=8192 vitest run "
+                  "&& NODE_OPTIONS=--max-old-space-size=1024 vitest run --shard=2"),
+    })
+    assert leerie._declared_node_heap_bytes(repo_root) == 8192 * 1024 * 1024
+
+
 def test_one_level_of_script_chaining_is_followed(leerie, repo_root):
     """`test` delegating to another script is common (`pretest`, `test:ci`)."""
     _write_node_repo(repo_root, {
@@ -296,6 +309,28 @@ def test_cyclic_scripts_terminate(leerie, repo_root):
 def test_malformed_package_json_degrades_to_none(leerie, repo_root):
     """Unparseable package.json must not crash the run at startup."""
     (repo_root / "package.json").write_text("{ not json")
+    (repo_root / "pnpm-lock.yaml").write_text("")
+    assert leerie._declared_node_heap_bytes(repo_root) is None
+
+
+def test_package_json_with_no_scripts_key_degrades_to_none(leerie, repo_root):
+    """`_package_json_scripts` has two distinct `return {}` sites: one for
+    a `package.json` that cannot be parsed at all (`json.loads` raising
+    `OSError`/`ValueError` -- already covered above), and a second,
+    untested one for a `package.json` that parses fine but carries no
+    usable `scripts` map (missing entirely, or present as a non-dict, e.g.
+    a repo that repurposes the key). Both must degrade the same way rather
+    than crashing the run at startup."""
+    (repo_root / "package.json").write_text('{"name": "x", "version": "1.0.0"}')
+    (repo_root / "pnpm-lock.yaml").write_text("")
+    assert leerie._declared_node_heap_bytes(repo_root) is None
+
+
+def test_package_json_with_non_dict_scripts_degrades_to_none(leerie, repo_root):
+    """The `scripts` key present but not a dict (e.g. malformed to a list)
+    takes the same `isinstance(scripts, dict)` guard as the missing-key
+    case above."""
+    (repo_root / "package.json").write_text('{"scripts": ["build", "test"]}')
     (repo_root / "pnpm-lock.yaml").write_text("")
     assert leerie._declared_node_heap_bytes(repo_root) is None
 
@@ -476,3 +511,52 @@ def test_degrade_log_names_the_demand_estimate_not_the_build_peak(
     msg = "".join(capsys.readouterr())
     assert "per-worker demand estimate" in msg
     assert "build-peak floor" not in msg
+
+
+# ---- resolve_worker_memory_max: pre-resolved declared_heap_bytes ---------
+#
+# `main()` (leerie.py:32744-32747) resolves `_declared_node_heap_bytes`
+# ONCE and passes it into `resolve_worker_memory_max` as
+# `declared_heap_bytes=`, specifically so the resolver does not re-scan the
+# repo (and re-emit its "BLT:"/"no --max-old-space-size" log lines) a
+# second time. Every other test in this module calls the resolver with the
+# `_UNSET` default and lets it scan for itself — none of them exercise the
+# caller-supplied branch that is the real production call site's actual
+# path.
+
+def test_explicit_declared_heap_bytes_skips_the_repo_scan(leerie, repo_root, monkeypatch):
+    """Passing a pre-resolved `declared_heap_bytes` must not trigger a
+    second `_declared_node_heap_bytes` scan of the repo — that is the
+    entire point of the parameter (leerie.py:5970-5979). Prove it by
+    making a second scan explode."""
+    monkeypatch.setattr(leerie, "_auto_worker_memory_max",
+                        lambda max_parallel: 6 * 1024**3)
+
+    def _boom(_repo_root):
+        raise AssertionError("resolve_worker_memory_max re-scanned the "
+                              "repo despite an explicit declared_heap_bytes")
+
+    monkeypatch.setattr(leerie, "_declared_node_heap_bytes", _boom)
+
+    result = leerie.resolve_worker_memory_max(
+        repo_root, max_parallel=4, declared_heap_bytes=8192 * 1024 * 1024)
+    needed = 8192 * 1024 * 1024 + leerie._NODE_HEAP_HEADROOM_BYTES
+    assert result == needed
+
+
+def test_explicit_declared_heap_bytes_none_also_skips_the_scan(leerie, repo_root, monkeypatch):
+    """The caller-supplied value can legitimately be `None` (repo scanned
+    once by the caller, found no declared heap) — that must also bypass a
+    second scan and fall straight through to the auto-derived ceiling."""
+    monkeypatch.setattr(leerie, "_auto_worker_memory_max",
+                        lambda max_parallel: 6 * 1024**3)
+
+    def _boom(_repo_root):
+        raise AssertionError("resolve_worker_memory_max re-scanned the "
+                              "repo despite an explicit declared_heap_bytes=None")
+
+    monkeypatch.setattr(leerie, "_declared_node_heap_bytes", _boom)
+
+    result = leerie.resolve_worker_memory_max(
+        repo_root, max_parallel=4, declared_heap_bytes=None)
+    assert result == 6 * 1024**3
