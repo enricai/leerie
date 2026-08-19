@@ -12,12 +12,7 @@ real container, and sources the relevant block from the launcher verbatim.
 from __future__ import annotations
 
 import os
-import re
 import subprocess
-from pathlib import Path
-
-REPO_ROOT = Path(__file__).resolve().parent.parent
-LAUNCHER = REPO_ROOT / "leerie"
 
 # Both halves are EXTRACTED from the launcher, not reproduced. The copy this
 # replaced was materially stale against `leerie`'s real `_run_argv` array —
@@ -28,16 +23,8 @@ LAUNCHER = REPO_ROOT / "leerie"
 # None of that flipped an assertion, which is the point: the tests were
 # blind, not wrong. They would pass identically if the launcher dropped the
 # state mount tomorrow — the exact regression this file exists to catch.
+from tests.launcher_argv_extract import extract_run_argv
 from tests.test_resolve_state_dir import _extract_state_dir_block
-
-
-def _extract_run_argv() -> str:
-    """The real `nerdctl run` argv array, lifted verbatim. Same marker pair
-    `tests/test_launcher_env_forwarding.py` already uses."""
-    src = LAUNCHER.read_text()
-    m = re.search(r"(  _run_argv=\(\n.*?\n  \)\n)", src, re.DOTALL)
-    assert m, "could not locate the _run_argv array in the launcher"
-    return m.group(1)
 
 
 # The extracted argv references many launcher-scope variables; stub the ones
@@ -67,7 +54,7 @@ ROOTLESS_SECOPT=()
 REWRITTEN_ARGS=()
 _leerie_env_args=()
 """
-    + _extract_run_argv()
+    + extract_run_argv()
     + '\nnerdctl run "${_run_argv[@]}"\n'
 )
 
