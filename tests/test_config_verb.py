@@ -52,25 +52,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.config_arm_extract import extract_config_arm as _extract_config_arm
+
 # Directory of the running interpreter — put on PATH for the end-to-end
 # recapture tests so the real orchestrator's runtime deps (tenacity, …)
 # resolve when the seam imports orchestrator/leerie.py.
 _PYBIN = str(Path(sys.executable).parent)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-
-
-def _extract_config_arm() -> str:
-    """Return the real `config)` case-arm body (including the `config)`
-    pattern and trailing `;;`) verbatim from the shipped launcher. See
-    module docstring for the body-blindness rationale and the live
-    falsification result."""
-    launcher_text = (REPO_ROOT / "leerie").read_text()
-    start_marker = "  config)\n"
-    end_marker = "\n  list)"
-    s = launcher_text.index(start_marker)
-    e = launcher_text.index(end_marker, s)
-    return launcher_text[s:e]
 
 
 def _make_stub_bin(tmp_path: Path) -> tuple[Path, Path, Path]:

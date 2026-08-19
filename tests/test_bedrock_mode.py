@@ -9,8 +9,9 @@ Closing this gap here so a future edit to the shared AUTH_MOUNTS/heredoc
 region doesn't silently regress the SSO path.
 
 Extracts detect_bedrock_mode()/bedrock_preflight() verbatim from the
-launcher (same discipline as test_bedrock_bearer_token.py's
-_extract_bedrock_functions) so the tests exercise real code, not a copy.
+launcher via tests/bedrock_extract.py's extract_bedrock_functions() (shared
+with test_bedrock_bearer_token.py) so the tests exercise real code, not a
+copy.
 """
 from __future__ import annotations
 
@@ -18,6 +19,10 @@ import json
 import shutil
 import subprocess
 from pathlib import Path
+
+# One shared extraction of detect_bedrock_mode()/bedrock_preflight() — see
+# tests/bedrock_extract.py for why it is not re-implemented per consumer.
+from tests.bedrock_extract import extract_bedrock_functions
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -30,16 +35,6 @@ LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
 # Resolve a modern bash so these tests exercise the same logic the launcher
 # itself runs under in practice (its own shebang is `#!/usr/bin/env bash`).
 _BASH = shutil.which("bash") or "/bin/bash"
-
-
-def _extract_bedrock_functions() -> str:
-    src = LAUNCHER.read_text()
-    start = src.index("detect_bedrock_mode() {")
-    end = src.index("\n}\n", src.index("bedrock_preflight() {")) + len("\n}\n")
-    block = src[start:end]
-    assert "detect_bedrock_mode() {" in block
-    assert "bedrock_preflight() {" in block
-    return block
 
 
 _DETECT_HARNESS = r"""
@@ -98,7 +93,7 @@ def _run_detect(tmp_path: Path, *, user_settings: dict | None = None,
     harness = (
         _DETECT_HARNESS
         .replace("__LOG_SH__", str(LOG_SH))
-        .replace("__BEDROCK_FUNCTIONS__", _extract_bedrock_functions())
+        .replace("__BEDROCK_FUNCTIONS__", extract_bedrock_functions())
         .replace("__HOME__", str(fake_home))
         .replace("__USER_REPO__", str(user_repo))
     )
@@ -135,7 +130,7 @@ def _run_preflight(tmp_path: Path, *, aws_on_path: bool, aws_succeeds: bool = Tr
     harness = (
         _PREFLIGHT_HARNESS
         .replace("__LOG_SH__", str(LOG_SH))
-        .replace("__BEDROCK_FUNCTIONS__", _extract_bedrock_functions())
+        .replace("__BEDROCK_FUNCTIONS__", extract_bedrock_functions())
         .replace("__HOME__", str(fake_home))
         .replace("__USER_REPO__", str(user_repo))
     )
@@ -198,7 +193,7 @@ def test_malformed_settings_json_tolerated(tmp_path: Path) -> None:
     harness = (
         _DETECT_HARNESS
         .replace("__LOG_SH__", str(LOG_SH))
-        .replace("__BEDROCK_FUNCTIONS__", _extract_bedrock_functions())
+        .replace("__BEDROCK_FUNCTIONS__", extract_bedrock_functions())
         .replace("__HOME__", str(fake_home))
         .replace("__USER_REPO__", str(user_repo))
     )
