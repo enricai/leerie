@@ -19,6 +19,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from tests.dockerfile_autogen_extract import extract_autogen_block as _extract_autogen_block
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # ---------------------------------------------------------------------------
@@ -27,15 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def _launcher_text() -> str:
     return (REPO_ROOT / "leerie").read_text()
-
-
-def _extract_autogen_block(text: str) -> str:
-    """Extract the per-repo image block from the launcher verbatim."""
-    marker_start = "# --- per-repo derived image (local nerdctl) "
-    marker_end = "\n# --- translate --inspect-dir paths"
-    s = text.index(marker_start)
-    e = text.index(marker_end, s)
-    return text[s:e]
 
 
 _HARNESS_PREFIX = r"""
