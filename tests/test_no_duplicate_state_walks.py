@@ -78,6 +78,27 @@ def test_the_owner_actually_contains_it() -> None:
         f"matching nothing, so its result above is meaningless")
 
 
+def test_scan_actually_detects_a_planted_stray(tmp_path, monkeypatch) -> None:
+    """`test_only_the_owner_derives_the_state_init_split` never fires its
+    `strays` branch on this repo's real tests/ tree (there are, by design,
+    zero unauthorized copies right now), so nothing proves
+    `_files_matching_marker` would actually catch a reintroduced duplicate
+    walk. Drive it against a temp tree holding a planted second copy of
+    the marker under a non-owner filename."""
+    monkeypatch.setattr("tests.test_no_duplicate_state_walks.TESTS_DIR",
+                         tmp_path)
+    (tmp_path / OWNER).write_text(f"# owner\n{_MARKER}\n")
+    (tmp_path / "test_fake_reimplementation.py").write_text(
+        f"# stray copy\n{_MARKER}\n")
+    (tmp_path / "test_fake_clean.py").write_text("def test_noop():\n    pass\n")
+
+    hits = _files_matching_marker()
+
+    assert hits[OWNER] == 1
+    assert hits["test_fake_reimplementation.py"] == 1
+    assert "test_fake_clean.py" not in hits
+
+
 def test_the_shared_walk_is_actually_used() -> None:
     """A single owner nobody imports is dead code, not deduplication."""
     importers = [

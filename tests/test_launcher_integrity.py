@@ -106,6 +106,66 @@ def _files_checking_launcher_syntax() -> list[str]:
     return out
 
 
+def _argv_expr(src: str) -> ast.expr:
+    """Parse `src` as a bare expression (a list literal) for feeding
+    straight into `_checks_launcher_syntax`."""
+    return ast.parse(src, mode="eval").body
+
+
+def test_checks_launcher_syntax_true_on_the_real_shape() -> None:
+    assert _checks_launcher_syntax(
+        _argv_expr('["bash", "-n", str(LAUNCHER)]'))
+
+
+def test_checks_launcher_syntax_false_on_non_list_argv() -> None:
+    """The predicate requires an `ast.List` — a name or call is not one,
+    even if it would resolve to an equivalent list at runtime."""
+    assert not _checks_launcher_syntax(_argv_expr("some_argv_variable"))
+
+
+def test_checks_launcher_syntax_false_without_dash_n() -> None:
+    assert not _checks_launcher_syntax(
+        _argv_expr('["bash", str(LAUNCHER)]'))
+
+
+def test_checks_launcher_syntax_false_without_bash() -> None:
+    assert not _checks_launcher_syntax(
+        _argv_expr('["sh", "-n", str(LAUNCHER)]'))
+
+
+def test_checks_launcher_syntax_false_on_a_different_target() -> None:
+    """The discriminator this test guards is exactly the one the
+    module docstring calls out: `container-entry.sh` is bash-n-checked
+    elsewhere in the suite and must not be mistaken for the launcher just
+    because both calls share the `["bash", "-n", ...]` shape."""
+    assert not _checks_launcher_syntax(
+        _argv_expr('["bash", "-n", str(CONTAINER_ENTRY)]'))
+
+
+def test_scan_does_not_flag_a_bash_n_check_of_a_different_script(tmp_path, monkeypatch) -> None:
+    """Positive/negative pair for the whole-directory scan
+    (`_files_checking_launcher_syntax`), mirroring the sibling guard files'
+    discipline: a planted file that runs `bash -n` on something other than
+    the launcher must not count as coverage."""
+    monkeypatch.setattr("tests.test_launcher_integrity.TESTS_DIR", tmp_path)
+    (tmp_path / "test_fake_other_script.py").write_text(
+        'import subprocess\n'
+        'def test_x():\n'
+        '    subprocess.run(["bash", "-n", "container-entry.sh"])\n'
+    )
+    (tmp_path / "test_fake_launcher_check.py").write_text(
+        'import subprocess\n'
+        'LAUNCHER = "leerie"\n'
+        'def test_x():\n'
+        '    subprocess.run(["bash", "-n", LAUNCHER])\n'
+    )
+
+    checkers = _files_checking_launcher_syntax()
+
+    assert "test_fake_other_script.py" not in checkers
+    assert "test_fake_launcher_check.py" in checkers
+
+
 def test_launcher_syntax_check_is_not_silently_dropped() -> None:
     """Someone must still be running `bash -n` on the launcher.
 
