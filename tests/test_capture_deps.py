@@ -1209,16 +1209,17 @@ class TestCancelArmWiring:
     def test_keyboard_interrupt_arm_invokes_capture(self, leerie):
         import inspect
         src = inspect.getsource(leerie.main)
-        # Locate the KeyboardInterrupt except block and verify capture_repo_deps
-        # appears between it and the exit_code = 130 assignment.
+        # Locate the KeyboardInterrupt except block and verify the shared
+        # best-effort capture helper (refactor-001) appears between it and
+        # the exit_code = 130 assignment.
         ki_idx = src.find("except KeyboardInterrupt:")
         assert ki_idx != -1, "main() must have a KeyboardInterrupt handler"
         exit_130_idx = src.find("exit_code = 130", ki_idx)
         assert exit_130_idx != -1, "KeyboardInterrupt arm must set exit_code = 130"
         arm_src = src[ki_idx:exit_130_idx]
-        assert "capture_repo_deps" in arm_src, (
-            "KeyboardInterrupt arm in main() must invoke capture_repo_deps "
-            "before setting exit_code = 130"
+        assert "_best_effort_capture_deps" in arm_src, (
+            "KeyboardInterrupt arm in main() must invoke "
+            "_best_effort_capture_deps before setting exit_code = 130"
         )
 
     def test_interrupted_by_signal_arm_invokes_capture(self, leerie):
@@ -1232,8 +1233,9 @@ class TestCancelArmWiring:
         assert signum_idx != -1, (
             "InterruptedBySignal arm must resolve signum after capture")
         arm_src = src[ibs_idx:signum_idx]
-        assert "capture_repo_deps" in arm_src, (
-            "InterruptedBySignal arm in main() must invoke capture_repo_deps"
+        assert "_best_effort_capture_deps" in arm_src, (
+            "InterruptedBySignal arm in main() must invoke "
+            "_best_effort_capture_deps"
         )
 
 

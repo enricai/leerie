@@ -1,8 +1,10 @@
 """Source-coupling pins for the dep_capture wiring seams.
 
 Pins three orchestrator seams that are only verifiable by source inspection:
-  1. main()'s KeyboardInterrupt arm invokes capture_repo_deps inside its own
-     asyncio.run() wrapped in a non-fatal try/except.
+  1. main()'s KeyboardInterrupt arm invokes the shared best-effort capture
+     helper (`_best_effort_capture_deps`, refactor-001) inside asyncio.run();
+     the helper itself (not the call site) owns the non-fatal try/except
+     around `capture_repo_deps`, since every terminating arm shares it.
   2. main()'s InterruptedBySignal arm does the same (same asyncio.run pattern).
   3. _run_phases() calls _backstop_capture_prior_runs before phase_classify at
      run-start (covers SIGKILL / crash where no cancel-arm window existed).
@@ -26,12 +28,15 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # ---------------------------------------------------------------------------
 
 class TestKeyboardInterruptArm:
-    """main()'s KeyboardInterrupt arm must call capture_repo_deps inside its
-    own asyncio.run() and wrap the call in a non-fatal try/except Exception.
+    """main()'s KeyboardInterrupt arm must call the shared best-effort
+    capture helper inside its own asyncio.run().
 
     The cancel-arm capture is inert without this wiring (DESIGN §6½).
     Mirrors the existing TestCancelArmWiring check but pins the asyncio.run
-    and try/except structure that makes the call non-fatal and self-contained."""
+    structure that makes the call self-contained. Non-fatal-ness is owned by
+    `_best_effort_capture_deps` itself (refactor-001 — every terminating arm
+    shares one helper rather than six copies of the same try/except), and is
+    pinned separately by TestBestEffortCaptureDepsHelper below."""
 
     def _arm_src(self, leerie) -> str:
         """Extract source slice from 'except KeyboardInterrupt:' to exit_code = 130."""
@@ -48,47 +53,32 @@ class TestKeyboardInterruptArm:
         event loop has exited, so a bare await would fail at runtime."""
         arm = self._arm_src(leerie)
         assert "asyncio.run(" in arm, (
-            "KeyboardInterrupt arm must invoke capture_repo_deps via asyncio.run(); "
-            "the event loop has already exited at this point so a bare await fails."
+            "KeyboardInterrupt arm must invoke the capture helper via "
+            "asyncio.run(); the event loop has already exited at this "
+            "point so a bare await fails."
         )
 
-    def test_keyboard_interrupt_arm_calls_capture_inside_asyncio_run(self, leerie):
-        """asyncio.run must contain capture_repo_deps (not some other coroutine)."""
+    def test_keyboard_interrupt_arm_calls_capture_helper_inside_asyncio_run(
+            self, leerie):
+        """asyncio.run must contain the shared capture helper (not some
+        other coroutine)."""
         arm = self._arm_src(leerie)
         asyncio_run_idx = arm.find("asyncio.run(")
         assert asyncio_run_idx != -1
-        # capture_repo_deps must appear on or after the asyncio.run( call.
-        capture_idx = arm.find("capture_repo_deps(", asyncio_run_idx)
+        # The helper must appear on or after the asyncio.run( call.
+        capture_idx = arm.find("_best_effort_capture_deps(", asyncio_run_idx)
         assert capture_idx != -1, (
-            "asyncio.run() in the KeyboardInterrupt arm must call capture_repo_deps"
-        )
-
-    def test_keyboard_interrupt_arm_has_nonfatal_try_except(self, leerie):
-        """The asyncio.run(capture_repo_deps) call must be inside a
-        try/except Exception block so a capture failure never blocks the exit."""
-        arm = self._arm_src(leerie)
-        try_idx = arm.find("try:")
-        assert try_idx != -1, (
-            "KeyboardInterrupt arm must contain a try: block around "
-            "asyncio.run(capture_repo_deps()) to keep capture non-fatal"
-        )
-        capture_idx = arm.find("capture_repo_deps(", try_idx)
-        assert capture_idx != -1, (
-            "capture_repo_deps must appear after the try: in the "
-            "KeyboardInterrupt arm"
-        )
-        except_idx = arm.find("except Exception", capture_idx)
-        assert except_idx != -1, (
-            "KeyboardInterrupt arm must have 'except Exception' after "
-            "capture_repo_deps() to keep capture errors non-fatal"
+            "asyncio.run() in the KeyboardInterrupt arm must call "
+            "_best_effort_capture_deps"
         )
 
 
 class TestInterruptedBySignalArm:
-    """main()'s InterruptedBySignal arm (SIGTERM/SIGHUP) must call
-    capture_repo_deps inside its own asyncio.run() wrapped in try/except.
+    """main()'s InterruptedBySignal arm (SIGTERM/SIGHUP) must call the
+    shared best-effort capture helper inside its own asyncio.run().
 
-    Same non-fatal contract as the KeyboardInterrupt arm; same wiring pin."""
+    Same wiring pin as the KeyboardInterrupt arm; non-fatal-ness is owned by
+    `_best_effort_capture_deps` itself (see TestBestEffortCaptureDepsHelper)."""
 
     def _arm_src(self, leerie) -> str:
         """Extract source slice from 'except InterruptedBySignal' to
@@ -106,36 +96,63 @@ class TestInterruptedBySignalArm:
         """Must use asyncio.run() — the event loop is gone at this point."""
         arm = self._arm_src(leerie)
         assert "asyncio.run(" in arm, (
-            "InterruptedBySignal arm must invoke capture_repo_deps via asyncio.run()"
+            "InterruptedBySignal arm must invoke the capture helper via "
+            "asyncio.run()"
         )
 
-    def test_interrupted_by_signal_arm_calls_capture_inside_asyncio_run(self, leerie):
-        """asyncio.run must contain capture_repo_deps."""
+    def test_interrupted_by_signal_arm_calls_capture_helper_inside_asyncio_run(
+            self, leerie):
+        """asyncio.run must contain the shared capture helper."""
         arm = self._arm_src(leerie)
         asyncio_run_idx = arm.find("asyncio.run(")
         assert asyncio_run_idx != -1
-        capture_idx = arm.find("capture_repo_deps(", asyncio_run_idx)
+        capture_idx = arm.find("_best_effort_capture_deps(", asyncio_run_idx)
         assert capture_idx != -1, (
-            "asyncio.run() in the InterruptedBySignal arm must call capture_repo_deps"
+            "asyncio.run() in the InterruptedBySignal arm must call "
+            "_best_effort_capture_deps"
         )
 
-    def test_interrupted_by_signal_arm_has_nonfatal_try_except(self, leerie):
-        """Non-fatal try/except Exception must wrap the capture call."""
-        arm = self._arm_src(leerie)
-        try_idx = arm.find("try:")
+
+class TestBestEffortCaptureDepsHelper:
+    """`_best_effort_capture_deps` (refactor-001) is the single owner of the
+    non-fatal try/except every terminating arm previously hand-rolled.
+
+    Six verbatim copies of `except (Exception, KeyboardInterrupt,
+    TerminalAuthFailure, RateLimitedExit, ContextOverflow, DiskLowSpace)`
+    around `capture_repo_deps` collapsed into one helper; this pins the
+    helper's own body carries the try/except (rather than merely being
+    called by every arm), so the non-fatal guarantee lives in one place."""
+
+    def _helper_src(self, leerie) -> str:
+        return inspect.getsource(leerie._best_effort_capture_deps)
+
+    def test_helper_calls_capture_repo_deps(self, leerie):
+        src = self._helper_src(leerie)
+        assert "capture_repo_deps(" in src, (
+            "_best_effort_capture_deps must call capture_repo_deps"
+        )
+
+    def test_helper_wraps_capture_in_nonfatal_try_except(self, leerie):
+        src = self._helper_src(leerie)
+        try_idx = src.find("try:")
         assert try_idx != -1, (
-            "InterruptedBySignal arm must contain a try: block around "
-            "asyncio.run(capture_repo_deps())"
+            "_best_effort_capture_deps must contain a try: block around "
+            "capture_repo_deps() to keep capture non-fatal"
         )
-        capture_idx = arm.find("capture_repo_deps(", try_idx)
+        capture_idx = src.find("capture_repo_deps(", try_idx)
         assert capture_idx != -1, (
-            "capture_repo_deps must appear after try: in the "
-            "InterruptedBySignal arm"
+            "capture_repo_deps must appear after the try: in "
+            "_best_effort_capture_deps"
         )
-        except_idx = arm.find("except Exception", capture_idx)
+        except_idx = src.find(
+            "except (Exception, KeyboardInterrupt, TerminalAuthFailure,",
+            capture_idx)
         assert except_idx != -1, (
-            "InterruptedBySignal arm must have 'except Exception' after "
-            "capture_repo_deps() so capture errors are non-fatal"
+            "_best_effort_capture_deps must catch the full "
+            "(Exception, KeyboardInterrupt, TerminalAuthFailure, "
+            "RateLimitedExit, ContextOverflow, DiskLowSpace) family after "
+            "capture_repo_deps() so capture errors never escape a "
+            "terminating arm"
         )
 
 

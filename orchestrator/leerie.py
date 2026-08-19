@@ -13204,6 +13204,44 @@ def _save_state_best_effort(st: "State", where: str) -> None:
             "stands and `leerie resume` still works from it")
 
 
+async def _best_effort_capture_deps(
+        repo_root: Path,
+        st: "State",
+        caps: dict | None,
+        models: dict[str, str] | None,
+        efforts: dict[str, str | None] | None,
+        context_label: str,
+) -> None:
+    """Run dep_capture best-effort from a `main()` terminal exception arm.
+
+    Every terminating arm in `main()` attempts `capture_repo_deps` on its way
+    out (DESIGN §6½) and must swallow the same exception family:
+    `TerminalAuthFailure` / `RateLimitedExit` / `ContextOverflow` /
+    `DiskLowSpace` deliberately subclass `BaseException`, so a bare `except
+    Exception` would let a re-raise (e.g. the auth-locked arm is *guaranteed*
+    to re-hit its own TerminalAuthFailure inside `capture_repo_deps ->
+    claude_p`) escape `main()` entirely, skipping the `exit_code` assignment
+    and crashing a resumable pause with exit 1. `KeyboardInterrupt` is IN the
+    tuple for the same reason: a terminal arm exists to record a disposition,
+    so a second Ctrl-C during this best-effort capture must not escape and
+    skip the exit_code/cleanup that arm was reached to set
+    (docs/POSTMORTEM-2026-08-14.md, F15).
+
+    `context_label` is interpolated into the non-fatal log line only — it
+    names which pause this capture attempt belongs to (e.g. "disk-low
+    pause", "cancel-arm capture").
+    """
+    try:
+        await capture_repo_deps(
+            repo_root, st,
+            caps=caps, models=models, efforts=efforts,
+        )
+    except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
+        log(f"capture: non-fatal error during {context_label} "
+            f"({_cap_exc})")
+
+
 def _brief_worker_exc(exc: BaseException) -> str:
     """Render a worker-spawn failure for a log line, WITHOUT the argv.
 
@@ -33101,23 +33139,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # auth-locked arm documents below: these subclass BaseException, and a
         # re-raise escaping here would skip the `exit_code` assignment and
         # crash the run with exit 1 instead of pausing resumably.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during context-overflow pause "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "context-overflow pause"))
         exit_code = EXIT_LOCKED
 
     except DiskLowSpace as e:
@@ -33159,23 +33182,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # auth-locked arm documents below: these subclass BaseException, and a
         # re-raise escaping here would skip the `exit_code` assignment and
         # crash the run with exit 1 instead of pausing resumably.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during disk-low pause "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "disk-low pause"))
         # `exit_code` / `abnormal` are deliberately NOT set here — they are
         # set at the top of this arm, before the guarded save, so that every
         # statement below them is best-effort.
@@ -33201,30 +33209,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             log(f"cleanup failed (non-fatal): {cleanup_err}")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Non-fatal. Mirrors the RateLimitedExit post-loop pattern.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # The auth-locked pause is *guaranteed* to re-hit the same terminal
-        # auth failure inside capture_repo_deps -> claude_p. Every member of
-        # the exit-signal family (TerminalAuthFailure, RateLimitedExit,
-        # ContextOverflow) subclasses BaseException, so a bare
-        # `except Exception` cannot catch the re-raise: it would escape main()
-        # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
-        # crash the run with exit 1 — defeating this whole resumable-pause arm.
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during auth-locked pause "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "auth-locked pause"))
         exit_code = EXIT_LOCKED
     except RateLimitedExit as e:
         # Claude Code session-limit / rate-limit (or out-of-credits mid-stream
@@ -33267,19 +33253,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 log(f"cleanup failed (non-fatal): {cleanup_err}")
             # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
             # Non-fatal. Mirrors the cancel-arm pattern.
-            try:
-                asyncio.run(capture_repo_deps(
-                    repo_root, st,
-                    caps=caps, models=models, efforts=efforts,
-                ))
-            # Same escape hazard as the auth-locked arm: TerminalAuthFailure /
-            # RateLimitedExit are BaseException subclasses a bare
-            # `except Exception` misses, which would skip the `exit_code =
-            # EXIT_LOCKED` below and crash the pause with exit 1.
-            except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                    RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-                log(f"capture: non-fatal error during out-of-credits pause "
-                    f"({_cap_exc})")
+            asyncio.run(_best_effort_capture_deps(
+                repo_root, st, caps, models, efforts, "out-of-credits pause"))
             exit_code = EXIT_LOCKED
         else:
             log(f"rate-limited: {e.raw_message}")
@@ -33320,27 +33295,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Mirrors the RateLimitedExit post-loop pattern. Non-fatal.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # TerminalAuthFailure / RateLimitedExit / ContextOverflow are
-        # BaseException subclasses a
-        # bare `except Exception` misses; catching them keeps capture non-fatal
-        # so the cancel arm still reaches its `exit_code = 130`.
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during cancel-arm capture "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "cancel-arm capture"))
         exit_code = 130
     except InterruptedBySignal as e:
         # SIGTERM / SIGHUP → external orchestration (CI cancel, systemd
@@ -33353,27 +33309,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Non-fatal.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # TerminalAuthFailure / RateLimitedExit / ContextOverflow are
-        # BaseException subclasses a
-        # bare `except Exception` misses; catching them keeps capture non-fatal
-        # so the signal arm still reaches its `exit_code = 128 + signum`.
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during signal-arm capture "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "signal-arm capture"))
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
         signum = getattr(signal, str(e), None)
         exit_code = (128 + int(signum)) if signum else 1

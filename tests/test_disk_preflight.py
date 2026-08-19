@@ -296,7 +296,7 @@ class TestMainHandlesDiskLowSpace:
 
     def test_runs_a_guarded_dep_capture_like_its_siblings(self):
         arm = self._arm()
-        assert "capture_repo_deps(" in arm, (
+        assert "_best_effort_capture_deps(" in arm, (
             "the DiskLowSpace arm skips the best-effort dep capture its "
             "sibling terminating arms all perform")
 
