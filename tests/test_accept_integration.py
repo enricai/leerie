@@ -141,6 +141,76 @@ def test_errors_on_missing_state_file(tmp_path):
     assert "no state.json" in r.stderr
 
 
+def test_errors_on_missing_run_dir(tmp_path):
+    """No run dir at all -- distinct from test_errors_on_missing_state_file
+    above, which has a run dir but no state.json inside it."""
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(tmp_path)
+    r = subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-integration", "never-existed",
+         "feat-001", "--runtime", "local"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert "no run dir" in r.stderr
+
+
+def test_rejects_invalid_runtime_value(tmp_path):
+    sf = _make_state(
+        tmp_path,
+        {"feat-001": {"defects": ["x"], "advisories": [],
+                      "merge_commit_sha": "a", "accepted": False}})
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(sf.parent.parent.parent)
+    run_id = sf.parent.name
+    r = subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-integration", run_id, "feat-001",
+         "--runtime", "bogus"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert "must be 'local', 'fly', or 'ec2'" in (r.stdout + r.stderr)
+    assert json.loads(sf.read_text())["integration_gate"]["feat-001"]["accepted"] is False
+
+
+def test_fly_runtime_requires_app_env(tmp_path):
+    sf = _make_state(
+        tmp_path,
+        {"feat-001": {"defects": ["x"], "advisories": [],
+                      "merge_commit_sha": "a", "accepted": False}})
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(sf.parent.parent.parent)
+    env.pop("LEERIE_FLY_APP", None)
+    run_id = sf.parent.name
+    r = subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-integration", run_id, "feat-001",
+         "--runtime", "fly"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert "LEERIE_FLY_APP is required" in (r.stdout + r.stderr)
+    assert json.loads(sf.read_text())["integration_gate"]["feat-001"]["accepted"] is False
+
+
+def test_records_accepted_defects_and_timestamp(tmp_path):
+    """The accepted-finding record must preserve what was waived (the
+    dropped defects list) and when, not just flip the bool
+    (docs/POSTMORTEM-2026-08-14.md, F16)."""
+    sf = _make_state(
+        tmp_path,
+        {"feat-001": {"defects": ["INTEGRATION_DEFECT dropped call site"],
+                      "advisories": [], "merge_commit_sha": "abc123",
+                      "accepted": False}},
+        integration_defects={"feat-001": ["INTEGRATION_DEFECT dropped call site"]},
+    )
+    r = _run_accept(sf, "feat-001")
+    assert r.returncode == 0, r.stderr
+    entry = json.loads(sf.read_text())["integration_gate"]["feat-001"]
+    assert entry["accepted"] is True
+    assert entry["accepted_at"]
+    assert entry["accepted_defects"] == ["INTEGRATION_DEFECT dropped call site"]
+
+
 def test_rejects_invalid_sid_before_touching_filesystem(tmp_path):
     sf = _make_state(
         tmp_path,

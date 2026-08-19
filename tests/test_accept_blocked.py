@@ -393,6 +393,96 @@ def test_force_still_rejects_a_sid_not_in_the_plan(tmp_path):
     assert "test-999" not in st["subtask_status"]
 
 
+def test_errors_on_missing_run_dir(tmp_path):
+    """No run dir at all -- the check that runs before _ab_state_file is
+    even built. Distinct from test_errors_on_missing_state_file below,
+    which has a run dir but no state.json inside it."""
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(tmp_path)
+    r = subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-blocked", "never-existed", "s1",
+         "--runtime", "local"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert "no run dir" in r.stderr
+
+
+def test_errors_on_missing_state_file(tmp_path):
+    """Run dir exists but state.json does not -- the local-path guard
+    right before the mutation is invoked."""
+    run_dir = tmp_path / "runs" / "test-run-001"
+    run_dir.mkdir(parents=True)
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(tmp_path)
+    r = subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-blocked", "test-run-001", "s1",
+         "--runtime", "local"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert "no state.json" in r.stderr
+
+
+def test_rejects_invalid_runtime_value(tmp_path):
+    sf = _make_state(tmp_path, {"s1": "blocked"})
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(sf.parent.parent.parent)
+    run_id = sf.parent.name
+    r = subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-blocked", run_id, "s1",
+         "--runtime", "bogus"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert "must be 'local', 'fly', or 'ec2'" in (r.stdout + r.stderr)
+    # No mutation happened.
+    assert json.loads(sf.read_text())["subtask_status"]["s1"] == "blocked"
+
+
+def test_fly_runtime_requires_app_env(tmp_path):
+    """`--runtime fly` with no LEERIE_FLY_APP set fails before flyctl is
+    ever invoked -- pin the guard rather than only its happy path."""
+    sf = _make_state(tmp_path, {"s1": "blocked"})
+    env = {k: v for k, v in os.environ.items()}
+    env["LEERIE_STATE_DIR"] = str(sf.parent.parent.parent)
+    env.pop("LEERIE_FLY_APP", None)
+    run_id = sf.parent.name
+    r = subprocess.run(
+        [str(REPO_ROOT / "leerie"), "accept-blocked", run_id, "s1",
+         "--runtime", "fly"],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert r.returncode != 0
+    assert "LEERIE_FLY_APP is required" in (r.stdout + r.stderr)
+    assert json.loads(sf.read_text())["subtask_status"]["s1"] == "blocked"
+
+
+def test_records_waiver_metadata_on_accept(tmp_path):
+    """The accepted_blocked record (docs/POSTMORTEM-2026-08-14.md, F16) must
+    carry enough to reconstruct what was waived, not just that it was."""
+    sf = _make_state(tmp_path, {"s1": "blocked"}, blocked={"s1": "needs postgres"})
+    r = _run_accept(sf, "s1")
+    assert r.returncode == 0, r.stderr
+    st = json.loads(sf.read_text())
+    rec = st["accepted_blocked"]["s1"]
+    assert rec["previous_status"] == "blocked"
+    assert rec["blocker"] == "needs postgres"
+    assert rec["forced"] is False
+    assert rec["at"]
+
+
+def test_records_forced_true_when_force_used(tmp_path):
+    sf = _make_state(tmp_path, {"test-015": "in_progress"}, blocked={},
+                     waves=[["test-015"]])
+    r = _run_accept(sf, "test-015", force=True)
+    assert r.returncode == 0, r.stderr
+    st = json.loads(sf.read_text())
+    rec = st["accepted_blocked"]["test-015"]
+    assert rec["forced"] is True
+    assert rec["blocker"] is None
+
+
 def test_force_reaches_every_transport(tmp_path):
     """`--force` must be threaded through ALL of accept-blocked's transports.
 
