@@ -113,33 +113,10 @@ _ec2_seed_repo_preflight() {
 # ---------------------------------------------------------------------------
 # _seed_use_shallow / _seed_branch_shallow_safe
 #
-# Transport-independent decisions — identical logic to seed-repo.sh's
-# functions of the same name (DESIGN §6 *Shallow seeding for heavy
-# repos*: depth/threshold/branch-safety are runtime-agnostic knobs). Not
-# sourced from seed-repo.sh (this file must stay independently
-# sourceable without pulling in Fly-specific lib.sh state); duplicated
-# here verbatim instead — mirror any change in seed-repo.sh here too.
+# Defined in scripts/remote/seed-common.sh, sourced transitively via
+# ec2-lib.sh above (single definition site, shared with seed-repo.sh's
+# functions of the same name via lib.sh).
 # ---------------------------------------------------------------------------
-_seed_use_shallow() {
-  local _depth="${LEERIE_SEED_DEPTH:-0}" _thresh="${LEERIE_SEED_SHALLOW_THRESHOLD_MB:-200}" _git_kb
-  case "$_depth" in ''|*[!0-9]*|0) return 1 ;; esac
-  case "$_thresh" in ''|*[!0-9]*|0) return 1 ;; esac
-  # .git size in KB. --git-dir handles worktrees / .git-file layouts.
-  local _gitdir
-  _gitdir="$(git -C "$USER_REPO" rev-parse --git-dir 2>/dev/null)" || return 1
-  case "$_gitdir" in /*) : ;; *) _gitdir="$USER_REPO/$_gitdir" ;; esac
-  _git_kb="$(du -sk "$_gitdir" 2>/dev/null | awk '{print $1}')" || return 1
-  case "$_git_kb" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$_git_kb" -gt "$(( _thresh * 1024 ))" ]
-}
-
-_seed_branch_shallow_safe() {
-  case "$1" in
-    ''|*[!A-Za-z0-9/._-]*) return 1 ;;
-    *__PARENT_MATERIALIZE__*|*__CLEANUP_TMP__*) return 1 ;;
-    *) return 0 ;;
-  esac
-}
 
 # ---------------------------------------------------------------------------
 # _ec2_pipe_file_via_tar <local-file> <remote-name>

@@ -177,7 +177,12 @@ def test_ec2_lib_sh_defines_transport_functions():
     src = EC2_LIB_SH.read_text()
     assert "ec2_remote_exec()" in src
     assert "ec2_tar_pipe()" in src
-    assert "_seed_timeout_prefix()" in src
+    # _seed_timeout_prefix's single definition site is
+    # scripts/remote/seed-common.sh, sourced by ec2-lib.sh — check it is
+    # reachable after sourcing ec2-lib.sh rather than defined inline here.
+    result = _run_bash(f"source {EC2_LIB_SH}; type _seed_timeout_prefix", env={})
+    assert result.returncode == 0, result.stderr
+    assert "_seed_timeout_prefix is a function" in result.stdout
 
 
 # --- ec2_remote_exec (SSM-based single-command exec) -----------------------
