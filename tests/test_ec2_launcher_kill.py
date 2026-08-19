@@ -389,3 +389,37 @@ def test_kill_with_correct_confirmation_proceeds(tmp_path):
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
     state = read_state(aws_dir)
     assert state["instances"][iid]["state"] == "terminated"
+
+
+# ---------------------------------------------------------------------------
+# Flag-parsing branches (distinct from --runtime value validation and the
+# confirmation-prompt branches above -- these are the raw `--*)` catch-all
+# and unbound-flag-value arms in kill's own arg loop).
+# ---------------------------------------------------------------------------
+
+
+def test_kill_runtime_flag_rejects_unknown_value(tmp_path):
+    env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
+    result = _run_launcher(["kill", "r1", "--runtime", "bogus", "--force"], env)
+    assert result.returncode == 1
+    assert "must be 'local', 'fly', or 'ec2'" in result.stderr
+    log = read_log(aws_dir)
+    assert not any(l.startswith("ec2 terminate-instances") for l in log)
+
+
+def test_kill_unknown_flag_errors(tmp_path):
+    env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
+    result = _run_launcher(["kill", "r1", "--bogus-flag", "--force"], env)
+    assert result.returncode == 1
+    assert "unknown kill flag" in result.stderr
+    log = read_log(aws_dir)
+    assert not any(l.startswith("ec2 terminate-instances") for l in log)
+
+
+def test_kill_unexpected_second_positional_errors(tmp_path):
+    env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
+    result = _run_launcher(["kill", "r1", "r2", "--force"], env)
+    assert result.returncode == 1
+    assert "unexpected kill arg" in result.stderr
+    log = read_log(aws_dir)
+    assert not any(l.startswith("ec2 terminate-instances") for l in log)

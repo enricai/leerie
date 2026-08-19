@@ -258,3 +258,30 @@ def test_stop_ec2_run_credential_failure_does_not_call_stop_instances(tmp_path: 
     from tests.ec2_stub import read_log
     log = read_log(aws_dir)
     assert not any("stop-instances" in line for line in log)
+
+
+def test_stop_unknown_flag_errors(tmp_path: Path) -> None:
+    """An unrecognized `--flag` (as opposed to a bad --runtime value)
+    must fail closed rather than being silently absorbed as the
+    run-id positional -- this is the flag-parsing loop's own `--*)`
+    catch-all arm, distinct from the `--runtime` value-validation arm
+    already pinned above."""
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _stub_aws(aws_dir)
+    env, _ = _env(tmp_path, aws_dir)
+    result = _run(tmp_path, ["stop", "some-run", "--bogus-flag"], env)
+    assert result.returncode == 1
+    assert "unknown stop flag" in result.stderr
+
+
+def test_stop_unexpected_second_positional_errors(tmp_path: Path) -> None:
+    """A second bare positional arg (the run-id is already bound) must
+    fail closed rather than silently overwriting or ignoring it."""
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _stub_aws(aws_dir)
+    env, _ = _env(tmp_path, aws_dir)
+    result = _run(tmp_path, ["stop", "run-a", "run-b"], env)
+    assert result.returncode == 1
+    assert "unexpected stop arg" in result.stderr
