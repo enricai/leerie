@@ -234,6 +234,26 @@ class TestExtractDepcapCommandsFiltering:
         text, _ = leerie._extract_depcap_commands(log_dir)
         assert text == ""
 
+    def test_consecutive_separator_empty_segment_does_not_crash_and_is_skipped(
+            self, leerie, tmp_path):
+        """A command with a doubled shell separator (e.g. 'a;;b') splits into
+        an empty segment via _DEPCAP_SEGMENT_RE. _is_install_command's
+        per-segment loop must skip that empty segment (`if not words:
+        continue`) rather than raise on an out-of-range words[0], and still
+        find the real install verb in the non-empty segment that follows."""
+        log_dir = tmp_path / "logs"
+        _write_log(log_dir, ["echo hi;;pip install flask"], "w-001.log")
+        text, _ = leerie._extract_depcap_commands(log_dir)
+        assert "echo hi;;pip install flask" in text
+
+    def test_trailing_separator_empty_segment_is_skipped(self, leerie, tmp_path):
+        """A trailing '&&' produces an empty final segment on split; the whole
+        command is still kept because an earlier segment is install-shaped."""
+        log_dir = tmp_path / "logs"
+        _write_log(log_dir, ["npm install &&"], "w-001.log")
+        text, _ = leerie._extract_depcap_commands(log_dir)
+        assert "npm install &&" in text
+
 
 # ---------------------------------------------------------------------------
 # Byte-budget gate (_DEPCAP_TOTAL_BUDGET)
