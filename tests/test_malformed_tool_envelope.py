@@ -82,6 +82,42 @@ def test_malformed_lines_are_skipped_not_fatal(leerie, tmp_path):
     assert leerie._detect_malformed_tool_envelope(log_path) is True
 
 
+def test_non_user_event_is_skipped(leerie, tmp_path):
+    """A line whose top-level `type` isn't `user` (e.g. an `assistant` or
+    `system` event) must be skipped, not crash the tolerant scan."""
+    log_path = tmp_path / "worker.log"
+    log_path.write_text(
+        json.dumps({"type": "assistant", "message": {"content": [
+            {"type": "tool_result", "is_error": True,
+             "content": "An unexpected parameter `Bash` was provided"},
+        ]}}) + "\n")
+    assert leerie._detect_malformed_tool_envelope(log_path) is False
+
+
+def test_non_dict_top_level_event_is_skipped(leerie, tmp_path):
+    """A JSON line that parses but isn't a dict (e.g. a bare JSON array or
+    string) must not crash the tolerant scan."""
+    log_path = tmp_path / "worker.log"
+    log_path.write_text('["not", "a", "dict"]\n' + _user_event(
+        "An unexpected parameter `Bash` was provided") + "\n")
+    assert leerie._detect_malformed_tool_envelope(log_path) is True
+
+
+def test_non_dict_content_block_is_skipped(leerie, tmp_path):
+    """A `content` list containing a non-dict entry (e.g. a bare string)
+    alongside a real block must not crash the tolerant scan."""
+    log_path = tmp_path / "worker.log"
+    log_path.write_text(json.dumps({
+        "type": "user",
+        "message": {"content": [
+            "not a dict",
+            {"type": "tool_result", "is_error": True,
+             "content": "An unexpected parameter `Bash` was provided"},
+        ]},
+    }) + "\n")
+    assert leerie._detect_malformed_tool_envelope(log_path) is True
+
+
 # --- _run_checked_loop(log_path=...) forces one retry round ---------------- #
 
 def test_checked_loop_retries_once_when_envelope_detected(leerie, tmp_path):

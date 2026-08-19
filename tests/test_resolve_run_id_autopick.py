@@ -110,6 +110,15 @@ def test_unknown_explicit_run_id_still_fails_closed(leerie, tmp_path):
         leerie.resolve_run_id(tmp_path, "e" * 64)
 
 
+def test_no_runs_at_all_dies(leerie, tmp_path):
+    """Distinct from `test_no_resumable_runs_dies_with_the_list`: this is
+    the `not runs` early branch (`_discover_runs` finds zero rows at all,
+    e.g. a fresh state dir with no `runs/` entries), not the
+    `resumable_only` filter finding zero candidates among existing runs."""
+    with pytest.raises(SystemExit):
+        leerie.resolve_run_id(tmp_path, None)
+
+
 # ---------------------------------------------------------------------------
 # the read-only consumers (--report / --phase) must NOT get the filter
 # ---------------------------------------------------------------------------

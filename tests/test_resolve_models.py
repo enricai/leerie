@@ -259,3 +259,140 @@ def test_worker_types_match_expected_set(leerie):
     # If a new worker type is added to the orchestrator, this test
     # catches that the test suite needs to extend WORKERS too.
     assert set(leerie.WORKER_TYPES) == set(WORKERS)
+
+
+# ---------------------------------------------------------------------------
+# judge / heal dedicated model chains
+#
+# judge and heal are post-run skill workers, not in WORKER_TYPES, so they
+# don't go through the WORKERS loop above (test_judge_worker_resolves_to_sonnet
+# pins only their zero-override default). Before this section,
+# resolve_models()'s dedicated judge_cli/judge_env/judge_file and
+# heal_cli/heal_env/heal_file chains (the
+# `models["judge"] = (judge_cli or judge_env or global_cli or ...)` and
+# `models["heal"] = (heal_cli or heal_env or global_cli or ...)` blocks) were
+# exercised nowhere in the suite -- neither "judge_model"/"heal_model" (the
+# CLI attrs) nor MODEL_JUDGE_ENV/LEERIE_MODEL_HEAL appear anywhere else under
+# tests/. Mirrors test_resolve_pr_writer_model.py's pattern, since judge and
+# heal share its exact precedence shape (dedicated CLI/env both sit ABOVE the
+# global CLI rung, unlike the WORKER_TYPES loop where per-worker env sits
+# below global CLI).
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def judge_heal_repo_root(tmp_path, monkeypatch):
+    monkeypatch.delenv("LEERIE_MODEL", raising=False)
+    monkeypatch.delenv("LEERIE_MODEL_JUDGE", raising=False)
+    monkeypatch.delenv("LEERIE_MODEL_HEAL", raising=False)
+    return tmp_path
+
+
+def test_judge_dedicated_env_wins_over_global_env(
+        leerie, judge_heal_repo_root, monkeypatch):
+    monkeypatch.setenv("LEERIE_MODEL", "haiku")
+    monkeypatch.setenv("LEERIE_MODEL_JUDGE", "opus")
+    models = leerie.resolve_models(judge_heal_repo_root, ns())
+    assert models["judge"] == "opus"
+
+
+def test_judge_dedicated_toml_wins_over_global_toml(
+        leerie, judge_heal_repo_root):
+    (judge_heal_repo_root / "leerie.toml").write_text(
+        "model = opus\nmodel_judge = haiku\n")
+    models = leerie.resolve_models(judge_heal_repo_root, ns())
+    assert models["judge"] == "haiku"
+
+
+def test_judge_dedicated_env_wins_over_global_cli(
+        leerie, judge_heal_repo_root, monkeypatch):
+    # Pins the actual shipped precedence: judge_env sits ABOVE global_cli,
+    # unlike the per-worker WORKER_TYPES loop.
+    monkeypatch.setenv("LEERIE_MODEL_JUDGE", "opus")
+    models = leerie.resolve_models(judge_heal_repo_root, ns(model="sonnet"))
+    assert models["judge"] == "opus"
+
+
+def test_judge_dedicated_cli_beats_everything(
+        leerie, judge_heal_repo_root, monkeypatch):
+    (judge_heal_repo_root / "leerie.toml").write_text(
+        "model = haiku\nmodel_judge = haiku\n")
+    monkeypatch.setenv("LEERIE_MODEL", "haiku")
+    monkeypatch.setenv("LEERIE_MODEL_JUDGE", "haiku")
+    models = leerie.resolve_models(
+        judge_heal_repo_root, ns(model="haiku", judge_model="opus"))
+    assert models["judge"] == "opus"
+
+
+def test_bad_judge_dedicated_env_dies(
+        leerie, judge_heal_repo_root, monkeypatch, capsys):
+    monkeypatch.setenv("LEERIE_MODEL_JUDGE", "gpt5")
+    with pytest.raises(SystemExit) as exc:
+        leerie.resolve_models(judge_heal_repo_root, ns())
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "LEERIE_MODEL_JUDGE" in err
+    assert "gpt5" in err
+
+
+def test_bad_judge_dedicated_toml_dies(leerie, judge_heal_repo_root, capsys):
+    (judge_heal_repo_root / "leerie.toml").write_text("model_judge = bogus\n")
+    with pytest.raises(SystemExit) as exc:
+        leerie.resolve_models(judge_heal_repo_root, ns())
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "model_judge" in err
+    assert "bogus" in err
+
+
+def test_heal_worker_resolves_to_sonnet_default(leerie, judge_heal_repo_root):
+    models = leerie.resolve_models(judge_heal_repo_root, ns())
+    assert models["heal"] == "sonnet"
+    assert leerie.MODEL_DEFAULT_PER_WORKER.get("heal") == "sonnet"
+
+
+def test_heal_dedicated_env_wins_over_global_env(
+        leerie, judge_heal_repo_root, monkeypatch):
+    monkeypatch.setenv("LEERIE_MODEL", "haiku")
+    monkeypatch.setenv("LEERIE_MODEL_HEAL", "opus")
+    models = leerie.resolve_models(judge_heal_repo_root, ns())
+    assert models["heal"] == "opus"
+
+
+def test_heal_dedicated_toml_wins_over_global_toml(
+        leerie, judge_heal_repo_root):
+    (judge_heal_repo_root / "leerie.toml").write_text(
+        "model = opus\nmodel_heal = haiku\n")
+    models = leerie.resolve_models(judge_heal_repo_root, ns())
+    assert models["heal"] == "haiku"
+
+
+def test_heal_dedicated_cli_beats_everything(
+        leerie, judge_heal_repo_root, monkeypatch):
+    (judge_heal_repo_root / "leerie.toml").write_text(
+        "model = haiku\nmodel_heal = haiku\n")
+    monkeypatch.setenv("LEERIE_MODEL", "haiku")
+    monkeypatch.setenv("LEERIE_MODEL_HEAL", "haiku")
+    models = leerie.resolve_models(
+        judge_heal_repo_root, ns(model="haiku", heal_model="opus"))
+    assert models["heal"] == "opus"
+
+
+def test_bad_heal_dedicated_env_dies(
+        leerie, judge_heal_repo_root, monkeypatch, capsys):
+    monkeypatch.setenv("LEERIE_MODEL_HEAL", "gpt5")
+    with pytest.raises(SystemExit) as exc:
+        leerie.resolve_models(judge_heal_repo_root, ns())
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "LEERIE_MODEL_HEAL" in err
+    assert "gpt5" in err
+
+
+def test_bad_heal_dedicated_toml_dies(leerie, judge_heal_repo_root, capsys):
+    (judge_heal_repo_root / "leerie.toml").write_text("model_heal = bogus\n")
+    with pytest.raises(SystemExit) as exc:
+        leerie.resolve_models(judge_heal_repo_root, ns())
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "model_heal" in err
+    assert "bogus" in err

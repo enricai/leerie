@@ -203,6 +203,103 @@ def test_rescue_cleans_up_temp_index_even_when_it_raises(leerie,
     assert leftovers == [], f"temp index survived an exception: {leftovers}"
 
 
+def _make_nth_call_fail_stub(real, fail_at_call, rc=1):
+    """Return a run_proc stub whose Nth invocation (1-indexed) returns a
+    nonzero-returncode CompletedProcess instead of raising — exercising
+    the `if <step>.returncode != 0: return None` guards directly, distinct
+    from `test_rescue_swallows_an_exception`'s raising-git case."""
+    calls: list[list[str]] = []
+
+    async def _stub(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == fail_at_call:
+            return subprocess.CompletedProcess(cmd, rc, stdout="", stderr="boom")
+        return await real(cmd, **kw)
+    return _stub, calls
+
+
+def test_rescue_returns_none_when_add_fails(leerie, conflicted_repo, monkeypatch):
+    """`git add -A` failing (2nd call, after read-tree) must degrade to None
+    via the returncode guard, not raise."""
+    (conflicted_repo / "f.txt").write_text("RESOLVED\n")
+    real = leerie.run_proc
+    stub, calls = _make_nth_call_fail_stub(real, fail_at_call=2)
+    monkeypatch.setattr(leerie, "run_proc", stub)
+
+    ref = _run(leerie._rescue_integrator_work(
+        conflicted_repo, "feat-006", "run1"))
+    assert ref is None
+    assert len(calls) == 2, "must stop at the failing add, not continue on"
+
+
+def test_rescue_returns_none_when_write_tree_fails(leerie, conflicted_repo,
+                                                    monkeypatch):
+    """`git write-tree` failing (3rd call) must degrade to None."""
+    (conflicted_repo / "f.txt").write_text("RESOLVED\n")
+    real = leerie.run_proc
+    stub, calls = _make_nth_call_fail_stub(real, fail_at_call=3)
+    monkeypatch.setattr(leerie, "run_proc", stub)
+
+    ref = _run(leerie._rescue_integrator_work(
+        conflicted_repo, "feat-006", "run1"))
+    assert ref is None
+    assert len(calls) == 3
+
+
+def test_rescue_returns_none_when_write_tree_prints_no_sha(leerie,
+                                                            conflicted_repo,
+                                                            monkeypatch):
+    """`write-tree` exiting 0 with empty stdout is the same "nothing usable"
+    case as a nonzero rc — the `or not tree.stdout.strip()` half of the
+    guard, not just the `tree.returncode != 0` half."""
+    (conflicted_repo / "f.txt").write_text("RESOLVED\n")
+    real = leerie.run_proc
+    calls: list[list[str]] = []
+
+    async def _stub(cmd, **kw):
+        calls.append(cmd)
+        if len(calls) == 3:
+            return subprocess.CompletedProcess(cmd, 0, stdout="  \n", stderr="")
+        return await real(cmd, **kw)
+    monkeypatch.setattr(leerie, "run_proc", _stub)
+
+    ref = _run(leerie._rescue_integrator_work(
+        conflicted_repo, "feat-006", "run1"))
+    assert ref is None
+
+
+def test_rescue_returns_none_when_commit_tree_fails(leerie, conflicted_repo,
+                                                     monkeypatch):
+    """`git commit-tree` failing (5th call, after the head-tree comparison)
+    must degrade to None."""
+    (conflicted_repo / "f.txt").write_text("RESOLVED\n")
+    real = leerie.run_proc
+    stub, calls = _make_nth_call_fail_stub(real, fail_at_call=5)
+    monkeypatch.setattr(leerie, "run_proc", stub)
+
+    ref = _run(leerie._rescue_integrator_work(
+        conflicted_repo, "feat-006", "run1"))
+    assert ref is None
+    assert len(calls) == 5
+
+
+def test_rescue_returns_none_when_update_ref_fails(leerie, conflicted_repo,
+                                                    monkeypatch):
+    """`git update-ref` failing (6th call, the last step) must degrade to
+    None even though the commit object was created successfully — a
+    stray, unreferenced commit is harmless, but claiming a ref exists
+    when it doesn't would be a lie to the operator."""
+    (conflicted_repo / "f.txt").write_text("RESOLVED\n")
+    real = leerie.run_proc
+    stub, calls = _make_nth_call_fail_stub(real, fail_at_call=6)
+    monkeypatch.setattr(leerie, "run_proc", stub)
+
+    ref = _run(leerie._rescue_integrator_work(
+        conflicted_repo, "feat-006", "run1"))
+    assert ref is None
+    assert len(calls) == 6
+
+
 def test_rescue_ref_is_namespaced_by_run_and_subtask(leerie, conflicted_repo):
     """Two crashed integrators in one run must not clobber each other."""
     (conflicted_repo / "f.txt").write_text("A\n")

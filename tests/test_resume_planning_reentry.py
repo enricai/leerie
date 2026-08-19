@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import json
+import os
 from types import SimpleNamespace
 
 import pytest
@@ -804,3 +805,178 @@ def test_genuinely_no_progress_and_no_task_still_dies(
     with pytest.raises(SystemExit):
         asyncio.run(leerie._run_phases(
             args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
+
+
+def test_progress_marker_with_no_waves_or_categories_still_dies(
+        leerie, monkeypatch, run_dirs, capsys):
+    """A resume whose state carries neither `waves` nor `categories` but
+    DOES carry a `current_phase` stamp (so the never-started demotion above
+    does not fire — a task with no progress at all is a fresh START, not
+    this case) hits the one genuinely-unusable resume state: it got past
+    its first save but never reached `_schedule()`, and there is no
+    checkpointed `plans` to re-enter from."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = _make_state(leerie, run_dirs, {
+        "task": "test task", "worker_count": 1,
+        "current_phase": "phase 1: classify",
+    })
+    caps = _caps(leerie)
+    args = _args()
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie._run_phases(
+            args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
+    err = capsys.readouterr().err
+    assert "cannot resume" in err
+    assert "records neither progress nor a task" in err
+    assert "phase_classify" not in calls, (
+        "this is the genuinely-unusable state — it must die(), not restart")
+
+
+def test_resume_reexports_mise_override_env_var(
+        leerie, monkeypatch, run_dirs, tmp_path):
+    """A resumed run whose original invocation synthesized a mise override
+    file re-exports MISE_OVERRIDE_CONFIG_FILENAMES for downstream
+    implementer/conformer subprocesses — phase_provision itself is
+    skipped on resume (recipe already persisted), so nothing else would
+    set it."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    monkeypatch.delenv("MISE_OVERRIDE_CONFIG_FILENAMES", raising=False)
+    override_path = tmp_path / "mise-override.toml"
+    override_path.write_text("[tools]\ngo = '1.22'\n")
+    persisted_plans = [_plan("bug-fixing", _subtask("bugfix-001"))]
+    st = _make_state(leerie, run_dirs, {
+        "task": "test task", "worker_count": 3,
+        "categories": ["bug-fixing"],
+        "provision": {"source": "table", "recipe": [], "override_file": str(override_path)},
+        "plans_after_classify": [],
+        "plans_after_plan": persisted_plans,
+        "plans_after_reconcile": persisted_plans,
+        "plans_after_overlap_judge": persisted_plans,
+        "plans_after_adherence_gate": persisted_plans,
+        "plans_after_coverage_gate": persisted_plans,
+        "plans_after_filters": persisted_plans,
+    })
+    caps = _caps(leerie)
+    args = _args()
+    _drive(leerie, args, caps, run_dirs, st)
+    assert os.environ.get("MISE_OVERRIDE_CONFIG_FILENAMES") == str(override_path)
+
+
+def test_fresh_run_with_no_task_dies(leerie, monkeypatch, run_dirs):
+    """`resume=False` with no task text supplied at all — the fresh-run
+    branch's own guard, distinct from `main()`'s argparse-level check
+    (this function is invoked directly by tests, bypassing argparse)."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = leerie.State(run_dirs[0], run_dirs[1])
+    caps = _caps(leerie)
+    args = _args(resume=False, task=None)
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie._run_phases(
+            args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
+    assert "phase_classify" not in calls
+
+
+def test_classification_gate_routing_to_no_work_stops_the_pipeline(
+        leerie, monkeypatch, run_dirs):
+    """When `phase_classification_gate` itself routes to the cleared-but-
+    empty terminal state (a re-classify round found the deliverable
+    already on HEAD), `_run_phases` must return immediately rather than
+    falling through into phase_provision/phase_plan."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+
+    async def _gate_routes_to_no_work(task, st, caps, clarify, models, efforts):
+        calls["phase_classification_gate"] = calls.get(
+            "phase_classification_gate", 0) + 1
+        # Mirrors what the real gate does before returning True: it has
+        # already called _finish_no_work_run itself.
+        leerie._finish_no_work_run(st, {"bug-fixing": "already on HEAD"})
+        return True
+    monkeypatch.setattr(
+        leerie, "phase_classification_gate", _gate_routes_to_no_work)
+
+    st = _make_state(leerie, run_dirs, {"task": "test task", "worker_count": 0})
+    caps = _caps(leerie)
+    args = _args()
+    # No _StopAtExecute here — a clean early `return`, not a raise.
+    asyncio.run(leerie._run_phases(
+        args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
+    assert calls.get("phase_classification_gate") == 1
+    assert "phase_provision" not in calls
+    assert "phase_plan" not in calls
+    assert st.data["no_work_required"] is True
+
+
+def test_reconcile_detecting_no_work_stops_the_pipeline(
+        leerie, monkeypatch, run_dirs):
+    """`_detect_no_work` (real, unstubbed) finding every plan `ready` with
+    zero subtasks right after `phase_reconcile` must route to the
+    cleared-but-empty terminal state and stop before the overlap judge."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+
+    empty_ready_plan = {
+        "domain": "bug-fixing", "status": "ready", "subtasks": [],
+        "confidence": {"basis": "the fix is already on HEAD"},
+    }
+
+    async def _reconcile_to_empty(plans, task, st, caps, models, efforts):
+        calls["phase_reconcile"] = calls.get("phase_reconcile", 0) + 1
+        return [empty_ready_plan]
+    monkeypatch.setattr(leerie, "phase_reconcile", _reconcile_to_empty)
+
+    st = _make_state(leerie, run_dirs, {
+        "task": "test task", "worker_count": 0,
+        "categories": ["bug-fixing"],
+        "plans_after_classify": [],
+        "plans_after_plan": [_plan("bug-fixing", _subtask("bugfix-001"))],
+    })
+    caps = _caps(leerie)
+    args = _args()
+    asyncio.run(leerie._run_phases(
+        args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
+    assert calls.get("phase_reconcile") == 1
+    assert "phase_overlap_judge" not in calls
+    assert st.data["no_work_required"] is True
+    assert st.data["no_work_reasons"] == {
+        "bug-fixing": "the fix is already on HEAD"}
+
+
+def test_satisfied_filter_detecting_no_work_stops_the_pipeline(
+        leerie, monkeypatch, run_dirs):
+    """`_filter_satisfied_subtasks` returning a non-None no-work map (every
+    ready plan's subtasks all dropped as already satisfied) must route to
+    the cleared-but-empty terminal state and stop before scheduling."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+
+    async def _satisfied_to_no_work(plans, repo_root, st, caps, models, efforts):
+        calls["_filter_satisfied_subtasks"] = calls.get(
+            "_filter_satisfied_subtasks", 0) + 1
+        return {"bug-fixing": "sibling run already merged this"}
+    monkeypatch.setattr(
+        leerie, "_filter_satisfied_subtasks", _satisfied_to_no_work)
+
+    persisted_plans = [_plan("bug-fixing", _subtask("bugfix-001"))]
+    st = _make_state(leerie, run_dirs, {
+        "task": "test task", "worker_count": 0,
+        "categories": ["bug-fixing"],
+        "plans_after_classify": [],
+        "plans_after_plan": persisted_plans,
+        "plans_after_reconcile": persisted_plans,
+        "plans_after_overlap_judge": persisted_plans,
+        "plans_after_adherence_gate": persisted_plans,
+        "plans_after_coverage_gate": persisted_plans,
+    })
+    caps = _caps(leerie)
+    args = _args()
+    asyncio.run(leerie._run_phases(
+        args, caps, run_dirs[2], st, "codebase", "normal", MODELS, EFFORTS))
+    assert calls.get("_filter_satisfied_subtasks") == 1
+    assert "check_budget_feasibility" not in calls
+    assert st.data["no_work_required"] is True
+    assert st.data["no_work_reasons"] == {
+        "bug-fixing": "sibling run already merged this"}

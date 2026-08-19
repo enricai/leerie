@@ -113,6 +113,28 @@ class TestClobberedOwnedFiles:
         assert asyncio.run(leerie._clobbered_owned_files(str(d), "", impl)) == []
         assert asyncio.run(leerie._clobbered_owned_files(str(d), "run", "")) == []
 
+    def test_bad_base_ref_git_failure_returns_empty(self, leerie, tmp_path):
+        """A `git diff` failure (unresolvable base ref) must degrade to
+        empty rather than propagate — the r.returncode != 0 branch."""
+        d, impl = _impl_repo(tmp_path)
+        r = asyncio.run(
+            leerie._clobbered_owned_files(str(d), "no-such-ref", impl))
+        assert r == []
+
+    def test_mode_only_change_with_identical_blob_is_skipped(self, leerie, tmp_path):
+        """A file whose executable bit changes but blob content is
+        byte-identical between base and impl_head appears in `git diff
+        --name-only` (the tree entry differs) while `b_impl == b_base` —
+        the `continue` branch treating it as not actually owned."""
+        d, impl = _impl_repo(tmp_path)
+        (d / "c.py").chmod(0o755)
+        _git(d, "add", "-A")
+        _git(d, "commit", "-qm", "implementer: chmod +x c.py")
+        impl2 = _rev(d)
+        r = asyncio.run(leerie._clobbered_owned_files(str(d), "run", impl2))
+        assert "c.py" not in " ".join(r), \
+            f"a mode-only change with identical blob must not be flagged; got {r}"
+
 
 class TestBlobSha:
     def test_present_and_absent(self, leerie, tmp_path):
@@ -145,6 +167,16 @@ class TestRollbackRestoresClobber:
             == ["a.py (reverted-to-base)"]
         asyncio.run(leerie._rollback_conformer_commits(str(d), impl))
         # implementer content restored, and no clobber remains detectable
+
+    def test_empty_before_sha_is_a_noop(self, leerie, tmp_path):
+        # A falsy before_sha means there is no known pre-conformer
+        # snapshot to roll back to (e.g. the implementer never committed
+        # anything) — the function must return without touching the
+        # worktree rather than resetting to a garbage ref.
+        d, impl = _impl_repo(tmp_path)
+        before_head = _rev(d)
+        asyncio.run(leerie._rollback_conformer_commits(str(d), ""))
+        assert _rev(d) == before_head
         assert (d / "a.py").read_text() == "IMPL a\n"
         assert _rev(d) == impl
         assert asyncio.run(
@@ -376,3 +408,58 @@ class TestUncommittedPaths:
         d.mkdir()
         r = asyncio.run(leerie._uncommitted_paths(str(d)))
         assert r == []
+
+    def test_nonexistent_directory_returns_empty(self, leerie, tmp_path):
+        """`run_proc` raising OSError (e.g. cwd does not exist) must
+        degrade to empty, not propagate — the except OSError branch."""
+        missing = tmp_path / "does-not-exist"
+        r = asyncio.run(leerie._uncommitted_paths(str(missing)))
+        assert r == []
+
+
+class TestBranchHeadSha:
+    def test_returns_head_sha(self, leerie, tmp_path):
+        d, impl = _impl_repo(tmp_path)
+        r = asyncio.run(leerie._branch_head_sha(str(d)))
+        assert r == impl
+
+    def test_git_failure_returns_empty_string(self, leerie, tmp_path):
+        d = tmp_path / "not-a-repo"
+        d.mkdir()
+        r = asyncio.run(leerie._branch_head_sha(str(d)))
+        assert r == ""
+
+
+class TestRollbackConformerCommits:
+    def test_empty_before_sha_is_a_noop(self, leerie, tmp_path):
+        """An empty before_sha must not attempt a reset at all — the
+        early-return guard, distinct from a no-op reset to the same sha."""
+        d, impl = _impl_repo(tmp_path)
+        head_before = _rev(d)
+        asyncio.run(leerie._rollback_conformer_commits(str(d), ""))
+        assert _rev(d) == head_before
+
+
+class TestUnprefixedConformerCommits:
+    def test_empty_before_sha_returns_empty(self, leerie, tmp_path):
+        d, _impl = _impl_repo(tmp_path)
+        r = asyncio.run(leerie._unprefixed_conformer_commits(str(d), ""))
+        assert r == []
+
+    def test_bad_before_sha_git_failure_returns_empty(self, leerie, tmp_path):
+        d, _impl = _impl_repo(tmp_path)
+        r = asyncio.run(
+            leerie._unprefixed_conformer_commits(str(d), "deadbeefdeadbeef"))
+        assert r == []
+
+    def test_all_commits_prefixed_returns_empty(self, leerie, tmp_path):
+        d, impl = _impl_repo(tmp_path)
+        _git(d, "commit", "--allow-empty", "-qm", "conformer: clean pass")
+        r = asyncio.run(leerie._unprefixed_conformer_commits(str(d), impl))
+        assert r == []
+
+    def test_unprefixed_commit_subject_returned(self, leerie, tmp_path):
+        d, impl = _impl_repo(tmp_path)
+        _git(d, "commit", "--allow-empty", "-qm", "oops forgot the prefix")
+        r = asyncio.run(leerie._unprefixed_conformer_commits(str(d), impl))
+        assert r == ["oops forgot the prefix"]

@@ -200,6 +200,69 @@ def test_has_commits_empty_handoff_rescue_logs_named_oom(env, monkeypatch, capsy
     assert "does not exist on disk" not in out
 
 
+# --- the OTHER OOM path: OomKilledError raised straight out of ------------
+# `_run_implementer` (e.g. `_run_conformer`'s own build/test step overshot
+# memory.max), caught by `_settle_subtask`'s `except OomKilledError` arm —
+# distinct from the empty_handoff-summary naming above, which fires when
+# `_invoke`'s no-envelope probe detects the OOM. This is `_settle_subtask`'s
+# own `fail("oom_killed", str(e))` call.
+
+def test_oom_killed_error_returns_failed_with_named_cause(env, monkeypatch):
+    """`_run_implementer` raising `OomKilledError` must surface as a
+    `failed` result carrying the exception's own message, not the generic
+    empty_handoff checkpoint text (this path never reaches
+    `_validate_result` at all -- it is caught before that call)."""
+    c = env["leerie"]
+
+    async def _stub(sid_, leerie_dir, caps, st, models, efforts,
+                    continuation=False, note=""):
+        raise c.OomKilledError(
+            f"worker {sid_} was OOM-killed on `pnpm run build` "
+            "(memory.max=2.6 GiB) -- raise --worker-memory-max or lower "
+            "--max-parallel")
+    monkeypatch.setattr(c, "_run_implementer", _stub)
+
+    caps = dict(env["caps"])
+    caps["failed_retries"] = 0
+    res = asyncio.run(c._settle_subtask(
+        env["sid"], env["run_dir"], caps, env["st"],
+        env["models"], env["efforts"]))
+
+    assert res["status"] == "failed"
+    assert "OOM-killed" in res["summary"]
+    assert "pnpm run build" in res["summary"]
+    assert "--worker-memory-max" in res["summary"]
+
+
+def test_oom_killed_error_retries_in_place_bounded(env, monkeypatch):
+    """`oom_killed` is an infrastructure kind (DESIGN §6): a fresh worker
+    gets a clean cgroup, so it retries IN PLACE (no worktree reset, no
+    corrective-note overwrite) up to the retry cap, then terminates."""
+    c = env["leerie"]
+    calls: list[tuple] = []
+
+    async def _stub(sid_, leerie_dir, caps, st, models, efforts,
+                    continuation=False, note=""):
+        calls.append((sid_, continuation, note))
+        raise c.OomKilledError(f"worker {sid_} was OOM-killed on `pnpm test`")
+    monkeypatch.setattr(c, "_run_implementer", _stub)
+
+    caps = dict(env["caps"])
+    caps["failed_retries"] = 2
+    res = asyncio.run(c._settle_subtask(
+        env["sid"], env["run_dir"], caps, env["st"],
+        env["models"], env["efforts"]))
+
+    assert len(calls) == 3, (
+        f"expected 3 attempts (1 + failed_retries=2), got {len(calls)}")
+    assert res["status"] == "failed"
+    # Infrastructure retry-in-place: no per-attempt corrective note is
+    # fabricated, unlike a genuine worker-failure retry.
+    assert all(note == "" for (_, _, note) in calls), (
+        "an oom_killed retry must not overwrite the corrective note field "
+        f"the way a worker-failure retry does: {calls!r}")
+
+
 # --- oom_kill == 0 (or unavailable): no false positive ---------------------
 
 def test_no_oom_empty_handoff_does_not_emit_oom_message(env, monkeypatch):

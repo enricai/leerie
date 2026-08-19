@@ -19,7 +19,10 @@ Same mockless / source-pinning style as `test_inspect_tools.py`.
 """
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
@@ -112,6 +115,71 @@ def test_version_check_runs_before_skip_smoke_gate():
     assert check_pos < skip_pos, (
         "_check_claude_cli_version() must run before the skip_smoke gate"
     )
+
+
+# --- behavioral tests on _check_claude_cli_version() itself ---------------
+#
+# The three tests above this section pin only placement (source text). The
+# function body — the subprocess call, the timeout die(), the too-old die(),
+# and the unrecognized-format/pass-through no-op — had no behavioral test at
+# all; these drive the real function with `claude` stubbed on PATH.
+
+def _stub_claude(tmp_path, monkeypatch, *, version_line: str | None,
+                  sleep_forever: bool = False):
+    """Put a fake `claude` executable on PATH that prints `version_line` (or
+    hangs, for the timeout case) in response to `--version`."""
+    stub = tmp_path / "claude"
+    if sleep_forever:
+        stub.write_text("#!/bin/sh\nsleep 3600\n")
+    else:
+        stub.write_text(f"#!/bin/sh\nprintf '%s\\n' '{version_line}'\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}{__import__('os').pathsep}"
+                        f"{__import__('os').environ.get('PATH', '')}")
+
+
+def test_check_cli_version_dies_on_too_old_cli(leerie, tmp_path, monkeypatch):
+    _stub_claude(tmp_path, monkeypatch, version_line="1.0.72 (Claude Code)")
+    with pytest.raises(SystemExit):
+        leerie._check_claude_cli_version()
+
+
+def test_check_cli_version_too_old_message_names_the_floor(
+        leerie, tmp_path, monkeypatch, capsys):
+    _stub_claude(tmp_path, monkeypatch, version_line="1.0.72 (Claude Code)")
+    with pytest.raises(SystemExit):
+        leerie._check_claude_cli_version()
+    err = capsys.readouterr().err
+    assert "1.0.72" in err
+    assert "2.1.22" in err
+    assert "--json-schema" in err
+
+
+def test_check_cli_version_passes_on_new_enough_cli(leerie, tmp_path, monkeypatch):
+    _stub_claude(tmp_path, monkeypatch, version_line="2.1.150 (Claude Code)")
+    # Must not raise.
+    leerie._check_claude_cli_version()
+
+
+def test_check_cli_version_passes_at_exact_floor(leerie, tmp_path, monkeypatch):
+    _stub_claude(tmp_path, monkeypatch, version_line="2.1.22 (Claude Code)")
+    leerie._check_claude_cli_version()
+
+
+def test_check_cli_version_defers_on_unrecognized_output(leerie, tmp_path, monkeypatch):
+    """An unparseable `--version` string falls through to the live smoke
+    test rather than failing closed on a regex miss."""
+    _stub_claude(tmp_path, monkeypatch, version_line="not a version at all")
+    leerie._check_claude_cli_version()
+
+
+def test_check_cli_version_dies_on_timeout(leerie, tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        leerie.subprocess, "run",
+        lambda *a, **k: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(cmd=["claude", "--version"], timeout=30)))
+    with pytest.raises(SystemExit):
+        leerie._check_claude_cli_version()
 
 
 def test_min_claude_cli_defined_in_source():

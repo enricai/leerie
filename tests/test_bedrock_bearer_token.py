@@ -399,6 +399,81 @@ def test_settings_json_sso_still_works_without_bearer_token(tmp_path: Path) -> N
     assert pairs["CLAUDE_CODE_USE_BEDROCK"] == "1"
 
 
+def test_sso_mode_forwards_aws_profile_and_region_from_settings(tmp_path: Path) -> None:
+    """SSO/profile mode extracts AWS_PROFILE/AWS_REGION out of
+    ~/.claude/settings.json's env block (last-match-wins merge) and
+    forwards both into AUTH_MOUNTS -- previously untested here."""
+    rc, tokens, bearer_active, sso_active = _run(
+        {},
+        aws_on_path=True,
+        aws_succeeds=True,
+        settings_json={
+            "env": {
+                "CLAUDE_CODE_USE_BEDROCK": "1",
+                "AWS_PROFILE": "my-sso-profile",
+                "AWS_REGION": "eu-west-1",
+            }
+        },
+        tmp_path=tmp_path,
+    )
+    assert rc == 0, tokens
+    assert bearer_active is False
+    assert sso_active is True
+    pairs = _env_pairs(tokens)
+    assert pairs["AWS_PROFILE"] == "my-sso-profile"
+    assert pairs["AWS_REGION"] == "eu-west-1"
+
+
+def test_sso_mode_omits_profile_and_region_when_unset(tmp_path: Path) -> None:
+    """Neither key appears in settings.json's env block -> neither
+    AUTH_MOUNTS entry is emitted (no empty `-e AWS_PROFILE=` etc)."""
+    rc, tokens, bearer_active, sso_active = _run(
+        {},
+        aws_on_path=True,
+        aws_succeeds=True,
+        settings_json={"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
+        tmp_path=tmp_path,
+    )
+    assert rc == 0, tokens
+    assert sso_active is True
+    pairs = _env_pairs(tokens)
+    assert "AWS_PROFILE" not in pairs
+    assert "AWS_REGION" not in pairs
+
+
+def test_sso_mode_dies_when_home_aws_missing(tmp_path: Path) -> None:
+    """SSO/profile mode is detected but $HOME/.aws does not exist on the
+    host -- the block must exit 1 with an actionable hint rather than
+    proceeding to bedrock_preflight()/rsync against a missing dir."""
+    rc, tokens, bearer_active, sso_active = _run(
+        {},
+        aws_on_path=True,
+        aws_succeeds=True,
+        settings_json={"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
+        home_has_aws=False,
+        tmp_path=tmp_path,
+    )
+    assert rc == 1
+    # SSO activation happens before the ~/.aws check, so _BEDROCK_ACTIVE
+    # is set even though the block then dies -- confirm via stderr rather
+    # than the (unreachable) trailer lines this harness prints at its end.
+
+
+def test_sso_mode_preflight_failure_propagates_exit(tmp_path: Path) -> None:
+    """A failing bedrock_preflight() (AWS creds expired) must abort the
+    whole activation block with exit 1, before any AWS_PROFILE/AWS_REGION
+    forwarding or aws mount happens."""
+    rc, tokens, bearer_active, sso_active = _run(
+        {},
+        aws_on_path=True,
+        aws_succeeds=False,
+        settings_json={"env": {"CLAUDE_CODE_USE_BEDROCK": "1"}},
+        tmp_path=tmp_path,
+    )
+    assert rc == 1
+    assert not _has_aws_mount(tokens)
+
+
 # ---------------------------------------------------------------------------
 # Fly detached-launch heredoc mirrors the same precedence/defaults.
 # ---------------------------------------------------------------------------

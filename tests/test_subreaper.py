@@ -23,6 +23,7 @@ import subprocess
 import textwrap
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -518,6 +519,187 @@ def test_echild_pid_is_retained_inside_the_window(leerie, monkeypatch):
         leerie._REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
 
 
+# ---------------------------------------------------------------------------
+# `_become_subreaper`'s two failure branches (prctl rc != 0, and the OSError
+# arm around the ctypes call itself). Only the Linux success path was
+# previously exercised; a real prctl failure or a broken libc handle must
+# still return False and log rather than raise.
+# ---------------------------------------------------------------------------
+
+@linux_only
+def test_become_subreaper_logs_and_returns_false_on_prctl_failure(leerie, monkeypatch):
+    """A nonzero prctl rc (e.g. a sandboxed environment without CAP_SYS_ADMIN
+    for the subreaper prctl, or an unexpected kernel refusal) must be treated
+    as a soft failure: log and return False, never raise."""
+    class FakeLibc:
+        def prctl(self, *args):
+            return -1
+
+    monkeypatch.setattr(leerie.ctypes, "CDLL", lambda *a, **k: FakeLibc())
+    monkeypatch.setattr(leerie.ctypes, "get_errno", lambda: 1)  # EPERM
+    logged = []
+    monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
+
+    assert leerie._become_subreaper() is False
+    assert any("prctl" in m for m in logged), (
+        "a failed prctl() call must be logged so the operator can see why "
+        "orphan reaping is degraded")
+
+
+@linux_only
+def test_become_subreaper_returns_false_on_oserror(leerie, monkeypatch):
+    """A ctypes.CDLL construction failure (e.g. no libc handle available) is
+    caught and treated the same way as a prctl failure: log, return False,
+    never propagate."""
+    def _raise(*a, **k):
+        raise OSError("no libc")
+
+    monkeypatch.setattr(leerie.ctypes, "CDLL", _raise)
+    logged = []
+    monkeypatch.setattr(leerie, "log", lambda msg: logged.append(msg))
+
+    assert leerie._become_subreaper() is False
+    assert any("could not install child-subreaper" in m for m in logged)
+
+
+# ---------------------------------------------------------------------------
+# `_zombie_reaper`'s three remaining untested branches:
+#   (1) a pid that became a live worker's pid mid-flight is skipped, not
+#       waitpid()ed, even though it is still on _REAPABLE_PIDS;
+#   (2) an ECHILD for a pid CONFIRMED gone (not merely "not yet reparented")
+#       discards it immediately, without waiting for the retry window;
+#   (3) any other OSError (e.g. ESRCH) also discards it immediately.
+# All three previously showed as missing lines in test-001's coverage report
+# (16678, 16700-16709).
+# ---------------------------------------------------------------------------
+
+@linux_only
+def test_zombie_reaper_skips_a_pid_that_became_asyncio_managed(leerie):
+    """A pid can be on `_REAPABLE_PIDS` and simultaneously get claimed by
+    `_ASYNCIO_MANAGED_PIDS` (a worker's own process group briefly overlapping
+    a pid the tracker already recorded from an earlier, unrelated subtree).
+    The reaper must skip it entirely rather than waitpid() a pid asyncio's
+    own child watcher still owns."""
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0)
+    leerie._mark_reapable({pid})
+    leerie._ASYNCIO_MANAGED_PIDS.add(pid)
+    try:
+        async def _one_tick():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            await asyncio.sleep(0.15)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_one_tick())
+
+        # Still on the allowlist -- the reaper skipped it rather than
+        # discarding or reaping it.
+        assert pid in leerie._REAPABLE_PIDS, (
+            "a pid claimed by asyncio must be left alone by the zombie "
+            "reaper, not removed or waitpid()ed")
+    finally:
+        leerie._ASYNCIO_MANAGED_PIDS.discard(pid)
+        leerie._REAPABLE_PIDS.discard(pid)
+        with contextlib.suppress(ChildProcessError, OSError):
+            os.waitpid(pid, 0)
+
+
+@linux_only
+def test_zombie_reaper_discards_immediately_when_pid_confirmed_gone(leerie, monkeypatch):
+    """An ECHILD for a pid that is confirmed absent from /proc (never ours,
+    or already reaped by someone else) must be dropped on the very first
+    tick -- it must NOT wait out `_ECHILD_RETRY_MAX_SEC` the way a live,
+    not-yet-reparented grandchild does."""
+    fake_pid = 999999  # not a real pid: os.waitpid raises ECHILD, /proc entry absent
+    assert not os.path.exists(f"/proc/{fake_pid}")
+    leerie._mark_reapable({fake_pid})
+    monkeypatch.setattr(leerie, "_ECHILD_RETRY_MAX_SEC", 3600.0)  # would hide the bug if retained
+    try:
+        async def _one_tick():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_one_tick())
+
+        assert fake_pid not in leerie._REAPABLE_PIDS, (
+            "a pid confirmed absent from /proc must be discarded immediately, "
+            "not retained for the ECHILD retry window meant for live "
+            "not-yet-reparented grandchildren")
+        assert fake_pid not in leerie._REAPABLE_PID_FIRST_ECHILD
+    finally:
+        leerie._REAPABLE_PIDS.discard(fake_pid)
+        leerie._REAPABLE_PID_FIRST_ECHILD.pop(fake_pid, None)
+
+
+@linux_only
+def test_zombie_reaper_discards_on_other_oserror(leerie, monkeypatch):
+    """Any OSError other than ChildProcessError (e.g. ESRCH from a raw
+    os.waitpid) is unambiguous -- the pid must be dropped immediately, same
+    as the confirmed-gone ECHILD case, without consulting /proc at all."""
+    pid = 12345
+    leerie._mark_reapable({pid})
+
+    def fake_waitpid(p, flags):
+        if p == pid:
+            raise ProcessLookupError("no such process")  # OSError subclass, not ChildProcessError
+        return os.waitpid(p, flags)
+
+    monkeypatch.setattr(leerie.os, "waitpid", fake_waitpid)
+    try:
+        async def _one_tick():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            await asyncio.sleep(0.1)
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_one_tick())
+
+        assert pid not in leerie._REAPABLE_PIDS, (
+            "a non-ChildProcessError OSError must discard the pid "
+            "immediately -- it is unambiguous, unlike ECHILD")
+    finally:
+        leerie._REAPABLE_PIDS.discard(pid)
+        leerie._REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+
+
+@linux_only
+def test_zombie_reaper_survives_unexpected_exception_in_loop_body(leerie, monkeypatch):
+    """The whole per-tick body is wrapped in a bare `except Exception: pass`
+    (reaping must never crash the orchestrator). Force something other than
+    the anticipated ChildProcessError/OSError -- a bug in the loop itself --
+    and confirm the reaper logs nothing, raises nothing, and keeps ticking."""
+    pid = 12345
+    leerie._mark_reapable({pid})
+
+    def broken_waitpid(p, flags):
+        raise RuntimeError("boom -- not a subprocess-related error at all")
+
+    monkeypatch.setattr(leerie.os, "waitpid", broken_waitpid)
+    try:
+        async def _run():
+            task = asyncio.create_task(leerie._zombie_reaper(interval_sec=0.02))
+            await asyncio.sleep(0.15)
+            assert not task.done(), (
+                "an unexpected exception inside the loop body must be "
+                "swallowed by the outer guard, not propagate and kill the "
+                "background task")
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+        asyncio.run(_run())
+    finally:
+        leerie._REAPABLE_PIDS.discard(pid)
+        leerie._REAPABLE_PID_FIRST_ECHILD.pop(pid, None)
+
+
 def test_echild_retry_window_value_is_pinned(leerie):
     """The 60s value is only safe because of a coupling elsewhere.
 
@@ -537,3 +719,109 @@ def test_echild_retry_window_value_is_pinned(leerie):
         "the tracker must re-mark descendants far more often than the ECHILD "
         "window expires, or a live worker's descendants fall off the "
         "allowlist and their orphans are never reaped")
+
+
+# ----- the autouse restore fixture (tests/conftest.py) ---------------------
+#
+# `_become_subreaper()` mutates the CALLING process, so any test that drives
+# the real `main()` -- whose second statement it is, before argparse -- leaves
+# the pytest process a child-subreaper for the rest of the session. That
+# silently changes what process liveness means: an orphan that would reparent
+# to PID 1 and be reaped instead reparents to pytest, which never wait()s it,
+# so it lingers as a zombie still owning its PID slot and `os.kill(pid, 0)`
+# keeps succeeding. Measured: three `tests/test_signal_cleanup.py`
+# orphan-reaping assertions went red on CI with both that file and
+# `orchestrator/leerie.py` byte-identical to main. This file escaped only by
+# sorting after `test_signal_cleanup` -- an accident of filename, not a fix.
+
+def _read_child_subreaper(leerie) -> int:
+    """Current PR_CHILD_SUBREAPER value for this process, or -1 if unreadable."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    out = ctypes.c_int(0)
+    if libc.prctl(leerie._PR_GET_CHILD_SUBREAPER, ctypes.byref(out),
+                  0, 0, 0) != 0:
+        return -1
+    return out.value
+
+
+def _set_child_subreaper(leerie, value: int) -> None:
+    """Force this process's PR_CHILD_SUBREAPER to `value`."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.prctl(leerie._PR_SET_CHILD_SUBREAPER, value, 0, 0, 0) == 0
+
+
+@linux_only
+def test_restore_fixture_puts_the_flag_back(leerie):
+    """Drive the autouse fixture's own setup/teardown around a real
+    `_become_subreaper()` call and assert the flag comes back.
+
+    Driven directly rather than as an ordered pair of tests. The obvious
+    ordered-pair shape -- one test sets the flag, the next asserts it was
+    restored -- is VACUOUS in precisely the case it exists to catch: with the
+    fixture broken, an earlier test in this very file
+    (`test_become_subreaper_sets_the_flag`) has already left the flag at 1,
+    so the second test's baseline is 1, it observes 1, and it passes. That was
+    confirmed live -- the pair skipped instead of failing when the fixture was
+    disabled. Driving the context manager here pins a known starting value, so
+    the assertion is unconditional."""
+    from tests import conftest
+
+    original = _read_child_subreaper(leerie)
+    try:
+        _set_child_subreaper(leerie, 0)
+        with conftest.child_subreaper_restored():
+            assert leerie._become_subreaper() is True
+            assert _read_child_subreaper(leerie) == 1, (
+                "precondition: _become_subreaper must actually set the flag, "
+                "or this test proves nothing about restoring it")
+        assert _read_child_subreaper(leerie) == 0, (
+            "tests/conftest.py's `child_subreaper_restored` did not restore "
+            "PR_SET_CHILD_SUBREAPER; every later orphan-liveness assertion "
+            "in the session is then measuring a zombie, not a live process")
+    finally:
+        if original in (0, 1):
+            _set_child_subreaper(leerie, original)
+
+
+def test_conftest_defines_the_autouse_restore_fixture():
+    """Structural partner to the behavioural pair above: the fixture exists,
+    is autouse, and lives in conftest (suite-wide) rather than in one file.
+
+    A per-file fixture would fix whichever file it was added to and leave the
+    next `main()`-driving file to rediscover this the same expensive way."""
+    src = (Path(__file__).resolve().parent / "conftest.py").read_text()
+    tree = ast.parse(src)
+    fn = next(
+        (n for n in tree.body
+         if isinstance(n, ast.FunctionDef) and n.name == "_restore_child_subreaper"),
+        None)
+    assert fn is not None, (
+        "tests/conftest.py must define `_restore_child_subreaper`")
+    autouse = [
+        kw for d in fn.decorator_list if isinstance(d, ast.Call)
+        for kw in d.keywords
+        if kw.arg == "autouse" and getattr(kw.value, "value", None) is True]
+    assert autouse, (
+        "`_restore_child_subreaper` must be autouse -- an opt-in fixture is "
+        "one every future main()-driving test file has to remember")
+    # The behavioural test drives `child_subreaper_restored` directly, so it
+    # only proves the fixture works if the fixture actually delegates to it.
+    assert "child_subreaper_restored" in ast.unparse(fn), (
+        "`_restore_child_subreaper` must delegate to "
+        "`child_subreaper_restored` -- otherwise the behavioural test "
+        "exercises a context manager the autouse fixture never calls")
+
+
+def test_conftest_prctl_constants_match_leeries(leerie):
+    """conftest duplicates the two prctl option numbers as literals rather
+    than importing them (it is autouse, and must not force the session-scoped
+    `leerie` module load onto every test). This is the coupling guard that
+    keeps the copy honest."""
+    from tests import conftest
+
+    assert conftest._PR_SET_CHILD_SUBREAPER == leerie._PR_SET_CHILD_SUBREAPER
+    assert conftest._PR_GET_CHILD_SUBREAPER == leerie._PR_GET_CHILD_SUBREAPER

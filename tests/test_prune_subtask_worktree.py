@@ -89,6 +89,31 @@ def test_prune_does_not_touch_other_sids_worktree(leerie, tmp_path, monkeypatch)
     assert wt_b.exists()
 
 
+def test_prune_falls_back_to_rmtree_when_git_leaves_dir_behind(
+        leerie, tmp_path, monkeypatch):
+    """`git worktree remove` fails (unregistered dir) but the directory
+    still exists — the helper must fall back to a direct `shutil.rmtree`
+    rather than leaving it behind. Mirrors the same fallback in
+    `_cleanup_on_abnormal_exit`."""
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "leftover.txt").write_text("stray\n")
+    # Never registered with git, so `git worktree remove --force` returns
+    # nonzero and the directory survives that call.
+    r = _git("worktree", "remove", "--force", str(wt_dir), cwd=repo)
+    assert r.returncode != 0
+    assert wt_dir.exists()
+
+    asyncio.run(leerie._prune_subtask_worktree("sid-x", leerie_dir))
+
+    assert not wt_dir.exists(), (
+        "an unregistered worktree directory must still be removed via the "
+        "shutil.rmtree fallback")
+
+
 def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
     """After a prune, a blocked/failed sibling sid's own worktree can still
     be reset via `_reset_subtask_worktree` independently — proves the two

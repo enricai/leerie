@@ -14,8 +14,14 @@ fine. What it must not be is invisible.
 """
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
+import subprocess
+
+import pytest
+
+from tests.test_oom_naming import env  # noqa: F401  (pytest fixture)
 
 
 def test_state_key_is_declared(leerie):
@@ -148,3 +154,107 @@ def test_no_duplicate_ids_recorded(leerie):
     crash_site = [s for s in sites if "unreviewed_subtasks" in s]
     assert len(crash_site) == 1
     assert "if sid not in unreviewed:" in crash_site[0]
+
+
+# === Behavioral coverage: the bookkeeping actually runs =====================
+#
+# Everything above is source-coupled (the write sites are deep inside
+# _settle_subtask, which normally needs a live worktree, a spawned
+# implementer and a spawned conformer to reach). These tests drive the real
+# _settle_subtask end to end against a real git worktree (the `env` fixture
+# from test_oom_naming), stubbing only _run_implementer (to commit and
+# return `complete`) and _run_conformance_phase (to control conf_res), so
+# the actual `st.data["unreviewed_subtasks"]` list/`append`/`remove` code
+# executes rather than merely being read as source text.
+
+def _run(cmd, cwd, check=True):
+    r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check:
+        assert r.returncode == 0, f"{cmd} failed in {cwd}: {r.stderr}"
+    return r
+
+
+def _stub_complete_implementer(leerie_mod, worktree, monkeypatch, counter):
+    """Each call commits a distinct file and returns a well-formed
+    `complete` result — `production_evidence` is included so
+    `check_implementer_output`'s gating NO_PRODUCTION_EVIDENCE issue never
+    fires and re-drives the implementer instead of reaching the conformer."""
+    async def _stub(sid_, leerie_dir, caps, st, models, efforts,
+                    continuation=False, note=""):
+        counter["n"] += 1
+        (worktree / f"change-{counter['n']}.txt").write_text(
+            f"round {counter['n']}\n")
+        _run(["git", "add", "-A"], cwd=worktree)
+        _run(["git", "commit", "-q", "-m", f"round {counter['n']}"],
+             cwd=worktree)
+        return {
+            "subtask_id": sid_, "status": "complete",
+            "summary": "ok", "criteria_results": [],
+            "production_evidence": {"exercised": False,
+                                     "unexercisable_reason": "test stub"},
+        }
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub)
+
+
+def _stub_conformance_sequence(leerie_mod, monkeypatch, outcomes):
+    """`outcomes` is a list of "crash" | "clean", one per call to
+    `_run_conformance_phase`; the last entry repeats once exhausted."""
+    calls = {"n": 0}
+
+    async def _stub(sid_, leerie_dir, worktree, subtask, caps, st,
+                    models, efforts):
+        i = min(calls["n"], len(outcomes) - 1)
+        calls["n"] += 1
+        if outcomes[i] == "crash":
+            return None, [], None
+        conf_res = {
+            "subtask_id": sid_, "solution_defects": [],
+            "confidence": {"conformance": 9.0},
+            "production_evidence": {"exercised": False,
+                                     "unexercisable_reason": "test stub"},
+        }
+        return conf_res, [], None
+    monkeypatch.setattr(leerie_mod, "_run_conformance_phase", _stub)
+    return calls
+
+
+def test_crashed_conformer_records_sid_then_clean_review_clears_it(
+        env, monkeypatch):  # noqa: F811
+    """The full round trip the structural tests above only assert on
+    source: a conformer crash on round 1 appends the sid to
+    `unreviewed_subtasks`, and a later clean review on round 2 (the
+    completeness gate re-driving the same subtask, per the docstring at
+    the write site) removes it — line 29738's `unreviewed.remove(sid)`."""
+    c = env["leerie"]
+    counter = {"n": 0}
+    _stub_complete_implementer(c, env["worktree"], monkeypatch, counter)
+    _stub_conformance_sequence(c, monkeypatch, ["crash", "clean"])
+
+    res1 = asyncio.run(c._settle_subtask(
+        env["sid"], env["run_dir"], env["caps"], env["st"],
+        env["models"], env["efforts"]))
+    assert res1["status"] == "complete"
+    assert env["st"].data["unreviewed_subtasks"] == [env["sid"]]
+    assert env["st"].data["conformance"][env["sid"]]["reviewed"] is False
+
+    res2 = asyncio.run(c._settle_subtask(
+        env["sid"], env["run_dir"], env["caps"], env["st"],
+        env["models"], env["efforts"]))
+    assert res2["status"] == "complete"
+    assert env["st"].data["unreviewed_subtasks"] == []
+    assert env["st"].data["conformance"][env["sid"]]["reviewed"] is True
+
+
+def test_clean_conformer_never_records_the_sid(env, monkeypatch):  # noqa: F811
+    """The negative control: a conformer that produces a result on the
+    first try never appends the sid at all."""
+    c = env["leerie"]
+    counter = {"n": 0}
+    _stub_complete_implementer(c, env["worktree"], monkeypatch, counter)
+    _stub_conformance_sequence(c, monkeypatch, ["clean"])
+
+    res = asyncio.run(c._settle_subtask(
+        env["sid"], env["run_dir"], env["caps"], env["st"],
+        env["models"], env["efforts"]))
+    assert res["status"] == "complete"
+    assert env["st"].data["unreviewed_subtasks"] == []

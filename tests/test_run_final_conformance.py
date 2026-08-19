@@ -258,6 +258,41 @@ def test_clean_result_without_evidence_warns(env):
 
     warnings = env["st"].data["conformance"]["_final"]["warnings"]
     assert any("NO_PRODUCTION_EVIDENCE" in w for w in warnings), warnings
+
+
+def test_baseline_and_recipe_sections_injected_into_prompt_when_present(env):
+    """When a base-health baseline and a non-empty provision recipe are
+    already recorded in state, both get formatted and appended to the
+    final-conformer prompt (the `up.append(...)` branches guarded on
+    `is not None`)."""
+    c = env["leerie"]
+    env["st"].data["conformance"] = {
+        "_baseline": {"axes": {
+            "build": {"ran": True, "measured": True, "passed": True},
+            "lint": {"ran": True, "measured": True, "passed": True},
+            "tests": {"ran": True, "measured": True, "passed": True},
+        }, "red_axes": []},
+    }
+    env["st"].data["provision"] = {"recipe": [
+        {"kind": "install", "command": ["npm", "ci"]}]}
+    env["st"].save()
+
+    prompts = []
+
+    async def _stub(**kwargs):
+        prompts.append(kwargs["user_prompt"])
+        return _clean_result()
+    c.claude_p = _stub
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    assert len(prompts) == 1
+    assert "BASELINE:" in prompts[0]
+    # `_format_provision_recipe_section` renders each recipe entry with a
+    # `cwd:`/`timeout:` suffix; presence of that shape is the section.
+    assert "cwd:" in prompts[0] and "timeout:" in prompts[0]
     # Advisory, not blocking: the result is still recorded.
     assert env["st"].data["conformance"]["_final"]["result"] is not None
 
@@ -338,6 +373,81 @@ def test_protected_path_commit_is_rolled_back(env):
     assert state["i"] == 1  # loop broke after rollback
 
 
+def test_protected_path_rollback_warns_about_discarded_dirty_files(env):
+    """When a protected-path violation triggers rollback AND the worktree
+    also carries uncommitted tracked changes at that moment, the discard
+    warning fires before the rollback proceeds (git reset --hard would
+    silently drop those changes otherwise)."""
+    c = env["leerie"]
+
+    def _bad_commit_and_leave_dirty(wt: Path):
+        (wt / ".claude").mkdir(exist_ok=True)
+        (wt / ".claude" / "settings.json").write_text("{}\n")
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m",
+              "conformer: BAD touched protected path"], cwd=wt)
+        # Leave an additional, uncommitted change to a tracked file.
+        (wt / "README.md").write_text("dirty on top of the bad commit\n")
+
+    _stub_claude_p(c, [_clean_result()],
+                   commits={0: _bad_commit_and_leave_dirty})
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert any("discarding" in w and "rollback" in w
+               for w in block["warnings"]), block["warnings"]
+    # The rollback still restores README.md to its pre-round content.
+    assert env["staging"].joinpath("README.md").read_text() == "# repo\n"
+
+
+def test_clobber_strict_rollback_warns_about_discarded_dirty_files(env):
+    c = env["leerie"]
+    env["caps"] = dict(env["caps"])
+    env["caps"]["strict_conformer"] = True
+
+    def _clobber_and_leave_dirty(wt: Path):
+        (wt / "src.py").unlink()
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: oops"], cwd=wt)
+        (wt / "README.md").write_text("dirty on top of the clobber\n")
+
+    with pytest.raises(SystemExit):
+        _stub_claude_p(c, [_clean_result()],
+                       commits={0: _clobber_and_leave_dirty})
+        asyncio.run(c._run_final_conformance(
+            env["run_dir"], env["st"], env["caps"], env["models"],
+            env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert any("discarding" in w and "clobber rollback" in w
+               for w in block["warnings"]), block["warnings"]
+
+
+def test_round_regression_between_pre_and_post_is_warned(env):
+    """A build that was passing at the top of the round (`pre`) and fails
+    by the bottom (`post`) — introduced by the conformer's own edits
+    during the round — is surfaced via `_round_axis_regressions`."""
+    c = env["leerie"]
+    env["caps"] = dict(env["caps"])
+    env["caps"]["conformance_rounds"] = 1
+    _stub_claude_p(c, [_clean_result()])
+    _stub_measure_axes(c, [
+        _passing_axis("build"),  # pre: green
+        _failing_axis("build"),  # post: now red — a regression
+    ])
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert any("passed before your changes this round and fails after them"
+               in w for w in block["warnings"]), block["warnings"]
+
+
 # --- BLT-repetition feedback threading (mirrors the per-subtask phase) ----
 
 def _bash_event(tid, cmd):
@@ -374,6 +484,11 @@ def _stub_measure_axes(leerie_mod, seq):
 def _failing_axis(axis="build", command="npm run build", summary="fail"):
     return {axis: {"ran": True, "measured": True, "passed": False,
                    "command": command, "summary": summary}}
+
+
+def _passing_axis(axis="build", command="npm run build"):
+    return {axis: {"ran": True, "measured": True, "passed": True,
+                   "command": command, "summary": ""}}
 
 
 def test_within_round_repetition_injects_feedback_into_next_round(env):
@@ -421,6 +536,203 @@ def test_within_round_repetition_injects_feedback_into_next_round(env):
     assert any("ran the full" in p for p in prompts[1:]), \
         f"round 1's prompt should carry the repetition feedback; " \
         f"prompts={prompts!r}"
+
+
+# --- timeout: caught, recorded as warning, loop breaks --------------------
+
+def test_timeout_expired_breaks_with_warning(env):
+    c = env["leerie"]
+
+    async def _stub(**kwargs):
+        raise subprocess.TimeoutExpired(cmd="claude -p", timeout=5400)
+    c.claude_p = _stub
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert any("timed out" in w for w in block["warnings"]), block["warnings"]
+
+
+# --- unprefixed commit subject: warned, not rolled back --------------------
+
+def test_unprefixed_commit_subject_warns(env):
+    c = env["leerie"]
+
+    def _bad_subject_commit(wt: Path):
+        (wt / "notes.md").write_text("notes\n")
+        _run(["git", "add", "-A"], cwd=wt)
+        # deliberately missing the mandatory `conformer:` prefix
+        _run(["git", "commit", "-q", "-m", "fix a thing"], cwd=wt)
+
+    state = _stub_claude_p(
+        c, [_clean_result()], commits={0: _bad_subject_commit})
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert any("missing `conformer:` prefix" in w for w in block["warnings"]), \
+        block["warnings"]
+    assert any("fix a thing" in w for w in block["warnings"])
+    # An unprefixed subject is advisory only — the loop does not break here,
+    # and a well-formed clean result still terminates the round.
+    assert state["i"] == 1
+
+
+# --- dirty uncommitted changes: surfaced, not rolled back -------------------
+
+def test_dirty_uncommitted_changes_warn_not_rolled_back(env):
+    c = env["leerie"]
+
+    def _leave_dirty(wt: Path):
+        # A TRACKED-file modification: _uncommitted_paths deliberately
+        # excludes untracked files (`?? ` porcelain lines), so an untracked
+        # scratch file would not exercise this branch at all.
+        (wt / "README.md").write_text("dirty, uncommitted\n")
+
+    _stub_claude_p(c, [_clean_result()], commits={0: _leave_dirty})
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert any("uncommitted change" in w for w in block["warnings"]), \
+        block["warnings"]
+    assert (env["staging"] / "README.md").read_text() == "dirty, uncommitted\n", (
+        "dirty files are surfaced as advisory, not discarded")
+
+
+# --- clobbered owned files: strict mode rolls back and blocks --------------
+
+def test_clobbered_owned_file_strict_mode_rolls_back_and_blocks(env):
+    c = env["leerie"]
+    env["caps"] = dict(env["caps"])
+    env["caps"]["strict_conformer"] = True
+
+    def _clobber(wt: Path):
+        # src.py was added by the implementer's wave-1 commit (owned set is
+        # working_branch..staging_before, i.e. main..run_branch). Deleting
+        # it here is the data-loss signature the guard exists to catch.
+        (wt / "src.py").unlink()
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: oops"], cwd=wt)
+
+    state = _stub_claude_p(c, [_clean_result()], commits={0: _clobber})
+    head_before = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=env["staging"],
+        capture_output=True, text=True).stdout.strip()
+
+    with pytest.raises(SystemExit):
+        asyncio.run(c._run_final_conformance(
+            env["run_dir"], env["st"], env["caps"], env["models"],
+            env["efforts"]))
+
+    head_after = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=env["staging"],
+        capture_output=True, text=True).stdout.strip()
+    assert head_after == head_before, "strict rollback did not reset HEAD"
+    assert (env["staging"] / "src.py").exists(), (
+        "the clobbered implementer file must be restored")
+
+    block = env["st"].data["conformance"]["_final"]
+    assert block["blocked"] is True
+    assert any("reverted/deleted" in w for w in block["warnings"])
+    assert any("rolled conformer commits back" in w for w in block["warnings"])
+    assert state["i"] == 1  # loop broke after strict rollback
+
+
+def test_clobbered_owned_file_advisory_when_not_strict(env):
+    """Same clobber, but without --strict-conformer: surfaced as a warning
+    and left in place (no rollback, no die())."""
+    c = env["leerie"]
+    assert not env["caps"].get("strict_conformer")
+
+    def _clobber(wt: Path):
+        (wt / "src.py").unlink()
+        _run(["git", "add", "-A"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: oops"], cwd=wt)
+
+    state = _stub_claude_p(c, [_clean_result()], commits={0: _clobber})
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert any("reverted/deleted" in w for w in block["warnings"])
+    assert not (env["staging"] / "src.py").exists(), (
+        "advisory mode must not restore the clobbered file")
+
+
+# --- final_blocked: strict-conformer residuals die() ------------------------
+
+def test_strict_conformer_residuals_die(env):
+    c = env["leerie"]
+    env["caps"] = dict(env["caps"])
+    env["caps"]["strict_conformer"] = True
+    env["caps"]["conformance_rounds"] = 1
+
+    dirty_result = _clean_result(
+        rule_violations=[
+            {"status": "residual", "rule": "no-console", "file": "a.py",
+             "line": 1, "why_not_fixed": "pre-existing"}],
+        rules_files_read=["README.md"],
+    )
+    _stub_claude_p(c, [dirty_result] * 2)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(c._run_final_conformance(
+            env["run_dir"], env["st"], env["caps"], env["models"],
+            env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert block["blocked"] is True
+
+
+# --- completeness gate: actionable solution_defects die() -------------------
+
+def test_completeness_gate_actionable_defect_dies(env):
+    c = env["leerie"]
+
+    defective = _clean_result(solution_defects=[
+        {"kind": "unhandled_case", "where": "src.py:10",
+         "concrete_case": "empty input list", "actionable": True},
+    ])
+    _stub_claude_p(c, [defective])
+
+    with pytest.raises(SystemExit):
+        asyncio.run(c._run_final_conformance(
+            env["run_dir"], env["st"], env["caps"], env["models"],
+            env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert block["blocked"] is True
+
+
+def test_completeness_gate_advisory_when_skip_flag_set(env):
+    """--skip-completeness-check demotes an actionable defect to advisory:
+    surfaced as a warning, run not blocked, no die()."""
+    c = env["leerie"]
+    env["st"].data["skip_completeness_check"] = True
+    env["st"].save()
+
+    defective = _clean_result(solution_defects=[
+        {"kind": "unhandled_case", "where": "src.py:10",
+         "concrete_case": "empty input list", "actionable": True},
+    ])
+    _stub_claude_p(c, [defective])
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    block = env["st"].data["conformance"]["_final"]
+    assert block["blocked"] is False
+    assert any("skip-completeness-check" in w for w in block["warnings"])
 
 
 # --- residuals get summarized into warnings -------------------------------

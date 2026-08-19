@@ -697,3 +697,172 @@ def test_write_failure_is_catchable(leerie, tmp_path, monkeypatch):
     if exc_caught is not None:
         assert isinstance(exc_caught, Exception), (
             f"Expected a catchable Exception, got {type(exc_caught)}")
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap closures (test-005): capture_repo_deps early-return / gating
+# branches not exercised by the existing write-path and replace-mode tests.
+# See test-001's coverage baseline report.
+# ---------------------------------------------------------------------------
+
+def test_no_run_dir_attribute_is_a_noop(leerie, tmp_path, monkeypatch):
+    """getattr(st, 'run_dir', None) is None -> early return before any
+    manifest read or worker invocation (log_dir resolution guard)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text("tenacity==9.1.4\n")
+
+    class _NoRunDirState:
+        data = {"worker_count": 0}
+
+    invoked = False
+
+    async def spy_invoke(*a, **kw):
+        nonlocal invoked
+        invoked = True
+        return _DEP_CAPTURE_ENVELOPE
+
+    monkeypatch.setattr(leerie, "_invoke", spy_invoke)
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, _NoRunDirState(), caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+    ))
+
+    assert not invoked, "no run_dir attribute must short-circuit before invoking the worker"
+    assert not (repo / ".leerie" / "config.toml").exists()
+
+
+def test_worker_budget_exhausted_skips_worker(leerie, tmp_path, monkeypatch):
+    """wc >= caps['max_total_workers'] skips the worker invocation entirely,
+    even when manifests/commands are present."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text("tenacity==9.1.4\n")
+    st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
+    st.data["worker_count"] = _CAPS["max_total_workers"]  # already at ceiling
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+
+    invoked = False
+
+    async def spy_invoke(*a, **kw):
+        nonlocal invoked
+        invoked = True
+        return _DEP_CAPTURE_ENVELOPE
+
+    monkeypatch.setattr(leerie, "_invoke", spy_invoke)
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+    ))
+
+    assert not invoked, "worker budget exhausted must skip the dep_capture worker"
+    assert not (repo / ".leerie" / "config.toml").exists()
+
+
+def test_malformed_existing_language_installs_json_treated_as_empty(
+        leerie, tmp_path, monkeypatch):
+    """A corrupted existing `language_installs` TOML value (invalid JSON)
+    must not raise — it is treated as an empty existing list, and the fresh
+    capture's entries are written as if nothing existed before."""
+    repo = tmp_path / "repo"
+    leerie_dir = repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    cfg = leerie_dir / "config.toml"
+    cfg.write_text('language_installs = "not-valid-json{["\n')
+
+    st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+    _patch_invoke(leerie, monkeypatch)  # default envelope carries a pnpm entry
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+    ))
+
+    content = cfg.read_text()
+    assert "pnpm" in content
+    assert "not-valid-json" not in content
+
+
+def test_replace_true_worker_invoked_with_empty_capture_logs_unchanged(
+        leerie, tmp_path, monkeypatch):
+    """replace=True where the worker actually runs (manifests present) and
+    returns an empty capture must hit the 'captured no deps' log branch and
+    leave the existing config byte-identical."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "requirements.txt").write_text("tenacity==9.1.4\n")
+    leerie_dir = repo / ".leerie"
+    leerie_dir.mkdir(parents=True)
+    cfg = leerie_dir / "config.toml"
+    cfg.write_text('setup_packages = "postgresql"\n')
+    content_before = cfg.read_text()
+
+    env = dict(_DEP_CAPTURE_ENVELOPE)
+    env["structured_output"] = {
+        "setup_packages": [],
+        "language_installs": [],
+        "dockerfile_notes": None,
+    }
+
+    st = _make_fake_state(leerie, tmp_path, ["echo noop"])
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+    _patch_invoke(leerie, monkeypatch, envelope=env)
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+        replace=True,
+    ))
+
+    assert cfg.read_text() == content_before
+
+
+def test_sentinel_file_write_failure_is_swallowed(leerie, tmp_path, monkeypatch):
+    """A failure writing the dep_capture.done sentinel file must not raise —
+    it is wrapped in its own best-effort try/except."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+    _patch_invoke(leerie, monkeypatch)
+
+    real_write_text = Path.write_text
+
+    def _raise_on_sentinel(self, *a, **kw):
+        if self.name == "dep_capture.done":
+            raise OSError("simulated disk full")
+        return real_write_text(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "write_text", _raise_on_sentinel)
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+    ))  # must not raise
+
+    # The config write itself (a different Path) still succeeded.
+    assert (repo / ".leerie" / "config.toml").exists()
+
+
+def test_state_data_write_failure_is_swallowed(leerie, tmp_path, monkeypatch):
+    """A failure setting st.data['dep_capture_done'] must not raise — it is
+    wrapped in its own best-effort try/except, independent of the sentinel
+    file write."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    st = _make_fake_state(leerie, tmp_path, ["apt-get install -y postgresql"])
+    monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+    _patch_invoke(leerie, monkeypatch)
+
+    class _RaisingData(dict):
+        def __setitem__(self, key, value):
+            if key == "dep_capture_done":
+                raise RuntimeError("simulated state write failure")
+            super().__setitem__(key, value)
+
+    st.data = _RaisingData(st.data)
+
+    asyncio.run(leerie.capture_repo_deps(
+        repo, st, caps=_CAPS, models=_MODELS, efforts=_EFFORTS,
+    ))  # must not raise
+
+    assert (repo / ".leerie" / "config.toml").exists()

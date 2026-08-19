@@ -216,6 +216,104 @@ def test_phase_degrades_to_empty_on_crash(leerie, tmp_path, monkeypatch):
 
 
 # --------------------------------------------------------------------------
+# repo-map grounding: --skip-repo-map interaction (the one behavioral branch
+# every existing phase-behavior test above never exercises, since
+# _make_state always seeds skip_repo_map=True)
+# --------------------------------------------------------------------------
+
+def _make_state_repo_map_enabled(leerie, run_dir: Path):
+    st = _make_state(leerie, run_dir)
+    st.data["skip_repo_map"] = False
+    return st
+
+
+def test_phase_builds_repo_map_when_not_skipped(leerie, tmp_path, monkeypatch):
+    """skip_repo_map=False → _build_repo_map/_rank_repo_map are called, and a
+    non-empty ranked map is folded into the ctx JSON handed to the worker."""
+    st = _make_state_repo_map_enabled(leerie, tmp_path / "run")
+    calls = []
+
+    def fake_build(repo_root, leerie_root):
+        calls.append((repo_root, leerie_root))
+        return {"fake": "graph"}
+
+    def fake_rank(repo_map, seed_files, seed_symbols):
+        assert repo_map == {"fake": "graph"}
+        return "ranked-repo-map-text"
+
+    captured = {}
+
+    async def fake_claude_p(**kw):
+        captured["user_prompt"] = kw["user_prompt"]
+        return {"artifacts": []}
+
+    monkeypatch.setattr(leerie, "_build_repo_map", fake_build)
+    monkeypatch.setattr(leerie, "_rank_repo_map", fake_rank)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    _run(leerie.phase_artifact_registry("task", st, _CAPS, _MODELS, _EFFORTS))
+    assert len(calls) == 1
+    assert calls[0][0] == Path(__import__("os").getcwd())
+    assert calls[0][1] == st.leerie_root
+    assert "ranked-repo-map-text" in captured["user_prompt"]
+
+
+def test_phase_skips_repo_map_build_when_skipped(leerie, tmp_path, monkeypatch):
+    """skip_repo_map=True (the default in _make_state) → _build_repo_map is
+    never called at all."""
+    st = _make_state(leerie, tmp_path / "run")
+    called = []
+    monkeypatch.setattr(
+        leerie, "_build_repo_map",
+        lambda *a, **k: called.append(1) or {})
+
+    async def fake_claude_p(**_kw):
+        return {"artifacts": []}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    _run(leerie.phase_artifact_registry("task", st, _CAPS, _MODELS, _EFFORTS))
+    assert called == []
+
+
+def test_phase_omits_repo_map_key_when_ranked_empty(leerie, tmp_path, monkeypatch):
+    """An empty ranked map (e.g. no source files) must not add a `repo_map`
+    key to the ctx JSON — mirrors phase_plan's own degrade."""
+    st = _make_state_repo_map_enabled(leerie, tmp_path / "run")
+    monkeypatch.setattr(leerie, "_build_repo_map", lambda *a, **k: {})
+    monkeypatch.setattr(leerie, "_rank_repo_map", lambda *a, **k: "")
+
+    captured = {}
+
+    async def fake_claude_p(**kw):
+        captured["user_prompt"] = kw["user_prompt"]
+        return {"artifacts": []}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    _run(leerie.phase_artifact_registry("task", st, _CAPS, _MODELS, _EFFORTS))
+    assert '"repo_map"' not in captured["user_prompt"]
+
+
+def test_phase_degrades_silently_on_repo_map_exception(leerie, tmp_path, monkeypatch):
+    """A crashing _build_repo_map must not propagate — the phase degrades
+    silently and the worker still runs on the task alone (never die()s)."""
+    st = _make_state_repo_map_enabled(leerie, tmp_path / "run")
+
+    def raising(*_a, **_k):
+        raise RuntimeError("tree-sitter blew up")
+    monkeypatch.setattr(leerie, "_build_repo_map", raising)
+
+    captured = {}
+
+    async def fake_claude_p(**kw):
+        captured["user_prompt"] = kw["user_prompt"]
+        return {"artifacts": [
+            {"description": "hook", "tag": "io-hook", "path": "src/io.ts"}]}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = _run(leerie.phase_artifact_registry(
+        "task", st, _CAPS, _MODELS, _EFFORTS))
+    assert out == [{"description": "hook", "tag": "io-hook",
+                    "path": "src/io.ts"}]
+    assert '"repo_map"' not in captured["user_prompt"]
+
+
+# --------------------------------------------------------------------------
 # injection wiring + resume round-trip
 # --------------------------------------------------------------------------
 

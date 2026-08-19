@@ -851,3 +851,126 @@ def test_call_site_proceeds_with_healthy_keychain_unaffected_by_bedrock_change()
         )
         assert rc == 0, f"call site died despite a healthy resolved Keychain credential (rc={rc}): {out}"
         assert "CALL_SITE_RESULT=proceeded" in out
+
+
+# ---------------------------------------------------------------------------
+# (m) The call site's staged-credential side effects and its
+# _check_claude_credential_ttl integration ("_check_claude_credential_ttl
+# "$_CLAUDE_CREDS_JSON" || exit 1" at the real call site) -- neither of
+# these is exercised by any test above: the (l) group above proves the
+# Bedrock-exemption *boolean composition* runs correctly, but none of it
+# resolves a real claudeAiOauth credential with an expiresAt, so the TTL
+# integration line itself has never actually executed in this suite.
+# tests/test_credential_ttl_preflight.py covers _check_claude_credential_ttl
+# in isolation; these tests cover its wiring into the real STAGE-assembly
+# call site via the same harness as group (l).
+# ---------------------------------------------------------------------------
+
+def _future_ms_epoch(seconds_from_now: float) -> int:
+    import time
+
+    return int((time.time() + seconds_from_now) * 1000)
+
+
+def _past_ms_epoch(seconds_ago: float) -> int:
+    import time
+
+    return int((time.time() - seconds_ago) * 1000)
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_dies_on_expired_resolved_credential() -> None:
+    """An expired claudeAiOauth.expiresAt resolved from Keychain must make
+    the real call site die() via its _check_claude_credential_ttl
+    integration -- not merely that the standalone function returns 1 in
+    isolation (test_credential_ttl_preflight.py), but that the call site's
+    `|| exit 1` actually fires and the run never reaches
+    CALL_SITE_RESULT=proceeded."""
+    expired_ms = _past_ms_epoch(3600)
+    blob = json.dumps({"claudeAiOauth": {"accessToken": "sk-stale", "expiresAt": expired_ms}})
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = _run_call_site(Path(d), stub_security_returns=blob)
+        assert rc != 0, f"call site proceeded despite an expired resolved credential: {out}"
+        assert "CALL_SITE_RESULT=proceeded" not in out
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_proceeds_and_warns_on_near_expiry_credential() -> None:
+    """A credential within the warn threshold must still proceed (rc 0,
+    reaches CALL_SITE_RESULT=proceeded) -- the TTL check warns but does not
+    refuse, distinct from the expired case above."""
+    soon_ms = _future_ms_epoch(60)  # well inside the 90-minute threshold
+    blob = json.dumps({"claudeAiOauth": {"accessToken": "sk-soon", "expiresAt": soon_ms}})
+    with tempfile.TemporaryDirectory() as d:
+        rc, out = _run_call_site(Path(d), stub_security_returns=blob)
+        assert rc == 0, f"call site died on a near-expiry (not yet expired) credential (rc={rc}): {out}"
+        assert "CALL_SITE_RESULT=proceeded" in out
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_writes_resolved_credential_to_stage_file() -> None:
+    """On a successful resolution, the call site stages the resolved JSON
+    verbatim into $STAGE/.claude/.credentials.json with mode 600 -- the
+    actual side effect the whole block exists to produce, which none of
+    the rc/stdout-only assertions above observe directly."""
+    blob = '{"claudeAiOauth":{"accessToken":"sk-good"}}'
+    with tempfile.TemporaryDirectory() as d:
+        tmp_path = Path(d)
+        rc, out = _run_call_site(tmp_path, stub_security_returns=blob)
+        assert rc == 0, f"call site died on a healthy credential (rc={rc}): {out}"
+        staged = tmp_path / "stage" / ".claude" / ".credentials.json"
+        assert staged.exists()
+        assert staged.read_text() == blob
+        assert oct(staged.stat().st_mode)[-3:] == "600"
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Keychain code path is gated by `uname -s = Darwin` in the launcher",
+)
+def test_call_site_removes_stale_staged_file_on_die(tmp_path: Path) -> None:
+    """When the call site dies (no auth anywhere), it must remove any
+    stale $STAGE/.claude/.credentials.json left over from a prior
+    invocation rather than leaving a container to mount stale
+    credentials it believes are fresh."""
+    harness = _build_call_site_harness(tmp_path)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    bin_dir = tmp_path / "stub-bin"
+    bin_dir.mkdir()
+    sec = bin_dir / "security"
+    sec.write_text(
+        "#!/bin/sh\n"
+        "printf '%s' '{\"mcpOAuth\":{\"plugin:x:x|1\":{\"accessToken\":\"\"}}}'\n"
+        "exit 0\n"
+    )
+    sec.chmod(0o755)
+
+    stage = tmp_path / "stage"
+    (stage / ".claude").mkdir(parents=True)
+    stale = stage / ".claude" / ".credentials.json"
+    stale.write_text('{"claudeAiOauth":{"accessToken":"sk-stale-from-prior-run"}}')
+
+    repo_dir = tmp_path / "repo"
+    repo_dir.mkdir()
+    env = {
+        "HOME": str(fake_home),
+        "PATH": f"{bin_dir}:/usr/bin:/bin",
+        "TMPDIR": str(stage),
+        "TEST_STAGE": str(stage),
+        "TEST_USER_REPO": str(repo_dir),
+    }
+    result = subprocess.run(
+        ["bash", str(harness)], env=env, capture_output=True, text=True, timeout=10,
+    )
+    assert result.returncode != 0
+    assert not stale.exists(), "stale staged credentials file survived a die()"

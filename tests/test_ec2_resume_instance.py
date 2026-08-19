@@ -532,3 +532,75 @@ def test_resume_instance_clears_pause_sidecar_fields(tmp_path):
     assert run_json.get("paused_at") is None
     assert run_json.get("pause_reason") is None
     assert run_json.get("ec2_instance_id") == iid
+
+
+# --- resume_instance: unresolvable IP degrades to a warning, not a failure --
+
+
+def test_resume_instance_unresolvable_ip_warns_but_still_succeeds(tmp_path):
+    """_resolve_ssh_target_from_instance returns 1 when PublicIpAddress is
+    empty (e.g. the instance has no public IP assigned). That must not fail
+    resume_instance as a whole -- the instance is genuinely running and
+    reachable via other means (SSM), so resume_instance logs a warning and
+    still returns 0 with LEERIE_EC2_SSH_TARGET left unset.
+
+    Seeded already-`running` (rather than `stopped`) so the already-running
+    no-op branch is taken and start-instances never runs -- the stub's
+    start-instances always assigns a fresh public_ip, which would mask the
+    empty-IP condition this test targets."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    state = read_state(aws_dir)
+    iid = "i-" + format(len(state["instances"]), "017x")
+    state["instances"][iid] = {
+        "state": "running",
+        "_ip_gen": 1,
+        "public_ip": "",
+        "status_ok": True,
+    }
+    (aws_dir / "state.json").write_text(json.dumps(state))
+    env = _stub_env(aws_dir)
+
+    result = _run_bash(
+        f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; "
+        f"resume_instance {iid}; rc=$?; "
+        f"trap - EXIT INT TERM; "
+        f"echo \"target=[${{LEERIE_EC2_SSH_TARGET:-}}]\"; exit $rc",
+        env=env,
+    )
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "could not resolve a public ip" in result.stderr.lower()
+    assert "target=[]" in result.stdout
+
+    log = read_log(aws_dir)
+    assert not any(l.startswith("ec2 start-instances") for l in log)
+
+
+# --- resume_instance: unexpected state falls through the catch-all arm ------
+
+
+def test_resume_instance_unexpected_state_fails_without_starting(tmp_path):
+    """A state that is neither running/stopped-transitional nor
+    terminated-shaped (e.g. AWS reports 'rebooting', which this script
+    does not special-case) must hit the catch-all `*)` arm: fail closed
+    and never call start-instances."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    iid = _seed_stopped_instance(aws_dir)
+    state = read_state(aws_dir)
+    state["instances"][iid]["state"] = "rebooting"
+    (aws_dir / "state.json").write_text(json.dumps(state))
+    env = _stub_env(aws_dir)
+
+    result = _run_bash(
+        f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
+        env=env,
+    )
+
+    assert result.returncode != 0
+    assert "cannot resume" in result.stderr.lower()
+    assert "rebooting" in result.stderr
+
+    log = read_log(aws_dir)
+    assert not any(l.startswith("ec2 start-instances") for l in log)

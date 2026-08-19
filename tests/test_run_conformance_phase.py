@@ -543,6 +543,83 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
         "budget exhaustion should surface as a 'crashed' advisory warning"
 
 
+# --- _run_conformer directly: success path, timeout, optional sections ----
+
+def test_run_conformer_success_path_returns_expanded_output(env, monkeypatch):
+    """A clean claude_p call returns `_expand_conformer_output(raw)` — the
+    success return, distinct from every crash/timeout arm covered above."""
+    c = env["leerie"]
+    captured = {}
+
+    async def _fake_claude_p(*, user_prompt, **kwargs):
+        captured["user_prompt"] = user_prompt
+        return {"subtask_id": env["sid"], "rule_violations": [],
+                "file_updates": [], "solution_defects": [],
+                "summary": "clean"}
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    result = asyncio.run(c._run_conformer(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+        env["st"], env["models"], {"conformer": None}, rules_files=[],
+        blt_results={}, blt_scope="off", diff_base=env["run_branch"]))
+
+    assert result is not None
+    assert result["summary"] == "clean"
+    # _expand_conformer_output fans the flattened wire arrays back out.
+    assert result["rule_violations_fixed"] == []
+    assert result["rule_violations_residual"] == []
+
+
+def test_run_conformer_timeout_returns_none(env, monkeypatch):
+    """A worker that hits its wall-clock ceiling is swallowed as an
+    advisory None, not left to propagate the TimeoutExpired traceback."""
+    c = env["leerie"]
+
+    async def _fake_claude_p(*args, **kwargs):
+        raise __import__("subprocess").TimeoutExpired(cmd="claude", timeout=1)
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    result = asyncio.run(c._run_conformer(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+        env["st"], env["models"], {"conformer": None}, rules_files=[],
+        blt_results={}, blt_scope="off", diff_base=env["run_branch"]))
+    assert result is None
+
+
+def test_run_conformer_appends_optional_prompt_sections(env, monkeypatch):
+    """baseline_section / recipe_section / extra_feedback are each appended
+    to the user prompt when present — the three optional-append branches."""
+    c = env["leerie"]
+    captured = {}
+
+    async def _fake_claude_p(*, user_prompt, **kwargs):
+        captured["user_prompt"] = user_prompt
+        return {"subtask_id": env["sid"]}
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    env["st"].data["conformance"] = {"_baseline": {
+        "build": {"passed": True, "measured": True, "ran": True,
+                  "command": "make build", "summary": "ok"},
+    }}
+    env["st"].data["provision"] = {"recipe": [
+        {"kind": "install", "command": ["npm", "install"], "language": "node"},
+    ]}
+
+    result = asyncio.run(c._run_conformer(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+        env["st"], env["models"], {"conformer": None}, rules_files=[],
+        blt_results={}, blt_scope="off", diff_base=env["run_branch"],
+        extra_feedback="ORCHESTRATOR MECHANICAL CHECK: fix the thing"))
+
+    assert result is not None
+    assert "npm install" in captured["user_prompt"]
+    assert "ORCHESTRATOR MECHANICAL CHECK: fix the thing" in \
+        captured["user_prompt"]
+
+
 # --- outer contract: _settle_subtask never escalates conformance failures --
 
 def test_settle_subtask_never_escalates_on_conformer_crash(env, monkeypatch):
@@ -920,6 +997,126 @@ def test_strict_clobber_break_still_reports_measured_axes(env):
     assert res["tests"]["passed"] is False, (
         "a strict-mode break carried the worker's claimed axes into the "
         "blocking decision")
+
+
+# --- subtask_tests="off": _measure short-circuits with no axes -----------
+
+def test_axes_off_short_circuits_measure(env, monkeypatch):
+    """When `subtask_tests` resolves to `off`, `_select_subtask_axes`
+    returns an empty axes dict and the inner `_measure` closure must
+    short-circuit to `{}` without ever calling `_measure_axes` — a
+    docs-only subtask pays nothing for measurement it has no axes for."""
+    c = env["leerie"]
+    env["st"].data["subtask_tests"] = "off"
+    _stub_run_conformer(c, [_clean_result()])
+
+    called = {"n": 0}
+    original = c._measure_axes
+
+    async def _spy(*args, **kwargs):
+        called["n"] += 1
+        return await original(*args, **kwargs)
+    c._measure_axes = _spy
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert called["n"] == 0, (
+        "_measure_axes must not be called when the axes dict is empty")
+    assert res is not None
+
+
+# --- dirty worktree that is NOT a protected-path or clobber violation ----
+
+def test_dirty_leftover_warns_without_rollback(env):
+    """A conformer that leaves an uncommitted change to a tracked file —
+    with no protected-path commit and no clobber — must surface a
+    'left N uncommitted change(s)' advisory warning, and must NOT be
+    rolled back (the phase tolerates this; it only warns)."""
+    c = env["leerie"]
+
+    def _leave_dirty(wt: Path):
+        (wt / "src.py").write_text(
+            "def f():\n    pass\n\n# left dirty, never committed\n")
+
+    _stub_run_conformer(c, [_clean_result()], commits={0: _leave_dirty})
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert any(
+        "left" in w and "uncommitted change" in w
+        and "not rolled back" in w for w in warnings), warnings
+    # Confirm the file is still dirty — no rollback happened.
+    assert "left dirty" in (env["worktree"] / "src.py").read_text()
+
+
+# --- clobber rollback (strict mode) also discards other uncommitted work -
+
+def test_strict_clobber_rollback_warns_about_discarded_uncommitted(env):
+    """Mirrors `test_protected_path_rollback_warns_about_discarded_uncommitted`
+    for the OTHER rollback path: under --strict-conformer, a clobber
+    rollback (`git reset --hard` to the implementer HEAD) will also
+    silently erase any other uncommitted tracked-file scribble. The phase
+    must name it before rolling back."""
+    c = env["leerie"]
+    env["caps"]["strict_conformer"] = True
+
+    def _clobber_with_uncommitted(wt: Path):
+        (wt / "src.py").unlink()
+        (wt / "extra.txt").write_text("tracked\n")
+        subprocess.run(["git", "add", "-A"], cwd=wt, check=True,
+                       capture_output=True, text=True)
+        subprocess.run(["git", "commit", "-q", "-m", "conformer: clobber"],
+                       cwd=wt, check=True, capture_output=True, text=True)
+        # Leave a further uncommitted change to the newly-tracked file.
+        (wt / "extra.txt").write_text("uncommitted scribble\n")
+
+    _stub_run_conformer(c, [_clean_result()],
+                        commits={0: _clobber_with_uncommitted})
+
+    res, warnings, blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert blocked is not None
+    assert any(
+        "discarding" in w and "clobber rollback" in w for w in warnings), \
+        warnings
+    # src.py restored by the rollback (implementer's file was clobbered).
+    assert (env["worktree"] / "src.py").exists()
+
+
+# --- a within-round regression continues the loop and is surfaced --------
+
+def test_within_round_regression_surfaces_and_continues(env):
+    """An axis measured green BEFORE a round and red AFTER it, on the same
+    command, is the one build/lint/test signal that keeps the loop going
+    even when the conformer's own result otherwise looks clean — and it
+    must be named in the warnings."""
+    c = env["leerie"]
+    same_cmd = {"command": "npm test"}
+    pre_green = {"tests": {"ran": True, "measured": True, "passed": True,
+                           "summary": "", **same_cmd}}
+    post_red = {"tests": {"ran": True, "measured": True, "passed": False,
+                          "summary": "broke it", **same_cmd}}
+    clean_pre = {"tests": {"ran": True, "measured": True, "passed": True,
+                           "summary": "", **same_cmd}}
+    _stub_measure_axes(c, [pre_green, post_red, clean_pre, clean_pre])
+    state = _stub_run_conformer(c, [_clean_result(), _clean_result()])
+
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+
+    assert state["i"] == 2, (
+        "a within-round regression must trigger a second round even "
+        "though round 0's conformer result was clean")
+    assert any(
+        "passed before your changes this round and fails after them" in w
+        for w in warnings), warnings
 
 
 def test_a_completed_round_reports_the_post_measurement(env):

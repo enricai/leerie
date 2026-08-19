@@ -156,6 +156,27 @@ def test_compose_pr_body_footer_link_without_version(leerie):
     assert "[leerie v" not in body
 
 
+def test_compose_pr_body_footer_link_with_version_and_commit(leerie):
+    """`leerie_version` + `leerie_commit` both present → the sha
+    disambiguates the version, rendered as ` v<version> (<commit>)`."""
+    state = _full_state()
+    state["leerie_version"] = "1.4.0"
+    state["leerie_commit"] = "abc1234"
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "[leerie v1.4.0 (abc1234)](https://github.com/enricai/leerie)" in body
+
+
+def test_compose_pr_body_commit_without_version_omitted(leerie):
+    """`leerie_commit` alone (no `leerie_version`) must not render — the
+    commit only disambiguates an existing version suffix; it is never a
+    substitute for one."""
+    state = _full_state()
+    state["leerie_commit"] = "abc1234"
+    body = leerie.compose_pr_body(state, "feat-foo-abc123")
+    assert "[leerie](https://github.com/enricai/leerie)" in body
+    assert "abc1234" not in body
+
+
 def test_compose_pr_body_no_literal_none(leerie):
     """Sweep guard: under no realistic state shape should the literal
     string 'None' appear in the body."""

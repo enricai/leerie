@@ -131,3 +131,137 @@ def test_die_message_does_not_claim_resume_cannot_bypass_falsely(leerie):
         "`resume` does not bypass" in src), (
         "the die() message must state that resume re-runs the gate, "
         "since the pre-fix behaviour silently bypassed it")
+
+
+# ===========================================================================
+# The deterministic `check_plan_wiring` re-check that runs right after
+# `phase_wiring_gate` in `_run_phases` (DESIGN §5 *A wiring re-check on the
+# fully-merged plan*). `phase_wiring_gate` is stubbed to a no-op pass here
+# (as it is everywhere else in this file), so this exercises the REAL
+# `check_plan_wiring` against the real `_schedule()` output — a dangle the
+# semantic judge stub cannot have caught. Previously only unit-tested in
+# isolation (tests/test_check_plan_wiring.py); this is the first test to
+# drive it from inside `_run_phases` itself.
+# ===========================================================================
+
+BAD_PLANS = [_plan(
+    "refactoring",
+    _subtask("refactor-030"),
+    _subtask(
+        "refactor-031",
+        requires=[{"tag": "nothing-provides-this", "extent": "in_plan"}]),
+)]
+
+
+def _seeded_bad(**extra) -> dict:
+    data = {
+        "task": "t",
+        "categories": ["refactoring"],
+        "answers": {"source_of_truth": "codebase"},
+    }
+    for phase in ("classify", "plan", "reconcile", "overlap_judge",
+                  "adherence_gate", "coverage_gate", "filters"):
+        data[f"plans_after_{phase}"] = BAD_PLANS
+    data.update(extra)
+    return data
+
+
+def test_check_plan_wiring_die_branch_fires_in_run_phases(
+        leerie, monkeypatch, run_dirs):  # noqa: F811
+    """A merged plan that still carries an unresolved `requires` tag after
+    scheduling must die() from `_run_phases`' own `check_plan_wiring` call
+    — distinct from (and a backstop for) the semantic `wiring_judge` gate,
+    which is stubbed here to a clean no-op pass and therefore cannot be
+    what is catching this."""
+    import asyncio
+
+    from tests.test_resume_planning_reentry import EFFORTS, MODELS
+
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = _make_state(leerie, run_dirs, _seeded_bad())
+    leerie_root, run_id, run_dir = run_dirs
+
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie._run_phases(
+            _args(), _caps(leerie), run_dir, st, "codebase", "normal",
+            MODELS, EFFORTS))
+
+    # Anti-vacuity: the semantic gate stub really did pass cleanly (it was
+    # invoked and returned plans unchanged), so the die() above can only be
+    # the deterministic check_plan_wiring re-check, not the judge.
+    assert calls.get("phase_wiring_gate", 0) == 1
+    assert calls.get("phase_execute", 0) == 0, (
+        "the die() must fire before phase_execute is ever reached")
+
+
+# ===========================================================================
+# The repairs branch: a `phase_wiring_gate` repair adds a `requires` edge,
+# which changes the wave partition, so `_run_phases` must re-derive
+# `_schedule()` and rewrite `plan_snapshot` — previously only pinned by
+# source-coupling (test_wiring_gate_repair.py::
+# test_caller_reschedules_when_repairs_land). This drives the branch for
+# real by stubbing `phase_wiring_gate` to perform an actual repair.
+# ===========================================================================
+
+GOOD_PLANS = [_plan(
+    "refactoring",
+    _subtask("refactor-040", provides=["thing"]),
+    _subtask("refactor-041"),
+)]
+
+
+def _seeded_repair(**extra) -> dict:
+    data = {
+        "task": "t",
+        "categories": ["refactoring"],
+        "answers": {"source_of_truth": "codebase"},
+    }
+    for phase in ("classify", "plan", "reconcile", "overlap_judge",
+                  "adherence_gate", "coverage_gate", "filters"):
+        data[f"plans_after_{phase}"] = GOOD_PLANS
+    data.update(extra)
+    return data
+
+
+def test_run_phases_reschedules_and_repersists_snapshot_after_a_repair(
+        leerie, monkeypatch, run_dirs):  # noqa: F811
+    """Behavioural counterpart to
+    test_wiring_gate_repair.py::test_caller_reschedules_when_repairs_land,
+    which only source-couples the branch. Here `phase_wiring_gate` is
+    stubbed to simulate a real repair — adding a `requires` edge — and this
+    asserts `_run_phases` actually re-derives `_schedule()` and rewrites
+    `plan_snapshot` to the repaired wave partition rather than persisting
+    the pre-repair one."""
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+
+    async def _wiring_gate_with_repair(plans, task, st, caps, models,
+                                       efforts):
+        calls["phase_wiring_gate"] = calls.get("phase_wiring_gate", 0) + 1
+        for p in plans:
+            for s in p["subtasks"]:
+                if s["id"] == "refactor-041":
+                    s["requires"] = [
+                        {"tag": "thing", "extent": "in_plan"}]
+        st.data["wiring_gate"] = {
+            "wiring_defects": [],
+            "repairs": [{"sid": "refactor-041", "tag": "thing",
+                        "channel": "tag"}],
+        }
+        return plans
+    monkeypatch.setattr(leerie, "phase_wiring_gate", _wiring_gate_with_repair)
+
+    st = _make_state(leerie, run_dirs, _seeded_repair())
+    _drive(leerie, _args(), _caps(leerie), run_dirs, st)
+
+    assert calls.get("phase_wiring_gate") == 1
+    snap = st.data["plan_snapshot"]
+    # The repaired schedule must reflect the added edge: refactor-041 now
+    # requires "thing" (provided by refactor-040), so they land in separate
+    # waves rather than the single wave a schedule of the pre-repair plan
+    # (no edges at all) would produce.
+    pos = {sid: i for i, w in enumerate(snap["waves"]) for sid in w}
+    assert pos["refactor-040"] < pos["refactor-041"], (
+        "plan_snapshot must be rewritten from the REPAIRED schedule, not "
+        "the pre-repair one")

@@ -61,6 +61,20 @@ class TestDiskHeadroomMessage:
         assert str(tmp_path) in msg
         assert f"{leerie.DISK_MIN_FREE_RATIO:.0%}" in msg
 
+    def test_walks_up_to_nearest_existing_ancestor(self, tmp_path):
+        # Mirrors _disk_free_ratio's own walk-up test: a missing leaf path
+        # (e.g. a run dir not yet created) must resolve against its nearest
+        # existing ancestor rather than raising FileNotFoundError.
+        missing = tmp_path / "does" / "not" / "exist"
+        with mock.patch.object(leerie.shutil, "disk_usage",
+                                return_value=_fake_usage(0.02)) as m:
+            msg = leerie._disk_headroom_message(missing, 0.02)
+        m.assert_called_once_with(tmp_path)
+        # The message still names the ORIGINAL path, not the ancestor it
+        # walked up to -- the operator asked about `missing`, not tmp_path.
+        assert str(missing) in msg
+        assert "2.0%" in msg
+
 
 class TestPreflightDiskCheck:
     """Near-zero free space dies before any worker spawns; a healthy disk
@@ -617,5 +631,82 @@ class TestDepCaptureGuardsIncludeDiskLowSpace:
                      "                ContextOverflow)")
         assert old_shape not in src
         assert "ContextOverflow, DiskLowSpace)" in src
+
+
+class TestInvokeStdinStagingDiskLowSpace:
+    """`_invoke` stages the worker prompt to a temp file BEFORE the child is
+    spawned (see test_stdin_feeder_ordering.py for why). Running out of
+    space during that staging step is not hypothetical -- it is the single
+    largest disk write leerie makes per worker invocation (~150 KB, once
+    per attempt) -- and nothing upstream converts a raw OSError there, so
+    it must become DiskLowSpace itself rather than reaching main() as an
+    unhandled crash."""
+
+    async def _invoke_never_spawns(self, tmp_path, stdin_data="a prompt"):
+        # The staging failure must short-circuit before create_subprocess_exec
+        # ever runs -- a spawn here would mean the failure was not caught in
+        # time and a real `claude` child (or an attempt to launch one) leaked
+        # past the guard.
+        async def _fail_if_spawned(*a, **k):
+            raise AssertionError("must not spawn after a staging failure")
+
+        with mock.patch.object(leerie.asyncio, "create_subprocess_exec",
+                                new=_fail_if_spawned):
+            return await leerie._invoke(
+                ["claude", "-p"], cwd=str(tmp_path), timeout=60,
+                sid="t-stage", leerie_dir=tmp_path, verbosity="quiet",
+                stdin_data=stdin_data)
+
+    def test_mkstemp_enospc_becomes_disklowspace(self, tmp_path):
+        import errno as _errno
+
+        def _raise_enospc(*a, **k):
+            raise OSError(_errno.ENOSPC, "No space left on device")
+
+        with mock.patch("tempfile.mkstemp", side_effect=_raise_enospc):
+            with pytest.raises(leerie.DiskLowSpace) as exc_info:
+                asyncio.run(self._invoke_never_spawns(tmp_path))
+        # mkstemp itself failed -- no stdin_path was ever minted, so the
+        # message must name a directory instead of interpolating None.
+        assert "staging the worker prompt failed" in str(exc_info.value)
+        assert "None" not in str(exc_info.value)
+
+    def test_write_enospc_becomes_disklowspace_and_unlinks(self, tmp_path):
+        import errno as _errno
+        import tempfile as _tempfile
+
+        unlinked = []
+        real_unlink = leerie.os.unlink
+
+        def _tracking_unlink(path, *a, **k):
+            unlinked.append(path)
+            return real_unlink(path, *a, **k)
+
+        def _raise_enospc(*a, **k):
+            raise OSError(_errno.ENOSPC, "No space left on device")
+
+        with mock.patch("tempfile.mkstemp",
+                         wraps=_tempfile.mkstemp) as m_mkstemp, \
+             mock.patch.object(leerie.os, "fdopen", side_effect=_raise_enospc), \
+             mock.patch.object(leerie.os, "unlink", side_effect=_tracking_unlink):
+            with pytest.raises(leerie.DiskLowSpace) as exc_info:
+                asyncio.run(self._invoke_never_spawns(tmp_path))
+        assert "staging the worker prompt failed" in str(exc_info.value)
+        # The real stdin_path (a live path, not None) was minted and must be
+        # named in the message and reaped -- a leaked ~150KB file per failed
+        # attempt is not academic on a run that is already low on space.
+        assert m_mkstemp.call_count == 1
+        assert len(unlinked) == 1
+        assert str(unlinked[0]) in str(exc_info.value)
+
+    def test_non_enospc_oserror_propagates_unconverted(self, tmp_path):
+        def _raise_eacces(*a, **k):
+            raise OSError(13, "Permission denied")
+
+        with mock.patch("tempfile.mkstemp", side_effect=_raise_eacces):
+            with pytest.raises(OSError) as exc_info:
+                asyncio.run(self._invoke_never_spawns(tmp_path))
+        assert not isinstance(exc_info.value, leerie.DiskLowSpace)
+        assert exc_info.value.errno == 13
 
 

@@ -125,6 +125,24 @@ def test_convention_docs_section_none_when_no_docs(leerie, tmp_path):
     assert leerie._format_convention_docs_section(tmp_path) is None
 
 
+def test_discover_rules_files_skips_candidate_that_raises_oserror(
+        leerie, tmp_path, monkeypatch):
+    """A candidate whose `is_file()` raises OSError (e.g. a permission
+    error walking a symlinked path) is skipped rather than propagating —
+    discovery must never raise."""
+    (tmp_path / "README.md").write_text("r\n")
+    real_is_file = leerie.Path.is_file
+
+    def flaky_is_file(self):
+        if self.name == "CLAUDE.md":
+            raise OSError("simulated stat failure")
+        return real_is_file(self)
+
+    monkeypatch.setattr(leerie.Path, "is_file", flaky_is_file)
+    out = leerie._discover_rules_files(tmp_path)
+    assert out == [tmp_path / "README.md"]
+
+
 def test_convention_docs_section_lists_discovered_paths(leerie, tmp_path):
     docs = tmp_path / "docs"
     docs.mkdir()

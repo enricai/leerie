@@ -1235,3 +1235,111 @@ class TestCancelArmWiring:
         assert "capture_repo_deps" in arm_src, (
             "InterruptedBySignal arm in main() must invoke capture_repo_deps"
         )
+
+
+# ---------------------------------------------------------------------------
+# Coverage-gap closures (test-005): _is_install_command empty-segment guard,
+# _gather_dep_manifests unreadable-file + total-budget-break branches,
+# resolve_capture_deps malformed-value fallback, _write_config_toml_keys
+# append/preserve branches. See test-001's coverage baseline report.
+# ---------------------------------------------------------------------------
+
+class TestIsInstallCommandEmptySegment:
+    """A command with an empty shell segment (consecutive separators, or a
+    separator with nothing after it) must not crash and must not be
+    mistaken for an install — the `if not words: continue` guard."""
+
+    def test_trailing_separator_with_empty_segment_is_not_install(self, leerie):
+        # Splitting on ';' yields a trailing empty segment after the final ';'.
+        assert not leerie._is_install_command("echo hi;")
+
+    def test_double_separator_yields_empty_segment_between(self, leerie):
+        # "a && && b" splits into an empty segment between the two '&&'s.
+        assert not leerie._is_install_command("echo hi && && echo bye")
+
+    def test_leading_separator_still_finds_the_real_install(self, leerie):
+        # A leading ';' produces an empty first segment; the real install
+        # segment after it must still be detected.
+        assert leerie._is_install_command(";pip install requests")
+
+
+class TestGatherDepManifestsErrorAndBudget:
+    """Unreadable manifest files are skipped (OSError guard); the running
+    total-budget check breaks the loop rather than silently overflowing."""
+
+    def test_unreadable_manifest_is_skipped_not_raised(self, leerie, tmp_path, monkeypatch):
+        (tmp_path / "requirements.txt").write_text("tenacity==9.1.4\n")
+        (tmp_path / "package.json").write_text('{"dependencies":{}}')
+
+        real_read_text = Path.read_text
+
+        def _raise_on_requirements(self, *a, **kw):
+            if self.name == "requirements.txt":
+                raise OSError("simulated unreadable file")
+            return real_read_text(self, *a, **kw)
+
+        monkeypatch.setattr(Path, "read_text", _raise_on_requirements)
+        block = leerie._gather_dep_manifests(tmp_path)
+        # The unreadable manifest is skipped entirely (no exception escapes,
+        # no empty section for it); the readable one still appears.
+        assert "requirements.txt" not in block
+        assert "### package.json" in block
+
+    def test_total_budget_break_stops_before_exceeding(self, leerie, tmp_path, monkeypatch):
+        # Force a tiny total budget so the second manifest can't fit and the
+        # loop breaks rather than appending a third, over-budget block.
+        (tmp_path / "requirements.txt").write_text("a==1\n")
+        (tmp_path / "package.json").write_text("b==2\n")
+        monkeypatch.setattr(leerie, "_DEPCAP_MANIFEST_TOTAL_BUDGET", 40)
+        block = leerie._gather_dep_manifests(tmp_path)
+        assert len(block.encode()) <= 40 + 200  # single block max, loop broke
+        # At most one of the two manifests made it in (order is
+        # _DEP_MANIFEST_NAMES order); the loop must have broken, not raised.
+        assert block.count("### ") <= 1
+
+
+class TestResolveCaptureDepsMalformedValue:
+    """A malformed env/config value raises ValueError inside
+    _parse_bool_envtoml; resolve_capture_deps must fall through rather than
+    propagate, ending at the next tier (or the True default)."""
+
+    def test_malformed_env_value_falls_through_to_config(self, leerie, tmp_path, monkeypatch):
+        monkeypatch.setenv("LEERIE_CAPTURE_DEPS", "maybe")
+        repo = tmp_path / "repo"
+        (repo / ".leerie").mkdir(parents=True)
+        (repo / ".leerie" / "config.toml").write_text('capture_deps = "false"\n')
+        assert leerie.resolve_capture_deps(repo) is False
+
+    def test_malformed_config_value_falls_through_to_default_true(self, leerie, tmp_path, monkeypatch):
+        monkeypatch.delenv("LEERIE_CAPTURE_DEPS", raising=False)
+        repo = tmp_path / "repo"
+        (repo / ".leerie").mkdir(parents=True)
+        (repo / ".leerie" / "config.toml").write_text('capture_deps = "maybe"\n')
+        assert leerie.resolve_capture_deps(repo) is True
+
+
+class TestWriteConfigTomlKeysBranches:
+    """Direct coverage of _write_config_toml_keys' append-new-key and
+    preserve-unrelated-line branches (usually exercised only incidentally
+    through capture_repo_deps, which never leaves an unrelated line)."""
+
+    def test_appends_key_absent_from_existing_file(self, leerie, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text("# leerie config\nother_key = \"x\"\n")
+        leerie._write_config_toml_keys(cfg, {"setup_packages": "libvips-dev"})
+        content = cfg.read_text()
+        assert 'other_key = "x"' in content  # unrelated line preserved verbatim
+        assert 'setup_packages = "libvips-dev"' in content  # appended
+
+    def test_preserves_unrelated_lines_while_replacing_matched_key(self, leerie, tmp_path):
+        cfg = tmp_path / "config.toml"
+        cfg.write_text(
+            "# header\n"
+            "runtime = \"local\"\n"
+            "setup_packages = \"stale\"\n"
+        )
+        leerie._write_config_toml_keys(cfg, {"setup_packages": "fresh-pkg"})
+        content = cfg.read_text()
+        assert 'runtime = "local"' in content
+        assert 'setup_packages = "fresh-pkg"' in content
+        assert "stale" not in content

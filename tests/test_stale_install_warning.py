@@ -98,7 +98,7 @@ def install(tmp_path):
     return {"origin": origin, "clone": clone, "state": state}
 
 
-def _run(install, version="0.9.100", repo=None):
+def _run(install, version="0.9.100", repo=None, path=None):
     script = install["state"].parent / "harness.sh"
     script.write_text(
         _HARNESS
@@ -107,8 +107,35 @@ def _run(install, version="0.9.100", repo=None):
         .replace("__STATE__", str(install["state"]))
         .replace("__VERSION__", version)
     )
+    env = dict(os.environ)
+    if path is not None:
+        env["PATH"] = path
     return subprocess.run(["bash", str(script)], capture_output=True,
-                          text=True, timeout=120)
+                          text=True, timeout=120, env=env)
+
+
+def _path_without(tmp_path: Path, *binaries: str) -> str:
+    """A synthetic PATH dir symlinking every real PATH entry except
+    `binaries` — removing whole directories (as CLAUDE.md's PATH-stripping
+    convention does for `claude`) is unsafe here since `bash` itself often
+    shares a directory with `git` (e.g. /usr/bin), which would break the
+    harness rather than exercise the guard's missing-binary fallback."""
+    bindir = tmp_path / ("bin-without-" + "-".join(binaries))
+    bindir.mkdir(exist_ok=True)
+    for d in os.environ.get("PATH", "").split(":"):
+        p = Path(d)
+        if not p.is_dir():
+            continue
+        for entry in p.iterdir():
+            if entry.name in binaries:
+                continue
+            link = bindir / entry.name
+            if not link.exists():
+                try:
+                    link.symlink_to(entry)
+                except OSError:
+                    pass
+    return str(bindir)
 
 
 # --------------------------------------------------------------------- #
@@ -234,6 +261,63 @@ def test_guard_is_invoked_by_the_launcher():
         "launcher must invoke _warn_if_leerie_stale, and with `|| true` — "
         "that suspends `set -e` for the function body, without which a "
         "failing `git show ... | awk` pipeline (pipefail) aborts the run")
+
+
+# --- further gaps: version fallback, missing binaries ------------------ #
+
+def test_silent_when_git_is_not_on_path(install, tmp_path):
+    """The `command -v git` guard at the top must exit cleanly with no git
+    binary at all, rather than crashing on the first `git -C ...` call."""
+    path = _path_without(tmp_path, "git")
+    r = _run(install, path=path)
+    assert r.returncode == 0
+    assert "behind" not in r.stderr
+
+
+def test_falls_back_to_unknown_version_when_upstream_manifest_is_missing(install):
+    """`_up_v` is extracted via `git show @{upstream}:.claude-plugin/plugin.json
+    | awk ...`; if the upstream tree has no manifest (or an unparseable one),
+    the message must still fire, naming the upstream version as 'unknown'
+    rather than silently blanking or crashing."""
+    # Replace the upstream commit with one that carries no plugin.json at all,
+    # so `git show @{upstream}:.claude-plugin/plugin.json` fails and `_up_v`
+    # is empty.
+    (install["origin"] / ".claude-plugin" / "plugin.json").unlink()
+    _git(install["origin"], "add", "-A")
+    _git(install["origin"], "commit", "-qm", "drop manifest")
+    r = _run(install)
+    assert "behind" in r.stderr
+    assert "unknown" in r.stderr
+    assert "v0.9.100" in r.stderr
+
+
+def test_fetch_still_runs_without_a_timeout_binary(install, tmp_path):
+    """Without `timeout` on PATH (stock BSD/macOS), the guard must fall back
+    to an unbounded `git fetch` rather than skipping the fetch outright."""
+    path = _path_without(tmp_path, "timeout")
+    r = _run(install, path=path)
+    assert "behind" in r.stderr
+    assert "0.9.100" in r.stderr and "0.9.102" in r.stderr
+
+
+def test_silent_on_a_non_numeric_rev_list_result(install):
+    """`case "$_behind"` must reject any non-purely-numeric value (including
+    a `rev-list` failure captured via `|| echo 0`, and any stray non-digit
+    output) rather than emitting a warning with a garbage commit count."""
+    # A corrupted/missing upstream ref makes `rev-list --count HEAD..@{upstream}`
+    # fail; the `|| echo 0` fallback feeds the case statement a clean '0',
+    # which the existing 0-branch already covers. Exercise the sibling
+    # non-digit branch directly by proving the case pattern itself rejects a
+    # non-numeric string (guards the *pattern*, since corrupting live rev-list
+    # output requires re-writing packed-refs internals no fixture should
+    # depend on).
+    for value, expect_silent in [("", True), ("0", True), ("3abc", True),
+                                  ("abc", True), ("7", False), ("42", False)]:
+        r2 = subprocess.run(
+            ["bash", "-c",
+             f'case "{value}" in \'\'|0|*[!0-9]*) exit 0 ;; *) exit 1 ;; esac'],
+        )
+        assert (r2.returncode == 0) == expect_silent, value
 
 
 def test_guard_runs_before_the_container_starts():

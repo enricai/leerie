@@ -243,3 +243,20 @@ def test_format_for_sid_predecessor_without_artifacts(leerie, tmp_path):
     # No artifacts file for feat-001.
     rendered = leerie._format_upstream_artifacts_for_sid(tmp_path, "feat-002")
     assert rendered is None
+
+
+def test_format_for_sid_corrupt_plan_returns_none(leerie, tmp_path):
+    """A plan.json that fails to parse (e.g. a torn write during a crash)
+    degrades to 'no upstream artifacts' rather than raising."""
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    (tmp_path / "plan.json").write_text("{ not valid json")
+    rendered = leerie._format_upstream_artifacts_for_sid(tmp_path, "feat-001")
+    assert rendered is None
+
+
+def test_format_for_sid_unknown_sid_returns_none(leerie, tmp_path):
+    """A sid absent from the plan's subtasks map (or a malformed,
+    non-dict `subtasks` field) is treated as having no predecessors."""
+    _write_plan(tmp_path, {"feat-001": _stub_subtask("feat-001")})
+    rendered = leerie._format_upstream_artifacts_for_sid(tmp_path, "feat-999")
+    assert rendered is None

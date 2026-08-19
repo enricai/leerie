@@ -18,6 +18,7 @@ import importlib.util
 import json
 import math
 import re
+import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -1144,3 +1145,346 @@ def test_peel_grandchild_expansion_remaps_downstream_dep(leerie, tmp_path):
     combined = {l["id"]: l for l in leaves}
     combined["feat-006"] = downstream
     leerie._validate_plan(combined)
+
+
+# ---------------------------------------------------------------------------
+# _partition_lines (DESIGN §5½ (P1) *Sub-file* — tier 2 tiling primitive)
+# ---------------------------------------------------------------------------
+
+def test_partition_lines_empty_range_returns_empty(leerie):
+    """hi < lo is a degenerate empty range: returns []."""
+    assert leerie._partition_lines(10, 5, 100) == []
+
+
+def test_partition_lines_degenerate_max_span_returns_whole_range(leerie):
+    """max_span < 1 is a degenerate guard mirroring _partition_files: the
+    whole range comes back as a single (unsplit) window rather than looping
+    forever or raising."""
+    assert leerie._partition_lines(1, 50, 0) == [(1, 50)]
+    assert leerie._partition_lines(10, 20, -3) == [(10, 20)]
+
+
+def test_partition_lines_tiles_exactly(leerie):
+    """Normal tiling: every line in [lo, hi] falls in exactly one window."""
+    windows = leerie._partition_lines(1, 25, 10)
+    assert windows == [(1, 10), (11, 20), (21, 25)]
+    covered = set()
+    for lo, hi in windows:
+        rng = set(range(lo, hi + 1))
+        assert not (rng & covered), "windows overlap"
+        covered |= rng
+    assert covered == set(range(1, 26))
+
+
+# ---------------------------------------------------------------------------
+# _partition_symbols_by_line (DESIGN §5½ (P1) *Sub-file* — tier 1 tiling)
+# ---------------------------------------------------------------------------
+
+def test_partition_symbols_by_line_zero_total_lines_returns_empty(leerie):
+    """total_lines < 1 (an empty/degenerate file) returns [] rather than a
+    bogus (1, 0) region."""
+    assert leerie._partition_symbols_by_line([("f", 1, 1)], 0, 100) == []
+
+
+# ---------------------------------------------------------------------------
+# _check_intra_file_surface (zero-tolerance coverage/overlap backstop)
+# ---------------------------------------------------------------------------
+
+def test_check_intra_file_surface_zero_total_lines_returns_no_issues(leerie):
+    """total_lines < 1 short-circuits to an empty issue list — nothing to
+    check against a degenerate/empty file."""
+    assert leerie._check_intra_file_surface([(1, 5)], 0) == []
+
+
+def test_check_intra_file_surface_detects_missing_lines(leerie):
+    """A region set that leaves gaps reports INTRA_FILE_UNCOVERED."""
+    issues = leerie._check_intra_file_surface([(1, 5)], 10)
+    assert any("INTRA_FILE_UNCOVERED" in i for i in issues)
+
+
+def test_check_intra_file_surface_detects_out_of_range_lines(leerie):
+    """A region that extends past total_lines reports INTRA_FILE_OUT_OF_RANGE."""
+    issues = leerie._check_intra_file_surface([(1, 15)], 10)
+    assert any("INTRA_FILE_OUT_OF_RANGE" in i for i in issues)
+
+
+def test_check_intra_file_surface_detects_overlap(leerie):
+    """Two regions sharing a line report INTRA_FILE_OVERLAP."""
+    issues = leerie._check_intra_file_surface([(1, 5), (4, 10)], 10)
+    assert any("INTRA_FILE_OVERLAP" in i for i in issues)
+
+
+def test_check_intra_file_surface_exact_partition_has_no_issues(leerie):
+    """A partition that is exactly [1, total_lines] with no gap/overlap is
+    clean — the guarantee _partition_lines/_partition_symbols_by_line make
+    by construction."""
+    assert leerie._check_intra_file_surface([(1, 5), (6, 10)], 10) == []
+
+
+# ---------------------------------------------------------------------------
+# _bump_decompose_workers (N3+N4 decomposition worker-budget partition)
+# ---------------------------------------------------------------------------
+
+def test_bump_decompose_workers_raises_when_share_exhausted(leerie):
+    """When decompose_worker_count already meets the reserved share, the call
+    is refused BEFORE touching worker_count or decompose_worker_count."""
+    st = MagicMock()
+    st.data = {"decompose_worker_count": 2}
+    st.bump_workers = MagicMock()
+    caps = {"max_total_workers": 20, "decompose_budget_share": 0.1}  # share*cap=2
+
+    with pytest.raises(leerie.DecompositionBudgetExceeded):
+        leerie._bump_decompose_workers(st, caps)
+
+    # Refusal must not touch worker_count or decompose_worker_count.
+    st.bump_workers.assert_not_called()
+    assert st.data["decompose_worker_count"] == 2
+
+
+def test_bump_decompose_workers_bumps_and_increments_below_share(leerie):
+    """Below the share ceiling, the call goes through: st.bump_workers runs
+    and decompose_worker_count increments."""
+    st = MagicMock()
+    st.data = {"decompose_worker_count": 0}
+    st.bump_workers = MagicMock()
+    st.save = MagicMock()
+    caps = {"max_total_workers": 20, "decompose_budget_share": 0.5}  # share*cap=10
+
+    leerie._bump_decompose_workers(st, caps)
+
+    st.bump_workers.assert_called_once_with(caps)
+    assert st.data["decompose_worker_count"] == 1
+    st.save.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# _recursive_decompose — decomposition-budget exhaustion before a worker spawn
+# ---------------------------------------------------------------------------
+
+def test_recursive_decompose_budget_exceeded_before_fit_judge_is_leaf(leerie, capsys):
+    """When the decomposition budget share is already exhausted, the subtask
+    is accepted as a leaf WITHOUT ever spawning the fit_judge worker."""
+    subtask = {"id": "t-100", "title": "t", "success_criteria_seed": "c",
+               "files_likely_touched": ["a.py"]}
+    caps = _make_caps(leerie, decompose_budget_share=0.0)  # share*cap=0 → exhausted
+    st = _make_state(leerie, caps)
+    st.data["decompose_worker_count"] = 0
+    models = {"fit_judge": "opus", "splitter": "opus"}
+    efforts = {"fit_judge": "high", "splitter": "high"}
+
+    async def fake_claude_p(*args, **kwargs):
+        pytest.fail("no worker should be spawned once the budget is exhausted")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie._recursive_decompose(
+            subtask, 0, st, caps, models, efforts, Path("/tmp")))
+
+    assert leaves == [subtask]
+    assert st.bump_workers.call_count == 0
+    out = capsys.readouterr().out
+    assert "decomposition budget exceeded" in out
+
+
+def test_recursive_decompose_budget_exceeded_before_splitter_is_leaf(leerie):
+    """The budget check runs again before the coupled-minority splitter call:
+    exhausted after the fit_judge spend, the parent is accepted as a leaf
+    WITHOUT ever spawning the splitter worker."""
+    subtask = {"id": "t-101", "title": "t", "success_criteria_seed": "c",
+               "files_likely_touched": ["a.py"]}  # single small file → coupled path
+    # share*cap == 1: the fit_judge bump (spent 0→1) succeeds; the splitter
+    # bump (spent 1) then finds spent >= share*cap and refuses.
+    caps = _make_caps(leerie, max_total_workers=200, decompose_budget_share=1 / 200)
+    st = _make_state(leerie, caps)
+    st.data["decompose_worker_count"] = 0
+
+    async def fake_claude_p(*args, schema_key, **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.10)  # low score → attempt to split
+        pytest.fail("splitter should not be spawned once the budget is exhausted")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie._recursive_decompose(
+            subtask, 0, st, caps, models={"fit_judge": "opus", "splitter": "opus"},
+            efforts={"fit_judge": "high", "splitter": "high"}, repo_root=Path("/tmp")))
+
+    assert leaves == [subtask]
+    assert st.data["decompose_worker_count"] == 1  # only the fit_judge spend
+
+
+def test_recursive_decompose_budget_exceeded_before_migration_label_call(leerie, capsys):
+    """The migration (label-only) path also re-checks the budget before its
+    splitter call: when exhausted, chunk children fall back to the
+    deterministic labels WITHOUT ever spawning the label-only splitter."""
+    big_files = [f"src/m{i:02d}.ts" for i in range(24)]
+    parent = {"id": "sweep", "title": "Parent title",
+              "success_criteria_seed": "parent criteria",
+              "files_likely_touched": big_files}
+    # share*cap == 1: the parent fit_judge bump (spent 0→1) succeeds; the
+    # label-only splitter's bump (spent 1) then refuses.
+    caps = _make_caps(leerie, max_total_workers=200, decompose_budget_share=1 / 200)
+    st = _make_state(leerie, caps)
+    st.data["decompose_worker_count"] = 0
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.20 if sid.endswith("-d0") else 0.85)
+        pytest.fail("label-only splitter should not be spawned once the "
+                    "decomposition budget is exhausted")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie._recursive_decompose(
+            parent, 0, st, caps, models={"fit_judge": "opus", "splitter": "opus"},
+            efforts={"fit_judge": "high", "splitter": "high"}, repo_root=Path("/tmp")))
+
+    # 24 files / 8 per chunk = 3 children, all deterministically labeled.
+    assert len(leaves) == 3
+    titles = [leaf["title"] for leaf in leaves]
+    assert len(set(titles)) == len(titles)
+    assert "Parent title" not in titles
+    out = capsys.readouterr().out
+    assert "decomposition budget exceeded" in out
+    assert "using deterministic chunk labels" in out
+
+
+# ---------------------------------------------------------------------------
+# _recursive_decompose — worker crash degrades to leaf (DESIGN §6 *Credential
+# strategy*: one crash must not discard sibling fit/split decisions)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("raiser", ["worker_error", "timeout_expired"])
+def test_recursive_decompose_fit_judge_crash_degrades_to_leaf(leerie, capsys, raiser):
+    """A fit_judge worker crash (WorkerError, or a killed session surfacing as
+    subprocess.TimeoutExpired) degrades the node to a leaf rather than
+    propagating and discarding sibling decisions."""
+    subtask = {"id": "t-102", "title": "t", "success_criteria_seed": "c",
+               "files_likely_touched": ["a.py"]}
+    caps = _make_caps(leerie)
+    st = _make_state(leerie, caps)
+
+    async def fake_claude_p(*args, schema_key, **kwargs):
+        if schema_key == "fit_judge":
+            if raiser == "worker_error":
+                raise leerie.WorkerError("killed session")
+            raise subprocess.TimeoutExpired(cmd="claude", timeout=90)
+        pytest.fail("splitter should not be reached")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie._recursive_decompose(
+            subtask, 0, st, caps, models={"fit_judge": "opus", "splitter": "opus"},
+            efforts={"fit_judge": "high", "splitter": "high"}, repo_root=Path("/tmp")))
+
+    assert leaves == [subtask]
+    out = capsys.readouterr().out
+    assert "fit_judge crashed" in out
+
+
+@pytest.mark.parametrize("raiser", ["worker_error", "timeout_expired"])
+def test_recursive_decompose_coupled_splitter_crash_degrades_to_leaf(leerie, capsys, raiser):
+    """A coupled-minority splitter worker crash (not the migration label-only
+    path) degrades the parent to a leaf rather than propagating."""
+    subtask = {"id": "t-103", "title": "t", "success_criteria_seed": "c",
+               "files_likely_touched": ["a.py"]}  # single small file → coupled path
+    caps = _make_caps(leerie)
+    st = _make_state(leerie, caps)
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.10)  # low score → attempt to split
+        assert schema_key == "splitter"
+        assert not sid.startswith("splitter-label-")  # coupled path, not migration
+        if raiser == "worker_error":
+            raise leerie.WorkerError("killed session")
+        raise subprocess.TimeoutExpired(cmd="claude", timeout=90)
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie._recursive_decompose(
+            subtask, 0, st, caps, models={"fit_judge": "opus", "splitter": "opus"},
+            efforts={"fit_judge": "high", "splitter": "high"}, repo_root=Path("/tmp")))
+
+    assert leaves == [subtask]
+    out = capsys.readouterr().out
+    assert "splitter crashed" in out
+
+
+# ---------------------------------------------------------------------------
+# _recursive_decompose — repo-map ranking failure degrades silently (P6)
+# ---------------------------------------------------------------------------
+
+def test_recursive_decompose_repo_map_rank_exception_degrades_silently(leerie):
+    """If _rank_repo_map raises (e.g. a malformed repo_map), the node runs
+    without structural grounding instead of crashing — the worker prompt
+    carries no RANKED REPO-MAP SUBGRAPH section."""
+    subtask = {"id": "t-104", "title": "t", "success_criteria_seed": "c",
+               "files_likely_touched": ["a.py"]}
+    caps = _make_caps(leerie)
+    st = _make_state(leerie, caps)
+    seen_prompts: list[str] = []
+
+    async def fake_claude_p(*args, schema_key, user_prompt="", **kwargs):
+        seen_prompts.append(user_prompt)
+        if schema_key == "fit_judge":
+            return _fit_response(0.85)  # well-fit → leaf, no further calls
+        pytest.fail("splitter should not be reached")
+
+    with patch.object(leerie, "_rank_repo_map",
+                       side_effect=RuntimeError("malformed repo_map")), \
+         patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie._recursive_decompose(
+            subtask, 0, st, caps, models={"fit_judge": "opus", "splitter": "opus"},
+            efforts={"fit_judge": "high", "splitter": "high"},
+            repo_root=Path("/tmp"), repo_map={"nodes": {}}))
+
+    assert leaves == [subtask]
+    assert seen_prompts, "fit_judge should still have been called"
+    assert "RANKED REPO-MAP SUBGRAPH" not in seen_prompts[0]
+
+
+# ---------------------------------------------------------------------------
+# _subfile_split — degenerate/backstop-failure branches
+# ---------------------------------------------------------------------------
+
+def test_subfile_split_whole_file_within_cap_returns_no_children(leerie, tmp_path):
+    """First-entry path: a file whose total line count already fits within
+    max_span is not split — returns [] so the caller treats it as a leaf."""
+    f = tmp_path / "small.ts"
+    _write_lines(f, 50)
+    subtask = {"id": "feat-030", "files_likely_touched": ["small.ts"]}
+
+    children = leerie._subfile_split(subtask, tmp_path, max_span=700)
+
+    assert children == []
+
+
+def test_subfile_split_backstop_failure_returns_no_children(leerie, tmp_path, capsys):
+    """If _check_intra_file_surface reports issues despite the by-construction
+    guarantee, _subfile_split logs the failure and falls back to a leaf
+    rather than shipping a broken partition."""
+    f = tmp_path / "big.ts"
+    _write_lines(f, 2000)
+    subtask = {"id": "feat-031", "files_likely_touched": ["big.ts"]}
+
+    with patch.object(leerie, "_extract_symbol_ranges",
+                       return_value=[("a", 1, 900), ("b", 901, 2000)]), \
+         patch.object(leerie, "_check_intra_file_surface",
+                       return_value=["INTRA_FILE_UNCOVERED: fake"]):
+        children = leerie._subfile_split(subtask, tmp_path, max_span=700)
+
+    assert children == []
+    out = capsys.readouterr().out
+    assert "coverage backstop" in out
+
+
+def test_subfile_split_reentry_degenerate_max_span_yields_no_gain(leerie):
+    """Re-entry path (owned_region set): when max_span < 1, _partition_lines
+    degrades to a single unsplit window covering the whole region, which is
+    "nothing gained" — _subfile_split returns [] rather than a one-child
+    no-op split."""
+    subtask = {
+        "id": "feat-032",
+        "files_likely_touched": ["big.ts"],
+        "owned_region": {"file": "big.ts", "start": 1, "end": 500},
+    }
+
+    children = leerie._subfile_split(subtask, Path("/tmp"), max_span=0)
+
+    assert children == []

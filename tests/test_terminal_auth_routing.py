@@ -268,3 +268,234 @@ def test_terminal_auth_checked_before_auth_or_quota_in_claude_p(leerie):
     # never be routed into the backoff loop.
     backoff_idx = src.index("_needs_backoff(envelope)")
     assert terminal_idx < backoff_idx
+
+
+# ---------------------------------------------------------------------------
+# main() handler: ACTUAL EXECUTION, not just source-coupled assertions.
+#
+# Every test above this point (and every one in test_terminal_auth_failure.py)
+# reads `main()`'s TerminalAuthFailure handler via `ast.unparse` — none of them
+# ever run its statements, so the ~18-line handler body (the assignments, the
+# nested best-effort cleanup/capture try/excepts, the log calls) shipped with
+# zero execution coverage despite being fully pinned structurally. That is
+# exactly the gap `tests/test_integration_judge_coverage.py`'s
+# `TestGateExecutes` class documents for a different handler: "Source-coupling
+# cannot see a runtime error; only running the code can." This lifts the
+# handler's statement list out of `main()` by AST (mirroring that file's
+# `_extract` staticmethod) and executes it directly against a stubbed
+# namespace, rather than driving all of `main()` (argparse, phase dispatch,
+# real process exit) end-to-end — no other test in this suite does that,
+# for the same reason `main()` is 1300+ lines of orchestration.
+# ---------------------------------------------------------------------------
+
+def _extract_terminal_auth_handler_node(leerie):
+    import ast
+    import inspect
+    import textwrap
+    src = textwrap.dedent(inspect.getsource(leerie.main))
+    tree = ast.parse(src)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ExceptHandler) and node.type is not None:
+            if getattr(node.type, "id", None) == "TerminalAuthFailure":
+                return node
+    raise AssertionError("no except TerminalAuthFailure handler found")
+
+
+def _compile_terminal_auth_handler_body(leerie):
+    """Builds an executable module from the handler's real statement list,
+    with line numbers shifted to match `orchestrator/leerie.py`'s actual
+    lines and compiled against that real filename — so executing it is
+    recorded by coverage.py as covering those exact source lines, not merely
+    behaviorally equivalent lines in a throwaway `<string>` compile unit."""
+    import ast
+    import inspect
+
+    node = _extract_terminal_auth_handler_node(leerie)
+    _, start_line = inspect.getsourcelines(leerie.main)
+    mod = ast.Module(body=node.body, type_ignores=[])
+    ast.fix_missing_locations(mod)
+    ast.increment_lineno(mod, start_line - 1)
+    return compile(mod, leerie.__file__, "exec")
+
+
+def _run_terminal_auth_handler(leerie, raw_message="OAuth session expired "
+                                "and could not be refreshed"):
+    """Executes the real handler body (extracted by AST) against a stubbed
+    namespace and returns (ns, logs, save_calls, cleanup_calls, capture_calls).
+    """
+    code = _compile_terminal_auth_handler_body(leerie)
+
+    logs: list[str] = []
+    save_calls: list[str] = []
+    cleanup_calls: list[bool] = []
+    capture_calls: list[tuple] = []
+
+    def fake_save(st, reason):
+        save_calls.append(reason)
+
+    def fake_cleanup(st, full_purge=False):
+        cleanup_calls.append(full_purge)
+
+    async def fake_capture_repo_deps(repo_root, st, caps, models, efforts):
+        capture_calls.append((repo_root, caps, models, efforts))
+
+    class _FakeSt:
+        run_id = "r-terminal-auth"
+
+    ns = {
+        "e": leerie.TerminalAuthFailure(raw_message),
+        "st": _FakeSt(),
+        "log": logs.append,
+        "_save_state_best_effort": fake_save,
+        "_cleanup_on_abnormal_exit": fake_cleanup,
+        "capture_repo_deps": fake_capture_repo_deps,
+        "asyncio": asyncio,
+        "repo_root": "/repo",
+        "caps": {"c": 1},
+        "models": {"m": 1},
+        "efforts": {"e": 1},
+        "EXIT_LOCKED": leerie.EXIT_LOCKED,
+        "TerminalAuthFailure": leerie.TerminalAuthFailure,
+        "RateLimitedExit": leerie.RateLimitedExit,
+        "ContextOverflow": leerie.ContextOverflow,
+        "DiskLowSpace": leerie.DiskLowSpace,
+    }
+    exec(code, ns)
+    return ns, logs, save_calls, cleanup_calls, capture_calls
+
+
+def test_extracted_handler_is_found_and_nonempty(leerie):
+    """Anti-vacuity: the extraction must actually find the handler and it
+    must carry statements, or the execution test below would silently pass
+    against nothing."""
+    import ast
+    node = _extract_terminal_auth_handler_node(leerie)
+    assert isinstance(node, ast.ExceptHandler)
+    assert len(node.body) > 5
+
+
+def test_handler_execution_sets_locals_and_calls_cleanup_and_capture(leerie):
+    """Runs the real handler statements end to end: full_purge/abnormal/
+    exit_code are set correctly, `_save_state_best_effort` and
+    `_cleanup_on_abnormal_exit(st, full_purge=False)` are actually invoked
+    (not merely present in the source text), the best-effort `capture_repo_deps`
+    call receives the real repo_root/caps/models/efforts, and a resume hint is
+    logged."""
+    ns, logs, save_calls, cleanup_calls, capture_calls = (
+        _run_terminal_auth_handler(leerie))
+
+    assert ns["full_purge"] is False
+    assert ns["abnormal"] is False
+    assert ns["exit_code"] == leerie.EXIT_LOCKED
+
+    assert save_calls == ["TerminalAuthFailure exit"]
+    assert cleanup_calls == [False], (
+        "the worktree-only cleanup (full_purge=False) must actually run — "
+        "state and the run branch must survive so resume can pick it up")
+    assert capture_calls == [("/repo", {"c": 1}, {"m": 1}, {"e": 1})]
+
+    joined = "\n".join(logs)
+    assert "auth session locked" in joined
+    assert "claude /login" in joined
+    assert "leerie resume r-terminal-auth" in joined
+
+
+def test_handler_execution_survives_a_cleanup_that_raises(leerie):
+    """The nested `except BaseException as cleanup_err` around
+    `_cleanup_on_abnormal_exit` must swallow a cleanup failure (logged,
+    non-fatal) rather than letting it escape and skip the exit_code
+    assignment below it — mirrors `_save_state_best_effort`'s own
+    non-fatal discipline for the sibling save call."""
+    code = _compile_terminal_auth_handler_body(leerie)
+
+    logs: list[str] = []
+
+    def fake_save(st, reason):
+        pass
+
+    def raising_cleanup(st, full_purge=False):
+        raise RuntimeError("cleanup blew up")
+
+    async def fake_capture_repo_deps(repo_root, st, caps, models, efforts):
+        pass
+
+    class _FakeSt:
+        run_id = "r-cleanup-raises"
+
+    ns = {
+        "e": leerie.TerminalAuthFailure("session expired and could not be "
+                                         "refreshed"),
+        "st": _FakeSt(),
+        "log": logs.append,
+        "_save_state_best_effort": fake_save,
+        "_cleanup_on_abnormal_exit": raising_cleanup,
+        "capture_repo_deps": fake_capture_repo_deps,
+        "asyncio": asyncio,
+        "repo_root": "/repo",
+        "caps": {},
+        "models": {},
+        "efforts": {},
+        "EXIT_LOCKED": leerie.EXIT_LOCKED,
+        "TerminalAuthFailure": leerie.TerminalAuthFailure,
+        "RateLimitedExit": leerie.RateLimitedExit,
+        "ContextOverflow": leerie.ContextOverflow,
+        "DiskLowSpace": leerie.DiskLowSpace,
+    }
+    exec(code, ns)
+
+    # Reached the end of the handler despite the cleanup raising — proves
+    # the exception was caught, not propagated.
+    assert ns["exit_code"] == leerie.EXIT_LOCKED
+    assert any("cleanup failed" in m and "cleanup blew up" in m
+               for m in logs)
+
+
+def test_handler_execution_survives_a_capture_repo_deps_that_raises(leerie):
+    """`capture_repo_deps` is guaranteed to re-hit the same terminal auth
+    failure (it calls claude_p again). The handler's own broad
+    `except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+    RateLimitedExit, ContextOverflow, DiskLowSpace)` around it must catch
+    a re-raised TerminalAuthFailure specifically — a bare `except Exception`
+    would miss it, since TerminalAuthFailure subclasses BaseException — and
+    still reach the final `exit_code = EXIT_LOCKED` assignment."""
+    code = _compile_terminal_auth_handler_body(leerie)
+
+    logs: list[str] = []
+
+    def fake_save(st, reason):
+        pass
+
+    def fake_cleanup(st, full_purge=False):
+        pass
+
+    async def raising_capture_repo_deps(repo_root, st, caps, models, efforts):
+        raise leerie.TerminalAuthFailure("session expired and could not be "
+                                          "refreshed")
+
+    class _FakeSt:
+        run_id = "r-capture-reraises"
+
+    ns = {
+        "e": leerie.TerminalAuthFailure("session expired and could not be "
+                                         "refreshed"),
+        "st": _FakeSt(),
+        "log": logs.append,
+        "_save_state_best_effort": fake_save,
+        "_cleanup_on_abnormal_exit": fake_cleanup,
+        "capture_repo_deps": raising_capture_repo_deps,
+        "asyncio": asyncio,
+        "repo_root": "/repo",
+        "caps": {},
+        "models": {},
+        "efforts": {},
+        "EXIT_LOCKED": leerie.EXIT_LOCKED,
+        "TerminalAuthFailure": leerie.TerminalAuthFailure,
+        "RateLimitedExit": leerie.RateLimitedExit,
+        "ContextOverflow": leerie.ContextOverflow,
+        "DiskLowSpace": leerie.DiskLowSpace,
+    }
+    exec(code, ns)
+
+    assert ns["exit_code"] == leerie.EXIT_LOCKED
+    assert any("capture: non-fatal error during auth-locked pause" in m
+               for m in logs)

@@ -657,6 +657,223 @@ def _pid_alive(pid: int) -> bool:
         return True
 
 
+@pytest.mark.skipif(
+    os.name == "nt",
+    reason="start_new_session is a no-op on Windows; the POSIX "
+           "process-group semantics this test exercises don't apply.",
+)
+def test_terminate_proc_tree_sigkills_after_sigterm_timeout(leerie):
+    """Behavioral: a leader that TRAPS SIGTERM (ignores it) must still be
+    reaped — _terminate_proc_tree waits _PROC_TREE_GRACE_SEC for a clean
+    exit, then falls back to SIGKILL and reaps the leader itself via the
+    `not exited_cleanly` branch (the `asyncio.TimeoutError` pass and the
+    subsequent `asyncio.shield(proc.wait())` reap)."""
+    import asyncio
+    import time
+
+    async def _run():
+        script = (
+            "trap '' TERM; "
+            "sleep 60"
+        )
+        proc = await asyncio.create_subprocess_exec(
+            "bash", "-c", script,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            start_new_session=True,
+        )
+        # Give bash a moment to install the trap before we signal it.
+        await asyncio.sleep(0.2)
+        assert _pid_alive(proc.pid), "leader died before test could run"
+
+        start = time.monotonic()
+        await leerie._terminate_proc_tree(proc)
+        elapsed = time.monotonic() - start
+
+        # The leader ignored SIGTERM, so this must have taken at least
+        # the grace window before the SIGKILL pass fired.
+        assert elapsed >= leerie._PROC_TREE_GRACE_SEC, (
+            f"_terminate_proc_tree returned in {elapsed:.2f}s — too fast "
+            f"to have waited out the SIGTERM grace window against a "
+            f"leader that traps SIGTERM."
+        )
+        # The leader must have been reaped (returncode set) despite
+        # ignoring SIGTERM — this is the `not exited_cleanly` reap path.
+        assert proc.returncode is not None, (
+            "leader was not reaped after the SIGKILL fallback"
+        )
+        assert not _pid_alive(proc.pid), (
+            f"leader PID {proc.pid} survived _terminate_proc_tree's "
+            f"SIGKILL fallback"
+        )
+
+    asyncio.run(_run())
+
+
+def test_cleanup_skips_non_directory_entries_in_worktrees_dir(leerie, tmp_path,
+                                                               monkeypatch):
+    """A stray non-directory file directly under worktrees/ (e.g. a
+    leftover lockfile) must be skipped by the removal loop rather than
+    passed to `git worktree remove`."""
+    run_id = "feat-x-aaa111"
+    run_dir = tmp_path / "runs" / run_id
+    worktrees_dir = run_dir / "worktrees"
+    worktrees_dir.mkdir(parents=True)
+    (worktrees_dir / "stray.lock").write_text("not a directory")
+    st = _FakeState(run_id, run_dir)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if list(cmd)[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, str(tmp_path / ".git") + "\n", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    leerie._cleanup_on_abnormal_exit(st, full_purge=False)
+
+    remove_calls = [c for c in calls if c[:3] == ["git", "worktree", "remove"]]
+    assert not remove_calls, (
+        f"a non-directory entry under worktrees/ must never be passed to "
+        f"`git worktree remove`: {calls}"
+    )
+    # The file itself is untouched — the loop's `continue` skips it
+    # entirely rather than attempting any removal.
+    assert (worktrees_dir / "stray.lock").exists()
+
+
+def test_cleanup_full_purge_skips_failed_for_each_ref_and_blank_lines(
+        leerie, tmp_path, monkeypatch):
+    """Full-purge branch deletion must tolerate a `git for-each-ref` that
+    fails for one glob (nonzero exit — e.g. a corrupt or missing ref
+    namespace) by moving on to the next glob, and must skip blank lines
+    in a successful glob's stdout rather than passing an empty string to
+    `git branch -D`."""
+    run_id = "feat-x-aaa111"
+    run_dir = tmp_path / "runs" / run_id
+    run_dir.mkdir(parents=True)
+    st = _FakeState(run_id, run_dir)
+
+    calls: list[list[str]] = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        if cmd[:2] == ["git", "for-each-ref"]:
+            glob = cmd[3]
+            if glob == f"refs/heads/leerie/runs/{run_id}":
+                # This glob fails outright (nonzero exit).
+                return subprocess.CompletedProcess(cmd, 1, "", "error")
+            if glob == f"refs/heads/leerie/subtasks/{run_id}/":
+                # Blank lines interleaved with one real ref must be
+                # skipped rather than turned into a `git branch -D ""`
+                # call.
+                return subprocess.CompletedProcess(
+                    cmd, 0,
+                    f"\nleerie/subtasks/{run_id}/feat-001\n\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    leerie._cleanup_on_abnormal_exit(st, full_purge=True)
+
+    delete_calls = [c for c in calls if c[:3] == ["git", "branch", "-D"]]
+    assert delete_calls == [
+        ["git", "branch", "-D", f"leerie/subtasks/{run_id}/feat-001"]
+    ], (
+        f"expected exactly one delete for the real ref, with the failed "
+        f"glob and blank lines both skipped: {delete_calls}"
+    )
+
+
+def test_prune_leerie_worktrees_removes_matching_stale_entry(leerie, tmp_path,
+                                                              monkeypatch):
+    """`_prune_leerie_worktrees` parses `git worktree prune -n -v`'s
+    "Removing worktrees/<name>: ..." lines (which git emits on stderr),
+    attributes each to a path via the entry's `gitdir` file, and removes
+    only the git-common-dir registration whose resolved worktree path
+    falls under the given root."""
+    leerie_root = tmp_path / "runs" / "feat-x-aaa111"
+    leerie_root.mkdir(parents=True)
+    worktree_path = leerie_root / "worktrees" / "feat-001"
+    worktree_path.mkdir(parents=True)
+
+    git_common_dir = tmp_path / "shared-git" / ".git"
+    entry_dir = git_common_dir / "worktrees" / "feat-001"
+    entry_dir.mkdir(parents=True)
+    (entry_dir / "gitdir").write_text(str(worktree_path / ".git") + "\n")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, str(git_common_dir) + "\n", "")
+        if cmd[:3] == ["git", "worktree", "prune"]:
+            # Real git emits this line on stderr, not stdout.
+            return subprocess.CompletedProcess(
+                cmd, 0, "",
+                f"Removing worktrees/feat-001: gitdir file points to "
+                f"non-existent location\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    assert entry_dir.exists()
+    leerie._prune_leerie_worktrees(leerie_root)
+    assert not entry_dir.exists(), (
+        "a stale worktree registration whose resolved path falls under "
+        "leerie_root must be removed from the shared git-common-dir"
+    )
+
+
+def test_prune_leerie_worktrees_leaves_out_of_scope_entry(leerie, tmp_path,
+                                                           monkeypatch):
+    """A stale registration whose resolved path falls OUTSIDE the given
+    root (e.g. it belongs to a sibling run, or the host) must be left
+    alone — the scoped replacement for a bare `git worktree prune` exists
+    specifically so leerie never touches registrations it doesn't own."""
+    leerie_root = tmp_path / "runs" / "feat-x-aaa111"
+    leerie_root.mkdir(parents=True)
+
+    other_worktree = tmp_path / "elsewhere" / "not-ours"
+    other_worktree.mkdir(parents=True)
+
+    git_common_dir = tmp_path / "shared-git" / ".git"
+    entry_dir = git_common_dir / "worktrees" / "not-ours"
+    entry_dir.mkdir(parents=True)
+    (entry_dir / "gitdir").write_text(str(other_worktree / ".git") + "\n")
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "rev-parse"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, str(git_common_dir) + "\n", "")
+        if cmd[:3] == ["git", "worktree", "prune"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, "",
+                "Removing worktrees/not-ours: gitdir file points to "
+                "non-existent location\n")
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    leerie._prune_leerie_worktrees(leerie_root)
+    assert entry_dir.exists(), (
+        "a registration outside leerie_root must not be removed"
+    )
+
+
+def test_prune_leerie_worktrees_swallows_rev_parse_failure(leerie, tmp_path,
+                                                            monkeypatch):
+    """A failing (or timing-out) `git rev-parse --git-common-dir` must
+    make the function decline silently rather than raise — pruning is
+    best-effort housekeeping and must never take down the caller."""
+    def fake_run(cmd, **kwargs):
+        if cmd[:2] == ["git", "rev-parse"]:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        raise AssertionError(f"unexpected call: {cmd}")
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    leerie._prune_leerie_worktrees(tmp_path)  # must not raise
+
+
 # --- PPID-walk + detached-session reaping ----------------------------------
 
 @pytest.mark.skipif(
@@ -769,6 +986,44 @@ def test_terminate_proc_tree_reaps_detached_session_grandchildren(leerie):
     asyncio.run(_run())
 
 
+def test_terminate_proc_tree_swallows_signal_and_wait_failures(leerie, monkeypatch):
+    """`_terminate_proc_tree` must never raise, even when every OS call it
+    makes fails: `os.killpg` raising (process/group already gone), the
+    grace-window `proc.wait()` timing out, and the final reap's
+    `asyncio.shield(proc.wait())` also raising. All three are documented as
+    swallowed — this drives each branch directly rather than relying on a
+    real process to happen to hit them."""
+    import asyncio
+
+    class _FakeProc:
+        pid = 999999999  # never a real PID; killpg/wait must not find it
+        def __init__(self):
+            self.wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                # Never returns before the grace window elapses — forces
+                # the asyncio.TimeoutError branch in the try/except.
+                await asyncio.sleep(999)
+            # Second call (the post-SIGKILL reap in `finally`) raises,
+            # exercising the reap's own except-and-swallow branch.
+            raise ProcessLookupError("already reaped")
+
+    monkeypatch.setattr(leerie, "_PROC_TREE_GRACE_SEC", 0.05)
+    monkeypatch.setattr(leerie, "_enumerate_descendants", lambda pid: set())
+
+    def _raising_killpg(pgid, sig):
+        raise ProcessLookupError("no such process group")
+
+    monkeypatch.setattr(leerie.os, "killpg", _raising_killpg)
+
+    fake = _FakeProc()
+    # Must complete cleanly — every failure path is swallowed by design.
+    asyncio.run(leerie._terminate_proc_tree(fake))
+    assert fake.wait_calls == 2
+
+
 # --- Success-path cleanup via _DescendantTracker ---------------------------
 
 @pytest.mark.skipif(
@@ -878,6 +1133,42 @@ def test_enumerate_descendants_returns_empty_for_nonexistent_pid(leerie):
     assert leerie._enumerate_descendants(999_999_999) == set()
 
 
+def test_enumerate_descendants_empty_on_ps_failure(leerie, monkeypatch):
+    """A failing `ps` (e.g. no permission, or missing binary) must return
+    an empty set rather than raising — callers fall back to the
+    leader-only kill path."""
+    def fake_run(cmd, **kwargs):
+        raise subprocess.SubprocessError("ps failed")
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    assert leerie._enumerate_descendants(123) == set()
+
+
+def test_enumerate_descendants_skips_malformed_lines(leerie, monkeypatch):
+    """A `ps` line with too few fields, or non-integer pid/ppid, must be
+    skipped rather than raising — the parse loop tolerates a garbled
+    snapshot."""
+    fake_ps = (
+        "  PID  PPID\n"
+        "  10\n"                # too few fields -> skipped
+        "  abc   def\n"         # non-integer -> skipped
+        "  20    10\n"          # real child of 10, but 10 is unparsed
+        "  30     1\n"          # child of root's non-existent parent
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    # root_pid=1: the only well-formed row naming ppid 1 is pid 30 (pid 20's
+    # declared parent, 10, was itself a malformed row and so never entered
+    # children_of). The point of this test is that no exception propagates
+    # and the malformed rows contribute nothing beyond that.
+    assert leerie._enumerate_descendants(1) == {30}
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="POSIX-only test.",
@@ -939,6 +1230,39 @@ def test_descendant_tracker_records_descendants_during_lifetime(leerie):
         )
 
     asyncio.run(_run())
+
+
+# --- _signal_pids unit tests ------------------------------------------------
+
+def test_signal_pids_swallows_process_lookup_error(leerie):
+    """A PID that is already dead must not raise — this is a best-effort
+    cleanup path."""
+    # A PID this large is virtually guaranteed not to exist (PID_MAX_LIMIT
+    # on Linux is 2**22); os.kill on it raises ProcessLookupError.
+    leerie._signal_pids({2**30}, _signal.SIGTERM)  # must not raise
+
+
+def test_signal_pids_swallows_permission_error(leerie, monkeypatch):
+    """A PID we're not allowed to signal (e.g. owned by another user) must
+    not abort the cleanup sweep."""
+    def fake_kill(pid, sig):
+        raise PermissionError("not ours")
+
+    monkeypatch.setattr(leerie.os, "kill", fake_kill)
+    leerie._signal_pids({123, 456}, _signal.SIGTERM)  # must not raise
+
+
+def test_signal_pids_delivers_to_a_live_pid(leerie):
+    """Sanity: a real, signalable process actually receives the signal."""
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        leerie._signal_pids({proc.pid}, _signal.SIGKILL)
+        proc.wait(timeout=5)
+        assert proc.returncode is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 # --- _reparented_orphans unit tests ----------------------------------------
@@ -1017,6 +1341,28 @@ def test_reparented_orphans_empty_set_input(leerie, monkeypatch):
     monkeypatch.setattr(leerie.subprocess, "run", fake_run)
     result = leerie._reparented_orphans(set())
     assert result == []
+
+
+def test_reparented_orphans_skips_malformed_lines(leerie, monkeypatch):
+    """A garbled `ps` snapshot (too few fields, or non-integer fields) must
+    be tolerated: those lines are skipped rather than raising, and a
+    well-formed line elsewhere in the same output is still picked up."""
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+    fake_ps = (
+        "  PID  PPID ELAPSED\n"
+        "  100     1\n"                     # too few fields -> skipped
+        "  abc   def   ghi\n"                # non-integer -> skipped
+        f"  200     1 {min_age + 10}\n"      # well-formed, eligible
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    result = leerie._reparented_orphans({100, 200})
+    assert result == [200]
 
 
 # --- _poll_loop pressure-gated reaping tests -------------------------------

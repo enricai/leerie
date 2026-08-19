@@ -314,6 +314,48 @@ def test_rejects_volume_id_without_fly_machine_id(leerie):
         ))
 
 
+# --- sync_failed_at invariants (rule 7) -------------------------------------
+
+def test_accepts_sync_failed_with_fly_machine_id(leerie):
+    """Valid: decide_teardown's clean-exit branch left the machine running
+    with un-synced work — sync_failed_at + fly_machine_id, no pushed_at/
+    killed_at."""
+    leerie._validate_run_json(_minimal_run_json(
+        sync_failed_at="2026-05-29T16:00:00+00:00",
+        fly_machine_id="148e445b911389",
+    ))
+
+
+def test_rejects_sync_failed_and_pushed_both_set(leerie):
+    """A successfully pushed run cannot also be sync-failed."""
+    with pytest.raises(ValueError, match="sync_failed_at and pushed_at"):
+        leerie._validate_run_json(_minimal_run_json(
+            sync_failed_at="2026-05-29T16:00:00+00:00",
+            pushed_at="2026-05-29T15:00:00+00:00",
+            fly_machine_id="abc",
+        ))
+
+
+def test_rejects_sync_failed_and_killed_both_set(leerie):
+    """A destroyed machine cannot also be sync-failed."""
+    with pytest.raises(ValueError, match="sync_failed_at and killed_at"):
+        leerie._validate_run_json(_minimal_run_json(
+            sync_failed_at="2026-05-29T16:00:00+00:00",
+            killed_at="2026-05-29T15:00:00+00:00",
+            fly_machine_id="abc",
+        ))
+
+
+def test_rejects_sync_failed_without_fly_machine_id(leerie):
+    """The running machine needs a pointer for the user to recover via
+    finalize/kill."""
+    with pytest.raises(ValueError, match="sync_failed_at is set but "
+                        "fly_machine_id is null"):
+        leerie._validate_run_json(_minimal_run_json(
+            sync_failed_at="2026-05-29T16:00:00+00:00",
+        ))
+
+
 # --- defensive cases -------------------------------------------------------
 
 def test_rejects_non_dict(leerie):

@@ -84,22 +84,60 @@ def test_launcher_defines_it_exactly_once(label, marker):
         f"start, found {len(hits)}; the marker in _BLOCKS is stale")
 
 
-@pytest.mark.parametrize("label,marker", _BLOCKS,
-                         ids=[b[0] for b in _BLOCKS])
-def test_no_test_file_reproduces_it(label, marker):
+def _offending_files(tests_dir: Path, marker: str, self_name: str) -> list[str]:
+    """Every `*.py` under `tests_dir` (except `self_name`) whose text
+    reproduces `marker` at a line start. Extracted out of the parametrized
+    test below so the whole-directory scan itself — not just the regex in
+    isolation — can be driven against a planted fixture."""
     pattern = _line_start_re(marker)
     offenders = []
-    for path in sorted(TESTS_DIR.glob("*.py")):
-        if path.name == Path(__file__).name:
+    for path in sorted(tests_dir.glob("*.py")):
+        if path.name == self_name:
             continue
         if pattern.search(path.read_text()):
             offenders.append(path.name)
+    return offenders
+
+
+@pytest.mark.parametrize("label,marker", _BLOCKS,
+                         ids=[b[0] for b in _BLOCKS])
+def test_no_test_file_reproduces_it(label, marker):
+    offenders = _offending_files(TESTS_DIR, marker, Path(__file__).name)
     assert not offenders, (
         f"{offenders} reproduce the launcher's {label} instead of "
         f"extracting it. Read it out of `leerie` at test time (see "
         f"tests/test_resolve_state_dir.py::_extract_state_dir_block or "
         f"tests/test_launcher_env_forwarding.py::_extract_run_argv) so a "
         f"change to the launcher can actually fail the test.")
+
+
+def test_scan_actually_detects_a_planted_reproduction(tmp_path):
+    """The parametrized test above never fires its `offenders` branch on
+    this repo's real tests/ tree (there are, by design, zero
+    reproductions right now) — so nothing proves the whole-directory scan
+    itself would catch one if it existed, only that the regex matches a
+    bare string (`test_the_scan_can_find_a_reproduction`). Drive the real
+    `_offending_files` scan against a temp directory holding a planted
+    reproduction to close that gap."""
+    label, marker = _BLOCKS[1]  # _state_dir_default
+    assert label == "_state_dir_default"
+    (tmp_path / "test_fake_reproduction.py").write_text(
+        marker + "\n  echo nope\n}\n")
+    (tmp_path / "test_fake_clean.py").write_text(
+        "def test_noop():\n    pass\n")
+    offenders = _offending_files(tmp_path, marker, "test_no_duplicate_launcher_blocks.py")
+    assert offenders == ["test_fake_reproduction.py"]
+
+
+def test_scan_does_not_flag_a_quoted_extractor_reference(tmp_path):
+    """Negative control paired with the positive one above: a file that
+    legitimately extracts the block (quoting the marker mid-line, the
+    pattern every converted harness uses) must not itself be flagged."""
+    label, marker = _BLOCKS[1]  # _state_dir_default
+    (tmp_path / "test_fake_extractor.py").write_text(
+        f'    start = src.index({marker!r})\n')
+    offenders = _offending_files(tmp_path, marker, "test_no_duplicate_launcher_blocks.py")
+    assert offenders == []
 
 
 def test_the_scan_can_find_a_reproduction():

@@ -21,11 +21,12 @@ array empty) and asserts the shell does not complain. A new
 macOS.
 
 Every EC2 launcher arm wired after this guard was first written
-(test-001..test-005: `stop`, `kill`, `accept-blocked`, `resume`,
-and the full `RUNTIME=ec2` dispatch) builds its own `LEERIE_AWS_PROFILE`/
-`LEERIE_AWS_REGION`-derived optional-arg array
+(test-001..test-005: `stop`, `kill`, `accept-blocked`, `accept-integration`,
+`resume`, `finalize`, and the full `RUNTIME=ec2` dispatch) builds its own
+`LEERIE_AWS_PROFILE`/`LEERIE_AWS_REGION`-derived optional-arg array
 (`_ab_aws_creds_args`/`_stop_aws_creds_args`/`_kill_ec2_creds_args`/
-`_leerie_aws_creds_args` in `leerie` itself) and expands it into
+`_ai_aws_creds_args`/`_fin_ec2_creds_args`/`_leerie_aws_creds_args` in
+`leerie` itself) and expands it into
 `resolve_aws_credentials`. Each of those call sites is new bash on the
 same surface this module already guards, so this module extends the
 "call the function, don't just source the script" discipline to the
@@ -236,8 +237,9 @@ def test_no_namerefs_in_launcher():
 # --- Launcher-arm coverage --------------------------------------------------
 #
 # test-001..test-005 wired real bash directly into the `leerie` launcher
-# for the EC2 arms (`stop`, `kill`, `accept-blocked`, and the full
-# `RUNTIME=ec2` dispatch), each building its own optional-arg array from
+# for the EC2 arms (`stop`, `kill`, `accept-blocked`, `accept-integration`,
+# `finalize`, and the full `RUNTIME=ec2` dispatch), each building its own
+# optional-arg array from
 # LEERIE_AWS_PROFILE/LEERIE_AWS_REGION and expanding it into
 # resolve_aws_credentials. That is new bash on the same class of surface
 # this module already guards for scripts/remote/ec2-*.sh — sourcing
@@ -331,6 +333,12 @@ def _run_launcher_under_bash32(args: list[str], env: dict) -> subprocess.Complet
     # would hit the 30 s timeout rather than exercise anything. Its arrays live
     # in the `RUNTIME=ec2` dispatch block, which this harness never reaches.
     pytest.param(["finalize", RUN_ID], id="finalize"),
+    # `accept-integration`'s EC2 arm (`_ai_aws_creds_args`) mirrors
+    # accept-blocked's shape exactly, reaches its array expansion as soon as
+    # the run dir exists (before any state.json/integration_gate content is
+    # inspected), and exits inside the early verb-dispatch region — well
+    # within the timeout.
+    pytest.param(["accept-integration", RUN_ID, "feat-001"], id="accept-integration"),
 ])
 def test_ec2_launcher_verb_runs_cleanly_under_bash32(verb_args, tmp_path):
     """Run each newly wired EC2 launcher verb end to end under bash 3.2.
