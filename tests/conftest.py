@@ -7,6 +7,7 @@ fixture.
 from __future__ import annotations
 
 import importlib.util
+import os
 import shutil
 from pathlib import Path
 
@@ -67,3 +68,30 @@ HAS_TREESITTER = _has_treesitter()
 # Do NOT "fix" a skip here by installing jq into the image: that buys a green
 # tick, not working code, and erodes the boundary.
 HAS_JQ = shutil.which("jq") is not None
+
+
+def fake_claude_on_path(tmp_path: Path, monkeypatch) -> Path:
+    """Put a stub `claude` binary on PATH and return it.
+
+    `main()` gates on `shutil.which("claude")` and `die()`s (exit 1) long
+    before anything a `main()`-driving test asserts on -- 87 lines before
+    `State(...)` mints the run dir, and well before the top-level
+    try/except. The binary is on a developer's PATH and NOT on the CI
+    runner's, so a suite that drives the real `main()` without this passes
+    locally and fails on CI with every expected exit code collapsed to
+    `die()`'s 1. That is the trap CLAUDE.md records ("A local pass is not
+    evidence until the host lacks `claude`"), and it is how 14 tests in
+    `test_main_exception_arms.py` shipped red.
+
+    Single owner on purpose: this lived in `test_main_cli_wiring.py` while
+    `test_main_exception_arms.py` -- the same harness minus this one call --
+    had no copy at all. Anything driving the real `main()` imports it from
+    here rather than reproducing it.
+    """
+    bindir = tmp_path / "fakebin"
+    bindir.mkdir(exist_ok=True)
+    stub = bindir / "claude"
+    stub.write_text("#!/bin/sh\necho '{}'\n")
+    stub.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    return stub

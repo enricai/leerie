@@ -29,12 +29,19 @@ import sys
 
 import pytest
 
+from tests.conftest import fake_claude_on_path
+
 
 @pytest.fixture
-def repo(tmp_path, monkeypatch):
+def repo(leerie, tmp_path, monkeypatch):
     """A real git repo with a clean working tree and configured identity —
     `_preflight_repo()` (called unconditionally on a non-resume run, before
-    the try/except under test) requires both."""
+    the try/except under test) requires both.
+
+    Also installs the two prerequisites every `main()` invocation in this
+    file needs. They live here rather than in `_run_main` because three
+    tests below call `leerie.main()` directly, and a prerequisite attached
+    to the harness would silently miss them."""
     r = tmp_path / "repo"
     r.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=r, check=True)
@@ -50,6 +57,17 @@ def repo(tmp_path, monkeypatch):
     # run in this file would try to mint `<run-id>` directories under the
     # REAL state root this run's own orchestrator owns.
     monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
+    # main() gates on `shutil.which("claude")` and die()s (exit 1) before it
+    # ever mints the run dir, let alone reaches the try/except under test.
+    # The binary is absent on CI runners, so without this stub every exit-code
+    # assertion in this file collapses to `1 == <expected>`. See the helper's
+    # docstring in tests/conftest.py.
+    fake_claude_on_path(tmp_path, monkeypatch)
+    # `leerie` is a session-scoped fixture (one module load for the whole
+    # suite) and `_CURRENT_RUN_ID` is a module-level global that `die()` reads
+    # to annotate its message -- it otherwise leaks a prior test's run id into
+    # this one's error text.
+    monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
     return r
 
 
@@ -60,9 +78,12 @@ def _run_main(leerie, monkeypatch, repo, run_id, *, orchestrate_stub):
     monkeypatch.setattr(
         sys, "argv", ["leerie", "a trivial task", "--run-id", run_id])
     monkeypatch.setattr(leerie, "_orchestrate", orchestrate_stub)
-    # Real signal handlers/subreaper calls are harmless side effects in a
-    # test process; left unstubbed so the very first lines of main() also
-    # get exercised for once.
+    # main()'s first two statements (_restore_sigchld_default,
+    # _become_subreaper) are left unstubbed so they get exercised for real.
+    # They are NOT side-effect-free: _become_subreaper() makes this pytest
+    # process a child-subreaper, which changes what process liveness means
+    # for every later test. conftest's autouse `_restore_child_subreaper`
+    # fixture puts the flag back.
     run_dir = repo / ".leerie" / "runs" / run_id
     exit_code = None
     try:

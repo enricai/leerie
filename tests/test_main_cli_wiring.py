@@ -22,6 +22,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import fake_claude_on_path
+
 
 def _init_repo(repo: Path) -> None:
     repo.mkdir(parents=True, exist_ok=True)
@@ -34,16 +36,6 @@ def _init_repo(repo: Path) -> None:
     subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
                     "commit", "-qm", "init"], cwd=repo, check=True)
-
-
-def _fake_claude_on_path(tmp_path: Path, monkeypatch) -> None:
-    """A stub `claude` binary so `shutil.which('claude')` finds one."""
-    bindir = tmp_path / "fakebin"
-    bindir.mkdir(exist_ok=True)
-    stub = bindir / "claude"
-    stub.write_text("#!/bin/sh\necho '{}'\n")
-    stub.chmod(0o755)
-    monkeypatch.setenv("PATH", f"{bindir}:{__import__('os').environ['PATH']}")
 
 
 class _ReachedOrchestrate(Exception):
@@ -59,7 +51,7 @@ def _drive_main(leerie, monkeypatch, tmp_path, *, extra_argv=()) -> None:
     monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
     repo = tmp_path / "repo"
     _init_repo(repo)
-    _fake_claude_on_path(tmp_path, monkeypatch)
+    fake_claude_on_path(tmp_path, monkeypatch)
     monkeypatch.chdir(repo)
     monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
 
@@ -105,7 +97,7 @@ class TestMainReachesOrchestrateBoundary:
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
         _init_repo(repo)
-        _fake_claude_on_path(tmp_path, monkeypatch)
+        fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
         monkeypatch.setenv("ANTHROPIC_BASE_URL", "https://example.invalid")
@@ -123,7 +115,7 @@ class TestMainReachesOrchestrateBoundary:
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
         _init_repo(repo)
-        _fake_claude_on_path(tmp_path, monkeypatch)
+        fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
         monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
@@ -141,7 +133,7 @@ class TestMainReachesOrchestrateBoundary:
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
         _init_repo(repo)
-        _fake_claude_on_path(tmp_path, monkeypatch)
+        fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
         monkeypatch.setattr(sys, "argv", ["leerie", "a task"])
@@ -172,7 +164,7 @@ class TestMainReachesOrchestrateBoundary:
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
         _init_repo(repo)
-        _fake_claude_on_path(tmp_path, monkeypatch)
+        fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
         monkeypatch.setattr(
@@ -190,7 +182,7 @@ class TestMainReachesOrchestrateBoundary:
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
         _init_repo(repo)
-        _fake_claude_on_path(tmp_path, monkeypatch)
+        fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         state_dir = tmp_path / "state"
         monkeypatch.setenv("LEERIE_STATE_DIR", str(state_dir))
