@@ -176,6 +176,33 @@ def test_stat_arity_drift_is_detected(broker, leerie, monkeypatch):
     assert leerie._cgroup_stat("wsid") is None
 
 
+# ---- probe ------------------------------------------------------------
+
+def test_probe_response_parses_in_leerie(broker, leerie, monkeypatch):
+    """`_cgroup_probe` parses `"OK <hierarchy>"` -- the third broker
+    response leerie's client parses field-by-field, alongside `slice` and
+    `stat` above. Untested against the real broker output before this:
+    `tests/test_cgroup_helpers.py` only ever feeds it hand-written
+    fixture strings ("OK v2"/"OK v1"), never the real probe's own
+    fork+create+enroll+destroy round trip."""
+    leerie._CGROUP_PROBE_RESULT = None
+    leerie._CGROUP_HIERARCHY = None
+    try:
+        resp = broker._handle("probe")
+        assert resp.startswith("OK "), resp
+
+        _feed(leerie, monkeypatch, resp)
+        assert leerie._cgroup_probe() is True
+        assert leerie._CGROUP_HIERARCHY == "v2"
+    finally:
+        # `leerie` is session-scoped (tests/conftest.py); reset the
+        # module-level memo so this probe result doesn't leak into a
+        # later test in a different file (mirrors
+        # tests/test_cgroup_helpers.py's reset_probe_memo autouse fixture).
+        leerie._CGROUP_PROBE_RESULT = None
+        leerie._CGROUP_HIERARCHY = None
+
+
 # ---- guard-the-guard ------------------------------------------------------
 
 def test_broker_emits_the_verbs_this_file_pins(broker):
@@ -183,3 +210,4 @@ def test_broker_emits_the_verbs_this_file_pins(broker):
     contract rather than silently pinning nothing."""
     assert not broker._handle("slice").startswith("ERR")
     assert not broker._handle("stat wsid").startswith("ERR")
+    assert not broker._handle("probe").startswith("ERR")

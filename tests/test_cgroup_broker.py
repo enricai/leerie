@@ -446,6 +446,13 @@ def test_stat_rejects_bad_sid(broker):
     assert broker._handle("stat ../evil") == "ERR bad sid"
 
 
+def test_destroy_rejects_bad_sid(broker):
+    """The `destroy` arm's own `_valid_sid` guard -- distinct from
+    `create`'s (already pinned) and `stat`'s, each of which is a separate
+    branch in `_do`'s dispatch."""
+    assert broker._handle("destroy ../evil") == "ERR bad sid"
+
+
 def test_stat_missing_sid_arg_errors(broker):
     # _handle wraps _do in try/except (OSError, ValueError, IndexError).
     assert broker._handle("stat").startswith("ERR")
@@ -991,3 +998,184 @@ def test_sweep_budget_bounds_the_walk_not_just_the_removals(broker,
     assert len(seen) <= 1, (
         f"the budget did not stop the walk: {len(seen)} entries were still "
         "stat'd/read after it was exhausted")
+
+
+# ---- malformed controller-file content (degrades to safe sentinels,
+# never raises) --------------------------------------------------------------
+
+def test_pids_max_malformed_content_degrades_to_minus_one(broker):
+    """`_pids_max` treats a garbage (non-integer, not the literal "max")
+    value the same as unreadable: -1, never a raise. `test_stat_unlimited_max_reports_minus_one`
+    only pins the literal "max" case; this pins the ValueError branch."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "pids.current").write_text("5")
+    (d / "pids.max").write_text("garbage\n")
+    (d / "pids.events").write_text("max 0\n")
+    (d / "memory.events").write_text("oom_kill 0\n")
+    assert broker._handle("stat wsid") == "OK 5 -1 0 0"
+
+
+def test_pids_events_max_malformed_count_degrades_to_zero(broker):
+    """The `max` key's count field is non-integer -> 0, not a raise --
+    mirrors the missing-key/missing-file sentinel already pinned by
+    test_stat_events_parser_ignores_unknown_keys."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "pids.current").write_text("10")
+    (d / "pids.max").write_text("64")
+    (d / "pids.events").write_text("max notanumber\n")
+    (d / "memory.events").write_text("oom_kill 0\n")
+    assert broker._handle("stat wsid") == "OK 10 64 0 0"
+
+
+def test_memory_events_oom_malformed_count_degrades_to_zero(broker):
+    """Same ValueError-degrades-to-0 discipline for the oom_kill parser."""
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "pids.current").write_text("10")
+    (d / "pids.max").write_text("64")
+    (d / "pids.events").write_text("max 0\n")
+    (d / "memory.events").write_text("oom_kill notanumber\n")
+    assert broker._handle("stat wsid") == "OK 10 64 0 0"
+
+
+def test_slice_memory_max_malformed_content_degrades_to_minus_one(broker):
+    """`_slice_memory_max`'s own ValueError branch -- distinct from the
+    already-pinned "max"/absent-file cases, which return -1 via the
+    earlier `not raw or raw == "max"` guard rather than the try/except."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    (slice_dir / "memory.max").write_text("not-a-number\n")
+    assert broker._slice_memory_max() == -1
+
+
+def test_slice_unreclaimable_malformed_value_degrades_to_minus_one(broker):
+    """A non-integer value on a tracked key (anon) makes the whole read
+    fail closed to -1 rather than raising or silently treating it as 0 --
+    the ValueError branch inside the per-line loop, distinct from the
+    already-pinned "primary key absent" and "unreadable file" cases."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    (slice_dir / "memory.stat").write_text("anon not-a-number\nfile 99\n")
+    assert broker._slice_unreclaimable() == -1
+
+
+# ---- _write / _detect error paths ------------------------------------------
+
+def test_write_raises_when_swallow_is_false(broker, tmp_path):
+    """The default (swallow=False) propagates the OSError -- callers that
+    need best-effort semantics (e.g. cgroup.kill, memory.swap.max) pass
+    swallow=True explicitly; everything else must fail loudly rather than
+    silently no-op a limit write."""
+    bad_path = tmp_path / "does" / "not" / "exist" / "pids.max"
+    with pytest.raises(OSError):
+        broker._write(str(bad_path), "64")
+
+
+def test_write_swallows_when_requested(broker, tmp_path):
+    bad_path = tmp_path / "does" / "not" / "exist" / "pids.max"
+    broker._write(str(bad_path), "64", swallow=True)  # must not raise
+
+
+def test_detect_returns_none_on_oserror(broker, monkeypatch):
+    """`_detect`'s outer try/except: an OSError while probing for the v2
+    marker (e.g. a permission-denied stat) degrades to "none" rather than
+    crashing broker startup."""
+    def raising_isfile(path):
+        raise OSError("permission denied")
+
+    monkeypatch.setattr(broker.os.path, "isfile", raising_isfile)
+    assert broker._detect() == "none"
+
+
+# ---- v1 create/enroll round trip (D1-equivalent gap: only destroy/stat
+# were exercised on v1 before this) ------------------------------------------
+
+def test_v1_create_enroll_writes_split_controller_files(broker, monkeypatch):
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    broker._v1_create("wsid", 1 << 20, 32)
+    broker._v1_enroll("wsid", 4321)
+    pdir, mdir = broker._v1_dirs("wsid")
+    assert (Path(pdir) / "pids.max").read_text() == "32"
+    assert (Path(mdir) / "memory.limit_in_bytes").read_text() == str(1 << 20)
+    assert "4321" in (Path(pdir) / "cgroup.procs").read_text()
+    assert "4321" in (Path(mdir) / "cgroup.procs").read_text()
+
+
+def test_v1_dispatch_create_enroll_stat_round_trip(broker, monkeypatch):
+    """End to end through `_handle`, forcing the v1 dispatch table
+    (`_do`'s `create = _v2_create if _HIER == "v2" else _v1_create`, etc.)
+    -- the only other v1 coverage exercises destroy/stat directly, never
+    through the verb dispatcher."""
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    assert broker._handle("create wsid 1048576 32") == "OK"
+    assert broker._handle("enroll wsid 555") == "OK"
+    # pids.current is kernel-managed (not written by create/enroll on this
+    # fake cgroupfs), so it degrades to the missing-file sentinel (0).
+    assert broker._handle("stat wsid") == "OK 0 32 0 0"
+
+
+# ---- _live_sibling_count / _sweep OSError branches -------------------------
+
+def test_live_sibling_count_returns_zero_when_slice_dir_missing(broker,
+                                                                 monkeypatch):
+    """No `leerie.slice` directory at all (fresh host, nothing created
+    yet) -> os.listdir raises -> 0 live siblings, not a raise."""
+    monkeypatch.setattr(broker, "_slice_dir",
+                        lambda: str(Path(broker.V2_ROOT) / "does-not-exist"))
+    assert broker._live_sibling_count() == 0
+
+
+def test_sweep_tolerates_a_missing_root_dir(broker, monkeypatch):
+    """`os.listdir(root)` raising OSError inside the per-root loop is
+    caught and the loop moves on -- covers a root vanishing between
+    `_HIER` detection and the sweep (e.g. a concurrent broker tore it
+    down), not just the analogous `_live_sibling_count` case."""
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    # Seed only the pids/ root; leave memory/ entirely absent so listdir()
+    # on it raises rather than returning an empty list.
+    pdir = Path(broker.V1_ROOT) / "pids" / broker.SLICE
+    pdir.mkdir(parents=True)
+    _seed_worker_dir(pdir, "leerie-w-abc-conformer",
+                     age_sec=broker._ORPHAN_MIN_AGE_SEC * 2)
+    # memory/leerie.slice deliberately not created.
+    assert broker._sweep_orphaned_worker_cgroups() == 1
+
+
+def test_sweep_skips_an_entry_whose_mtime_disappears_mid_walk(broker,
+                                                               monkeypatch):
+    """`os.stat(d).st_mtime` raising OSError (the directory was removed by
+    a concurrent process between the listdir() and the stat()) is caught
+    per-entry and the walk continues rather than crashing the sweep."""
+    slice_dir = Path(broker.V2_ROOT) / broker.SLICE
+    _seed_worker_dir(slice_dir, "leerie-w-vanishing-conformer", procs="",
+                     age_sec=broker._ORPHAN_MIN_AGE_SEC * 2)
+    survivor = _seed_worker_dir(slice_dir, "leerie-w-survivor-conformer",
+                                procs="",
+                                age_sec=broker._ORPHAN_MIN_AGE_SEC * 2)
+
+    real_stat = broker.os.stat
+
+    def flaky_stat(path, *a, **kw):
+        if "vanishing" in str(path):
+            raise OSError("no such file or directory")
+        return real_stat(path, *a, **kw)
+
+    monkeypatch.setattr(broker.os, "stat", flaky_stat)
+    assert broker._sweep_orphaned_worker_cgroups() == 1
+    assert not survivor.exists()
+
+
+# ---- probe's own OSError handling ------------------------------------------
+
+def test_probe_reports_err_on_oserror(broker, monkeypatch):
+    """`_handle`'s "probe" arm wraps the fork/create/enroll/destroy
+    sequence in its own try/except OSError (distinct from the generic
+    try/except around `_do` for every other verb) -- pin that an OSError
+    raised inside the probe body surfaces as `ERR probe: ...` rather than
+    propagating and killing the connection handler."""
+    def raising_fork():
+        raise OSError("fork failed: resource temporarily unavailable")
+
+    monkeypatch.setattr(broker.os, "fork", raising_fork)
+    resp = broker._handle("probe")
+    assert resp.startswith("ERR probe:")
