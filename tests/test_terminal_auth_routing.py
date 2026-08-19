@@ -39,6 +39,7 @@ classifier alone, as test-004 already covers, cannot see this) and pins:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 
 import pytest
@@ -318,6 +319,30 @@ def _compile_terminal_auth_handler_body(leerie):
     return compile(mod, leerie.__file__, "exec")
 
 
+@contextlib.contextmanager
+def _real_best_effort_capture_deps_patched(leerie, capture_fn, logs):
+    """Yields the real `leerie._best_effort_capture_deps`, with the module's
+    `capture_repo_deps` and `log` temporarily swapped for test doubles.
+
+    `_best_effort_capture_deps` is itself the extracted helper under test
+    (refactor-001) — it lives in `leerie`'s own module namespace, so its
+    `await capture_repo_deps(...)` and `log(...)` calls resolve `leerie`'s
+    module globals, not the exec()'d handler's local `ns`. Patching the
+    module attributes for the duration of the call keeps this file's
+    per-scenario stubbing (a raising capture, a captured log line) working
+    without hand-rolling a second copy of the helper's try/except.
+    """
+    orig_capture = leerie.capture_repo_deps
+    orig_log = leerie.log
+    leerie.capture_repo_deps = capture_fn
+    leerie.log = logs.append
+    try:
+        yield leerie._best_effort_capture_deps
+    finally:
+        leerie.capture_repo_deps = orig_capture
+        leerie.log = orig_log
+
+
 def _run_terminal_auth_handler(leerie, raw_message="OAuth session expired "
                                 "and could not be refreshed"):
     """Executes the real handler body (extracted by AST) against a stubbed
@@ -348,7 +373,6 @@ def _run_terminal_auth_handler(leerie, raw_message="OAuth session expired "
         "log": logs.append,
         "_save_state_best_effort": fake_save,
         "_cleanup_on_abnormal_exit": fake_cleanup,
-        "capture_repo_deps": fake_capture_repo_deps,
         "asyncio": asyncio,
         "repo_root": "/repo",
         "caps": {"c": 1},
@@ -360,7 +384,10 @@ def _run_terminal_auth_handler(leerie, raw_message="OAuth session expired "
         "ContextOverflow": leerie.ContextOverflow,
         "DiskLowSpace": leerie.DiskLowSpace,
     }
-    exec(code, ns)
+    with _real_best_effort_capture_deps_patched(
+            leerie, fake_capture_repo_deps, logs) as bec:
+        ns["_best_effort_capture_deps"] = bec
+        exec(code, ns)
     return ns, logs, save_calls, cleanup_calls, capture_calls
 
 
@@ -429,7 +456,6 @@ def test_handler_execution_survives_a_cleanup_that_raises(leerie):
         "log": logs.append,
         "_save_state_best_effort": fake_save,
         "_cleanup_on_abnormal_exit": raising_cleanup,
-        "capture_repo_deps": fake_capture_repo_deps,
         "asyncio": asyncio,
         "repo_root": "/repo",
         "caps": {},
@@ -441,7 +467,10 @@ def test_handler_execution_survives_a_cleanup_that_raises(leerie):
         "ContextOverflow": leerie.ContextOverflow,
         "DiskLowSpace": leerie.DiskLowSpace,
     }
-    exec(code, ns)
+    with _real_best_effort_capture_deps_patched(
+            leerie, fake_capture_repo_deps, logs) as bec:
+        ns["_best_effort_capture_deps"] = bec
+        exec(code, ns)
 
     # Reached the end of the handler despite the cleanup raising — proves
     # the exception was caught, not propagated.
@@ -482,7 +511,6 @@ def test_handler_execution_survives_a_capture_repo_deps_that_raises(leerie):
         "log": logs.append,
         "_save_state_best_effort": fake_save,
         "_cleanup_on_abnormal_exit": fake_cleanup,
-        "capture_repo_deps": raising_capture_repo_deps,
         "asyncio": asyncio,
         "repo_root": "/repo",
         "caps": {},
@@ -494,7 +522,10 @@ def test_handler_execution_survives_a_capture_repo_deps_that_raises(leerie):
         "ContextOverflow": leerie.ContextOverflow,
         "DiskLowSpace": leerie.DiskLowSpace,
     }
-    exec(code, ns)
+    with _real_best_effort_capture_deps_patched(
+            leerie, raising_capture_repo_deps, logs) as bec:
+        ns["_best_effort_capture_deps"] = bec
+        exec(code, ns)
 
     assert ns["exit_code"] == leerie.EXIT_LOCKED
     assert any("capture: non-fatal error during auth-locked pause" in m

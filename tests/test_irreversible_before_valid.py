@@ -89,9 +89,21 @@ class TestRepoChecksPrecedeTheRunDirectory:
 
 
 class TestTerminalArmsSurviveTheirOwnInterrupt:
+    # The functions that may hold a direct `try:` around `capture_repo_deps`.
+    # `_best_effort_capture_deps` (refactor-001) is the single owner of the
+    # guard that main()'s six terminating arms previously hand-rolled inline;
+    # they now delegate to it, so it must be scanned alongside the two
+    # arm-holding functions or the sweep goes blind to the very guard it
+    # exists to protect. `test_every_main_capture_goes_through_the_guard`
+    # below closes the corresponding hole: an arm that called
+    # capture_repo_deps WITHOUT the helper (and without an inline try) is the
+    # unguarded escape the collapse could otherwise hide.
+    _GUARD_FUNCS = ("main", "phase_finalize", "_best_effort_capture_deps")
+
     def _guarded_arms(self, leerie) -> list[str]:
-        """Every `except (...)` tuple guarding a best-effort capture in a
-        terminal arm of `main()` or `phase_finalize`.
+        """Every `except (...)` tuple guarding a best-effort capture — the
+        inline arms of `main()`/`phase_finalize` plus the shared
+        `_best_effort_capture_deps` helper the collapsed arms delegate to.
 
         Selected by what the guarded `try` DOES — it calls `capture_repo_deps`
         — not by which exception names the tuple happens to contain. The first
@@ -105,7 +117,7 @@ class TestTerminalArmsSurviveTheirOwnInterrupt:
         for node in ast.walk(tree):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
-            if node.name not in ("main", "phase_finalize"):
+            if node.name not in self._GUARD_FUNCS:
                 continue
             for t in ast.walk(node):
                 if not isinstance(t, ast.Try):
@@ -122,13 +134,15 @@ class TestTerminalArmsSurviveTheirOwnInterrupt:
 
     def test_the_scan_finds_them(self, leerie):
         """Anti-vacuity: a scan matching nothing passes the next test."""
-        # Raised from 4: the content-based selector finds 7, and a floor well
-        # below reality is a weak control. Note the selector keys on the try
-        # body calling `capture_repo_deps`, so a terminal arm doing some OTHER
-        # best-effort work is still invisible — narrower than "every terminal
-        # arm", which is why this stays a floor rather than an equality.
+        # After refactor-001 collapsed main()'s six inline arms into
+        # `_best_effort_capture_deps`, the direct-try guards left are that
+        # helper plus phase_finalize's own inline arm — two. A floor well
+        # below reality is a weak control, so this is pinned at exactly what
+        # the current structure yields; a new arm that hand-rolls its own
+        # guard raises it, and the KeyboardInterrupt sweep below still covers
+        # every arm the scan finds.
         arms = self._guarded_arms(leerie)
-        assert len(arms) >= 7, arms
+        assert len(arms) >= 2, arms
 
     def test_every_one_catches_KeyboardInterrupt(self, leerie):
         offenders = [n for n in self._guarded_arms(leerie)
@@ -137,6 +151,32 @@ class TestTerminalArmsSurviveTheirOwnInterrupt:
             "a terminal arm exists to record a disposition; a Ctrl-C during "
             "its best-effort capture must not escape main() and skip the "
             f"exit_code and cleanup that arm was reached to set: {offenders}")
+
+    def test_every_main_capture_goes_through_the_guard(self, leerie):
+        """Every `capture_repo_deps` call inside a `main()` terminal arm must
+        be routed through the guarded `_best_effort_capture_deps` helper.
+
+        After refactor-001 the arms no longer carry their own try/except, so
+        the KeyboardInterrupt sweep above would not see an arm that called
+        `capture_repo_deps` BARE — the exact unguarded escape the collapse
+        could hide. Enforce it structurally: in `main()`, `capture_repo_deps`
+        may appear only as an argument to `_best_effort_capture_deps` (i.e.
+        never as its own call target)."""
+        tree = ast.parse(_ORCH.read_text())
+        main_node = next(
+            n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and n.name == "main")
+        bare_calls = [
+            ast.unparse(c) for c in ast.walk(main_node)
+            if isinstance(c, ast.Call)
+            and isinstance(c.func, ast.Name)
+            and c.func.id == "capture_repo_deps"
+        ]
+        assert not bare_calls, (
+            "main() must route best-effort capture through "
+            "_best_effort_capture_deps (which carries the non-fatal "
+            f"try/except), never call capture_repo_deps directly: {bare_calls}")
 
 
 class TestNeverStartedIsRestartable:

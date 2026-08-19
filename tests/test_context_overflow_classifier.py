@@ -152,32 +152,27 @@ class TestWiring:
         assert "schema" not in arm.lower()
 
     def test_arm_runs_a_guarded_dep_capture_like_its_siblings(self):
-        """Every other terminating arm makes a best-effort `capture_repo_deps`
-        call (DESIGN §6½); this one must too, and it must be guarded against
-        the whole exit-signal family.
+        """Every other terminating arm makes a best-effort dep-capture call
+        (DESIGN §6½) via the shared `_best_effort_capture_deps` helper
+        (refactor-001); this one must too.
 
         `capture_repo_deps` invokes `claude_p` again, so an unguarded call can
         re-raise a BaseException that escapes `main()`, skips the `exit_code`
         assignment below it, and crashes the run with exit 1 instead of pausing
         resumably — the verbatim 2026-07-19 incident that
-        `tests/test_capture_swallows_exit_signals.py` exists to prevent.
+        `tests/test_capture_swallows_exit_signals.py` exists to prevent. The
+        guard itself now lives once, inside `_best_effort_capture_deps`
+        (pinned by `tests/test_dep_capture_wiring.py`'s
+        `TestBestEffortCaptureDepsHelper`), rather than being reproduced
+        per-arm — this test only pins that the ContextOverflow arm calls it.
         """
         src = inspect.getsource(leerie.main)
         arm = src.split("except ContextOverflow as e:", 1)[1] \
                  .split("\n    except ", 1)[0]
-        assert "capture_repo_deps(" in arm, (
+        assert "_best_effort_capture_deps(" in arm, (
             "the ContextOverflow arm skips the best-effort dep capture its "
             "sibling terminating arms all perform")
-        # Membership, not literal tuple text: the order of these names is not
-        # the property under test, and pinning the exact prefix made this fail
-        # when KeyboardInterrupt was added to every terminal arm's guard.
-        assert "except (" in arm
-        guard = arm.split("except (", 1)[1].split(") as", 1)[0]
-        for required in ("Exception", "ContextOverflow", "KeyboardInterrupt"):
-            assert required in guard, (
-                f"the arm's own capture guard must catch {required} — "
-                "capture_repo_deps calls claude_p, which can raise it again, "
-                f"and a Ctrl-C during that capture escapes main(). guard: {guard}")
         # The capture must precede the exit_code assignment; an escape past an
         # unguarded call skips it. The ordering *is* the property under test.
-        assert arm.index("capture_repo_deps(") < arm.index("exit_code =")
+        assert (arm.index("_best_effort_capture_deps(")
+                < arm.index("exit_code ="))

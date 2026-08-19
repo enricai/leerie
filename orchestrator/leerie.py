@@ -10404,6 +10404,30 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
 
     Advisory as shipped — the caller logs these rather than gating on them,
     pending confirmation across live runs (DESIGN §5)."""
+    issues: list[str] = []
+    for sid_a, sid_b, tag, shared in _iter_duplicate_provider_pairs(plans):
+        issues.append(
+            f"DUPLICATE_PROVIDER: {sid_a} and {sid_b} both "
+            f"provide {tag!r} and both touch "
+            f"{', '.join(sorted(shared))} — two subtasks doing the "
+            "same work to the same file. One should be dropped or "
+            "merged into the other, or they should be sequenced with "
+            "an explicit depends_on and given distinct surfaces "
+            "(DESIGN §5 *Cross-domain surface overlap*)")
+    return issues
+
+
+def _iter_duplicate_provider_pairs(
+        plans: list[dict]) -> Iterator[tuple[str, str, str, set[str]]]:
+    """Shared detection loop behind `check_duplicate_providers` and
+    `_duplicate_provider_merge_collisions`: builds the tag->providers map,
+    then yields `(sid_a, sid_b, tag, shared_files)` for every pair of
+    subtasks that declare the same `provides` tag and share a touched file —
+    skipping pairs that are a deliberate `_cofile_cluster` sub-file split of
+    one file (LOAD-BEARING, not an optimization — see
+    `check_duplicate_providers`'s docstring for the corpus measurement this
+    exclusion rests on). Callers differ only in what they do with a found
+    pair (an advisory issue string vs. a merge-collision dict)."""
     subtasks: dict[str, dict] = {}
     for plan in plans:
         for s in plan.get("subtasks", []) or []:
@@ -10430,7 +10454,6 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
             if isinstance(f, str) and f.strip()
         }
 
-    issues: list[str] = []
     for tag in sorted(providers):
         sids = sorted(providers[tag])
         for i in range(len(sids)):
@@ -10442,15 +10465,7 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
                 shared = _files(a) & _files(b)
                 if not shared:
                     continue
-                issues.append(
-                    f"DUPLICATE_PROVIDER: {sids[i]} and {sids[j]} both "
-                    f"provide {tag!r} and both touch "
-                    f"{', '.join(sorted(shared))} — two subtasks doing the "
-                    "same work to the same file. One should be dropped or "
-                    "merged into the other, or they should be sequenced with "
-                    "an explicit depends_on and given distinct surfaces "
-                    "(DESIGN §5 *Cross-domain surface overlap*)")
-    return issues
+                yield sids[i], sids[j], tag, shared
 
 
 def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
@@ -10477,50 +10492,20 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
     a cluster (e.g. pair (B, C) once A↔B and A↔C have already collapsed
     both to the same survivor) is recorded as `skipped_redundant` by that
     helper rather than double-applied."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
-
-    providers: dict[str, list[str]] = {}
-    for sid, s in subtasks.items():
-        for tag in s.get("provides", []) or []:
-            if isinstance(tag, str) and tag.strip():
-                providers.setdefault(tag, []).append(sid)
-
-    def _files(s: dict) -> set[str]:
-        return {
-            _normalize_artifact_path(f)
-            for f in (s.get("files_likely_touched") or [])
-            if isinstance(f, str) and f.strip()
-        }
-
     collisions: list[dict] = []
-    for tag in sorted(providers):
-        sids = sorted(providers[tag])
-        for i in range(len(sids)):
-            for j in range(i + 1, len(sids)):
-                a, b = subtasks[sids[i]], subtasks[sids[j]]
-                cluster = a.get("_cofile_cluster")
-                if cluster and cluster == b.get("_cofile_cluster"):
-                    continue  # deliberate sub-file split of one file
-                shared = _files(a) & _files(b)
-                if not shared:
-                    continue
-                collisions.append({
-                    "a_sid": sids[i], "b_sid": sids[j],
-                    "resolution": "merge",
-                    "artifact": tag,
-                    "merge_feasibility": (
-                        f"deterministic duplicate-provider floor: both "
-                        f"subtasks declare provides={tag!r} and both touch "
-                        f"{', '.join(sorted(shared))} — merged rather than "
-                        "left as duplicate work (DESIGN §5 *A deterministic "
-                        "floor underneath the judge*, M11 DECISION)"),
-                    "reason": "DUPLICATE_PROVIDER",
-                })
+    for sid_a, sid_b, tag, shared in _iter_duplicate_provider_pairs(plans):
+        collisions.append({
+            "a_sid": sid_a, "b_sid": sid_b,
+            "resolution": "merge",
+            "artifact": tag,
+            "merge_feasibility": (
+                f"deterministic duplicate-provider floor: both "
+                f"subtasks declare provides={tag!r} and both touch "
+                f"{', '.join(sorted(shared))} — merged rather than "
+                "left as duplicate work (DESIGN §5 *A deterministic "
+                "floor underneath the judge*, M11 DECISION)"),
+            "reason": "DUPLICATE_PROVIDER",
+        })
     return collisions
 
 
@@ -13202,6 +13187,44 @@ def _save_state_best_effort(st: "State", where: str) -> None:
         log(f"warning: could not persist state at {where} "
             f"({type(exc).__name__}: {exc}); the last saved state.json "
             "stands and `leerie resume` still works from it")
+
+
+async def _best_effort_capture_deps(
+        repo_root: Path,
+        st: "State",
+        caps: dict | None,
+        models: dict[str, str] | None,
+        efforts: dict[str, str | None] | None,
+        context_label: str,
+) -> None:
+    """Run dep_capture best-effort from a `main()` terminal exception arm.
+
+    Every terminating arm in `main()` attempts `capture_repo_deps` on its way
+    out (DESIGN §6½) and must swallow the same exception family:
+    `TerminalAuthFailure` / `RateLimitedExit` / `ContextOverflow` /
+    `DiskLowSpace` deliberately subclass `BaseException`, so a bare `except
+    Exception` would let a re-raise (e.g. the auth-locked arm is *guaranteed*
+    to re-hit its own TerminalAuthFailure inside `capture_repo_deps ->
+    claude_p`) escape `main()` entirely, skipping the `exit_code` assignment
+    and crashing a resumable pause with exit 1. `KeyboardInterrupt` is IN the
+    tuple for the same reason: a terminal arm exists to record a disposition,
+    so a second Ctrl-C during this best-effort capture must not escape and
+    skip the exit_code/cleanup that arm was reached to set
+    (docs/POSTMORTEM-2026-08-14.md, F15).
+
+    `context_label` is interpolated into the non-fatal log line only — it
+    names which pause this capture attempt belongs to (e.g. "disk-low
+    pause", "cancel-arm capture").
+    """
+    try:
+        await capture_repo_deps(
+            repo_root, st,
+            caps=caps, models=models, efforts=efforts,
+        )
+    except (Exception, KeyboardInterrupt, TerminalAuthFailure,
+            RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
+        log(f"capture: non-fatal error during {context_label} "
+            f"({_cap_exc})")
 
 
 def _brief_worker_exc(exc: BaseException) -> str:
@@ -20611,6 +20634,54 @@ def _find_oversized_added_subtasks(plans: list[dict]) -> list[dict]:
     return oversized
 
 
+def _merge_subtask_core_fields(
+    into_s: dict, from_s: dict, into_id: str, from_id: str
+) -> None:
+    """Mutate `into_s` in place with the union of `into_s`/`from_s`'s
+    `provides`, `requires`, and `depends_on` — shared by
+    `_apply_reconciler_output`'s `merged_subtasks` handling and
+    `_apply_overlap_merge`. `title`/`intent`/`success_criteria_seed`/
+    `files_likely_touched` merges are NOT identical between the two call
+    sites and stay local to each."""
+    # provides: union, dedup, order-preserving.
+    merged_provides = list(into_s.get("provides", []) or [])
+    for tag in (from_s.get("provides") or []):
+        if tag not in merged_provides:
+            merged_provides.append(tag)
+    into_s["provides"] = merged_provides
+
+    # requires: union, drop self-references (entries whose tag is now in
+    # the merged provides — would be a graph self-loop). External
+    # entries stay regardless (out-of-graph, surface as preconditions).
+    seen_req: set[tuple[str, str]] = set()
+    merged_requires = []
+    for entry in (list(into_s.get("requires", []) or [])
+                  + list(from_s.get("requires", []) or [])):
+        if not isinstance(entry, dict):
+            continue
+        tag = entry.get("tag", "")
+        extent = entry.get("extent", "")
+        key = (tag, extent)
+        if key in seen_req:
+            continue
+        seen_req.add(key)
+        if extent == "in_plan" and tag in merged_provides:
+            continue
+        merged_requires.append(entry)
+    into_s["requires"] = merged_requires
+
+    # depends_on: union minus self-references (would be a self-loop),
+    # dedup, order-preserving.
+    merged_deps: list[str] = []
+    for dep in (list(into_s.get("depends_on", []) or [])
+                + list(from_s.get("depends_on", []) or [])):
+        if dep == from_id or dep == into_id:
+            continue
+        if dep not in merged_deps:
+            merged_deps.append(dep)
+    into_s["depends_on"] = merged_deps
+
+
 def _apply_reconciler_output(
     plans: list[dict],
     output: dict,
@@ -20901,46 +20972,7 @@ def _apply_reconciler_output(
         into_s = by_id[into_id]
         from_s = by_id[from_id]
 
-        # provides: union (dedup, order-preserving).
-        merged_provides = list(into_s.get("provides", []) or [])
-        for tag in (from_s.get("provides") or []):
-            if tag not in merged_provides:
-                merged_provides.append(tag)
-        into_s["provides"] = merged_provides
-
-        # requires: union, then drop self-references (an entry whose tag
-        # is now in the merged provides is satisfied by the merged unit
-        # itself — would be a self-loop in the graph).
-        seen_req: set[tuple[str, str]] = set()
-        merged_requires = []
-        for entry in (list(into_s.get("requires", []) or [])
-                      + list(from_s.get("requires", []) or [])):
-            if not isinstance(entry, dict):
-                continue
-            tag = entry.get("tag", "")
-            extent = entry.get("extent", "")
-            key = (tag, extent)
-            if key in seen_req:
-                continue
-            seen_req.add(key)
-            # Self-reference cleanup: only drop in_plan entries whose
-            # tag is now produced by the merged unit. external entries
-            # are out-of-graph and stay regardless.
-            if extent == "in_plan" and tag in merged_provides:
-                continue
-            merged_requires.append(entry)
-        into_s["requires"] = merged_requires
-
-        # depends_on: union, minus `from` itself (would be a self-loop),
-        # dedup, order-preserving.
-        merged_deps: list[str] = []
-        for dep in (list(into_s.get("depends_on", []) or [])
-                    + list(from_s.get("depends_on", []) or [])):
-            if dep == from_id or dep == into_id:
-                continue
-            if dep not in merged_deps:
-                merged_deps.append(dep)
-        into_s["depends_on"] = merged_deps
+        _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
 
         # files_likely_touched: union, order-preserving dedup.
         merged_files: list[str] = []
@@ -23390,43 +23422,7 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
     elif from_scs:
         into_s["success_criteria_seed"] = from_scs
 
-    # provides: union, dedup, order-preserving.
-    merged_provides = list(into_s.get("provides", []) or [])
-    for tag in (from_s.get("provides") or []):
-        if tag not in merged_provides:
-            merged_provides.append(tag)
-    into_s["provides"] = merged_provides
-
-    # requires: union, drop self-references (entries whose tag is now in
-    # the merged provides — would be a graph self-loop). External
-    # entries stay regardless (out-of-graph, surface as preconditions).
-    seen_req: set[tuple[str, str]] = set()
-    merged_requires = []
-    for entry in (list(into_s.get("requires", []) or [])
-                  + list(from_s.get("requires", []) or [])):
-        if not isinstance(entry, dict):
-            continue
-        tag = entry.get("tag", "")
-        extent = entry.get("extent", "")
-        key = (tag, extent)
-        if key in seen_req:
-            continue
-        seen_req.add(key)
-        if extent == "in_plan" and tag in merged_provides:
-            continue
-        merged_requires.append(entry)
-    into_s["requires"] = merged_requires
-
-    # depends_on: union minus self-references (would be a self-loop),
-    # dedup, order-preserving.
-    merged_deps: list[str] = []
-    for dep in (list(into_s.get("depends_on", []) or [])
-                + list(from_s.get("depends_on", []) or [])):
-        if dep == from_id or dep == into_id:
-            continue
-        if dep not in merged_deps:
-            merged_deps.append(dep)
-    into_s["depends_on"] = merged_deps
+    _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
 
     # files_likely_touched: union, order-preserving dedup.
     merged_files: list[str] = []
@@ -27263,6 +27259,24 @@ async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
             if line and not line.startswith(prefix)]
 
 
+def _append_conformer_context_sections(up: list[str], blt_results: dict[str, dict],
+                                        blt_scope: str, st: State) -> None:
+    """Build and append the blt/baseline/recipe context sections shared by
+    the per-subtask conformer and the whole-tree final conformance pass."""
+    blt_section = _format_blt_results_section(blt_results, blt_scope)
+    if blt_section is not None:
+        up.append(blt_section)
+    baseline_section = _format_baseline_section(
+        (st.data.get("conformance") or {}).get("_baseline"))
+    if baseline_section is not None:
+        up.append(baseline_section)
+    recipe_section = _format_provision_recipe_section(
+        (st.data.get("provision") or {}).get("recipe") or [],
+        audience="conformer")
+    if recipe_section is not None:
+        up.append(recipe_section)
+
+
 async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
                         caps: dict, st: State, models: dict[str, str],
                         efforts: dict[str, str | None],
@@ -27291,18 +27305,7 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
           "with `conformer:`.",
           f"RULES_FILES: {rules_paths_str}",
           f"DIFF_BASE: {diff_base} (compare with `git diff {diff_base}..HEAD`)"]
-    blt_section = _format_blt_results_section(blt_results, blt_scope)
-    if blt_section is not None:
-        up.append(blt_section)
-    baseline_section = _format_baseline_section(
-        (st.data.get("conformance") or {}).get("_baseline"))
-    if baseline_section is not None:
-        up.append(baseline_section)
-    recipe_section = _format_provision_recipe_section(
-        (st.data.get("provision") or {}).get("recipe") or [],
-        audience="conformer")
-    if recipe_section is not None:
-        up.append(recipe_section)
+    _append_conformer_context_sections(up, blt_results, blt_scope, st)
     if extra_feedback is not None:
         up.append(extra_feedback)
 
@@ -29016,18 +29019,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             f"DIFF_BASE: {working_branch} (compare with "
             f"`git diff {working_branch}..HEAD`)",
         ]
-        blt_section = _format_blt_results_section(pre, "full")
-        if blt_section is not None:
-            up.append(blt_section)
-        baseline_section = _format_baseline_section(
-            (st.data.get("conformance") or {}).get("_baseline"))
-        if baseline_section is not None:
-            up.append(baseline_section)
-        recipe_section = _format_provision_recipe_section(
-            (st.data.get("provision") or {}).get("recipe") or [],
-            audience="conformer")
-        if recipe_section is not None:
-            up.append(recipe_section)
+        _append_conformer_context_sections(up, pre, "full", st)
         if blt_feedback is not None:
             up.append(blt_feedback)
 
@@ -33101,23 +33093,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # auth-locked arm documents below: these subclass BaseException, and a
         # re-raise escaping here would skip the `exit_code` assignment and
         # crash the run with exit 1 instead of pausing resumably.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during context-overflow pause "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "context-overflow pause"))
         exit_code = EXIT_LOCKED
 
     except DiskLowSpace as e:
@@ -33159,23 +33136,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         # auth-locked arm documents below: these subclass BaseException, and a
         # re-raise escaping here would skip the `exit_code` assignment and
         # crash the run with exit 1 instead of pausing resumably.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during disk-low pause "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "disk-low pause"))
         # `exit_code` / `abnormal` are deliberately NOT set here — they are
         # set at the top of this arm, before the guarded save, so that every
         # statement below them is best-effort.
@@ -33201,30 +33163,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             log(f"cleanup failed (non-fatal): {cleanup_err}")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Non-fatal. Mirrors the RateLimitedExit post-loop pattern.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # The auth-locked pause is *guaranteed* to re-hit the same terminal
-        # auth failure inside capture_repo_deps -> claude_p. Every member of
-        # the exit-signal family (TerminalAuthFailure, RateLimitedExit,
-        # ContextOverflow) subclasses BaseException, so a bare
-        # `except Exception` cannot catch the re-raise: it would escape main()
-        # entirely, skip the `exit_code = EXIT_LOCKED` assignment below, and
-        # crash the run with exit 1 — defeating this whole resumable-pause arm.
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during auth-locked pause "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "auth-locked pause"))
         exit_code = EXIT_LOCKED
     except RateLimitedExit as e:
         # Claude Code session-limit / rate-limit (or out-of-credits mid-stream
@@ -33267,19 +33207,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                 log(f"cleanup failed (non-fatal): {cleanup_err}")
             # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
             # Non-fatal. Mirrors the cancel-arm pattern.
-            try:
-                asyncio.run(capture_repo_deps(
-                    repo_root, st,
-                    caps=caps, models=models, efforts=efforts,
-                ))
-            # Same escape hazard as the auth-locked arm: TerminalAuthFailure /
-            # RateLimitedExit are BaseException subclasses a bare
-            # `except Exception` misses, which would skip the `exit_code =
-            # EXIT_LOCKED` below and crash the pause with exit 1.
-            except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                    RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-                log(f"capture: non-fatal error during out-of-credits pause "
-                    f"({_cap_exc})")
+            asyncio.run(_best_effort_capture_deps(
+                repo_root, st, caps, models, efforts, "out-of-credits pause"))
             exit_code = EXIT_LOCKED
         else:
             log(f"rate-limited: {e.raw_message}")
@@ -33320,27 +33249,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Mirrors the RateLimitedExit post-loop pattern. Non-fatal.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # TerminalAuthFailure / RateLimitedExit / ContextOverflow are
-        # BaseException subclasses a
-        # bare `except Exception` misses; catching them keeps capture non-fatal
-        # so the cancel arm still reaches its `exit_code = 130`.
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during cancel-arm capture "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "cancel-arm capture"))
         exit_code = 130
     except InterruptedBySignal as e:
         # SIGTERM / SIGHUP → external orchestration (CI cancel, systemd
@@ -33353,27 +33263,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             f"state preserved (resume with leerie resume {st.run_id})")
         # Best-effort dep_capture in its own asyncio.run (DESIGN §6½).
         # Non-fatal.
-        try:
-            asyncio.run(capture_repo_deps(
-                repo_root, st,
-                caps=caps, models=models, efforts=efforts,
-            ))
-        # TerminalAuthFailure / RateLimitedExit / ContextOverflow are
-        # BaseException subclasses a
-        # bare `except Exception` misses; catching them keeps capture non-fatal
-        # so the signal arm still reaches its `exit_code = 128 + signum`.
-        # KeyboardInterrupt is IN this tuple, and it is the one that
-        # matters: a terminal arm exists to record a disposition, so a
-        # Ctrl-C during its best-effort capture must not escape main()
-        # and skip the exit_code/cleanup that arm was reached to set.
-        # The comment this replaces enumerated the BaseException
-        # subclasses a bare `except Exception` misses and omitted the
-        # only one guaranteed to be in flight when the arm is a SIGINT
-        # handler (docs/POSTMORTEM-2026-08-14.md, F15).
-        except (Exception, KeyboardInterrupt, TerminalAuthFailure,
-                RateLimitedExit, ContextOverflow, DiskLowSpace) as _cap_exc:
-            log(f"capture: non-fatal error during signal-arm capture "
-                f"({_cap_exc})")
+        asyncio.run(_best_effort_capture_deps(
+            repo_root, st, caps, models, efforts, "signal-arm capture"))
         # 128 + signal number; SIGTERM=15 → 143, SIGHUP=1 → 129.
         signum = getattr(signal, str(e), None)
         exit_code = (128 + int(signum)) if signum else 1

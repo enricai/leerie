@@ -100,10 +100,13 @@ def _handler_type_names(handler: ast.ExceptHandler) -> set[str]:
 
 
 # The functions carrying a best-effort capture guard (each verified to hold at
-# least one). `main` carries four (auth-locked, out-of-credits, cancel,
-# signal arms); the rest carry one each.
+# least one). refactor-001 collapsed main()'s six verbatim per-arm guards
+# (DiskLowSpace, TerminalAuthFailure, RateLimitedExit x2, KeyboardInterrupt,
+# InterruptedBySignal) into one shared `_best_effort_capture_deps` helper, so
+# `main` itself no longer contains a `Try` whose body directly calls
+# `capture_repo_deps` — the guard now lives in the helper every arm calls.
 _GUARD_FUNCS = [
-    "main",
+    "_best_effort_capture_deps",
     "_backstop_capture_prior_runs",
     "run_recapture_deps",
 ]
@@ -174,8 +177,9 @@ def test_every_capture_guard_catches_the_exit_signals(leerie):
                 f"{fname}: a capture guard dropped Exception (names="
                 f"{sorted(names)}) — ordinary capture errors must still be "
                 f"swallowed")
-    # main() has 4 arms; the two module-level helpers have 1 each → 6 total.
-    assert total >= 6, f"expected >= 6 hardened capture guards, saw {total}"
+    # _best_effort_capture_deps has 1 (shared by all six of main()'s arms
+    # since refactor-001); the two other module-level helpers have 1 each.
+    assert total >= 3, f"expected >= 3 hardened capture guards, saw {total}"
 
 
 def test_finalize_capture_guard_is_hardened(leerie):
