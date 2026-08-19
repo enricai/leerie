@@ -59,6 +59,63 @@ def test_the_prompt_stops_asking_the_worker_to_run_the_axes(leerie):
 
 
 # --------------------------------------------------------------------------
+# `_format_blt_results_section` — the rendered block itself, per axis state
+# --------------------------------------------------------------------------
+
+def test_format_blt_results_section_none_when_nothing_measured(leerie):
+    assert leerie._format_blt_results_section({}, "full") is None
+
+
+def test_format_blt_results_section_not_applicable_axis(leerie):
+    out = leerie._format_blt_results_section(
+        {"build": {"ran": False}}, "full")
+    assert "build: not applicable to this repo" in out
+
+
+def test_format_blt_results_section_could_not_measure(leerie):
+    out = leerie._format_blt_results_section(
+        {"tests": {"ran": True, "measured": False, "command": "pytest"}},
+        "full")
+    assert "COULD NOT MEASURE" in out
+    assert "`pytest`" in out
+    assert "attribute failures yourself" in out
+
+
+def test_format_blt_results_section_passed_axis(leerie):
+    out = leerie._format_blt_results_section(
+        {"lint": {"ran": True, "measured": True, "passed": True,
+                  "command": "eslint ."}}, "scoped")
+    assert "lint: PASSED" in out
+    assert "`eslint .`" in out
+
+
+def test_format_blt_results_section_failed_axis_includes_summary(leerie):
+    out = leerie._format_blt_results_section(
+        {"tests": {"ran": True, "measured": True, "passed": False,
+                   "command": "vitest run", "summary": "2 failed"}},
+        "full")
+    assert "tests: FAILED" in out
+    assert "2 failed" in out
+
+
+def test_format_blt_results_section_passed_axis_omits_summary(leerie):
+    """A PASSED axis never prints its `summary` field, even if the worker
+    left stale text there — only a FAILED axis' summary is worth reading."""
+    out = leerie._format_blt_results_section(
+        {"build": {"ran": True, "measured": True, "passed": True,
+                   "command": "tsc", "summary": "leftover text"}},
+        "full")
+    assert "leftover text" not in out
+
+
+def test_format_blt_results_section_includes_the_scope(leerie):
+    out = leerie._format_blt_results_section(
+        {"build": {"ran": True, "measured": True, "passed": True,
+                   "command": "tsc"}}, "scoped")
+    assert "scope: scoped" in out
+
+
+# --------------------------------------------------------------------------
 # Lever 2: the overwrite — behavioural, not just structural
 # --------------------------------------------------------------------------
 

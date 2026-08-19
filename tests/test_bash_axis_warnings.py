@@ -181,6 +181,94 @@ def test_count_tolerates_malformed_lines(leerie, tmp_path):
         log, leerie._BLT_AXIS_RES["test"]) == 1
 
 
+def test_count_full_only_excludes_a_scoped_invocation(leerie, tmp_path):
+    """`full_only=True` matches the axis but drops it when the command is
+    scoped to a specific selector — a single targeted falsifier must not
+    inflate the full-axis count."""
+    log = tmp_path / "w.log"
+    _write_log(log, [_bash_event("a", "npm test src/a.test.ts")])
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["test"], full_only=True) == 0
+    # The plain (non-full_only) count still sees it.
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["test"]) == 1
+
+
+def test_is_full_axis_invocation_skips_blank_and_comment_segments(leerie):
+    """A blank segment (from a trailing separator) or a `#`-prefixed
+    comment segment must be skipped rather than misread as the axis."""
+    assert leerie._is_full_axis_invocation(
+        "npm test &&", leerie._BLT_AXIS_RES["test"]) is True
+    assert leerie._is_full_axis_invocation(
+        "# npm test", leerie._BLT_AXIS_RES["test"]) is False
+
+
+def test_iter_log_tool_use_skips_non_dict_message(leerie, tmp_path):
+    """A top-level event whose `message` is a string, not a dict, must
+    not crash the tolerant two-pass scan."""
+    log = tmp_path / "w.log"
+    log.write_text(
+        json.dumps({"message": "not a dict"}) + "\n"
+        + json.dumps(_bash_event("a", "npm test")) + "\n")
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["test"]) == 1
+
+
+def test_iter_log_tool_use_skips_non_list_content(leerie, tmp_path):
+    """A `message.content` that isn't a list (e.g. a bare string) must
+    not crash the tolerant scan."""
+    log = tmp_path / "w.log"
+    log.write_text(
+        json.dumps({"message": {"content": "not a list"}}) + "\n"
+        + json.dumps(_bash_event("a", "npm test")) + "\n")
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["test"]) == 1
+
+
+def test_iter_log_tool_use_skips_non_dict_content_block(leerie, tmp_path):
+    """A `content` list containing a non-dict entry alongside a real
+    `tool_use` block must not crash the tolerant scan."""
+    log = tmp_path / "w.log"
+    log.write_text(json.dumps({"message": {"content": [
+        "not a dict",
+        {"type": "tool_use", "id": "a", "name": "Bash",
+         "input": {"command": "npm test"}},
+    ]}}) + "\n")
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["test"]) == 1
+
+
+def test_count_bash_axis_invocations_skips_non_bash_tool_use(leerie, tmp_path):
+    """A non-Bash `tool_use` block (e.g. `Read`) must be skipped by the
+    Bash-only counter."""
+    log = tmp_path / "w.log"
+    _write_log(log, [
+        _read_event("a", "src/whatever.ts"),
+        _bash_event("b", "npm test"),
+    ])
+    assert leerie._count_bash_axis_invocations(
+        log, leerie._BLT_AXIS_RES["test"]) == 1
+
+
+def test_iter_log_tool_use_joins_list_shaped_tool_result_content(leerie, tmp_path):
+    """A `tool_result.content` shaped as a list of content blocks (rather
+    than a bare string) is joined into one text, and orphan detection
+    still finds the auto-background marker inside it."""
+    log = tmp_path / "w.log"
+    log.write_text(
+        json.dumps(_bash_event("a", "npm test")) + "\n"
+        + json.dumps({"message": {"content": [{
+            "type": "tool_result", "tool_use_id": "a",
+            "content": [
+                {"type": "text", "text": _bg_text("b44wb370b")},
+                "trailing raw string",
+            ],
+        }]}}) + "\n"
+        + json.dumps(_bash_event("b", "npm test")) + "\n")
+    orphans = leerie._count_orphaned_bg_axis(log, leerie._BLT_AXIS_RES["test"])
+    assert orphans == ["b44wb370b"]
+
+
 # ---------------------------------------------------------------------------
 # _count_orphaned_bg_axis
 # ---------------------------------------------------------------------------
@@ -256,6 +344,52 @@ def test_bg_id_extraction_regex(leerie):
     m = leerie._BG_ID_RE.search(text)
     assert m is not None
     assert m.group(1) == "b44wb370b"
+
+
+def test_not_orphan_when_killed_via_killbash(leerie, tmp_path):
+    """Recovery path: model calls `KillBash shell_id=<id>` after the
+    auto-background — a clean termination, not an orphan."""
+    log = tmp_path / "w.log"
+    _write_log(log, [
+        _bash_event("a", "npm test"),
+        _result_event("a", _bg_text("b44wb370b")),
+        {"message": {"content": [
+            {"type": "tool_use", "id": "b", "name": "KillBash",
+             "input": {"shell_id": "b44wb370b"}}
+        ]}},
+    ])
+    assert leerie._count_orphaned_bg_axis(
+        log, leerie._BLT_AXIS_RES["test"]) == []
+
+
+def test_unrelated_read_between_bg_and_recovery_keeps_scanning(leerie, tmp_path):
+    """A `Read` of a file that isn't this bg job's temp output (e.g. the
+    model reads an unrelated source file) must not count as recovery —
+    the scan keeps looking for the real recovery or the retry."""
+    log = tmp_path / "w.log"
+    _write_log(log, [
+        _bash_event("a", "npm test"),
+        _result_event("a", _bg_text("b44wb370b")),
+        _read_event("b", "src/unrelated.ts"),
+        _bash_event("c", "npm test"),
+    ])
+    assert leerie._count_orphaned_bg_axis(
+        log, leerie._BLT_AXIS_RES["test"]) == ["b44wb370b"]
+
+
+def test_unrelated_bash_with_no_bg_id_mention_keeps_scanning(leerie, tmp_path):
+    """A Bash invocation that neither matches the axis nor mentions the
+    bg_id (e.g. `git log`) must be skipped over — recovery or retry may
+    still come later in the log."""
+    log = tmp_path / "w.log"
+    _write_log(log, [
+        _bash_event("a", "npm test"),
+        _result_event("a", _bg_text("b44wb370b")),
+        _bash_event("b", "git log --oneline -5"),
+        _bash_event("c", "npm test"),
+    ])
+    assert leerie._count_orphaned_bg_axis(
+        log, leerie._BLT_AXIS_RES["test"]) == ["b44wb370b"]
 
 
 def test_unrelated_bash_between_bg_and_recovery_doesnt_break_recovery(
