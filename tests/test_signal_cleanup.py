@@ -769,6 +769,44 @@ def test_terminate_proc_tree_reaps_detached_session_grandchildren(leerie):
     asyncio.run(_run())
 
 
+def test_terminate_proc_tree_swallows_signal_and_wait_failures(leerie, monkeypatch):
+    """`_terminate_proc_tree` must never raise, even when every OS call it
+    makes fails: `os.killpg` raising (process/group already gone), the
+    grace-window `proc.wait()` timing out, and the final reap's
+    `asyncio.shield(proc.wait())` also raising. All three are documented as
+    swallowed — this drives each branch directly rather than relying on a
+    real process to happen to hit them."""
+    import asyncio
+
+    class _FakeProc:
+        pid = 999999999  # never a real PID; killpg/wait must not find it
+        def __init__(self):
+            self.wait_calls = 0
+
+        async def wait(self):
+            self.wait_calls += 1
+            if self.wait_calls == 1:
+                # Never returns before the grace window elapses — forces
+                # the asyncio.TimeoutError branch in the try/except.
+                await asyncio.sleep(999)
+            # Second call (the post-SIGKILL reap in `finally`) raises,
+            # exercising the reap's own except-and-swallow branch.
+            raise ProcessLookupError("already reaped")
+
+    monkeypatch.setattr(leerie, "_PROC_TREE_GRACE_SEC", 0.05)
+    monkeypatch.setattr(leerie, "_enumerate_descendants", lambda pid: set())
+
+    def _raising_killpg(pgid, sig):
+        raise ProcessLookupError("no such process group")
+
+    monkeypatch.setattr(leerie.os, "killpg", _raising_killpg)
+
+    fake = _FakeProc()
+    # Must complete cleanly — every failure path is swallowed by design.
+    asyncio.run(leerie._terminate_proc_tree(fake))
+    assert fake.wait_calls == 2
+
+
 # --- Success-path cleanup via _DescendantTracker ---------------------------
 
 @pytest.mark.skipif(

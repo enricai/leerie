@@ -76,6 +76,29 @@ def test_removes_existing_worktree_and_branch(leerie, tmp_path, monkeypatch):
     assert show.returncode != 0
 
 
+def test_reset_falls_back_to_rmtree_when_git_leaves_dir_behind(
+        leerie, tmp_path, monkeypatch):
+    """`git worktree remove` fails (unregistered dir) but the directory
+    still exists — the helper must fall back to a direct `shutil.rmtree`
+    rather than leaving it behind, which would otherwise make the next
+    `new-worktree.sh` attempt collide with a stray directory."""
+    repo = _init_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "leftover.txt").write_text("stray\n")
+    r = _git("worktree", "remove", "--force", str(wt_dir), cwd=repo)
+    assert r.returncode != 0
+    assert wt_dir.exists()
+
+    asyncio.run(leerie._reset_subtask_worktree("sid-x", leerie_dir, "run-id"))
+
+    assert not wt_dir.exists(), (
+        "an unregistered worktree directory must still be removed via the "
+        "shutil.rmtree fallback")
+
+
 def test_resets_so_worktree_add_b_succeeds_on_retry(leerie, tmp_path, monkeypatch):
     """The end-to-end shape this helper exists to enable: after reset, a
     fresh `git worktree add -b <branch>` succeeds where it would otherwise

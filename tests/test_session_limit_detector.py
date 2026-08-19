@@ -305,6 +305,32 @@ def test_sleep_then_reexec_execv_failure_returns_75(leerie, monkeypatch):
     assert rc == leerie.EXIT_LOCKED == 75
 
 
+def test_sleep_then_reexec_cleanup_failure_is_non_fatal(leerie, monkeypatch):
+    """A crashing `_cleanup_on_abnormal_exit` must not abort the sleep/re-exec
+    tail — it's caught and logged, and the wait + re-exec still proceed. The
+    alternative (letting it escape) would turn a best-effort cleanup failure
+    into an unhandled crash of the whole rate-limit auto-resume path."""
+    def boom_cleanup(st, **k):
+        raise RuntimeError("worktree removal blew up")
+    monkeypatch.setattr(leerie, "_cleanup_on_abnormal_exit", boom_cleanup)
+
+    calls = {}
+    monkeypatch.setattr(leerie.time, "sleep",
+                        lambda s: calls.setdefault("slept", s))
+
+    def fake_execv(exe, argv):
+        calls["execv"] = argv
+        raise SystemExit(0)
+    monkeypatch.setattr(leerie.os, "execv", fake_execv)
+
+    import pytest
+    with pytest.raises(SystemExit):
+        leerie._sleep_then_reexec(_fake_st("run-xyz"), 300, "reason")
+
+    assert calls.get("slept") == 300
+    assert calls.get("execv") is not None
+
+
 def test_rate_limit_no_reset_uses_fixed_backoff_not_exit_75(leerie):
     """Source-pin the new contract: the reset_at-None arm calls
     `_sleep_then_reexec(... RATE_LIMIT_RETRY_BACKOFF_SEC ...)` instead of
