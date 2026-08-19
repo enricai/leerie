@@ -16,7 +16,11 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    # Raised from 10 on 2026-08-19. Observed runtime had reached
+    # 7.9-9.7 min against the old 10 min cap, so a fully green suite
+    # was one slow runner away from failing on the timeout rather than
+    # on a test. Headroom, not a licence to let the suite grow.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
