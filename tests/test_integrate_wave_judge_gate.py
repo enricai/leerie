@@ -689,3 +689,472 @@ def test_accepted_finding_skips_the_judge_entirely(leerie, tmp_path, monkeypatch
     assert not calls["judge"], "an accepted finding must not re-invoke the judge"
     assert not calls["integrate_sh"], "an accepted finding must not re-drive integrate.sh"
     assert "feat-001" in out
+
+
+# --- Coverage: the paths that never involve a clean judge result ----------
+# (integrate.sh precondition failure, integrator crash+rescue, a claimed
+# "resolved" merge that lied about being committed, a non-fatal commit
+# warning, and a design-conflict/failed integrator verdict.)
+
+def test_precondition_failure_dies_and_records_blocked(leerie, tmp_path, monkeypatch):
+    """integrate.sh exit 2 is a precondition failure (missing worktree/
+    branch), not a conflict — must die() with the script's own message and
+    record it in state.data['blocked'] before dying."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = leerie_dir / "worktrees" / "staging"
+    staging.mkdir(parents=True)
+
+    results = {"feat-001": {"status": "complete"}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 2
+        mock.stderr = "subtask branch missing"
+        mock.stdout = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+
+    async def _run():
+        await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(_run())
+
+    assert "feat-001" in st.data.get("blocked", {})
+    assert "subtask branch missing" in st.data["blocked"]["feat-001"]
+
+
+def test_integrator_crash_rescues_work_aborts_and_dies(leerie, tmp_path, monkeypatch):
+    """An integrator that crashes every round (WorkerError) is infrastructure,
+    not a verdict: its in-progress resolution is rescued to a ref BEFORE the
+    merge is aborted, `blocked[sid]` names the rescue, and the run dies
+    naming the rescue ref."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = _staging_repo(leerie_dir)
+
+    results = {"feat-001": {"status": "complete"}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 1  # conflict -> spawn integrator
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    async def fake_claude_p(**kwargs):
+        # Every round of the integrator's _run_checked_loop raises
+        # WorkerError, so ires ends up None.
+        raise leerie.WorkerError("session killed")
+
+    rescue_calls = []
+
+    async def fake_rescue(staging_path, sid, run_id):
+        rescue_calls.append(sid)
+        return "refs/leerie/rescue/test-int-gate-aaa/feat-001"
+
+    abort_calls = []
+
+    async def fake_run_proc(cmd, cwd=None):
+        if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+            abort_calls.append(True)
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stdout = ""
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_rescue_integrator_work", fake_rescue)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    caps = _caps(leerie)
+    caps["judgment_check_rounds"] = 1
+
+    async def _run():
+        await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, caps, st, MODELS, EFFORTS)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(_run())
+
+    assert rescue_calls == ["feat-001"]
+    assert abort_calls, "merge must be aborted after the rescue capture"
+    assert "feat-001" in st.data.get("blocked", {})
+    assert "rescued" in st.data["blocked"]["feat-001"]
+
+
+def test_resolved_but_merge_not_committed_aborts_and_dies(leerie, tmp_path, monkeypatch):
+    """An integrator claiming 'resolved' while the worktree is still
+    mid-merge is a lie (the integrator-side analogue of
+    check_branch_has_commits) — the merge is aborted and the run dies."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = _staging_repo(leerie_dir)
+
+    results = {"feat-001": {"status": "complete"}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 1
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    async def fake_claude_p(**kwargs):
+        return {"status": "resolved", "resolution_summary": "merged",
+                "confidence": {"resolution": 9.0, "basis": "clean"}}
+
+    async def fake_check_merge_committed(staging_path):
+        return "MERGE_HEAD still present — merge was never committed"
+
+    abort_calls = []
+
+    async def fake_run_proc(cmd, cwd=None):
+        if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+            abort_calls.append(True)
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stdout = ""
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    async def _run():
+        await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(_run())
+
+    assert abort_calls
+
+
+def test_integrator_commit_warning_is_non_fatal_and_recorded(leerie, tmp_path, monkeypatch):
+    """A non-empty check_integrator_commit warning does not abort the
+    integration — it's logged and recorded in integrator_warnings, and the
+    subtask still gets integrated."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = _staging_repo(leerie_dir)
+
+    results = {"feat-001": {"status": "complete", "intent": "x",
+                            "criteria_results": []}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 1
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "integrator":
+            return {"status": "resolved", "resolution_summary": "merged",
+                    "confidence": {"resolution": 9.0, "basis": "clean"}}
+        elif kwargs.get("schema_key") == "integration_judge":
+            return {"merge_reviewed": True, "defects": [],
+                    "rationale": "clean"}
+        return {}
+
+    async def fake_check_merge_committed(staging_path):
+        return None
+
+    async def fake_check_integrator_commit(staging_path):
+        return "commit message doesn't mention the resolved conflict"
+
+    async def fake_run_proc(cmd, cwd=None):
+        mock = AsyncMock()
+        mock.returncode = 0
+        if "rev-parse" in cmd:
+            mock.stdout = "abc123\n"
+        elif "show" in cmd:
+            mock.stdout = "Merge commit\n\ndiff\n"
+        else:
+            mock.stdout = ""
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
+    monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
+
+    assert out == ["feat-001"]
+    assert "feat-001" in st.data.get("integrator_warnings", {})
+    assert "resolved conflict" in st.data["integrator_warnings"]["feat-001"]
+
+
+def test_design_conflict_verdict_aborts_and_dies(leerie, tmp_path, monkeypatch):
+    """An integrator verdict of 'design-conflict' (could not produce a
+    correct merge) aborts the in-progress merge and terminates, naming the
+    diagnosis."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = _staging_repo(leerie_dir)
+
+    results = {"feat-001": {"status": "complete"}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 1
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    async def fake_claude_p(**kwargs):
+        return {"status": "design-conflict",
+                "diagnosis": "the two subtasks disagree on the API shape"}
+
+    abort_calls = []
+
+    async def fake_run_proc(cmd, cwd=None):
+        if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
+            abort_calls.append(True)
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stdout = ""
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    async def _run():
+        await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    with pytest.raises(SystemExit):
+        asyncio.run(_run())
+
+    assert abort_calls
+
+
+def test_clean_merge_no_conflict_appends_without_integrator(leerie, tmp_path, monkeypatch):
+    """integrate.sh returncode 0 (no conflict) appends the sid directly and
+    never spawns an integrator or the judge."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = leerie_dir / "worktrees" / "staging"
+    staging.mkdir(parents=True)
+
+    results = {"feat-001": {"status": "complete"}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    claude_p_calls = []
+
+    async def fake_claude_p(**kwargs):
+        claude_p_calls.append(kwargs.get("schema_key"))
+        return {}
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
+
+    assert out == ["feat-001"]
+    assert claude_p_calls == [], "a clean merge must not spawn an integrator or judge"
+
+
+def test_integrator_crash_then_recovery_logs_warning_and_still_integrates(
+        leerie, tmp_path, monkeypatch):
+    """A WorkerError on round 0 that recovers on round 1 is logged as a
+    warning (infrastructure retry, not a found-issue retry) and the
+    subtask still completes integration normally."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = _staging_repo(leerie_dir)
+
+    results = {"feat-001": {"status": "complete", "intent": "x",
+                            "criteria_results": []}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 1
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    call_count = {"integrator": 0}
+
+    async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "integrator":
+            call_count["integrator"] += 1
+            if call_count["integrator"] == 1:
+                raise leerie.WorkerError("PID table exhausted")
+            return {"status": "resolved", "resolution_summary": "merged",
+                    "confidence": {"resolution": 9.0, "basis": "clean"}}
+        elif kwargs.get("schema_key") == "integration_judge":
+            return {"merge_reviewed": True, "defects": [], "rationale": "clean"}
+        return {}
+
+    async def fake_check_merge_committed(staging_path):
+        return None
+
+    async def fake_check_integrator_commit(staging_path):
+        return None
+
+    async def fake_run_proc(cmd, cwd=None):
+        mock = AsyncMock()
+        mock.returncode = 0
+        if "rev-parse" in cmd:
+            mock.stdout = "abc123\n"
+        elif "show" in cmd:
+            mock.stdout = "Merge commit\n\ndiff\n"
+        else:
+            mock.stdout = ""
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
+    monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    caps = _caps(leerie)
+    caps["judgment_check_rounds"] = 3
+
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, caps, st, MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
+
+    assert out == ["feat-001"]
+    assert call_count["integrator"] == 2
+
+
+def test_wave_skips_non_complete_sids(leerie, tmp_path, monkeypatch):
+    """A sid whose settle status isn't 'complete' (e.g. blocked/failed) is
+    skipped entirely by the wave loop — never handed to integrate.sh."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = leerie_dir / "worktrees" / "staging"
+    staging.mkdir(parents=True)
+
+    results = {"feat-001": {"status": "complete"},
+               "feat-002": {"status": "blocked"}}
+
+    called = []
+
+    async def fake_run_script(script, sid, run_id):
+        called.append(sid)
+        mock = AsyncMock()
+        mock.returncode = 0
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001", "feat-002"], results, leerie_dir, _caps(leerie), st,
+            MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
+
+    assert out == ["feat-001"]
+    assert called == ["feat-001"], "a non-complete sid must never reach integrate.sh"
+
+
+def test_advisory_defect_logs_but_does_not_gate(leerie, tmp_path, monkeypatch):
+    """A defect whose citation clears (equivalent coverage exists elsewhere in
+    the merged tree) is logged as an advisory (the single logging call site
+    inside integrate_wave/_run_integration_judge_gate) rather than gating."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging = _staging_repo(leerie_dir)
+    # A real file the citation can point to, so _coverage_citation_clears
+    # treats it as an existing location in the merged tree.
+    (staging / "tests" / "other_test.py").parent.mkdir(exist_ok=True)
+    (staging / "tests" / "other_test.py").write_text("def test_x(): pass\n")
+
+    results = {"feat-001": {"status": "complete", "intent": "x",
+                            "criteria_results": []}}
+
+    async def fake_run_script(script, sid, run_id):
+        mock = AsyncMock()
+        mock.returncode = 1
+        mock.stderr = ""
+        mock.stdout = ""
+        return mock
+
+    async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "integrator":
+            return {"status": "resolved", "resolution_summary": "merged",
+                    "confidence": {"resolution": 9.0, "basis": "clean"}}
+        elif kwargs.get("schema_key") == "integration_judge":
+            return {"merge_reviewed": True, "defects": [{
+                "kind": "dropped_change",
+                "concrete_scenario": "feat-005's assertions are absent",
+                "location": "tests/export_route_test.py",
+                "why_broken": "no longer runs from this file",
+                "coverage_elsewhere": {"file": "tests/other_test.py",
+                                       "assertion": "test_x"},
+            }], "rationale": "checked coverage"}
+        return {}
+
+    async def fake_check_merge_committed(staging_path):
+        return None
+
+    async def fake_check_integrator_commit(staging_path):
+        return None
+
+    async def fake_run_proc(cmd, cwd=None):
+        mock = AsyncMock()
+        mock.returncode = 0
+        if "rev-parse" in cmd:
+            mock.stdout = "abc123\n"
+        elif "show" in cmd:
+            mock.stdout = "Merge commit\n\ndiff\n"
+        else:
+            mock.stdout = ""
+        mock.stderr = ""
+        return mock
+
+    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
+    monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    # _run_integration_judge_gate resolves the citation against
+    # Path(os.getcwd()), not `staging` — match that so the citation clears.
+    monkeypatch.chdir(staging)
+
+    async def _run():
+        return await leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+
+    out = asyncio.run(_run())
+
+    assert out == ["feat-001"]
+    assert st.data["integration_gate"]["feat-001"]["accepted"] is True
+    assert st.data["integration_gate"]["feat-001"]["advisories"]
