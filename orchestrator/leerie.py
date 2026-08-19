@@ -10404,6 +10404,30 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
 
     Advisory as shipped — the caller logs these rather than gating on them,
     pending confirmation across live runs (DESIGN §5)."""
+    issues: list[str] = []
+    for sid_a, sid_b, tag, shared in _iter_duplicate_provider_pairs(plans):
+        issues.append(
+            f"DUPLICATE_PROVIDER: {sid_a} and {sid_b} both "
+            f"provide {tag!r} and both touch "
+            f"{', '.join(sorted(shared))} — two subtasks doing the "
+            "same work to the same file. One should be dropped or "
+            "merged into the other, or they should be sequenced with "
+            "an explicit depends_on and given distinct surfaces "
+            "(DESIGN §5 *Cross-domain surface overlap*)")
+    return issues
+
+
+def _iter_duplicate_provider_pairs(
+        plans: list[dict]) -> Iterator[tuple[str, str, str, set[str]]]:
+    """Shared detection loop behind `check_duplicate_providers` and
+    `_duplicate_provider_merge_collisions`: builds the tag->providers map,
+    then yields `(sid_a, sid_b, tag, shared_files)` for every pair of
+    subtasks that declare the same `provides` tag and share a touched file —
+    skipping pairs that are a deliberate `_cofile_cluster` sub-file split of
+    one file (LOAD-BEARING, not an optimization — see
+    `check_duplicate_providers`'s docstring for the corpus measurement this
+    exclusion rests on). Callers differ only in what they do with a found
+    pair (an advisory issue string vs. a merge-collision dict)."""
     subtasks: dict[str, dict] = {}
     for plan in plans:
         for s in plan.get("subtasks", []) or []:
@@ -10430,7 +10454,6 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
             if isinstance(f, str) and f.strip()
         }
 
-    issues: list[str] = []
     for tag in sorted(providers):
         sids = sorted(providers[tag])
         for i in range(len(sids)):
@@ -10442,15 +10465,7 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
                 shared = _files(a) & _files(b)
                 if not shared:
                     continue
-                issues.append(
-                    f"DUPLICATE_PROVIDER: {sids[i]} and {sids[j]} both "
-                    f"provide {tag!r} and both touch "
-                    f"{', '.join(sorted(shared))} — two subtasks doing the "
-                    "same work to the same file. One should be dropped or "
-                    "merged into the other, or they should be sequenced with "
-                    "an explicit depends_on and given distinct surfaces "
-                    "(DESIGN §5 *Cross-domain surface overlap*)")
-    return issues
+                yield sids[i], sids[j], tag, shared
 
 
 def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
@@ -10477,50 +10492,20 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
     a cluster (e.g. pair (B, C) once A↔B and A↔C have already collapsed
     both to the same survivor) is recorded as `skipped_redundant` by that
     helper rather than double-applied."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
-
-    providers: dict[str, list[str]] = {}
-    for sid, s in subtasks.items():
-        for tag in s.get("provides", []) or []:
-            if isinstance(tag, str) and tag.strip():
-                providers.setdefault(tag, []).append(sid)
-
-    def _files(s: dict) -> set[str]:
-        return {
-            _normalize_artifact_path(f)
-            for f in (s.get("files_likely_touched") or [])
-            if isinstance(f, str) and f.strip()
-        }
-
     collisions: list[dict] = []
-    for tag in sorted(providers):
-        sids = sorted(providers[tag])
-        for i in range(len(sids)):
-            for j in range(i + 1, len(sids)):
-                a, b = subtasks[sids[i]], subtasks[sids[j]]
-                cluster = a.get("_cofile_cluster")
-                if cluster and cluster == b.get("_cofile_cluster"):
-                    continue  # deliberate sub-file split of one file
-                shared = _files(a) & _files(b)
-                if not shared:
-                    continue
-                collisions.append({
-                    "a_sid": sids[i], "b_sid": sids[j],
-                    "resolution": "merge",
-                    "artifact": tag,
-                    "merge_feasibility": (
-                        f"deterministic duplicate-provider floor: both "
-                        f"subtasks declare provides={tag!r} and both touch "
-                        f"{', '.join(sorted(shared))} — merged rather than "
-                        "left as duplicate work (DESIGN §5 *A deterministic "
-                        "floor underneath the judge*, M11 DECISION)"),
-                    "reason": "DUPLICATE_PROVIDER",
-                })
+    for sid_a, sid_b, tag, shared in _iter_duplicate_provider_pairs(plans):
+        collisions.append({
+            "a_sid": sid_a, "b_sid": sid_b,
+            "resolution": "merge",
+            "artifact": tag,
+            "merge_feasibility": (
+                f"deterministic duplicate-provider floor: both "
+                f"subtasks declare provides={tag!r} and both touch "
+                f"{', '.join(sorted(shared))} — merged rather than "
+                "left as duplicate work (DESIGN §5 *A deterministic "
+                "floor underneath the judge*, M11 DECISION)"),
+            "reason": "DUPLICATE_PROVIDER",
+        })
     return collisions
 
 
