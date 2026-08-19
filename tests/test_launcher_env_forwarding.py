@@ -27,6 +27,8 @@ import re
 import subprocess
 from pathlib import Path
 
+from tests.launcher_argv_extract import extract_run_argv
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
@@ -93,15 +95,6 @@ def _forwarded_names(tokens: list[str]) -> set[str]:
     return names
 
 
-def _extract_run_argv() -> str:
-    """Pull the `_run_argv` array assignment verbatim from the launcher, same
-    reason as _extract_forwarding_loop: assert against real code, not a copy."""
-    src = LAUNCHER.read_text()
-    m = re.search(r"(  _run_argv=\(\n.*?\n  \)\n)", src, re.DOTALL)
-    assert m, "could not locate the _run_argv array in the launcher"
-    return m.group(1)
-
-
 _ARGV_HARNESS = r"""
 #!/usr/bin/env bash
 set -euo pipefail
@@ -125,7 +118,7 @@ for a in "${_run_argv[@]}"; do printf '%s\n' "$a"; done
 
 def _run_argv_tokens() -> list[str]:
     """Assemble the launcher's real _run_argv with stubbed vars; return tokens."""
-    harness = _ARGV_HARNESS.replace("__RUN_ARGV__", _extract_run_argv())
+    harness = _ARGV_HARNESS.replace("__RUN_ARGV__", extract_run_argv())
     result = subprocess.run(
         ["bash", "-c", harness],
         env={"PATH": "/usr/bin:/bin"},
