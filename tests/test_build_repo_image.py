@@ -18,6 +18,8 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+from tests.repo_image_block_extract import extract_block as _extract_block
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -27,12 +29,6 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 def _launcher_text() -> str:
     return (REPO_ROOT / "leerie").read_text()
-
-
-def _extract_block(text: str, start_marker: str, end_marker: str) -> str:
-    s = text.index(start_marker)
-    e = text.index(end_marker, s)
-    return text[s:e]
 
 
 # ---------------------------------------------------------------------------
