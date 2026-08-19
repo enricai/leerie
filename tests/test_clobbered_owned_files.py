@@ -167,6 +167,16 @@ class TestRollbackRestoresClobber:
             == ["a.py (reverted-to-base)"]
         asyncio.run(leerie._rollback_conformer_commits(str(d), impl))
         # implementer content restored, and no clobber remains detectable
+
+    def test_empty_before_sha_is_a_noop(self, leerie, tmp_path):
+        # A falsy before_sha means there is no known pre-conformer
+        # snapshot to roll back to (e.g. the implementer never committed
+        # anything) — the function must return without touching the
+        # worktree rather than resetting to a garbage ref.
+        d, impl = _impl_repo(tmp_path)
+        before_head = _rev(d)
+        asyncio.run(leerie._rollback_conformer_commits(str(d), ""))
+        assert _rev(d) == before_head
         assert (d / "a.py").read_text() == "IMPL a\n"
         assert _rev(d) == impl
         assert asyncio.run(

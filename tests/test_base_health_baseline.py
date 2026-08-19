@@ -399,6 +399,106 @@ def test_capture_baseline_argv_is_bash_dash_c_exactly(leerie, tmp_path,
                                               "pytest"}
 
 
+def test_capture_baseline_skips_when_already_captured(leerie, tmp_path,
+                                                        monkeypatch):
+    """Idempotency: a run resumed after the baseline already ran must not
+    re-measure — the presence of conformance._baseline is the completion
+    sentinel."""
+    leerie_dir = tmp_path / "leerie_dir"
+    (leerie_dir / "worktrees" / "staging").mkdir(parents=True)
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    st = types.SimpleNamespace(
+        run_dir=run_dir,
+        repo_root=tmp_path / "repo",
+        data={"conformance": {"_baseline": {"axes": {}, "red_axes": []}}},
+        save=lambda: None,
+    )
+    called = []
+    monkeypatch.setattr(leerie, "resolve_blt",
+                        lambda repo_root: called.append(1) or {})
+    asyncio.run(leerie._capture_conformance_baseline(leerie_dir, st, {}))
+    assert not called, "must skip resolve_blt/measurement on a re-run"
+
+
+def test_capture_baseline_skips_when_staging_absent(leerie, tmp_path,
+                                                      monkeypatch):
+    """No staging worktree (e.g. setup-run.sh hasn't created it yet) — the
+    baseline must skip rather than fail."""
+    leerie_dir = tmp_path / "leerie_dir"  # no worktrees/staging created
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    st = types.SimpleNamespace(
+        run_dir=run_dir, repo_root=tmp_path / "repo",
+        data={}, save=lambda: None)
+    called = []
+    monkeypatch.setattr(leerie, "resolve_blt",
+                        lambda repo_root: called.append(1) or {})
+    asyncio.run(leerie._capture_conformance_baseline(leerie_dir, st, {}))
+    assert not called
+
+
+def test_capture_baseline_skips_when_no_blt_commands_resolved(
+        leerie, tmp_path, monkeypatch):
+    """A repo with no resolvable build/lint/test commands at all — the
+    baseline must skip rather than run three no-op measurements."""
+    leerie_dir = tmp_path / "leerie_dir"
+    (leerie_dir / "worktrees" / "staging").mkdir(parents=True)
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    st = types.SimpleNamespace(
+        run_dir=run_dir, repo_root=tmp_path / "repo",
+        data={"provision": {"recipe": []}, "verbosity": "quiet"},
+        save=lambda: None)
+    monkeypatch.setattr(leerie, "resolve_blt", lambda repo_root: {})
+    called = []
+
+    async def _fake_run_streaming(cmd, **kwargs):
+        called.append(cmd)
+        return (0, "ok")
+    monkeypatch.setattr(leerie, "_run_streaming", _fake_run_streaming)
+    asyncio.run(leerie._capture_conformance_baseline(leerie_dir, st, {}))
+    assert not called, "no BLT commands resolved — must not invoke any axis"
+    assert "_baseline" not in st.data.get("conformance", {})
+
+
+def test_capture_baseline_red_path_writes_run_json_and_persists_state(
+        leerie, tmp_path, monkeypatch):
+    """A failing axis takes the RED branch: run.json.health.base_suite
+    records status=red with the failing axes, and conformance._baseline
+    persists via st.save()."""
+    leerie_dir = tmp_path / "leerie_dir"
+    (leerie_dir / "worktrees" / "staging").mkdir(parents=True)
+    run_dir = tmp_path / "run"
+    (run_dir / "logs").mkdir(parents=True)
+    saved = []
+    st = types.SimpleNamespace(
+        run_dir=run_dir, repo_root=tmp_path / "repo",
+        data={"provision": {"recipe": []}, "verbosity": "quiet"},
+        save=lambda: saved.append(dict(st.data)))
+    monkeypatch.setattr(
+        leerie, "resolve_blt",
+        lambda repo_root: {"build": "make build", "lint": "make lint",
+                            "test": "pytest"})
+
+    async def _fake_run_streaming(cmd, **kwargs):
+        # fail the lint axis, pass the others
+        return (1, "boom") if "lint" in cmd[2] else (0, "ok")
+    monkeypatch.setattr(leerie, "_run_streaming", _fake_run_streaming)
+
+    written = {}
+    monkeypatch.setattr(
+        leerie, "_write_run_json",
+        lambda run_dir, **kw: written.update(kw))
+
+    asyncio.run(leerie._capture_conformance_baseline(leerie_dir, st, {}))
+
+    assert saved, "st.save() must be called to persist the baseline"
+    assert st.data["conformance"]["_baseline"]["red_axes"] == ["lint"]
+    assert written["health"]["base_suite"]["status"] == "red"
+    assert written["health"]["base_suite"]["red_axes"] == ["lint"]
+
+
 def test_login_shell_would_lose_env_only_path_but_dash_c_keeps_it(tmp_path):
     """Regression control reproducing the actual N8 failure mode without a
     real container: a PATH entry added ONLY via an env var (simulating a
