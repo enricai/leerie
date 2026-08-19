@@ -30,24 +30,12 @@ from unittest.mock import AsyncMock, patch
 
 import pytest
 
+from tests.config_arm_extract import extract_config_arm as _extract_config_arm
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 # The directory of the running interpreter, so the real seam can import
 # tenacity/other runtime deps when invoking the orchestrator.
 _PYBIN = str(Path(sys.executable).parent)
-
-
-# ---------------------------------------------------------------------------
-# Shared: extract the real `config)` arm from the launcher
-# ---------------------------------------------------------------------------
-
-def _extract_config_arm() -> str:
-    """Return the real `config)` case-arm body verbatim from the launcher."""
-    launcher_text = (REPO_ROOT / "leerie").read_text()
-    start_marker = "  config)\n"
-    end_marker = "\n  list)"
-    s = launcher_text.index(start_marker)
-    e = launcher_text.index(end_marker, s)
-    return launcher_text[s:e]
 
 
 def _run_real_config_arm_with_state(
