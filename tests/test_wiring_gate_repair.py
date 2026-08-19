@@ -979,3 +979,19 @@ class TestDismissalIsVisible:
         leerie._repair_missing_requires(plans, defects)
         out = capsys.readouterr().out
         assert "named an edge the subtask already declares" in out
+
+
+class TestFilterDefectsAlreadyOrderedEmptyInput:
+    """`_filter_defects_already_ordered`'s early return on an empty defects
+    list — the residual pass is a no-op on a fully-repaired plan, and it
+    must not build the predecessor graph or scan an empty defect list to
+    prove that."""
+
+    def test_empty_defects_returns_empty_lists_unchanged(self, leerie):
+        plans = _plan([
+            {"id": "p1", "provides": ["solo"], "requires": [],
+             "depends_on": []},
+        ])
+        surviving, notes = leerie._filter_defects_already_ordered(plans, [])
+        assert surviving == []
+        assert notes == []
