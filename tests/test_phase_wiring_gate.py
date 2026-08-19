@@ -395,3 +395,120 @@ def test_latent_risk_missing_tag_or_dep_is_not_logged(leerie, tmp_path,
     out = asyncio.run(leerie.phase_wiring_gate(
         _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
     assert out == _PLANS
+
+
+# ----- gaps flagged by test-001's coverage report -----------------------
+#
+# One further region inside phase_wiring_gate itself was uncovered even with
+# every sibling wiring test file loaded: the "discarded provably-false
+# finding" log line that fires when `_filter_provably_false_wiring_defects`
+# drops a defect before repair/die ever sees it, and the repair-channel log
+# lines (id / cofile_cluster) driven through phase_wiring_gate end-to-end.
+# The repair-channel unit behavior itself is already exercised by
+# tests/test_wiring_gate_repair.py's `test_gate_repairs_then_passes_and_records`
+# and its `channel`-specific unit tests; the tests below pin that
+# phase_wiring_gate drives each channel through to a clean pass.
+
+def test_provably_false_defect_is_discarded_and_does_not_gate(
+        leerie, tmp_path, monkeypatch):
+    """A `broken_by_merge` finding naming a capability the merged plan
+    STILL provides is provably false by set membership
+    (`_filter_provably_false_wiring_defects`) — it is discarded (and
+    logged as discarded) before repair/die ever sees it, so the gate
+    passes clean rather than dying on a self-contradicting finding.
+
+    `_PLANS`' feat-001 provides "schema", so a broken_by_merge defect
+    naming "schema" contradicts its own premise."""
+    st = _state(leerie, tmp_path)
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "broken_by_merge", "sid": "feat-002",
+            "tag_or_dep": "schema",
+            "concrete_reason": "a merge severed the schema dependency",
+            "severity": "live_defect",
+        }], "rationale": "premise falsified by the plan itself"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.phase_wiring_gate(
+        _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert out == _PLANS
+    # A discarded finding is not a repair — the audit record carries none.
+    assert st.data["wiring_gate"]["repairs"] == []
+
+
+def test_id_channel_repair_logs_its_own_branch(leerie, tmp_path, monkeypatch):
+    """A defect whose `tag_or_dep` names a surviving subtask id (not a tag)
+    repairs via the id channel — a distinct logging branch inside
+    phase_wiring_gate from the tag/sole-provider default. The repair-log
+    unit behavior itself is `tests/test_wiring_gate_repair.py`'s job; this
+    pins the phase drives it through to a clean pass end-to-end."""
+    st = _state(leerie, tmp_path)
+    plans = [{"domain": "testing", "status": "ready", "subtasks": [
+        {"id": "test-001", "provides": [], "requires": [],
+         "depends_on": [], "intent": "verify feat-001", "title": "t",
+         "files_likely_touched": []},
+        {"id": "feat-001", "provides": [], "requires": [],
+         "depends_on": [], "intent": "build it", "title": "f",
+         "files_likely_touched": []},
+    ]}]
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "test-001",
+            "tag_or_dep": "feat-001",
+            "concrete_reason": "test-001 verifies feat-001's output but "
+                               "declares no edge to it",
+            "severity": "live_defect",
+        }], "rationale": "missing id-channel edge"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.phase_wiring_gate(
+        plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert out == plans
+    repairs = st.data["wiring_gate"]["repairs"]
+    assert [r["channel"] for r in repairs] == ["id"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["depends_on"] == ["feat-001"]
+
+
+def test_cofile_cluster_repair_logs_its_own_branch(leerie, tmp_path,
+                                                     monkeypatch):
+    """A defect whose tag is provided by several subtasks that all share one
+    `_cofile_cluster` (sub-file region splits of a single file) repairs via
+    the cofile_cluster channel — a third distinct logging branch."""
+    st = _state(leerie, tmp_path)
+    plans = [
+        {"domain": "testing", "status": "ready", "subtasks": [
+            {"id": "test-001", "provides": [], "requires": [],
+             "depends_on": [], "intent": "verify baked config", "title": "t",
+             "files_likely_touched": []},
+        ]},
+        {"domain": "feature-implementation", "status": "ready", "subtasks": [
+            {"id": "feat-001-r1", "provides": ["baked"], "requires": [],
+             "depends_on": [], "intent": "bake part 1", "title": "f1",
+             "files_likely_touched": [], "_cofile_cluster": "feat-001"},
+            {"id": "feat-001-r2", "provides": ["baked"], "requires": [],
+             "depends_on": [], "intent": "bake part 2", "title": "f2",
+             "files_likely_touched": [], "_cofile_cluster": "feat-001"},
+        ]},
+    ]
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "test-001",
+            "tag_or_dep": "baked",
+            "concrete_reason": "test-001 verifies the baked config but "
+                               "declares no requires on it",
+            "severity": "live_defect",
+        }], "rationale": "missing cofile-cluster edge"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.phase_wiring_gate(
+        plans, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert out == plans
+    repairs = st.data["wiring_gate"]["repairs"]
+    assert [r["channel"] for r in repairs] == ["cofile_cluster"]
+    by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
+    assert by_id["test-001"]["requires"] == [
+        {"tag": "baked", "extent": "in_plan"}]
