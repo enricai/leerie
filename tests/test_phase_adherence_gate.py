@@ -519,3 +519,38 @@ def test_worker_error_every_round_dies_when_floor_violates(
 
     captured = capsys.readouterr()
     assert "adherence_judge crashed on every round" in captured.err
+
+
+# ===========================================================================
+# 3. check_prescribed_command_coverage — direct unit coverage of its two
+#    short-circuit/skip branches not otherwise exercised by the phase-level
+#    tests above (coverage-baseline-report, test-001: lines 8385-8386 and
+#    8397-8398 of orchestrator/leerie.py).
+# ===========================================================================
+
+class TestCheckPrescribedCommandCoverageEdgeCases:
+    """Direct unit tests for the two branches of the deterministic floor
+    that the phase-level integration tests above never reach: an
+    is_prescribed=true procedure with an EMPTY commands list (line
+    8385-8386 — nothing to check coverage against, so it must short-circuit
+    to [] rather than iterate zero commands and vacuously pass), and a
+    commands list containing a non-string/blank entry (line 8397-8398 —
+    must be skipped rather than crash _command_tokens on non-str input)."""
+
+    def test_is_prescribed_true_with_empty_commands_returns_empty(self, leerie):
+        prescribed = {"is_prescribed": True, "commands": []}
+        issues = leerie.check_prescribed_command_coverage(prescribed, [])
+        assert issues == []
+
+    def test_skips_non_string_and_blank_command_entries(self, leerie):
+        prescribed = {
+            "is_prescribed": True,
+            "commands": [None, "   ", "recon browser"],
+        }
+        subtasks = [_subtask(
+            "feat-001", runs_commands=["barnacle recon browser"])]
+        issues = leerie.check_prescribed_command_coverage(prescribed, subtasks)
+        assert issues == [], (
+            "None and blank entries must be skipped (not crash on "
+            "_command_tokens), and the one real command is covered"
+        )
