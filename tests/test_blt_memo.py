@@ -172,6 +172,19 @@ def test_dirty_tree_is_not_stored(leerie, repo, st, measure):
         "than what was measured")
 
 
+def test_no_head_yields_no_sha(leerie, tmp_path):
+    """A freshly-`git init`ed repo with no commit has a clean status
+    (nothing to be dirty) but `HEAD^{tree}` cannot resolve — the second
+    `git rev-parse` fails rather than the first `git status`. Distinct
+    branch from the dirty-tree case above: that one returns None because
+    `git status --porcelain` prints something; this one returns None
+    because `rev-parse` itself fails on a clean, HEAD-less repo."""
+    d = tmp_path / "empty-wt"
+    d.mkdir()
+    _git("init", "-q", cwd=d)
+    assert asyncio.run(leerie._worktree_tree_sha(str(d))) is None
+
+
 def test_dirty_tree_is_not_served(leerie, repo, st, measure):
     """Distinct defect from the above: a store-but-never-hit bug and a
     hit-a-stale-entry bug are not the same bug."""
