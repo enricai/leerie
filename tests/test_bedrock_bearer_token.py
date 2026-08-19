@@ -29,6 +29,10 @@ from pathlib import Path
 # tests/launcher_blocks.py for why it is not re-implemented per consumer.
 from tests.launcher_blocks import launch_env_blocks
 
+# One shared extraction of detect_bedrock_mode()/bedrock_preflight() — see
+# tests/bedrock_extract.py for why it is not re-implemented per consumer.
+from tests.bedrock_extract import extract_bedrock_functions
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
@@ -55,19 +59,6 @@ def _extract_bedrock_block() -> str:
     block = src[start:end]
     assert "AWS_BEARER_TOKEN_BEDROCK=$AWS_BEARER_TOKEN_BEDROCK" in block
     assert "detect_bedrock_mode" in block
-    return block
-
-
-def _extract_bedrock_functions() -> str:
-    """Pull detect_bedrock_mode() and bedrock_preflight() verbatim from the
-    launcher so the harness has real implementations, not stubs, for the
-    SSO/profile control-flow paths this module also covers."""
-    src = LAUNCHER.read_text()
-    start = src.index("detect_bedrock_mode() {")
-    end = src.index("\n}\n", src.index("bedrock_preflight() {")) + len("\n}\n")
-    block = src[start:end]
-    assert "detect_bedrock_mode() {" in block
-    assert "bedrock_preflight() {" in block
     return block
 
 
@@ -134,7 +125,7 @@ def _run(env: dict, *, aws_on_path: bool = False, aws_succeeds: bool = True,
     harness = (
         _HARNESS
         .replace("__LOG_SH__", str(LOG_SH))
-        .replace("__BEDROCK_FUNCTIONS__", _extract_bedrock_functions())
+        .replace("__BEDROCK_FUNCTIONS__", extract_bedrock_functions())
         .replace("__BEDROCK_BLOCK__", _extract_bedrock_block())
         .replace("__HOME__", str(fake_home))
         .replace("__USER_REPO__", str(user_repo))
