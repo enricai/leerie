@@ -543,6 +543,83 @@ def test_bump_workers_exhaustion_surfaces_as_warning(env, monkeypatch):
         "budget exhaustion should surface as a 'crashed' advisory warning"
 
 
+# --- _run_conformer directly: success path, timeout, optional sections ----
+
+def test_run_conformer_success_path_returns_expanded_output(env, monkeypatch):
+    """A clean claude_p call returns `_expand_conformer_output(raw)` — the
+    success return, distinct from every crash/timeout arm covered above."""
+    c = env["leerie"]
+    captured = {}
+
+    async def _fake_claude_p(*, user_prompt, **kwargs):
+        captured["user_prompt"] = user_prompt
+        return {"subtask_id": env["sid"], "rule_violations": [],
+                "file_updates": [], "solution_defects": [],
+                "summary": "clean"}
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    result = asyncio.run(c._run_conformer(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+        env["st"], env["models"], {"conformer": None}, rules_files=[],
+        blt_results={}, blt_scope="off", diff_base=env["run_branch"]))
+
+    assert result is not None
+    assert result["summary"] == "clean"
+    # _expand_conformer_output fans the flattened wire arrays back out.
+    assert result["rule_violations_fixed"] == []
+    assert result["rule_violations_residual"] == []
+
+
+def test_run_conformer_timeout_returns_none(env, monkeypatch):
+    """A worker that hits its wall-clock ceiling is swallowed as an
+    advisory None, not left to propagate the TimeoutExpired traceback."""
+    c = env["leerie"]
+
+    async def _fake_claude_p(*args, **kwargs):
+        raise __import__("subprocess").TimeoutExpired(cmd="claude", timeout=1)
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    result = asyncio.run(c._run_conformer(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+        env["st"], env["models"], {"conformer": None}, rules_files=[],
+        blt_results={}, blt_scope="off", diff_base=env["run_branch"]))
+    assert result is None
+
+
+def test_run_conformer_appends_optional_prompt_sections(env, monkeypatch):
+    """baseline_section / recipe_section / extra_feedback are each appended
+    to the user prompt when present — the three optional-append branches."""
+    c = env["leerie"]
+    captured = {}
+
+    async def _fake_claude_p(*, user_prompt, **kwargs):
+        captured["user_prompt"] = user_prompt
+        return {"subtask_id": env["sid"]}
+
+    monkeypatch.setattr(c, "claude_p", _fake_claude_p)
+
+    env["st"].data["conformance"] = {"_baseline": {
+        "build": {"passed": True, "measured": True, "ran": True,
+                  "command": "make build", "summary": "ok"},
+    }}
+    env["st"].data["provision"] = {"recipe": [
+        {"kind": "install", "command": ["npm", "install"], "language": "node"},
+    ]}
+
+    result = asyncio.run(c._run_conformer(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["caps"],
+        env["st"], env["models"], {"conformer": None}, rules_files=[],
+        blt_results={}, blt_scope="off", diff_base=env["run_branch"],
+        extra_feedback="ORCHESTRATOR MECHANICAL CHECK: fix the thing"))
+
+    assert result is not None
+    assert "npm install" in captured["user_prompt"]
+    assert "ORCHESTRATOR MECHANICAL CHECK: fix the thing" in \
+        captured["user_prompt"]
+
+
 # --- outer contract: _settle_subtask never escalates conformance failures --
 
 def test_settle_subtask_never_escalates_on_conformer_crash(env, monkeypatch):

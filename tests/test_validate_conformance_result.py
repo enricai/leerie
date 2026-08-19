@@ -184,3 +184,45 @@ def test_nested_traversal_to_legitimate_subtree_still_rejected(leerie, tmp_path)
     err = leerie._validate_conformance_result(res, str(tmp_path))
     assert err is None, \
         f"path that resolves inside worktree should be accepted, got: {err}"
+
+
+# --- OSError-on-resolve branches (Path.resolve() failing outright) --------
+
+def test_worktree_path_unresolvable_rejected(leerie, tmp_path, monkeypatch):
+    """`Path(worktree).resolve()` raising OSError (e.g. a filesystem-level
+    resolution failure) must be reported, not left to propagate."""
+    import pathlib
+    bad = tmp_path / "bad-worktree"
+    orig_resolve = pathlib.Path.resolve
+
+    def fake_resolve(self, *a, **kw):
+        if self.name == "bad-worktree":
+            raise OSError("simulated resolution failure")
+        return orig_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", fake_resolve)
+    err = leerie._validate_conformance_result(_good_result(), str(bad))
+    assert err is not None
+    assert "could not be resolved" in err
+
+
+def test_docs_update_path_unresolvable_rejected(leerie, tmp_path, monkeypatch):
+    """`(wt_resolved / rel).resolve()` raising OSError for a cited
+    docs_updates path must be reported per-item, distinct from the
+    worktree-level resolve failure above."""
+    import pathlib
+    orig_resolve = pathlib.Path.resolve
+
+    def fake_resolve(self, *a, **kw):
+        if self.name == "unresolvable.md":
+            raise OSError("simulated resolution failure")
+        return orig_resolve(self, *a, **kw)
+
+    monkeypatch.setattr(pathlib.Path, "resolve", fake_resolve)
+    res = _good_result(
+        docs_updates=[{"path": "unresolvable.md", "reason": "x"}],
+    )
+    err = leerie._validate_conformance_result(res, str(tmp_path))
+    assert err is not None
+    assert "docs_updates[0]" in err
+    assert "could not be resolved" in err
