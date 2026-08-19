@@ -27301,6 +27301,24 @@ async def _unprefixed_conformer_commits(worktree: str, before_sha: str,
             if line and not line.startswith(prefix)]
 
 
+def _append_conformer_context_sections(up: list[str], blt_results: dict[str, dict],
+                                        blt_scope: str, st: State) -> None:
+    """Build and append the blt/baseline/recipe context sections shared by
+    the per-subtask conformer and the whole-tree final conformance pass."""
+    blt_section = _format_blt_results_section(blt_results, blt_scope)
+    if blt_section is not None:
+        up.append(blt_section)
+    baseline_section = _format_baseline_section(
+        (st.data.get("conformance") or {}).get("_baseline"))
+    if baseline_section is not None:
+        up.append(baseline_section)
+    recipe_section = _format_provision_recipe_section(
+        (st.data.get("provision") or {}).get("recipe") or [],
+        audience="conformer")
+    if recipe_section is not None:
+        up.append(recipe_section)
+
+
 async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
                         caps: dict, st: State, models: dict[str, str],
                         efforts: dict[str, str | None],
@@ -27329,18 +27347,7 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
           "with `conformer:`.",
           f"RULES_FILES: {rules_paths_str}",
           f"DIFF_BASE: {diff_base} (compare with `git diff {diff_base}..HEAD`)"]
-    blt_section = _format_blt_results_section(blt_results, blt_scope)
-    if blt_section is not None:
-        up.append(blt_section)
-    baseline_section = _format_baseline_section(
-        (st.data.get("conformance") or {}).get("_baseline"))
-    if baseline_section is not None:
-        up.append(baseline_section)
-    recipe_section = _format_provision_recipe_section(
-        (st.data.get("provision") or {}).get("recipe") or [],
-        audience="conformer")
-    if recipe_section is not None:
-        up.append(recipe_section)
+    _append_conformer_context_sections(up, blt_results, blt_scope, st)
     if extra_feedback is not None:
         up.append(extra_feedback)
 
@@ -29054,18 +29061,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             f"DIFF_BASE: {working_branch} (compare with "
             f"`git diff {working_branch}..HEAD`)",
         ]
-        blt_section = _format_blt_results_section(pre, "full")
-        if blt_section is not None:
-            up.append(blt_section)
-        baseline_section = _format_baseline_section(
-            (st.data.get("conformance") or {}).get("_baseline"))
-        if baseline_section is not None:
-            up.append(baseline_section)
-        recipe_section = _format_provision_recipe_section(
-            (st.data.get("provision") or {}).get("recipe") or [],
-            audience="conformer")
-        if recipe_section is not None:
-            up.append(recipe_section)
+        _append_conformer_context_sections(up, pre, "full", st)
         if blt_feedback is not None:
             up.append(blt_feedback)
 
