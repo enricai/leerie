@@ -23,6 +23,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import unittest.mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -140,6 +141,38 @@ def test_install_is_nonfatal_when_run_dir_unwritable(leerie, tmp_path):
         assert sys.stdout is orig_out
     finally:
         sys.stdout, sys.stderr = orig_out, orig_err
+
+
+def test_install_wraps_stdout_and_stderr_on_success(leerie, tmp_path):
+    """The success path: stdout/stderr get wrapped in `_TeeStream` and a
+    write reaches the on-disk log. In-process (not the subprocess form
+    other tests here use), so streams are carefully saved and restored."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    orig_out, orig_err = sys.stdout, sys.stderr
+    try:
+        leerie._install_run_log_tee(run_dir)
+        assert isinstance(sys.stdout, leerie._TeeStream)
+        assert isinstance(sys.stderr, leerie._TeeStream)
+        print("captured-by-tee")
+        sys.stdout.flush()
+    finally:
+        sys.stdout, sys.stderr = orig_out, orig_err
+    assert "captured-by-tee" in (run_dir / "orchestrator.log").read_text()
+
+
+def test_install_skips_when_stdout_already_targets_the_log(leerie, tmp_path):
+    """When `_stdout_already_targets` is True, `_install_run_log_tee` must
+    return before wrapping stdout at all (the remote-runtime no-op path)."""
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    orig_out = sys.stdout
+    with unittest.mock.patch.object(
+        leerie, "_stdout_already_targets", return_value=True
+    ) as mocked:
+        leerie._install_run_log_tee(run_dir)
+        mocked.assert_called_once()
+    assert sys.stdout is orig_out  # never wrapped
 
 
 def test_install_skipped_when_stdout_is_the_log(tmp_path):

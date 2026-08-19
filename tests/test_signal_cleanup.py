@@ -878,6 +878,42 @@ def test_enumerate_descendants_returns_empty_for_nonexistent_pid(leerie):
     assert leerie._enumerate_descendants(999_999_999) == set()
 
 
+def test_enumerate_descendants_empty_on_ps_failure(leerie, monkeypatch):
+    """A failing `ps` (e.g. no permission, or missing binary) must return
+    an empty set rather than raising — callers fall back to the
+    leader-only kill path."""
+    def fake_run(cmd, **kwargs):
+        raise subprocess.SubprocessError("ps failed")
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    assert leerie._enumerate_descendants(123) == set()
+
+
+def test_enumerate_descendants_skips_malformed_lines(leerie, monkeypatch):
+    """A `ps` line with too few fields, or non-integer pid/ppid, must be
+    skipped rather than raising — the parse loop tolerates a garbled
+    snapshot."""
+    fake_ps = (
+        "  PID  PPID\n"
+        "  10\n"                # too few fields -> skipped
+        "  abc   def\n"         # non-integer -> skipped
+        "  20    10\n"          # real child of 10, but 10 is unparsed
+        "  30     1\n"          # child of root's non-existent parent
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    # root_pid=1: the only well-formed row naming ppid 1 is pid 30 (pid 20's
+    # declared parent, 10, was itself a malformed row and so never entered
+    # children_of). The point of this test is that no exception propagates
+    # and the malformed rows contribute nothing beyond that.
+    assert leerie._enumerate_descendants(1) == {30}
+
+
 @pytest.mark.skipif(
     os.name == "nt",
     reason="POSIX-only test.",
@@ -939,6 +975,39 @@ def test_descendant_tracker_records_descendants_during_lifetime(leerie):
         )
 
     asyncio.run(_run())
+
+
+# --- _signal_pids unit tests ------------------------------------------------
+
+def test_signal_pids_swallows_process_lookup_error(leerie):
+    """A PID that is already dead must not raise — this is a best-effort
+    cleanup path."""
+    # A PID this large is virtually guaranteed not to exist (PID_MAX_LIMIT
+    # on Linux is 2**22); os.kill on it raises ProcessLookupError.
+    leerie._signal_pids({2**30}, _signal.SIGTERM)  # must not raise
+
+
+def test_signal_pids_swallows_permission_error(leerie, monkeypatch):
+    """A PID we're not allowed to signal (e.g. owned by another user) must
+    not abort the cleanup sweep."""
+    def fake_kill(pid, sig):
+        raise PermissionError("not ours")
+
+    monkeypatch.setattr(leerie.os, "kill", fake_kill)
+    leerie._signal_pids({123, 456}, _signal.SIGTERM)  # must not raise
+
+
+def test_signal_pids_delivers_to_a_live_pid(leerie):
+    """Sanity: a real, signalable process actually receives the signal."""
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        leerie._signal_pids({proc.pid}, _signal.SIGKILL)
+        proc.wait(timeout=5)
+        assert proc.returncode is not None
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
 
 
 # --- _reparented_orphans unit tests ----------------------------------------
@@ -1017,6 +1086,28 @@ def test_reparented_orphans_empty_set_input(leerie, monkeypatch):
     monkeypatch.setattr(leerie.subprocess, "run", fake_run)
     result = leerie._reparented_orphans(set())
     assert result == []
+
+
+def test_reparented_orphans_skips_malformed_lines(leerie, monkeypatch):
+    """A garbled `ps` snapshot (too few fields, or non-integer fields) must
+    be tolerated: those lines are skipped rather than raising, and a
+    well-formed line elsewhere in the same output is still picked up."""
+    min_age = leerie._PID_REAP_MIN_AGE_SEC
+    fake_ps = (
+        "  PID  PPID ELAPSED\n"
+        "  100     1\n"                     # too few fields -> skipped
+        "  abc   def   ghi\n"                # non-integer -> skipped
+        f"  200     1 {min_age + 10}\n"      # well-formed, eligible
+    )
+
+    def fake_run(cmd, **kwargs):
+        class R:
+            stdout = fake_ps
+        return R()
+
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+    result = leerie._reparented_orphans({100, 200})
+    assert result == [200]
 
 
 # --- _poll_loop pressure-gated reaping tests -------------------------------
