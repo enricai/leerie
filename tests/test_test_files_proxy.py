@@ -200,6 +200,29 @@ def test_axis_uses_the_proxy_when_a_test_file_changed(leerie):
 
 
 # --------------------------------------------------------------------------
+# resolve_test_file_globs
+# --------------------------------------------------------------------------
+
+def test_resolve_test_file_globs_empty_when_no_config(leerie, tmp_path):
+    assert leerie.resolve_test_file_globs(tmp_path) == []
+
+
+def test_resolve_test_file_globs_empty_when_key_absent(leerie, tmp_path):
+    (tmp_path / ".leerie").mkdir()
+    (tmp_path / ".leerie" / "config.toml").write_text('build = "make"\n')
+    assert leerie.resolve_test_file_globs(tmp_path) == []
+
+
+def test_resolve_test_file_globs_splits_whitespace_separated_value(
+        leerie, tmp_path):
+    (tmp_path / ".leerie").mkdir()
+    (tmp_path / ".leerie" / "config.toml").write_text(
+        'test_file_globs = "src/**/__tests__/* *.spec.rb"\n')
+    assert leerie.resolve_test_file_globs(tmp_path) == [
+        "src/**/__tests__/*", "*.spec.rb"]
+
+
+# --------------------------------------------------------------------------
 # spec parity
 # --------------------------------------------------------------------------
 
