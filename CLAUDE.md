@@ -2069,7 +2069,7 @@ pre-planning worker that reads the task plus the global repo-map
 (ranked to fit the token budget only, no task-file seeding) and emits a small
 canonical `{description, tag, path}` vocabulary injected into every planner's
 context, softening (not replacing) the reconciler's tag-drift resolution — is
-tested in `tests/test_artifact_registry.py` (17 tests): schema validity
+tested in `tests/test_artifact_registry.py` (23 tests): schema validity
 (`SCHEMAS["artifact_registry"]`, required `artifacts` array of
 `{description, tag, path}`), worker registration parity
 (`artifact_registry` in `WORKER_TYPES`, absent from
@@ -2081,7 +2081,14 @@ rather than propagated, `test_phase_degrades_to_empty_on_crash` — a
 `WorkerError` on every `_run_checked_loop` round degrades to `[]` rather than
 dying, since the registry is advisory), `--skip-repo-map` degrade (the worker
 still runs on the task alone and can still return a non-empty list — only the
-`ctx_dict["repo_map"]` build is skipped), ctx-injection wiring
+`ctx_dict["repo_map"]` build is skipped) plus the repo-map grounding branch
+itself — the `skip_repo_map=False` path every other phase-behavior test above
+leaves unexercised (`_make_state` always seeds `skip_repo_map=True`):
+`_build_repo_map`/`_rank_repo_map` are called and a non-empty ranked map
+reaches the worker's prompt when not skipped, `_build_repo_map` is never
+called when skipped, an empty ranked map omits the `repo_map` ctx key
+(mirroring `phase_plan`'s own degrade), and a crashing `_build_repo_map`
+degrades silently rather than propagating — ctx-injection wiring
 (`test_phase_plan_injects_registry_into_ctx` — every planner's context gets
 `ctx_dict["artifact_registry"]` when the registry is non-empty), checkpoint
 ordering (`test_run_phases_checkpoints_registry_before_plan` — the
