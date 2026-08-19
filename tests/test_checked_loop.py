@@ -687,6 +687,79 @@ def test_loop_still_catches_exact_repeat_of_a_shrunk_set(leerie):
     assert any("repeats an earlier round" in w for w in warnings)
 
 
+# --- _partition_issues_by_severity / advisory-only round logging ---------- #
+
+def test_partition_issues_non_string_is_never_advisory(leerie):
+    """`_issue_is_advisory`'s `isinstance` guard: a malformed non-string
+    entry in a check()'s issue list (a bug in the caller, not something
+    this loop should special-case) must fall through to gating rather than
+    being silently classified as advice."""
+    gating, advisory = leerie._partition_issues_by_severity(
+        ["SAME_WORK_RISK: two subtasks touch one file — evidence", 42])
+    assert 42 in gating
+    assert advisory == ["SAME_WORK_RISK: two subtasks touch one file — evidence"]
+
+
+def test_loop_advisory_only_round_logs_and_accepts(leerie, capsys):
+    """A round whose only findings are advisory must be accepted (no
+    gating issues means the loop breaks clean) and must log the
+    'advisory finding(s) ... accepting' line rather than staying silent."""
+    async def invoke():
+        return {"ok": True}
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke,
+        check=lambda r: ["SAME_WORK_RISK: two subtasks touch one file — ev"],
+        name="classifier",
+        max_rounds=3,
+    ))
+    assert result == {"ok": True}
+    assert any("SAME_WORK_RISK" in w for w in warnings), (
+        "advisory findings must still be surfaced in warnings")
+    out = capsys.readouterr().out
+    assert "advisory finding(s)" in out
+    assert "accepting" in out
+
+
+# --- log_path malformed-tool-envelope forcing an extra issue -------------- #
+
+def _user_event(text, is_error=False):
+    import json
+    return json.dumps({
+        "type": "user",
+        "message": {
+            "content": [{"type": "tool_result", "content": text,
+                         "is_error": is_error}],
+        },
+    }) + "\n"
+
+
+def test_loop_log_path_malformed_envelope_forces_a_retry(leerie, tmp_path):
+    """`log_path=` scans the round's per-worker JSONL log for a malformed
+    tool-call envelope after `invoke()` returns; a hit is appended as a
+    gating `MALFORMED_TOOL_ENVELOPE` issue even when `check()` itself finds
+    nothing, forcing one more round through `make_feedback_prompt`."""
+    log_path = tmp_path / "worker-checked-loop.log"
+    calls = [0]
+
+    async def invoke():
+        calls[0] += 1
+        if calls[0] == 1:
+            log_path.write_text(_user_event(
+                'Unexpected parameter "Bash": {"command": "ls"} is not '
+                "valid for this tool", is_error=True))
+        else:
+            log_path.write_text(_user_event("ls: fine", is_error=False))
+        return {"n": calls[0]}
+
+    result, warnings = _run(leerie._run_checked_loop(
+        invoke=invoke, check=lambda r: [], name="test", max_rounds=3,
+        make_feedback_prompt=_noop_feedback, log_path=log_path))
+    assert result == {"n": 2}
+    assert calls[0] == 2, "the malformed-envelope hit must force a retry"
+    assert any("MALFORMED_TOOL_ENVELOPE" in w for w in warnings)
+
+
 def test_loop_oscillation_guard_respects_worker_error_rounds(leerie):
     """A WorkerError round records no issue signature (no `check()` call
     happened) — it must not corrupt the seen-set bookkeeping for
