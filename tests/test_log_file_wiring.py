@@ -26,6 +26,12 @@ import re
 import subprocess
 from pathlib import Path
 
+from tests.log_file_extract_helpers import (
+    extract_invocation as _extract_invocation,
+    extract_reap_tail as _extract_reap_tail,
+    extract_setup_block as _extract_setup_block,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
@@ -45,37 +51,6 @@ def _extract_mkdir_line() -> str:
     return _extract(
         'mkdir -p "$(dirname "$LEERIE_LOG_FILE_RESOLVED")" 2>/dev/null || true\n',
         'mkdir -p "$(dirname "$LEERIE_LOG_FILE_RESOLVED")" 2>/dev/null || true\n',
-    )
-
-
-def _extract_setup_block() -> str:
-    """The `_run_log=...` / `_log_tee_target=...` resolution block. Computed
-    independent of `$_run_log` (bugfix-005) so the interactive/-it branch
-    can wire it too."""
-    return _extract(
-        '  _run_log=""\n',
-        '  _log_tee_target=""\n  if [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then\n'
-        '    if : >> "$LEERIE_LOG_FILE_RESOLVED" 2>/dev/null; then\n'
-        '      _log_tee_target="$LEERIE_LOG_FILE_RESOLVED"\n'
-        "    fi\n"
-        "  fi\n",
-    )
-
-
-def _extract_reap_tail() -> str:
-    return _extract(
-        "  _reap_tail() {\n",
-        "  }\n",
-    )
-
-
-def _extract_invocation() -> str:
-    """The full `if [ -n "$_run_log" ]; then ... fi` block: the piped
-    tail/tee branch, the `script`-wrapped interactive/-it branch
-    (bugfix-005), and the unwrapped fallback."""
-    return _extract(
-        '  if [ -n "$_run_log" ]; then\n    # Decoupled: nerdctl',
-        '    nerdctl run "${_run_argv[@]}" || container_rc=$?\n  fi\n',
     )
 
 

@@ -24,6 +24,12 @@ import re
 import subprocess
 from pathlib import Path
 
+from tests.log_file_extract_helpers import (
+    extract_invocation as _extract_invocation,
+    extract_reap_tail as _extract_reap_tail,
+    extract_setup_block as _extract_setup_block,
+)
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
@@ -53,31 +59,6 @@ def _extract_resolver() -> str:
         src, re.DOTALL)
     assert m, "could not locate the --log-file resolution block in the launcher"
     return m.group(1)
-
-
-def _extract_setup_block() -> str:
-    """The `_run_log=...` / `_log_tee_target=...` decoupled-streaming
-    resolution block. `_log_tee_target` is computed independent of
-    `$_run_log` (bugfix-005) so the interactive/-it branch can wire it too."""
-    return _extract(
-        '  _run_log=""\n',
-        '  _log_tee_target=""\n  if [ -n "${LEERIE_LOG_FILE_RESOLVED:-}" ]; then\n'
-        '    if : >> "$LEERIE_LOG_FILE_RESOLVED" 2>/dev/null; then\n'
-        '      _log_tee_target="$LEERIE_LOG_FILE_RESOLVED"\n'
-        "    fi\n"
-        "  fi\n",
-    )
-
-
-def _extract_reap_tail() -> str:
-    return _extract("  _reap_tail() {\n", "  }\n")
-
-
-def _extract_invocation() -> str:
-    return _extract(
-        '  if [ -n "$_run_log" ]; then\n    # Decoupled: nerdctl',
-        '    nerdctl run "${_run_argv[@]}" || container_rc=$?\n  fi\n',
-    )
 
 
 assert "LEERIE_LOG_FILE_RESOLVED" in _extract_resolver()
