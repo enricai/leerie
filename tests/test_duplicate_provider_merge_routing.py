@@ -141,3 +141,33 @@ class TestDuplicateProviderMergeApply:
         collisions = _duplicate_provider_merge_collisions(plans)
         assert collisions == []
         assert plans == before
+
+    def test_subtask_missing_id_is_tolerated_and_never_indexed(self):
+        """A subtask dict with no `id` key must not crash the indexing pass
+        (the `if sid:` guard) and must never be indexable as a collision
+        participant."""
+        idless = {
+            "title": "no-id", "intent": "i", "success_criteria_seed": "c",
+            "runs_commands": [], "files_likely_touched": ["src/widget.py"],
+            "provides": ["widget"], "requires": [], "depends_on": [],
+            "size": "small",
+        }
+        plans = _plans(("a", [
+            idless,
+            _sub("a-2", provides=["widget"], files=["src/widget.py"]),
+        ]))
+        collisions = _duplicate_provider_merge_collisions(plans)
+        assert collisions == []
+
+    def test_non_string_and_blank_provides_tags_are_skipped(self):
+        """A `provides` entry that is not a non-blank string (None, an int,
+        or whitespace-only) must be skipped rather than indexed as a
+        collision-triggering tag."""
+        plans = _plans(("a", [
+            _sub("a-1", provides=[None, 42, "   ", "widget"],
+                 files=["src/widget.py"]),
+            _sub("a-2", provides=["widget"], files=["src/widget.py"]),
+        ]))
+        collisions = _duplicate_provider_merge_collisions(plans)
+        assert len(collisions) == 1
+        assert collisions[0]["artifact"] == "widget"
