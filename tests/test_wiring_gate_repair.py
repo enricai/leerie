@@ -480,6 +480,100 @@ def test_gate_still_dies_on_unrepairable(leerie, monkeypatch):
             _incident_plan(), "task", _St(), dict(leerie.DEFAULT_CAPS), {}, {}))
 
 
+def test_gate_logs_the_id_channel_repair(leerie, monkeypatch, capsys):
+    """End-to-end through phase_wiring_gate: a defect whose tag_or_dep names a
+    surviving subtask id repairs via the id channel and the gate logs the
+    'named subtask id' line distinct from the tag-channel wording."""
+    import asyncio
+
+    plans = _plans(("testing", [_sub("test-001"), _sub("feat-001")]))
+
+    async def fake_claude_p(**kw):
+        return {"plan_reviewed": True, "rationale": "r",
+                "wiring_defects": [_defect("test-001", "feat-001")]}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    class _St:
+        def __init__(self): self.data = {}
+        def save(self): pass
+        def bump_workers(self, caps): pass
+
+    st = _St()
+    out = asyncio.run(leerie.phase_wiring_gate(
+        plans, "task", st, dict(leerie.DEFAULT_CAPS), {}, {}))
+    assert out is plans
+    assert [r["channel"] for r in st.data["wiring_gate"]["repairs"]] == ["id"]
+    captured = capsys.readouterr()
+    assert "named subtask id" in captured.out
+
+
+def test_gate_logs_the_cofile_cluster_repair(leerie, monkeypatch, capsys):
+    """End-to-end through phase_wiring_gate: a defect whose tag has several
+    providers that are all one `_cofile_cluster` repairs via that channel and
+    the gate logs the 'sub-file cluster of' line."""
+    import asyncio
+
+    plans = _plans(
+        ("testing", [_sub("test-001")]),
+        ("feature-implementation", [
+            _sub("feat-001-r1", provides=["baked"], cluster="feat-001"),
+            _sub("feat-001-r2", provides=["baked"], cluster="feat-001"),
+        ]),
+    )
+
+    async def fake_claude_p(**kw):
+        return {"plan_reviewed": True, "rationale": "r",
+                "wiring_defects": [_defect("test-001", "baked")]}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    class _St:
+        def __init__(self): self.data = {}
+        def save(self): pass
+        def bump_workers(self, caps): pass
+
+    st = _St()
+    out = asyncio.run(leerie.phase_wiring_gate(
+        plans, "task", st, dict(leerie.DEFAULT_CAPS), {}, {}))
+    assert out is plans
+    assert [r["channel"] for r in st.data["wiring_gate"]["repairs"]] == \
+        ["cofile_cluster"]
+    captured = capsys.readouterr()
+    assert "sub-file cluster of" in captured.out
+
+
+def test_gate_logs_a_provably_false_finding_as_discarded(leerie, monkeypatch,
+                                                          capsys):
+    """A defect naming a tag the plan still provides is provably false (the
+    finding's own premise contradicts the plan) — the gate must log it as
+    discarded and never gate or repair on it."""
+    import asyncio
+
+    plans = _plans(("testing", [_sub("test-001", provides=["still-here"])]))
+
+    async def fake_claude_p(**kw):
+        return {"plan_reviewed": True, "rationale": "r",
+                "wiring_defects": [{
+                    "kind": "broken_by_merge", "sid": "test-001",
+                    "tag_or_dep": "still-here",
+                    "concrete_reason": "a merge severed this capability",
+                    "severity": "live_defect",
+                }]}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    class _St:
+        def __init__(self): self.data = {"dropped_subtasks": {}}
+        def save(self): pass
+        def bump_workers(self, caps): pass
+
+    st = _St()
+    out = asyncio.run(leerie.phase_wiring_gate(
+        plans, "task", st, dict(leerie.DEFAULT_CAPS), {}, {}))
+    assert out is plans
+    assert st.data["wiring_gate"]["repairs"] == []
+    captured = capsys.readouterr()
+    assert "discarded provably-false finding" in captured.out
+
+
 def test_caller_reschedules_when_repairs_land(leerie):
     """Source-coupling pin: the added edges change the wave partition, so
     `_run_phases` must re-derive subtasks/waves and rewrite plan_snapshot —

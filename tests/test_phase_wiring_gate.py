@@ -352,3 +352,46 @@ def test_prompt_still_asks_for_severity(leerie):
     text = leerie._load_prompt("wiring_judge")
     assert "severity" in text
     assert "latent_risk" in text and "live_defect" in text
+
+
+def test_latent_risk_missing_concrete_reason_is_not_logged(leerie, tmp_path,
+                                                            monkeypatch):
+    """A `latent_risk` entry with no `concrete_reason` never reaches the
+    LATENT_RISK log line — it is dropped alongside the vague/gating findings
+    (a `severity` label alone is not enough anti-gaming evidence). It must
+    also never gate, since only live_defect findings do."""
+    st = _state(leerie, tmp_path)
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "feat-003-1",
+            "tag_or_dep": "some-fixture",
+            "concrete_reason": "",
+            "severity": "latent_risk",
+        }], "rationale": "vague latent risk"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.phase_wiring_gate(
+        _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert out == _PLANS
+
+
+def test_latent_risk_missing_tag_or_dep_is_not_logged(leerie, tmp_path,
+                                                       monkeypatch):
+    """The sibling half of the anti-gaming check: a `latent_risk` entry with a
+    real `concrete_reason` but no `tag_or_dep` also stops short of the
+    LATENT_RISK log line, and still never gates."""
+    st = _state(leerie, tmp_path)
+
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "feat-003-1",
+            "tag_or_dep": "",
+            "concrete_reason": "resolves today but is fragile to a future edit",
+            "severity": "latent_risk",
+        }], "rationale": "vague latent risk"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.phase_wiring_gate(
+        _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert out == _PLANS
