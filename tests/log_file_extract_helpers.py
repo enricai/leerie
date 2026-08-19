@@ -5,11 +5,14 @@ independently defined byte-identical `_extract_setup_block`,
 single owner, following the `launcher_blocks.py` / `ec2_stub.py`
 single-owner convention documented in CLAUDE.md.
 
-Each file's own plain `_extract(start_marker, end_marker)` helper is
-deliberately NOT folded in here -- it is a thin marker-slicing primitive
-used for other, file-specific extractions too (e.g. `_extract_resolver`,
-`_extract_mkdir_line`), not part of the three-helper group this module
-consolidates.
+The plain `_extract(start_marker, end_marker)` marker-slicing primitive is
+also owned here and imported by `test_log_file_wiring.py`
+(`_extract_mkdir_line` needs it directly, not just the three helpers
+above). `test_log_file_persistence.py` keeps its own variant rather than
+importing this one -- its version routes through a local `_launcher_text()`
+wrapper for its own `_extract_resolver()`, so the two are not
+byte-identical and folding them together would be a cosmetic rename, not a
+dedup.
 """
 from __future__ import annotations
 

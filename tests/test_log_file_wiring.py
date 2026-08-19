@@ -27,6 +27,7 @@ import subprocess
 from pathlib import Path
 
 from tests.log_file_extract_helpers import (
+    _extract,
     extract_invocation as _extract_invocation,
     extract_reap_tail as _extract_reap_tail,
     extract_setup_block as _extract_setup_block,
@@ -34,13 +35,6 @@ from tests.log_file_extract_helpers import (
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
-
-
-def _extract(start_marker: str, end_marker: str) -> str:
-    src = LAUNCHER.read_text()
-    s = src.index(start_marker)
-    e = src.index(end_marker, s) + len(end_marker)
-    return src[s:e]
 
 
 def _extract_mkdir_line() -> str:
