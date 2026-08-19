@@ -2795,6 +2795,112 @@ def test_prompt_documents_cofile_cluster_exclusion():
     )
 
 
+# --------------------------------------------------------------------- #
+# phase_overlap_judge() cheap-skip short-circuits, run for real (a gap
+# the module docstring above already flagged: "exercised indirectly
+# through its short-circuit conditions" was aspirational, not actual —
+# no test previously drove the real function through these branches).
+# Each asserts the worker is never invoked (the whole point of a
+# cheap-skip is spending zero claude -p calls) and the plans list is
+# returned unchanged.
+# --------------------------------------------------------------------- #
+
+def _sub(sid, **overrides):
+    base = {
+        "id": sid, "title": f"t {sid}", "intent": "do", "scope_note": "s",
+        "files_likely_touched": [], "depends_on": [], "requires": [],
+        "provides": [], "success_criteria_seed": "done", "size": "small",
+        "investigation_notes": "",
+    }
+    base.update(overrides)
+    return base
+
+
+def _plan(domain, subs, status="ready"):
+    return {"domain": domain, "status": status, "subtasks": list(subs)}
+
+
+class _RecordingState:
+    def __init__(self, data=None):
+        self.data = dict(data or {})
+
+    def save(self):
+        pass
+
+    def bump_workers(self, caps):
+        pass
+
+
+def _never_invoke(*a, **k):
+    raise AssertionError(
+        "the judge worker must not be invoked on a cheap-skip path")
+
+
+def test_skip_overlap_judge_flag_short_circuits(leerie, monkeypatch, capsys):
+    plans = [_plan("feature-implementation", [_sub("feat-001")]),
+             _plan("bug-fixing", [_sub("bugfix-001")])]
+    monkeypatch.setattr(leerie, "_run_checked_loop", _never_invoke)
+    st = _RecordingState({"skip_overlap_judge": True})
+    out = asyncio.run(leerie.phase_overlap_judge(
+        plans, "task", st, {"judgment_check_rounds": 1}, {}, {}))
+    assert out is plans
+    assert "overlap-judge skipped" in capsys.readouterr().out
+
+
+def test_single_contributing_planner_short_circuits(leerie, monkeypatch,
+                                                     capsys):
+    """Only one domain contributed non-empty subtasks (a second plan with
+    zero subtasks does not count as a contributor) — cross-planner surface
+    collisions are structurally impossible."""
+    plans = [_plan("feature-implementation",
+                   [_sub("feat-001"), _sub("feat-002")]),
+             _plan("bug-fixing", [])]
+    monkeypatch.setattr(leerie, "_run_checked_loop", _never_invoke)
+    st = _RecordingState()
+    out = asyncio.run(leerie.phase_overlap_judge(
+        plans, "task", st, {"judgment_check_rounds": 1}, {}, {}))
+    assert out is plans
+    assert "single contributing planner" in capsys.readouterr().out
+
+
+def test_judge_crash_with_no_result_dies(leerie, monkeypatch, capsys):
+    """`_run_checked_loop` exhausting every round returns `(None, warnings)`
+    — the judge crashed on every attempt. `phase_overlap_judge` must die()
+    immediately rather than treat `None` as an empty collision set."""
+    plans = [_plan("feature-implementation", [_sub("feat-001")]),
+             _plan("bug-fixing", [_sub("bugfix-001")])]
+
+    async def _fake_loop(**kw):
+        return (None, ["worker crashed twice"])
+
+    monkeypatch.setattr(leerie, "_run_checked_loop", _fake_loop)
+    st = _RecordingState()
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_overlap_judge(
+            plans, "task", st, {"judgment_check_rounds": 1}, {}, {}))
+    err = capsys.readouterr().err
+    assert "crashed and produced no result" in err
+
+
+# --------------------------------------------------------------------- #
+# _schedule() — the bare "planners produced no subtasks" die(), reached
+# only when there are zero subtasks AND zero blocked domains (e.g. every
+# plan has status "ready" with an empty subtasks list — the cleared-but-
+# empty shape that _detect_no_work exists to intercept upstream, but
+# _schedule() itself has no knowledge of that and must still fail safely
+# if reached directly with this exact input shape).
+# --------------------------------------------------------------------- #
+
+def test_schedule_dies_on_no_subtasks_and_no_blocked_domains(leerie, capsys):
+    plans = [{"domain": "feature-implementation", "status": "ready",
+             "subtasks": []}]
+    with pytest.raises(SystemExit):
+        leerie._schedule(plans)
+    err = capsys.readouterr().err
+    assert "planners produced no subtasks" in err
+    assert "blocked" not in err
+
+
 def test_prompt_input_example_lists_cofile_cluster():
     """The literal worked JSON example in `prompts/plan_overlap_judge.md`'s
     "## Input" section must itself include `_cofile_cluster` as a field
