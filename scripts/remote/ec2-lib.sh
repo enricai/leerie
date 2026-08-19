@@ -13,6 +13,8 @@
 #
 # shellcheck disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_log.sh"
+# shellcheck disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/seed-common.sh"
 
 # --- require_aws -----------------------------------------------------------
 # Ensure the AWS CLI is on PATH and credentials resolve, before the EC2
@@ -74,23 +76,11 @@ require_aws() {
 }
 
 # --- _seed_timeout_prefix ---------------------------------------------------
-# Identical to lib.sh's helper of the same name (Fly path): emits
-# `timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` so a stalled
-# transport session yields a clean non-zero rc instead of hanging.
-# Duplicated here (not sourced from lib.sh) because ec2-lib.sh must stay
-# independently sourceable — pulling in lib.sh would drag Fly-specific
-# state (require_fly_ssh, the private ssh-agent) into the EC2 runtime.
-# On hosts without GNU `timeout` (BSD macOS w/o coreutils) this echoes
-# nothing and the caller falls back to an unbounded pipe.
-#
-# Usage:
-#   $(_seed_timeout_prefix) aws ssm start-session ...
-_seed_timeout_prefix() {
-  if ! command -v timeout >/dev/null 2>&1; then
-    return 0
-  fi
-  printf 'timeout --kill-after=5 %s' "${LEERIE_SEED_TIMEOUT_S:-600}"
-}
+# Shared with the Fly path (lib.sh); single definition site is
+# scripts/remote/seed-common.sh, sourced above alongside _log.sh. Not
+# sourced from lib.sh directly — ec2-lib.sh must stay independently
+# sourceable, and pulling in lib.sh would drag Fly-specific state
+# (require_fly_ssh, the private ssh-agent) into the EC2 runtime.
 
 # --- ec2_remote_exec ---------------------------------------------------
 # Run a single command on the target EC2 instance, mirroring `flyctl ssh

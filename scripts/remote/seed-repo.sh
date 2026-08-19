@@ -134,56 +134,12 @@ _seed_repo_preflight() {
 }
 
 # ---------------------------------------------------------------------------
-# _seed_use_shallow
+# _seed_use_shallow / _seed_branch_shallow_safe
 #
-# Decide whether the parent repo should be shipped via the shallow
-# tar-of-.git path instead of the full `git bundle --all`. Returns 0
-# (shallow) when BOTH hold: LEERIE_SEED_DEPTH is a non-zero integer AND
-# the host repo's .git exceeds LEERIE_SEED_SHALLOW_THRESHOLD_MB. Returns
-# 1 (full bundle) otherwise — including on any probe failure, so the
-# safe default is always the proven full-bundle path.
-# (DESIGN §6 *Shallow seeding for heavy repos*.)
+# Defined in scripts/remote/seed-common.sh, sourced transitively via
+# lib.sh above (single definition site, shared with ec2-seed-repo.sh via
+# ec2-lib.sh).
 # ---------------------------------------------------------------------------
-_seed_use_shallow() {
-  local _depth="${LEERIE_SEED_DEPTH:-0}" _thresh="${LEERIE_SEED_SHALLOW_THRESHOLD_MB:-200}" _git_kb
-  case "$_depth" in ''|*[!0-9]*|0) return 1 ;; esac
-  case "$_thresh" in ''|*[!0-9]*|0) return 1 ;; esac
-  # .git size in KB. --git-dir handles worktrees / .git-file layouts.
-  local _gitdir
-  _gitdir="$(git -C "$USER_REPO" rev-parse --git-dir 2>/dev/null)" || return 1
-  case "$_gitdir" in /*) : ;; *) _gitdir="$USER_REPO/$_gitdir" ;; esac
-  _git_kb="$(du -sk "$_gitdir" 2>/dev/null | awk '{print $1}')" || return 1
-  case "$_git_kb" in ''|*[!0-9]*) return 1 ;; esac
-  [ "$_git_kb" -gt "$(( _thresh * 1024 ))" ]
-}
-
-# ---------------------------------------------------------------------------
-# _seed_branch_shallow_safe <branch>
-#
-# The shallow path injects the branch name into a `git checkout -f <branch>`
-# line inside the machine-side script, which is sent as `flyctl … -C
-# "sh -c '<script>'"`. A branch name is under user control and git permits
-# characters that would break that single-quoted wrapper or inject into the
-# remote shell — an apostrophe (`feat/it's-a-branch` is a valid ref) closes
-# the quote early; `$` / backtick could construct commands. Rather than
-# escape (fragile), we allow the shallow path ONLY for a conservative,
-# shell-safe charset (the overwhelming majority of real branches) and fall
-# back to the proven full-bundle path for anything else. Returns 0 (safe)
-# when the branch is non-empty and matches ^[A-Za-z0-9/._-]+$, 1 otherwise.
-#
-# Also reject the machine-script placeholder tokens: the branch is baked
-# into $_parent_materialize before the `${//__CLEANUP_TMP__/…}` pass, so a
-# branch literally named __CLEANUP_TMP__ / __PARENT_MATERIALIZE__ would be
-# mangled by that later substitution. Such branch names don't exist in
-# practice; rejecting them (→ full bundle) is free insurance.
-# ---------------------------------------------------------------------------
-_seed_branch_shallow_safe() {
-  case "$1" in
-    ''|*[!A-Za-z0-9/._-]*) return 1 ;;
-    *__PARENT_MATERIALIZE__*|*__CLEANUP_TMP__*) return 1 ;;
-    *) return 0 ;;
-  esac
-}
 
 # ---------------------------------------------------------------------------
 # _seed_shallow_parent
