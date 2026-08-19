@@ -315,3 +315,71 @@ class TestRescuedSubtaskIntegratesAsNoOp:
         # up-to-date: no new commit, no conflict
         assert head_before == head_after
         assert "up to date" in (r.stdout + r.stderr).lower()
+
+
+class TestSettleAlreadySatisfiedDirectly:
+    """`_settle_already_satisfied` itself — previously exercised only via
+    `inspect.getsource` source-coupling pins in this file and in
+    `test_pre_spawn_settle_is_integrable.py` / `test_provider_subset_pre_spawn_probe.py`,
+    never actually invoked. Both real callers (the pre-spawn provider-subset
+    probe and this file's mid-run no-commits rescue) reach it only through a
+    stubbed `claude_p`/full-phase harness, so its own state-write contract —
+    `dropped_subtasks`, `subtask_status`, the `blocked` pop, and the
+    `conformance[sid]` sentinel with `reviewed: False` — had no direct
+    coverage."""
+
+    def test_writes_all_four_state_fields_and_returns_terminal_result(
+            self, leerie, tmp_path):
+        st = _make_state(leerie, tmp_path / "run")
+        st.data["blocked"] = {"test-003": "no_commits"}
+        drop = {"reason": "already_satisfied_mid_run",
+                "evidence": "sibling committed the deliverable"}
+
+        result = leerie._settle_already_satisfied("test-003", drop, st)
+
+        assert st.data["dropped_subtasks"]["test-003"] == drop
+        assert st.data["subtask_status"]["test-003"] == "complete"
+        # The blocked entry for this sid is cleared...
+        assert "test-003" not in st.data["blocked"]
+        conf = st.data["conformance"]["test-003"]
+        assert conf["result"] is None
+        assert conf["reviewed"] is False
+        assert any("satisfied rescue" in w for w in conf["warnings"])
+
+        assert result["subtask_id"] == "test-003"
+        assert result["status"] == "complete"
+        assert "already satisfied" in result["summary"]
+        assert result["criteria_results"] == []
+
+    def test_deliberately_absent_from_unreviewed_subtasks(
+            self, leerie, tmp_path):
+        """`reviewed: False` is literally true (no conformer ran), but this
+        subtask must not be counted among `unreviewed_subtasks` — that
+        classifier is for a review that was attempted and died, and a
+        zero-commit rescue never needed one."""
+        st = _make_state(leerie, tmp_path / "run")
+        leerie._settle_already_satisfied("test-004", {"reason": "x"}, st)
+
+        assert "test-004" not in (st.data.get("unreviewed_subtasks") or [])
+
+    def test_custom_summary_and_criteria_results_are_honored(
+            self, leerie, tmp_path):
+        st = _make_state(leerie, tmp_path / "run")
+        criteria = [{"criterion": "x", "met": True, "evidence": "y"}]
+        result = leerie._settle_already_satisfied(
+            "test-005", {"reason": "provider_subset"}, st,
+            summary="custom summary text", criteria_results=criteria)
+
+        assert result["summary"] == "custom summary text"
+        assert result["criteria_results"] == criteria
+
+    def test_save_is_invoked_so_the_write_survives_a_crash(
+            self, leerie, tmp_path):
+        st = _make_state(leerie, tmp_path / "run")
+        saved = {"n": 0}
+        original_save = st.path.write_text
+        st.save = lambda: saved.__setitem__("n", saved["n"] + 1)
+
+        leerie._settle_already_satisfied("test-006", {"reason": "x"}, st)
+
+        assert saved["n"] == 1
