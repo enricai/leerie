@@ -285,3 +285,357 @@ def test_install_sh_documents_no_claude_install_flag() -> None:
     text = INSTALL_SH.read_text()
     assert "--no-claude-install" in text
     assert "LEERIE_NO_CLAUDE_INSTALL" in text
+
+
+# ---------------------------------------------------------------------------
+# runtime-install.sh — macOS/Colima path (Darwin-gated)
+# ---------------------------------------------------------------------------
+# Every function under test opens with `[ "$(uname -s)" = "Darwin" ] || return
+# 0`, so on this (Linux) test host they no-op unless `uname` itself is stubbed
+# on PATH to report Darwin — mirroring the file's existing PATH-stub pattern
+# for apt-get/dnf/pacman above. A dedicated stub bin dir is prepended to PATH
+# per test so the guard's `uname -s` call resolves to the fake.
+def _darwin_stub_dir(tmp_path: Path) -> Path:
+    stub = tmp_path / "stub"
+    stub.mkdir(exist_ok=True)
+    uname = stub / "uname"
+    uname.write_text('#!/bin/sh\nif [ "$1" = "-s" ]; then echo Darwin; fi\n')
+    uname.chmod(0o755)
+    return stub
+
+
+def _run_macos_snippet(
+    tmp_path: Path,
+    body: str,
+    *,
+    darwin: bool = True,
+    extra_env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    path = "/usr/bin:/bin"
+    if darwin:
+        stub = _darwin_stub_dir(tmp_path)
+        path = f"{stub}:{path}"
+    script = f"""
+      set -u
+      . "{RUNTIME_INSTALL}"
+      {body}
+    """
+    env = {"DRY_RUN": "true", "PATH": path, "HOME": str(home)}
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(
+        ["bash", "-c", script], capture_output=True, text=True, env=env
+    )
+
+
+def test_darwin_guards_are_inert_on_the_real_linux_test_host() -> None:
+    # Control: without the uname stub (darwin=False), the real host is Linux,
+    # so every Darwin-gated function must no-op (return 0, emit nothing) even
+    # though DRY_RUN=true and nothing else is stubbed.
+    r = _run_macos_snippet(
+        Path("/tmp"),
+        """
+          out1="$(_runtime_colima_size_flags)"; rc1=$?
+          _runtime_check_colima_sizing; rc2=$?
+          out3="$(_runtime_colima_swap_yaml)"; rc3=$?
+          _runtime_install_colima_swap_yaml; rc4=$?
+          _runtime_check_colima_swap; rc5=$?
+          echo "flags=[$out1] rc1=$rc1 rc2=$rc2 rc4=$rc4 rc5=$rc5"
+        """,
+        darwin=False,
+    )
+    assert "flags=[] rc1=0 rc2=0 rc4=0 rc5=0" in r.stdout, r.stdout
+    # _runtime_colima_swap_yaml has no Darwin guard (it's a pure heredoc
+    # emitter with no OS-specific behavior), so it is not part of the
+    # inertness assertion above; its output is pinned separately in
+    # test_colima_swap_yaml_contains_sentinel_and_provision_block.
+
+
+def test_colima_size_flags_clamps_cpu_and_mem(tmp_path: Path) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    sysctl = stub / "sysctl"
+    # 20 cpu / 64 GiB host -> cpu 20/2=10 clamped to 8, mem 64/2=32 clamped to 16.
+    sysctl.write_text(
+        '#!/bin/sh\n'
+        'if [ "$2" = "hw.ncpu" ]; then echo 20; '
+        'elif [ "$2" = "hw.memsize" ]; then echo $((64 * 1073741824)); fi\n'
+    )
+    sysctl.chmod(0o755)
+    r = _run_macos_snippet(tmp_path, '_runtime_colima_size_flags')
+    assert r.stdout.strip() == "--cpu 8 --memory 16", r.stdout
+
+
+def test_colima_size_flags_clamps_to_minimums(tmp_path: Path) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    sysctl = stub / "sysctl"
+    # 2 cpu / 4 GiB host -> cpu 2/2=1 clamped to 2, mem 4/2=2 clamped to 4.
+    sysctl.write_text(
+        '#!/bin/sh\n'
+        'if [ "$2" = "hw.ncpu" ]; then echo 2; '
+        'elif [ "$2" = "hw.memsize" ]; then echo $((4 * 1073741824)); fi\n'
+    )
+    sysctl.chmod(0o755)
+    r = _run_macos_snippet(tmp_path, '_runtime_colima_size_flags')
+    assert r.stdout.strip() == "--cpu 2 --memory 4", r.stdout
+
+
+def _write_sysctl_stub(stub: Path, cpu: int, mem_gb: int) -> None:
+    sysctl = stub / "sysctl"
+    sysctl.write_text(
+        '#!/bin/sh\n'
+        f'if [ "$2" = "hw.ncpu" ]; then echo {cpu * 2}; '
+        f'elif [ "$2" = "hw.memsize" ]; then echo $(({mem_gb * 2} * 1073741824)); fi\n'
+    )
+    sysctl.chmod(0o755)
+
+
+def test_check_colima_sizing_warns_only_when_both_below_recommendation(
+    tmp_path: Path,
+) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    # Recommendation resolves to --cpu 4 --memory 8 (host reports 8 cpu/16GB).
+    _write_sysctl_stub(stub, cpu=4, mem_gb=8)
+    home = tmp_path / "home"
+    (home / ".colima" / "default").mkdir(parents=True)
+    (home / ".colima" / "default" / "colima.yaml").write_text(
+        "cpu: 2\nmemory: 4\n"
+    )
+    r = _run_macos_snippet(tmp_path, "_runtime_check_colima_sizing")
+    assert "Colima is running with 2 cpu / 4 GB" in r.stdout, r.stdout
+    assert "≥4 cpu / 8 GB" in r.stdout, r.stdout
+
+
+def test_check_colima_sizing_silent_when_only_one_axis_is_low(
+    tmp_path: Path,
+) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    _write_sysctl_stub(stub, cpu=4, mem_gb=8)
+    home = tmp_path / "home"
+    (home / ".colima" / "default").mkdir(parents=True)
+    # cpu below recommendation, mem above — must not warn (half-match).
+    (home / ".colima" / "default" / "colima.yaml").write_text(
+        "cpu: 2\nmemory: 32\n"
+    )
+    r = _run_macos_snippet(tmp_path, "_runtime_check_colima_sizing")
+    assert "Colima is running with" not in r.stdout, r.stdout
+
+
+def test_check_colima_sizing_no_config_is_a_silent_noop(tmp_path: Path) -> None:
+    _darwin_stub_dir(tmp_path)
+    r = _run_macos_snippet(
+        tmp_path, '_runtime_check_colima_sizing; echo "__rc=$?"'
+    )
+    assert "__rc=0" in r.stdout
+    assert r.stderr == ""
+
+
+def test_colima_swap_yaml_contains_sentinel_and_provision_block() -> None:
+    r = _run_macos_snippet(Path("/tmp"), "_runtime_colima_swap_yaml")
+    assert "# leerie:swap-provision-v1 BEGIN" in r.stdout
+    assert "# leerie:swap-provision-v1 END" in r.stdout
+    assert "vm.swappiness=10" in r.stdout
+    assert "SWAPSIZE_GB=4" in r.stdout
+
+
+def test_install_colima_swap_yaml_writes_when_absent(tmp_path: Path) -> None:
+    _darwin_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    r = _run_macos_snippet(
+        tmp_path,
+        '_runtime_install_colima_swap_yaml; echo "__rc=$?"',
+        extra_env={"DRY_RUN": "false"},
+    )
+    assert "__rc=0" in r.stdout, r.stdout
+    cfg = home / ".colima" / "default" / "colima.yaml"
+    assert cfg.exists(), r.stdout + r.stderr
+    assert "leerie:swap-provision-v1" in cfg.read_text()
+
+
+def test_install_colima_swap_yaml_never_overwrites_existing(tmp_path: Path) -> None:
+    _darwin_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    (home / ".colima" / "default").mkdir(parents=True)
+    cfg = home / ".colima" / "default" / "colima.yaml"
+    cfg.write_text("cpu: 6\nmemory: 12\n# a user's own custom tuning\n")
+    original = cfg.read_text()
+    r = _run_macos_snippet(
+        tmp_path,
+        '_runtime_install_colima_swap_yaml; echo "__rc=$?"',
+        extra_env={"DRY_RUN": "false"},
+    )
+    assert "__rc=0" in r.stdout, r.stdout
+    assert cfg.read_text() == original, "existing colima.yaml must not be mutated"
+
+
+def test_install_colima_swap_yaml_is_a_noop_under_dry_run(tmp_path: Path) -> None:
+    _darwin_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    r = _run_macos_snippet(
+        tmp_path, '_runtime_install_colima_swap_yaml; echo "__rc=$?"'
+    )
+    assert "__rc=0" in r.stdout, r.stdout
+    assert not (home / ".colima").exists()
+
+
+def test_check_colima_swap_hints_only_when_sentinel_missing(tmp_path: Path) -> None:
+    _darwin_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    (home / ".colima" / "default").mkdir(parents=True)
+    (home / ".colima" / "default" / "colima.yaml").write_text(
+        "cpu: 4\nmemory: 8\n"
+    )
+    r = _run_macos_snippet(tmp_path, "_runtime_check_colima_swap")
+    assert "without leerie's swap provisioning" in r.stdout, r.stdout
+    assert "leerie:swap-provision-v1 BEGIN" in r.stderr
+
+
+def test_check_colima_swap_silent_when_sentinel_present(tmp_path: Path) -> None:
+    _darwin_stub_dir(tmp_path)
+    home = tmp_path / "home"
+    (home / ".colima" / "default").mkdir(parents=True)
+    (home / ".colima" / "default" / "colima.yaml").write_text(
+        "cpu: 4\nmemory: 8\n# leerie:swap-provision-v1 BEGIN\n"
+    )
+    r = _run_macos_snippet(tmp_path, "_runtime_check_colima_swap")
+    assert "without leerie's swap provisioning" not in r.stdout, r.stdout
+    assert r.stderr == ""
+
+
+# --- runtime_install_macos: the three top-level paths -----------------------
+def _colima_brew_stub(
+    stub: Path,
+    *,
+    colima_present: bool,
+    brew_present: bool,
+    colima_running: bool,
+) -> Path:
+    log = stub.parent / "calls.log"
+    if colima_present:
+        colima = stub / "colima"
+        colima.write_text(
+            f"""#!/bin/sh
+echo "colima $*" >> "{log}"
+if [ "$1" = "--version" ]; then exit 0; fi
+if [ "$1" = "status" ]; then exit {0 if colima_running else 1}; fi
+if [ "$1" = "start" ]; then exit 0; fi
+exit 0
+"""
+        )
+        colima.chmod(0o755)
+    if brew_present:
+        brew = stub / "brew"
+        colima_after_install = stub / "colima"
+        # Simulate `brew install colima` actually placing the binary on PATH,
+        # so runtime_install_macos's subsequent `colima start` call resolves.
+        brew.write_text(
+            rf"""#!/bin/sh
+echo "brew $*" >> "{log}"
+if [ "$1" = "--version" ]; then exit 0; fi
+if [ "$1 $2" = "install colima" ]; then
+  cat > "{colima_after_install}" <<SH
+#!/bin/sh
+echo "colima \$*" >> "{log}"
+if [ "\$1" = "--version" ]; then exit 0; fi
+if [ "\$1" = "status" ]; then exit 1; fi
+if [ "\$1" = "start" ]; then exit 0; fi
+exit 0
+SH
+  chmod 755 "{colima_after_install}"
+fi
+exit 0
+"""
+        )
+        brew.chmod(0o755)
+    return log
+
+
+def test_runtime_install_macos_installs_via_brew_when_colima_missing(
+    tmp_path: Path,
+) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    log = _colima_brew_stub(
+        stub, colima_present=False, brew_present=True, colima_running=False
+    )
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    r = _run_macos_snippet(
+        tmp_path,
+        'runtime_install_macos; echo "__rc=$?"',
+        extra_env={"DRY_RUN": "false"},
+    )
+    assert "__rc=0" in r.stdout, r.stdout + r.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert "brew install colima" in calls, calls
+    assert "colima start" in calls, calls
+    cfg = home / ".colima" / "default" / "colima.yaml"
+    assert cfg.exists(), "swap yaml must be installed before first start"
+
+
+def test_runtime_install_macos_errors_without_brew_when_colima_missing(
+    tmp_path: Path,
+) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    _colima_brew_stub(
+        stub, colima_present=False, brew_present=False, colima_running=False
+    )
+    r = _run_macos_snippet(
+        tmp_path,
+        'runtime_install_macos; echo "__rc=$?"',
+        extra_env={"DRY_RUN": "false"},
+    )
+    assert "__rc=1" in r.stdout, r.stdout + r.stderr
+    assert "Homebrew is needed" in r.stderr
+
+
+def test_runtime_install_macos_starts_vm_when_installed_but_not_running(
+    tmp_path: Path,
+) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    log = _colima_brew_stub(
+        stub, colima_present=True, brew_present=True, colima_running=False
+    )
+    home = tmp_path / "home"
+    home.mkdir(exist_ok=True)
+    r = _run_macos_snippet(
+        tmp_path,
+        'runtime_install_macos; echo "__rc=$?"',
+        extra_env={"DRY_RUN": "false"},
+    )
+    assert "__rc=0" in r.stdout, r.stdout + r.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert "brew install colima" not in calls, "colima already installed"
+    assert "colima start" in calls, calls
+    cfg = home / ".colima" / "default" / "colima.yaml"
+    assert cfg.exists(), "swap yaml must be installed before starting a stopped VM"
+
+
+def test_runtime_install_macos_leaves_running_vm_alone_and_hints(
+    tmp_path: Path,
+) -> None:
+    stub = _darwin_stub_dir(tmp_path)
+    log = _colima_brew_stub(
+        stub, colima_present=True, brew_present=True, colima_running=True
+    )
+    _write_sysctl_stub(stub, cpu=4, mem_gb=8)
+    home = tmp_path / "home"
+    (home / ".colima" / "default").mkdir(parents=True)
+    # Deliberately undersized on both axes and missing the swap sentinel, so
+    # both _runtime_check_colima_sizing and _runtime_check_colima_swap fire.
+    (home / ".colima" / "default" / "colima.yaml").write_text(
+        "cpu: 2\nmemory: 4\n"
+    )
+    r = _run_macos_snippet(
+        tmp_path,
+        'runtime_install_macos; echo "__rc=$?"',
+        extra_env={"DRY_RUN": "false"},
+    )
+    assert "__rc=0" in r.stdout, r.stdout + r.stderr
+    calls = log.read_text() if log.exists() else ""
+    assert "colima start" not in calls, "an already-running VM must not be restarted"
+    assert "brew install colima" not in calls
+    assert "Colima is running with 2 cpu / 4 GB" in r.stdout
+    assert "without leerie's swap provisioning" in r.stdout
