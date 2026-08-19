@@ -826,6 +826,55 @@ rather than skip — skipping on CI removes the coverage instead of the
 dependency (`tests/test_append_system_prompt_file.py` shows the skip form, for
 the case where the CLI genuinely *is* the subject).
 
+**A test that drives the real `main()` needs a stub `claude` on PATH, and the
+gate is in `main()` itself — not `preflight()`.** `main()`'s
+`if not shutil.which("claude"): die(...)` fires 87 lines before `State(...)`
+mints the run dir and long before the top-level try/except, so
+`_check_claude_cli_version` (which lives under `_orchestrate`, routinely
+stubbed) is never reached and stubbing it does nothing. `die()` exits 1, which
+is the tell: *every* expected exit code collapses to 1 at once
+(`1 == 75`, `1 == 130`, `1 == 143`, `1 == 7`). A test whose expected code is
+itself 1 passes that assertion by coincidence and then fails one line later on
+a missing sidecar. Measured: 14 of `tests/test_main_exception_arms.py` shipped
+red this way while its sibling `tests/test_main_cli_wiring.py` — the same
+harness plus one call — was green. `tests/conftest.py::fake_claude_on_path` is
+the single owner; import it rather than copying it, and install it in the
+*fixture* every test in the file shares, not in the harness function — three
+tests there call `leerie.main()` directly and a harness-attached prerequisite
+misses them silently.
+
+**`main()` mutates the pytest process, and one of those mutations changes what
+"alive" means.** `_become_subreaper()` is `main()`'s SECOND statement, before
+argparse, so any test driving the real `main()` leaves
+`prctl(PR_SET_CHILD_SUBREAPER, 1)` set on the pytest process for the rest of
+the session. An orphan that would reparent to PID 1 and be reaped then
+reparents to pytest, which never `wait()`s it; it lingers as a zombie, a zombie
+still owns its PID slot, and `os.kill(pid, 0)` keeps succeeding — so a liveness
+probe reports a process that was in fact killed. Measured: three
+`tests/test_signal_cleanup.py` orphan-reaping assertions went red on CI with
+both that file and `orchestrator/leerie.py` byte-identical to `main`. Collection
+is alphabetical, so `test_main_*` poisons `test_signal_cleanup`, and
+`tests/test_subreaper.py` escaped only by sorting *after* it — an accident of
+filename, not a fix. Hence `tests/conftest.py`'s autouse
+`_restore_child_subreaper` (delegating to the public `child_subreaper_restored`
+context manager) rather than a per-file fixture. Note the failure is
+**deterministic** — the same 17 IDs on all three Python versions — which is how
+it is told apart from the CPU-starvation flake class above.
+
+**The obvious test for that fixture is vacuous, and the vacuity only shows
+under falsification.** The natural shape is an ordered pair: one test sets the
+flag, the next asserts it was restored. With the fixture broken, an earlier
+test in the same file has already left the flag at 1, so the second test's
+baseline *is* 1, it observes 1, and it passes — confirmed live, where it
+skipped instead of failing. Drive the context manager directly with a
+`prctl(…, 0)` first so the starting value is pinned and the assertion is
+unconditional. Drive the **public** context manager, not the fixture object:
+pytest 9 wraps fixtures in `FixtureFunctionDefinition` with no
+`__pytest_wrapped__`, so reaching for the raw function is version-coupled. That
+split needs its own guard — the behavioural test only proves the fixture works
+if the fixture actually delegates, so `test_conftest_defines_the_autouse_restore_fixture`
+pins `autouse=True` *and* the delegation.
+
 `shellcheck` is likewise not installed on every dev host but does run in CI, so
 a `scripts/*.sh` change is unverified until pushed — and it catches things
 `bash -n` cannot (SC1007 on a bare `LANGUAGE=` prefix, and the backtick class

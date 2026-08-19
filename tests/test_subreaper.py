@@ -23,6 +23,7 @@ import subprocess
 import textwrap
 import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -718,3 +719,109 @@ def test_echild_retry_window_value_is_pinned(leerie):
         "the tracker must re-mark descendants far more often than the ECHILD "
         "window expires, or a live worker's descendants fall off the "
         "allowlist and their orphans are never reaped")
+
+
+# ----- the autouse restore fixture (tests/conftest.py) ---------------------
+#
+# `_become_subreaper()` mutates the CALLING process, so any test that drives
+# the real `main()` -- whose second statement it is, before argparse -- leaves
+# the pytest process a child-subreaper for the rest of the session. That
+# silently changes what process liveness means: an orphan that would reparent
+# to PID 1 and be reaped instead reparents to pytest, which never wait()s it,
+# so it lingers as a zombie still owning its PID slot and `os.kill(pid, 0)`
+# keeps succeeding. Measured: three `tests/test_signal_cleanup.py`
+# orphan-reaping assertions went red on CI with both that file and
+# `orchestrator/leerie.py` byte-identical to main. This file escaped only by
+# sorting after `test_signal_cleanup` -- an accident of filename, not a fix.
+
+def _read_child_subreaper(leerie) -> int:
+    """Current PR_CHILD_SUBREAPER value for this process, or -1 if unreadable."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    out = ctypes.c_int(0)
+    if libc.prctl(leerie._PR_GET_CHILD_SUBREAPER, ctypes.byref(out),
+                  0, 0, 0) != 0:
+        return -1
+    return out.value
+
+
+def _set_child_subreaper(leerie, value: int) -> None:
+    """Force this process's PR_CHILD_SUBREAPER to `value`."""
+    import ctypes
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    assert libc.prctl(leerie._PR_SET_CHILD_SUBREAPER, value, 0, 0, 0) == 0
+
+
+@linux_only
+def test_restore_fixture_puts_the_flag_back(leerie):
+    """Drive the autouse fixture's own setup/teardown around a real
+    `_become_subreaper()` call and assert the flag comes back.
+
+    Driven directly rather than as an ordered pair of tests. The obvious
+    ordered-pair shape -- one test sets the flag, the next asserts it was
+    restored -- is VACUOUS in precisely the case it exists to catch: with the
+    fixture broken, an earlier test in this very file
+    (`test_become_subreaper_sets_the_flag`) has already left the flag at 1,
+    so the second test's baseline is 1, it observes 1, and it passes. That was
+    confirmed live -- the pair skipped instead of failing when the fixture was
+    disabled. Driving the context manager here pins a known starting value, so
+    the assertion is unconditional."""
+    from tests import conftest
+
+    original = _read_child_subreaper(leerie)
+    try:
+        _set_child_subreaper(leerie, 0)
+        with conftest.child_subreaper_restored():
+            assert leerie._become_subreaper() is True
+            assert _read_child_subreaper(leerie) == 1, (
+                "precondition: _become_subreaper must actually set the flag, "
+                "or this test proves nothing about restoring it")
+        assert _read_child_subreaper(leerie) == 0, (
+            "tests/conftest.py's `child_subreaper_restored` did not restore "
+            "PR_SET_CHILD_SUBREAPER; every later orphan-liveness assertion "
+            "in the session is then measuring a zombie, not a live process")
+    finally:
+        if original in (0, 1):
+            _set_child_subreaper(leerie, original)
+
+
+def test_conftest_defines_the_autouse_restore_fixture():
+    """Structural partner to the behavioural pair above: the fixture exists,
+    is autouse, and lives in conftest (suite-wide) rather than in one file.
+
+    A per-file fixture would fix whichever file it was added to and leave the
+    next `main()`-driving file to rediscover this the same expensive way."""
+    src = (Path(__file__).resolve().parent / "conftest.py").read_text()
+    tree = ast.parse(src)
+    fn = next(
+        (n for n in tree.body
+         if isinstance(n, ast.FunctionDef) and n.name == "_restore_child_subreaper"),
+        None)
+    assert fn is not None, (
+        "tests/conftest.py must define `_restore_child_subreaper`")
+    autouse = [
+        kw for d in fn.decorator_list if isinstance(d, ast.Call)
+        for kw in d.keywords
+        if kw.arg == "autouse" and getattr(kw.value, "value", None) is True]
+    assert autouse, (
+        "`_restore_child_subreaper` must be autouse -- an opt-in fixture is "
+        "one every future main()-driving test file has to remember")
+    # The behavioural test drives `child_subreaper_restored` directly, so it
+    # only proves the fixture works if the fixture actually delegates to it.
+    assert "child_subreaper_restored" in ast.unparse(fn), (
+        "`_restore_child_subreaper` must delegate to "
+        "`child_subreaper_restored` -- otherwise the behavioural test "
+        "exercises a context manager the autouse fixture never calls")
+
+
+def test_conftest_prctl_constants_match_leeries(leerie):
+    """conftest duplicates the two prctl option numbers as literals rather
+    than importing them (it is autouse, and must not force the session-scoped
+    `leerie` module load onto every test). This is the coupling guard that
+    keeps the copy honest."""
+    from tests import conftest
+
+    assert conftest._PR_SET_CHILD_SUBREAPER == leerie._PR_SET_CHILD_SUBREAPER
+    assert conftest._PR_GET_CHILD_SUBREAPER == leerie._PR_GET_CHILD_SUBREAPER
