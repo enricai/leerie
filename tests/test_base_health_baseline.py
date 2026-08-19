@@ -283,13 +283,18 @@ def test_phase_execute_calls_baseline_gated_on_skip(leerie):
 
 def test_both_conformers_inject_baseline_section(leerie):
     """_run_conformer and _run_final_conformance must both append the
-    BASELINE: section so the conformer scopes residuals to the delta."""
+    BASELINE: section so the conformer scopes residuals to the delta. Both
+    delegate to the shared `_append_conformer_context_sections` helper
+    (refactor-002) rather than calling `_format_baseline_section` inline."""
     for fn in (leerie._run_conformer, leerie._run_final_conformance):
         src = inspect.getsource(fn)
-        assert "_format_baseline_section(" in src, (
-            f"{fn.__name__} must inject _format_baseline_section() into the "
-            "conformer prompt — without it the BASELINE: context is lost "
-            "and the conformer falls back to self-judging pre-existing.")
+        assert "_append_conformer_context_sections(" in src, (
+            f"{fn.__name__} must call _append_conformer_context_sections() "
+            "so the BASELINE: context is injected into the conformer "
+            "prompt — without it the conformer falls back to self-judging "
+            "pre-existing.")
+    helper_src = inspect.getsource(leerie._append_conformer_context_sections)
+    assert "_format_baseline_section(" in helper_src
 
 
 def test_phase_finalize_records_run_health(leerie):

@@ -46,9 +46,14 @@ def test_no_command_strings_are_injected(leerie, fn_name):
 @pytest.mark.parametrize("fn_name", ["_run_conformer", "_run_final_conformance"])
 def test_the_results_block_is_injected_instead(leerie, fn_name):
     """ANTI-VACUITY PARTNER for the absence test: an absence-only assertion
-    passes against a function that injects nothing at all."""
+    passes against a function that injects nothing at all. Both call sites
+    delegate to the shared `_append_conformer_context_sections` helper
+    (refactor-002) rather than calling `_format_blt_results_section` inline."""
     src = _strip_comments(inspect.getsource(getattr(leerie, fn_name)))
-    assert "_format_blt_results_section" in src
+    assert "_append_conformer_context_sections" in src
+    helper_src = _strip_comments(
+        inspect.getsource(leerie._append_conformer_context_sections))
+    assert "_format_blt_results_section" in helper_src
 
 
 def test_the_prompt_stops_asking_the_worker_to_run_the_axes(leerie):
@@ -212,7 +217,7 @@ def test_the_final_pass_uses_canonical_commands_only(leerie):
     src = _strip_comments(inspect.getsource(leerie._run_final_conformance))
     assert "_select_subtask_axes" not in src
     assert "resolve_blt_scoped" not in src
-    assert '_format_blt_results_section(pre, "full")' in src
+    assert '_append_conformer_context_sections(up, pre, "full", st)' in src
 
 
 # --------------------------------------------------------------------------
