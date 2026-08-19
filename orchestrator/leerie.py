@@ -20649,6 +20649,54 @@ def _find_oversized_added_subtasks(plans: list[dict]) -> list[dict]:
     return oversized
 
 
+def _merge_subtask_core_fields(
+    into_s: dict, from_s: dict, into_id: str, from_id: str
+) -> None:
+    """Mutate `into_s` in place with the union of `into_s`/`from_s`'s
+    `provides`, `requires`, and `depends_on` — shared by
+    `_apply_reconciler_output`'s `merged_subtasks` handling and
+    `_apply_overlap_merge`. `title`/`intent`/`success_criteria_seed`/
+    `files_likely_touched` merges are NOT identical between the two call
+    sites and stay local to each."""
+    # provides: union, dedup, order-preserving.
+    merged_provides = list(into_s.get("provides", []) or [])
+    for tag in (from_s.get("provides") or []):
+        if tag not in merged_provides:
+            merged_provides.append(tag)
+    into_s["provides"] = merged_provides
+
+    # requires: union, drop self-references (entries whose tag is now in
+    # the merged provides — would be a graph self-loop). External
+    # entries stay regardless (out-of-graph, surface as preconditions).
+    seen_req: set[tuple[str, str]] = set()
+    merged_requires = []
+    for entry in (list(into_s.get("requires", []) or [])
+                  + list(from_s.get("requires", []) or [])):
+        if not isinstance(entry, dict):
+            continue
+        tag = entry.get("tag", "")
+        extent = entry.get("extent", "")
+        key = (tag, extent)
+        if key in seen_req:
+            continue
+        seen_req.add(key)
+        if extent == "in_plan" and tag in merged_provides:
+            continue
+        merged_requires.append(entry)
+    into_s["requires"] = merged_requires
+
+    # depends_on: union minus self-references (would be a self-loop),
+    # dedup, order-preserving.
+    merged_deps: list[str] = []
+    for dep in (list(into_s.get("depends_on", []) or [])
+                + list(from_s.get("depends_on", []) or [])):
+        if dep == from_id or dep == into_id:
+            continue
+        if dep not in merged_deps:
+            merged_deps.append(dep)
+    into_s["depends_on"] = merged_deps
+
+
 def _apply_reconciler_output(
     plans: list[dict],
     output: dict,
@@ -20939,46 +20987,7 @@ def _apply_reconciler_output(
         into_s = by_id[into_id]
         from_s = by_id[from_id]
 
-        # provides: union (dedup, order-preserving).
-        merged_provides = list(into_s.get("provides", []) or [])
-        for tag in (from_s.get("provides") or []):
-            if tag not in merged_provides:
-                merged_provides.append(tag)
-        into_s["provides"] = merged_provides
-
-        # requires: union, then drop self-references (an entry whose tag
-        # is now in the merged provides is satisfied by the merged unit
-        # itself — would be a self-loop in the graph).
-        seen_req: set[tuple[str, str]] = set()
-        merged_requires = []
-        for entry in (list(into_s.get("requires", []) or [])
-                      + list(from_s.get("requires", []) or [])):
-            if not isinstance(entry, dict):
-                continue
-            tag = entry.get("tag", "")
-            extent = entry.get("extent", "")
-            key = (tag, extent)
-            if key in seen_req:
-                continue
-            seen_req.add(key)
-            # Self-reference cleanup: only drop in_plan entries whose
-            # tag is now produced by the merged unit. external entries
-            # are out-of-graph and stay regardless.
-            if extent == "in_plan" and tag in merged_provides:
-                continue
-            merged_requires.append(entry)
-        into_s["requires"] = merged_requires
-
-        # depends_on: union, minus `from` itself (would be a self-loop),
-        # dedup, order-preserving.
-        merged_deps: list[str] = []
-        for dep in (list(into_s.get("depends_on", []) or [])
-                    + list(from_s.get("depends_on", []) or [])):
-            if dep == from_id or dep == into_id:
-                continue
-            if dep not in merged_deps:
-                merged_deps.append(dep)
-        into_s["depends_on"] = merged_deps
+        _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
 
         # files_likely_touched: union, order-preserving dedup.
         merged_files: list[str] = []
@@ -23428,43 +23437,7 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
     elif from_scs:
         into_s["success_criteria_seed"] = from_scs
 
-    # provides: union, dedup, order-preserving.
-    merged_provides = list(into_s.get("provides", []) or [])
-    for tag in (from_s.get("provides") or []):
-        if tag not in merged_provides:
-            merged_provides.append(tag)
-    into_s["provides"] = merged_provides
-
-    # requires: union, drop self-references (entries whose tag is now in
-    # the merged provides — would be a graph self-loop). External
-    # entries stay regardless (out-of-graph, surface as preconditions).
-    seen_req: set[tuple[str, str]] = set()
-    merged_requires = []
-    for entry in (list(into_s.get("requires", []) or [])
-                  + list(from_s.get("requires", []) or [])):
-        if not isinstance(entry, dict):
-            continue
-        tag = entry.get("tag", "")
-        extent = entry.get("extent", "")
-        key = (tag, extent)
-        if key in seen_req:
-            continue
-        seen_req.add(key)
-        if extent == "in_plan" and tag in merged_provides:
-            continue
-        merged_requires.append(entry)
-    into_s["requires"] = merged_requires
-
-    # depends_on: union minus self-references (would be a self-loop),
-    # dedup, order-preserving.
-    merged_deps: list[str] = []
-    for dep in (list(into_s.get("depends_on", []) or [])
-                + list(from_s.get("depends_on", []) or [])):
-        if dep == from_id or dep == into_id:
-            continue
-        if dep not in merged_deps:
-            merged_deps.append(dep)
-    into_s["depends_on"] = merged_deps
+    _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
 
     # files_likely_touched: union, order-preserving dedup.
     merged_files: list[str] = []
