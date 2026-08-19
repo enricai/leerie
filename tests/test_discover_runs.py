@@ -126,6 +126,20 @@ def test_discover_runs_skips_malformed_fly_machine_json(leerie, tmp_path, capsys
     assert [r["run_id"] for r in runs] == ["feat-foo-abc123"]
 
 
+def test_discover_runs_skips_non_object_fly_machine_json(leerie, tmp_path, capsys):
+    """A fly-machine.json that parses as valid JSON but isn't an object
+    (e.g. a bare array) must be skipped and logged, same as the malformed
+    (unparseable) case. Other runs still surface."""
+    run_dir = tmp_path / "runs" / "feat-array-fly-xyz999"
+    run_dir.mkdir(parents=True)
+    (run_dir / "fly-machine.json").write_text("[1, 2, 3]")
+    _make_run(tmp_path, "feat-foo-abc123",
+              {"task": "x", "started_at": "2026-05-26T10:00:00+00:00"})
+    runs = leerie._discover_runs(tmp_path)
+    assert [r["run_id"] for r in runs] == ["feat-foo-abc123"]
+    assert "not a JSON object" in capsys.readouterr().out
+
+
 def test_discover_runs_mixed_orphan_and_healthy(leerie, tmp_path):
     """Orphans and healthy runs coexist in list — sorted by
     started_at descending like any other rows."""

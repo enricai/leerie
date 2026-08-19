@@ -83,6 +83,16 @@ class TestLiveDuplicateDetection:
         _run_json(tmp_path, "other", task_sha256="")
         assert leerie._live_duplicate_runs(tmp_path, "mine", "") == []
 
+    def test_non_dict_sidecar_is_skipped_not_fatal(self, leerie, tmp_path):
+        """A syntactically valid but non-object run.json (e.g. a bare JSON
+        array) must be skipped like an unreadable one, not crash the
+        duplicate check with an AttributeError on `.get`."""
+        d = tmp_path / "runs" / "not-a-dict"
+        d.mkdir(parents=True)
+        (d / "run.json").write_text("[1, 2, 3]")
+        _run_json(tmp_path, "other", task_sha256="abc")
+        assert leerie._live_duplicate_runs(tmp_path, "mine", "abc") == ["other"]
+
 
 class _ReachedClassify(Exception):
     """Raised by the stubbed `phase_classify` — the first worker call after the
