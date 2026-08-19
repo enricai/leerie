@@ -103,3 +103,59 @@ def test_unknown_audience_raises(leerie):
     with pytest.raises(ValueError, match="unknown audience"):
         leerie._format_provision_recipe_section(
             [PNPM_INSTALL], audience="planner")
+
+
+def test_all_baked_ecosystem_recipe_returns_none(leerie):
+    """A recipe whose only install is a fully-baked ecosystem (Python)
+    filters down to nothing — the whole point of the bake, and distinct
+    from `test_empty_recipe_returns_none` (which starts with no entries
+    at all rather than filtering every entry away)."""
+    pip_install = {
+        "kind": "install", "command": ["pip", "install", "-r", "requirements.txt"],
+        "working_dir": ".", "timeout_s": 300,
+    }
+    assert leerie._format_provision_recipe_section(
+        [pip_install], audience="implementer") is None
+
+
+# --- _is_baked_ecosystem_command: the filter itself, in isolation --------
+
+def test_is_baked_ecosystem_command_empty_command_is_false(leerie):
+    assert leerie._is_baked_ecosystem_command([]) is False
+
+
+@pytest.mark.parametrize("cmd", [
+    ["pip", "install", "-r", "requirements.txt"],
+    ["pip3", "install", "foo"],
+    ["uv", "sync"],
+    ["poetry", "install"],
+    ["pipenv", "install"],
+    ["python", "-m", "pip", "install", "foo"],
+    ["python3", "-m", "pip", "install", "foo"],
+])
+def test_is_baked_ecosystem_command_python_variants(leerie, cmd):
+    assert leerie._is_baked_ecosystem_command(cmd) is True
+
+
+def test_is_baked_ecosystem_command_python_dash_m_without_pip_is_false(leerie):
+    # `-m` present but not followed by `pip` — must not false-positive.
+    assert leerie._is_baked_ecosystem_command(
+        ["python", "-m", "venv", ".venv"]) is False
+
+
+def test_is_baked_ecosystem_command_ruby(leerie):
+    assert leerie._is_baked_ecosystem_command(["bundle", "install"]) is True
+
+
+def test_is_baked_ecosystem_command_rust(leerie):
+    assert leerie._is_baked_ecosystem_command(["cargo", "fetch"]) is True
+
+
+def test_is_baked_ecosystem_command_go(leerie):
+    assert leerie._is_baked_ecosystem_command(["go", "mod", "download"]) is True
+
+
+def test_is_baked_ecosystem_command_node_is_false(leerie):
+    # Node/pnpm is the documented irreducible residual — never baked.
+    assert leerie._is_baked_ecosystem_command(
+        ["pnpm", "install", "--frozen-lockfile"]) is False
