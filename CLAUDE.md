@@ -2625,7 +2625,10 @@ unguarded instance of the class: all four call sites
 dispatch) expanded their creds-args array as a bare `"${arr[@]}"`
 instead of `${arr[@]+"${arr[@]}"}` — fixed in the same change. The
 nameref ban was likewise extended to `leerie` itself
-(`test_no_namerefs_in_launcher`).
+(`test_no_namerefs_in_launcher`). A later child added
+`pytest.param(["accept-integration", ...])`, covering
+`accept-integration`'s own `_ai_aws_creds_args` array expansion the
+same way.
 
 **Host-only tests are gated on `jq`** (`HAS_JQ` in `tests/conftest.py`,
 mirroring the `HAS_TREESITTER` pattern). Five modules —
