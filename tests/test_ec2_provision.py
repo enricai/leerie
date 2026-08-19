@@ -19,6 +19,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from tests.ec2_stub import _stub_aws, leaked_resources, read_log, read_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -75,6 +77,36 @@ def test_provision_instance_fails_when_ami_unset(tmp_path):
 
     assert result.returncode != 0
     assert "LEERIE_EC2_AMI" in result.stderr
+
+
+@pytest.mark.parametrize(
+    "missing_var",
+    [
+        "LEERIE_EC2_AMI",
+        "LEERIE_EC2_INSTANCE_TYPE",
+        "LEERIE_EC2_KEY_NAME",
+        "LEERIE_EC2_SECURITY_GROUP",
+        "LEERIE_EC2_SUBNET_ID",
+    ],
+)
+def test_provision_instance_fails_closed_when_required_var_unset(tmp_path, missing_var):
+    """Each of the 5 instance-shape vars is independently required —
+    blanking just one (with the other 4 present) must fail closed before
+    any `aws ec2 run-instances` call reaches the stub, and stderr must
+    name the specific missing var."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    env = _stub_env(aws_dir)
+    env[missing_var] = ""
+
+    result = _run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+
+    assert result.returncode != 0
+    assert missing_var in result.stderr
+
+    log = read_log(aws_dir)
+    run_instances_calls = [l for l in log if l.startswith("ec2 run-instances")]
+    assert run_instances_calls == []
 
 
 def test_provision_instance_fails_when_aws_missing():
