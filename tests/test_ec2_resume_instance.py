@@ -26,11 +26,22 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import run_bash
 from tests.ec2_stub import _stub_aws, leaked_resources, read_log, read_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "ec2-provision.sh"
 EC2_RESUME_SH = REPO_ROOT / "scripts" / "remote" / "ec2-resume-instance.sh"
+
+
+@pytest.fixture(autouse=True)
+def _no_leerie_state_dir(monkeypatch):
+    """LEERIE_STATE_DIR must never leak into these tests' subprocess env —
+    see the footgun reminder above (LEERIE_STATE_HOST_DIR is the knob these
+    scripts actually consume)."""
+    monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
 
 REQUIRED_ENV = {
     "LEERIE_EC2_AMI": "ami-0123456789abcdef0",
@@ -39,19 +50,6 @@ REQUIRED_ENV = {
     "LEERIE_EC2_SECURITY_GROUP": "sg-0123456789abcdef0",
     "LEERIE_EC2_SUBNET_ID": "subnet-0123456789abcdef0",
 }
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    base_env.pop("LEERIE_STATE_DIR", None)
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _stub_env(aws_dir: Path, extra: dict | None = None) -> dict:
@@ -97,7 +95,7 @@ def test_resume_instance_starts_a_stopped_instance(tmp_path):
     iid = _seed_stopped_instance(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -125,7 +123,7 @@ def test_resume_instance_readiness_poll_does_not_return_early(tmp_path):
     iid = _seed_stopped_instance(aws_dir, status_ok=False)
     env = _stub_env(aws_dir, {"LEERIE_INSTANCE_START_TIMEOUT": "3"})
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -142,7 +140,7 @@ def test_resume_instance_readiness_poll_succeeds_once_status_ok(tmp_path):
     iid = _seed_stopped_instance(aws_dir, status_ok=True)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -164,7 +162,7 @@ def test_resume_instance_reresolves_ssh_target(tmp_path):
     iid = _seed_stopped_instance(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; "
         f"resume_instance {iid} && echo \"target=$LEERIE_EC2_SSH_TARGET\"",
         env=env,
@@ -186,7 +184,7 @@ def test_provision_stop_resume_round_trip_leaves_one_running_instance(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         "_try_fetch_state_for_ec2_teardown() { return 0; }; "
         "provision_instance; "
@@ -208,7 +206,7 @@ def test_provision_stop_resume_round_trip_leaves_one_running_instance(tmp_path):
     state = read_state(aws_dir)
     assert state["instances"][iid]["state"] == "stopped"
 
-    result2 = _run_bash(
+    result2 = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -238,7 +236,7 @@ def test_provision_stop_resume_terminate_round_trip_leaves_no_leaks(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         "_try_fetch_state_for_ec2_teardown() { return 0; }; "
         "provision_instance; "
@@ -259,7 +257,7 @@ def test_provision_stop_resume_terminate_round_trip_leaves_no_leaks(tmp_path):
     # ec2-resume-instance.sh re-sources ec2-provision.sh internally, which
     # would clobber a fetch stub defined before that source line — define
     # it after both sources instead.
-    result2 = _run_bash(
+    result2 = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         f"source {EC2_RESUME_SH}; "
         "_try_fetch_state_for_ec2_teardown() { return 0; }; "
@@ -321,7 +319,7 @@ _try_fetch_state_for_ec2_teardown() {{
 resume_instance {iid}
 export LEERIE_REMOTE_EXIT_RC=0 )
 """
-    result = _run_bash(script, env=env)
+    result = run_bash(script, env=env)
     assert result.returncode == 0, f"stderr: {result.stderr}"
 
     state = read_state(aws_dir)
@@ -363,7 +361,7 @@ _try_fetch_state_for_ec2_teardown() {{ return 1; }}
 resume_instance {iid}
 export LEERIE_REMOTE_EXIT_RC=0 )
 """
-    result = _run_bash(script, env=env)
+    result = run_bash(script, env=env)
     assert result.returncode == 0, f"stderr: {result.stderr}"
 
     state = read_state(aws_dir)
@@ -385,7 +383,7 @@ def test_resume_instance_on_already_running_is_noop(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         "provision_instance; "
         "echo \"iid=$LEERIE_EC2_INSTANCE_ID\" )",
@@ -397,7 +395,7 @@ def test_resume_instance_on_already_running_is_noop(tmp_path):
     state = read_state(aws_dir)
     assert state["instances"][iid]["state"] == "running"
 
-    result2 = _run_bash(
+    result2 = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -418,7 +416,7 @@ def test_resume_instance_never_terminates_or_deletes_volume(tmp_path):
     iid = _seed_stopped_instance(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -438,7 +436,7 @@ def test_resume_instance_failure_path_never_terminates_or_deletes_volume(tmp_pat
     iid = _seed_stopped_instance(aws_dir, status_ok=False)
     env = _stub_env(aws_dir, {"LEERIE_INSTANCE_START_TIMEOUT": "2"})
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -473,7 +471,7 @@ def test_resume_instance_source_contains_no_terminate_or_delete_volume_calls():
 
 
 def test_resume_instance_requires_instance_id():
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance ''",
         env={**REQUIRED_ENV, "PATH": "/usr/bin:/bin"},
     )
@@ -486,7 +484,7 @@ def test_resume_instance_fails_on_unknown_instance(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance i-doesnotexist",
         env=env,
     )
@@ -519,7 +517,7 @@ def test_resume_instance_clears_pause_sidecar_fields(tmp_path):
         "LEERIE_RUN_ID": run_id,
     })
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )
@@ -561,7 +559,7 @@ def test_resume_instance_unresolvable_ip_warns_but_still_succeeds(tmp_path):
     (aws_dir / "state.json").write_text(json.dumps(state))
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; "
         f"resume_instance {iid}; rc=$?; "
         f"trap - EXIT INT TERM; "
@@ -593,7 +591,7 @@ def test_resume_instance_unexpected_state_fails_without_starting(tmp_path):
     (aws_dir / "state.json").write_text(json.dumps(state))
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}",
         env=env,
     )

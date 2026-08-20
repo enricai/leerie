@@ -21,20 +21,10 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_bash
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FORCE_FINALIZE_SH = REPO_ROOT / "scripts" / "remote" / "force-finalize.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path) -> Path:
@@ -128,7 +118,7 @@ def test_force_finalize_sh_is_executable():
 
 def test_refuses_when_no_machine_id():
     """force_finalize_remote returns 1 when LEERIE_MACHINE_ID is empty."""
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie ''",
         env={"LEERIE_REPO": str(REPO_ROOT)},
     )
@@ -151,7 +141,7 @@ def test_patches_dead_run(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -180,7 +170,7 @@ def test_idempotent_when_already_finalized(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -208,7 +198,7 @@ def test_refuses_when_pid_alive(tmp_path):
     # The /proc check only works on Linux; on Darwin the script falls
     # through to the alive-but-not-python branch which still patches.
     # Gate the assertion on platform.
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -246,7 +236,7 @@ def test_refuses_when_pid_file_missing(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -271,7 +261,7 @@ def test_refuses_on_multiple_run_dirs(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -288,7 +278,7 @@ def test_refuses_on_zero_run_dirs(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -340,7 +330,7 @@ def test_refuses_when_proc_scan_finds_live_orchestrator(tmp_path):
             "LEERIE_REPO": str(REPO_ROOT),
             "PATH": f"{stub.parent}:{os.environ['PATH']}",
         }
-        result = _run_bash(
+        result = run_bash(
             f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
             env=env,
         )
@@ -382,7 +372,7 @@ def test_patches_when_proc_scan_finds_nothing(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )

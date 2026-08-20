@@ -38,22 +38,12 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_bash
+
 from tests.stub_helpers import _make_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_stub_flyctl(stub_path: Path, exec_log: Path, dest_dir: Path,
@@ -232,7 +222,7 @@ def test_seed_inspect_dirs_no_op_when_empty(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, tmp_path)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -249,7 +239,7 @@ def test_seed_inspect_dirs_no_op_when_empty(tmp_path):
 
 
 def test_seed_inspect_dirs_fails_without_machine_id(tmp_path):
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "",
@@ -270,7 +260,7 @@ def test_seed_inspect_dirs_skips_malformed_record(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -297,7 +287,7 @@ def test_seed_inspect_dirs_skips_non_inspect_targets(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src}\t/work/sub"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -325,7 +315,7 @@ def test_seed_inspect_dirs_creates_inspect_parent_first(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src}\t/inspect/first"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -366,7 +356,7 @@ def test_seed_inspect_dirs_git_repo_uses_bundle_clone(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src}\t/inspect/beacon"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -406,7 +396,7 @@ def test_seed_inspect_dirs_git_repo_includes_dirty_delta(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src}\t/inspect/beacon"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -449,7 +439,7 @@ def test_seed_inspect_dirs_skips_bundle_on_resume(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src}\t/inspect/beacon"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -490,7 +480,7 @@ def test_seed_inspect_dirs_clones_new_dir_added_at_resume(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src_a}\t/inspect/old\n{src_b}\t/inspect/new"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -530,7 +520,7 @@ def test_seed_inspect_dirs_aborts_on_rsync_failure(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src_a}\t/inspect/alpha\n{src_b}\t/inspect/bravo"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -566,7 +556,7 @@ def test_seed_inspect_dirs_non_git_dir_uses_plain_rsync(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src}\t/inspect/docs"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -600,7 +590,7 @@ def test_seed_inspect_dirs_non_git_preserves_nfc_unicode_filenames(tmp_path):
     _make_stub_timeout(tmp_path)
 
     record = f"{src}\t/inspect/docs"
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_inspect_dirs",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
