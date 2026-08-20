@@ -2,16 +2,17 @@
 in exactly one place: `tests/conftest.py`'s `run_git_repo_first` /
 `run_git_cwd_kw` / `run_git_cwd_first_stdout` / `init_git_repo`.
 
-The `_git(...)` migration (refactor-002/003/004, three distinct signature
-families) is complete; `_init_repo(...)` migration is still in progress —
-migrating those remaining call sites is separate, later work. This guard is
-written so that a test file cannot quietly reintroduce a local
-reimplementation instead of importing the shared helper.
+Both migrations are complete: no `tests/test_*.py` defines a local `_git(...)`
+(refactor-002/003/004, three distinct signature families) or `_init_repo(...)`
+helper any more. So this guard is fully strict on both halves — every hit is a
+new regression, and both known-offender snapshots are empty.
 
-Until `_init_repo` migration completes, this test is intentionally scoped to
-catch NEW occurrences without failing on the pre-existing ones: it snapshots
-the currently-known offenders and fails only if a file outside that snapshot
-(or `tests/conftest.py` itself) defines `def _git(` or `def _init_repo(`.
+An allowlist that is empty on both halves means the enforcement tests pass by
+finding nothing, which a broken glob or a broken regex also achieves. The
+positive controls below (`test_the_scan_enumerates_the_tests_directory`,
+`test_the_patterns_detect_a_planted_definition`) exist so that a scan which has
+silently stopped scanning fails as a broken scan rather than certifying
+everything.
 """
 from __future__ import annotations
 
@@ -23,30 +24,20 @@ TESTS_DIR = Path(__file__).resolve().parent
 _GIT_DEF_RE = re.compile(r"^\s*def _git\(", re.MULTILINE)
 _INIT_REPO_DEF_RE = re.compile(r"^\s*def _init_repo\(", re.MULTILINE)
 
-# Files that pre-date the shared conftest helpers (measured via Grep at the
-# time this guard was written). Migrating each off its local `_git`/
-# `_init_repo` is separate, later work — see this subtask's investigation_notes.
-#
-# The last batch of local `_git(...)` definitions (refactor-002/003/004)
-# has been migrated, so this set is now empty — every remaining `_git(...)`
-# occurrence is a genuinely new regression, not a pre-existing offender.
+# Files that pre-dated the shared conftest helpers. Both snapshots are now
+# empty: the last batch of local `_git(...)` definitions (refactor-002/003/004)
+# and the last batch of local `_init_repo(...)` definitions have both been
+# migrated, so every remaining occurrence of either is a genuinely new
+# regression rather than a pre-existing offender. The sets are kept (rather
+# than deleted along with the `hits - KNOWN` subtraction) so that a future
+# partial migration has somewhere to record its own snapshot.
 _KNOWN_GIT_OFFENDERS: set[str] = set()
-
-_KNOWN_INIT_REPO_OFFENDERS = {
-    "test_check_rebaser_worktree_state.py",
-    "test_external_leerie_branch.py",
-    "test_finalize_sh_behavior.py",
-    "test_host_finalize_hook_probe.py",
-    "test_host_finalize_rebase.py",
-    "test_main_cli_wiring.py",
-    "test_run_rebaser.py",
-    "test_scan_conflict_markers.py",
-}
+_KNOWN_INIT_REPO_OFFENDERS: set[str] = set()
 
 
-def _files_defining(pattern: re.Pattern) -> set[str]:
+def _files_defining(pattern: re.Pattern, root: Path = TESTS_DIR) -> set[str]:
     hits: set[str] = set()
-    for path in sorted(TESTS_DIR.glob("test_*.py")):
+    for path in sorted(root.glob("test_*.py")):
         try:
             text = path.read_text(errors="replace")
         except OSError:
@@ -87,21 +78,71 @@ def test_no_new_local_init_repo_definitions() -> None:
 
 
 def test_offender_lists_can_shrink_when_migration_lands() -> None:
-    """Anti-vacuity: prove the snapshot lists actually reflect current
-    reality, so a file quietly migrating off its local helper is noticed
-    (a stale entry doesn't break enforcement, but it does mean the guard
-    has drifted from what it claims to describe).
+    """Prove the snapshot lists still reflect current reality.
 
-    The `_git(...)` migration (refactor-002/003/004) is complete, so
-    `_KNOWN_GIT_OFFENDERS` is deliberately empty and `git_hits` is expected
-    to be empty too — asserted via the equality check below rather than a
-    non-empty check, which would now be vacuously false. `_init_repo(...)`
-    migration is not yet complete, so that half still asserts non-empty."""
+    Both migrations are complete, so both halves assert equality against the
+    empty set rather than a non-empty check (which would now be vacuously
+    false). Asserting the allowlists themselves are empty is what catches a
+    silent re-expansion: adding a name back would otherwise let a new local
+    helper through `test_no_new_local_*` unnoticed.
+    """
+    assert _KNOWN_GIT_OFFENDERS == set(), (
+        f"_KNOWN_GIT_OFFENDERS grew back to {sorted(_KNOWN_GIT_OFFENDERS)}; an "
+        "allowlisted file is exempt from the enforcement guard above"
+    )
+    assert _KNOWN_INIT_REPO_OFFENDERS == set(), (
+        f"_KNOWN_INIT_REPO_OFFENDERS grew back to "
+        f"{sorted(_KNOWN_INIT_REPO_OFFENDERS)}; an allowlisted file is exempt "
+        "from the enforcement guard above"
+    )
+
     git_hits = _files_defining(_GIT_DEF_RE)
     init_hits = _files_defining(_INIT_REPO_DEF_RE)
     assert git_hits == set(), (
         f"expected zero remaining _git(...) definitions now that migration "
-        f"is complete; found {sorted(git_hits)} — either update "
-        "_KNOWN_GIT_OFFENDERS or migrate these files"
+        f"is complete; found {sorted(git_hits)} — either migrate these files "
+        "or record them in _KNOWN_GIT_OFFENDERS"
     )
-    assert init_hits, "expected at least one pre-migration _init_repo(...) definition"
+    assert init_hits == set(), (
+        f"expected zero remaining _init_repo(...) definitions now that "
+        f"migration is complete; found {sorted(init_hits)} — either migrate "
+        "these files or record them in _KNOWN_INIT_REPO_OFFENDERS"
+    )
+
+
+def test_the_scan_enumerates_the_tests_directory() -> None:
+    """Anti-vacuity: a glob that matches nothing makes every guard above pass.
+
+    The floor is deliberately far below the real count (514 at the time of
+    writing) — this catches a broken root/pattern, not a shrinking suite.
+    """
+    found = list(TESTS_DIR.glob("test_*.py"))
+    assert len(found) > 100, (
+        f"the scan enumerated only {len(found)} test files under {TESTS_DIR}; "
+        "the guards above are passing because they are scanning nothing"
+    )
+
+
+def test_the_patterns_detect_a_planted_definition(tmp_path: Path) -> None:
+    """Anti-vacuity: drive the real `_files_defining` over a planted tree.
+
+    Covers the module-level and the nested/indented form (hence `re.MULTILINE`
+    plus the leading `\\s*`), proves a non-matching file is not swept up, and
+    pins the negative control: `_init_repo_with_origin(...)` is a real name in
+    tests/test_host_finalize_rebase.py, so widening the regex to drop the `\\(`
+    would start false-positiving that file.
+    """
+    (tmp_path / "test_planted_git.py").write_text(
+        "import subprocess\n\n\ndef _git(*args):\n    return args\n"
+    )
+    (tmp_path / "test_planted_init_repo.py").write_text(
+        "class T:\n    def _init_repo(self, tmp_path):\n        return tmp_path\n"
+    )
+    (tmp_path / "test_planted_clean.py").write_text(
+        "def _init_repo_with_origin(tmp_path):\n    return tmp_path\n"
+    )
+
+    assert _files_defining(_GIT_DEF_RE, root=tmp_path) == {"test_planted_git.py"}
+    assert _files_defining(_INIT_REPO_DEF_RE, root=tmp_path) == {
+        "test_planted_init_repo.py"
+    }
