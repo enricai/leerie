@@ -40,31 +40,12 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.ec2_stub import _stub_aws, read_state, seed_running_instance, write_ec2_sidecar
+from tests.ec2_stub import build_ec2_launcher_env, _stub_aws, read_state, seed_running_instance, write_ec2_sidecar
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
 RUN_ID = "ec2-run-0001"
-
-
-def _env(tmp_path: Path, aws_dir: Path, *, home: Path | None = None) -> dict:
-    state_dir = tmp_path / ".leerie" / "myrepo"
-    if home is None:
-        home = tmp_path / "home"
-        home.mkdir(parents=True, exist_ok=True)
-    env = {
-        "PATH": f"{aws_dir}:/usr/bin:/bin",
-        "USER_REPO": str(tmp_path),
-        "LEERIE_REPO": str(REPO_ROOT),
-        "HOME": str(home),
-        "LEERIE_STATE_HOST_DIR": str(state_dir),
-        "LEERIE_STATE_DIR": str(state_dir),
-        "AWS_ACCESS_KEY_ID": "AKIASTUBFIXTURE",
-        "AWS_SECRET_ACCESS_KEY": "stubfixturesecret",
-        "AWS_REGION": "us-east-1",
-    }
-    return env, state_dir
 
 
 def _run(tmp_path: Path, args: list[str], env: dict) -> subprocess.CompletedProcess:
@@ -80,7 +61,7 @@ def test_stop_ec2_run_stops_instance_and_writes_sidecar(tmp_path: Path) -> None:
     _stub_aws(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir = _env(tmp_path, aws_dir)
+    env, state_dir = build_ec2_launcher_env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
 
@@ -106,7 +87,7 @@ def test_stop_ec2_run_explicit_runtime_flag(tmp_path: Path) -> None:
     _stub_aws(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir = _env(tmp_path, aws_dir)
+    env, state_dir = build_ec2_launcher_env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
 
@@ -124,7 +105,7 @@ def test_stop_ec2_run_does_not_terminate_instance(tmp_path: Path) -> None:
     _stub_aws(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir = _env(tmp_path, aws_dir)
+    env, state_dir = build_ec2_launcher_env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
 
@@ -146,7 +127,7 @@ def test_stop_local_path_unchanged(tmp_path: Path) -> None:
     aws_dir.mkdir()
     _stub_aws(aws_dir)
 
-    env, state_dir = _env(tmp_path, aws_dir)
+    env, state_dir = build_ec2_launcher_env(tmp_path, aws_dir)
     run_id = "local-run-0001"
     run_dir = state_dir / "runs" / run_id
     run_dir.mkdir(parents=True)
@@ -166,7 +147,7 @@ def test_stop_runtime_flag_rejects_unknown_value(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    env, _ = _env(tmp_path, aws_dir)
+    env, _ = build_ec2_launcher_env(tmp_path, aws_dir)
     result = _run(tmp_path, ["stop", "some-run", "--runtime", "bogus"], env)
     assert result.returncode == 1
     assert "must be 'local', 'fly', or 'ec2'" in result.stderr
@@ -181,7 +162,7 @@ def test_stop_ec2_run_missing_instance_id_fails_closed(tmp_path: Path) -> None:
     aws_dir.mkdir()
     _stub_aws(aws_dir)
 
-    env, state_dir = _env(tmp_path, aws_dir)
+    env, state_dir = build_ec2_launcher_env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
     run_dir.mkdir(parents=True)
     (run_dir / "ec2-instance.json").write_text(json.dumps({
@@ -207,7 +188,7 @@ def test_stop_ec2_run_credential_failure_does_not_call_stop_instances(tmp_path: 
     _stub_aws(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir = _env(tmp_path, aws_dir)
+    env, state_dir = build_ec2_launcher_env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
     # No $HOME/.aws and no AWS_* env vars → resolve_aws_credentials fails
@@ -238,7 +219,7 @@ def test_stop_unknown_flag_errors(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    env, _ = _env(tmp_path, aws_dir)
+    env, _ = build_ec2_launcher_env(tmp_path, aws_dir)
     result = _run(tmp_path, ["stop", "some-run", "--bogus-flag"], env)
     assert result.returncode == 1
     assert "unknown stop flag" in result.stderr
@@ -250,7 +231,7 @@ def test_stop_unexpected_second_positional_errors(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    env, _ = _env(tmp_path, aws_dir)
+    env, _ = build_ec2_launcher_env(tmp_path, aws_dir)
     result = _run(tmp_path, ["stop", "run-a", "run-b"], env)
     assert result.returncode == 1
     assert "unexpected stop arg" in result.stderr

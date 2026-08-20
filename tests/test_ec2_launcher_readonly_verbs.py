@@ -46,6 +46,7 @@ from pathlib import Path
 
 from tests.ec2_stub import (
     _STUB_SOURCE,
+    build_ec2_launcher_env,
     read_log,
     read_state,
     seed_running_instance,
@@ -179,27 +180,6 @@ def _seed_remote_state(work_dest: Path, run_id: str, state: dict) -> Path:
     return path
 
 
-def _env(tmp_path: Path, aws_dir: Path) -> tuple[dict, Path, Path]:
-    state_dir = tmp_path / ".leerie" / "myrepo"
-    home = tmp_path / "home"
-    home.mkdir(parents=True, exist_ok=True)
-    work_dest = tmp_path / "remote-work"
-    work_dest.mkdir(parents=True, exist_ok=True)
-    env = {
-        "PATH": f"{aws_dir}:/usr/bin:/bin",
-        "USER_REPO": str(tmp_path),
-        "LEERIE_REPO": str(REPO_ROOT),
-        "HOME": str(home),
-        "LEERIE_STATE_HOST_DIR": str(state_dir),
-        "LEERIE_STATE_DIR": str(state_dir),
-        "AWS_ACCESS_KEY_ID": "AKIASTUBFIXTURE",
-        "AWS_SECRET_ACCESS_KEY": "stubfixturesecret",
-        "AWS_REGION": "us-east-1",
-        "LEERIE_TEST_WORK_DEST": str(work_dest),
-    }
-    return env, state_dir, work_dest
-
-
 def _run(args: list[str], env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
         ["bash", str(LAUNCHER)] + args,
@@ -219,7 +199,7 @@ def test_accept_blocked_ec2_autodetects_runtime_not_local(tmp_path: Path) -> Non
     _stub_aws_with_ssm(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir, work_dest = _env(tmp_path, aws_dir)
+    env, state_dir, work_dest = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
@@ -242,7 +222,7 @@ def test_accept_blocked_ec2_writes_accept_record(tmp_path: Path) -> None:
     _stub_aws_with_ssm(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir, work_dest = _env(tmp_path, aws_dir)
+    env, state_dir, work_dest = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid,
                         with_host_state={"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
@@ -268,7 +248,7 @@ def test_accept_blocked_ec2_explicit_runtime_flag_accepted(tmp_path: Path) -> No
     _stub_aws_with_ssm(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir, work_dest = _env(tmp_path, aws_dir)
+    env, state_dir, work_dest = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
@@ -285,7 +265,7 @@ def test_accept_blocked_rejects_unknown_runtime_value(tmp_path: Path) -> None:
     validation entirely."""
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
-    env, _, _ = _env(tmp_path, aws_dir)
+    env, _, _ = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     result = _run(["accept-blocked", "some-run", "some-sid", "--runtime", "bogus"], env)
     assert result.returncode == 1
     assert "must be 'local', 'fly', or 'ec2'" in result.stderr
@@ -299,7 +279,7 @@ def test_accept_blocked_ec2_wakes_stopped_instance_and_repauses(tmp_path: Path) 
     _stub_aws_with_ssm(aws_dir)
     iid = _seed_stopped_instance(aws_dir)
 
-    env, state_dir, work_dest = _env(tmp_path, aws_dir)
+    env, state_dir, work_dest = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
@@ -328,7 +308,7 @@ def test_accept_blocked_ec2_already_running_not_paused_afterward(tmp_path: Path)
     _stub_aws_with_ssm(aws_dir)
     iid = seed_running_instance(aws_dir)
 
-    env, state_dir, work_dest = _env(tmp_path, aws_dir)
+    env, state_dir, work_dest = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     run_dir = state_dir / "runs" / RUN_ID
     write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
@@ -348,7 +328,7 @@ def test_accept_blocked_ec2_missing_instance_id_fails_closed(tmp_path: Path) -> 
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
 
-    env, state_dir, _ = _env(tmp_path, aws_dir)
+    env, state_dir, _ = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     run_dir = state_dir / "runs" / RUN_ID
     run_dir.mkdir(parents=True)
     (run_dir / "ec2-instance.json").write_text(json.dumps({
@@ -370,7 +350,7 @@ def test_accept_blocked_local_path_unchanged(tmp_path: Path) -> None:
     takes the local path unchanged."""
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
-    env, state_dir, _ = _env(tmp_path, aws_dir)
+    env, state_dir, _ = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
     run_id = "local-run-ab01"
     run_dir = state_dir / "runs" / run_id
     run_dir.mkdir(parents=True)

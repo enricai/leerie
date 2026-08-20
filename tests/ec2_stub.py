@@ -454,6 +454,61 @@ def write_ec2_sidecar(
     return run_dir
 
 
+# --- Shared launcher-env builder -------------------------------------------
+#
+# tests/test_ec2_launcher_readonly_verbs.py and
+# tests/test_ec2_launcher_stop.py each defined a near-identical `_env(tmp_path,
+# aws_dir)` building the minimal PATH/USER_REPO/LEERIE_REPO/HOME/
+# LEERIE_STATE_HOST_DIR/LEERIE_STATE_DIR/AWS_* env dict a `leerie` launcher
+# subprocess invocation needs against the stubbed `aws` binary. They diverged
+# only in extras: readonly_verbs.py additionally creates a `remote-work` dir
+# and returns it as a 3-tuple `(env, state_dir, work_dest)`; stop.py accepts
+# an optional pre-built `home` Path and returns a 2-tuple `(env, state_dir)`.
+# Single-owner discipline (same precedent as the state-machine stub above):
+# one parameterized version here, reconciled via optional params the way
+# `write_ec2_sidecar` reconciles its callers' divergent optional params.
+
+
+def build_ec2_launcher_env(
+    tmp_path: Path,
+    aws_dir: Path,
+    *,
+    home: Path | None = None,
+    with_work_dest: bool = False,
+) -> tuple[dict, Path] | tuple[dict, Path, Path]:
+    """Build the minimal env dict for a `leerie` launcher subprocess run
+    against a stubbed `aws` binary.
+
+    Returns `(env, state_dir)` by default, or `(env, state_dir, work_dest)`
+    when `with_work_dest=True` — mirroring the two callers' original
+    2-tuple/3-tuple return shapes so each keeps its own unpacking. `home`,
+    when given, is used as-is instead of creating a fresh `tmp_path/"home"`
+    dir (test_ec2_launcher_stop.py's isolation-guard test needs a home dir
+    it controls independently).
+    """
+    state_dir = tmp_path / ".leerie" / "myrepo"
+    if home is None:
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": f"{aws_dir}:/usr/bin:/bin",
+        "USER_REPO": str(tmp_path),
+        "LEERIE_REPO": str(REPO_ROOT),
+        "HOME": str(home),
+        "LEERIE_STATE_HOST_DIR": str(state_dir),
+        "LEERIE_STATE_DIR": str(state_dir),
+        "AWS_ACCESS_KEY_ID": "AKIASTUBFIXTURE",
+        "AWS_SECRET_ACCESS_KEY": "stubfixturesecret",
+        "AWS_REGION": "us-east-1",
+    }
+    if not with_work_dest:
+        return env, state_dir
+    work_dest = tmp_path / "remote-work"
+    work_dest.mkdir(parents=True, exist_ok=True)
+    env["LEERIE_TEST_WORK_DEST"] = str(work_dest)
+    return env, state_dir, work_dest
+
+
 # --- Shared SSM-exec-decode `aws`/`ssh` stub builders ---------------------
 #
 # tests/test_ec2_seed_repo.py, tests/test_ec2_fetch_branch.py, and
