@@ -18,21 +18,7 @@ _DEF_RE = re.compile(r"^\s*def _run_bash\(", re.MULTILINE)
 # is a shrink-only allowlist: a migration subtask removes a file's local
 # `_run_bash` def, drops the file's name from this set in the same
 # commit, and CI catches any new local `_run_bash` def outside this set.
-_KNOWN_UNMIGRATED = frozenset(
-    {
-        "tests/test_collect_subtrees_sh.py",
-        "tests/test_ec2_decide_teardown.py",
-        "tests/test_ec2_ssm.py",
-        "tests/test_ec2_volume_reaping.py",
-        "tests/test_fetch_branch_sh.py",
-        "tests/test_force_stop.py",
-        "tests/test_pause_on_failure.py",
-        "tests/test_provision_sh_lifecycle.py",
-        "tests/test_provision_volume.py",
-        "tests/test_re_seed.py",
-        "tests/test_require_fly_ssh_isolation.py",
-    }
-)
+_KNOWN_UNMIGRATED: frozenset[str] = frozenset()
 
 
 def test_run_bash_is_defined_in_conftest():

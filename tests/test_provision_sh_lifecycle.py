@@ -7,36 +7,32 @@ subprocess, with flyctl stubbed out so no real Fly.io calls are made.
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
+
+import pytest
+
+from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
 
 
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    # Exclude LEERIE_STATE_DIR, LEERIE_STATE_HOST_DIR, XDG_CACHE_HOME, and
-    # USER_REPO from the base environment so tests run in isolation.
-    # XDG_CACHE_HOME points to /tmp/.cache which may not be writable in all
-    # test contexts, causing mkdir failures in lib.sh's
-    # _leerie_fly_agent_ensure function. USER_REPO is set by the leerie
-    # harness itself (when these tests run inside a leerie-managed worker
-    # container) to a bare marker value rather than a real repo path — left
-    # in place, decide_teardown's "$USER_REPO/.leerie/runs" state-sync
-    # fallback resolves to a cwd-relative "leerie/.leerie/runs", and `mkdir
-    # -p` on that path collides with the `leerie` launcher script file that
-    # sits at this repo's own root, failing with "Not a directory".
-    base_env = {k: v for k, v in os.environ.items()
-                if k not in ("LEERIE_STATE_DIR", "LEERIE_STATE_HOST_DIR",
-                             "XDG_CACHE_HOME", "USER_REPO")}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
+@pytest.fixture(autouse=True)
+def _isolated_base_env(monkeypatch):
+    """Exclude LEERIE_STATE_DIR, LEERIE_STATE_HOST_DIR, XDG_CACHE_HOME, and
+    USER_REPO from the subprocess base environment so tests run in
+    isolation. XDG_CACHE_HOME points to /tmp/.cache which may not be
+    writable in all test contexts, causing mkdir failures in lib.sh's
+    _leerie_fly_agent_ensure function. USER_REPO is set by the leerie
+    harness itself (when these tests run inside a leerie-managed worker
+    container) to a bare marker value rather than a real repo path — left
+    in place, decide_teardown's "$USER_REPO/.leerie/runs" state-sync
+    fallback resolves to a cwd-relative "leerie/.leerie/runs", and `mkdir
+    -p` on that path collides with the `leerie` launcher script file that
+    sits at this repo's own root, failing with "Not a directory"."""
+    for key in ("LEERIE_STATE_DIR", "LEERIE_STATE_HOST_DIR",
+                "XDG_CACHE_HOME", "USER_REPO"):
+        monkeypatch.delenv(key, raising=False)
 
 
 def test_provision_sh_exists():
@@ -51,7 +47,7 @@ def test_provision_sh_is_executable():
 
 def test_provision_machine_fails_without_fly_image_tag():
     """provision_machine returns 1 when FLY_IMAGE_TAG is unset."""
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; provision_machine",
         env={"FLY_IMAGE_TAG": ""},
     )
@@ -62,7 +58,7 @@ def test_provision_machine_fails_without_fly_image_tag():
 def test_provision_machine_fails_when_flyctl_missing():
     """provision_machine returns 1 with an actionable error when flyctl is absent."""
     # Override PATH to a directory with no flyctl binary.
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; provision_machine",
         env={
             "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
@@ -75,7 +71,7 @@ def test_provision_machine_fails_when_flyctl_missing():
 
 def test_destroy_machine_noop_when_no_machine_id():
     """destroy_machine is idempotent: returns 0 when LEERIE_MACHINE_ID is empty."""
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; LEERIE_MACHINE_ID=''; destroy_machine; echo 'ok'",
     )
     assert result.returncode == 0
@@ -93,7 +89,7 @@ def test_provision_machine_fails_when_flyctl_unauthenticated(tmp_path):
                            "exit 0\n")
     fake_flyctl.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; provision_machine",
         env={
             "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
@@ -127,7 +123,7 @@ def test_provision_machine_exports_machine_id_on_success(tmp_path):
     )
     fake_flyctl.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; provision_machine && echo \"machine=$LEERIE_MACHINE_ID\"",
         env={
             "FLY_IMAGE_TAG": "registry.fly.io/leerie:test",
@@ -164,7 +160,7 @@ def test_destroy_machine_called_on_exit_trap(tmp_path):
     # destroy_machine. The sync-failure branch (which leaves the machine
     # running by design) is not what this test is verifying — see
     # scripts/remote/provision.sh:176.
-    result = _run_bash(
+    result = run_bash(
         f"( source {PROVISION_SH}; "
         "_try_fetch_branch_for_teardown() { return 0; }; "
         "provision_machine )",

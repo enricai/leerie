@@ -30,8 +30,9 @@ from __future__ import annotations
 
 import base64
 import os
-import subprocess
 from pathlib import Path
+
+from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
@@ -79,20 +80,6 @@ exit "$rc"
 """
     )
     stub.chmod(0o755)
-
-
-def _run_bash(script: str, env: dict, *, input: str | None = None,
-              cwd: Path | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        input=input,
-        cwd=str(cwd) if cwd is not None else None,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _stub_aws_interactive_session(bin_dir: Path, *, stall: bool = False) -> Path:
@@ -163,7 +150,7 @@ def test_ec2_launch_detached_pipes_payload_and_uses_start_interactive_command(tm
     # ec2_launch_detached bootstraps `python3 -`, so the piped payload
     # must be valid Python — mirrors the real launch-wrapper script.
     payload = "print('launched-ok')"
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' \"{payload}\" | ec2_launch_detached",
         env={
@@ -192,7 +179,7 @@ def test_ec2_launch_detached_propagates_rc_75_flock_loser_pivot(tmp_path):
     _stub_aws_interactive_session(bin_dir)
 
     payload = "import sys; sys.exit(75)"
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' \"{payload}\" | ec2_launch_detached",
         env={
@@ -208,7 +195,7 @@ def test_ec2_launch_detached_propagates_other_nonzero_rc(tmp_path):
     bin_dir.mkdir()
     _stub_aws_interactive_session(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' \"import sys; sys.exit(42)\" | ec2_launch_detached",
         env={
@@ -224,7 +211,7 @@ def test_ec2_launch_detached_fails_closed_on_empty_instance_id(tmp_path):
     bin_dir.mkdir()
     _stub_aws_interactive_session(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' \"print('should-not-run')\" | ec2_launch_detached",
         env={
@@ -243,7 +230,7 @@ def test_ec2_launch_detached_timeout_yields_124_or_137(tmp_path):
     _stub_aws_interactive_session(bin_dir, stall=True)
     _stub_timeout(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' \"pass\" | ec2_launch_detached",
         env={
@@ -262,7 +249,7 @@ def test_ec2_launch_detached_passes_profile_and_region(tmp_path):
     bin_dir.mkdir()
     _stub_aws_interactive_session(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' \"pass\" | ec2_launch_detached",
         env={
@@ -292,7 +279,7 @@ def test_ec2_launch_detached_handles_large_payload_over_4kb(tmp_path):
     payload = (filler * 80) + "print('LARGE_PAYLOAD_OK')"
     assert len(payload) > 4096
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"ec2_launch_detached",
         env={
@@ -313,7 +300,7 @@ def test_ec2_attach_uses_sh_s_bootstrap(tmp_path):
     bin_dir.mkdir()
     _stub_aws_interactive_session(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' 'echo attached-ok' | ec2_attach",
         env={
@@ -344,7 +331,7 @@ def test_ec2_attach_propagates_nonzero_rc(tmp_path):
     bin_dir.mkdir()
     _stub_aws_interactive_session(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' 'exit 17' | ec2_attach",
         env={
@@ -360,7 +347,7 @@ def test_ec2_attach_fails_closed_on_empty_instance_id(tmp_path):
     bin_dir.mkdir()
     _stub_aws_interactive_session(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' 'echo should-not-run' | ec2_attach",
         env={
@@ -379,7 +366,7 @@ def test_ec2_attach_timeout_yields_124_or_137(tmp_path):
     _stub_aws_interactive_session(bin_dir, stall=True)
     _stub_timeout(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
         f"printf '%s' 'true' | ec2_attach",
         env={
@@ -402,7 +389,7 @@ def test_ec2_ssm_sourcing_is_idempotent_and_independent(tmp_path):
     bin_dir.mkdir()
     _stub_aws_interactive_session(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SSM_SH}; source {EC2_SSM_SH}; "
         f"type ec2_launch_detached >/dev/null && type ec2_remote_exec >/dev/null && echo SOURCED_OK",
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},

@@ -12,13 +12,14 @@ darwin/linux dev box).
 """
 from __future__ import annotations
 
-import os
 import shutil
 import subprocess
 import uuid
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_SH = REPO_ROOT / "scripts" / "remote" / "lib.sh"
@@ -49,24 +50,23 @@ def short_home():
         shutil.rmtree(home, ignore_errors=True)
 
 
-def _run_bash(
+def _run_bash_isolated(
     script: str, env: dict | None = None, tmp_home: Path | None = None
 ) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    # Strip the parent's SSH_AUTH_SOCK so the test doesn't accidentally
-    # poke at the developer's real agent.
-    base_env.pop("SSH_AUTH_SOCK", None)
+    """Thin wrapper around tests.conftest.run_bash that layers this file's
+    two isolation requirements on top of the shared helper's env-merge
+    contract: SSH_AUTH_SOCK is forced to the empty string (equivalent to
+    unset for every `[ -n "$SSH_AUTH_SOCK" ]`-style check in lib.sh, and
+    the shared helper has no way to *delete* a parent-env key) so the
+    test never pokes at the developer's real agent, and HOME/
+    XDG_CACHE_HOME are pointed at the per-test tmp_home when given."""
+    overrides: dict = {"SSH_AUTH_SOCK": ""}
     if tmp_home is not None:
-        base_env["HOME"] = str(tmp_home)
-        base_env["XDG_CACHE_HOME"] = str(tmp_home / ".cache")
+        overrides["HOME"] = str(tmp_home)
+        overrides["XDG_CACHE_HOME"] = str(tmp_home / ".cache")
     if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
+        overrides.update(env)
+    return run_bash(script, env=overrides)
 
 
 def _stub_flyctl(tmp_path: Path) -> Path:
@@ -121,7 +121,7 @@ def test_lib_sh_exists():
 
 def test_agent_ensure_creates_socket_dir_at_0700(short_home):
     """`_leerie_fly_agent_ensure` creates the socket dir with mode 0700."""
-    result = _run_bash(
+    result = _run_bash_isolated(
         f"source {LIB_SH}; _leerie_fly_agent_ensure; echo $SSH_AUTH_SOCK",
         tmp_home=short_home,
     )
@@ -147,7 +147,7 @@ def test_agent_ensure_reuses_live_socket(short_home):
         second_pid=$(pgrep -f "ssh-agent -a {sock}" | head -1)
         echo "first=$first_pid second=$second_pid"
     """
-    result = _run_bash(script, tmp_home=short_home)
+    result = _run_bash_isolated(script, tmp_home=short_home)
     assert result.returncode == 0, result.stderr
     # Same agent PID across two calls = reuse, not respawn.
     line = [l for l in result.stdout.splitlines() if l.startswith("first=")][0]
@@ -175,7 +175,7 @@ def test_require_fly_ssh_isolates_from_user_agent(short_home):
         echo "exit=$?"
         echo "final_sock=$SSH_AUTH_SOCK"
     """
-    result = _run_bash(script, tmp_home=short_home)
+    result = _run_bash_isolated(script, tmp_home=short_home)
     assert "exit=0" in result.stdout, f"require_fly_ssh failed: {result.stderr}"
     # SSH_AUTH_SOCK MUST be redirected to the leerie-private path, not
     # the bogus user path.
@@ -209,7 +209,7 @@ def test_agent_ensure_reuses_keyless_but_reachable_agent(short_home):
         echo "before=$before"
         echo "after=$after"
     """
-    result = _run_bash(script, tmp_home=short_home)
+    result = _run_bash_isolated(script, tmp_home=short_home)
     assert result.returncode == 0, result.stderr
     assert "add_rc=1" in result.stdout, (
         f"expected ssh-add -l to return rc 1 (keyless, reachable) against a "
@@ -254,7 +254,7 @@ s.close()
         pid=$(pgrep -x ssh-agent | head -1)
         echo "pid=$pid"
     """
-    result = _run_bash(script, tmp_home=short_home)
+    result = _run_bash_isolated(script, tmp_home=short_home)
     assert result.returncode == 0, result.stderr
     assert "add_rc=2" in result.stdout, (
         f"expected ssh-add -l to return rc 2 against an unreachable/stale "
@@ -278,7 +278,7 @@ def test_agent_ensure_spawns_new_agent_with_idle_timeout(short_home):
         _leerie_fly_agent_ensure
         ps -eo args= | grep '^ssh-agent -a'
     """
-    result = _run_bash(script, tmp_home=short_home)
+    result = _run_bash_isolated(script, tmp_home=short_home)
     assert result.returncode == 0, result.stderr
     cmdline = result.stdout.strip()
     assert " -t " in f" {cmdline} ", (
@@ -298,7 +298,7 @@ def test_require_fly_ssh_is_idempotent(short_home):
         require_fly_ssh
         require_fly_ssh
     """
-    result = _run_bash(script, tmp_home=short_home)
+    result = _run_bash_isolated(script, tmp_home=short_home)
     assert result.returncode == 0, result.stderr
     assert counter.read_text().strip() == "1", (
         f"expected exactly 1 issuance across two calls, got {counter.read_text().strip()}"

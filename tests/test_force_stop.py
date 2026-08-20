@@ -17,21 +17,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import run_bash
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FORCE_FINALIZE_SH = REPO_ROOT / "scripts" / "remote" / "force-finalize.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
 
 
 def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path) -> Path:
@@ -115,7 +104,7 @@ def test_force_stop_patches_dead_run(tmp_path):
         "FORCE_STOP": "1",
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; FORCE_STOP=1 force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -147,7 +136,7 @@ def test_force_stop_kills_alive_pid(tmp_path):
             "FORCE_STOP": "1",
             "PATH": f"{stub.parent}:{os.environ['PATH']}",
         }
-        result = _run_bash(
+        result = run_bash(
             f"source {FORCE_FINALIZE_SH}; FORCE_STOP=1 force_finalize_remote leerie machine-xxx",
             env=env,
         )
@@ -185,7 +174,7 @@ def test_force_stop_idempotent_already_finalized(tmp_path):
         "FORCE_STOP": "1",
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; FORCE_STOP=1 force_finalize_remote leerie machine-xxx",
         env=env,
     )
@@ -207,7 +196,7 @@ def test_without_force_stop_still_refuses_alive(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {FORCE_FINALIZE_SH}; force_finalize_remote leerie machine-xxx",
         env=env,
     )

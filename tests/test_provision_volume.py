@@ -19,25 +19,12 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 from pathlib import Path
+
+from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
-
-
-def _run_bash(script: str, env: dict | None = None,
-              cwd: Path | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_recording_flyctl(tmp_path: Path) -> tuple[Path, Path]:
@@ -160,7 +147,7 @@ def test_no_volume_when_disk_gb_unset(tmp_path):
     }
     # Stub wait_for_started to a no-op so the test doesn't actually
     # poll. We do this by overriding the function after sourcing.
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}\n"
         "wait_for_started() { return 0; }\n"
         "provision_machine\n",
@@ -208,7 +195,7 @@ def test_volume_created_when_disk_gb_set(tmp_path):
         "FLY_VM_DISK_GB": "30",
         "LEERIE_MACHINE_START_TIMEOUT": "1",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}\n"
         "wait_for_started() { return 0; }\n"
         "provision_machine\n",
@@ -262,7 +249,7 @@ def test_destroy_machine_destroys_volume_when_set(tmp_path):
         "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}\n"
         'LEERIE_MACHINE_ID="machine-foo"\n'
         'LEERIE_VOLUME_ID="vol_bar"\n'
@@ -298,7 +285,7 @@ def test_destroy_machine_does_not_call_volumes_when_unset(tmp_path):
         "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}\n"
         'LEERIE_MACHINE_ID="machine-foo"\n'
         'LEERIE_VOLUME_ID=""\n'
@@ -395,7 +382,7 @@ def test_orphan_volume_cleaned_on_machine_create_failure(tmp_path):
         "FLY_VM_DISK_GB": "30",
         "LEERIE_MACHINE_START_TIMEOUT": "1",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}\n"
         "wait_for_started() { return 0; }\n"
         "provision_machine\n",
@@ -466,7 +453,7 @@ def test_destroy_volume_reaps_without_a_machine_id(tmp_path):
         "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}\n"
         'LEERIE_MACHINE_ID=""\n'          # machine already destroyed
         'LEERIE_VOLUME_ID="vol_orphan99"\n'  # but we know the volume
@@ -491,7 +478,7 @@ def test_destroy_volume_is_a_noop_without_a_volume_id(tmp_path):
         "LEERIE_FLY_APP": "leerie",
         "FLY_APP": "leerie",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}\n"
         'LEERIE_MACHINE_ID=""\n'
         'LEERIE_VOLUME_ID=""\n'
@@ -523,7 +510,7 @@ def test_resolve_volume_id_falls_through_to_run_json(tmp_path):
     (run_dir / "run.json").write_text(json.dumps({
         "fly_machine_id": "m1", "volume_id": "vol_in_run_json",
     }))
-    result = _run_bash(
+    result = run_bash(
         # Extract just the resolver from the launcher and exercise it.
         f'sed -n "/^_resolve_volume_id_from_run_dir()/,/^}}/p" '
         f'"{REPO_ROOT / "leerie"}" > "{tmp_path}/fn.sh"\n'
@@ -550,7 +537,7 @@ def test_resolve_volume_id_from_fly_reads_machine_mounts(tmp_path):
         "FLY_STUB_MACHINE_ID": "m-target",
         "FLY_STUB_MOUNT_VOLUME": "vol_from_fly",
     }
-    result = _run_bash(
+    result = run_bash(
         f'sed -n "/^_resolve_volume_id_from_fly()/,/^}}/p" '
         f'"{REPO_ROOT / "leerie"}" > "{tmp_path}/fn.sh"\n'
         f'. "{tmp_path}/fn.sh"\n'
@@ -571,7 +558,7 @@ def test_resolve_volume_id_from_fly_empty_when_no_mounts(tmp_path):
         "FLY_STUB_MACHINE_ID": "m-target",
         # FLY_STUB_MOUNT_VOLUME unset -> stub emits "mounts":[]
     }
-    result = _run_bash(
+    result = run_bash(
         f'sed -n "/^_resolve_volume_id_from_fly()/,/^}}/p" '
         f'"{REPO_ROOT / "leerie"}" > "{tmp_path}/fn.sh"\n'
         f'. "{tmp_path}/fn.sh"\n'
@@ -608,7 +595,7 @@ def test_kill_with_machine_id_and_no_run_dir_reaps_volume(tmp_path):
         "FLY_STUB_MACHINE_ID": "m-orphan",
         "FLY_STUB_MOUNT_VOLUME": "vol_leaked",
     }
-    result = _run_bash(
+    result = run_bash(
         f'"{REPO_ROOT / "leerie"}" kill --machine-id m-orphan\n',
         env=env,
         cwd=REPO_ROOT,

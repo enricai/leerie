@@ -19,24 +19,12 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.conftest import run_git_repo_first
+from tests.conftest import run_bash, run_git_repo_first
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COLLECT_SH = REPO_ROOT / "scripts" / "remote" / "collect-subtrees.sh"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 PROMPTS_DIR = REPO_ROOT / "prompts"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_fixture_repo(tmp_path: Path) -> Path:
@@ -170,7 +158,7 @@ def test_collect_subtrees_sh_exists():
 
 
 def test_refuses_when_no_machine_id():
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie ''",
         env={"LEERIE_REPO": str(REPO_ROOT)},
     )
@@ -197,7 +185,7 @@ def test_collected_none_when_all_integrated(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -224,7 +212,7 @@ def test_collected_all_clean_merges(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -263,7 +251,7 @@ def test_conflict_resolved_by_integrator(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -297,7 +285,7 @@ def test_conflict_skipped_when_integrator_fails(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -335,7 +323,7 @@ def test_conflict_skipped_when_no_claude(tmp_path):
     no_claude = no_claude_dir / "claude"
     no_claude.write_text("#!/usr/bin/env bash\nexit 127\n")
     no_claude.chmod(0o755)
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -358,7 +346,7 @@ def test_collected_none_when_no_subtask_branches(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -384,7 +372,7 @@ def test_setup_run_creates_missing_worktree(tmp_path):
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
