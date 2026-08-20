@@ -83,6 +83,32 @@ def run_bash(
     )
 
 
+try:
+    import jsonschema  # type: ignore
+    HAS_JSONSCHEMA = True
+except ImportError:
+    HAS_JSONSCHEMA = False
+
+
+def validate_or_fallback_required(schema: dict, instance: dict) -> bool:
+    """Validate `instance` against `schema`, or fall back to a required-field
+    check when `jsonschema` isn't installed.
+
+    Single owner for the idiom duplicated across the schema-test files
+    (e.g. tests/test_fit_judge_schema.py:22-30): when jsonschema is
+    available, use it directly (raises on an invalid instance) and return
+    True; otherwise assert every `schema["required"]` key is present in
+    `instance` and return False, so the caller runs its own type-specific
+    fallback assertions on top.
+    """
+    if HAS_JSONSCHEMA:
+        jsonschema.validate(instance, schema)
+        return True
+    for k in schema["required"]:
+        assert k in instance, f"missing required field {k!r}"
+    return False
+
+
 @pytest.fixture(scope="session")
 def leerie():
     """The leerie module loaded from orchestrator/leerie.py."""
