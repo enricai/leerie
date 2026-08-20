@@ -1478,7 +1478,9 @@ def test_backstop_die_on_logic_bug(leerie, monkeypatch, capsys):
 
     class _St:
         def __init__(self):
-            self.data = {}
+            # judgment workers run in a disposable worktree
+            # (DESIGN §12), never the user's checkout
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
 
         def save(self):
             pass
@@ -2384,7 +2386,8 @@ def test_phase_overlap_judge_dies_on_unresolvable(leerie, monkeypatch,
         def __init__(self):
             # Pre-set: the scoped re-plan has already been attempted, so this
             # is the second verdict — the one that must still be terminal.
-            self.data = {"overlap_replan_done": True}
+            self.data = {"overlap_replan_done": True,
+                         "planning_worktree": "/tmp/leerie-test-wt"}
 
         def save(self):
             pass
@@ -2465,7 +2468,9 @@ def _run_phase_overlap_judge(leerie, monkeypatch, plans, collisions):
     rather than reproduced in the test."""
     class _St:
         def __init__(self):
-            self.data = {}
+            # judgment workers run in a disposable worktree
+            # (DESIGN §12), never the user's checkout
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
 
         def save(self):
             pass
@@ -2933,7 +2938,14 @@ class _CovSt:
     the loop outright."""
 
     def __init__(self, data=None):
-        self.data = data if data is not None else {}
+        # `planning_worktree` is the cwd every judgment worker runs in
+        # (DESIGN §12 *Judgment-worker isolation*): they are confined to a
+        # disposable worktree, never the user's checkout. Seeded by default
+        # so a caller passing its own `data` still gets a usable State,
+        # while an explicit key still wins.
+        base = {"planning_worktree": "/tmp/leerie-test-wt"}
+        base.update(data or {})
+        self.data = base
         self._worker_count = 0
 
     def save(self):

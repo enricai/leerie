@@ -610,10 +610,20 @@ export LEERIE_CAPTURE_DEPS=0
 export LEERIE_BAKE_LANGUAGE_DEPS=0
 ./leerie "task"
 
-# Waive §12 mechanical read-only enforcement on judgment workers
-# (use on repos where the planner needs pnpm/tsc/vitest visibility —
-# also LEERIE_DANGEROUSLY_SKIP_PERMISSIONS=1 or
-# `dangerously_skip_permissions = true` in leerie.toml):
+# Give judgment workers the repo's build/lint/test verbs (use on repos where
+# the planner needs pnpm/tsc/vitest visibility — also
+# LEERIE_DANGEROUSLY_SKIP_PERMISSIONS=1 or
+# `dangerously_skip_permissions = true` in leerie.toml).
+# It does NOT hand them the CLI flag of the same name: that is unreachable for
+# judgment workers, because it removes the CLI's working-directory boundary
+# along with the prompts. Measured (claude 2.1.237, filesystem-verified): a
+# worker holding only INSPECT_TOOLS and carrying the flag used Write — absent
+# from that allowlist — to overwrite a tracked file outside its cwd and commit
+# on the user's branch, and did so even from a detached worktree. The flag now
+# WIDENS the allowlist instead (`_widen_inspect_tools`). Still a real trust
+# decision: a build verb runs arbitrary code and can write outside the
+# worktree, which is what `_assert_repo_unchanged` catches. DESIGN §12
+# *Judgment-worker isolation*:
 ./leerie "task" --dangerously-skip-permissions
 
 # Run workers WITHOUT cgroup containment when the host can't enforce it
@@ -3441,6 +3451,71 @@ call sites at all (a scan that finds nothing passes every assertion), and the
 behavioral file pins that narrowing the `except` did not make an advisory
 gate fatal. All were falsified live against each defect reintroduced
 individually.
+
+**Judgment-worker isolation** (DESIGN §12) is covered by four files, and the
+thing worth remembering is that the design was settled by *experiment*, not by
+reading the CLI's docs. `tests/test_judgment_worker_isolation.py` pins the
+four layers: judgment workers never receive `--dangerously-skip-permissions`
+(the load-bearing one), `claude_p` refuses any of them whose cwd resolves to
+`st.repo_root`, and the flag instead widens their allowlist with the repo's
+build verbs. Probed live against claude 2.1.237, filesystem-verified — with
+the flag set, a worker holding only `INSPECT_TOOLS` used `Write` (absent from
+that allowlist) to create a file outside its cwd, and in the exact shape this
+feature ships (cwd = a detached worktree, flag still on) overwrote the real
+checkout and committed on its branch. **A worktree is not a boundary while
+that flag is set**, which is why the isolation tests pin the flag and the cwd
+together rather than either alone. Two traps: the widening is scoped to
+`INSPECT_TOOLS` because `SATISFIED_PROBE_TOOLS` is deliberately narrower and
+*calibrated* (12/12 false positives with full latitude, 0 when scoped), and an
+earlier revision handed that probe `Bash(pytest:*)`; and `_blt_verbs`
+memoizes, because `resolve_blt` logs, so an unmemoized call per judgment
+worker is dozens of identical lines — its `_BLT_VERBS_CACHE` is module-level
+against a session-scoped `leerie` fixture, so the file clears it in an autouse
+fixture for the reason `_active_admissions` does.
+`tests/test_work_sentinel.py` covers the mechanical half — snapshot the real
+checkout's HEAD/porcelain/refs before phase 1, re-check after every planning
+phase — including the trap that a *failed* after-snapshot returns empty
+strings that a naive diff reads as "HEAD moved" plus "every branch deleted",
+fabricating tampering on a healthy run; hence the `ok` field, and an
+anti-vacuity partner proving the underlying diff really would have fired.
+`tests/test_planning_worktree_script.py` drives the real script against real
+repos: detached, no branch created (the reapers know only `leerie/runs/*` and
+`leerie/subtasks/*`, so a fourth namespace would leak forever), reset on
+re-entry, and `clean -fd` **not** `-fdx` so `node_modules` survives.
+`tests/test_ensure_planning_worktree.py` covers the Python wrapper — path
+parsing, fail-closed on a script error, and the staging of what
+`git worktree add` cannot carry (untracked task-reference files, an untracked
+`.claude/`). It is the ONLY file that opts out of the conftest stub via
+`@pytest.mark.real_planning_worktree`, so every test in it `chdir`s into a
+throwaway repo AND sets `LEERIE_STATE_DIR`; both halves are load-bearing, and
+`test_no_worktree_leaks_into_this_repo` is the standing proof. Its subtlest
+pin is `test_staging_runs_after_the_reset` — staging before the script means
+`git clean -fd` deletes it, which presence-only assertions cannot see.
+All three guards were falsified live — restoring the `autonomous or …` OR
+fails 2 tests, neutering `_diff_repo_state` fails exactly the 4 detection
+tests, and moving the staging call above the script fails 3.
+A related discipline note: `_judgment_cwd` falls back to the conventional
+run-dir path rather than raising when `planning_worktree` is absent. That is
+deliberate and costs nothing — the fallback is derived from `run_dir`, so it
+can never *be* the checkout, and `claude_p`'s guard is the actual enforcement.
+Raising bought diagnostics only, at the price of a precondition every
+hand-built `State` must know about: measured, **141 tests red**, and 8 test
+files still needed a fixture seed after the fallback landed.
+**A conftest autouse fixture (`_no_real_planning_worktree`) stubs
+`_ensure_planning_worktree` for every test**, opt-out via
+`@pytest.mark.real_planning_worktree`. It shells out to a real
+`git worktree add` rooted at `resolve_leerie_root()`, which with
+`LEERIE_STATE_DIR` unset is `<repo>/.leerie` — so every test driving the real
+`_run_phases` created a full checkout of this repo inside this repo. Silent
+three ways over: `.leerie/*` is gitignored so `git status` stayed clean, the
+directories outlived the session, and the damage surfaced in
+`tests/test_helper_naming_convention.py`, whose `tests/` exclusion is a
+relative-path prefix that a nested
+`.leerie/…/worktrees/planning/tests/…` copy does not match. Measured before
+the guard: 2 worktrees, 25 MB, and one red test on CI with no visible link to
+the change that caused it — local runs were green because the pollution only
+bites a later scanner. When adding a fixture that shells out to git, assume
+the state root is inside the repo unless the test pins it elsewhere.
 
 `leerie resume <run-id>` — the documented positional form — is pinned by
 `tests/test_resume_positional_run_id.py`. It silently ignored the run-id on

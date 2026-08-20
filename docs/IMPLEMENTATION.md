@@ -1624,29 +1624,34 @@ same shape as `--source-of-truth` resolution.
 
 ### Permission override (dangerous)
 
-By default, judgment workers (classifier, planner, reconciler,
-plan_overlap_judge, provision) run in the real repo cwd with a narrow
-Bash allowlist (`INSPECT_TOOLS`) and **without**
-`--dangerously-skip-permissions`.
-This mechanically prevents them from mutating state — the §12
-enforcement that a planner cannot run `pnpm run typecheck`,
-`tsc --noEmit`, or any other side-effecting subprocess. Acting workers
-(implementer, conformer, integrator) run in isolated worktrees with
-the broader `ACT_TOOLS` allowlist and the skip-permissions flag —
-their blast radius is bounded by the worktree.
+Judgment workers (`PLANNING_WORKER_TYPES`) run in a **disposable detached
+worktree** (`_judgment_cwd()`, created by `scripts/planning-worktree.sh`) with
+a narrow Bash allowlist (`INSPECT_TOOLS`) and **never**
+`--dangerously-skip-permissions` — not by default, but at any setting.
+`claude_p` raises if such a worker is handed the real checkout as its `cwd`.
+Acting workers (implementer, conformer, integrator, rebaser) run in isolated
+worktrees with the broader `ACT_TOOLS` allowlist and the skip-permissions flag;
+their blast radius is the worktree they own.
 
-`--dangerously-skip-permissions` is the escape hatch. When set, every
-`claude -p` invocation — including judgment workers in the real repo
-cwd — is invoked with `--dangerously-skip-permissions`. This waives
-the §12 mechanical read-only enforcement on judgment workers and
-shifts trust onto their prompts. Use it on repositories where the
-planner needs to observe build/test tooling that the narrow inspect
-allowlist excludes — Node/TS repos where the planner reflexively
-reaches for `pnpm`/`tsc`/`biome`/`vitest`/`npx` and currently
-~18-19% of its Bash calls fail with "requires approval" in headless
-mode. See DESIGN §12 and §15 *Known limitations* (the "unattended
-execution requires broad write permission" paragraph) for the
-guarantee being waived.
+The reason the flag is unreachable for judgment workers is measured, not
+stylistic: it removes the CLI's working-directory boundary as well as the
+prompts. Probed live (claude 2.1.237, filesystem-verified), a worker holding
+only `INSPECT_TOOLS` and carrying the flag used `Write` — absent from that
+allowlist — to overwrite a tracked file outside its cwd and `git commit` on the
+user's branch, and did so *even with its cwd already set to a detached
+worktree*. With the flag absent, every one of those attempts was rejected.
+
+`--dangerously-skip-permissions` therefore no longer bypasses permissions for
+these workers; it **widens their allowlist** (`_widen_inspect_tools`) with the
+leading verbs of the repo's own declared build/lint/test commands, as
+`Bash(<verb>:*)` patterns. That is the visibility the flag was always
+documented to buy — Node/TS repos where the planner reaches for
+`pnpm`/`tsc`/`biome`/`vitest`/`npx`, ~18-19% of whose Bash calls otherwise fail
+with "requires approval" in headless mode — without the write access that was
+never the point. Residual, stated rather than hidden: a build verb executes
+arbitrary code, so an allowlisted `pnpm`/`node`/`python3` *can* still write
+outside the cwd; `_assert_repo_unchanged()` is what catches that. See DESIGN
+§12 *Judgment-worker isolation* for the full four-layer argument.
 
 Resolution order (highest priority first):
 
@@ -3627,7 +3632,7 @@ Each worker is one `claude -p` headless process. Flags used:
 | `--max-turns` | per-worker turn cap (values in §6) |
 | `--model` | model alias for this worker — `sonnet` / `opus` / `haiku`. Value comes from per-worker resolution (see §2 *Model selection*) |
 | `--add-dir` | repeated per entry in `state.json["inspect_dirs"]` (forwarded by `claude_p`'s `add_dirs` param). Used only by inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) so their sandboxed Read/Grep/Glob and allowlisted Bash verbs can reach sibling repos referenced in the task. See §2 *Inspect directories* |
-| `--dangerously-skip-permissions` | acting workers (implementer, integrator, conformer) — suppresses all permission prompts for unattended Bash and file writes. **Not** applied to inspect workers — they run in the real repo cwd (no worktree isolation), so the blast-radius assumption that justifies skip-permissions doesn't hold. The `Bash(<verb>:*)` patterns in `INSPECT_TOOLS` pre-approve listed verbs at the CLI level; anything else (e.g. `rm`, redirect-to-file) falls through and is rejected in non-interactive mode |
+| `--dangerously-skip-permissions` | acting workers only (implementer, integrator, conformer, rebaser) — suppresses all permission prompts for unattended Bash and file writes; their blast radius is the worktree they own. **Never** applied to judgment workers (`PLANNING_WORKER_TYPES`) at any setting: the flag removes the CLI's working-directory boundary as well as the prompts, and that boundary is the only thing confining a worker that runs against a tree it does not own — measured, a worker carrying the flag wrote outside its cwd and committed on the user's branch even from a detached worktree. The `Bash(<verb>:*)` patterns in `INSPECT_TOOLS` pre-approve listed verbs at the CLI level; anything else (e.g. `rm`, redirect-to-file) falls through and is rejected in non-interactive mode |
 | `--strict-mcp-config` | unconditional for every `claude -p` argv leerie builds — every worker, **and** `preflight`'s smoke test, and the remote integrator in `collect-subtrees.sh` — independent of and prior to any `mcp__*` denylist enumeration. Cuts MCP tool exposure off at the source regardless of what `.claude.json` seeding copies into the container. Measured single-variable on CLI 2.1.234 (identical argv otherwise, fresh empty cwd): **27 MCP tools / 4 `mcp_servers` -> 0 / 0**, rc 0, at a cost of ~880 prompt tokens — this is a containment fix, not a prompt-size one. No `--mcp-config` is ever passed, so it can't strand a caller with zero server config but a nonzero tool surface |
 
 `claude_p()` is `async`; every caller awaits it. Internally it awaits
@@ -8991,6 +8996,8 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `plans_after_coverage_gate` | list[dict] | the per-phase planning checkpoint for `phase_planning_coverage_gate` (post-task-coverage-gate `plans`, DESIGN §8 *Independent adversarial verification*). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
 | `plans_after_filters` | list[dict] | the per-phase planning checkpoint written after the off-tree (`_filter_offtree_subtasks`) and already-satisfied (`_filter_satisfied_subtasks`) phase-3 filters both complete — the filtered `plans` immediately before `_schedule()`. Same absence/presence and resume-cursor semantics as `plans_after_classify`; this is the last `plans_after_*` checkpoint before `plan_snapshot`/`waves` take over as the resume cursor. |
 | `satisfied_probe_cache` | dict[str, dict] | per-subtask `satisfied_probe` verdicts (DESIGN §6 "The satisfied-probe sweep needs finer-than-phase granularity"; §8 *Already-satisfied subtask elimination*), keyed by subtask id. Each value is `{satisfied: bool, evidence: str, checked: [str], base_sha: str}` — `base_sha` is the base commit sha (`git rev-parse HEAD`) recorded at probe time. Written by `probe_one` as soon as its own verdict returns, for both `satisfied` and not-satisfied outcomes — not only in aggregate after the whole sweep's `gather` completes, so a pause mid-sweep does not lose already-decided subtasks. **Correctness-critical:** on `resume`, a cached entry whose `base_sha` no longer matches the current `HEAD` is treated as absent and that subtask is re-probed — the base tree can move between a pause and a resume (e.g. a sibling run merging its own PR into the same base branch), and a stale hit could wrongly keep a subtask that is no longer satisfied or drop one that now is. A probe that crashes (`WorkerError`) is deliberately never cached — no verdict was actually reached, and caching "kept" for a crash would wrongly skip re-probing a subtask that was never really judged. |
+| `planning_worktree` | str | absolute path to this run's disposable judgment-worker worktree (DESIGN §12 *Judgment-worker isolation*), created and reset by `scripts/planning-worktree.sh` via `_ensure_planning_worktree()`. Every worker in `PLANNING_WORKER_TYPES` runs with this as its `cwd`; `_judgment_cwd()` is the single accessor and raises rather than falling back to the real checkout. Written before `phase_classify` and again immediately before the satisfied-probe sweep (the probe judges whatever tree its cwd points at, so a tree an earlier judgment worker dirtied would produce false `satisfied=true` drops). Deliberately **not** used as a resume skip check — the worktree is a filesystem fact, so it is re-established unconditionally on every entry; the field exists for attribution (which tree a worker's Bash calls landed in), the same argument `leerie_commit` carries. |
+| `repo_state_before_planning` | dict | `{head: str, porcelain: [str], refs: [str]}` for the USER'S REAL CHECKOUT, captured once before `phase_classify` and re-checked after every planning phase by `_assert_repo_unchanged()`. This is the mechanical half of the §12 judgment-worker guarantee: the worktree makes an escape unlikely, this makes it loud, and it `die()`s naming the changed paths/refs and the phase window. Includes untracked files on purpose — `_preflight_repo`'s clean-tree gate filters `??` lines, so a worker *creating* files is exactly what that gate cannot see. Paths under `.leerie/` and refs under `refs/heads/leerie/` are exempt (leerie's own bookkeeping). Persisted so a resume compares against the ORIGINAL baseline rather than a tree an earlier planning pass may already have moved. |
 | `active_oauth_token` | str \| None | the raw `CLAUDE_CODE_OAUTH_TOKEN` value currently selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token rotation*; IMPLEMENTATION.md §3 *Multi-token rotation*). Set by `_select_active_oauth_token` (the start-of-run probe/ranking sweep, run only when `CLAUDE_CODE_OAUTH_TOKENS` is present) and mutated by `claude_p`'s mid-run failover on a rate-limited active token. Absent/`None` when only the singular `CLAUDE_CODE_OAUTH_TOKEN` is in play — no rotation, and `_invoke`'s `active_token` param stays `None` (behavior byte-identical to before this feature). **The one sanctioned exception to this feature's secrets-hygiene rule**: the raw token is never written to `calls.ndjson`, `run.json`, or any log line (only its fingerprint is), but `state.json` is local-orchestrator-owned and already carries other operational data, so this field is the one place the raw active token persists at rest. |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `_schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
@@ -9013,7 +9020,7 @@ written somewhere in `orchestrator/leerie.py`. The coupling test in
 | `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation. **Recorded only, with no readers** — nothing in `orchestrator/`, `chain/`, `scripts/` or `prompts/` consumes it; it survives as an audit record of the classifier's judgement and does not gate delivery of the value. `gather_answers` writes `answers["source_of_truth"]` on every run regardless (DESIGN §11: the question is skipped, never the setting) |
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
-| `dangerously_skip_permissions` | bool | whether every `claude -p` worker — including the judgment workers running in the real repo cwd — is invoked with `--dangerously-skip-permissions`. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. When `True`, waives the DESIGN §12 mechanical read-only enforcement on the classifier / planner / reconciler / plan_overlap_judge / provision workers; trust shifts onto their prompts. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
+| `dangerously_skip_permissions` | bool | the operator's tooling escape hatch. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. It no longer grants judgment workers the CLI flag of the same name — that is unreachable for them (DESIGN §12 *Judgment-worker isolation*, L1). When `True` it instead WIDENS their allowlist via `_widen_inspect_tools()` with the leading verbs of the repo's declared build/lint/test commands, so a planner can run `pnpm`/`tsc`/`vitest` without gaining write access. Acting workers carry the CLI flag regardless, from `autonomous=True`. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
 | `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` in leerie.toml). Mirrored from `caps["force_strict_output"]`. Recorded because the flag changes worker behaviour invisibly — it owns `ANTHROPIC_BASE_URL`, which makes the CLI treat the session as gateway-routed and apply a conservative client-side context ceiling instead of the model's native window (see `_model_arg`). Originally attribution-only ("without this field a run's failure cannot be attributed to the flag after the fact"); now also load-bearing — `run_rebaser` and `run_recapture_deps` read it back from `st.data` to decide whether to wire their own per-call proxy instance, since they run in a separate process the original CLI flag never reaches (§ *Forced constrained decoding*). |
 | `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |
 | `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the `adherence_judge` worker in the planner check loop) is suppressed. Resolved from `--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` in `leerie.toml` / default `False`. When True, a plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Re-resolved fresh on every run, including `resume`, so the user can flip it without editing state |

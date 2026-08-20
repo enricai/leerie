@@ -7398,22 +7398,80 @@ strengths, and the design depends on keeping them clearly separated. The
 concrete enforcement points — which function checks what, at which phase — are
 catalogued in `IMPLEMENTATION.md`.
 
-One enforcement point — the mechanical "judgment workers (classifier, planner,
-reconciler, plan_overlap_judge, provision) cannot mutate state because they run in the real repo
-cwd without `--dangerously-skip-permissions`" guarantee — has an explicit
-opt-out: `leerie --dangerously-skip-permissions`. The flag is named identically
-to the underlying Claude Code CLI flag, on purpose: choosing it means the user
-understands they are removing a guardrail, not merely changing a setting. When
-set, every worker is invoked with `--dangerously-skip-permissions`, including
-the judgment workers; the §12 mechanical enforcement that they stay read-only
-is waived, and trust shifts onto the prompts. The default is off, the safe
-invariant is preserved for everyone who does not pass it, and the opt-out is
-intended for repositories where the planner needs visibility into build/test
-tooling that the narrow inspect allowlist excludes (`pnpm`/`tsc`/`vitest` and
-friends). This is a documented breach of the §12 contract for that single
-invocation, not a softening of the contract.
+### Judgment-worker isolation
 
-A second enforcement layer compensates for the permission bypass:
+Judgment workers (`PLANNING_WORKER_TYPES`: classifier, planner, reconciler,
+the judges, provision, the satisfied-probe) are kept away from the user's
+checkout by **four layers**, in order of how much each actually buys.
+
+This used to be one layer, and it failed. The old guarantee read "judgment
+workers cannot mutate state because they run in the real repo cwd *without*
+`--dangerously-skip-permissions`", with that flag as a documented opt-out that
+"shifts trust onto the prompts". Measured outcome: a classifier on a run with
+the flag set implemented an entire task in the operator's checkout on `main` —
+`Edit` calls to three files, a repo-wide `lint:fix`, and a `git stash`/`pop`
+pair — and then died at its turn cap. The prompt said "you run read-only". It
+was the only thing that said so.
+
+**L1 — the flag never reaches a judgment worker.** `claude_p` appends
+`--dangerously-skip-permissions` on `autonomous` alone. This is the layer that
+does the work, and it is worth stating why rather than asserting it. Probed
+live (claude 2.1.237, four runs, ground truth taken from the filesystem):
+
+| configuration | Write in cwd | Write *outside* cwd | Bash write outside cwd |
+|---|---|---|---|
+| `INSPECT_TOOLS`, flag on | succeeded | succeeded | succeeded |
+| `INSPECT_TOOLS`, flag off | rejected | rejected | rejected |
+
+With the flag set, a worker holding only `INSPECT_TOOLS` used `Write` — a tool
+absent from that allowlist — to create a file outside its cwd. With the flag
+absent, the CLI rejected every one of those attempts, naming the allowed
+working directory. **The working-directory boundary is real; the flag is what
+erases it.**
+
+A separate probe put the two together in the exact shape this feature ships —
+cwd set to a detached worktree, flag still on — and the worker overwrote a
+tracked file in the real checkout *and* committed on its branch. That is the
+result behind L2's caveat below.
+
+**L2 — they run in a disposable worktree.** A detached worktree per run, reset
+to the checkout's HEAD on entry (`scripts/planning-worktree.sh`). Note the
+ordering dependency: probed in the *exact* configuration of cwd = detached
+worktree with the flag still set, the worker overwrote the real checkout and
+committed on the branch anyway. **L2 is worth nothing without L1** — a
+worktree is not a boundary, it is where the boundary lands once L1 restores
+one.
+
+**L3 — the operator's escape hatch, re-expressed.** The flag's documented
+purpose was always tooling visibility, "repositories where the planner needs
+`pnpm`/`tsc`/`vitest`" — never write access; write access was collateral, and
+the collateral is what rewrote a branch. `--dangerously-skip-permissions` now
+*widens the allowlist* with the repo's own declared build/lint/test verbs
+(`_widen_inspect_tools`) instead of bypassing permissions. The planner gets its
+tooling; the boundary stays.
+
+The residual is real and is not hidden: a build verb runs arbitrary code, so an
+allowlisted `pnpm`/`node`/`python3` can write outside the cwd. Measured — with
+permissions on and `python3` allowlisted, `python3 -c "open('<outside>','w')"`
+succeeded while the `Write` tool aimed at the same path was rejected. This is a
+strictly narrower hole than the flag it replaces, and L4 covers it.
+
+**L4 — the sentinel, which is the actual guarantee.** `_snapshot_repo_state`
+records the real checkout's HEAD, porcelain status and refs before phase 1;
+`_assert_repo_unchanged` re-checks after every planning phase and `die()`s on
+any delta. Same discipline as `check_rebaser_worktree_state` — trust the
+worker, then mechanically re-check the claim — and run per-phase rather than
+once at the end so it fires within one worker of the damage. Untracked files
+are compared deliberately: `_preflight_repo`'s clean-tree gate filters `??`
+lines, so a worker *creating* files is precisely what it cannot see.
+
+What this does **not** achieve, stated plainly: kernel-level confinement.
+`/work` is a read-write bind mount in the same container for the whole run, and
+nothing short of a read-only mount or a separate uid would make a determined
+worker unable to reach it. L1–L3 make the escape unlikely; L4 makes it loud.
+
+A further enforcement layer sits underneath all four, and is the one that holds
+even for `autonomous` workers, which *do* still carry the permission bypass:
 `DISALLOWED_TOOLS` is passed via `--disallowedTools` on every `claude -p`
 invocation that starts a session. (The sole exemption is
 `_append_system_prompt_file_supported`'s capability probe, which passes empty
@@ -7442,9 +7500,13 @@ it, which makes the entry defense-in-depth rather than a fix for an observed lea
 **A plain file writer does not belong on this list**, which is why `NotebookEdit` is
 classified into `ACT_TOOLS` rather than denied. The tempting argument for denying it —
 that `--allowedTools` is only a permission tier, so a judgment worker can reach a writer
-anyway — holds only under the opt-out described above; by default judgment
-workers are not autonomous and do not carry `--dangerously-skip-permissions`,
-so the allowlist does hold. Meanwhile the deny list is
+anyway — was true while the escape hatch handed those workers the flag, and that
+is precisely the hole L1 closes: judgment workers are never `autonomous` and can
+no longer receive `--dangerously-skip-permissions` at any setting, so the
+allowlist holds for them unconditionally rather than only by default. Note the
+conclusion here was right for the wrong reason and survives the correction
+intact — denying a writer would not have helped either, because the escape was
+`Bash`, not `NotebookEdit`. Meanwhile the deny list is
 a single global constant, so denying a writer removes it from every acting worker in
 every repository leerie is pointed at, and `Bash`/`Write`/`Edit` — the same class — stay
 allowed regardless, so the deny never produced the read-only property it was justified

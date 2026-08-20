@@ -446,7 +446,10 @@ def test_gate_repairs_then_passes_and_records(leerie, monkeypatch, tmp_path):
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
     class _St:
-        def __init__(self): self.data = {}
+        def __init__(self):
+            # `_judgment_cwd` reads this; judgment workers run in a
+            # disposable worktree (DESIGN §12), never the checkout.
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
         def save(self): pass
         def bump_workers(self, caps): pass
 
@@ -471,7 +474,10 @@ def test_gate_still_dies_on_unrepairable(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
     class _St:
-        def __init__(self): self.data = {}
+        def __init__(self):
+            # `_judgment_cwd` reads this; judgment workers run in a
+            # disposable worktree (DESIGN §12), never the checkout.
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
         def save(self): pass
         def bump_workers(self, caps): pass
 
@@ -494,7 +500,10 @@ def test_gate_logs_the_id_channel_repair(leerie, monkeypatch, capsys):
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
     class _St:
-        def __init__(self): self.data = {}
+        def __init__(self):
+            # `_judgment_cwd` reads this; judgment workers run in a
+            # disposable worktree (DESIGN §12), never the checkout.
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
         def save(self): pass
         def bump_workers(self, caps): pass
 
@@ -527,7 +536,10 @@ def test_gate_logs_the_cofile_cluster_repair(leerie, monkeypatch, capsys):
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
     class _St:
-        def __init__(self): self.data = {}
+        def __init__(self):
+            # `_judgment_cwd` reads this; judgment workers run in a
+            # disposable worktree (DESIGN §12), never the checkout.
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
         def save(self): pass
         def bump_workers(self, caps): pass
 
@@ -561,7 +573,9 @@ def test_gate_logs_a_provably_false_finding_as_discarded(leerie, monkeypatch,
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
     class _St:
-        def __init__(self): self.data = {"dropped_subtasks": {}}
+        def __init__(self):
+            self.data = {"dropped_subtasks": {},
+                         "planning_worktree": "/tmp/leerie-test-wt"}
         def save(self): pass
         def bump_workers(self, caps): pass
 

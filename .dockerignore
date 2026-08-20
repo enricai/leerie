@@ -38,6 +38,7 @@
 !scripts/
 !scripts/container-entry.sh
 !scripts/new-worktree.sh
+!scripts/planning-worktree.sh
 !scripts/setup-run.sh
 !scripts/integrate.sh
 !scripts/finalize.sh
