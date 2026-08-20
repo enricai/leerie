@@ -29,7 +29,10 @@ def _make_real_state(leerie):
 
     class _RealishState:
         def __init__(self):
-            self.data = {"worker_count": 0}
+            self.data = {"worker_count": 0,
+                         # judgment workers run in a disposable worktree
+                         # (DESIGN §12), never the user's checkout
+                         "planning_worktree": "/tmp/leerie-test-wt"}
 
         def save(self):
             pass  # no persistence needed for this test

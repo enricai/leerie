@@ -47,6 +47,11 @@ def _make_state(leerie, run_dir: Path):
     st.run_dir = run_dir
     st.path = run_dir / "state.json"
     st.data = {
+        # Judgment workers now run in a disposable worktree
+        # (DESIGN §12 *Judgment-worker isolation*); `_judgment_cwd`
+        # raises rather than silently falling back to the real
+        # checkout, so every State fixture must seed the path.
+        "planning_worktree": str(run_dir / "worktrees" / "planning"),
         "telemetry": {"calls": 0, "cost_usd": 0.0,
                       "input_tokens": 0, "output_tokens": 0},
         "verbosity": "quiet",

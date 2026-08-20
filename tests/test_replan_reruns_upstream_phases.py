@@ -117,7 +117,10 @@ def test_no_replan_means_no_extra_phase_calls(leerie, monkeypatch):
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
     class _St:
-        def __init__(self): self.data = {}
+        def __init__(self):
+            # judgment workers run in a disposable worktree
+            # (DESIGN §12), never the user's checkout
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
         def save(self): pass
         def bump_workers(self, caps): pass
 

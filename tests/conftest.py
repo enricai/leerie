@@ -144,6 +144,46 @@ def child_subreaper_restored():
 
 
 @pytest.fixture(autouse=True)
+def _no_real_planning_worktree(request, monkeypatch):
+    """Keep `_ensure_planning_worktree` from shelling out to real git.
+
+    It runs `scripts/planning-worktree.sh`, which does a real
+    `git worktree add` rooted at `resolve_leerie_root()`. With
+    `LEERIE_STATE_DIR` unset -- the default for a direct Python caller -- that
+    resolves to `<repo>/.leerie`, so any test driving the real `_run_phases`
+    created a FULL CHECKOUT OF THIS REPO inside this repo and left it
+    registered in `.git/worktrees/`.
+
+    The failure mode is silent in three ways at once, which is why this is a
+    conftest-level guard rather than a stub in each driving test: `.leerie/*`
+    is gitignored so `git status` stays clean; the directories survive the
+    session; and the damage surfaces in an unrelated file, because a nested
+    `.leerie/.../worktrees/planning/tests/...` copy does not match the
+    `rel.startswith("tests/")` exclusion that scanners like
+    `test_helper_naming_convention` use. Measured: two worktrees, 25 MB, and
+    one red test with no visible connection to the change that caused it.
+
+    Opt out with `@pytest.mark.real_planning_worktree` when the worktree
+    mechanics are themselves the subject.
+    """
+    if request.node.get_closest_marker("real_planning_worktree"):
+        return
+    leerie = request.getfixturevalue("leerie")
+
+    async def _stub(st):
+        path = str(Path(getattr(st, "run_dir", ".")) / "worktrees"
+                   / "planning")
+        try:
+            st.data["planning_worktree"] = path
+            st.save()
+        except Exception:
+            pass
+        return path
+
+    monkeypatch.setattr(leerie, "_ensure_planning_worktree", _stub)
+
+
+@pytest.fixture(autouse=True)
 def _restore_child_subreaper():
     """Put `PR_SET_CHILD_SUBREAPER` back after every test.
 

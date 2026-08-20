@@ -645,6 +645,23 @@ STATE_FIELDS = (
     # sibling run merging its own PR). A probe that crashes (`WorkerError`)
     # is deliberately never cached — no verdict was actually reached.
     "satisfied_probe_cache",
+    # planning_worktree: absolute path to this run's disposable judgment-worker
+    # worktree (DESIGN §12 *Judgment-worker isolation*), created by
+    # `scripts/planning-worktree.sh` before phase_classify and reset again
+    # before the satisfied-probe sweep. Recorded rather than re-derived so a
+    # post-mortem can tell which tree a judgment worker's Bash calls landed in
+    # — the same attributability argument `leerie_commit` carries. Never used
+    # as a skip check: the worktree is a filesystem fact, so it is
+    # re-established unconditionally on every entry.
+    "planning_worktree",
+    # repo_state_before_planning: HEAD + porcelain + refs of the USER'S REAL
+    # CHECKOUT, captured before phase_classify and re-checked after each
+    # planning phase (`_assert_repo_unchanged`). This is the mechanical half
+    # of the §12 judgment-worker guarantee: the worktree makes an escape
+    # unlikely, this makes it loud. Persisted so a resume compares against the
+    # ORIGINAL baseline rather than a tree an earlier planning pass may
+    # already have moved.
+    "repo_state_before_planning",
     # active_oauth_token: the raw CLAUDE_CODE_OAUTH_TOKEN value currently
     # selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token
     # rotation*). Set by the start-of-run probe/ranking sweep when
@@ -708,29 +725,33 @@ def _is_protected_path(path: str) -> bool:
     return False
 
 _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
-# INSPECT_TOOLS is the read-only-with-shell bucket for classifier, planner,
-# and reconciler. These workers run in the real repo cwd (not a worktree),
-# so the default is that they cannot use --dangerously-skip-permissions.
+# INSPECT_TOOLS is the read-only-with-shell bucket for every judgment worker
+# (PLANNING_WORKER_TYPES). Those workers run in a disposable detached worktree
+# (`_judgment_cwd`), never the user's checkout, and never carry
+# --dangerously-skip-permissions — see DESIGN §12 *Judgment-worker isolation*.
 # Without pre-approval, Bash calls in -p mode are gated by the permission
 # system, return is_error=true, and surface as "tool-fail" — even for
 # benign commands like `ls foo 2>&1` whose redirection trips the
 # multiple-operations splitter. The Bash(<verb>:*) prefix patterns
 # pre-approve specific read-only verbs (verified against claude 2.1.150:
 # the pattern matcher handles trailing redirection like `2>&1`).
-# Write/Edit are deliberately omitted: by default, the §12 "read-only
-# worker" contract stays mechanically enforced — anything outside this
-# allowlist falls through and is rejected in non-interactive mode. The
-# top-level `leerie --dangerously-skip-permissions` flag (DESIGN §12 last
-# paragraph) is the documented escape hatch: when set, claude_p passes
-# --dangerously-skip-permissions to every worker, including the inspect
-# bucket; the allowlist still names what the worker can call without
-# prompting, but the gate that rejects everything else is lifted.
+#
+# Write/Edit are deliberately omitted, and that omission is now load-bearing
+# rather than advisory. It previously was not: the top-level
+# `--dangerously-skip-permissions` flag used to reach these workers and lift
+# the gate, and a classifier then used Write — absent from this list — to
+# rewrite the operator's branch. The flag now widens this allowlist with the
+# repo's build/lint/test verbs (`_widen_inspect_tools`) instead of bypassing
+# the gate, so what is not named here genuinely cannot be called.
 #
 # Tool restriction is two-layered:
-#   --allowedTools  (soft) — pre-approves tools for auto-execution;
-#       bypassed entirely by --dangerously-skip-permissions.
+#   --allowedTools  (soft) — pre-approves tools for auto-execution, and
+#       carries the CLI's working-directory boundary with it; bypassed
+#       entirely by --dangerously-skip-permissions, which is exactly why
+#       judgment workers no longer receive that flag.
 #   --disallowedTools (hard, DISALLOWED_TOOLS) — removes tools from the
-#       model's context; survives --dangerously-skip-permissions.
+#       model's context; survives --dangerously-skip-permissions, so it is
+#       the layer that still holds for `autonomous` acting workers.
 INSPECT_TOOLS = (
     f"{_READ_BASE},"
     "Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),"
@@ -872,6 +893,95 @@ KNOWN_TOOLS: frozenset[str] = frozenset(
     | _bare_tool_names(DISALLOWED_TOOLS)
     | {"StructuredOutput"}
 )
+
+
+# Memoized per repo: `resolve_blt` reads config, runs inference AND logs a
+# "BLT: config axes=..." line. Called per judgment worker (there are dozens)
+# that would be dozens of identical lines and dozens of redundant file reads.
+_BLT_VERBS_CACHE: dict[str, list[str]] = {}
+
+
+def _blt_verbs(repo_root: Path) -> list[str]:
+    """The distinct executables this repo's declared/inferred build, lint and
+    test commands invoke — `pnpm` from `pnpm run build`, `npx` from
+    `npx tsc --noEmit`, `python3` from `python3 -m pytest`.
+
+    One verb per SHELL SEGMENT, not per axis: `pnpm build && vitest run`
+    genuinely invokes two executables, and granting only the first leaves the
+    planner unable to run half of what it was just given.
+
+    Deliberately the first token of each segment, no finer. A tighter-looking
+    pattern (`Bash(pnpm run:*)`) is not tighter in practice: the CLI matches
+    `Bash(<prefix>:*)` on the command prefix, so `pnpm run` would reject the
+    equally-legitimate `pnpm test` / `pnpm -s exec tsc` a planner reaches for,
+    and every rejection surfaces as a tool-fail the model then reasons around.
+    The verb is the honest granularity — see `_widen_inspect_tools` for why
+    widening at all is a bounded concession rather than a safe operation.
+
+    Memoized per repo: `resolve_blt` reads config, runs inference AND logs, so
+    an uncached call per judgment worker would be dozens of identical lines."""
+    key = str(repo_root)
+    if key in _BLT_VERBS_CACHE:
+        return list(_BLT_VERBS_CACHE[key])
+    out: list[str] = []
+    try:
+        blt = resolve_blt(repo_root)
+    except Exception:
+        _BLT_VERBS_CACHE[key] = out
+        return out
+    for axis in ("build", "lint", "test"):
+        cmd = (blt.get(axis) or "").strip()
+        if not cmd:
+            continue
+        # Reuse the pair of rules this module already owns rather than a
+        # second copy of either — a duplicated rule drifts exactly the way a
+        # duplicated list does. They compose in this order: split on shell
+        # separators FIRST (`_BLT_SEG_RE`), then strip each segment's
+        # non-invoking lead (`_BLT_SEG_LEAD_RE`: `timeout 90 …`, `cd x …`,
+        # `NODE_ENV=test …`). Stripping before splitting leaves the separator
+        # itself as the first token, so `cd api && vitest run` yields `&&`.
+        #
+        # Every segment contributes: `pnpm build && vitest run` genuinely
+        # invokes two executables, and granting only the first leaves the
+        # planner unable to run half of what it was just given.
+        for seg in _BLT_SEG_RE.split(cmd):
+            seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
+            if not seg:
+                continue
+            try:
+                toks = shlex.split(seg)
+            except ValueError:
+                # Unbalanced quotes in a user-declared command. Skip the
+                # segment rather than guessing — a wrong verb widens the
+                # wrong thing.
+                continue
+            if toks and toks[0] not in out:
+                out.append(toks[0])
+    _BLT_VERBS_CACHE[key] = out
+    return list(out)
+
+
+def _widen_inspect_tools(base: str, repo_root: Path) -> str:
+    """Add `Bash(<verb>:*)` for this repo's build/lint/test executables.
+
+    This is what `--dangerously-skip-permissions` now buys a judgment worker,
+    and it is strictly less than what that flag used to buy. The flag's stated
+    purpose (DESIGN §12) was always tooling visibility — "repositories where
+    the planner needs `pnpm`/`tsc`/`vitest`" — never write access; write access
+    was collateral, and it is the collateral that let a classifier rewrite a
+    user's branch.
+
+    The concession is real and must not be undersold: a build verb runs
+    arbitrary code, so an allowlisted `pnpm`/`node`/`python3` CAN write outside
+    the worker's cwd. Measured directly — with permissions ON and `python3`
+    allowlisted, `python3 -c "open('<outside>','w')"` succeeded, while the Write
+    tool aimed at the same path was rejected. So this restores the planner's
+    tooling and leaves a narrower hole than the flag it replaces; the
+    `/work` sentinel (`_snapshot_repo_state`) is what covers the remainder."""
+    verbs = _blt_verbs(repo_root)
+    if not verbs:
+        return base
+    return base + "," + ",".join(f"Bash({v}:*)" for v in verbs)
 
 # --inspect-dir preference: extra directories to grant the inspect-bucket
 # workers (classifier, planner, reconciler, plan_overlap_judge, provision) read access to via the
@@ -1044,13 +1154,18 @@ NO_PUSH_FILE = SOURCE_OF_TRUTH_FILE
 CLARIFY_ENV = "LEERIE_CLARIFY"
 CLARIFY_FILE = SOURCE_OF_TRUTH_FILE
 
-# --dangerously-skip-permissions escape hatch (DESIGN §12). Forces
-# every claude -p worker — including the judgment workers that run in
-# the real repo cwd — to pass --dangerously-skip-permissions, waiving
-# the mechanical §12 read-only enforcement on classifier / planner /
-# reconciler / provision. Named identically to the underlying CLI flag
-# on purpose: choosing it means the user understands they are removing
-# a guardrail. Resolution order: --dangerously-skip-permissions CLI
+# The operator's tooling escape hatch (DESIGN §12 *Judgment-worker
+# isolation*, L3). It does NOT hand judgment workers the CLI flag of the
+# same name — that is unreachable for them, because the flag removes the
+# CLI's working-directory boundary along with the prompts and a worker
+# that escaped it rewrote an operator's branch. It instead WIDENS their
+# allowlist with the repo's build/lint/test verbs (`_widen_inspect_tools`),
+# which is the tooling visibility the flag was always documented to buy.
+# Acting workers carry the CLI flag regardless, from autonomous=True.
+# The name is kept deliberately: it still grants a judgment worker the
+# ability to run arbitrary build commands, which can write outside its
+# worktree, so it is still a trust decision — just a far smaller one.
+# Resolution order: --dangerously-skip-permissions CLI
 # flag → LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env → leerie.toml → False.
 DANGEROUS_SKIP_PERMS_ENV = "LEERIE_DANGEROUSLY_SKIP_PERMISSIONS"
 DANGEROUS_SKIP_PERMS_FILE = SOURCE_OF_TRUTH_FILE
@@ -1446,6 +1561,37 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "rebaser")
+
+# PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
+# with `autonomous=False` against a tree it does not own. The partition
+# matters because it is what `claude_p` keys the permission decision on:
+# these workers NEVER receive --dangerously-skip-permissions, no matter what
+# the operator passed.
+#
+# This is not a style preference, it is a measured containment boundary.
+# Live probe (claude 2.1.237, filesystem-verified, four runs):
+#   * with --dangerously-skip-permissions, a worker holding only
+#     INSPECT_TOOLS used the Write tool (absent from the allowlist) to
+#     overwrite a tracked file OUTSIDE its cwd, and `git commit`ed on the
+#     user's branch. cwd was a detached worktree at the time — so a worktree
+#     is NOT a boundary while the flag is set.
+#   * with the flag absent, the identical prompt had every one of those
+#     attempts rejected, the CLI naming the allowed working directory.
+# The cwd boundary is real; the flag is what erases it. Hence: judgment
+# workers get the boundary, and the operator's escape hatch is re-expressed
+# as an allowlist widening (see _widen_inspect_tools) rather than a
+# permission bypass.
+PLANNING_WORKER_TYPES = frozenset({
+    "classifier", "classification_judge", "provision", "provision_judge",
+    "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
+    "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
+    "wiring_judge", "satisfied_probe", "integration_judge",
+})
+# The complement: workers that legitimately act on files, inside a worktree
+# they own. `rebaser` is here by the DESIGN §12 scoped exception.
+ACTING_WORKER_TYPES = frozenset({
+    "implementer", "integrator", "conformer", "rebaser",
+})
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main _orchestrate loop, but they do get dedicated model resolution via
 # --judge-model / --heal-model (and their env / TOML mirrors).
@@ -6184,13 +6330,15 @@ def resolve_dangerously_skip_permissions(
     LEERIE_DANGEROUSLY_SKIP_PERMISSIONS env var →
     dangerously_skip_permissions in leerie.toml → False.
 
-    When True, EVERY claude -p worker — including the judgment workers
-    (classifier, planner, reconciler, plan_overlap_judge, provision) that run
-    in the real repo cwd, not an isolated worktree — is invoked with
-    --dangerously-skip-permissions. This waives the DESIGN §12
-    mechanical enforcement that planners stay read-only; trust shifts
-    onto the prompts. Off by default; users opting in are making one
-    all-or-nothing trust decision. See DESIGN §12 (last paragraph) and
+    When True, judgment workers (PLANNING_WORKER_TYPES) get a WIDENED
+    allowlist — the leading verbs of the repo's declared build/lint/test
+    commands, added as Bash(<verb>:*) patterns by `_widen_inspect_tools` —
+    and NOT --dangerously-skip-permissions, which is unreachable for them
+    at any setting (DESIGN §12 *Judgment-worker isolation*). Acting workers
+    receive the CLI flag from autonomous=True regardless of this value.
+    Off by default. Still a trust decision: a build verb runs arbitrary
+    code and can write outside the worker's worktree, which is what
+    `_assert_repo_unchanged` exists to catch. See DESIGN §12 and
     IMPLEMENTATION.md §2 "Permission override (dangerous)"."""
     return _resolve_bool_pref(
         repo_root, cli_value,
@@ -6912,6 +7060,250 @@ async def _gather_or_cancel(*aws):
 async def _run_script(name: str, *args: str) -> subprocess.CompletedProcess:
     """Run one of the bundled git worktree scripts in the target repo."""
     return await run_proc(["bash", str(SCRIPTS / name), *args], cwd=os.getcwd())
+
+
+def _stage_worktree_extras(st: "State", worktree: str) -> None:
+    """Copy the things a judgment worker needs that `git worktree add` does
+    not carry, because git only checks out TRACKED content.
+
+    Two classes, both measured rather than imagined:
+
+    1. **Untracked task-reference files.** `_preflight_repo` filters `??`
+       lines out of its clean-tree gate, so untracked content is a normal
+       state for a repo leerie will happily run on. Meanwhile
+       `_glob_task_references` resolves the task's file references against the
+       real checkout and `_format_task_file_references` emits them
+       repo-relative, with an instruction to read each one — so a worker in a
+       worktree would be told to read a path that is not there. This is not
+       hypothetical: on the run that motivated this change, the classifier's
+       very first action was reading a task document that `git status` reports
+       as untracked. Losing it would have been a silent, total loss of the
+       spec.
+    2. **`.claude/`**, when the repo has one and does not track it. Repos
+       commonly gitignore it, and `scripts/remote/seed-repo.sh` already
+       force-ships it to `/work` for exactly this reason — "workers need its
+       hooks/agents/skills/commands to function".
+
+    Best-effort throughout: a copy failure degrades the worker's context but
+    must never take down a run that would otherwise proceed."""
+    try:
+        repo_root = Path(st.repo_root)
+        wt = Path(worktree)
+        task = st.data.get("task") or ""
+        staged = 0
+        if task:
+            for src in _glob_task_references(task, repo_root):
+                try:
+                    rel = src.resolve().relative_to(repo_root.resolve())
+                except ValueError:
+                    continue          # outside the repo; not ours to stage
+                dst = wt / rel
+                if dst.exists():
+                    continue          # tracked — the worktree already has it
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    if src.is_dir():
+                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(src, dst)
+                    staged += 1
+                except Exception:
+                    continue
+        claude_src, claude_dst = repo_root / ".claude", wt / ".claude"
+        if claude_src.is_dir() and not claude_dst.exists():
+            try:
+                shutil.copytree(claude_src, claude_dst, dirs_exist_ok=True)
+                staged += 1
+            except Exception:
+                pass
+        if staged:
+            log(f"planning worktree: staged {staged} untracked path(s) "
+                "the worker would otherwise not see")
+    except Exception as e:
+        log(f"planning worktree: could not stage untracked paths "
+            f"(non-fatal): {e}")
+
+
+async def _ensure_planning_worktree(st: "State") -> str:
+    """Create (or reset) this run's disposable judgment-worker worktree and
+    return its absolute path, recording it in `st.data["planning_worktree"]`.
+
+    Called before `phase_classify` and again before the satisfied-probe
+    sweep. It is NOT guarded on the state key being absent: the worktree is a
+    filesystem fact, not run state, so a resume must re-establish it (an
+    abnormal exit removes it) and a second call must re-reset it (the probe
+    needs a clean tree — see the script's header). The state key records the
+    path for the audit trail and for `_judgment_cwd`, not for a skip check.
+
+    Fails closed. A silent fallback to the real checkout would reinstate
+    exactly the exposure this exists to remove, and this runs after preflight
+    and before phase 1, so the run has spent essentially nothing — the
+    cheapest possible moment to refuse (DESIGN §13)."""
+    proc = await _run_script("planning-worktree.sh", st.run_id)
+    if proc.returncode != 0:
+        die("could not create the judgment-worker worktree "
+            f"(planning-worktree.sh exited {proc.returncode}).\n"
+            f"{proc.stderr.strip()}\n"
+            "leerie refuses to run judgment workers in your real checkout — "
+            "without the worktree they would plan against, and can write to, "
+            "the branch you are sitting on (DESIGN §12).\n"
+            "If a previous run left a stale registration behind:\n"
+            f"  bash scripts/cleanup.sh --run-id {st.run_id}\n"
+            "  ./leerie prune --apply")
+    # The script echoes `planning-worktree: <abs path>` as its last line.
+    line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
+    path = line.split("planning-worktree:", 1)[-1].strip() if line else ""
+    if not path or not os.path.isdir(path):
+        die("planning-worktree.sh reported no usable path "
+            f"(stdout: {proc.stdout.strip()!r}).")
+    st.data["planning_worktree"] = path
+    st.save()
+    # After the reset, not before: `git clean -fd` would remove anything
+    # staged by a previous call.
+    _stage_worktree_extras(st, path)
+    return path
+
+
+# Paths leerie itself is entitled to write inside the user's checkout, so the
+# sentinel below does not report leerie's own bookkeeping as tampering.
+# `.leerie/config.toml` is the one committable file the orchestrator writes
+# (DESIGN §6½ dep capture); `.leerie/` at large is the state root on the
+# Fly/EC2 runtimes, where `resolve_leerie_root` falls back to `<repo>/.leerie`.
+_SENTINEL_EXEMPT_PREFIXES = (".leerie/",)
+
+
+async def _snapshot_repo_state(repo_root: str) -> dict:
+    """Capture the user's checkout identity: HEAD, porcelain status, refs.
+
+    Deliberately includes UNTRACKED files. `_preflight_repo` filters `??`
+    lines out of its clean-tree gate, which means "clean at run start" already
+    tolerates arbitrary untracked content — so a worker *creating* files is
+    precisely the case that gate cannot see, and precisely what a runaway
+    judgment worker does first."""
+    ok = True
+
+    async def _out(*argv: str) -> str:
+        nonlocal ok
+        r = await run_proc(list(argv), cwd=repo_root)
+        if r.returncode != 0:
+            ok = False
+            return ""
+        return r.stdout
+
+    porcelain = [
+        ln for ln in (await _out("git", "status", "--porcelain")).splitlines()
+        if not any(ln[3:].startswith(p) for p in _SENTINEL_EXEMPT_PREFIXES)
+    ]
+    head = (await _out("git", "rev-parse", "HEAD")).strip()
+    refs = sorted((await _out(
+        "git", "for-each-ref", "--format=%(refname) %(objectname)",
+        "refs/heads")).splitlines())
+    # `ok` records whether every probe actually answered. Without it a
+    # transiently unreadable checkout produces head="" and refs=[], which
+    # `_diff_repo_state` reads as "HEAD moved" plus "every branch deleted" —
+    # a fabricated tampering report that would die() a perfectly healthy run.
+    # A check that cries wolf gets disabled, which would cost the guarantee.
+    return {"head": head, "porcelain": sorted(porcelain), "refs": refs,
+            "ok": ok}
+
+
+def _diff_repo_state(before: dict, after: dict) -> list[str]:
+    """Human-readable deltas between two `_snapshot_repo_state` results.
+
+    Ref changes under leerie's own namespaces are expected — the run branch
+    and subtask branches are created during a run — so only refs OUTSIDE
+    `refs/heads/leerie/` count as tampering."""
+    out: list[str] = []
+    if before.get("head") != after.get("head"):
+        out.append(f"HEAD moved: {before.get('head', '?')[:12]} -> "
+                   f"{after.get('head', '?')[:12]}")
+    b_files, a_files = set(before.get("porcelain", [])), set(
+        after.get("porcelain", []))
+    for ln in sorted(a_files - b_files):
+        out.append(f"working tree changed: {ln}")
+    def _own(ref_line: str) -> bool:
+        return ref_line.split(" ", 1)[0].startswith("refs/heads/leerie/")
+    b_refs = {r for r in before.get("refs", []) if not _own(r)}
+    a_refs = {r for r in after.get("refs", []) if not _own(r)}
+    for r in sorted(a_refs - b_refs):
+        out.append(f"ref created/moved: {r}")
+    for r in sorted(b_refs - a_refs):
+        out.append(f"ref deleted: {r}")
+    return out
+
+
+async def _assert_repo_unchanged(st: "State", phase: str) -> None:
+    """The §12 guarantee: verify no worker has touched the user's checkout.
+
+    Judgment workers no longer carry `--dangerously-skip-permissions`, which
+    restores the CLI's working-directory boundary — but that boundary is
+    enforced on tool *arguments*, and an allowlisted build verb runs arbitrary
+    code. Measured: with permissions ON and `python3` allowlisted,
+    `python3 -c "open('<outside path>','w')"` wrote outside the cwd while the
+    Write tool aimed at the same path was rejected. So a residual escape
+    exists by construction, and this is what covers it.
+
+    Modelled on `check_rebaser_worktree_state`: trust the worker, then
+    mechanically re-check the claim. Runs after every planning phase rather
+    than once at the end, so it fires within one worker of the damage instead
+    of after the whole planning spend."""
+    before = st.data.get("repo_state_before_planning")
+    if not before:
+        return
+    if not before.get("ok", True):
+        # The baseline itself is untrustworthy, so nothing can be concluded
+        # from a comparison against it.
+        return
+    after = await _snapshot_repo_state(str(st.repo_root))
+    if not after.get("ok", True):
+        # "Could not tell" is not "tampered". Warn rather than die: the run is
+        # still recoverable and the next phase re-checks.
+        log(f"could not verify the checkout after {phase} "
+            "(git did not answer); skipping the tamper check this round")
+        return
+    deltas = _diff_repo_state(before, after)
+    if not deltas:
+        return
+    die("a worker modified your real checkout during " + phase + ".\n  "
+        + "\n  ".join(deltas)
+        + "\n\nleerie runs judgment workers in a disposable worktree "
+          "precisely so this cannot happen; reaching here means a worker "
+          "escaped it (most likely via a build command, which runs arbitrary "
+          "code). Your checkout is the source of truth for this run, so it "
+          "refuses to keep planning against a tree that moved underneath it.\n"
+          "Inspect and restore, then resume:\n"
+          f"  git -C {st.repo_root} status\n"
+          f"  git -C {st.repo_root} checkout -- <paths>   # tracked edits\n"
+          f"  git -C {st.repo_root} clean -i               # files it created\n"
+          f"  ./leerie resume {st.run_id}")
+
+
+def _judgment_cwd(st: "State") -> str:
+    """The cwd every judgment worker runs in.
+
+    Raises rather than falling back to the real checkout. `claude_p` also
+    refuses a judgment worker whose cwd is the checkout, so a fallback here
+    would only convert a clear failure into a confusing one two frames later.
+    """
+    path = st.data.get("planning_worktree")
+    if path:
+        return str(path)
+    # Fall back to the conventional location rather than raising. The fallback
+    # CANNOT violate the §12 guarantee: it is derived from the run directory,
+    # so it is never the user's checkout, and `claude_p` independently refuses
+    # any judgment worker whose cwd resolves to `st.repo_root`. The enforcement
+    # therefore does not rest on this lookup, which makes raising here pure
+    # diagnostics bought at the price of a precondition every caller that
+    # constructs a `State` by hand must now know about — ~30 test files, none
+    # of which spawn a real worker. If this fires in production the worker
+    # spawns against a directory that does not exist and fails loudly at exec
+    # time, which is the same signal one frame later.
+    run_dir = getattr(st, "run_dir", None)
+    if run_dir is None:
+        raise RuntimeError(
+            "cannot derive a judgment-worker cwd: state has neither "
+            "`planning_worktree` nor `run_dir`")
+    return str(Path(run_dir) / "worktrees" / "planning")
 
 
 # =========================================================================
@@ -7731,7 +8123,7 @@ async def _label_migration_chunks(
             system_prompt=sys_prompt,
             user_prompt=user_prompt,
             schema_key="splitter",
-            cwd=str(repo_root),
+            cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS,
             max_turns=30,
             autonomous=False,
@@ -8036,7 +8428,7 @@ async def _recursive_decompose(
             system_prompt=sys_prompt,
             user_prompt=user_prompt,
             schema_key="fit_judge",
-            cwd=str(repo_root),
+            cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS,
             max_turns=30,
             autonomous=False,
@@ -8152,7 +8544,7 @@ async def _recursive_decompose(
                 system_prompt=sys_prompt_s,
                 user_prompt=user_prompt_s,
                 schema_key="splitter",
-                cwd=str(repo_root),
+                cwd=_judgment_cwd(st),
                 allowed_tools=INSPECT_TOOLS,
                 max_turns=30,
                 autonomous=False,
@@ -9688,6 +10080,16 @@ def _build_repo_map(
         ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
         ".tox", "dist", "build", ".mypy_cache", ".pytest_cache",
         ".ruff_cache", "target", "vendor", ".bundle",
+        # `.leerie` is the STATE ROOT on the Fly/EC2 runtimes: only the local
+        # nerdctl arm exports LEERIE_STATE_DIR, so `resolve_leerie_root` falls
+        # back to `<repo>/.leerie` there and every worktree (staging, per
+        # subtask, and now the judgment worktree) materializes inside the repo.
+        # Without this the map walks N full copies of the tree — every current
+        # worktree plus every prior run's leftovers — indexing each file
+        # repeatedly and spending the token budget on worktree paths. `.git` is
+        # already pruned by name, but a worktree's `.git` is a FILE, not a
+        # directory, so its contents were walked in full.
+        ".leerie",
     })
 
     def _cache_path(abs_path: Path) -> Path | None:
@@ -10876,7 +11278,7 @@ async def _filter_satisfied_subtasks(
             try:
                 out = await claude_p(
                     user_prompt=user_prompt, system_prompt=sys_prompt,
-                    schema_key="satisfied_probe", cwd=str(repo_root),
+                    schema_key="satisfied_probe", cwd=_judgment_cwd(st),
                     allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=20,
                     autonomous=False, caps=caps, st=st,
                     model=models["satisfied_probe"],
@@ -16858,11 +17260,15 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     single-result mode (`structured_output` present on schema success).
 
     `autonomous` workers skip permission prompts (they act on files inside an
-    isolated worktree); non-autonomous workers get only read tools — unless
-    `state.dangerously_skip_permissions` is set, in which case every worker
-    is invoked with `--dangerously-skip-permissions`, waiving the §12
-    mechanical read-only enforcement on judgment workers. See DESIGN §12
-    and IMPLEMENTATION.md §2 "Permission override (dangerous)".
+    isolated worktree). Judgment workers (`PLANNING_WORKER_TYPES`) never do:
+    `--dangerously-skip-permissions` is not reachable for them at any setting,
+    because the flag removes the CLI's working-directory boundary as well as
+    the prompts, and that boundary is the only thing standing between a
+    judgment worker and the user's branch. `state.dangerously_skip_permissions`
+    instead WIDENS their allowlist with the repo's build/lint/test verbs
+    (`_widen_inspect_tools`), which is the visibility the flag was always
+    documented to buy. See DESIGN §12 and IMPLEMENTATION.md §2 "Permission
+    override (dangerous)".
 
     `model` is a `claude --model` alias (`sonnet` / `opus` / `haiku`);
     resolved per worker-type by `resolve_models()` at startup.
@@ -16903,6 +17309,43 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     schema = json.dumps(SCHEMAS[schema_key], separators=(",", ":"))
     leerie_dir = st.path.parent
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+
+    # §12 containment gate. A judgment worker must never be handed the real
+    # checkout as its cwd: without --dangerously-skip-permissions the CLI's
+    # own working-directory boundary is what confines it, and a cwd of /work
+    # makes that boundary the whole repo. Raised rather than corrected,
+    # because silently rewriting a caller's cwd would hide the contract
+    # violation (CLAUDE.md: a check that coerces a bad argument is a check
+    # that is disabled). Stated as "not the real checkout" rather than "equals
+    # the planning worktree" so the post-execution satisfied_probe rescue —
+    # which legitimately runs in a SUBTASK worktree — passes unchanged.
+    if schema_key in PLANNING_WORKER_TYPES:
+        try:
+            _same = (os.path.realpath(cwd)
+                     == os.path.realpath(str(st.repo_root)))
+        except Exception:
+            _same = False
+        if _same:
+            raise ValueError(
+                f"judgment worker {schema_key!r} was given the real repo "
+                f"checkout as cwd ({cwd}). Judgment workers must run in a "
+                "disposable worktree — see DESIGN §12 and "
+                "_ensure_planning_worktree()."
+            )
+        # The operator's escape hatch, re-expressed: more tools, same
+        # boundary. See _widen_inspect_tools for the measured residual.
+        #
+        # Scoped to INSPECT_TOOLS on purpose. `SATISFIED_PROBE_TOOLS` is a
+        # DELIBERATELY narrower bucket whose narrowness is calibrated, not
+        # incidental — 12/12 false positives with full INSPECT_TOOLS latitude
+        # against 0 when scoped to the base tree — and a false positive there
+        # silently deletes real work. Widening it would have handed that probe
+        # `Bash(pytest:*)` on this very repo. An operator asking for build
+        # tooling is asking on behalf of the planner, not the probe.
+        if (st.data.get("dangerously_skip_permissions", False)
+                and allowed_tools == INSPECT_TOOLS):
+            allowed_tools = _widen_inspect_tools(
+                allowed_tools, Path(getattr(st, "repo_root", os.getcwd())))
 
     # The appended system prompt is a second large argv element (reconciler.md
     # is ~25KB) that compounds with the user prompt toward MAX_ARG_STRLEN —
@@ -16951,16 +17394,23 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 cmd.extend(["--effort", effort])
             for d in (add_dirs or ()):
                 cmd.extend(["--add-dir", d])
-            skip_perms = autonomous or bool(
-                st.data.get("dangerously_skip_permissions", False))
-            if skip_perms:
-                # Acting workers (autonomous=True) run inside an isolated
-                # worktree; skipping prompts is what makes the run unattended,
-                # blast radius bounded by the worktree. When the user passes
-                # the top-level --dangerously-skip-permissions escape hatch
-                # (DESIGN §12 last paragraph), judgment workers in the real
-                # repo cwd also get the flag — §12 mechanical enforcement
-                # waived, trust shifts onto the prompts.
+            # Acting workers (autonomous=True) run inside an isolated worktree
+            # they own; skipping prompts is what makes the run unattended, and
+            # the blast radius really is the worktree because nothing else is
+            # writable by them that matters.
+            #
+            # Judgment workers NEVER get the flag, regardless of
+            # `dangerously_skip_permissions`. That flag used to be OR'd in
+            # here, and it was the whole of the containment failure: measured
+            # live (claude 2.1.237, filesystem-verified), a worker holding only
+            # INSPECT_TOOLS and carrying the flag used the Write tool — which
+            # is not in that allowlist — to overwrite a tracked file outside
+            # its cwd and `git commit` on the user's branch. Removing the flag
+            # restores the CLI's own working-directory boundary, which the same
+            # probe showed rejecting every one of those attempts. The operator's
+            # escape hatch is preserved as a widened allowlist instead (see
+            # `_widen_inspect_tools`) — more tools, same boundary.
+            if autonomous:
                 cmd.append("--dangerously-skip-permissions")
             return cmd
 
@@ -18823,7 +19273,7 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
         return await claude_p(
             user_prompt="\n\n".join(user_prompt_parts),
             system_prompt=sys_prompt, schema_key="classifier",
-            cwd=str(repo_root),
+            cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=60, autonomous=False,
             caps=caps, st=st, model=models["classifier"],
             effort=efforts["classifier"], sid="classifier",
@@ -18949,7 +19399,6 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     Returns True iff it routed to the no-work terminal state (caller must
     stop); False otherwise (the categories live on state, like
     `phase_classify`'s own writes, and the caller proceeds normally)."""
-    repo_root = Path(os.getcwd())
     sys_prompt = _load_prompt("classification_judge")
 
     # Accumulated across every round of this gate call: every category the
@@ -18986,7 +19435,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
         )
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt,
-            schema_key="classification_judge", cwd=str(repo_root),
+            schema_key="classification_judge", cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
             caps=caps, st=st, model=models.get("classification_judge",
                                                MODEL_DEFAULT),
@@ -19435,7 +19884,7 @@ async def phase_provision(repo_root: Path, st: State, caps: dict,
                 user_prompt="\n\n".join(prov_up_parts),
                 system_prompt=sys_prompt,
                 schema_key="provision",
-                cwd=str(repo_root),
+                cwd=_judgment_cwd(st),
                 allowed_tools=INSPECT_TOOLS,
                 max_turns=30,
                 autonomous=False,
@@ -19558,7 +20007,7 @@ async def phase_provision_gate(repo_root: Path, st: State, caps: dict,
         )
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt,
-            schema_key="provision_judge", cwd=str(repo_root),
+            schema_key="provision_judge", cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
             caps=caps, st=st,
             model=models.get("provision_judge", MODEL_DEFAULT),
@@ -19799,7 +20248,7 @@ async def phase_artifact_registry(
         )
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt,
-            schema_key="artifact_registry", cwd=str(repo_root),
+            schema_key="artifact_registry", cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=20, autonomous=False,
             caps=caps, st=st,
             model=models.get("artifact_registry", MODEL_DEFAULT),
@@ -20046,7 +20495,7 @@ async def phase_plan(task: str, st: State, caps: dict,
                 return await claude_p(
                     user_prompt="\n\n".join(up_parts + feedback_slot),
                     system_prompt=sys_prompt,
-                    schema_key="planner", cwd=str(repo_root),
+                    schema_key="planner", cwd=_judgment_cwd(st),
                     allowed_tools=INSPECT_TOOLS, max_turns=100,
                     autonomous=False, caps=caps, st=st,
                     model=models["planner"],
@@ -21161,7 +21610,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         st.bump_workers(caps)
         raw = await claude_p(
             user_prompt=up, system_prompt=sys_prompt,
-            schema_key="reconciler", cwd=os.getcwd(),
+            schema_key="reconciler", cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=30,
             autonomous=False, caps=caps, st=st,
             model=models["reconciler"], effort=efforts["reconciler"],
@@ -24301,7 +24750,6 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
     st.data["current_phase"] = "phase 2⅞: adherence-gate"
     st.save()
 
-    repo_root = Path(os.getcwd())
     sys_prompt = _load_prompt("adherence_judge")
 
     def _build_payload(cur_plans: list[dict]) -> dict:
@@ -24337,7 +24785,7 @@ async def phase_adherence_gate(plans: list[dict], task: str, st: State,
         return await claude_p(
             user_prompt=user_prompt,
             system_prompt=sys_prompt,
-            schema_key="adherence_judge", cwd=str(repo_root),
+            schema_key="adherence_judge", cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=30,
             autonomous=False, caps=caps, st=st,
             model=models["adherence_judge"],
@@ -24600,7 +25048,7 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
             json.dumps(payload, indent=2),
             system_prompt=sys_prompt,
             schema_key="task_coverage_judge",
-            cwd=os.getcwd(),
+            cwd=_judgment_cwd(st),
             # INSPECT_TOOLS is load-bearing, not decoration: the judge's
             # prompt instructs it to read task-referenced files itself.
             allowed_tools=INSPECT_TOOLS,
@@ -24681,7 +25129,6 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
 
     Returns `plans` unchanged (the gate does not mutate the plan; it either
     passes it through or `die()`s)."""
-    repo_root = Path(os.getcwd())
     sys_prompt = _load_prompt("wiring_judge")
 
     payload = {
@@ -24713,7 +25160,7 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
         )
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt,
-            schema_key="wiring_judge", cwd=str(repo_root),
+            schema_key="wiring_judge", cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
             caps=caps, st=st,
             model=models.get("wiring_judge", MODEL_DEFAULT),
@@ -24962,7 +25409,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
         return await claude_p(
             user_prompt="\n\n".join(oj_up_parts),
             system_prompt=sys_prompt,
-            schema_key="plan_overlap_judge", cwd=str(repo_root),
+            schema_key="plan_overlap_judge", cwd=_judgment_cwd(st),
             allowed_tools=INSPECT_TOOLS, max_turns=30,
             autonomous=False, caps=caps, st=st,
             model=models["plan_overlap_judge"],
@@ -25313,6 +25760,24 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
     st.data["subtask_status"] = {}
     st.data["current_phase"] = "done: no work required"
     st.save()
+    # Reap the judgment worktree. This path reaches neither `cleanup.sh` (see
+    # the docstring) nor `_cleanup_on_abnormal_exit` — it returns normally, so
+    # `abnormal` stays False and main()'s finally-block never fires. That was
+    # harmless while the only worktrees were created by phase_execute, which a
+    # no-work run returns before ever reaching; the judgment worktree is
+    # created before phase_classify, so this exit is now the one normal path
+    # that would leak a full checkout copy until `leerie prune` reaps it 14
+    # days later. And a no-work run is the shape most likely to take it, since
+    # it terminates *during* planning.
+    _wt = st.data.get("planning_worktree")
+    if _wt and os.path.isdir(_wt):
+        try:
+            subprocess.run(["git", "worktree", "remove", "--force", str(_wt)],
+                           capture_output=True, check=False, timeout=120)
+            if os.path.isdir(_wt):
+                shutil.rmtree(_wt, ignore_errors=True)
+        except Exception as e:                     # never block the exit
+            log(f"could not remove the judgment worktree (non-fatal): {e}")
     _write_run_json(
         st.run_dir,
         finished_at=st.data["finished_at"],
@@ -29987,7 +30452,7 @@ async def _run_integration_judge_gate(
         )
         return await claude_p(
             user_prompt=user_prompt, system_prompt=sys_prompt_judge,
-            schema_key="integration_judge", cwd=str(repo_root),
+            schema_key="integration_judge", cwd=str(staging),
             allowed_tools=INSPECT_TOOLS, max_turns=30, autonomous=False,
             caps=caps, st=st,
             model=models.get("integration_judge", MODEL_DEFAULT),
@@ -31625,6 +32090,24 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     # executes every step exactly as before, and a resumed run skips
     # whatever a prior invocation already completed and checkpointed.
     if "waves" not in st.data:
+        # DESIGN §12 *Judgment-worker isolation*. Deliberately here — inside
+        # the `waves` guard (a run resumed into execution spawns no judgment
+        # worker and needs neither) but ABOVE the `plans_after_classify`
+        # guard, so EVERY planning resume re-establishes it at whichever
+        # `plans_after_*` cursor it re-enters. Nesting it one level deeper is
+        # the N8 trap this function's own header comment documents: work
+        # placed inside the inner guard silently stops happening on every
+        # resume past classify, which is the common case.
+        await _ensure_planning_worktree(st)
+        # Baseline for the sentinel. Guarded on absence, so it is captured
+        # once and kept across resumes: a later pass must compare against the
+        # tree as it was before ANY judgment worker ran, or a modification
+        # made by an earlier pass is laundered into the new baseline and
+        # never reported.
+        if "repo_state_before_planning" not in st.data:
+            st.data["repo_state_before_planning"] = (
+                await _snapshot_repo_state(str(st.repo_root)))
+            st.save()
         if "plans_after_classify" not in st.data:
             # Run-start backstop (DESIGN §6½): before phase_classify, scan
             # prior runs that produced logs but whose dep_capture.done
@@ -31729,6 +32212,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # need not be re-invoked.
             st.data["plans_after_classify"] = []
             st.save()
+            await _assert_repo_unchanged(st, "phase 1 (classify)")
             # Provision per-repo deps (DESIGN §6½). Runs after classify (so
             # a docs-only run can short-circuit). Guarded on presence of
             # the "recipe" key rather than unconditional: `mise install`
@@ -31750,6 +32234,22 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # phase skips it.
             await phase_provision_gate(
                 Path(os.getcwd()), st, caps, models, efforts)
+            # Make the judgment worktree runnable, but only when the operator
+            # asked for tooling. With the escape hatch off, INSPECT_TOOLS
+            # contains no build verb at all — no pnpm, no tsc, no pytest — so
+            # installed deps would be unreachable and the install pure cost.
+            # With it on, `_widen_inspect_tools` has just granted those verbs,
+            # and a build verb in a tree with no node_modules fails in a way
+            # the planner reads as a real repo defect and plans phantom work
+            # around. Placed here because the recipe does not exist until
+            # phase_provision has run. Reuses the same helper the conformance
+            # baseline uses: once per tree per process, and never raises.
+            if st.data.get("dangerously_skip_permissions", False):
+                await _ensure_worktree_deps(
+                    _judgment_cwd(st), st, caps,
+                    log_path=st.run_dir / "logs" / "planning-install.log",
+                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                    label_prefix="planning", log_prefix="planning-install")
             # gather_answers blocks on input(). That's fine here: no
             # concurrent tasks are scheduled yet, so blocking the loop
             # blocks nothing. Kept on the event loop deliberately — every
@@ -31776,6 +32276,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # phase_plan (DESIGN §6).
             st.data["plans_after_plan"] = copy.deepcopy(plans)
             st.save()
+            await _assert_repo_unchanged(st, "phase 2 (plan)")
         else:
             plans = copy.deepcopy(st.data["plans_after_plan"])
 
@@ -31790,6 +32291,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # checkpoint (DESIGN §6).
             st.data["plans_after_reconcile"] = copy.deepcopy(plans)
             st.save()
+            await _assert_repo_unchanged(st, "phase 2.5 (reconcile)")
             # Cleared-but-empty terminal state (DESIGN §8): every planner
             # cleared its gate and confirmed the task is already satisfied
             # on HEAD. Nothing to _schedule, nothing to execute, no run
@@ -31830,6 +32332,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # overlap*).
             st.data["plans_after_overlap_judge"] = copy.deepcopy(plans)
             st.save()
+            await _assert_repo_unchanged(st, "phase 2.75 (overlap judge)")
         else:
             plans = copy.deepcopy(st.data["plans_after_overlap_judge"])
 
@@ -31853,6 +32356,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # phase_adherence_gate (DESIGN §6).
             st.data["plans_after_adherence_gate"] = copy.deepcopy(plans)
             st.save()
+            await _assert_repo_unchanged(st, "phase 2.875 (adherence gate)")
         else:
             plans = copy.deepcopy(st.data["plans_after_adherence_gate"])
 
@@ -31871,6 +32375,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # phase_planning_coverage_gate (DESIGN §6).
             st.data["plans_after_coverage_gate"] = copy.deepcopy(plans)
             st.save()
+            await _assert_repo_unchanged(st, "phase 2.9 (coverage gate)")
         else:
             plans = copy.deepcopy(st.data["plans_after_coverage_gate"])
 
@@ -31918,6 +32423,20 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # per-subtask satisfied_probe_cache (DESIGN §6, keyed by base
             # commit sha) already makes a resumed sweep skip every
             # subtask decided before the pause.
+            # Reset the judgment worktree before the sweep. Load-bearing,
+            # not hygiene: the probe is handed no diff and no file contents —
+            # its prompt tells it to judge "the CURRENT working tree / HEAD",
+            # so its cwd is the ONLY thing determining which tree it sees. An
+            # earlier judgment worker that wrote into that tree would make the
+            # probe answer "already satisfied" and silently drop real work,
+            # which is the exact false-positive class its narrowed tool scope
+            # was calibrated against (12/12, see SATISFIED_PROBE_TOOLS).
+            await _ensure_planning_worktree(st)
+            # NOTE the repo_root argument stays the REAL checkout. It feeds
+            # `base_sha`, the cache key that invalidates verdicts when HEAD
+            # moves across a pause; keyed off the detached worktree instead it
+            # would be constant by construction and the invalidation would
+            # silently never fire.
             satisfied_no_work = await _filter_satisfied_subtasks(
                 plans, Path(os.getcwd()), st, caps, models, efforts)
             if satisfied_no_work is not None:
@@ -31929,6 +32448,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # resume cursor (DESIGN §6).
             st.data["plans_after_filters"] = copy.deepcopy(plans)
             st.save()
+            await _assert_repo_unchanged(st, "phase 3 (filters)")
         else:
             plans = copy.deepcopy(st.data["plans_after_filters"])
 

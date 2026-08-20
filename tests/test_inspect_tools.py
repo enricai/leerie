@@ -1,12 +1,14 @@
 """Coupling tests for INSPECT_TOOLS — the tool bucket for classifier,
 planner, reconciler, plan_overlap_judge, and provision.
 
-These workers run in the real repo cwd (no worktree isolation), so they
-cannot use --dangerously-skip-permissions. INSPECT_TOOLS preserves the
+These workers run in a disposable detached worktree (`_judgment_cwd`), never
+the user's checkout, and never carry --dangerously-skip-permissions — see
+DESIGN §12 *Judgment-worker isolation*. INSPECT_TOOLS preserves the
 DESIGN §12 "read-only worker" contract mechanically: read tools plus
 allowlisted Bash(<verb>:*) patterns for cross-cwd inspection, no
 Write/Edit. Anything outside the allowlist falls through and is rejected
-in non-interactive mode.
+in non-interactive mode — an omission that is load-bearing rather than
+advisory now that the flag can no longer lift the gate for these workers.
 
 These tests pin both halves so a future edit that adds Write/Edit or
 swaps in a bare Bash wildcard (which would defeat the allowlist) fails
@@ -159,7 +161,7 @@ def test_reconciler_call_site_uses_inspect_tools():
 
 def test_overlap_judge_call_site_uses_inspect_tools():
     """phase_overlap_judge (DESIGN §5 *Cross-domain surface overlap*)
-    runs in the real repo cwd like the other judgment workers, so it
+    runs in the judgment worktree like the other judgment workers, so it
     must inherit the same INSPECT_TOOLS allowlist — no Write/Edit, only
     allowlisted Bash verbs. A future edit swapping in ACT_TOOLS would
     silently waive the §12 read-only contract for the overlap judge."""
