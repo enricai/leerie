@@ -263,3 +263,140 @@ class TestWiring:
         planning pass into the new baseline."""
         src = inspect.getsource(leerie._run_phases)
         assert '"repo_state_before_planning" not in st.data' in src
+
+
+# ---------------------------------------------------------------------------
+# L4 extended past planning: the execute phase
+# ---------------------------------------------------------------------------
+
+def _check_exec(leerie, st):
+    return asyncio.run(leerie._assert_repo_unchanged(
+        st, "phase 5 (wave 1)", porcelain_only=True))
+
+
+class TestPorcelainOnlyMode:
+    """Why execute needs a narrower comparison than planning.
+
+    Planning phases take minutes with the operator watching, so any movement
+    in their checkout is suspicious. The execute phase runs for hours —
+    measured p90 285 min over 87 runs — and an operator legitimately pulls
+    their own checkout while it runs. `HEAD moved` is then a *correct*
+    observation about an *innocent* act, and killing a five-hour run over it
+    is worse than the escape being guarded. A guard that cries wolf is a
+    guard someone switches off.
+    """
+
+    def test_a_pull_during_execute_does_not_fire(
+            self, leerie, tmp_path, monkeypatch):
+        """The regression that would make this feature unusable."""
+        repo = _init(tmp_path / "repo")
+        st = _St(repo)
+        st.data["repo_state_before_planning"] = _snap(leerie, repo)
+        # Somebody pulls: HEAD moves, working tree stays clean.
+        (repo / "src.txt").write_text("upstream change\n")
+        run_git_repo_first(repo, "commit", "-am", "upstream")
+        monkeypatch.setattr(leerie, "die",
+                            lambda m, code=1: pytest.fail(
+                                f"sentinel fired on a plain pull: {m}"))
+        _check_exec(leerie, st)
+
+    def test_a_new_branch_during_execute_does_not_fire(
+            self, leerie, tmp_path, monkeypatch):
+        """Same reasoning for refs: an operator branching off their own
+        checkout mid-run is not tampering."""
+        repo = _init(tmp_path / "repo")
+        st = _St(repo)
+        st.data["repo_state_before_planning"] = _snap(leerie, repo)
+        run_git_repo_first(repo, "branch", "my-side-branch")
+        monkeypatch.setattr(leerie, "die",
+                            lambda m, code=1: pytest.fail(
+                                f"sentinel fired on a new branch: {m}"))
+        _check_exec(leerie, st)
+
+    def test_a_worker_write_during_execute_STILL_fires(
+            self, leerie, tmp_path, monkeypatch):
+        """The anti-vacuity partner, and the whole point of the phase.
+
+        Without this, `porcelain_only` could be implemented as "return []"
+        and every test above would pass. This is the production shape: an
+        implementer editing a tracked file in the real checkout — 146 such
+        calls across 36 runs (measured 2026-08-20).
+        """
+        repo = _init(tmp_path / "repo")
+        st = _St(repo)
+        st.data["repo_state_before_planning"] = _snap(leerie, repo)
+        (repo / "src.txt").write_text("WRITTEN BY A WORKER\n")
+        monkeypatch.setattr(leerie, "die",
+                            lambda m, code=1: (_ for _ in ()).throw(
+                                SystemExit(m)))
+        with pytest.raises(SystemExit) as ei:
+            _check_exec(leerie, st)
+        assert "src.txt" in str(ei.value)
+        assert "phase 5 (wave 1)" in str(ei.value)
+
+    def test_planning_mode_is_unchanged(self, leerie, tmp_path, monkeypatch):
+        """The narrowing must be opt-in. Planning still fails on a HEAD move,
+        or this change quietly weakened the layer it was extending."""
+        repo = _init(tmp_path / "repo")
+        st = _St(repo)
+        st.data["repo_state_before_planning"] = _snap(leerie, repo)
+        (repo / "src.txt").write_text("moved\n")
+        run_git_repo_first(repo, "commit", "-am", "move")
+        monkeypatch.setattr(leerie, "die",
+                            lambda m, code=1: (_ for _ in ()).throw(
+                                SystemExit(m)))
+        with pytest.raises(SystemExit) as ei:
+            _check(leerie, st)
+        assert "HEAD moved" in str(ei.value)
+
+    def test_differ_drops_only_the_head_and_ref_axes(self, leerie):
+        """Unit-level pin on the two axes, independent of any repo."""
+        before = {"head": "a" * 40, "porcelain": [], "refs": ["refs/heads/x 1"],
+                  "ok": True}
+        after = {"head": "b" * 40, "porcelain": [], "refs": ["refs/heads/y 2"],
+                 "ok": True}
+        assert leerie._diff_repo_state(before, after) != []
+        assert leerie._diff_repo_state(
+            before, after, porcelain_only=True) == []
+
+
+class TestExecuteWiring:
+    """The sentinel is inert unless it is actually called from the wave loop.
+
+    DESIGN §12's four layers were all scoped to PLANNING_WORKER_TYPES, and
+    §12 states the consequence itself: "L2 is worth nothing without L1."
+    Acting workers have L2 (a per-subtask worktree) and cannot have L1, so
+    until this call existed nothing checked the checkout for the entire
+    execute phase — the phase in which the measured escape happened.
+    """
+
+    def test_phase_execute_checks_the_checkout(self, leerie):
+        src = inspect.getsource(leerie.phase_execute)
+        assert "_assert_repo_unchanged(" in src, (
+            "phase_execute never verifies the checkout; the execute phase is "
+            "where the measured escape occurred")
+
+    def test_the_execute_check_is_porcelain_only(self, leerie):
+        """A HEAD-sensitive check here would kill any run whose operator
+        pulled — see TestPorcelainOnlyMode."""
+        src = inspect.getsource(leerie.phase_execute)
+        i = src.index("_assert_repo_unchanged(")
+        assert "porcelain_only=True" in src[i:i + 200]
+
+    def test_it_runs_per_wave_inside_the_loop(self, leerie):
+        """Per wave, so it fires within one wave of the damage rather than
+        after every wave has spent. Proven by the call sitting after the
+        wave loop header in source order."""
+        src = inspect.getsource(leerie.phase_execute)
+        i_loop = src.index("for wi in range(start, len(waves))")
+        i_check = src.index("_assert_repo_unchanged(")
+        assert i_loop < i_check
+
+    def test_it_precedes_the_wave_die_paths(self, leerie):
+        """A blocked subtask or a conflict marker die()s. If the check sat
+        after those, the wave that tampered would frequently exit without
+        ever being checked."""
+        src = inspect.getsource(leerie.phase_execute)
+        i_check = src.index("_assert_repo_unchanged(")
+        i_marker = src.index("marker_err = await _scan_conflict_markers")
+        assert i_check < i_marker

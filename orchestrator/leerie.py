@@ -7207,14 +7207,25 @@ async def _snapshot_repo_state(repo_root: str) -> dict:
             "ok": ok}
 
 
-def _diff_repo_state(before: dict, after: dict) -> list[str]:
+def _diff_repo_state(before: dict, after: dict, *,
+                     porcelain_only: bool = False) -> list[str]:
     """Human-readable deltas between two `_snapshot_repo_state` results.
 
     Ref changes under leerie's own namespaces are expected — the run branch
     and subtask branches are created during a run — so only refs OUTSIDE
-    `refs/heads/leerie/` count as tampering."""
+    `refs/heads/leerie/` count as tampering.
+
+    `porcelain_only` drops the HEAD and ref comparisons, keeping only the
+    working-tree one. Planning phases take minutes and the operator is
+    waiting, so any movement there is suspicious; the execute phase runs for
+    hours (measured p90 285 min, n=87) and an operator legitimately pulls
+    their own checkout mid-run. Killing a five-hour run because someone ran
+    `git pull` is worse than the escape being guarded, and a guard that cries
+    wolf gets switched off — the same reasoning that put the `ok` field on
+    `_snapshot_repo_state`. File mutation is the damage class that matters.
+    """
     out: list[str] = []
-    if before.get("head") != after.get("head"):
+    if not porcelain_only and before.get("head") != after.get("head"):
         out.append(f"HEAD moved: {before.get('head', '?')[:12]} -> "
                    f"{after.get('head', '?')[:12]}")
     b_files, a_files = set(before.get("porcelain", [])), set(
@@ -7223,16 +7234,18 @@ def _diff_repo_state(before: dict, after: dict) -> list[str]:
         out.append(f"working tree changed: {ln}")
     def _own(ref_line: str) -> bool:
         return ref_line.split(" ", 1)[0].startswith("refs/heads/leerie/")
-    b_refs = {r for r in before.get("refs", []) if not _own(r)}
-    a_refs = {r for r in after.get("refs", []) if not _own(r)}
-    for r in sorted(a_refs - b_refs):
-        out.append(f"ref created/moved: {r}")
-    for r in sorted(b_refs - a_refs):
-        out.append(f"ref deleted: {r}")
+    if not porcelain_only:
+        b_refs = {r for r in before.get("refs", []) if not _own(r)}
+        a_refs = {r for r in after.get("refs", []) if not _own(r)}
+        for r in sorted(a_refs - b_refs):
+            out.append(f"ref created/moved: {r}")
+        for r in sorted(b_refs - a_refs):
+            out.append(f"ref deleted: {r}")
     return out
 
 
-async def _assert_repo_unchanged(st: "State", phase: str) -> None:
+async def _assert_repo_unchanged(st: "State", phase: str, *,
+                                 porcelain_only: bool = False) -> None:
     """The §12 guarantee: verify no worker has touched the user's checkout.
 
     Judgment workers no longer carry `--dangerously-skip-permissions`, which
@@ -7244,9 +7257,15 @@ async def _assert_repo_unchanged(st: "State", phase: str) -> None:
     exists by construction, and this is what covers it.
 
     Modelled on `check_rebaser_worktree_state`: trust the worker, then
-    mechanically re-check the claim. Runs after every planning phase rather
-    than once at the end, so it fires within one worker of the damage instead
-    of after the whole planning spend."""
+    mechanically re-check the claim. Runs after every planning phase and after
+    every execute wave rather than once at the end, so it fires within one
+    worker (or one wave) of the damage instead of after the whole spend.
+
+    The execute-phase call passes `porcelain_only` — see `_diff_repo_state`.
+    Its known blind spot is a gitignored write: `git status --porcelain` never
+    lists `node_modules/`, so the in-checkout dependency installs observed in
+    the run corpus stay invisible here. That is an accepted residual, recorded
+    rather than assumed away."""
     before = st.data.get("repo_state_before_planning")
     if not before:
         return
@@ -7261,7 +7280,7 @@ async def _assert_repo_unchanged(st: "State", phase: str) -> None:
         log(f"could not verify the checkout after {phase} "
             "(git did not answer); skipping the tamper check this round")
         return
-    deltas = _diff_repo_state(before, after)
+    deltas = _diff_repo_state(before, after, porcelain_only=porcelain_only)
     if not deltas:
         return
     die("a worker modified your real checkout during " + phase + ".\n  "
@@ -17196,8 +17215,87 @@ def _append_system_prompt_file_supported() -> bool:
     return supported
 
 
+_denial_skipped_warned = False
+
+
+def _warn_denial_skipped_once(root: Path) -> None:
+    """At most one warning per process when the checkout write-denial cannot
+    be applied because run state lives inside the checkout. Silent would be
+    worse: the operator would believe acting workers are contained when they
+    are not."""
+    global _denial_skipped_warned
+    if _denial_skipped_warned:
+        return
+    _denial_skipped_warned = True
+    log(f"warning: run state lives inside the checkout ({root}), so the "
+        "worker write-denial for it cannot be applied without also denying "
+        "each worker its own worktree. Acting workers are NOT confined to "
+        "their worktree this run; the post-wave checkout sentinel still "
+        "applies. Set LEERIE_STATE_DIR outside the repo to restore it.")
+
+
+def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
+    """Path-scoped deny rules keeping every worker's file writers out of the
+    user's real checkout.
+
+    DESIGN §12 L1 is unavailable to acting workers: they must write without
+    prompting, so `claude_p` gives them `--dangerously-skip-permissions`, and
+    that flag erases the CLI's working-directory boundary. A deny rule is the
+    one control that survives it — measured live (claude 2.1.237, ground truth
+    from the filesystem, cwd a worktree, flag ON):
+
+    | configuration        | write outside cwd | write inside cwd |
+    |----------------------|-------------------|------------------|
+    | no path deny         | SUCCEEDED         | succeeded        |
+    | `Edit(//<root>/**)`  | blocked           | succeeded        |
+
+    The first row is the production failure: 146 `Edit`/`Write` calls with a
+    `file_path` under the checkout, across 36 runs and 4 repos — 8.8% of the
+    411 runs in the state root (measured 2026-08-20; the corpus grows, so
+    re-derive before citing). The second row is this function. Workers keep
+    full write access to their own worktree.
+
+    `Edit(...)` subsumes `Write`, `NotebookEdit` and `MultiEdit`, and also
+    covers `sed -i` (the CLI models it as an edit) — all verified in the same
+    probe. It does NOT cover a shell redirect, `rm`, `touch` or `mkdir`, which
+    the same probe showed still writing; `_assert_repo_unchanged` is the
+    backstop for those, which is why it now runs during execute too.
+
+    Derived from `repo_root` rather than hard-coding `/work` so it stays
+    correct if the bind-mount path ever moves. `//` is the CLI's anchor for an
+    absolute filesystem path, so `/work` becomes `//work/**`.
+
+    Returns `""` when `run_dir` is inside `repo_root`. Worker worktrees are
+    siblings under the run dir, so in that layout a blanket deny under
+    `repo_root` would deny a worker its own worktree and every implementer
+    would fail — silently, since a denial is not an error. It is reachable:
+    `resolve_leerie_root` falls back to `repo_root / ".leerie"` whenever
+    `LEERIE_STATE_DIR` is unset, which is the direct-invocation and test path
+    (the launcher always sets `/leerie-state`). A deny rule cannot carry a
+    carve-out — deny wins in every mode and allow rules are inert under
+    `--dangerously-skip-permissions` — so skipping is the only option, and it
+    is announced rather than silent. `_assert_repo_unchanged` still covers
+    that configuration.
+    """
+    # `.resolve()` is load-bearing for the containment comparison below, but
+    # it also decides the emitted pattern — and the CLI matches that against
+    # the path the MODEL passes to Edit. The two must agree or the rule
+    # silently stops matching. They do: `repo_root` is `Path(os.getcwd())`,
+    # `getcwd()` is already symlink-resolved, and `/work` is a bind mount
+    # rather than a symlink, so this is the identity in every container
+    # runtime. A direct invocation against a symlinked checkout is the one
+    # shape where they could diverge.
+    root = Path(str(repo_root)).resolve()
+    run = Path(str(run_dir)).resolve()
+    if run == root or root in run.parents:
+        _warn_denial_skipped_once(root)
+        return ""
+    return f"Edit(/{str(root).rstrip('/')}/**)"
+
+
 def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
-                           model: str, prompt: str | None = None) -> list[str]:
+                           model: str, prompt: str | None = None,
+                           deny_extra: str = "") -> list[str]:
     """The `claude -p` argv every live invocation shares, containment included.
 
     Single owner by design. #216 widened `DISALLOWED_TOOLS` and added
@@ -17229,7 +17327,8 @@ def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
         "--verbose",
         "--json-schema", schema,
         "--allowedTools", allowed_tools,
-        "--disallowedTools", DISALLOWED_TOOLS,
+        "--disallowedTools",
+        DISALLOWED_TOOLS + ("," + deny_extra if deny_extra else ""),
         "--max-turns", str(max_turns),
         "--model", _model_arg(model),
         "--strict-mcp-config",
@@ -17379,9 +17478,15 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # shared builder so this site and preflight's smoke test cannot
             # drift apart again — see _contained_claude_argv. `prompt` stays
             # None: the user prompt goes over stdin (see above).
+            # Path-scoped write denial for the user's real checkout. Deny
+            # rules are the only permission control that survives
+            # --dangerously-skip-permissions, so this binds acting workers
+            # too — the ones L1 cannot reach. See _repo_write_denials.
             cmd = _contained_claude_argv(
                 schema=schema, allowed_tools=allowed_tools,
-                max_turns=max_turns, model=model)
+                max_turns=max_turns, model=model,
+                deny_extra=_repo_write_denials(st.repo_root,
+                                               st.run_dir))
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
@@ -17775,7 +17880,14 @@ async def _replay_capture(record: dict, *,
         tmp_state_path = tmp_run_dir / "state.json"
         tmp_state_path.write_text("{}")
 
-        replay_st = _ReplayState(tmp_run_dir, tmp_state_path)
+        # `repo_root` is the replay's own temp dir, deliberately. A replay is
+        # a host-side debug re-run of ONE captured call, not a run: there is
+        # no checkout it should be writing, and pointing this at the real one
+        # would newly subject replay to the §12 judgment-worker cwd guard —
+        # which it has always been exempt from, since it never carried a
+        # `repo_root` for that guard to compare against. Keeping the exemption
+        # explicit beats acquiring it from a missing attribute.
+        replay_st = _ReplayState(tmp_run_dir, tmp_state_path, tmp_run_dir)
         caps = dict(DEFAULT_CAPS)
         # Honour the operator's global ceiling here too, for the same reason
         # the two host-side entrypoints do: a replay has no CLI, but env and
@@ -17847,15 +17959,21 @@ def _accumulate_telemetry(data: dict, envelope: dict) -> None:
 class _ReplayState:
     """Minimal State-alike for _replay_capture: no persistent writes.
 
-    Satisfies the interface claude_p() calls on the state object (bump_workers,
-    add_telemetry, .data, .run_id, .run_dir, .path) without touching the
-    state root on disk. All save() calls are no-ops. last_envelope captures the envelope returned
-    by _invoke so _replay_capture can return (envelope, structured_output).
+    Satisfies the interface claude_p() calls on the state object
+    (bump_workers, add_telemetry, .data, .run_id, .run_dir, .path,
+    .repo_root) without touching the state root on disk. All save() calls
+    are no-ops. last_envelope captures the envelope returned by _invoke so
+    _replay_capture can return (envelope, structured_output).
     """
 
-    def __init__(self, run_dir: Path, state_path: Path) -> None:
+    def __init__(self, run_dir: Path, state_path: Path,
+                 repo_root: Path) -> None:
         self.run_dir = run_dir
         self.path = state_path
+        # claude_p reads this for the checkout write-denial
+        # (`_repo_write_denials`) and the §12 cwd guard. See the call site in
+        # `_replay_capture` for why a replay passes its own temp dir.
+        self.repo_root = repo_root
         self.run_id = "replay"
         self.data: dict = {
             "telemetry": {"calls": 0, "cost_usd": 0.0,
@@ -30888,6 +31006,18 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # visible signature of a silent integration skip.
         log(f"phase 5: wave {wi + 1} integrated {len(integrated)} of "
             f"{expected} completed subtask(s)")
+
+        # DESIGN §12 L4, extended past planning. Acting workers cannot be
+        # given L1 (they must write unprompted), so `_repo_write_denials`
+        # blocks their file-writer tools and this catches what a deny rule
+        # cannot: a Bash write. Measured live — with `Edit(//<root>/**)`
+        # denied, a shell redirect, `rm`, `touch` and `mkdir` all still wrote
+        # to the denied path. Per wave, not per subtask: a wave's subtasks run
+        # concurrently against one shared checkout, so a per-subtask check
+        # races itself for no extra coverage. Placed before the marker-scan
+        # and blocked-subtask die()s so it still runs on those paths.
+        await _assert_repo_unchanged(
+            st, f"phase 5 (wave {wi + 1})", porcelain_only=True)
 
         # N31: the worktree (including node_modules) is dead weight once
         # its branch is merged into staging — pruning it here, instead of
