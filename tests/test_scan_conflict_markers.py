@@ -15,22 +15,7 @@ from pathlib import Path
 
 import pytest
 
-
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args], check=True,
-                          capture_output=True, text=True)
-
-
-def _init_repo(tmp_path: Path) -> Path:
-    repo = tmp_path / "staging"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "test@x")
-    _git(repo, "config", "user.name", "test")
-    (repo / "a.txt").write_text("a\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "a")
-    return repo
+from tests.conftest import init_git_repo, run_git_repo_first
 
 
 def test_nonexistent_staging_returns_none_without_shelling_out(
@@ -46,17 +31,17 @@ def test_nonexistent_staging_returns_none_without_shelling_out(
 
 
 def test_clean_tree_returns_none(leerie, tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "staging")
     result = asyncio.run(leerie._scan_conflict_markers(repo))
     assert result is None
 
 
 def test_tree_with_conflict_markers_returns_message_with_file_count_and_sample(
         leerie, tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "staging")
     (repo / "b.txt").write_text("<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> x\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "leaves markers")
+    run_git_repo_first(repo, "add", ".")
+    run_git_repo_first(repo, "commit", "-q", "-m", "leaves markers")
 
     result = asyncio.run(leerie._scan_conflict_markers(repo))
     assert result is not None
@@ -66,12 +51,12 @@ def test_tree_with_conflict_markers_returns_message_with_file_count_and_sample(
 
 
 def test_more_than_five_files_gets_ellipsis_marker(leerie, tmp_path):
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "staging")
     for i in range(7):
         (repo / f"c{i}.txt").write_text(
             "<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> x\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "leaves markers in 7 files")
+    run_git_repo_first(repo, "add", ".")
+    run_git_repo_first(repo, "commit", "-q", "-m", "leaves markers in 7 files")
 
     result = asyncio.run(leerie._scan_conflict_markers(repo))
     assert result is not None
@@ -81,7 +66,7 @@ def test_more_than_five_files_gets_ellipsis_marker(leerie, tmp_path):
 
 def test_oserror_from_run_proc_is_caught_and_returns_none(
         leerie, tmp_path, monkeypatch):
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "staging")
 
     async def _raise_oserror(*a, **k):
         raise OSError("git binary not found")

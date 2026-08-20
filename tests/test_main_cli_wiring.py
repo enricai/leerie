@@ -22,20 +22,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import fake_claude_on_path
-
-
-def _init_repo(repo: Path) -> None:
-    repo.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "config", "user.email", "t@t"], cwd=repo, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "config", "user.name", "t"], cwd=repo, check=True)
-    (repo / "README.md").write_text("hi\n")
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-qm", "init"], cwd=repo, check=True)
+from tests.conftest import fake_claude_on_path, init_git_repo
 
 
 class _ReachedOrchestrate(Exception):
@@ -50,7 +37,7 @@ def _drive_main(leerie, monkeypatch, tmp_path, *, extra_argv=()) -> None:
     # one's error text otherwise.
     monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
     repo = tmp_path / "repo"
-    _init_repo(repo)
+    init_git_repo(repo)
     fake_claude_on_path(tmp_path, monkeypatch)
     monkeypatch.chdir(repo)
     monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
@@ -96,7 +83,7 @@ class TestMainReachesOrchestrateBoundary:
         already set, rather than silently hijacking or ignoring it."""
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
-        _init_repo(repo)
+        init_git_repo(repo)
         fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
@@ -114,7 +101,7 @@ class TestMainReachesOrchestrateBoundary:
         vars, not just an explicit ANTHROPIC_BASE_URL."""
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
-        _init_repo(repo)
+        init_git_repo(repo)
         fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
@@ -132,7 +119,7 @@ class TestMainReachesOrchestrateBoundary:
         """`--run-id` is mandatory outside `resume` (line ~32684)."""
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
-        _init_repo(repo)
+        init_git_repo(repo)
         fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
@@ -147,7 +134,7 @@ class TestMainReachesOrchestrateBoundary:
         (line ~32611)."""
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
-        _init_repo(repo)
+        init_git_repo(repo)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
         monkeypatch.setattr(leerie.shutil, "which", lambda *_a, **_k: None)
@@ -163,7 +150,7 @@ class TestMainReachesOrchestrateBoundary:
         silently picking one (lines ~32583-32586)."""
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
-        _init_repo(repo)
+        init_git_repo(repo)
         fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
@@ -181,7 +168,7 @@ class TestMainReachesOrchestrateBoundary:
         than racing the first (lines ~32696-32711)."""
         monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
         repo = tmp_path / "repo"
-        _init_repo(repo)
+        init_git_repo(repo)
         fake_claude_on_path(tmp_path, monkeypatch)
         monkeypatch.chdir(repo)
         state_dir = tmp_path / "state"

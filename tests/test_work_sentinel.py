@@ -24,20 +24,17 @@ import subprocess
 
 import pytest
 
-
-def _git(repo, *args):
-    return subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True, check=False)
+from tests.conftest import run_git_repo_first
 
 
 def _init(repo):
     repo.mkdir(parents=True, exist_ok=True)
-    _git(repo, "init", "-q", ".")
-    _git(repo, "config", "user.email", "t@t")
-    _git(repo, "config", "user.name", "t")
+    run_git_repo_first(repo, "init", "-q", ".")
+    run_git_repo_first(repo, "config", "user.email", "t@t")
+    run_git_repo_first(repo, "config", "user.name", "t")
     (repo / "src.txt").write_text("original\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "init")
+    run_git_repo_first(repo, "add", "-A")
+    run_git_repo_first(repo, "commit", "-qm", "init")
     return repo
 
 
@@ -118,8 +115,8 @@ class TestDetection:
         st = _St(repo)
         st.data["repo_state_before_planning"] = _snap(leerie, repo)
         (repo / "src.txt").write_text("changed\n")
-        _git(repo, "add", "-A")
-        _git(repo, "commit", "-qm", "worker commit")
+        run_git_repo_first(repo, "add", "-A")
+        run_git_repo_first(repo, "commit", "-qm", "worker commit")
         monkeypatch.setattr(leerie, "die",
                             lambda m, code=1: (_ for _ in ()).throw(
                                 SystemExit(m)))
@@ -173,8 +170,8 @@ class TestBaselineIdentity:
         repo = _init(tmp_path / "repo")
         other = _init(tmp_path / "other")
         (other / "src.txt").write_text("DIFFERENT\n")
-        _git(other, "add", "-A")
-        _git(other, "commit", "-qm", "diverge")
+        run_git_repo_first(other, "add", "-A")
+        run_git_repo_first(other, "commit", "-qm", "diverge")
         snap_repo = _snap(leerie, repo)
         snap_other = _snap(leerie, other)
         assert snap_repo["head"] != snap_other["head"]

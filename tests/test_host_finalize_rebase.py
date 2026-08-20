@@ -29,7 +29,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import HAS_JQ
+from tests.conftest import HAS_JQ, run_git_repo_first
 
 pytestmark = pytest.mark.skipif(
     not HAS_JQ,
@@ -41,12 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FINALIZE_SH = REPO_ROOT / "scripts" / "host-finalize.sh"
 
 
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(["git", "-C", str(repo), *args], check=True,
-                    capture_output=True, text=True)
-
-
-def _init_repo(tmp_path: Path) -> Path:
+def _init_repo_with_origin(tmp_path: Path) -> Path:
     """Real repo on `main`, one commit, with a real BARE `origin` remote so
     `git push`/`git ls-remote`/`git fetch` all work genuinely (unlike
     test_host_finalize_sh.py's stubbed-git harness, this file needs real git
@@ -57,14 +52,14 @@ def _init_repo(tmp_path: Path) -> Path:
                    check=True, capture_output=True, text=True)
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "test@x")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "remote", "add", "origin", str(bare))
+    run_git_repo_first(repo, "init", "-q", "-b", "main")
+    run_git_repo_first(repo, "config", "user.email", "test@x")
+    run_git_repo_first(repo, "config", "user.name", "test")
+    run_git_repo_first(repo, "remote", "add", "origin", str(bare))
     (repo / "a.txt").write_text("a\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "a")
-    _git(repo, "push", "-q", "-u", "origin", "main")
+    run_git_repo_first(repo, "add", ".")
+    run_git_repo_first(repo, "commit", "-q", "-m", "a")
+    run_git_repo_first(repo, "push", "-q", "-u", "origin", "main")
     return repo
 
 
@@ -161,15 +156,15 @@ def _make_diverged_repo(tmp_path: Path) -> Path:
     own commit. This is exactly the shape the rebase step should attempt to
     act on: pr_base_branch (main) resolves locally, and the run branch is
     behind it."""
-    repo = _init_repo(tmp_path)
-    _git(repo, "checkout", "-qb", "leerie/runs/test-run")
+    repo = _init_repo_with_origin(tmp_path)
+    run_git_repo_first(repo, "checkout", "-qb", "leerie/runs/test-run")
     (repo / "b.txt").write_text("b\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "run: add b")
-    _git(repo, "checkout", "-q", "main")
+    run_git_repo_first(repo, "add", ".")
+    run_git_repo_first(repo, "commit", "-q", "-m", "run: add b")
+    run_git_repo_first(repo, "checkout", "-q", "main")
     (repo / "c.txt").write_text("c\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "upstream: add c")
+    run_git_repo_first(repo, "add", ".")
+    run_git_repo_first(repo, "commit", "-q", "-m", "upstream: add c")
     return repo
 
 
@@ -290,11 +285,11 @@ def test_unresolvable_base_branch_skips_rebase_entirely(tmp_path):
     remote at all in this test repo) → the rebase block's own guard skips
     it before ever touching git worktree/python3 — falls straight through
     to the normal push."""
-    repo = _init_repo(tmp_path)
-    _git(repo, "checkout", "-qb", "leerie/runs/test-run")
+    repo = _init_repo_with_origin(tmp_path)
+    run_git_repo_first(repo, "checkout", "-qb", "leerie/runs/test-run")
     (repo / "b.txt").write_text("b\n")
-    _git(repo, "add", ".")
-    _git(repo, "commit", "-q", "-m", "run: add b")
+    run_git_repo_first(repo, "add", ".")
+    run_git_repo_first(repo, "commit", "-q", "-m", "run: add b")
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     p = bin_dir / "python3"

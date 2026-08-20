@@ -25,22 +25,19 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import run_git_repo_first
+
 pytestmark = pytest.mark.real_planning_worktree
-
-
-def _git(repo, *args):
-    return subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True, check=False)
 
 
 def _init(repo):
     repo.mkdir(parents=True, exist_ok=True)
-    _git(repo, "init", "-q", ".")
-    _git(repo, "config", "user.email", "t@t")
-    _git(repo, "config", "user.name", "t")
+    run_git_repo_first(repo, "init", "-q", ".")
+    run_git_repo_first(repo, "config", "user.email", "t@t")
+    run_git_repo_first(repo, "config", "user.name", "t")
     (repo / "tracked.txt").write_text("tracked\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "init")
+    run_git_repo_first(repo, "add", "-A")
+    run_git_repo_first(repo, "commit", "-qm", "init")
     return repo
 
 
@@ -88,8 +85,8 @@ class TestEnsurePlanningWorktree:
         repo, state, st = env
         path = _run(leerie, st)
         assert path.startswith("/")
-        assert (_git(path, "rev-parse", "HEAD").stdout.strip()
-                == _git(repo, "rev-parse", "HEAD").stdout.strip())
+        assert (run_git_repo_first(path, "rev-parse", "HEAD").stdout.strip()
+                == run_git_repo_first(repo, "rev-parse", "HEAD").stdout.strip())
 
     def test_second_call_is_idempotent(self, leerie, env):
         """It is called twice per run — before phase_classify and again before

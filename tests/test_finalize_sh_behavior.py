@@ -14,24 +14,10 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from tests.conftest import init_git_repo
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FINALIZE_SH = REPO_ROOT / "scripts" / "finalize.sh"
-
-
-def _init_repo(tmp_path: Path) -> Path:
-    """Create a minimal git repo on branch `main` with one commit on
-    `main` and one further commit on `leerie/runs/test`. Returns the
-    repo root path. Caller must populate
-    `.leerie/runs/test/working-branch` to point at the desired base."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.email", "test@x"], cwd=repo, check=True)
-    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
-    (repo / "a").write_text("a")
-    subprocess.run(["git", "add", "."], cwd=repo, check=True)
-    subprocess.run(["git", "commit", "-q", "-m", "a"], cwd=repo, check=True)
-    return repo
 
 
 def _add_run_branch_with_extra_commit(repo: Path) -> None:
@@ -50,7 +36,7 @@ def _write_working_branch_file(repo: Path, value: str) -> None:
 
 def test_happy_path_exits_zero(tmp_path):
     """Run branch is 1 commit ahead of working branch → exit 0."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     _add_run_branch_with_extra_commit(repo)
     _write_working_branch_file(repo, "main")
 
@@ -65,7 +51,7 @@ def test_happy_path_exits_zero(tmp_path):
 
 def test_run_branch_missing_exits_two(tmp_path):
     """working-branch file present but the run branch ref does not exist."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     _write_working_branch_file(repo, "main")
     # No leerie/runs/test branch created.
 
@@ -80,7 +66,7 @@ def test_run_branch_missing_exits_two(tmp_path):
 
 def test_working_branch_missing_exits_two(tmp_path):
     """working-branch file points at a branch that does not exist locally."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     _add_run_branch_with_extra_commit(repo)
     _write_working_branch_file(repo, "branch-that-does-not-exist")
 
@@ -98,7 +84,7 @@ def test_working_branch_missing_exits_two(tmp_path):
 
 def test_ahead_zero_exits_one(tmp_path):
     """Run branch ref exists but has no commits beyond the working branch."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     # Create leerie/runs/test pointing at the same commit as main.
     subprocess.run(["git", "branch", "leerie/runs/test", "main"],
                    cwd=repo, check=True)
@@ -116,7 +102,7 @@ def test_ahead_zero_exits_one(tmp_path):
 def test_working_branch_file_missing_exits_two(tmp_path):
     """No .leerie/runs/<id>/working-branch file → exit 2 with the
     setup-run.sh instruction."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     _add_run_branch_with_extra_commit(repo)
     # Do NOT create the working-branch file.
 
@@ -132,7 +118,7 @@ def test_does_not_modify_working_branch_head(tmp_path):
     """The whole point of the design change: finalize.sh must NOT change
     HEAD or modify the working branch's tip. This is the behavioral
     invariant that closes the loop on the source-text pins."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     _add_run_branch_with_extra_commit(repo)
     # Now switch back to main so HEAD points at the working branch tip.
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
@@ -189,7 +175,7 @@ def test_does_not_modify_working_branch_head(tmp_path):
 def test_finalize_finds_working_branch_under_state_dir(tmp_path):
     """When LEERIE_STATE_DIR points outside the repo, finalize.sh reads
     working-branch from that path — NOT from <repo>/.leerie/runs/."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     _add_run_branch_with_extra_commit(repo)
     # Put working-branch under an out-of-repo state dir.
     state_dir = tmp_path / "leerie-state"
@@ -213,7 +199,7 @@ def test_finalize_finds_working_branch_under_state_dir(tmp_path):
 def test_finalize_state_dir_unset_falls_back_to_repo(tmp_path):
     """When LEERIE_STATE_DIR is unset, finalize.sh still resolves
     .leerie/runs/<id>/ relative to CWD (legacy/in-repo install path)."""
-    repo = _init_repo(tmp_path)
+    repo = init_git_repo(tmp_path / "repo")
     _add_run_branch_with_extra_commit(repo)
     _write_working_branch_file(repo, "main")  # writes to repo/.leerie/...
 

@@ -28,12 +28,7 @@ import inspect
 import subprocess
 from pathlib import Path
 
-from tests.conftest import _run
-
-
-def _git(path, *args):
-    subprocess.run(["git", *args], cwd=str(path), check=True,
-                   capture_output=True, text=True)
+from tests.conftest import _run, run_git_repo_first
 
 
 _CAPS = {"max_parallel": 4, "max_total_workers": 999}
@@ -287,17 +282,17 @@ class TestRescuedSubtaskIntegratesAsNoOp:
 
     def test_no_ff_merge_of_zero_commit_branch_is_clean_noop(self, tmp_path):
         d = tmp_path
-        _git(d, "init", "-q", "-b", "main")
-        _git(d, "config", "user.email", "t@leerie.local")
-        _git(d, "config", "user.name", "leerie test")
+        run_git_repo_first(d, "init", "-q", "-b", "main")
+        run_git_repo_first(d, "config", "user.email", "t@leerie.local")
+        run_git_repo_first(d, "config", "user.name", "leerie test")
         (d / "base.py").write_text("base\n")
-        _git(d, "add", "-A")
-        _git(d, "commit", "-qm", "base")
+        run_git_repo_first(d, "add", "-A")
+        run_git_repo_first(d, "commit", "-qm", "base")
         # run branch and the rescued subtask branch at the SAME sha
         # (subtask committed nothing — its deliverable is already on run).
-        _git(d, "branch", "run")
-        _git(d, "branch", "leerie/subtasks/r/test-003")
-        _git(d, "checkout", "-q", "run")
+        run_git_repo_first(d, "branch", "run")
+        run_git_repo_first(d, "branch", "leerie/subtasks/r/test-003")
+        run_git_repo_first(d, "checkout", "-q", "run")
         head_before = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=str(d),
             capture_output=True, text=True).stdout.strip()
