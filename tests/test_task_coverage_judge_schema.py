@@ -11,20 +11,18 @@ from __future__ import annotations
 import json
 import pytest
 
+from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
+
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    pass
 
 
 def _validate(leerie, instance: dict) -> None:
     schema = leerie.SCHEMAS["task_coverage_judge"]
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k!r}"
     assert isinstance(instance["task_covered"], bool)
     assert isinstance(instance["coverage_gaps"], list)
     for g in instance["coverage_gaps"]:
