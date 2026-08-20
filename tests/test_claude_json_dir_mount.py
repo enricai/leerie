@@ -20,6 +20,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from tests.stub_helpers import _entry_sh_rootful_block
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 ENTRY_SH = REPO_ROOT / "scripts" / "container-entry.sh"
@@ -78,20 +80,6 @@ def test_claude_dir_mount_untouched():
 def _entry_sh_claude_json_copy_block() -> str:
     text = _entry_sh_text()
     marker = "if [ -f /opt/leerie-claude-json-src/.claude.json ]; then"
-    start = text.index(marker)
-    end = text.index("\nfi", start)
-    return text[start:end]
-
-
-def _entry_sh_rootful_block() -> str:
-    """The pre-existing `/work` ownership-fix guard, which now also owns
-    the `.claude.json` chown. Same marker pair
-    `tests/test_home_leerie_ownership.py` /
-    `tests/test_tmp_cache_writable.py` already extract this block with —
-    deliberately reused so a future edit to this guard's boundaries can't
-    silently desync between the two files."""
-    text = _entry_sh_text()
-    marker = 'if [ "$ROOTLESS" != "true" ] && getent passwd leerie'
     start = text.index(marker)
     end = text.index("\nfi", start)
     return text[start:end]
