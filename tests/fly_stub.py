@@ -23,7 +23,10 @@ def make_fake_flyctl(
     `$CMD`, `auth ...` into `$SUB=auth` (exiting 0 immediately — every
     call site's only use of `auth` is the `auth status` preflight probe,
     so any auth subcommand succeeding is equivalent), `machine <subsub>`
-    into `$SUB=machine` / `$MSUB`, and `ssh` into `$SUB=ssh`.
+    into `$SUB=machine` / `$MSUB`, `ssh` into `$SUB=ssh`, and
+    `apps <subsub> [arg]` (`apps list --json` / `apps create <name>`)
+    into `$SUB=apps` / `$MSUB` / `$AARG` — `$AARG` carries the app name
+    for `create` (unused, but harmlessly consumed, for `list --json`).
 
     `extra_preamble` is emitted verbatim before flag parsing (for
     caller-specific path/state variables the case body needs).
@@ -41,12 +44,15 @@ def make_fake_flyctl(
         + 'CMD=""\n'
         'SUB=""\n'
         'MSUB=""\n'
+        'AARG=""\n'
         'while [ $# -gt 0 ]; do\n'
         '  case "$1" in\n'
         '    -C) CMD="$2"; shift 2 ;;\n'
         '    auth) SUB="auth"; shift ;;\n'
         '    machine) SUB="machine"; shift; MSUB="${1:-}"; shift || true ;;\n'
         '    ssh) SUB="ssh"; shift ;;\n'
+        '    apps) SUB="apps"; shift; MSUB="${1:-}"; shift || true; '
+        'AARG="${1:-}"; shift || true ;;\n'
         '    *) shift ;;\n'
         '  esac\n'
         'done\n'
