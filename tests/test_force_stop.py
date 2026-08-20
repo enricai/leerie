@@ -18,30 +18,21 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import run_bash
+from tests.fly_stub import make_fake_flyctl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FORCE_FINALIZE_SH = REPO_ROOT / "scripts" / "remote" / "force-finalize.sh"
 
 
-def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path) -> Path:
+def _flyctl_stub(tmp_path: Path, machine_runs_dir: Path) -> Path:
     """Stub flyctl that routes payloads to local python3/bash.
 
     For FORCE_STOP=1 mode, the SSH command is:
         bash -lc 'FORCE_STOP=1 exec python3 -'
     The stub detects both forms and routes appropriately.
     """
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'MRUNS="{machine_runs_dir}"\n'
-        'CMD=""\n'
-        'while [ $# -gt 0 ]; do\n'
-        '  case "$1" in\n'
-        '    -C) CMD="$2"; shift 2 ;;\n'
-        '    auth) shift; case "${1:-}" in status) exit 0 ;; esac ;;\n'
-        '    *) shift ;;\n'
-        '  esac\n'
-        'done\n'
+    extra_preamble = f'MRUNS="{machine_runs_dir}"\n'
+    case_body = (
         '[ -z "$CMD" ] && exit 0\n'
         'case "$CMD" in\n'
         # FORCE_STOP mode: bash -lc 'FORCE_STOP=1 exec python3 -'
@@ -62,8 +53,7 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path) -> Path:
         '  *) exit 0 ;;\n'
         'esac\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(tmp_path, case_body, extra_preamble=extra_preamble)
 
 
 def _make_run(
@@ -98,7 +88,7 @@ def test_force_stop_patches_dead_run(tmp_path):
     mruns.mkdir()
     run_id = "feat-dead-abc123"
     run_dir = _make_run(mruns, run_id, pid=999_999_999)
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "FORCE_STOP": "1",
@@ -130,7 +120,7 @@ def test_force_stop_kills_alive_pid(tmp_path):
     )
     try:
         run_dir = _make_run(mruns, run_id, pid=sleeper.pid)
-        stub = _make_fake_flyctl(tmp_path, mruns)
+        stub = _flyctl_stub(tmp_path, mruns)
         env = {
             "LEERIE_REPO": str(REPO_ROOT),
             "FORCE_STOP": "1",
@@ -168,7 +158,7 @@ def test_force_stop_idempotent_already_finalized(tmp_path):
     run_id = "feat-done-abc"
     run_dir = _make_run(mruns, run_id, finished_at="2026-06-02T20:00:00Z")
     before = (run_dir / "run.json").read_text()
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "FORCE_STOP": "1",
@@ -191,7 +181,7 @@ def test_without_force_stop_still_refuses_alive(tmp_path):
     run_id = "feat-running-reg"
     own_pid = os.getpid()
     _make_run(mruns, run_id, pid=own_pid)
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
