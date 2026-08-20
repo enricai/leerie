@@ -215,22 +215,40 @@ def test_settle_subtask_needs_clarification_uses_unified_cap():
     change reintroduced a separate clarification cap, this test
     fails — preserving the "no extra ask-the-user allowance"
     invariant.
+
+    The checkpoint-validation + continuation-cap logic that both the
+    `incomplete-handoff` and `needs-clarification` branches once
+    duplicated inline is now a shared nested helper
+    (`_checkpoint_and_continuation_gate`). The branch delegates the
+    cap check to it, so this test pins two things: the branch routes
+    through that shared gate (not an ad-hoc cap of its own), and the
+    gate — the sole place the cap is read — consumes from the unified
+    `subtask_continuations` budget, never a separate/renamed cap.
     """
     body = _function_body("_settle_subtask")
-    # The needs-clarification branch must reference the unified cap.
+    # The needs-clarification branch must delegate to the shared
+    # continuation gate rather than carrying its own cap check.
     branch_start = body.index('status == "needs-clarification"')
     next_branch = body.find('if status ==', branch_start + 1)
     branch_end = next_branch if next_branch > 0 else len(body)
     branch = body[branch_start:branch_end]
-    assert 'caps["subtask_continuations"]' in branch, (
-        "the needs-clarification branch must consume from "
+    assert "_checkpoint_and_continuation_gate(" in branch, (
+        "the needs-clarification branch must route through the shared "
+        "_checkpoint_and_continuation_gate(), the single place that "
+        "enforces the unified per-subtask re-spawn budget shared with "
+        "incomplete-handoff. A branch that grew its own cap check would "
+        "re-introduce the two-separate-caps confusion DESIGN §11 rejects.")
+    # The shared gate (inside this function body) is the only cap read,
+    # and it must consume from the unified budget — not a separate one.
+    assert 'caps["subtask_continuations"]' in body, (
+        "_settle_subtask must consume from "
         'caps["subtask_continuations"], the unified per-subtask '
-        "re-spawn budget shared with incomplete-handoff. Per DESIGN "
+        "re-spawn budget shared by both continuation branches. Per DESIGN "
         "§11, a separate clarification cap would invite the worker "
         "to ask instead of research.")
-    # And the OLD cap name must not have crept back in.
-    assert 'caps["handoff_continuations"]' not in branch, (
-        "the needs-clarification branch must NOT reference "
+    # And the OLD cap name must not have crept back in anywhere.
+    assert 'caps["handoff_continuations"]' not in body, (
+        "_settle_subtask must NOT reference "
         'caps["handoff_continuations"] — that cap was renamed to '
         "subtask_continuations in the Pass-4 work. A regression "
         "that brought the old name back would also re-introduce the "
