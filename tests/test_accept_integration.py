@@ -33,38 +33,26 @@ import subprocess
 from pathlib import Path
 from unittest.mock import AsyncMock
 
+from functools import partial
+
 from tests.test_accept_blocked import (
     _expected_remote_state,
     _flyctl_stub,
+    _make_state as _make_state_base,
+    _run_accept,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+# accept-integration's local-path invocation shares _run_accept's argv
+# shape with accept-blocked (tests/test_accept_blocked.py), differing
+# only in which launcher verb is dispatched.
+_run_accept = partial(_run_accept, verb="accept-integration")
 
-def _run_accept(state_path: Path, sid: str) -> subprocess.CompletedProcess:
-    env = {k: v for k, v in os.environ.items()}
-    env["LEERIE_STATE_DIR"] = str(state_path.parent.parent.parent)
-    run_id = state_path.parent.name
-    return subprocess.run(
-        [str(REPO_ROOT / "leerie"), "accept-integration", run_id, sid,
-         "--runtime", "local"],
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-
-
-def _make_state(tmp_path: Path, integration_gate: dict,
-                integration_defects: dict | None = None) -> Path:
-    run_dir = tmp_path / "runs" / "test-run-001"
-    run_dir.mkdir(parents=True)
-    state = {"integration_gate": integration_gate}
-    if integration_defects is not None:
-        state["integration_defects"] = integration_defects
-    state_file = run_dir / "state.json"
-    state_file.write_text(json.dumps(state, indent=2))
-    return state_file
+# accept-integration writes state.json's "integration_gate" field where
+# accept-blocked writes "subtask_status" -- everything else about state
+# construction is shared.
+_make_state = partial(_make_state_base, key="integration_gate")
 
 
 def test_accepts_a_rejected_finding(tmp_path):

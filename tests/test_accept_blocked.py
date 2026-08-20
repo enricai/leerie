@@ -23,12 +23,19 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _run_accept(state_path: Path, sid: str,
-                force: bool = False) -> subprocess.CompletedProcess:
-    """Run the accept-blocked mutation via the launcher."""
+                force: bool = False,
+                verb: str = "accept-blocked") -> subprocess.CompletedProcess:
+    """Run the accept-blocked/accept-integration mutation via the launcher.
+
+    Shared by the whole accept-verb test family (see
+    tests/test_accept_integration.py's ``verb="accept-integration"``
+    callers) -- this is the sole owner of the local-path launcher
+    invocation shape.
+    """
     env = {k: v for k, v in os.environ.items()}
     env["LEERIE_STATE_DIR"] = str(state_path.parent.parent.parent)
     run_id = state_path.parent.name
-    argv = [str(REPO_ROOT / "leerie"), "accept-blocked", run_id, sid,
+    argv = [str(REPO_ROOT / "leerie"), verb, run_id, sid,
             "--runtime", "local"]
     if force:
         argv.append("--force")
@@ -41,16 +48,20 @@ def _run_accept(state_path: Path, sid: str,
     )
 
 
-def _make_state(tmp_path: Path, subtask_status: dict,
-                blocked: dict | None = None,
-                waves: list | None = None) -> Path:
+def _make_state(tmp_path: Path, primary: dict, *,
+                key: str = "subtask_status",
+                **extra) -> Path:
+    """Write a state.json under a fresh run dir.
+
+    ``key`` names the top-level field ``primary`` is stored under
+    (``subtask_status`` for accept-blocked, ``integration_gate`` for
+    accept-integration -- see tests/test_accept_integration.py).
+    ``**extra`` (e.g. ``blocked=``, ``waves=``, ``integration_defects=``)
+    are merged in as further top-level fields when given.
+    """
     run_dir = tmp_path / "runs" / "test-run-001"
     run_dir.mkdir(parents=True)
-    state = {"subtask_status": subtask_status}
-    if blocked is not None:
-        state["blocked"] = blocked
-    if waves is not None:
-        state["waves"] = waves
+    state = {key: primary, **extra}
     state_file = run_dir / "state.json"
     state_file.write_text(json.dumps(state, indent=2))
     return state_file
