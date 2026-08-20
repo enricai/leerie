@@ -10,6 +10,22 @@
 # portable — no namerefs, no bash-4-only syntax (CLAUDE.md; see
 # tests/test_ec2_bash32_portability.py).
 
+_SEED_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- _seed_dirty_filter -----------------------------------------------------
+# Runs on the HOST (never shipped to the remote machine): filters the
+# newline-delimited candidate file list on stdin down to what should
+# actually rsync, writing NUL-delimited survivors to stdout. Single-owner
+# implementation lives in seed_dirty_filter.py, right beside this file, so
+# the Fly transport (seed-repo.sh) and the EC2 transport (ec2-seed-repo.sh)
+# can no longer drift on editor-temp detection, the .git/.leerie exclusion
+# + whitelist, the worktree-path defense, or the vanished-entry check.
+# USER_REPO must already be exported by the caller — it anchors the
+# lexists() vanished-entry check.
+_seed_dirty_filter() {
+  python3 "$_SEED_COMMON_DIR/seed_dirty_filter.py"
+}
+
 # --- _seed_timeout_prefix --------------------------------------------------
 # Emit the `timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` prefix
 # used to bound the bulk-transfer side of `flyctl ssh console` (Fly) / `aws
