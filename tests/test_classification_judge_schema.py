@@ -13,18 +13,16 @@ import pytest
 
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    jsonschema = None  # type: ignore
+
+from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
 
 
 def _validate(leerie, instance: dict) -> None:
     schema = leerie.SCHEMAS["classification_judge"]
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k!r}"
     assert isinstance(instance["categories_reviewed"], list)
     assert isinstance(instance["miscategorizations"], list)
     for m in instance["miscategorizations"]:

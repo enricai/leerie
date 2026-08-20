@@ -16,9 +16,10 @@ import pytest
 
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    jsonschema = None  # type: ignore
+
+from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
 
 
 def _validate(leerie, instance: dict) -> None:
@@ -27,13 +28,10 @@ def _validate(leerie, instance: dict) -> None:
     must pass in both modes so CI without jsonschema installed still
     catches regressions."""
     schema = leerie.SCHEMAS["dep_capture"]
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
     # Manual structural check matching the schema's `required` and
     # the language_installs item shape.
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k!r}"
     if "setup_packages" in instance:
         assert isinstance(instance["setup_packages"], list)
         for pkg in instance["setup_packages"]:

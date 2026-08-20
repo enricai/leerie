@@ -14,9 +14,10 @@ import json
 
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    jsonschema = None  # type: ignore
+
+from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
 
 
 CONFIDENCE_OPTIONAL_SCHEMAS = [
@@ -87,11 +88,7 @@ def test_schemas_validate_without_confidence(leerie):
     for name, instance in _FIXTURES.items():
         schema = leerie.SCHEMAS[name]
         assert "confidence" not in instance
-        if HAS_JSONSCHEMA:
-            jsonschema.validate(instance, schema)
-        else:
-            for k in schema.get("required", []):
-                assert k in instance, f"{name}: missing required field {k}"
+        validate_or_fallback_required(schema, instance)
 
 
 def test_schemas_are_json_serializable(leerie):

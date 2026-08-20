@@ -28,13 +28,12 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import _run, HAS_JSONSCHEMA, validate_or_fallback_required
 
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    jsonschema = None  # type: ignore
 
 
 _CAPS = {"max_parallel": 4, "max_total_workers": 999}
@@ -323,11 +322,8 @@ def _validate(leerie, instance: dict) -> None:
     pass in both modes so CI without jsonschema installed still catches
     drift."""
     schema = leerie.SCHEMAS["satisfied_probe"]
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k!r}"
     assert isinstance(instance["satisfied"], bool)
     assert isinstance(instance["evidence"], str)
     if "checked" in instance:
