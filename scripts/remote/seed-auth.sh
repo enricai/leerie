@@ -146,6 +146,9 @@ seed_auth() {
     # Debian 13 image has GNU tar which auto-detects -z. macOS bsdtar
     # also supports -z. COPYFILE_DISABLE=1 strips the macOS provenance
     # xattr so the stream is byte-deterministic.
+    # shellcheck disable=SC2046  # intentional word-split of the
+    # `--exclude=...` flag string (single-owner list in seed-common.sh);
+    # no path in it contains whitespace or a glob character.
     COPYFILE_DISABLE=1 tar -czC "$STAGE" \
          $(_seed_auth_tar_excludes) \
          . \

@@ -144,6 +144,9 @@ ec2_seed_auth() {
     # markdown / small binaries; gzip cuts ~2x off the wire.
     # COPYFILE_DISABLE=1 strips the macOS provenance xattr so the stream
     # is byte-deterministic (no effect on Linux).
+    # shellcheck disable=SC2046  # intentional word-split of the
+    # `--exclude=...` flag string (single-owner list in seed-common.sh);
+    # no path in it contains whitespace or a glob character.
     COPYFILE_DISABLE=1 tar -czC "$STAGE" \
          $(_seed_auth_tar_excludes) \
          . \
