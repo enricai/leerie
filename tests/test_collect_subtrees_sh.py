@@ -19,6 +19,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_git_repo_first
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COLLECT_SH = REPO_ROOT / "scripts" / "remote" / "collect-subtrees.sh"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
@@ -37,25 +39,16 @@ def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProce
     )
 
 
-def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(repo)] + list(args),
-        capture_output=True,
-        text=True,
-        check=check,
-    )
-
-
 def _make_fixture_repo(tmp_path: Path) -> Path:
     """Create a minimal git repo with an initial commit."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "config", "user.email", "test@test.com")
+    run_git_repo_first(repo, "init", "-b", "main")
+    run_git_repo_first(repo, "config", "user.name", "test")
+    run_git_repo_first(repo, "config", "user.email", "test@test.com")
     (repo / "README.md").write_text("hello\n")
-    _git(repo, "add", "README.md")
-    _git(repo, "commit", "-m", "initial")
+    run_git_repo_first(repo, "add", "README.md")
+    run_git_repo_first(repo, "commit", "-m", "initial")
     return repo
 
 
@@ -64,19 +57,19 @@ def _make_subtask_branch(
 ) -> None:
     """Create a subtask branch with commits off parent_branch."""
     branch = f"leerie/subtasks/{run_id}/{sid}"
-    _git(repo, "branch", branch, parent_branch)
-    _git(repo, "checkout", branch)
+    run_git_repo_first(repo, "branch", branch, parent_branch)
+    run_git_repo_first(repo, "checkout", branch)
     for name, content in files.items():
         (repo / name).write_text(content)
-        _git(repo, "add", name)
-    _git(repo, "commit", "-m", f"subtask {sid}")
-    _git(repo, "checkout", "main")
+        run_git_repo_first(repo, "add", name)
+    run_git_repo_first(repo, "commit", "-m", f"subtask {sid}")
+    run_git_repo_first(repo, "checkout", "main")
 
 
 def _make_run_branch(repo: Path, run_id: str) -> None:
     """Create the run branch at HEAD (simulates setup-run.sh having run)."""
     branch = f"leerie/runs/{run_id}"
-    _git(repo, "branch", branch, "HEAD")
+    run_git_repo_first(repo, "branch", branch, "HEAD")
 
 
 def _make_fake_flyctl(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
@@ -196,7 +189,7 @@ def test_collected_none_when_all_integrated(tmp_path):
     _make_state_json(state_dir, run_id, waves=[["s1"]], completed_waves=1)
 
     # Create a subtask branch at the same commit as run branch (already integrated).
-    _git(repo, "branch", f"leerie/subtasks/{run_id}/s1",
+    run_git_repo_first(repo, "branch", f"leerie/subtasks/{run_id}/s1",
          f"leerie/runs/{run_id}")
 
     stub = _make_fake_flyctl(tmp_path, repo, state_dir)
@@ -239,8 +232,12 @@ def test_collected_all_clean_merges(tmp_path):
     assert "integrated 2" in result.stderr.lower()
 
     # Verify the run branch now has both files.
-    show_a = _git(repo, "show", f"leerie/runs/{run_id}:file_a.txt", check=False)
-    show_b = _git(repo, "show", f"leerie/runs/{run_id}:file_b.txt", check=False)
+    show_a = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:file_a.txt"],
+        capture_output=True, text=True, check=False)
+    show_b = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:file_b.txt"],
+        capture_output=True, text=True, check=False)
     assert show_a.returncode == 0, "file_a.txt missing from run branch"
     assert show_b.returncode == 0, "file_b.txt missing from run branch"
 
@@ -274,7 +271,9 @@ def test_conflict_resolved_by_integrator(tmp_path):
     assert "integrated 2" in result.stderr.lower()
 
     # The run branch should have conflict.txt (content from s2 via theirs).
-    show = _git(repo, "show", f"leerie/runs/{run_id}:conflict.txt", check=False)
+    show = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:conflict.txt"],
+        capture_output=True, text=True, check=False)
     assert show.returncode == 0, "conflict.txt missing from run branch"
 
 
@@ -393,5 +392,7 @@ def test_setup_run_creates_missing_worktree(tmp_path):
     assert "integrated 1" in result.stderr.lower()
 
     # Verify the run branch was created and has the file.
-    show = _git(repo, "show", f"leerie/runs/{run_id}:new_file.txt", check=False)
+    show = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:new_file.txt"],
+        capture_output=True, text=True, check=False)
     assert show.returncode == 0, "new_file.txt missing from run branch"

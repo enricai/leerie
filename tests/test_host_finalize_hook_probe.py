@@ -28,13 +28,10 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import init_git_repo
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FINALIZE_SH = REPO_ROOT / "scripts" / "host-finalize.sh"
-
-
-def _init_repo(path: Path) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    subprocess.run(["git", "init", "-q", str(path)], check=True)
 
 
 def _hook_present(repo: Path) -> bool:
@@ -91,7 +88,7 @@ def test_non_husky_branded_hook_classifies_as_hook_present(tmp_path):
     failed' / 'exit code 254') would have missed this shape entirely
     since the hook here mentions none of those strings."""
     repo = tmp_path / "repo"
-    _init_repo(repo)
+    init_git_repo(repo)
     hooks_dir = repo / ".git" / "hooks"
     hooks_dir.mkdir(exist_ok=True)
     hook = hooks_dir / "pre-push"
@@ -109,7 +106,7 @@ def test_no_hook_and_unreachable_remote_classifies_as_not_hook(tmp_path):
     pre-push hook installed, whose push fails for an unreachable-remote
     reason, must NOT classify as a hook failure."""
     repo = tmp_path / "repo"
-    _init_repo(repo)
+    init_git_repo(repo)
 
     assert _hook_present(repo) is False
 
@@ -118,7 +115,7 @@ def test_non_executable_hook_file_does_not_count(tmp_path):
     """A pre-push file that exists but lacks the executable bit is not a
     live hook (git itself skips non-executable hook files)."""
     repo = tmp_path / "repo"
-    _init_repo(repo)
+    init_git_repo(repo)
     hooks_dir = repo / ".git" / "hooks"
     hooks_dir.mkdir(exist_ok=True)
     (hooks_dir / "pre-push").write_text("#!/bin/sh\nexit 1\n")
@@ -130,7 +127,7 @@ def test_custom_hooksPath_relative_is_resolved_against_repo_root(tmp_path):
     """core.hooksPath can point anywhere, and a relative value is
     resolved against the worktree root — not .git/hooks."""
     repo = tmp_path / "repo"
-    _init_repo(repo)
+    init_git_repo(repo)
     custom = repo / "custom-hooks"
     custom.mkdir()
     hook = custom / "pre-push"
@@ -146,7 +143,7 @@ def test_custom_hooksPath_with_no_hook_file_is_absent(tmp_path):
     """A configured hooksPath with no pre-push file inside it is
     correctly reported as no hook present."""
     repo = tmp_path / "repo"
-    _init_repo(repo)
+    init_git_repo(repo)
     custom = repo / "custom-hooks"
     custom.mkdir()
     subprocess.run(["git", "-C", str(repo), "config", "core.hooksPath", "custom-hooks"],

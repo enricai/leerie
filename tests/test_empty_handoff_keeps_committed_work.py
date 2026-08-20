@@ -30,23 +30,20 @@ import asyncio
 import inspect
 import subprocess
 
-
-def _git(path, *args):
-    subprocess.run(["git", *args], cwd=str(path), check=True,
-                   capture_output=True, text=True)
+from tests.conftest import run_git_repo_first
 
 
 def _repo_with_run_branch(tmp_path):
     """A repo with a base commit on branch `run` (the run branch). Returns
     the path. HEAD == run, no commits ahead yet."""
     d = tmp_path
-    _git(d, "init", "-q", "-b", "main")
-    _git(d, "config", "user.email", "t@leerie.local")
-    _git(d, "config", "user.name", "leerie test")
+    run_git_repo_first(d, "init", "-q", "-b", "main")
+    run_git_repo_first(d, "config", "user.email", "t@leerie.local")
+    run_git_repo_first(d, "config", "user.name", "leerie test")
     (d / "base.py").write_text("base\n")
-    _git(d, "add", "-A")
-    _git(d, "commit", "-qm", "base")
-    _git(d, "branch", "run")
+    run_git_repo_first(d, "add", "-A")
+    run_git_repo_first(d, "commit", "-qm", "base")
+    run_git_repo_first(d, "branch", "run")
     return d
 
 
@@ -60,8 +57,8 @@ class TestBranchHasCommitsAhead:
         # checkpoint). The branch has a commit ahead of `run` → rescuable.
         d = _repo_with_run_branch(tmp_path)
         (d / "feature.py").write_text("the implemented feature\n")
-        _git(d, "add", "-A")
-        _git(d, "commit", "-qm", "feat: implement the thing")
+        run_git_repo_first(d, "add", "-A")
+        run_git_repo_first(d, "commit", "-qm", "feat: implement the thing")
         r = asyncio.run(leerie._branch_has_commits_ahead(str(d), "run"))
         assert r is True
 
@@ -107,8 +104,8 @@ class TestCheckBranchHasCommitsUnchanged:
     def test_has_commits_returns_none(self, leerie, tmp_path):
         d = _repo_with_run_branch(tmp_path)
         (d / "feature.py").write_text("x\n")
-        _git(d, "add", "-A")
-        _git(d, "commit", "-qm", "feat")
+        run_git_repo_first(d, "add", "-A")
+        run_git_repo_first(d, "commit", "-qm", "feat")
         r = asyncio.run(leerie.check_branch_has_commits("sid", str(d), "run"))
         assert r is None
 
