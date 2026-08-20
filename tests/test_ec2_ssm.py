@@ -33,53 +33,12 @@ import os
 from pathlib import Path
 
 from tests.conftest import run_bash
+from tests.stub_helpers import _stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
 EC2_SSM_SH = REPO_ROOT / "scripts" / "remote" / "ec2-ssm.sh"
 LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
-
-
-def _stub_timeout(bin_dir: Path) -> None:
-    """Real, group-killing `timeout` stub — see test_ec2_transport.py's
-    identical helper for the full rationale (macOS ships no
-    /usr/bin/timeout, so an unbounded stall test would hang the suite)."""
-    stub = bin_dir / "timeout"
-    stub.write_text(
-        """#!/usr/bin/env bash
-kill_after=""
-while [[ "$1" == --* ]]; do
-  case "$1" in
-    --kill-after=*) kill_after="${1#--kill-after=}" ;;
-    --kill-after)   kill_after="$2"; shift ;;
-    --foreground)   ;;
-  esac
-  shift
-done
-secs="$1"; shift
-
-set -m
-"$@" &
-child=$!
-set +m
-
-(
-  sleep "$secs"
-  kill -TERM -- "-$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null
-  if [ -n "$kill_after" ]; then
-    sleep "$kill_after"
-    kill -KILL -- "-$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null
-  fi
-) &
-waiter=$!
-
-wait "$child" 2>/dev/null; rc=$?
-kill -TERM "$waiter" 2>/dev/null
-[ "$rc" -eq 143 ] && rc=124
-exit "$rc"
-"""
-    )
-    stub.chmod(0o755)
 
 
 def _stub_aws_interactive_session(bin_dir: Path, *, stall: bool = False) -> Path:

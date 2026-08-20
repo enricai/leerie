@@ -26,7 +26,7 @@ from pathlib import Path
 from tests import ec2_stub
 from tests.conftest import run_bash
 from tests.stub_helpers import _make_stub_timeout
-from tests.test_ec2_transport import _stub_timeout as _make_killing_stub_timeout
+from tests.stub_helpers import _stub_timeout as _make_killing_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_SEED_AUTH_SH = REPO_ROOT / "scripts" / "remote" / "ec2-seed-auth.sh"
