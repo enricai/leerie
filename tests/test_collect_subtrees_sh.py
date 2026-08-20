@@ -19,43 +19,25 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_bash, run_git_repo_first
+from tests.fly_stub import make_fake_flyctl
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COLLECT_SH = REPO_ROOT / "scripts" / "remote" / "collect-subtrees.sh"
 SCRIPTS_DIR = REPO_ROOT / "scripts"
 PROMPTS_DIR = REPO_ROOT / "prompts"
 
 
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _git(repo: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", "-C", str(repo)] + list(args),
-        capture_output=True,
-        text=True,
-        check=check,
-    )
-
-
 def _make_fixture_repo(tmp_path: Path) -> Path:
     """Create a minimal git repo with an initial commit."""
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(repo, "init", "-b", "main")
-    _git(repo, "config", "user.name", "test")
-    _git(repo, "config", "user.email", "test@test.com")
+    run_git_repo_first(repo, "init", "-b", "main")
+    run_git_repo_first(repo, "config", "user.name", "test")
+    run_git_repo_first(repo, "config", "user.email", "test@test.com")
     (repo / "README.md").write_text("hello\n")
-    _git(repo, "add", "README.md")
-    _git(repo, "commit", "-m", "initial")
+    run_git_repo_first(repo, "add", "README.md")
+    run_git_repo_first(repo, "commit", "-m", "initial")
     return repo
 
 
@@ -64,40 +46,31 @@ def _make_subtask_branch(
 ) -> None:
     """Create a subtask branch with commits off parent_branch."""
     branch = f"leerie/subtasks/{run_id}/{sid}"
-    _git(repo, "branch", branch, parent_branch)
-    _git(repo, "checkout", branch)
+    run_git_repo_first(repo, "branch", branch, parent_branch)
+    run_git_repo_first(repo, "checkout", branch)
     for name, content in files.items():
         (repo / name).write_text(content)
-        _git(repo, "add", name)
-    _git(repo, "commit", "-m", f"subtask {sid}")
-    _git(repo, "checkout", "main")
+        run_git_repo_first(repo, "add", name)
+    run_git_repo_first(repo, "commit", "-m", f"subtask {sid}")
+    run_git_repo_first(repo, "checkout", "main")
 
 
 def _make_run_branch(repo: Path, run_id: str) -> None:
     """Create the run branch at HEAD (simulates setup-run.sh having run)."""
     branch = f"leerie/runs/{run_id}"
-    _git(repo, "branch", branch, "HEAD")
+    run_git_repo_first(repo, "branch", branch, "HEAD")
 
 
-def _make_fake_flyctl(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
+def _flyctl_stub(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
     """Stub flyctl that routes `bash -s` payloads to a local bash invocation
     with paths rewritten to point at the fixture repo."""
-    stub = tmp_path / "bin" / "flyctl"
-    stub.parent.mkdir(parents=True, exist_ok=True)
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
+    extra_preamble = (
         f'REPO="{repo}"\n'
         f'STATE_DIR="{state_dir}"\n'
         f'SCRIPTS="{SCRIPTS_DIR}"\n'
         f'PROMPTS="{PROMPTS_DIR}"\n'
-        'CMD=""\n'
-        'while [ $# -gt 0 ]; do\n'
-        '  case "$1" in\n'
-        '    -C) CMD="$2"; shift 2 ;;\n'
-        '    auth) shift; case "${1:-}" in status) exit 0 ;; esac ;;\n'
-        '    *) shift ;;\n'
-        '  esac\n'
-        'done\n'
+    )
+    case_body = (
         '[ -z "$CMD" ] && exit 0\n'
         'case "$CMD" in\n'
         '  bash*-s*)\n'
@@ -115,8 +88,9 @@ def _make_fake_flyctl(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
         '  *) exit 0 ;;\n'
         'esac\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(
+        tmp_path, case_body, extra_preamble=extra_preamble, filename="bin/flyctl"
+    )
 
 
 def _make_fake_claude(tmp_path: Path, *, succeed: bool = True) -> Path:
@@ -177,7 +151,7 @@ def test_collect_subtrees_sh_exists():
 
 
 def test_refuses_when_no_machine_id():
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie ''",
         env={"LEERIE_REPO": str(REPO_ROOT)},
     )
@@ -196,15 +170,15 @@ def test_collected_none_when_all_integrated(tmp_path):
     _make_state_json(state_dir, run_id, waves=[["s1"]], completed_waves=1)
 
     # Create a subtask branch at the same commit as run branch (already integrated).
-    _git(repo, "branch", f"leerie/subtasks/{run_id}/s1",
+    run_git_repo_first(repo, "branch", f"leerie/subtasks/{run_id}/s1",
          f"leerie/runs/{run_id}")
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -226,12 +200,12 @@ def test_collected_all_clean_merges(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"file_b.txt": "content b\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -239,8 +213,12 @@ def test_collected_all_clean_merges(tmp_path):
     assert "integrated 2" in result.stderr.lower()
 
     # Verify the run branch now has both files.
-    show_a = _git(repo, "show", f"leerie/runs/{run_id}:file_a.txt", check=False)
-    show_b = _git(repo, "show", f"leerie/runs/{run_id}:file_b.txt", check=False)
+    show_a = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:file_a.txt"],
+        capture_output=True, text=True, check=False)
+    show_b = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:file_b.txt"],
+        capture_output=True, text=True, check=False)
     assert show_a.returncode == 0, "file_a.txt missing from run branch"
     assert show_b.returncode == 0, "file_b.txt missing from run branch"
 
@@ -260,13 +238,13 @@ def test_conflict_resolved_by_integrator(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"conflict.txt": "version B\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     claude_stub = _make_fake_claude(tmp_path, succeed=True)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -274,7 +252,9 @@ def test_conflict_resolved_by_integrator(tmp_path):
     assert "integrated 2" in result.stderr.lower()
 
     # The run branch should have conflict.txt (content from s2 via theirs).
-    show = _git(repo, "show", f"leerie/runs/{run_id}:conflict.txt", check=False)
+    show = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:conflict.txt"],
+        capture_output=True, text=True, check=False)
     assert show.returncode == 0, "conflict.txt missing from run branch"
 
 
@@ -292,13 +272,13 @@ def test_conflict_skipped_when_integrator_fails(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"conflict.txt": "version B\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     claude_stub = _make_fake_claude(tmp_path, succeed=False)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -322,7 +302,7 @@ def test_conflict_skipped_when_no_claude(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"conflict.txt": "version B\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     # No fake claude on PATH — use stub dir (flyctl) + system dirs but
     # ensure no claude binary is reachable. The stub dir is first so
     # flyctl is found; system dirs provide bash/git/python3.
@@ -336,7 +316,7 @@ def test_conflict_skipped_when_no_claude(tmp_path):
     no_claude = no_claude_dir / "claude"
     no_claude.write_text("#!/usr/bin/env bash\nexit 127\n")
     no_claude.chmod(0o755)
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -354,12 +334,12 @@ def test_collected_none_when_no_subtask_branches(tmp_path):
     _make_run_branch(repo, run_id)
     _make_state_json(state_dir, run_id, waves=[[]], completed_waves=0)
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -380,12 +360,12 @@ def test_setup_run_creates_missing_worktree(tmp_path):
     _make_subtask_branch(repo, run_id, "s1", "main",
                          {"new_file.txt": "new content\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
     }
-    result = _run_bash(
+    result = run_bash(
         f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
         env=env,
     )
@@ -393,5 +373,7 @@ def test_setup_run_creates_missing_worktree(tmp_path):
     assert "integrated 1" in result.stderr.lower()
 
     # Verify the run branch was created and has the file.
-    show = _git(repo, "show", f"leerie/runs/{run_id}:new_file.txt", check=False)
+    show = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:new_file.txt"],
+        capture_output=True, text=True, check=False)
     assert show.returncode == 0, "new_file.txt missing from run branch"

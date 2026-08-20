@@ -28,10 +28,9 @@ re-probed (fail-safe-to-reprobe), the same discipline as an unrelated sha.
 """
 from __future__ import annotations
 
-import subprocess
 from pathlib import Path
 
-from tests.conftest import _run
+from tests.conftest import _run, run_git_cwd_first_stdout
 
 _CAPS = {"max_parallel": 4, "max_total_workers": 999}
 _MODELS = {"satisfied_probe": "sonnet"}
@@ -65,31 +64,25 @@ def _sub(sid, **kw):
     return s
 
 
-def _git(args: list[str], cwd: Path) -> str:
-    out = subprocess.run(["git", *args], cwd=cwd, check=True,
-                          capture_output=True, text=True)
-    return out.stdout.strip()
-
-
 def _init_git_repo(path: Path) -> str:
     """Create a minimal real git repo at `path` and return HEAD's sha."""
     path.mkdir(parents=True, exist_ok=True)
-    _git(["init", "-q"], path)
-    _git(["config", "user.email", "t@example.com"], path)
-    _git(["config", "user.name", "t"], path)
+    run_git_cwd_first_stdout(path, "init", "-q")
+    run_git_cwd_first_stdout(path, "config", "user.email", "t@example.com")
+    run_git_cwd_first_stdout(path, "config", "user.name", "t")
     (path / "a.py").write_text("x = 1\n")
-    _git(["add", "-A"], path)
-    _git(["commit", "-q", "-m", "init"], path)
-    return _git(["rev-parse", "HEAD"], path)
+    run_git_cwd_first_stdout(path, "add", "-A")
+    run_git_cwd_first_stdout(path, "commit", "-q", "-m", "init")
+    return run_git_cwd_first_stdout(path, "rev-parse", "HEAD")
 
 
 def _commit_more(path: Path, filename: str = "b.py") -> str:
     """Advance HEAD in an already-initialized repo with a new commit.
     Returns the new HEAD sha."""
     (path / filename).write_text("y = 2\n")
-    _git(["add", "-A"], path)
-    _git(["commit", "-q", "-m", f"add {filename}"], path)
-    return _git(["rev-parse", "HEAD"], path)
+    run_git_cwd_first_stdout(path, "add", "-A")
+    run_git_cwd_first_stdout(path, "commit", "-q", "-m", f"add {filename}")
+    return run_git_cwd_first_stdout(path, "rev-parse", "HEAD")
 
 
 

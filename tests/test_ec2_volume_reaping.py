@@ -50,9 +50,11 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import run_bash
 from tests.ec2_stub import _stub_aws, leaked_resources, read_log, read_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -68,18 +70,12 @@ REQUIRED_ENV = {
 }
 
 
-def _run_bash(script: str, env: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    base_env.pop("LEERIE_STATE_DIR", None)
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        cwd=str(cwd) if cwd is not None else None,
-        capture_output=True,
-        text=True,
-    )
+@pytest.fixture(autouse=True)
+def _no_leerie_state_dir(monkeypatch):
+    """LEERIE_STATE_DIR must never leak into these tests' subprocess env —
+    see the footgun reminder in test_ec2_resume_instance.py
+    (LEERIE_STATE_HOST_DIR is the knob these scripts actually consume)."""
+    monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
 
 
 def _stub_env(aws_dir: Path, extra: dict | None = None) -> dict:
@@ -115,7 +111,7 @@ def test_run_instances_has_no_block_device_mapping_override(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}\n"
         "wait_for_instance_ready() { return 0; }\n"
         "provision_instance\n",
@@ -172,7 +168,7 @@ def test_terminate_instance_noop_on_empty_instance_id_makes_no_aws_call(tmp_path
     env = _stub_env(aws_dir)
     env["LEERIE_EC2_INSTANCE_ID"] = ""
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; LEERIE_EC2_INSTANCE_ID=''; terminate_instance",
         env=env,
     )
@@ -194,7 +190,7 @@ def test_terminate_instance_reaps_the_instance_and_leaves_no_leak(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}\n"
         "wait_for_instance_ready() { return 0; }\n"
         "provision_instance\n"

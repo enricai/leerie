@@ -22,10 +22,7 @@ import types
 
 import pytest
 
-
-def _git(*args, cwd):
-    subprocess.run(["git", *args], cwd=cwd, check=True,
-                   capture_output=True, text=True)
+from tests.conftest import run_git_cwd_kw as _git
 
 
 @pytest.fixture

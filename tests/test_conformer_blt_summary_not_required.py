@@ -11,9 +11,10 @@ import pytest
 
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    jsonschema = None  # type: ignore
+
+from tests.conftest import HAS_JSONSCHEMA
 
 
 def _minimal_conformer_instance(axis_without_summary: dict) -> dict:

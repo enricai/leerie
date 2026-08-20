@@ -35,7 +35,7 @@ from unittest.mock import AsyncMock
 
 from tests.test_accept_blocked import (
     _expected_remote_state,
-    _make_fake_flyctl,
+    _flyctl_stub,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -474,7 +474,7 @@ def test_fly_path_accepts_an_integration_finding(tmp_path):
         "feat-001": {"defects": [{"what": "races on shutdown"}],
                      "accepted": False},
     })
-    flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    flyctl = _flyctl_stub(tmp_path, sf, _expected_remote_state(sf))
     r = _run_accept_integration_fly(sf, "feat-001", flyctl)
 
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
@@ -487,7 +487,7 @@ def test_fly_path_reports_noop_on_already_accepted(tmp_path):
     sf = _make_state(tmp_path, {
         "feat-001": {"defects": [], "accepted": True},
     })
-    flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    flyctl = _flyctl_stub(tmp_path, sf, _expected_remote_state(sf))
     r = _run_accept_integration_fly(sf, "feat-001", flyctl)
 
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
@@ -498,7 +498,7 @@ def test_fly_path_rejects_an_injection_sid_before_any_transport(tmp_path):
     """The `-C` string is double-parsed by the remote shell, so the sid
     allowlist has to run before flyctl is invoked at all."""
     sf = _make_state(tmp_path, {"feat-001": {"defects": [], "accepted": False}})
-    flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    flyctl = _flyctl_stub(tmp_path, sf, _expected_remote_state(sf))
     r = _run_accept_integration_fly(sf, "feat-001'; touch pwned; '", flyctl)
 
     assert r.returncode != 0

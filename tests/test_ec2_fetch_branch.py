@@ -23,23 +23,12 @@ import subprocess
 from pathlib import Path
 
 from tests import ec2_stub
+from tests.conftest import run_bash
 from tests.stub_helpers import _make_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_FETCH_SH = REPO_ROOT / "scripts" / "remote" / "ec2-fetch-branch.sh"
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_stub_aws(stub_path: Path, exec_log: Path, instance_work: Path) -> None:
@@ -168,7 +157,7 @@ def test_ec2_fetch_branch_defines_fetch_state_ec2():
 
 
 def test_fetch_state_ec2_fails_without_instance_id():
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env={
             "LEERIE_EC2_INSTANCE_ID": "",
@@ -181,7 +170,7 @@ def test_fetch_state_ec2_fails_without_instance_id():
 
 
 def test_fetch_state_ec2_fails_without_ssh_target():
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -194,7 +183,7 @@ def test_fetch_state_ec2_fails_without_ssh_target():
 
 
 def test_fetch_state_ec2_fails_without_user_repo():
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -207,7 +196,7 @@ def test_fetch_state_ec2_fails_without_user_repo():
 
 
 def test_fetch_state_ec2_fails_when_aws_missing(tmp_path):
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -241,7 +230,7 @@ def test_fetch_state_ec2_streams_bundle_and_state(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, instance_work)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=_base_env(tmp_path, repo),
     )
@@ -284,7 +273,7 @@ def test_fetch_state_ec2_uses_leerie_state_host_dir(tmp_path):
     env = _base_env(tmp_path, repo)
     env["LEERIE_STATE_HOST_DIR"] = str(custom_host_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=env,
     )
@@ -314,7 +303,7 @@ def test_fetch_state_ec2_strips_no_push_when_branch_present(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, instance_work)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=_base_env(tmp_path, repo),
     )
@@ -371,7 +360,7 @@ def test_fetch_state_ec2_skips_bundle_and_preserves_no_push_when_branch_missing(
     _make_stub_ssh(tmp_path / "ssh", exec_log, instance_work)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=_base_env(tmp_path, repo),
     )
@@ -414,7 +403,7 @@ def test_fetch_state_ec2_streams_config_and_dockerfile_to_host(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, instance_work)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=_base_env(tmp_path, repo),
     )
@@ -450,7 +439,7 @@ def test_fetch_state_ec2_never_clobbers_existing_host_file(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, instance_work)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=_base_env(tmp_path, repo),
     )
@@ -479,7 +468,7 @@ def test_fetch_state_ec2_nonfatal_when_instance_leerie_files_absent(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, instance_work)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=_base_env(tmp_path, repo),
     )
@@ -506,7 +495,7 @@ def test_fetch_state_ec2_uses_ec2_transport_only(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, instance_work)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_FETCH_SH}; fetch_state_ec2",
         env=_base_env(tmp_path, repo),
     )

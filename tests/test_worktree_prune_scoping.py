@@ -31,6 +31,7 @@ import tokenize
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_cwd_first_stdout as _git
 from tests.source_strip import (
     code_only as _code_only, shell_code_only as _shell_code_only)   # single owner; see that module
 
@@ -62,11 +63,6 @@ _PRUNE_SURFACE = (
     + sorted((REPO_ROOT / "chain").rglob("*.py"))
     + [REPO_ROOT / "leerie"]
 )
-
-
-def _git(cwd: Path, *args: str) -> str:
-    return subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                          capture_output=True, text=True).stdout
 
 
 def _repo(tmp_path: Path) -> Path:

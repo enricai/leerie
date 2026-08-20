@@ -21,13 +21,14 @@ import subprocess
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import _run, run_git_cwd_kw as _git
 
 
-
-def _git(*args, cwd, **kw):
+def _git_noraise(*args, cwd):
+    """Like `_git`, but never raises -- for the one call whose non-zero
+    exit is the thing under test (a merge left mid-conflict)."""
     return subprocess.run(["git", *args], cwd=str(cwd),
-                          capture_output=True, text=True, **kw)
+                          capture_output=True, text=True)
 
 
 @pytest.fixture()
@@ -52,7 +53,7 @@ def conflicted_repo(tmp_path):
     _git("checkout", "-q", "-", cwd=repo)
     (repo / "f.txt").write_text("main\n")
     _git("commit", "-qam", "main", cwd=repo)
-    _git("merge", "side", cwd=repo)  # conflicts by construction
+    _git_noraise("merge", "side", cwd=repo)  # conflicts by construction
     assert (repo / ".git" / "MERGE_HEAD").exists(), "fixture must be mid-merge"
     del base
     return repo

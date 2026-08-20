@@ -28,15 +28,11 @@ import subprocess
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_cwd_first_unchecked as _git
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INTEGRATE = REPO_ROOT / "scripts" / "integrate.sh"
 RUN_ID = "run-abc123"
-
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                          text=True, check=False)
 
 
 @pytest.fixture

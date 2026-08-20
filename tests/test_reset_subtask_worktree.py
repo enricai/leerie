@@ -12,14 +12,18 @@ import asyncio
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_git_cwd_kw as _git
 
-def _git(*args, cwd):
+
+def _git_noraise(*args, cwd):
+    """Like `_git`, but never raises -- for calls whose non-zero exit is
+    the thing under test (a stale worktree/branch collision)."""
     return subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False,
     )
 
 
-def _init_repo(path: Path) -> Path:
+def _make_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     _git("init", "-q", "-b", "main", cwd=path)
     _git("config", "user.email", "test@leerie.local", cwd=path)
@@ -34,7 +38,7 @@ def _init_repo(path: Path) -> Path:
 def test_noop_when_neither_worktree_nor_branch_exists(leerie, tmp_path, monkeypatch):
     """Idempotent: when the worktree and branch are already absent the helper
     returns cleanly. This is the steady-state on a fresh subtask."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     (leerie_dir / "worktrees").mkdir(parents=True)
@@ -51,7 +55,7 @@ def test_noop_when_neither_worktree_nor_branch_exists(leerie, tmp_path, monkeypa
 def test_removes_existing_worktree_and_branch(leerie, tmp_path, monkeypatch):
     """After `new-worktree.sh`-equivalent setup, the helper drops both the
     worktree registration and the branch ref."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     wt_dir = leerie_dir / "worktrees" / "sid-x"
@@ -71,7 +75,7 @@ def test_removes_existing_worktree_and_branch(leerie, tmp_path, monkeypatch):
     asyncio.run(leerie._reset_subtask_worktree("sid-x", leerie_dir, "run-id"))
 
     assert not wt_dir.exists()
-    show = _git("show-ref", "--verify", "--quiet",
+    show = _git_noraise("show-ref", "--verify", "--quiet",
                 "refs/heads/leerie/subtasks/run-id/sid-x", cwd=repo)
     assert show.returncode != 0
 
@@ -82,13 +86,13 @@ def test_reset_falls_back_to_rmtree_when_git_leaves_dir_behind(
     still exists — the helper must fall back to a direct `shutil.rmtree`
     rather than leaving it behind, which would otherwise make the next
     `new-worktree.sh` attempt collide with a stray directory."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     wt_dir = leerie_dir / "worktrees" / "sid-x"
     wt_dir.mkdir(parents=True)
     (wt_dir / "leftover.txt").write_text("stray\n")
-    r = _git("worktree", "remove", "--force", str(wt_dir), cwd=repo)
+    r = _git_noraise("worktree", "remove", "--force", str(wt_dir), cwd=repo)
     assert r.returncode != 0
     assert wt_dir.exists()
 
@@ -104,7 +108,7 @@ def test_resets_so_worktree_add_b_succeeds_on_retry(leerie, tmp_path, monkeypatc
     fresh `git worktree add -b <branch>` succeeds where it would otherwise
     fail with `fatal: a branch ... already exists`. Mirrors the live
     container repro that motivated Fix B."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     wt_dir = leerie_dir / "worktrees" / "sid-x"
@@ -117,7 +121,7 @@ def test_resets_so_worktree_add_b_succeeds_on_retry(leerie, tmp_path, monkeypatc
     assert r1.returncode == 0
 
     # Attempt #2 without reset: fails because branch already exists.
-    r2 = _git("worktree", "add", str(wt_dir) + "-again", "-b",
+    r2 = _git_noraise("worktree", "add", str(wt_dir) + "-again", "-b",
               "leerie/subtasks/run-id/sid-x", "leerie/runs/run-id", cwd=repo)
     assert r2.returncode != 0
     assert "already exists" in r2.stderr

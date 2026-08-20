@@ -24,24 +24,13 @@ import subprocess
 from pathlib import Path
 
 from tests import ec2_stub
+from tests.conftest import run_bash
 from tests.stub_helpers import _make_stub_timeout
 from tests.test_ec2_transport import _stub_timeout as _make_killing_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_SEED_AUTH_SH = REPO_ROOT / "scripts" / "remote" / "ec2-seed-auth.sh"
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_stub_aws(stub_path: Path, exec_log: Path, dest_dir: Path,
@@ -119,7 +108,7 @@ def test_ec2_seed_auth_sh_is_executable():
 def test_ec2_seed_auth_fails_without_instance_id(tmp_path):
     stage = tmp_path / "stage"
     stage.mkdir()
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env={
             "LEERIE_EC2_INSTANCE_ID": "",
@@ -134,7 +123,7 @@ def test_ec2_seed_auth_fails_without_instance_id(tmp_path):
 def test_ec2_seed_auth_fails_without_ssh_target(tmp_path):
     stage = tmp_path / "stage"
     stage.mkdir()
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -147,7 +136,7 @@ def test_ec2_seed_auth_fails_without_ssh_target(tmp_path):
 
 
 def test_ec2_seed_auth_fails_without_stage(tmp_path):
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -162,7 +151,7 @@ def test_ec2_seed_auth_fails_without_stage(tmp_path):
 def test_ec2_seed_auth_fails_when_aws_missing(tmp_path):
     stage = tmp_path / "stage"
     stage.mkdir()
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -188,7 +177,7 @@ def test_ec2_seed_auth_fails_without_credentials_or_token(tmp_path):
     _make_stub_timeout(tmp_path)
     _make_stub_git(tmp_path / "git")
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage),
     )
@@ -214,7 +203,7 @@ def test_ec2_seed_auth_fails_without_git_identity(tmp_path):
     fake_git.write_text("#!/usr/bin/env bash\nexit 1\n")
     fake_git.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage),
     )
@@ -237,7 +226,7 @@ def test_ec2_seed_auth_succeeds_with_credentials_file(tmp_path):
     _make_stub_timeout(tmp_path)
     _make_stub_git(tmp_path / "git")
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage),
     )
@@ -262,7 +251,7 @@ def test_ec2_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     _make_stub_timeout(tmp_path)
     _make_stub_git(tmp_path / "git")
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage, CLAUDE_CODE_OAUTH_TOKEN="my-oauth-token"),
     )
@@ -309,7 +298,7 @@ def test_ec2_seed_auth_plugin_cache_and_marketplaces_not_re_excluded_by_tar(tmp_
     _make_stub_timeout(tmp_path)
     _make_stub_git(tmp_path / "git")
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage),
     )
@@ -369,7 +358,7 @@ def test_ec2_seed_auth_fixes_ownership_to_leerie(tmp_path):
     _make_stub_timeout(tmp_path)
     _make_stub_git(tmp_path / "git")
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage),
     )
@@ -398,7 +387,7 @@ def test_ec2_seed_auth_uses_ec2_transport_never_flyctl(tmp_path):
     _make_stub_timeout(tmp_path)
     _make_stub_git(tmp_path / "git")
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage),
     )
@@ -436,7 +425,7 @@ def test_ec2_seed_auth_writes_git_identity(tmp_path):
     )
     fake_git.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=_base_env(tmp_path, stage),
     )
@@ -486,7 +475,7 @@ sleep 600
 
     env = _base_env(tmp_path, stage, LEERIE_SEED_TIMEOUT_S="1")
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_LIB_SH}; source {EC2_SEED_AUTH_SH}; ec2_seed_auth",
         env=env,
     )

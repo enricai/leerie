@@ -21,6 +21,11 @@ import time
 from pathlib import Path
 
 import pytest
+# `check=False` on purpose: several call sites expect a nonzero rc (a refused
+# `-d`, a missing branch). It means a SETUP failure is silent, so every
+# fixture below asserts its own postcondition — an `assert "<branch>" not in
+# out` is satisfied for free by a branch that was never created.
+from tests.conftest import run_git_cwd_first_unchecked as _git
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -35,16 +40,6 @@ def _run_dir(root: Path, run_id: str, *, old: bool, **fields) -> Path:
     if old:
         os.utime(d, (OLD, OLD))
     return d
-
-
-def _git(cwd: Path, *args: str):
-    # `check=False` on purpose: several call sites expect a nonzero rc (a
-    # refused `-d`, a missing branch). It means a SETUP failure is silent, so
-    # every fixture below asserts its own postcondition — an
-    # `assert "<branch>" not in out` is satisfied for free by a branch that
-    # was never created.
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                          text=True, check=False)
 
 
 def _repo(tmp_path: Path) -> Path:

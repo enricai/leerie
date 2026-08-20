@@ -40,6 +40,8 @@ import subprocess
 import threading
 from pathlib import Path
 
+from tests.conftest import run_git_cwd_kw as _git
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "new-worktree.sh"
 
@@ -48,13 +50,6 @@ WORKERS_PER_ROUND = 8
 # Widens the critical section so concurrent invocations are very likely to
 # overlap in wall-clock time within a short test run, on the unlocked copy.
 INJECTED_DELAY_SEC = "0.05"
-
-
-def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd),
-        capture_output=True, text=True, check=False,
-    )
 
 
 def _make_repo(tmp_path: Path, name: str) -> Path:

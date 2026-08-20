@@ -28,10 +28,12 @@ the stateful stub in tests/ec2_stub.py — no real AWS API call is made.
 """
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import run_bash
 from tests.ec2_stub import _stub_aws, read_log, read_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -46,16 +48,12 @@ REQUIRED_ENV = {
 }
 
 
-def _run_bash(script: str, env: dict) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    base_env.pop("LEERIE_STATE_DIR", None)
-    base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
+@pytest.fixture(autouse=True)
+def _no_leerie_state_dir(monkeypatch):
+    """LEERIE_STATE_DIR must never leak into these tests' subprocess env —
+    see the footgun reminder in test_ec2_resume_instance.py
+    (LEERIE_STATE_HOST_DIR is the knob these scripts actually consume)."""
+    monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
 
 
 def _stub_env(aws_dir: Path, extra: dict | None = None) -> dict:
@@ -84,7 +82,7 @@ def _provision_and_classify(
         "provision_instance; "
         f"export LEERIE_REMOTE_EXIT_RC={rc} )"
     )
-    return _run_bash(script, env)
+    return run_bash(script, env)
 
 
 # --- clean-exit rc arms: sync then terminate ---------------------------------
@@ -345,7 +343,7 @@ def test_double_fire_does_not_reclassify_with_clobbered_rc(tmp_path):
         "decide_ec2_teardown; "
         "echo done"
     )
-    result = _run_bash(script, env)
+    result = run_bash(script, env)
 
     assert result.returncode == 0, result.stderr
     assert "done" in result.stdout
@@ -384,7 +382,7 @@ def test_double_fire_after_pause_does_not_re_pause_or_terminate(tmp_path):
         "decide_ec2_teardown; "
         "echo done"
     )
-    result = _run_bash(script, env)
+    result = run_bash(script, env)
 
     assert result.returncode == 0, result.stderr
     assert "done" in result.stdout
@@ -423,7 +421,7 @@ _try_fetch_state_for_ec2_teardown() {{
 provision_instance
 export LEERIE_REMOTE_EXIT_RC=0
 """
-    result = _run_bash(f"( {script} )", env)
+    result = run_bash(f"( {script} )", env)
 
     assert result.returncode == 0, result.stderr
     assert marker.exists(), (

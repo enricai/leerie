@@ -12,6 +12,9 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_bash
+from tests.fly_stub import make_fake_flyctl
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FETCH_SH = REPO_ROOT / "scripts" / "remote" / "fetch-branch.sh"
 
@@ -54,19 +57,7 @@ print(best[3])
 """
 
 
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
-
-
-def _make_fake_flyctl(
+def _flyctl_stub(
     tmp_path: Path,
     machine_runs_dir: Path,
     git_repo: Path,
@@ -98,26 +89,12 @@ def _make_fake_flyctl(
     # Machine-side .leerie/ directory (stands in for /work/.leerie/).
     mleerie = str(machine_leerie_dir) if machine_leerie_dir else ""
 
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        # New flyctl call shape (post-`--stdin` removal): the launcher
-        # now uses `flyctl ssh console --app <app> --machine <id>
-        # --pty=false -C "<cmd-string>"`. The command is a single
-        # shell-quoted string; we eval it after rewriting the in-machine
-        # paths to point at the test fixtures.
+    extra_preamble = (
         f'REPO={git_repo}\n'
         f'MRUNS={machine_runs_dir}\n'
         f'MLEERIE={mleerie}\n'
-        # Parse out the -C argument.
-        'CMD=""\n'
-        'while [ $# -gt 0 ]; do\n'
-        '  case "$1" in\n'
-        '    -C) CMD="$2"; shift 2 ;;\n'
-        '    auth) shift; case "$1" in status) exit 0 ;; esac ;;\n'
-        '    *) shift ;;\n'
-        '  esac\n'
-        'done\n'
+    )
+    case_body = (
         '[ -z "$CMD" ] && exit 0\n'
         # Rewrite in-machine paths to the local fixture paths.
         '# discover_run_for_fetch python3 -c \'<script>\' — match on python3 -c\n'
@@ -162,8 +139,7 @@ def _make_fake_flyctl(
         '  *) exit 0 ;;\n'
         'esac\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(tmp_path, case_body, extra_preamble=extra_preamble)
 
 
 def _make_git_repo(tmp_path: Path, subdir: str = "myrepo") -> Path:
@@ -197,7 +173,7 @@ def test_fetch_branch_sh_is_executable():
 
 def test_fetch_branch_fails_without_machine_id():
     """fetch_branch returns 1 when LEERIE_MACHINE_ID is unset."""
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={"LEERIE_MACHINE_ID": "", "USER_REPO": "/tmp"},
     )
@@ -207,7 +183,7 @@ def test_fetch_branch_fails_without_machine_id():
 
 def test_fetch_branch_fails_without_user_repo():
     """fetch_branch returns 1 when USER_REPO is unset."""
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={"LEERIE_MACHINE_ID": "test-machine-001", "USER_REPO": ""},
     )
@@ -217,7 +193,7 @@ def test_fetch_branch_fails_without_user_repo():
 
 def test_fetch_branch_fails_when_flyctl_missing():
     """fetch_branch returns 1 with an actionable error when flyctl is absent."""
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -240,9 +216,9 @@ def test_fetch_branch_fails_when_no_completed_run(tmp_path):
     stale_run.mkdir()
     (stale_run / "run.json").write_text(json.dumps({"branch": "leerie/runs/some-run-id"}))
 
-    fake_flyctl = _make_fake_flyctl(tmp_path, machine_runs, repo)
+    fake_flyctl = _flyctl_stub(tmp_path, machine_runs, repo)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -281,9 +257,9 @@ def test_fetch_branch_streams_bundle_and_state(tmp_path):
     }))
     (run_dir / "state.json").write_text(json.dumps({"task": "test task"}))
 
-    fake_flyctl = _make_fake_flyctl(tmp_path, machine_runs, repo)
+    fake_flyctl = _flyctl_stub(tmp_path, machine_runs, repo)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "test-machine-abc",
@@ -357,9 +333,9 @@ def test_fetch_branch_skips_bundle_when_branch_missing(tmp_path):
         "no_work_required": True,
     }))
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo)
+    _flyctl_stub(tmp_path, machine_runs, repo)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "no-work-machine",
@@ -450,9 +426,9 @@ def test_fetch_branch_strips_no_push_when_branch_present(tmp_path):
     }))
     (run_dir / "state.json").write_text("{}")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo)
+    _flyctl_stub(tmp_path, machine_runs, repo)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "test-machine",
@@ -520,9 +496,9 @@ def test_fetch_branch_picks_normal_run_over_no_push(tmp_path):
     }))
     (normal_dir / "state.json").write_text("{}")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo)
+    _flyctl_stub(tmp_path, machine_runs, repo)
 
-    result = _run_bash(
+    result = run_bash(
         f'source {FETCH_SH}; fetch_branch && echo "RUN_ID=$LEERIE_REMOTE_RUN_ID"',
         env={
             "LEERIE_MACHINE_ID": "mixed-machine",
@@ -563,9 +539,9 @@ def test_fetch_branch_exports_run_id(tmp_path):
     }))
     (run_dir / "state.json").write_text("{}")
 
-    fake_flyctl = _make_fake_flyctl(tmp_path, machine_runs, repo)
+    fake_flyctl = _flyctl_stub(tmp_path, machine_runs, repo)
 
-    result = _run_bash(
+    result = run_bash(
         f'source {FETCH_SH}; fetch_branch && echo "RUN_ID=$LEERIE_REMOTE_RUN_ID"',
         env={
             "LEERIE_MACHINE_ID": "m1",
@@ -618,9 +594,9 @@ def test_step4_streams_config_and_dockerfile_to_host(tmp_path):
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = []\n")
     (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-streamback",
@@ -655,9 +631,9 @@ def test_step4_never_clobbers_existing_host_file(tmp_path):
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = []\n")
     (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-noclobber",
@@ -682,9 +658,9 @@ def test_step4_nonfatal_when_machine_file_absent(tmp_path):
     repo, machine_runs, _ = _make_run_fixture(tmp_path, run_id)
 
     # Stub with no machine .leerie/ dir — test -f will fail for all files.
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=None)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=None)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-nofail",
@@ -708,12 +684,12 @@ def test_step4_uses_leerie_state_host_dir(tmp_path):
     machine_leerie.mkdir()
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = ['curl']\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
     custom_host_dir = tmp_path / "custom_leerie_state"
     custom_host_dir.mkdir()
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-hostdir",

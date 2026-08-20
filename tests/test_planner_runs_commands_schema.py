@@ -7,11 +7,12 @@ optional — most subtasks run no prescribed command.
 """
 from __future__ import annotations
 
+from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
+
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    pass
 
 import pytest
 
@@ -22,11 +23,8 @@ def _subtask_item_schema(leerie):
 
 def _validate_subtask_item(leerie, instance: dict) -> None:
     schema = _subtask_item_schema(leerie)
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k!r}"
     if "runs_commands" in instance:
         assert isinstance(instance["runs_commands"], list)
         assert all(isinstance(c, str) for c in instance["runs_commands"])

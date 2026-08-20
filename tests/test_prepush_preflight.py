@@ -22,15 +22,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import run_git_repo_first
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOST_FINALIZE_SH = REPO_ROOT / "scripts" / "host-finalize.sh"
 
 PROBE_REF = "leerie/runs/preflight-probe"
-
-
-def _git(repo: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(repo), *args],
-                          capture_output=True, text=True, check=False)
 
 
 @pytest.fixture
@@ -41,13 +38,13 @@ def repo(tmp_path: Path) -> Path:
     work = tmp_path / "work"
     subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
     subprocess.run(["git", "init", "-q", "-b", "main", str(work)], check=True)
-    _git(work, "config", "user.email", "t@example.com")
-    _git(work, "config", "user.name", "t")
+    run_git_repo_first(work, "config", "user.email", "t@example.com")
+    run_git_repo_first(work, "config", "user.name", "t")
     (work / "a.txt").write_text("x\n")
-    _git(work, "add", "a.txt")
-    _git(work, "commit", "-qm", "init")
-    _git(work, "remote", "add", "origin", str(origin))
-    assert _git(work, "push", "-q", "--no-verify", "-u", "origin", "main").returncode == 0
+    run_git_repo_first(work, "add", "a.txt")
+    run_git_repo_first(work, "commit", "-qm", "init")
+    run_git_repo_first(work, "remote", "add", "origin", str(origin))
+    assert run_git_repo_first(work, "push", "-q", "--no-verify", "-u", "origin", "main").returncode == 0
     return work
 
 
@@ -68,7 +65,7 @@ def _preflight(repo: Path, branch: str = "main") -> subprocess.CompletedProcess:
 
 
 def _remote_refs(repo: Path) -> set[str]:
-    out = _git(repo, "ls-remote", "--heads", "origin").stdout
+    out = run_git_repo_first(repo, "ls-remote", "--heads", "origin").stdout
     return {ln.split("\t")[-1] for ln in out.splitlines() if ln.strip()}
 
 
@@ -157,7 +154,7 @@ def test_probe_creates_no_ref_anywhere(repo):
         _hook(repo, body)
         _preflight(repo)
         assert _remote_refs(repo) == before
-        local = {ln.strip() for ln in _git(repo, "branch", "--list").stdout.splitlines()}
+        local = {ln.strip() for ln in run_git_repo_first(repo, "branch", "--list").stdout.splitlines()}
         assert not any(PROBE_REF in b for b in local)
     assert before == {"refs/heads/main"}
 
@@ -196,7 +193,7 @@ def test_auth_or_network_failure_is_not_reported_as_a_hook_problem(repo):
     reports it properly, and a warning here would be noise on every run made
     offline. Classified with the same stderr-only rule as the push path."""
     _hook(repo, "#!/bin/sh\nexit 0\n")
-    _git(repo, "remote", "set-url", "origin", str(repo.parent / "nonexistent.git"))
+    run_git_repo_first(repo, "remote", "set-url", "origin", str(repo.parent / "nonexistent.git"))
     r = _preflight(repo)
     assert r.returncode == 0, r.stderr
     assert "hook already fails" not in r.stderr
@@ -205,7 +202,7 @@ def test_auth_or_network_failure_is_not_reported_as_a_hook_problem(repo):
 def test_hook_probe_short_circuits_before_any_network_call(repo):
     """Ordering guard: the hook-present check must gate the push, not the
     other way round, or every hookless repo pays a round trip to origin."""
-    _git(repo, "remote", "set-url", "origin", str(repo.parent / "nonexistent.git"))
+    run_git_repo_first(repo, "remote", "set-url", "origin", str(repo.parent / "nonexistent.git"))
     r = _preflight(repo)   # no hook installed
     assert r.returncode == 0 and r.stderr == ""
 
@@ -439,7 +436,7 @@ def test_launcher_skips_a_detached_head(repo):
     a ref the run will never push."""
     block = _launcher_preflight_block()
     _hook(repo, "#!/bin/sh\nexit 1\n")
-    _git(repo, "checkout", "-q", "--detach", "HEAD")
+    run_git_repo_first(repo, "checkout", "-q", "--detach", "HEAD")
     script = (
         "set -euo pipefail\n"
         'NO_PUSH="false"\nNO_VERIFY_PUSH="false"\n'

@@ -13,22 +13,18 @@ from __future__ import annotations
 import json
 import pytest
 
-try:
+from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
+
+if HAS_JSONSCHEMA:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
-except ImportError:
-    HAS_JSONSCHEMA = False
 
 
 def _validate(leerie, instance: dict) -> None:
     """Validate using jsonschema when available; otherwise fall back to
     structural assertions that mirror what the schema declares."""
     schema = leerie.SCHEMAS["adherence_judge"]
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k!r}"
     if "user_prescribed_a_procedure" in instance:
         assert isinstance(instance["user_prescribed_a_procedure"], bool)
     if "instruction_adherence" in instance:

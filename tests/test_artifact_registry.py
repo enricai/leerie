@@ -25,13 +25,10 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import HAS_JSONSCHEMA, _run, validate_or_fallback_required
 
-try:
+if HAS_JSONSCHEMA:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
-except ImportError:
-    HAS_JSONSCHEMA = False
 
 
 # --------------------------------------------------------------------------
@@ -40,11 +37,8 @@ except ImportError:
 
 def _validate(leerie, instance: dict) -> None:
     schema = leerie.SCHEMAS["artifact_registry"]
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k!r}"
     assert isinstance(instance["artifacts"], list)
     for a in instance["artifacts"]:
         for k in ("description", "tag", "path"):

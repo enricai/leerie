@@ -17,6 +17,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.fly_stub import make_fake_flyctl
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -155,7 +157,7 @@ def test_preserves_other_blocked_entries(tmp_path):
 # --- Fly path (stubbed flyctl) ------------------------------------------
 
 
-def _make_fake_flyctl(tmp_path: Path, host_state_file: Path,
+def _flyctl_stub(tmp_path: Path, host_state_file: Path,
                       expected_remote_state: str) -> Path:
     """Stub flyctl for the accept-blocked Fly path.
 
@@ -175,26 +177,13 @@ def _make_fake_flyctl(tmp_path: Path, host_state_file: Path,
         with the parsed sid.
     """
     started_marker = tmp_path / ".machine-started"
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
+    extra_preamble = (
         f'STARTED_MARKER="{started_marker}"\n'
         f'HOST_STATE="{host_state_file}"\n'
         f'EXPECT_REMOTE="{expected_remote_state}"\n'
-        'CMD=""\n'
-        'SUB=""\n'
-        'MSUB=""\n'
-        'while [ $# -gt 0 ]; do\n'
-        '  case "$1" in\n'
-        '    -C) CMD="$2"; shift 2 ;;\n'
-        '    auth) SUB="auth"; shift ;;\n'
-        '    machine) SUB="machine"; shift; MSUB="${1:-}"; shift || true ;;\n'
-        '    ssh) SUB="ssh"; shift ;;\n'
-        '    *) shift ;;\n'
-        '  esac\n'
-        'done\n'
+    )
+    case_body = (
         'case "$SUB" in\n'
-        '  auth) exit 0 ;;\n'
         '  machine)\n'
         '    case "$MSUB" in\n'
         '      status)\n'
@@ -232,8 +221,7 @@ def _make_fake_flyctl(tmp_path: Path, host_state_file: Path,
         'esac\n'
         'exit 0\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(tmp_path, case_body, extra_preamble=extra_preamble)
 
 
 def _run_accept_fly(tmp_path: Path, state_path: Path, sid: str,
@@ -268,7 +256,7 @@ def test_fly_path_accepts_blocked_subtask(tmp_path):
     argv-quoting bugs."""
     sf = _make_state(tmp_path, {"s1": "blocked"},
                      blocked={"s1": "needs postgres"})
-    fake_flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    fake_flyctl = _flyctl_stub(tmp_path, sf, _expected_remote_state(sf))
     r = _run_accept_fly(tmp_path, sf, "s1", fake_flyctl)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     # The stdin-piped python actually ran and mutated the fixture.
@@ -282,7 +270,7 @@ def test_fly_path_accepts_blocked_subtask(tmp_path):
 def test_fly_path_reports_noop_on_already_complete(tmp_path):
     """An already-complete subtask yields the NOOP sentinel and exit 0."""
     sf = _make_state(tmp_path, {"s1": "complete"})
-    fake_flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    fake_flyctl = _flyctl_stub(tmp_path, sf, _expected_remote_state(sf))
     r = _run_accept_fly(tmp_path, sf, "s1", fake_flyctl)
     assert r.returncode == 0, f"stdout:\n{r.stdout}\nstderr:\n{r.stderr}"
     assert "NOOP:" in (r.stdout + r.stderr)
@@ -307,7 +295,7 @@ def test_rejects_injection_sid_fly(tmp_path):
     """Same guard on the Fly path: the injection sid never reaches the
     machine (rejected before flyctl is invoked at all)."""
     sf = _make_state(tmp_path, {"s1": "blocked"})
-    fake_flyctl = _make_fake_flyctl(tmp_path, sf, _expected_remote_state(sf))
+    fake_flyctl = _flyctl_stub(tmp_path, sf, _expected_remote_state(sf))
     r = _run_accept_fly(tmp_path, sf, "s1'; touch pwned; '", fake_flyctl)
     assert r.returncode != 0
     assert "invalid subtask-id" in (r.stdout + r.stderr)

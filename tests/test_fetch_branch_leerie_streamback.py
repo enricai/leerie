@@ -25,10 +25,10 @@ import json
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_bash
 from tests.test_fetch_branch_sh import (
-    _make_fake_flyctl,
+    _flyctl_stub,
     _make_git_repo,
-    _run_bash,
     FETCH_SH,
 )
 
@@ -81,9 +81,9 @@ def test_streams_both_files_when_host_has_neither(tmp_path):
     )
     (machine_leerie / "Dockerfile").write_text("FROM debian:13\nRUN apt-get install -y curl\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-sb-both",
@@ -117,9 +117,9 @@ def test_never_clobbers_existing_config_toml(tmp_path):
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = []\n")
     (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-noclobber",
@@ -155,9 +155,9 @@ def test_never_clobbers_existing_dockerfile(tmp_path):
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = ['wget']\n")
     (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-noclobber-df",
@@ -185,9 +185,9 @@ def test_nonfatal_when_no_machine_leerie_files(tmp_path):
     repo, machine_runs = _make_completed_run(tmp_path, run_id)
 
     # No machine_leerie_dir — stub returns exit 1 for all test -f probes.
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=None)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=None)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-nofatal",
@@ -221,9 +221,9 @@ def test_streams_only_present_machine_file(tmp_path):
     # Only config.toml exists on the machine; Dockerfile is absent.
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = ['vim']\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-partial",
@@ -261,9 +261,9 @@ def test_skips_both_when_both_host_files_exist(tmp_path):
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = []\n")
     (machine_leerie / "Dockerfile").write_text("FROM debian:13\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-both-exist",
@@ -289,12 +289,12 @@ def test_writes_to_leerie_state_host_dir_when_set(tmp_path):
     (machine_leerie / "config.toml").write_text("[config]\nsetup_packages = ['jq']\n")
     (machine_leerie / "Dockerfile").write_text("FROM debian:13\nRUN apt-get install -y jq\n")
 
-    _make_fake_flyctl(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
+    _flyctl_stub(tmp_path, machine_runs, repo, machine_leerie_dir=machine_leerie)
 
     custom_root = tmp_path / "custom_state_root"
     custom_root.mkdir()
 
-    result = _run_bash(
+    result = run_bash(
         f"source {FETCH_SH}; fetch_branch",
         env={
             "LEERIE_MACHINE_ID": "m-hostdir",

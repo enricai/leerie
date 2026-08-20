@@ -12,6 +12,7 @@ import ctypes
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -21,11 +22,101 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
 
 
+def run_git_repo_first(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """`git -C <repo> <args>`, repo-first signature (`_git(repo, *args)`)."""
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True)
+
+
+def run_git_cwd_kw(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    """`git <args>` run in `cwd`, keyword-only signature (`_git(*args, cwd=)`)."""
+    return subprocess.run(["git", *args], cwd=str(cwd), check=True,
+                          capture_output=True, text=True)
+
+
+def run_git_cwd_first_stdout(cwd: Path, *args: str) -> str:
+    """`git <args>` run in `cwd`, cwd-first signature, returns stripped stdout."""
+    out = subprocess.run(["git", *args], cwd=str(cwd), check=True,
+                         capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def run_git_cwd_first_unchecked(
+    cwd: Path, *args: str, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """`git <args>` run in `cwd`, cwd-first signature, unchecked (`check=False`)
+    so a nonzero rc is returned rather than raised. Several call sites expect
+    a nonzero rc (a refused `-d`, a missing branch) as a normal outcome."""
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                          text=True, check=False, env=env)
+
+
+def init_git_repo(path: Path) -> Path:
+    """Create a minimal git repo at `path` with one commit on `main`."""
+    path.mkdir(parents=True, exist_ok=True)
+    run_git_repo_first(path, "init", "-q", "-b", "main")
+    run_git_repo_first(path, "config", "user.email", "test@x")
+    run_git_repo_first(path, "config", "user.name", "test")
+    (path / "a.txt").write_text("a\n")
+    run_git_repo_first(path, "add", ".")
+    run_git_repo_first(path, "commit", "-q", "-m", "a")
+    return path
+
+
 def _run(coro):
     """Run an async coroutine synchronously (this repo does not use
     pytest-asyncio). Single owner for the byte-identical helper that was
     previously redefined in fifteen test files."""
     return asyncio.run(coro)
+
+
+def run_bash(
+    script: str,
+    env: dict | None = None,
+    *,
+    cwd: Path | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a bash script via `bash -c`, merging `env` onto the parent
+    process environment. Single owner for the byte-identical `_run_bash`
+    helper previously redefined across ~22 test files."""
+    base_env = {k: v for k, v in os.environ.items()}
+    if env:
+        base_env.update(env)
+    return subprocess.run(
+        ["bash", "-c", script],
+        env=base_env,
+        cwd=str(cwd) if cwd is not None else None,
+        input=input,
+        capture_output=True,
+        text=True,
+    )
+
+
+try:
+    import jsonschema  # type: ignore
+    HAS_JSONSCHEMA = True
+except ImportError:
+    HAS_JSONSCHEMA = False
+
+
+def validate_or_fallback_required(schema: dict, instance: dict) -> bool:
+    """Validate `instance` against `schema`, or fall back to a required-field
+    check when `jsonschema` isn't installed.
+
+    Single owner for the idiom duplicated across the schema-test files
+    (e.g. tests/test_fit_judge_schema.py:22-30): when jsonschema is
+    available, use it directly (raises on an invalid instance) and return
+    True; otherwise assert every `schema["required"]` key is present in
+    `instance` and return False, so the caller runs its own type-specific
+    fallback assertions on top.
+    """
+    if HAS_JSONSCHEMA:
+        jsonschema.validate(instance, schema)
+        return True
+    for k in schema["required"]:
+        assert k in instance, f"missing required field {k!r}"
+    return False
 
 
 @pytest.fixture(scope="session")

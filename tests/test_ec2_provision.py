@@ -21,6 +21,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import run_bash
 from tests.ec2_stub import _stub_aws, leaked_resources, read_log, read_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,18 +36,12 @@ REQUIRED_ENV = {
 }
 
 
-def _run_bash(script: str, env: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    base_env.pop("LEERIE_STATE_DIR", None)
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        cwd=str(cwd) if cwd is not None else None,
-        capture_output=True,
-        text=True,
-    )
+@pytest.fixture(autouse=True)
+def _no_leerie_state_dir(monkeypatch):
+    """LEERIE_STATE_DIR must never leak into these tests' subprocess env —
+    see the footgun reminder above (LEERIE_STATE_HOST_DIR is the knob these
+    scripts actually consume)."""
+    monkeypatch.delenv("LEERIE_STATE_DIR", raising=False)
 
 
 def _stub_env(aws_dir: Path, extra: dict | None = None) -> dict:
@@ -73,7 +68,7 @@ def test_provision_instance_fails_when_ami_unset(tmp_path):
     env = _stub_env(aws_dir)
     env["LEERIE_EC2_AMI"] = ""
 
-    result = _run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
 
     assert result.returncode != 0
     assert "LEERIE_EC2_AMI" in result.stderr
@@ -99,7 +94,7 @@ def test_provision_instance_fails_closed_when_required_var_unset(tmp_path, missi
     env = _stub_env(aws_dir)
     env[missing_var] = ""
 
-    result = _run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
 
     assert result.returncode != 0
     assert missing_var in result.stderr
@@ -110,7 +105,7 @@ def test_provision_instance_fails_closed_when_required_var_unset(tmp_path, missi
 
 
 def test_provision_instance_fails_when_aws_missing():
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; provision_instance",
         env={**REQUIRED_ENV, "PATH": "/usr/bin:/bin", "USER_REPO": "/tmp"},
     )
@@ -125,7 +120,7 @@ def test_provision_instance_exports_instance_id_on_success(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; provision_instance && echo \"iid=$LEERIE_EC2_INSTANCE_ID\"",
         env=env,
     )
@@ -147,7 +142,7 @@ def test_provision_instance_id_parsed_from_real_shaped_output(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; provision_instance && echo \"iid=$LEERIE_EC2_INSTANCE_ID\"",
         env=env,
     )
@@ -184,7 +179,7 @@ def test_failed_create_leaks_no_resources(tmp_path):
     stub_path.write_text(failing)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
 
     assert result.returncode != 0
     state = read_state(aws_dir)
@@ -207,7 +202,7 @@ def test_failed_create_does_not_register_teardown_trap(tmp_path):
     stub_path.write_text(failing)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; provision_instance )",
         env=env,
     )
@@ -218,7 +213,7 @@ def test_failed_create_does_not_register_teardown_trap(tmp_path):
 # --- teardown: idempotent, terminate/stop dispatch ---------------------------
 
 def test_terminate_instance_noop_when_no_instance_id():
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; LEERIE_EC2_INSTANCE_ID=''; terminate_instance; echo 'ok'",
     )
     assert result.returncode == 0
@@ -232,7 +227,7 @@ def test_decide_ec2_teardown_terminates_on_clean_exit(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         "_try_fetch_state_for_ec2_teardown() { return 0; }; "
         "provision_instance )",
@@ -254,7 +249,7 @@ def test_decide_ec2_teardown_leaves_instance_running_on_sync_failure(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         "_try_fetch_state_for_ec2_teardown() { return 1; }; "
         "provision_instance )",
@@ -285,7 +280,7 @@ _try_fetch_state_for_ec2_teardown() {{
 }}
 provision_instance
 """
-    result = _run_bash(f"( {script} )", env=env)
+    result = run_bash(f"( {script} )", env=env)
     assert result.returncode == 0, f"stderr: {result.stderr}"
     # marker only gets touched if the instance was still "running"
     # (i.e. not yet terminated) at the moment the fetch hook ran.
@@ -305,7 +300,7 @@ def test_decide_ec2_teardown_pauses_on_unknown_rc(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         "provision_instance; "
         "export LEERIE_REMOTE_EXIT_RC=1 )",
@@ -326,7 +321,7 @@ def test_decide_ec2_teardown_detaches_on_sigint_rc(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"( source {EC2_PROVISION_SH}; "
         "provision_instance; "
         "export LEERIE_REMOTE_EXIT_RC=130 )",
@@ -347,7 +342,7 @@ def test_decide_ec2_teardown_is_idempotent(tmp_path):
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; "
         "_try_fetch_state_for_ec2_teardown() { return 0; }; "
         "provision_instance; "
@@ -382,7 +377,7 @@ def test_provision_instance_writes_ec2_instance_sidecar(tmp_path):
         "LEERIE_RUN_ID": run_id,
     })
 
-    result = _run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
     assert result.returncode == 0, f"stderr: {result.stderr}"
 
     sidecar = run_dir / "ec2-instance.json"
@@ -412,7 +407,7 @@ def test_wait_for_instance_ready_returns_early_on_terminal_state(tmp_path):
     (aws_dir / "state.json").write_text(json.dumps(state))
     env = _stub_env(aws_dir, {"LEERIE_INSTANCE_START_TIMEOUT": "120"})
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_PROVISION_SH}; wait_for_instance_ready {iid}",
         env=env,
     )
