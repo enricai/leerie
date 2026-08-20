@@ -545,12 +545,15 @@ def test_the_orchestrator_has_a_scoped_helper():
     the stale metadata a SIGKILLed run leaves behind."""
     src = (REPO_ROOT / "orchestrator" / "leerie.py").read_text()
     assert "def _prune_leerie_worktrees(" in src
-    # Count REFERENCES, not call syntax: two of the four sites go through
+    # Count REFERENCES, not call syntax: one of the three sites goes through
     # `asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)`, which passes
     # the function by reference and therefore has no `(` after the name.
+    # _reset_subtask_worktree and _prune_subtask_worktree share that
+    # to_thread reference via `_rmtree_fallback_and_prune` (one textual
+    # occurrence, two functional call sites) rather than each inlining it.
     refs = len(re.findall(r"\b_prune_leerie_worktrees\b", _code_only(src)))
-    assert refs >= 5, (
-        f"the definition plus its four call sites; found {refs}")
+    assert refs >= 4, (
+        f"the definition plus its three call sites; found {refs}")
 
 
 @pytest.mark.parametrize("path,pattern", [
