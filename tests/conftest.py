@@ -12,6 +12,7 @@ import ctypes
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -19,6 +20,37 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
+
+
+def run_git_repo_first(repo: Path, *args: str) -> subprocess.CompletedProcess:
+    """`git -C <repo> <args>`, repo-first signature (`_git(repo, *args)`)."""
+    return subprocess.run(["git", "-C", str(repo), *args], check=True,
+                          capture_output=True, text=True)
+
+
+def run_git_cwd_kw(*args: str, cwd: Path) -> subprocess.CompletedProcess:
+    """`git <args>` run in `cwd`, keyword-only signature (`_git(*args, cwd=)`)."""
+    return subprocess.run(["git", *args], cwd=str(cwd), check=True,
+                          capture_output=True, text=True)
+
+
+def run_git_cwd_first_stdout(cwd: Path, *args: str) -> str:
+    """`git <args>` run in `cwd`, cwd-first signature, returns stripped stdout."""
+    out = subprocess.run(["git", *args], cwd=str(cwd), check=True,
+                         capture_output=True, text=True)
+    return out.stdout.strip()
+
+
+def init_git_repo(path: Path) -> Path:
+    """Create a minimal git repo at `path` with one commit on `main`."""
+    path.mkdir(parents=True, exist_ok=True)
+    run_git_repo_first(path, "init", "-q", "-b", "main")
+    run_git_repo_first(path, "config", "user.email", "test@x")
+    run_git_repo_first(path, "config", "user.name", "test")
+    (path / "a.txt").write_text("a\n")
+    run_git_repo_first(path, "add", ".")
+    run_git_repo_first(path, "commit", "-q", "-m", "a")
+    return path
 
 
 def _run(coro):
