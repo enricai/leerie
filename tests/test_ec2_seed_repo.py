@@ -26,6 +26,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.stub_helpers import _make_stub_timeout
 from tests.test_ec2_transport import _stub_timeout as _make_killing_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -193,26 +194,6 @@ esac
 """
     )
     stub_path.chmod(0o755)
-
-
-def _make_stub_timeout(stub_dir: Path) -> None:
-    """No-op `timeout`: run the child, ignore the cap.
-
-    Adequate for tests that merely need the binary to exist on the
-    stubbed PATH (macOS ships no /usr/bin/timeout). A test that asserts
-    the cap actually *fires* must use `_stub_timeout` from
-    test_ec2_transport instead — this one would let a stalled stub run
-    to completion.
-    """
-    stub = stub_dir / "timeout"
-    stub.write_text(
-        """#!/usr/bin/env bash
-while [[ "$1" == --* ]]; do shift; done
-shift
-exec "$@"
-"""
-    )
-    stub.chmod(0o755)
 
 
 def _init_repo(repo: Path) -> None:

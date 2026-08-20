@@ -22,6 +22,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.stub_helpers import _make_stub_timeout
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_FETCH_SH = REPO_ROOT / "scripts" / "remote" / "ec2-fetch-branch.sh"
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
@@ -135,18 +137,6 @@ esac
 """
     )
     stub_path.chmod(0o755)
-
-
-def _make_stub_timeout(stub_dir: Path) -> None:
-    stub = stub_dir / "timeout"
-    stub.write_text(
-        """#!/usr/bin/env bash
-while [[ "$1" == --* ]]; do shift; done
-shift
-exec "$@"
-"""
-    )
-    stub.chmod(0o755)
 
 
 def _make_git_repo(tmp_path: Path, subdir: str = "myrepo") -> Path:
