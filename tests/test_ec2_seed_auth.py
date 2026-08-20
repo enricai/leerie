@@ -314,25 +314,43 @@ def test_ec2_seed_auth_plugin_cache_and_marketplaces_not_re_excluded_by_tar(tmp_
 
 
 def test_ec2_seed_auth_tar_exclude_list_matches_fly_original(tmp_path):
-    """The tar --exclude flags must be identical to seed-auth.sh's —
-    this is the mechanical proof of 'byte-identical port, transport
-    substituted only'."""
+    """Both seed-auth.sh (Fly) and ec2-seed-auth.sh (EC2) must invoke the
+    single shared `_seed_auth_tar_excludes` helper in seed-common.sh
+    rather than each hard-coding the exclude flags — the drift risk this
+    test used to catch by comparing two literal lists is now removed by
+    construction (one definition site)."""
     fly_src = (REPO_ROOT / "scripts" / "remote" / "seed-auth.sh").read_text()
     ec2_src = EC2_SEED_AUTH_SH.read_text()
+    seed_common_src = (REPO_ROOT / "scripts" / "remote" / "seed-common.sh").read_text()
+
+    assert "_seed_auth_tar_excludes() {" in seed_common_src, (
+        "seed-common.sh must define the single-owner _seed_auth_tar_excludes helper"
+    )
+    assert "$(_seed_auth_tar_excludes)" in fly_src, (
+        "seed-auth.sh must consume the shared _seed_auth_tar_excludes helper"
+    )
+    assert "$(_seed_auth_tar_excludes)" in ec2_src, (
+        "ec2-seed-auth.sh must consume the shared _seed_auth_tar_excludes helper"
+    )
+    # Neither script may hard-code the exclude flags directly any more.
+    assert "--exclude='.gitconfig'" not in fly_src
+    assert "--exclude='.gitconfig'" not in ec2_src
+
     excludes = [
-        "--exclude='.gitconfig'",
-        "--exclude='.gitconfig.local'",
-        "--exclude='.gitignore'",
-        "--exclude='.gitignore_global'",
-        "--exclude='.git-credentials'",
-        "--exclude='.netrc'",
-        "--exclude='.ssh'",
-        "--exclude='.gnupg'",
-        "--exclude='.config'",
+        "--exclude=.gitconfig",
+        "--exclude=.gitconfig.local",
+        "--exclude=.gitignore",
+        "--exclude=.gitignore_global",
+        "--exclude=.git-credentials",
+        "--exclude=.netrc",
+        "--exclude=.ssh",
+        "--exclude=.gnupg",
+        "--exclude=.config",
     ]
     for excl in excludes:
-        assert excl in fly_src, f"test fixture assumption broken: {excl} missing from seed-auth.sh"
-        assert excl in ec2_src, f"ec2-seed-auth.sh is missing exclude flag present in the Fly original: {excl}"
+        assert excl in seed_common_src, (
+            f"seed-common.sh's _seed_auth_tar_excludes is missing exclude flag: {excl}"
+        )
 
 
 def test_ec2_seed_auth_fixes_ownership_to_leerie(tmp_path):

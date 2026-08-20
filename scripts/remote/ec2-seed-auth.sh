@@ -145,15 +145,7 @@ ec2_seed_auth() {
     # COPYFILE_DISABLE=1 strips the macOS provenance xattr so the stream
     # is byte-deterministic (no effect on Linux).
     COPYFILE_DISABLE=1 tar -czC "$STAGE" \
-         --exclude='.gitconfig' \
-         --exclude='.gitconfig.local' \
-         --exclude='.gitignore' \
-         --exclude='.gitignore_global' \
-         --exclude='.git-credentials' \
-         --exclude='.netrc' \
-         --exclude='.ssh' \
-         --exclude='.gnupg' \
-         --exclude='.config' \
+         $(_seed_auth_tar_excludes) \
          . \
          | ec2_tar_pipe "$ssh_target" /home/leerie
     tar_rc=$?

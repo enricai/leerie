@@ -48,6 +48,24 @@ _seed_timeout_prefix() {
   printf 'timeout --kill-after=5 %s' "${LEERIE_SEED_TIMEOUT_S:-600}"
 }
 
+# --- _seed_auth_tar_excludes -------------------------------------------------
+# Echoes the `tar --exclude=...` flags (space-separated, one per excluded
+# path) guarding git/ssh/gnupg auth material — which lives on the HOST per
+# DESIGN §6 *Finalization* — from the staged `.claude`/`.claude.json`/
+# `.gitconfig` tar both seed-auth.sh (Fly) and ec2-seed-auth.sh (EC2) ship
+# to the remote machine. Single-owner list; both callers consume it via
+# `$(_seed_auth_tar_excludes)` on an unquoted `tar` command line, same
+# convention as `_seed_timeout_prefix`. No quoting in the emitted text —
+# unquoted command substitution word-splits but never re-parses quote
+# characters, so a literal `'` here would reach `tar` as part of the
+# exclude pattern instead of being stripped.
+_seed_auth_tar_excludes() {
+  printf '%s' \
+    "--exclude=.gitconfig --exclude=.gitconfig.local --exclude=.gitignore" \
+    " --exclude=.gitignore_global --exclude=.git-credentials --exclude=.netrc" \
+    " --exclude=.ssh --exclude=.gnupg --exclude=.config"
+}
+
 # ---------------------------------------------------------------------------
 # _seed_use_shallow
 #
