@@ -22,12 +22,13 @@ import subprocess
 from pathlib import Path
 
 from tests.conftest import run_bash
+from tests.fly_stub import make_fake_flyctl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 FORCE_FINALIZE_SH = REPO_ROOT / "scripts" / "remote" / "force-finalize.sh"
 
 
-def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path) -> Path:
+def _flyctl_stub(tmp_path: Path, machine_runs_dir: Path) -> Path:
     """Stub flyctl that routes `python3 -` payloads to a local python3.
 
     force-finalize.sh sends its discovery + patch payload via:
@@ -44,27 +45,16 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path) -> Path:
     The path rewrite lets the embedded Python work against the fixture
     tree shaped like /work/.leerie/runs/.
     """
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'MRUNS="{machine_runs_dir}"\n'
-        # Parse -C "<command>" out of the argv.
-        'CMD=""\n'
-        'while [ $# -gt 0 ]; do\n'
-        '  case "$1" in\n'
-        '    -C) CMD="$2"; shift 2 ;;\n'
-        '    auth) shift; case "${1:-}" in status) exit 0 ;; esac ;;\n'
-        '    *) shift ;;\n'
-        '  esac\n'
-        'done\n'
+    extra_preamble = f'MRUNS="{machine_runs_dir}"\n'
+    # The only -C command force-finalize.sh sends is `python3 -`.
+    # Rewrite the in-machine /work/.leerie/runs path in the stdin
+    # payload to point at the test fixture. The substitution uses
+    # bash's ${var//pattern/replacement}, which is GLOB substitution
+    # (not literal-string). Safe here because both /work/.leerie/runs
+    # and $MRUNS contain no glob metacharacters (*, ?, [); a future
+    # fixture path with such characters would silently misbehave.
+    case_body = (
         '[ -z "$CMD" ] && exit 0\n'
-        # The only -C command force-finalize.sh sends is `python3 -`.
-        # Rewrite the in-machine /work/.leerie/runs path in the stdin
-        # payload to point at the test fixture. The substitution uses
-        # bash's ${var//pattern/replacement}, which is GLOB substitution
-        # (not literal-string). Safe here because both /work/.leerie/runs
-        # and $MRUNS contain no glob metacharacters (*, ?, [); a future
-        # fixture path with such characters would silently misbehave.
         'case "$CMD" in\n'
         '  python3*-*)\n'
         '    SCRIPT="$(cat)"\n'
@@ -75,8 +65,7 @@ def _make_fake_flyctl(tmp_path: Path, machine_runs_dir: Path) -> Path:
         '  *) exit 0 ;;\n'
         'esac\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(tmp_path, case_body, extra_preamble=extra_preamble)
 
 
 def _make_run(
@@ -136,7 +125,7 @@ def test_patches_dead_run(tmp_path):
     mruns.mkdir()
     run_id = "feat-cool-abc123"
     run_dir = _make_run(mruns, run_id, pid=999_999_999)
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -165,7 +154,7 @@ def test_idempotent_when_already_finalized(tmp_path):
         mruns, run_id, finished_at="2026-06-02T20:00:00Z", pid=999_999_999
     )
     before = (run_dir / "run.json").read_text()
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -190,7 +179,7 @@ def test_refuses_when_pid_alive(tmp_path):
     # we're running under pytest.
     own_pid = os.getpid()
     run_dir = _make_run(mruns, run_id, pid=own_pid)
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -231,7 +220,7 @@ def test_refuses_when_pid_file_missing(tmp_path):
     mruns.mkdir()
     run_id = "feat-early-fail-ghi321"
     run_dir = _make_run(mruns, run_id, pid_file_missing=True)
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -256,7 +245,7 @@ def test_refuses_on_multiple_run_dirs(tmp_path):
     mruns.mkdir()
     _make_run(mruns, "feat-one-aaa111", pid=999_999_999)
     _make_run(mruns, "feat-two-bbb222", pid=999_999_999)
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -273,7 +262,7 @@ def test_refuses_on_zero_run_dirs(tmp_path):
     """No run dir on the machine → REFUSE-NONE."""
     mruns = tmp_path / "runs"
     mruns.mkdir()
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -325,7 +314,7 @@ def test_refuses_when_proc_scan_finds_live_orchestrator(tmp_path):
          fake_orch_path, "--run-id", run_id],
     )
     try:
-        stub = _make_fake_flyctl(tmp_path, mruns)
+        stub = _flyctl_stub(tmp_path, mruns)
         env = {
             "LEERIE_REPO": str(REPO_ROOT),
             "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -367,7 +356,7 @@ def test_patches_when_proc_scan_finds_nothing(tmp_path):
     mruns.mkdir()
     run_id = "feat-no-scan-hit-qfx8462"
     run_dir = _make_run(mruns, run_id, pid=999_999_999)
-    stub = _make_fake_flyctl(tmp_path, mruns)
+    stub = _flyctl_stub(tmp_path, mruns)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",

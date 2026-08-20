@@ -20,6 +20,7 @@ import subprocess
 from pathlib import Path
 
 from tests.conftest import run_bash, run_git_repo_first
+from tests.fly_stub import make_fake_flyctl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 COLLECT_SH = REPO_ROOT / "scripts" / "remote" / "collect-subtrees.sh"
@@ -60,25 +61,16 @@ def _make_run_branch(repo: Path, run_id: str) -> None:
     run_git_repo_first(repo, "branch", branch, "HEAD")
 
 
-def _make_fake_flyctl(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
+def _flyctl_stub(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
     """Stub flyctl that routes `bash -s` payloads to a local bash invocation
     with paths rewritten to point at the fixture repo."""
-    stub = tmp_path / "bin" / "flyctl"
-    stub.parent.mkdir(parents=True, exist_ok=True)
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
+    extra_preamble = (
         f'REPO="{repo}"\n'
         f'STATE_DIR="{state_dir}"\n'
         f'SCRIPTS="{SCRIPTS_DIR}"\n'
         f'PROMPTS="{PROMPTS_DIR}"\n'
-        'CMD=""\n'
-        'while [ $# -gt 0 ]; do\n'
-        '  case "$1" in\n'
-        '    -C) CMD="$2"; shift 2 ;;\n'
-        '    auth) shift; case "${1:-}" in status) exit 0 ;; esac ;;\n'
-        '    *) shift ;;\n'
-        '  esac\n'
-        'done\n'
+    )
+    case_body = (
         '[ -z "$CMD" ] && exit 0\n'
         'case "$CMD" in\n'
         '  bash*-s*)\n'
@@ -96,8 +88,9 @@ def _make_fake_flyctl(tmp_path: Path, repo: Path, state_dir: Path) -> Path:
         '  *) exit 0 ;;\n'
         'esac\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(
+        tmp_path, case_body, extra_preamble=extra_preamble, filename="bin/flyctl"
+    )
 
 
 def _make_fake_claude(tmp_path: Path, *, succeed: bool = True) -> Path:
@@ -180,7 +173,7 @@ def test_collected_none_when_all_integrated(tmp_path):
     run_git_repo_first(repo, "branch", f"leerie/subtasks/{run_id}/s1",
          f"leerie/runs/{run_id}")
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -207,7 +200,7 @@ def test_collected_all_clean_merges(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"file_b.txt": "content b\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -245,7 +238,7 @@ def test_conflict_resolved_by_integrator(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"conflict.txt": "version B\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     claude_stub = _make_fake_claude(tmp_path, succeed=True)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
@@ -279,7 +272,7 @@ def test_conflict_skipped_when_integrator_fails(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"conflict.txt": "version B\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     claude_stub = _make_fake_claude(tmp_path, succeed=False)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
@@ -309,7 +302,7 @@ def test_conflict_skipped_when_no_claude(tmp_path):
     _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
                          {"conflict.txt": "version B\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     # No fake claude on PATH — use stub dir (flyctl) + system dirs but
     # ensure no claude binary is reachable. The stub dir is first so
     # flyctl is found; system dirs provide bash/git/python3.
@@ -341,7 +334,7 @@ def test_collected_none_when_no_subtask_branches(tmp_path):
     _make_run_branch(repo, run_id)
     _make_state_json(state_dir, run_id, waves=[[]], completed_waves=0)
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
@@ -367,7 +360,7 @@ def test_setup_run_creates_missing_worktree(tmp_path):
     _make_subtask_branch(repo, run_id, "s1", "main",
                          {"new_file.txt": "new content\n"})
 
-    stub = _make_fake_flyctl(tmp_path, repo, state_dir)
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
     env = {
         "LEERIE_REPO": str(REPO_ROOT),
         "PATH": f"{stub.parent}:{os.environ['PATH']}",
