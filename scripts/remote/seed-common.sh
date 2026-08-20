@@ -10,6 +10,22 @@
 # portable — no namerefs, no bash-4-only syntax (CLAUDE.md; see
 # tests/test_ec2_bash32_portability.py).
 
+_SEED_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# --- _seed_dirty_filter -----------------------------------------------------
+# Runs on the HOST (never shipped to the remote machine): filters the
+# newline-delimited candidate file list on stdin down to what should
+# actually rsync, writing NUL-delimited survivors to stdout. Single-owner
+# implementation lives in seed_dirty_filter.py, right beside this file, so
+# the Fly transport (seed-repo.sh) and the EC2 transport (ec2-seed-repo.sh)
+# can no longer drift on editor-temp detection, the .git/.leerie exclusion
+# + whitelist, the worktree-path defense, or the vanished-entry check.
+# USER_REPO must already be exported by the caller — it anchors the
+# lexists() vanished-entry check.
+_seed_dirty_filter() {
+  python3 "$_SEED_COMMON_DIR/seed_dirty_filter.py"
+}
+
 # --- _seed_timeout_prefix --------------------------------------------------
 # Emit the `timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` prefix
 # used to bound the bulk-transfer side of `flyctl ssh console` (Fly) / `aws
@@ -30,6 +46,24 @@ _seed_timeout_prefix() {
     return 0
   fi
   printf 'timeout --kill-after=5 %s' "${LEERIE_SEED_TIMEOUT_S:-600}"
+}
+
+# --- _seed_auth_tar_excludes -------------------------------------------------
+# Echoes the `tar --exclude=...` flags (space-separated, one per excluded
+# path) guarding git/ssh/gnupg auth material — which lives on the HOST per
+# DESIGN §6 *Finalization* — from the staged `.claude`/`.claude.json`/
+# `.gitconfig` tar both seed-auth.sh (Fly) and ec2-seed-auth.sh (EC2) ship
+# to the remote machine. Single-owner list; both callers consume it via
+# `$(_seed_auth_tar_excludes)` on an unquoted `tar` command line, same
+# convention as `_seed_timeout_prefix`. No quoting in the emitted text —
+# unquoted command substitution word-splits but never re-parses quote
+# characters, so a literal `'` here would reach `tar` as part of the
+# exclude pattern instead of being stripped.
+_seed_auth_tar_excludes() {
+  printf '%s' \
+    "--exclude=.gitconfig --exclude=.gitconfig.local --exclude=.gitignore" \
+    " --exclude=.gitignore_global --exclude=.git-credentials --exclude=.netrc" \
+    " --exclude=.ssh --exclude=.gnupg --exclude=.config"
 }
 
 # ---------------------------------------------------------------------------

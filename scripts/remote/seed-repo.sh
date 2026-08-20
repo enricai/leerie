@@ -557,61 +557,12 @@ seed_repo_dirty() {
   #   (a) git porcelain dirty set, filtered (drop .git/, .leerie/runs/
   #       worktrees, editor-temp files, vanished entries, blanks)
   #   (b) repo-local .claude/ files (force-included even if gitignored)
-  # The python filter applies to both; .claude/* entries from (b)
-  # pass the filter trivially (no .git/ or worktree prefix).
-  # shellcheck disable=SC2016  # the -c body below is Python, not shell — a
-  # $ in it must reach the interpreter unexpanded
+  # The filter applies to both; .claude/* entries from (b)
+  # pass it trivially (no .git/ or worktree prefix). Shared with the EC2
+  # transport via _seed_dirty_filter() (seed-common.sh) so the two can
+  # never silently drift.
   printf '%s\n%s\n' "$dirty_files" "$claude_files" \
-    | USER_REPO="$USER_REPO" python3 -c '
-import os, re, sys
-
-# Editor-temp filename patterns — these are per-process editor state
-# (Emacs lock files, backups, Vim swap files) that should never be
-# shipped. Emacs locks in particular are dangling symlinks of the form
-# .#NAME -> user@host.pid:timestamp that vanish as buffers close;
-# letting them into the rsync file list produces "stat: No such file
-# or directory" failures (exit 23).
-_VIM_SWAP_RE = re.compile(r"^\..*\.sw[a-z]$")
-def _is_editor_temp(path: str) -> bool:
-    base = path.rsplit("/", 1)[-1]
-    return (
-        base.startswith(".#")          # Emacs lock
-        or base.endswith("~")          # backup
-        or bool(_VIM_SWAP_RE.match(base))  # Vim swap
-    )
-
-repo_root = os.environ.get("USER_REPO", "")
-
-for line in sys.stdin.read().splitlines():
-    if not line:
-        continue
-    # .git/ and .leerie/ are coordination state, never transported here.
-    # .git/ → bundle path creates it natively on the machine.
-    # .leerie/ → host-side run state; the machine writes its own.
-    # Exception: committed config files (.leerie/config.toml, .leerie/Dockerfile,
-    # .leerie/.leerie-setup.sh) are repo-owned declarations that workers need.
-    if line.startswith(".git/") or line == ".git":
-        continue
-    if line.startswith(".leerie/"):
-        if line not in (".leerie/config.toml", ".leerie/Dockerfile",
-                        ".leerie/.leerie-setup.sh"):
-            continue
-    elif line == ".leerie":
-        continue
-    # Defensive: drop worktree paths if they ever surface.
-    if "/.leerie/runs/" in line and "/worktrees/" in line:
-        continue
-    if _is_editor_temp(line):
-        continue
-    # Drop entries that vanished between `git status` and now (Emacs
-    # closing a buffer, a build tool cleaning a temp file, etc).
-    # lexists() is True for a symlink whose target is missing — we
-    # want to ship those (rsync -a preserves the link, target irrelevant
-    # on the sender). It is False only when the path itself is gone.
-    if repo_root and not os.path.lexists(os.path.join(repo_root, line)):
-        continue
-    sys.stdout.buffer.write(line.encode() + b"\x00")
-' > "$file_list"
+    | USER_REPO="$USER_REPO" _seed_dirty_filter > "$file_list"
 
   # Capture stderr to a temp file so we can replay it on failure. Without
   # this the user sees only "rsync delta transfer failed (exit N)" with no

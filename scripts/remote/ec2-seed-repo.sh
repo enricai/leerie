@@ -415,40 +415,10 @@ ec2_seed_repo_dirty() {
   file_list="$(mktemp -t leerie-reseed-list.XXXXXX)"
   wrapper="$(_ec2_ssh_wrapper)"
 
+  # Filter shared with the Fly transport via _seed_dirty_filter()
+  # (seed-common.sh) so the two can never silently drift.
   printf '%s\n%s\n' "$dirty_files" "$claude_files" \
-    | USER_REPO="$USER_REPO" python3 -c '
-import os, re, sys
-
-_VIM_SWAP_RE = re.compile(r"^\..*\.sw[a-z]$")
-def _is_editor_temp(path: str) -> bool:
-    base = path.rsplit("/", 1)[-1]
-    return (
-        base.startswith(".#")
-        or base.endswith("~")
-        or bool(_VIM_SWAP_RE.match(base))
-    )
-
-repo_root = os.environ.get("USER_REPO", "")
-
-for line in sys.stdin.read().splitlines():
-    if not line:
-        continue
-    if line.startswith(".git/") or line == ".git":
-        continue
-    if line.startswith(".leerie/"):
-        if line not in (".leerie/config.toml", ".leerie/Dockerfile",
-                        ".leerie/.leerie-setup.sh"):
-            continue
-    elif line == ".leerie":
-        continue
-    if "/.leerie/runs/" in line and "/worktrees/" in line:
-        continue
-    if _is_editor_temp(line):
-        continue
-    if repo_root and not os.path.lexists(os.path.join(repo_root, line)):
-        continue
-    sys.stdout.buffer.write(line.encode() + b"\x00")
-' > "$file_list"
+    | USER_REPO="$USER_REPO" _seed_dirty_filter > "$file_list"
 
   local rsync_err
   rsync_err="$(mktemp -t leerie-reseed-err.XXXXXX)"
