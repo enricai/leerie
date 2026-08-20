@@ -14,26 +14,15 @@ All tests stub flyctl so no real Fly.io calls are made.
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
+
+from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_SH = REPO_ROOT / "scripts" / "remote" / "lib.sh"
 PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
 RESUME_SH = REPO_ROOT / "scripts" / "remote" / "resume-machine.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_flyctl_stub(tmp_path: Path, *, behavior: str) -> Path:
@@ -75,7 +64,7 @@ def test_update_run_json_creates_fields(tmp_path: Path):
     """update_run_json merges new fields into an existing sidecar."""
     sidecar = tmp_path / "run.json"
     sidecar.write_text(json.dumps({"run_id": "test-001", "branch": "leerie/runs/test-001"}))
-    result = _run_bash(
+    result = run_bash(
         f"source {LIB_SH}; update_run_json {sidecar} fly_machine_id mach-abc paused_at 2026-05-29T16:00:00+00:00",
     )
     assert result.returncode == 0, result.stderr
@@ -90,7 +79,7 @@ def test_update_run_json_empty_value_clears_to_null(tmp_path: Path):
     """An empty-string value clears the field to null (used by resume to wipe paused_at)."""
     sidecar = tmp_path / "run.json"
     sidecar.write_text(json.dumps({"paused_at": "2026-05-29T16:00:00", "pause_reason": "x"}))
-    result = _run_bash(
+    result = run_bash(
         f'source {LIB_SH}; update_run_json {sidecar} paused_at "" pause_reason ""',
     )
     assert result.returncode == 0, result.stderr
@@ -103,14 +92,14 @@ def test_update_run_json_atomic_via_temp_rename(tmp_path: Path):
     """After successful merge, no temp files remain in the sidecar's directory."""
     sidecar = tmp_path / "run.json"
     sidecar.write_text("{}")
-    _run_bash(f"source {LIB_SH}; update_run_json {sidecar} key value")
+    run_bash(f"source {LIB_SH}; update_run_json {sidecar} key value")
     leftover = [p.name for p in tmp_path.iterdir() if p.name != "run.json"]
     assert leftover == [], f"temp files leaked: {leftover}"
 
 
 def test_iso_now_returns_iso8601(tmp_path: Path):
     """iso_now emits an ISO-8601 UTC timestamp parseable by Python."""
-    result = _run_bash(f"source {LIB_SH}; iso_now")
+    result = run_bash(f"source {LIB_SH}; iso_now")
     assert result.returncode == 0
     import datetime
     parsed = datetime.datetime.fromisoformat(result.stdout.strip())
@@ -121,7 +110,7 @@ def test_iso_now_returns_iso8601(tmp_path: Path):
 
 def test_stop_machine_noop_when_no_machine_id(tmp_path: Path):
     """stop_machine returns 0 when LEERIE_MACHINE_ID is empty (idempotency)."""
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; LEERIE_MACHINE_ID=''; stop_machine; echo ok",
     )
     assert result.returncode == 0
@@ -132,7 +121,7 @@ def test_stop_machine_calls_flyctl_stop(tmp_path: Path):
     """stop_machine invokes flyctl machine stop with the machine id."""
     _make_flyctl_stub(tmp_path, behavior="happy")
     log = tmp_path / "flyctl.log"
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; LEERIE_MACHINE_ID=mach-xyz; stop_machine",
         env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
     )
@@ -198,7 +187,7 @@ def _decide_teardown_with_rc(
         # destroys without printing the hint. Default off so the
         # existing rc=0/10/75/130/143/1/2 tests stay byte-identical.
         env["LEERIE_REMOTE_RUN_ID"] = run_id
-    result = _run_bash(script, env=env)
+    result = run_bash(script, env=env)
     return result, sidecar
 
 
@@ -364,7 +353,7 @@ def test_decide_teardown_pause_reason_overridable(tmp_path: Path):
     run_dir.mkdir(parents=True)
     sidecar = run_dir / "run.json"
     sidecar.write_text(json.dumps({"run_id": "test-001"}))
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; LEERIE_MACHINE_ID=mach-test; decide_teardown",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -388,7 +377,7 @@ def test_decide_teardown_pause_notify_cmd_invoked(tmp_path: Path):
     sidecar = run_dir / "run.json"
     sidecar.write_text(json.dumps({"run_id": "test-001"}))
     notify_marker = tmp_path / "notify-fired"
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; LEERIE_MACHINE_ID=mach-test; decide_teardown",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -406,7 +395,7 @@ def test_decide_teardown_pause_notify_cmd_invoked(tmp_path: Path):
 
 def test_resume_machine_requires_machine_id(tmp_path: Path):
     """resume_machine errors when no machine id is passed."""
-    result = _run_bash(
+    result = run_bash(
         f"source {RESUME_SH}; resume_machine",
     )
     assert result.returncode != 0
@@ -427,7 +416,7 @@ def test_resume_machine_calls_start_and_clears_paused_at(tmp_path: Path):
         "pause_reason": "worker-error",
     }))
     # Source provision.sh first so wait_for_started is available.
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-resumed",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -460,7 +449,7 @@ def test_resume_machine_refuses_destroyed_machine(tmp_path: Path):
         "exit 0\n"
     )
     fake.chmod(0o755)
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-gone",
         env={"PATH": f"{tmp_path}:/usr/bin:/bin"},
     )
@@ -496,7 +485,7 @@ def test_resume_machine_updates_image_on_version_drift(tmp_path: Path):
         "pause_reason": "worker-error",
         "image_tag": "registry.fly.io/leerie:0.6.6",
     }))
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-upgrade",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -532,7 +521,7 @@ def test_resume_machine_skips_image_update_when_same_version(tmp_path: Path):
         "pause_reason": "worker-error",
         "image_tag": "registry.fly.io/leerie:0.6.7",
     }))
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-same",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -561,7 +550,7 @@ def test_resume_machine_updates_image_when_no_stored_tag(tmp_path: Path):
         "fly_machine_id": "mach-legacy",
         "pause_reason": "worker-error",
     }))
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-legacy",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -604,7 +593,7 @@ def test_resume_machine_continues_on_image_update_failure(tmp_path: Path):
         "pause_reason": "worker-error",
         "image_tag": "registry.fly.io/leerie:0.6.6",
     }))
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-failopen",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",
@@ -650,7 +639,7 @@ def test_resume_machine_image_update_via_state_host_dir(tmp_path: Path):
         "pause_reason": "worker-error",
         "image_tag": "registry.fly.io/leerie:0.6.6",
     }))
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {RESUME_SH}; resume_machine mach-statedir",
         env={
             "PATH": f"{tmp_path}:/usr/bin:/bin",

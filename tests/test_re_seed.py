@@ -12,28 +12,16 @@ Covers:
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
+
+from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_REPO_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
 RE_SEED_SH = REPO_ROOT / "scripts" / "remote" / "re-seed.sh"
 PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "provision.sh"
 LAUNCHER = REPO_ROOT / "leerie"
-
-
-def _run_bash(script: str, env: dict | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        cwd=str(cwd) if cwd else None,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_git_repo(repo_dir: Path) -> None:
@@ -157,7 +145,7 @@ def _stub_flyctl(tmp_path: Path, *, remote_status: str = "started",
 
 def test_seed_repo_clone_function_exists():
     """seed_repo_clone is a publicly-callable function after refactor."""
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_REPO_SH}; declare -f seed_repo_clone >/dev/null && echo OK"
     )
     assert "OK" in result.stdout
@@ -165,7 +153,7 @@ def test_seed_repo_clone_function_exists():
 
 def test_seed_repo_dirty_function_exists():
     """seed_repo_dirty is a publicly-callable function after refactor."""
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_REPO_SH}; declare -f seed_repo_dirty >/dev/null && echo OK"
     )
     assert "OK" in result.stdout
@@ -173,7 +161,7 @@ def test_seed_repo_dirty_function_exists():
 
 def test_seed_repo_wrapper_still_exists():
     """seed_repo (the wrapper) is still callable so existing callers don't break."""
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_REPO_SH}; declare -f seed_repo >/dev/null && echo OK"
     )
     assert "OK" in result.stdout
@@ -182,7 +170,7 @@ def test_seed_repo_wrapper_still_exists():
 # --- re_seed: argument validation -----------------------------------------
 
 def test_re_seed_requires_run_id(tmp_path: Path):
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={"USER_REPO": str(tmp_path)},
     )
@@ -201,7 +189,7 @@ def test_re_seed_uses_run_id_as_machine_id(tmp_path: Path):
     _make_git_repo(repo)
 
     _stub_flyctl(tmp_path, remote_status="stopped", remote_dirty="")
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
@@ -225,7 +213,7 @@ def test_re_seed_starts_stopped_machine_and_calls_dirty(tmp_path: Path):
     (repo / "edit.txt").write_text("new file\n")
 
     _stub_flyctl(tmp_path, remote_status="stopped", remote_dirty="")
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
@@ -255,7 +243,7 @@ def test_re_seed_skips_start_when_machine_already_started(tmp_path: Path):
         "fly_machine_id": "mach-001",
     }))
     _stub_flyctl(tmp_path, remote_status="started", remote_dirty="")
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
@@ -279,7 +267,7 @@ def test_re_seed_refuses_destroyed_machine(tmp_path: Path):
         "fly_machine_id": "mach-gone",
     }))
     _stub_flyctl(tmp_path, remote_status="destroyed")
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
@@ -307,7 +295,7 @@ def test_re_seed_refuses_when_machine_has_dirty_tracked_files(tmp_path: Path):
     # Stub the machine's git status to show a dirty src/foo.py.
     _stub_flyctl(tmp_path, remote_status="started",
                  remote_dirty=" M src/foo.py\n")
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
@@ -334,7 +322,7 @@ def test_re_seed_ignores_leerie_dirty_paths(tmp_path: Path):
     }))
     _stub_flyctl(tmp_path, remote_status="started",
                  remote_dirty=" M .leerie/runs/my-run/state.json\n M .leerie/runs/my-run/logs/orch.log\n")
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
@@ -357,7 +345,7 @@ def test_re_seed_force_bypasses_safety_check(tmp_path: Path):
     }))
     _stub_flyctl(tmp_path, remote_status="started",
                  remote_dirty=" M src/foo.py\n")
-    result = _run_bash(
+    result = run_bash(
         f"source {PROVISION_SH}; source {SEED_REPO_SH}; source {RE_SEED_SH}; re_seed",
         env={
             "USER_REPO": str(repo),
@@ -393,7 +381,7 @@ def test_launcher_consumes_re_seed_flags():
 
 def test_launcher_re_seed_requires_run_id_arg():
     """`leerie re-seed` without <run-id> errors with usage."""
-    result = _run_bash(
+    result = run_bash(
         f"{LAUNCHER} re-seed",
     )
     assert result.returncode != 0
