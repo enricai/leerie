@@ -10,11 +10,12 @@ from __future__ import annotations
 import json
 import pytest
 
+from tests.conftest import HAS_JSONSCHEMA, validate_or_fallback_required
+
 try:
     import jsonschema  # type: ignore
-    HAS_JSONSCHEMA = True
 except ImportError:
-    HAS_JSONSCHEMA = False
+    pass
 
 
 def _validate(leerie, instance: dict) -> None:
@@ -23,13 +24,10 @@ def _validate(leerie, instance: dict) -> None:
     must pass in both modes so CI without jsonschema installed still
     catches regressions."""
     schema = leerie.SCHEMAS["pr_writer"]
-    if HAS_JSONSCHEMA:
-        jsonschema.validate(instance, schema)
+    if validate_or_fallback_required(schema, instance):
         return
     # Manual structural check matching the schema's `required` and the
     # title's length cap.
-    for k in schema["required"]:
-        assert k in instance, f"missing required field {k}"
     if "title" in instance:
         assert isinstance(instance["title"], str)
         assert 1 <= len(instance["title"]) <= 200, "title length out of range"
