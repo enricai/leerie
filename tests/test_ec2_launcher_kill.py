@@ -40,7 +40,13 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.ec2_stub import leaked_resources, read_log, read_state, seed_running_instance
+from tests.ec2_stub import (
+    leaked_resources,
+    read_log,
+    read_state,
+    run_launcher as _run_launcher_shared,
+    seed_running_instance,
+)
 from tests.stub_helpers import _make_stub_timeout
 from tests.test_ec2_fetch_branch import (
     _init_instance_repo_with_run,
@@ -189,14 +195,8 @@ def _setup_fixture(tmp_path: Path, *, with_completed_run: bool = True):
     return env, bin_dir, state_dir, run_dir, instance_id
 
 
-def _run_launcher(args: list[str], env: dict) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        [str(LAUNCHER)] + args,
-        env=env,
-        capture_output=True,
-        text=True,
-        timeout=60,
-    )
+def _launcher(args: list[str], env: dict) -> subprocess.CompletedProcess:
+    return _run_launcher_shared(args, env, launcher=LAUNCHER, timeout=60)
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +207,7 @@ def _run_launcher(args: list[str], env: dict) -> subprocess.CompletedProcess:
 def test_fetch_precedes_terminate_by_call_index(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["kill", "r1", "--force"], env)
+    result = _launcher(["kill", "r1", "--force"], env)
 
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
@@ -228,7 +228,7 @@ def test_fetch_precedes_terminate_by_call_index(tmp_path):
 def test_successful_kill_leaves_zero_non_terminated_instances_and_no_leaked_volumes(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["kill", "r1", "--force"], env)
+    result = _launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
     state = read_state(aws_dir)
@@ -245,7 +245,7 @@ def test_fetch_failure_leaves_instance_running_not_terminated(tmp_path):
         tmp_path, with_completed_run=False
     )
 
-    result = _run_launcher(["kill", "r1", "--force"], env)
+    result = _launcher(["kill", "r1", "--force"], env)
 
     assert result.returncode != 0
     combined = result.stdout + result.stderr
@@ -272,7 +272,7 @@ def test_kill_never_hands_the_run_id_to_flyctl(tmp_path):
     run, on both the success and failure paths."""
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["kill", "r1", "--force"], env)
+    result = _launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
     assert _read_flyctl_log(aws_dir) == [], "flyctl must never be invoked for an EC2 run"
 
@@ -282,7 +282,7 @@ def test_kill_never_hands_the_run_id_to_flyctl_on_fetch_failure(tmp_path):
         tmp_path, with_completed_run=False
     )
 
-    result = _run_launcher(["kill", "r1", "--force"], env)
+    result = _launcher(["kill", "r1", "--force"], env)
     assert result.returncode != 0
     assert _read_flyctl_log(aws_dir) == [], "flyctl must never be invoked for an EC2 run"
 
@@ -295,7 +295,7 @@ def test_kill_never_hands_the_run_id_to_flyctl_on_fetch_failure(tmp_path):
 def test_successful_kill_marks_run_json_killed(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
 
-    result = _run_launcher(["kill", "r1", "--force"], env)
+    result = _launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
     run_json = json.loads((run_dir / "run.json").read_text())
@@ -310,7 +310,7 @@ def test_kill_bootstraps_run_json_from_ec2_instance_sidecar_when_absent(tmp_path
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
     (run_dir / "run.json").unlink()
 
-    result = _run_launcher(["kill", "r1", "--force"], env)
+    result = _launcher(["kill", "r1", "--force"], env)
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
     run_json = json.loads((run_dir / "run.json").read_text())
@@ -328,7 +328,7 @@ def test_kill_fails_closed_when_no_instance_id_in_sidecar(tmp_path):
     (run_dir / "ec2-instance.json").unlink()
     (run_dir / "run.json").write_text(json.dumps({}))
 
-    result = _run_launcher(["kill", "r1", "--runtime", "ec2", "--force"], env)
+    result = _launcher(["kill", "r1", "--runtime", "ec2", "--force"], env)
 
     assert result.returncode != 0
     assert "no ec2_instance_id found" in result.stderr
@@ -386,7 +386,7 @@ def test_kill_with_correct_confirmation_proceeds(tmp_path):
 
 def test_kill_runtime_flag_rejects_unknown_value(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
-    result = _run_launcher(["kill", "r1", "--runtime", "bogus", "--force"], env)
+    result = _launcher(["kill", "r1", "--runtime", "bogus", "--force"], env)
     assert result.returncode == 1
     assert "must be 'local', 'fly', or 'ec2'" in result.stderr
     log = read_log(aws_dir)
@@ -395,7 +395,7 @@ def test_kill_runtime_flag_rejects_unknown_value(tmp_path):
 
 def test_kill_unknown_flag_errors(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
-    result = _run_launcher(["kill", "r1", "--bogus-flag", "--force"], env)
+    result = _launcher(["kill", "r1", "--bogus-flag", "--force"], env)
     assert result.returncode == 1
     assert "unknown kill flag" in result.stderr
     log = read_log(aws_dir)
@@ -404,7 +404,7 @@ def test_kill_unknown_flag_errors(tmp_path):
 
 def test_kill_unexpected_second_positional_errors(tmp_path):
     env, aws_dir, state_dir, run_dir, iid = _setup_fixture(tmp_path)
-    result = _run_launcher(["kill", "r1", "r2", "--force"], env)
+    result = _launcher(["kill", "r1", "r2", "--force"], env)
     assert result.returncode == 1
     assert "unexpected kill arg" in result.stderr
     log = read_log(aws_dir)
