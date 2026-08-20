@@ -34,7 +34,6 @@ _KNOWN_GIT_OFFENDERS: set[str] = set()
 
 _KNOWN_INIT_REPO_OFFENDERS = {
     "test_check_rebaser_worktree_state.py",
-    "test_ec2_seed_repo.py",
     "test_external_leerie_branch.py",
     "test_finalize_sh_behavior.py",
     "test_host_finalize_hook_probe.py",

@@ -20,28 +20,17 @@ _DEF_RE = re.compile(r"^\s*def _run_bash\(", re.MULTILINE)
 # commit, and CI catches any new local `_run_bash` def outside this set.
 _KNOWN_UNMIGRATED = frozenset(
     {
-        "tests/test_aws_credentials.py",
         "tests/test_collect_subtrees_sh.py",
         "tests/test_ec2_decide_teardown.py",
-        "tests/test_ec2_fetch_branch.py",
-        "tests/test_ec2_provision.py",
-        "tests/test_ec2_resume_instance.py",
-        "tests/test_ec2_seed_auth.py",
-        "tests/test_ec2_seed_repo.py",
         "tests/test_ec2_ssm.py",
-        "tests/test_ec2_transport.py",
         "tests/test_ec2_volume_reaping.py",
         "tests/test_fetch_branch_sh.py",
-        "tests/test_force_finalize_sh.py",
         "tests/test_force_stop.py",
         "tests/test_pause_on_failure.py",
         "tests/test_provision_sh_lifecycle.py",
         "tests/test_provision_volume.py",
         "tests/test_re_seed.py",
         "tests/test_require_fly_ssh_isolation.py",
-        "tests/test_seed_auth_sh.py",
-        "tests/test_seed_inspect_dirs.py",
-        "tests/test_seed_repo_sh.py",
     }
 )
 

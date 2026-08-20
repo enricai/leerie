@@ -20,19 +20,12 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+from tests.conftest import run_bash
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AWS_CREDS_SH = REPO_ROOT / "scripts" / "remote" / "aws-credentials.sh"
 
 SSO_START_URL = "https://my-sso-portal.awsapps.com/start"
-
-
-def _run_bash(script: str, env: dict) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _base_env(home: Path, **extra: str) -> dict:
@@ -89,7 +82,7 @@ def test_env_credentials_win_over_named_profile(tmp_path):
         AWS_ACCESS_KEY_ID="AKIAENVKEY",
         AWS_SECRET_ACCESS_KEY="envsecret",
     )
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials", env
     )
     assert result.returncode == 0, result.stderr
@@ -121,7 +114,7 @@ def test_aws_profile_env_selects_named_profile_over_default(tmp_path):
     )
 
     env = _base_env(home, AWS_PROFILE="dev")
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials", env
     )
     assert result.returncode == 0, result.stderr
@@ -142,7 +135,7 @@ def test_default_profile_used_when_no_profile_selected(tmp_path):
     )
 
     env = _base_env(home)
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials", env
     )
     assert result.returncode == 0, result.stderr
@@ -162,7 +155,7 @@ def test_region_precedence_aws_region_over_default_region_over_profile(tmp_path)
     )
 
     # profile region only.
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home),
     )
@@ -170,7 +163,7 @@ def test_region_precedence_aws_region_over_default_region_over_profile(tmp_path)
     assert "AWS_REGION=us-east-1" in result.stdout
 
     # AWS_DEFAULT_REGION beats profile region.
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home, AWS_DEFAULT_REGION="eu-west-1"),
     )
@@ -178,7 +171,7 @@ def test_region_precedence_aws_region_over_default_region_over_profile(tmp_path)
     assert "AWS_REGION=eu-west-1" in result.stdout
 
     # AWS_REGION beats AWS_DEFAULT_REGION.
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home, AWS_REGION="ap-south-1", AWS_DEFAULT_REGION="eu-west-1"),
     )
@@ -197,7 +190,7 @@ def test_region_die_with_hint_when_absent_everywhere(tmp_path):
         "aws_secret_access_key = defaultsecret\n"
     )
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home),
     )
@@ -223,7 +216,7 @@ def test_expired_sso_cache_token_produces_hint_not_silent_fallthrough(tmp_path):
         home, SSO_START_URL, expires_delta=timedelta(hours=-1), token="EXPIRED"
     )
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home, AWS_PROFILE="dev"),
     )
@@ -248,7 +241,7 @@ def test_sso_never_logged_in_produces_hint(tmp_path):
         f"sso_start_url = {SSO_START_URL}\n"
     )
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home, AWS_PROFILE="dev"),
     )
@@ -272,7 +265,7 @@ def test_valid_sso_cache_token_resolves_session_token(tmp_path):
     )
     _write_sso_cache(home, SSO_START_URL, expires_delta=timedelta(hours=8))
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home, AWS_PROFILE="dev"),
     )
@@ -297,7 +290,7 @@ def test_legacy_inline_sso_config_resolves(tmp_path):
     )
     _write_sso_cache(home, SSO_START_URL, expires_delta=timedelta(hours=8))
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home, AWS_PROFILE="legacy"),
     )
@@ -309,7 +302,7 @@ def test_no_aws_dir_at_all_produces_actionable_error(tmp_path):
     home = tmp_path / "home"
     home.mkdir()  # no .aws subdirectory created
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home),
     )
@@ -329,7 +322,7 @@ def test_nonexistent_profile_does_not_fall_back_to_default(tmp_path):
         "aws_secret_access_key = defaultsecret\n"
     )
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials",
         _base_env(home, AWS_PROFILE="ghost"),
     )
@@ -355,7 +348,7 @@ def test_cli_profile_flag_overrides_aws_profile_env(tmp_path):
         "aws_secret_access_key = devsecret\n"
     )
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials --profile dev",
         _base_env(home, AWS_PROFILE="default"),
     )
@@ -374,7 +367,7 @@ def test_cli_region_flag_overrides_env_and_profile(tmp_path):
         "aws_secret_access_key = defaultsecret\n"
     )
 
-    result = _run_bash(
+    result = run_bash(
         f"source {AWS_CREDS_SH}; resolve_aws_credentials --region ca-central-1",
         _base_env(home, AWS_REGION="ap-south-1"),
     )

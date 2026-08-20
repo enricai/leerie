@@ -11,20 +11,10 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_bash
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_AUTH_SH = REPO_ROOT / "scripts" / "remote" / "seed-auth.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def test_seed_auth_sh_exists():
@@ -41,7 +31,7 @@ def test_seed_auth_fails_without_machine_id(tmp_path):
     """seed_auth returns 1 when LEERIE_MACHINE_ID is unset."""
     stage = tmp_path / "stage"
     stage.mkdir()
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={"LEERIE_MACHINE_ID": "", "STAGE": str(stage)},
     )
@@ -51,7 +41,7 @@ def test_seed_auth_fails_without_machine_id(tmp_path):
 
 def test_seed_auth_fails_without_stage(tmp_path):
     """seed_auth returns 1 when STAGE is unset."""
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={"LEERIE_MACHINE_ID": "test-machine-001", "STAGE": ""},
     )
@@ -77,7 +67,7 @@ def test_seed_auth_fails_without_credentials_or_token(tmp_path):
     )
     fake_flyctl.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -117,7 +107,7 @@ def test_seed_auth_fails_without_git_identity(tmp_path):
     )
     fake_git.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -157,7 +147,7 @@ def test_seed_auth_succeeds_with_credentials_file(tmp_path):
     )
     fake_git.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -198,7 +188,7 @@ def test_seed_auth_uses_token_fallback_when_no_credentials_file(tmp_path):
     )
     fake_git.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -231,7 +221,7 @@ def test_seed_auth_tar_failure_returns_nonzero(tmp_path):
     fake_git.write_text("#!/usr/bin/env bash\nexit 0\n")
     fake_git.chmod(0o755)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_AUTH_SH}; seed_auth",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",

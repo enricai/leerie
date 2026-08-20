@@ -19,9 +19,9 @@ SSH calls are made.
 """
 from __future__ import annotations
 
-import os
-import subprocess
 from pathlib import Path
+
+from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
@@ -88,20 +88,6 @@ exit "$rc"
 """
     )
     stub.chmod(0o755)
-
-
-def _run_bash(script: str, env: dict, *, input: str | None = None,
-              cwd: Path | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        input=input,
-        cwd=str(cwd) if cwd is not None else None,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _stub_aws_ssm(bin_dir: Path, *, remote_rc: int = 0,
@@ -180,7 +166,7 @@ def test_ec2_lib_sh_defines_transport_functions():
     # _seed_timeout_prefix's single definition site is
     # scripts/remote/seed-common.sh, sourced by ec2-lib.sh — check it is
     # reachable after sourcing ec2-lib.sh rather than defined inline here.
-    result = _run_bash(f"source {EC2_LIB_SH}; type _seed_timeout_prefix", env={})
+    result = run_bash(f"source {EC2_LIB_SH}; type _seed_timeout_prefix", env={})
     assert result.returncode == 0, result.stderr
     assert "_seed_timeout_prefix is a function" in result.stdout
 
@@ -195,7 +181,7 @@ def test_ec2_remote_exec_round_trips_a_command(tmp_path):
     bin_dir.mkdir()
     _stub_aws_ssm(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; "
         f"ec2_remote_exec i-0123456789abcdef0 'echo remote-hello'",
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
@@ -213,7 +199,7 @@ def test_ec2_remote_exec_propagates_nonzero_remote_rc(tmp_path):
     bin_dir.mkdir()
     _stub_aws_ssm(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; "
         f"ec2_remote_exec i-0123456789abcdef0 'exit 42'",
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
@@ -226,7 +212,7 @@ def test_ec2_remote_exec_passes_profile_and_region(tmp_path):
     bin_dir.mkdir()
     _stub_aws_ssm(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; "
         f"ec2_remote_exec i-0123456789abcdef0 'true'",
         env={
@@ -252,7 +238,7 @@ def test_ec2_remote_exec_timeout_yields_124_or_137(tmp_path):
     # no-ops and nothing kills the stalled session.
     _stub_timeout(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; "
         f"ec2_remote_exec i-0123456789abcdef0 'true'",
         env={
@@ -275,7 +261,7 @@ def test_ec2_tar_pipe_streams_stdin_through(tmp_path):
     _stub_ssh(bin_dir, rc=0)
 
     payload = "fake-gzipped-tar-bytes"
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; "
         f"printf '%s' '{payload}' | ec2_tar_pipe ec2-user@1.2.3.4 /home/leerie",
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
@@ -290,7 +276,7 @@ def test_ec2_tar_pipe_propagates_nonzero_remote_rc(tmp_path):
     bin_dir.mkdir()
     _stub_ssh(bin_dir, rc=17)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; "
         f"printf 'x' | ec2_tar_pipe ec2-user@1.2.3.4 /home/leerie",
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
@@ -306,7 +292,7 @@ def test_ec2_tar_pipe_timeout_yields_124_or_137(tmp_path):
     # on macOS, so without this stub the stalled `ssh` runs unbounded.
     _stub_timeout(bin_dir)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {LOG_SH}; source {EC2_LIB_SH}; "
         f"printf 'x' | ec2_tar_pipe ec2-user@1.2.3.4 /home/leerie",
         env={

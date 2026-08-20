@@ -27,24 +27,13 @@ import subprocess
 from pathlib import Path
 
 from tests import ec2_stub
+from tests.conftest import init_git_repo, run_bash
 from tests.stub_helpers import _make_stub_timeout
 from tests.test_ec2_transport import _stub_timeout as _make_killing_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_SEED_SH = REPO_ROOT / "scripts" / "remote" / "ec2-seed-repo.sh"
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_stub_aws(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
@@ -90,19 +79,6 @@ def _make_stub_ssh(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
     )
 
 
-def _init_repo(repo: Path) -> None:
-    repo.mkdir()
-    subprocess.run(["git", "-C", str(repo), "init"], check=True, capture_output=True)
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.email", "test@test.com"],
-        check=True, capture_output=True,
-    )
-    subprocess.run(
-        ["git", "-C", str(repo), "config", "user.name", "Test"],
-        check=True, capture_output=True,
-    )
-
-
 def _base_env(tmp_path: Path, repo: Path) -> dict:
     return {
         "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -123,7 +99,7 @@ def test_ec2_seed_repo_sh_is_executable():
 
 
 def test_ec2_seed_repo_fails_without_instance_id(tmp_path):
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env={
             "LEERIE_EC2_INSTANCE_ID": "",
@@ -136,7 +112,7 @@ def test_ec2_seed_repo_fails_without_instance_id(tmp_path):
 
 
 def test_ec2_seed_repo_fails_without_ssh_target(tmp_path):
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -149,7 +125,7 @@ def test_ec2_seed_repo_fails_without_ssh_target(tmp_path):
 
 
 def test_ec2_seed_repo_fails_without_user_repo(tmp_path):
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -162,7 +138,7 @@ def test_ec2_seed_repo_fails_without_user_repo(tmp_path):
 
 
 def test_ec2_seed_repo_fails_when_aws_missing(tmp_path):
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env={
             "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
@@ -177,7 +153,7 @@ def test_ec2_seed_repo_fails_when_aws_missing(tmp_path):
 
 def test_ec2_seed_repo_succeeds_on_minimal_repo(tmp_path):
     repo = tmp_path / "myrepo"
-    _init_repo(repo)
+    init_git_repo(repo)
     (repo / "README.md").write_text("hello")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
@@ -189,7 +165,7 @@ def test_ec2_seed_repo_succeeds_on_minimal_repo(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env=_base_env(tmp_path, repo),
     )
@@ -205,7 +181,7 @@ def test_ec2_seed_repo_uses_ec2_transport(tmp_path):
     commands and ec2_tar_pipe (ssh) for the bundle payload — never
     flyctl."""
     repo = tmp_path / "myrepo"
-    _init_repo(repo)
+    init_git_repo(repo)
     (repo / "README.md").write_text("hello")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
@@ -217,7 +193,7 @@ def test_ec2_seed_repo_uses_ec2_transport(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env=_base_env(tmp_path, repo),
     )
@@ -235,7 +211,7 @@ def test_ec2_seed_repo_respects_gitignore_and_force_includes_claude(tmp_path):
     .gitignore excludes it — same contract as the Fly path
     (test_seed_repo_sh.py::test_seed_repo_respects_gitignore_and_force_includes_claude)."""
     repo = tmp_path / "myrepo"
-    _init_repo(repo)
+    init_git_repo(repo)
     (repo / ".gitignore").write_text("build/\n*.log\n.claude/\n")
     (repo / "src.py").write_text("print('hi')")
     (repo / "untracked.txt").write_text("untracked")
@@ -263,7 +239,7 @@ def test_ec2_seed_repo_respects_gitignore_and_force_includes_claude(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env=_base_env(tmp_path, repo),
     )
@@ -303,7 +279,7 @@ def test_ec2_seed_repo_whitelists_leerie_config_files(tmp_path):
     drops non-whitelisted .leerie/* paths — same filter as
     test_seed_repo_sh.py::test_seed_repo_whitelists_leerie_config_files."""
     repo = tmp_path / "myrepo"
-    _init_repo(repo)
+    init_git_repo(repo)
     (repo / "README.md").write_text("hello")
     (repo / ".leerie").mkdir()
     (repo / ".leerie" / "config.toml").write_text('[leerie]\nbuild = "make"\n')
@@ -329,7 +305,7 @@ def test_ec2_seed_repo_whitelists_leerie_config_files(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env=_base_env(tmp_path, repo),
     )
@@ -357,7 +333,7 @@ def test_ec2_seed_repo_preserves_nfc_unicode_filenames_in_submodule(tmp_path):
     nfc_str = nfc_name.decode("utf-8")
 
     sub = tmp_path / "submodule-source"
-    _init_repo(sub)
+    init_git_repo(sub)
     (sub / nfc_str).write_text("fake pdf content")
     subprocess.run(["git", "-C", str(sub), "add", nfc_str], check=True, capture_output=True)
     subprocess.run(
@@ -366,7 +342,7 @@ def test_ec2_seed_repo_preserves_nfc_unicode_filenames_in_submodule(tmp_path):
     )
 
     parent = tmp_path / "myrepo"
-    _init_repo(parent)
+    init_git_repo(parent)
     (parent / "README.md").write_text("parent")
     subprocess.run(["git", "-C", str(parent), "add", "README.md"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(parent), "commit", "-m", "init"], check=True, capture_output=True)
@@ -389,7 +365,7 @@ def test_ec2_seed_repo_preserves_nfc_unicode_filenames_in_submodule(tmp_path):
     _make_stub_ssh(tmp_path / "ssh", exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo",
         env=_base_env(tmp_path, parent),
     )
@@ -425,7 +401,7 @@ def test_ec2_seed_repo_transport_stall_yields_124_or_137(tmp_path):
     must be killed by the timeout wrapper and produce a non-hanging
     failure — ec2_seed_repo_clone returns non-zero rather than hanging."""
     repo = tmp_path / "myrepo"
-    _init_repo(repo)
+    init_git_repo(repo)
     (repo / "README.md").write_text("hello")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True, capture_output=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
@@ -457,7 +433,7 @@ sleep 600
     env = _base_env(tmp_path, repo)
     env["LEERIE_SEED_TIMEOUT_S"] = "1"
 
-    result = _run_bash(
+    result = run_bash(
         f"source {EC2_SEED_SH}; ec2_seed_repo_clone",
         env=env,
     )

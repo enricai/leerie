@@ -36,22 +36,12 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_bash
+
 from tests.stub_helpers import _make_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
-
-
-def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProcess:
-    base_env = {k: v for k, v in os.environ.items()}
-    if env:
-        base_env.update(env)
-    return subprocess.run(
-        ["bash", "-c", script],
-        env=base_env,
-        capture_output=True,
-        text=True,
-    )
 
 
 def _make_stub_flyctl(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
@@ -171,7 +161,7 @@ def test_seed_repo_sh_is_executable():
 
 def test_seed_repo_fails_without_machine_id():
     """seed_repo returns 1 when LEERIE_MACHINE_ID is unset."""
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={"LEERIE_MACHINE_ID": "", "USER_REPO": "/tmp"},
     )
@@ -181,7 +171,7 @@ def test_seed_repo_fails_without_machine_id():
 
 def test_seed_repo_fails_without_user_repo():
     """seed_repo returns 1 when USER_REPO is unset."""
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={"LEERIE_MACHINE_ID": "test-machine-001", "USER_REPO": ""},
     )
@@ -191,7 +181,7 @@ def test_seed_repo_fails_without_user_repo():
 
 def test_seed_repo_fails_when_flyctl_missing():
     """seed_repo returns 1 with an actionable error when flyctl is absent."""
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -233,7 +223,7 @@ def test_seed_repo_succeeds_on_minimal_repo(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={
             "LEERIE_MACHINE_ID": "test-machine-001",
@@ -282,7 +272,7 @@ def test_seed_repo_pipes_bundle_via_ssh_console(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={
             "LEERIE_MACHINE_ID": "test-machine-abc",
@@ -387,7 +377,7 @@ def test_seed_repo_respects_gitignore_and_force_includes_claude(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={
             "LEERIE_MACHINE_ID": "test-machine-gitaware",
@@ -497,7 +487,7 @@ def test_seed_repo_whitelists_leerie_config_files(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={
             "LEERIE_MACHINE_ID": "test-machine-leerie-config",
@@ -611,7 +601,7 @@ def test_seed_repo_preserves_nfc_unicode_filenames_in_submodule(tmp_path):
     _make_stub_flyctl(fake_flyctl, exec_log, dest)
     _make_stub_timeout(tmp_path)
 
-    result = _run_bash(
+    result = run_bash(
         f"source {SEED_SH}; seed_repo",
         env={
             "LEERIE_MACHINE_ID": "test-machine-submodule",
