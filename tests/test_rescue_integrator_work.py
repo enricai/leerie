@@ -17,14 +17,12 @@ which is what defeats both `git stash push` and `git stash create`
 
 from __future__ import annotations
 
-import asyncio
 import subprocess
 
 import pytest
 
+from tests.conftest import _run
 
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _git(*args, cwd, **kw):

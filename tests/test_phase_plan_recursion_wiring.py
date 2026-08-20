@@ -21,13 +21,14 @@ boundary.
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from tests.conftest import _run
 
 
 # ---------------------------------------------------------------------------
@@ -145,9 +146,6 @@ _PLANNER_RESPONSE = {
     "subtasks": [_OVERSIZED_SUBTASK],
 }
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

@@ -24,10 +24,11 @@ silently reverted.
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 import subprocess
 from pathlib import Path
+
+from tests.conftest import _run
 
 
 def _git(path, *args):
@@ -82,9 +83,6 @@ def _patch_probe(leerie, monkeypatch, verdict):
     monkeypatch.setattr(leerie, "_load_prompt", lambda *_a, **_k: "SYS")
     return seen
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,6 @@ fit_judge / splitter responses. Verifies:
 """
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import json
 import math
@@ -23,6 +22,8 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from tests.conftest import _run
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -164,9 +165,6 @@ def _split_response(parent_id: str, n: int) -> dict:
         ],
     }
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

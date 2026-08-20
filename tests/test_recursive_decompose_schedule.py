@@ -16,11 +16,12 @@ Tests verify:
 """
 from __future__ import annotations
 
-import asyncio
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+
+from tests.conftest import _run
 
 
 # ---------------------------------------------------------------------------
@@ -89,9 +90,6 @@ def _fit_response(score: float) -> dict:
         },
     }
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

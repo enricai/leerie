@@ -28,9 +28,10 @@ re-probed (fail-safe-to-reprobe), the same discipline as an unrelated sha.
 """
 from __future__ import annotations
 
-import asyncio
 import subprocess
 from pathlib import Path
+
+from tests.conftest import _run
 
 _CAPS = {"max_parallel": 4, "max_total_workers": 999}
 _MODELS = {"satisfied_probe": "sonnet"}
@@ -90,9 +91,6 @@ def _commit_more(path: Path, filename: str = "b.py") -> str:
     _git(["commit", "-q", "-m", f"add {filename}"], path)
     return _git(["rev-parse", "HEAD"], path)
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

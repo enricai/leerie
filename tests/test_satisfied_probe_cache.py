@@ -32,6 +32,8 @@ import json
 import subprocess
 from pathlib import Path
 
+from tests.conftest import _run
+
 _CAPS = {"max_parallel": 4, "max_total_workers": 999}
 _MODELS = {"satisfied_probe": "sonnet"}
 _EFFORTS = {"satisfied_probe": None}
@@ -79,9 +81,6 @@ def _init_git_repo(path: Path) -> str:
                           check=True, capture_output=True, text=True)
     return out.stdout.strip()
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

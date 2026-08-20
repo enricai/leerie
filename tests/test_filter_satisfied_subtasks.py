@@ -22,12 +22,13 @@ dependency.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import _run
 
 try:
     import jsonschema  # type: ignore
@@ -82,9 +83,6 @@ def _patch_probe(leerie, monkeypatch, verdicts: dict):
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

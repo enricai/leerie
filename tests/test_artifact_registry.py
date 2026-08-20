@@ -19,12 +19,13 @@ Mirrors test_fit_judge_schema.py / test_resolve_fit_judge_model.py patterns.
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 import json
 from pathlib import Path
 
 import pytest
+
+from tests.conftest import _run
 
 try:
     import jsonschema  # type: ignore
@@ -174,9 +175,6 @@ def _make_state(leerie, run_dir: Path):
     st.path.write_text("{}")
     return st
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def test_phase_returns_artifacts(leerie, tmp_path, monkeypatch):

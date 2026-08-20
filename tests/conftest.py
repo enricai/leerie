@@ -6,6 +6,7 @@ fixture.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ctypes
 import importlib.util
@@ -18,6 +19,13 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
+
+
+def _run(coro):
+    """Run an async coroutine synchronously (this repo does not use
+    pytest-asyncio). Single owner for the byte-identical helper that was
+    previously redefined in fifteen test files."""
+    return asyncio.run(coro)
 
 
 @pytest.fixture(scope="session")
