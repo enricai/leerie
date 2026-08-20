@@ -41,11 +41,11 @@ import subprocess
 from pathlib import Path
 
 from tests.ec2_stub import leaked_resources, read_log, read_state
+from tests.stub_helpers import _make_stub_timeout
 from tests.test_ec2_fetch_branch import (
     _init_instance_repo_with_run,
     _make_git_repo,
     _make_stub_ssh,
-    _make_stub_timeout,
     _setup_instance,
 )
 
