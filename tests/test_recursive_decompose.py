@@ -131,11 +131,10 @@ def _make_state(leerie, caps):
 def _make_caps(leerie, **overrides):
     """This file's caps always carry `subfile_split_max_span`, which the
     shared builder does not default -- layer it on top."""
-    return _shared_make_caps(
-        leerie,
-        subfile_split_max_span=leerie.DEFAULT_CAPS["subfile_split_max_span"],
-        **overrides,
+    overrides.setdefault(
+        "subfile_split_max_span", leerie.DEFAULT_CAPS["subfile_split_max_span"]
     )
+    return _shared_make_caps(leerie, **overrides)
 
 
 
