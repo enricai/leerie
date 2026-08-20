@@ -13,14 +13,8 @@ from __future__ import annotations
 
 import subprocess
 
-from tests.conftest import _run
+from tests.conftest import _run, run_git_cwd_kw as _git
 from tests.test_oom_naming import env  # noqa: F401  (pytest fixture)
-
-
-
-def _git(*args, cwd):
-    return subprocess.run(["git", *args], cwd=str(cwd),
-                          capture_output=True, text=True)
 
 
 _VALID_CHECKPOINT_TEXT = (
@@ -353,7 +347,8 @@ def _conflicted_staging(tmp_path):
     _git("checkout", "-q", "-", cwd=repo)
     (repo / "f.txt").write_text("main\n")
     _git("commit", "-qam", "main", cwd=repo)
-    _git("merge", "side", cwd=repo)
+    subprocess.run(["git", "merge", "side"], cwd=str(repo),
+                   capture_output=True, text=True)  # conflicts by construction
     assert (repo / ".git" / "MERGE_HEAD").exists()
     return repo
 

@@ -12,15 +12,10 @@ import shutil
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_git_cwd_kw as _git
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "new-worktree.sh"
-
-
-def _git(*args: str, cwd: Path) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["git", *args], cwd=str(cwd),
-        capture_output=True, text=True, check=False,
-    )
 
 
 def _run_new_worktree(cwd: Path, sid: str, run_id: str) -> subprocess.CompletedProcess:
