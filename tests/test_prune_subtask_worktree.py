@@ -10,14 +10,18 @@ import asyncio
 import subprocess
 from pathlib import Path
 
+from tests.conftest import run_git_cwd_kw as _git
 
-def _git(*args, cwd):
+
+def _git_noraise(*args, cwd):
+    """Like `_git`, but never raises -- for calls whose non-zero exit is
+    the thing under test (e.g. an unregistered `worktree remove`)."""
     return subprocess.run(
         ["git", *args], cwd=str(cwd), capture_output=True, text=True, check=False,
     )
 
 
-def _init_repo(path: Path) -> Path:
+def _make_repo(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     _git("init", "-q", "-b", "main", cwd=path)
     _git("config", "user.email", "test@leerie.local", cwd=path)
@@ -31,7 +35,7 @@ def _init_repo(path: Path) -> Path:
 
 def test_noop_when_worktree_absent(leerie, tmp_path, monkeypatch):
     """Idempotent: no worktree to prune is not an error."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     (leerie_dir / "worktrees").mkdir(parents=True)
@@ -44,7 +48,7 @@ def test_noop_when_worktree_absent(leerie, tmp_path, monkeypatch):
 def test_removes_worktree_dir_but_keeps_branch(leerie, tmp_path, monkeypatch):
     """The core contract: worktree directory (and node_modules-style content
     within it) is gone, but the branch ref survives for finalize/PR use."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     wt_dir = leerie_dir / "worktrees" / "sid-x"
@@ -70,7 +74,7 @@ def test_removes_worktree_dir_but_keeps_branch(leerie, tmp_path, monkeypatch):
 def test_prune_does_not_touch_other_sids_worktree(leerie, tmp_path, monkeypatch):
     """Scoped to exactly one sid — a sibling wave member's worktree is
     untouched."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     leerie_dir.joinpath("worktrees").mkdir(parents=True)
@@ -95,7 +99,7 @@ def test_prune_falls_back_to_rmtree_when_git_leaves_dir_behind(
     still exists — the helper must fall back to a direct `shutil.rmtree`
     rather than leaving it behind. Mirrors the same fallback in
     `_cleanup_on_abnormal_exit`."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     wt_dir = leerie_dir / "worktrees" / "sid-x"
@@ -103,7 +107,7 @@ def test_prune_falls_back_to_rmtree_when_git_leaves_dir_behind(
     (wt_dir / "leftover.txt").write_text("stray\n")
     # Never registered with git, so `git worktree remove --force` returns
     # nonzero and the directory survives that call.
-    r = _git("worktree", "remove", "--force", str(wt_dir), cwd=repo)
+    r = _git_noraise("worktree", "remove", "--force", str(wt_dir), cwd=repo)
     assert r.returncode != 0
     assert wt_dir.exists()
 
@@ -119,7 +123,7 @@ def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
     be reset via `_reset_subtask_worktree` independently — proves the two
     helpers don't interfere via shared state (e.g. `git worktree prune`
     calls)."""
-    repo = _init_repo(tmp_path / "repo")
+    repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
     leerie_dir.joinpath("worktrees").mkdir(parents=True)
@@ -138,6 +142,6 @@ def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
 
     asyncio.run(leerie._reset_subtask_worktree("sid-blocked", leerie_dir, "run-id"))
     assert not wt_blocked.exists()
-    show = _git("show-ref", "--verify", "--quiet",
+    show = _git_noraise("show-ref", "--verify", "--quiet",
                 "refs/heads/leerie/subtasks/run-id/sid-blocked", cwd=repo)
     assert show.returncode != 0

@@ -12,14 +12,10 @@ of the same repo averaged 23 s.
 from __future__ import annotations
 
 import asyncio
-import subprocess
 
 import pytest
 
-
-def _git(*a, cwd):
-    subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True,
-                   text=True)
+from tests.conftest import run_git_cwd_kw as _git
 
 
 # --------------------------------------------------------------------------

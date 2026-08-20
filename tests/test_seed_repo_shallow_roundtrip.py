@@ -26,15 +26,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import run_git_cwd_kw as _git
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
 
 SEED_DEPTH = 5
-
-
-def _git(*args, cwd, **kw):
-    return subprocess.run(["git", *args], cwd=cwd, check=True,
-                          capture_output=True, text=True, **kw)
 
 
 def _make_host_repo(root: Path) -> Path:
