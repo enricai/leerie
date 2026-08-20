@@ -7495,8 +7495,8 @@ escape hatch.
 
 #### Acting-worker isolation — the same deny, scoped to a path
 
-L1–L4 above are scoped to `PLANNING_WORKER_TYPES`. Acting workers
-(implementer, conformer, integrator, rebaser) get **only L2**, and this
+L1–L4 above are scoped to `PLANNING_WORKER_TYPES`. Before this change acting
+workers (implementer, conformer, integrator, rebaser) had **only L2**, and this
 section already states what that is worth: *L2 is worth nothing without L1*.
 They cannot be given L1 — writing files unprompted is the job — so
 `claude_p` appends `--dangerously-skip-permissions` on `autonomous` alone,
