@@ -9,10 +9,10 @@ additionally created a `remote-work` dir and returned a 3-tuple; stop.py
 accepted an optional pre-built `home` Path and returned a 2-tuple.
 Consolidated into tests/ec2_stub.py's `build_ec2_launcher_env`, following the
 same single-owner convention as `write_ec2_sidecar`
-(tests/test_no_duplicate_ec2_sidecar_writer.py).
+(tests/test_no_duplicate_ec2_sidecar_helper.py).
 
 This is the same defect class, and the same guard shape, as
-`tests/test_no_duplicate_ec2_sidecar_writer.py`,
+`tests/test_no_duplicate_ec2_sidecar_helper.py`,
 `tests/test_no_duplicate_ec2_knob.py`, and
 `tests/test_no_duplicate_launcher_splitters.py`: a hand-copied fixture
 helper is body-blind by construction, so a third file could silently
@@ -30,7 +30,7 @@ OWNER = TESTS_DIR / "ec2_stub.py"
 # Anchored to the START OF A LINE: a real (re)definition of the helper
 # opens at column 0, while a legitimate reference — an import, a call —
 # is never preceded by nothing but whitespace at the start of a line in
-# that exact shape. Mirrors test_no_duplicate_ec2_sidecar_writer.py's
+# that exact shape. Mirrors test_no_duplicate_ec2_sidecar_helper.py's
 # discipline. Matches both the retired `_env(` name and the current
 # `build_ec2_launcher_env(` name, so a partial revert (renaming back
 # without restoring the shared owner) is also caught.
