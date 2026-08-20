@@ -12,6 +12,7 @@ import ctypes
 import importlib.util
 import os
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -26,6 +27,29 @@ def _run(coro):
     pytest-asyncio). Single owner for the byte-identical helper that was
     previously redefined in fifteen test files."""
     return asyncio.run(coro)
+
+
+def run_bash(
+    script: str,
+    env: dict | None = None,
+    *,
+    cwd: Path | None = None,
+    input: str | None = None,
+) -> subprocess.CompletedProcess:
+    """Run a bash script via `bash -c`, merging `env` onto the parent
+    process environment. Single owner for the byte-identical `_run_bash`
+    helper previously redefined across ~22 test files."""
+    base_env = {k: v for k, v in os.environ.items()}
+    if env:
+        base_env.update(env)
+    return subprocess.run(
+        ["bash", "-c", script],
+        env=base_env,
+        cwd=str(cwd) if cwd is not None else None,
+        input=input,
+        capture_output=True,
+        text=True,
+    )
 
 
 @pytest.fixture(scope="session")
