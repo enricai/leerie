@@ -1600,6 +1600,107 @@ def _confidence_schema(axes: list[str]) -> dict:
     }
 
 
+def _subtask_item_schema(
+    *,
+    include_requires: bool = False,
+    include_migration_targets: bool = False,
+    include_runs_commands: bool = False,
+    include_fixes_reported_symptom: bool = False,
+) -> dict:
+    """Build the child-subtask item schema shared by planner.subtasks,
+    reconciler.added_subtasks, and splitter.children.
+
+    The three call sites emit structurally identical subtask objects
+    (id/title/intent/scope_note/files_likely_touched/depends_on/provides/
+    success_criteria_seed/size/investigation_notes) but differ on which
+    optional fields they carry — reconciler's added_subtasks is the
+    narrowest (no requires, no migration/runs_commands/symptom fields, since
+    bridging work added by the reconciler is not itself planner-authored
+    original scope). Each include_* flag exists because a prior version of
+    this refactor tried to make all three identical and would have WIDENED
+    reconciler.added_subtasks and splitter.children to accept fields they
+    never validated before — the flags keep each of the three schemas'
+    accepted-field set byte-for-byte what it was.
+    """
+    properties: dict = {
+        "id": {"type": "string"},
+        "title": {"type": "string"},
+        "intent": {"type": "string"},
+        "scope_note": {"type": "string"},
+        "files_likely_touched": {
+            "type": "array", "items": {"type": "string"}},
+        "depends_on": {"type": "array", "items": {"type": "string"}},
+    }
+    if include_requires:
+        properties["requires"] = {"type": "array", "items": _REQUIRES_ITEM}
+    properties["provides"] = {"type": "array", "items": {"type": "string"}}
+    properties["success_criteria_seed"] = {"type": "string"}
+    properties["size"] = {
+        "type": "string", "enum": ["small", "medium", "large"]}
+    properties["investigation_notes"] = {"type": "string"}
+    if include_migration_targets:
+        # The old pattern(s) this subtask replaces, as structured data — so
+        # the migration-surface check can grep for a symbol the planner
+        # NAMED rather than one inferred from its prose. Optional: most
+        # subtasks replace nothing and omit it.
+        #
+        # `old_pattern` is a code identifier (a symbol, a dotted access
+        # path, an import specifier) — the literal string to grep for.
+        # `minLength: 3` keeps out one- and two-character noise; the prompt
+        # carries the "must be a real identifier" rule. `is_real_identifier`
+        # is the planner's own attestation that `old_pattern` is a
+        # grep-pastable symbol rather than an English word from its own
+        # sentence — CLAUDE.md *Language-to-JSON* forbids Python from
+        # regex-classifying an LLM's response, so this can't be a shape
+        # check the orchestrator runs after the fact; the planner has to
+        # say so itself. Required (not optional) so a planner cannot
+        # silently skip the attestation for an entry it already decided to
+        # declare.
+        properties["migration_targets"] = {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": [
+                    "old_pattern", "replacement", "is_real_identifier"],
+                "properties": {
+                    "old_pattern": {"type": "string", "minLength": 3},
+                    "replacement": {"type": "string", "minLength": 1},
+                    "is_real_identifier": {"type": "boolean"},
+                },
+            },
+        }
+        # Self-reported companion to migration_targets: does this subtask
+        # replace an existing pattern at all? A same-worker, same-call
+        # mechanical contradiction check (MIGRATION_TARGETS_MISSING)
+        # flags `performs_replacement: true` with an empty/absent
+        # `migration_targets`. NOT an independent witness — see
+        # MIGRATION_TARGETS_MISSING's own docstring. Optional; omit or
+        # leave false when nothing is replaced.
+        properties["performs_replacement"] = {"type": "boolean"}
+    if include_runs_commands:
+        # The commands this subtask actually invokes, as structured data —
+        # so a prescribed-procedure coverage check can set-compare over
+        # runs_commands rather than re-interpret subtask prose. Optional:
+        # most subtasks run no prescribed command.
+        properties["runs_commands"] = {
+            "type": "array", "items": {"type": "string"}}
+    if include_fixes_reported_symptom:
+        # Does this subtask fix a symptom the task REPORTED as currently
+        # broken? `check_symptom_evidence` gates on this, and on nothing
+        # else — deliberately not on an id-prefix heuristic (CLAUDE.md
+        # *Language-to-JSON*: POSTMORTEM-2026-08-14 F18 measured 10/10 false
+        # positives from an id-prefix inference). Deliberately OPTIONAL, and
+        # absence means "no" — the check is advisory, so a silent check is
+        # strictly better than one at a 100% false-positive rate.
+        properties["fixes_reported_symptom"] = {"type": "boolean"}
+    return {
+        "type": "object",
+        "required": ["id", "title", "success_criteria_seed"],
+        "properties": properties,
+    }
+
+
 def _production_evidence_schema() -> dict:
     """DESIGN §9 *Evidence must be production-grounded*.
 
@@ -1734,111 +1835,12 @@ SCHEMAS: dict[str, dict] = {
                 ["task_understanding", "decomposition_quality"]),
             "subtasks": {
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["id", "title", "success_criteria_seed"],
-                    "properties": {
-                        "id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "intent": {"type": "string"},
-                        "scope_note": {"type": "string"},
-                        "files_likely_touched": {
-                            "type": "array", "items": {"type": "string"}},
-                        "depends_on": {"type": "array", "items": {"type": "string"}},
-                        "requires": {"type": "array", "items": _REQUIRES_ITEM},
-                        "provides": {"type": "array", "items": {"type": "string"}},
-                        "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string", "enum": ["small", "medium", "large"]},
-                        "investigation_notes": {"type": "string"},
-                        # The old pattern(s) this subtask replaces, as
-                        # structured data — so the migration-surface check
-                        # can grep for a symbol the planner NAMED rather
-                        # than one inferred from its prose. Optional: most
-                        # subtasks replace nothing and omit it.
-                        #
-                        # `old_pattern` is a code identifier (a symbol, a
-                        # dotted access path, an import specifier) — the
-                        # literal string to grep for. `minLength: 3` keeps
-                        # out one- and two-character noise; the prompt
-                        # carries the "must be a real identifier" rule.
-                        # `is_real_identifier` is the planner's own
-                        # attestation that `old_pattern` is a grep-pastable
-                        # symbol rather than an English word from its own
-                        # sentence (`with`, `both`, `task`) — CLAUDE.md
-                        # *Language-to-JSON* forbids Python from
-                        # regex-classifying an LLM's response, so this can't
-                        # be a shape check the orchestrator runs after the
-                        # fact; the planner has to say so itself, the same
-                        # way `performs_replacement` self-reports next to
-                        # `migration_targets` and `artifact_paths`
-                        # self-reports next to `artifact` elsewhere in this
-                        # file. Required (not optional) so a planner cannot
-                        # silently skip the attestation for an entry it
-                        # already decided to declare.
-                        "migration_targets": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "additionalProperties": False,
-                                "required": [
-                                    "old_pattern", "replacement",
-                                    "is_real_identifier"],
-                                "properties": {
-                                    "old_pattern": {
-                                        "type": "string", "minLength": 3},
-                                    "replacement": {
-                                        "type": "string", "minLength": 1},
-                                    "is_real_identifier": {"type": "boolean"},
-                                },
-                            },
-                        },
-                        # Self-reported companion to migration_targets: does
-                        # this subtask replace an existing pattern at all?
-                        # A same-worker, same-call mechanical contradiction
-                        # check (MIGRATION_TARGETS_MISSING, below) flags
-                        # `performs_replacement: true` with an empty/absent
-                        # `migration_targets` — catching the "planner forgot
-                        # to fill the optional field" case. It is NOT an
-                        # independent witness: a planner that gets both
-                        # fields wrong in the same consistent direction
-                        # (e.g. false + omitted, for a subtask that truly
-                        # replaces something) defeats this check, since both
-                        # signals come from the same self-report. Optional;
-                        # omit or leave false when nothing is replaced.
-                        "performs_replacement": {"type": "boolean"},
-                        # The commands this subtask actually invokes, as
-                        # structured data — so a prescribed-procedure
-                        # coverage check can set-compare over runs_commands
-                        # rather than re-interpret subtask prose. Optional:
-                        # most subtasks run no prescribed command.
-                        "runs_commands": {
-                            "type": "array", "items": {"type": "string"}},
-                        # Does this subtask fix a symptom the task REPORTED as
-                        # currently broken? `check_symptom_evidence` gates on
-                        # this, and on nothing else.
-                        #
-                        # It used to gate on `sid.startswith("bugfix-")`, which
-                        # is the *Language-to-JSON* rule violated on an id
-                        # rather than on prose: Python inferred the nature of
-                        # the work from an identifier string. Two mechanisms
-                        # mint that prefix onto work that fixes no symptom —
-                        # `_repair_prescribed_commands` synthesises
-                        # `{prefix}{900+n}` from the HOST subtask's domain, and
-                        # a duplicate-provider/overlap merge re-homes a `feat-`
-                        # subtask under a surviving `bugfix-` id. Measured
-                        # across the corpus, **10 of 10** findings were false
-                        # positives (POSTMORTEM-2026-08-14, F18), which is how a
-                        # warning stops being read.
-                        #
-                        # Deliberately OPTIONAL, and absence means "no" — the
-                        # check is advisory, so a silent check is strictly
-                        # better than one at a 100% false-positive rate, and
-                        # requiring the field would risk the validity-rate
-                        # collapse `severity` caused on `wiring_judge` (9 of 66
-                        # invalid, all on one required field).
-                        "fixes_reported_symptom": {"type": "boolean"},
-                    },
-                },
+                "items": _subtask_item_schema(
+                    include_requires=True,
+                    include_migration_targets=True,
+                    include_runs_commands=True,
+                    include_fixes_reported_symptom=True,
+                ),
             },
         },
     },
@@ -1871,26 +1873,7 @@ SCHEMAS: dict[str, dict] = {
                 # Net-new bridging work. `requires` is NOT nested here any
                 # more — it moves to `added_requires`, keyed by sid.
                 "type": "array",
-                "items": {
-                    "type": "object",
-                    "required": ["id", "title", "success_criteria_seed"],
-                    "properties": {
-                        "id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "intent": {"type": "string"},
-                        "scope_note": {"type": "string"},
-                        "files_likely_touched": {
-                            "type": "array", "items": {"type": "string"}},
-                        "depends_on": {
-                            "type": "array", "items": {"type": "string"}},
-                        "provides": {
-                            "type": "array", "items": {"type": "string"}},
-                        "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string",
-                                 "enum": ["small", "medium", "large"]},
-                        "investigation_notes": {"type": "string"},
-                    },
-                },
+                "items": _subtask_item_schema(),
             },
             "added_requires": {
                 # Lifted out of `added_subtasks.requires`. The subtask->requires
@@ -2574,27 +2557,7 @@ SCHEMAS: dict[str, dict] = {
                 # more (a single-child split being a no-op), and every empty
                 # return was rejected and retried before the consumer that
                 # already handled it could ever see it.
-                "items": {
-                    "type": "object",
-                    "required": ["id", "title", "success_criteria_seed"],
-                    "properties": {
-                        "id": {"type": "string"},
-                        "title": {"type": "string"},
-                        "intent": {"type": "string"},
-                        "scope_note": {"type": "string"},
-                        "files_likely_touched": {
-                            "type": "array", "items": {"type": "string"}},
-                        "depends_on": {
-                            "type": "array", "items": {"type": "string"}},
-                        "requires": {
-                            "type": "array", "items": _REQUIRES_ITEM},
-                        "provides": {
-                            "type": "array", "items": {"type": "string"}},
-                        "success_criteria_seed": {"type": "string"},
-                        "size": {"type": "string", "enum": ["small", "medium", "large"]},
-                        "investigation_notes": {"type": "string"},
-                    },
-                },
+                "items": _subtask_item_schema(include_requires=True),
             },
         },
     },
@@ -3910,6 +3873,24 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
         shutil.rmtree(entry, ignore_errors=True)
 
 
+async def _rmtree_fallback_and_prune(worktree: Path, leerie_dir: Path) -> None:
+    """Shared tail of _reset_subtask_worktree/_prune_subtask_worktree: rmtree
+    fallback for a worktree git's remove left behind, then re-prune stale
+    registrations.
+
+    to_thread: this is reached concurrently for every subtask in a wave
+    under `gather`, and _prune_leerie_worktrees is synchronous (two
+    subprocess calls). Measured at ~16 ms, so the mean cost is negligible
+    -- but each call carries a 10 s timeout, and a git that blocks would
+    stall the whole loop for it."""
+    if worktree.exists():
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+        except OSError:
+            pass
+    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
+
+
 async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> None:
     """Remove the per-subtask worktree directory and branch so a corrective
     retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
@@ -3928,17 +3909,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     branch = f"leerie/subtasks/{run_id}/{sid}"
     await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
     await run_proc(["git", "branch", "-D", branch])
-    if worktree.exists():
-        try:
-            shutil.rmtree(worktree, ignore_errors=True)
-        except OSError:
-            pass
-    # to_thread: this is reached concurrently for every subtask in a
-    # wave under `gather`, and _prune_leerie_worktrees is synchronous
-    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
-    # negligible -- but each call carries a 10 s timeout, and a git
-    # that blocks would stall the whole loop for it.
-    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
+    await _rmtree_fallback_and_prune(worktree, leerie_dir)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -3955,17 +3926,7 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     pressure deferred to run-end cleanup, not a reason to fail the wave."""
     worktree = leerie_dir / "worktrees" / sid
     await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
-    if worktree.exists():
-        try:
-            shutil.rmtree(worktree, ignore_errors=True)
-        except OSError:
-            pass
-    # to_thread: this is reached concurrently for every subtask in a
-    # wave under `gather`, and _prune_leerie_worktrees is synchronous
-    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
-    # negligible -- but each call carries a 10 s timeout, and a git
-    # that blocks would stall the whole loop for it.
-    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
+    await _rmtree_fallback_and_prune(worktree, leerie_dir)
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
@@ -10661,6 +10622,41 @@ def _resolves_under(path_str: str, root: Path) -> bool:
         return False
 
 
+def _apply_subtask_drop_propagation(
+    plans: list[dict], dropped: dict[str, dict], st: "State") -> None:
+    """Shared 'apply an id-vanishing subtask drop' tail (DESIGN §5
+    *Id-vanishing operations*) for `_filter_offtree_subtasks` and
+    `_filter_satisfied_subtasks`. `dropped` maps sid -> drop-record dict
+    (each carrying at least a `"provides"` list); the caller has already
+    removed the dropped subtasks from `plan["subtasks"]` before calling
+    this. Prunes dangling `depends_on` references to the vanished ids,
+    prunes orphaned `requires` tags only the dropped subtasks provided,
+    and persists the drop record to `st.data["dropped_subtasks"]`.
+
+    Logging is deliberately NOT done here — the two callers' log wording
+    differs and stays caller-specific. `st.save()` here is each caller's
+    own final checkpoint write for this drop; its position in the existing
+    call sequence must not change (see CLAUDE.md's checkpoint-ordering
+    discipline)."""
+    # A dropped id can no longer satisfy any dependent, so prune every inbound
+    # `depends_on` reference to it (DESIGN §5 *Id-vanishing operations*).
+    # Without this the edge dangles: _schedule() drops it silently and
+    # _validate_plan then die()s the run.
+    pruned = {sid: [] for sid in dropped}
+    dropped_provides = {t for info in dropped.values()
+                        for t in info.get("provides", [])}
+    for plan in plans:
+        _remap_vanished_deps(plan.get("subtasks", []), pruned)
+    # A drop also orphans the tag channel — the dropped subtasks' provides are
+    # gone, so prune any inbound `requires` naming a tag only they provided
+    # (DESIGN §5 *Id-vanishing operations*, the drop half). Called once over all
+    # plans (NOT per-plan): capability tags are cross-domain, so a tag provided
+    # by a surviving subtask in another plan must not be pruned.
+    _prune_orphaned_requires(plans, dropped_provides)
+    st.data.setdefault("dropped_subtasks", {}).update(dropped)
+    st.save()
+
+
 def _filter_offtree_subtasks(plans: list[dict], repo_root: Path,
                             inspect_dirs: list[str], st: "State") -> None:
     """Mutate `plans` in place: drop any subtask whose `files_likely_touched`
@@ -10715,28 +10711,12 @@ def _filter_offtree_subtasks(plans: list[dict], repo_root: Path,
         plan["subtasks"] = survivors
     if not dropped:
         return
-    # A dropped id can no longer satisfy any dependent, so prune every inbound
-    # `depends_on` reference to it (DESIGN §5 *Id-vanishing operations*).
-    # Without this the edge dangles: _schedule() drops it silently and
-    # _validate_plan then die()s the run.
-    pruned = {sid: [] for sid in dropped}
-    dropped_provides = {t for info in dropped.values()
-                        for t in info.get("provides", [])}
-    for plan in plans:
-        _remap_vanished_deps(plan.get("subtasks", []), pruned)
-    # A drop also orphans the tag channel — the dropped subtasks' provides are
-    # gone, so prune any inbound `requires` naming a tag only they provided
-    # (DESIGN §5 *Id-vanishing operations*, the drop half). Called once over all
-    # plans (NOT per-plan): capability tags are cross-domain, so a tag provided
-    # by a surviving subtask in another plan must not be pruned.
-    _prune_orphaned_requires(plans, dropped_provides)
     log(f"⚠  _filter_offtree_subtasks: dropped {len(dropped)} subtask(s) "
         "with off-tree files_likely_touched:")
     for sid, info in sorted(dropped.items()):
         for r in info["reasons"]:
             log(f"     {sid}: {r}")
-    st.data.setdefault("dropped_subtasks", {}).update(dropped)
-    st.save()
+    _apply_subtask_drop_propagation(plans, dropped, st)
 
 
 async def _filter_satisfied_subtasks(
@@ -10954,28 +10934,11 @@ async def _filter_satisfied_subtasks(
             if s.get("id") not in dropped
         ]
 
-    # A dropped id can no longer satisfy any dependent, so prune every inbound
-    # `depends_on` reference to it (DESIGN §5 *Id-vanishing operations*).
-    # Without this the edge dangles: _schedule() drops it silently and
-    # _validate_plan then die()s the run — after the full planner spend.
-    pruned = {sid: [] for sid in dropped}
-    dropped_provides = {t for info in dropped.values()
-                        for t in info.get("provides", [])}
-    for plan in plans:
-        _remap_vanished_deps(plan.get("subtasks", []), pruned)
-    # A drop also orphans the tag channel — the dropped subtasks' provides are
-    # gone, so prune any inbound `requires` naming a tag only they provided
-    # (DESIGN §5 *Id-vanishing operations*, the drop half). Called once over all
-    # plans (NOT per-plan): capability tags are cross-domain, so a tag provided
-    # by a surviving subtask in another plan must not be pruned.
-    _prune_orphaned_requires(plans, dropped_provides)
-
     log(f"phase 3: satisfied-probe dropped {len(dropped)}/{total} "
         "already-satisfied subtask(s):")
     for sid, info in sorted(dropped.items()):
         log(f"     {sid}: {info['evidence'][:160]}")
-    st.data.setdefault("dropped_subtasks", {}).update(dropped)
-    st.save()
+    _apply_subtask_drop_propagation(plans, dropped, st)
 
     # If every ready plan is now empty, this is the per-subtask analogue
     # of the cleared-but-empty terminal state. Build a no_work_map from
@@ -29289,6 +29252,31 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
     subtask_path = leerie_dir / "subtasks" / f"{sid}.json"
     subtask = json.loads(subtask_path.read_text()) if subtask_path.exists() else {}
 
+    def _checkpoint_and_continuation_gate(res: dict) -> dict | None:
+        """Shared by the `incomplete-handoff` and `needs-clarification`
+        branches: validate the checkpoint, then enforce the continuation
+        cap. Returns a terminal blocked-result dict if either gate fails
+        (checkpoint invalid, or continuation cap exceeded), or None if the
+        caller should proceed (continuations has already been incremented
+        here on the success path)."""
+        nonlocal continuations
+        wt_root = leerie_dir / "worktrees" / sid
+        cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
+                                     worktree_root=wt_root)
+        if cp_err:
+            log(f"  bad checkpoint for {sid}: {cp_err}")
+            return {"subtask_id": sid, "status": "blocked",
+                    "blocker": f"checkpoint invalid: {cp_err}",
+                    "summary": cp_err}
+        continuations += 1
+        if continuations > caps["subtask_continuations"]:
+            return {"subtask_id": sid, "status": "blocked",
+                    "blocker": ("exceeded subtask continuation cap — "
+                                "subtask is mis-scoped and needs "
+                                "re-decomposition"),
+                    "summary": "subtask continuation cap exceeded"}
+        return None
+
     async def fail(kind: str, reason: str) -> dict | None:
         """Record a failed attempt. `kind` is the structured discriminator
         `_retryable_failure` dispatches on (see `_RETRYABLE_FAILURE_KINDS`);
@@ -29806,21 +29794,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # `## Files touched` validates paths against this directory;
             # if it no longer exists (e.g. cleanup ran early), the check
             # is skipped gracefully.
-            wt_root = leerie_dir / "worktrees" / sid
-            cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
-                                         worktree_root=wt_root)
-            if cp_err:
-                log(f"  bad checkpoint for {sid}: {cp_err}")
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": f"checkpoint invalid: {cp_err}",
-                        "summary": cp_err}
-            continuations += 1
-            if continuations > caps["subtask_continuations"]:
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": ("exceeded subtask continuation cap — "
-                                    "subtask is mis-scoped and needs "
-                                    "re-decomposition"),
-                        "summary": "subtask continuation cap exceeded"}
+            gate_result = _checkpoint_and_continuation_gate(res)
+            if gate_result is not None:
+                return gate_result
             continuation, note = True, ""
             continue
 
@@ -29832,21 +29808,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # the user's answer. Consumes from the same
             # subtask_continuations budget — there is no extra "ask the
             # user" allowance.
-            wt_root = leerie_dir / "worktrees" / sid
-            cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
-                                         worktree_root=wt_root)
-            if cp_err:
-                log(f"  bad checkpoint for {sid}: {cp_err}")
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": f"checkpoint invalid: {cp_err}",
-                        "summary": cp_err}
-            continuations += 1
-            if continuations > caps["subtask_continuations"]:
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": ("exceeded subtask continuation cap — "
-                                    "subtask is mis-scoped and needs "
-                                    "re-decomposition"),
-                        "summary": "subtask continuation cap exceeded"}
+            gate_result = _checkpoint_and_continuation_gate(res)
+            if gate_result is not None:
+                return gate_result
             # Surface the question; interactive prompt or non-interactive
             # exit with EXIT_NEEDS_ANSWERS. On interactive return, the
             # answer is already in st.data['answers'] so the re-spawned
