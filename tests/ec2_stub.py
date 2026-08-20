@@ -57,12 +57,46 @@ Usage:
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 STATE_FILENAME = "state.json"
 LOG_FILENAME = "aws.log"
 
 _EMPTY_STATE = {"instances": {}, "volumes": {}}
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+DEFAULT_LAUNCHER = REPO_ROOT / "leerie"
+
+
+def run_launcher(
+    args: list[str],
+    env: dict,
+    *,
+    launcher: Path = DEFAULT_LAUNCHER,
+    timeout: int = 30,
+    use_bash: bool = False,
+) -> subprocess.CompletedProcess:
+    """Invoke the `leerie` launcher as a subprocess and return the result.
+
+    Single-owner replacement for the near-identical `_run_launcher` helper
+    previously redefined in tests/test_auto_detect_run_runtime.py,
+    tests/test_ec2_launcher_kill.py, and tests/test_ec2_launcher_resume.py
+    (all `subprocess.run([LAUNCHER] + args, env=env, capture_output=True,
+    text=True, timeout=N)`, differing only in the timeout value and
+    whether the launcher is invoked via an explicit `bash` prefix). Not to
+    be confused with tests/test_group_state_dir_guard.py's own
+    `_run_launcher`, which has a materially different signature and
+    purpose (stub-binary injection) and is left untouched.
+    """
+    argv = (["bash", str(launcher)] if use_bash else [str(launcher)]) + args
+    return subprocess.run(
+        argv,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
 
 # The stub script itself. Kept as a single string (rather than importing
 # a shared module at runtime) so the stub has zero dependency on this

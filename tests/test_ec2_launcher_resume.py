@@ -27,7 +27,13 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.ec2_stub import _stub_aws, read_log, read_state, seed_running_instance
+from tests.ec2_stub import (
+    _stub_aws,
+    read_log,
+    read_state,
+    run_launcher as _run_launcher_shared,
+    seed_running_instance,
+)
 from tests.test_ec2_e2e_provision import (
     REQUIRED_PROVISION_ENV,
     extract_ec2_dispatch_block,
@@ -355,10 +361,8 @@ def _paused_ec2_run(state_dir: Path, run_id: str, iid: str) -> None:
         "pause_reason": "user-requested"}))
 
 
-def _run_launcher(args: list[str], env: dict):
-    import subprocess
-    return subprocess.run(["bash", str(LAUNCHER)] + args,
-                          env=env, capture_output=True, text=True, timeout=120)
+def _launcher(args: list[str], env: dict):
+    return _run_launcher_shared(args, env, launcher=LAUNCHER, timeout=120, use_bash=True)
 
 
 def test_real_launcher_promotes_runtime_for_a_paused_ec2_run(tmp_path: Path):
@@ -370,7 +374,7 @@ def test_real_launcher_promotes_runtime_for_a_paused_ec2_run(tmp_path: Path):
     env, state_dir = _seam_env(tmp_path, aws_dir)
     _paused_ec2_run(state_dir, RUN_ID, "i-00000000000000042")
 
-    err = (_run_launcher(["resume", RUN_ID], env).stderr or "")
+    err = (_launcher(["resume", RUN_ID], env).stderr or "")
     assert "promoting --runtime to ec2" in err, (
         "the resume verb must promote RUNTIME=ec2 for a run whose sidecar "
         f"names an instance, so the dispatch block is reachable. stderr:\n{err}")
@@ -383,7 +387,7 @@ def test_real_launcher_no_longer_fails_closed_on_ec2_resume(tmp_path: Path):
     env, state_dir = _seam_env(tmp_path, aws_dir)
     _paused_ec2_run(state_dir, RUN_ID, "i-00000000000000043")
 
-    err = (_run_launcher(["resume", RUN_ID], env).stderr or "")
+    err = (_launcher(["resume", RUN_ID], env).stderr or "")
     assert "does not support EC2 runs yet" not in err, err
 
 
@@ -400,7 +404,7 @@ def test_fly_resume_promotion_is_unchanged(tmp_path: Path):
     (run_dir / "fly-machine.json").write_text(json.dumps(
         {"fly_machine_id": "5683dcd0", "run_id": "fly-run-0001"}))
 
-    err = (_run_launcher(["resume", "fly-run-0001"], env).stderr or "")
+    err = (_launcher(["resume", "fly-run-0001"], env).stderr or "")
     assert "promoting --runtime to fly" in err, err
     assert "promoting --runtime to ec2" not in err, err
 
