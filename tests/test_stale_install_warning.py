@@ -28,6 +28,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_cwd_first_stdout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -58,11 +59,6 @@ _warn_if_leerie_stale || true
 """
 
 
-def _git(cwd, *args):
-    subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                   capture_output=True, text=True)
-
-
 def _write_version(path: Path, version: str) -> None:
     manifest = path / ".claude-plugin"
     manifest.mkdir(parents=True, exist_ok=True)
@@ -75,23 +71,23 @@ def install(tmp_path):
     """An 'origin' at v0.9.102 and an install clone rewound to v0.9.100."""
     origin = tmp_path / "origin"
     origin.mkdir()
-    _git(origin, "init", "-q", "-b", "main")
-    _git(origin, "config", "user.email", "t@example.com")
-    _git(origin, "config", "user.name", "t")
+    run_git_cwd_first_stdout(origin, "init", "-q", "-b", "main")
+    run_git_cwd_first_stdout(origin, "config", "user.email", "t@example.com")
+    run_git_cwd_first_stdout(origin, "config", "user.name", "t")
     _write_version(origin, "0.9.100")
-    _git(origin, "add", "-A")
-    _git(origin, "commit", "-qm", "v0.9.100")
+    run_git_cwd_first_stdout(origin, "add", "-A")
+    run_git_cwd_first_stdout(origin, "commit", "-qm", "v0.9.100")
 
     clone = tmp_path / "install"
     subprocess.run(["git", "clone", "-q", str(origin), str(clone)],
                    check=True, capture_output=True)
-    _git(clone, "config", "user.email", "t@example.com")
-    _git(clone, "config", "user.name", "t")
+    run_git_cwd_first_stdout(clone, "config", "user.email", "t@example.com")
+    run_git_cwd_first_stdout(clone, "config", "user.name", "t")
 
     # origin moves ahead; the clone's cached remote ref stays behind.
     _write_version(origin, "0.9.102")
-    _git(origin, "add", "-A")
-    _git(origin, "commit", "-qm", "v0.9.102")
+    run_git_cwd_first_stdout(origin, "add", "-A")
+    run_git_cwd_first_stdout(origin, "commit", "-qm", "v0.9.102")
 
     state = tmp_path / "state"
     state.mkdir()
@@ -165,8 +161,8 @@ def test_names_the_installed_path_not_the_dev_checkout(install):
 
 
 def test_silent_when_up_to_date(install):
-    _git(install["clone"], "fetch", "-q", "origin")
-    _git(install["clone"], "merge", "-q", "--ff-only", "origin/main")
+    run_git_cwd_first_stdout(install["clone"], "fetch", "-q", "origin")
+    run_git_cwd_first_stdout(install["clone"], "merge", "-q", "--ff-only", "origin/main")
     r = _run(install, version="0.9.102")
     assert "behind" not in r.stderr
     assert r.returncode == 0
@@ -183,14 +179,14 @@ def test_silent_on_a_detached_head(install):
     sha = subprocess.run(
         ["git", "-C", str(install["clone"]), "rev-parse", "HEAD"],
         capture_output=True, text=True, check=True).stdout.strip()
-    _git(install["clone"], "checkout", "-q", sha)
+    run_git_cwd_first_stdout(install["clone"], "checkout", "-q", sha)
     r = _run(install)
     assert "behind" not in r.stderr and r.returncode == 0
 
 
 def test_silent_without_an_upstream(install):
     """A branch with no upstream makes @{upstream} meaningless."""
-    _git(install["clone"], "checkout", "-q", "-b", "local-only")
+    run_git_cwd_first_stdout(install["clone"], "checkout", "-q", "-b", "local-only")
     r = _run(install)
     assert "behind" not in r.stderr and r.returncode == 0
 
@@ -204,7 +200,7 @@ def test_silent_when_not_a_git_checkout(install, tmp_path):
 
 def test_silent_when_the_remote_is_unreachable(install):
     """An offline host must never fail or spam a run."""
-    _git(install["clone"], "remote", "set-url", "origin",
+    run_git_cwd_first_stdout(install["clone"], "remote", "set-url", "origin",
          "/nonexistent/path/to/repo.git")
     r = _run(install)
     assert r.returncode == 0
@@ -283,8 +279,8 @@ def test_falls_back_to_unknown_version_when_upstream_manifest_is_missing(install
     # so `git show @{upstream}:.claude-plugin/plugin.json` fails and `_up_v`
     # is empty.
     (install["origin"] / ".claude-plugin" / "plugin.json").unlink()
-    _git(install["origin"], "add", "-A")
-    _git(install["origin"], "commit", "-qm", "drop manifest")
+    run_git_cwd_first_stdout(install["origin"], "add", "-A")
+    run_git_cwd_first_stdout(install["origin"], "commit", "-qm", "drop manifest")
     r = _run(install)
     assert "behind" in r.stderr
     assert "unknown" in r.stderr

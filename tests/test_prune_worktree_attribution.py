@@ -27,6 +27,7 @@ See docs/POSTMORTEM-2026-08-14.md, F19/F22.
 from __future__ import annotations
 
 import fcntl
+import functools
 import json
 import os
 import subprocess
@@ -34,6 +35,7 @@ import time
 from pathlib import Path
 
 import pytest
+from tests.conftest import run_git_cwd_first_unchecked
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -41,11 +43,10 @@ OLD = time.time() - 60 * 86400
 
 RID = "run-aaa"
 
-
-def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
-                          text=True, check=False,
-                          env={**os.environ, "LC_ALL": "C", "LANGUAGE": ""})
+# Locale-pinned (git's plumbing output must not vary with the host's
+# LC_ALL/LANGUAGE) alias of the shared unchecked cwd-first runner.
+_git = functools.partial(
+    run_git_cwd_first_unchecked, env={**os.environ, "LC_ALL": "C", "LANGUAGE": ""})
 
 
 def _repo(tmp_path: Path) -> Path:

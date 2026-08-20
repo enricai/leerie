@@ -41,6 +41,16 @@ def run_git_cwd_first_stdout(cwd: Path, *args: str) -> str:
     return out.stdout.strip()
 
 
+def run_git_cwd_first_unchecked(
+    cwd: Path, *args: str, env: dict[str, str] | None = None,
+) -> subprocess.CompletedProcess:
+    """`git <args>` run in `cwd`, cwd-first signature, unchecked (`check=False`)
+    so a nonzero rc is returned rather than raised. Several call sites expect
+    a nonzero rc (a refused `-d`, a missing branch) as a normal outcome."""
+    return subprocess.run(["git", *args], cwd=str(cwd), capture_output=True,
+                          text=True, check=False, env=env)
+
+
 def init_git_repo(path: Path) -> Path:
     """Create a minimal git repo at `path` with one commit on `main`."""
     path.mkdir(parents=True, exist_ok=True)

@@ -2,16 +2,15 @@
 in exactly one place: `tests/conftest.py`'s `run_git_repo_first` /
 `run_git_cwd_kw` / `run_git_cwd_first_stdout` / `init_git_repo`.
 
-As of this subtask, ~31 test files still define their own local `_git(...)`
-(three distinct signature families) and ~12 define their own `_init_repo(...)`
-— migrating those call sites is separate, later work (see the subtask's
-`scope_note`). This guard is written now so that once migration subtasks
-land, a test file cannot quietly reintroduce a local reimplementation instead
-of importing the shared helper.
+The `_git(...)` migration (refactor-002/003/004, three distinct signature
+families) is complete; `_init_repo(...)` migration is still in progress —
+migrating those remaining call sites is separate, later work. This guard is
+written so that a test file cannot quietly reintroduce a local
+reimplementation instead of importing the shared helper.
 
-Until migration completes, this test is intentionally scoped to catch NEW
-occurrences without failing on the pre-existing ones: it snapshots the
-currently-known offenders and fails only if a file outside that snapshot
+Until `_init_repo` migration completes, this test is intentionally scoped to
+catch NEW occurrences without failing on the pre-existing ones: it snapshots
+the currently-known offenders and fails only if a file outside that snapshot
 (or `tests/conftest.py` itself) defines `def _git(` or `def _init_repo(`.
 """
 from __future__ import annotations
@@ -27,26 +26,11 @@ _INIT_REPO_DEF_RE = re.compile(r"^\s*def _init_repo\(", re.MULTILINE)
 # Files that pre-date the shared conftest helpers (measured via Grep at the
 # time this guard was written). Migrating each off its local `_git`/
 # `_init_repo` is separate, later work — see this subtask's investigation_notes.
-_KNOWN_GIT_OFFENDERS = {
-    "test_check_rebaser_worktree_state.py",
-    "test_clobbered_owned_files.py",
-    "test_collect_subtrees_sh.py",
-    "test_empty_handoff_keeps_committed_work.py",
-    "test_ensure_planning_worktree.py",
-    "test_host_finalize_rebase.py",
-    "test_mid_run_satisfied_no_commits.py",
-    "test_planning_worktree_script.py",
-    "test_pre_spawn_settle_is_integrable.py",
-    "test_prepush_preflight.py",
-    "test_prune_verb.py",
-    "test_prune_worktree_attribution.py",
-    "test_run_rebaser.py",
-    "test_satisfied_probe_cache_invalidation.py",
-    "test_scan_conflict_markers.py",
-    "test_stale_install_warning.py",
-    "test_work_sentinel.py",
-    "test_worktree_prune_scoping.py",
-}
+#
+# The last batch of local `_git(...)` definitions (refactor-002/003/004)
+# has been migrated, so this set is now empty — every remaining `_git(...)`
+# occurrence is a genuinely new regression, not a pre-existing offender.
+_KNOWN_GIT_OFFENDERS: set[str] = set()
 
 _KNOWN_INIT_REPO_OFFENDERS = {
     "test_check_rebaser_worktree_state.py",
@@ -107,8 +91,18 @@ def test_offender_lists_can_shrink_when_migration_lands() -> None:
     """Anti-vacuity: prove the snapshot lists actually reflect current
     reality, so a file quietly migrating off its local helper is noticed
     (a stale entry doesn't break enforcement, but it does mean the guard
-    has drifted from what it claims to describe)."""
+    has drifted from what it claims to describe).
+
+    The `_git(...)` migration (refactor-002/003/004) is complete, so
+    `_KNOWN_GIT_OFFENDERS` is deliberately empty and `git_hits` is expected
+    to be empty too — asserted via the equality check below rather than a
+    non-empty check, which would now be vacuously false. `_init_repo(...)`
+    migration is not yet complete, so that half still asserts non-empty."""
     git_hits = _files_defining(_GIT_DEF_RE)
     init_hits = _files_defining(_INIT_REPO_DEF_RE)
-    assert git_hits, "expected at least one pre-migration _git(...) definition"
+    assert git_hits == set(), (
+        f"expected zero remaining _git(...) definitions now that migration "
+        f"is complete; found {sorted(git_hits)} — either update "
+        "_KNOWN_GIT_OFFENDERS or migrate these files"
+    )
     assert init_hits, "expected at least one pre-migration _init_repo(...) definition"
