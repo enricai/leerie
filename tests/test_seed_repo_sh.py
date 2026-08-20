@@ -36,6 +36,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.stub_helpers import _make_stub_timeout
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SEED_SH = REPO_ROOT / "scripts" / "remote" / "seed-repo.sh"
 
@@ -155,30 +157,6 @@ esac
 """
     )
     stub_path.chmod(0o755)
-
-
-def _make_stub_timeout(stub_dir: Path) -> None:
-    """Stub `timeout` for hosts where coreutils isn't on /usr/bin.
-
-    lib.sh's wait_for_fly_ssh_ready wraps flyctl in `timeout <secs>`
-    so a stuck WireGuard handshake doesn't hang the seed forever.
-    macOS doesn't ship `timeout` in /usr/bin (it's in
-    coreutils via Homebrew). Tests pin PATH to a controlled set so they
-    don't depend on the host's Homebrew layout; this stub provides
-    `timeout` semantics (run the child, propagate rc, ignore the time
-    cap) good enough for unit tests."""
-    stub = stub_dir / "timeout"
-    stub.write_text(
-        """#!/usr/bin/env bash
-# Stub timeout: skip the time arg(s), exec the rest. Handles both
-#   timeout 8 cmd ...
-#   timeout --kill-after=2 10 cmd ...
-while [[ "$1" == --* ]]; do shift; done
-shift  # discard the seconds arg
-exec "$@"
-"""
-    )
-    stub.chmod(0o755)
 
 
 def test_seed_repo_sh_exists():

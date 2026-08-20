@@ -16,8 +16,9 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-import textwrap
 from pathlib import Path
+
+from tests.stub_helpers import _stub_self_cmd
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -64,24 +65,6 @@ def _fixture_two_run_chain(tmp_path: Path) -> Path:
         "fly_machine_id": NON_CHAIN_RUN,
     })
     return state_dir
-
-
-def _stub_self_cmd(tmp_path: Path) -> tuple[Path, Path]:
-    """Build a stub binary that records its argv. Exposed to the launcher
-    via the ``LEERIE_SELF_CMD`` env override so --chain-id dispatch invokes
-    the stub instead of the real launcher for per-run recursion.
-
-    Returns ``(stub_path, log_path)``.
-    """
-    log = tmp_path / "stub-self.log"
-    stub = tmp_path / "self-stub"
-    stub.write_text(textwrap.dedent(f"""\
-        #!/usr/bin/env bash
-        echo "$@" >> "{log}"
-        exit 0
-        """))
-    stub.chmod(0o755)
-    return stub, log
 
 
 def _run(tmp_path: Path, args: list[str], env_extra: dict | None = None,

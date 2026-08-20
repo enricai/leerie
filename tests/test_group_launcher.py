@@ -18,6 +18,8 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from tests.stub_helpers import _stub_self_cmd
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
@@ -53,19 +55,6 @@ def _write_run(state_dir: Path, run_id: str, fields: dict) -> None:
     rd = state_dir / "runs" / run_id
     rd.mkdir(parents=True)
     (rd / "run.json").write_text(json.dumps(fields))
-
-
-def _stub_self_cmd(tmp_path: Path) -> tuple[Path, Path]:
-    """Stub binary that records its argv to a log and exits 0."""
-    log = tmp_path / "stub-self.log"
-    stub = tmp_path / "self-stub"
-    stub.write_text(textwrap.dedent(f"""\
-        #!/usr/bin/env bash
-        echo "$@" >> "{log}"
-        exit 0
-        """))
-    stub.chmod(0o755)
-    return stub, log
 
 
 def _stub_group_self_cmd(tmp_path: Path) -> tuple[Path, Path]:

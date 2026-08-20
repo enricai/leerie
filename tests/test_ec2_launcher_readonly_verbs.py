@@ -44,7 +44,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from tests.ec2_stub import _STUB_SOURCE, read_log, read_state
+from tests.ec2_stub import _STUB_SOURCE, read_log, read_state, seed_running_instance
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -153,14 +153,6 @@ def _stub_aws_with_ssm(dir: Path) -> Path:
     return stub
 
 
-def _seed_running_instance(aws_dir: Path) -> str:
-    state = read_state(aws_dir)
-    iid = "i-" + format(len(state["instances"]), "017x")
-    state["instances"][iid] = {"state": "running", "public_ip": "203.0.113.20", "status_ok": True}
-    (aws_dir / "state.json").write_text(json.dumps(state))
-    return iid
-
-
 def _seed_stopped_instance(aws_dir: Path) -> str:
     state = read_state(aws_dir)
     iid = "i-" + format(len(state["instances"]), "017x")
@@ -238,7 +230,7 @@ def test_accept_blocked_ec2_autodetects_runtime_not_local(tmp_path: Path) -> Non
     and fail with a 'local' error message rather than an EC2 one."""
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
@@ -261,7 +253,7 @@ def test_accept_blocked_ec2_writes_accept_record(tmp_path: Path) -> None:
     prove the mirror step runs) reflects the same mutation afterward."""
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
@@ -287,7 +279,7 @@ def test_accept_blocked_ec2_explicit_runtime_flag_accepted(tmp_path: Path) -> No
     by the pre-fix fly|local-only check (leerie:1321 pre-fix)."""
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
@@ -347,7 +339,7 @@ def test_accept_blocked_ec2_already_running_not_paused_afterward(tmp_path: Path)
     _ab_started_machine conditional."""
     aws_dir = tmp_path / "bin"
     _stub_aws_with_ssm(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID

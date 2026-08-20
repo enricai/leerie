@@ -40,27 +40,12 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.ec2_stub import _stub_aws, read_state
+from tests.ec2_stub import _stub_aws, read_state, seed_running_instance
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
 RUN_ID = "ec2-run-0001"
-
-
-def _seed_running_instance(aws_dir: Path) -> str:
-    """Directly seed a `running` instance in the stub's state.json,
-    bypassing `run-instances` — this file only exercises the launcher's
-    `stop` dispatch, not provisioning (covered by
-    tests/test_ec2_provision.py)."""
-    state = read_state(aws_dir)
-    iid = "i-" + format(len(state["instances"]), "017x")
-    state["instances"][iid] = {
-        "state": "running",
-        "public_ip": "203.0.113.20",
-    }
-    (aws_dir / "state.json").write_text(json.dumps(state))
-    return iid
 
 
 def _write_ec2_sidecar(run_dir: Path, run_id: str, instance_id: str) -> None:
@@ -109,7 +94,7 @@ def test_stop_ec2_run_stops_instance_and_writes_sidecar(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
@@ -135,7 +120,7 @@ def test_stop_ec2_run_explicit_runtime_flag(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
@@ -153,7 +138,7 @@ def test_stop_ec2_run_does_not_terminate_instance(tmp_path: Path) -> None:
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
@@ -236,7 +221,7 @@ def test_stop_ec2_run_credential_failure_does_not_call_stop_instances(tmp_path: 
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID

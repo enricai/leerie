@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from tests.stub_helpers import _entry_sh_rootful_block
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = REPO_ROOT / "Dockerfile"
 ENTRY_SH = REPO_ROOT / "scripts" / "container-entry.sh"
@@ -23,14 +25,6 @@ def _dockerfile_home_leerie_block() -> str:
     end_marker = "chmod 700 /home/leerie/.gnupg"
     start = text.index(marker)
     end = text.index(end_marker, start) + len(end_marker)
-    return text[start:end]
-
-
-def _entry_sh_rootful_block() -> str:
-    text = ENTRY_SH.read_text()
-    marker = 'if [ "$ROOTLESS" != "true" ] && getent passwd leerie'
-    start = text.index(marker)
-    end = text.index("\nfi", start)
     return text[start:end]
 
 
