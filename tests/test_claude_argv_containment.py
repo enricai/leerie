@@ -255,6 +255,10 @@ def _worker_argv(leerie, monkeypatch) -> list[str]:
     st = SimpleNamespace(
         path=Path("/tmp/leerie-test-nonexistent/state.json"),
         run_dir=Path("/tmp/leerie-test-nonexistent"),
+        # `repo_root` is real, not decorative: claude_p derives the
+        # path-scoped write denial from it (`_repo_write_denials`). An
+        # under-specified stub here hides that producer-side contract.
+        repo_root=Path("/work"),
         data={"verbosity": "quiet"}, run_id="r1",
         bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None,
@@ -266,8 +270,14 @@ def _worker_argv(leerie, monkeypatch) -> list[str]:
     # session-scoped `leerie` fixture shares with every other test.
     monkeypatch.setattr(
         leerie, "_append_system_prompt_file_supported", lambda: False)
+    # cwd is a disposable worktree, never `repo_root` — a judgment worker
+    # handed the real checkout is refused outright (DESIGN §12). Before this
+    # stub carried `repo_root`, that guard's `except Exception` swallowed the
+    # AttributeError and the check was silently inert here.
     asyncio.run(leerie.claude_p(
-        "u", "s", schema_key="classifier", cwd="/work", allowed_tools="Read",
+        "u", "s", schema_key="classifier",
+        cwd="/leerie-state/runs/r1/worktrees/planning",
+        allowed_tools="Read",
         max_turns=40, autonomous=False, caps=dict(leerie.DEFAULT_CAPS),
         st=st, model="sonnet", sid="argv-test"))
     return captured["cmd"]
@@ -312,9 +322,16 @@ def test_both_sites_share_the_builder(leerie, monkeypatch, tmp_path):
     smoke = _smoke_argv(leerie, monkeypatch, tmp_path)
     assert "--strict-mcp-config" in worker, worker
     assert "--strict-mcp-config" in smoke, smoke
-    for argv in (worker, smoke):
-        assert argv[argv.index("--disallowedTools") + 1] == \
-            leerie.DISALLOWED_TOOLS
+    # The smoke test has no run and no checkout to guard, so it carries the
+    # bare constant. A worker additionally carries the repo-scoped write
+    # denial — the only permission control that survives
+    # --dangerously-skip-permissions (DESIGN §12 L1 is unavailable to acting
+    # workers). Asserting the exact strings, not a substring, so neither site
+    # can drift into carrying the other's list.
+    assert smoke[smoke.index("--disallowedTools") + 1] == \
+        leerie.DISALLOWED_TOOLS
+    assert worker[worker.index("--disallowedTools") + 1] == \
+        leerie.DISALLOWED_TOOLS + ",Edit(//work/**)"
 
     # (b) break the single owner — BOTH must lose it. A site that rebuilt its
     #     own argv would keep the flag here and fail.

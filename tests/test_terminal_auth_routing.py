@@ -65,6 +65,10 @@ class _FakeState:
     def __init__(self, tmp_path):
         self.path = tmp_path / "runs" / "r1" / "state.json"
         self.run_dir = self.path.parent
+        # claude_p derives the checkout write-denial from this
+        # (_repo_write_denials) and the §12 cwd guard compares against it;
+        # a stub without it silently disables both.
+        self.repo_root = "/leerie-test-user-repo"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.run_id = "r1"
         self.data = {"verbosity": "quiet"}

@@ -238,6 +238,10 @@ def test_gate_actually_synthesises_the_subtask_end_to_end(leerie, tmp_path,
                 "worker_count": 0,
             }
             self.run_dir = hp
+            # claude_p derives the checkout write-denial from this
+            # (_repo_write_denials) and the §12 cwd guard compares against it;
+            # a stub without it silently disables both.
+            self.repo_root = "/leerie-test-user-repo"
         def save(self):
             pass
         def bump_workers(self, caps):

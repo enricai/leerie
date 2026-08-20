@@ -71,6 +71,10 @@ def _build_cmd(leerie, user_prompt: str, extra_user: str = "") -> list[str]:
     st = types.SimpleNamespace(
         path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
         run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        # claude_p derives the checkout write-denial from this
+        # (_repo_write_denials) and the §12 cwd guard compares against it;
+        # a stub without it silently disables both.
+        repo_root="/leerie-test-user-repo",
         data={"verbosity": "quiet"}, run_id="r1",
         bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None,
@@ -194,6 +198,10 @@ def test_retry_note_reaches_stdin_not_argv(leerie):
     st = types.SimpleNamespace(
         path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
         run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        # claude_p derives the checkout write-denial from this
+        # (_repo_write_denials) and the §12 cwd guard compares against it;
+        # a stub without it silently disables both.
+        repo_root="/leerie-test-user-repo",
         data={"verbosity": "quiet"}, run_id="r1",
         bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None,

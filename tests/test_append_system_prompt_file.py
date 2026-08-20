@@ -134,6 +134,10 @@ def _make_state():
     return types.SimpleNamespace(
         path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
         run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
+        # claude_p derives the checkout write-denial from this
+        # (_repo_write_denials) and the §12 cwd guard compares against it;
+        # a stub without it silently disables both.
+        repo_root=pathlib.Path("/leerie-test-user-repo"),
         data={"verbosity": "quiet"}, run_id="r1",
         bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None,

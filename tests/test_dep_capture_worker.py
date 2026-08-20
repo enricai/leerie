@@ -72,6 +72,11 @@ def _make_state(leerie, run_dir: Path) -> object:
     own class is used, but __init__'s flock acquisition is bypassed.
     """
     st = leerie.State.__new__(leerie.State)
+    # claude_p derives the checkout write-denial from this
+    # (_repo_write_denials); State.__new__ skips __init__, so it
+    # must be set explicitly or both that and the §12 cwd guard
+    # silently no-op.
+    st.repo_root = "/leerie-test-user-repo"
     st.run_id = "test-dep-capture"
     st.run_dir = run_dir
     st.path = run_dir / "state.json"

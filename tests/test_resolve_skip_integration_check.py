@@ -85,6 +85,11 @@ def test_env_garbage_dies(leerie, repo_root, monkeypatch):
 
 def _state(leerie, tmp_path):
     st = leerie.State.__new__(leerie.State)
+    # claude_p derives the checkout write-denial from this
+    # (_repo_write_denials); State.__new__ skips __init__, so it
+    # must be set explicitly or both that and the §12 cwd guard
+    # silently no-op.
+    st.repo_root = "/leerie-test-user-repo"
     st.data = {}
     st.run_dir = tmp_path
     st.save = lambda: None

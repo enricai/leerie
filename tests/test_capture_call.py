@@ -26,6 +26,11 @@ import pytest
 def _make_state(leerie, run_dir: Path):
     """Minimal State-alike enough for claude_p to write the capture file."""
     st = leerie.State.__new__(leerie.State)
+    # claude_p derives the checkout write-denial from this
+    # (_repo_write_denials); State.__new__ skips __init__, so it
+    # must be set explicitly or both that and the §12 cwd guard
+    # silently no-op.
+    st.repo_root = "/leerie-test-user-repo"
     st.run_id = "test-run-001"
     st.run_dir = run_dir
     st.path = run_dir / "state.json"

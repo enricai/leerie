@@ -7402,7 +7402,9 @@ catalogued in `IMPLEMENTATION.md`.
 
 Judgment workers (`PLANNING_WORKER_TYPES`: classifier, planner, reconciler,
 the judges, provision, the satisfied-probe) are kept away from the user's
-checkout by **four layers**, in order of how much each actually buys.
+checkout by **four layers**, in order of how much each actually buys. Acting
+workers get only one of those four and cannot be given L1 at all;
+*Acting-worker isolation* below covers what holds them instead.
 
 This used to be one layer, and it failed. The old guarantee read "judgment
 workers cannot mutate state because they run in the real repo cwd *without*
@@ -7490,6 +7492,90 @@ untracked parallel work or set timers the orchestrator cannot track: `Agent`,
 tools (`ListMcpResourcesTool`, `ReadMcpResourceTool`, `ReadMcpResourceDirTool`). This
 is the §12-correct direction: a mechanical code-side deny that survives the permission
 escape hatch.
+
+#### Acting-worker isolation — the same deny, scoped to a path
+
+L1–L4 above are scoped to `PLANNING_WORKER_TYPES`. Acting workers
+(implementer, conformer, integrator, rebaser) get **only L2**, and this
+section already states what that is worth: *L2 is worth nothing without L1*.
+They cannot be given L1 — writing files unprompted is the job — so
+`claude_p` appends `--dangerously-skip-permissions` on `autonomous` alone,
+and the working-directory boundary is gone for the whole execute phase.
+
+Measured, by parsing `tool_use` blocks out of every run log in the state
+root: **146 `Edit`/`Write` calls whose `file_path` was under the user's real
+checkout, across 36 runs, 4 repos and 13 leerie versions** — 8.8% of the 411
+runs then present, leerie's own checkout among them. (Measured 2026-08-20
+across every state dir; the corpus grows with every run, so this is a dated
+measurement rather than a constant.) The judgment-worker share of that
+(`classifier` ×11, `planner-*` ×11) stops dead at 0.25.0, which is the
+evidence L1 works; the acting-worker share does not.
+
+The fix reuses the insight already stated above — deny rules survive the
+bypass — but scoped to a path rather than a bare tool name.
+`_repo_write_denials(repo_root)` renders `Edit(//<root>/**)`, where `//` is
+the CLI's anchor for an absolute filesystem path, and `claude_p` appends it
+to `DISALLOWED_TOOLS` per call. It is derived from `repo_root` rather than
+hard-coding `/work`, so it cannot silently guard nothing if the mount moves.
+
+Probed live (claude 2.1.237, cwd a worktree, flag ON, ground truth from the
+filesystem — same methodology as the L1 table):
+
+| configuration | write outside cwd | write inside cwd |
+|---|---|---|
+| no path deny | succeeded | succeeded |
+| `Edit(//<root>/**)` denied | **rejected** | succeeded |
+
+The second column is load-bearing: containment that also broke a worker's own
+worktree would be useless. `Edit(...)` subsumes `Write`, `NotebookEdit` and
+`MultiEdit`, and the same probe showed it also covering `sed -i` — the CLI
+models that as an edit.
+
+**The residual, measured rather than assumed.** With the rule in place, a
+shell redirect, `rm -f`, `touch` and `mkdir -p` all still wrote to the denied
+path; Bash is not covered by a file-tool deny. The corpus shows this is not
+hypothetical — 48 Bash commands writing directly to a `/work` path across 22
+runs, and 1,328 `cd /work` invocations across 87 runs, including 16 dependency
+installs and 105 build/test runs inside the user's checkout (measured
+2026-08-20 across every state dir). So **L4 now runs during execute too**,
+after every wave, closing the phase that previously had no check at all.
+
+The execute-phase call passes `porcelain_only`, dropping the HEAD and ref
+comparisons. Planning phases take minutes; the execute phase runs for hours
+(p90 285 min, n=87), and an operator legitimately pulls their own checkout
+mid-run. `HEAD moved` would then be a correct observation about an innocent
+act, and killing a five-hour run over it is worse than the escape — a guard
+that cries wolf gets switched off. File mutation is the damage class that
+matters.
+
+Its own blind spot, stated rather than assumed away: `git status --porcelain`
+never lists gitignored paths, so the in-checkout `node_modules/` installs
+above remain invisible to it. Closing that needs the motive fixed — workers
+reach into `/work` because their worktree has no dependencies — not a wider
+guard.
+
+**Two further non-coverages, recorded for the same reason.**
+
+*The denial is skipped when run state lives inside the checkout.*
+`resolve_leerie_root` falls back to `repo_root / ".leerie"` whenever
+`LEERIE_STATE_DIR` is unset — the direct-invocation and test path; the
+launcher always sets `/leerie-state`. Worker worktrees then sit *inside* the
+checkout, and a blanket deny under it would deny each worker its own worktree,
+failing every implementer silently. A deny rule cannot carry a carve-out (deny
+wins in every mode, and allow rules are inert under the bypass), so
+`_repo_write_denials` returns `""` in that layout and `log()`s once saying so.
+Silence there would be the worse failure: an operator would believe acting
+workers are confined when they are not.
+
+*The remote integrator does not carry it.* `scripts/remote/collect-subtrees.sh`
+invokes `claude -p` directly from bash — it cannot import the orchestrator, so
+it carries its own duplicated deny list, the same reason it embeds a copy of
+`SCHEMAS["integrator"]`. It is sourced only on the flyctl transport path, where
+`/work` is a *seeded copy* of the developer's tree rather than the developer's
+checkout, so the blast radius is the machine and the branch it pushes, not the
+laptop. Adding the rule there means a third copy of a value the orchestrator
+owns; the schema duplication next door has already drifted in production once,
+which is the argument against a fourth.
 
 `Task` is the live CLI's name for subagent spawning; `Agent` is the retired one, so
 until `Task` was added the "no subagent spawning" constraint (§2, Constraint 1) was
