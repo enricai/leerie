@@ -29252,6 +29252,31 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
     subtask_path = leerie_dir / "subtasks" / f"{sid}.json"
     subtask = json.loads(subtask_path.read_text()) if subtask_path.exists() else {}
 
+    def _checkpoint_and_continuation_gate(res: dict) -> dict | None:
+        """Shared by the `incomplete-handoff` and `needs-clarification`
+        branches: validate the checkpoint, then enforce the continuation
+        cap. Returns a terminal blocked-result dict if either gate fails
+        (checkpoint invalid, or continuation cap exceeded), or None if the
+        caller should proceed (continuations has already been incremented
+        here on the success path)."""
+        nonlocal continuations
+        wt_root = leerie_dir / "worktrees" / sid
+        cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
+                                     worktree_root=wt_root)
+        if cp_err:
+            log(f"  bad checkpoint for {sid}: {cp_err}")
+            return {"subtask_id": sid, "status": "blocked",
+                    "blocker": f"checkpoint invalid: {cp_err}",
+                    "summary": cp_err}
+        continuations += 1
+        if continuations > caps["subtask_continuations"]:
+            return {"subtask_id": sid, "status": "blocked",
+                    "blocker": ("exceeded subtask continuation cap — "
+                                "subtask is mis-scoped and needs "
+                                "re-decomposition"),
+                    "summary": "subtask continuation cap exceeded"}
+        return None
+
     async def fail(kind: str, reason: str) -> dict | None:
         """Record a failed attempt. `kind` is the structured discriminator
         `_retryable_failure` dispatches on (see `_RETRYABLE_FAILURE_KINDS`);
@@ -29769,21 +29794,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # `## Files touched` validates paths against this directory;
             # if it no longer exists (e.g. cleanup ran early), the check
             # is skipped gracefully.
-            wt_root = leerie_dir / "worktrees" / sid
-            cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
-                                         worktree_root=wt_root)
-            if cp_err:
-                log(f"  bad checkpoint for {sid}: {cp_err}")
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": f"checkpoint invalid: {cp_err}",
-                        "summary": cp_err}
-            continuations += 1
-            if continuations > caps["subtask_continuations"]:
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": ("exceeded subtask continuation cap — "
-                                    "subtask is mis-scoped and needs "
-                                    "re-decomposition"),
-                        "summary": "subtask continuation cap exceeded"}
+            gate_result = _checkpoint_and_continuation_gate(res)
+            if gate_result is not None:
+                return gate_result
             continuation, note = True, ""
             continue
 
@@ -29795,21 +29808,9 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # the user's answer. Consumes from the same
             # subtask_continuations budget — there is no extra "ask the
             # user" allowance.
-            wt_root = leerie_dir / "worktrees" / sid
-            cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
-                                         worktree_root=wt_root)
-            if cp_err:
-                log(f"  bad checkpoint for {sid}: {cp_err}")
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": f"checkpoint invalid: {cp_err}",
-                        "summary": cp_err}
-            continuations += 1
-            if continuations > caps["subtask_continuations"]:
-                return {"subtask_id": sid, "status": "blocked",
-                        "blocker": ("exceeded subtask continuation cap — "
-                                    "subtask is mis-scoped and needs "
-                                    "re-decomposition"),
-                        "summary": "subtask continuation cap exceeded"}
+            gate_result = _checkpoint_and_continuation_gate(res)
+            if gate_result is not None:
+                return gate_result
             # Surface the question; interactive prompt or non-interactive
             # exit with EXIT_NEEDS_ANSWERS. On interactive return, the
             # answer is already in st.data['answers'] so the re-spawned
