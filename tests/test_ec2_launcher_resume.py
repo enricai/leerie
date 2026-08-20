@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from tests.ec2_stub import _stub_aws, read_log, read_state
+from tests.ec2_stub import _stub_aws, read_log, read_state, seed_running_instance
 from tests.test_ec2_e2e_provision import (
     REQUIRED_PROVISION_ENV,
     extract_ec2_dispatch_block,
@@ -69,19 +69,6 @@ def _seed_stopped_instance(aws_dir: Path, *, status_ok: bool = True,
         "_ip_gen": 1,
         "public_ip": public_ip,
         "status_ok": status_ok,
-    }
-    (aws_dir / "state.json").write_text(json.dumps(state))
-    return iid
-
-
-def _seed_running_instance(aws_dir: Path, *, public_ip: str = "203.0.113.20") -> str:
-    state = read_state(aws_dir)
-    iid = "i-" + format(len(state["instances"]), "017x")
-    state["instances"][iid] = {
-        "state": "running",
-        "_ip_gen": 1,
-        "public_ip": public_ip,
-        "status_ok": True,
     }
     (aws_dir / "state.json").write_text(json.dumps(state))
     return iid
@@ -237,7 +224,7 @@ def test_resume_on_already_running_instance_is_noop(tmp_path):
     aws_dir = tmp_path / "bin"
     env, state_dir = _resume_env(aws_dir, RUN_ID)
     _stub_aws(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir, ip_gen=1)
     _write_ec2_sidecar(state_dir, RUN_ID, iid)
 
     result = run_ec2_dispatch(env)

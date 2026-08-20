@@ -40,7 +40,7 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.ec2_stub import leaked_resources, read_log, read_state
+from tests.ec2_stub import leaked_resources, read_log, read_state, seed_running_instance
 from tests.test_ec2_fetch_branch import (
     _init_instance_repo_with_run,
     _make_git_repo,
@@ -128,21 +128,6 @@ def _read_flyctl_log(bin_dir: Path) -> list[str]:
     return [l for l in log.read_text().splitlines() if l]
 
 
-def _seed_running_instance(aws_dir: Path, *, public_ip: str = "203.0.113.11") -> str:
-    """Seed the stub's state with one already-`running` instance (as if
-    a prior `provision_instance()` call had created it) without paying
-    for a real run-instances round trip."""
-    state = json.loads((aws_dir / "state.json").read_text())
-    state["instances"][INSTANCE_ID] = {
-        "state": "running",
-        "_ip_gen": 1,
-        "public_ip": public_ip,
-        "status_ok": True,
-    }
-    (aws_dir / "state.json").write_text(json.dumps(state))
-    return INSTANCE_ID
-
-
 def _make_run_dir(state_dir: Path, run_id: str, *, instance_id: str = INSTANCE_ID,
                    on_run_json: bool = True) -> Path:
     run_dir = state_dir / "runs" / run_id
@@ -184,7 +169,8 @@ def _setup_fixture(tmp_path: Path, *, with_completed_run: bool = True):
 
     state_dir = tmp_path / "state"
     run_dir = _make_run_dir(state_dir, "r1")
-    instance_id = _seed_running_instance(bin_dir)
+    instance_id = seed_running_instance(
+        bin_dir, instance_id=INSTANCE_ID, public_ip="203.0.113.11", ip_gen=1)
 
     home = tmp_path / "home"
     home.mkdir()
