@@ -410,6 +410,105 @@ def leaked_resources(state: dict) -> dict:
     }
 
 
+def write_ec2_sidecar(
+    run_dir: Path,
+    run_id: str,
+    instance_id: str,
+    *,
+    with_host_state: dict | None = None,
+    paused_at: str | None = None,
+    pause_reason: str | None = None,
+) -> Path:
+    """Write an `ec2-instance.json` + `run.json` sidecar pair into `run_dir`.
+
+    Consolidates the four near-identical `_write_ec2_sidecar` copies
+    previously redefined in test_ec2_bash32_portability.py,
+    test_ec2_launcher_readonly_verbs.py, test_ec2_launcher_resume.py, and
+    test_ec2_launcher_stop.py — single-owner discipline, same precedent as
+    the state-machine stub above. `paused_at`/`pause_reason` are omitted
+    from `run.json` unless given (most callers want a live, unpaused run);
+    `with_host_state`, when given, additionally writes it as `state.json`
+    (the readonly-verbs file's mirror-step fixture). Returns `run_dir`.
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "ec2-instance.json").write_text(json.dumps({
+        "ec2_instance_id": instance_id,
+        "region": "us-east-1",
+        "started_at": "2026-07-01T00:00:00+00:00",
+        "run_id": run_id,
+        "launcher_pid": 12345,
+    }))
+    run_json: dict = {
+        "run_id": run_id,
+        "branch": f"leerie/runs/{run_id}",
+        "ec2_instance_id": instance_id,
+    }
+    if paused_at is not None:
+        run_json["paused_at"] = paused_at
+    if pause_reason is not None:
+        run_json["pause_reason"] = pause_reason
+    (run_dir / "run.json").write_text(json.dumps(run_json))
+    if with_host_state is not None:
+        (run_dir / "state.json").write_text(json.dumps(with_host_state))
+    return run_dir
+
+
+# --- Shared launcher-env builder -------------------------------------------
+#
+# tests/test_ec2_launcher_readonly_verbs.py and
+# tests/test_ec2_launcher_stop.py each defined a near-identical `_env(tmp_path,
+# aws_dir)` building the minimal PATH/USER_REPO/LEERIE_REPO/HOME/
+# LEERIE_STATE_HOST_DIR/LEERIE_STATE_DIR/AWS_* env dict a `leerie` launcher
+# subprocess invocation needs against the stubbed `aws` binary. They diverged
+# only in extras: readonly_verbs.py additionally creates a `remote-work` dir
+# and returns it as a 3-tuple `(env, state_dir, work_dest)`; stop.py accepts
+# an optional pre-built `home` Path and returns a 2-tuple `(env, state_dir)`.
+# Single-owner discipline (same precedent as the state-machine stub above):
+# one parameterized version here, reconciled via optional params the way
+# `write_ec2_sidecar` reconciles its callers' divergent optional params.
+
+
+def build_ec2_launcher_env(
+    tmp_path: Path,
+    aws_dir: Path,
+    *,
+    home: Path | None = None,
+    with_work_dest: bool = False,
+) -> tuple[dict, Path] | tuple[dict, Path, Path]:
+    """Build the minimal env dict for a `leerie` launcher subprocess run
+    against a stubbed `aws` binary.
+
+    Returns `(env, state_dir)` by default, or `(env, state_dir, work_dest)`
+    when `with_work_dest=True` — mirroring the two callers' original
+    2-tuple/3-tuple return shapes so each keeps its own unpacking. `home`,
+    when given, is used as-is instead of creating a fresh `tmp_path/"home"`
+    dir (test_ec2_launcher_stop.py's isolation-guard test needs a home dir
+    it controls independently).
+    """
+    state_dir = tmp_path / ".leerie" / "myrepo"
+    if home is None:
+        home = tmp_path / "home"
+        home.mkdir(parents=True, exist_ok=True)
+    env = {
+        "PATH": f"{aws_dir}:/usr/bin:/bin",
+        "USER_REPO": str(tmp_path),
+        "LEERIE_REPO": str(REPO_ROOT),
+        "HOME": str(home),
+        "LEERIE_STATE_HOST_DIR": str(state_dir),
+        "LEERIE_STATE_DIR": str(state_dir),
+        "AWS_ACCESS_KEY_ID": "AKIASTUBFIXTURE",
+        "AWS_SECRET_ACCESS_KEY": "stubfixturesecret",
+        "AWS_REGION": "us-east-1",
+    }
+    if not with_work_dest:
+        return env, state_dir
+    work_dest = tmp_path / "remote-work"
+    work_dest.mkdir(parents=True, exist_ok=True)
+    env["LEERIE_TEST_WORK_DEST"] = str(work_dest)
+    return env, state_dir, work_dest
+
+
 # --- Shared SSM-exec-decode `aws`/`ssh` stub builders ---------------------
 #
 # tests/test_ec2_seed_repo.py, tests/test_ec2_fetch_branch.py, and

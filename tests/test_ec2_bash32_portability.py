@@ -40,13 +40,12 @@ it is a macOS-developer guard, never a CI flake.
 """
 from __future__ import annotations
 
-import json
 import subprocess
 from pathlib import Path
 
 import pytest
 
-from tests.ec2_stub import _stub_aws, seed_running_instance
+from tests.ec2_stub import _stub_aws, seed_running_instance, write_ec2_sidecar
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts" / "remote"
@@ -286,22 +285,6 @@ def _launcher_env(tmp_path: Path, aws_dir: Path) -> tuple[dict, Path]:
     return env, state_dir
 
 
-def _write_ec2_sidecar(run_dir: Path, run_id: str, instance_id: str) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "ec2-instance.json").write_text(json.dumps({
-        "ec2_instance_id": instance_id,
-        "region": "us-east-1",
-        "started_at": "2026-07-01T00:00:00+00:00",
-        "run_id": run_id,
-        "launcher_pid": 12345,
-    }))
-    (run_dir / "run.json").write_text(json.dumps({
-        "run_id": run_id,
-        "branch": f"leerie/runs/{run_id}",
-        "ec2_instance_id": instance_id,
-    }))
-
-
 def _run_launcher_under_bash32(args: list[str], env: dict) -> subprocess.CompletedProcess:
     return subprocess.run(
         [str(SYSTEM_BASH), str(LAUNCHER)] + args,
@@ -347,7 +330,7 @@ def test_ec2_launcher_verb_runs_cleanly_under_bash32(verb_args, tmp_path):
 
     env, state_dir = _launcher_env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
 
     result = _run_launcher_under_bash32(verb_args, env)
     combined = result.stdout + result.stderr
