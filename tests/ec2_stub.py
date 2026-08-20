@@ -410,6 +410,50 @@ def leaked_resources(state: dict) -> dict:
     }
 
 
+def write_ec2_sidecar(
+    run_dir: Path,
+    run_id: str,
+    instance_id: str,
+    *,
+    with_host_state: dict | None = None,
+    paused_at: str | None = None,
+    pause_reason: str | None = None,
+) -> Path:
+    """Write an `ec2-instance.json` + `run.json` sidecar pair into `run_dir`.
+
+    Consolidates the four near-identical `_write_ec2_sidecar` copies
+    previously redefined in test_ec2_bash32_portability.py,
+    test_ec2_launcher_readonly_verbs.py, test_ec2_launcher_resume.py, and
+    test_ec2_launcher_stop.py — single-owner discipline, same precedent as
+    the state-machine stub above. `paused_at`/`pause_reason` are omitted
+    from `run.json` unless given (most callers want a live, unpaused run);
+    `with_host_state`, when given, additionally writes it as `state.json`
+    (the readonly-verbs file's mirror-step fixture). Returns `run_dir`.
+    """
+    run_dir = Path(run_dir)
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "ec2-instance.json").write_text(json.dumps({
+        "ec2_instance_id": instance_id,
+        "region": "us-east-1",
+        "started_at": "2026-07-01T00:00:00+00:00",
+        "run_id": run_id,
+        "launcher_pid": 12345,
+    }))
+    run_json: dict = {
+        "run_id": run_id,
+        "branch": f"leerie/runs/{run_id}",
+        "ec2_instance_id": instance_id,
+    }
+    if paused_at is not None:
+        run_json["paused_at"] = paused_at
+    if pause_reason is not None:
+        run_json["pause_reason"] = pause_reason
+    (run_dir / "run.json").write_text(json.dumps(run_json))
+    if with_host_state is not None:
+        (run_dir / "state.json").write_text(json.dumps(with_host_state))
+    return run_dir
+
+
 # --- Shared SSM-exec-decode `aws`/`ssh` stub builders ---------------------
 #
 # tests/test_ec2_seed_repo.py, tests/test_ec2_fetch_branch.py, and

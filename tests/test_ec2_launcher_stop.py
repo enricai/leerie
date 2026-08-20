@@ -40,28 +40,12 @@ import os
 import subprocess
 from pathlib import Path
 
-from tests.ec2_stub import _stub_aws, read_state, seed_running_instance
+from tests.ec2_stub import _stub_aws, read_state, seed_running_instance, write_ec2_sidecar
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
 RUN_ID = "ec2-run-0001"
-
-
-def _write_ec2_sidecar(run_dir: Path, run_id: str, instance_id: str) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "ec2-instance.json").write_text(json.dumps({
-        "ec2_instance_id": instance_id,
-        "region": "us-east-1",
-        "started_at": "2026-07-01T00:00:00+00:00",
-        "run_id": run_id,
-        "launcher_pid": 12345,
-    }))
-    (run_dir / "run.json").write_text(json.dumps({
-        "run_id": run_id,
-        "branch": f"leerie/runs/{run_id}",
-        "ec2_instance_id": instance_id,
-    }))
 
 
 def _env(tmp_path: Path, aws_dir: Path, *, home: Path | None = None) -> dict:
@@ -98,7 +82,7 @@ def test_stop_ec2_run_stops_instance_and_writes_sidecar(tmp_path: Path) -> None:
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
 
     result = _run(tmp_path, ["stop", RUN_ID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -124,7 +108,7 @@ def test_stop_ec2_run_explicit_runtime_flag(tmp_path: Path) -> None:
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
 
     result = _run(tmp_path, ["stop", RUN_ID, "--runtime", "ec2"], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -142,7 +126,7 @@ def test_stop_ec2_run_does_not_terminate_instance(tmp_path: Path) -> None:
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
 
     result = _run(tmp_path, ["stop", RUN_ID], env)
     assert result.returncode == 0, f"stdout: {result.stdout}\nstderr: {result.stderr}"
@@ -225,7 +209,7 @@ def test_stop_ec2_run_credential_failure_does_not_call_stop_instances(tmp_path: 
 
     env, state_dir = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
     # No $HOME/.aws and no AWS_* env vars → resolve_aws_credentials fails
     # closed before require_aws's own probe is ever reached.
     env.pop("AWS_ACCESS_KEY_ID", None)

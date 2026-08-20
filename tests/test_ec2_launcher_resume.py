@@ -33,6 +33,7 @@ from tests.ec2_stub import (
     read_state,
     run_launcher as _run_launcher_shared,
     seed_running_instance,
+    write_ec2_sidecar as _write_ec2_sidecar_shared,
 )
 from tests.test_ec2_e2e_provision import (
     REQUIRED_PROVISION_ENV,
@@ -80,26 +81,24 @@ def _seed_stopped_instance(aws_dir: Path, *, status_ok: bool = True,
     return iid
 
 
-def _write_ec2_sidecar(state_dir: Path, run_id: str, instance_id: str,
-                        *, paused_at: str = "2026-07-15T00:00:00+00:00",
-                        pause_reason: str = "user-requested") -> Path:
-    run_dir = state_dir / "runs" / run_id
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "ec2-instance.json").write_text(json.dumps({
-        "ec2_instance_id": instance_id,
-        "region": "us-east-1",
-        "started_at": "2026-07-01T00:00:00+00:00",
-        "run_id": run_id,
-        "launcher_pid": 12345,
-    }))
-    (run_dir / "run.json").write_text(json.dumps({
-        "run_id": run_id,
-        "branch": f"leerie/runs/{run_id}",
-        "ec2_instance_id": instance_id,
-        "paused_at": paused_at,
-        "pause_reason": pause_reason,
-    }))
-    return run_dir
+# Defaults every call site below relies on (every other consumer of the
+# shared helper wants paused_at/pause_reason omitted, so the shared
+# helper's own defaults are None/None; this file supplies its own).
+_DEFAULT_PAUSED_AT = "2026-07-15T00:00:00+00:00"
+_DEFAULT_PAUSE_REASON = "user-requested"
+
+
+def _sidecar(state_dir: Path, run_id: str, instance_id: str,
+             *, paused_at: str = _DEFAULT_PAUSED_AT,
+             pause_reason: str = _DEFAULT_PAUSE_REASON) -> Path:
+    """State-dir-relative convenience shim over the shared
+    `ec2_stub.write_ec2_sidecar` (which takes `run_dir` directly) — this
+    file's callers pass the state dir, not the run dir, and always want
+    paused_at/pause_reason populated."""
+    return _write_ec2_sidecar_shared(
+        state_dir / "runs" / run_id, run_id, instance_id,
+        paused_at=paused_at, pause_reason=pause_reason,
+    )
 
 
 def _resume_env(aws_dir: Path, run_id: str) -> tuple[dict, Path]:
@@ -141,7 +140,7 @@ def test_resume_stopped_instance_reaches_running_with_one_start_call(tmp_path):
     env, state_dir = _resume_env(aws_dir, RUN_ID)
     _stub_aws(aws_dir)
     iid = _seed_stopped_instance(aws_dir)
-    _write_ec2_sidecar(state_dir, RUN_ID, iid)
+    _sidecar(state_dir, RUN_ID, iid)
 
     result = run_ec2_dispatch(env)
     assert result.returncode == 130, (
@@ -176,7 +175,7 @@ def test_resume_reresolves_ssh_target_to_new_public_ip(tmp_path):
     _stub_aws(aws_dir)
     old_ip = "203.0.113.11"
     iid = _seed_stopped_instance(aws_dir, public_ip=old_ip)
-    _write_ec2_sidecar(state_dir, RUN_ID, iid)
+    _sidecar(state_dir, RUN_ID, iid)
 
     result = run_ec2_dispatch(
         env,
@@ -207,7 +206,7 @@ def test_resume_clears_paused_at_and_pause_reason_on_run_json(tmp_path):
     env, state_dir = _resume_env(aws_dir, RUN_ID)
     _stub_aws(aws_dir)
     iid = _seed_stopped_instance(aws_dir)
-    run_dir = _write_ec2_sidecar(state_dir, RUN_ID, iid)
+    run_dir = _sidecar(state_dir, RUN_ID, iid)
 
     result = run_ec2_dispatch(env)
     assert result.returncode == 130, (
@@ -231,7 +230,7 @@ def test_resume_on_already_running_instance_is_noop(tmp_path):
     env, state_dir = _resume_env(aws_dir, RUN_ID)
     _stub_aws(aws_dir)
     iid = seed_running_instance(aws_dir, ip_gen=1)
-    _write_ec2_sidecar(state_dir, RUN_ID, iid)
+    _sidecar(state_dir, RUN_ID, iid)
 
     result = run_ec2_dispatch(env)
     assert result.returncode == 130, (
@@ -261,7 +260,7 @@ def test_resume_success_path_never_terminates_or_deletes_volume(tmp_path):
     env, state_dir = _resume_env(aws_dir, RUN_ID)
     _stub_aws(aws_dir)
     iid = _seed_stopped_instance(aws_dir)
-    _write_ec2_sidecar(state_dir, RUN_ID, iid)
+    _sidecar(state_dir, RUN_ID, iid)
 
     result = run_ec2_dispatch(env)
     assert result.returncode == 130, (
@@ -286,7 +285,7 @@ def test_resume_never_ready_failure_path_never_terminates_or_deletes_volume(tmp_
     env["LEERIE_INSTANCE_START_TIMEOUT"] = "2"
     _stub_aws(aws_dir)
     iid = _seed_stopped_instance(aws_dir, status_ok=False)
-    _write_ec2_sidecar(state_dir, RUN_ID, iid)
+    _sidecar(state_dir, RUN_ID, iid)
 
     result = run_ec2_dispatch(env)
 

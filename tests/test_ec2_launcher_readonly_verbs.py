@@ -44,7 +44,13 @@ import json
 import subprocess
 from pathlib import Path
 
-from tests.ec2_stub import _STUB_SOURCE, read_log, read_state, seed_running_instance
+from tests.ec2_stub import (
+    _STUB_SOURCE,
+    read_log,
+    read_state,
+    seed_running_instance,
+    write_ec2_sidecar,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
@@ -161,25 +167,6 @@ def _seed_stopped_instance(aws_dir: Path) -> str:
     return iid
 
 
-def _write_ec2_sidecar(run_dir: Path, run_id: str, instance_id: str,
-                        with_host_state: dict | None = None) -> None:
-    run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "ec2-instance.json").write_text(json.dumps({
-        "ec2_instance_id": instance_id,
-        "region": "us-east-1",
-        "started_at": "2026-07-01T00:00:00+00:00",
-        "run_id": run_id,
-        "launcher_pid": 12345,
-    }))
-    (run_dir / "run.json").write_text(json.dumps({
-        "run_id": run_id,
-        "branch": f"leerie/runs/{run_id}",
-        "ec2_instance_id": instance_id,
-    }))
-    if with_host_state is not None:
-        (run_dir / "state.json").write_text(json.dumps(with_host_state))
-
-
 def _seed_remote_state(work_dest: Path, run_id: str, state: dict) -> Path:
     """Seed state.json at the rewritten '/work' fixture path — this is
     what accept-blocked's EC2 branch actually mutates over SSM (the
@@ -234,7 +221,7 @@ def test_accept_blocked_ec2_autodetects_runtime_not_local(tmp_path: Path) -> Non
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
@@ -257,7 +244,7 @@ def test_accept_blocked_ec2_writes_accept_record(tmp_path: Path) -> None:
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid,
+    write_ec2_sidecar(run_dir, RUN_ID, iid,
                         with_host_state={"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
     remote_state_path = _seed_remote_state(
         work_dest, RUN_ID, {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
@@ -283,7 +270,7 @@ def test_accept_blocked_ec2_explicit_runtime_flag_accepted(tmp_path: Path) -> No
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
@@ -314,7 +301,7 @@ def test_accept_blocked_ec2_wakes_stopped_instance_and_repauses(tmp_path: Path) 
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
@@ -343,7 +330,7 @@ def test_accept_blocked_ec2_already_running_not_paused_afterward(tmp_path: Path)
 
     env, state_dir, work_dest = _env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID
-    _write_ec2_sidecar(run_dir, RUN_ID, iid)
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
     _seed_remote_state(work_dest, RUN_ID,
                         {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}})
 
