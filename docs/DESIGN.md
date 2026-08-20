@@ -7403,8 +7403,8 @@ catalogued in `IMPLEMENTATION.md`.
 Judgment workers (`PLANNING_WORKER_TYPES`: classifier, planner, reconciler,
 the judges, provision, the satisfied-probe) are kept away from the user's
 checkout by **four layers**, in order of how much each actually buys. Acting
-workers get only one of those four and cannot be given L1 at all;
-*Acting-worker isolation* below covers what holds them instead.
+workers cannot be given L1 at all: they get L2, plus L4 per wave and a
+path-scoped write denial — see *Acting-worker isolation* below.
 
 This used to be one layer, and it failed. The old guarantee read "judgment
 workers cannot mutate state because they run in the real repo cwd *without*
@@ -7513,10 +7513,20 @@ evidence L1 works; the acting-worker share does not.
 
 The fix reuses the insight already stated above — deny rules survive the
 bypass — but scoped to a path rather than a bare tool name.
-`_repo_write_denials(repo_root)` renders `Edit(//<root>/**)`, where `//` is
-the CLI's anchor for an absolute filesystem path, and `claude_p` appends it
-to `DISALLOWED_TOOLS` per call. It is derived from `repo_root` rather than
-hard-coding `/work`, so it cannot silently guard nothing if the mount moves.
+`_repo_write_denials(repo_root, run_dir)` renders `Edit(//<root>/**)`, where
+`//` is the CLI's anchor for an absolute filesystem path, and `claude_p`
+appends it to `DISALLOWED_TOOLS` per call. It is derived from `repo_root`
+rather than hard-coding `/work`, so it cannot silently guard nothing if the
+mount moves.
+
+It denies **both** the given path and its realpath when they differ. The CLI
+matches the pattern against the path the worker was handed, not its realpath,
+and `repo_root` is `os.getcwd()` only for the in-container orchestrator —
+`run_rebaser` (`scripts/host-finalize.sh`) and `run_recapture_deps` (the
+launcher's `config --recapture` arm) take it as a parameter and receive the
+host's `$USER_REPO`. The rebaser is `autonomous` with `ACT_TOOLS`, i.e. exactly
+this worker class, running against a real user checkout whose path may contain
+a symlink; denying only the resolved form would leave that silently uncovered.
 
 Probed live (claude 2.1.237, cwd a worktree, flag ON, ground truth from the
 filesystem — same methodology as the L1 table):
