@@ -3873,6 +3873,24 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
         shutil.rmtree(entry, ignore_errors=True)
 
 
+async def _rmtree_fallback_and_prune(worktree: Path, leerie_dir: Path) -> None:
+    """Shared tail of _reset_subtask_worktree/_prune_subtask_worktree: rmtree
+    fallback for a worktree git's remove left behind, then re-prune stale
+    registrations.
+
+    to_thread: this is reached concurrently for every subtask in a wave
+    under `gather`, and _prune_leerie_worktrees is synchronous (two
+    subprocess calls). Measured at ~16 ms, so the mean cost is negligible
+    -- but each call carries a 10 s timeout, and a git that blocks would
+    stall the whole loop for it."""
+    if worktree.exists():
+        try:
+            shutil.rmtree(worktree, ignore_errors=True)
+        except OSError:
+            pass
+    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
+
+
 async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> None:
     """Remove the per-subtask worktree directory and branch so a corrective
     retry can start clean from `new-worktree.sh`'s "fresh subtask" path.
@@ -3891,17 +3909,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     branch = f"leerie/subtasks/{run_id}/{sid}"
     await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
     await run_proc(["git", "branch", "-D", branch])
-    if worktree.exists():
-        try:
-            shutil.rmtree(worktree, ignore_errors=True)
-        except OSError:
-            pass
-    # to_thread: this is reached concurrently for every subtask in a
-    # wave under `gather`, and _prune_leerie_worktrees is synchronous
-    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
-    # negligible -- but each call carries a 10 s timeout, and a git
-    # that blocks would stall the whole loop for it.
-    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
+    await _rmtree_fallback_and_prune(worktree, leerie_dir)
 
 
 async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
@@ -3918,17 +3926,7 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     pressure deferred to run-end cleanup, not a reason to fail the wave."""
     worktree = leerie_dir / "worktrees" / sid
     await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
-    if worktree.exists():
-        try:
-            shutil.rmtree(worktree, ignore_errors=True)
-        except OSError:
-            pass
-    # to_thread: this is reached concurrently for every subtask in a
-    # wave under `gather`, and _prune_leerie_worktrees is synchronous
-    # (two subprocess calls). Measured at ~16 ms, so the mean cost is
-    # negligible -- but each call carries a 10 s timeout, and a git
-    # that blocks would stall the whole loop for it.
-    await asyncio.to_thread(_prune_leerie_worktrees, leerie_dir)
+    await _rmtree_fallback_and_prune(worktree, leerie_dir)
 
 
 def _sleep_then_reexec(st: "State", wait_seconds: int, reason: str) -> int | None:
