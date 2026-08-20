@@ -22,6 +22,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests import ec2_stub
 from tests.stub_helpers import _make_stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -42,46 +43,17 @@ def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProce
 
 
 def _make_stub_aws(stub_path: Path, exec_log: Path, instance_work: Path) -> None:
-    """Stub `aws` that decodes+executes ec2_remote_exec's base64-wrapped
-    command locally against instance_work (standing in for /work on the
-    instance), re-encoding the real exit code as the rc sentinel
-    ec2_remote_exec expects while itself always exiting 0 (mirroring the
-    real SSM session-manager-plugin's documented always-exit-0 behavior).
-    Modeled on tests/test_ec2_seed_repo.py's _make_stub_aws.
+    """Stub `aws` decoding+executing ec2_remote_exec's SSM command
+    locally against instance_work (standing in for /work on the
+    instance). See tests/ec2_stub.py::make_ssm_stub_aws for the shared
+    mechanics.
     """
-    dest = str(instance_work.parent.resolve())
-    stub_path.write_text(
-        f"""#!/usr/bin/env bash
-echo "aws $*" >> {exec_log}
-
-DEST={dest!r}
-
-param=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "--parameters" ]; then
-    param="$arg"
-  fi
-  prev="$arg"
-done
-
-if [ -z "$param" ]; then
-  exit 0
-fi
-
-inner="${{param#command=[\\"}}"
-inner="${{inner%\\"]}}"
-b64="${{inner#echo }}"
-b64="${{b64%% | base64*}}"
-decoded="$(printf '%s' "$b64" | base64 -d)"
-
-decoded="${{decoded//\\/work/$DEST/work}}"
-
-bash -c "$decoded"
-exit 0
-"""
+    ec2_stub.make_ssm_stub_aws(
+        stub_path,
+        exec_log,
+        instance_work.parent,
+        {"/work": "$DEST/work"},
     )
-    stub_path.chmod(0o755)
 
 
 def _make_stub_ssh(stub_path: Path, exec_log: Path, instance_work: Path) -> None:
@@ -90,53 +62,16 @@ def _make_stub_ssh(stub_path: Path, exec_log: Path, instance_work: Path) -> None
     stdout streamed straight back) and, defensively, ec2_tar_pipe's
     upload `sh -c '...'` receiver shape (unused by fetch-branch.sh
     itself but kept for parity with the seed-repo stub in case a shared
-    helper is exercised).
+    helper is exercised). See tests/ec2_stub.py::make_ssm_stub_ssh for
+    the shared mechanics.
     """
-    dest = str(instance_work.parent.resolve())
-    stub_path.write_text(
-        f"""#!/usr/bin/env bash
-echo "ssh $*" >> {exec_log}
-DEST={dest!r}
-
-args=("$@")
-i=0
-while [ $i -lt ${{#args[@]}} ]; do
-  case "${{args[$i]}}" in
-    -o|-l) i=$((i+2)); continue ;;
-    -*) i=$((i+1)); continue ;;
-    *) break ;;
-  esac
-done
-target="${{args[$i]}}"
-rest=("${{args[@]:$((i+1))}}")
-
-if [ "${{#rest[@]}}" -eq 0 ]; then
-  cat > /dev/null
-  exit 0
-fi
-
-case "${{rest[0]}}" in
-  sh*)
-    remote_cmd="${{rest[0]}}"
-    remote_cmd="${{remote_cmd//\\/work/$DEST/work}}"
-    eval "$remote_cmd"
-    exit $?
-    ;;
-  *)
-    # Raw command form: ssh <target> "<cmd>" — a single argv element
-    # containing the whole remote command (git bundle create, tar -cC,
-    # test -f, cat). Rewrite /work path references and eval, streaming
-    # this stub's own stdout straight back (binary-safe: no command
-    # substitution in this path).
-    remote_cmd="${{rest[*]}}"
-    remote_cmd="${{remote_cmd//\\/work/$DEST/work}}"
-    eval "$remote_cmd"
-    exit $?
-    ;;
-esac
-"""
+    ec2_stub.make_ssm_stub_ssh(
+        stub_path,
+        exec_log,
+        instance_work.parent,
+        {"/work": "$DEST/work"},
+        raw_command_rewrite=True,
     )
-    stub_path.chmod(0o755)
 
 
 def _make_git_repo(tmp_path: Path, subdir: str = "myrepo") -> Path:

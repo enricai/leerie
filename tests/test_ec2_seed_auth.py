@@ -23,6 +23,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests import ec2_stub
 from tests.stub_helpers import _make_stub_timeout
 from tests.test_ec2_transport import _stub_timeout as _make_killing_stub_timeout
 
@@ -45,67 +46,22 @@ def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProce
 
 def _make_stub_aws(stub_path: Path, exec_log: Path, dest_dir: Path,
                     chown_log: Path | None = None) -> None:
-    """Stub `aws` that decodes+executes ec2_remote_exec's base64-wrapped
-    command locally, rewriting /home/leerie to dest_dir first, then
-    re-encodes the (possibly nonzero) real exit code as the rc sentinel
-    ec2_remote_exec expects — while itself always exiting 0 (mirroring
-    the real SSM session-manager-plugin's documented always-exit-0
-    behavior).
-
-    `chown -R leerie:`/`chown leerie:` calls are replaced with a logging
-    no-op (rather than silently swallowed) when `chown_log` is given, so
-    tests can assert the real script actually issued the ownership fix
-    rather than merely grepping its source.
+    """Stub `aws` rewriting /home/leerie to dest_dir. `chown -R leerie:`
+    /`chown leerie:`/`runuser -u leerie --` calls are replaced with a
+    logging no-op (rather than silently swallowed) when `chown_log` is
+    given, so tests can assert the real script actually issued the
+    ownership fix rather than merely grepping its source. See
+    tests/ec2_stub.py::make_ssm_stub_aws for the shared mechanics.
     """
-    dest = str(dest_dir.resolve())
-    chown_sink = str(chown_log.resolve()) if chown_log else "/dev/null"
-    stub_path.write_text(
-        f"""#!/usr/bin/env bash
-echo "aws $*" >> {exec_log}
-
-DEST={dest!r}
-CHOWN_LOG={chown_sink!r}
-mkdir -p "$DEST/home/leerie"
-
-# Find the --parameters "command=[...]" argument.
-param=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "--parameters" ]; then
-    param="$arg"
-  fi
-  prev="$arg"
-done
-
-if [ -z "$param" ]; then
-  exit 0
-fi
-
-# param looks like: command=["echo <b64> | base64 -d | bash"]
-inner="${{param#command=[\\"}}"
-inner="${{inner%\\"]}}"
-# inner is: echo <b64> | base64 -d | bash
-b64="${{inner#echo }}"
-b64="${{b64%% | base64*}}"
-decoded="$(printf '%s' "$b64" | base64 -d)"
-
-# Rewrite absolute instance-side paths to land inside DEST.
-decoded="${{decoded//\\/home\\/leerie/$DEST/home/leerie}}"
-# No leerie user in the test sandbox — replace chown/runuser with a
-# logging no-op so tests can assert the ownership-fix call actually
-# happened, rather than silently discarding the evidence.
-decoded="${{decoded//chown -R leerie: /echo chown-R >> \\"\\$CHOWN_LOG\\"; true }}"
-decoded="${{decoded//chown leerie: /echo chown >> \\"\\$CHOWN_LOG\\"; true }}"
-decoded="${{decoded//runuser -u leerie -- /}}"
-
-CHOWN_LOG="$CHOWN_LOG" bash -c "$decoded"
-# SSM's own process always exits 0 regardless of the wrapped command's
-# real exit status; the sentinel inside `decoded` already carried the
-# real rc back over stdout, which ec2_remote_exec parses.
-exit 0
-"""
+    ec2_stub.make_ssm_stub_aws(
+        stub_path,
+        exec_log,
+        dest_dir,
+        {"/home/leerie": "$DEST/home/leerie"},
+        mkdir_subdir="home/leerie",
+        chown_log=chown_log,
+        swallow_runuser=True,
     )
-    stub_path.chmod(0o755)
 
 
 def _make_stub_ssh(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
@@ -115,46 +71,15 @@ def _make_stub_ssh(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
     ec2_tar_pipe passes its whole `sh -c '...'` receiver as a SINGLE
     argv element — see ec2-lib.sh's ec2_tar_pipe body. This stub
     matches that shape (same technique as test_ec2_seed_repo.py's
-    `_make_stub_ssh`).
+    `_make_stub_ssh`). See tests/ec2_stub.py::make_ssm_stub_ssh for the
+    shared mechanics.
     """
-    dest = str(dest_dir.resolve())
-    stub_path.write_text(
-        f"""#!/usr/bin/env bash
-echo "ssh $*" >> {exec_log}
-DEST={dest!r}
-
-args=("$@")
-i=0
-while [ $i -lt ${{#args[@]}} ]; do
-  case "${{args[$i]}}" in
-    -o|-l) i=$((i+2)); continue ;;
-    -*) i=$((i+1)); continue ;;
-    *) break ;;
-  esac
-done
-target="${{args[$i]}}"
-rest=("${{args[@]:$((i+1))}}")
-
-if [ "${{#rest[@]}}" -eq 0 ]; then
-  cat > /dev/null
-  exit 0
-fi
-
-case "${{rest[0]}}" in
-  sh*)
-    remote_cmd="${{rest[0]}}"
-    remote_cmd="${{remote_cmd//\\/home\\/leerie/$DEST/home/leerie}}"
-    eval "$remote_cmd"
-    exit $?
-    ;;
-  *)
-    cat > /dev/null
-    exit 0
-    ;;
-esac
-"""
+    ec2_stub.make_ssm_stub_ssh(
+        stub_path,
+        exec_log,
+        dest_dir,
+        {"/home/leerie": "$DEST/home/leerie"},
     )
-    stub_path.chmod(0o755)
 
 
 def _make_stub_git(stub_path: Path, *, name: str = "Test User",

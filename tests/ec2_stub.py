@@ -374,3 +374,247 @@ def leaked_resources(state: dict) -> dict:
             if rec.get("state") != "deleted"
         },
     }
+
+
+# --- Shared SSM-exec-decode `aws`/`ssh` stub builders ---------------------
+#
+# tests/test_ec2_seed_repo.py, tests/test_ec2_fetch_branch.py, and
+# tests/test_ec2_seed_auth.py each defined their own near-identical
+# `_make_stub_aws`/`_make_stub_ssh`: a bash stub that decodes
+# ec2_remote_exec's base64-wrapped SSM command (or, for ssh, drains
+# ec2_tar_pipe's payload / execs a real rsync --server), rewrites one or
+# more absolute instance-side path prefixes to land inside a local test
+# dest dir, and re-executes the (rewritten) command locally. The three
+# copies differed only in which paths got rewritten and, for
+# test_ec2_seed_auth.py, an optional chown-log hook. Single-owner
+# discipline (same precedent as the state-machine stub above and
+# tests/launcher_blocks.py): one parameterized pair here, callers pass
+# the rewrite mapping.
+
+
+def _bash_rewrite_lines(var: str, rewrites: dict[str, str]) -> str:
+    """`{var}="${{{var}//pat/repl}}"` lines, one per `rewrites` entry, in
+    order. Only the pattern (`old`) side is slash-escaped — required
+    because `/` is the `${var//pattern/string}` delimiter; the
+    replacement side is inserted verbatim (callers pass bash text like
+    `"$DEST/work"`, whose slashes are not delimiters)."""
+    lines = []
+    for old, new in rewrites.items():
+        old_esc = old.replace("/", "\\/")
+        lines.append(f'{var}="${{{var}//{old_esc}/{new}}}"')
+    return "\n".join(lines)
+
+
+def make_ssm_stub_aws(
+    stub_path: Path,
+    exec_log: Path,
+    dest_dir: Path,
+    rewrites: dict[str, str],
+    *,
+    mkdir_subdir: str | None = None,
+    chown_log: Path | None = None,
+    swallow_runuser: bool = False,
+) -> None:
+    """Write a stub `aws` that decodes+executes ec2_remote_exec's
+    base64-wrapped SSM command locally, rewriting absolute instance-side
+    path prefixes (per `rewrites`, applied in order to the decoded
+    command text) so it operates against `dest_dir` instead of the real
+    instance filesystem — then re-encodes the (possibly nonzero) real
+    exit code as the rc sentinel ec2_remote_exec expects, while itself
+    always exiting 0 (mirroring the real SSM session-manager-plugin's
+    documented always-exit-0 behavior, which is exactly what
+    ec2_remote_exec's sentinel-recovery logic is designed to work
+    around).
+
+    `rewrites` maps an unescaped instance-side path prefix (e.g.
+    `"/work"`) to its bash replacement expression (e.g. `"$DEST/work"` —
+    `DEST` is bound to `dest_dir.resolve()` inside the stub).
+    `mkdir_subdir`, when given, pre-creates `$DEST/<mkdir_subdir>` before
+    the command runs, matching a directory the real AMI/image bakes in
+    ahead of any seed. `chown -R leerie: ` / `chown leerie: ` calls are
+    always replaced with a logging no-op (no leerie user exists in the
+    test sandbox); pass `chown_log` to make that log assertable,
+    otherwise it is discarded to /dev/null. `swallow_runuser`
+    additionally drops a `runuser -u leerie -- ` prefix.
+    """
+    dest = str(dest_dir.resolve())
+    chown_sink = str(chown_log.resolve()) if chown_log else "/dev/null"
+    rewrite_lines = _bash_rewrite_lines("decoded", rewrites)
+    mkdir_line = f'mkdir -p "$DEST/{mkdir_subdir}"' if mkdir_subdir else ""
+    runuser_line = (
+        'decoded="${decoded//runuser -u leerie -- /}"' if swallow_runuser else ""
+    )
+    stub_path.write_text(
+        f"""#!/usr/bin/env bash
+echo "aws $*" >> {exec_log}
+
+DEST={dest!r}
+CHOWN_LOG={chown_sink!r}
+{mkdir_line}
+
+# Find the --parameters "command=[...]" argument.
+param=""
+prev=""
+for arg in "$@"; do
+  if [ "$prev" = "--parameters" ]; then
+    param="$arg"
+  fi
+  prev="$arg"
+done
+
+if [ -z "$param" ]; then
+  exit 0
+fi
+
+# param looks like: command=["echo <b64> | base64 -d | bash"]
+inner="${{param#command=[\\"}}"
+inner="${{inner%\\"]}}"
+# inner is: echo <b64> | base64 -d | bash
+b64="${{inner#echo }}"
+b64="${{b64%% | base64*}}"
+decoded="$(printf '%s' "$b64" | base64 -d)"
+
+# Rewrite absolute instance-side paths to land inside DEST.
+{rewrite_lines}
+{runuser_line}
+# No leerie user in the test sandbox — swallow chown, logging it when
+# a caller wants to assert the ownership fix actually happened.
+decoded="${{decoded//chown -R leerie: /echo chown-R >> \\"\\$CHOWN_LOG\\"; true }}"
+decoded="${{decoded//chown leerie: /echo chown >> \\"\\$CHOWN_LOG\\"; true }}"
+
+CHOWN_LOG="$CHOWN_LOG" bash -c "$decoded"
+# SSM's own process always exits 0 regardless of the wrapped command's
+# real exit status; the sentinel inside `decoded` already carried the
+# real rc back over stdout, which ec2_remote_exec parses.
+exit 0
+"""
+    )
+    stub_path.chmod(0o755)
+
+
+def make_ssm_stub_ssh(
+    stub_path: Path,
+    exec_log: Path,
+    dest_dir: Path,
+    rewrites: dict[str, str],
+    *,
+    rsync_rewrite: tuple[str, str] | None = None,
+    raw_command_rewrite: bool = False,
+) -> None:
+    """Write a stub `ssh` used as ec2_tar_pipe's transport (extracts a
+    one-entry gzipped tar / evals a single `sh -c '...'` receiver
+    argv element from stdin, rewriting absolute instance-side paths
+    per `rewrites` first) and, optionally, as rsync's `-e` transport
+    or a raw single-command-string transport.
+
+    ec2_tar_pipe passes its whole `sh -c '...'` receiver as a SINGLE
+    argv element (not three separate sh/-c/<script> args) — see
+    ec2-lib.sh's ec2_tar_pipe body. This stub matches that shape.
+
+    `rsync_rewrite`, when given as `(old, new)`, adds an `rsync*)` case
+    arm that execs a real local `rsync --server` after rewriting the
+    trailing target argument the same way `rewrites` does (used by
+    ec2-seed-repo.sh's upload path, which never appears in the other
+    two callers). `raw_command_rewrite`, when true, makes the fallback
+    `*)` arm treat the remaining argv as a single raw command string
+    (`ssh <target> "<cmd>"`, used by ec2-fetch-branch.sh's download
+    path) — rewritten and eval'd, streaming this stub's own stdout
+    straight back — instead of draining and discarding stdin.
+    """
+    dest = str(dest_dir.resolve())
+    sh_rewrite_lines = _bash_rewrite_lines("remote_cmd", rewrites)
+
+    if rsync_rewrite is not None:
+        old, new = rsync_rewrite
+        old_esc = old.replace("/", "\\/")
+        subdir = old.lstrip("/")
+        rsync_arm = f"""  rsync*)
+    # rsync --server invocation. Rewrite the trailing /{subdir}/ target arg.
+    # The replacement half of ${{var/pat/repl}} is NOT a regex and needs
+    # no escaping: a `\\/` there is a *literal backslash*, which sent the
+    # transfer to a directory named `<dest>\\` and left `<dest>/{subdir}`
+    # empty — rsync exits 0, so the test failed with "untracked.txt
+    # missing" and no error anywhere. Only the pattern half escapes.
+    new_rest=()
+    for a in "${{rest[@]}}"; do
+      case "$a" in
+        */{subdir}/*|*/{subdir}) a="${{a/{old_esc}/{new}}}" ;;
+      esac
+      new_rest+=("$a")
+    done
+    exec "${{new_rest[@]}}"
+    ;;
+"""
+    else:
+        rsync_arm = ""
+
+    if raw_command_rewrite:
+        raw_rewrite_lines = _bash_rewrite_lines("remote_cmd", rewrites)
+        default_arm = f"""  *)
+    # Raw command form: ssh <target> "<cmd>" — a single argv element
+    # containing the whole remote command. Rewrite path references and
+    # eval, streaming this stub's own stdout straight back (binary-safe:
+    # no command substitution in this path).
+    remote_cmd="${{rest[*]}}"
+    {raw_rewrite_lines}
+    eval "$remote_cmd"
+    exit $?
+    ;;
+"""
+    else:
+        default_arm = """  *)
+    cat > /dev/null
+    exit 0
+    ;;
+"""
+
+    stub_path.write_text(
+        f"""#!/usr/bin/env bash
+echo "ssh $*" >> {exec_log}
+DEST={dest!r}
+
+# Drop leading ssh flags to find the target and the remainder of argv.
+# `-o <opt>` (our own ec2_tar_pipe/rsync -e invocation) and `-l <user>`
+# (rsync's own -e-transport invocation always passes login name via
+# `-l`, e.g. `ssh -o ... -o ... -l ec2-user 1.2.3.4 rsync --server
+# ...`) both take a separate value argument — treat them the same as
+# any other single-token flag, or `target`/`rest` end up off-by-one and
+# the rsync* case below is never reached (the real bug this comment
+# guards against: silently falling through to the drain-and-exit
+# default, which leaves the sending rsync hung waiting on a protocol
+# handshake that never arrives).
+args=("$@")
+i=0
+while [ $i -lt ${{#args[@]}} ]; do
+  case "${{args[$i]}}" in
+    -o|-l) i=$((i+2)); continue ;;
+    -*) i=$((i+1)); continue ;;
+    *) break ;;
+  esac
+done
+target="${{args[$i]}}"
+rest=("${{args[@]:$((i+1))}}")
+
+if [ "${{#rest[@]}}" -eq 0 ]; then
+  # No remote command — this is ec2_tar_pipe's bare-target invocation
+  # form. Shouldn't happen in production (ec2_tar_pipe always appends a
+  # remote command), but guard defensively.
+  cat > /dev/null
+  exit 0
+fi
+
+case "${{rest[0]}}" in
+  sh*)
+    # ec2_tar_pipe passes its whole receiver as ONE argv element:
+    # "sh -c 'mkdir -p '\\''<dir>'\\'' && tar -xzC '\\''<dir>'\\'''"
+    # (not three separate sh/-c/<script> args) — rewrite paths in that
+    # single string and eval it as-is.
+    remote_cmd="${{rest[0]}}"
+    {sh_rewrite_lines}
+    eval "$remote_cmd"
+    exit $?
+    ;;
+{rsync_arm}{default_arm}esac
+"""
+    )
+    stub_path.chmod(0o755)
