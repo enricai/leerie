@@ -18,6 +18,8 @@ import os
 import tempfile
 from pathlib import Path
 
+from tests.stub_helpers import _entry_sh_rootful_block
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 ENTRY_SH = REPO_ROOT / "scripts" / "container-entry.sh"
@@ -31,14 +33,6 @@ def _entry_sh_copy_block() -> str:
     marker = "if [ -f /opt/leerie-claude-json-src/.claude.json ]; then"
     start = text.index(marker)
     end = text.index("\nfi", start) + len("\nfi")
-    return text[start:end]
-
-
-def _entry_sh_rootful_block() -> str:
-    text = ENTRY_SH.read_text()
-    marker = 'if [ "$ROOTLESS" != "true" ] && getent passwd leerie'
-    start = text.index(marker)
-    end = text.index("\nfi", start)
     return text[start:end]
 
 
