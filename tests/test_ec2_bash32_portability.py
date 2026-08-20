@@ -46,7 +46,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.ec2_stub import _stub_aws, read_state
+from tests.ec2_stub import _stub_aws, seed_running_instance
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPTS = REPO_ROOT / "scripts" / "remote"
@@ -286,15 +286,6 @@ def _launcher_env(tmp_path: Path, aws_dir: Path) -> tuple[dict, Path]:
     return env, state_dir
 
 
-def _seed_running_instance(aws_dir: Path) -> str:
-    state = read_state(aws_dir)
-    iid = "i-" + format(len(state["instances"]), "017x")
-    state["instances"][iid] = {"state": "running", "public_ip": "203.0.113.20",
-                                "status_ok": True}
-    (aws_dir / "state.json").write_text(json.dumps(state))
-    return iid
-
-
 def _write_ec2_sidecar(run_dir: Path, run_id: str, instance_id: str) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "ec2-instance.json").write_text(json.dumps({
@@ -352,7 +343,7 @@ def test_ec2_launcher_verb_runs_cleanly_under_bash32(verb_args, tmp_path):
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
-    iid = _seed_running_instance(aws_dir)
+    iid = seed_running_instance(aws_dir)
 
     env, state_dir = _launcher_env(tmp_path, aws_dir)
     run_dir = state_dir / "runs" / RUN_ID

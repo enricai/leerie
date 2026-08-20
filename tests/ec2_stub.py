@@ -328,6 +328,34 @@ def read_log(dir: Path) -> list[str]:
     return [line for line in log_path.read_text().splitlines() if line]
 
 
+def seed_running_instance(
+    aws_dir: Path,
+    *,
+    instance_id: str | None = None,
+    public_ip: str = "203.0.113.20",
+    status_ok: bool = True,
+    ip_gen: int | None = None,
+) -> str:
+    """Directly seed a `running` instance into the stub's state.json.
+
+    Bypasses a real `run-instances` round trip, for tests that only need
+    a pre-existing instance to act on (stop/kill/resume dispatch, not
+    provisioning itself — covered by test_ec2_provision.py). `instance_id`
+    defaults to an auto-generated id (mirroring the stub's own `next_id`
+    shape); pass it explicitly to pin a known id. `ip_gen` seeds the
+    stub's `_ip_gen` counter field only when given, since not every
+    caller's readiness/IP-reassignment assertions need it.
+    """
+    state = read_state(aws_dir)
+    iid = instance_id or ("i-" + format(len(state["instances"]), "017x"))
+    entry: dict = {"state": "running", "public_ip": public_ip, "status_ok": status_ok}
+    if ip_gen is not None:
+        entry["_ip_gen"] = ip_gen
+    state["instances"][iid] = entry
+    (aws_dir / STATE_FILENAME).write_text(json.dumps(state))
+    return iid
+
+
 def leaked_resources(state: dict) -> dict:
     """Return the subset of `state` that is not fully torn down.
 
