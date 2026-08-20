@@ -11,14 +11,11 @@ mocking git.
 """
 from __future__ import annotations
 
-import asyncio
 import subprocess
 
+from tests.conftest import _run
 from tests.test_oom_naming import env  # noqa: F401  (pytest fixture)
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _git(*args, cwd):

@@ -13,7 +13,6 @@ fit_judge / splitter responses. Verifies:
 """
 from __future__ import annotations
 
-import asyncio
 import importlib.util
 import json
 import math
@@ -23,6 +22,9 @@ from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from tests.conftest import _fit_response, _run, _split_response
+from tests.conftest import _make_caps as _shared_make_caps
 
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -127,46 +129,13 @@ def _make_state(leerie, caps):
 
 
 def _make_caps(leerie, **overrides):
-    caps = {
-        "max_total_workers": 200,
-        "decompose_max_depth": leerie.DEFAULT_CAPS["decompose_max_depth"],
-        "decompose_fit_threshold": leerie.DEFAULT_CAPS["decompose_fit_threshold"],
-        "decompose_noprogress_rounds": leerie.DEFAULT_CAPS["decompose_noprogress_rounds"],
-        "subfile_split_max_span": leerie.DEFAULT_CAPS["subfile_split_max_span"],
-    }
-    caps.update(overrides)
-    return caps
+    """This file's caps always carry `subfile_split_max_span`, which the
+    shared builder does not default -- layer it on top."""
+    overrides.setdefault(
+        "subfile_split_max_span", leerie.DEFAULT_CAPS["subfile_split_max_span"]
+    )
+    return _shared_make_caps(leerie, **overrides)
 
-
-def _fit_response(score: float) -> dict:
-    return {
-        "score": score,
-        "rationale": f"score={score}",
-        "diffuse": "" if score >= 0.70 else "too broad",
-        "confidence": {
-            "fit": 8.5, "basis": "test",
-            "falsifiers_tested": ["x"], "contradictions_reconciled": [],
-            "gap_to_close": {},
-        },
-    }
-
-
-def _split_response(parent_id: str, n: int) -> dict:
-    return {
-        "children": [
-            {
-                "id": f"{parent_id}-{i + 1}",
-                "title": f"child {i + 1}",
-                "success_criteria_seed": f"criterion {i + 1}",
-                "files_likely_touched": [f"f{i}.py"],
-            }
-            for i in range(n)
-        ],
-    }
-
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 # ---------------------------------------------------------------------------

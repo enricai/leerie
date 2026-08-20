@@ -9,15 +9,13 @@ per-framework output parsing.
 """
 from __future__ import annotations
 
-import asyncio
 import inspect
 import subprocess
 
 import pytest
 
+from tests.conftest import _run
 
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _call(leerie, cmd="pytest", tree="/tmp/x", timeout=60.0, **kw):

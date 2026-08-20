@@ -6,6 +6,7 @@ fixture.
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import ctypes
 import importlib.util
@@ -18,6 +19,13 @@ import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE_PY = REPO_ROOT / "orchestrator" / "leerie.py"
+
+
+def _run(coro):
+    """Run an async coroutine synchronously (this repo does not use
+    pytest-asyncio). Single owner for the byte-identical helper that was
+    previously redefined in fifteen test files."""
+    return asyncio.run(coro)
 
 
 @pytest.fixture(scope="session")
@@ -71,6 +79,52 @@ HAS_TREESITTER = _has_treesitter()
 # Do NOT "fix" a skip here by installing jq into the image: that buys a green
 # tick, not working code, and erodes the boundary.
 HAS_JQ = shutil.which("jq") is not None
+
+
+def _make_caps(leerie, **overrides) -> dict:
+    """Shared DEFAULT_CAPS-derived caps builder for the recursive-decompose
+    test family (§5½ (P1)). Callers layer on extra keys (e.g.
+    `subfile_split_max_span`) via **overrides rather than every file forcing
+    an identical cap set."""
+    caps = {
+        "max_total_workers": 200,
+        "decompose_max_depth": leerie.DEFAULT_CAPS["decompose_max_depth"],
+        "decompose_fit_threshold": leerie.DEFAULT_CAPS["decompose_fit_threshold"],
+        "decompose_noprogress_rounds": leerie.DEFAULT_CAPS["decompose_noprogress_rounds"],
+    }
+    caps.update(overrides)
+    return caps
+
+
+def _fit_response(score: float) -> dict:
+    """Shared stubbed fit_judge worker response for the recursive-decompose
+    test family (§5½ (P1))."""
+    return {
+        "score": score,
+        "rationale": f"score={score}",
+        "diffuse": "" if score >= 0.70 else "too broad",
+        "confidence": {
+            "fit": 8.5, "basis": "test",
+            "falsifiers_tested": ["x"], "contradictions_reconciled": [],
+            "gap_to_close": {},
+        },
+    }
+
+
+def _split_response(parent_id: str, n: int) -> dict:
+    """Shared stubbed splitter worker response for the recursive-decompose
+    test family (§5½ (P1))."""
+    return {
+        "children": [
+            {
+                "id": f"{parent_id}-{i + 1}",
+                "title": f"child {i + 1}",
+                "success_criteria_seed": f"criterion {i + 1}",
+                "files_likely_touched": [f"f{i}.py"],
+            }
+            for i in range(n)
+        ],
+    }
 
 
 def fake_claude_on_path(tmp_path: Path, monkeypatch) -> Path:

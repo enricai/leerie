@@ -33,6 +33,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.conftest import _run
+
 
 # ---------------------------------------------------------------------------
 # Helpers (mirrors tests/test_recursive_decompose.py and
@@ -63,9 +65,6 @@ def _make_decompose_caps(leerie, **overrides):
     caps.update(overrides)
     return caps
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 _CATEGORY = "feature-implementation"  # a real entry in CATEGORY_ABBREV

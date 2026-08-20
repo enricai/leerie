@@ -26,6 +26,7 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests import ec2_stub
 from tests.stub_helpers import _make_stub_timeout
 from tests.test_ec2_transport import _stub_timeout as _make_killing_stub_timeout
 
@@ -47,68 +48,30 @@ def _run_bash(script: str, env: dict | None = None) -> subprocess.CompletedProce
 
 
 def _make_stub_aws(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
-    """Stub `aws` that decodes+executes ec2_remote_exec's base64-wrapped
-    command locally, rewriting /work and /tmp/leerie-* paths to dest_dir
-    first, then re-encodes the (possibly nonzero) real exit code as the
-    rc sentinel ec2_remote_exec expects — while itself always exiting 0
-    (mirroring the real SSM session-manager-plugin's documented
-    always-exit-0 behavior, which is exactly what ec2_remote_exec's
-    sentinel-recovery logic is designed to work around).
+    """Stub `aws` rewriting /work and /tmp/leerie-* paths to dest_dir.
+
+    Basenames must match exactly what the ssh stub's `/tmp` -> $DEST
+    rewrite produces (ec2_tar_pipe extracts into /tmp preserving each
+    payload's basename, e.g. /tmp/leerie-seed.bundle,
+    /tmp/leerie-subs/<bn>.bundle) — these are NOT renamed on the way in.
+    See tests/ec2_stub.py::make_ssm_stub_aws for the shared mechanics.
     """
-    dest = str(dest_dir.resolve())
-    stub_path.write_text(
-        f"""#!/usr/bin/env bash
-echo "aws $*" >> {exec_log}
-
-DEST={dest!r}
-# /work is baked into the real AMI/image ahead of any seed; pre-create
-# it here so the first `find /work -mindepth 1 ...` reset step (which
-# assumes the directory already exists, same as production) succeeds.
-mkdir -p "$DEST/work"
-
-# Find the --parameters "command=[...]" argument.
-param=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "--parameters" ]; then
-    param="$arg"
-  fi
-  prev="$arg"
-done
-
-if [ -z "$param" ]; then
-  exit 0
-fi
-
-# param looks like: command=["echo <b64> | base64 -d | bash"]
-inner="${{param#command=[\\"}}"
-inner="${{inner%\\"]}}"
-# inner is: echo <b64> | base64 -d | bash
-b64="${{inner#echo }}"
-b64="${{b64%% | base64*}}"
-decoded="$(printf '%s' "$b64" | base64 -d)"
-
-# Rewrite absolute instance-side paths to land inside DEST. Basenames
-# must match exactly what the ssh stub's `/tmp` -> $DEST rewrite
-# produces (ec2_tar_pipe extracts into /tmp preserving each payload's
-# basename, e.g. /tmp/leerie-seed.bundle, /tmp/leerie-subs/<bn>.bundle)
-# — these are NOT renamed on the way in.
-decoded="${{decoded//\\/tmp\\/leerie-subs/$DEST/leerie-subs}}"
-decoded="${{decoded//\\/tmp\\/leerie-seed.bundle/$DEST/leerie-seed.bundle}}"
-decoded="${{decoded//\\/tmp\\/leerie-seed-git.tar/$DEST/leerie-seed-git.tar}}"
-decoded="${{decoded//\\/work/$DEST/work}}"
-# No leerie user in the test sandbox — swallow chown.
-decoded="${{decoded//chown -R leerie: /true }}"
-decoded="${{decoded//chown leerie: /true }}"
-
-bash -c "$decoded"
-# SSM's own process always exits 0 regardless of the wrapped command's
-# real exit status; the sentinel inside `decoded` already carried the
-# real rc back over stdout, which ec2_remote_exec parses.
-exit 0
-"""
+    ec2_stub.make_ssm_stub_aws(
+        stub_path,
+        exec_log,
+        dest_dir,
+        {
+            "/tmp/leerie-subs": "$DEST/leerie-subs",
+            "/tmp/leerie-seed.bundle": "$DEST/leerie-seed.bundle",
+            "/tmp/leerie-seed-git.tar": "$DEST/leerie-seed-git.tar",
+            "/work": "$DEST/work",
+        },
+        # /work is baked into the real AMI/image ahead of any seed;
+        # pre-create it here so the first `find /work -mindepth 1 ...`
+        # reset step (which assumes the directory already exists, same
+        # as production) succeeds.
+        mkdir_subdir="work",
     )
-    stub_path.chmod(0o755)
 
 
 def _make_stub_ssh(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
@@ -116,84 +79,15 @@ def _make_stub_ssh(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
     one-entry gzipped tar from stdin into the rewritten dest dir) and as
     rsync's `-e` transport (execs a real local `rsync --server` so the
     two rsync processes can talk, with `/work` rewritten to dest/work).
-
-    ec2_tar_pipe passes its whole `sh -c '...'` receiver as a SINGLE
-    argv element (not three separate sh/-c/<script> args, unlike a
-    typical `ssh host sh -c script` invocation) — see ec2-lib.sh's
-    ec2_tar_pipe body. This stub matches that shape.
+    See tests/ec2_stub.py::make_ssm_stub_ssh for the shared mechanics.
     """
-    dest = str(dest_dir.resolve())
-    stub_path.write_text(
-        f"""#!/usr/bin/env bash
-echo "ssh $*" >> {exec_log}
-DEST={dest!r}
-
-# Drop leading ssh flags to find the target and the remainder of argv.
-# `-o <opt>` (our own ec2_tar_pipe/rsync -e invocation) and `-l <user>`
-# (rsync's own -e-transport invocation always passes login name via
-# `-l`, e.g. `ssh -o ... -o ... -l ec2-user 1.2.3.4 rsync --server
-# ...`) both take a separate value argument — treat them the same as
-# any other single-token flag, or `target`/`rest` end up off-by-one and
-# the rsync* case below is never reached (the real bug this comment
-# guards against: silently falling through to the drain-and-exit
-# default, which leaves the sending rsync hung waiting on a protocol
-# handshake that never arrives).
-args=("$@")
-i=0
-while [ $i -lt ${{#args[@]}} ]; do
-  case "${{args[$i]}}" in
-    -o|-l) i=$((i+2)); continue ;;
-    -*) i=$((i+1)); continue ;;
-    *) break ;;
-  esac
-done
-target="${{args[$i]}}"
-rest=("${{args[@]:$((i+1))}}")
-
-if [ "${{#rest[@]}}" -eq 0 ]; then
-  # No remote command — this is ec2_tar_pipe's bare-target invocation
-  # form. Shouldn't happen in production (ec2_tar_pipe always appends a
-  # remote command), but guard defensively.
-  cat > /dev/null
-  exit 0
-fi
-
-case "${{rest[0]}}" in
-  sh*)
-    # ec2_tar_pipe passes its whole receiver as ONE argv element:
-    # "sh -c 'mkdir -p '\\''<dir>'\\'' && tar -xzC '\\''<dir>'\\'''"
-    # (not three separate sh/-c/<script> args) — rewrite paths in that
-    # single string and eval it as-is.
-    remote_cmd="${{rest[0]}}"
-    remote_cmd="${{remote_cmd//\\/work/$DEST/work}}"
-    remote_cmd="${{remote_cmd//\\/tmp/$DEST}}"
-    eval "$remote_cmd"
-    exit $?
-    ;;
-  rsync*)
-    # rsync --server invocation. Rewrite the trailing /work/ target arg.
-    # The replacement half of ${{var/pat/repl}} is NOT a regex and needs
-    # no escaping: a `\/` there is a *literal backslash*, which sent the
-    # transfer to a directory named `<dest>\` and left `<dest>/work`
-    # empty — rsync exits 0, so the test failed with "untracked.txt
-    # missing" and no error anywhere. Only the pattern half escapes.
-    new_rest=()
-    for a in "${{rest[@]}}"; do
-      case "$a" in
-        */work/*|*/work) a="${{a/\\/work/${{DEST}}/work}}" ;;
-      esac
-      new_rest+=("$a")
-    done
-    exec "${{new_rest[@]}}"
-    ;;
-  *)
-    cat > /dev/null
-    exit 0
-    ;;
-esac
-"""
+    ec2_stub.make_ssm_stub_ssh(
+        stub_path,
+        exec_log,
+        dest_dir,
+        {"/work": "$DEST/work", "/tmp": "$DEST"},
+        rsync_rewrite=("/work", "${DEST}/work"),
     )
-    stub_path.chmod(0o755)
 
 
 def _init_repo(repo: Path) -> None:

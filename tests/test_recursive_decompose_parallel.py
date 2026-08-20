@@ -13,6 +13,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.conftest import _run
+
 
 _CATEGORY = "feature-implementation"  # a real entry in CATEGORY_ABBREV
 
@@ -55,9 +57,6 @@ def _subtask(sid: str, path: str) -> dict:
         "investigation_notes": "",
     }
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _planner_response(subtasks: list[dict]) -> dict:

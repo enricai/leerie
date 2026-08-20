@@ -13,10 +13,11 @@ earlier invocation's in the same run.
 """
 from __future__ import annotations
 
-import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from tests.conftest import _run
 
 _CATEGORY = "feature-implementation"  # a real entry in CATEGORY_ABBREV
 
@@ -67,9 +68,6 @@ _PLANNER_RESPONSE = {
     "subtasks": [_SUBTASK],
 }
 
-
-def _run(coro):
-    return asyncio.run(coro)
 
 
 def _run_phase_plan(leerie, task: str, replan_round: int = 0,
