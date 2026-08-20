@@ -247,3 +247,55 @@ class TestStateRootInsideTheCheckout:
         for _ in range(3):
             leerie._repo_write_denials("/repo", "/repo/.leerie/runs/r1")
         assert len(msgs) == 1, msgs
+
+
+class TestSymlinkedCheckout:
+    """The CLI matches the deny pattern against the path the worker was
+    HANDED, not its realpath — so denying only the resolved form leaves a
+    symlinked checkout uncovered, silently.
+
+    Reachable, and for the worker class that matters most: `repo_root` is
+    `Path(os.getcwd())` only for the in-container orchestrator. `run_rebaser`
+    (scripts/host-finalize.sh) and `run_recapture_deps` (the launcher's
+    `config --recapture` arm) take it as a parameter and receive the host's
+    $USER_REPO. The rebaser is autonomous with ACT_TOOLS — bypass flag, writer
+    tools — running against a real user checkout on their own machine.
+
+    Real symlinks on a real filesystem here; a mocked Path would be testing
+    the mock. tmp_path is resolved first because the temp root is itself a
+    symlink on some hosts (/tmp -> /private/tmp on macOS), which would make
+    the "forms agree" case accidentally disagree.
+    """
+
+    def test_both_forms_denied_when_they_differ(self, leerie, tmp_path):
+        base = tmp_path.resolve()
+        real = base / "real-checkout"; real.mkdir()
+        link = base / "linked-checkout"; link.symlink_to(real)
+        run = base / "state" / "runs" / "r1"; run.mkdir(parents=True)
+        out = leerie._repo_write_denials(link, run)
+        assert f"Edit(/{link}/**)" in out, out
+        assert f"Edit(/{real}/**)" in out, out
+        assert out.count("Edit(") == 2, out
+
+    def test_one_rule_when_the_forms_agree(self, leerie, tmp_path):
+        """Anti-vacuity partner. Without it, "always emit both" passes the
+        test above while doubling every rule on the common path."""
+        base = tmp_path.resolve()
+        real = base / "checkout"; real.mkdir()
+        run = base / "state" / "runs" / "r1"; run.mkdir(parents=True)
+        out = leerie._repo_write_denials(real, run)
+        assert out == f"Edit(/{real}/**)", out
+        assert out.count("Edit(") == 1, out
+
+    def test_containment_still_sees_through_the_symlink(
+            self, leerie, tmp_path, monkeypatch):
+        """`.resolve()` must stay: a run dir inside the checkout reached by
+        its symlinked name is still inside it, and must still skip the
+        denial rather than deny a worker its own worktree."""
+        monkeypatch.setattr(leerie, "_denial_skipped_warned", False)
+        monkeypatch.setattr(leerie, "log", lambda m: None)
+        base = tmp_path.resolve()
+        real = base / "checkout"; real.mkdir()
+        link = base / "linked"; link.symlink_to(real)
+        run = link / ".leerie" / "runs" / "r1"; run.mkdir(parents=True)
+        assert leerie._repo_write_denials(link, run) == ""

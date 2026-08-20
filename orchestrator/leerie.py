@@ -17263,7 +17263,10 @@ def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
 
     Derived from `repo_root` rather than hard-coding `/work` so it stays
     correct if the bind-mount path ever moves. `//` is the CLI's anchor for an
-    absolute filesystem path, so `/work` becomes `//work/**`.
+    absolute filesystem path, so `/work` becomes `//work/**`. Emits one rule
+    normally, and two — the given path and its realpath — when they differ,
+    since the CLI matches against the path the worker was handed rather than
+    its realpath (see the comment on `given`/`root` below).
 
     Returns `""` when `run_dir` is inside `repo_root`. Worker worktrees are
     siblings under the run dir, so in that layout a blanket deny under
@@ -17277,20 +17280,29 @@ def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
     is announced rather than silent. `_assert_repo_unchanged` still covers
     that configuration.
     """
-    # `.resolve()` is load-bearing for the containment comparison below, but
-    # it also decides the emitted pattern — and the CLI matches that against
-    # the path the MODEL passes to Edit. The two must agree or the rule
-    # silently stops matching. They do: `repo_root` is `Path(os.getcwd())`,
-    # `getcwd()` is already symlink-resolved, and `/work` is a bind mount
-    # rather than a symlink, so this is the identity in every container
-    # runtime. A direct invocation against a symlinked checkout is the one
-    # shape where they could diverge.
-    root = Path(str(repo_root)).resolve()
+    # `.resolve()` is required for the containment comparison below — a
+    # symlinked run dir must still be recognised as inside the checkout. It
+    # must NOT be the only form denied, though: the CLI matches the pattern
+    # against the path the MODEL passes to Edit, which is the path the worker
+    # was given, not its realpath. `repo_root` is `Path(os.getcwd())` only for
+    # the in-container orchestrator; `run_rebaser` and `run_recapture_deps`
+    # take it as a parameter and are handed the HOST's $USER_REPO
+    # (scripts/host-finalize.sh, and the launcher's `config --recapture` arm).
+    # The rebaser is autonomous with ACT_TOOLS, i.e. exactly the worker class
+    # this denial exists for, running against a real user checkout whose path
+    # may contain a symlink. Denying both forms removes the question; a
+    # pattern that matches nothing is inert, and on the common path where the
+    # two are equal this emits exactly one rule.
+    given = Path(str(repo_root))
+    root = given.resolve()
     run = Path(str(run_dir)).resolve()
     if run == root or root in run.parents:
         _warn_denial_skipped_once(root)
         return ""
-    return f"Edit(/{str(root).rstrip('/')}/**)"
+    forms = [str(given).rstrip("/")]
+    if str(root).rstrip("/") not in forms:
+        forms.append(str(root).rstrip("/"))
+    return ",".join(f"Edit(/{f}/**)" for f in forms)
 
 
 def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
