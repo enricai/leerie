@@ -20,6 +20,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import run_bash
+from tests.fly_stub import make_fake_flyctl
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIB_SH = REPO_ROOT / "scripts" / "remote" / "lib.sh"
@@ -99,19 +100,17 @@ def _stub_flyctl(tmp_path: Path) -> Path:
         ],
         check=True,
     )
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        f"""#!/usr/bin/env bash
-if [ "$1" = "ssh" ] && [ "$2" = "issue" ]; then
+    make_fake_flyctl(
+        tmp_path,
+        f"""if [ "$SUB" = "ssh" ]; then
   n=$(cat "{counter}")
   echo $((n+1)) > "{counter}"
   ssh-add "{userkey}" >/dev/null 2>&1
   exit 0
 fi
 exit 0
-"""
+""",
     )
-    stub.chmod(0o755)
     return counter
 
 

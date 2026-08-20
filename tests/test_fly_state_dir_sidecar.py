@@ -24,6 +24,8 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from tests.fly_stub import make_fake_flyctl
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LEERIE = REPO_ROOT / "leerie"
 FETCH_SH = REPO_ROOT / "scripts" / "remote" / "fetch-branch.sh"
@@ -143,16 +145,7 @@ def _make_user_repo(tmp_path: Path) -> Path:
 
 def _make_flyctl_stub_auth_only(tmp_path: Path) -> Path:
     """Minimal flyctl stub: auth status passes, all else fails."""
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        'case "$1 ${2:-}" in\n'
-        "  'auth status') exit 0 ;;\n"
-        "  *) exit 1 ;;\n"
-        "esac\n"
-    )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(tmp_path, "exit 1\n")
 
 
 def test_stop_resolves_run_dir_from_state_host_dir(tmp_path: Path):
