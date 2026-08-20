@@ -8331,7 +8331,9 @@ post-`setup-run.sh` prune — go through `_prune_leerie_worktrees`, the Python
 port of the same mechanism at run-dir granularity (see above). Two of the four
 (`_reset_subtask_worktree` and `_prune_subtask_worktree`) dispatch it via
 `asyncio.to_thread`, because both are awaited from inside the wave and the
-call shells out to git; `_cleanup_on_abnormal_exit` runs synchronously off
+call shells out to git — both share that rmtree-fallback+`to_thread`-prune
+tail through one helper, `_rmtree_fallback_and_prune`, rather than each
+inlining it; `_cleanup_on_abnormal_exit` runs synchronously off
 `st.run_dir` on a path where there is no loop left to block. The probe itself
 runs under `LC_ALL=C LANGUAGE=` — `git worktree prune -n -v` wraps its output
 in `_()`, so parsing English prefixes under another locale matches nothing
