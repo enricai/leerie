@@ -21,7 +21,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import _fit_response, _make_caps, _run
 
 
 # ---------------------------------------------------------------------------
@@ -65,31 +65,6 @@ def _make_state(leerie, caps: dict) -> MagicMock:
 
     st.bump_workers = MagicMock(side_effect=bump)
     return st
-
-
-def _make_caps(leerie, **overrides) -> dict:
-    caps = {
-        "max_total_workers": 200,
-        "decompose_max_depth": leerie.DEFAULT_CAPS["decompose_max_depth"],
-        "decompose_fit_threshold": leerie.DEFAULT_CAPS["decompose_fit_threshold"],
-        "decompose_noprogress_rounds": leerie.DEFAULT_CAPS["decompose_noprogress_rounds"],
-    }
-    caps.update(overrides)
-    return caps
-
-
-def _fit_response(score: float) -> dict:
-    return {
-        "score": score,
-        "rationale": f"score={score}",
-        "diffuse": "" if score >= 0.70 else "too broad",
-        "confidence": {
-            "fit": 8.5, "basis": "test",
-            "falsifiers_tested": ["x"], "contradictions_reconciled": [],
-            "gap_to_close": {},
-        },
-    }
-
 
 
 # ---------------------------------------------------------------------------

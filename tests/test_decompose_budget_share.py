@@ -20,7 +20,7 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import _fit_response, _run, _split_response
 
 
 def _make_real_state(leerie):
@@ -63,30 +63,8 @@ def _caps(leerie, max_total_workers, decompose_budget_share=0.40):
 
 
 def _low_fit_response() -> dict:
-    return {
-        "score": 0.10,
-        "rationale": "always oversized",
-        "diffuse": "too broad",
-        "confidence": {
-            "fit": 8.5, "basis": "test",
-            "falsifiers_tested": ["x"], "contradictions_reconciled": [],
-            "gap_to_close": {},
-        },
-    }
-
-
-def _split_response(parent_id: str, n: int) -> dict:
-    return {
-        "children": [
-            {
-                "id": f"{parent_id}-{i + 1}",
-                "title": f"child {i + 1}",
-                "success_criteria_seed": f"criterion {i + 1}",
-                "files_likely_touched": [f"f{i}.py"],
-            }
-            for i in range(n)
-        ],
-    }
+    """This file's decomposition subtasks are always oversized at 0.10."""
+    return _fit_response(0.10)
 
 
 
