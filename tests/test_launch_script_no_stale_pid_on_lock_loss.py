@@ -138,14 +138,19 @@ def test_poll_writes_pid_when_child_exits_0_immediately(tmp_path):
 
 
 def test_launcher_logic_matches_driver_template():
-    """Coupling test: the launcher's actual poll+write block must
-    structurally match what DRIVER_TEMPLATE encodes.
+    """Coupling test: the actual poll+write block must structurally
+    match what DRIVER_TEMPLATE encodes.
 
-    If the launcher's logic is edited, this test fires to remind the
-    author to update DRIVER_TEMPLATE so the behavioral tests above
-    still describe the real code."""
-    launcher = (REPO_ROOT / "leerie").read_text()
-    # Anchors from the launcher's poll+write block; if any of these
+    The poll+write scaffold used to live inline in the launcher's Fly
+    and EC2 launch heredocs; it has since been consolidated into the
+    single shared `_render_launch_suffix` helper in
+    `scripts/remote/seed-common.sh` (sourced by both the Fly and EC2
+    launch paths), so this test now checks that file instead of the
+    `leerie` launcher itself. If the logic is edited, this test fires
+    to remind the author to update DRIVER_TEMPLATE so the behavioral
+    tests above still describe the real code."""
+    seed_common = (REPO_ROOT / "scripts" / "remote" / "seed-common.sh").read_text()
+    # Anchors from the shared poll+write block; if any of these
     # strings change, update DRIVER_TEMPLATE to match.
     must_contain = [
         "for _ in range(10):",
@@ -156,8 +161,9 @@ def test_launcher_logic_matches_driver_template():
         'with open(pid_path, "w") as pid_f:',
         'pid_f.write(str(p.pid) + "\\n")',
     ]
-    missing = [s for s in must_contain if s not in launcher]
+    missing = [s for s in must_contain if s not in seed_common]
     assert not missing, (
-        f"launcher poll+write block is missing expected anchors: {missing}. "
-        f"If the launcher changed, update DRIVER_TEMPLATE in this test."
+        f"scripts/remote/seed-common.sh's poll+write block is missing "
+        f"expected anchors: {missing}. If the logic changed, update "
+        f"DRIVER_TEMPLATE in this test."
     )
