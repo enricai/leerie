@@ -2164,6 +2164,8 @@ sidecar still promotes to `fly` as before. Neither `accept-blocked` nor
 a later `resume` subtask); this subtask's scope for those two remains the
 detection helper and the `--runtime` enum validation it feeds.
 
+## EC2 `kill` action ordering
+
 `kill`'s EC2 action — resolving `ec2_instance_id` from the run dir,
 resolving AWS credentials, re-resolving `LEERIE_EC2_SSH_TARGET`, and
 syncing state via `_try_fetch_state_for_ec2_teardown` BEFORE calling
@@ -2202,6 +2204,8 @@ with "no ec2_instance_id found" without ever calling `terminate-instances`
 or `flyctl`; and the confirmation prompt (bypassed by `--force`, same
 convention as the Fly/local `kill` paths) rejects a wrong confirmation
 and proceeds on the correct one.
+## Plan-overlap judge: multi-drop clusters
+
 The phase 2¾ plan-overlap judge (DESIGN §5 *Cross-domain surface overlap*)
 is tested in `tests/test_phase_overlap_judge.py`. Beyond the schema and
 merge-feasibility backstop, it pins the **multi-drop cluster** contract
@@ -2243,6 +2247,8 @@ primary case — via a shared `_normalize_artifact_path` that
 `./x` and `x` must not read as disjoint; no case folding, since container
 checkouts are case-sensitive).
 
+## Plan-overlap judge: multi-artifact pairs
+
 The same file also covers the **multi-artifact pair** contract (DESIGN §5
 *Multi-artifact pair*) and the `artifact`-is-a-logical-name rule, both
 added after run `e2882da6…` (2026-08-01) died in phase 2¾ having written
@@ -2271,6 +2277,8 @@ carry a path. The behavioural pair is
 `test_prose_in_artifact_is_never_parsed_for_paths`: the same invented path
 must be invisible in the label and flagged in the field, so neither half
 can pass vacuously.
+## Plan-overlap judge: duplicate collision resolution
+
 For duplicates, what must agree is the resolved **effect**
 (`_collision_effect`: dropped sid, or unordered merge pair) — never the
 `resolution` string, since swapped-endpoint `drop_a` rows share a string
@@ -2284,6 +2292,8 @@ and each conflicting shape is offered a `DUPLICATE_PAIR` retry round
 first. A separate test pins that the `DUPLICATE_PAIR` string keeps the
 `LABEL: subject — detail` shape, since `_issue_signature` splits on the
 first em dash and the row count must not perturb the oscillation key.
+
+## Wiring gate: resume must not bypass it
 
 `resume` must not bypass the phase-3 semantic wiring gate
 (`tests/test_wiring_gate_resume.py`). `phase_wiring_gate` is
@@ -2310,6 +2320,8 @@ cannot see: the call sits behind its own `wiring_gate`-keyed guard
 in the same change — it previously pinned the old structure by source
 order (gate call between the snapshot write and the `else:`); it now pins
 the audit-key guard while asserting the same cheap-resume property.
+
+## Wiring gate: constrained auto-repair
 
 The wiring gate's **constrained auto-repair** (DESIGN §5 *A wiring re-check on
 the fully-merged plan*) is pinned in `tests/test_wiring_gate_repair.py`. The
@@ -2357,6 +2369,8 @@ same cycle guard; the tag channel wins when a value is both a tag and an id; a
 non-`missing_requires` kind, an unknown sid, an empty `tag_or_dep`, and a
 self-provider all decline; an already-declared edge is neither repaired nor
 gating (on both channels).
+
+## Wiring gate: dismissing provably-false defects
 
 **The already-declared guard is channel-local AND sits downstream of channel
 selection**, so a defect matching no channel takes the `else: unrepaired;
@@ -2426,6 +2440,8 @@ four *specific* edges, not all of them, so the advisory's both-empty condition
 never held regardless of prefix. Widening only added noise by flagging
 legitimate root producers.
 
+## Wiring gate repair: corpus-measured effect
+
 The repair's *measured effect* — as opposed to its per-rule behavior — is
 locked separately in `tests/test_wiring_repair_corpus.py` against
 `tests/fixtures/wiring_repair_corpus/corpus.json`, the real recorded
@@ -2437,6 +2453,8 @@ through (a defect repairing for the *wrong* reason is a regression the counts
 alone cannot see), and the headline 5-of-6 ratio. Change the acceptance rules
 and this file fails with a message telling you the documented trade-off moved
 — which is the point.
+
+## Deterministic duplicate-provider floor
 
 The **deterministic duplicate-provider floor** beneath `phase_overlap_judge`
 (DESIGN §5 *A deterministic floor underneath the judge*) is
@@ -2462,6 +2480,8 @@ zero such pairs. Paths are canonicalized with `_normalize_artifact_path` (not
 `src/x.ts`), matching the sibling `NO_FILE_OVERLAP` check. Shipped
 **advisory** — logged, never gating — pending confirmation across live runs.
 
+## Launcher stale-install warning
+
 The launcher's **stale-install warning** (`_warn_if_leerie_stale`,
 IMPLEMENTATION.md §0) is pinned in `tests/test_stale_install_warning.py`,
 which extracts the function verbatim from `leerie` and drives it against real
@@ -2480,6 +2500,8 @@ fetch fails 4 tests). Bounded at `timeout 5`, throttled to once per 24h via an
 mtime stamp in the state dir (same convention as `.dockerfile-hash`), and
 warn-only — a detached HEAD, no upstream, a non-git prefix, or an unreachable
 remote must all stay silent and never fail a run.
+
+## Plan checkpoints: snapshot aliasing
 
 `plans_after_*` checkpoints must be snapshots, not live references
 (`tests/test_checkpoint_aliasing.py`). `_run_phases` assigned
@@ -2503,6 +2525,8 @@ guard requires `copy.deepcopy(` on all six assignments so a newly added
 checkpoint cannot reintroduce the alias. The same aliasing class applies
 to `st.data["plan_overlap_judge"]`, deep-copied at its persist so the
 coalescing step cannot rewrite the "raw judge output" audit.
+
+## Dead-function guard
 
 `tests/test_no_dead_functions.py` is a whole-module guard that no
 **private** module-level function in `orchestrator/leerie.py` is defined
@@ -2544,6 +2568,8 @@ between the two flags is unchanged and is load-bearing — requiring both
 would drop the npm and yarn forms, which
 `tests/test_capture_deps.py::test_keeps_node_offline_relink_only` pins.
 
+## Static `claude_p` call-site signature check
+
 Every `claude_p` call site in the module is statically checked against the
 real signature by `tests/test_claude_p_call_sites.py` — all-keyword (no
 positionals), every required parameter present, no unknown keyword, and
@@ -2579,6 +2605,8 @@ call sites at all (a scan that finds nothing passes every assertion), and the
 behavioral file pins that narrowing the `except` did not make an advisory
 gate fatal. All were falsified live against each defect reintroduced
 individually.
+
+## Judgment-worker isolation
 
 **Judgment-worker isolation** (DESIGN §12) is covered by four files, and the
 thing worth remembering is that the design was settled by *experiment*, not by
@@ -2629,6 +2657,8 @@ can never *be* the checkout, and `claude_p`'s guard is the actual enforcement.
 
 ---
 
+## Planning-worktree pollution: conftest fixture
+
 Raising bought diagnostics only, at the price of a precondition every
 hand-built `State` must know about: measured, **141 tests red**, and 8 test
 files still needed a fixture seed after the fallback landed.
@@ -2647,6 +2677,8 @@ the guard: 2 worktrees, 25 MB, and one red test on CI with no visible link to
 the change that caused it — local runs were green because the pollution only
 bites a later scanner. When adding a fixture that shells out to git, assume
 the state root is inside the repo unless the test pins it elsewhere.
+
+## `resume <run-id>` positional argument bug
 
 `leerie resume <run-id>` — the documented positional form — is pinned by
 `tests/test_resume_positional_run_id.py`. It silently ignored the run-id on
@@ -2672,6 +2704,8 @@ walks the AST of `_run_phases`, because the obvious
 `"args.task" not in getsource(main)` passes trivially (the reads are in
 `_run_phases`, not `main`) and proved nothing.
 
+## Fresh-run branch coverage gap
+
 **The fresh-run branch of `_run_phases` had no execution coverage at all**
 until `tests/test_run_phases_fresh_init.py`, and v0.20.0 shipped a
 `NameError` in it that killed every non-resume run. Two structural reasons,
@@ -2694,6 +2728,8 @@ key was in the dict literal, only its value expression was unevaluatable.
 Presence is not evaluation: a walk that checks a key exists says nothing about
 whether that key's value resolves, which takes either execution or scope
 resolution (the symtable scan below does the latter statically).
+
+## Structure-vs-substance testing principle
 
 **The general rule, of which that is one instance: a test asserting STRUCTURE
 must be paired with one asserting SUBSTANCE.** Structure is a dict key, a source
@@ -2722,6 +2758,8 @@ executes the branch, stopping at a sentinel on
 `st.save()`, so no other stub is needed), and carries the guard-the-guard test
 that the resume branch would `die()` here — without it the file could silently
 drift onto the path it exists to avoid.
+## Undefined-name static scan
+
 `tests/test_no_undefined_names.py` is the whole-module generalisation: stdlib
 `symtable` over `orchestrator/`, `chain/`, `scripts/` and `tests/`, flagging
 any name that is referenced, resolves to global scope, and is bound in neither
@@ -2744,6 +2782,8 @@ unconditionally passes every negative case. Anti-vacuity is a canary injected
 into the **real** module rather than a synthetic snippet, so a refactor that
 quietly stops analysing `leerie.py` fails.
 
+## Tool-containment scan: source-slicing blind spot
+
 **A test that source-slices one function cannot observe a property it asserts
 repo-wide, and that is how a containment bug shipped.** `tests/test_strict_mcp_config.py`
 opened *"unconditionally for every worker"* while its `_claude_p_body()` helper sliced
@@ -2761,6 +2801,8 @@ builder — which the pre-fix argv also satisfied, because missing that flag *wa
 A negative assertion the defect already satisfies proves nothing; the positive control
 (flag present on both argvs with the builder intact) is the load-bearing half.
 
+## Turn-cap taint-walk scope isolation
+
 **A name-keyed AST taint walk needs scope isolation or it swallows the module.**
 `tests/test_turn_cap_signal.py`'s `_aliases` propagates taint by variable NAME with no
 notion of scope, and was run over the whole module. One new assignment —
@@ -2774,6 +2816,8 @@ this cannot be a synthetic snippet — a minimal two-function reproduction does 
 cascade, so it passes under both implementations; the discriminating assertion is a
 property of the real module (no unrelated name tainted, per-scope set bounded).
 
+## Under-specified fixture hides producer contract
+
 **An under-specified fixture hides a producer-side contract.** Two files passed
 `models={}` to `_run_phases`, which was invisible until `preflight` began reading
 `models["classifier"]` and they raised `KeyError` before reaching the behaviour under
@@ -2781,8 +2825,9 @@ test. The fix is a real dict (derived from `WORKER_TYPES`, or a `defaultdict`), 
 `.get()` in production code — coercing there would have swallowed the contract violation
 in exactly the way this file warns about elsewhere.
 
-No coverage
-target is set — the suite was introduced from scratch and a number
+## No coverage target; launcher syntax check
+
+No coverage target is set — the suite was introduced from scratch and a number
 now would be arbitrary.
 `tests/test_launcher_integrity.py` is the **only** thing that checks the
 `leerie` launcher parses. CI does not: `shellcheck.yml` lints `scripts/*.sh`
