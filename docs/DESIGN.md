@@ -1889,77 +1889,72 @@ be a real regression:
 Two flags control push and PR independently of body composition:
 
 - `--no-push` skips both the push and the PR; the run completes with the
-  run branch local-only. The user can inspect, push, or open a PR manually
-  whenever they choose.
+  run branch local-only, for the user to inspect, push, or PR by hand.
 - `--no-verify` passes `--no-verify` to `git push`, skipping pre-push hooks.
-  Worker commits inside worktrees continue to run all hooks normally — only
-  the push gate is affected. This is the per-invocation explicit user
-  override called out by the project's "never skip hooks unless asked"
-  principle; defaults to off.
+  Worker commits inside worktrees still run all hooks normally — only the
+  push gate is affected. This is the explicit per-invocation override to the
+  project's "never skip hooks unless asked" principle; defaults to off.
 
 **A `pre-push` hook is a gate on the host, not on the run — so it is
 probed at run start.** git runs `pre-push` in the repository root against
-whatever is *checked out*. leerie never checks out the run branch — the
-push happens from the user's own checkout, and the finalize rebase uses a
-disposable worktree — so a hook that lints, typechecks, or tests the
-working tree measures the host's state and can reject a push for reasons
-no run could have caused or prevented (a stale `node_modules`, a tool
-missing from the hook's PATH, a half-finished dependency bump). Measured:
-every recorded push rejection in one operator's state directory was of
-exactly this shape, the most expensive arriving after 2h19m and $57 of work.
+whatever is *checked out*. leerie never checks out the run branch — the push
+happens from the user's own checkout, and the finalize rebase uses a
+disposable worktree — so a hook that lints, typechecks, or tests the working
+tree measures the host's state and can reject a push for reasons no run
+could have caused or prevented (a stale `node_modules`, a tool missing from
+the hook's PATH, a half-finished dependency bump). Measured: every recorded
+push rejection in one operator's state directory was of exactly this shape,
+the most expensive arriving after 2h19m and $57 of work.
 
-leerie does not treat that gate as a verdict on the run — it already ran
-the equivalent checks in-container — but cannot ignore it either, since the
-push genuinely will not happen. Because the hook reads the host checkout,
-which leerie never modifies during a run, a probe at run start predicts the
+leerie does not treat that gate as a verdict on the run — it already ran the
+equivalent checks in-container — but can't ignore it either, since the push
+genuinely won't happen. Because the hook reads the host checkout, which
+leerie never modifies during a run, a probe at run start predicts the
 finalize outcome by construction. `git push --dry-run` runs the hook and
 creates no ref, so the launcher runs it during host preflight and warns
 (never refuses — a hook can legitimately fail on a tree the run is about to
-fix, and a preflight must never become a new way to decline to start). A
-chain probes once per *wave* (its jobs share one checkout, so N probes
-would compute one answer N times concurrently); a group probes per member,
-since its members are separate repositories. Same "fail fast at the
-cheapest moment" reasoning §13 applies to budget feasibility.
+fix, and preflight must never become a new way to decline to start). A
+chain probes once per *wave* (its jobs share one checkout, so N probes would
+compute one answer N times concurrently); a group probes per member, since
+its members are separate repositories. Same "fail fast at the cheapest
+moment" reasoning as §13's budget feasibility.
 
 **Push and PR are honest about failure.** A push or PR step that fails does
-not pretend the run failed: the local work is intact and reachable on the
-run branch. The orchestrator records what was attempted and what failed in
-a per-run sidecar (`run.json` — `pushed_at`, `push_error`, `pr_url`,
-`pr_error`). Push failure exits non-zero with a message naming the run
-branch (where the work lives), the working branch (the diff fork-point,
-unchanged from run start), and the PR base branch (`pr_base_branch`,
-defaulting to `working_branch`), shows the captured push output — stderr
-plus any pre-push hook stdout, since git forwards a hook's stdout to its
-own and that is where `tsc`/`biome` report — and gives the exact retry
-command. PR-creation failure is non-fatal: the push already succeeded, so
-the user gets a warning with the pushed branch's URL and the exact `gh pr
-create` retry command. The user always knows exactly what state things are
-in and which branch holds the work.
+not pretend the run failed: the local work is intact on the run branch. The
+orchestrator records what was attempted and what failed in a per-run
+sidecar (`run.json` — `pushed_at`, `push_error`, `pr_url`, `pr_error`). Push
+failure exits non-zero with a message naming the run branch (where the work
+lives), the working branch (the diff fork-point, unchanged from run start),
+and the PR base branch (`pr_base_branch`, defaulting to `working_branch`),
+shows the captured push output — stderr plus any pre-push hook stdout,
+since git forwards a hook's stdout to its own and that's where
+`tsc`/`biome` report — and gives the exact retry command. PR-creation
+failure is non-fatal: the push already succeeded, so the user gets a
+warning with the pushed branch's URL and the exact `gh pr create` retry
+command.
 
 **`pushed_at` gates re-finalize by branch position, not mere presence.** A
 re-invoked finalize (`leerie finalize`, a second launcher pass, Fly's
-`decide_teardown`) must be idempotent, so a run whose `pushed_at` is
-already set is normally a no-op — but `pushed_at` records *that* a push
-happened, not *what* it pushed, and a finalize that fired while the run
-was still integrating can leave it set on a **partial** branch. So the
-short-circuit compares the local run-branch tip against the pushed origin
-tip: **equal tips → no-op** (the common case); **origin a strict ancestor
-of the local tip (or origin absent) → fast-forward re-push + re-open the
-PR**, gated behind the same completion check
-(`completed_waves == len(waves)`, itself fail-open on a missing
-`state.json`). A **diverged** origin is not treated as a partial push — it
-keeps the idempotent short-circuit rather than attempting a push that
-cannot fast-forward. This prevents a partial push from permanently wedging
-a run while preserving idempotency, the chain wave-skip signal (which reads
-`pushed_at`, still set, not the tip), and the invariant `pr_url ⇒
-pushed_at`.
+`decide_teardown`) must be idempotent, so a run whose `pushed_at` is already
+set is normally a no-op — but `pushed_at` records *that* a push happened,
+not *what* it pushed, and a finalize that fired while the run was still
+integrating can leave it set on a **partial** branch. The short-circuit
+instead compares the local run-branch tip against the pushed origin tip:
+**equal tips → no-op** (the common case); **origin a strict ancestor of the
+local tip (or origin absent) → fast-forward re-push + re-open the PR**,
+gated behind the same completion check (`completed_waves == len(waves)`,
+itself fail-open on a missing `state.json`). A **diverged** origin is not
+treated as a partial push — it keeps the idempotent short-circuit rather
+than attempting a push that cannot fast-forward. This prevents a partial
+push from permanently wedging a run while preserving idempotency, the
+chain wave-skip signal (which reads `pushed_at`, still set, not the tip),
+and the invariant `pr_url ⇒ pushed_at`.
 
-**Why push by default.** When leerie is invoked in CI or any unattended
-context, a successful run that leaves work only on a local branch is a
-silent failure mode — the work exists but the user has no signal that it
-needs to be reviewed. Defaulting to push + PR turns every run into a
-reviewable artifact. `--no-push` exists for users running leerie offline
-or in repositories without a GitHub remote.
+**Why push by default.** A successful unattended run that leaves work only
+on a local branch is a silent failure mode — the work exists but nothing
+signals it needs review. Defaulting to push + PR turns every run into a
+reviewable artifact. `--no-push` exists for offline use or repos without a
+GitHub remote.
 
 **Branch cleanup at finalize.** After the push + PR (or after the run
 completes under `--no-push`), the orchestrator deletes the per-subtask
@@ -1979,142 +1974,136 @@ completely scrub a finished run can do so with
 
 **A containerized headless run must prefer the long-lived token.** The
 host's interactive Claude Code session authenticates with a short-lived
-subscription OAuth token — corroborated at roughly 8h, though the exact
-TTL is undocumented (community reports range 2–15h), so leerie never
-hard-codes a duration and instead reads the credential's own
-authoritative `expiresAt` field. That token is refreshable only by the
-interactive host session that owns it — Claude Code renews it silently
-in the background while the user is logged in.
+subscription OAuth token — corroborated at roughly 8h, though the exact TTL
+is undocumented (community reports range 2–15h), so leerie never
+hard-codes a duration and instead reads the credential's own authoritative
+`expiresAt` field. That token is refreshable only by the interactive host
+session that owns it — Claude Code renews it silently in the background
+while the user is logged in.
 
 A leerie container cannot participate in that renewal. Keychain and
-`~/.claude/.credentials.json` never traverse the Lima VM boundary
-directly — the launcher copies whatever credential it resolves into a
-fresh `mktemp -d` staging directory and bind-mounts it read-through into
-the container, so the container holds a **snapshot**, not a live view.
-It cannot refresh a token whose refresh state lives in the host's
-Keychain, and Anthropic's refresh flow **rotates the refresh token on
-every use** — a container-side refresh, even if it succeeded, would
-silently invalidate the host's own copy out from under the still-running
-interactive session. Copied subscription credentials are documented
-upstream as not refreshing at all once removed from their original
-context (anthropics/claude-code#21765). Container-side token refresh is
-therefore **architecturally impossible**, not merely unimplemented.
+`~/.claude/.credentials.json` never traverse the Lima VM boundary directly
+— the launcher copies whatever credential it resolves into a fresh
+`mktemp -d` staging directory and bind-mounts it read-through into the
+container, so the container holds a **snapshot**, not a live view. It
+cannot refresh a token whose refresh state lives in the host's Keychain,
+and Anthropic's refresh flow **rotates the refresh token on every use** —
+a container-side refresh, even if it succeeded, would silently invalidate
+the host's own copy out from under the still-running interactive session.
+Copied subscription credentials are documented upstream as not refreshing
+at all once removed from their original context
+(anthropics/claude-code#21765). Container-side token refresh is therefore
+**architecturally impossible**, not merely unimplemented.
 
-The credential Anthropic's own docs prescribe for this situation is the
-**long-lived OAuth token** minted by `claude setup-token` — lasting
-roughly a year, meant for CI/automation, and — critically — still
-authenticating against the user's Claude subscription rather than the
-API, preserving leerie's no-API-key constraint. Sessions authenticated
-via `CLAUDE_CODE_OAUTH_TOKEN` never see the "OAuth session expired"
-failure at all, per Anthropic's own error reference, because they never
-depend on the saved, host-refreshed login — a container invoked with it
-set is immune to the mid-run expiry class of failure by construction,
-not by any retry or backoff leerie adds on top.
+The credential Anthropic's own docs prescribe here is the **long-lived
+OAuth token** minted by `claude setup-token` — lasting roughly a year,
+meant for CI/automation, and — critically — still authenticating against
+the user's Claude subscription rather than the API, preserving leerie's
+no-API-key constraint. Sessions authenticated via `CLAUDE_CODE_OAUTH_TOKEN`
+never see the "OAuth session expired" failure at all, per Anthropic's own
+error reference, because they never depend on the saved, host-refreshed
+login — a container invoked with it set is immune to the mid-run expiry
+class of failure by construction, not by any retry or backoff leerie adds
+on top.
 
 Consequently, credential resolution takes `$CLAUDE_CODE_OAUTH_TOKEN`
-**first**, ahead of Keychain and the credentials file — an inversion of
-the historical precedence, which silently preferred the 8h token even
-when a user had minted a durable one. A user who has set nothing is
-unaffected: resolution falls back to Keychain, then the file, as before.
-The emitted JSON shape is unchanged regardless of which branch resolved
-the credential
+**first**, ahead of Keychain and the credentials file — an inversion of the
+historical precedence, which silently preferred the 8h token even when a
+user had minted a durable one. A user who has set nothing is unaffected:
+resolution falls back to Keychain, then the file, as before. The emitted
+JSON shape is unchanged regardless of which branch resolved the credential
 (`{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` — the
 `scopes` field is required by the CLI's file-auth path, which rejects a
-scope-less blob as "Not logged in"), matching what `seed-auth.sh`
-already stages into the container.
+scope-less blob as "Not logged in"), matching what `seed-auth.sh` already
+stages into the container.
 
 **Keychain/file resolution requires a real token, not just non-empty
 JSON.** The macOS Keychain entry and `~/.claude/.credentials.json` are
 shared with Claude Code's own MCP-server OAuth state — a documented
 upstream bug (steipete/CodexBar#1844) lets a background MCP-plugin auth
-flow overwrite the shared `Claude Code-credentials` Keychain item with
-only `{"mcpOAuth": {...}}`, dropping `claudeAiOauth` (the actual session
-token) entirely. That blob is syntactically valid, non-empty JSON, so a
-presence-only check accepts it, stages it into the container, and the
-CLI fails with "Not logged in" despite the launcher reporting success.
-Both the Keychain and on-disk-file branches now additionally require a
+flow overwrite the shared `Claude Code-credentials` Keychain item with only
+`{"mcpOAuth": {...}}`, dropping `claudeAiOauth` (the actual session token)
+entirely. That blob is syntactically valid, non-empty JSON, so a
+presence-only check accepts it, stages it into the container, and the CLI
+fails with "Not logged in" despite the launcher reporting success. Both
+the Keychain and on-disk-file branches now additionally require a
 non-empty `claudeAiOauth.accessToken` before accepting the blob; a blob
-failing that check is treated as if that source were empty and
-resolution falls through the same chain (Keychain → file → the existing
-"could not extract credentials" hint) rather than short-circuiting on a
-false positive.
+failing that check is treated as if that source were empty and resolution
+falls through the same chain (Keychain → file → the existing "could not
+extract credentials" hint) rather than short-circuiting on a false
+positive.
 
-**The expiry preflight is best-effort, not a hard gate.** Before staging
-a resolved *subscription* credential (the long-lived token has no
-`expiresAt` and is exempt from this check entirely), leerie parses
-`claudeAiOauth.expiresAt` and compares it to the current time, mirroring
-the pattern already proven for AWS SSO token freshness in
-`scripts/remote/aws-credentials.sh`:
+**The expiry preflight is best-effort, not a hard gate.** Before staging a
+resolved *subscription* credential (the long-lived token has no
+`expiresAt` and is exempt entirely), leerie parses `claudeAiOauth.expiresAt`
+and compares it to the current time, mirroring the pattern already proven
+for AWS SSO token freshness in `scripts/remote/aws-credentials.sh`:
 
-- **Already expired** → refuse to launch and print `claude /login` as
-  the fix, rather than starting a run doomed to fail at worker #1.
-- **Inside a near-expiry threshold** (proposed 90 minutes — long enough
-  to cover realistic run durations without false-alarming on every
-  launch) → warn with the credential's exact expiry time and point at
-  `claude setup-token` as the durable fix, but still launch. A short run
-  may well finish before the token dies.
-- **`expiresAt` absent or malformed** → proceed silently. The 1-year
-  token has no `expiresAt` field at all, and a best-effort freshness
-  check must never harden into a hard requirement for a field that
-  legitimately may not be present — doing so would turn a diagnostic
-  aid into a new way to break the exact non-expiring credential this
-  whole strategy exists to prefer.
+- **Already expired** → refuse to launch and print `claude /login`, rather
+  than starting a run doomed to fail at worker #1.
+- **Inside a near-expiry threshold** (proposed 90 minutes — long enough to
+  cover realistic run durations without false-alarming on every launch) →
+  warn with the credential's exact expiry time and point at
+  `claude setup-token` as the durable fix, but still launch.
+- **`expiresAt` absent or malformed** → proceed silently. The 1-year token
+  has no `expiresAt` field at all, and a best-effort freshness check must
+  never harden into a hard requirement for a field that legitimately may
+  not be present — that would break the exact non-expiring credential this
+  strategy exists to prefer.
 
 **Auth failures split into two classes with different remedies.**
-`_is_auth_or_quota_failure` (see *Cleanup on abnormal exit* below for
-the full taxonomy) already treats numeric 401/429/529 statuses as
-**transient**: the gateway rejected one request, but a retry after
-backoff has a real chance of succeeding once the rolling usage window
-clears or gateway overload subsides. An expired or revoked *session* is
-categorically different — Claude Code's own error handling clears the
-saved credential locally and, per Anthropic's docs, sends no further
-request at all once it detects that state. Backing off and retrying
-against a session that will never renew itself burns the full
-`auth_retry_max_sec` budget on requests guaranteed to fail identically
-to the first — this was the `b57027d3…` incident's D2 defect: two
-retries fired 1.2s apart against the same dead session before the run
-gave up with a schema-error message that misattributed the failure.
+`_is_auth_or_quota_failure` (see *Cleanup on abnormal exit* below for the
+full taxonomy) treats numeric 401/429/529 statuses as **transient**: the
+gateway rejected one request, but a retry after backoff has a real chance
+once the rolling usage window clears or gateway overload subsides. An
+expired or revoked *session* is categorically different — Claude Code's own
+error handling clears the saved credential locally and, per Anthropic's
+docs, sends no further request at all once it detects that state. Backing
+off against a session that will never renew itself just burns the full
+`auth_retry_max_sec` budget — this was the `b57027d3…` incident's D2
+defect: two retries fired 1.2s apart against the same dead session before
+the run gave up with a schema-error message that misattributed the
+failure.
 
-The fix is a **terminal** auth-failure class, checked before the
-transient classifier ever runs: envelope text carrying "failed to
-authenticate," "oauth session expired," "session expired and could not
-be refreshed," or "not logged in" (measured against 611 historical
-`is_error` envelopes: 215 true positives, 0 false positives) never
-enters the backoff loop, raising immediately into the same **resumable
-pause** leerie already uses for out-of-credits (`EXIT_LOCKED`, exit
-75) — worktree-only cleanup, state and branches preserved, a `leerie
-resume <id>` hint logged. Like a billing shortfall, an expired session
-does not resolve on a clock, so auto-resume would spin uselessly; the
-run's completed work is fully preserved and picked back up on `resume`
-once the operator re-authenticates or sets `CLAUDE_CODE_OAUTH_TOKEN`.
+The fix is a **terminal** auth-failure class, checked before the transient
+classifier ever runs: envelope text carrying "failed to authenticate,"
+"oauth session expired," "session expired and could not be refreshed," or
+"not logged in" (measured against 611 historical `is_error` envelopes: 215
+true positives, 0 false positives) never enters the backoff loop, raising
+immediately into the same **resumable pause** leerie already uses for
+out-of-credits (`EXIT_LOCKED`, exit 75) — worktree-only cleanup, state and
+branches preserved, a `leerie resume <id>` hint logged. Like a billing
+shortfall, an expired session doesn't resolve on a clock, so auto-resume
+would spin uselessly; the run's completed work is preserved and picked
+back up on `resume` once the operator re-authenticates or sets
+`CLAUDE_CODE_OAUTH_TOKEN`.
 
 **The same refresh-vs-static distinction applies to Bedrock auth.** The
 launcher's Bedrock support defaults to AWS SSO/profile auth:
 `detect_bedrock_mode()` reads `CLAUDE_CODE_USE_BEDROCK` out of the merged
-Claude `settings.json` files, then `bedrock_preflight()` requires the
-host `aws` CLI and a live `aws sts get-caller-identity` before staging
-`~/.aws/` read-only into the container. SSO access tokens are
-short-lived (~12h) and refreshed only by the host's interactive `aws sso
-login` browser flow — the identical container-cannot-refresh problem
-this section already solved for subscription auth.
+Claude `settings.json` files, then `bedrock_preflight()` requires the host
+`aws` CLI and a live `aws sts get-caller-identity` before staging `~/.aws/`
+read-only into the container. SSO access tokens are short-lived (~12h) and
+refreshed only by the host's interactive `aws sso login` browser flow — the
+identical container-cannot-refresh problem this section already solved for
+subscription auth.
 
 `AWS_BEARER_TOKEN_BEDROCK` is the Bedrock analogue: a static bearer
 credential the Claude CLI sends directly to the Bedrock runtime endpoint,
-with no refresh-token/expiry machinery near it (verified against the
-CLI's own bundled source and live end-to-end testing — the token alone
-is a no-op unless `CLAUDE_CODE_USE_BEDROCK` is also set). Because it
-needs no `aws` CLI, no SSO session, and no `~/.aws/` staging, leerie
-triggers this path from a plain host env var, independent of the
-settings.json-driven gate, and skips `bedrock_preflight()`/the `~/.aws`
-mount entirely when set — the same precedent of preferring the
-credential immune to the expiry failure class. When both are present,
-the bearer token wins, matching the Claude CLI's own resolution order.
+with no refresh-token/expiry machinery near it (verified against the CLI's
+own bundled source and live end-to-end testing — the token alone is a
+no-op unless `CLAUDE_CODE_USE_BEDROCK` is also set). Because it needs no
+`aws` CLI, no SSO session, and no `~/.aws/` staging, leerie triggers this
+path from a plain host env var, independent of the settings.json-driven
+gate, and skips `bedrock_preflight()`/the `~/.aws` mount entirely when set.
+When both are present, the bearer token wins, matching the Claude CLI's own
+resolution order.
 
 **Multi-token rotation reduces quota exhaustion the same way the
 long-lived token above reduces expiry risk — by picking the credential
 least likely to fail, rather than reacting after it does.** A single
-`CLAUDE_CODE_OAUTH_TOKEN` still has one shared 5-hour/7-day usage window;
-a long run (many workers, high `max_parallel`) can exhaust that window
+`CLAUDE_CODE_OAUTH_TOKEN` still has one shared 5-hour/7-day usage window; a
+long run (many workers, high `max_parallel`) can exhaust that window
 mid-run even though the token itself never expires. `leerie` supports
 `CLAUDE_CODE_OAUTH_TOKENS` — a comma-separated list of tokens — which
 **supersedes** the singular var when set:
@@ -2133,82 +2122,78 @@ mid-run even though the token itself never expires. `leerie` supports
   leerie rotates to another token with runway and **continues in the same
   container** — no re-exec, no restart — by threading the active token
   through each worker spawn's environment. If every token is limited,
-  leerie picks the one whose window resets soonest and falls through to
-  the existing reset-wait auto-resume path rather than pausing on
-  whichever token happened to fail. This covers both surfaces a rate
+  leerie picks the one whose window resets soonest and falls through to the
+  existing reset-wait auto-resume path. This covers both surfaces a rate
   limit can reach `claude_p` through: a completed envelope carrying a
   401/429/529/auth-message, and the protocol-level `rate_limit_event`
-  stream event that raises `RateLimitedExit` directly out of the
-  streaming loop before any envelope is produced.
+  stream event that raises `RateLimitedExit` directly out of the streaming
+  loop before any envelope is produced.
 
 **This is deliberately structured data in, deterministic Python out — no
 LLM worker** (§12). Ranking is `min(1 − 5h_utilization, 1 −
 7d_utilization)` with a furthest-reset tie-break, computed identically
-given the same inputs — nothing here for a judgment worker to interpret.
+given the same inputs.
 
 **Both probe endpoints are undocumented and explicitly best-effort.**
 Anthropic can change or remove either without notice; every probe path
-degrades to "use the current/first token and react to the next 429"
-rather than fail the run. A probe response missing an expected field
-(contract drift, distinct from an ordinary transient failure) is logged
-at WARNING with a stable marker, kept visually distinct from an ordinary
-failure so a silent endpoint-shape change doesn't quietly degrade this
-feature for weeks with no signal. Each token's probe result is cached
-for a floor of ~180 seconds and identified in logs only by a short
-fingerprint — the raw token value is never written to a log line,
-`calls.ndjson`, or `run.json`. `state.json`'s `active_oauth_token` field
-is the one place the raw active token persists at rest (it is
-local-orchestrator-owned, not published), and it travels with
-`state.json` on the existing Fly/EC2 `fetch-branch.sh` state sync.
+degrades to "use the current/first token and react to the next 429" rather
+than fail the run. A probe response missing an expected field (contract
+drift, distinct from an ordinary transient failure) is logged at WARNING
+with a stable marker so a silent endpoint-shape change doesn't quietly
+degrade this feature for weeks with no signal. Each token's probe result
+is cached for a floor of ~180 seconds and identified in logs only by a
+short fingerprint — the raw token value is never written to a log line,
+`calls.ndjson`, or `run.json`. `state.json`'s `active_oauth_token` field is
+the one place the raw active token persists at rest (local-orchestrator-
+owned, not published), and it travels with `state.json` on the existing
+Fly/EC2 `fetch-branch.sh` state sync.
 
-**Decomposition needs the same discipline against the loss of
-in-progress spend.** §5½ (P1)'s `fit_judge` and coupled-minority
-`splitter` calls have no crash barrier: a single `WorkerError`
-mid-decomposition discards every fit/split judgment already paid for on
-that planning pass, not just the node being judged — the same class of
-loss D3 measured in the motivating incident, where decomposition was
-27.8% of the run's total spend. The remedy mirrors disciplines
-`_recursive_decompose` already applies elsewhere: a `WorkerError` from
-either call degrades that node to a **leaf**, the same way the existing
-depth-cap and no-progress-guard cases resolve uncertainty by accepting
-the node as-is; and `phase_plan` snapshots decomposition progress into
-state as each top-level subtask finishes expanding, the same way
-`plan_snapshot` persists the post-`_schedule()` plan. Like
-`plan_snapshot`, this snapshot is **diagnostic only** — nothing reads it
-back. The resumable-planning cursor (§6) checkpoints `phase_plan`'s
-output as a whole, so a pause mid-decomposition still re-runs the entire
-`phase_plan` invocation on resume rather than rehydrating from partial
-leaves; wiring `resume` to that finer granularity is a separate,
+**Decomposition needs the same discipline against the loss of in-progress
+spend.** §5½ (P1)'s `fit_judge` and coupled-minority `splitter` calls have
+no crash barrier: a single `WorkerError` mid-decomposition discards every
+fit/split judgment already paid for on that planning pass, not just the
+node being judged — the same class of loss D3 measured in the motivating
+incident, where decomposition was 27.8% of the run's total spend. The
+remedy mirrors disciplines `_recursive_decompose` already applies
+elsewhere: a `WorkerError` from either call degrades that node to a
+**leaf**, the same way the existing depth-cap and no-progress-guard cases
+resolve uncertainty by accepting the node as-is; and `phase_plan` snapshots
+decomposition progress into state as each top-level subtask finishes
+expanding, the same way `plan_snapshot` persists the post-`_schedule()`
+plan. Like `plan_snapshot`, this snapshot is **diagnostic only** — nothing
+reads it back. The resumable-planning cursor (§6) checkpoints
+`phase_plan`'s output as a whole, so a pause mid-decomposition still
+re-runs the entire `phase_plan` invocation on resume rather than
+rehydrating from partial leaves; finer-grained resume is a separate,
 not-yet-shipped capability.
 
 ### Cleanup on abnormal exit
 
 A run can end abnormally four ways: the user hits Ctrl-C, an external
-process sends a signal (SIGTERM/SIGHUP from CI, systemd, a terminal
-close), an unhandled exception fires, or the Claude Code subscription
-rate-limit / session-limit is hit mid-worker. In each case the
-orchestrator runs a cleanup pass before exiting, and the cleanup
-*scope* is uniformly conservative — **state and branches are always
-preserved**; only worktrees are torn down. The run is always
-resumable via `resume <id>` after any abnormal exit.
+process sends a signal (SIGTERM/SIGHUP from CI, systemd, a terminal close),
+an unhandled exception fires, or the Claude Code subscription rate-limit /
+session-limit is hit mid-worker. In each case the orchestrator runs a
+cleanup pass before exiting, and the cleanup *scope* is uniformly
+conservative — **state and branches are always preserved**; only worktrees
+are torn down. The run is always resumable via `resume <id>` after any
+abnormal exit.
 
-**Auth failures split into transient and terminal, and only one of
-them benefits from backoff.** 401/429/529 — a rejected request against
-a still-valid session, whether from the rolling subscription cap or
-transient gateway overload — is **transient**: the session is fine, so
-retrying after backoff has a real chance once the window clears,
-handled by the existing auth/quota retry loop
-(`_is_auth_or_quota_failure`, taxonomy below). An expired or revoked
-session — "OAuth session expired," "failed to authenticate," "not
-logged in" — is **terminal**: per Anthropic's docs, Claude Code clears
-the saved credential and sends no further request at all once it
-detects this state, so every retry fails identically to the first and
-backoff only burns the `auth_retry_max_sec` budget for no benefit (see
-*Credential strategy* above). Terminal auth failures are checked
-*before* the transient classifier and routed straight to the same
-resumable pause (`EXIT_LOCKED`, exit 75) used for out-of-credits below
-— worktree-only cleanup, state and branches preserved, `resume` picks
-back up once the operator re-authenticates.
+**Auth failures split into transient and terminal, and only one benefits
+from backoff.** 401/429/529 — a rejected request against a still-valid
+session, whether from the rolling subscription cap or transient gateway
+overload — is **transient**: the session is fine, so retrying after
+backoff has a real chance once the window clears, handled by the existing
+auth/quota retry loop (`_is_auth_or_quota_failure`, taxonomy below). An
+expired or revoked session — "OAuth session expired," "failed to
+authenticate," "not logged in" — is **terminal**: per Anthropic's docs,
+Claude Code clears the saved credential and sends no further request at
+all once it detects this state, so every retry fails identically to the
+first and backoff only burns the `auth_retry_max_sec` budget for no
+benefit (see *Credential strategy* above). Terminal auth failures are
+checked *before* the transient classifier and routed straight to the same
+resumable pause (`EXIT_LOCKED`, exit 75) used for out-of-credits below —
+worktree-only cleanup, state and branches preserved, `resume` picks back
+up once the operator re-authenticates.
 
 **A mid-stream transport disconnect is a third transient class, and it
 gets the same backoff.** When the network connection carrying a worker's
@@ -2218,40 +2203,41 @@ envelope with `is_error` set, `terminal_reason` = `"api_error"`, a *null*
 and result text `"API Error: Connection closed mid-response. The response
 above may be incomplete."` This is the same *family* as the 529 overload
 case — the session is fine, the request just never completed — so a fresh
-session after backoff has a real chance of succeeding. It is distinct from
-a schema mistake, which is what the immediate corrective-note retry exists
-for; routing a transport drop through that path retries once against the
-same bad network window with a nonsensical "conform to the schema" nudge,
-then fails the subtask. `_is_transient_transport_failure` classifies it
-(keyed on `terminal_reason == "api_error"` with no numeric
+session after backoff has a real chance of succeeding. It is distinct
+from a schema mistake, which is what the immediate corrective-note retry
+exists for; routing a transport drop through that path retries once
+against the same bad network window with a nonsensical "conform to the
+schema" nudge, then fails the subtask. `_is_transient_transport_failure`
+classifies it (keyed on `terminal_reason == "api_error"` with no numeric
 `api_error_status`, or — as a secondary catch — a narrow connection-drop
-text-marker set) and
-routes it through the *same* `_is_auth_or_quota_failure` tenacity backoff
-loop, checked after the terminal-auth classifier so an expired session is
-never mistaken for a transport blip. Measured over 9,020 worker logs: 58
-sids hit this drop; of the 56 that did **not** also hit `max_turns` (the
-pure-transport population), 83% recovered on a later attempt and 73% on
-the very next one — a network transient, not context exhaustion (a third
-of drops fire at ≤3 turns). The two `max_turns`-coupled sids recovered 0%
-— an oversized subtask that also drops is a *decomposition* problem (see
-§5½ P1 *Sub-file*), not one backoff can fix. This transient path mirrors
-Claude Code's own remedy for a mid-stream drop (an automatic retry, CLI
-v2.1.219); leerie's backoff is the fresh-session complement for when the
-CLI's in-session retries are exhausted.
+text-marker set) and routes it through the *same*
+`_is_auth_or_quota_failure` tenacity backoff loop, checked after the
+terminal-auth classifier so an expired session is never mistaken for a
+transport blip. Measured over 9,020 worker logs: 58 sids hit this drop; of
+the 56 that did **not** also hit `max_turns` (the pure-transport
+population), 83% recovered on a later attempt and 73% on the very next
+one — a network transient, not context exhaustion (a third of drops fire
+at ≤3 turns). The two `max_turns`-coupled sids recovered 0% — an oversized
+subtask that also drops is a *decomposition* problem (see §5½ P1
+*Sub-file*), not one backoff can fix. This path mirrors Claude Code's own
+remedy for a mid-stream drop (an automatic retry, CLI v2.1.219); leerie's
+backoff is the fresh-session complement for when the CLI's in-session
+retries are exhausted.
 
 **A client-side context refusal is a fourth class, and it is terminal.**
 Claude Code enforces a context ceiling *itself*: when the assembled prompt
-exceeds the window it believes the model has, it emits a synthetic assistant
-message (`model=<synthetic>`, usage all zeros) and ends the session with
-`terminal_reason` = `"blocking_limit"` and result text `"Prompt is too long"`
-— without issuing an API call at all. Retrying identical input therefore
-cannot succeed, which puts this in the same bucket as terminal auth rather
-than the transient classes above. `_is_context_overflow` requires *both*
-`terminal_reason` and the result text (the reason alone is shared with other
-blocking limits; the text alone could appear in a worker's own correct
-output), is checked immediately after the terminal-auth classifier and
-before the generic corrective-note retry, and routes to the same resumable
-`EXIT_LOCKED` pause — the remedy is an operator change, not a wait.
+exceeds the window it believes the model has, it emits a synthetic
+assistant message (`model=<synthetic>`, usage all zeros) and ends the
+session with `terminal_reason` = `"blocking_limit"` and result text
+`"Prompt is too long"` — without issuing an API call at all. Retrying
+identical input therefore cannot succeed, putting this in the same bucket
+as terminal auth rather than the transient classes above.
+`_is_context_overflow` requires *both* `terminal_reason` and the result
+text (the reason alone is shared with other blocking limits; the text
+alone could appear in a worker's own correct output), is checked
+immediately after the terminal-auth classifier and before the generic
+corrective-note retry, and routes to the same resumable `EXIT_LOCKED`
+pause — the remedy is an operator change, not a wait.
 
 Before refusing, the CLI attempts reactive compaction, which summarises
 **message groups**; a conversation with fewer than two of them fails
@@ -2265,33 +2251,33 @@ the *compaction trigger*, not the context ceiling itself.
 That is why the smoke test runs in an **empty working directory**: it
 validates the CLI (auth, streaming, `--json-schema`), not the repository.
 Loading the repo's own `CLAUDE.md`/skills/commands is by far the largest
-term (measured: 126,022 prompt tokens in this repo vs. 17,222 empty, a
-difference attributable to cwd alone, against a failing run that reached
-183,485). Since `CLAUDE.md` only grows, the margin has to be structural
-rather than a number someone re-tunes — an empty cwd is the only one whose
-prompt size is bounded by construction. The cost is real: preflight no
-longer proves the CLI can start *in this repo* (e.g. a malformed
-`.claude/settings.json`), which now surfaces at the classifier instead —
-acceptable because the refusal there is classified rather than printed as
-a bare string. Left unclassified, this failure was actively misleading:
-the envelope fell through to the two-attempt schema loop and surfaced as
-*"worker failed schema-valid output twice: Prompt is too long"* — blaming
-schema validation for a context refusal, which cost three misdiagnoses
-before the real cause was measured (2026-08-06). The pause message
-therefore names the actual contributors (task text, the repo's
-`CLAUDE.md`), and, when the strict-output proxy is active, names it first
-(see §7 *Forcing constrained decoding*).
+term (measured: 126,022 prompt tokens in this repo vs. 17,222 empty,
+against a failing run that reached 183,485). Since `CLAUDE.md` only grows,
+the margin has to be structural rather than a number someone re-tunes — an
+empty cwd is the only one whose prompt size is bounded by construction.
+The cost is real: preflight no longer proves the CLI can start *in this
+repo* (e.g. a malformed `.claude/settings.json`), which now surfaces at
+the classifier instead — acceptable because the refusal there is
+classified rather than printed as a bare string. Left unclassified, this
+failure was actively misleading: the envelope fell through to the
+two-attempt schema loop and surfaced as *"worker failed schema-valid
+output twice: Prompt is too long"* — blaming schema validation for a
+context refusal, costing three misdiagnoses before the real cause was
+measured (2026-08-06). The pause message therefore names the actual
+contributors (task text, the repo's `CLAUDE.md`), and, when the
+strict-output proxy is active, names it first (see §7 *Forcing
+constrained decoding*).
 
 **Worktrees are also pruned mid-run, not only at cleanup.** Once
 `integrate_wave` reports a subtask's branch merged into staging, that
 subtask's worktree is dead weight — the commits live in the branch, which
 survives worktree removal — so `phase_execute` removes it at the end of
 that wave rather than waiting for run end. The prune runs **once per
-wave**, after every subtask in it has been integrated, not as each one
-finishes, so peak worktree coexistence is the size of a wave. Without
-this, every worktree a run ever created persisted until the run finished:
-at 30–87 subtasks against a repo whose `node_modules` is ~1.4 GB, that is
-the measured 51 GB that killed two runs with an unhandled `ENOSPC`.
+wave**, after every subtask in it has been integrated, so peak worktree
+coexistence is the size of a wave. Without this, every worktree a run ever
+created persisted until the run finished: at 30–87 subtasks against a repo
+whose `node_modules` is ~1.4 GB, that is the measured 51 GB that killed
+two runs with an unhandled `ENOSPC`.
 
 The prune is scoped to *integrated* subtasks specifically. A `blocked` or
 `failed` subtask keeps its worktree, because that tree is exactly what an
@@ -2303,17 +2289,14 @@ evidence.
 content-addressed and normally *hardlink* from a shared store into each
 `node_modules`, so a second checkout of the same dependency set costs
 almost nothing when store and tree share a mount (measured once, on one
-host, not reproducible from this repo after the measuring script itself
-produced defects in two reviews — treat as illustrating the regime, not
-a verified quantity: 92.6% of `node_modules` bytes shared, private
-remainder 102 MiB against a 1.35 GiB tree). But leerie bind-mounts the
-package-manager store and the state
-directory as *separate* mounts, and Linux refuses `link()` across
-different mounts even when both resolve to the same filesystem
-(`do_linkat`'s `EXDEV`) — so the store cannot hardlink into a worktree,
-pnpm falls back to copying, and each worktree pays full freight. That is
-the multiplier behind the 51 GB, and the mid-run prune bounds coexistence
-to one wave's worth of trees.
+host: 92.6% of `node_modules` bytes shared, private remainder 102 MiB
+against a 1.35 GiB tree — illustrative, not a verified general quantity).
+But leerie bind-mounts the package-manager store and the state directory
+as *separate* mounts, and Linux refuses `link()` across different mounts
+even when both resolve to the same filesystem (`do_linkat`'s `EXDEV`) — so
+the store cannot hardlink into a worktree, pnpm falls back to copying, and
+each worktree pays full freight. That is the multiplier behind the 51 GB,
+and the mid-run prune bounds coexistence to one wave's worth of trees.
 
 This explains *why* worktrees are expensive; it deliberately does not
 drive a gate. A per-worktree measured bound was attempted and withdrawn
@@ -2324,8 +2307,8 @@ proportional free-space floor plus a resumable pause; see
 IMPLEMENTATION.md's "Disk headroom (N30)". Colocating the store with the
 worktrees on one mount would collapse the per-worktree cost and is the
 more fundamental fix, but it changes runtime behaviour across the local,
-Fly and EC2 runtimes and both privilege models, so it is deliberately held
-as a separate change rather than folded into the guardrail.
+Fly and EC2 runtimes and both privilege models, so it is held as a
+separate change rather than folded into the guardrail.
 
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
@@ -2360,22 +2343,21 @@ segfault, OOM-kill, or power loss — the container's PID 1 dies and the
 kernel reaps every process in the PID namespace via cgroup release, the
 same guarantee runc/containerd/Kubernetes rely on. There is no possible
 survivor: a process that detached into its own session, a daemon that
-double-forked, a pool worker that reparented to init — all of them are
-inside the namespace and all get reaped by the kernel, not by any code
-leerie wrote.
+double-forked, a pool worker that reparented to init — all get reaped by
+the kernel, not by any code leerie wrote.
 
 The contract reads identically to before — every exit path (Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, RateLimitedExit, any unhandled exception,
-plus SIGKILL and hard crashes) terminates the worker's *entire*
-subprocess subtree before resources are returned — but the mechanism is
-now load-bearing in a way prompt-level or heuristic-level cleanup never
-could be.
+plus SIGKILL and hard crashes) terminates the worker's *entire* subprocess
+subtree before resources are returned — but the mechanism is now
+load-bearing in a way prompt-level or heuristic-level cleanup never could
+be.
 
 The per-worker async cleanup that lives in `claude_p` (the PPID walk in
 `_terminate_proc_tree`, the `_DescendantTracker` polling loop) is *kept*
 as the fast happy path that reaps a single worker's subtree promptly on
 clean exit, but it is no longer the abnormal-exit guarantee — if it
-half-finishes under Ctrl-C, that is no longer a leak, since the container
+half-finishes under Ctrl-C, that's no longer a leak, since the container
 boundary catches every survivor when the orchestrator exits.
 
 **The container boundary's hidden precondition: the orchestrator must
@@ -2424,25 +2406,25 @@ killed by hand. Three mechanisms close this gap, defense in depth:
 
 The container boundary holds across both invocation modes:
 
-- **Terminal mode** — `leerie "task"` from a shell. The launcher gives
-  the container a controlling TTY (`-it`); `log()` streams live and
+- **Terminal mode** — `leerie "task"` from a shell. The launcher gives the
+  container a controlling TTY (`-it`); `log()` streams live and
   clarification questions use `input()`. Ctrl-C delivers SIGINT to
   container PID 1.
 - **Plugin mode** — Claude Code's Bash tool invokes the launcher from
   inside another Claude Code session (no host TTY). The launcher passes
   `-i` only; `sys.stdin.isatty()` returns False, activating the
   orchestrator's no-TTY clarification path, which writes
-  `<state-root>/runs/<run-id>/pending-questions.json` (visible on the
-  host via the `/leerie-state` bind mount) and exits with
+  `<state-root>/runs/<run-id>/pending-questions.json` (visible on the host
+  via the `/leerie-state` bind mount) and exits with
   `EXIT_NEEDS_ANSWERS=10`. The plugin agent reads the file, asks the user
   in chat, writes `<state-root>/answers.json`, and re-runs the container
   with `--answers`. Same exit codes, same file passing, same kernel
   teardown guarantee.
 
-See IMPLEMENTATION.md "Container shape" for the launcher's mount table,
-image build, per-OS preflight, and the `[ -t 0 ]` TTY adaptation between
-the two modes; and "Concurrency model" for the unchanged in-container
-worker cleanup that runs as the happy path.
+See IMPLEMENTATION.md "Container shape" for the mount table, image build,
+per-OS preflight, and the `[ -t 0 ]` TTY adaptation between the two modes;
+and "Concurrency model" for the unchanged in-container worker cleanup that
+runs as the happy path.
 
 **Launcher hang on abnormal container exit (decoupled streaming).** A
 second way the "PID 1 must exit" precondition is subverted: not the
@@ -2466,18 +2448,18 @@ pty and thus no hang. The stale-container reaper above remains the
 backstop for the uncatchable SIGKILL case.
 
 **Worker subtree termination — Memory containment via cgroup v2.** The
-kernel reap above handles *process lifecycle*, not memory: when a
-worker's tool subtree (a `pnpm test` spawning vitest pools, a `tsc
---noEmit` building a 1.5–2 GB V8 heap) overshoots the container's
-available RAM, the kernel's OOM killer fires inside the container's
-single memcg and can land on `sshd` / `lima-guestagent` / the leerie
-orchestrator itself, collapsing infrastructure the launcher relies on for
-SSH-tunnel survival to the macOS host. Observed on an undersized 11 GiB
-Colima VM with 4 concurrent implementers: vitest worker (1.85 GiB
-anon-rss) → OOM-killer fires → `agetty` → `journald` → `sshd` (Mac
-launcher sees `exit status 255`) → `lima-guestagent` → only then the
-offending Node process, while leerie's own RSS sat at 36.8 MiB throughout
-— the cascade was caused by all processes sharing one memcg.
+kernel reap above handles *process lifecycle*, not memory: when a worker's
+tool subtree (a `pnpm test` spawning vitest pools, a `tsc --noEmit`
+building a 1.5–2 GB V8 heap) overshoots the container's available RAM, the
+kernel's OOM killer fires inside the container's single memcg and can
+land on `sshd` / `lima-guestagent` / the leerie orchestrator itself,
+collapsing infrastructure the launcher relies on for SSH-tunnel survival
+to the macOS host. Observed on an undersized 11 GiB Colima VM with 4
+concurrent implementers: vitest worker (1.85 GiB anon-rss) → OOM-killer
+fires → `agetty` → `journald` → `sshd` (Mac launcher sees `exit status
+255`) → `lima-guestagent` → only then the offending Node process, while
+leerie's own RSS sat at 36.8 MiB throughout — the cascade was caused by
+all processes sharing one memcg.
 
 Each `claude -p` worker is therefore enrolled in its own child cgroup at
 `<cgroup-root>/leerie-w-<sid>/` (`<sid>` is the run-scoped composed sid,
@@ -2487,8 +2469,8 @@ a fixed isolation ceiling derived from the measured build peak, below) and
 `--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX`). When the worker subtree
 blows past `memory.max`, the kernel OOM-kills *inside that cgroup*;
 sibling workers, the orchestrator, and host-side services are not
-eligible victims. `memory.swap.max=0` prevents the kernel from delaying
-an inevitable OOM by paging worker memory to the Colima swap file.
+eligible victims. `memory.swap.max=0` prevents the kernel from delaying an
+inevitable OOM by paging worker memory to the Colima swap file.
 
 **The per-worker cgroup name is run-scoped**: `leerie-w-<run-id-prefix>-<sid>`,
 not a bare `leerie-w-<sid>`. The prefix is the first 12 hex chars of the
@@ -2525,10 +2507,9 @@ paths always reaped first; the success path did not, and that asymmetry
 was the dominant source of leaked `leerie-w-*` directories. Measured over
 1801 workers: conformers are 8% of all workers but 88% of destroy
 failures, with a median backgrounded-subprocess count of 984 against 12
-for everything else — the failures land exactly where the unreaped
-population is largest. The broker's drain (below) remains the backstop
-for the residual race; the ordering fix is pinned by a source-coupled
-test, since an ordering is invisible to a behavioural one.
+for everything else. The broker's drain (below) remains the backstop for
+the residual race; the ordering fix is pinned by a source-coupled test,
+since an ordering is invisible to a behavioural one.
 
 **Prevention is not reclamation, so the broker also sweeps.** Worker
 cgroups live on the *host* hierarchy (`--cgroupns=host`), so they outlive
@@ -2548,17 +2529,17 @@ a container with this id still alive" reports *dead* for every resumed
 run — a predicate that would have deleted live runs on the host where
 this was measured.
 
-**A per-worker cap is a ceiling, not a reservation.** Writing
-`memory.max` allocates nothing; it only bounds. The real backstop against
-host-level exhaustion is the *aggregate* `leerie.slice/memory.max` set by
+**A per-worker cap is a ceiling, not a reservation.** Writing `memory.max`
+allocates nothing; it only bounds. The real backstop against host-level
+exhaustion is the *aggregate* `leerie.slice/memory.max` set by
 `scripts/container-entry.sh` (`MemTotal - max(1 GiB, 12.5%)`), which
 bounds the whole worker fleet regardless of any individual worker's
 `memory.max`. Two consequences follow, and they are the load-bearing part
 of this design:
 
 1. Per-worker ceilings **may safely sum past the slice budget**. Eight
-   workers capped at 9.45 GiB do not reserve 75.6 GiB; each promises
-   only "kill me before I exceed 9.45". The slice cap still binds.
+   workers capped at 9.45 GiB do not reserve 75.6 GiB; each promises only
+   "kill me before I exceed 9.45". The slice cap still binds.
 2. Therefore the per-worker cap must **never** be derived by dividing the
    slice budget across a projected worker count — that treats a ceiling
    as a reservation and manufactures caps *below* the measured build
