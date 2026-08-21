@@ -256,8 +256,11 @@ orchestrator/leerie.py    All orchestrator control flow (single file by design)
 prompts/*.md                System prompts for each worker type
 scripts/*.sh                Git worktree mechanics (setup, integrate, finalize, cleanup)
 commands/leerie.md        Thin plugin skill — launches the orchestrator
-docs/DESIGN.md              Architecture and reasoning
-docs/IMPLEMENTATION.md      Current code surface
+docs/DESIGN.md               Architecture and reasoning
+docs/IMPLEMENTATION.md       Current code surface
+docs/TESTING.md               Per-feature test coverage inventory; CLAUDE.md's
+                              "## Testing" section covers only the operational
+                              rules for running the suite, not the inventory
 chain/                      Laptop-side chain helpers (see DESIGN.md §19). A chain is
                             N parallel `leerie --runtime fly` invocations per wave,
                             sequenced by the launcher's `chain` arm. `chain/git_ops.py`
