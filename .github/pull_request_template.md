@@ -9,29 +9,14 @@
 - [ ] `docs/DESIGN.md` (architecture)
 - [ ] `docs/IMPLEMENTATION.md` (code surface)
 - [ ] `orchestrator/leerie.py` (code)
-- [ ] docs (`README.md`, `docs/USAGE.md`, `CONTRIBUTING.md`, etc.)
-- [ ] tests (`tests/`)
-- [ ] CI / repo meta (`.github/`)
+- [ ] docs / tests / CI
 
-If multiple, has the change propagated **top-down** per the three-layer rule
-(DESIGN → IMPLEMENTATION → code)?
+If multiple, has the change propagated top-down (DESIGN → IMPLEMENTATION → code)?
 
-- [ ] yes
-- [ ] not applicable (single layer)
+## Checklist
 
-## Task-completion checklist
-
-(Mirrors `CLAUDE.md` and `CONTRIBUTING.md`.)
-
-- [ ] `docs/IMPLEMENTATION.md` updated if code surface changed
-- [ ] `docs/DESIGN.md` updated if architecture changed
 - [ ] `pytest tests/` passes
-- [ ] `python3 -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"` passes
-- [ ] `git diff --stat` reviewed for scope (no collateral edits)
-
-## Testing notes
-
-<!-- What new test coverage did you add? If none, why not? -->
+- [ ] `git diff --stat` reviewed for scope
 
 ## Related issue
 
