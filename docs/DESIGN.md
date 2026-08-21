@@ -514,22 +514,21 @@ dropped by several collisions is an anchor by appearance though nothing
 claims it survives) that killed those runs unrecoverably.
 
 **Multi-drop.** A single sid may legitimately be the dropped side of
-several collisions at once: the judge found its surface jointly
-covered by several siblings, which is the drop-shaped analogue of the
-anchor cluster above and is exactly what the judge prompt instructs
-when a shared endpoint genuinely should be dropped. This is coherent
-output and must not `die()`.
+several collisions at once — the judge found its surface jointly
+covered by several siblings, the drop-shaped analogue of the anchor
+cluster above and exactly what the judge prompt instructs when a
+shared endpoint genuinely should be dropped. Coherent output; must
+not `die()`.
 
 It cannot, however, be applied by replaying the pairs through the
 apply loop's transitive `survivor_of` rewrite. Chasing that pointer is
-safe for a `merge` — the absorbed subtask's intent carries forward, so
-nothing is lost — but a `drop_*` *deliberately discards* the dropped
-subtask's title, intent, and success criteria. Replaying pair two
-after pair one has already rewritten the endpoint therefore drops a
-**live, wanted** subtask the judge never named, silently, and
-fabricates a supersedure claim between two subtasks the judge never
-compared. The damage scales with cluster size: a sid dropped by three
-collisions destroys three of the four subtasks involved.
+safe for a `merge` — the absorbed subtask's intent carries forward —
+but a `drop_*` *deliberately discards* the dropped subtask's title,
+intent, and success criteria. Replaying pair two after pair one has
+rewritten the endpoint therefore drops a **live, wanted** subtask the
+judge never named, silently. The damage scales with cluster size: a
+sid dropped by three collisions destroys three of the four subtasks
+involved.
 
 Multi-drop is instead applied as a single operation over the whole
 cluster. The dropped subtask's `provides` are unioned into **every**
@@ -580,8 +579,8 @@ apply loop.
 `resolution` alone is the wrong signal here, and treating any repeated pair
 as incoherent is worse: it `die()`s correct output after the full planning
 spend, at a validator that runs *after* the retry loop and so cannot be
-recovered from. Both failure modes were observed together on one run
-(2026-08-01): a spurious phantom-artifact issue forced a retry, the retry
+recovered from. Both failure modes were observed together on run
+2026-08-01: a spurious phantom-artifact issue forced a retry, the retry
 expressed a two-file overlap as two rows, and the pair gate killed the run.
 
 The anchor rule introduces one invariant the orchestrator must preserve:
@@ -595,16 +594,15 @@ prevent, applied across a chain of absorptions rather than within one pair.
 
 **Post-merge acyclicity.** A collision resolution's dependency-union — the
 survivor inheriting the absorbed subtask's `provides`/`requires`/`depends_on`,
-plus downstream reference rewriting (any subtask depending on the absorbed sid
-now depends on the survivor) — can introduce transitive cycles absent from the
-post-reconcile graph, even though the phase 2½ acyclicity gate passed before
-these resolutions ran. The most common shape is a *pure dependency-tag
-artifact*: the survivor absorbs a `provides` tag that some third subtask already
-`requires`, closing a back-edge through a node outside the merged pair — with no
-shared file overlap at all (the cycle diagnostic reports `Shared
-files_likely_touched: none`). This affects both `merge` and `drop_*`
-resolutions, because `_apply_overlap_drop` likewise unions the dropped subtask's
-`provides` into the survivor and rewrites downstream `depends_on`.
+plus downstream reference rewriting — can introduce transitive cycles absent
+from the post-reconcile graph, even though the phase 2½ acyclicity gate passed
+before these resolutions ran. The most common shape: the survivor absorbs a
+`provides` tag that some third subtask already `requires`, closing a back-edge
+through a node outside the merged pair — with no shared file overlap at all
+(the cycle diagnostic reports `Shared files_likely_touched: none`). This
+affects both `merge` and `drop_*` resolutions, since `_apply_overlap_drop`
+likewise unions the dropped subtask's `provides` into the survivor and
+rewrites downstream `depends_on`.
 
 **Id-vanishing operations must rewrite inbound references.** The rewriting above is
 not a merge-specific courtesy; it is an invariant every operation that removes a
@@ -657,12 +655,11 @@ if the resolution would introduce a cycle, that resolution is **skipped**
 integrator to resolve at integration time. Every non-cycling resolution
 still applies — a deterministic, per-resolution degradation of the
 `--skip-overlap-judge` escape hatch, with no extra worker round-trip: the
-cycle is a global-graph property outside the judge's pairwise competence
-(its merge decision is typically correct; the cycle is an orthogonal
-topology side effect of unioning dependency tags). Tarjan's SCC still runs
-on the final post-merge graph as an internal backstop; with per-resolution
-avoidance in place it must never fire, so a surviving cycle is an
-orchestrator logic bug, not a user-recoverable condition.
+cycle is a global-graph property outside the judge's pairwise competence.
+Tarjan's SCC still runs on the final post-merge graph as an internal
+backstop; with per-resolution avoidance in place it must never fire, so a
+surviving cycle is an orchestrator logic bug, not a user-recoverable
+condition.
 
 **A wiring re-check on the fully-merged plan, before `_validate_plan`.** The
 per-operation rewrite discipline above is applied at each vanishing site — the
@@ -690,22 +687,22 @@ capability but never declares the `requires` tag, or a merge that silently dropp
 real dependency the tags never encoded. Those gaps are invisible to a
 provider-existence scan. So an independent `wiring_judge` (§8 *Independent
 adversarial verification*) reviews the merged plan and attacks its wiring for the
-semantic dangles the structural check is blind to. The two are complementary: the
-deterministic check owns "does every declared edge resolve," the judge owns "is the
-set of declared edges the right one."
+semantic dangles the structural check is blind to: the deterministic check owns
+"does every declared edge resolve," the judge owns "is the set of declared
+edges the right one."
 
 **The judge repairs what is unambiguously repairable, and dies on the rest.**
-Detecting-and-dying alone was wrong, because the commonest defect this judge finds
-is one *no planner could have avoided*. Planners run blind and in parallel: a
-planner's context carries the task, the repo map, and the shared artifact registry
-— never a sibling domain's subtasks. So when subtask A in domain X needs a
-capability that domain Y's planner will invent a tag for, A cannot declare that
-`requires`; the tag does not exist yet. The reconciler cannot fix it either: its
-charter is *declared-but-unmatched* tags, and A declared nothing, so A never enters
-its input at all. No phase upstream of the judge owns this edge, which makes the
-judge's finding the first and only point at which the plan can be corrected.
-Measured across the run corpus, two thirds of the runs that reached this gate died
-at it, and half of those deaths were this exact shape.
+Detecting-and-dying alone was wrong: the commonest defect this judge finds is one
+*no planner could have avoided*. Planners run blind and in parallel — a planner's
+context carries the task, the repo map, and the shared artifact registry, never a
+sibling domain's subtasks — so when subtask A in domain X needs a capability that
+domain Y's planner will invent a tag for, A cannot declare that `requires`; the
+tag does not exist yet. The reconciler cannot fix it either: its charter is
+*declared-but-unmatched* tags, and A declared nothing, so A never enters its
+input. No phase upstream of the judge owns this edge, making the judge's finding
+the first and only point the plan can be corrected. Measured across the run
+corpus, two thirds of runs reaching this gate died at it, half of those deaths
+this exact shape.
 
 The repair is deliberately narrow, but it must read the defect on **both** of the
 plan's dependency channels, because the judge names either one. The schema field
@@ -732,18 +729,15 @@ already-declared guard above is *channel-local* (the id arm asks whether the
 named id is in `depends_on`, the tag arm whether the named tag is in
 `requires`) and sits **downstream of channel selection** — a defect matching
 no channel takes the `else` arm straight to the residual, so the guard is
-never reached on the one path that reaches the `die()`. It was structurally
-dead exactly where it mattered: run `05fdffb8` died on
+never reached on the one path that reaches the `die()`. Run `05fdffb8` died on
 `WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload` even
 though `test-003` **already declared `requires: action-echoed-row-payload`**
-— the tag reported missing. That ordering makes the judge's stated failure
-impossible, but the tag had two providers in different clusters, no channel
-matched, and the plan died with the whole planning spend on a gate with no
-bypass flag.
+— the tag had two providers in different clusters, no channel matched, and the
+plan died with the whole planning spend on a gate with no bypass flag.
 
 So after the repair loop, any residual defect whose subtask is already
 ordered behind **every** producer of the named capability is dropped. Three
-properties are load-bearing:
+properties matter:
 
 - **Ordering is resolved through `_build_predecessor_graph`**, not read off
   `depends_on`, for the same reason the cycle trials route through it: so
@@ -817,9 +811,9 @@ When a plan introduces a new pattern replacing an old one — a new
 accessor replacing direct field reads, a new seam replacing scattered
 inline logic — the **migration surface** is the set of all call sites
 of the old pattern. A plan that creates the seam but does not cover the
-consumers is structurally incomplete: the seam exists but the codebase
-still uses the old path, and a follow-up run will discover the gap and
-repeat the classification/planning cost.
+consumers is structurally incomplete: the codebase still uses the old
+path, and a follow-up run repeats the classification/planning cost to
+discover the gap.
 
 This is enforced mechanically at two levels:
 
@@ -834,34 +828,29 @@ This is enforced mechanically at two levels:
   regex `intent`/`investigation_notes` for phrases like "replaces direct
   `X`" — measured on run `19a70d96`, every extraction was a stopword
   (`with` → 332 files, `both` → 178, `task` → 168) and not one was a real
-  symbol. The regex is deleted; the field is required-by-convention (the
-  prompt asks for it) but not schema-required, since most subtasks replace
-  nothing.
+  symbol. The regex is deleted; the field is required-by-convention but
+  not schema-required, since most subtasks replace nothing.
 
-  Whether `old_pattern` is actually a real, grep-pastable identifier — as
-  opposed to a stopword restated from the subtask's own prose — was
-  initially enforced by a mechanical shape check
-  (`_BARE_LOWERCASE_WORD_RE`), itself a *Language-to-JSON* violation just
-  relocated. It is replaced by a required sibling field,
-  `is_real_identifier: bool` — the planner's own attestation, made at the
-  same time it names the pattern. `_check_migration_surface` skips any
-  target where `is_real_identifier` is false or absent, and never
-  re-derives the judgment itself (mirroring `performs_replacement` and
-  `artifact_paths` self-reporting elsewhere: when Python needs a fact that
-  requires judging an LLM's own prose, the LLM states the fact as
-  structured output).
+  Whether `old_pattern` is actually a real, grep-pastable identifier — not
+  a stopword restated from the subtask's own prose — was initially
+  enforced by a mechanical shape check (`_BARE_LOWERCASE_WORD_RE`), itself
+  a *Language-to-JSON* violation just relocated. It is replaced by a
+  required sibling field, `is_real_identifier: bool` — the planner's own
+  attestation, made at the same time it names the pattern.
+  `_check_migration_surface` skips any target where `is_real_identifier`
+  is false or absent, and never re-derives the judgment itself (mirroring
+  `performs_replacement` and `artifact_paths` self-reporting elsewhere).
 
   Because `migration_targets` is optional, a planner that omits it
-  entirely produces silent agreement — nothing to check. A second,
-  narrower check closes the common case: the schema also carries a
-  self-reported `performs_replacement: bool` sibling, and
+  entirely produces silent agreement — nothing to check. A narrower check
+  closes the common case: the schema also carries a self-reported
+  `performs_replacement: bool` sibling, and
   `_check_migration_targets_declared()` flags `MIGRATION_TARGETS_MISSING`
   when a subtask sets it true but declares no `migration_targets`. This is
-  a same-worker, same-call internal-consistency check, not a self-graded
-  confidence score, and is explicitly **not an independent witness** — a
-  planner wrong on both fields in the same direction still defeats it. It
-  narrows the silent-miss window to "self-consistently wrong," not "forgot
-  one field."
+  a same-worker, same-call internal-consistency check, explicitly **not an
+  independent witness** — a planner wrong on both fields in the same
+  direction still defeats it. It narrows the silent-miss window to
+  "self-consistently wrong," not "forgot one field."
 
 - **Cross-domain (advisory).** `_warn_layer_gaps()` runs on the
   reconciled plan before scheduling and surfaces two heuristic warnings:
@@ -878,9 +867,9 @@ A planner does not always know that a *sibling subtask* in the same plan
 will produce another subtask's entire deliverable. The common shape: a code
 subtask lists a test file in its `files_likely_touched` and commits that
 test edit in the same commit, while a separate test-only subtask — scheduled
-a wave later, `requires`-ing a tag the code subtask `provides`, and whose
-whole surface is that same test file — reaches its worker with nothing left
-to commit. The mechanical no-commits gate then fails it, and (before the
+a wave later, `requires`-ing a tag the code subtask `provides`, whose whole
+surface is that same test file — reaches its worker with nothing left to
+commit. The mechanical no-commits gate then fails it, and (before the
 mid-run satisfied rescue, §8) the run loops to a wave death.
 
 `_warn_provider_subset_subtasks()` surfaces this one phase earlier. Reusing
@@ -890,12 +879,11 @@ the union of its **direct** ordered predecessors' files (direct edges only —
 a subtask owned only by an indirect predecessor is left unflagged, since the
 §8 rescue catches it anyway). It is **advisory only — never a drop**: a
 subtask may make a genuinely distinct edit to a shared file, and silently
-deleting it would be a strictly worse failure than an extra worker round
-(the satisfied-probe's conservative default). The actual safety net is the
-post-execution mid-run satisfied rescue (§8 *The mid-run sibling case*),
-which settles such a subtask `complete` when its criteria are already met on
-the run-branch HEAD; this warning just lets the operator re-frame the plan
-before workers run.
+deleting it would be strictly worse than an extra worker round. The actual
+safety net is the post-execution mid-run satisfied rescue (§8 *The mid-run
+sibling case*), which settles such a subtask `complete` when its criteria
+are already met on the run-branch HEAD; this warning just lets the operator
+re-frame the plan before workers run.
 
 ### Artifact passing between subtasks
 
@@ -904,15 +892,14 @@ consumes — a research spec, a parameter set, a design summary. Committing
 such a deliverable to the worktree is the wrong shape: it pollutes the
 merged branch with a coordination document users did not ask for, and
 relies on the downstream worker inferring relevance from commit history
-rather than receiving it through a declared contract.
+rather than a declared contract.
 
 The contract for cross-subtask deliverables is therefore separate from the
 contract for code changes. A producing subtask returns an `artifacts` field
 on its implementer result; the orchestrator persists them to
 `<state-root>/runs/<run-id>/artifacts/<sid>.json` and injects them into the
 prompts of subtasks whose predecessor graph names the producer.
-Code-implementation subtasks emit an absent or empty field — the mechanism
-does not change for them.
+Code-implementation subtasks emit an absent or empty field.
 
 The routing channel is the predecessor graph already used for wave
 ordering: a subtask B receives A's artifacts when B declares
@@ -927,10 +914,8 @@ and the orchestrator materializes the file, keeping the `.leerie/`
 protected boundary intact. A producer subtask whose only output is
 artifacts may return `status: "complete"` with no commits —
 `check_branch_has_commits` treats a non-empty `artifacts` field as a
-substitute deliverable. This is the sanctioned channel for cross-subtask
-coordination data that should not land on the production branch; subtasks
-sharing production code still use the ordinary worktree/commit/integration
-model.
+substitute deliverable. Subtasks sharing production code still use the
+ordinary worktree/commit/integration model.
 
 ### Why waves are sequential
 
@@ -945,14 +930,14 @@ the dependency is satisfied in the filesystem the dependent subtask starts from.
 ## 5½. ENRIC grounding — codebase-structural decomposition (P6 + P1)
 
 Leerie's planner is a judgment worker: it reads a task description and a
-light grep/glob seed of the codebase, then decomposes. The weakness of that
-baseline is structural: an LLM instructed to "investigate the repo" in a prompt
-forms shallow, prompt-driven splits. The ENRIC framework identifies two
-principles that close this gap — P6 (questions shaped by the codebase itself)
-and P1 (Task-Context Fit as the sizing variable) — and telemetry over 200 runs
-confirms exactly this failure: 20% of runs exhaust the implementer's context
-budget mid-execution, 84% of those concentrated in migration sweeps where the
-planner packed 30–65 files into one subtask.
+light grep/glob seed of the codebase, then decomposes. The weakness is
+structural: an LLM instructed to "investigate the repo" in a prompt forms
+shallow, prompt-driven splits. The ENRIC framework identifies two principles
+that close this gap — P6 (questions shaped by the codebase itself) and P1
+(Task-Context Fit as the sizing variable). Telemetry over 200 runs confirms
+the failure: 20% of runs exhaust the implementer's context budget
+mid-execution, 84% of those in migration sweeps where the planner packed
+30–65 files into one subtask.
 
 ### P6 — codebase structural map (foundation)
 
@@ -1020,15 +1005,12 @@ split mechanism therefore separates by structural type:
   sweep. Both whole-file mechanisms above operate at file granularity, so neither
   can help a subtask whose entire scope is *one* very large, edit-dense file — and
   the coupled-minority LLM splitter, asked to split one file, can only return it
-  unchanged. That leaves such a subtask with exactly one representation: a
-  monolithic unit too large to hold in one implementer context, finish before a
-  transport blip, or checkpoint before dying. Measured failure (run `5d488583`,
-  subtask feat-005): a 7,041-line file with ~85 edit sites failed 9 times across
-  three runs, each attempt restarting from scratch because it died before writing
-  a checkpoint. leerie's telemetry already grounds the many-file case (§5½: 20% of
-  runs exhaust the budget, 84% in migration sweeps of 30–65 files); the single
-  dense file is the un-covered variant. The mechanism decomposes *within* the
-  file, deterministically, in two tiers:
+  unchanged. That leaves such a subtask a monolithic unit too large to hold in
+  one implementer context, finish before a transport blip, or checkpoint before
+  dying. Measured failure (run `5d488583`, subtask feat-005): a 7,041-line file
+  with ~85 edit sites failed 9 times across three runs, each restarting from
+  scratch because it died before writing a checkpoint. The mechanism decomposes
+  *within* the file, deterministically, in two tiers:
   - **Tier 1 — function boundaries.** Tree-sitter symbol spans
     (`_extract_symbol_ranges`, reading `item.span.start_line`/`end_line`) tile
     `[1, EOF]` with no gaps or overlap by construction — the `_partition_files`
@@ -1043,23 +1025,22 @@ split mechanism therefore separates by structural type:
     is also the whole-file fallback when tree-sitter yields no ranges.
 
   Each child owns a region of the same file, so N children co-own it. This is
-  already legitimate everywhere downstream: `_schedule()` derives waves only from
+  already legitimate downstream: `_schedule()` derives waves only from
   `depends_on`/`requires` (never `files_likely_touched`), so co-owners run the
   same wave in parallel; the phase 2¾ overlap judge's charter is *same exported
-  artifact with incompatible APIs* and it explicitly excludes "multiple primitive
+  artifact with incompatible APIs* and explicitly excludes "multiple primitive
   extractions in the same parent file"; and integration is a plain `git merge`
   whose 3-way merge clean-merges non-overlapping regions, escalating to the
-  integrator worker only on a true textual conflict. The one deliberate
-  interaction: `check_planner_output`'s advisory `INTRA_DOMAIN_OVERLAP` warning
-  ("consider merging or splitting") is suppressed for children tagged with a
-  co-ownership cluster marker, since the overlap is intentional — an accidental
-  same-file overlap between unrelated subtasks still warns. `_check_intra_file_surface`
-  is the zero-tolerance analog of `_check_migration_surface`: the child regions'
-  union must equal `[1, EOF]` and be pairwise-disjoint. Bound:
-  `DEFAULT_CAPS["subfile_split_max_span"]` (line-span above which a file or region
-  is split rather than left a leaf — a heuristic anchored to the measured
-  1,733-vs-≤474 span separation, not telemetry-calibrated like the 0.70 fit
-  threshold).
+  integrator worker only on a true textual conflict. `check_planner_output`'s
+  advisory `INTRA_DOMAIN_OVERLAP` warning is suppressed for children tagged with
+  a co-ownership cluster marker, since the overlap is intentional — an
+  accidental same-file overlap between unrelated subtasks still warns.
+  `_check_intra_file_surface` is the zero-tolerance analog of
+  `_check_migration_surface`: the child regions' union must equal `[1, EOF]`
+  and be pairwise-disjoint. Bound: `DEFAULT_CAPS["subfile_split_max_span"]`
+  (line-span above which a file or region is split rather than left a leaf —
+  anchored to the measured 1,733-vs-≤474 span separation, not
+  telemetry-calibrated like the 0.70 fit threshold).
 
   - **Oversized-file peel (a dense file bundled with a few others).** The tier-1/2
     tiling above operates only on a subtask whose `files_likely_touched` is
@@ -1112,21 +1093,20 @@ rejected the payload before the consumer could ever see it.
 
 **A `WorkerError` from either the `fit_judge` call or the coupled-minority
 `splitter` call degrades that node to leaf**, the same disposition the
-depth cap and the no-progress guard above already reach when they cannot
-establish a confident split: an infrastructure failure mid-decomposition
-is uncertainty about *this* node, not a reason to discard every fit/split
+depth cap and the no-progress guard above reach when they cannot establish
+a confident split: an infrastructure failure mid-decomposition is
+uncertainty about *this* node, not a reason to discard every fit/split
 decision the run has already paid for elsewhere in the tree. The
 migration-path splitter (label-only mode, invoked from
 `_label_migration_chunks`) already carried this guard — a crash there
 keeps the code-computed file partition and falls back to deterministic
-per-chunk labels, since `_partition_files` already owns the split and the
-splitter is only titling it. `phase_plan` snapshots decomposition progress
-into state as each top-level subtask finishes expanding, mirroring how
-`plan_snapshot` already persists the plan after `_schedule()`; like
-`plan_snapshot`, this is diagnostic only — nothing reads it back. The
+per-chunk labels, since `_partition_files` already owns the split. `phase_plan`
+snapshots decomposition progress into state as each top-level subtask
+finishes expanding, mirroring how `plan_snapshot` already persists the plan
+after `_schedule()`; like `plan_snapshot`, this is diagnostic only. The
 resumable-planning cursor (§6 *Resumable planning*) checkpoints at the
 coarser `phase_plan` granularity (`plans_after_plan`, written only after
-the whole phase returns), so a resume that lands mid-decomposition still
+the whole phase returns), so a resume that lands mid-decomposition
 re-invokes `phase_plan` from scratch rather than rehydrating from
 `decompose_snapshot`'s partial leaves.
 
@@ -1143,23 +1123,21 @@ The axis remains in the planner schema as a signal, but `check_planner_output`
 no longer escalates on it.
 
 `task_understanding` does **not** independently gate the planner. The
-naive extension of this section's own pattern — replace the self-graded
-`task_understanding` score with an independent judge, exactly as was done
-for `decomposition_quality` above — was tried and measurably falsified:
-an independent judge asked to score *understanding* against a plan that
-had silently overridden an explicit, prescribed user instruction still
-scored that plan highly, because the plan did, in fact, reflect a
-correct reading of the task — it simply chose not to obey it. A planner
-can understand an instruction correctly and still not follow it; no
-variant of an understanding axis catches that, independent or not. The
-axis that actually discriminates is **instruction adherence**, and it is
-gated by a dedicated mechanism, not by a differently-judged
-`task_understanding` — see §12 *Instruction adherence is code-enforced*.
-(A separate, differently-framed gate, `task_coverage_judge` — §8
-*Independent adversarial verification* — later replaces the
-`task_understanding` self-score for a distinct question, plan-vs-task
-*coverage* rather than *understanding*; it does not reopen this
-falsification.)
+naive extension of this section's pattern — replace the self-graded
+`task_understanding` score with an independent judge, as was done for
+`decomposition_quality` above — was tried and measurably falsified: an
+independent judge asked to score *understanding* against a plan that had
+silently overridden an explicit, prescribed user instruction still scored
+that plan highly, because the plan did, in fact, reflect a correct reading
+of the task — it simply chose not to obey it. A planner can understand an
+instruction correctly and still not follow it; no variant of an
+understanding axis catches that. The axis that actually discriminates is
+**instruction adherence**, gated by a dedicated mechanism — see §12
+*Instruction adherence is code-enforced*. (A separate gate,
+`task_coverage_judge` — §8 *Independent adversarial verification* — later
+replaces the `task_understanding` self-score for a distinct question,
+plan-vs-task *coverage* rather than *understanding*; it does not reopen
+this falsification.)
 
 **Expansion vanishes the parent's id, so it owes the inbound-reference rewrite**
 (§5 *Id-vanishing operations*). A first-pass sibling that declared
