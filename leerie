@@ -5055,20 +5055,24 @@ fi
 #
 # _resolve_seed_knob <cli-value> <env-var-name> <toml-key> <default> — prints
 # the resolved value. CLI wins; else env if set; else leerie.toml flat key;
-# else default. Same flat-key grep/sed as the FLY_VM_DISK_GB read above.
+# else default.
+#
+# The CLI>env>toml ladder itself is the SAME nested helper
+# `_resolve_cli_env_toml_knob` that `_resolve_ec2_knob` (leerie:~919) defines
+# and delegates to -- this is the second (and only other) call site. It is
+# reproduced here, rather than shared via one top-level definition, because
+# tests/test_resolve_ec2_vars.py and tests/test_launcher_seed_depth_resolution.py
+# each extract their own function's body VERBATIM and source it standalone
+# (see those files' docstrings): a top-level helper defined outside either
+# extraction window would be undefined when that window is sourced in
+# isolation -- verified empirically. This wrapper's own body no longer
+# independently implements the grep/sed lookup; the only text this function
+# adds over the shared ladder is the trailing default-value fallback.
 _resolve_seed_knob() {
-  local _cli="$1" _envname="$2" _tomlkey="$3" _default="$4" _envval _tomlval
-  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
-  eval "_envval=\"\${$_envname:-}\""
-  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
-  if [ -f "$USER_REPO/leerie.toml" ]; then
-    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
-                        "$USER_REPO/leerie.toml" 2>/dev/null \
-                      | head -1 \
-                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
-    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
-  fi
-  printf '%s' "$_default"
+  local _cli="$1" _envname="$2" _tomlkey="$3" _default="$4" _r
+  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
+  _r="$(_resolve_cli_env_toml_knob "$_cli" "$_envname" "$_tomlkey")"
+  if [ -n "$_r" ]; then printf '%s' "$_r"; else printf '%s' "$_default"; fi
 }
 _cli_seed_depth=""
 _cli_seed_threshold=""
