@@ -2543,9 +2543,9 @@ of this design:
 2. Therefore the per-worker cap must **never** be derived by dividing the
    slice budget across a projected worker count — that treats a ceiling
    as a reservation and manufactures caps *below* the measured build
-   peak, reintroducing the OOM above. A run whose workers were sized
-   during a busy moment stays handicapped for its whole life, since the
-   cap is resolved once at startup.
+   peak, reintroducing the OOM above. A run sized during a busy moment
+   stays handicapped for its whole life, since the cap is resolved once
+   at startup.
 
 The cap is therefore a fixed isolation ceiling —
 `max(build_peak, min(build_peak × 1.5, slice_max / 2))` — a function of
@@ -2559,35 +2559,33 @@ load-independent is what makes resolving it once, at startup, correct.
 **A repo can declare its own memory needs, and the ceiling must honour
 them.** Node 20+ sizes its heap from the container it finds itself in,
 but an explicit `--max-old-space-size` overrides that entirely, and the
-heap then throws OOM at its declared limit regardless of how much room
-the cgroup has. A repo whose own build or test command declares a heap
-(most often inside the `package.json` script that command runs, which is
-why the resolver follows the indirection rather than scanning the literal
-string) has told leerie exactly what one of its workers needs, and a
-ceiling derived without reading that is derived from the wrong evidence —
-the repo's own number outranks any measurement leerie inherited from
-elsewhere.
+heap then throws OOM at its declared limit regardless of cgroup room. A
+repo whose build/test command declares a heap (most often inside the
+`package.json` script that command runs, which is why the resolver
+follows the indirection rather than scanning the literal string) has
+told leerie exactly what one of its workers needs — the repo's own
+number outranks any measurement leerie inherited elsewhere.
 
 The ceiling is therefore raised to `declared heap + headroom` when the
-repo declares one, where the headroom covers everything else sharing the
+repo declares one, where headroom covers everything else sharing the
 cgroup (Node's non-heap memory, the resident worker process). Two
 refusals bound it: an operator who pins a smaller cap explicitly is
 refused rather than silently overridden (a cap below a declared heap
-guarantees the OOM), and a declared heap that cannot fit the shared slice
-even alone is refused outright, since no per-worker arithmetic can rescue
-it. The same headroom figure runs in reverse elsewhere — leerie also
-tells Node how big a heap it may take given a cap — and the two must move
-together; they were once out of step, granting a heap larger than the
-cage it had to live in.
+guarantees the OOM), and a declared heap that cannot fit the shared
+slice even alone is refused outright, since no per-worker arithmetic can
+rescue it. The same headroom figure runs in reverse elsewhere — leerie
+also tells Node how big a heap it may take given a cap — and the two
+must move together; they were once out of step, granting a heap larger
+than the cage it had to live in.
 
 **The ceiling is not the only per-worker figure: admission needs a
 *demand* estimate, and the two are different quantities.** The ceiling
 answers "how big before *this* worker is killed" and reserves nothing.
 Admission answers "is there room for another build right now," which
-genuinely does reserve and so needs a prediction of what a worker will
-actually *use*. Reserving against the ceiling would throttle every run to
-fit a bound nobody is expected to reach. The two figures legitimately
-coincide when a repo declares a heap — the ceiling is raised to exactly
+genuinely does reserve and needs a prediction of what a worker will
+actually *use*. Reserving against the ceiling would throttle every run
+to fit a bound nobody is expected to reach. The two figures coincide
+only when a repo declares a heap — the ceiling is raised to exactly
 `declared heap + headroom`, the same value the demand estimate takes —
 and that is not the divide-the-slice failure above: it is a *floor*
 driven by what the repo says it needs, never a *share* of the slice
@@ -2595,27 +2593,25 @@ divided by a worker count.
 
 The estimate defaults to the measured build peak, and becomes distinct
 from the ceiling only when a repo *declares* its own memory demand: an
-explicit `--max-old-space-size` overrides Node's container-aware default,
-so such a worker's real demand is the declared heap plus non-heap
-headroom, well above the historical peak, and admission sizes on that
-instead — deliberately only then, since raising the estimate fleet-wide
-would throttle every repo to fix a case most do not have.
+explicit `--max-old-space-size` overrides Node's container-aware
+default, so such a worker's real demand is the declared heap plus
+non-heap headroom, well above the historical peak, and admission sizes
+on that instead — deliberately only then, since raising the estimate
+fleet-wide would throttle every repo to fix a case most do not have.
 
 Two consequences follow:
 
-1. The provable reservation ceiling is `demand × (max_parallel + 1)`, not
-   `build_peak × (max_parallel + 1)`. For a repo that declares a large
-   heap this can exceed the slice budget, and that is expected: wave-entry
-   degradation shrinks concurrency toward what fits, flooring at one
-   worker (a wave of zero makes no progress at all). A heap larger than
-   the whole slice is instead refused at startup, before the wave ever
-   runs — degradation floors at one worker because a wave of zero is
-   useless, not because one oversized worker is an acceptable outcome.
-   The refusal fires only when the resolved ceiling is *below* `declared
+1. The provable reservation ceiling is `demand × (max_parallel + 1)`,
+   not `build_peak × (max_parallel + 1)`. For a repo that declares a
+   large heap this can exceed the slice budget, and that is expected:
+   wave-entry degradation shrinks concurrency toward what fits, flooring
+   at one worker (a wave of zero makes no progress). A heap larger than
+   the whole slice is refused at startup, before the wave ever runs. The
+   refusal fires only when the resolved ceiling is *below* `declared
    heap + headroom`, so a repo whose auto-derived ceiling already clears
    that floor is admitted without the slice ever being consulted; the
-   slice check asks whether ONE such worker fits, never `max_parallel` of
-   them.
+   slice check asks whether ONE such worker fits, never `max_parallel`
+   of them.
 2. Because degradation is the designed response, a declared heap large
    relative to the slice buys fewer concurrent workers — the operator is
    told so at startup rather than discovering it as unexplained
@@ -2623,14 +2619,14 @@ Two consequences follow:
 
 **Contention is handled by admission in two stages, not by shrinking
 caps.** The cheap stage runs once at wave entry
-(`_degrade_max_parallel_for_wave`, called by `phase_execute`): it shrinks
-the wave's own concurrency to the largest N whose workers fit the
-headroom that actually exists, and hands N straight to the wave's
+(`_degrade_max_parallel_for_wave`, called by `phase_execute`): it
+shrinks the wave's own concurrency to the largest N whose workers fit
+the headroom that actually exists, and hands N straight to the wave's
 `asyncio.Semaphore`. The expensive stage is the per-spawn gate below,
-which can block for minutes. Sizing the wave to real headroom first means
-the gate is a backstop for what changes **during** the wave — a sibling
-run's workers arriving — rather than the routine path; shrinking
-concurrency is also the only lever this run actually controls, since it
+which can block for minutes. Sizing the wave to real headroom first
+means the gate is a backstop for what changes **during** the wave — a
+sibling run's workers arriving — rather than the routine path;
+shrinking concurrency is also the only lever this run controls, since it
 cannot shrink a sibling run's live worker count and must not shrink its
 own per-worker cap (the reservation error above). Both stages read the
 **same** signal, `slice_max - unreclaimable` — deliberately, since two
@@ -2650,40 +2646,40 @@ headroom by half and stall a fleet with ample room.
 The gate also **reserves** one per-worker demand estimate per worker
 still in flight (admitted and not yet exited) plus one for the worker
 being admitted, and is otherwise stateless; `_invoke` runs under
-`Semaphore(max_parallel)` with the gate *inside* it, so a whole wave would
-otherwise evaluate identical pre-allocation headroom and all admit at
-once. (The superseded divisor read `live_siblings`, which counts enrolled
-cgroups, and enrollment happens microseconds after spawn — no such gap.)
-On a slice already at 40 GiB of 54.9, the first two workers of a wave
-admit and the third waits, where a stateless gate would have let all five
-through against 14.9 GiB of headroom.
+`Semaphore(max_parallel)` with the gate *inside* it, so a whole wave
+would otherwise evaluate identical pre-allocation headroom and all admit
+at once. (The superseded divisor read `live_siblings`, which counts
+enrolled cgroups, and enrollment happens microseconds after spawn — no
+such gap.) On a slice already at 40 GiB of 54.9, the first two workers
+of a wave admit and the third waits, where a stateless gate would have
+let all five through against 14.9 GiB of headroom.
 
 **A reservation is bounded by the worker's lifetime, not by elapsed
 time**, and that distinction is the whole correctness argument. Most
-workers are short-lived (classifier, fit_judge, splitter, satisfied_probe
-finish in seconds), so an interval-based reservation outlives its worker
-by orders of magnitude and they accumulate. Measured against real runs,
-13–15 workers start within any 180 s window, which under an interval
-model demands 88–101 GiB on a 54.9 GiB slice — unsatisfiable at any load,
-so every worker stalls the full wait and admits anyway, reintroducing the
-same stall the mechanism exists to remove. Bounding by lifetime makes the
-ceiling provable instead: in-flight workers are capped by the semaphore
-the spawn path already runs under, so reservations cannot exceed
-`demand × (max_parallel + 1)` (about 38 GiB at the default estimate,
-fitting an idle 54.9 GiB slice while still blocking a busy one). A repo
-declaring a large heap raises the estimate and can push that product past
-the slice; wave-entry degradation then shrinks concurrency toward what
-fits, flooring at one, which is the designed response rather than a
-broken bound.
+workers are short-lived (classifier, fit_judge, splitter,
+satisfied_probe finish in seconds), so an interval-based reservation
+outlives its worker by orders of magnitude and they accumulate. Measured
+against real runs, 13–15 workers start within any 180 s window, which
+under an interval model demands 88–101 GiB on a 54.9 GiB slice —
+unsatisfiable at any load, so every worker stalls the full wait and
+admits anyway, reintroducing the same stall the mechanism exists to
+remove. Bounding by lifetime makes the ceiling provable instead:
+in-flight workers are capped by the semaphore the spawn path already
+runs under, so reservations cannot exceed `demand × (max_parallel + 1)`
+(about 38 GiB at the default estimate, fitting an idle 54.9 GiB slice
+while still blocking a busy one). A repo declaring a large heap raises
+the estimate and can push that product past the slice; wave-entry
+degradation then shrinks concurrency toward what fits, flooring at one,
+which is the designed response rather than a broken bound.
 
 `_WORKER_ADMISSION_RAMP_SEC` survives only as a leak backstop, for the
 window between the gate and the spawn path's `try`/`finally` — past that
 long, a still-running worker's demand is already in the `unreclaimable`
 reading, and reserving for it again would double-count. The wait is
 bounded (10 min) and then admits anyway: a run that never progresses is
-worse than a tight one, and because the ceiling is now always ≥ the build
-peak, a late-admitted worker is no longer doomed by construction. When no
-slice budget is readable at all (containment off,
+worse than a tight one, and because the ceiling is now always ≥ the
+build peak, a late-admitted worker is no longer doomed by construction.
+When no slice budget is readable at all (containment off,
 `--dangerously-allow-uncapped`, no broker), admission is a no-op and
 sizing falls back to the legacy `/proc/meminfo` basis. This replaces the
 older advice to hand-tune `--max-parallel` down for build-heavy waves,
@@ -2701,12 +2697,13 @@ from the orchestrator's own (non-root) identity impossible in the
 rootful case, both reproduced live inside a real leerie container and on
 a Fly Firecracker VM:
 
-1. **Cross-scope migration is denied.** Moving a task into a cgroup needs
-   write on `cgroup.procs` of the destination, the source, AND their
-   common ancestor. Workers are born in the root-owned container scope
-   (`/system.slice/nerdctl-<id>.scope` locally, the machine scope on Fly);
-   migrating them into `leerie.slice` crosses the root cgroup, which the
-   leerie user does not own → the enroll write fails with `EACCES`/`EIO`.
+1. **Cross-scope migration is denied.** Moving a task into a cgroup
+   needs write on `cgroup.procs` of the destination, the source, AND
+   their common ancestor. Workers are born in the root-owned container
+   scope (`/system.slice/nerdctl-<id>.scope` locally, the machine scope
+   on Fly); migrating them into `leerie.slice` crosses the root cgroup,
+   which the leerie user does not own → the enroll write fails with
+   `EACCES`/`EIO`.
 2. **Controller limit files stay root-owned.** Even inside a properly
    *delegated* subtree, the kernel keeps the controller interface files
    (`pids.max`, `memory.max`) owned by root — a delegatee may organize
@@ -2718,30 +2715,29 @@ not: the direct-write probe passed while the actual per-worker enroll
 silently failed on both runtimes, so every worker ran uncapped.
 
 The fix is a **cgroup broker** (`scripts/cgroup-broker.py`).
-`scripts/container-entry.sh` is PID 1 (the Dockerfile intentionally omits
-`USER leerie`); *before the privilege drop* it launches the broker at the
-identity that owns (or was delegated) the slice — real root in the rootful
-case (Colima, Fly), the rootlesskit-mapped host UID in the rootless case
-(which owns the systemd-delegated user slice; see *Rootless exception*
-below). The broker listens on a Unix socket at
+`scripts/container-entry.sh` is PID 1 (the Dockerfile intentionally
+omits `USER leerie`); *before the privilege drop* it launches the broker
+at the identity that owns (or was delegated) the slice — real root in
+the rootful case (Colima, Fly), the rootlesskit-mapped host UID in the
+rootless case (which owns the systemd-delegated user slice; see
+*Rootless exception* below). The broker listens on a Unix socket at
 `/run/leerie-cgroup.sock` (world-connectable; every request is
 validated). It performs `create` / `enroll` / `destroy` at that owning
-identity — the only identities where enrollment and limit-setting work —
-and detects the cgroup hierarchy: **v2** (Colima) uses the unified
+identity — the only identities where enrollment and limit-setting work
+— and detects the cgroup hierarchy: **v2** (Colima) uses the unified
 `leerie.slice/leerie-w-<sid>/{pids,memory}.max`; **v1/hybrid** (observed
 on Fly Firecracker VMs, whose unified mount exposes no controllers) uses
 the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
 `/sys/fs/cgroup/memory/leerie.slice/...`). The `<sid>` in these path
 templates is the run-scoped composed sid (`<run-id-prefix>-<worker-sid>`,
-above); the broker treats it as an opaque validated string. The entrypoint
-then drops to the leerie user via `runuser -u leerie --` before exec'ing
-the orchestrator (local nerdctl) or sleeping as PID 1 (Fly, where the
-orchestrator is started out-of-band by the launcher's ssh-console wrapper
-that drops via `Popen(user="leerie")`). The orchestrator's `_cgroup_*`
-helpers are thin socket clients of the broker; it never writes cgroupfs
-directly. (Rootless containerd has no real root to drop from or broker
-as — see *Rootless exception* below for how the same broker still works
-there.)
+above); the broker treats it as an opaque validated string. The
+entrypoint then drops to the leerie user via `runuser -u leerie --`
+before exec'ing the orchestrator (local nerdctl) or sleeping as PID 1
+(Fly, where the orchestrator is started out-of-band by the launcher's
+ssh-console wrapper that drops via `Popen(user="leerie")`). The
+orchestrator's `_cgroup_*` helpers are thin socket clients of the
+broker; it never writes cgroupfs directly. (Rootless containerd has no
+real root to drop from or broker as — see *Rootless exception* below.)
 
 **Fail-closed gate.** Because a silently-uncapped run is what caused the
 crash, `_enforce_and_record_cgroup_containment` runs once per run just
@@ -2749,34 +2745,34 @@ before the first worker spawns — in `_run_phases`, *after* the resume
 short-circuits so an already-completed / no-work resume (which spawns
 zero workers) is not gated and cannot `die()` spuriously on a
 containment-incapable host. It probes the broker end-to-end (a real
-create+enroll+destroy round-trip — the true test of the path workers use,
-unlike the old direct-write probe that false-passed) and records
-`{enforced, hierarchy}` in `state.json`. If containment cannot be enabled
-(broker down, no usable cgroup hierarchy, or read-only cgroupfs), the run
-`die()`s with an actionable message — **unless** the operator passes
-`--dangerously-allow-uncapped` (`LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` /
-`leerie.toml`), which downgrades the fatal gate to a loud warning.
-Persisting the outcome is deliberate: the crash left no artifact of the
-silent failure; now it is visible.
+create+enroll+destroy round-trip — the true test of the path workers
+use, unlike the old direct-write probe that false-passed) and records
+`{enforced, hierarchy}` in `state.json`. If containment cannot be
+enabled (broker down, no usable cgroup hierarchy, or read-only
+cgroupfs), the run `die()`s with an actionable message — **unless** the
+operator passes `--dangerously-allow-uncapped`
+(`LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` / `leerie.toml`), which downgrades
+the fatal gate to a loud warning. Persisting the outcome is deliberate:
+the crash left no artifact of the silent failure; now it is visible.
 
-**Rootless exception — the systemd-delegated user slice.** Under rootless
-containerd (Linux), rootlesskit maps the host UID to container UID 0, so
-"root" inside the container IS the unprivileged host user. The entrypoint
-detects rootless via `/proc/self/uid_map` (non-zero host-start field) and
-skips both the privilege drop (`runuser`) and the `/work` chown (which
-would reassign ownership into the subuid range, breaking host-side
-access).
+**Rootless exception — the systemd-delegated user slice.** Under
+rootless containerd (Linux), rootlesskit maps the host UID to container
+UID 0, so "root" inside the container IS the unprivileged host user. The
+entrypoint detects rootless via `/proc/self/uid_map` (non-zero
+host-start field) and skips both the privilege drop (`runuser`) and the
+`/work` chown (which would reassign ownership into the subuid range,
+breaking host-side access).
 
 `leerie.slice` is anchored at the cgroup v2 subtree systemd already
 delegates to that UID's login session
 (`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/`) — not
 the root-owned (mode 0555) top-level `/sys/fs/cgroup`. `pam_systemd`/logind
 chown that directory's `cgroup.procs`/`cgroup.subtree_control`/
-`cgroup.threads` to the real UID, so any cgroup the UID creates underneath
-it inherits ownership on every kernel-populated interface file, including
-`pids.max`/`memory.max`. Cross-scope migration works the same way: a
-worker's `claude -p` process is born under whatever scope rootless
-containerd placed the container in (e.g.
+`cgroup.threads` to the real UID, so any cgroup the UID creates
+underneath it inherits ownership on every kernel-populated interface
+file, including `pids.max`/`memory.max`. Cross-scope migration works the
+same way: a worker's `claude -p` process is born under whatever scope
+rootless containerd placed the container in (e.g.
 `user@<uid>.service/user.slice/nerdctl-<id>.scope`), and since both that
 scope and `leerie.slice` descend from the delegated `user@<uid>.service`,
 migrating a worker PID between them succeeds.
@@ -2784,59 +2780,61 @@ migrating a worker PID between them succeeds.
 `HOST_UID` (the real host UID rootlesskit mapped container UID 0 to) is
 read from the second field of `/proc/self/uid_map`'s first line. The
 entrypoint passes the resolved root to the broker via
-`LEERIE_CGROUP_V2_ROOT` (`scripts/cgroup-broker.py`'s `V2_ROOT`, defaulting
-to `/sys/fs/cgroup` for every other runtime). The broker needs no separate
-privileged identity: it launches at the same rootlesskit-mapped identity
-the whole container runs as, before the privilege drop.
+`LEERIE_CGROUP_V2_ROOT` (`scripts/cgroup-broker.py`'s `V2_ROOT`,
+defaulting to `/sys/fs/cgroup` for every other runtime). The broker
+needs no separate privileged identity: it launches at the same
+rootlesskit-mapped identity the whole container runs as, before the
+privilege drop.
 
 This relies on systemd + cgroup v2 delegating `pids`/`memory` into the
-per-session slice — the default on modern systemd hosts. Where that isn't
-the case, the slice-setup writes (`|| true`) and the broker's
+per-session slice — the default on modern systemd hosts. Where that
+isn't the case, the slice-setup writes (`|| true`) and the broker's
 write-then-read-back verification in `_detect()` fail silently, and the
 fail-closed containment gate stops the run unless the operator passes
 `--dangerously-allow-uncapped`.
 
-**User-namespace remap for `--dangerously-skip-permissions`.** Claude Code
-rejects `--dangerously-skip-permissions` when `os.getuid() == 0`. In
-rootless mode the entrypoint uses
-`unshare --user --map-user=<leerie-uid> --map-group=<leerie-gid>` to remap
-outer UID 0 to inner UID leerie in a nested user namespace: bind-mounted
-host dirs stay writable (outer UID 0 → inner UID leerie), image dirs at
-`/opt/leerie-image/` (outer UID leerie) traverse via their mode-755 bits,
-and Claude Code sees `getuid() == leerie` and accepts the flag with no
-escape-hatch check. The OCI default seccomp profile blocks
+**User-namespace remap for `--dangerously-skip-permissions`.** Claude
+Code rejects `--dangerously-skip-permissions` when `os.getuid() == 0`.
+In rootless mode the entrypoint uses
+`unshare --user --map-user=<leerie-uid> --map-group=<leerie-gid>` to
+remap outer UID 0 to inner UID leerie in a nested user namespace:
+bind-mounted host dirs stay writable (outer UID 0 → inner UID leerie),
+image dirs at `/opt/leerie-image/` (outer UID leerie) traverse via their
+mode-755 bits, and Claude Code sees `getuid() == leerie` and accepts the
+flag with no escape-hatch check. The OCI default seccomp profile blocks
 `unshare(CLONE_NEWUSER)` inside containers, so the launcher passes
 `--security-opt seccomp=unconfined` for rootless runs (gated on the
-`containerd-rootless/child_pid` sentinel, not `id -u`, so macOS/Colima runs
-are unaffected).
+`containerd-rootless/child_pid` sentinel, not `id -u`, so macOS/Colima
+runs are unaffected).
 
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
 bind-propagation=rshared` — so the entrypoint can see the host VM's
 cgroupfs, plus `--cgroupns=host`: without it, nerdctl's default private
-cgroup namespace (`--cgroupns=private`) combined with `nsdelegate` blocks
-the broker's process migration to `cgroup.procs` (the kernel treats the
-namespace boundary as a delegation boundary). With `--cgroupns=host` the
-container sees its real cgroup path and the broker can enroll worker PIDs
-under `leerie.slice/`. Fly's Firecracker microVM boots its own kernel with
-no cgroup namespace boundary, so this flag only affects local nerdctl.
+cgroup namespace (`--cgroupns=private`) combined with `nsdelegate`
+blocks the broker's process migration to `cgroup.procs` (the kernel
+treats the namespace boundary as a delegation boundary). With
+`--cgroupns=host` the container sees its real cgroup path and the broker
+can enroll worker PIDs under `leerie.slice/`. Fly's Firecracker microVM
+boots its own kernel with no cgroup namespace boundary, so this flag
+only affects local nerdctl.
 
-On macOS (Darwin) the launcher sets the mount unconditionally — Colima's VM
-always runs rootful containerd with cgroup v2 and shared propagation, but
-the macOS host has no `/sys/fs/cgroup` to probe. On native rootful Linux
-the launcher adds the same `rshared` mount unconditionally.
+On macOS (Darwin) the launcher sets the mount unconditionally — Colima's
+VM always runs rootful containerd with cgroup v2 and shared propagation,
+but the macOS host has no `/sys/fs/cgroup` to probe. On native rootful
+Linux the launcher adds the same `rshared` mount unconditionally.
 
 Rootless containerd is its own branch, gated on the
 `containerd-rootless/child_pid` sentinel, and uses a **plain** bind-mount
 with no `bind-propagation` flag: rootlesskit's `--propagation=rslave`
-demotes `/sys/fs/cgroup` to a slave mount inside its sandbox, incompatible
-with `bind-propagation=rshared`. Only read/write visibility into the
-already-mounted cgroupfs is needed, which a plain bind-mount provides.
-When cgroup v2 isn't present at all, the mount is skipped and
+demotes `/sys/fs/cgroup` to a slave mount inside its sandbox,
+incompatible with `bind-propagation=rshared`. Only read/write visibility
+into the already-mounted cgroupfs is needed, which a plain bind-mount
+provides. When cgroup v2 isn't present at all, the mount is skipped and
 `_cgroup_probe` falls back to uncapped workers (and, absent
 `--dangerously-allow-uncapped`, the fail-closed gate stops the run).
-Fly's Firecracker microVM exposes cgroupfs directly with no launcher flag
-required.
+Fly's Firecracker microVM exposes cgroupfs directly with no launcher
+flag required.
 
 `_cgroup_probe` sends a `probe` request to the broker, which does a real
 create+enroll+destroy round-trip of a throwaway cgroup and returns the
@@ -2876,8 +2874,8 @@ The cap is sized against a measured workload, not a guess: leerie's own
 suite (3762 tests, 251 modules) peaks at **33** concurrent PIDs (median
 7, P99 29, sampled at 20 Hz against the release image's `pids.current`),
 so the cap sits ~62× above it — a worker approaching the cap is almost
-never doing legitimate work. That gap is what lets the mid-run reaper
-below act on pressure at all. The default was 1024 until a second
+never doing legitimate work, which is what lets the mid-run reaper below
+act on pressure at all. The default was 1024 until a second
 1024-saturation incident (a conformer backgrounded a test run, lost
 track of its output file, and ran the suite a second time, together
 hitting the cap) — nothing in that trace needed more than 1024 PIDs, so
@@ -2901,16 +2899,15 @@ conformer's stays advisory (§9).
 **Detecting memory OOM — naming the cause instead of a cryptic checkpoint
 error.** A build/test command that overshoots the worker cgroup's
 `memory.max` is killed by the kernel with a bare `Killed` (exit 137, no
-error text) — unlike PID exhaustion, this leaves no failing tool-result
-for `_read_stream`'s window detector to key on, since `claude -p` is often
-reaped mid-turn before any `result` event is emitted. That symptom lands
-in `_invoke`'s no-envelope path indistinguishable from a session-limit
-no-op or `--max-turns` exhaustion; `_validate_result` tags it
-`empty_handoff`, and once the retry cap burns with no committed work the
-operator sees only *"checkpoint ... does not exist on disk"* — no mention
-of memory (a real run drove an operator through a default → 6G → 12G →
-16G `LEERIE_WORKER_MEMORY_MAX` escalation before finding the actual
-cause).
+error text) — unlike PID exhaustion this leaves no failing tool-result
+for `_read_stream`'s window detector to key on, since `claude -p` is
+often reaped mid-turn before any `result` event is emitted. That symptom
+lands in `_invoke`'s no-envelope path indistinguishable from a
+session-limit no-op or `--max-turns` exhaustion; `_validate_result` tags
+it `empty_handoff`, and once the retry cap burns the operator sees only
+*"checkpoint ... does not exist on disk"* — no mention of memory (a real
+run drove an operator through a default → 6G → 12G → 16G
+`LEERIE_WORKER_MEMORY_MAX` escalation before finding the actual cause).
 
 The broker's `stat <sid>` verb also returns `memory.events`' `oom_kill`
 counter (incremented once per OOM-kill, mirroring `pids.events.max`'s role
@@ -2931,9 +2928,9 @@ worktree holds committed work: when it does, the named-OOM `summary` was
 already preserved verbatim. The no-commits branch previously discarded
 the worker's `summary` in favor of `_validate_result`'s generic
 checkpoint-missing `message`; it now prefers the worker's own `summary`
-when present, falling back to the generic message only when no worker
-output exists — so a genuinely OOM-killed build is named even when the
-subtask terminates.
+when present, falling back to the generic message only when none exists —
+so a genuinely OOM-killed build is named even when the subtask
+terminates.
 
 The error signal is measured over a **sliding window of the last N
 tool-results**, not a run of *consecutive* ones — the stream never places
@@ -2945,17 +2942,17 @@ failing) fills it quickly. Even then the kill only fires once the
 authoritative cgroup read confirms exhaustion — the window merely decides
 *when to probe*.
 
-**Mid-run PID reaping — reducing the blast radius.** The 0.9.38 window
-detector above is a backstop: it *catches* a worker that has already
-saturated `pids.max`. But the root cause — `run_in_background`
-subprocesses reparenting to init and accumulating against the cap
-throughout the run — is not addressed by detection alone. A complementary
-*reducer* layer sits under the backstop inside
-`_DescendantTracker._poll_loop`: it probes `_cgroup_stat` each cycle and,
-when pressure rises, reaps the safest killable set before the cap is hit.
-Load-bearing safety property: below the pressure gate, behavior is
-byte-identical to today — zero mid-run kills. Both mechanisms share the
-same `_cgroup_stat(sid)` call as their authoritative source.
+**Mid-run PID reaping — reducing the blast radius.** The window detector
+above is a backstop: it *catches* a worker that has already saturated
+`pids.max`. But the root cause — `run_in_background` subprocesses
+reparenting to init and accumulating against the cap throughout the run
+— is not addressed by detection alone. A complementary *reducer* layer
+sits under the backstop inside `_DescendantTracker._poll_loop`: it
+probes `_cgroup_stat` each cycle and, when pressure rises, reaps the
+safest killable set before the cap is hit. Load-bearing safety property:
+below the pressure gate, behavior is byte-identical to today — zero
+mid-run kills. Both mechanisms share the same `_cgroup_stat(sid)` call
+as their authoritative source.
 
 *Trigger — pressure-gated, not timer-based.* Each cycle the tracker probes
 `pids.current / pids.max`; reaping arms only at or above
@@ -2969,10 +2966,10 @@ reparented to init (`ppid == 1`), and older than `_PID_REAP_MIN_AGE_SEC`
 `pids.current / pids.max` drops below `_PID_REAP_LOW_WATER` (0.75) —
 hysteresis so one pass does not over-kill. Killed PIDs are pruned from
 `_seen`; exit-time `stop_and_reap` is unchanged. The age floor matters
-because a background test the worker just launched has also reparented to
-init (`ppid == 1` alone cannot distinguish it from a leaked orphan), but
-it is young, so the floor protects it while a forgotten orphan (old) is
-still reaped.
+because a background test the worker just launched has also reparented
+to init (`ppid == 1` alone cannot distinguish it from a leaked orphan),
+but it is young, so the floor protects it while a forgotten orphan (old)
+is still reaped.
 
 *The critical tier.* A single fixed floor is not enough: a burst of
 leaked `run_in_background` trees can saturate the cap in seconds — faster
@@ -2989,29 +2986,25 @@ above) supplies the discriminator — a worker at 90% of a 2048 cap holds
 ~1843 PIDs to do work that costs 33, which has no legitimate reading. So
 at `_PID_REAP_CRITICAL_WATER` (0.90) the floor drops to
 `_PID_REAP_CRITICAL_AGE_SEC` (5 s); below that ratio the 60 s floor stands
-unchanged. This discriminator holds only while the cap sits well above the
-33-PID measurement — a `--worker-pids-max` set near the workload (e.g. 64)
-would put the critical tier's trigger inside the range legitimate work
-occupies and break the premise.
+unchanged. This discriminator holds only while the cap sits well above
+the 33-PID measurement — a `--worker-pids-max` set near the workload
+(e.g. 64) would put the critical tier's trigger inside the range
+legitimate work occupies and break the premise.
 
 *Accepted bounded regression.* Above the 90% gate a live background
 process older than the active floor can be killed — strictly better than
-the alternative (guaranteed total-worker-death-then-full-retry from the
-detector), since the imperfect reap is only attempted when the worker is
-already near EAGAIN death and the backstop would otherwise fire
-regardless.
+guaranteed total-worker-death-then-full-retry, since the imperfect reap
+fires only when the worker is already near EAGAIN death.
 
-*Composition.* Both the mid-run reaper and the window detector read
-`_cgroup_stat(sid)` as one authoritative source: if reaping keeps pressure
-below the cap, the detector never fires; if reaping stays too
-conservative, the detector catches it and retries fresh. Neither
-duplicates the other's logic.
+*Composition.* Both mechanisms read `_cgroup_stat(sid)` as one
+authoritative source: if reaping keeps pressure below the cap, the
+detector never fires; if reaping stays too conservative, the detector
+catches it and retries fresh. Neither duplicates the other's logic.
 
 *Rejected alternative.* A `cgroup.procs`-based broker verb would give a
-more precise orphan list but requires a new `list`/`kill` verb on
-`scripts/cgroup-broker.py`, widening the single audited root surface §12
-guards. `_seen ∩ (alive, ppid==1, old)` covers the same population without
-one.
+more precise orphan list but needs a new `list`/`kill` verb, widening the
+single audited root surface §12 guards. `_seen ∩ (alive, ppid==1, old)`
+covers the same population without one.
 
 Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made
@@ -3020,20 +3013,20 @@ this run") with run lifecycle ("nuke the artifacts"). The two are
 now separate: Ctrl-C stops; `scripts/cleanup.sh --run-id <id>
 --branches` is the explicit full-purge gesture.
 
-**Zombie reaping — the container PID 1 is not an init.** The mid-run reaper
-above relieves pressure from *live* leaked processes. A second, distinct
-population also counts against `pids.max`: **zombies** (`<defunct>` tasks —
-dead processes not yet `wait()`ed). These arise because the leerie
-container's PID 1 is not a reaping init: on the local path PID 1 is
-`runuser` (the orchestrator its child); on Fly, PID 1 is an idle
-`sleep infinity` and the orchestrator a detached `Popen` grandchild. A
-worker's tool subtree routinely orphans short-lived subprocesses (notably
-`git` and the leerie-private `ssh-agent`); when those orphan they reparent
-to PID 1, which never `wait()`s them, so they persist as zombies — each
-still occupying a cgroup task slot, accumulating until `pids.max` fills.
+**Zombie reaping — the container PID 1 is not an init.** The mid-run
+reaper above relieves pressure from *live* leaked processes. A second,
+distinct population also counts against `pids.max`: **zombies**
+(`<defunct>` tasks — dead processes not yet `wait()`ed), which arise
+because the leerie container's PID 1 is not a reaping init: on the local
+path PID 1 is `runuser` (the orchestrator its child); on Fly, PID 1 is
+an idle `sleep infinity` and the orchestrator a detached `Popen`
+grandchild. A worker's tool subtree routinely orphans short-lived
+subprocesses (notably `git` and the leerie-private `ssh-agent`); those
+reparent to PID 1, which never `wait()`s them, so they persist as
+zombies, each occupying a cgroup task slot until `pids.max` fills.
 Observed live: a worker running its repo's test suite accumulated 453
-`<defunct> git` tasks and wedged at the cap. The mid-run reaper cannot
-help here — a zombie is already dead; SIGKILL is a no-op, only `wait()`
+`<defunct> git` tasks and wedged at the cap — the mid-run reaper cannot
+help, since SIGKILL is a no-op on an already-dead process; only `wait()`
 clears it.
 
 The fix routes those orphans to the orchestrator and reaps them there.
@@ -3147,12 +3140,12 @@ already run, so state and the run branch are intact for the manual
 - If `reset_at` parsed cleanly, `wait_seconds` is the time until that
   moment plus a small margin.
 - If the reset clause didn't parse, `wait_seconds` is a fixed
-  `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) — we poll: sleep, re-resume. A
-  premature retry just re-hits the same clean pause and sleeps again,
-  bounded by the persisted worker budget.
-- An out-of-credits exit does not auto-resume at all: `main()` cleans up,
-  logs a `leerie resume <id>` hint, and exits `EXIT_LOCKED`. The operator
-  adds credits, then resumes.
+  `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) — we poll: sleep, re-resume,
+  bounded by the persisted worker budget. A premature retry just re-hits
+  the same clean pause.
+- Out-of-credits does not auto-resume at all: `main()` cleans up, logs a
+  `leerie resume <id>` hint, and exits `EXIT_LOCKED`. The operator adds
+  credits, then resumes.
 
 Rationale for the fixed-backoff auto-resume (vs. the earlier "parse
 failure → exit 75 manual resume"): with a fixed backoff no time is being
@@ -3203,16 +3196,16 @@ orchestrator.
 
 This matches the prior-art mental model of comparable tools (`fly
 machine`, Claude Code's `/bg` + `claude agents`, kubectl, tmux):
-**sessions are the unit of management, not terminals**. Leerie's session
-is the run; the local terminal is just one of many ways to observe it.
+**sessions are the unit of management, not terminals** — leerie's session
+is the run; the local terminal is just one way to observe it.
 
 The run-id is the bridge: the launcher needs it *before* starting the
-orchestrator (to know which `orchestrator.log` path to tail), but the
-orchestrator normally generates its run-id internally during phase 1. The
-launcher instead generates the slug + suffix host-side using the same
+orchestrator (to know which `orchestrator.log` path to tail), but
+normally the orchestrator generates its run-id internally during phase 1.
+The launcher instead generates the slug + suffix host-side using the same
 pattern and passes it as `--run-id <id>` — reusing the plumbing `resume`
 already establishes — and the orchestrator's `--run-id` short-circuit
-accepts the explicit value and skips auto-generation.
+skips auto-generation.
 
 **Remote pause-on-failure (Fly.io).** Local mode reaps the container's PID
 namespace on every exit because the host filesystem holds the durable
