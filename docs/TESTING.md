@@ -2204,6 +2204,7 @@ with "no ec2_instance_id found" without ever calling `terminate-instances`
 or `flyctl`; and the confirmation prompt (bypassed by `--force`, same
 convention as the Fly/local `kill` paths) rejects a wrong confirmation
 and proceeds on the correct one.
+
 ## Plan-overlap judge: multi-drop clusters
 
 The phase 2¾ plan-overlap judge (DESIGN §5 *Cross-domain surface overlap*)
@@ -2277,6 +2278,7 @@ carry a path. The behavioural pair is
 `test_prose_in_artifact_is_never_parsed_for_paths`: the same invented path
 must be invisible in the label and flagged in the field, so neither half
 can pass vacuously.
+
 ## Plan-overlap judge: duplicate collision resolution
 
 For duplicates, what must agree is the resolved **effect**
@@ -2758,6 +2760,7 @@ executes the branch, stopping at a sentinel on
 `st.save()`, so no other stub is needed), and carries the guard-the-guard test
 that the resume branch would `die()` here — without it the file could silently
 drift onto the path it exists to avoid.
+
 ## Undefined-name static scan
 
 `tests/test_no_undefined_names.py` is the whole-module generalisation: stdlib
