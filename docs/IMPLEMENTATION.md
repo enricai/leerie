@@ -8966,10 +8966,15 @@ Required fields, current shape:
   `{tag (required string), extent (required enum: "in_plan" | "external"),
   reason (string, required and non-empty when extent == "external")}`.
   `extent: in_plan` is satisfied by another subtask's `provides` (a graph
-  edge); `extent: external` is a planner-declared prerequisite outside this
-  run's graph (another repo, ops runbook, a sibling run, or a surface the
-  task itself fences off) and surfaces in `plan.json` as a `preconditions`
-  entry; `reason` must name the owner. See DESIGN §5 `requires.extent`.
+  edge); `extent: external` is a planner-declared prerequisite outside *this
+  run's* graph — either outside the build graph entirely (another repo, ops
+  runbook, manual step), or producible by code but owned by another run the
+  task names (sibling phase document, earlier phase), or fenced off by the
+  task itself (the task declares a surface out of scope and the capability's
+  only implementation site lies on it) — and surfaces in `plan.json` as a
+  `preconditions` entry. In every case `reason` must name the owner; the
+  discriminating test is "is it in this run's graph?", not "could any code
+  produce it?". See DESIGN §5 `requires.extent`.
   `provides` is an array of bare strings. `size` is an enum `small` /
   `medium` / `large` — `large` triggers the size-resolution retry loop and,
   if it survives, `_validate_plan` dies with an OVERSIZED error. `runs_commands`
@@ -9236,11 +9241,18 @@ names — ruff F821 without the dependency).
 `test_conformance_clean_delta.py` (`_conformance_clean` / `_baseline_red_axes`
 delta-not-verdict discipline), `test_measure_blt.py`,
 `test_ensure_worktree_deps.py`, `test_blt_memo.py` (memo hit issues zero
-subprocess calls), `test_scoped_axes.py`, `test_test_files_proxy.py`,
-`test_scoped_proxy_corpus.py` (36 real per-subtask diffs backing the
-`{test_files}` ratio), `test_scoped_degrade_warning.py`,
-`test_orchestrator_owns_blt.py`, `test_round_axis_regressions.py`,
-`test_resolve_blt.py`.
+subprocess calls), `test_scoped_axes.py`, `test_orchestrator_owns_blt.py`,
+`test_round_axis_regressions.py`, `test_resolve_blt.py`, and the three
+`{test_files}`-proxy files detailed below.
+
+The `{test_files}`-proxy files carry the per-file detail a reader scans to
+find what is already covered:
+
+| Test file | What it covers |
+|---|---|
+| `test_test_files_proxy.py` | `_is_test_file` / `_render_scoped`'s `{test_files}` tier / `_select_subtask_axes`' fallback (DESIGN §9). The load-bearing case is the empty-AFTER-filter one: `files` is NON-empty so the pre-existing empty-list guard does not fire, yet every member is a non-test path — rendering there yields a bare `pytest`, which runs EVERYTHING, the same inversion the `{files}` rule forbids reached by a different route. Also pins that the shipped vitest/jest `{files}` templates take SOURCE files on purpose, the `lstrip("./")`-vs-`removeprefix` case, and declared `test_file_globs` REPLACING rather than extending the built-ins. |
+| `test_scoped_proxy_corpus.py` | The measured basis for the `{test_files}` tier, frozen against `tests/fixtures/scoped_proxy_corpus/corpus.json` — 36 REAL per-subtask diffs recovered from leerie's own run branches. Exists because the ratio was first taken from the planner's `files_likely_touched` and was badly wrong (40% test-touching predicted vs 94% real). Each row must be ONE subtask's work (an integration merge's FIRST-PARENT diff, not a cumulative two-dot diff), and the fixture must retain its source-only rows or the canonical-fallback safety property goes untested. |
+| `test_scoped_degrade_warning.py` | `_warn_scoped_degraded_once` (DESIGN §9): `scoped` is the default and an unresolvable proxy falls back to canonical, so a pytest repo paid the full oracle once per subtask with nothing saying so. The anti-vacuity partner `test_silent_when_a_proxy_resolves` is mandatory: without it a warning that fired unconditionally would pass, turning the signal into noise on the ~99% of repos where scoping works. Two wiring guards — the call precedes the baseline block, and an AST check that it is NOT nested under the `skip_base_baseline` guard (sentinel-skipped on resume, i.e. silent on exactly the runs that most need telling). |
 
 **Container image / provisioning:** `test_resolve_repo_image_tag.py`,
 `test_launcher_cache_mounts.py`, `test_launcher_per_repo_image.py`,
