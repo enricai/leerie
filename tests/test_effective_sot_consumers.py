@@ -141,17 +141,18 @@ def test_the_spec_enumeration_is_scoped_to_the_sentence():
 # --- CLAUDE.md: a subset claim must say where the rest is covered -----------
 
 def test_claude_md_subset_claim_points_at_the_remaining_coverage():
-    """CLAUDE.md describes what one test file source-couples, which is
-    legitimately a subset. What must not happen is a reader concluding the
-    unlisted reader is unguarded, so the passage has to name where it IS
-    guarded. Asserting four names here would force a false statement instead.
+    """CLAUDE.md (now docs/TESTING.md, after the docs-001 CLAUDE.md/TESTING.md
+    split) describes what one test file source-couples, which is legitimately
+    a subset. What must not happen is a reader concluding the unlisted reader
+    is unguarded, so the passage has to name where it IS guarded. Asserting
+    four names here would force a false statement instead.
     """
-    text = (REPO / "CLAUDE.md").read_text()
+    text = (REPO / "docs" / "TESTING.md").read_text()
     m = _CLAUDE_CLAUSE.search(text)
     assert m, (
-        "could not find CLAUDE.md's 'The delivery file also source-couples' "
-        "passage — if reworded, update this anchor rather than dropping the "
-        "guard")
+        "could not find the 'The delivery file also source-couples' passage "
+        "in docs/TESTING.md — if reworded or moved, update this anchor "
+        "rather than dropping the guard")
     clause = m.group(1)
     coupled = {n for n in _consumers() if f"`{n}`" in clause}
     uncoupled = sorted(set(_consumers()) - coupled)
