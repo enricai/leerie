@@ -1467,168 +1467,153 @@ call ever happens), and a structural regression guard that no
 The EC2 counterpart to `scripts/remote/seed-repo.sh` — `scripts/remote/
 ec2-seed-repo.sh` (`ec2_seed_repo_clone`/`ec2_seed_repo_dirty`/
 `ec2_seed_repo`, transported over `ec2-lib.sh`'s `ec2_tar_pipe`/
-`ec2_remote_exec` instead of `flyctl ssh console`) is tested in two
-files, modeled directly on `tests/test_seed_repo_sh.py` +
-`tests/test_seed_repo_shallow_roundtrip.py`. `tests/test_ec2_seed_repo.py`
-covers the transport-level contract against a stubbed `aws` (decodes and
-locally executes `ec2_remote_exec`'s base64-wrapped SSM command,
-rewriting `/work`/`/tmp/leerie-*` paths into the test's `dest` dir — same
-technique as `test_ec2_transport.py`'s `_stub_aws_ssm`) and a stubbed
-`ssh` (drains `ec2_tar_pipe`'s one-entry gzipped-tar payload when invoked
-for bulk data, execs a real local `rsync --server` when invoked as
-rsync's `-e` transport): preflight failures (missing instance id / ssh
-target / `USER_REPO` / `aws` on PATH); a minimal repo round-trips to
-`/work`; both `aws` and `ssh` are exercised and `flyctl` never appears in
-the transport log; `.gitignore`-awareness plus `.claude/`
-force-inclusion via the rsync delta; the `.leerie/config.toml` /
-`.leerie/Dockerfile` / `.leerie/.leerie-setup.sh` whitelist (all other
-`.leerie/*` paths dropped); NFC-filename preservation through a
-submodule bundle; and a stalled `ssh` transport (real, unstubbed
-`timeout`) yielding a non-hanging failure. `tests/
-test_ec2_seed_repo_shallow.py` reproduces the shallow-path host/instance
-commands directly (coupled to the real script via `test_
-reconstruction_matches_source`, which asserts the exact clone/tar/
-checkout strings are still present) to pin: checkout parity between the
+`ec2_remote_exec` instead of `flyctl ssh console`) is tested in two files
+modeled on `tests/test_seed_repo_sh.py` + `tests/test_seed_repo_shallow_roundtrip.py`.
+`tests/test_ec2_seed_repo.py` covers the transport-level contract against a
+stubbed `aws` (decodes and locally executes `ec2_remote_exec`'s base64-wrapped
+SSM command, rewriting `/work`/`/tmp/leerie-*` paths into the test's `dest`
+dir — same technique as `test_ec2_transport.py`'s `_stub_aws_ssm`) and a
+stubbed `ssh` (drains `ec2_tar_pipe`'s one-entry gzipped-tar payload for bulk
+data, execs a real local `rsync --server` for rsync's `-e` transport):
+preflight failures (missing instance id / ssh target / `USER_REPO` / `aws` on
+PATH); a minimal repo round-trips to `/work`; both `aws` and `ssh` are
+exercised and `flyctl` never appears in the transport log; `.gitignore`-
+awareness plus `.claude/` force-inclusion via the rsync delta; the
+`.leerie/config.toml` / `.leerie/Dockerfile` / `.leerie/.leerie-setup.sh`
+whitelist (all other `.leerie/*` paths dropped); NFC-filename preservation
+through a submodule bundle; and a stalled `ssh` transport (real, unstubbed
+`timeout`) yielding a non-hanging failure. `tests/test_ec2_seed_repo_shallow.py`
+reproduces the shallow-path host/instance commands directly (coupled to the
+real script via `test_reconstruction_matches_source`, asserting the exact
+clone/tar/checkout strings are present) to pin: checkout parity between the
 shallow instance tree and the host tip, `.git/shallow` staying shallow,
-NFC-filename survival, a fetch-back-by-branch-name round-trip whose
-merge-base equals the host tip (PR-diff correctness), and
-`_seed_branch_shallow_safe`'s shell-injection gate (safe vs. unsafe
-branch names, including the live `__PARENT_MATERIALIZE__`/
-`__CLEANUP_TMP__` placeholder tokens) invoked against the real function
-rather than a reproduction of it.
+NFC-filename survival, a fetch-back-by-branch-name round-trip whose merge-base
+equals the host tip (PR-diff correctness), and `_seed_branch_shallow_safe`'s
+shell-injection gate (safe vs. unsafe branch names, including the live
+`__PARENT_MATERIALIZE__`/`__CLEANUP_TMP__` placeholder tokens) invoked against
+the real function rather than a reproduction of it.
+
 ## EC2 seed-auth transport
 
 The EC2 counterpart to `scripts/remote/seed-auth.sh` —
 `scripts/remote/ec2-seed-auth.sh`'s `ec2_seed_auth()` — is tested in
-`tests/test_ec2_seed_auth.py`, modeled on `tests/test_seed_auth_sh.py`
-and reusing `tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh`
-transport harness (the `aws` stub decodes and locally executes
-`ec2_remote_exec`'s base64-wrapped SSM command, rewriting `/home/leerie`
-into the test's `dest` dir; the `ssh` stub drains `ec2_tar_pipe`'s
-gzipped-tar-of-`$STAGE` payload into the same rewritten dest): a
-`$STAGE` dir containing `.claude/`, `.claude.json`, and `.gitconfig`
-round-trips to the instance's home dir with ownership fixed to
-`leerie:` (asserted via a `chown_log` sink so the test observes the real
-script issuing the call, not just its source text); the
+`tests/test_ec2_seed_auth.py`, modeled on `tests/test_seed_auth_sh.py` and
+reusing `tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh` transport
+harness (the `aws` stub rewrites `/home/leerie` into the test's `dest` dir;
+the `ssh` stub drains `ec2_tar_pipe`'s gzipped-tar-of-`$STAGE` payload into
+the same rewritten dest): a `$STAGE` dir containing `.claude/`,
+`.claude.json`, and `.gitconfig` round-trips to the instance's home dir with
+ownership fixed to `leerie:` (asserted via a `chown_log` sink so the test
+observes the real script issuing the call, not just its source text); the
 `CLAUDE_CODE_OAUTH_TOKEN` fallback writing a valid single-token
 `.credentials.json` when `$STAGE` has none; `plugins/cache` and
-`plugins/marketplaces` excluded from the tar (both a positive check that
-the exclude list matches `seed-auth.sh`'s original and a check that
-files outside those dirs are not swept up by the same exclusion);
-preflight failing closed on missing `LEERIE_EC2_INSTANCE_ID` /
-`LEERIE_EC2_SSH_TARGET` / `STAGE` / `aws` on PATH / credentials-or-token
-/ git identity; git identity written to `/home/leerie/.gitconfig`;
-`flyctl` never appearing in the transport log while `aws`/`ssh` both do;
-and a stalled transport (the process-group-killing `_stub_timeout`
-imported from `tests/test_ec2_transport.py` — the local no-op passthrough
-stub would hang for the full sleep, per the CLAUDE.md test-harness trap
-documented above) yielding rc 124/137 rather than hanging, bounded by
-`LEERIE_SEED_TIMEOUT_S`.
+`plugins/marketplaces` excluded from the tar (both a positive check that the
+exclude list matches `seed-auth.sh`'s original and a check that files outside
+those dirs are not swept up); preflight failing closed on missing
+`LEERIE_EC2_INSTANCE_ID` / `LEERIE_EC2_SSH_TARGET` / `STAGE` / `aws` on PATH /
+credentials-or-token / git identity; git identity written to
+`/home/leerie/.gitconfig`; `flyctl` never appearing in the transport log
+while `aws`/`ssh` both do; and a stalled transport (the process-group-killing
+`_stub_timeout` imported from `tests/test_ec2_transport.py` — the local no-op
+passthrough stub would hang for the full sleep) yielding rc 124/137 rather
+than hanging, bounded by `LEERIE_SEED_TIMEOUT_S`.
+
 ## EC2 instance lifecycle (provision / wait / stop / terminate / teardown)
 
 The EC2 instance lifecycle itself (`scripts/remote/ec2-provision.sh`'s
 `provision_instance()`/`wait_for_instance_ready()`/`stop_instance()`/
-`terminate_instance()`/`decide_ec2_teardown()`) is covered across two
-files. `tests/test_ec2_provision.py` (landed with the lifecycle
-implementation) covers the broader surface: instance creation, the
-running+ok readiness poll, stop/terminate idempotency on an empty
-instance id, and the sidecar writes. `tests/test_ec2_decide_teardown.py`
-is the dedicated, deeper pin for `decide_ec2_teardown()`'s
-`$LEERIE_REMOTE_EXIT_RC` classification table — the highest-consequence
-EC2 behavior, mirroring `tests/test_decide_teardown_auto_finalize.py`'s
-Fly coverage: each clean-exit rc (0/10/11/75) syncing state via
-`_try_fetch_state_for_ec2_teardown` before calling `terminate_instance`;
-a sync failure on any clean-exit rc leaving the instance `running` with
-no `terminate-instances`/`stop-instances` call ever reaching the `aws`
-stub's log (the one-way-ratchet invariant — destroy-then-fetch would
-make paid-for LLM work unrecoverable); rc=130/143 taking the detach-
-banner arm without pausing; any other non-zero rc stopping (never
-terminating) the instance and recording `pause_reason` in the run
-sidecar; the fetch-before-terminate ordering independently verified via
-a hook that asserts the instance is still `running` at the moment
-`_try_fetch_state_for_ec2_teardown` runs; and `LEERIE_TEARDOWN_DONE`
-idempotency surviving a double-fire (INT then EXIT) in both directions
-(clean-exit-then-pause and pause-then-clean-exit) even when
-`LEERIE_REMOTE_EXIT_RC` is clobbered between the two calls.
+`terminate_instance()`/`decide_ec2_teardown()`) is covered across two files.
+`tests/test_ec2_provision.py` covers the broader surface: instance creation,
+the running+ok readiness poll, stop/terminate idempotency on an empty
+instance id, and the sidecar writes. `tests/test_ec2_decide_teardown.py` is
+the dedicated, deeper pin for `decide_ec2_teardown()`'s
+`$LEERIE_REMOTE_EXIT_RC` classification table — the highest-consequence EC2
+behavior, mirroring `tests/test_decide_teardown_auto_finalize.py`'s Fly
+coverage: each clean-exit rc (0/10/11/75) syncing state via
+`_try_fetch_state_for_ec2_teardown` before calling `terminate_instance`; a
+sync failure on any clean-exit rc leaving the instance `running` with no
+`terminate-instances`/`stop-instances` call ever reaching the `aws` stub's log
+(the one-way-ratchet invariant — destroy-then-fetch would make paid-for LLM
+work unrecoverable); rc=130/143 taking the detach-banner arm without pausing;
+any other non-zero rc stopping (never terminating) the instance and recording
+`pause_reason` in the run sidecar; the fetch-before-terminate ordering
+independently verified via a hook asserting the instance is still `running`
+when `_try_fetch_state_for_ec2_teardown` runs; and `LEERIE_TEARDOWN_DONE`
+idempotency surviving a double-fire (INT then EXIT) in both directions even
+when `LEERIE_REMOTE_EXIT_RC` is clobbered between the two calls.
+
 ## EC2 fetch-branch streamback
 
 The EC2 stream-back counterpart to `fetch-branch.sh` —
 `scripts/remote/ec2-fetch-branch.sh`'s `fetch_state_ec2()` — is tested in
-`tests/test_ec2_fetch_branch.py`, modeled on `tests/test_fetch_branch_sh.py`
-+ `tests/test_fetch_branch_leerie_streamback.py` and using
-`tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh` transport
-harness (`aws` decodes and locally executes `ec2_remote_exec`'s
-base64-wrapped command; `ssh` streams the private download helper
-`_ec2_fetch_ssh`'s raw remote-command stdout straight back, since
-`ec2_tar_pipe` itself is upload-only): a branch committed on the
-instance round-trips to the host as a fetchable bundle whose tip matches
-the instance-side tip; the run-state tar extracts under
-`LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default) and the
-`no_push` mechanism flag is stripped only on the branch-present path
+`tests/test_ec2_fetch_branch.py`, modeled on `tests/test_fetch_branch_sh.py` +
+`tests/test_fetch_branch_leerie_streamback.py` and using
+`tests/test_ec2_seed_repo.py`'s stubbed-`aws`/stubbed-`ssh` transport harness
+(`ssh` streams the private download helper `_ec2_fetch_ssh`'s raw
+remote-command stdout straight back, since `ec2_tar_pipe` itself is
+upload-only): a branch committed on the instance round-trips to the host as a
+fetchable bundle whose tip matches the instance-side tip; the run-state tar
+extracts under `LEERIE_STATE_HOST_DIR` (or `USER_REPO/.leerie` by default)
+and the `no_push` mechanism flag is stripped only on the branch-present path
 (preserved as intent on the cleared-but-empty terminal-state path, same
 conditional as `fetch-branch.sh`); `.leerie/config.toml` and
 `.leerie/Dockerfile` stream back when the host has neither, are never
-clobbered when the host already has one, and are non-fatal when absent
-on the instance; and both `aws` and `ssh` appear in the transport log
-while `flyctl` never does.
+clobbered when the host already has one, and are non-fatal when absent on the
+instance; and both `aws` and `ssh` appear in the transport log while `flyctl`
+never does.
+
 ## EC2 SSM launch/attach
 
 The launch/attach counterpart to `flyctl ssh console` — `scripts/remote/
 ec2-ssm.sh`'s `ec2_launch_detached()`/`ec2_attach()` — is tested in
-`tests/test_ec2_ssm.py` against a stubbed `aws` binary that models
-`ssm start-session`'s two defining quirks: it always exits 0 itself
-regardless of the wrapped remote command's real exit status (the
-documented session-manager-plugin limitation both `ec2_remote_exec` and
-this file work around via an rc-sentinel), and it is a genuinely
-interactive session that drains its own stdin and execs it as the
-bootstrap interpreter's program — unlike `test_ec2_transport.py`'s
-`_stub_aws_ssm`, which only ever inspects the `--parameters` value and
-never touches stdin. Pinned: both functions issue `aws ssm start-session
---target <id> --document-name AWS-StartInteractiveCommand`; rc=75 (the
-flock-loser smart-resume pivot) and other nonzero remote rcs survive the
-round trip uncorrupted; both fail closed (rc 1, actionable stderr, no
-`aws` call) on an empty `LEERIE_EC2_INSTANCE_ID`; a stalled session
+`tests/test_ec2_ssm.py` against a stubbed `aws` binary modeling
+`ssm start-session`'s two quirks: it always exits 0 regardless of the wrapped
+remote command's real exit status (the documented session-manager-plugin
+limitation both `ec2_remote_exec` and this file work around via an
+rc-sentinel), and it is a genuinely interactive session that drains its own
+stdin and execs it as the bootstrap interpreter's program. Pinned: both functions issue
+`aws ssm start-session --target <id> --document-name AWS-StartInteractiveCommand`;
+rc=75 (the flock-loser smart-resume pivot) and other nonzero remote rcs
+survive the round trip uncorrupted; both fail closed (rc 1, actionable
+stderr, no `aws` call) on an empty `LEERIE_EC2_INSTANCE_ID`; a stalled session
 yields 124/137 via the same `_seed_timeout_prefix` convention
-`ec2_remote_exec` uses; `--profile`/`--region` passthrough; a payload
-well over SSM's ~4 KB `--parameters` ceiling still round-trips cleanly
-since only the interpreter name (`python3 -` / `sh -s`) goes in
-`--parameters` and the real payload travels over the session's stdin;
-`ec2_attach`'s `sh -s` bootstrap is verified by decoding the
-base64-wrapped `command=[...]` value rather than asserting on plaintext
-no longer in the log; and double-sourcing is idempotent and does not
-clobber `ec2_remote_exec`. `flyctl` never appears in the transport log.
-Also added to `tests/test_ec2_bash32_portability.py`'s `_EC2_SCRIPTS`
-list for bash 3.2 sourcing coverage.
+`ec2_remote_exec` uses; `--profile`/`--region` passthrough; a payload well
+over SSM's ~4 KB `--parameters` ceiling still round-trips cleanly since only
+the interpreter name (`python3 -` / `sh -s`) goes in `--parameters` and the
+real payload travels over the session's stdin; `ec2_attach`'s `sh -s`
+bootstrap is verified by decoding the base64-wrapped `command=[...]` value
+rather than asserting on plaintext no longer in the log; and double-sourcing
+is idempotent and does not clobber `ec2_remote_exec`. `flyctl` never appears
+in the transport log. Also added to `tests/test_ec2_bash32_portability.py`'s
+`_EC2_SCRIPTS` list for bash 3.2 sourcing coverage.
+
 ## EC2 launcher dispatch branch (`RUNTIME=ec2`)
 
-The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of
-the above can see, since they test `ec2-lib.sh`/`ec2-provision.sh`
-standalone rather than the `leerie` launcher's own dispatch — is
-covered in `tests/test_ec2_e2e_provision.py`: the branch is extracted
-verbatim from the launcher (mirroring `tests/test_launcher_env_forwarding.py`'s
-`_extract_forwarding_loop` approach, since sourcing `leerie` directly
-runs preflight + full CLI dispatch) and run against `tests/ec2_stub.py`'s
-resource-tracking `aws` stub. It pins that `require_aws`'s `sts
-get-caller-identity` call precedes any `ec2 run-instances` call by
-call index (mirroring `tests/test_provision_volume.py`'s ordering
-discipline), and that a failing credential probe aborts the launch
-non-zero, emits the `aws sso login --profile <p>` hint, and leaves
-zero tracked instances and volumes in the stub's state — both with
-provisioning wired in after the dispatch block and with the dispatch
-block alone, so the gate is pinned as the branch's own contract
-independent of what runs after it. The module also defines the shared
-bash harness (stub-on-PATH + launcher invocation helpers) that sibling
-EC2-dispatch test modules import. A dedicated
+The launcher's `RUNTIME=ec2` dispatch branch itself — the seam none of the
+above can see, since they test `ec2-lib.sh`/`ec2-provision.sh` standalone
+rather than the `leerie` launcher's own dispatch — is covered in
+`tests/test_ec2_e2e_provision.py`: the branch is extracted verbatim from the
+launcher and run against `tests/ec2_stub.py`'s
+resource-tracking `aws` stub. It pins that `require_aws`'s
+`sts get-caller-identity` call precedes any `ec2 run-instances` call by call
+index (mirroring `tests/test_provision_volume.py`'s ordering discipline), and
+that a failing credential probe aborts the launch non-zero, emits the
+`aws sso login --profile <p>` hint, and leaves zero tracked instances and
+volumes in the stub's state — both with provisioning wired in after the
+dispatch block and with the dispatch block alone, so the gate is pinned as
+the branch's own contract independent of what runs after it. The module also
+defines the shared bash harness (stub-on-PATH + launcher invocation helpers)
+that sibling EC2-dispatch test modules import. A dedicated
 `test_successful_provision_leaves_exactly_one_instance_and_no_orphaned_volume`
-pins the provision-success resource count against the stub's *tracked
-state* rather than argv/log line counts: exactly one instance (not
-zero — a no-op regression; not two — a double-provision regression,
-both falsified live against hand-broken harness variants during
-development) and zero tracked volumes, since `provision_instance()`
-never calls `create-volume` — root EBS is implicit via `run-instances`
-with AWS's own `DeleteOnTermination=true` default (DESIGN §6 "EBS
-volume lifecycle" case 1) — so any tracked volume on this path would by
+pins the provision-success resource count against the stub's *tracked state*
+rather than argv/log line counts: exactly one instance (not zero — a no-op
+regression; not two — a double-provision regression, both falsified live
+against hand-broken harness variants) and zero tracked volumes, since
+`provision_instance()` never calls `create-volume` — root EBS is implicit via
+`run-instances` with AWS's own `DeleteOnTermination=true` default (DESIGN §6
+"EBS volume lifecycle" case 1) — so any tracked volume on this path would by
 construction be an orphan.
+
 ## Worker prompt transport (stdin, not argv)
 
 The worker-prompt-over-stdin transport (docs/IMPLEMENTATION.md §3 "User
@@ -1638,82 +1623,72 @@ payloads routinely exceed that on their own, crashing with a raw execve
 `OSError: [Errno 7] Argument list too long`) is pinned in
 `tests/test_prompt_over_stdin.py`: `build()` emits no positional argument
 after `-p` at any payload size, so no argv element it constructs can carry
-the prompt (the argv-length property is true by construction, not merely
-measured for one size); a positional prompt would silently win over stdin
-with no error, so `test_no_positional_prompt_after_dash_p` pins the
-element immediately after `-p` is always a flag; the retry path
-(`build(retry_note)`) routes the concatenated retry text through
-`stdin_data` too, not argv; `_invoke` passes `stdin=PIPE` when
-`stdin_data` is given and `stdin=DEVNULL` otherwise (direct-cmd callers
-with no prompt to feed, e.g. the preflight smoke test, are unaffected);
-and `test_real_subprocess_150kb_stdin_no_deadlock` spawns a real `python3`
-child and feeds it a real 150,063-byte payload over a real OS pipe via
-`_invoke`'s concurrent `_feed_stdin` task, proving no deadlock between the
-feeder and `_read_stream`/`_drain_stderr` for a payload well over both a
-single pipe buffer and the single-argv ceiling this fix routes around.
-`tests/test_replay_capture.py` and `tests/test_no_result_event_retry.py`
-were updated in the same change to assert against `stdin_data` instead of
-an argv element, since both stub `_invoke` to inspect what `claude_p`
-constructs.
+the prompt (true by construction, not merely measured for one size); a
+positional prompt would silently win over stdin with no error, so
+`test_no_positional_prompt_after_dash_p` pins the element immediately after
+`-p` is always a flag; the retry path (`build(retry_note)`) routes the
+concatenated retry text through `stdin_data` too, not argv; `_invoke` passes
+`stdin=PIPE` when `stdin_data` is given and `stdin=DEVNULL` otherwise
+(direct-cmd callers with no prompt to feed, e.g. the preflight smoke test,
+are unaffected); and `test_real_subprocess_150kb_stdin_no_deadlock` spawns a
+real `python3` child and feeds it a real 150,063-byte payload over a real OS
+pipe via `_invoke`'s concurrent `_feed_stdin` task, proving no deadlock
+between the feeder and `_read_stream`/`_drain_stderr` for a payload well over
+both a single pipe buffer and the single-argv ceiling this fix routes around.
+`tests/test_replay_capture.py` and `tests/test_no_result_event_retry.py` were
+updated in the same change to assert against `stdin_data` instead of an argv
+element, since both stub `_invoke` to inspect what `claude_p` constructs.
+
 ### The stdin-feeder ordering deadline
 
-Routing the prompt over stdin then created a **deadline** the argv form
-never had, and `tests/test_stdin_feeder_ordering.py` guards it. `claude -p`
-waits a hard-coded 3 s for its first stdin byte (`KJr(process.stdin, 3000)`
-in the CLI bundle — no env var), then drops its own `data` listener, so a
-late write is DISCARDED and the worker exits 1 on `Input must be provided`.
-leerie made two SYNCHRONOUS broker round-trips between the spawn and the
-first write, each bounded by `_cgroup_request`'s 5 s timeout — an accepted
-stall larger than the deadline in front of it, i.e. the failure was
-permitted by construction, while the comment at that site called the stall
-"negligible". Measured across every run on one host: **218 workers lost,
-12.4% of all invocations in the affected runs**, retried up to 4x each with
-every attempt charged to `max_total_workers`, spanning v0.9.95–v0.16.0.
-`_cgroup_enroll`'s docstring had already recorded the pair in a different
-run as "two apparently-unconnected events" — they are one event.
-**Both halves of the fix are load-bearing**, which is what the file mostly
-exists to pin: a reproduction harness scored all four combinations and only
-`create_task` at the spawn AND `to_thread` on both broker calls delivers the
-prompt — hoisting alone fails because the blocked loop never schedules the
-task, and `to_thread` alone fails because the write lands after the child is
-already gone. A future edit keeping one and dropping the other silently
-reopens a 12% budget leak, so `test_only_both_halves_deliver_the_prompt_in_time`
-drives all four combinations behaviourally rather than trusting the source
-order. Two harness traps here, both hit on the first draft and both the
-comment-matching class this file documents elsewhere: the region is dense
-with comments that necessarily name `_feed_stdin`, `await` and
-`_cgroup_enroll` while explaining the ordering, so `_invoke_src` strips
-comments via `tokenize` (not a `#` heuristic — a `#` inside a string
-literal would corrupt the result); and `async def _feed_stdin():` contains
-`_feed_stdin()` as a substring, so a bare `.count()` reports two calls for
-correct code and the call-site scan has to exclude the definition.
+Routing the prompt over stdin created a **deadline** the argv form never
+had, guarded by `tests/test_stdin_feeder_ordering.py`. `claude -p` waits a
+hard-coded 3 s for its first stdin byte, then drops its `data` listener, so
+a late write is DISCARDED and the worker exits 1 on `Input must be
+provided`. leerie made two SYNCHRONOUS broker round-trips between spawn and
+first write, each bounded by `_cgroup_request`'s 5 s timeout — a stall
+larger than the deadline in front of it. Measured: **218 workers lost,
+12.4% of all invocations in the affected runs**, retried up to 4x each
+against `max_total_workers`, spanning v0.9.95–v0.16.0. **Both halves of the
+fix are load-bearing**: a reproduction harness scored all four combinations
+and only `create_task` at the spawn AND `to_thread` on both broker calls
+delivers the prompt — hoisting alone fails (blocked loop never schedules
+the task), `to_thread` alone fails (write lands after the child is gone).
+`test_only_both_halves_deliver_the_prompt_in_time` drives all four
+combinations behaviourally rather than trusting source order. Two harness
+traps: `_invoke_src` strips comments via `tokenize`, not a `#` heuristic (a
+`#` inside a string literal would corrupt the result), since the region
+names `_feed_stdin`/`await`/`_cgroup_enroll` in comments; and
+`async def _feed_stdin():` contains `_feed_stdin()` as a substring, so a
+bare `.count()` over-reports and the call-site scan excludes the
+definition.
+
 ## Appended system prompt transport
 
 The appended system prompt (docs/IMPLEMENTATION.md §3 "Appended system
-prompt transport — file, with a probe + inline fallback" — the second
-large argv element that compounds with the user prompt toward the same
+prompt transport — file, with a probe + inline fallback" — the second large
+argv element that compounds with the user prompt toward the same
 `MAX_ARG_STRLEN` ceiling, worst-case on the overlap judge) is pinned in
-`tests/test_append_system_prompt_file.py`: `_append_system_prompt_file_supported()`'s
-supported/unsupported classification (by stderr text — `"unknown
-option"` means unsupported, since both outcomes exit non-zero and only
-the message distinguishes them), fail-closed behavior on a missing
-`claude` binary or a probe timeout, once-per-process memoization (a
-second call makes no further `claude` invocation), and its own
-throwaway probe file being cleaned up; `build()`'s branch on the probe
-result (`--append-system-prompt-file <path>` with the temp file holding
-`system_prompt` verbatim when supported, the inline
+`tests/test_append_system_prompt_file.py`:
+`_append_system_prompt_file_supported()`'s supported/unsupported
+classification (by stderr text — `"unknown option"` means unsupported, since
+both outcomes exit non-zero and only the message distinguishes them),
+fail-closed behavior on a missing `claude` binary or a probe timeout,
+once-per-process memoization (a second call makes no further `claude`
+invocation), and its own throwaway probe file being cleaned up; `build()`'s
+branch on the probe result (`--append-system-prompt-file <path>` with the
+temp file holding `system_prompt` verbatim when supported, the inline
 `--append-system-prompt` when not); the temp file being removed once
-`claude_p()` returns, on both the success path and an exception path
-(a `TerminalAuthFailure` raised from inside the try/finally-wrapped
-retry loop — the schema-key drift guard itself runs before the temp
-file is created, so it needs no cleanup); and the retry loop reusing
-the same temp file across both attempts rather than recreating it, since
-`system_prompt` is fixed for the whole `claude_p()` call.
-`tests/test_replay_capture.py`'s two system-prompt-plumbing tests
-(`test_args_match_capture_fields`, `test_override_system_prompt`) pin the
-probe to unsupported via monkeypatch so their argv assertions don't
-depend on whether the live `claude` CLI on the test host happens to
-support the undocumented file flag.
+`claude_p()` returns, on both the success path and an exception path (a
+`TerminalAuthFailure` raised from inside the try/finally-wrapped retry loop —
+the schema-key drift guard itself runs before the temp file is created, so it
+needs no cleanup); and the retry loop reusing the same temp file across both
+attempts rather than recreating it, since `system_prompt` is fixed for the
+whole `claude_p()` call. `tests/test_replay_capture.py`'s two
+system-prompt-plumbing tests (`test_args_match_capture_fields`,
+`test_override_system_prompt`) pin the probe to unsupported via monkeypatch
+so their argv assertions don't depend on whether the live `claude` CLI on the
+test host happens to support the undocumented file flag.
 
 ## No-result-event retry
 
@@ -1722,56 +1697,51 @@ full session but never emits its terminal `result` event — upstream
 anthropics/claude-code #8126/#1920/#74761, unresolved) is pinned in
 `tests/test_no_result_event_retry.py`: `_invoke` returns a synthetic
 `_leerie_synthetic: "no_result_event"` envelope rather than raising, so
-`claude_p`'s existing 2-attempt loop absorbs it (a raised WorkerError
-propagated past that loop and die()d the run non-resumably). The
-load-bearing test is
-`test_synthetic_envelope_is_not_an_auth_or_quota_failure`: it extracts the
-**real** message from `_invoke`'s source via `ast` rather than asserting
-against a copied fixture — `_is_auth_or_quota_failure` falls back to text
-markers (`rate limit` / `invalid authentication`) on `result`, so a
-hand-copied fixture passes happily while the shipping message silently
-diverts every no-result retry into the tenacity backoff and burns the whole
-`auth_retry_max_sec` budget (verified: the copied-fixture version of this
-test does **not** fail when the landmine is introduced; the ast-extracted
-one does). Controlling leerie's own message is **not sufficient**, and
-assuming it was is how the bug shipped: the envelope interpolates the
-worker's **raw stderr** into `result`, so a worker whose stderr merely
-mentions auth or rate limiting trips the same markers. The fix is an
-exemption in `_is_auth_or_quota_failure` for `_leerie_synthetic` envelopes
-(the numeric `api_error_status` check still runs first and still wins);
-`test_worker_stderr_cannot_trip_the_auth_classifier` pins it against three
-realistic stderr payloads, and
-`test_real_envelopes_still_match_the_text_markers` guards the exemption
-from over-reaching. Paired with a source-coupling guard that the synthetic return is
-the **last** arm of the no-envelope block — every arm above it (overage,
-OOM, nonzero rc) is a named non-retryable condition that still raises, and
-the nonzero-rc arm in particular covers leerie's own deliberate
-SIGTERM/SIGKILLs, which must never be retried.
-`tests/test_warnings_before_die.py` pins the ordering that made that bug
-undiagnosable in the first place: all four judgment phases (classifier,
-provision, reconciler, plan_overlap_judge) log their `_run_checked_loop`
-warnings — which carry the underlying exception text — **before** `die()`,
-since `die()` calls `sys.exit()` and any loop after it is unreachable
-(falsified live: reverting one site fails the guard).
+`claude_p`'s 2-attempt loop absorbs it (a raised WorkerError propagated
+past that loop and die()d the run non-resumably). The load-bearing test,
+`test_synthetic_envelope_is_not_an_auth_or_quota_failure`, extracts the
+**real** message from `_invoke`'s source via `ast` rather than a copied
+fixture — `_is_auth_or_quota_failure` falls back to text markers on
+`result`, so a hand-copied fixture passes while the shipping message
+diverts every no-result retry into the tenacity backoff and burns the
+whole `auth_retry_max_sec` budget (verified: the copied-fixture version
+does **not** fail when the landmine is introduced; the ast-extracted one
+does). Controlling leerie's own message is **not sufficient** — the
+envelope interpolates the worker's **raw stderr** into `result`, so a
+worker whose stderr merely mentions auth/rate-limiting trips the same
+markers. Fix: an exemption in `_is_auth_or_quota_failure` for
+`_leerie_synthetic` envelopes (the numeric `api_error_status` check still
+runs first). `test_worker_stderr_cannot_trip_the_auth_classifier` pins it
+against three realistic stderr payloads, and
+`test_real_envelopes_still_match_the_text_markers` guards against
+over-reaching. A source-coupling guard pins the synthetic return as the
+**last** arm of the no-envelope block, since the nonzero-rc arm above it
+covers leerie's own deliberate SIGTERM/SIGKILLs, which must never be
+retried. `tests/test_warnings_before_die.py` pins that all four judgment
+phases (classifier, provision, reconciler, plan_overlap_judge) log their
+`_run_checked_loop` warnings **before** `die()`, since `die()` calls
+`sys.exit()` and any loop after it is unreachable (falsified live:
+reverting one site fails the guard).
+
 ### `_run_checked_loop` crash policy
 
 `_run_checked_loop`'s crash policy is pinned in `tests/test_checked_loop.py`:
 a `WorkerError` (infrastructure — PID exhaustion, OOM, a killed session) is
 **retried** against the same `judgment_check_rounds` budget, because the
-re-invocation is a fresh `claude -p` session with a clean PID table — which
-is what `_read_stream`'s own PID-cap message already promised ("a fresh
-worker retries") and what was true for implementers but false for every
-`_run_checked_loop` caller until the retry existed. A worker KILLED at its
-wall-clock ceiling is the same class and is retried too — `_invoke` raises
-`subprocess.TimeoutExpired`, which is not a `WorkerError` — though bounded to
-`_TIMEOUT_RETRY_MAX` attempts rather than the full round budget, since a
-timeout has already spent its whole ceiling before it is observed. Any
-*other* exception is a leerie bug rather than a flaky worker, so it still
-abandons the loop immediately (`test_loop_crash_breaks`, which uses `RuntimeError` precisely to
-pin that split). Also pinned: all-rounds-crash still returns `None` so the
-callers' `is None` escalation is unchanged, the retry is bounded at exactly
-`max_rounds`, and a crash must clear `last_res` so a stale earlier result is
-never returned as the crashed round's output.
+re-invocation is a fresh `claude -p` session with a clean PID table — true
+for implementers but false for every `_run_checked_loop` caller until the
+retry existed. A worker KILLED at its wall-clock ceiling is the same class
+and is retried too — `_invoke` raises `subprocess.TimeoutExpired`, not a
+`WorkerError` — though bounded to `_TIMEOUT_RETRY_MAX` attempts rather than
+the full round budget, since a timeout has already spent its whole ceiling
+before it is observed. Any *other* exception is a leerie bug rather than a
+flaky worker, so it still abandons the loop immediately (`test_loop_crash_breaks`,
+which uses `RuntimeError` precisely to pin that split). Also pinned:
+all-rounds-crash still returns `None` so callers' `is None` escalation is
+unchanged, the retry is bounded at exactly `max_rounds`, and a crash must
+clear `last_res` so a stale earlier result is never returned as the crashed
+round's output.
+
 ## Integrator-crash salvage path
 
 The integrator-crash salvage path (DESIGN §12 *salvage if there is something
@@ -1783,58 +1753,61 @@ file to its pre-merge content, leaving no stash and no reachable object). The
 load-bearing pin is `test_rescue_does_not_require_a_merge_commit`: the rescue
 must **not** be gated on `check_merge_committed`, because a crashed
 integrator typically dies mid-resolution having committed nothing —
-`integrator-feat-006` never ran `git commit` while `integrator-feat-005` did
-— so a commit-gated rescue declines exactly the case worth saving.
-Introducing that gate fails 4 tests. The mechanism is a throwaway
-`GIT_INDEX_FILE` seeded from HEAD, because both `git stash push` **and** `git
-stash create` refuse a conflicted tree ("Cannot save the current index
+`integrator-feat-006` never ran `git commit` while `integrator-feat-005`
+did — so a commit-gated rescue declines exactly the case worth saving.
+Introducing that gate fails 4 tests. The mechanism: a throwaway
+`GIT_INDEX_FILE` seeded from HEAD, because both `git stash push` **and**
+`git stash create` refuse a conflicted tree ("Cannot save the current index
 state") — an unmerged index is precisely what an integrator crash leaves
 behind. Also pinned: untracked files are captured, the real index/worktree
 and `MERGE_HEAD` are untouched, the temp index is cleaned up, refs are
 namespaced per run+subtask so two crashes cannot clobber each other, and a
 tree identical to `HEAD^{tree}` returns `None` rather than a ref naming an
 empty diff.
+
 ## Remote schema duplication (`collect-subtrees.sh`)
 
 **`scripts/remote/collect-subtrees.sh` embeds a second copy of
 `SCHEMAS["integrator"]`** as a single-quoted shell string, because it invokes
-`claude -p --json-schema` directly from bash on the remote machine and cannot
-import the orchestrator. **Any edit to that schema must update both.** That same
-direct invocation also puts the script outside the `--dangerously-force-strict-output`
-path — it runs only after the orchestrator (which owns the proxy) has exited, so
-output there is schema-validated but not constrained during generation.
-`tests/test_collect_subtrees_integrator_schema.py` is the guard: it parses the
-`integrator_schema='{...}'` assignment out of the real script and asserts
-whole-object equality with the live `SCHEMAS["integrator"]` — deliberately
-whole-object rather than a spot-check of the fields that last drifted, since
-the next drift will be somewhere else. It exists because the copy **had already
-silently drifted in production** (measured 2026-08-03): it still carried
-`maxLength` 2000/500 on the confidence fields, values the live schema had moved
-off twice since (to 8000/2000, then deleted outright), so remote integrator
-runs were validating worker output against a materially different contract than
-local ones — invisibly, because nothing compared the two. A corpus fixture had
-even named this test file before it existed; the guard was planned and never
-landed, which is precisely how the drift went unnoticed.
+`claude -p --json-schema` directly from bash on the remote machine and
+cannot import the orchestrator. **Any edit to that schema must update both.**
+That same direct invocation also puts the script outside the
+`--dangerously-force-strict-output` path — it runs only after the
+orchestrator (which owns the proxy) has exited, so output there is
+schema-validated but not constrained during generation.
+`tests/test_collect_subtrees_integrator_schema.py` is the guard: it parses
+the `integrator_schema='{...}'` assignment out of the real script and
+asserts whole-object equality with the live `SCHEMAS["integrator"]` —
+deliberately whole-object rather than a spot-check of the fields that last
+drifted, since the next drift will be somewhere else. It exists because the
+copy **had already silently drifted in production** (measured 2026-08-03):
+it still carried `maxLength` 2000/500 on the confidence fields, values the
+live schema had moved off twice since (to 8000/2000, then deleted outright),
+so remote integrator runs were validating worker output against a
+materially different contract than local ones — invisibly, because nothing
+compared the two. A corpus fixture had even named this test file before it
+existed; the guard was planned and never landed, which is precisely how the
+drift went unnoticed.
+
 ## `resume` auto-pick of the newest resumable run
 
 `tests/test_resolve_run_id_autopick.py` covers bare `resume` auto-picking
 the newest resumable run (`in-progress`/`paused`/`incomplete`), including
-the two traps found by running the design against a real 58-run state dir:
+two traps found by running the design against a real 58-run state dir:
 `seed-failed` rows carry no `started_at` and sorted to the *top* of a naive
 newest-first sort (they are now list-only, never auto-picked), and a
-missing `started_at` must never outrank a real timestamp. An explicit
-run-id stays exempt from the filter (so `resume <seed-failed-id>` still
-works) and an unknown one still fails closed. The `seed-failed` exclusion
-is a deliberate behavior change with a UX cost, pinned by
-`test_resolve_run_id.py::test_resolve_lone_orphan_is_not_auto_resumed`:
-bare `resume` used to auto-pick a *lone* orphan, and now dies instead —
-a seed-failed run aborted before `phase_classify` and needs an operator
+missing `started_at` must never outrank a real timestamp. An explicit run-id
+stays exempt from the filter (so `resume <seed-failed-id>` still works) and
+an unknown one still fails closed. The `seed-failed` exclusion is a
+deliberate behavior change with a UX cost, pinned by
+`test_resolve_run_id.py::test_resolve_lone_orphan_is_not_auto_resumed`: bare
+`resume` used to auto-pick a *lone* orphan, and now dies instead — a
+seed-failed run aborted before `phase_classify` and needs an operator
 decision (re-seed vs. kill), since resuming blind can re-trigger the same
 seed failure. The die is therefore required to stay actionable (names the
 run, its `status=seed-failed`, and the explicit-id escape hatch), because
-that escape hatch is the documented recovery path for the 2026-06-04
-hangs. `--report`/`--phase` still auto-pick a lone orphan — they are
-read-only.
+that escape hatch is the documented recovery path for the 2026-06-04 hangs.
+`--report`/`--phase` still auto-pick a lone orphan — they are read-only.
 `tests/test_container_entry_run_id.py` covers `container-entry.sh` skipping
 its cidfile `--run-id` injection when `resume` is present — a resume
 container is a *new* container whose id matches no run on disk, which is
@@ -1849,73 +1822,59 @@ the shell the EC2 tests actually get (they pin `PATH` to
 `{stub_dir}:/usr/bin:/bin` to isolate their stubbed `aws`, which excludes
 Homebrew's bash 5). CI is `ubuntu-latest`, so it **structurally cannot**
 catch a bash-4-only construct; two of them lived in `ec2-lib.sh` /
-`ec2-provision.sh` and showed up only as 33 failing tests on a
-developer's Mac. `tests/test_ec2_bash32_portability.py` is the guard: it
-sources each EC2 script under a real `/bin/bash` with `set -u` and no
-`LEERIE_AWS_*`/`AWS_*` (the default config, which leaves every
-optional-arg array empty), **and calls the functions that expand those
-arrays** — sourcing alone is not enough, since an unguarded
-`"${arr[@]}"` sits inside a function body the shell never evaluates until
-called (verified: the source-only version of this test passes with the
-bug reintroduced). It skips cleanly on hosts whose `/bin/bash` is ≥ 4.3,
-so it is a macOS-developer guard, never a CI flake. Paired with a
-source-level `local -n` / `declare -n` ban (namerefs are bash 4.3+;
-echo the tokens instead — see `_aws_region_profile_args`).
-The guard was extended (test-006) to cover every EC2 launcher arm wired
-by test-001..test-005: `_EC2_SCRIPTS` gained `ec2-resume-instance.sh`,
-`ec2-seed-auth.sh`, and `ec2-fetch-branch.sh` (all sourced by the
-launcher's EC2 arms but previously untested here); `_EXPANSION_CALLSITES`
-gained `resume_instance`; and a new
+`ec2-provision.sh` and showed up only as 33 failing tests on a developer's
+Mac. `tests/test_ec2_bash32_portability.py` is the guard: it sources each
+EC2 script under a real `/bin/bash` with `set -u` and no
+`LEERIE_AWS_*`/`AWS_*` (the default config, which leaves every optional-arg
+array empty), **and calls the functions that expand those arrays** —
+sourcing alone is not enough, since an unguarded `"${arr[@]}"` sits inside a
+function body the shell never evaluates until called (verified: the
+source-only version of this test passes with the bug reintroduced). It skips
+cleanly on hosts whose `/bin/bash` is ≥ 4.3, so it is a macOS-developer
+guard, never a CI flake. Paired with a source-level `local -n` / `declare -n`
+ban (namerefs are bash 4.3+; echo the tokens instead — see
+`_aws_region_profile_args`). The guard was extended (test-006) to cover every
+EC2 launcher arm wired by test-001..test-005: `_EC2_SCRIPTS` gained
+`ec2-resume-instance.sh`, `ec2-seed-auth.sh`, and `ec2-fetch-branch.sh` (all
+sourced by the launcher's EC2 arms but previously untested here);
+`_EXPANSION_CALLSITES` gained `resume_instance`; and a new
 `test_ec2_launcher_verb_runs_cleanly_under_bash32` runs the real `leerie`
 binary itself (not just `scripts/remote/ec2-*.sh`) under bash 3.2 for
-`stop`/`kill`/`accept-blocked` with `LEERIE_AWS_PROFILE`/
-`LEERIE_AWS_REGION` unset, since each of those arms builds its own
-optional-arg array from those two vars directly in `leerie` before
-calling `resolve_aws_credentials`. This surfaced a real, previously
-unguarded instance of the class: all four call sites
-(`accept-blocked`, `stop`, `kill`, and the main `RUNTIME=ec2`
-dispatch) expanded their creds-args array as a bare `"${arr[@]}"`
-instead of `${arr[@]+"${arr[@]}"}` — fixed in the same change. The
-nameref ban was likewise extended to `leerie` itself
-(`test_no_namerefs_in_launcher`). A later child added
-`pytest.param(["accept-integration", ...])`, covering
-`accept-integration`'s own `_ai_aws_creds_args` array expansion the
-same way.
+`stop`/`kill`/`accept-blocked` with `LEERIE_AWS_PROFILE`/`LEERIE_AWS_REGION`
+unset, since each of those arms builds its own optional-arg array from those
+two vars directly in `leerie` before calling `resolve_aws_credentials`. This
+surfaced a real, previously unguarded instance of the class: all four call
+sites (`accept-blocked`, `stop`, `kill`, and the main `RUNTIME=ec2` dispatch)
+expanded their creds-args array as a bare `"${arr[@]}"` instead of
+`${arr[@]+"${arr[@]}"}` — fixed in the same change. The nameref ban was
+likewise extended to `leerie` itself (`test_no_namerefs_in_launcher`). A
+later child added `pytest.param(["accept-integration", ...])`, covering
+`accept-integration`'s own `_ai_aws_creds_args` array expansion the same way.
 
 ## Host-only tests gated on `jq`
 
 **Host-only tests are gated on `jq`** (`HAS_JQ` in `tests/conftest.py`,
-mirroring the `HAS_TREESITTER` pattern). Five modules —
-`test_host_finalize_sh.py`, `test_decide_teardown_auto_finalize.py`,
-`test_launcher_finalize_no_work.py`, `test_launcher_no_push_skips.py`,
-`test_push_output_capture.py` — source bash the **host** owns:
-`scripts/host-finalize.sh`, `provision.sh`'s `decide_teardown`, and the
-launcher's `finalize` / `no_push` paths. All parse `run.json` with real `jq`.
-(A per-file test count in this file is a measurement with a date on it, not
-a constant; re-derive before citing one.) The harnesses stub
-`git` and `gh` onto PATH but not `jq`, so jq is silently inherited from
-whichever machine runs pytest — it passes on a dev host and in CI (both ship
-jq) and failed only inside the leerie image, which deliberately omits it.
-That is the host/container split: host bash uses `jq` (the launcher
-hard-fails at preflight without it — "jq not found on PATH", `brew install
-jq`), while code running *inside* the container uses python3, exactly as
-`scripts/remote/seed-auth.sh` documents ("python3 over jq because jq isn't in
-the leerie image (see Dockerfile)"). `gh` **is** in the image for the mirror
-reason: Python inside the container preflights for it.
-**Do not "fix" a skip here by adding `jq` to the Dockerfile.** Per DESIGN §6
-*Finalization* those scripts can never succeed in-container anyway (gh auth,
-ssh-agent, and Keychain are host-side), so installing jq buys a green tick,
-not working code, and erodes the boundary. Note a `grep jq` does **not**
-reproduce the gated list — two of the five never mention jq and fail only
-because the script under test shells out to it; the list is measured from a
-real in-container run. The fifth entry shows a second way in: a module-level
-`skipif` does **not** propagate through an import, so
-`test_push_output_capture.py` reusing `test_host_finalize_sh.py`'s runner
-needs its own. `tests/test_jq_gate_wiring.py` is the guard-the-guard
-(conftest exposes a module-level `HAS_JQ` bool derived from a live
-`shutil.which` probe; each of the five both imports it and carries a
-`skipif` referencing it) — dropping one file's skipif fails it, which is the
-same silent regression the `HAS_TREESITTER` gate exists to prevent.
+mirroring `HAS_TREESITTER`). Five modules — `test_host_finalize_sh.py`,
+`test_decide_teardown_auto_finalize.py`, `test_launcher_finalize_no_work.py`,
+`test_launcher_no_push_skips.py`, `test_push_output_capture.py` — source
+bash the **host** owns (`scripts/host-finalize.sh`, `provision.sh`'s
+`decide_teardown`, the launcher's `finalize`/`no_push` paths) and parse
+`run.json` with real `jq`. The harnesses stub `git`/`gh` but not `jq`, so
+it's silently inherited from whichever machine runs pytest — passing on a
+dev host and CI (both ship jq), failing only inside the leerie image,
+which deliberately omits it: host bash uses `jq` (launcher hard-fails at
+preflight without it), code *inside* the container uses python3 (per
+`scripts/remote/seed-auth.sh`). `gh` **is** in the image for the mirror
+reason. **Do not "fix" a skip by adding `jq` to the Dockerfile** — per
+DESIGN §6 *Finalization* those scripts can never succeed in-container
+anyway (gh auth, ssh-agent, Keychain are host-side); installing jq buys a
+green tick, not working code. A `grep jq` does **not** reproduce the gated
+list — two of the five never mention jq and fail only because the script
+under test shells out to it. A module-level `skipif` does **not**
+propagate through an import, so `test_push_output_capture.py` reusing
+`test_host_finalize_sh.py`'s runner needs its own.
+`tests/test_jq_gate_wiring.py` guards that each of the five both imports
+`HAS_JQ` and carries a `skipif` referencing it.
 
 ## Push output capture (stdout+stderr split)
 
@@ -1927,277 +1886,236 @@ is why this went unnoticed). Measured: a `push_error` of two pnpm deprecation
 warnings for a push whose real cause was 13 lines of `TS2307`, undiagnosable
 from leerie's own output, three misdiagnoses, at the end of a $57 run. But
 plain `2>&1` is **wrong**, because the captured blob is also the input to
-`_host_finalize_is_auth_or_network_push_error`, whose arm matches a qualified
-phrase on a `^fatal:`/`^remote:` line — and a hook that refreshes submodules
-or runs `git ls-remote` prints exactly that shape on stdout, flipping a hook
-failure to "auth/network" and suppressing the `--no-verify` hint. Measured
-against the real classifier: **3 of 3** adversarial hook shapes flip, while
-real `tsc`/`vitest` output does not. So stderr classifies and stdout+stderr is
-displayed, which leaves the committed 23-case corpus score unchanged **by
-construction** rather than by re-measurement.
+`_host_finalize_is_auth_or_network_push_error`, whose arm matches a
+qualified phrase on a `^fatal:`/`^remote:` line — and a hook that refreshes
+submodules or runs `git ls-remote` prints exactly that shape on stdout,
+flipping a hook failure to "auth/network" and suppressing the `--no-verify`
+hint. Measured against the real classifier: **3 of 3** adversarial hook
+shapes flip, while real `tsc`/`vitest` output does not. So stderr classifies
+and stdout+stderr is displayed, leaving the committed 23-case corpus score
+unchanged **by construction** rather than by re-measurement.
 `tests/test_push_output_capture.py` pins both halves; its parametrized
 `test_git_framed_hook_stdout_does_not_suppress_the_hook_hint` is the
 load-bearing one, paired with an anti-vacuity control that a genuine
 credential failure on stderr still classifies as auth (else the guard could
-pass by disabling the classifier). Falsified live: routing `push_all` into the
-classifier fails 4 tests, and the control keeps passing.
+pass by disabling the classifier). Falsified live: routing `push_all` into
+the classifier fails 4 tests, and the control keeps passing.
 
 ### Three further traps in the same change
 
-**Three further traps in the same change, each caught by a test rather than by
-review.** (1) `push_error` reaches `run.json` as a single `jq --arg` value, so
-it is bounded by `MAX_ARG_STRLEN` (131,072 bytes) — and one real recorded
-`push_error` is already **104,520 bytes on stderr alone**, so folding hook
-stdout into the same value is precisely what makes the ceiling reachable. Past
-it `jq` cannot be exec'd and `set -e` aborts `host_finalize` *before* the
-diagnostic prints, losing the output the capture exists to preserve. The
-persisted copy is therefore tail-bounded at 32 KiB (the printed one at 4000
-bytes — a separate and much tighter bound);
-`test_oversized_push_output_still_writes_the_sidecar` drives ~200 KB through
-it. Same argv-E2BIG class as the 2026-07-19 orchestrator incident.
-(2) Husky v9 prints its banner on **stdout** — a repo with
-`core.hooksPath=.husky/_` runs `.husky/_/h`, whose line 20 is a bare
-`echo "husky - $n script failed (code $c)"` with no `>&2` — so the
-supplementary "which hook" naming grep, reading stderr only, could never match
-the commonest hook runner in existence, and the existing stderr-stub test in
-`test_host_finalize_sh.py` is why that looked covered. It now reads stderr
-plus the hook's stdout; classification is untouched.
-(3) That grep must NOT read `push_all`, because the section marker leerie
-itself inserts (`--- pre-push hook output (stdout) ---`) contains the words
-"pre-push" and "hook" and is matched *first* — measured, the hint read
-"(pre-push hook failed)" while husky's own banner further down the same blob
-said "pre-push script failed". A separate `push_hook_out` variable holds the
-raw stdout so the grep never sees leerie's own prose. This is the same
-label-matching-the-thing-it-describes trap the zombie-reaper guard and the
-`unreviewed_subtasks` scan document elsewhere in this project's history, in a
-third disguise: a *label* read as *evidence*. The test asserts the name is
-"script", not merely that "pre-push" appears — a laxer assertion passes
-against the bug.
+Three further traps, each caught by a test rather than by review. (1)
+`push_error` reaches `run.json` as a single `jq --arg` value, bounded by
+`MAX_ARG_STRLEN` (131,072 bytes) — one real recorded `push_error` is
+already **104,520 bytes on stderr alone**, so folding hook stdout in is
+what makes the ceiling reachable; past it `jq` cannot be exec'd and
+`set -e` aborts `host_finalize` before the diagnostic prints. The
+persisted copy is tail-bounded at 32 KiB (printed copy: 4000 bytes);
+`test_oversized_push_output_still_writes_the_sidecar` drives ~200 KB
+through it. (2) Husky v9 prints its banner on **stdout** (line 20 of
+`.husky/_/h` is a bare `echo` with no `>&2`), so the "which hook" naming
+grep, reading stderr only, could never match the commonest hook runner in
+existence; it now reads stderr plus the hook's stdout. (3) That grep must
+NOT read `push_all`, because leerie's own section marker
+(`--- pre-push hook output (stdout) ---`) contains "pre-push"/"hook" and
+matches *first* — measured, the hint misattributed husky's own banner. A
+separate `push_hook_out` variable holds the raw stdout so the grep never
+sees leerie's own prose. The test asserts the name is "script", not merely
+that "pre-push" appears — a laxer assertion passes against the bug.
 
 ## Locale-stripped harness masks a byte-vs-character bug
 
 **A harness that strips the locale makes a byte-vs-character bug
-undetectable, and this is the sharpest vacuity trap in the file.** Both push
-bounds are `tail -c`, which cuts BYTES, while `${#var}` counts CHARACTERS —
-but only under a multibyte locale. `test_host_finalize_sh.py`'s runner builds
-a minimal env (`PATH`/`USER_REPO`/`HOME`, no `LANG`, no `LC_ALL`), so bash
-runs in the **C locale, where `${#var}` counts bytes** and a char-based and a
-byte-based implementation are *indistinguishable*. The first version of
-`test_persist_bound_is_measured_in_bytes_not_characters` therefore passed
-against the exact bug it was written for — falsification confirmed it: 35
-passed with the fix reverted. It now resolves a working multibyte locale
-first (`_multibyte_locale()` probes bash's own `${#}` and requires 2, not 6,
-for a two-character Japanese string), passes it through `extra_env`, and
-**skips loudly** when none exists rather than silently proving nothing.
-Generalise the rule: when a test's subject is a locale-, encoding-, or
-timezone-sensitive behaviour, the harness's minimal env is a *variable of the
-experiment*, not neutral scaffolding.
+undetectable — the sharpest vacuity trap in the file.** Both push bounds
+are `tail -c` (cuts BYTES), while `${#var}` counts CHARACTERS only under a
+multibyte locale. `test_host_finalize_sh.py`'s runner builds a minimal env
+(no `LANG`/`LC_ALL`), so bash runs in the **C locale, where `${#var}`
+counts bytes** and byte-based vs char-based implementations are
+*indistinguishable*. The first version of
+`test_persist_bound_is_measured_in_bytes_not_characters` passed against the
+exact bug it targeted — falsified: 35 passed with the fix reverted. It now
+resolves a working multibyte locale first (`_multibyte_locale()` probes
+bash's own `${#}`, requiring 2 not 6 for a two-character Japanese string),
+passes it through `extra_env`, and **skips loudly** when none exists.
+Generalise: for locale-/encoding-/timezone-sensitive behaviour, the
+harness's minimal env is a *variable of the experiment*, not scaffolding.
 
-Two further harness traps —
-the degrade test stubs `mktemp` to force the no-temp-dir fallback, and
-stubbing it for **every** form aborts the function at the rebase step's
-`mktemp -d`, several steps earlier, so the test passed on a path that never
-reached the push; the stub must fail only the plain-file form. And the shared
-runner decodes with `errors="replace"`, because a byte-anchored truncation
-can legitimately land mid-character and strict decoding makes the harness
-raise `UnicodeDecodeError` before a single assertion runs — testing the
-harness rather than the code. (`jq` itself is unbothered: verified, it
-substitutes U+FFFD and still writes valid JSON at rc 0, which is why the
-byte cut is safe for `run.json`.)
+Two further harness traps: the degrade test's `mktemp` stub must fail only
+the plain-file form, since stubbing every form aborts at the rebase step's
+`mktemp -d` earlier, passing on a path that never reached the push. And the
+shared runner decodes with `errors="replace"`, since a byte-anchored
+truncation can land mid-character and strict decoding raises
+`UnicodeDecodeError` before any assertion runs. (`jq` substitutes U+FFFD
+and still writes valid JSON at rc 0, so the byte cut is safe for
+`run.json`.)
 
 ## Per-subtask delta proxy: the `{test_files}` tier
 
 The per-subtask delta proxy's `{test_files}` tier is covered by
-`tests/test_test_files_proxy.py` (48), `tests/test_scoped_proxy_corpus.py` (5)
-and `tests/test_scoped_degrade_warning.py` (11). Three lessons generalise past
-this feature. **(1) A non-test path is an ERROR to pytest, not a no-op, and one
-of them poisons the whole invocation** — measured, `pytest orchestrator/leerie.py`
-exits 5, `pytest docs/DESIGN.md` exits 4, and `pytest docs/DESIGN.md
-tests/test_blt_semaphore.py` ALSO exits 4. Since a real subtask diff mixes docs
-and source with its tests, a `{files}` template on a runner with no source→test
-impact analysis reports RED on nearly every subtask; the fix is to filter the
-substitution (`{test_files}`), not to abandon the proxy, with the pre-existing
-empty-list rule doing the rest — a diff with no test file renders nothing and
-falls back to canonical. **(2) Scan the author's input, not the rendered
-output.** The unknown-placeholder guard first shipped scanning the SUBSTITUTED
-command, so a changed-file path containing braces (`src/{locale}/page.test.ts`
-— the brace-routing analogue of the `src/app/[locale]/(app)/…` path
-`shlex.quote` exists for in that very function) was read as an unknown
-placeholder: it disabled the proxy *and* emitted a warning misdiagnosing it as
-install skew, sending the operator to re-run install.sh for nothing. Scanning
-the template with `_SCOPED_PLACEHOLDERS` stripped removes the hazard by
-construction rather than by widening the regex. **(3) A planner prediction is
-not a diff.** The ratio the tier rests on was first taken from
-`files_likely_touched` and was badly wrong — 40% test-touching predicted (109
-of 270) against 94% real (34 of 36) — because CLAUDE.md mandates tests and
-implementers add them whether or not the planner predicted it. The frozen
-corpus is 36 REAL per-subtask diffs recovered from leerie's own run branches,
-and each row must be ONE subtask's work: an integration merge's **first-parent**
-diff, since a plain two-dot diff against the run base is cumulative and folds
-in siblings — which is how the first recovery attempt reported 0% source-only
-and nearly shipped a fixture that could not exercise the canonical fallback at
-all.
+`tests/test_test_files_proxy.py` (48), `tests/test_scoped_proxy_corpus.py`
+(5) and `tests/test_scoped_degrade_warning.py` (11). Three lessons
+generalise. **(1) A non-test path is an ERROR to pytest, not a no-op** —
+`pytest orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4,
+and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4. A
+real subtask diff mixes docs/source with tests, so a `{files}` template on
+a runner with no source→test impact analysis reports RED on nearly every
+subtask; fix: filter the substitution (`{test_files}`), with the
+pre-existing empty-list rule falling back to canonical when no test file
+is present. **(2) Scan the author's input, not the rendered output.** The
+unknown-placeholder guard first scanned the SUBSTITUTED command, so a
+changed-file path containing braces (e.g. `src/{locale}/page.test.ts`) was
+misread as an unknown placeholder, disabling the proxy and misdiagnosing
+it as install skew. Scanning the template with `_SCOPED_PLACEHOLDERS`
+stripped removes the hazard by construction. **(3) A planner prediction is
+not a diff.** The ratio was first taken from `files_likely_touched` and
+was badly wrong — 40% test-touching predicted (109 of 270) vs. 94% real
+(34 of 36) — since CLAUDE.md mandates tests regardless of planner
+prediction. The frozen corpus is 36 REAL per-subtask diffs from leerie's
+own run branches, each row an integration merge's **first-parent** diff (a
+plain two-dot diff against the run base folds in siblings — the first
+recovery attempt reported 0% source-only this way).
+shipped a fixture that could not exercise the canonical fallback at all.
 
 ## Pre-push preflight probe
 
 `tests/test_prepush_preflight.py` (25) covers `host_prepush_preflight`, the
-run-start probe (DESIGN §6 *Finalization*). Real repos, real hooks, no stubs —
-the probe's whole value is running the real gate. Its load-bearing test is
-`test_probe_pushes_a_new_ref_so_the_hook_gets_real_stdin`: probing the
-already-up-to-date working branch still runs the hook but hands it **empty
-stdin** (verified against real git), so a hook that iterates the ref updates
-git feeds it exits 0 — a false pass, the worst possible outcome for a probe
-whose job is predicting a rejection. Pushing a new ref under leerie's own
-namespace reproduces the exact line finalize will produce. Falsified live:
-changing the refspec to `"$branch"` fails exactly that test with rc 0.
-Paired with `test_probe_creates_no_ref_anywhere` (the property that makes
-running a real gate safe) and a launcher-gate parametrization that **extracts**
-the preflight block from `leerie` rather than reproducing it. It also pins the
-**chain** contract: `chain` backgrounds one `./leerie` per job against a single
-shared checkout, so without care every job re-runs the hook — N concurrent
-lint/typecheck runs computing one answer, N identical warnings. The chain arm
-probes once per WAVE (after the checkout that establishes the tree those jobs
-will push from) and hands each child `LEERIE_SKIP_PREPUSH_PREFLIGHT=1`. Both
-halves are pinned, and both are load-bearing: skipping in the children alone
-removes the check from the most expensive kind of run, which is the opposite of
-the point. `group` is deliberately exempt — separate repos, separate questions.
-Two traps in that arm. Its `--no-push` skip must read `_ch_passthrough`, since
-`NO_PUSH` is first assigned *after* the chain arm and so does not exist there —
-the single-run gate's opt-out silently has no counterpart otherwise. And the
-block is **executed** by its tests, not merely string-matched: `bash -n` catches
-syntax, not an unbound variable or a bare `"${arr[@]}"` on an empty array under
-`set -u`, which is the same "scanning is not calling" lesson
-`test_ec2_bash32_portability.py` records — so `_chain_probe_block()` is bounded
-before the fan-out (running the wider extraction would background a real
-`./leerie`) and driven against a real repo.
+run-start probe (DESIGN §6 *Finalization*). Real repos, real hooks, no
+stubs — the probe's whole value is running the real gate. Its load-bearing
+test is `test_probe_pushes_a_new_ref_so_the_hook_gets_real_stdin`: probing
+the already-up-to-date working branch still runs the hook but hands it
+**empty stdin** (verified against real git), so a hook that iterates the ref
+updates git feeds it exits 0 — a false pass, the worst possible outcome for
+a probe whose job is predicting a rejection. Pushing a new ref under
+leerie's own namespace reproduces the exact line finalize will produce.
+Falsified live: changing the refspec to `"$branch"` fails exactly that test
+with rc 0. Paired with `test_probe_creates_no_ref_anywhere` (the property
+that makes running a real gate safe) and a launcher-gate parametrization
+that **extracts** the preflight block from `leerie` rather than reproducing
+it. It also pins the **chain** contract: `chain` backgrounds one `./leerie`
+per job against a single shared checkout, so without care every job re-runs
+the hook — N concurrent lint/typecheck runs computing one answer, N
+identical warnings. The chain arm probes once per WAVE (after the checkout
+that establishes the tree those jobs will push from) and hands each child
+`LEERIE_SKIP_PREPUSH_PREFLIGHT=1`. Both halves are pinned, and both are
+load-bearing: skipping in the children alone removes the check from the
+most expensive kind of run, the opposite of the point. `group` is
+deliberately exempt — separate repos, separate questions. Two traps in that
+arm: its `--no-push` skip must read `_ch_passthrough`, since `NO_PUSH` is
+first assigned *after* the chain arm and so does not exist there — the
+single-run gate's opt-out silently has no counterpart otherwise. And the
+block is **executed** by its tests, not merely string-matched: `bash -n`
+catches syntax, not an unbound variable or a bare `"${arr[@]}"` on an empty
+array under `set -u`, the same "scanning is not calling" lesson
+`test_ec2_bash32_portability.py` records — so `_chain_probe_block()` is
+bounded before the fan-out (running the wider extraction would background a
+real `./leerie`) and driven against a real repo.
 
 ### Three test-side traps (EC2 transport stubs)
 
 Three test-side traps in the same area, all of which made a test pass or
-hang while proving nothing:
-`tests/test_ec2_transport.py::_stub_timeout` must **kill the process
-group**, not just the direct child — macOS ships no `/usr/bin/timeout`,
-so `_seed_timeout_prefix` correctly no-ops on the stubbed PATH and a
-stall test's `sleep 600` runs unbounded (a 10-minute hang, not a
-failure); and killing only the child leaves its grandchildren holding the
-captured stdout, so a `$(...)` capture blocks until every writer closes
-the pipe. Real GNU `timeout` kills the group for exactly this reason.
-`tests/test_ec2_seed_repo.py` imports that killing stub for its stall
-test rather than its own local `_make_stub_timeout`, which is a no-op
-passthrough (fine for tests that just need the binary to exist, useless
-for one asserting the cap fires). And its `_make_stub_ssh` rewrite used
+hang while proving nothing: `tests/test_ec2_transport.py::_stub_timeout`
+must **kill the process group**, not just the direct child — macOS ships no
+`/usr/bin/timeout`, so `_seed_timeout_prefix` correctly no-ops on the
+stubbed PATH and a stall test's `sleep 600` runs unbounded (a 10-minute
+hang, not a failure); and killing only the child leaves its grandchildren
+holding the captured stdout, so a `$(...)` capture blocks until every writer
+closes the pipe. Real GNU `timeout` kills the group for exactly this reason.
+`tests/test_ec2_seed_repo.py` imports that killing stub for its stall test
+rather than its own local `_make_stub_timeout`, which is a no-op passthrough
+(fine for tests that just need the binary to exist, useless for one
+asserting the cap fires). And its `_make_stub_ssh` rewrite used
 `${{a/\/work/$DEST\/work}}` — the replacement half of `${{var/pat/repl}}`
 is not a regex and needs no escaping, so the `\/` was a **literal
 backslash**: the transfer landed in a directory named `<dest>\`, rsync
 exited 0, and the test failed with "untracked.txt missing" and no error
-anywhere. Only the pattern half escapes. (Do not "fix" the resulting
-`SyntaxWarning` by making that f-string raw — the surrounding bash relies
-on Python collapsing `\\` to `\`, and `rf"""` silently breaks the stub.)
+anywhere. Only the pattern half escapes.
 
 ## EC2 credential-resolution wiring
 
 The launcher's credential-resolution wiring within that same `RUNTIME=ec2`
 branch — sourcing `aws-credentials.sh`, calling `resolve_aws_credentials`,
-and `eval`ing its `export` lines before `require_aws` runs — is pinned in
+`eval`ing its `export` lines before `require_aws` runs — is pinned in
 `tests/test_ec2_e2e_provision.py` (call-index ordering: an SSO-configured
 profile with explicit env-var credentials layered on top resolves via the
-env vars and `require_aws`'s `sts get-caller-identity` is the first `aws`
-CLI call observed, proving credential resolution ran first without
-invoking the `aws` binary itself; explicit env credentials winning over a
-fully-configured SSO profile; `LEERIE_AWS_PROFILE` selecting a named
-profile's static credentials over `[default]`; an expired SSO cached
-token aborting non-zero with `aws-credentials.sh`'s own
-`aws sso login --profile <p>` hint and zero `aws ec2 ...`/`sts
-get-caller-identity` calls) and in the dedicated
-`tests/test_ec2_launcher_credentials.py`, which closes the one part of
-the seam neither that file nor `tests/test_aws_credentials.py` (internal
-precedence, standalone) nor `tests/test_ec2_lib_sh.py` (`require_aws`'s
-own profile precedence, standalone) exercises: region. `require_aws`'s
-`sts get-caller-identity` call never passes a `--region` flag — the
-resolved region reaches it only through the `AWS_REGION` env var the
-dispatch block `eval`s from `resolve_aws_credentials`'s `export` lines —
-so this file's stub records the *effective `AWS_REGION` env value* seen
-at call time (not argv) to pin: `LEERIE_AWS_REGION` (leerie's own knob,
-CLAUDE.md-distinguished from the SDK's `AWS_REGION` credential-chain var)
-winning over an ambient `AWS_REGION`; the ambient `AWS_REGION` reaching
-`require_aws` unchanged when `LEERIE_AWS_REGION` is unset; and an
-unresolvable region (no `AWS_REGION`, no `AWS_DEFAULT_REGION`, no profile
-`region` key) aborting non-zero via `resolve_aws_credentials`'s own
-die-with-hint before `require_aws`'s probe ever runs, with zero `sts
-get-caller-identity` calls reaching the stub's log. It also adds a direct
-argv assertion for the profile seam (`--profile <resolved>` present when
-`LEERIE_AWS_PROFILE` is set, absent entirely when neither var is set) and
-a harness-sanity check that it imports and exercises the same
+env vars, with `require_aws`'s `sts get-caller-identity` the first `aws`
+call observed; explicit env credentials win over a fully-configured SSO
+profile; `LEERIE_AWS_PROFILE` selects a named profile's static credentials
+over `[default]`; an expired SSO cached token aborts non-zero with
+`aws-credentials.sh`'s own hint and zero `aws` calls) and in
+`tests/test_ec2_launcher_credentials.py`, which closes the one part of the
+seam no sibling file exercises: region. `require_aws`'s
+`sts get-caller-identity` never passes `--region` — the resolved region
+reaches it only via the `AWS_REGION` env var the dispatch block `eval`s —
+so this file's stub records the *effective `AWS_REGION` env value* to pin:
+`LEERIE_AWS_REGION` (leerie's own knob, distinct from the SDK's
+`AWS_REGION`) winning over an ambient `AWS_REGION`; the ambient value
+passing through unchanged when unset; and an unresolvable region (no
+`AWS_REGION`/`AWS_DEFAULT_REGION`/profile `region` key) aborting non-zero
+via `resolve_aws_credentials`'s own die-with-hint before `require_aws`'s
+probe ever runs. Also adds a direct argv assertion for `--profile
+<resolved>` and a harness-sanity check that it exercises the same
 verbatim-extracted dispatch block as `tests/test_ec2_e2e_provision.py`
 rather than a hand-copied reproduction.
+
 ## EC2 resume path (`ec2-resume-instance.sh`)
 
 The EC2 resume path — `scripts/remote/ec2-resume-instance.sh`'s
-`resume_instance()`, the EC2 counterpart to `resume-machine.sh` — is
-tested in `tests/test_ec2_resume_instance.py` against the same
-resource-tracking `aws` stub: starting a `stopped` instance drives it
-to `running` via a single `start-instances` call; the readiness poll
-does not return early when a seeded `status_ok: False` keeps
-`describe-instance-status` reporting "initializing" (and does return
-promptly once `status_ok: True`); `LEERIE_EC2_SSH_TARGET` is
-re-resolved to the instance's current `PublicIpAddress` rather than
-any address cached from provision time (EC2 assigns a new public IP on
-every stop/start cycle absent an attached Elastic IP); a full
-provision → stop → resume round trip leaves exactly one `running`
-instance with no leaked volumes; resuming an already-`running`
+`resume_instance()`, the EC2 counterpart to `resume-machine.sh` — is tested
+in `tests/test_ec2_resume_instance.py` against the same resource-tracking
+`aws` stub: starting a `stopped` instance drives it to `running` via a
+single `start-instances` call; the readiness poll does not return early
+when a seeded `status_ok: False` keeps `describe-instance-status` reporting
+"initializing" (and does return promptly once `status_ok: True`);
+`LEERIE_EC2_SSH_TARGET` is re-resolved to the instance's current
+`PublicIpAddress` rather than any address cached from provision time (EC2
+assigns a new public IP on every stop/start cycle absent an attached
+Elastic IP); a full provision → stop → resume round trip leaves exactly one
+`running` instance with no leaked volumes; resuming an already-`running`
 instance is an idempotent no-op that issues no `start-instances` call;
 resuming an unknown/terminated instance fails with the "no longer
 recoverable" hint and issues no `start-instances` call; the run.json
-sidecar's `paused_at`/`pause_reason` fields are cleared on success; and
-the one-way-ratchet invariant (never `terminate-instances` or
-`delete-volume`) holds both on the success path and the failure path
-(instance never becomes ready), backed by a source-level grep guard on
-the script file. `tests/ec2_stub.py` was extended to model a
-per-instance `public_ip` that's reassigned (via an `_ip_gen` counter)
-on every `start-instances` call, and an optional `status_ok` flag so
-`describe-instance-status` can report "initializing" instead of "ok"
-without an infinite/slow poll in tests.
+sidecar's `paused_at`/`pause_reason` fields are cleared on success; and the
+one-way-ratchet invariant (never `terminate-instances` or `delete-volume`)
+holds both on the success path and the failure path (instance never becomes
+ready), (source-level grep guard).
+`tests/ec2_stub.py` gained a reassigning `public_ip` (`_ip_gen` counter) and an optional `status_ok` flag for slow-poll simulation.
+
 ## `stop` verb EC2 dispatch
 
 The launcher's `stop` verb EC2 dispatch — the counterpart to
-`_auto_detect_fly_runtime` for EC2 runs, DESIGN §6 "Run identifier" —
-is tested in `tests/test_ec2_launcher_stop.py` by invoking the real
-`leerie` binary (not an extracted block, since `stop` is an early
-fast-path verb dispatched before container preflight) against the
-same resource-tracking `aws` stub: an `ec2-instance.json` sidecar
-auto-detects the EC2 runtime and `stop <run-id>` drives the
-stub-tracked instance to `stopped` (never `terminate-instances`) and
-writes `paused_at`/`pause_reason`/`ec2_instance_id` onto `run.json`;
-explicit `--runtime ec2` works without autodetection; the local/Fly
-fallthrough error text is unchanged when no sidecar of any kind is
-present; `--runtime bogus` is still rejected, now with the
-`'local', 'fly', or 'ec2'` wording; a sidecar present but missing
-`ec2_instance_id` fails closed with an actionable error rather than
-silently no-op'ing; and a failing AWS credential probe aborts before
-any `aws ec2 ...` call reaches the stub, leaving the instance
-`running`.
+`_auto_detect_fly_runtime` for EC2 runs, DESIGN §6 "Run identifier" — is
+tested in `tests/test_ec2_launcher_stop.py` by invoking the real `leerie`
+binary (not an extracted block, since `stop` is an early fast-path verb
+dispatched before container preflight) against the same resource-tracking
+`aws` stub: an `ec2-instance.json` sidecar auto-detects the EC2 runtime and
+`stop <run-id>` drives the stub-tracked instance to `stopped` (never
+`terminate-instances`) and writes `paused_at`/`pause_reason`/`ec2_instance_id`
+onto `run.json`; explicit `--runtime ec2` works without autodetection; the
+local/Fly fallthrough error text is unchanged when no sidecar of any kind is
+present; `--runtime bogus` is still rejected, now with the `'local', 'fly',
+or 'ec2'` wording; a sidecar present but missing `ec2_instance_id` fails
+closed with an actionable error rather than silently no-op'ing; and a
+failing AWS credential probe aborts before any `aws ec2 ...` call reaches
+the stub, leaving the instance `running`.
+
 ## Full EC2 dispatch lifecycle (create -> seed -> orchestrate -> teardown)
 
-The `RUNTIME=ec2` dispatch branch continuing past preflight into the
-full create -> seed -> orchestrate -> teardown lifecycle (the old
-`--runtime ec2 preflight passed, but instance provisioning is not yet
-wired` abort is gone) is pinned in
-`tests/test_ec2_launcher_dispatch_e2e.py`, which reuses (rather than
-reimplements) `tests/test_ec2_e2e_provision.py`'s
-`extract_ec2_dispatch_block`/`run_ec2_dispatch`/`stub_aws_env` harness
-and `tests/ec2_stub.py`'s resource-tracking `aws` stub — mirroring
-`tests/test_ec2_launcher_credentials.py`'s harness-sanity convention.
-It pins: a full launch with valid credentials provisions exactly one
-instance, reaches the stubbed `ec2_seed_repo`, and terminates cleanly
-at `decide_ec2_teardown`'s clean-exit arm, leaving zero leaked
-instances and zero leaked volumes; a grep guard that neither `"not yet
-wired"` nor the more specific historical string `"instance
-provisioning is not yet wired"` appears anywhere in `leerie`;
-`require_aws`'s `sts get-caller-identity` still precedes any `ec2
-run-instances` call by call index across the *full* lifecycle path
-(not just the provision-only path `test_ec2_e2e_provision.py` already
-covers); and a failing credential probe still aborts non-zero with the
-`aws sso login --profile <p>` hint and zero tracked resources.
+The `RUNTIME=ec2` dispatch branch continuing past preflight into the full
+create -> seed -> orchestrate -> teardown lifecycle (the old `--runtime ec2
+preflight passed, but instance provisioning is not yet wired` abort is
+gone) is pinned in `tests/test_ec2_launcher_dispatch_e2e.py`, which reuses
+(rather than reimplements) `tests/test_ec2_e2e_provision.py`'s
+`extract_ec2_dispatch_block`/`run_ec2_dispatch`/`stub_aws_env` harness and
+`tests/ec2_stub.py`'s resource-tracking `aws` stub. It
+pins: a full launch with valid credentials provisions exactly one instance,
+reaches the stubbed `ec2_seed_repo`, and terminates cleanly at
+`decide_ec2_teardown`'s clean-exit arm, leaving zero leaked instances and
+zero leaked volumes; a grep guard that neither `"not yet wired"` nor the
+more specific historical string `"instance provisioning is not yet wired"`
+appears anywhere in `leerie`; `require_aws`'s `sts get-caller-identity`
+still precedes any `ec2 run-instances` call by call index across the *full*
+lifecycle path (not just the provision-only path `test_ec2_e2e_provision.py`
+already covers); and a failing credential probe still aborts non-zero with
+the `aws sso login --profile <p>` hint and zero tracked resources.
 
 ## Run-dir sidecar runtime autodetection
 
@@ -2205,15 +2123,15 @@ The generalized run-dir sidecar autodetection — `_auto_detect_run_runtime`
 (checks `fly-machine.json` then `ec2-instance.json`, echoing the detected
 runtime) and the `_auto_detect_fly_runtime` back-compat Fly-only wrapper
 built on top of it — is tested in `tests/test_auto_detect_run_runtime.py`.
-The first half extracts both functions verbatim from the launcher (mirroring
-`tests/test_oom_wedge_prevention.py`'s `_reaper_fn_source` approach) and
+The first half extracts both functions verbatim from the launcher and
 exercises them against fixture run dirs: an ec2-instance.json-only run dir
-detects as `ec2`; a fly-machine.json-only run dir still detects as `fly` (no
-regression); neither sidecar present returns nonzero with nothing echoed; an
-explicit runtime short-circuits detection even when a sidecar for a
-different runtime is present; Fly wins when (never expected in practice)
-both sidecars co-exist; and the Fly-only wrapper returns nonzero for an EC2
-run. The second half invokes the real launcher end to end (mirroring
+detects as `ec2`; a fly-machine.json-only run dir still detects as `fly`
+(no regression); neither sidecar present returns nonzero with nothing
+echoed; an explicit runtime short-circuits detection even when a sidecar
+for a different runtime is present; Fly wins when (never expected in
+practice) both sidecars co-exist; and the Fly-only wrapper returns
+nonzero for an EC2 run. The second half invokes the real launcher end to
+end (mirroring
 `tests/test_accept_blocked.py`'s local-path pattern) across `stop`,
 `kill`, `accept-blocked`, and `finalize`: each accepts `ec2`
 alongside `local`/`fly` in its `--runtime` enum validation (rejects other
