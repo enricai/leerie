@@ -3926,11 +3926,11 @@ classification and planning, layered top-to-bottom by determinism:
    Cargo keys its build cache by profile — `debug/` and
    `release/` are separate subtrees under `CARGO_TARGET_DIR` —
    so a `--release` bake produces **zero cache benefit** for a
-   plain `cargo build`/`cargo test`, both of which default to
-   the debug profile. Reproduced live: a `--release` bake left a
-   worktree's subsequent `cargo build` recompiling every
-   dependency from scratch; dropping `--release` fixed it. Go has
-   no equivalent profile split, so this trap is Rust-specific.
+   plain `cargo build`/`cargo test`, both of which default to the
+   debug profile. Reproduced live: a `--release` bake left a
+   worktree's subsequent `cargo build` recompiling every dependency
+   from scratch. Go has no equivalent split, so this trap is
+   Rust-specific.
 
    **Immutability invariant:** The baked layer is shared and
    read-only across up to `max_parallel` (default 5) concurrent
@@ -3947,56 +3947,49 @@ classification and planning, layered top-to-bottom by determinism:
    **Python requires a clone-then-delta approach.** A `.pth`-file
    overlay or a `--system-site-packages` venv does not correctly
    handle dependency *removal* or a fresh venv's isolation from
-   another venv's packages. The correct mechanism is `cp -r
-   /opt/venv` into a private copy, then apply the dependency delta
-   via `pip install`/`pip uninstall`. No `pyvenv.cfg` editing or
-   `bin/` shebang relocation is needed — `pyvenv.cfg`'s `home =`
-   line points at the system Python install and is unaffected by
-   moving the clone. The one real trap is invoking the clone's
-   `bin/pip` directly: that script's shebang is hardcoded to the
-   *original* `/opt/venv`'s python binary, so `bin/pip
-   install`/`uninstall` silently operate on the shared `/opt/venv`
-   instead of the clone, corrupting the bake for every other
-   concurrent worktree (reproduced live). The fix is an invocation
-   convention: always run `<clone>/bin/python3 -m pip
-   install|uninstall`, never `<clone>/bin/pip` — `-m pip` runs pip
-   as a module inside that interpreter's own `sys.prefix`,
-   sidestepping the shebang. This materializes a full private
-   environment only when a worktree's subtask actually mutates
-   dependencies — the common case consumes the shared `/opt/venv`
-   directly with zero clone cost. `uv sync` silently ignores
-   `VIRTUAL_ENV` unless `--active` is passed, and `pipenv` has
-   long-standing bugs about not respecting an already-active venv
-   at all — the bake sidesteps both by installing the tool itself
-   into `/opt/venv` via pip at build time, so the tool's own
-   `/opt/venv/bin/<tool>` resolves `sys.prefix` correctly by
-   construction.
+   another venv's packages. The mechanism is `cp -r /opt/venv` into
+   a private copy, then apply the dependency delta via `pip
+   install`/`pip uninstall`. No `pyvenv.cfg` editing or `bin/`
+   shebang relocation is needed — `pyvenv.cfg`'s `home =` line
+   points at the system Python install and is unaffected by moving
+   the clone. The one real trap is invoking the clone's `bin/pip`
+   directly: that script's shebang is hardcoded to the *original*
+   `/opt/venv`'s python binary, so `bin/pip install`/`uninstall`
+   silently operate on the shared `/opt/venv` instead of the clone,
+   corrupting the bake for every other concurrent worktree
+   (reproduced live). The fix is an invocation convention: always
+   run `<clone>/bin/python3 -m pip install|uninstall`, never
+   `<clone>/bin/pip` — `-m pip` runs pip as a module inside that
+   interpreter's own `sys.prefix`, sidestepping the shebang. This
+   materializes a full private environment only when a subtask
+   actually mutates dependencies — the common case consumes the
+   shared `/opt/venv` directly with zero clone cost. `uv sync`
+   silently ignores `VIRTUAL_ENV` unless `--active` is passed, and
+   `pipenv` has long-standing bugs about not respecting an
+   already-active venv at all — the bake sidesteps both by
+   installing the tool itself into `/opt/venv` via pip at build
+   time, so the tool's own `/opt/venv/bin/<tool>` resolves
+   `sys.prefix` correctly by construction.
 
-   **Cache invalidation is preserved.** The existing
-   rebuild-decision mechanism — SHA-256 of every
-   dependency-input file (lockfiles, manifests, workspace
-   `package.json`s, `patches/`, `.npmrc`) folded into the
-   generated Dockerfile, driving a `.dockerfile-hash` rebuild
-   check — continues to work. The lockfiles and manifests are
-   still `COPY`'d into the Dockerfile's build context for
-   hashing; only the install *target* changes from `/work` to
-   `/opt/*`. A dependency-input change triggers a full image
-   rebuild. A change to an unrelated source file does not
-   invalidate the layer. The cost — minutes per rebuild — is paid
-   once across all subsequent runs.
+   **Cache invalidation is preserved.** The existing rebuild-decision
+   mechanism — SHA-256 of every dependency-input file (lockfiles,
+   manifests, workspace `package.json`s, `patches/`, `.npmrc`) folded
+   into the generated Dockerfile, driving a `.dockerfile-hash`
+   rebuild check — continues to work; only the install *target*
+   changes from `/work` to `/opt/*`. A dependency-input change
+   triggers a full image rebuild; an unrelated source-file change
+   does not. The cost — minutes per rebuild — is paid once across all
+   subsequent runs.
 
    **config.toml's role narrows to residual-only.** The file no
    longer represents "what gets installed per run" broadly — it
-   holds only the irreducible residual that cannot be baked. For
-   Python, Ruby, Rust, and Go repos, this is typically empty
-   (everything bakes). For Node/pnpm repos, it holds only the
-   residual offline-relink note. The `dep_capture` worker (see
-   *Auto-capture* below) always runs at finalize time — it is not
-   skipped when a committed `.leerie/Dockerfile` exists — and
-   writes only residual dependencies that workers actually
-   executed but could not be baked. This makes `config.toml` a
-   stable artifact: it grows only when new residual deps appear,
-   never churns on every baked-dep change.
+   holds only the irreducible residual that cannot be baked: typically
+   empty for Python/Ruby/Rust/Go, and just the offline-relink note for
+   Node/pnpm. The `dep_capture` worker (*Auto-capture* below) always
+   runs at finalize time, even with a committed `.leerie/Dockerfile`,
+   and writes only residual dependencies workers executed but could
+   not bake — so `config.toml` grows only when new residuals appear,
+   never churning on every baked-dep change.
 
    **Permissions under rootless containerd.** The baked `/opt/*`
    directories must be **root-owned and world-readable** (`drwxr-xr-x
@@ -4021,50 +4014,45 @@ classification and planning, layered top-to-bottom by determinism:
 
    The detected recipe is still **persisted to state and injected
    into the implementer and conformer prompts as a
-   `PROVISION_RECIPE:` advisory block**, but its role has
-   narrowed: for baked ecosystems (Python/Ruby/Rust/Go), the
-   recipe is informational (shows what was baked); for Node, it
-   carries the residual offline-relink command. Each worker reads
-   the recipe and decides whether its subtask needs the residual
-   step (a config-only or docs-only subtask doesn't; a "run the
-   tests" subtask does). The host's checked-out source tree and
-   tracked dep artifacts (`node_modules/`, `.venv/`, `target/`,
-   etc.) are never written to by leerie's install path —
-   `.leerie-setup.sh` (user-opt-in) is the only path leerie ever
-   modifies under the host repo (run state lives outside the repo
-   at `<state-root>`).
+   `PROVISION_RECIPE:` advisory block**, but its role has narrowed:
+   informational for baked ecosystems (Python/Ruby/Rust/Go, shows
+   what was baked), and the residual offline-relink command for
+   Node. Each worker reads the recipe and decides whether its
+   subtask needs the residual step (a config-only or docs-only
+   subtask doesn't; a "run the tests" subtask does). The host's
+   checked-out source tree and tracked dep artifacts
+   (`node_modules/`, `.venv/`, `target/`, etc.) are never written to
+   by leerie's install path — `.leerie-setup.sh` (user-opt-in) is the
+   only path leerie ever modifies under the host repo (run state
+   lives outside the repo at `<state-root>`).
 
 ### The §12 carve-out
 
 Step 4 is the only place in leerie where an LLM-generated artifact
 gets persisted and shown to other workers as authoritative content.
-The central principle of §12 is that prompts are advisory and code
-enforces; an LLM-generated install plan that the orchestrator
-then *renders verbatim into downstream worker prompts* needs the
-same containment any other LLM-to-code path would. The carve-out
-is justified by three constraints that contain it:
+§12's central principle is that prompts are advisory and code
+enforces; an LLM-generated install plan that the orchestrator then
+*renders verbatim into downstream worker prompts* needs the same
+containment any other LLM-to-code path would. Three constraints
+contain it:
 
-1. **It only fires when the table returns empty.** The 80% of
-   repos with conventional lockfiles never reach the worker. The
-   model sees the genuinely ambiguous tail, which is where
-   human judgment would be doing the work anyway.
-2. **The recipe is mechanically bounded.** Every command's
-   `argv[0]` must come from a fixed allowlist of package managers.
-   Shell metacharacters and traversing working directories are
-   rejected. The worker cannot emit `sudo`, cannot pipe into
-   `sh`, cannot reach outside the repo. This containment is
-   *what makes the prompt-injection safe* — the validator ensures
-   the rendered `PROVISION_RECIPE:` block carries only argv
-   sequences from a known-safe vocabulary, so a downstream worker
-   that copy-runs an entry can't accidentally execute something
-   harmful. The §12 principle ("any guarantee that matters and
-   can be checked mechanically lives in code") holds — the
-   *guarantee* is in the validator, not in any worker prompt.
-3. **It is the only documented exception.** Any future feature
-   that wants to render LLM-generated content into a downstream
-   worker prompt has to add its own §-level justification, not
-   point at this one. Documenting the carve-out explicitly is
-   what prevents it from becoming precedent.
+1. **It only fires when the table returns empty.** The 80% of repos
+   with conventional lockfiles never reach the worker. The model sees
+   the genuinely ambiguous tail, where human judgment would be doing
+   the work anyway.
+2. **The recipe is mechanically bounded.** Every command's `argv[0]`
+   must come from a fixed allowlist of package managers; shell
+   metacharacters and directory traversal are rejected. The worker
+   cannot emit `sudo`, pipe into `sh`, or reach outside the repo —
+   this is what makes the prompt-injection safe, since the validator
+   ensures the rendered `PROVISION_RECIPE:` block carries only argv
+   sequences from a known-safe vocabulary. The §12 guarantee lives in
+   the validator, not in any worker prompt.
+3. **It is the only documented exception.** Any future feature that
+   wants to render LLM-generated content into a downstream worker
+   prompt needs its own §-level justification, not a pointer to this
+   one — documenting the carve-out explicitly is what prevents it
+   from becoming precedent.
 
 The alternative — refusing the run when the table doesn't match —
 would be strictly more §12-compliant but worse for the user. The
@@ -4168,100 +4156,96 @@ the repo genuinely needs across all languages and frameworks:
   `libvips-dev`, `pkg-config`).
 
 This replaces an earlier design in which the worker read the *complete* set of
-shell commands and reverse-engineered deps from command strings — that corpus was
-overwhelmingly noise (greps, `git`, `pytest`, `python3 -c` one-liners) and let the
-worker degenerate into echoing prose as package names. Reasoning over manifest
-files (with commands as a hint) is what actually delivers the "across all
+shell commands and reverse-engineered deps from command strings — that corpus
+was overwhelmingly noise (greps, `git`, `pytest`, `python3 -c` one-liners) and
+let the worker degenerate into echoing prose as package names. Reasoning over
+manifest files (with commands as a hint) is what delivers the "across all
 languages and frameworks" goal. Which files and commands the worker sees is
 deterministic corpus selection in code; the model still decides content (§12
-*Prompts are advisory, code enforces*). Structured output (`setup_packages` and
-`language_installs`) is validated against a JSON schema and written to
+*Prompts are advisory, code enforces*). Structured output (`setup_packages`
+and `language_installs`) is validated against a JSON schema and written to
 `.leerie/config.toml` deterministically. The `dep_capture` worker defaults to
-`sonnet`/`medium` and is overridable via `LEERIE_MODEL_DEP_CAPTURE`.
+`sonnet`/`medium`, overridable via `LEERIE_MODEL_DEP_CAPTURE`.
 
 **System packages → `setup_packages` → warm apt layer.** `dep_capture`'s
 `setup_packages` output is union-merged into `setup_packages` in
 `.leerie/config.toml` (never clobber: only new packages are appended;
-user-edited values and comments are preserved). The existing launcher
-auto-generation path (see *Per-repo container image* above) turns the updated
-`setup_packages` into a derived apt-install Dockerfile next run. Workers that
-previously failed every `apt-get install` attempt (because they run unprivileged)
-find the package pre-installed; the install-intent loop stops.
+user-edited values and comments preserved). The launcher auto-generation path
+(*Per-repo container image* above) turns the updated `setup_packages` into a
+derived apt-install Dockerfile next run. Workers that previously failed every
+`apt-get install` attempt (unprivileged) find the package pre-installed; the
+install-intent loop stops.
 
 **Language deps → `language_installs` → richer Dockerfile bake (gated on
 `bake_language_deps`, default true).** `dep_capture`'s `language_installs`
 output (per-manager `{manager, command, copy_inputs}` entries) is written to
-`.leerie/config.toml`, keyed by manager, never-clobber. When `bake_language_deps`
-is enabled, the auto-generated `.leerie/Dockerfile` (and, when `build_repo_image`
-builds it, the derived image) also includes a language-dep layer: `COPY` for the
-lockfile, manifest files, and any ancillary inputs the package manager requires,
-followed by `RUN <command>` (`pnpm install --frozen-lockfile`,
+`.leerie/config.toml`, keyed by manager, never-clobber. When enabled, the
+auto-generated `.leerie/Dockerfile` (and the derived image, when
+`build_repo_image` builds it) also includes a language-dep layer: `COPY` for
+the lockfile, manifest files, and any ancillary inputs the package manager
+requires, followed by `RUN <command>` (`pnpm install --frozen-lockfile`,
 `pip install -r requirements.txt`, etc.). Workers that inherit this image find
-their `node_modules` / site-packages already populated — the per-worker install
-drops to near-zero.
+`node_modules`/site-packages already populated — per-worker install drops to
+near-zero.
 
-**Rebuild tradeoff.** A dependency-input change triggers a full image
-rebuild (`build_repo_image` fires when the hash mismatches). To keep
-rebuilds narrow, `.dockerfile-hash` folds in the sha256 of every input that
-participates in the `COPY` list (lockfiles, manifests, workspace
-`package.json`s, `patches/`, `.npmrc`). A change to an unrelated source file
-does not invalidate the layer. The cost — minutes per rebuild — is paid once
-across all subsequent runs, a clear net win against per-worker install time
-accumulated across hundreds of workers.
+**Rebuild tradeoff.** A dependency-input change triggers a full image rebuild
+(`build_repo_image` fires when the hash mismatches). To keep rebuilds narrow,
+`.dockerfile-hash` folds in the sha256 of every input in the `COPY` list
+(lockfiles, manifests, workspace `package.json`s, `patches/`, `.npmrc`); an
+unrelated source-file change does not invalidate the layer. The cost —
+minutes per rebuild — is paid once across all subsequent runs, a clear net
+win against per-worker install time accumulated across hundreds of workers.
 
 **Trigger seams.** All three funnel to one `dep_capture` worker — the trigger
 differs, the decision-maker does not:
 
-- **Clean finish → finalize.** `capture_repo_deps` is called (with `await`)
-  from `phase_finalize` after `finished_at` is written and run-branch
-  verification completes. On a `resume` of an already-finished run the
-  resume guard returns before finalize; capture does not re-fire. On a
-  `resume` that reaches finalize (partial resume), capture re-runs — the
-  union merge makes this a no-op when nothing new was found.
+- **Clean finish → finalize.** `capture_repo_deps` is called (`await`) from
+  `phase_finalize` after `finished_at` is written and run-branch verification
+  completes. A `resume` of an already-finished run returns before finalize —
+  capture does not re-fire; a `resume` that reaches finalize (partial resume)
+  re-runs it, and union merge makes that a no-op when nothing new is found.
 - **Cancel / SIGTERM → cancel arm in `main()`.** Catchable signals
   (`KeyboardInterrupt` / `InterruptedBySignal`) surface in `main()` after
   `asyncio.run(orchestrate)` unwinds, with a real Python window before the
   `finally` cleanup block. A best-effort `asyncio.run(capture_repo_deps(...))`
-  runs there — the same post-loop pattern as the `RateLimitedExit` arm.
-  Non-fatal; covers `nerdctl stop` / Ctrl-C. `SIGKILL` gives no window.
+  runs there — same post-loop pattern as the `RateLimitedExit` arm. Non-fatal;
+  covers `nerdctl stop` / Ctrl-C. `SIGKILL` gives no window.
 - **SIGKILL / crash / host-side → backstop + `--recapture`.** Covered two
-  ways, both host-side, modeled on the `--phase judge` scaffolding:
-  *Run-start backstop* — at run start, before `phase_classify`, a scan of
-  prior run dirs detects any with `logs/` but no `dep_capture.done` sentinel
-  and runs capture over them automatically. *On-demand `--recapture`* — the
-  `leerie config --recapture` verb resolves the target run, constructs and
-  flocks its `State` (refusing to race a live orchestrator via
-  `StateLockedError`), and runs the worker via `asyncio.run`.
+  ways, both host-side, modeled on the `--phase judge` scaffolding: a
+  *run-start backstop* scans prior run dirs at start, before `phase_classify`,
+  for any with `logs/` but no `dep_capture.done` sentinel and runs capture
+  over them automatically; and *on-demand `--recapture`* — `leerie config
+  --recapture` resolves the target run, constructs and flocks its `State`
+  (refusing to race a live orchestrator via `StateLockedError`), and runs the
+  worker via `asyncio.run`.
 
 **Union by default; replace only on `--recapture --force`.** Every automatic
-seam — finalize, cancel, backstop — writes as a never-clobber *union* so a
-capture can only ever add packages/managers, never remove one the operator
-narrowed by hand. The single deliberate exception is the operator-driven
-`leerie config --recapture --force`, which wholesale-*replaces* the persisted
-`setup_packages` + `language_installs` from the fresh capture (dropping deps no
-longer captured) — an explicit "rebuild the dep set from current history"
+seam — finalize, cancel, backstop — writes as a never-clobber *union*, so
+capture can only add packages/managers, never remove one the operator
+narrowed by hand. The one exception is operator-driven `leerie config
+--recapture --force`, which wholesale-*replaces* the persisted
+`setup_packages` + `language_installs` from the fresh capture (dropping deps
+no longer captured) — an explicit "rebuild the dep set from current history"
 gesture. Even under `--force`, an empty capture leaves the existing config
 untouched, so a bad run can never blank a good config.
 
 **Idempotency.** After a successful write, `capture_repo_deps` writes a
-lightweight `<run_dir>/dep_capture.done` sentinel file and sets
-`dep_capture_done = True` in `state.json`. The run-start backstop skips
-any run whose sentinel file is already present. When the union merge adds
-no new packages and no new install command, the function returns immediately
-without touching `.leerie/config.toml`.
+lightweight `<run_dir>/dep_capture.done` sentinel and sets
+`dep_capture_done = True` in `state.json`. The run-start backstop skips any
+run whose sentinel is already present. When the union merge finds nothing
+new, the function returns immediately without touching `.leerie/config.toml`.
 
 **No auto-commit.** Capture writes `.leerie/config.toml` (and, if generated,
-`.leerie/Dockerfile`) as uncommitted files in the user's working tree.
-Leerie logs one line: *"captured N package(s)/install command — run `git add
-.leerie/ && git commit` to bake into the next run's image."* The user
-controls when and whether to commit. This preserves the committed-Dockerfile
-authority rule: a user who has hand-authored `.leerie/Dockerfile` is not
-surprised by an auto-commit altering it.
+`.leerie/Dockerfile`) as uncommitted files. Leerie logs one line: *"captured N
+package(s)/install command — run `git add .leerie/ && git commit` to bake
+into the next run's image."* The user controls when to commit — this
+preserves the committed-Dockerfile authority rule: a hand-authored
+`.leerie/Dockerfile` is never surprised by an auto-commit.
 
-**Non-fatal.** Any error during capture or write — log parsing failure,
-TOML write error, filesystem permission issue — is caught, logged at debug
-level, and swallowed. A run must never fail because dependency capture
-failed. The run is marked complete regardless.
+**Non-fatal.** Any error during capture or write — log parsing failure, TOML
+write error, filesystem permission issue — is caught, logged at debug level,
+and swallowed. A run must never fail because dependency capture failed; the
+run is marked complete regardless.
 
 **Opt-out.** Set `capture_deps = false` in `.leerie/config.toml` or
 `LEERIE_CAPTURE_DEPS=0` in the environment to disable capture entirely.
@@ -4276,65 +4260,61 @@ is ignored when a committed Dockerfile is present (see *Per-repo container
 image* above).
 
 **Fly parity.** Capture writes the same files regardless of runtime. On
-`--runtime fly` the workflow is split across two directions:
+`--runtime fly` the workflow splits across two directions:
 - **Machine → host (stream-back).** After the run-state tar, `fetch-branch.sh`
   best-effort streams `/work/.leerie/config.toml` and `/work/.leerie/Dockerfile`
   from the Fly Machine back to `$USER_REPO/.leerie/` (or `$LEERIE_STATE_HOST_DIR`).
   Each file is existence-guarded on the remote side and never clobbers a
-  host-edited file; failure is non-fatal and does not affect `fetch_branch`'s
-  return code. This fires only on a clean finish (the same condition gate that
+  host-edited file; failure is non-fatal and doesn't affect `fetch_branch`'s
+  return code. This fires only on a clean finish (same condition gate that
   runs `fetch_branch` at all — rc `0|10|11|75`). Cancel/kill recovery uses the
   host-side `--recapture` / next-run backstop instead.
 - **Host → machine (seed-repo whitelist).** Pre-existing committed `.leerie/`
-  files (including a previously streamed-back and committed `config.toml`
-  or `Dockerfile`) are included in the `seed-repo.sh` dirty-delta filter so
-  they reach the machine's `/work/.leerie/` on the next run. The Fly
-  derived-image path then picks them up identically to the local nerdctl path.
+  files (including a previously streamed-back and committed `config.toml` or
+  `Dockerfile`) are included in `seed-repo.sh`'s dirty-delta filter so they
+  reach the machine's `/work/.leerie/` next run. The Fly derived-image path
+  then picks them up identically to the local nerdctl path.
 
 ### Browser-based test execution in the base image
 
-The base image ships headless Chromium and a version-matched
-chromedriver (see *Image build*, IMPLEMENTATION.md §0.5). This is
-scoped narrowly: it exists so that workers can **execute** browser-driven
-tests — Selenium, Capybara, Playwright, Puppeteer — inside the
-container, the same way they run any other test command. It is not a
-visual-verification capability; nothing renders a screenshot back to a
-worker or the user. A Rails repo with a Capybara feature-spec suite, or
-a Next.js repo with Playwright e2e tests, needs a real browser to `bundle
-exec rspec` or `pnpm test:e2e` at all — without one, an entire test
-category is unreachable and reports as a false pass (skipped) or a
-misleading failure (driver-not-found) rather than a real result.
+The base image ships headless Chromium and a version-matched chromedriver
+(see *Image build*, IMPLEMENTATION.md §0.5). This is scoped narrowly: it
+exists so workers can **execute** browser-driven tests — Selenium, Capybara,
+Playwright, Puppeteer — inside the container, the same way they run any
+other test command. It is not a visual-verification capability; nothing
+renders a screenshot back to a worker or the user. A Rails repo with a
+Capybara feature-spec suite, or a Next.js repo with Playwright e2e tests,
+needs a real browser to `bundle exec rspec` or `pnpm test:e2e` at all —
+without one an entire test category is unreachable and reports as a false
+pass (skipped) or a misleading failure (driver-not-found).
 
 **Baked at build time, not resolved at run time.** The browser and its
-driver are installed from Debian's own apt repos in the same
-transaction (`chromium` + `chromium-driver` + the `libc6` bump that
-keeps `chromium` from failing to load — see *Image build*), so the two
-are always version-matched and neither downloads anything when a
-worker's test suite runs. This follows the same reasoning as runtime
-version resolution in §6½ above: keep the model out of the loop for
-something deterministic. Selenium Manager (the common
-auto-download-a-driver mechanism) would otherwise reach out to the
+driver install from Debian's own apt repos in the same transaction
+(`chromium` + `chromium-driver` + the `libc6` bump that keeps `chromium`
+from failing to load — see *Image build*), so the two are always
+version-matched and neither downloads anything when a worker's suite runs.
+This follows the same reasoning as runtime version resolution in §6½: keep
+the model out of the loop for something deterministic. Selenium Manager (the
+common auto-download-a-driver mechanism) would otherwise reach out to the
 network on first use inside every fresh worktree — extra latency per
-subtask, and a dependency on network egress the container may not have.
-Baking the browser into the image turns a per-worker runtime concern
-into a one-time build-time concern, consistent with how the image
-separates cross-cutting state (pre-installed in the container) from
-per-worktree state (installed by each worker) elsewhere in this
-section.
+subtask, and a dependency on egress the container may not have. Baking the
+browser turns a per-worker runtime concern into a one-time build-time
+concern, consistent with how the image separates cross-cutting state
+(pre-installed) from per-worktree state (installed by each worker)
+elsewhere in this section.
 
 **Sandbox flags baked in, not left to each repo.** Workers run as the
-non-root `leerie` user, so Chrome's SUID sandbox cannot work in
-this container regardless of which project's test suite invokes it.
-Rather than expect every repo's test config to discover and set
-`--no-sandbox` / `--disable-setuid-sandbox` / `--disable-dev-shm-usage`
-correctly, the flags are written once into
-`/etc/chromium.d/leerie-container-flags` at image build time (detail:
-IMPLEMENTATION.md §"Browser-based testing"). A project that already
-sets these flags is unaffected — they're idempotent; a project that
-doesn't now still works, because the wrapper applies them globally.
-This mirrors the container-image posture elsewhere in this doc: fix a
-class of failure once at the image layer instead of asking every
-worker, in every worktree, on every run, to route around it correctly.
+non-root `leerie` user, so Chrome's SUID sandbox cannot work here regardless
+of which project's test suite invokes it. Rather than expect every repo's
+test config to discover and set `--no-sandbox` /
+`--disable-setuid-sandbox` / `--disable-dev-shm-usage` correctly, the flags
+are written once into `/etc/chromium.d/leerie-container-flags` at image
+build time (detail: IMPLEMENTATION.md §"Browser-based testing"). A project
+that already sets these flags is unaffected (idempotent); one that doesn't
+now still works, because the wrapper applies them globally — the same
+image-layer posture as elsewhere in this doc: fix a class of failure once
+instead of asking every worker, in every worktree, on every run, to route
+around it.
 
 ### `leerie config` — host-side onramp
 
@@ -4344,20 +4324,19 @@ that generates and inspects these files without starting a container.
 
 **Why no container.** Config generation only needs to read the repo's
 existing files (lockfiles, CI yaml, `package.json`, `Gemfile`, etc.) and
-write into `.leerie/`. That is a read-plus-local-write operation — no
-worker isolation, no network, no package-manager caches. Starting a
-container to do it would add thirty-plus seconds of startup overhead with
-no benefit and would complicate the UX: the user is being asked to
-*configure* leerie before running it, so making them provision a machine
-first inverts the sequence.
+write into `.leerie/` — a read-plus-local-write operation needing no worker
+isolation, network, or package-manager caches. A container would add
+thirty-plus seconds of startup for no benefit, and would invert the UX: the
+user is configuring leerie before running it, not provisioning a machine
+first.
 
 **Why it is not in the four-verb remote-lifecycle table (§6 "verb
-surface").** That table (`leerie "task" --runtime fly`, `stop`,
-`resume`, `kill`) is explicitly scoped to the remote *run* lifecycle —
-machine allocation, pausing, resuming, and destruction. `leerie config` has
-no run lifecycle; it never allocates a machine or a container. It is a
-host-side utility verb in the same family as `leerie list`: fast, local,
-and orthogonal to run management.
+surface").** That table (`leerie "task" --runtime fly`, `stop`, `resume`,
+`kill`) is scoped to the remote *run* lifecycle — allocation, pausing,
+resuming, destruction. `leerie config` has none of that; it never
+allocates a machine or a container. It is a host-side utility verb in the
+same family as `leerie list`: fast, local, and orthogonal to run
+management.
 
 **Three modes:**
 
@@ -4408,9 +4387,9 @@ absent** and no `output_config`.
 
 The consequence is measured: across the run corpus, **28.8% of `StructuredOutput`
 submissions are malformed**, in the shapes the vendor documents as the cost of
-omitting strict mode — the payload wrapped in a container key, the decoder
-flipping to legacy XML mid-value, unparseable bytes, and required fields simply
-absent. None of these is a model being unable to do the work — the answers are
+omitting strict mode — payload wrapped in a container key, the decoder
+flipping to legacy XML mid-value, unparseable bytes, required fields simply
+absent. None of this is a model unable to do the work — the answers are
 usually correct and merely unreachable, which is why the CLI's own re-prompt
 loop recovers most of them at the cost of regenerating the payload.
 
@@ -4466,50 +4445,49 @@ leerie has to buy it back.** The Claude Code CLI treats any custom
 confirm which model actually answers, so it falls back to a conservative
 client-side context ceiling instead of the model's real window. Sonnet 5
 natively carries 1M on the first-party API; behind the proxy the CLI refuses
-prompts at roughly 224K. That refusal is client-side and silent — no API call,
-no server error (see §6 *A client-side context refusal*) — so nothing in the
-run explains why an otherwise-fine prompt was rejected.
+prompts at roughly 224K, client-side and silently — no API call, no server
+error (see §6 *A client-side context refusal*) — so nothing in the run
+explains why an otherwise-fine prompt was rejected.
 
 The remedy is the documented gateway-side selector: leerie appends `[1m]` to
-the model alias whenever the proxy is active (`_model_arg`), which is a no-op
-on the direct path where the native window already applies. It is scoped to
-the aliases that *have* a 1M variant — `haiku` has none and rejects the
-suffix — and is applied automatically rather than exposed as a flag, since an
-operator gains nothing by setting by hand a value that is inert whenever the
-proxy is off.
+the model alias whenever the proxy is active (`_model_arg`), a no-op on the
+direct path where the native window already applies. It's scoped to aliases
+that *have* a 1M variant — `haiku` has none and rejects the suffix — and
+applied automatically rather than exposed as a flag, since an operator gains
+nothing setting by hand a value that's inert whenever the proxy is off.
 
 Measured across five arms on one 225 KB worker payload, varying only
 `ANTHROPIC_BASE_URL`: direct sustained 235,805 tokens with no refusal; both a
 passthrough proxy and the real strict proxy refused around ~224K (120 tokens
-apart, which is what establishes the base-URL override rather than the schema
-rewriting as the cause). Adding `[1m]` cleared both paths, with the proxy's
-rewritten/passed-through/fell-back counters identical under either alias — so
-the window is bought back without giving up the constrained decoding the flag
-exists for.
+apart, establishing the base-URL override rather than schema rewriting as the
+cause). Adding `[1m]` cleared both paths, with the proxy's
+rewritten/passed-through/fell-back counters identical under either alias —
+the window is bought back without giving up the constrained decoding the
+flag exists for.
 
 What happens after a hard worker error depends on whether partial progress can
-be salvaged. An **implementer** has a worktree branch and possibly a checkpoint,
-so its failure is converted into a handoff: a fresh implementer can continue.
-The **classifier, planner, reconciler, plan_overlap_judge, and provision** have no partial-progress
-artifact to hand off — there is nothing for a successor to continue from — so
-their hard failure aborts the run with state saved for `resume`. The
-**conformer** has commits but its phase is advisory, so a hard failure surfaces
-as a warning, not an abort. The rule is general: salvage if there is something
-to salvage; abort cleanly otherwise. When `planner_samples > 1`, a crashed
-sample is dropped and the surviving samples for that domain proceed to
-selection; the abort fires only when all samples for a domain fail.
+be salvaged. An **implementer** has a worktree branch and possibly a
+checkpoint, so its failure converts into a handoff: a fresh implementer can
+continue. The **classifier, planner, reconciler, plan_overlap_judge, and
+provision** have no partial-progress artifact to hand off, so their hard
+failure aborts the run with state saved for `resume`. The **conformer** has
+commits but its phase is advisory, so a hard failure surfaces as a warning,
+not an abort. The rule is general: salvage if there is something to salvage;
+abort cleanly otherwise. When `planner_samples > 1`, a crashed sample is
+dropped and the surviving samples for that domain proceed to selection; the
+abort fires only when all samples for a domain fail.
 
 The **integrator** is the case where that rule and the code disagreed. Its
 partial progress is the *resolved staging worktree* — files whose conflict
-markers are gone and whose hunks carry real merge judgment — and that is an
-artifact in exactly the sense the implementer's branch is. It is also the
-most expensive artifact in the run to recreate, because reproducing it means
-re-deriving every side's intent from the subtask specs. Crucially, the work
-need not be committed to be real: a crashed integrator typically dies
-*mid-resolution*, with the resolution in the working tree and no merge commit
-(this is what run `879defae`'s wave-2 integrator did). Preservation therefore
-cannot be conditioned on `check_merge_committed` — that predicate is false in
-precisely the case worth salvaging.
+markers are gone and whose hunks carry real merge judgment — an artifact in
+exactly the sense the implementer's branch is, and the most expensive one in
+the run to recreate, since reproducing it means re-deriving every side's
+intent from the subtask specs. The work need not be committed to be real: a
+crashed integrator typically dies *mid-resolution*, with the resolution in
+the working tree and no merge commit (run `879defae`'s wave-2 integrator did
+exactly this). Preservation therefore cannot be conditioned on
+`check_merge_committed` — that predicate is false in precisely the case
+worth salvaging.
 
 This distinction is between a *crash* and a *verdict*, and only the first is
 new. A crash is infrastructure — PID exhaustion, OOM, a killed session — and
@@ -4517,8 +4495,8 @@ says nothing about whether the resolution was any good; the run rescues the
 work and pauses for `resume`. A `design-conflict` or `failed` **verdict** is
 the integrator's considered judgment that the merge should not stand, and
 still aborts and discards, exactly as *When integration cannot succeed*
-describes. Salvaging a crash does not weaken that: a verdict is a fact about
-the work, a crash is a fact about the machine.
+describes: a verdict is a fact about the work, a crash is a fact about the
+machine.
 
 ### Forcing constrained decoding
 
@@ -4535,15 +4513,15 @@ to `0` and reading back what the OS assigned, so concurrent runs never collide.
 The guarantee is per-*call*, not per-orchestrator-process. Three entrypoints
 invoke workers without reaching `_orchestrate()`, so each opens its own proxy:
 `run_rebaser` and `run_recapture_deps` (host-seam entrypoints, §6
-*Finalization*, §6½, running in their own short-lived `python3` process and
-reading the flag `_orchestrate()` already resolved and persisted onto the
-run's state, since it never crosses that process boundary), and `--phase
-heal` (returns before `_orchestrate()` is reached). Before this, all three
-silently ran unconstrained regardless of the flag. Because they are
-best-effort paths that must never block a push, abort a multi-run loop, or
-fail a heal, their proxies fail *soft* rather than following the fail-closed
-startup rule below: a listener that cannot bind costs the guarantee for that
-call, not the call itself.
+*Finalization*, §6½, each a short-lived `python3` process reading the flag
+`_orchestrate()` already resolved and persisted onto run state, since it
+never crosses that process boundary), and `--phase heal` (returns before
+`_orchestrate()` is reached). Before this, all three silently ran
+unconstrained regardless of the flag. Because they're best-effort paths that
+must never block a push, abort a multi-run loop, or fail a heal, their
+proxies fail *soft* rather than following the fail-closed startup rule below:
+a listener that cannot bind costs the guarantee for that call, not the call
+itself.
 
 The proxy rewrites exactly one thing: on a request carrying a single tool
 named `StructuredOutput`, it sets `strict: true` and normalises the schema to
@@ -4557,14 +4535,13 @@ Two properties make that safe to run in the path of every worker call.
 
 **It fails open.** If the tool is renamed, duplicated, or shaped unexpectedly
 by an upstream release, the request is forwarded unmodified — the guarantee
-is lost, not the run, and that loss is reported. A request that simply
-carries no such tool is *not* a loss and is not reported: the CLI injects the
-tool only on turns that ask for structured output, so a multi-turn worker
-routinely makes some requests without it (measured, roughly a quarter to a
-third). The rename case is indistinguishable per-request from that ordinary
-traffic, but not across a run — every worker is invoked with a schema, so a
-run that rewrote *nothing* is reported once, at the end, as a probable
-rename.
+is lost, not the run, and that loss is reported. A request carrying no such
+tool is *not* a loss and is not reported: the CLI injects the tool only on
+turns that ask for structured output, so a multi-turn worker routinely makes
+some requests without it (measured, roughly a quarter to a third). The
+rename case is indistinguishable per-request from that ordinary traffic, but
+not across a run — every worker is invoked with a schema, so a run that
+rewrote *nothing* is reported once, at the end, as a probable rename.
 
 **It fails closed at startup.** If the listener cannot bind, the run dies
 rather than proceeding unconstrained, so an operator who asked for the
@@ -4580,38 +4557,40 @@ string properties are refused where 20 enums/booleans/integers/arrays
 compile). Nesting array-of-objects inside array-of-objects compounds both.
 
 leerie answers each at the layer that owns it: the proxy forces every
-optional `required` on the wire only, collapsing the subset explosion without
-touching the schema the CLI validates against; and the two schemas that still
-didn't fit were restructured — the planner's by that transform alone, the
-reconciler's by lifting its nested `requires` array into a sibling keyed by
-id and collapsing four isomorphic `{sid, tag, reason}` arrays into one
-enum-discriminated `tag_ops`. Seven lesser in-place reductions ($defs
+optional `required` on the wire only, collapsing the subset explosion
+without touching the schema the CLI validates against; the two schemas that
+still didn't fit were restructured — the planner's by that transform alone,
+the reconciler's by lifting its nested `requires` array into a sibling
+keyed by id and collapsing four isomorphic `{sid, tag, reason}` arrays into
+one enum-discriminated `tag_ops`. Seven lesser in-place reductions ($defs
 dedup, stripping descriptions, dropping subtrees, trimming properties,
-identifiers-to-enums) were tried against the live API first and all refused;
-only the restructure worked.
+identifiers-to-enums) were tried against the live API first and all
+refused; only the restructure worked.
 
-**A schema that still cannot be constrained is survivable.** Measured against
-the API across all 23 schemas (2026-08-04), two are refused outright — the
-planner's and the reconciler's, both driven by optional properties inside
-array items (twelve each), not size (the conformer's larger schema compiles
-fine). The fix is not to make those fields required — that already failed
-once, for a different reason: requiring fields is what made workers fail to
-produce schema-valid output at all (see *Findings carry a severity*, and the
-overlap judge's `artifact_paths`). So the proxy fails open on the *response*
-too: a rejection of the hardened request is answered by re-sending the
-untouched one, and that worker falls back to ordinary post-hoc validation
-while every other worker still gets constrained decoding. Logged at every
-verbosity and counted in the end-of-run summary, since a silently lost
-guarantee is the one outcome this design refuses.
+**A schema that still cannot be constrained is survivable.** Measured
+against the API across all 23 schemas (2026-08-04), two are refused
+outright — the planner's and the reconciler's, both driven by optional
+properties inside array items (twelve each), not size (the conformer's
+larger schema compiles fine). The fix is not to make those fields required
+— that already failed once, for a different reason: requiring fields is
+what made workers fail to produce schema-valid output at all (see *Findings
+carry a severity*, and the overlap judge's `artifact_paths`). So the proxy
+fails open on the *response* too: a rejection of the hardened request is
+answered by re-sending the untouched one, and that worker falls back to
+ordinary post-hoc validation while every other worker still gets
+constrained decoding. Logged at every verbosity and counted in the
+end-of-run summary, since a silently lost guarantee is the one outcome
+this design refuses.
 
 The normalisation has a real cost: stripped keywords were carrying
 validation. Sixteen of twenty-one are string-length bounds on strings whose
-consumers already test truthiness, so nothing changes. The remaining five are
-numeric bounds that fail *permissively* if dropped (e.g. `fit_judge`'s score
-compared against a threshold with no range check would read an out-of-range
-value as well-fit), so leerie re-checks those in Python — unconditionally,
-not gated on the flag, since a value outside its declared range was always a
-worker bug regardless of what removed the schema-level bound.
+consumers already test truthiness, so nothing changes. The remaining five
+are numeric bounds that fail *permissively* if dropped (e.g. `fit_judge`'s
+score compared against a threshold with no range check would read an
+out-of-range value as well-fit), so leerie re-checks those in Python —
+unconditionally, not gated on the flag, since a value outside its declared
+range was always a worker bug regardless of what removed the schema-level
+bound.
 
 ---
 
