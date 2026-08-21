@@ -509,7 +509,7 @@ empty map returns `""`); `TestBinarySearchShrink` (lowering the budget yields
 shorter output and fewer files; increasing budgets yield non-decreasing lengths;
 1-token budget yields empty or a single very-short entry). Fixture is built
 directly (no `_build_repo_map`) — isolates ranking. No LLM calls; deterministic.
-<!-- docs-001-f1-r3: lines 1403-2083 of the pre-split CLAUDE.md -->
+
 The P1 recursive decomposition surface (DESIGN §5½ (P1)) is tested across four
 files. `tests/test_fit_judge_schema.py` covers `SCHEMAS["fit_judge"]` —
 required fields (`score`, `rationale`, `diffuse`, `confidence`), `score`
