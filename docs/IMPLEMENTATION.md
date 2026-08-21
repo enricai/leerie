@@ -6152,23 +6152,22 @@ catches nothing). A
 `dropped_change` whose `coverage_elsewhere` names a file that **exists in
 the merged tree** plus a non-blank `assertion` is downgraded to advisory —
 logged, not gating. Absence, a blank field, or a named file absent from
-the tree all gate exactly as before; absence is the conservative
-direction. Blankness and file existence are checked in
-`_coverage_citation_clears`, not by the schema: neither string carries a
-`minLength`, because a `minLength` on an *optional* property breaks the
-`--dangerously-force-strict-output` invariant that forcing a field must
-never make a trivial value illegal. A hallucinated path therefore cannot
-buy a downgrade, and the strict-output grammar stays satisfiable. Given the
-merged result plus both parent diffs and the conflicting subtasks' intents,
-it attacks the merge for behavioral breakage the mechanical conflict-marker
-scan and `check_merge_committed` cannot see — a syntactically clean merge
-that keeps one side's signature but the other side's call sites, or
-silently drops one side's behavior entirely. Wired into `integrate_wave` as a
-**detect-and-die, single pass** gate after a successful merge commit: a
-non-empty `defects` array `die()`s immediately with the concrete defect named
-(an integrator cannot always mechanically re-derive a correct behavioral
-resolution from a semantic finding the same way a planner can add a subtask,
-so no re-drive). Persists to `state.data["integration_gate"][sid]` and
+the tree all gate exactly as before (the conservative direction). Blankness
+and file existence are checked in `_coverage_citation_clears`, not by the
+schema: neither string carries a `minLength`, since one on an *optional*
+property would break the `--dangerously-force-strict-output` invariant that
+forcing a field must never make a trivial value illegal. A hallucinated path
+therefore cannot buy a downgrade. Given the merged result plus both parent
+diffs and the conflicting subtasks' intents, the judge attacks the merge for
+behavioral breakage the mechanical conflict-marker scan and
+`check_merge_committed` cannot see — a syntactically clean merge that keeps
+one side's signature but the other side's call sites, or silently drops one
+side's behavior entirely. Wired into `integrate_wave` as a **detect-and-die,
+single pass** gate after a successful merge commit: a non-empty `defects`
+array `die()`s immediately with the concrete defect named (an integrator
+cannot always mechanically re-derive a correct resolution from a semantic
+finding the way a planner can add a subtask, so no re-drive). Persists to
+`state.data["integration_gate"][sid]` and
 `state.data["integration_defects"][sid]` — see "Integration gate resume +
 `accept-integration`" below.
 
@@ -6177,16 +6176,15 @@ so no re-drive). Persists to `state.data["integration_gate"][sid]` and
 Unlike `wiring_gate`, which is written only on a clean pass,
 `state.data["integration_gate"][sid]` is written **before** `die()`ing:
 `{defects: list[str], advisories: list[str], merge_commit_sha: str, accepted:
-bool}` (`accepted` is `not defects` on a fresh judge verdict — true for a
-clean pass, false for a gating finding). A non-empty `defects` entry is
-mirrored to the flatter `state.data["integration_defects"][sid]` (a plain
-`list[str]`), which is what `accept-integration` clears. Both keys let a
-resume distinguish "this sid's merge was never reviewed" (both keys absent)
-from "reviewed and rejected, not yet accepted" (`integration_gate[sid]`
-present, `accepted: False`) from "reviewed and either clean or
-operator-accepted" (`accepted: True`) — `wiring_gate`'s single "written only
-on pass" key cannot express the middle state, which is exactly the state a
-run stuck on a false-positive `integration_judge` verdict is in.
+bool}` (`accepted` is `not defects` on a fresh judge verdict). A non-empty
+`defects` entry is mirrored to the flatter `state.data["integration_defects"][sid]`
+(a plain `list[str]`), which is what `accept-integration` clears. Both keys
+let a resume distinguish "never reviewed" (both keys absent) from "reviewed
+and rejected, not yet accepted" (`integration_gate[sid]` present, `accepted:
+False`) from "reviewed and either clean or operator-accepted" (`accepted:
+True`) — `wiring_gate`'s single "written only on pass" key cannot express the
+middle state, which is exactly the state a run stuck on a false-positive
+`integration_judge` verdict is in.
 
 **Granularity: per-sid, chosen on structural grounds.** An sid is stable by
 construction, so per-sid acceptance sidesteps the harder question a
@@ -6199,25 +6197,21 @@ defect keeps its identity.
 re-driving `integrate.sh`/the integrator: `integrate.sh`'s `git merge --no-ff`
 is idempotent, so on resume it would just see the branch already merged (rc
 0, "Already up to date") and short-circuit straight to `integrated.append`
-*without ever re-invoking the judge* — the judge only ever runs from inside
-the conflict/integrator branch. A present, not-yet-`accepted` entry instead
-re-invokes the judge directly against the already-committed merge via the
-shared `_run_integration_judge_gate` helper (used by both the normal
+*without ever re-invoking the judge*. A present, not-yet-`accepted` entry
+instead re-invokes the judge directly against the already-committed merge via
+the shared `_run_integration_judge_gate` helper (used by both the normal
 post-integrator-commit call site and this resume call site, so the
 invoke/partition/persist/die sequence cannot drift between them); a present,
 `accepted` entry skips straight to `integrated.append` with no judge call at
 all. `phase_execute`'s wave loop has a matching adjustment: the
-already-complete-subtasks resume shortcut (`if not remaining: ... skip the
-whole wave`) additionally checks for any wave sid with a pending,
-un-accepted `integration_gate` entry (`pending_gate_sids`) and, when one
-exists, does NOT take the shortcut — otherwise `integrate_wave` (and its gate
-re-check) would never be reached again for that wave, silently advancing
-`completed_waves` past a rejected merge. Such sids get a `{"status":
-"complete"}` stand-in `results` entry (their original `intent`/
-`criteria_results` are not persisted anywhere this far removed from the
-original settle, so the resumed judge re-invocation runs with an empty
-`incoming_intent`/`incoming_criteria` — cosmetic only, since the judge's
-primary evidence is the merge diff itself).
+already-complete-subtasks resume shortcut additionally checks for any wave
+sid with a pending, un-accepted `integration_gate` entry
+(`pending_gate_sids`) and, when one exists, does NOT take the shortcut —
+otherwise `integrate_wave` would never be reached again for that wave,
+silently advancing `completed_waves` past a rejected merge. Such sids get a
+`{"status": "complete"}` stand-in `results` entry, so the resumed judge
+re-invocation runs with an empty `incoming_intent`/`incoming_criteria` —
+cosmetic only, since the judge's primary evidence is the merge diff itself.
 
 `leerie accept-integration <run-id> <subtask-id> [--runtime fly|ec2|local]`
 mirrors `accept-blocked`'s shape and local/Fly/EC2 state-mutation machinery
@@ -6288,9 +6282,8 @@ structured `failure_kind` enum tagged at the producer; the prose `reason`
 stays for user-visible diagnostics but no longer drives control flow. The
 retryable set is the module-level constant `_RETRYABLE_FAILURE_KINDS`.
 
-Per DESIGN §12, classification by substring match on a prose `reason`
-would be deterministic code making a judgment call on natural-language
-text — a model should classify prose; a substring match cannot. Tagging
+Per DESIGN §12, classifying a prose `reason` by substring match would be
+deterministic code making a judgment call on natural-language text. Tagging
 at the producer eliminates the prose round-trip.
 
 The coupling test in `tests/test_retryable_failure.py` enforces that
@@ -6334,23 +6327,21 @@ evidence.
 
 **Retry in place vs. reset first.** `fail()` normally calls
 `_reset_subtask_worktree` before looping, which runs `git branch -D` on the
-subtask branch — correct for `no_commits` (the branch holds nothing worth
-keeping) and destructive when it does not. Infrastructure kinds skip that
-reset: a worktree-setup failure fires before any worker runs, so there is no
-leftover from *this* attempt to clear, while an *earlier* attempt's commits
-may already be sitting on the branch. `new-worktree.sh` reuses an existing
+subtask branch — correct for `no_commits` (nothing worth keeping) and
+destructive when it does not. Infrastructure kinds skip that reset: a
+worktree-setup failure fires before any worker runs, so there is nothing
+from *this* attempt to clear, while an *earlier* attempt's commits may
+already be sitting on the branch. `new-worktree.sh` reuses an existing
 branch by design, so retrying in place re-attaches to that work instead of
 deleting it.
 
-The exemption covers the `continuation` flag and the corrective `note` too,
-not just the reset. An infrastructure failure carries no information about
-what the worker should do differently, so it must not overwrite the state
-that says what the worker should do differently — a worktree failure after
-the mechanical-check path has already set `continuation=True` plus a
-`_format_check_feedback` note must leave that pending feedback intact, or
-the retried worker is blind to the thing it was sent back to fix and burns
-`implementer_confidence_retries` re-discovering it. Only a *worker* failure
-earns a corrective note, because only a worker failure produced one.
+The exemption also covers the `continuation` flag and the corrective `note`:
+an infrastructure failure carries no information about what the worker
+should do differently, so it must not overwrite state that does — a
+worktree failure after the mechanical-check path has already set
+`continuation=True` plus a `_format_check_feedback` note must leave that
+feedback intact, or the retried worker burns `implementer_confidence_retries`
+re-discovering it. Only a *worker* failure earns a corrective note.
 
 `_settle_subtask` routes every failure through `_retryable_failure` via the
 `fail(kind, reason)` helper. Retryable consumes the retry cap; terminal ends
@@ -6468,33 +6459,26 @@ branch, after the `_write_run_json(...)` block and before
    `mise.toml`/`.mise.toml` go pin, parse `go.mod`'s `go 1.X[.Y]`
    directive and write `<run_dir>/mise-overrides.toml` containing
    `[tools]\ngo = "<version>"`. **Both `mise.toml` AND `.mise.toml`
-   (dotted form, also a valid mise config name) are recognized**;
-   non-dotted form wins if both exist (matches mise's discovery
-   precedence). If the repo has an existing mise config, its
-   `[tools]` content is preserved in the override file
-   (`MISE_OVERRIDE_CONFIG_FILENAMES` replaces rather than merges; the
-   override is the only file mise reads, so it must carry the repo's
-   existing pins plus leerie's addition). Idiomatic version files
-   (`.nvmrc`, `.node-version`, `.python-version`, `.ruby-version`)
-   and `.tool-versions` entries are ALSO copied into the override
-   when the same tool isn't already pinned in the existing mise
-   config — otherwise the override would silently drop them too
-   (mise discussions #6598 / #7058). Returns the absolute path to
-   the override file.
+   (dotted form) are recognized**; non-dotted form wins if both exist
+   (matches mise's discovery precedence). If the repo has an existing
+   mise config, its `[tools]` content is preserved in the override
+   file (`MISE_OVERRIDE_CONFIG_FILENAMES` replaces rather than merges,
+   so the override must carry the repo's existing pins plus leerie's
+   addition). Idiomatic version files (`.nvmrc`, `.node-version`,
+   `.python-version`, `.ruby-version`) and `.tool-versions` entries are
+   ALSO copied in when the same tool isn't already pinned — otherwise
+   the override would silently drop them too (mise discussions #6598 /
+   #7058). Returns the absolute path to the override file.
 
-   **Precedence between idiomatic files** (leerie's choice, not
-   mise's documented behavior): when the synth fires and both
-   `.nvmrc` and `.tool-versions` pin the same tool with different
-   versions, `.nvmrc` wins. The iteration order in
-   `_read_idiomatic_pins` runs the dedicated single-tool files
-   (`.nvmrc`, `.python-version`, etc.) BEFORE `.tool-versions`,
-   so the first-seen pin sticks. A repo with conflicting pins is
-   a misconfiguration, but leerie picks `.nvmrc` over
-   `.tool-versions` for determinism. asdf-compatible names like
-   `nodejs` and `python3` in `.tool-versions` are normalized to
-   mise's `node` / `python` via `_ASDF_TOOL_ALIASES` so a
-   `.nvmrc` + `.tool-versions: nodejs ...` repo doesn't end up
-   with both `node` and `nodejs` pins in the override.
+   **Precedence between idiomatic files** (leerie's choice, not mise's
+   documented behavior): when both `.nvmrc` and `.tool-versions` pin
+   the same tool with different versions, `.nvmrc` wins — the
+   iteration order in `_read_idiomatic_pins` runs the dedicated
+   single-tool files BEFORE `.tool-versions`, so the first-seen pin
+   sticks. asdf-compatible names like `nodejs` and `python3` in
+   `.tool-versions` are normalized to mise's `node` / `python` via
+   `_ASDF_TOOL_ALIASES` so a `.nvmrc` + `.tool-versions: nodejs ...`
+   repo doesn't end up with both `node` and `nodejs` pins.
 4. **Mise install.** `_run_mise_install(repo_root, log_dir, st)`:
    exports `MISE_OVERRIDE_CONFIG_FILENAMES=<path>` if step 3
    produced one, then runs `mise install` at the repo root. mise
@@ -6524,22 +6508,18 @@ branch, after the `_write_run_json(...)` block and before
    `die()`.
 8½. **Normalize pip installs.** `_normalize_pip_installs(recipe)` adds
    `--break-system-packages` to every `pip`/`pip3`/`python -m pip`
-   *install* entry that lacks it (`_is_pip_install` identifies them — it
-   finds the `install` subcommand as the first non-option token after the
-   pip prefix, so a leading global flag like `pip -v install` is still
-   matched; `uv pip install` and `pipx install` are not, as they manage
-   their own environments). The
-   container's system Python is Debian-13 externally-managed (PEP 668) —
-   a bare `pip install` exits non-zero, which otherwise silently breaks
-   every recipe consumer (most visibly `_capture_conformance_baseline`,
-   whose failed `pip install` leaves the base test axis recording
-   `command not found`). Normalizing at this single data chokepoint —
-   the one point every consumer reads the recipe — fixes the baseline
-   installer *and* the `PROVISION_RECIPE:` prompt block for
-   implementer/conformer workers at once (§12: code enforces; the LLM
-   worker mirrors CI, which runs in a venv and never emits the flag). The
-   flag is a no-op on a non-externally-managed interpreter, so it is
-   applied unconditionally.
+   *install* entry that lacks it (`_is_pip_install` finds the `install`
+   subcommand as the first non-option token after the pip prefix, so a
+   leading global flag like `pip -v install` still matches; `uv pip
+   install` and `pipx install` are exempt — they manage their own
+   environments). The container's system Python is Debian-13
+   externally-managed (PEP 668) — a bare `pip install` exits non-zero,
+   silently breaking every recipe consumer (most visibly
+   `_capture_conformance_baseline`, whose failed `pip install` leaves
+   the base test axis recording `command not found`). Normalizing at
+   this one chokepoint fixes the baseline installer *and* the
+   `PROVISION_RECIPE:` prompt block at once. The flag is a no-op on a
+   non-externally-managed interpreter, so it is applied unconditionally.
 9. **Persist (do not execute).** Full recipe + `source` + resolved
     versions saved to `st.data["provision"]`. The recipe is not
     executed by `phase_provision` — the implementer and conformer
@@ -6632,16 +6612,14 @@ Why this shape (persistent bake + residual worker install):
   binaries into the host's darwin `node_modules`, corrupting the
   host's checkout.
 - Per-worktree pre-install wastes work for subtasks that don't need
-  built deps (config-only, doc-only, pure-code refactors that don't
-  run tests). The persistent bake eliminates this waste for
-  Python/Ruby/Rust/Go; Node's residual relink is minimal.
+  built deps (config-only, doc-only, non-test refactors). The
+  persistent bake eliminates this for Python/Ruby/Rust/Go; Node's
+  residual relink is minimal.
 - The bake is shared read-only across concurrent worktrees, so
-  dependency installs are paid once per image build, not once per
-  worktree.
-- `claude -p`'s built-in stream-event plumbing surfaces Bash tool
-  I/O to the orchestrator log live, so an install running inside a
-  worker is visible to the user without any special orchestrator
-  streaming code.
+  installs are paid once per image build, not once per worktree.
+- `claude -p`'s built-in stream-event plumbing surfaces Bash tool I/O
+  to the orchestrator log live, so an install inside a worker is
+  visible without any special streaming code.
 
 The `MISE_OVERRIDE_CONFIG_FILENAMES` env var that `phase_provision`
 synthesizes for polyglot Go repos (go.mod with no `.go-version`
@@ -6651,21 +6629,18 @@ inherit it without any per-worker plumbing because `_invoke` does
 not pass an explicit `env=` to `create_subprocess_exec`.
 
 **Convention-doc injection (`CONVENTION_DOCS:` block).** Alongside the
-recipe, `_run_implementer` injects the repo's authoritative convention
-docs so the implementer writes UI to the repo's design conventions on
-the first try rather than drifting and relying on a post-hoc conformer
-catch (DESIGN §9). It calls `_discover_rules_files(st.repo_root)` — the
-same discovery the conformer uses — and renders the surviving paths
-(relative to `repo_root`) as a `CONVENTION_DOCS:` line in the user
-prompt, using the same relative-path formatting as `_run_conformer`'s
-`RULES_FILES:` line. Paths only, not contents: the implementer runs in
-a full worktree checkout and opens the docs relevant to its subtask, so
-inlining a large design-system doc into every prompt is avoided. When
-discovery returns nothing, no block is injected. `st.repo_root` is
-already in scope in `_run_implementer` (set at `State` construction), so
-this needs no new parameter or call-site change. The `prompts/implementer.md`
-§3 evidence gate and §4 Implement step name this block so the worker
-reconciles the pattern it followed against the discovered conventions.
+recipe, `_run_implementer` injects the repo's authoritative convention docs
+so the implementer writes to the repo's design conventions on the first try
+rather than drifting and relying on a post-hoc conformer catch (DESIGN §9).
+It calls `_discover_rules_files(st.repo_root)` — the same discovery the
+conformer uses — and renders the surviving paths (relative to `repo_root`)
+as a `CONVENTION_DOCS:` line, matching `_run_conformer`'s `RULES_FILES:`
+formatting. Paths only, not contents: the implementer opens the docs
+relevant to its subtask itself, avoiding inlining a large design-system
+doc into every prompt. When discovery returns nothing, no block is
+injected. The `prompts/implementer.md` §3 evidence gate and §4 Implement
+step name this block so the worker reconciles the pattern it followed
+against the discovered conventions.
 
 ### Auto-capture of repo dependencies
 
@@ -6727,17 +6702,16 @@ path additionally gates the write on the rendered value being non-empty.
    `caps`, `models`, and `efforts` are forwarded from `phase_finalize`'s
    parameters. The resume-of-finished guard in `_run_phases` returns before
    `phase_finalize` is reached, so capture never re-fires on a completed
-   resume. A partial resume that reaches finalize re-runs capture — the union
-   merge makes this a no-op when nothing new was found.
-   `st.run_dir / "logs" / "*.log"` is populated by this point.
+   resume; a partial resume that reaches finalize re-runs capture, and the
+   union merge makes this a no-op when nothing new was found.
 
 2. **Cancel / SIGTERM arm (catchable signals).** In `main()`'s
    `KeyboardInterrupt` and `InterruptedBySignal` exception handlers, after
    `st.save()`, a best-effort `asyncio.run(capture_repo_deps(...))` runs in
    its own event loop — the same post-loop pattern as the `RateLimitedExit`
-   arm. Non-fatal: any exception is logged and suppressed. This covers the
-   Ctrl-C and `nerdctl stop` cases where the orchestrator gets a real Python
-   window before the `finally` cleanup block.
+   arm. Non-fatal: any exception is logged and suppressed. Covers Ctrl-C and
+   `nerdctl stop`, where the orchestrator gets a real Python window before
+   the `finally` cleanup block.
 
 3. **Host-side (`run_recapture_deps` / run-start backstop).** Two host-side
    seams funnel to the same worker:
@@ -6776,12 +6750,10 @@ COPY <copy_inputs> ./
 RUN <install command>
 ```
 
-The `COPY`+`RUN` layer is emitted by a `python3` script the launcher
-writes to a temp file (`cat >"$_dep_pyf" <<'PY'`) and runs as
-`python3 "$_dep_pyf" "$USER_REPO" "$_leerie_config_toml"` — de-nested
-from a `"$(…)"` command substitution so the block parses under bash 3.2
-(it is extracted and run under the system bash by the Dockerfile-bake
-tests). It has two tiers:
+The `COPY`+`RUN` layer is emitted by a `python3` script the launcher writes
+to a temp file (`cat >"$_dep_pyf" <<'PY'`) and runs as `python3 "$_dep_pyf"
+"$USER_REPO" "$_leerie_config_toml"` — de-nested from a `"$(…)"` command
+substitution so the block parses under bash 3.2. It has two tiers:
 
 1. **Primary — persisted `language_installs` from `.leerie/config.toml`.**
    The `dep_capture` worker writes a `language_installs` JSON array (keyed
@@ -6816,17 +6788,17 @@ untouched — triggers a full image rebuild; an unrelated source file
 change does not. The Fly path inherits the same generated Dockerfile via
 the seed-repo whitelist, so there is no second hash site.
 
-When `bake_language_deps=false`, the auto-generated Dockerfile contains
-only the apt layer (`USER root; apt-get install ...`), identical to the
-pre-existing path. The generated Dockerfile ends with the image still at
-`USER root` — it does **not** append a trailing `USER leerie`. The base
-image's ENTRYPOINT (`scripts/container-entry.sh`) is inherited by the
-derived image and **must** run as PID-1 root to set up cgroup containment
-and launch the cgroup broker before dropping to leerie itself via `runuser`
-(DESIGN §6 *Memory containment*; the base Dockerfile deliberately omits
-`USER leerie` for the same reason). A trailing `USER leerie` here would
-override that, making PID 1 run as leerie — cgroup writes, the broker
-socket bind, and `runuser` then all fail EACCES and the container exits 1.
+When `bake_language_deps=false`, the auto-generated Dockerfile contains only
+the apt layer (`USER root; apt-get install ...`), identical to the
+pre-existing path, and ends with the image still at `USER root` — it does
+**not** append a trailing `USER leerie`. The base image's ENTRYPOINT
+(`scripts/container-entry.sh`) is inherited by the derived image and
+**must** run as PID-1 root to set up cgroup containment and launch the
+cgroup broker before dropping to leerie via `runuser` (DESIGN §6 *Memory
+containment*; the base Dockerfile omits `USER leerie` for the same reason).
+A trailing `USER leerie` here would override that — cgroup writes, the
+broker socket bind, and `runuser` would then all fail EACCES and the
+container would exit 1.
 
 #### Config knobs
 
