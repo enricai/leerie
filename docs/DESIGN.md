@@ -1202,30 +1202,28 @@ assigned by the container runtime:
 - **Local runtime**: the container ID written by `nerdctl run --cidfile`
   (full 64-character hex digest).
 
-The ID is known at container creation time — before the orchestrator starts.
-There is no deferred computation and no rename. The launcher passes the ID
-to the orchestrator via `--run-id`.
+The ID is known at container creation time, before the orchestrator starts —
+no deferred computation, no rename. The launcher passes it via `--run-id`.
 
 The same string appears in three places: the run branch name
 (`leerie/runs/<run-id>`), the per-run state directory
-(`<state-root>/runs/<run-id>/`), and the PR body. A user looking at any of the
-three can grep for the others; for Fly runs the run_id is also the machine
-ID visible in the Fly dashboard.
+(`<state-root>/runs/<run-id>/`), and the PR body — a user looking at any one
+can grep for the others; for Fly runs it is also the machine ID in the Fly
+dashboard.
 
-A run identifier is *per-run*, not per-repository. Two concurrent invocations
-in the same repository produce two different `run_id`s — their branches,
-state directories, worktrees, and PRs are disjoint by construction (each
-container/machine gets its own unique ID from the runtime). There is no
-shared "staging" namespace that two runs could collide on.
+A run identifier is *per-run*, not per-repository: two concurrent invocations
+in the same repository get two different `run_id`s, so their branches, state
+directories, worktrees, and PRs are disjoint by construction. There is no
+shared "staging" namespace to collide on.
 
 ### The run branch as an integration buffer
 
 Integration does not happen on the user's working branch. Each run has its
 own **run branch** (`leerie/runs/<run-id>`) that receives every subtask's
-work; the user's branch is untouched until the run finishes and succeeds. A
-failed or messy integration therefore never lands on the branch the user
-cares about. Multiple runs in the same repository each have their own run
-branch and integrate independently.
+work; the user's branch is untouched until the run finishes and succeeds, so
+a failed or messy integration never lands on the branch the user cares
+about. Multiple runs in the same repository each have their own run branch
+and integrate independently.
 
 Subtask branches live under a sibling namespace: `leerie/subtasks/<run-id>/<sid>`.
 The run-branch and subtask-branch prefixes are deliberately disjoint
@@ -1254,35 +1252,32 @@ untangle.
 others succeed, the orchestrator integrates the *successful* subtasks
 into the run branch before exiting with the failure diagnostic.
 `integrate_wave` already filters for `status == "complete"` and skips
-failed/blocked subtasks, so partial integration is a matter of
-invocation order: `integrate_wave` runs before `die()`. The wave
-counter (`completed_waves`) is **not** incremented for a
-partially-integrated wave, so `resume` re-enters the wave.
-Already-integrated subtask branches produce a no-op `git merge
---no-ff` ("Already up to date.", exit 0) — `integrate.sh` uses `git
-merge --no-ff`, which is idempotent on branches that are already
+failed/blocked subtasks, so partial integration is a matter of invocation
+order: `integrate_wave` runs before `die()`. `completed_waves` is **not**
+incremented for a partially-integrated wave, so `resume` re-enters it.
+Already-integrated subtask branches produce a no-op `git merge --no-ff`
+("Already up to date.", exit 0) — idempotent on branches that are already
 ancestors of the run branch.
 
 ### The run branch is the resume contract
 
 The run branch is also the durable record of everything completed so far:
-every integrated wave is a commit on it. This is what `resume` is built on.
-Run state records *which wave* to resume from; the run branch holds *the
-work* every prior wave produced. The two together are the entire resume
-contract. Within a wave, `phase_execute` skips subtasks whose
-`subtask_status` is already `complete` — only failed or blocked
-subtasks are re-run. When every subtask in a wave is already complete,
-the wave is skipped entirely and `completed_waves` is advanced.
+every integrated wave is a commit on it, and this is what `resume` is
+built on. Run state records *which wave* to resume from; the run branch
+holds *the work* every prior wave produced — together they are the entire
+resume contract. Within a wave, `phase_execute` skips subtasks whose
+`subtask_status` is already `complete`; when every subtask in a wave is
+already complete, the wave is skipped entirely and `completed_waves` is
+advanced.
 
 This places one hard requirement on the design: **a run branch, once
 created, is never reset.** Setup creates it only if it does not already
-exist (and a `run_id` collision against an existing branch is a preflight
-failure, not a silent overwrite). On a resume the branch already carries
-the completed waves' commits, and resetting it would silently discard them
-while the wave loop resumed past them — delivering a final result that is
-missing everything before the interruption. "Create if absent, never reset"
-is not an implementation nicety; it is the invariant the resume guarantee
-depends on.
+exist (a `run_id` collision against an existing branch is a preflight
+failure, not a silent overwrite). On resume the branch already carries the
+completed waves' commits, and resetting it would silently discard them
+while the wave loop resumed past them, delivering a final result missing
+everything before the interruption. "Create if absent, never reset" is the
+invariant the resume guarantee depends on.
 
 When more than one run is in flight in the same repository, `resume`
 needs to know *which* run to resume; the discovery scans
@@ -1298,28 +1293,25 @@ or the newest cannot be identified, `resume` lists the candidates and
 requires an explicit id.
 
 Recency is read from `started_at`, falling back to the state file's mtime
-when that field is absent — a run missing a timestamp must never sort above
-a real one and win the auto-pick by accident.
+when absent — a run missing a timestamp must never sort above a real one
+and win the auto-pick by accident.
 
-Auto-picking a run that is still running is not an error: the run
-directory's `flock` (see *Single owner per run dir*) rejects the second
-orchestrator, so the outcome is a clear "already running", not a
-double-drive.
+Auto-picking a still-running run is not an error: the run directory's
+`flock` (see *Single owner per run dir*) rejects the second orchestrator,
+so the outcome is a clear "already running", not a double-drive.
 
 The resumable-status narrowing belongs to `resume` alone. The read-only
-verbs that share the same run-selection logic (`--report`, `--phase`) skip
-it: they act on a run's *records*, not its remaining work, and a finished
-run is the ordinary thing to report on.
+verbs sharing the same run-selection logic (`--report`, `--phase`) skip it:
+they act on a run's *records*, not its remaining work, and a finished run
+is the ordinary thing to report on.
 
-**The wave loop above is not the whole resume story.** Everything in this
-section describes resume *after* scheduling — once `waves` exists,
-`resume` re-enters the wave loop and skips completed waves/subtasks.
-But a run's planning pipeline (classify → provision → plan → reconcile →
-overlap-judge → adherence-gate → off-tree/satisfied filters → schedule)
-can itself run for 30+ minutes and spend real budget before `waves` is
-ever written — and until the per-phase checkpoint model below existed,
-none of that was resumable: a pause anywhere in the planning pipeline
-threw away everything before it, with no way to recover.
+**The wave loop above is not the whole resume story.** It describes resume
+*after* scheduling — once `waves` exists. But the planning pipeline
+(classify → provision → plan → reconcile → overlap-judge → adherence-gate →
+off-tree/satisfied filters → schedule) can itself run 30+ minutes and spend
+real budget before `waves` is ever written, and before the per-phase
+checkpoint model below existed none of that was resumable: a pause anywhere
+in planning threw away everything before it.
 
 ### Resumable planning — a per-phase checkpoint cursor, not a `waves` gate
 
@@ -1357,21 +1349,18 @@ budget.
 
 **Why the resume cursor is the *presence of an output key*, and not
 `current_phase` — the load-bearing distinction.** Every planning phase
-stamps `current_phase` at phase *entry*, before it spends anything (so
-the value on disk when a pause lands mid-phase is the name of the phase
-that was interrupted, not the last one that finished). Treating
-`current_phase` as "this phase is done" would resume by skipping a phase
-that only *started* before the pause and never produced output — silently
-carrying forward a half-built plan as though it were complete. The
-correctness property the checkpoint model depends on is: a phase's
-output key is written **only after** the phase fully completes and
-`st.save()`s, never at entry — the same ordering already established and
-pinned for `plan_snapshot` (`tests/test_plan_snapshot_wiring.py`) and for
-`decompose_snapshot`'s crash barrier (§5½, `tests/test_decompose_snapshot.py`):
-a snapshot's absence must mean "this phase's work is not yet safely
-persisted," full stop, with no exception for a phase that merely began.
-`current_phase` remains useful as a secondary, human-readable hint (which
-phase was interrupted) but is never the resume cursor itself.
+stamps `current_phase` at phase *entry*, before it spends anything, so the
+value on disk when a pause lands mid-phase names the phase that was
+interrupted, not the last one that finished. Treating `current_phase` as
+"this phase is done" would resume by skipping a phase that only *started*
+and never produced output — silently carrying forward a half-built plan as
+complete. The correctness property the checkpoint model depends on: a
+phase's output key is written **only after** the phase fully completes and
+`st.save()`s, never at entry — the same ordering already pinned for
+`plan_snapshot` (`tests/test_plan_snapshot_wiring.py`) and
+`decompose_snapshot`'s crash barrier (§5½,
+`tests/test_decompose_snapshot.py`). `current_phase` remains a useful
+secondary, human-readable hint, but is never the resume cursor itself.
 
 This makes the checkpoint approach safe by construction, not merely
 convenient: `_schedule()` re-sorts every wave by subtask id, so the wave
@@ -1400,23 +1389,18 @@ subtask that was never really judged.
 **Correctness-critical: the cache is scoped to the base-tree commit sha,
 and a resume across a moved `HEAD` invalidates it.** This is a distinct
 hazard from the mid-run sibling case §8 describes (where the run's *own*
-later wave changes what's satisfied): here, the gap is between a *pause*
+later wave changes what's satisfied): here the gap is between a *pause*
 and a *resume* of the same run, during which some other process —
-commonly a sibling run merging its own PR into the same base branch —
-can move `HEAD` out from under a cached verdict. The satisfied-probe
-judges the base tree as it stood at probe time; if the tree has since
-changed, that verdict no longer describes reality. A stale cache hit is
-not a harmless inefficiency here: it can keep a subtask whose deliverable
-now already exists (which the probe would have caught fresh), or drop one
-that no longer holds (silently discarding real work). The cache is
-therefore keyed or gated on the base commit sha recorded at probe time,
-and any cached verdict whose sha no longer matches `HEAD` on resume is
-treated as absent — the subtask is re-probed, never trusted stale. This
-sha-scoping is mandatory, not an optional refinement, for exactly the
-reason a stale `plan_snapshot`/`decompose_snapshot` would be if resume
-ever rehydrated across a moved base: correctness of a resumed run must
-not depend on nothing else having touched the repository while it was
-paused.
+commonly a sibling run merging its own PR into the same base branch — can
+move `HEAD` out from under a cached verdict. A stale hit is not a harmless
+inefficiency: it can keep a subtask whose deliverable now already exists
+(which a fresh probe would catch), or drop one that no longer holds
+(silently discarding real work). So the cache is keyed on the base commit
+sha recorded at probe time, and any cached verdict whose sha no longer
+matches `HEAD` on resume is treated as absent — re-probed, never trusted
+stale. This is mandatory, not an optional refinement: correctness of a
+resumed run must not depend on nothing else having touched the repository
+while it was paused.
 
 **Budget-check resume.** Once plans are checkpointed per phase, a run
 that stopped at the post-`_schedule()` budget-feasibility gate (§13) is no
@@ -1428,48 +1412,44 @@ from-scratch re-run.
 
 ### Single owner per run dir
 
-`resume` picks a run; but `resume` does not by itself prevent the
-*same* run from being resumed twice. The hazard is concrete: a user
-invokes `resume` while the original orchestrator is still alive, the
-launcher dutifully spawns a second orchestrator, and two processes now
-race on the same `state.json` and the same run-branch worktrees — both
-spawn workers, both write conformance entries, both interleave log
-lines into the same `orchestrator.log` that the launcher tails. State
-diverges; worker budget burns on duplicate work; the user sees a
-streamed log whose progress prefix oscillates because the two
-orchestrators have diverged in-memory views of `subtask_status`.
+`resume` picks a run, but does not by itself prevent the *same* run being
+resumed twice. The hazard is concrete: a user invokes `resume` while the
+original orchestrator is still alive, the launcher spawns a second one, and
+both now race on the same `state.json` and run-branch worktrees — both
+spawn workers, both write conformance entries, both interleave log lines
+into the same `orchestrator.log`. State diverges and worker budget burns on
+duplicate work.
 
 The architectural property: **at most one orchestrator owns a run
-directory at any time.** The mechanism is an exclusive advisory flock
-on the run directory, acquired in `State.__init__` and released
-by the kernel on process exit (clean, SIGTERM, or SIGKILL — no manual
-pidfile cleanup, no `/proc` liveness check, no PID-recycling false
-positives). A second orchestrator that tries to construct `State` on
-the same run dir gets `StateLockedError` and exits with `EXIT_LOCKED`,
-the launcher routes the user to `leerie resume <run-id>` instead
-(which, observing the live-orchestrator condition, attaches to its
-log stream rather than spawning a duplicate).
+directory at any time.** The mechanism is an exclusive advisory flock on
+the run directory, acquired in `State.__init__` and released by the kernel
+on process exit (clean, SIGTERM, or SIGKILL — no manual pidfile cleanup, no
+`/proc` liveness check, no PID-recycling false positives). A second
+orchestrator that tries to construct `State` on the same run dir gets
+`StateLockedError` and exits with `EXIT_LOCKED`; the launcher routes the
+user to `leerie resume <run-id>` instead, which attaches to the live log
+stream rather than spawning a duplicate.
 
 Why the *directory* and not `state.json`: `State.save()`'s atomic
-`tmp + rename` swaps state.json's inode every save. A lock on
+`tmp + rename` swaps state.json's inode every save, so a lock on
 state.json's fd would be orphaned from the new inode at every save,
-opening a window where a racing `resume` could acquire on the
-unlocked replacement. Directory inodes are never replaced — the lock
-fd stays valid for the process lifetime.
+opening a window where a racing `resume` could acquire the unlocked
+replacement. Directory inodes are never replaced — the lock fd stays
+valid for the process lifetime.
 
-Defense in depth: the launcher heredoc takes an opportunistic flock
-probe before invoking the orchestrator subprocess (fast-path refusal,
-saves the cost of spawning a Python process that would just die in
-startup). The orchestrator's `State.__init__` flock acquire is the
-load-bearing enforcement and catches anything the launcher misses
-(manual `python3 leerie.py resume`, future verbs, debugging).
+Defense in depth: the launcher heredoc takes an opportunistic flock probe
+before invoking the orchestrator subprocess (fast-path refusal, saves
+spawning a Python process that would just die in startup). The
+orchestrator's `State.__init__` flock acquire is the load-bearing
+enforcement and catches anything the launcher misses (manual `python3
+leerie.py resume`, future verbs, debugging).
 
-What this does *not* prevent: cross-host races. The lock is per-host.
-This is fine in practice: on Fly each run is pinned to a specific
-Machine via `fly-machine.json`, and only that Machine runs the
-orchestrator; on local runs the host is the user's workstation. There
-is no architectural path today by which two hosts could attach to the
-same state directory simultaneously.
+What this does *not* prevent: cross-host races — the lock is per-host.
+This is fine in practice: on Fly each run is pinned to a specific Machine
+via `fly-machine.json`, and only that Machine runs the orchestrator; on
+local runs the host is the user's workstation. There is no architectural
+path today by which two hosts could attach to the same state directory
+simultaneously.
 
 **Concurrent-spawn race between two `resume` launches, and stale-pid
 contagion.** Two `resume` invocations against the same run can each pass
@@ -1478,54 +1458,53 @@ the launcher's fast-path probe (`LOCK_EX | LOCK_NB` then immediate
 The two `State.__init__` calls race in the kernel; the loser (B) gets
 `BlockingIOError` and exits `EXIT_LOCKED=75`. The hazard is not the
 duplicate spawn (correctly caught) but that the launcher writes
-`orchestrator.pid` *between* `Popen` and the child's `State.__init__` —
-by the time B exits 75, B's pid is already in the file, silently
-overwriting winner A's. Every downstream reader of `orchestrator.pid`
-(the `resume` tail watcher's `kill -0` liveness check, `finalize
---force`'s liveness gate) is then wrong about A: a false "orchestrator
-exited" banner, or a `finished_at` patched onto A's state mid-run.
+`orchestrator.pid` *between* `Popen` and the child's `State.__init__` — by
+the time B exits 75, B's pid is already in the file, silently overwriting
+winner A's. Every downstream reader of `orchestrator.pid` (the `resume`
+tail watcher's `kill -0` liveness check, `finalize --force`'s liveness
+gate) is then wrong about A: a false "orchestrator exited" banner, or a
+`finished_at` patched onto A's state mid-run.
 
 The fix is two-sided: `_launch_script` polls `Popen` briefly for `rc=75`
-before writing the pid file, and readers do not trust the pid file as
-the sole liveness oracle — both the tail watcher and `finalize --force`
+before writing the pid file, and readers do not trust the pid file as the
+sole liveness oracle — both the tail watcher and `finalize --force`
 cross-check via a `/proc` scan for any process whose argv contains
 `orchestrator/leerie.py` AND this run-id. Either anchor catching the live
-orchestrator is sufficient to declare "alive," which makes the pid file
-advisory: even a future race produces, at worst, a false-positive REFUSE
-rather than silent corruption.
+orchestrator is sufficient to declare "alive," making the pid file
+advisory: even a future race produces at worst a false-positive REFUSE,
+never silent corruption.
 
 ### Never a repository-global git operation
 
-The user's repo is bind-mounted whole, so `.git` is SHARED — with the host, and
-with every other container. A repository-global operation therefore reaches
-state this run does not own and cannot see.
+The user's repo is bind-mounted whole, so `.git` is SHARED — with the host,
+and with every other container. A repository-global operation therefore
+reaches state this run does not own and cannot see.
 
 `git worktree prune` is the case that bit. It has no grace period (the
-three-month `gc.worktreePruneExpire` applies to `git gc`, not to an explicit
-prune), so it drops the registration of every worktree whose path is absent
-from the pruning process's namespace — including each host-side
-`/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
-can see. The result: a rebase worktree git has forgotten while its directory
-still exists.
+three-month `gc.worktreePruneExpire` applies to `git gc`, not to an
+explicit prune), so it drops the registration of every worktree whose path
+is absent from the pruning process's namespace — including each host-side
+`/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no
+container can see. The result: a rebase worktree git has forgotten while
+its directory still exists.
 
 So no call site runs one. `prune_leerie_worktrees` (shell) and
 `_prune_leerie_worktrees` (Python) ask git what it *would* prune, attribute
-each entry to a path, and remove only entries under a root the caller names.
-An entry that cannot be attributed is left strictly alone: deleting a
-registration we cannot identify is exactly the accident this exists to prevent.
-Both pin `LC_ALL=C`, because git wraps that output in gettext and a translated
-prefix silently matches nothing — a no-op indistinguishable from "nothing was
-stale", which is worse than the bare prune it replaced.
+each entry to a path, and remove only entries under a root the caller
+names; an entry that cannot be attributed is left strictly alone. Both pin
+`LC_ALL=C`, because git wraps that output in gettext and a translated
+prefix silently matches nothing — a no-op indistinguishable from "nothing
+was stale", worse than the bare prune it replaced.
 
-The rule generalises past pruning: any git verb that acts on the whole
-repository rather than on this run's own refs and worktrees is out of bounds
-from inside a container.
+The rule generalises: any git verb that acts on the whole repository rather
+than on this run's own refs and worktrees is out of bounds from inside a
+container.
 
 ### One task, one run
 
-The flock above makes a *run directory* single-owner. It says nothing about two
-runs working the same **task**, because `run_id` is the container id — two
-launches of byte-identical task text are, to each other, invisible.
+The flock above makes a *run directory* single-owner. It says nothing about
+two runs working the same **task**, because `run_id` is the container id —
+two launches of byte-identical task text are, to each other, invisible.
 
 Measured: one brief ran twice three minutes apart, for $72.21 across 173
 worker calls, and produced two architecturally incompatible branches with
@@ -1533,97 +1512,93 @@ worker calls, and produced two architecturally incompatible branches with
 survives. Neither run was wrong; nothing told either one the other existed
 (docs/POSTMORTEM-2026-08-14.md, F10).
 
-So a run records a fingerprint of its task text (`task_sha256` on `run.json`)
-and, before spawning its first worker, refuses to start when another **live**
-run carries the same one. "Live" means started and not finished, killed or
-paused: a completed run sharing a fingerprint is an ordinary re-run and says
-nothing. The check is deliberately placed at the last cheap moment: after state exists,
-before this task's first worker. Not literally before any spend —
-`preflight()`'s smoke test and the dep-capture backstop both run earlier and
-both cost. The refusal names the other run and the two commands that resolve it
-(`leerie attach`, `leerie kill`).
+So a run records a fingerprint of its task text (`task_sha256` on
+`run.json`) and, before spawning its first worker, refuses to start when
+another **live** run carries the same one. "Live" means started and not
+finished, killed or paused: a completed run sharing a fingerprint is an
+ordinary re-run. The check sits at the last cheap moment — after state
+exists, before this task's first worker (`preflight()`'s smoke test and
+the dep-capture backstop both run earlier and both cost). The refusal
+names the other run and the commands that resolve it (`leerie attach`,
+`leerie kill`).
 
-Running the same brief twice on purpose is a real thing to want, so there is an
-escape hatch, `LEERIE_ALLOW_DUPLICATE_TASK`. It is an environment variable
-rather than a CLI flag because it should be *stated* rather than discovered
-mid-argument-list, and with it set the duplicate is still announced — the run
-proceeds, it is not silenced.
+Running the same brief twice on purpose is a real thing to want, so there
+is an escape hatch, `LEERIE_ALLOW_DUPLICATE_TASK` — an environment
+variable rather than a CLI flag because it should be *stated* rather than
+discovered mid-argument-list. With it set the duplicate is still
+announced, not silenced.
 
 Fingerprinting the text rather than the resolved plan is the conservative
-choice in both directions: two different briefs that would produce the same
-plan are not caught (they are also not obviously wrong to run together), and
-two identical briefs are caught before the planner has been paid for.
+choice both ways: two different briefs that would produce the same plan
+are not caught (also not obviously wrong to run together), and two
+identical briefs are caught before the planner has been paid for.
 
 
 ### Why merge, not cherry-pick
 
-Subtask branches are integrated into the run branch by merging, not by cherry-picking.
-A merge records ancestry, which gives the integrator a real common base for
-three-way conflict resolution: far more auto-resolves, and only genuine
-conflicts surface. Cherry-pick copies commits without ancestry, so it has a
-weaker base and produces more spurious conflicts. Recorded ancestry also makes
-re-integration idempotent and the run's history a true audit trail rather than
-a set of duplicated commits.
+Subtask branches are integrated into the run branch by merging, not
+cherry-picking. A merge records ancestry, giving the integrator a real
+common base for three-way conflict resolution: far more auto-resolves, and
+only genuine conflicts surface. Cherry-pick copies commits without
+ancestry, so it has a weaker base and produces more spurious conflicts.
+Recorded ancestry also makes re-integration idempotent and the run's
+history a true audit trail rather than duplicated commits.
 
 On the success path a subtask branch may contain commits from two distinct
-workers: the implementer's code change and any conformer fixes (§9 *Post-work
-conformance*) that landed before integration. Both flow through the same
-merge — the integrator does not need to know which worker authored which
-commit. Conformer commits are conventionally prefixed `conformer:` in their
-subject so a reviewer can identify them in `git log`, and the orchestrator
-emits a non-blocking warning for any conformer commit that lacks the prefix.
+workers — the implementer's code change and any conformer fixes (§9
+*Post-work conformance*) that landed before integration — both flowing
+through the same merge; the integrator does not need to know which worker
+authored which commit. Conformer commits are conventionally prefixed
+`conformer:` in their subject so a reviewer can identify them in `git log`,
+and the orchestrator emits a non-blocking warning for any conformer commit
+lacking the prefix.
 
 ### Conflict resolution is behavioral, not textual
 
-When two subtasks' branches conflict, resolving the conflict to git's
-satisfaction is not enough. A textually clean merge can still silently break
-the behavior one of the subtasks was validated against.
+When two subtasks' branches conflict, resolving to git's satisfaction is
+not enough: a textually clean merge can still silently break the behavior
+one of the subtasks was validated against.
 
-So conflict resolution is defined behaviorally. The integrator reads the intent
-and the success-criteria notes of *every* subtask whose work is part of the
-conflicting merge — the incoming subtask and every already-integrated subtask
-it collides with — and resolves the merge so that each side's intent is
-preserved. Resolving a *semantic* conflict is what the integrator is for;
-a purely textual merge can satisfy git while silently breaking the behavior
-one side was validated against, and only a worker that understands intent
-can avoid that.
+So conflict resolution is defined behaviorally. The integrator reads the
+intent and success-criteria notes of *every* subtask whose work is part of
+the conflicting merge — the incoming subtask and every already-integrated
+subtask it collides with — and resolves the merge so each side's intent is
+preserved. Resolving a *semantic* conflict is what the integrator is for; a
+purely textual merge can satisfy git while silently breaking behavior one
+side was validated against, and only a worker that understands intent can
+avoid that.
 
-The mechanical re-check that *catches* a merge that broke the tree
-runs immediately after: once the integrator commits the merge, the
-orchestrator scans the integrated worktree for unresolved conflict
-markers (`<<<<<<<`). A merge that left markers behind aborts the
-run. Per-wave quality stops there: per-subtask quality is the
-implementer's confidence gate (§8), and Leerie does not re-run
-subtask criteria at the wave boundary — that role belonged to an
-earlier wave-level validator that was removed when the criteria file
-became informational (§8, §9).
+The mechanical re-check that *catches* a merge that broke the tree runs
+immediately after: once the integrator commits, the orchestrator scans the
+integrated worktree for unresolved conflict markers (`<<<<<<<`); a merge
+that left markers behind aborts the run. Per-wave quality stops there —
+per-subtask quality is the implementer's confidence gate (§8), and Leerie
+does not re-run subtask criteria at the wave boundary (that role belonged
+to an earlier wave-level validator, removed when the criteria file became
+informational, §8/§9).
 
-After the *final* wave integrates — once the staging tree contains
-every subtask's work — one conformer pass runs on the integrated
-tree as a whole. It is the same conformer the per-subtask phase
-spawns (§9), pointed at the staging worktree with `DIFF_BASE` set
-to the user's working branch (the PR's eventual base) so the diff
-under review is what the PR will contain. The pass catches drift
-that only manifests once two subtasks co-exist: a lint rule
-sensitive to file count, an import collision that compiled cleanly
-in isolation, a test fixture two implementers each augmented in
-incompatible ways. Its findings are advisory in the same sense as
-the per-subtask phase (§9) — the orchestrator never blocks
-finalize on them; the residuals surface as warnings on state and
-in the PR body, where a human and CI can act on them. The pass is
-bounded by the same `conformance_rounds` cap and the same per-run
-worker budget; its `claude -p` invocation has no special standing.
+After the *final* wave integrates — once the staging tree contains every
+subtask's work — one conformer pass runs on the integrated tree as a
+whole. It is the same conformer the per-subtask phase spawns (§9), pointed
+at the staging worktree with `DIFF_BASE` set to the user's working branch
+(the PR's eventual base) so the diff under review is what the PR will
+contain. The pass catches drift that only manifests once two subtasks
+co-exist: a lint rule sensitive to file count, an import collision that
+compiled cleanly in isolation, a test fixture two implementers each
+augmented incompatibly. Its findings are advisory in the same sense as the
+per-subtask phase (§9) — the orchestrator never blocks finalize on them;
+residuals surface as warnings on state and in the PR body. The pass is
+bounded by the same `conformance_rounds` cap and per-run worker budget; its
+`claude -p` invocation has no special standing.
 
 This pass always measures the repo's **canonical** build/lint/test
-commands, never a delta proxy — and that is what distinguishes it
-from the per-subtask phase, which may run a diff-scoped proxy
-instead (§9 *Per-subtask scope: a delta proxy, not the suite*).
-The three failures listed above are precisely the ones no
-diff-scoped selection can see: each arises from subtasks
-co-existing, not from any one subtask's diff, so a selection
-computed per subtask would exclude them by construction. Together
-with the base-health baseline these are the only two places a run
-executes the whole suite.
+commands, never a delta proxy — distinguishing it from the per-subtask
+phase, which may run a diff-scoped proxy instead (§9 *Per-subtask scope: a
+delta proxy, not the suite*). The three failures above are precisely the
+ones no diff-scoped selection can see: each arises from subtasks
+co-existing, not from any one subtask's diff, so a per-subtask selection
+would exclude them by construction. Together with the base-health baseline
+these are the only two places a run executes the whole suite.
 
 ### When integration cannot succeed
 
@@ -1647,43 +1622,42 @@ The final step turns the completed run branch into a reviewable artifact
 and never touches the user's working branch.
 
 **The run branch is the integration artifact.** Every wave's work is
-already integrated on `leerie/runs/<run-id>`. Leerie does not merge
-the run branch into the working branch locally — that would duplicate the
+already integrated on `leerie/runs/<run-id>`. Leerie does not merge the
+run branch into the working branch locally — that would duplicate the
 same change in two places (a local commit and a PR) and put the working
 branch in a state the user did not request. The working branch is the same
-ref at the end of a run as it was at the start; the PR is the proposal to
-change that.
+ref at the end of a run as at the start; the PR is the proposal to change
+that.
 
 **Push and PR happen on the host, after the container exits.** The
-container's job is the LLM work plus the deterministic integration
-of every wave into `leerie/runs/<run-id>`. Once integration is done,
-the container exits cleanly and the launcher takes over: it reads
-`run.json`'s `finished_at` sentinel, then runs `git push` and
-`gh pr create` on the host.
+container's job is the LLM work plus deterministic integration of every
+wave into `leerie/runs/<run-id>`. Once integration is done, the container
+exits cleanly and the launcher takes over: it reads `run.json`'s
+`finished_at` sentinel, then runs `git push` and `gh pr create` on the
+host.
 
 This boundary is load-bearing. The container exists to bound worker
-subprocess subtrees (DESIGN §6 *Worker subtree termination*), not to
-be a git/gh client. Auth state — gh tokens, SSH agent sockets,
-Claude Code's OAuth token in macOS Keychain — lives in host
-processes that don't traverse the Lima VM boundary cleanly. In
-Bedrock mode (`CLAUDE_CODE_USE_BEDROCK=1` detected in any settings
-file), the launcher additionally stages `~/.aws/` read-only so the
-AWS SDK credential chain can resolve SSO tokens inside the container;
-`awsAuthRefresh` (interactive `aws sso login`) remains a host-side
-operation enforced by a preflight check before the container starts. Bind-mounting that state into the container was a leaky workaround for a
-structural mismatch: on macOS the SSH agent socket can't cross the Lima
-VM boundary, the gh token bind mount catches stale states, and Claude
-Code's OAuth token is in Keychain rather than any mountable file. Moving
-the network-y phases to the host eliminates all of that — the host has
-working auth for git, gh, and ssh because the user already uses them
-daily.
+subprocess subtrees (DESIGN §6 *Worker subtree termination*), not to be a
+git/gh client. Auth state — gh tokens, SSH agent sockets, Claude Code's
+OAuth token in macOS Keychain — lives in host processes that don't
+traverse the Lima VM boundary cleanly. In Bedrock mode
+(`CLAUDE_CODE_USE_BEDROCK=1` detected in any settings file), the launcher
+additionally stages `~/.aws/` read-only so the AWS SDK credential chain
+can resolve SSO tokens inside the container; `awsAuthRefresh` (interactive
+`aws sso login`) remains a host-side operation enforced by a preflight
+check before the container starts. Bind-mounting that state into the
+container was a leaky workaround for a structural mismatch: on macOS the
+SSH agent socket can't cross the Lima VM boundary, the gh token bind mount
+catches stale states, and Claude Code's OAuth token is in Keychain rather
+than any mountable file. Moving the network-y phases to the host
+eliminates all of that — the host already has working git/gh/ssh auth.
 
 **Local runs** hand off through `run.json` on the bind-mounted host
-filesystem. The orchestrator writes `finished_at` and exits with status 0;
-the launcher reads that field from the bind-mounted path and proceeds with
-push + PR. If the container exits non-zero (an unrecoverable error
-mid-run), the launcher does not push — nothing changed on disk that the
-user didn't already see in the worker logs.
+filesystem. The orchestrator writes `finished_at` and exits 0; the
+launcher reads that field and proceeds with push + PR. If the container
+exits non-zero (an unrecoverable error mid-run), the launcher does not
+push — nothing changed on disk beyond what the user already saw in the
+worker logs.
 
 **Remote runs** (Fly.io `--runtime fly`) face the same auth boundary from
 the other direction: the run branch and `.leerie/runs/<run-id>/` state live
@@ -1714,20 +1688,19 @@ between them on the host:
    `leerie kill <run-id>` when satisfied.
 
 **Controlled exits write `finished_at` eagerly.** `die()` raises
-`SystemExit`; `main()`'s `except SystemExit` handler writes
-`finished_at` to both `state.json` and `run.json` (best-effort, guarded
-by `st is not None`; `state.json` additionally guarded by
-`st.data.get("task")` so the handler firing before state was loaded —
-e.g. a failed `resume` against an incomplete host-side state — never
-poisons the file with a bare `{"finished_at": …}` stub) before
-re-raising, and writes the exit code to `orchestrator.exit_code` so the
-tail wrapper can propagate it to `decide_teardown` (absent that file,
-the wrapper falls back to exit 0 and `decide_teardown` takes the
-clean-exit branch). `fetch_branch` needs the `finished_at` write to
-discover the run at all — without it, every post-setup `die()` triggers
-the sync-failure banner. The value is idempotent on `resume`:
-`phase_finalize` overwrites it with the real completion time if the run
-succeeds on retry.
+`SystemExit`; `main()`'s `except SystemExit` handler writes `finished_at`
+to both `state.json` and `run.json` (best-effort, guarded by `st is not
+None`; `state.json` additionally guarded by `st.data.get("task")` so the
+handler firing before state was loaded — e.g. a failed `resume` against
+incomplete host-side state — never poisons the file with a bare
+`{"finished_at": …}` stub) before re-raising, and writes the exit code to
+`orchestrator.exit_code` so the tail wrapper can propagate it to
+`decide_teardown` (absent that file, the wrapper falls back to exit 0 and
+`decide_teardown` takes the clean-exit branch). `fetch_branch` needs the
+`finished_at` write to discover the run at all — without it, every
+post-setup `die()` triggers the sync-failure banner. The value is
+idempotent on `resume`: `phase_finalize` overwrites it with the real
+completion time if the run succeeds on retry.
 
 **`finished_at` is a discovery sentinel, not a completion signal.**
 The `except SystemExit` handler stamps `finished_at` on *any* post-setup
@@ -1760,93 +1733,89 @@ A genuine completion is unaffected: by the time `phase_finalize` and
 uncontrolled exit (SIGKILL, OOM, power loss, or any crash bypassing the
 `except SystemExit` handler) before `phase_finalize` leaves a run
 `fetch-branch.sh` cannot discover (its predicate requires `finished_at`
-set + `pushed_at` unset). For these cases, `leerie finalize <run-id>`
-SSHes into the machine, verifies the orchestrator process is dead (via
-`orchestrator.pid` and `/proc/<pid>/cmdline`), patches `finished_at`
-into `run.json` with audit fields `recovered_at` and
-`recovered_via="force-finalize"`, and falls through to the normal
-finalize flow. If the orchestrator is still alive, the non-force path
-refuses with a message naming the live pid and suggests `--force`.
+set + `pushed_at` unset). `leerie finalize <run-id>` SSHes into the
+machine, verifies the orchestrator process is dead (via `orchestrator.pid`
+and `/proc/<pid>/cmdline`), patches `finished_at` into `run.json` with
+audit fields `recovered_at` and `recovered_via="force-finalize"`, and
+falls through to the normal finalize flow. If the orchestrator is still
+alive, the non-force path refuses with a message naming the live pid and
+suggesting `--force`.
 
 **Subtree collection.** When the orchestrator dies mid-wave, subtask
-branches (`leerie/subtasks/<run-id>/<sid>`) may have committed work
-never integrated into the run branch. `finalize` detects un-integrated
-subtask branches, runs `setup-run.sh` to ensure the staging worktree
-exists, and merges each via `integrate.sh` — conflicts resolved by
-spawning a `claude -p` integrator worker (same prompt, schema, and
-verification as `integrate_wave()`). Branches the integrator cannot
-resolve are skipped and reported. This runs after the `finished_at`
-patch and before `fetch_branch` streams the result to the host.
-`fetch-branch.sh`'s bundle already carries the raw subtask branches
-independent of whether collection ran, so a crash between subtask
-completion and integration is still recoverable on the host: collection
-integrates, the bundle scope preserves.
+branches (`leerie/subtasks/<run-id>/<sid>`) may hold committed work never
+integrated into the run branch. `finalize` detects un-integrated subtask
+branches, runs `setup-run.sh` to ensure the staging worktree exists, and
+merges each via `integrate.sh` — conflicts resolved by spawning a
+`claude -p` integrator worker (same prompt, schema, and verification as
+`integrate_wave()`). Branches the integrator cannot resolve are skipped
+and reported. This runs after the `finished_at` patch and before
+`fetch_branch` streams the result to the host. `fetch-branch.sh`'s bundle
+already carries the raw subtask branches regardless of whether collection
+ran, so a crash between subtask completion and integration is still
+recoverable on the host.
 
 **`--force`: stop the orchestrator, then collect.** `leerie finalize
 <run-id> --force` extends recovery to runs where the orchestrator is
-still alive. It SIGTERMs the orchestrator process inside the machine
-(not the machine, which must stay running for collection and fetch),
-waits for it to die (polling `/proc`, escalating to SIGKILL after 30s),
-then runs the same subtree-collection and `finished_at`-patch flow. The
-SIGTERM handler runs `_cleanup_on_abnormal_exit(full_purge=False)`,
-which removes worktrees but preserves all branches, so `setup-run.sh`
-(idempotent) recreates the staging worktree and collection integrates
-from what survived.
+still alive. It SIGTERMs the orchestrator process inside the machine (not
+the machine, which must stay running for collection and fetch), waits for
+it to die (polling `/proc`, escalating to SIGKILL after 30s), then runs
+the same subtree-collection and `finished_at`-patch flow. The SIGTERM
+handler runs `_cleanup_on_abnormal_exit(full_purge=False)`, which removes
+worktrees but preserves all branches, so `setup-run.sh` (idempotent)
+recreates the staging worktree and collection integrates from what
+survived.
 
-The local-runtime path runs the same `host_finalize` block inline in
-the launcher (no trap needed — launcher and pusher are the same
-process). Both paths share `scripts/host-finalize.sh`; the recovery
-command `leerie finalize <run-id>` also sources it. Three call sites,
-one finalize implementation.
+The local-runtime path runs the same `host_finalize` block inline in the
+launcher (no trap needed — launcher and pusher are the same process).
+Both paths share `scripts/host-finalize.sh`; the recovery command
+`leerie finalize <run-id>` also sources it — three call sites, one
+finalize implementation.
 
-**`no_push`: intent vs mechanism.** The orchestrator inside the Machine
-is *always* invoked with `--no-push` because the Fly Machine has no
-GitHub auth — a **mechanism flag**, not the user's preference. The
-user's actual launch-time intent lives separately in
-`fly-machine.json.host_no_push` on the host (set by `provision.sh` at
-machine creation) and is propagated into the Machine via a hidden
-`--host-no-push true|false` argv flag. The orchestrator gates
-`pr_writer` and the `run.json.no_push` it writes on **intent**
-(`push_will_happen(no_push, host_no_push)`), not the mechanism flag,
-and `host_finalize` reads that intent value to decide whether to skip
-push. This split is load-bearing: without it, `pr_writer` never runs
+**`no_push`: intent vs mechanism.** The orchestrator inside the Machine is
+*always* invoked with `--no-push` because the Fly Machine has no GitHub
+auth — a **mechanism flag**, not the user's preference. The user's actual
+launch-time intent lives separately in `fly-machine.json.host_no_push` on
+the host (set by `provision.sh` at machine creation) and is propagated
+into the Machine via a hidden `--host-no-push true|false` argv flag. The
+orchestrator gates `pr_writer` and the `run.json.no_push` it writes on
+**intent** (`push_will_happen(no_push, host_no_push)`), not the mechanism
+flag, and `host_finalize` reads that intent value to decide whether to
+skip push. This split is load-bearing: without it, `pr_writer` never runs
 on Fly and the LLM-written PR body is replaced by the deterministic
 fallback.
 
-The run branch is pushed to `origin` and a pull request opened via
-`gh pr create` against the working branch (HEAD-at-run-start) by
-default. **This PR base is overridable** — `--pr-base-branch` /
-`LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` lets the
-user merge into a different final branch without changing where the
-diff is computed from. `working_branch` always remains the diff
-fork-point (`rev_range = working_branch..run_branch`) regardless of
-this override, so the diff base never corrupts if the override branch
-isn't the actual fork point.
+The run branch is pushed to `origin` and a pull request opened via `gh pr
+create` against the working branch (HEAD-at-run-start) by default. **This
+PR base is overridable** — `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` /
+`pr_base_branch` in `leerie.toml` — without changing where the diff is
+computed from: `working_branch` always remains the diff fork-point
+(`rev_range = working_branch..run_branch`) regardless of the override, so
+the diff base never corrupts if the override branch isn't the actual fork
+point.
 
-The PR title and body are written by an LLM worker (`pr_writer`,
-defaults to Sonnet) that runs inside the container right before it
-exits, where `claude -p` and the bind-mounted repo are both available.
-The worker reads the target repo's PR template if one exists (canonical
-GitHub locations, then any `PULL_REQUEST_TEMPLATE/` directory) and
-fills it out faithfully — preserving HTML comments, leaving checklists
-unticked unless the diff demonstrably satisfies them, honoring "delete
-if N/A" markers; absent a template it produces a default structure
-(Summary / What changed / Why / Run metadata). Its primary signal is
-the **commit log** (`git log --no-merges working_branch..run_branch`),
-since every implementer/conformer worker already wrote those messages
-in domain language as it landed a subtask; a capped diff-stat, dirstat,
-and sampled hunks from the heaviest-changed files supplement it.
-Subtask titles pass through verbatim; the launcher prepends `leerie: `
-to the title.
+The PR title and body are written by an LLM worker (`pr_writer`, defaults
+to Sonnet) that runs inside the container right before it exits, where
+`claude -p` and the bind-mounted repo are both available. The worker
+reads the target repo's PR template if one exists (canonical GitHub
+locations, then any `PULL_REQUEST_TEMPLATE/` directory) and fills it out
+faithfully — preserving HTML comments, leaving checklists unticked unless
+the diff demonstrably satisfies them, honoring "delete if N/A" markers;
+absent a template it produces a default structure (Summary / What changed
+/ Why / Run metadata). Its primary signal is the **commit log** (`git log
+--no-merges working_branch..run_branch`), since every implementer/
+conformer worker already wrote those messages in domain language landing
+a subtask; a capped diff-stat, dirstat, and sampled hunks from the
+heaviest-changed files supplement it. Subtask titles pass through
+verbatim; the launcher prepends `leerie: ` to the title.
 
-The worker writes `pr_title`/`pr_body`/`pr_template_used` to `run.json`
-— the same container→host handoff channel used for
-`finished_at`/`pushed_at`/`pr_url` — and the host launcher passes them
-to `gh pr create` via `jq`. This is **fail-open**: any failure (worker
-error, schema mismatch, timeout, budget exhaustion, oversized payload)
-is logged and swallowed, falling back to a deterministic body composed
-from `state.json` (`compose_pr_body`). Generating a richer body must
-never block finalize success.
+The worker writes `pr_title`/`pr_body`/`pr_template_used` to `run.json` —
+the same container→host handoff channel used for
+`finished_at`/`pushed_at`/`pr_url` — and the host launcher passes them to
+`gh pr create` via `jq`. This is **fail-open**: any failure (worker
+error, schema mismatch, timeout, budget exhaustion, oversized payload) is
+logged and swallowed, falling back to a deterministic body composed from
+`state.json` (`compose_pr_body`). Generating a richer body must never
+block finalize success.
 
 When the target repo has multiple templates inside
 `PULL_REQUEST_TEMPLATE/`, the alphabetically first `.md` wins by
@@ -1856,66 +1825,66 @@ not fatal — leerie warns and falls back to the alphabetical default.
 
 **Rebase-onto-base before push (`rebaser` worker) — a scoped, fully-agentic
 exception to §12.** A run that takes a while can finish against a
-`pr_base_branch` that has since moved, so the PR it opens conflicts at merge
-time or is stale by review. `host_finalize` addresses this with a best-effort
-rebase step, inserted after the empty-branch guard and before the push, that
-is deliberately **not** driven by mechanical bash rebase/conflict/abort
-logic. Instead a single autonomous worker (`rebaser`, Sonnet,
-`EFFORT_DEFAULT_PER_WORKER["rebaser"] = "medium"`, matching `integrator`) is
-handed a disposable `git worktree add` copy of the run branch and told to
-fetch the latest `pr_base_branch`, rebase the run's own commits
-(`working_branch..run_branch`) onto it, resolve any conflicts itself —
-preserving the intent of both the run's changes and upstream's — and abort
-the rebase itself, leaving the branch untouched, if a conflict is genuinely
-semantically irreconcilable rather than merely textually messy. It reports a
-schema-validated verdict (`status ∈ {rebased, irreconcilable, failed}` +
-`diagnosis`, the same trichotomy shape as `SCHEMAS["integrator"]`).
+`pr_base_branch` that has since moved, so the PR it opens conflicts at
+merge time or is stale by review. `host_finalize` addresses this with a
+best-effort rebase step, inserted after the empty-branch guard and before
+the push, that is deliberately **not** driven by mechanical bash
+rebase/conflict/abort logic. Instead a single autonomous worker
+(`rebaser`, Sonnet, `EFFORT_DEFAULT_PER_WORKER["rebaser"] = "medium"`,
+matching `integrator`) is handed a disposable `git worktree add` copy of
+the run branch and told to fetch the latest `pr_base_branch`, rebase the
+run's own commits (`working_branch..run_branch`) onto it, resolve any
+conflicts itself — preserving both sides' intent — and abort the rebase
+itself, leaving the branch untouched, if a conflict is genuinely
+semantically irreconcilable rather than merely textually messy. It
+reports a schema-validated verdict (`status ∈ {rebased, irreconcilable,
+failed}` + `diagnosis`, the same trichotomy shape as
+`SCHEMAS["integrator"]`).
 
 This is a **named, deliberately scoped exception** to §12 ("prompts are
 advisory, code enforces"), the same shape as the existing
-`--dangerously-skip-permissions` carve-out, narrower still: scoped to one
-worker acting inside one disposable worktree, not a run-level flag. The
-carve-out is warranted because the procedure itself — switch branches, detect
-a conflict, judge whether it is resolvable, resolve or abort — is not usefully
-decomposable into mechanically checkable sub-steps the way "did the merge
-commit complete" is for `integrator`; the abort-or-resolve judgment call *is*
-the task. Validated empirically before adoption: two live trials (a resolvable
-adjacent-line conflict, and a genuinely irreconcilable same-function
-mutually-exclusive conflict) both produced the intended outcome, confirmed by
-inspecting the resulting git state rather than trusting the worker's
-self-report.
+`--dangerously-skip-permissions` carve-out but narrower: scoped to one
+worker acting inside one disposable worktree, not a run-level flag. It is
+warranted because the procedure itself — switch branches, detect a
+conflict, judge whether it is resolvable, resolve or abort — is not
+usefully decomposable into mechanically checkable sub-steps the way "did
+the merge commit complete" is for `integrator`; the abort-or-resolve
+judgment call *is* the task. Validated empirically before adoption: two
+live trials (a resolvable adjacent-line conflict, and a genuinely
+irreconcilable same-function mutually-exclusive conflict) both produced
+the intended outcome, confirmed by inspecting the resulting git state
+rather than trusting the worker's self-report.
 
-What stays mechanical, because it is cheap, objective, and losing it would be
-a real regression:
+What stays mechanical, because it is cheap, objective, and losing it would
+be a real regression:
 
-- **Isolation.** The worker never operates on the user's real checkout or the
-  run's primary worktree — only a disposable `git worktree add` copy, matching
-  the containment already used for every other `ACT_TOOLS` + `autonomous=True`
-  worker (`implementer`, `conformer`, `integrator` — see §6; none of their call
-  sites pass a real-repo `cwd`).
-- **Post-hoc mechanical verification of the claimed outcome**, not of the
-  reasoning behind it: on `status: "rebased"`, `host_finalize` confirms the
-  worktree has no conflict markers and is not mid-rebase; on
+- **Isolation.** The worker never operates on the user's real checkout or
+  the run's primary worktree — only a disposable `git worktree add` copy,
+  matching the containment already used for every other `ACT_TOOLS` +
+  `autonomous=True` worker (`implementer`, `conformer`, `integrator` — §6;
+  none of their call sites pass a real-repo `cwd`).
+- **Post-hoc mechanical verification of the claimed outcome**, not the
+  reasoning behind it: on `status: "rebased"`, `host_finalize` confirms
+  the worktree has no conflict markers and is not mid-rebase; on
   `status ∈ {irreconcilable, failed}`, it confirms the worktree's tip is
   unchanged from the pre-rebase run branch — the same "don't trust an
   integrator's self-report" discipline §12 already establishes.
-- **`working_branch` bookkeeping.** A rebase changes the run branch's parent
-  chain, so a naive `working_branch..run_branch` diff after rebasing would
-  silently pick up unrelated upstream commits. Only on a verified successful
-  rebase does `host_finalize` advance `working_branch` to
-  `origin/<pr_base_branch>` (both as a git ref and in `run.json`) so
-  `rev_range`/`DIFF_BASE` keep computing the PR diff correctly; on an aborted
-  or failed rebase, `working_branch` is left untouched.
-- **Routing the outcome to the right push path.** `host_finalize` reads the
-  worker's schema-validated verdict and branches on it — push the rebased
-  branch, or push the original branch with the worker's `diagnosis` folded
-  into the PR body — without re-deriving *how* the worker reached that
-  verdict.
-- **Never blocking the run.** Every branch of this logic (worktree-creation
-  failure, success, a resolved conflict, an aborted rebase, a worker seam
-  failure, or a malformed worker response) falls through to a push — the
-  rebase step is strictly best-effort and never returns non-zero, pauses, or
-  blocks finalize.
+- **`working_branch` bookkeeping.** A rebase changes the run branch's
+  parent chain, so a naive `working_branch..run_branch` diff after
+  rebasing would silently pick up unrelated upstream commits. Only on a
+  verified successful rebase does `host_finalize` advance `working_branch`
+  to `origin/<pr_base_branch>` (git ref and `run.json`) so
+  `rev_range`/`DIFF_BASE` keep computing the PR diff correctly; on an
+  aborted or failed rebase, `working_branch` is left untouched.
+- **Routing the outcome.** `host_finalize` reads the worker's
+  schema-validated verdict and branches on it — push the rebased branch,
+  or push the original with the worker's `diagnosis` folded into the PR
+  body — without re-deriving *how* the worker reached that verdict.
+- **Never blocking the run.** Every branch (worktree-creation failure,
+  success, a resolved conflict, an aborted rebase, a worker seam failure,
+  or a malformed response) falls through to a push — the rebase step is
+  strictly best-effort and never returns non-zero, pauses, or blocks
+  finalize.
 
 Two flags control push and PR independently of body composition:
 
