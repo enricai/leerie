@@ -1,4 +1,11 @@
-"""Numbered lists in CLAUDE.md must actually be numbered in order.
+"""Numbered lists in CLAUDE.md and docs/TESTING.md must actually be numbered
+in order.
+
+Scans both files: the docs-001 split moved most of CLAUDE.md's per-feature
+Testing changelog (and its ordinal-declaring passages) into docs/TESTING.md,
+leaving CLAUDE.md with too few to satisfy the anti-vacuity floor below on its
+own. The failure mode this test guards is identical in either file, so one
+scan over the concatenation keeps the guard live without duplicating it.
 
 CLAUDE.md is loaded into every session, so a passage that says "Three lessons"
 and then runs First → Third → Second is read that way by every worker and
@@ -11,14 +18,15 @@ of words apart, and the count and the sequence are separated by a page of
 prose. Prototyped before landing: over CLAUDE.md's ordinal-declaring phrases
 it flags exactly the one defect and nothing else.
 
-**Coverage is narrow, and saying so is the honest framing.** Of the nine
-phrases `_DECL` currently matches, eight are followed by no ordinals at all,
-so the `>= 5` floor below is satisfied by declarations that check nothing —
-only the `any(seq ...)` clause does real work, and today it rests on a single
-passage. The noun list is a sample, not a taxonomy: "Three consequences"
-elsewhere in this file is not matched. This guards the shape that already
-broke, cheaply; it is not a general prose checker, and widening the nouns
-would trade false negatives for false positives in a 247 KB document.
+**Coverage is narrow, and saying so is the honest framing.** Of the phrases
+`_DECL` currently matches across CLAUDE.md and docs/TESTING.md, most are
+followed by no ordinals at all, so the `>= 5` floor below is satisfied by
+declarations that check nothing — only the `any(seq ...)` clause does real
+work, and today it rests on a handful of passages. The noun list is a
+sample, not a taxonomy: "Three consequences" elsewhere is not matched. This
+guards the shape that already broke, cheaply; it is not a general prose
+checker, and widening the nouns would trade false negatives for false
+positives across two large documents.
 
 Deliberately narrow. It checks two mechanical properties — the ordinals appear
 in ascending order, and there are no more of them than the declared count — and
@@ -31,7 +39,9 @@ import re
 
 import pytest
 
-CLAUDE_MD = pathlib.Path(__file__).resolve().parent.parent / "CLAUDE.md"
+REPO = pathlib.Path(__file__).resolve().parent.parent
+CLAUDE_MD = REPO / "CLAUDE.md"
+TESTING_MD = REPO / "docs" / "TESTING.md"
 
 _ORDINALS = {"first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5}
 _COUNTS = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
@@ -49,12 +59,13 @@ _WINDOW = 2500
 
 
 def _declarations() -> list[tuple[str, int, list[int]]]:
-    text = CLAUDE_MD.read_text()
     out = []
-    for m in _DECL.finditer(text):
-        seq = [_ORDINALS[w.lower()]
-               for w in _ORD.findall(text[m.end():m.end() + _WINDOW])]
-        out.append((m.group(0), _COUNTS[m.group(1).lower()], seq))
+    for path in (CLAUDE_MD, TESTING_MD):
+        text = path.read_text()
+        for m in _DECL.finditer(text):
+            seq = [_ORDINALS[w.lower()]
+                   for w in _ORD.findall(text[m.end():m.end() + _WINDOW])]
+            out.append((m.group(0), _COUNTS[m.group(1).lower()], seq))
     return out
 
 
@@ -62,8 +73,9 @@ def test_scan_finds_declarations():
     """Anti-vacuity: a scan that matches nothing passes forever."""
     decls = _declarations()
     assert len(decls) >= 5, (
-        f"only {len(decls)} ordinal-declaring phrase(s) found in CLAUDE.md — "
-        "the pattern probably broke, so the checks below are hollow")
+        f"only {len(decls)} ordinal-declaring phrase(s) found in CLAUDE.md + "
+        "docs/TESTING.md — the pattern probably broke, so the checks below "
+        "are hollow")
     assert any(seq for _, _, seq in decls), (
         "no declaration has any ordinals after it; the window or the ordinal "
         "pattern is wrong")
