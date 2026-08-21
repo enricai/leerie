@@ -6118,13 +6118,12 @@ skipped when run state lives inside the checkout (`resolve_leerie_root`
 falling back to `repo_root / ".leerie"` when `LEERIE_STATE_DIR` is unset —
 the direct-invocation/test path; the launcher always sets
 `/leerie-state`), since a blanket deny there would deny each worker its own
-worktree; `_repo_write_denials` returns `""` in that layout and logs once,
-since silent false confidence would be worse. And the remote integrator
+worktree; `_repo_write_denials` returns `""` in that layout and logs once
+rather than staying silently confident. The remote integrator
 (`scripts/remote/collect-subtrees.sh`) cannot import the orchestrator, so
 it carries its own duplicated deny list (like its duplicated
 `SCHEMAS["integrator"]`) — its blast radius is the seeded machine and the
-branch it pushes, not the laptop, which is the argument against adding a
-third copy of a value the orchestrator owns.
+branch it pushes, not the laptop, which is why a third copy is acceptable.
 
 `Task` is the live CLI's name for subagent spawning, `Agent` the retired
 one — until `Task` was added, the "no subagent spawning" constraint (§2,
@@ -6133,37 +6132,35 @@ ship (found in the preflight smoke test's own then-uncontained surface;
 contained workers never leaked it, so this entry is defense-in-depth).
 
 **A plain file writer does not belong on this list**, which is why
-`NotebookEdit` is classified into `ACT_TOOLS` rather than denied — denying
-it would not have closed the original leak (the escape was `Bash`, not
-`NotebookEdit`), and the deny list is a single global constant, so denying
-a writer would remove it from every acting worker in every repo while
-`Bash`/`Write`/`Edit` stayed allowed regardless.
+`NotebookEdit` is classified into `ACT_TOOLS` rather than denied — the
+original leak's escape was `Bash`, not `NotebookEdit`, and the deny list
+is a single global constant, so denying a writer would remove it from
+every acting worker in every repo.
 
-**Containment comes from one builder, not from each call site remembering
-it.** Every session-starting `claude -p` argv the orchestrator constructs
-goes through `_contained_claude_argv` (the capability probe is the one
-exemption), so a new call site inherits the deny list and
-`--strict-mcp-config` by construction. This replaces a per-site discipline
-that had already failed once: introducing `--strict-mcp-config` was audited
-by hand, fixed the shell integrator, and missed `preflight`'s smoke test,
-which then ran with the CLI's full default surface (measured: 78 tools, 4
-MCP servers, 46 `mcp__claude_ai_*` including `send_message`,
-`slack_send_message`) — and left `--disallowedTools` off the shell
-integrator entirely. `tests/test_claude_argv_containment.py` now derives
-and enforces the rule across the module and `scripts/**/*.sh` rather than
-naming call sites by hand.
+**Containment comes from one builder, not from each call site
+remembering it.** Every session-starting `claude -p` argv goes through
+`_contained_claude_argv` (the capability probe is the one exemption), so
+a new call site inherits the deny list and `--strict-mcp-config` by
+construction. This replaces a per-site discipline that had already
+failed once: `--strict-mcp-config` was audited by hand, fixed the shell
+integrator, and missed `preflight`'s smoke test, which then ran with the
+CLI's full default surface (measured: 78 tools, 4 MCP servers, 46
+`mcp__claude_ai_*` including `send_message`, `slack_send_message`) — and
+left `--disallowedTools` off the shell integrator entirely.
+`tests/test_claude_argv_containment.py` now derives and enforces the
+rule across the module and `scripts/**/*.sh` rather than naming call
+sites by hand.
 
 ### Instruction adherence is code-enforced
 
 A sibling of the central principle above, forced into the design by a
-production incident: a run was given a task whose core instruction was an
-explicit, prescribed procedure — "your ONLY job is to run tool X in a loop
-until it finishes, then run tool Y; do not hand-write the output." The
-planner read that instruction, reasoned (correctly, on its own terms) that
-running Y alone would likely be insufficient, and silently substituted
-hand-written code for the prescribed step. The plan looked internally
-coherent, self-scored high confidence, and shipped a PR containing exactly
-the change the user had prohibited.
+production incident: a run was given an explicit, prescribed procedure —
+"your ONLY job is to run tool X in a loop until it finishes, then run
+tool Y; do not hand-write the output." The planner reasoned (correctly,
+on its own terms) that running Y alone would likely be insufficient, and
+silently substituted hand-written code for the prescribed step. The plan
+looked internally coherent, self-scored high confidence, and shipped a
+PR containing exactly the change the user had prohibited.
 
 The gap this exposed: §12's discipline is applied rigorously to *worker*
 behavior — schema validation, caps, the conformer gate — but nothing
@@ -6174,15 +6171,14 @@ prefixes, cycles, budget, file overlap. None of them compares the plan
 against the literal thing the user asked for. A planner can reason its way
 around an explicit "only do X" instruction with no mechanical backstop.
 
-The first fix considered was the obvious application of this section's own
-established pattern — replace a self-graded axis with an independent judge,
-as §5½ already did for `decomposition_quality` — applied to the planner's
-self-reported `task_understanding` score. That fix was built, tested against
-the real incident, and **falsified**: an independent judge asked to score
-*understanding* rated the incident plan highly, because the plan did, in
-fact, reflect a correct reading of the task. It just chose not to obey it.
-Understanding and adherence are different axes, and no framing of an
-understanding judge — independent or not — catches a plan that understood
+The first fix considered — replace a self-graded axis with an independent
+judge, as §5½ already did for `decomposition_quality`, applied to the
+planner's self-reported `task_understanding` score — was built, tested
+against the real incident, and **falsified**: an independent judge asked
+to score *understanding* rated the incident plan highly, because the
+plan did, in fact, reflect a correct reading of the task. It just chose
+not to obey it. Understanding and adherence are different axes; no
+framing of an understanding judge catches a plan that understood
 correctly and disobeyed anyway.
 
 **The axis that discriminates is instruction adherence, not understanding,**
@@ -6216,13 +6212,12 @@ and it is enforced as a genuinely separate, code-owned gate:
   visibility, and can reintroduce cross-domain `provides`/`requires`
   drift `phase_reconcile` already resolved on the first pass.
 
-This is deliberately *not* a new subsystem. It is the same principle §12
-states for every other guarantee in this design — a plan's adherence to a
-prescribed instruction is a fact that matters and can, in the deterministic
-case, be checked mechanically, so it is not left to a prompt telling the
-planner "please follow instructions." Where it cannot be checked purely
-mechanically (the semantic-substitution case), judgment is still required —
-but that judgment is independent of the planner and gated by the
+This is deliberately not a new subsystem — the same §12 principle applied:
+a plan's adherence to a prescribed instruction is a fact that, in the
+deterministic case, can be checked mechanically, so it is not left to a
+prompt telling the planner "please follow instructions." Where it cannot
+be checked purely mechanically (the semantic-substitution case), judgment
+is still required — but independent of the planner and gated by the
 deterministic signal, not trusted as an unconditional self-report.
 
 ### Language-to-JSON: natural-language interpretation is never regex
@@ -6233,21 +6228,18 @@ never by pattern-matching or hand-parsing prose in the orchestrator.**
 Python operates only on already-structured data: set membership, string
 equality on typed fields, arithmetic. It never infers meaning from prose.
 
-This is the input-side twin of the worker-output contract in §7 — a
-worker's *output* must be schema-validated JSON before the orchestrator
-acts on it, and the same discipline applies to a worker's *input*
-processing. If a check needs a fact that only exists in natural language
-(does the task prescribe a specific command; does a subtask's own
-description reference a sibling's output), the fact is extracted by the
-LLM that already reads that prose, returned as a structured field, and the
-orchestrator's code compares structured fields to structured fields. A
-regex over task text, planner prose, or a worker's free-text response is
-not a shortcut — it is a hand-written model of natural-language
-understanding, and it fails silently on inputs the author didn't
-anticipate. Regex remains legitimate only where the string being matched
-is itself mechanical rather than natural language — a semver, a shell
-command, a fixed CLI output string, a file path — never prose a human
-wrote to communicate intent.
+This is the input-side twin of the worker-output contract in §7. If a
+check needs a fact that only exists in natural language (does the task
+prescribe a specific command; does a subtask's own description reference
+a sibling's output), the fact is extracted by the LLM that already reads
+that prose, returned as a structured field, and the orchestrator's code
+compares structured fields to structured fields. A regex over task text,
+planner prose, or a worker's free-text response is not a shortcut — it is
+a hand-written model of natural-language understanding that fails
+silently on inputs the author didn't anticipate. Regex remains legitimate
+only where the string matched is itself mechanical rather than natural
+language — a semver, a shell command, a fixed CLI output string, a file
+path — never prose a human wrote to communicate intent.
 
 An earlier audit found several orchestrator sites that violated this by
 regexing natural-language prose (task text, planner intent,
@@ -6284,64 +6276,61 @@ principle applied to caps.
 
 ### Code-enforced caps
 
-Some caps are counted by the orchestrator: the number of subtask continuations
-for a subtask, the number of mechanical-feedback rounds for a judgment worker,
-the total number of workers a whole run may spawn, the parallelism within a
-wave, and a per-worker time and turn limit. These are real counters in real
-code. When one is hit, the orchestrator takes a defined action — block the
-subtask, abort the run with state saved, throttle. Because the orchestrator
-owns the counter, the cap is a genuine guarantee.
+Some caps are counted by the orchestrator: subtask continuations, the
+mechanical-feedback rounds for a judgment worker, the total number of
+workers a run may spawn, parallelism within a wave, and a per-worker time
+and turn limit. These are real counters in real code. When one is hit,
+the orchestrator takes a defined action — block the subtask, abort the
+run with state saved, throttle. Because the orchestrator owns the
+counter, the cap is a genuine guarantee.
 
-The post-work conformance cap (`conformance_rounds`, §9) is also code-enforced
-but its escalation is *advisory*, not blocking: when the cap is hit, residual
-findings surface as `conformance_warnings` on the subtask result and the
-subtask still returns `complete`. The cap bounds work, the warnings make the
-unfinished work observable, and the subtask never escalates to `failed` or
-`blocked`. This is the §12 principle applied to a phase that is itself
-advisory: the count is real, the action it triggers is to record, not to
-block.
+The post-work conformance cap (`conformance_rounds`, §9) is code-enforced
+but its escalation is *advisory*: when hit, residual findings surface as
+`conformance_warnings` and the subtask still returns `complete`. The cap
+bounds work, the warnings make the unfinished work observable, and the
+subtask never escalates to `failed`/`blocked` — §12 applied to a phase
+that is itself advisory.
 
 The mechanical-feedback caps (`judgment_check_rounds`,
 `planner_check_rounds`, `implementer_confidence_retries`) are also
-code-enforced. The orchestrator runs deterministic structural checks on
+code-enforced: the orchestrator runs deterministic structural checks on
 each worker's output and re-invokes with the results as external
 feedback (§8 *Mechanical-feedback loops*). Escalation on exhaustion is
-worker-specific: planners proceed with the best result + warnings,
-the classifier dies, the integrator aborts the merge. (That last is the
+worker-specific: planners proceed with the best result + warnings, the
+classifier dies, the integrator aborts the merge. (That last is the
 *check-exhaustion* path — the integrator kept returning output the
-mechanical checks rejected, which is a verdict about the work. A worker
-**crash** mid-resolution takes the salvage path in §12 instead.)
+mechanical checks rejected, a verdict about the work. A worker **crash**
+mid-resolution takes the salvage path in §12 instead.)
 
 The multi-sample cap (`planner_samples`) controls independent parallel
-invocations. Selection among samples is mechanical (fewest issues,
-most subtasks) — no LLM judgment involved.
+invocations. Selection among samples is mechanical (fewest issues, most
+subtasks) — no LLM judgment involved.
 
 ### Worker-internal caps
 
 Other limits — how many times an implementer or planner re-runs its evidence
-gate, how many times an implementer re-runs its validation loop — live
-*inside* a single worker. The orchestrator never sees these iterations; it
-sees only the worker's final result. These limits are therefore
-*prompt-governed*: the worker is instructed to bound itself, and the genuine
-hard backstop is the worker's overall turn limit, which the orchestrator does
-control.
+gate or validation loop — live *inside* a single worker. The orchestrator
+never sees these iterations; it sees only the worker's final result. These
+limits are therefore *prompt-governed*: the worker is instructed to bound
+itself, and the genuine hard backstop is the worker's overall turn limit,
+which the orchestrator does control.
 
 The evidence-gate bound is exposed to users as `--confidence-rounds` (also
 `LEERIE_CONFIDENCE_ROUNDS` and `leerie.toml`); the orchestrator passes the
-resolved value into each worker's prompt. The user-visible knob is real — the
-worker reads it — but the worker is what counts iterations against it, so the
-guarantee is still prompt-governed in the sense above. Surfacing the knob
-lets a user dial how persistent workers are at building confidence without
-changing what kind of guarantee that bound is.
+resolved value into each worker's prompt. The knob is real — the worker
+reads it — but the worker is what counts iterations against it, so the
+guarantee stays prompt-governed. Surfacing it lets a user dial how
+persistent workers are at building confidence without changing what kind
+of guarantee that bound is.
 
-This distinction matters and must not be blurred. Presenting a worker-internal,
-prompt-governed limit as if it were a code-enforced guarantee would mislead
-anyone reasoning about the system's reliability. The orchestrator enforces the
-*consequences* of a worker's result deterministically; it does not count the
-iterations inside the worker that produced it. That is acceptable only because
-the orchestrator gates on outcomes, not on iteration counts — and because the
-overall turn limit is a real backstop regardless of whether a worker honored
-its instructed self-discipline.
+This distinction must not be blurred: presenting a worker-internal,
+prompt-governed limit as a code-enforced guarantee would mislead anyone
+reasoning about the system's reliability. The orchestrator enforces the
+*consequences* of a worker's result deterministically; it does not count
+the iterations inside the worker that produced it. That is acceptable
+only because the orchestrator gates on outcomes, not iteration counts —
+and because the overall turn limit is a real backstop regardless of
+whether a worker honored its instructed self-discipline.
 
 ### The two-tier retry policy
 
@@ -6353,41 +6342,42 @@ governing rule:
 > dishonest — re-running it burns a worker for no expected gain, and a cold
 > restart can discard partial work.
 
-A **retryable** failure is a correctable mistake: the worker did real work but,
-say, forgot to commit it, or left its worktree dirty. A fresh worker told
-exactly what went wrong can plausibly succeed. A retryable failure is retried
-up to the retry cap; a second occurrence terminates it.
+A **retryable** failure is a correctable mistake: the worker did real work
+but, say, forgot to commit it, or left its worktree dirty. A fresh worker
+told exactly what went wrong can plausibly succeed. It is retried up to
+the retry cap; a second occurrence terminates it.
 
-A **terminal** failure means the worker itself is unreliable: it returned a
-self-contradictory result (claimed success with no supporting evidence), or
-wrote to a protected path it was told never to touch, or failed at the process
-level even after the schema retry. Re-running a broken worker does not make it
-honest. A terminal failure ends the subtask on first occurrence.
+A **terminal** failure means the worker itself is unreliable: it returned
+a self-contradictory result (claimed success with no supporting
+evidence), wrote to a protected path it was told never to touch, or
+failed at the process level even after the schema retry. Re-running a
+broken worker does not make it honest — a terminal failure ends the
+subtask on first occurrence.
 
-Either way a terminated subtask is fatal at its wave boundary: the run stops
-with state saved, rather than carrying a broken subtask forward into
-integration. The specific failure-to-tier mapping is in `IMPLEMENTATION.md`;
-the *principle* — correctable-mistake versus broken-worker — is the design.
+Either way a terminated subtask is fatal at its wave boundary: the run
+stops with state saved rather than carrying a broken subtask forward into
+integration. The specific failure-to-tier mapping is in
+`IMPLEMENTATION.md`; the *principle* — correctable-mistake versus
+broken-worker — is the design.
 
 ### Budget feasibility — fail fast at the cheapest moment
 
 `max_total_workers` is a hard ceiling on the number of `claude -p`
 invocations a single run may spawn. The late check, `State.bump_workers()`,
 raises `WorkerError` the moment the counter would exceed the cap — a
-necessary backstop, but it fires *during execution*, after some or most of
-the run's compute is already spent, discovering infeasibility mid-run and
-leaving only a partial set of integrated waves.
+necessary backstop, but it fires *during execution*, discovering
+infeasibility mid-run and leaving only a partial set of integrated waves.
 
-The corresponding *early* check runs once at the plan/execute boundary. By
-the time `_schedule()` returns its `(subtasks, waves)` pair, every unknown
-that determines remaining budget is resolved: subtask count is fixed, wave
-count is computed deterministically (Kahn's algorithm, no LLM call), and
-every upstream phase — including the easy-to-forget per-subtask ones (P1
-decomposition's `fit_judge`/`splitter`, phase-3 `satisfied_probe`) — is
-already billed into `worker_count`. A feasibility check here estimates the
-remaining cost (implementer + conformer per subtask, integrator per wave,
-finalize) with no free variables beyond an empirically-bounded
-per-subtask call multiplier.
+The corresponding *early* check runs once at the plan/execute boundary.
+By the time `_schedule()` returns its `(subtasks, waves)` pair, every
+unknown that determines remaining budget is resolved: subtask count is
+fixed, wave count is computed deterministically (Kahn's algorithm, no LLM
+call), and every upstream phase — including the easy-to-forget
+per-subtask ones (P1 decomposition's `fit_judge`/`splitter`, phase-3
+`satisfied_probe`) — is already billed into `worker_count`. A feasibility
+check here estimates the remaining cost (implementer + conformer per
+subtask, integrator per wave, finalize) with no free variables beyond an
+empirically-bounded per-subtask call multiplier.
 
 **A re-plan needs its own preflight.** The gate above runs once, after
 `_schedule()`. A gate that re-plans (`phase_adherence_gate`,
@@ -6409,24 +6399,21 @@ calls are billed before this gate can fire. Moving the gate earlier was
 considered and rejected: the probe *drops* subtasks and `_schedule()`
 merges the post-drop plans, so anything running before it sees a
 pre-drop, systematically inflated count — a guard conservative enough to
-be safe there would only fire when upstream spend alone nearly exhausts
-the cap, which is almost never. The ordering is deliberate: the gate
-accepts the probe's spend as the price of an accurate post-drop estimate.
-The `WorkerError` backstop still bounds the run either way.
+be safe there would fire only when upstream spend alone nearly exhausts
+the cap, which is almost never. The gate accepts the probe's spend as the
+price of an accurate post-drop estimate; `WorkerError` still bounds the
+run either way.
 
-This is the §12 principle applied: a mechanically-checkable guarantee
-lives in code. `WorkerError` remains the ultimate backstop, but fail-fast
-at planner-output time saves the most compute (implementers/conformers
-have not yet been spawned) and surfaces the actionable fix — a
-recommended `--max-workers`, or a hint to split the task — while the user
-can still trivially apply it.
+This is the §12 principle applied: fail-fast at planner-output time saves
+the most compute (implementers/conformers have not yet been spawned) and
+surfaces the actionable fix — a recommended `--max-workers`, or a hint to
+split the task.
 
 The estimate is intentionally conservative (worst observed per-subtask
 ratio plus margin), with a documented escape hatch
 (`--skip-budget-check`, same precedence chain as `--skip-smoke` and
 `--skip-overlap-judge`) for operators who know the conformer phase will
-degrade heavily to advisory warnings or otherwise come in under the
-estimate.
+degrade heavily to advisory warnings or otherwise come in under estimate.
 
 **This gate firing is not a dead end.** Because `_schedule()`'s output is
 one of the per-phase planning checkpoints (§6 *Resumable planning*), a
@@ -6463,48 +6450,43 @@ Three capabilities build on this partition to make the system observable,
 self-diagnosing, and self-improving:
 
 1. **Per-call NDJSON telemetry.** Every `claude -p` invocation emits a
-   structured record to a per-run append-only NDJSON file. The file is written
-   by the orchestrator — one JSON object per line, one line per call —
-   immediately after the call returns. Crash-safety comes from the format
-   itself: each line is a complete, self-contained JSON object. A hard kill
-   between writes leaves the file valid through the last fully-written line.
-   No partial write can corrupt earlier records.
+   structured record to a per-run append-only NDJSON file, written by the
+   orchestrator immediately after each call returns. Crash-safety comes
+   from the format itself: each line is a complete, self-contained JSON
+   object, so a hard kill between writes leaves the file valid through
+   the last fully-written line.
 
 2. **LLM judge skill.** A Claude Code skill that reads a harvest of captured
    calls (one call_type at a time), applies a multi-dimensional rubric to each
-   captured prompt/response pair, and writes structured verdicts. The rubric
-   evaluates three dimensions: schema adherence (did the worker produce
-   well-formed output), factual accuracy (are the claims grounded in the
-   codebase or research the worker was given), and hallucination-freeness (does
-   the output introduce content absent from the inputs). The judge is advisory
-   at the rubric level — its rubric lives in a prompt — but the scoring
-   aggregation and pass/fail threshold are real Python in the skill's
-   orchestrator script (§12 applied: the rubric is a prompt, the verdict
-   accounting is code).
+   prompt/response pair, and writes structured verdicts across three
+   dimensions: schema adherence, factual accuracy (grounded in the codebase
+   or research the worker was given), and hallucination-freeness. The
+   rubric is advisory — it lives in a prompt — but the scoring aggregation
+   and pass/fail threshold are real Python in the skill's orchestrator
+   script (§12 applied: rubric is a prompt, verdict accounting is code).
 
-3. **LLM self-heal skill.** A Claude Code skill that takes the judge's verdicts
-   for a given call_type, identifies the failure modes, proposes targeted patches
-   to the relevant worker system prompt in `prompts/`, applies those patches, and
-   replays the failing samples against the patched prompt to measure improvement.
-   The loop is capped and its convergence check — whether a heal iteration is an
-   improvement, a plateau, or a regression — is real Python (§12 applied: the
-   patch proposal is a prompt, the convergence detection is code).
+3. **LLM self-heal skill.** A Claude Code skill that takes the judge's
+   verdicts for a given call_type, identifies failure modes, proposes
+   targeted patches to the relevant worker system prompt in `prompts/`,
+   applies them, and replays the failing samples to measure improvement.
+   The loop is capped and its convergence check — improvement, plateau,
+   or regression — is real Python (§12 applied: patch proposal is a
+   prompt, convergence detection is code).
 
 ### The subprocess contract — no new runtime
 
-Both the judge skill and the self-heal skill run exclusively through the
-existing `claude -p` subprocess invocation path (the same `claude_p()` function
-the orchestrator uses for all workers). They introduce no new runtime, no API
-key, and no dependency beyond the `claude` CLI already required for the rest of
-the system. This is the same resolution as §2: subscriptions rather than the
-metered API, and headless CLI subprocesses rather than an agent library.
+Both the judge and self-heal skills run exclusively through the existing
+`claude -p` subprocess path (the same `claude_p()` function the
+orchestrator uses for all workers) — no new runtime, no API key, no
+dependency beyond the `claude` CLI. Same resolution as §2: subscriptions
+over the metered API, headless CLI subprocesses over an agent library.
 
-The judge spawns a fresh `claude -p` worker per batch of calls to be scored;
-the self-heal spawns fresh workers for patch generation and for replaying the
-failing samples against the patched prompt. Each worker sees exactly the inputs
-it needs for its slice of work, and its structured output is schema-validated
-before the skill's orchestrator acts on it — the same contract as every other
-worker in the system (§7).
+The judge spawns a fresh `claude -p` worker per batch of calls to be
+scored; self-heal spawns fresh workers for patch generation and for
+replaying failing samples against the patched prompt. Each worker sees
+exactly the inputs it needs, and its structured output is schema-validated
+before the skill's orchestrator acts on it — the same contract as every
+other worker (§7).
 
 ### The NDJSON file convention
 
@@ -6537,8 +6519,7 @@ they always operate on one call_type at a time, matching Beacon's design.
 
 ### §12 applied — prompts are advisory, code enforces
 
-The central principle (§12) governs this subsystem the same way it governs
-everything else:
+§12 governs this subsystem the same way it governs everything else:
 
 - The **judge rubric** — what counts as schema-valid, factually grounded, or
   hallucination-free — is an instruction to the judge worker. The worker
@@ -6557,14 +6538,12 @@ everything else:
   applying, and it verifies the improvement by replay rather than by the
   subagent's own assessment.
 
-The heal loop re-applies the evidence-gate discipline from §8: each heal
+The heal loop re-applies the evidence-gate discipline from §8: each
 iteration must show measured improvement (a quantitative outcome, not an
-assertion) before it updates the "best patch so far." The loop is bounded; a
-cap that cannot be cleared within the bound terminates the heal loop rather
-than running forever. The same falsification and convergence discipline that
-governs an implementer's confidence loop governs the heal loop's patch
-iteration — the number of rounds, the success threshold, and the plateau
-detection window are all configured, not left open-ended.
+assertion) before it updates the "best patch so far." The loop is bounded
+and terminates rather than running forever; the number of rounds, success
+threshold, and plateau-detection window are all configured, not
+open-ended.
 
 ---
 
@@ -6602,64 +6581,59 @@ and none can be turned into one — they are things to recognise in a log.
 These are honest, designed-in limitations — not bugs, but the known edges of
 what the architecture can guarantee.
 
-- **Unattended execution requires broad write permission.** A worker that edits
-  files without a human approving each action must run with permission prompts
-  suppressed. A narrower "auto-approve edits only" mode was considered and
-  rejected: it still prompts on shell commands, which would stall an unattended
-  run the first time a worker needs to run one. The blast radius is bounded by
-  worktree isolation, not eliminated. Leerie should be run on repositories the
-  user trusts, ideally inside a container, and the run branch reviewed
-  before it is relied on.
+- **Unattended execution requires broad write permission.** A worker that
+  edits files without a human approving each action must run with
+  permission prompts suppressed. A narrower "auto-approve edits only"
+  mode was rejected: it still prompts on shell commands, stalling an
+  unattended run the first time one is needed. The blast radius is
+  bounded by worktree isolation, not eliminated — run leerie on trusted
+  repositories, ideally inside a container, and review the run branch
+  before relying on it.
 - **A worker that exhausts its turn limit without checkpointing loses its
-  work.** Handoff depends on the worker writing a checkpoint before it stops. A
-  worker that runs out of turns first leaves its successor to start cold. This
-  is the most likely failure mode for an under-scoped, too-large subtask —
-  which is why planner sizing (§5) is the primary defense.
+  work.** Handoff depends on the worker writing a checkpoint before it
+  stops; a worker that runs out of turns first leaves its successor to
+  start cold. This is the likeliest failure mode for an under-scoped,
+  too-large subtask — planner sizing (§5) is the primary defense.
 - **Handoff timing is heuristic.** A worker cannot read its own context
-  percentage; it estimates pressure from proxies like transcript length and
-  tool-call count. The estimate can be wrong in either direction.
-- **Checkpoint quality bounds handoff quality.** Schema validation catches a
-  *structurally* incomplete checkpoint; it cannot judge whether a
-  structurally-complete checkpoint is *semantically* adequate.
-- **Evidence gates reduce overconfidence but do not eliminate it.** Anchoring
-  the confidence score to artifacts is a large improvement over a self-reported
-  number, but a worker can still misjudge the strength of evidence it did
-  gather.
-- **Cross-domain dependency detection now goes through a reconciler worker.**
-  The scheduler wires cross-domain edges by matching capability tags. If two
-  planners describe the same capability with different words, the literal-
-  string match would miss the equivalence. A reconciler worker (DESIGN §5)
-  catches these mismatches before the scheduler runs: it proposes renames,
-  added `provides` declarations, or new connector subtasks. Genuinely
-  unresolvable gaps (no plausible match and no reasonable connector) abort
-  the run with the reconciler's diagnosis — fail-loud rather than the
-  silent-edge-drop the v1 design accepted.
-- **Headless usage is metered.** Subscription-based headless usage draws on a
-  finite pool, and a large multi-wave run consumes a meaningful amount of it.
-  Cost scales with worker count.
-- **Parallelism is single-repo per run.** Multiple concurrent runs in the same git
-  clone are explicitly supported via the per-run state and branch design.
-  Multiple clones running concurrently are also fine — they are independent
-  by construction — but the per-run namespacing applies only within one
-  clone; leerie does nothing to coordinate across clones within a single run.
-  For workloads that span *multiple repositories*, leerie offers **run-groups**
-  (§20): N isolated single-repo runs launched together with a shared brief and
-  read-only cross-repo visibility. The group boundary is deliberate: it does
-  not merge across repos, does not produce cross-repo DAG edges inside the
-  planning graph, and opens N independent PRs (non-atomic). Cross-repo
-  prerequisites are surfaced as deploy-ordering notes rather than hard edges.
-- **Push assumes a remote named `origin`.** Finalize pushes to `origin` and
-  opens the PR against the same remote's GitHub repo. A fork pattern where
-  the user's write-access remote is named something else (e.g., `mine`
-  pushing to a personal fork, `origin` reading from upstream) is not
-  supported today; the workaround is `--no-push` plus a manual push. A
-  follow-up `--remote <name>` flag is possible but outside the current
-  design.
+  percentage; it estimates pressure from proxies like transcript length
+  and tool-call count, which can be wrong in either direction.
+- **Checkpoint quality bounds handoff quality.** Schema validation catches
+  a *structurally* incomplete checkpoint; it cannot judge whether a
+  structurally-complete one is *semantically* adequate.
+- **Evidence gates reduce overconfidence but do not eliminate it.**
+  Anchoring the confidence score to artifacts is a large improvement over
+  a self-reported number, but a worker can still misjudge the strength of
+  evidence it gathered.
+- **Cross-domain dependency detection goes through a reconciler worker.**
+  The scheduler wires cross-domain edges by matching capability tags; a
+  literal-string match would miss two planners describing the same
+  capability differently. A reconciler worker (§5) catches these
+  mismatches before the scheduler runs, proposing renames, added
+  `provides` declarations, or new connector subtasks. Genuinely
+  unresolvable gaps abort the run with the reconciler's diagnosis —
+  fail-loud rather than the silent-edge-drop the v1 design accepted.
+- **Headless usage is metered.** Subscription-based headless usage draws
+  on a finite pool; cost scales with worker count.
+- **Parallelism is single-repo per run.** Multiple concurrent runs in the
+  same git clone are supported via the per-run state and branch design,
+  and multiple clones running concurrently are independent by
+  construction — but leerie does nothing to coordinate across clones
+  within a single run. For workloads spanning *multiple repositories*,
+  leerie offers **run-groups** (§20): N isolated single-repo runs
+  launched together with a shared brief and read-only cross-repo
+  visibility. The boundary is deliberate — no cross-repo merge, no
+  cross-repo DAG edges, N independent (non-atomic) PRs, with cross-repo
+  prerequisites surfaced as deploy-ordering notes rather than hard edges.
+- **Push assumes a remote named `origin`.** Finalize pushes to `origin`
+  and opens the PR against its GitHub repo. A fork pattern where the
+  user's write-access remote has a different name (e.g. `mine` pushing to
+  a personal fork) isn't supported today; the workaround is `--no-push`
+  plus a manual push. A follow-up `--remote <name>` flag is possible but
+  outside the current design.
 - **System-wide worker concurrency scales with run count.** Each run obeys
   its own `max_parallel` cap; with N concurrent runs the total active
-  worker count can be N × max_parallel. The blast radius is bounded per
-  run but not globally; users running many concurrent leerie invocations
-  should be aware of the headless-usage cost implication.
+  worker count can be N × max_parallel — bounded per run but not
+  globally.
 
 ---
 
@@ -6677,16 +6651,16 @@ stubbed worker, including failure/retry paths; the deterministic
 enforcement points have unit tests.
 
 **Not demonstrated as a matter of principle.** The behavioral quality of
-workers — whether the evidence gates, handoff, and conflict resolution
-work as *intended* rather than merely as *coded* — is inherently
-unverifiable by inspection; it can only be observed by running the prompts
-against a live model and reading the outcome. The deterministic surface is
-sound by construction and by test; worker behavior is validated by
-production usage over time, not by this document.
+workers — whether evidence gates, handoff, and conflict resolution work
+as *intended* rather than merely as *coded* — is inherently unverifiable
+by inspection; it can only be observed by running the prompts against a
+live model and reading the outcome. The deterministic surface is sound by
+construction and by test; worker behavior is validated by production
+usage over time, not by this document.
 
 Remote-mode features (`--runtime fly`, git-aware host-to-machine seeding,
 stream-back finalize, remote pause-on-failure) stack on the host-side
-finalize path in §6 *Finalization* and depend on the run-branch-as-
+finalize path (§6 *Finalization*) and depend on the run-branch-as-
 durable-record contract; the local-mode finalize path is the foundation
 they build on.
 
@@ -6702,12 +6676,12 @@ chains by filtering `run.json` by `chain_id`. GitHub credentials are never
 on a Fly machine: each per-job `host_finalize` runs on the laptop using
 the user's `gh auth` and `~/.git-credentials`, and workers have no GitHub
 credentials by construction (`scripts/remote/seed-auth.sh:149-158`
-excludes them from the seed tar) — an earlier design that placed a
-coordinator machine on Fly holding a GitHub token has been removed in
-favor of this laptop-only model. Chain verification today is unit-level
-only (`tests/test_chain_*`, covering credential transport, git
-operations, verb routing, and the wave loop with stubs); an end-to-end
-run against real Fly worker machines has not been observed.
+excludes them from the seed tar) — an earlier design placing a
+coordinator machine on Fly with a GitHub token has been removed in favor
+of this laptop-only model. Chain verification today is unit-level only
+(`tests/test_chain_*`, covering credential transport, git operations,
+verb routing, and the wave loop with stubs); an end-to-end run against
+real Fly worker machines has not been observed.
 
 **Recommended first step.** Run Leerie once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.
@@ -6747,22 +6721,23 @@ is deliberate and is justified in the section named.
 Directions that would strengthen the system but are not part of the current
 design:
 
-- **Token-aware budgeting** instead of a blunt worker count — bound a run by
-  cost rather than by number of workers.
-- **Subtask-level resume.** Resume is currently wave-granular: work done since
-  the last fully-completed wave is re-run. Finer-grained resume would re-run
-  less.
-- ~~A dependency-graph sanity pass~~ — implemented as the reconciler worker
-  (§5 and §15). After all planners finish, a reconciler worker
-  resolves vocabulary drift between domains' capability tags before the
-  scheduler builds its DAG.
-- **Per-domain implementer specialization.** One generic implementer serves all
-  nine domains today. Nine domain-specialized implementers would allow richer
-  per-domain guidance, at the cost of more to maintain.
+- **Token-aware budgeting** instead of a blunt worker count — bound a run
+  by cost rather than by number of workers.
+- **Subtask-level resume.** Resume is currently wave-granular: work done
+  since the last fully-completed wave is re-run. Finer-grained resume
+  would re-run less.
+- ~~A dependency-graph sanity pass~~ — implemented as the reconciler
+  worker (§5 and §15): after all planners finish, it resolves vocabulary
+  drift between domains' capability tags before the scheduler builds its DAG.
+- **Per-domain implementer specialization.** One generic implementer
+  serves all nine domains today; nine domain-specialized implementers
+  would allow richer per-domain guidance, at the cost of more to
+  maintain.
 - **Chain dependency DAG.** The chain subsystem (§19) uses an N-wave
-  sequential model (wave 0, wave 1, …, wave N−1). A general task-dependency
-  DAG would allow arbitrary inter-run ordering for workloads that do not
-  fit a purely sequential pattern (e.g. diamond dependencies).
+  sequential model (wave 0, wave 1, …, wave N−1). A general
+  task-dependency DAG would allow arbitrary inter-run ordering for
+  workloads that don't fit a purely sequential pattern (e.g. diamond
+  dependencies).
 
 ---
 
@@ -6775,40 +6750,39 @@ A single leerie run takes one task and drives it to a merged PR — one
 classification, one plan, one wave sequence, one finalized branch. Many
 real workloads are *sequences of tasks* that must run in a fixed order
 across one repository: run job A and job B in parallel, then run job C
-after both complete. That sequencing problem is outside the scope of
-the core orchestrator, which is scoped to one run. **Chain
-orchestration** is the subsystem that manages it.
+after both complete. That sequencing problem is outside the scope of the
+core orchestrator, which is scoped to one run. **Chain orchestration** is
+the subsystem that manages it.
 
 ### Shape: a chain is N parallel single runs per wave, sequenced by the laptop
 
 A chain is **a laptop-side wave sequencer that fans out N parallel
 copies of today's single-run `--runtime fly` flow per wave, then
-synth-merges between waves to build the next wave's base branch,
-then repeats.** Nothing more.
+synth-merges between waves to build the next wave's base branch, then
+repeats.** Nothing more.
 
-Every wave job is a normal `./leerie "$prompt" --runtime fly`
-invocation. The existing single-run path
-(`scripts/remote/provision.sh` → `seed-auth.sh` → `seed-repo.sh` →
-orchestrator → `decide_teardown` trap on laptop →
-`scripts/remote/fetch-branch.sh` → `scripts/host-finalize.sh` →
-`destroy_machine`) handles each job's lifecycle **unchanged**. The
+Every wave job is a normal `./leerie "$prompt" --runtime fly` invocation.
+The existing single-run path (`scripts/remote/provision.sh` →
+`seed-auth.sh` → `seed-repo.sh` → orchestrator → `decide_teardown` trap
+on laptop → `scripts/remote/fetch-branch.sh` → `scripts/host-finalize.sh`
+→ `destroy_machine`) handles each job's lifecycle **unchanged**. The
 chain wrapper just loops over waves and synth-merges between them.
 
 ### Why no Fly coordinator
 
-Earlier designs (v3+v4) launched an ephemeral Fly machine per chain
-to hold chain state, watch worker heartbeats, push branches, and
-open PRs. That introduced four new failure modes (workers
-unreachable from coordinator's 6PN; coordinator volume contention;
-coordinator self-destruct race; coordinator's own GitHub credential
-surface) and didn't actually reduce total Fly footprint — the
-coordinator was overhead on top of the worker count.
+Earlier designs (v3+v4) launched an ephemeral Fly machine per chain to
+hold chain state, watch worker heartbeats, push branches, and open PRs.
+That introduced four new failure modes (workers unreachable from the
+coordinator's 6PN; coordinator volume contention; coordinator
+self-destruct race; coordinator's own GitHub credential surface) and
+didn't reduce total Fly footprint — the coordinator was overhead on top
+of the worker count.
 
-Shape A removes the coordinator entirely. The laptop is the
-sequencer; the workers are normal single-run workers; GitHub is
-touched only by the laptop via the existing `host_finalize`
-mechanism, using the user's `gh auth` and `~/.git-credentials`. Zero
-Fly machines hold GitHub credentials at any point.
+Shape A removes the coordinator entirely. The laptop is the sequencer;
+the workers are normal single-run workers; GitHub is touched only by the
+laptop via the existing `host_finalize` mechanism, using the user's
+`gh auth` and `~/.git-credentials`. Zero Fly machines hold GitHub
+credentials at any point.
 
 ### Full flow
 
