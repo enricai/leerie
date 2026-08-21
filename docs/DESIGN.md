@@ -4607,10 +4607,10 @@ evidence**. Before an implementer writes any code it must clear domain-specific
 *evidence gates*, each carrying a concrete artifact — a file-and-line
 citation, a reproduction, a measurement, a cited research source — not an
 assertion. The confidence score is a *summary of which gates carry hard
-evidence*, not an independent feeling. A bug-fixing task, for instance, must
-show a deterministic reproduction, a test that fails because of this specific
-bug, a traced symptom-to-cause path, and a mechanistic explanation of the fix.
-Other domains have their own gate sets.
+evidence*, not a feeling. A bug-fixing task, for instance, must show a
+deterministic reproduction, a test that fails because of this specific bug, a
+traced symptom-to-cause path, and a mechanistic explanation of the fix. Other
+domains have their own gate sets.
 
 Three further disciplines apply at every scoring step, and are what make the
 score load-bearing rather than ornamental:
@@ -4636,22 +4636,20 @@ legitimate exception to "never ask the user" (§11).
 
 **The disciplines are asked for; they are not schema-required.** Falsification
 and drift reconciliation keep an optional property each
-(`falsifiers_tested`/`contradictions_reconciled`); gap surfacing has none —
-the gap lives in the required `basis` field. None of the three is `required`
-in the schema, a deliberate reversal forced by measurement: requiring them
-made the confidence block a five-required-field object with two arrays, a
-paragraph string, and a nested object — field for field the trigger profile
-in upstream [anthropics/claude-code#49747](https://github.com/anthropics/claude-code/issues/49747),
+(`falsifiers_tested`/`contradictions_reconciled`); gap surfacing has none — the
+gap lives in the required `basis` field. None of the three is `required` in
+the schema, a deliberate reversal forced by measurement: requiring them made
+the confidence block a five-required-field object with two arrays, a
+paragraph string, and a nested object — field for field the trigger profile in
+upstream [anthropics/claude-code#49747](https://github.com/anthropics/claude-code/issues/49747),
 where the decoder flips from JSON to legacy XML mid-argument on tool calls
-with many required parameters and verbose string/array mixes. A controlled
-A/B (real `fit_judge` schema, n=8 per arm) measured 8/8 first attempts
-corrupted with the block present, 0/8 without; corpus-wide, 48.9% of all
-worker calls were wasted retries. Requiring the field destroyed the entire
-payload including the score itself — a constraint that annihilates the
-response it validates enforces nothing. leerie keeps the numeric score axes
-and `basis` required, so every gate still reads a real number anchored to a
-stated basis, and asks for falsifiers/contradictions/gaps in the prompt where
-a missing one costs a judgment rather than the whole answer.
+with many required parameters and verbose string/array mixes. A controlled A/B
+(real `fit_judge` schema, n=8 per arm) measured 8/8 first attempts corrupted
+with the block present, 0/8 without; corpus-wide, 48.9% of all worker calls
+were wasted retries — requiring the field destroyed the entire payload
+including the score itself. leerie keeps the numeric score axes and `basis`
+required, and asks for falsifiers/contradictions/gaps in the prompt, where a
+missing one costs a judgment rather than the whole answer.
 
 `gap_to_close` (the block's only nested object, the sharpest edge of the
 #49747 profile) is removed outright — its sole consumer, a diagnostic log
@@ -4699,10 +4697,10 @@ the classification-gate retry loop exhausts without converging and
 same terminal state reached one phase earlier. The field is OR-accumulated
 across re-classify rounds within one gate call, not last-write-wins: a fresh
 `True`+evidence claim always wins, and a falsy/absent claim only clears a
-prior `True` if there was none. (A production incident hit exactly the
-un-accumulated version: one round found the deliverable already on HEAD, a
-later category-focused re-classify silently dropped the claim, and the gate
-died instead of routing to no-work.) This extends the same trust boundary
+prior `True` if there was none. (A production incident hit the un-accumulated
+version: one round found the deliverable already on HEAD, a later
+category-focused re-classify silently dropped the claim, and the gate died
+instead of routing to no-work.) This extends the trust boundary
 `_detect_no_work` already accepts — an investigation un-double-checked by a
 second judge — to "classification could not otherwise converge anyway." A
 classifier that never sets the field sees zero behavior change.
@@ -4711,11 +4709,11 @@ Reaching this state from classification instead of post-plan meant a run
 could hit `_finish_no_work_run` earlier than `run.json`'s own run-identity
 fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`,
 `task`) used to be written — and `_finish_no_work_run` writes only
-`{finished_at, no_push, no_verify}`, so such a run would produce a
-`run.json` the launcher's auto-finalize scan cannot distinguish from a crash
-before `phase_classify` completed. The identity write is therefore hoisted
-to run immediately at run start, before `phase_classify` itself, so every
-early-exit path sees a correctly-identified `run.json`.
+`{finished_at, no_push, no_verify}`, producing a `run.json` the launcher's
+auto-finalize scan can't distinguish from a crash before `phase_classify`
+completed. The identity write is therefore hoisted to run start, before
+`phase_classify`, so every early-exit path sees a correctly-identified
+`run.json`.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
@@ -4733,14 +4731,14 @@ already seen.
 The comparison is exact equality, not subset containment. An earlier version
 used `issue_set <= seen`, on the theory that a shrinking signature set is
 never a subset of a prior one — false: a round that fixes some issues and
-leaves others open produces a set that is *both* shrinking *and* a proper
-subset of the prior round's, the ordinary shape of incremental convergence.
-That version aborted mid-convergence on real incremental progress
-(root-caused against a 2026-07-31 incident where a classification-gate run
-needing three categories simultaneously never held all three and died at
-exhaustion despite genuine forward progress each round). Exact-equality still
-catches the true A→B→A cycle while letting a proper subset keep retrying,
-bounded as always by `max_rounds`.
+leaves others open produces a set that is both shrinking and a proper subset
+of the prior round's, the ordinary shape of incremental convergence. That
+version aborted mid-convergence on real progress (root-caused against a
+2026-07-31 incident where a classification-gate run needing three categories
+simultaneously never held all three and died at exhaustion despite genuine
+forward progress each round). Exact-equality still catches the true A→B→A
+cycle while letting a proper subset keep retrying, bounded as always by
+`max_rounds`.
 
 The same incident surfaced a compounding defect: `check_classifier_output`'s
 `SAME_WORK_RISK`/`TEST_OWNERSHIP_RISK` advisories fire unconditionally inside
@@ -4866,16 +4864,15 @@ the orchestrator reads it. Their *quality* is model-judged; their *presence*
 is not.
 
 **Self-graded confidence is advisory; an independent verifier gates.** A
-self-report has a structural ceiling no adversarial-falsification
-instruction can raise — you cannot disprove a failure mode you cannot
-conceive, and the mind that produced an incomplete solution bounds the
-failure modes it can imagine. A real subtask scored itself `solution 9.5`
-with maximal confidence, every falsifier it "tested" about its own test
-plumbing, and shipped three latent behavioral defects a later re-run had to
-fix — despite the prompt already commanding maximal adversarial
-falsification. The fix is to change *who* runs the check, generalizing the
-`fit_judge` precedent below: an independent judge finds cuts the
-self-grader was blind to *because it did not produce the artifact*. So the
+self-report has a structural ceiling no adversarial-falsification instruction
+can raise — you cannot disprove a failure mode you cannot conceive, and the
+mind that produced an incomplete solution bounds the failure modes it can
+imagine. A real subtask scored itself `solution 9.5` with every falsifier it
+"tested" about its own test plumbing, and shipped three latent behavioral
+defects a later re-run had to fix — despite the prompt already commanding
+maximal adversarial falsification. The fix is to change *who* runs the check,
+generalizing the `fit_judge` precedent below: an independent judge finds cuts
+the self-grader was blind to *because it did not produce the artifact*. So the
 load-bearing gate for each self-graded axis becomes an **independent
 adversarial verifier**, and the self-score is demoted to advisory.
 
@@ -4936,15 +4933,13 @@ mis-wirings:
   visibility, so it can reintroduce cross-domain tag drift `phase_reconcile`
   already resolved — the re-drive is followed by a second `phase_reconcile`
   call before the next judge round (§5 *Bridge cross-domain capability-tag
-  mismatches*). This does not reopen the earlier falsified attempt at gating
+  mismatches*). This doesn't reopen the earlier falsified attempt at gating
   `task_understanding` directly (§12 *Instruction adherence is
   code-enforced*): that finding was specific to an *understanding*-framed
-  judge, which cannot distinguish "understood and disobeyed" from
-  "understood and obeyed." `task_coverage_judge` scores neither — only
-  whether the subtask union is complete against the task, a question neither
-  that finding nor instruction-adherence enforcement (§12) covers, since a
-  plan can honor every prescribed instruction and still omit unprescribed
-  required work.
+  judge, which can't distinguish "understood and disobeyed" from "understood
+  and obeyed." `task_coverage_judge` scores neither — only whether the
+  subtask union is complete against the task, since a plan can honor every
+  prescribed instruction and still omit unprescribed required work.
 
   `task_coverage_judge` originally had no deterministic PRIMARY check, only
   this SECONDARY judge. A floor, `check_required_items_coverage`, was tried
@@ -4986,47 +4981,45 @@ mis-wirings:
 
   **Location is not coverage.** A merge that drops a *duplicate* is textually
   indistinguishable from one that drops the only copy — both remove content
-  present in a parent — so reasoning from the parent diffs alone cannot tell
+  present in a parent — so reasoning from the parent diffs alone can't tell
   them apart. A `dropped_change` is therefore only behavioral if the behavior
   is absent from the **merged tree**, not merely from the side the merge
-  chose. The judge already holds inspection tools, so it is asked to search
-  the merged tree for equivalent coverage and cite it concretely (file +
-  assertion). A defect carrying a specific citation is advisory; one without
-  still gates — judge by *coverage*, not by *location*, the same correction
-  applied to the on-HEAD satisfied-probe.
+  chose. The judge holds inspection tools, so it's asked to search the merged
+  tree for equivalent coverage and cite it concretely (file + assertion). A
+  defect carrying a specific citation is advisory; one without still gates —
+  judge by *coverage*, not *location*, the same correction applied to the
+  on-HEAD satisfied-probe.
 
-  The citation is **asked for and never required**. Requiring a field on a
+  The citation is **asked for and never required**: requiring a field on a
   judge's schema has repeatedly produced a worker that emits no schema-valid
   output at all, and a gate that never runs catches nothing (§8 *Findings
-  carry a severity* — the default is gating). Absence therefore gates: the
-  exception narrows this gate only when the judge does the extra work and
-  shows it.
+  carry a severity* — the default is gating). Absence therefore gates.
 - **`plan_overlap_judge`'s own `judgment` self-score is dropped, with no new
   independent verifier.** This worker is already the independent adversarial
-  check for cross-planner surface collisions — layering a second judge on
-  top of a judge would be self-scoring one level removed. Its existing
+  check for cross-planner surface collisions — layering a second judge on top
+  of a judge would be self-scoring one level removed. Its existing
   deterministic validators — `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`,
   `DROP_BREAKS_GRAPH`, `DUPLICATE_PAIR` (`check_overlap_judge_output`, §5
   *Cross-domain surface overlap*), and `_validate_overlap_judge_output`'s
   `merge_feasibility`-presence backstop — already catch the concrete,
   checkable failure modes. What remains ungated by dropping the self-score is
   purely a *quality-of-judgment* concern with no mechanically-attackable
-  "artifact" for a second worker to find concrete defects in — the same
-  reason the implementer's `solution` axis is verified by a *different-role*
-  worker (the conformer) rather than a second implementer grading the first.
-  The deterministic validators become this worker's sole gate; the
-  `confidence` object stays emitted as an advisory record only.
+  "artifact" for a second worker to find defects in — the same reason the
+  implementer's `solution` axis is verified by a *different-role* worker (the
+  conformer) rather than a second implementer grading the first. The
+  deterministic validators become this worker's sole gate; `confidence` stays
+  an advisory record only.
 
 **Why this does not reintroduce the gameable bar §9 removed.** The old
-criteria-lock / "tests must pass" gate was gameable because the *same*
-worker controlled the bar. Independence dissolves that incentive: an
-independent verifier that (a) did not write the artifact and (b) gates on
-"here is a concrete input this artifact mishandles" — never on "a test
-passed" or "the criteria say met" — presents no bar for the graded worker to
-lower, and cannot be defeated by weakening a test, because the verifier
-constructs *new* adversarial inputs the graded worker never anticipated. A
-verdict is a list of concrete found defects, not a score crossing a
-threshold — the invariant every new verifier must preserve.
+criteria-lock / "tests must pass" gate was gameable because the *same* worker
+controlled the bar. Independence dissolves that incentive: a verifier that
+(a) did not write the artifact and (b) gates on "here is a concrete input
+this artifact mishandles" — never "a test passed" or "the criteria say met"
+— presents no bar for the graded worker to lower, and can't be defeated by
+weakening a test, because it constructs *new* adversarial inputs the graded
+worker never anticipated. A verdict is a list of concrete found defects, not
+a score crossing a threshold — the invariant every new verifier must
+preserve.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 
@@ -5161,23 +5154,22 @@ warning, but it does not change the subtask's terminal status.
 
 The §8 confidence gate says whether the work landed; the implementer's
 criteria notes describe what it was aimed at. Neither says whether the
-*change* is in good standing with the repo it lives in: whether
-documentation that describes the touched surface is still accurate, whether
-tests for the touched code were updated, whether the change still honors
-whatever rules the repo declares for itself (CLAUDE.md, AGENTS.md,
-`.cursorrules`, a section of the README, a `docs/` file). These are real
-obligations of a finished change, but the wrong thing to bake into the
-assigned criteria: criteria are scoped to the subtask, and the repo's rules
-are an environmental fact that survives across subtasks.
+*change* is in good standing with the repo it lives in: whether documentation
+that describes the touched surface is still accurate, whether tests for the
+touched code were updated, whether the change still honors whatever rules the
+repo declares for itself (CLAUDE.md, AGENTS.md, `.cursorrules`, a section of
+the README, a `docs/` file). These are real obligations of a finished change,
+but the wrong thing to bake into the assigned criteria: criteria are scoped
+to the subtask, and the repo's rules are an environmental fact that survives
+across subtasks.
 
 So a separate phase runs once a subtask's work has settled: the
 **conformer**. It triggers only on the success path — implementer reports
 `status: "complete"`, commits are present, the worktree is clean, no
-protected path was written. It reads the diff the subtask just produced,
-reads whatever rules files the orchestrator located in the repo, and is
-empowered to commit fixes to the same worktree branch — updating
-documentation, adding or amending tests, repairing a rule violation it
-spotted.
+protected path was written. It reads the diff just produced, reads whatever
+rules files the orchestrator located in the repo, and is empowered to commit
+fixes to the same worktree branch — updating documentation, adding or
+amending tests, repairing a rule violation it spotted.
 
 Where the rule files live varies, so location discovery is code, not the
 worker's problem: a fixed, capped allowlist of paths in the repo root and
@@ -5190,13 +5182,12 @@ the rule-conformance axis.
 The same discovered set is surfaced to the *implementer* at write time too,
 not only to the conformer post-hoc: convention drift is cheaper to prevent
 than to catch, since a conformer that only reads the diff afterward can flag
-a rule violation but cannot re-derive an unwritten visual convention. The
+a rule violation but can't re-derive an unwritten visual convention. The
 implementer's prompt names the discovered convention docs as paths, and its
 evidence gate asks it to reconcile the pattern it followed against them —
-advisory, since matching an existing design is judgment, but the discovery
-itself is code so the doc list cannot silently drift. The allowlist
-therefore includes the repo's design-system doc (e.g.
-`docs/DESIGN-SYSTEM.md`).
+advisory, since matching an existing design is judgment, but discovery itself
+is code so the doc list can't silently drift. The allowlist therefore
+includes the repo's design-system doc (e.g. `docs/DESIGN-SYSTEM.md`).
 
 Two further disciplines sit at the §12 axis:
 
@@ -5256,11 +5247,11 @@ Two further disciplines sit at the §12 axis:
   free and worthless: a new test against code that doesn't exist yet
   trivially fails, so all four findings already satisfied it. What has value
   is reproducing the reported *symptom*, a stronger requirement that would
-  have caught the one finding that had already been fixed by an earlier PR.
-  *Producer-branch coverage* — requiring tests to exercise both branches of
-  the producer feeding the fix — also fails: instrumented, the defective
-  branch executed under the defective fixture too, so the gate passes while
-  the defect stands.
+  have caught the finding already fixed by an earlier PR. *Producer-branch
+  coverage* — requiring tests to exercise both branches of the producer
+  feeding the fix — also fails: instrumented, the defective branch executed
+  under the defective fixture too, so the gate passes while the defect
+  stands.
 - **A stale finding is not a bug.** The evidence contract above asks whether
   a fix fires; this asks whether the failure it fixes still happens. On one
   run a subtask "fixed" a cgroup leak an earlier PR had already fixed before
@@ -5271,14 +5262,14 @@ Two further disciplines sit at the §12 axis:
   that could not reproduce it says so.
 
   **Advisory, and the asymmetry with the evidence gate is deliberate.** A
-  retry cannot make a stale finding un-stale — it asks the same worker the
+  retry can't make a stale finding un-stale — it asks the same worker the
   same question — so gating would spend budget without changing the answer.
   "This may already be done" is the most valuable thing such a subtask can
-  report, and it only has to be visible once. Note what this is **not**:
-  "the new tests fail on the base tree" is free and proves nothing, since a
-  new test against code that does not yet exist trivially fails — the claim
-  wanted is behavioural, which is why the field asks for a command and an
-  observation rather than a boolean.
+  report, and it only has to be visible once. This is not "the new tests
+  fail on the base tree" — that's free and proves nothing, since a new test
+  against code that doesn't yet exist trivially fails; the claim wanted is
+  behavioural, which is why the field asks for a command and an observation
+  rather than a boolean.
 - **No backsliding.** The conformer can add commits but must not write to
   protected paths. The diff-scope check — no writes to `.leerie/`, `.git/`,
   or `.claude/` *except for the user-deliverable subtrees*
