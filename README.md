@@ -662,6 +662,7 @@ live `claude` binary would be needed; out of scope for the current suite).
 | `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
 | `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
 | `docs/USAGE.md` | End-to-end walkthrough of one Leerie run + chain orchestration example |
+| `docs/TESTING.md` | Per-feature / per-incident test coverage inventory; `CLAUDE.md`'s `## Testing` section covers only the operational rules for running the suite |
 
 ## Safety
 
