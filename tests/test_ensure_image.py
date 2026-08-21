@@ -34,6 +34,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.fly_stub import make_fake_flyctl
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LAUNCHER = REPO_ROOT / "leerie"
 
@@ -81,23 +83,20 @@ def _stub_flyctl(tmp_path: Path, existing_apps: list[str] | None = None,
     create_succeeds: whether `apps create <name>` exits 0.
     """
     apps = existing_apps or []
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f"echo \"$@\" >> {tmp_path}/flyctl.log\n"
-        'if [ "$1" = "apps" ] && [ "$2" = "list" ]; then\n'
+    extra_preamble = f'echo "$@" >> {tmp_path}/flyctl.log\n'
+    case_body = (
+        'if [ "$SUB" = "apps" ] && [ "$MSUB" = "list" ]; then\n'
         '  cat <<JSON\n'
         + "[" + ", ".join(f'{{"Name": "{n}"}}' for n in apps) + "]\n"
         + "JSON\n"
         '  exit 0\n'
         'fi\n'
-        'if [ "$1" = "apps" ] && [ "$2" = "create" ]; then\n'
+        'if [ "$SUB" = "apps" ] && [ "$MSUB" = "create" ]; then\n'
         f"  exit {0 if create_succeeds else 1}\n"
         'fi\n'
         'exit 0\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(tmp_path, case_body, extra_preamble=extra_preamble)
 
 
 def _run(tag: str, *, env: dict, cwd: Path,

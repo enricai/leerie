@@ -15,6 +15,7 @@ import hashlib
 import subprocess
 from pathlib import Path
 
+from tests.fly_stub import make_fake_flyctl
 from tests.repo_image_block_extract import extract_block as _extract_block
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -240,15 +241,14 @@ def _make_build_push_stub(tmp_path: Path, rc: int = 0) -> Path:
 
 def _make_flyctl_stub(tmp_path: Path, app: str = "testapp") -> Path:
     """Create a flyctl stub that returns app-list JSON and exits 0."""
-    stub = tmp_path / "flyctl"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'if [ "${{1:-}}" = "apps" ]; then\n'
+    case_body = (
+        f'if [ "$SUB" = "apps" ]; then\n'
         f'  printf \'[{{"Name":"{app}"}}]\\n\'\n'
-        f'  exit 0\nfi\nexit 0\n'
+        '  exit 0\n'
+        'fi\n'
+        'exit 0\n'
     )
-    stub.chmod(0o755)
-    return stub
+    return make_fake_flyctl(tmp_path, case_body)
 
 
 def _run_ensure_image(

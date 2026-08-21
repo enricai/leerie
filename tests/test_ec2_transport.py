@@ -22,72 +22,11 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.conftest import run_bash
+from tests.stub_helpers import _stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
 LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
-
-
-def _stub_timeout(bin_dir: Path) -> None:
-    """Provide a real, killing `timeout` on the test's stubbed PATH.
-
-    These tests pin PATH to `{bin_dir}:/usr/bin:/bin` so the fake `aws`
-    is found and the host's Homebrew layout can't leak in. But macOS
-    ships no `timeout` in /usr/bin (it's coreutils, via Homebrew), so
-    `_seed_timeout_prefix` correctly no-ops — and the stall test's
-    `sleep 600` then runs unbounded, hanging the suite for 10 minutes
-    rather than failing.
-
-    Unlike `_make_stub_timeout` in tests/test_seed_repo_sh.py, this one
-    must honour the cap: the test it serves asserts the timeout *fires*
-    (rc 124), so an `exec "$@"` stub that ignores the duration would
-    hang exactly like no stub at all.
-    """
-    stub = bin_dir / "timeout"
-    stub.write_text(
-        """#!/usr/bin/env bash
-# Stub GNU timeout. Runs the child in its own process GROUP and signals
-# the whole group on expiry — killing only the direct child is not
-# enough: its grandchildren (the stalled stub's own `sleep`) inherit the
-# captured stdout, and a $(...) capture blocks until every writer closes
-# the pipe, so the caller would hang even though the child is dead.
-# Real GNU timeout kills the group for exactly this reason.
-kill_after=""
-while [[ "$1" == --* ]]; do
-  case "$1" in
-    --kill-after=*) kill_after="${1#--kill-after=}" ;;
-    --kill-after)   kill_after="$2"; shift ;;
-    --foreground)   ;;
-  esac
-  shift
-done
-secs="$1"; shift
-
-# `set -m` puts the child in its own process group (pgid == its pid), so
-# `kill -- -$pgid` reaches the whole subtree.
-set -m
-"$@" &
-child=$!
-set +m
-
-(
-  sleep "$secs"
-  kill -TERM -- "-$child" 2>/dev/null || kill -TERM "$child" 2>/dev/null
-  if [ -n "$kill_after" ]; then
-    sleep "$kill_after"
-    kill -KILL -- "-$child" 2>/dev/null || kill -KILL "$child" 2>/dev/null
-  fi
-) &
-waiter=$!
-
-wait "$child" 2>/dev/null; rc=$?
-kill -TERM "$waiter" 2>/dev/null
-# GNU timeout reports 124 when it had to kill the child.
-[ "$rc" -eq 143 ] && rc=124
-exit "$rc"
-"""
-    )
-    stub.chmod(0o755)
 
 
 def _stub_aws_ssm(bin_dir: Path, *, remote_rc: int = 0,

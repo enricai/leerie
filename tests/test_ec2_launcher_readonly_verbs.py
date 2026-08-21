@@ -49,6 +49,7 @@ from tests.ec2_stub import (
     build_ec2_launcher_env,
     read_log,
     read_state,
+    run_launcher as _run_launcher_shared,
     seed_running_instance,
     write_ec2_sidecar,
 )
@@ -181,10 +182,7 @@ def _seed_remote_state(work_dest: Path, run_id: str, state: dict) -> Path:
 
 
 def _run(args: list[str], env: dict) -> subprocess.CompletedProcess:
-    return subprocess.run(
-        ["bash", str(LAUNCHER)] + args,
-        env=env, capture_output=True, text=True, timeout=30,
-    )
+    return _run_launcher_shared(args, env, launcher=LAUNCHER, use_bash=True, timeout=30)
 
 
 # --- accept-blocked: EC2 runtime resolution ------------------------------
