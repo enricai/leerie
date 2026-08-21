@@ -6123,7 +6123,8 @@ rather than staying silently confident. The remote integrator
 (`scripts/remote/collect-subtrees.sh`) cannot import the orchestrator, so
 it carries its own duplicated deny list (like its duplicated
 `SCHEMAS["integrator"]`) — its blast radius is the seeded machine and the
-branch it pushes, not the laptop, which is why a third copy is acceptable.
+branch it pushes, not the laptop, which is the argument against adding a
+third copy of a value the orchestrator owns.
 
 `Task` is the live CLI's name for subagent spawning, `Agent` the retired
 one — until `Task` was added, the "no subagent spawning" constraint (§2,
