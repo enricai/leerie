@@ -6847,56 +6847,51 @@ laptop:
 ### Strict invariants
 
 1. **Workers never see GitHub credentials.** Worker env never contains
-   `GH_DISPATCH_PAT`, `GH_TOKEN`, or any github.com authentication. The
-   existing `seed-auth.sh:149-158` exclusion list (`.git-credentials`,
-   `.ssh`, `.netrc`, `.gnupg` excluded from the tar pipe) is what
-   enforces this; chain workers take that same path unchanged.
+   `GH_DISPATCH_PAT`, `GH_TOKEN`, or any github.com authentication —
+   enforced by the existing `seed-auth.sh:149-158` exclusion list
+   (`.git-credentials`, `.ssh`, `.netrc`, `.gnupg` excluded from the tar
+   pipe); chain workers take that same path unchanged.
 
 2. **Each per-job lifecycle is independent.** A worker dying mid-chain
-   pauses that one run (existing single-run pause-on-failure
-   semantics). The chain wave loop detects the failure via its `wait`
-   exit codes and pauses chain advancement; sibling wave-N runs that
-   completed earlier remain done.
+   pauses that one run (existing single-run pause-on-failure semantics).
+   The wave loop detects the failure via its `wait` exit codes and pauses
+   chain advancement; sibling wave-N runs that already completed stay
+   done.
 
 3. **Chain-scoped verbs operate by iteration, not coordination.**
-   `leerie status <chain-id>`, `leerie kill <chain-id>`, `leerie stop <chain-id>`,
-   `leerie resume <chain-id>`, `leerie finalize <chain-id>`, and
-   `leerie list chains` all work by iterating
-   `$LEERIE_STATE_HOST_DIR/runs/*/run.json` and filtering by the
-   `chain_id` field. For per-run action, they dispatch to the
-   existing single-run verb implementation per discovered run.
+   `leerie status/kill/stop/resume/finalize <chain-id>` and `leerie list
+   chains` all iterate `$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtering
+   by `chain_id`, dispatching to the existing single-run verb per
+   discovered run.
 
 4. **The laptop is the sequencer.** Wave transitions, synth-merge,
-   stage-branch pushes, and chain-scoped verbs all run on the
-   laptop. The laptop must be online for wave advancement; per-job
-   workers can run autonomously on Fly between fan-out and finalize.
+   stage-branch pushes, and chain-scoped verbs all run on the laptop,
+   which must be online for wave advancement; per-job workers run
+   autonomously on Fly between fan-out and finalize.
 
 5. **Synth-merge between waves is local + deterministic.** The laptop
-   runs `chain.git_ops.synth_merge_branches` against `$USER_REPO`
-   after each wave's branches reach origin. Conflicts pause the
-   chain with a clear message; user resolves manually in
-   `$USER_REPO` and re-runs `leerie chain --wave ...` to continue.
+   runs `chain.git_ops.synth_merge_branches` against `$USER_REPO` after
+   each wave's branches reach origin. Conflicts pause the chain; the user
+   resolves manually in `$USER_REPO` and re-runs `leerie chain --wave ...`
+   to continue.
 
 ### What this design deliberately rejects
 
-- **A coordinator machine on Fly.** No per-chain SQLite, no 6PN
-  HTTP, no `chain/coordinator.py`, no `chain/state.py`, no
-  `chain/fly_client.py`, no worker hook scripts. The laptop already
-  handles all of this for single runs; running the same path N
-  times in parallel costs nothing extra.
+- **A coordinator machine on Fly.** No per-chain SQLite, no 6PN HTTP, no
+  `chain/coordinator.py`/`chain/state.py`/`chain/fly_client.py`, no
+  worker hook scripts — the laptop already handles this for single runs,
+  and running the same path N times in parallel costs nothing extra.
 
-- **Auto-retry on failure.** Wave failures pause the chain. The
-  user resolves and explicitly resumes. This matches today's
-  single-run pause-on-failure semantics; no new retry policy.
+- **Auto-retry on failure.** Wave failures pause the chain; the user
+  resolves and explicitly resumes, matching today's single-run
+  pause-on-failure semantics.
 
-- **Always-on background poller on the laptop.** The wave loop runs
-  in the foreground of the user's terminal. If the user wants to
-  detach mid-chain, they can Ctrl-C (the `_kill_wave_children` trap
-  propagates SIGTERM to in-flight wave children, each of which
-  invokes its own `decide_teardown` trap to clean up its Fly
-  machine). Resume re-invokes `leerie chain --wave ...` and the
-  wave loop's idempotency check (`pushed_at` set on all wave-N runs)
-  skips already-done waves.
+- **Always-on background poller on the laptop.** The wave loop runs in
+  the foreground; Ctrl-C mid-chain triggers `_kill_wave_children`, which
+  propagates SIGTERM to in-flight wave children, each invoking its own
+  `decide_teardown` trap to clean up its Fly machine. Resume re-invokes
+  `leerie chain --wave ...`; the wave loop's idempotency check
+  (`pushed_at` set on all wave-N runs) skips already-done waves.
 
 ### Why this is the right scope for model judgment vs determinism
 
@@ -6905,8 +6900,8 @@ central principle. The chain envelope itself is purely deterministic: wave
 fan-out is a bash for-loop, inter-wave ordering comes from `--wave` flag
 order, synth-merge is `git merge --no-ff --no-edit`
 (`chain.git_ops.synth_merge_branches`, a conflict is a bash exit code), and
-chain status is a `jq` filter over `run.json` files. None of this is
-inferred or judged by a model.
+chain status is a `jq` filter over `run.json` files — none of it inferred
+or judged by a model.
 
 ### Relation to run-groups
 
@@ -6964,33 +6959,33 @@ The group layer adds four thin capabilities on top:
 
 1. **Shared brief.** The group brief — joint intent plus each member's
    external contract — is authored once and prepended to every member's
-   prompt. Repo B's planner reads what repo A is building *before* it writes
-   its own plan. This is advisory steering; the write-confinement guarantee
-   (§12) stays code, not prose.
+   prompt, so repo B's planner reads what repo A is building before it
+   writes its own plan. This is advisory steering; the write-confinement
+   guarantee (§12) stays code, not prose.
 
 2. **Read-only cross-repo visibility.** Each member is launched with its
    siblings seeded as read-only inspect-dirs (`--inspect-dir <sibling-repo>`).
-   Workers may `Read`/`Grep`/`Glob` under `/inspect/<name>`; they may not
-   write there. The enforcement mechanism is the existing
-   `_filter_offtree_subtasks` guard (§12), unchanged.
+   Workers may `Read`/`Grep`/`Glob` under `/inspect/<name>` but not write
+   there, enforced by the existing `_filter_offtree_subtasks` guard (§12),
+   unchanged.
 
 3. **Deploy-ordering notes.** When a member's planner declares a cross-repo
    prerequisite as `requires.extent: external` (§5) naming a sibling repo,
-   those `external_preconditions` are collected and rendered by finalize as a
-   "merge / deploy sibling first" section in that member's PR body. The two
-   PRs cannot merge atomically on GitHub — the inconsistency window between a
-   backend endpoint landing and a frontend using it is a deploy-ordering fact
-   the user already manages (e.g., with feature flags). Leerie surfaces the
+   the collected `external_preconditions` render as a "merge / deploy
+   sibling first" section in that member's PR body. The two PRs cannot
+   merge atomically on GitHub — the inconsistency window between a backend
+   endpoint landing and a frontend using it is a deploy-ordering fact the
+   user already manages (e.g. with feature flags). Leerie surfaces the
    ordering; it cannot enforce it.
 
-4. **Group-scoped verbs.** `status`, `stop`, `resume`, `kill`,
-   `finalize`, and `list --groups` on a `group_id` discover members by
-   scanning for `group_id`-tagged `run.json` files across the members'
-   *separate* state directories. Each verb dispatches to the existing per-run
-   implementation for each discovered member. The scanning must iterate over
-   the set of member state directories (one per member basename); unlike
-   chain-scoped verbs (§19) it cannot assume a single state directory.
-   (`stop` is Fly-runtime-only; it pauses running machines.)
+4. **Group-scoped verbs.** `status`, `stop`, `resume`, `kill`, `finalize`,
+   and `list --groups` on a `group_id` discover members by scanning for
+   `group_id`-tagged `run.json` files across the members' *separate* state
+   directories, then dispatch to the existing per-run implementation for
+   each discovered member. Unlike chain-scoped verbs (§19) this cannot
+   assume a single state directory — it iterates the set of member state
+   directories, one per member basename. (`stop` is Fly-runtime-only; it
+   pauses running machines.)
 
 ### Why the lean shape
 
@@ -6998,12 +6993,12 @@ The rejected alternative folds N repositories into one run — N run-branches
 in one state, a per-repo namespace inside `state.json`, a dependency graph
 crossing repo boundaries. That rewrites leerie's single most load-bearing
 invariant, the run-branch as the resume contract (§6): resume guarantees,
-the per-run flock, and the flat state layout are all predicated on one
-run = one repo, for a capability (cross-repo atomicity) GitHub doesn't
-support anyway — two PRs across two repos can never merge atomically
-regardless of design. The lean shape reaches the same user value through
-the **shared plan**, not atomic joint execution, so resume, state,
-isolation, and finalize mechanics stay untouched.
+the per-run flock, and the flat state layout are all predicated on one run =
+one repo, for a capability (cross-repo atomicity) GitHub doesn't support
+anyway — two PRs across two repos can never merge atomically regardless of
+design. The lean shape reaches the same user value through the **shared
+plan**, not atomic joint execution, so resume, state, isolation, and
+finalize mechanics stay untouched.
 
 ### State isolation is free
 
@@ -7011,39 +7006,39 @@ Per-repo state isolation falls out of the existing basename-keyed state
 directory design (§6 *Single owner per run dir*): a member that `cd`s into
 `../frontend` resolves `$HOME/.leerie/frontend/` independently of any
 sibling, and the `.owner` sidecar prevents two concurrent members with
-distinct basenames from colliding. The one guard the group launcher must
-add: reject any `--state-dir` / `LEERIE_STATE_DIR` override that would pin
-all members to one shared directory — correct for a chain (one repo) but a
+distinct basenames from colliding. The one guard the group launcher must add:
+reject any `--state-dir` / `LEERIE_STATE_DIR` override that would pin all
+members to one shared directory — correct for a chain (one repo) but a
 `.owner` collision for a group (N repos, N dirs required).
 
 ### Cross-repo visibility is enforced, not advisory
 
-`--inspect-dir` mounts a sibling repo read-only into the worker's
-filesystem (`/inspect/<name>`) — a kernel-enforced `:ro` bind mount
-locally, convention-enforced on Fly (the sibling is seeded without write
+`--inspect-dir` mounts a sibling repo read-only into the worker's filesystem
+(`/inspect/<name>`) — a kernel-enforced `:ro` bind mount locally,
+convention-enforced on Fly (the sibling is seeded without write
 credentials). `_filter_offtree_subtasks` (§12) soft-drops any subtask whose
-files fall outside the member's repo root, the same mechanism that already
+files fall outside the member's repo root — the same mechanism that already
 stops a single-run worker writing outside its worktree, applied to a new
 directory.
 
 ### The laptop is the sequencer; no coordinator machine
 
-The group launcher runs on the laptop (the same node as chain fan-out,
-§19): it mints a `group_id`, fans out one leerie invocation per member
-(each `cd`'d into the member's repo), waits, then tags each member's
-`run.json` with the shared `group_id` — discovered from each member's
-basename-keyed state dir via the same newest-`finished_at` scan local
-finalize already uses. No coordinator machine, no in-container group
-state, no cross-machine protocol; GitHub is touched only host-side, per
-member, by that member's own `host_finalize`.
+The group launcher runs on the laptop (the same node as chain fan-out, §19):
+it mints a `group_id`, fans out one leerie invocation per member (each
+`cd`'d into the member's repo), waits, then tags each member's `run.json`
+with the shared `group_id` — discovered from each member's basename-keyed
+state dir via the same newest-`finished_at` scan local finalize already
+uses. No coordinator machine, no in-container group state, no cross-machine
+protocol; GitHub is touched only host-side, per member, by that member's own
+`host_finalize`.
 
 ### Single-repo is the N=1 degenerate case
 
 A run-group with one member is indistinguishable from a standalone run. The
 `group_id` is written into `run.json` and the group-scoped verbs work, but
 the cross-repo visibility and deploy-ordering machinery have nothing to
-operate on. This means the group verb surface can be tested against a single
-member before any multi-repo integration work.
+operate on — so the group verb surface can be tested against a single member
+before any multi-repo integration work.
 
 ### What run-groups deliberately do not provide
 
