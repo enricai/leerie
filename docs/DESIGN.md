@@ -8,10 +8,10 @@
 
 **Scope of this document.** This is the *theory*: the architecture, the
 constraints that forced it, and the reasoning behind each decision. It
-describes the intended system, not the current code, and stays correct across
-any reimplementation that honors the same architecture. Mechanism — function
-names, cap values, file paths, schemas, enforcement tables, install steps —
-lives in the companion `IMPLEMENTATION.md`, which is true only against the
+describes the intended system, not the current code, and stays correct
+across any reimplementation honoring the same architecture. Mechanism —
+function names, cap values, file paths, schemas, enforcement tables, install
+steps — lives in the companion `IMPLEMENTATION.md`, true only against
 current code. Where the two disagree, this document wins and the code is the
 defect.
 
@@ -19,54 +19,53 @@ defect.
 
 ## 1. Purpose
 
-Given one task description, Leerie drives it to a validated, integrated result
-without further human input — except where input is genuinely impossible to
-derive. Every loop is bounded, every decision is made from the codebase or
-research, and state is kept on disk so a run is observable and resumable.
+Given one task description, Leerie drives it to a validated, integrated
+result without further human input except where input is genuinely
+impossible to derive. Every loop is bounded, every decision is made from the
+codebase or research, and state is kept on disk so a run is observable and
+resumable.
 
 ---
 
 ## 2. The two constraints that produced this architecture
 
-Two platform constraints eliminate the obvious designs and leave essentially
-one.
+Two platform constraints eliminate the obvious designs and leave one.
 
-**Constraint 1 — subagents cannot spawn subagents.** The original concept had
-three levels of delegation: orchestrator → domain subagent → granular
+**Constraint 1 — subagents cannot spawn subagents.** The original concept
+had three levels of delegation: orchestrator → domain subagent → granular
 subagent. Claude Code's rule is that only the main thread can spawn a
 subagent, so a three-level delegation tree has no native implementation.
 
-**Constraint 2 — a plugin slash-command body is advisory, not executable.** A
-plugin command's markdown is injected into a model's context as instructions,
-not executed as deterministic code. For a long, capped, multi-wave run, "the
-model will probably follow these steps" is not a strong enough guarantee —
-control flow can drift, silently.
+**Constraint 2 — a plugin slash-command body is advisory, not executable.**
+A plugin command's markdown is injected into a model's context as
+instructions, not executed as deterministic code. For a long, capped,
+multi-wave run, "the model will probably follow these steps" is not a
+strong enough guarantee — control flow can drift, silently.
 
-Both constraints resolve the same way: **the orchestrator is an ordinary
-program, not an in-session agent.** Every unit of LLM work is a separate
-headless process; the program owns all control flow. Subagent nesting is
-impossible because there are no subagents, only independent OS processes.
-Control-flow drift is impossible because the orchestrator is real loops and
+Both resolve the same way: **the orchestrator is an ordinary program, not
+an in-session agent.** Every unit of LLM work is a separate headless
+process; the program owns all control flow. Subagent nesting is impossible
+because there are no subagents, only independent OS processes. Control-flow
+drift is impossible because the orchestrator is real loops and
 conditionals, not a model interpreting instructions.
 
 **Why a headless CLI process, not an API library.** Two forms satisfy "the
-orchestrator is a program": shelling out to the headless CLI binary (runs on
-the interactive Claude Code subscription, with only the CLI as a dependency),
-or an agent library returning typed objects (less brittle — no marshalling of
-CLI strings — but authenticates against the metered API, not the
-subscription). Running on the subscription was a hard requirement, so Leerie
-takes the CLI-subprocess form. The brittleness that choice accepts is
-contained by two later mechanisms: worktree isolation limits the blast
-radius of a misbehaving worker, and every worker result is schema-validated
-before the orchestrator acts on it.
+orchestrator is a program": the headless CLI binary (runs on the
+interactive Claude Code subscription, with only the CLI as a dependency) or
+an agent library returning typed objects (less brittle — no CLI-string
+marshalling — but billed against the metered API, not the subscription).
+Running on the subscription was a hard requirement, so Leerie takes the
+CLI-subprocess form; the brittleness that accepts is contained by worktree
+isolation (limits a misbehaving worker's blast radius) and schema
+validation of every worker result before the orchestrator acts on it.
 
 ---
 
 ## 3. Architecture
 
-The orchestrator is a deterministic program. It runs six phases; each unit of
-LLM work within a phase is a separate headless worker process with its own
-context and a defined input/output contract.
+The orchestrator is a deterministic program running six phases; each unit
+of LLM work within a phase is a separate headless worker process with its
+own context and a defined input/output contract.
 
 ```
 Orchestrator (deterministic — owns all control flow, caps, state)
@@ -89,36 +88,30 @@ Orchestrator (deterministic — owns all control flow, caps, state)
 
 **Why classification precedes clarification.** Clarify runs within Phase 1,
 after the classifier, because the set of worthwhile questions is a function
-of the classification. It is skipped entirely for fully-specified tasks.
-
-**A note on phase numbering.** Sub-steps that always run carry no qualifier;
-skippable ones are marked `(optional)`. The phase table in
-`docs/IMPLEMENTATION.md` §4 uses the same nesting and additionally lists
-`Provision` (per-repo dep detection) as a Phase 1 sub-step — an
-implementation-layer concern not shown here.
+of the classification; it is skipped entirely for fully-specified tasks.
 
 **Why planners run before scheduling.** Decomposition (Phase 2) needs LLM
-judgment about a domain; scheduling (Phase 3) is pure graph computation over
-the merged result. Separating them means the scheduler never trusts a
+judgment about a domain; scheduling (Phase 3) is pure graph computation
+over the merged result. Separating them means the scheduler never trusts a
 model's ordering.
 
-**The division of labor.** Everything that requires understanding — classify,
+**The division of labor.** Everything requiring understanding — classify,
 decompose, write code, resolve a semantic merge conflict — is done by a
 worker. Everything checkable mechanically — scheduling, caps, retries,
 state, integration bookkeeping — is done by the orchestrator. This is the
 single most important idea in the system and recurs throughout: see §12.
 
 **Invocation.** The orchestrator is invoked directly as a command-line
-program; that is the primary path. A thin plugin skill is also provided as a
-convenience entry point from inside Claude Code, but it is only a wrapper
-around the same program, with no logic of its own.
+program; that is the primary path. A thin plugin skill is also a
+convenience entry point from inside Claude Code, but only a wrapper with no
+logic of its own.
 
-**Observability.** Each worker's stream of tool calls, text, and intermediate
-results is read line-by-line, written verbatim to a per-worker log file, and
-summarized inline at a user-controllable verbosity level (default: one line
-per worker event; `-q` terser, `-vv` raw event payloads). Errors emit at
-every level. The per-worker file is the ground-truth audit trail; the inline
-view is the live feed.
+**Observability.** Each worker's stream of tool calls, text, and
+intermediate results is read line-by-line, written verbatim to a
+per-worker log file, and summarized inline at a user-controllable
+verbosity level (default: one line per worker event; `-q` terser, `-vv`
+raw event payloads). Errors emit at every level. The per-worker file is the
+ground-truth audit trail; the inline view is the live feed.
 
 ---
 
@@ -153,7 +146,7 @@ would produce the same deliverables, the classifier picks the single
 best-fitting label. The orchestrator surfaces a `SAME_WORK_RISK` advisory
 for category pairs that commonly over-classify (e.g. `bug-fixing` +
 `feature-implementation`); the classifier addresses it on its
-structured-feedback retry. This yields to the independent
+structured-feedback retry, yielding to the independent
 `classification_judge`'s (§8) authoritative finding: once the judge
 confirms both categories in a flagged pair are genuinely required, the
 advisory is suppressed for that pair on later re-classify rounds rather
@@ -165,195 +158,183 @@ than re-litigated — see §8 *The CRITIC retry pattern's oscillation guard*.
 
 ### The sizing target
 
-Each planner decomposes its domain into subtasks. The decomposition target is
-**the smallest independently verifiable unit of change** — deliberately not
-"the smallest possible unit" (the original spec's phrasing).
+Each planner decomposes its domain into subtasks. The decomposition target
+is **the smallest independently verifiable unit of change** — deliberately
+not "the smallest possible unit" (the original spec's phrasing).
 
 Over-decomposition is not free: every subtask runs as a fresh worker that
 must re-establish its understanding of the codebase from cold context, so
-splitting one coherent change into five trivial subtasks pays that cold-start
-cost five times and adds four integration steps. The floor is the point
-below which a subtask can no longer be verified on its own. The matching
-ceiling: a subtask must fit inside one worker's context; one requiring a
-large read/change surface is split before execution begins.
+splitting one coherent change into five trivial subtasks pays that
+cold-start cost five times and adds four integration steps. The floor is
+the point below which a subtask can no longer be verified on its own; the
+matching ceiling is that a subtask must fit inside one worker's context —
+one requiring a large read/change surface is split before execution
+begins.
 
 Sizing is also the **primary defense against context exhaustion** (§10): a
-subtask scoped to fit inside one worker's context never needs a handoff, and
-splitting a plan is cheap while a mid-implementation handoff is not. Planner
-decomposition quality is the load-bearing assumption of the whole system, and
-the first place to look when a run goes wrong.
+subtask scoped to fit inside one worker's context never needs a handoff,
+and splitting a plan is cheap while a mid-implementation handoff is not.
+Planner decomposition quality is the load-bearing assumption of the whole
+system, and the first place to look when a run goes wrong.
 
 **Conceptual dominance is a planner-judgment axis, deliberately not a
 mechanical gate.** A related sizing failure is *dilution*: one subtask far
-more conceptually involved than its siblings, degrading the plan if batched
-with them — the fix is to isolate it into its own cluster, not split it. The
-planner prompt asks for this judgment (§2) and it is **not** backed by a code
-check, because **sizing is the wrong variable — fit is the variable.** Two
-independent studies (Stanford/Microsoft: 30× intrinsic same-task token
-variance; BAGEN: 47% estimation ceiling) plus our own estimator confirm no
-pre-execution size predictor achieves useful precision — file count, planner
-text-length, `requires`/`provides` fan-out, text-per-file density are all
-proxies for an unpredictable quantity (turn count). What *can* be judged is
-*Task-Context Fit*: whether a subtask's scope and context are co-minimized.
-Per §12, a signal that cannot be checked mechanically without misfiring
-belongs in the prompt, not in code. §5½ describes the structural mechanism
-giving the planner the codebase knowledge to judge this well, and the
-recursive fit-judge that becomes the authoritative decomposition-quality gate
-(demoting the self-scored `decomposition_quality` axis to non-gating
-advisory). Contrast `UNCOVERED_MIGRATION_SURFACE`, which *is* a code check
-because migration coverage *is* mechanically countable.
+more conceptually involved than its siblings, degrading the plan if
+batched with them — the fix is to isolate it into its own cluster, not
+split it. The planner prompt asks for this judgment (§2) and it is
+**not** backed by a code check, because **sizing is the wrong variable —
+fit is the variable**: two independent studies (Stanford/Microsoft: 30×
+intrinsic same-task token variance; BAGEN: 47% estimation ceiling) plus
+our own estimator confirm no pre-execution size predictor achieves
+useful precision — file count, text-length, `requires`/`provides`
+fan-out, text-per-file density are all proxies for an unpredictable
+quantity (turn count). What *can* be judged is *Task-Context Fit*:
+whether a subtask's scope and context are co-minimized, a signal that,
+per §12, belongs in the prompt rather than a mechanical check. §5½
+describes the structural mechanism giving the planner the codebase
+knowledge to judge this well, and the recursive fit-judge that becomes
+the authoritative decomposition-quality gate (demoting the self-scored
+`decomposition_quality` axis to non-gating advisory) — contrast
+`UNCOVERED_MIGRATION_SURFACE`, a code check because migration coverage
+*is* mechanically countable.
 
 ### Cross-domain dependencies
 
-Planners run in parallel and cannot see each other's output, yet dependencies
-cross domains (a testing subtask may depend on the feature subtask it
-tests). That coupling is reconciled by the orchestrator with three
-mechanisms:
+Planners run in parallel and cannot see each other's output, yet
+dependencies cross domains (a testing subtask may depend on the feature
+subtask it tests). That coupling is reconciled by the orchestrator with
+three mechanisms:
 
-- **Intra-domain ordering** — within its own domain a planner declares which
-  subtasks must precede which, because it owns and can see those subtasks.
-- **Cross-domain capability tags** — a planner cannot name another domain's
-  subtasks, so each subtask instead declares the capabilities it *produces*
-  and *requires* as abstract tags. The orchestrator matches every "requires"
-  against every domain's "provides" and adds a dependency edge from producer
-  to consumer.
+- **Intra-domain ordering** — within its own domain a planner declares
+  which subtasks must precede which, since it owns and can see those
+  subtasks.
+- **Cross-domain capability tags** — a planner cannot name another
+  domain's subtasks, so each subtask instead declares the capabilities it
+  *produces* and *requires* as abstract tags; the orchestrator matches
+  every "requires" against every domain's "provides" and adds a dependency
+  edge from producer to consumer.
 - **Reconciler worker** — capability tags are a shared vocabulary with no
   enforced dictionary, so two planners can name the same capability
   differently (`event-capture-shim` vs. `capture-call-implemented`) and a
-  literal-string match misses the equivalence. After all planners finish, the
-  orchestrator computes the set of `requires` tags no `provides` claims, and
-  if non-empty spawns a single *reconciler* worker. It reads the full task
-  plus every subtask and emits eight actions. Five are *resolution* actions:
-  `renames` (unify two tags naming the same thing), `add_provide` (an
-  existing subtask produces the capability but didn't declare it),
-  `added_subtasks` (a genuine gap — propose a new subtask), `conditional_drop`
-  (drop a consumer subtask whose own `intent` declares it conditional on an
-  unresolvable precondition, converting the planner's prose conditionality
-  into a structured drop), `drop_require` (drop an over-specified `requires`
-  entry — an aggregate, coarser synonym, or authoring-time decision the
-  consumer itself records rather than a real cross-subtask dependency; the
-  consumer stays, only the bad edge goes). Two are *cycle-breaking-only*:
-  `dependency_edges` (assert explicit ordering when both sides legitimately
-  need each other) and `merged_subtasks` (collapse two subtasks into one when
-  the cycle reflects genuine authoring overlap). One is an *escape hatch*:
-  `unresolvable`, for unmet requirements with no plausible resolution
-  (aborts the run with the reconciler's diagnosis). All judgment about tag
-  equivalence, conditional-drop eligibility, and cycle resolution lives in
-  the reconciler worker; the orchestrator computes the unresolved set
-  mechanically, runs Tarjan's SCC on the post-mutation graph, and applies the
-  worker's output mechanically.
+  literal-string match misses the equivalence. After all planners finish,
+  the orchestrator computes the set of `requires` tags no `provides`
+  claims, and if non-empty spawns a single *reconciler* worker that reads
+  the full task plus every subtask and emits eight actions: five
+  *resolution* actions (`renames` unifies two tags naming the same
+  thing; `add_provide` marks an existing subtask as already producing an
+  undeclared capability; `added_subtasks` proposes a new subtask for a
+  genuine gap; `conditional_drop` converts a consumer's prose
+  conditionality on an unresolvable precondition into a structured drop;
+  `drop_require` drops an over-specified `requires` entry — an
+  aggregate, coarser synonym, or authoring-time decision, leaving the
+  consumer in place), two *cycle-breaking-only* actions (`dependency_edges`
+  asserts explicit ordering when both sides legitimately need each
+  other; `merged_subtasks` collapses two subtasks reflecting genuine
+  authoring overlap), and one *escape hatch* — `unresolvable`, for unmet
+  requirements with no plausible resolution, aborting the run with the
+  reconciler's diagnosis. All judgment about tag equivalence,
+  conditional-drop eligibility, and cycle resolution lives in the
+  reconciler worker; the orchestrator computes the unresolved set,
+  cycle-checks with Tarjan's SCC, and applies the output mechanically.
 
-  **The wire shape is flatter than the action list reads, deliberately.**
-  `add_provide` / `drop_require` / `conditional_drop` / `unresolvable`
-  travel as one `tag_ops` array discriminated by an `op` field, and a new
-  subtask's `requires` travels in a sibling `added_requires` keyed by
-  subtask id rather than nested inside it — the natural nested shape exceeds
-  what grammar compilation accepts under § *Forcing constrained decoding*
-  and was refused outright. One adapter fans the wire shape back into the
-  eight arrays before anything else sees it, so downstream code is written
-  against the action names, not the wire names.
+  **The wire shape is flatter than the action list reads, deliberately** —
+  `tag_ops` (one array, discriminated by `op`) and a sibling
+  `added_requires`, since the natural nested shape exceeds what grammar
+  compilation accepts under § *Forcing constrained decoding*. One adapter
+  fans the wire shape back into the eight arrays before anything else
+  sees it, so downstream code is written against the action names.
 
-  **Artifact-registry worker (an *advisory* shared vocabulary, upstream of
-  the reconciler).** "No enforced dictionary" is deliberate — no planner
-  must bind to a canonical name, and the reconciler remains the authority
-  that bridges whatever drift survives. But letting every planner invent its
-  own tag *and* file path for the same artifact enlarges the reconciler's
-  job and produces path disagreements it never attempts to bridge (it works
-  the tag channel, not `files_likely_touched`; see *Cross-domain surface
-  overlap* below). So before the planners run, a read-only
-  `artifact_registry` worker reads the task plus the global repo-map (ranked
-  to fit the token budget, no task-file seeding — it names artifacts
-  broadly) and emits a small canonical list of artifacts the task will
-  plainly create, each with one suggested capability tag and file path. That
-  registry is injected into every planner's context with an instruction to
-  *prefer* the canonical tag/path when applicable. This is strictly advisory
-  and additive: a planner may still invent names the registry didn't
-  foresee, the reconciler still bridges the remainder, and the wiring gate
-  is still the backstop. Its only job is to raise the *rate* at which two
-  blind planners land on the same string, so the exact-string matcher wires
+  **Artifact-registry worker (an *advisory* shared vocabulary, upstream
+  of the reconciler).** "No enforced dictionary" is deliberate, but
+  letting every planner invent its own tag *and* file path for the same
+  artifact enlarges the reconciler's job and produces path disagreements
+  it never bridges (it works the tag channel, not
+  `files_likely_touched`; see *Cross-domain surface overlap* below). So
+  before the planners run, a read-only `artifact_registry` worker reads
+  the task plus the global repo-map (ranked to fit the token budget) and
+  emits a small canonical list of artifacts the task will plainly
+  create, each with one suggested capability tag and file path, injected
+  into every planner's context to *prefer* when applicable. This is
+  strictly advisory and additive — a planner may still invent names the
+  registry didn't foresee, and the reconciler and wiring gate remain the
+  backstops — its only job is to raise the *rate* at which two blind
+  planners land on the same string, so the exact-string matcher wires
   the edge with no reconciliation needed. It does not enforce, gate, or
-  `die()`. (It does not by itself prevent a missing-edge wiring death — a
-  planner must also *declare* the edge, below.)
+  `die()`, and doesn't by itself prevent a missing-edge wiring death,
+  since a planner must also *declare* the edge (below).
 
   **Test subtasks must wire to their producers (planner discipline +
-  advisory).** The registry raises the rate at which two planners agree on a
-  name, but an edge only forms when the consumer *declares* it. One
-  recurring shape: a `testing`-domain subtask exercises a file, symbol, or
-  behavior another subtask creates yet declares neither a `requires` tag nor
-  a `depends_on` id for it, so the scheduler may run the test before its
-  producer and the wiring gate rejects the plan.
+  advisory).** The registry raises the rate at which two planners agree
+  on a name, but an edge only forms when the consumer *declares* it. One
+  recurring shape: a `testing`-domain subtask exercises a file, symbol,
+  or behavior another subtask creates yet declares neither a `requires`
+  tag nor a `depends_on` id for it, so the scheduler may run the test
+  before its producer and the wiring gate rejects the plan. This isn't
+  the *dominant* shape — measured across the run corpus (2026-08-01), the
+  commoner failure is a subtask missing a *specific* few edges out of
+  several declared ones — but a both-channels-empty advisory is blind to
+  that by construction, which is why the gate's constrained repair, not
+  this discipline, closes the class. This includes *indirect* guards,
+  like a coverage-floor test depending on the feature subtask whose new
+  source files it enumerates even though the file sets differ: the
+  discipline is prompt-side, not a Python inference, because the
+  dependency is *semantic* (raw file overlap is unreliable; see
+  *Provider-subset subtasks*) and §12 assigns prose-only facts to a
+  worker. `_warn_test_subtask_missing_producer_edge` surfaces the
+  high-risk shape one phase earlier as an advisory; the wiring gate
+  remains the enforcer.
 
-  This is not the *dominant* shape — measured across the run corpus
-  (2026-08-01), the commoner failure is a subtask missing a *specific* few
-  edges out of several declared ones (e.g. a cross-cutting verifier wired to
-  the code subtasks it follows but not the test-rewrite subtasks whose
-  output it consumes). A both-channels-empty advisory is blind to that by
-  construction, which is why the gate's constrained repair, not this
-  discipline, closes the class. This includes *indirect* guards: a
-  coverage-floor or parity test that must enumerate a feature's new source
-  files depends on that feature subtask even though the test and source
-  files differ. The discipline is prompt-side — the planner declares an edge
-  to the producer of every not-yet-existing artifact a test targets —
-  because the dependency is *semantic* (raw file overlap is an unreliable
-  signal; see *Provider-subset subtasks*) and §12 assigns such prose-only
-  facts to a worker, not a Python inference. A deterministic
-  `_warn_test_subtask_missing_producer_edge` surfaces the high-risk shape
-  one phase earlier as an advisory; the wiring gate remains the enforcer.
-
-  **Transitive-chain wiring is not producer wiring.** A narrower,
-  repeatedly-observed failure: a test subtask `T` declares `depends_on: [B]`
-  (the subtask immediately before it in the plan's chain), but `B` is not
-  the actual producer of everything `T`'s assertions exercise — if `T` also
-  exercises a fixture an earlier subtask `A` produces directly, chaining to
-  `B` alone is not equivalent to wiring to `A`, since `A`'s output is not
-  guaranteed to survive as `B`'s own `provides` if `B` is later merged,
-  dropped, or re-scoped. Two real incidents (barnacle, 2026-07-31) hit this
-  shape and the wiring gate correctly rejected both plans. The planner
-  traces every subtask whose *output* (not just chain position) the test's
-  assertions touch, and wires to each directly.
+  **Transitive-chain wiring is not producer wiring.** A narrower failure:
+  test subtask `T` declares `depends_on: [B]` (the subtask immediately
+  before it in the chain), but if `T` also exercises a fixture an earlier
+  subtask `A` produces directly, chaining to `B` alone doesn't substitute
+  for wiring to `A` — `A`'s output isn't guaranteed to survive as `B`'s
+  own `provides` if `B` is later merged, dropped, or re-scoped. Two real
+  incidents (barnacle, 2026-07-31) hit this shape and the wiring gate
+  correctly rejected both plans, so the planner now traces every subtask
+  whose *output* (not just chain position) the test's assertions touch,
+  and wires to each directly.
 
   **Dead-subtask elimination (code-enforced).** A planner can emit
   `requires: {tag, extent: in_plan}` for a capability it expects another
-  domain to produce. If that domain returns 0 subtasks, the requires is
+  domain to produce. If that domain returns 0 subtasks the requires is
   unresolvable, and a subtask whose *every* `in_plan` requires is
-  unresolvable is fully speculative. Before `die()`, the orchestrator prunes
-  such subtasks mechanically (mirroring dead-code elimination after constant
-  folding: a domain returning 0 subtasks is a constant fold, subtasks
-  depending solely on it are dead code). The prune fires only when at least
-  one domain has 0 subtasks and does not weaken the reconciler's
-  `unresolvable` verdict generally. If all domains end up empty,
-  `_detect_no_work` fires; if unresolvable entries remain after pruning, the
-  run dies as before.
+  unresolvable is fully speculative; before `die()` the orchestrator
+  prunes such subtasks mechanically (a 0-subtask domain is dead-code
+  elimination's constant fold, subtasks depending solely on it are dead
+  code). The prune fires only when at least one domain has 0 subtasks and
+  doesn't weaken the reconciler's `unresolvable` verdict generally;
+  `_detect_no_work` fires if all domains end up empty, and the run dies
+  as before if unresolvable entries remain after pruning.
 
-  Acyclicity is a first-class output property — the reconciler must produce
-  an acyclic merged plan, not just resolve unresolved tags. If its first
-  attempt closes a cycle, the orchestrator detects it with Tarjan's SCC,
-  computes a recommended resolution from structural signals
-  (planner-declared `depends_on` orientation; `files_likely_touched`
-  overlap), and respawns the worker once with the cycle data, the
-  recommendation, and a bounded set of acceptable operations — the model
-  never has to detect cycles itself. A second cycle aborts the run with the
-  SCC and offending mutations named.
+  Acyclicity is a first-class output property, not merely resolving
+  unresolved tags: if the reconciler's first attempt closes a cycle, the
+  orchestrator detects it with Tarjan's SCC, computes a recommended
+  resolution from structural signals (planner-declared `depends_on`
+  orientation; `files_likely_touched` overlap), and respawns the worker
+  once with the cycle data, the recommendation, and a bounded set of
+  acceptable operations — the model never has to detect cycles itself. A
+  second cycle aborts the run with the SCC and offending mutations named.
 
   The same retry-with-structural-feedback pattern applies to **unresolved
-  `requires` tags surviving the reconciler's first attempt** — commonly the
-  model inventing a new tag in `added_subtasks`/`add_provide` without
-  renaming the original consumer's tag to match. The orchestrator computes
+  `requires` tags surviving the reconciler's first attempt** — commonly
+  the model inventing a new tag in `added_subtasks`/`add_provide` without
+  renaming the consumer's tag to match. The orchestrator computes
   string-similarity hints over the post-mutation `provides` namespace,
-  surfaces them in the retry prompt as a *prior* (not the answer — textual
-  similarity can produce false friends), and respawns once. A still-
-  unresolved tag aborts the run with the structured report.
+  surfaces them in the retry prompt as a *prior* (textual similarity can
+  produce false friends), and respawns once; a still-unresolved tag
+  aborts the run with the structured report.
 
 ### `requires.extent` — in-graph vs. external prerequisites
 
 Not every prerequisite a planner identifies is satisfiable by another code
-subtask in the plan. When a planner researches its domain (especially under
-`source_of_truth = both`), it sometimes surfaces a genuine prerequisite that
-lives *outside* the build graph: a Dynamo table provisioned by another repo,
-an ops runbook, a manual step in another team's queue. Treating those as
-unresolved cross-domain edges forces the reconciler to either invent a
-connector subtask with its own out-of-scope `requires`, or abort — neither
-preserves the insight.
+subtask in the plan. When a planner researches its domain (especially
+under `source_of_truth = both`), it sometimes surfaces a genuine
+prerequisite that lives *outside* the build graph: a Dynamo table
+provisioned by another repo, an ops runbook, a manual step in another
+team's queue. Treating those as unresolved cross-domain edges forces the
+reconciler to either invent a connector subtask with its own out-of-scope
+`requires`, or abort — neither preserves the insight.
 
 To carry that distinction, each `requires` entry is an object — `{tag,
 extent, reason}` — rather than a bare string, classified along one axis:
@@ -362,28 +343,28 @@ extent, reason}` — rather than a bare string, classified along one axis:
   orchestrator wires a graph edge by matching against `provides`, resolved
   via the reconciler's action vocabulary above.
 - `extent: external` — a real prerequisite the planner is declaring lives
-  outside *this run's* build graph. Three kinds qualify: **outside the build
-  graph entirely** (another repo's deploy, an ops runbook, a manual step in
-  another team's queue); **producible by code but owned by another run**
-  (a sibling phase document, an earlier phase, or another run of the same
-  multi-part deck); **fenced off by the task itself** (the task declares a
-  surface out of scope and the capability's only implementation site lies
-  there). `reason` always names the owner. The orchestrator filters these
-  out of the matching pass and collects them into a `preconditions` section
-  of the assembled plan — the human sees the insight as a deploy note, not
-  a hard edge. In a run-group (§20), a sibling repo in the same group is
-  still `external` by design — its cross-repo dependency cannot be a hard
-  DAG edge, and `reason` naming the sibling is what finalize turns into a
-  deploy-ordering note.
+  outside *this run's* build graph. Three kinds qualify: **outside the
+  build graph entirely** (another repo's deploy, an ops runbook, a
+  manual step in another team's queue); **producible by code but owned
+  by another run** (a sibling phase document, an earlier phase, or
+  another run of the same multi-part deck); **fenced off by the task
+  itself** (the task declares a surface out of scope and the
+  capability's only implementation site lies there). `reason` always
+  names the owner; the orchestrator filters these out of the matching
+  pass and collects them into a `preconditions` section of the assembled
+  plan — the human sees the insight as a deploy note, not a hard edge.
+  In a run-group (§20), a sibling repo in the same group is still
+  `external` by design, and `reason` naming it is what finalize turns
+  into a deploy-ordering note.
 
-The test separating the two values is **"is it in *this run's* graph?"** —
-not "could any code produce it?". That distinction is load-bearing: the
-second `external` kind above is producible by a code subtask, so a "could
-code produce this?" reading forces `in_plan`, which by definition has no
-provider and routes straight to `unresolvable`. On a multi-part task deck
-whose files reference each other, that leaves the planner with no correct
-answer and aborts the run after the full planning spend. The run-group
-carve-out is the same principle one scope wider.
+The test separating the two values is **"is it in *this run's* graph?"**
+— not "could any code produce it?": the second `external` kind above is
+producible by code, so a "could code produce this?" reading forces
+`in_plan`, which by definition has no provider and routes straight to
+`unresolvable`. On a multi-part task deck whose files reference each
+other, that leaves the planner with no correct answer and aborts the
+run after the full planning spend — the run-group carve-out is the same
+principle one scope wider.
 
 **A task-declared fence removes a surface from this run's graph as surely
 as another run owning it does.** Run `2d7527f1` (2026-08-17, 55 workers,
@@ -393,309 +374,293 @@ constant inside it. Planners run blind, so they split: the domain owning
 the surface obeyed the fence, while `testing` obeyed the criterion and
 declared `extent: in_plan` on a capability nobody could provide. The
 reconciler had no legal resolution — the consumer's prose was
-unconditional, so `conditional_drop` did not apply, and a rename would have
-wired a test to a documentation artifact — and correctly aborted. The
-fence is what the planner should have keyed on: "could a connector subtask
-produce this?" answers *yes* for a fenced code change, which is precisely
-why that question must not be asked first.
+unconditional, so `conditional_drop` didn't apply, and a rename would
+have wired a test to a documentation artifact — and correctly aborted.
+"Could a connector subtask produce this?" answers *yes* for a fenced
+code change, which is why the fence, not that question, is what the
+planner should key on.
 
-The planner is the right classifier because it just did the research that
-surfaced the prerequisite; the reconciler cannot answer "does some *other*
-domain's planner produce this?" any better than planners can answer it
-about each other.
+The planner is the right classifier — it just did the research that
+surfaced the prerequisite; the reconciler cannot answer "does some
+*other* domain's planner produce this?" any better than planners can.
 
 **The external twin.** Planners run blind, so two can classify the same
 capability differently: one says `external`, another says `in_plan` —
 which has no provider by construction and reaches `unresolvable`, killing
-the run while evidence it is out-of-graph sits unread in the externals the
-orchestrator collected moments earlier. Measured on run `1178f696`, both
-fatal entries had such a twin (one exact match, one off by a single
-character). So before dying, the orchestrator checks each `unresolvable`
-entry against the collected externals — exact tag first, then a
-singularized token set — and a hit rewrites the entry to `external`,
-inheriting the twin's `reason`, dropping it from `unresolvable`.
+the run while evidence it is out-of-graph sits unread in the externals
+the orchestrator collected moments earlier. Measured on run `1178f696`,
+both fatal entries had such a twin (one exact match, one off by a single
+character). Before dying, the orchestrator now checks each
+`unresolvable` entry against the collected externals — exact tag first,
+then a singularized token set — and a hit rewrites the entry to
+`external`, inheriting the twin's `reason`, dropping it from
+`unresolvable`.
 
 **Placement is the safety property.** This runs *after* the reconciler's
-verdict, so it can only convert a `die()` into a deploy note — never skip
-an edge the reconciler would have wired. Running it *before* was measured
-demoting three tags the reconciler went on to resolve successfully; the
-reconciler resolves far more than it aborts (279 resolutions against 4
-aborts across the corpus), so preempting it is both expensive and wrong.
-The pass is deliberately narrow — set equality after singularization,
-never partial token overlap — and every demotion is recorded so a wrong
-pairing is auditable, not silent.
+verdict, so it can only convert a `die()` into a deploy note, never skip
+an edge the reconciler would have wired — running it *before* was
+measured demoting three tags the reconciler went on to resolve
+successfully, and the reconciler resolves far more than it aborts (279
+resolutions against 4 aborts across the corpus). The pass is
+deliberately narrow — set equality after singularization, never partial
+token overlap — and every demotion is logged so a wrong pairing is
+auditable.
 
 **Collision rule.** If any planner declares `requires: {tag: X, extent:
-external}` and another declares `provides: X`, `provides` wins and the entry
-is silently promoted to `in_plan` before matching — preventing a planner from
-unilaterally bypassing a real producer already in another domain's plan. The
-promotion is mechanical and needs no reconciler involvement.
+external}` and another declares `provides: X`, `provides` wins and the
+entry is silently promoted to `in_plan` before matching — preventing a
+planner from unilaterally bypassing a real producer already in another
+domain's plan. The promotion is mechanical and needs no reconciler
+involvement.
 
 `unresolvable` is now reserved for genuinely-broken in-plan tags — typos,
-hallucinations, or in-plan capabilities the reconciler can neither rename,
-attribute, nor connect. An external prerequisite never reaches that path; a
-planner-declared *conditional* consumer routes through `conditional_drop`;
-an *over-specified* `requires` entry routes through `drop_require`.
+hallucinations, or in-plan capabilities the reconciler can neither
+rename, attribute, nor connect. An external prerequisite never reaches
+that path; a planner-declared *conditional* consumer routes through
+`conditional_drop`; an *over-specified* `requires` entry routes through
+`drop_require`.
 
-**Accepting external-blocked subtasks.** When a subtask's only unsatisfied
-prerequisites are `extent: external`, the worker discovers the dependency
-is missing (e.g. no Postgres server in the container) and returns `status:
-blocked`. The orchestrator does not gate dispatch on external
-preconditions — informational, not graph edges — so the wave dies and
-`resume` retries the same subtask, blocking again. `accept-blocked
-<run-id> <subtask-id>` lets the operator acknowledge the block: it sets
-`subtask_status[sid]` to `complete` in state.json so `resume` skips it,
-keeping external preconditions a human concern while giving an escape
-hatch against an otherwise-indefinite loop.
+**Accepting external-blocked subtasks.** When a subtask's only
+unsatisfied prerequisites are `extent: external`, the worker discovers
+the dependency is missing (e.g. no Postgres server in the container) and
+returns `status: blocked`. The orchestrator doesn't gate dispatch on
+external preconditions — informational, not graph edges — so the wave
+dies and `resume` retries the same subtask, blocking again.
+`accept-blocked <run-id> <subtask-id>` sets `subtask_status[sid]` to
+`complete` in state.json so `resume` skips it — keeping external
+preconditions a human concern while escaping an otherwise-indefinite
+loop.
 
-**The integration gate needs the same escape hatch, for a sharper reason.**
-`integrate_wave` dies on a behavioral defect from `integration_judge` — an
-LLM. A false positive there permanently kills a run *after* full planning
-and implementation spend, and since the merge is already committed to
-staging, `resume` re-runs the same judge against the same tree and reaches
-the same verdict. `integrate_wave` persists the judge's verdict to
-`integration_gate[sid]` *before* it dies, so a resume distinguishes "not
-yet reviewed" from "rejected" from "accepted" — `integrate.sh`'s merge is
-idempotent, so without the audit key a resume would see the branch already
-merged and skip silently past a rejected verdict. `accept-integration
-<run-id> <subtask-id>` then flips that record's `accepted` flag, mirroring
-`accept-blocked`'s state-mutation machinery; a resume with an unaccepted
+**The integration gate needs the same escape hatch, for a sharper
+reason.** `integrate_wave` dies on a behavioral defect from
+`integration_judge` — an LLM. A false positive there permanently kills a
+run *after* full planning and implementation spend, and since the merge
+is already committed to staging, `resume` re-runs the same judge against
+the same tree and reaches the same verdict. `integrate_wave` persists the
+judge's verdict to `integration_gate[sid]` *before* it dies, so a resume
+distinguishes "not yet reviewed" from "rejected" from "accepted" —
+`integrate.sh`'s merge is idempotent, so without the audit key a resume
+would see the branch already merged and skip silently past a rejected
+verdict. `accept-integration <run-id> <subtask-id>` flips that record's
+`accepted` flag, mirroring `accept-blocked`; a resume with an unaccepted
 finding re-invokes the judge rather than dying on the stale record, so a
 verdict that no longer reproduces resolves itself.
 
 `--skip-integration-check` disables the gate wholesale, matching the five
-other gates that already carry a bypass — independent of acceptance, which
-settles a finding the judge has already produced rather than preventing it
-from running.
+other gates that already carry a bypass — independent of acceptance,
+which settles a finding the judge has already produced rather than
+preventing it from running.
 
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
-independent and run in parallel; waves run in sequence. A dependency cycle is
-unsatisfiable; the reconciler's retry loop tries to break it (preferring
-`drop_require` / `dependency_edges` / `merged_subtasks` over cycle-closing
-renames), and if that fails the run aborts with the SCC and the mutations
-that closed it named.
-
-Cross-domain dependencies are reconciled by the orchestrator from capability
-tags (with the reconciler bridging vocabulary drift) and enforced as wave
-ordering — planners can run in parallel without coordination, since the
-coupling between their outputs is recovered globally by the scheduler.
+independent and run in parallel; waves run in sequence. A dependency
+cycle is unsatisfiable; the reconciler's retry loop tries to break it
+(preferring `drop_require` / `dependency_edges` / `merged_subtasks` over
+cycle-closing renames), and if that fails the run aborts with the SCC and
+the mutations that closed it named.
 
 ### Cross-domain surface overlap
 
 The reconciler bridges *vocabulary* drift. A second class it does not
 address: two planners independently proposing subtasks that produce **the
-same exported artifact** with **incompatible APIs**. Because each planner can
-legitimately declare its own `provides` tag for the artifact
+same exported artifact** with **incompatible APIs**. Because each planner
+can legitimately declare its own `provides` tag for the artifact
 (`widget-frame-component` and `widget-frame-adopted` for the same
 `WidgetFrame` extraction), this class slips past every check between
-planning and integration, surfacing as an integrator merge-conflict mid-run
-with worker budget already spent across earlier waves.
+planning and integration, surfacing as an integrator merge-conflict
+mid-run with worker budget already spent across earlier waves.
 
 **A re-plan invalidates every phase that already ran.** The planning
-pipeline is `reconcile → overlap-judge → adherence-gate → coverage-gate`,
-and the two later gates can reject a plan and re-drive `phase_plan`. A
-re-plan runs one planner per category in parallel with no cross-category
-visibility, exactly like the first pass, so it reintroduces the same
-vocabulary drift and surface collisions the earlier phases already resolved.
-Whatever a gate re-plans, it owes a re-run of every phase upstream of itself.
+pipeline is `reconcile → overlap-judge → adherence-gate → coverage-gate`;
+the two later gates can reject a plan and re-drive `phase_plan`, running
+one planner per category in parallel with no cross-category visibility
+just like the first pass — so it reintroduces the same vocabulary drift
+and surface collisions the earlier phases already resolved. Whatever a
+gate re-plans, it owes a re-run of every phase upstream of itself. The
+repair is asymmetric because the gates sit at different positions: a
+re-plan from the adherence gate must re-run reconcile and the overlap
+judge, but not the coverage gate, which hasn't run yet. The coverage
+gate itself no longer re-plans at all — demoted to advisory on
+2026-08-04 (§8 *Independent adversarial verification*) — so its
+obligation (reconcile, overlap judge, **and** adherence gate) is
+currently unexercised, stated here because the rule is positional, not
+gate-specific. Nesting a gate inside another's retry loop is bounded,
+not recursive — every gate drives re-plans through the shared
+mechanical-feedback loop under one round budget, so the worst case is
+the product of two budgets.
 
-The repair is asymmetric because the gates sit at different positions. A
-re-plan from the adherence gate must re-run reconcile and the overlap judge;
-it does not need the coverage gate, which has not run yet. The coverage gate
-itself no longer re-plans at all — demoted to advisory on 2026-08-04 (§8
-*Independent adversarial verification*) — so its obligation (reconcile, the
-overlap judge, **and** the adherence gate) is currently unexercised; stated
-here because the rule is positional, not gate-specific. Nesting a gate
-inside another gate's retry loop is bounded, not recursive: every gate
-drives its re-plans through the shared mechanical-feedback loop under one
-round budget, so the worst case is the product of two budgets.
-
-Getting this wrong is expensive and silent. Run `19a70d96` (2026-08-01): the
-overlap judge merged 8 subtasks down to 4; the coverage gate then
-re-planned, all 8 duplicates came back undetected, and all 8 executed —
-two did the same migration, the integrator merged both into one document
-section, and the integration gate refused the result after 4.7 hours and
-164 workers. Execution ran a plan the overlap judge had already rejected.
+Getting this wrong is expensive and silent. Run `19a70d96` (2026-08-01):
+the overlap judge merged 8 subtasks down to 4; the coverage gate
+re-planned, all 8 duplicates came back undetected and executed, two did
+the same migration, and the integration gate refused the result after
+4.7 hours and 164 workers — execution ran a plan the overlap judge had
+already rejected.
 
 A **plan-overlap judge** worker runs between reconcile and schedule
 specifically to catch this. It reads the full reconciled subtask list
 (title, intent, `files_likely_touched`, `provides`, `requires`) and emits
-zero or more `collisions`, each with one of four resolutions: `merge` (one
-component satisfies both intents), `drop_a`/`drop_b` (one intent is
+zero or more `collisions`, each with one of four resolutions: `merge`
+(one component satisfies both intents), `drop_a`/`drop_b` (one intent is
 strictly superseded), or `unresolvable` (the intents are structurally
 contradictory and the run should die at plan time, not crash at
 integration).
 
-**An `unresolvable` verdict re-plans before it dies.** The judge refusing to
-merge two contradictory designs is correct behavior, but a terminal `die()`
-after the entire planning spend is not. Measured across the corpus: 43 runs
-reached this judge and 5 (12%) died here, burning 404 workers none
-recoverable, while the judge resolved the other 95.5% of collisions (232 of
+**An `unresolvable` verdict re-plans before it dies.** The judge refusing
+to merge two contradictory designs is correct, but a terminal `die()`
+after the entire planning spend is not. Measured across the corpus: 43
+runs reached this judge and 5 (12%) died here, burning 404 unrecoverable
+workers, while the judge resolved the other 95.5% of collisions (232 of
 243) without incident. An unresolvable collision is a verdict about the
-**plan**, not the judge's output quality, so it now re-plans the implicated
-domains once, with the contradiction as feedback, and dies only if the
-second verdict is still unresolvable (bounded by `overlap_replan_done`).
+**plan**, not the judge's output quality, so it now re-plans the
+implicated domains once with the contradiction as feedback, and dies
+only if the second verdict is still unresolvable (bounded by
+`overlap_replan_done`).
 
 The re-plan is **scoped**, and this gate is the only one where that is
 currently possible: a collision names `a_sid`/`b_sid`, so the implicated
 domains are mechanically derivable, whereas `coverage_gaps` and the
-adherence judge's `violations` carry no subtask reference at all. Scope is
-the implicated domains plus `_replan_domain_closure` — the transitive set of
-domains depending on them across both the id and tag channels — so no
+adherence judge's `violations` carry no subtask reference at all. Scope
+is the implicated domains plus `_replan_domain_closure` — the transitive
+set of domains depending on them across both id and tag channels, so no
 surviving edge can dangle. Measured over 85 (domain, plan) re-plan
-simulations on real corpus plans: closure-scoped schedules and validates
-85/85, naive single-domain 79/85.
+simulations: closure-scoped schedules and validates 85/85, naive
+single-domain 79/85.
 
-The artifact a collision names is often one that does **not yet exist** —
-the canonical case is two planners each proposing to *create* the same
-component or test file. Artifact existence is checked against the union of
-the plan's `files_likely_touched` as well as the repo, so a to-be-created
-file counts as real evidence and only a genuinely invented path is flagged.
+The artifact a collision names is often one that does **not yet exist**
+— the canonical case is two planners each proposing to *create* the same
+component or test file. Existence is checked against the union of the
+plan's `files_likely_touched` and the repo, so a to-be-created file
+counts as real evidence and only a genuinely invented path is flagged.
 
 `artifact` is a free-text label — the judge's own description of what's
 colliding — and Python never parses it (CLAUDE.md *Language-to-JSON*: no
-tokenizing, no stripping punctuation, no testing tokens for path shape). A
-collision instead carries a separate `artifact_paths` field: the
+tokenizing, no stripping punctuation, no testing tokens for path shape).
+A collision instead carries a separate `artifact_paths` field: the
 repo-relative paths the judge names explicitly, the only thing
-`PHANTOM_ARTIFACT`'s existence check reads. `artifact` stays purely
+`PHANTOM_ARTIFACT`'s existence check reads; `artifact` stays purely
 descriptive for a human reading the plan.
 
-`artifact_paths` is **asked for but not schema-required**. Requiring it was
-far more destructive than the false positives it prevented: across the
-corpus this phase produced valid output on only **40.9% of its invocations**
-(vs. 99.6–100% for every other worker), and **84 of its 85 validation
-failures were the single error `'artifact_paths' is a required
-property'`** — a whole-payload rejection of an otherwise-sound collision
-analysis, in the phase runs most often die in. Absence was already the
-designed-for case (`paths = c.get("artifact_paths") or []` skips the
-collision when empty, since a purely logical artifact has no path to check),
-so requiring the field only turned a graceful skip into a discarded plan.
+`artifact_paths` is **asked for but not schema-required**. Requiring it
+was far more destructive than the false positives it prevented: across
+the corpus this phase produced valid output on only **40.9% of its
+invocations** (vs. 99.6–100% for every other worker), and **84 of its 85
+validation failures were the single error `'artifact_paths' is a
+required property'`** — a whole-payload rejection of an otherwise-sound
+collision analysis, in the phase runs most often die in. Absence was
+already the designed-for case (`paths = c.get("artifact_paths") or []`
+skips the collision when empty, since a purely logical artifact has no
+path to check), so requiring the field only turned a graceful skip into a
+discarded plan.
 
-The judge is biased toward escalation. Before emitting `merge`, it must
-verify the two intents are compositionally consistent — no required-
-vs-forbidden prop conflict, no structural body contradiction, no
-adoption-site contract conflict — and write a concrete `merge_feasibility`
-statement the orchestrator carries forward as the merged subtask's unified
-intent. If no such statement can be written, the resolution must be
-`unresolvable`, not `merge`. This is what distinguishes detection from
-silent auto-merging of two incompatible specs into a frankenstein
-implementer brief; the orchestrator enforces it in Python — a `merge`
-emission with empty `merge_feasibility` is a fatal error.
+The judge is biased toward escalation: before emitting `merge`, it must
+verify the two intents are compositionally consistent — no
+required-vs-forbidden prop conflict, no structural body contradiction, no
+adoption-site contract conflict — and write a concrete
+`merge_feasibility` statement the orchestrator carries forward as the
+merged subtask's unified intent. If no such statement can be written the
+resolution must be `unresolvable`, not `merge` — distinguishing detection
+from silently auto-merging two incompatible specs into a frankenstein
+implementer brief; the orchestrator enforces this in Python, since a
+`merge` emission with empty `merge_feasibility` is a fatal error.
 
 The judge's recall on the test corpus was 100% (every observed surface
-collision flagged, including the run that motivated this phase), with the
-merge-feasibility discipline correctly downgrading incompatible-API pairs to
-`drop_*` and `unresolvable`. Skip is automatic on single-planner runs;
-opt-out via `--skip-overlap-judge`. The complementary file-overlap warning
-(`_warn_cross_planner_file_overlap`) stays advisory — the judge handles the
-load-bearing case, the warning surfaces the deliberately-permissive
-same-file-different-surface cases.
+collision flagged, including the run that motivated this phase), with
+the merge-feasibility discipline correctly downgrading incompatible-API
+pairs to `drop_*` and `unresolvable`. Skip is automatic on
+single-planner runs; opt-out via `--skip-overlap-judge`. The
+complementary file-overlap warning (`_warn_cross_planner_file_overlap`)
+stays advisory — the judge handles the load-bearing case, the warning
+surfaces the deliberately-permissive same-file-different-surface cases.
 
-**A deterministic floor underneath the judge.** Recall being 100% *when the
-judge runs* is not the same as the collision class being guarded: the judge
-is skipped outright on single-planner runs, skippable by flag, and — before
-the re-plan repair above — could be bypassed entirely by a downstream gate
-re-planning after it had already passed. In each case nothing checked the
-class at all. So the §12 split applies here as at every other gate: the
-judgment layer keeps the semantic call, and a mechanical floor beneath it
-catches the shape needing no judgment.
+**A deterministic floor underneath the judge.** Recall being 100% *when
+the judge runs* is not the same as the collision class being guarded:
+the judge is skipped outright on single-planner runs, skippable by flag,
+and — before the re-plan repair above — could be bypassed entirely by a
+downstream gate re-planning after it had already passed. Nothing checked
+the class in those paths, so §12's split applies here too: the judgment
+layer keeps the semantic call, and a mechanical floor beneath it catches
+the shape needing no judgment.
 
 The floor is pure set logic over already-structured planner output — no
 prose is read (*Language-to-JSON*). Two subtasks that declare the **same
-`provides` tag** and whose **`files_likely_touched` intersect** are doing
-the same work to the same file. The one exclusion is load-bearing: two
-subtasks sharing a `_cofile_cluster` are the deliberate sub-file region
-splits of one file and must never be flagged. Without that exclusion the
-rule matches 3571 pairs across the corpus; with it, 9 — in exactly two
-runs, both destroyed by duplicate work (one died at this gate's downstream
-wiring check, the other executed both duplicates and was refused at the
-integration gate after 4.7 hours). The other 50 corpus runs produce no
-flags at all.
+`provides` tag** and whose **`files_likely_touched` intersect** are
+doing the same work to the same file. The one exclusion is load-bearing:
+two subtasks sharing a `_cofile_cluster` are the deliberate sub-file
+region splits of one file and must never be flagged — without it the
+rule matches 3571 pairs across the corpus; with it, 9, in exactly two
+runs, both destroyed by duplicate work (one died at this gate's
+downstream wiring check, the other executed both duplicates and was
+refused at the integration gate after 4.7 hours). The other 50 corpus
+runs produce no flags.
 
-An "already ordered by `depends_on`" exemption looks obviously necessary and
-is not: across the same corpus, **zero** flagged pairs were ordered. It is
-deliberately not implemented, so the rule stays the smallest thing that
-separates the two populations. Like every floor in this system, it is
-evaluated even when the judgment layer crashes — infrastructure failure must
-never waive a mechanical check.
+An "already ordered by `depends_on`" exemption looks obviously necessary
+and is not: across the same corpus, **zero** flagged pairs were ordered,
+so it is deliberately not implemented — the rule stays the smallest
+thing that separates the two populations, evaluated even when the
+judgment layer crashes, since infrastructure failure must never waive a
+mechanical check.
 
-**M11 DECISION — the floor's detections are resolved, not merely logged.**
-Shipped purely advisory, the floor left every flagged pair as duplicate work
-for the integrator to discover on its own. Each flagged pair is now
-synthesized into a `merge` collision and applied through the same
-`_apply_overlap_collisions` machinery the judge's own output uses —
-including its anchor + transitive `survivor_of` cluster resolution, so a
-3-or-more-participant collision (several subtasks sharing one `provides` tag
-and file) collapses to a single survivor rather than leaving any participant
-both dropped and referenced as a dangling dependency target. This runs above
-every skip in the same phase, firing on the paths the floor exists for:
-single-planner plans and `--skip-overlap-judge` runs, where the judge never
-gets a chance to resolve the collision.
+**M11 DECISION — the floor's detections are resolved, not merely
+logged.** Shipped purely advisory, the floor left every flagged pair as
+duplicate work for the integrator to discover on its own. Each flagged
+pair is now synthesized into a `merge` collision and applied through
+`_apply_overlap_collisions`, the same machinery the judge's own output
+uses — including its anchor + transitive `survivor_of` cluster
+resolution, so a 3-or-more-participant collision collapses to a single
+survivor rather than leaving any participant both dropped and
+referenced as a dangling dependency target. This runs above every skip
+in the same phase, firing on the paths the floor exists for
+(single-planner plans, `--skip-overlap-judge` runs) where the judge
+never gets a chance to resolve the collision.
 
 A single subtask can legitimately overlap with several siblings on
-different artifacts — e.g. one creates a new config file *and* wires an
-existing config to it, each half colliding with a different sibling's
-narrower piece. The judge's protocol stays pairwise; the orchestrator walks
-the pairs into a coherent cluster decision via the **anchor-survivor rule**:
-a subtask sid appearing in two or more non-`unresolvable` collisions is the
-*anchor* of that cluster and survives every merge it participates in — in
-the motivating case, the subtask the judge paired against several narrower
-siblings, so absorbing each partner *into* it matches what the judge
-described. Without this override the default lex-smaller survivor rule (a
-determinism device with no semantic content) would silently keep an
-arbitrary narrower subtask and discard the spec the judge identified as
-broader.
+different artifacts (e.g. one creates a config file *and* wires an
+existing one to it). Since the judge's protocol stays pairwise, the
+orchestrator walks the pairs into a coherent cluster decision via the
+**anchor-survivor rule**: a subtask sid appearing in two or more
+non-`unresolvable` collisions is the *anchor* and survives every merge
+it participates in, absorbing each partner — matching the motivating
+case where the judge paired one subtask against several narrower
+siblings. Without this override, the default lex-smaller survivor rule
+(a determinism device with no semantic content) would silently keep an
+arbitrary narrower subtask and discard the broader spec the judge
+identified.
 
-Membership is bare *appearance*, not absorption: a sid is an anchor once it
-appears in two or more non-`unresolvable` collisions on either side, under
-any resolution (merges and drops count alike; only `unresolvable` is
-excluded, since it never mutates the plan). A sid *dropped* twice is an
-anchor too — it just never survives to use the hint. This is a
-signal-strength claim ("the judge kept returning to this sid," a better
-tie-break than alphabetical order), and the richer reading — "the anchor
-absorbs its partners" — is false on roughly a third of resolution
-combinations and must not be inferred from the name.
-
-A second, narrower predicate matters separately: the orchestrator rejects
-one pathological emission, a `drop_*` whose dropped sid *survives* another
-collision (kept as a merge endpoint, or the non-dropped side of another
-`drop_*`). One claim deletes the subtask, another keeps it — no apply order
-satisfies both, so that contradiction `die()`s at plan time with both pairs
-surfaced. The condition is *survives-somewhere ∧ dropped-somewhere*, **not**
-anchor membership: gating on the anchor set instead was a real defect,
-since a sid dropped by several collisions is an anchor by appearance while
-nothing claims it survives — the multi-drop shape the judge prompt
-explicitly instructs. The appearance-based gate killed those runs after the
-full planning spend, unrecoverably.
+Membership is bare *appearance*, not absorption: any sid appearing in
+two or more non-`unresolvable` collisions is an anchor (merges and drops
+count alike), including a sid *dropped* twice — it just never survives
+to use the hint. This is a signal-strength claim only: "the anchor
+absorbs its partners" is false on roughly a third of resolution
+combinations. Separately, the orchestrator rejects one pathological
+emission — a `drop_*` whose dropped sid *survives* another collision —
+since no apply order can satisfy both claims; that `die()`s at plan
+time with both pairs surfaced. The condition is *survives-somewhere ∧
+dropped-somewhere*, **not** anchor membership: gating on the anchor set
+instead was a real defect (a sid dropped by several collisions is an
+anchor by appearance though nothing claims it survives — the multi-drop
+shape below), and killed those runs after the full planning spend,
+unrecoverably.
 
 **Multi-drop.** A single sid may legitimately be the dropped side of
-several collisions at once: the judge found its surface jointly
-covered by several siblings, which is the drop-shaped analogue of the
-anchor cluster above and is exactly what the judge prompt instructs
-when a shared endpoint genuinely should be dropped. This is coherent
-output and must not `die()`.
-
-It cannot, however, be applied by replaying the pairs through the
-apply loop's transitive `survivor_of` rewrite. Chasing that pointer is
-safe for a `merge` — the absorbed subtask's intent carries forward, so
-nothing is lost — but a `drop_*` *deliberately discards* the dropped
-subtask's title, intent, and success criteria. Replaying pair two
-after pair one has already rewritten the endpoint therefore drops a
-**live, wanted** subtask the judge never named, silently, and
-fabricates a supersedure claim between two subtasks the judge never
-compared. The damage scales with cluster size: a sid dropped by three
-collisions destroys three of the four subtasks involved.
+several collisions at once — the drop-shaped analogue of the anchor
+cluster, and coherent output that must not `die()`. It can't be applied
+by replaying pairs through the apply loop's transitive `survivor_of`
+rewrite, though: safe for a `merge` (the absorbed subtask's intent
+carries forward), but a `drop_*` *deliberately discards* the dropped
+subtask's title, intent, and criteria, so replaying pair two after pair
+one has rewritten the endpoint silently drops a **live, wanted**
+subtask the judge never named and fabricates a supersedure claim
+between subtasks it never compared — a sid dropped by three collisions
+this way destroys three of the four subtasks involved.
 
 Multi-drop is instead applied as a single operation over the whole
-cluster. The dropped subtask's `provides` are unioned into **every**
-named survivor and inbound `depends_on` references fan out to all of
-them (mirroring the id-vanishing fan-out rule — a dropped sid's work
-is genuinely split across its survivors, so a consumer depends on all
-of them). Because the fan-out *adds* graph edges it can close a
-dependency cycle that none of the individual pairs would, so it is
-guarded by the same trial-apply check every other resolution uses,
-degrading rather than dying:
+cluster: the dropped subtask's `provides` are unioned into **every**
+named survivor, and inbound `depends_on` references fan out to all of
+them (mirroring the id-vanishing fan-out rule, since a dropped sid's
+work is genuinely split across its survivors). Because the fan-out
+*adds* graph edges it can close a cycle none of the individual pairs
+would, so it is guarded by the same trial-apply check every other
+resolution uses, degrading rather than dying:
 
 1. **`multi_drop_fanout`** — the full fan-out, when it stays acyclic.
 2. **`multi_drop_degraded_single`** — fan-out would cycle: fall back
