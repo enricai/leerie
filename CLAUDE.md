@@ -4187,15 +4187,29 @@ there is no substring gate left to freeze.
 same generated fixtures in one test, matching the incident note's
 claim that the two fixes compose on one realistic payload.
 
-**A handler must SURVIVE its own exception, not merely catch it.** An
-`except DiskLowSpace` arm's own `st.save()` re-entered the same failure and
-raised again from inside the handler, escaping `main()` unhandled. Three
-lessons worth keeping. First, guard *every* save in a handler, not just the
-one you know can fail (`tests/test_disk_preflight.py`). Second, fixing one
-arm is never the fix if the pattern (a bare `st.save()`) is repeated —
-route all such saves through one best-effort helper that logs and never
-raises. Third, `issubclass(X, BaseException)` proves nothing about whether
-a handler is reachable or safe. Full incident detail: docs/TESTING.md.
+**A handler must SURVIVE its own exception, not merely catch it.**
+`main()`'s `except DiskLowSpace` arm opened with an unguarded `st.save()`
+— and `State.save()`'s own out-of-space conversion is one of the three
+raise sites, so on the disk-full path that call re-entered the failure and
+raised again *from inside the handler*. A sibling `except` of the same
+`try` does not see an exception raised in another arm's body, so it
+escaped `main()`, skipping the cleanup, the dep capture and the
+`EXIT_LOCKED` assignment: an exit-1 traceback where the whole arm exists
+to produce a resumable pause. Three lessons worth keeping. First,
+the arm's own comment already documented this hazard for the
+`dep_capture` call ten lines below and guarded that one — the likelier
+re-raiser went unguarded because the comment named only one of the raise
+sites, which is why `test_survives_a_save_that_is_still_failing` in
+`tests/test_disk_preflight.py` asserts against *every* save in the arm
+rather than pinning one call. Second, fixing one arm is never the fix if
+the pattern (a bare `st.save()`) is repeated — eight other handlers in
+`main()` carried the identical bare `st.save()`; all now route through
+`_save_state_best_effort`, which logs and never raises. Third,
+`issubclass(X, BaseException)` proves nothing about whether a handler is
+reachable or safe — the test it replaced asserted only
+`issubclass(DiskLowSpace, BaseException)` and concluded no separate
+handler was required, a tautology that reasoned its way to a false
+conclusion. Full incident detail: docs/TESTING.md.
 
 **A timeout is infrastructure, not a leerie bug**, and must be classified
 alongside `WorkerError` in every retry/escalation path, not treated as "a
