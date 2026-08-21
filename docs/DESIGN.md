@@ -3240,15 +3240,15 @@ exit 0, so uncontrolled exits still route through the clean-exit branch
 where `fetch_branch` bundles whatever is on the run branch before
 destroying.
 
-The Ctrl-C row is the load-bearing change. Earlier versions treated
-rc=130 as "user cancelled, destroy the machine" — but with the detach,
-rc=130 only means "user stopped watching"; the orchestrator on the
-machine is still running, and destroying it would be exactly the
-behavior the detach exists to prevent. The launcher instead prints a
-banner listing the reattach/pause/destroy commands and exits without
-touching the machine: `leerie resume <run-id> --runtime fly` to watch
-progress (`--shell` opens a bash shell instead), `leerie stop --runtime
-fly` to pause cleanly, or `leerie kill --runtime fly` to destroy.
+The Ctrl-C row is load-bearing. Earlier versions treated rc=130 as
+"user cancelled, destroy the machine" — but with the detach, rc=130
+only means "user stopped watching"; the orchestrator on the machine is
+still running, and destroying it would defeat the detach. The launcher
+instead prints a banner listing reattach/pause/destroy commands and
+exits without touching the machine: `leerie resume <run-id> --runtime
+fly` to watch progress (`--shell` opens a bash shell instead), `leerie
+stop --runtime fly` to pause cleanly, or `leerie kill --runtime fly` to
+destroy.
 
 The decision lives in the launcher (`scripts/remote/provision.sh`'s EXIT
 trap), not the orchestrator — per §6 *Worker subtree termination* the
@@ -3260,14 +3260,14 @@ machine's filesystem; the orchestrator's state is already in
 `<state-root>/runs/<run-id>/run.json` and the run branch holds the
 committed work, so `flyctl machine start` brings the machine back from
 disk without losing anything. Memory state is not preserved across a
-pause — the contract is that the run branch plus
-`<state-root>/runs/<run-id>/` are the only durable record, and both
-already live on the machine's filesystem by the time a pause fires.
+pause — the run branch plus `<state-root>/runs/<run-id>/` are the only
+durable record, and both already live on the machine's filesystem by
+the time a pause fires.
 
 Before `stop_machine`, the pause branch syncs the machine-side
 `.leerie/runs/<run-id>/` directory to the host via the same tar-pipe
 primitive `fetch_branch` uses — best-effort (bounded 60 s timeout,
-failure logged but non-blocking), giving the host a local copy of
+failure logged but non-blocking) — giving the host a local copy of
 `state.json` for a subsequent auto-detected `resume` and surfacing logs
 for offline inspection without restarting the machine.
 
@@ -3283,27 +3283,25 @@ dominate disk footprint. The caches under `/home/leerie/.cache/...` and
 the auth bundle at `/home/leerie/.claude` are bounded in size and
 intentionally left on the rootfs — `seed_auth` re-runs unconditionally on
 every resume, refreshing the auth bundle regardless of whether the rootfs
-survived. The workload-vs-cache split is empirical, not absolute: a heavy
-pnpm-store or cargo registry can still hit the rootfs cap on unusually
-large monorepos; runs that exhaust caches should set `FLY_VM_DISK_GB`
-higher and treat the spillover as a separate rootfs problem. The rootfs's
-throughput cap (2,000 IOPS / 8 MiB/s) compounds disk pressure by slowing
-spillover; the volume avoids this since per-machine tiers run 4k–32k
-IOPS.
+survived. The split is empirical, not absolute: a heavy pnpm-store or
+cargo registry can still hit the rootfs cap on unusually large
+monorepos; runs that exhaust caches should set `FLY_VM_DISK_GB` higher.
+The rootfs's throughput cap (2,000 IOPS / 8 MiB/s) also compounds disk
+pressure by slowing spillover; the volume avoids this since per-machine
+tiers run 4k–32k IOPS.
 
 **Volume lifecycle — leerie owns the reap, because Fly does not.** A Fly
 volume outlives its machine (*"a Machine can be destroyed without
 destroying its volume"*) and an orphaned one is a documented
 **"unattached volume"** that bills per-GB-month indefinitely. There is
 no platform-side lifecycle hook: `auto_destroy` only destroys the
-machine, and `mounts` has no destroy-on-exit mode. Since
-`FLY_VM_DISK_GB` defaults to `8`, every Fly run creates a volume, so an
-unreaped one is the default outcome of any teardown path that forgets
-it — every path that destroys a machine must also destroy its volume,
-and "the machine is already gone" is precisely when the reap is still
-owed, not a reason to skip it. Gating the reap behind a live-machine
-check inverts the requirement, and did: it silently leaked the volume
-of every run whose machine died first.
+machine, and `mounts` has no destroy-on-exit mode. Since every Fly run
+creates a volume by default, an unreaped one is the default outcome of
+any teardown path that forgets it — every path that destroys a machine
+must also destroy its volume, and "the machine is already gone" is
+precisely when the reap is still owed, not a reason to skip it. Gating
+the reap behind a live-machine check inverts the requirement, and did:
+it silently leaked the volume of every run whose machine died first.
 
 Two platform facts fix the ordering, pulling opposite ways: the
 volume→machine association (`attached_machine_id` / `config.mounts`)
@@ -3347,8 +3345,8 @@ These fields live on `run.json`. Since the run_id is the machine ID
 after `flyctl machine run` succeeds; `provision.sh` writes
 `fly-machine.json` as a crash-recovery pointer, `run.json` is written
 later by the orchestrator, and every run-id verb (`stop`, `kill`,
-`finalize`, `resume`) can use the run_id directly as the machine ID —
-no lookup needed.
+`finalize`, `resume`) uses the run_id directly as the machine ID — no
+lookup needed.
 
 `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
 run cannot be in more than one terminal-or-paused state.
@@ -3404,11 +3402,10 @@ repo (not just the cwd).
 
 This separation matches the convention every comparable tool follows
 (`fly machine start`/`stop`/`destroy`; kubectl's `delete` distinct from
-a watched stream ending; tmux's `kill-session` distinct from
-`detach`). Ctrl-C as a destructive verb was an artifact of the
-lifetime coupling; with it removed, Ctrl-C reduces to its conventional
-meaning ("stop this terminal-side activity") and destruction gets its
-own verb.
+a watched stream ending; tmux's `kill-session` distinct from `detach`).
+Ctrl-C as a destructive verb was an artifact of the lifetime coupling;
+with it removed, Ctrl-C reduces to its conventional meaning ("stop this
+terminal-side activity") and destruction gets its own verb.
 
 **Runtime auto-detection on run-id-bearing verbs.** When `resume`,
 `stop`, `kill`, `accept-blocked`, `accept-integration`, or `finalize`
@@ -3442,11 +3439,11 @@ resolves credentials, gates on `require_aws()`, resolves
 semantics as Fly's `machine stop`). `kill`'s EC2 action resolves the
 instance id, re-resolves its current SSH target (public IP changes on
 every stop/start), and calls `_try_fetch_state_for_ec2_teardown` — the
-same hook `decide_ec2_teardown`'s clean-exit branch uses — to sync
-back BEFORE `terminate_instance()` (the one-way-ratchet invariant:
+same hook `decide_ec2_teardown`'s clean-exit branch uses — to sync back
+BEFORE `terminate_instance()` (the one-way-ratchet invariant:
 destroy-then-fetch would make paid-for LLM work unrecoverable). A
-failed sync leaves the instance running rather than terminating it;
-`flyctl` is never invoked for an EC2 run.
+failed sync leaves the instance running; `flyctl` is never invoked for
+an EC2 run.
 
 When no sidecar exists, `stop`/`kill` probe for a live local nerdctl
 container via `_is_local_container` (`nerdctl inspect <run-id>`).
@@ -3516,13 +3513,12 @@ backgrounding), so there is no detached container to attach to —
 **Shallow seeding for heavy repos.** The fresh-provision seed
 (`seed_repo_clone`) delivers the host's committed state as a
 `git bundle create - --all` piped over `flyctl ssh console`. `--all`
-packs full history of every ref; for a repo with deep history or
-large committed blobs, that bundle can be hundreds of MB — enough to
-exceed `LEERIE_SEED_TIMEOUT_S` (default 600 s) and fail the run before
-any worker starts. The bloat is history, not the working tree (build
+packs full history of every ref; for a repo with deep history or large
+committed blobs, that bundle can be hundreds of MB — enough to exceed
+`LEERIE_SEED_TIMEOUT_S` (default 600 s) and fail the run before any
+worker starts. The bloat is history, not the working tree (build
 artifacts / `node_modules` are already excluded — a bundle carries
-committed objects only), so the lever is history depth, not disk
-usage.
+committed objects only), so the lever is history depth, not disk usage.
 
 Above a size threshold (`.git` larger than a bounded default), the
 seed switches to a **shallow** transport: the host makes a throwaway
@@ -3549,23 +3545,22 @@ staying correct on every downstream path:
 - **PR diff stays correct.** A real `git clone --depth=N` keeps the
   working branch's true tip hash, so `git merge-base` on the host
   resolves the run branch correctly and the PR diff shows only the
-  worker's changes — a synthetic re-rooting would break the merge-base,
-  so the seed uses a genuine shallow clone.
+  worker's changes — a synthetic re-rooting would break the merge-base.
 
 Submodules are orthogonal (a `--depth` clone doesn't populate
 `.git/modules`, so the existing per-submodule bundle machinery carries
-over unchanged). The cost is that workers see only depth-N history
-(the machine can't deepen — no origin credentials). Depth and the size
-threshold are operator-tunable; setting depth to full disables shallow
-seeding. Small repos stay on the full bundle. The shallow path also
-falls back to full bundle for a detached HEAD or a branch name outside
-a conservative shell-safe charset (the machine-side reconstruction
+over unchanged). Cost: workers see only depth-N history (the machine
+can't deepen — no origin credentials). Depth and the size threshold
+are operator-tunable; setting depth to full disables shallow seeding.
+Small repos stay on the full bundle. The shallow path also falls back
+to full bundle for a detached HEAD or a branch name outside a
+conservative shell-safe charset (the machine-side reconstruction
 interpolates the branch into a `git checkout` over `sh -c`).
 
 This switch is confined to fresh provisions (`seed_repo_clone` always
 wipes `/work`); mid-run re-seed (below) never re-clones. Corollary:
-`resume` now probes whether the initial seed produced a valid `/work`
-git repo, and re-runs the full seed rather than dead-ending on a
+`resume` probes whether the initial seed produced a valid `/work` git
+repo, and re-runs the full seed rather than dead-ending on a
 dirty-only re-seed if a prior seed died before completing.
 
 **Mid-run re-seed (remote mode).** The host's working tree keeps
@@ -3573,8 +3568,8 @@ evolving after a remote run starts (new commits, dirty edits, a new
 submodule), and the machine needs a user-triggered way to pick that up
 without destroying its volume. Two surfaces share one mechanism — an
 explicit `leerie re-seed <run-id>` subcommand and an implicit
-auto-re-seed inside `leerie resume <id> --runtime fly` — both waking
-the machine if stopped, running a safety check, and calling the same
+auto-re-seed inside `leerie resume <id> --runtime fly` — both wake the
+machine if stopped, run a safety check, and call the same
 `seed_repo_dirty` helper the fresh-provision path uses.
 
 Three operations, in order ("current laptop state" = host commits plus
@@ -3596,8 +3591,8 @@ The dirty set is computed on the host, where worktree paths structurally
 cannot appear (worktrees live only on the machine). A defensive filter
 excludes `.git/*` and non-whitelisted `.leerie/*` paths before handing
 the file list to rsync's `--files-from=-`, guarding against a future
-change letting host-side paths name worktree files. The three
-committed config files (`.leerie/config.toml`, `.leerie/Dockerfile`,
+change letting host-side paths name worktree files. The three committed
+config files (`.leerie/config.toml`, `.leerie/Dockerfile`,
 `.leerie/.leerie-setup.sh`) pass through the filter as repo-owned
 declarations workers need.
 
@@ -3608,9 +3603,9 @@ gitignored content. Every fresh seed and mid-run re-seed delivers the
 host's current `.claude/` to the machine.
 
 Resume auto-re-seeds by default; `--no-re-seed` opts out for the
-rate-limit auto-resume case where no host edits happened. The trust
-model matches the spec: the user picks the moment (by typing
-`resume`), so the seed is treated as authoritative.
+rate-limit auto-resume case where no host edits happened. The user
+picks the moment (by typing `resume`), so the seed is treated as
+authoritative.
 
 ### EC2 runtime lifecycle
 
@@ -3618,10 +3613,10 @@ model matches the spec: the user picks the moment (by typing
 instance (`scripts/remote/aws-credentials.sh`, the launcher's AWS
 region/profile resolution, the `boto3`/`botocore` pin, and the
 launcher's `RUNTIME=ec2` dispatch — see IMPLEMENTATION.md "Runtime
-mode" / "AWS region/profile prefs"). This is the EC2 counterpart to
-everything above for Fly: it reuses Fly's stage names and dispositions
-wherever the two platforms agree, and calls out explicitly where EC2's
-semantics diverge.
+mode" / "AWS region/profile prefs"). This is the EC2 counterpart to the
+Fly design above: it reuses Fly's stage names and dispositions wherever
+the platforms agree, and calls out explicitly where EC2's semantics
+diverge.
 
 **Stage mapping.** The five Fly stages above (provision → wait-ready →
 seed → detached-orchestrate → teardown) carry over one-for-one:
@@ -3659,18 +3654,19 @@ disk-image snapshot), not a per-run pulled artifact. Three strategies:
 2. **Push to a registry (ECR), pull at boot.** The direct Fly analog.
    Rejected: it reintroduces registry-auth surface a second time
    (`aws ecr get-login-password`), requires a container runtime inside
-   the EC2 instance (a container-in-a-VM layering a VM alone would
-   do), and adds per-provision pull latency with no evidence it's
-   necessary. Worth reconsidering only if leerie ever needs the same
-   image shared verbatim across EC2 and a containerized runtime.
+   the EC2 instance, and adds per-provision pull latency with no
+   evidence it's necessary. Worth reconsidering only if leerie ever
+   needs the same image shared verbatim across EC2 and a containerized
+   runtime.
 3. **User-data pull-and-build.** The instance clones leerie fresh on
-   every boot off a generic stock AMI. Rejected as default: multi-minute
-   build cost per `RunInstances` call, requires outbound internet
-   egress at boot (the security-group/NAT surface the SSM-only
-   transport below otherwise avoids), and turns registry flakiness into
-   a provisioning failure mode. Remains a reasonable manual bootstrap
-   fallback (`LEERIE_EC2_AMI` pointing at a stock AMI plus a documented
-   user-data script) for an operator without a custom AMI yet.
+   every boot off a generic stock AMI. Rejected as default:
+   multi-minute build cost per `RunInstances` call, requires outbound
+   internet egress at boot (the security-group/NAT surface the
+   SSM-only transport below otherwise avoids), and turns registry
+   flakiness into a provisioning failure mode. Remains a reasonable
+   manual bootstrap fallback (`LEERIE_EC2_AMI` pointing at a stock AMI
+   plus a documented user-data script) for an operator without a
+   custom AMI yet.
 
 **IAM actions the chosen strategy requires.** Baking into the AMI keeps
 the build-time IAM surface (Packer/Image Builder's own
@@ -3693,9 +3689,9 @@ and nothing more:
   leerie's caller identity) for the transport-substitution stage below
 - No `ecr:*` actions and no `iam:PassRole` beyond the SSM instance
   profile attachment above — bake-into-AMI needs neither a registry
-  pull permission nor a user-data role broad enough to install
-  arbitrary packages at boot, a security argument for strategy 1 over
-  2/3: the run-time IAM surface stays minimal and auditable.
+  pull permission nor a broad user-data role, a security argument for
+  strategy 1 over 2/3: the run-time IAM surface stays minimal and
+  auditable.
 
 **New `LEERIE_EC2_*` knobs implied.** None beyond what IMPLEMENTATION.md
 already reserves. `LEERIE_EC2_AMI` names the chosen artifact under all
@@ -3713,8 +3709,7 @@ obligation on leerie because a Fly volume has no destroy-on-exit hook.
 EC2's default is the mirror image: AWS's `DeleteOnTermination=true`
 deletes the root EBS volume automatically when the instance is
 *terminated* — a platform-enforced hook Fly lacks, so for the default
-EC2 shape the reap is AWS's problem, not leerie's. This collapses to
-three cases:
+EC2 shape the reap is AWS's problem, not leerie's. Three cases:
 
 1. **Root volume only, default `DeleteOnTermination=true`.**
    `RunInstances` with a single root EBS volume and no block-device
@@ -3723,11 +3718,11 @@ three cases:
    design adopts.**
 2. **Stop, don't terminate, on pause.** Like Fly's `machine stop`,
    `StopInstances` leaves the root volume attached (EC2 keeps billing
-   the attached EBS volume while stopped, mirroring Fly) and never
-   touches `DeleteOnTermination` — that attribute is
-   termination-scoped, not stop-scoped. Fly's stop/start-preserves-
-   filesystem contract carries over unchanged: an EC2 pause uses
-   `StopInstances`, never `TerminateInstances`.
+   it while stopped, mirroring Fly) and never touches
+   `DeleteOnTermination` — that attribute is termination-scoped, not
+   stop-scoped. Fly's stop/start-preserves-filesystem contract carries
+   over unchanged: an EC2 pause uses `StopInstances`, never
+   `TerminateInstances`.
 3. **A future secondary EBS volume** would reintroduce Fly's exact
    problem — additional (non-root) volumes default
    `DeleteOnTermination=false` — and would need the same reap
@@ -3742,17 +3737,17 @@ opening a session for `resume`/`--shell` attach and log tailing. This
 design picks SSM Session Manager over SSH:
 
 - **SSM Session Manager** (`aws ssm start-session`) needs no inbound
-  security group rule, no key-pair distribution, and no public IP —
-  the preinstalled SSM Agent calls out to the SSM service over HTTPS,
-  the same "no sshd, no key management, no public exposure" property
-  Fly gets from hallpass + WireGuard. Auth flows through the same AWS
-  credential chain and IAM already established for the rest of the EC2
-  runtime, rather than a parallel key-pair-management surface.
+  security group rule, no key-pair distribution, and no public IP — the
+  preinstalled SSM Agent calls out to the SSM service over HTTPS, the
+  same "no sshd, no key management, no public exposure" property Fly
+  gets from hallpass + WireGuard. Auth flows through the same AWS
+  credential chain and IAM already established for EC2, rather than a
+  parallel key-pair-management surface.
 - **SSH** (a managed key pair, `LEERIE_EC2_KEY_NAME`, inbound port-22
   rule) is the closer textual analog to `flyctl ssh console`, but
-  requires provisioning/rotating a key pair and opening network
-  ingress — exactly what SSM avoids. Remains available as a fallback
-  for operators whose account policy disallows SSM, but is not the
+  requires provisioning/rotating a key pair and opening network ingress
+  — exactly what SSM avoids. Remains available as a fallback for
+  operators whose account policy disallows SSM, but is not the
   default.
 
 `aws ssm start-session --target <instance-id> --document-name
@@ -3767,29 +3762,28 @@ carries over unchanged from the Fly design (lines 2185-2206 above).
 
 **Pause/resume semantics.** EC2 `stop`/`start` maps directly onto Fly's
 `machine stop`/`machine start`: `StopInstances` preserves the root EBS
-volume (case 1 above), and the instance's public IP may change on
-restart unless an Elastic IP or a persistent ENI is used — so the
-instance's current address is resolved via `describe_instances` on
-every resume rather than cached, mirroring Fly. `TerminateInstances` is
-the `kill` / clean-exit-after-sync-success counterpart to `flyctl
-machine destroy`. The existing sidecar fields (`paused_at`,
-`pause_reason`, `killed_at`, `sync_failed_at`, `sync_fail_reason`) are
-runtime-agnostic in shape (they describe *when* and *why*, not *how*)
-and the EC2 path reuses them verbatim; `ec2_instance_id` plays the role
-`fly_machine_id` plays today.
+volume (case 1 above); the instance's public IP may change on restart
+unless an Elastic IP or a persistent ENI is used, so its current
+address is resolved via `describe_instances` on every resume rather
+than cached, mirroring Fly. `TerminateInstances` is the `kill` /
+clean-exit-after-sync-success counterpart to `flyctl machine destroy`.
+The sidecar fields (`paused_at`, `pause_reason`, `killed_at`,
+`sync_failed_at`, `sync_fail_reason`) are runtime-agnostic in shape
+(they describe *when* and *why*, not *how*) and the EC2 path reuses
+them verbatim; `ec2_instance_id` plays the role `fly_machine_id` plays
+today.
 
 **Run identifier.** `run_id` is "the container/machine ID assigned by
 the container runtime" (DESIGN's "The run identifier"). An EC2 instance
 ID (`i-0123456789abcdef0`) fills the same role — known at
 `RunInstances` time, before the orchestrator starts, no deferred
 computation, no rename. Two Fly-specific coupling points needed
-generalizing when EC2 provisioning landed: `provision.sh` writing
-`fly-machine.json` as the crash-recovery pointer, and
-`_discover_runs`'s (DESIGN §6) lookup for that exact filename to
-recognize a pre-`state.json` crash-recoverable orphan. The
-generalization is a same-shaped `ec2-instance.json` sidecar (instance
-id, region, created-at) plus widening the orphan scan to check either
-sidecar — `fly-machine.json` itself is unchanged for Fly runs.
+generalizing: `provision.sh` writing `fly-machine.json` as the
+crash-recovery pointer, and `_discover_runs`'s (DESIGN §6) lookup for
+that filename to recognize a pre-`state.json` crash-recoverable orphan.
+The generalization is a same-shaped `ec2-instance.json` sidecar
+(instance id, region, created-at) plus widening the orphan scan to
+check either sidecar — `fly-machine.json` is unchanged for Fly runs.
 
 ---
 
@@ -3797,30 +3791,29 @@ sidecar — `fly-machine.json` itself is unchanged for Fly runs.
 
 The container image ships a fixed base toolchain; every target repo
 ships its own — different language versions, package managers,
-lockfiles. Two distinct things go wrong if the orchestrator just runs
-workers against a fresh checkout:
+lockfiles. Two things go wrong if the orchestrator just runs workers
+against a fresh checkout:
 
 - **Dependencies are missing.** A Next.js repo needs `pnpm install`
   before any worker can `pnpm lint` or `pnpm test`. A Django repo
   needs `uv sync`. A Go repo needs `go mod download`. The container
   has none of these installed for the specific repo.
 - **Runtime versions are wrong.** A Next.js repo with `.nvmrc:
-  20.11.0` does not behave correctly under the image's baked Node
-  LTS. A Django repo with `.python-version: 3.11.7` should not run
-  on Python 3.12. Mismatched runtimes manifest as opaque failures
-  far from the cause — a worker reports a passing test under the
-  wrong Python, the integration step finds the version mismatch
-  later, the user sees a confusing failure.
+  20.11.0` does not behave correctly under the image's baked Node LTS.
+  A Django repo with `.python-version: 3.11.7` should not run on
+  Python 3.12. Mismatched runtimes manifest as opaque failures far
+  from the cause — a worker reports a passing test under the wrong
+  Python, the integration step finds the version mismatch later, the
+  user sees a confusing failure.
 
 A third compounding factor: `git worktree add` checks out tracked
 files only — untracked artifacts (`node_modules`, `.venv`, build
-outputs) are not copied from the main checkout, so every per-subtask
-worktree starts empty even if the host repo were fully installed. The
-orchestrator handles this in two layers: runtime versions and the
-optional setup hook are pre-installed *in* the container before any
-worker runs (cross-cutting state every worker shares); dependency
-installs (pnpm, pip, cargo, etc.) happen per worktree, against shared
-package-manager caches.
+outputs) are not copied, so every per-subtask worktree starts empty
+even if the host repo were fully installed. The orchestrator handles
+this in two layers: runtime versions and the optional setup hook are
+pre-installed *in* the container before any worker runs (cross-cutting
+state every worker shares); dependency installs (pnpm, pip, cargo,
+etc.) happen per worktree, against shared package-manager caches.
 
 **Who runs that install.** Both the orchestrator and the workers do,
 for different trees and moments. Since the orchestrator took over
@@ -3838,8 +3831,8 @@ every worktree would hand that cost back. What laziness removes is the
 *repeat*: 263 installs ran across 161 worker logs — ~2.8 per worktree,
 since a subtask's implementer and conformer share one — converging on
 the same state each time. The memo is keyed on the resolved absolute
-worktree path and lives in the process, not in run state — it records
-a filesystem fact, and re-installing once after a `resume` is correct
+worktree path and lives in the process, not in run state: it records a
+filesystem fact, and re-installing once after a `resume` is correct
 since a fresh container starts with an empty worktree.
 
 The orchestrator addresses both with a dedicated phase between
@@ -3848,76 +3841,69 @@ classification and planning, layered top-to-bottom by determinism:
 1. **`.leerie-setup.sh` hook.** Optional, repo-owned. If the repo
    needs user-space tooling the language layer can't install — a
    language version mise supports beyond the LTS bake (Ruby, Java,
-   Rust), an additional CLI tool installed under `~/.local/bin`,
-   pre-populated fixtures the workers need — the repo commits a
-   script that handles it. The orchestrator execs it inside the
-   container as the non-root `leerie` user (the image deliberately
-   does not ship `sudo`). Repo author controls trust; the script
-   runs in the same container that runs the workers.
+   Rust), an additional CLI tool under `~/.local/bin`, pre-populated
+   fixtures — the repo commits a script that handles it. The
+   orchestrator execs it inside the container as the non-root `leerie`
+   user (the image deliberately does not ship `sudo`). Repo author
+   controls trust; the script runs in the same container that runs the
+   workers.
 
    System packages requiring root (apt-get-installable libraries,
-   anything writing to `/usr/*` or `/etc/*`) are out of scope for
-   the hook — the container's unprivileged user model can't satisfy
-   them. A repo with that need maintains a fork of the leerie
-   Dockerfile that installs the package at image-build time and
-   overrides `IMAGE_TAG`.
-2. **Runtime version resolution.** The orchestrator delegates to
-   a polyglot version manager that reads the repo's existing
-   version declarations (the same files repo authors have already
-   been committing for years — `.nvmrc`, `.python-version`,
-   `.tool-versions`, `rust-toolchain.toml`, `.go-version`).
-   Matching toolchain versions install into a cache that
-   survives across runs. If a repo declares nothing, the
-   image-baked LTS for Node and Python is the floor — the
+   anything writing to `/usr/*` or `/etc/*`) are out of scope for the
+   hook — the container's unprivileged user model can't satisfy them.
+   A repo with that need maintains a fork of the leerie Dockerfile
+   that installs the package at image-build time and overrides
+   `IMAGE_TAG`.
+2. **Runtime version resolution.** The orchestrator delegates to a
+   polyglot version manager that reads the repo's existing version
+   declarations (`.nvmrc`, `.python-version`, `.tool-versions`,
+   `rust-toolchain.toml`, `.go-version`). Matching toolchain versions
+   install into a cache that survives across runs. If a repo declares
+   nothing, the image-baked LTS for Node and Python is the floor — the
    resolver checks the per-run cache first, falls through to the
-   image-baked layer. This means the runtime selection has no
-   model in the loop; the version manager's parser is the
-   enforcement.
-3. **Deterministic install-command detection.** A lockfile-keyed
-   table maps observable file presence to the install command(s):
-   a pnpm lockfile means `pnpm install`, a `uv.lock` means
-   `uv sync`, a `Gemfile.lock` means `bundle install`. Polyglot
-   repos (Rails with both a Ruby lockfile and a JS one) emit
-   *all* matching commands, not the first match — silently
-   dropping a frontend install would leave half the workers
-   broken. When the table returns a non-empty result the
-   orchestrator uses it; there is no model in this path either.
-4. **LLM provision worker — fallback.** When the table returns
-   empty (Java with Gradle, a bare `pyproject.toml` without
-   lockfile, a polyglot Makefile-driven setup), the orchestrator
-   invokes a `claude -p` worker whose only job is reading the
-   repo's README and configuration files and emitting a JSON
-   recipe. The recipe is schema-validated, the commands inside
-   it are restricted by an argv-allowlist, and any deviation
-   from the schema rejects the worker. This is a *deliberate*
-   exception to §12 — see below.
+   image-baked layer. Runtime selection has no model in the loop; the
+   version manager's parser is the enforcement.
+3. **Deterministic install-command detection.** A lockfile-keyed table
+   maps observable file presence to the install command(s): a pnpm
+   lockfile means `pnpm install`, a `uv.lock` means `uv sync`, a
+   `Gemfile.lock` means `bundle install`. Polyglot repos (Rails with
+   both a Ruby lockfile and a JS one) emit *all* matching commands, not
+   the first match — silently dropping a frontend install would leave
+   half the workers broken. When the table returns a non-empty result
+   the orchestrator uses it; no model in this path either.
+4. **LLM provision worker — fallback.** When the table returns empty
+   (Java with Gradle, a bare `pyproject.toml` without lockfile, a
+   polyglot Makefile-driven setup), the orchestrator invokes a
+   `claude -p` worker whose only job is reading the repo's README and
+   configuration files and emitting a JSON recipe. The recipe is
+   schema-validated, the commands inside it are restricted by an
+   argv-allowlist, and any deviation from the schema rejects the
+   worker. This is a *deliberate* exception to §12 — see below.
 5. **Persistent out-of-repo dependency bake.** Dependencies are
-   installed once at image-build time into persistent paths
-   outside `/work`, so a fresh worktree inherits the bake with
-   zero (or minimal, for Node) install cost. The bake targets:
+   installed once at image-build time into persistent paths outside
+   `/work`, so a fresh worktree inherits the bake with zero (or
+   minimal, for Node) install cost. The bake targets:
 
-   - **Python:** `/opt/venv` — a virtual environment created via
-     `pip` or `uv` from the repo's `requirements.txt`,
-     `pyproject.toml`, or `Pipfile.lock`. Workers activate it via
-     `ENV VIRTUAL_ENV=/opt/venv` and `PATH`.
+   - **Python:** `/opt/venv` — a virtual environment created via `pip`
+     or `uv` from the repo's `requirements.txt`, `pyproject.toml`, or
+     `Pipfile.lock`. Workers activate it via `ENV VIRTUAL_ENV=/opt/venv`
+     and `PATH`.
    - **Ruby:** `/opt/bundle` — Bundler installs gems here via
-     `BUNDLE_PATH=/opt/bundle`. Workers inherit the env var and
-     find gems without a per-worktree `bundle install`.
-   - **Rust:** A pre-populated `CARGO_TARGET_DIR` (for build
-     artifacts) plus a warmed `CARGO_HOME` (for the registry
-     cache). A `cargo build` in a worktree hits no network and
-     reuses compiled dependencies from the bake.
-   - **Go:** A pre-populated `GOCACHE` (for build cache) plus a
-     warmed `GOMODCACHE` (for fetched modules). A `go build` in a
-     worktree is network-free and reuses the module cache.
+     `BUNDLE_PATH=/opt/bundle`. Workers inherit the env var and find
+     gems without a per-worktree `bundle install`.
+   - **Rust:** A pre-populated `CARGO_TARGET_DIR` (build artifacts)
+     plus a warmed `CARGO_HOME` (registry cache). A `cargo build` in a
+     worktree hits no network and reuses compiled dependencies.
+   - **Go:** A pre-populated `GOCACHE` (build cache) plus a warmed
+     `GOMODCACHE` (fetched modules). A `go build` in a worktree is
+     network-free and reuses the module cache.
    - **Node/pnpm:** A warmed pnpm content-addressable store with
-     `frozenStore` set. Node dependencies (`node_modules`) cannot
-     be fully baked — they must live inside the repo tree for
-     resolution to work — so the residual per-run step is a fast,
-     network-free, extract-free `pnpm install --offline
-     --frozen-lockfile` that relinks the baked store into the
-     worktree. This is not zero-cost but eliminates download and
-     extraction, leaving only symlink creation.
+     `frozenStore` set. `node_modules` cannot be fully baked — it must
+     live inside the repo tree to resolve — so the residual per-run
+     step is a fast, network-free, extract-free `pnpm install
+     --offline --frozen-lockfile` that relinks the baked store into
+     the worktree: not zero-cost, but no download or extraction, only
+     symlink creation.
 
    **Rust and Go require a discardable dummy source file at
    build time.** Neither `cargo fetch`/`cargo build` nor `go
