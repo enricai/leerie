@@ -5338,37 +5338,32 @@ The phase is bounded by a separate cap from the evidence loop: the conformer
 gets a small number of orchestrator-level rounds (default 3) to detect and
 fix drift. Exhausting the cap with residuals still present does *not* fail
 the subtask — the residuals become warnings, the subtask still returns
-`complete`, and the work moves on to integration. What cannot be guaranteed
-in code (a model genuinely catching every documentation drift) is not
-promoted to a hard guarantee by prompt; what *can* be guaranteed (protected
-paths stayed untouched, structured output is well-formed) is enforced in
-code.
+`complete`, and the work moves on to integration.
 
 **Orchestrator-run build/lint/test is bounded, not contained.** A BLT
 command the orchestrator starts is not a worker: it does not pass through
-the memory-admission gate and is not enrolled in a cgroup, so unlike a
-worker it has no `memory.max` and no `pids.max` of its own (§6 *Memory
-containment* covers the worker path only). What was one serial pre-wave run
-becomes one per subtask per round.
+the memory-admission gate and is not enrolled in a cgroup, so it has no
+`memory.max`/`pids.max` of its own (§6 *Memory containment* covers the
+worker path only). What was one serial pre-wave run becomes one per subtask
+per round.
 
-Two things bound it. The default `scoped` mode keeps each measurement small,
-so the uncontained footprint is negligible. And `blt_parallel` (default 2)
-caps how many run at once, which matters most under `--subtask-tests full`.
-Reaping is already handled: these run in their own session and are torn
-down as a process tree on timeout or exception. Enrolling them in a cgroup
-is the architecturally consistent answer and is not done yet — it would
-have to go through the broker, whose wire contract needs its own guard
-against silent drift.
+Two things bound it. The default `scoped` mode keeps each measurement
+small, so the uncontained footprint is negligible. And `blt_parallel`
+(default 2) caps how many run at once, mattering most under
+`--subtask-tests full`. Reaping is handled: these run in their own session
+and are torn down as a process tree on timeout or exception. Enrolling them
+in a cgroup is the architecturally consistent answer and is not done yet —
+it would have to go through the broker, whose wire contract needs its own
+guard against silent drift.
 
 **The signal that continues the loop is a delta, not a verdict.** The round
-cap above bounds the loop; what *ends* it early is the orchestrator's
-judgment that the conformer has nothing left to do. That judgment must be
-relative to the base tree, or the loop becomes unsatisfiable on any repo
-whose base is not already green — every subtask would spend its entire
-round budget rediscovering debt it did not create. Measured on a 91-subtask
-run whose base was RED on tests: only 6 of 79 subtasks were clean at round
-1, and 57 ran the full 3-round cap, each round re-running the whole suite to
-re-observe a failure the baseline had already recorded.
+cap bounds the loop; what *ends* it early is the orchestrator's judgment
+that the conformer has nothing left to do. That judgment must be relative
+to the base tree, or the loop becomes unsatisfiable on any repo whose base
+is not already green. Measured on a 91-subtask run whose base was RED on
+tests: only 6 of 79 subtasks were clean at round 1, and 57 ran the full
+3-round cap, each round re-running the whole suite to re-observe a failure
+the baseline had already recorded.
 
 The pre-existing failure reaches the loop through *two* channels, and both
 must be closed: the **axis** channel (an axis reporting `ran && !passed`),
@@ -5388,19 +5383,17 @@ baseline all continue the loop exactly as before.
 clean.** An axis whose command never produced a verdict is recorded
 `measured: False` and excluded from `red_axes` — "could not measure" is not
 "RED". That distinction was originally defined only for the baseline, but
-every later measurement can hit the same condition. When it does, the loop
-predicate must treat it as unresolved rather than silently clean: reading an
+every later measurement can hit the same condition, and the loop predicate
+must treat it as unresolved rather than silently clean: reading an
 unmeasured axis as clean is how a run once shipped a PR whose test axis
-never ran at all — its unmeasurability was swallowed by the same
-`red_axes` exclusion meant for the baseline
-(docs/POSTMORTEM-2026-08-14.md, F6). This is rare by construction, so
-treating it as unresolved costs almost nothing.
+never ran at all, its unmeasurability swallowed by the same `red_axes`
+exclusion meant for the baseline (docs/POSTMORTEM-2026-08-14.md, F6). This
+is rare by construction, so treating it as unresolved costs almost nothing.
 
 The baseline was already handed to the *worker* as prose in a `BASELINE:`
-block, asking it to scope its judgment to the delta — but the
-orchestrator's own predicate never read it, so the guarantee lived in a
-prompt while the code that could enforce it looked away. §12 says that is
-backwards.
+block, but the orchestrator's own predicate never read it, so the guarantee
+lived in a prompt while the code that could enforce it looked away. §12
+says that is backwards.
 
 Which axis a residual is about is read from a **schema field the conformer
 fills** (`axis`, one of `build`/`lint`/`tests`), never inferred from the
@@ -5425,7 +5418,7 @@ across the two channels. The floor is code; the rest is the prompt earning
 it.
 
 **The orchestrator measures; the conformer consumes.** Build, lint and test
-are executed by the orchestrator, not by the conformer. The worker receives
+are executed by the orchestrator, not the conformer. The worker receives
 *results* — the exact command, the exit-code verdict, and an output tail —
 in a `BLT_RESULTS:` block, and is told it did not run them and must not
 re-run a full axis. This is §12 applied to the axis that was costing the
@@ -5440,19 +5433,17 @@ the conformer's self-reported `build`/`lint`/`tests` before any consumer
 reads them — the loop-continuation predicate, the residual summary, and the
 persisted `conformance` entry all see what was measured, never what was
 claimed; the worker's own report survives only as telemetry. The overwrite
-happens twice per round, deliberately: once at the tail for the ordinary
-case, and once immediately after the worker returns for the three gates
-that abandon a round early (a malformed result, a protected-path violation,
-a strict-mode clobber), which is also the accurate answer there since two
-of those three exits roll the worktree back toward the state that earlier
-measurement describes.
+happens twice per round: once at the tail for the ordinary case, and once
+immediately after the worker returns for the three gates that abandon a
+round early (a malformed result, a protected-path violation, a strict-mode
+clobber) — also the accurate answer there, since two of those three exits
+roll the worktree back toward the state that earlier measurement describes.
 
-Worth being precise about what this does *not* fix: conformers were not
-over-firing (measured, implementers ran the full suite zero times and
-conformers ran it almost exactly once per round as prompted). Moving
-execution into the orchestrator therefore saves little by itself — it is
-what makes the next two paragraphs possible. The conformer keeps
-**targeted falsifiers**, promoted from exception to primary tool:
+This does *not* fix over-firing conformers (measured, implementers ran the
+full suite zero times and conformers ran it almost exactly once per round
+as prompted); moving execution into the orchestrator saves little by
+itself — it is what makes the next two paragraphs possible. The conformer
+keeps **targeted falsifiers**, promoted from exception to primary tool:
 `production_evidence` (§9) requires exercising the path the diff actually
 changed against the repo as it is, scoped work by construction and not a
 suite run.
@@ -5603,12 +5594,12 @@ same per-command timeout the provision recipe uses.
 The original specification said each worker should compact its context at 70%
 occupancy. This cannot be done as stated: there is no channel for an external
 process to make a running worker compact itself, and a worker has no reliable
-view of its own context percentage. An external monitor can *observe* context
-occupancy but has no way to *act* on it.
+view of its own context percentage — it can only be observed, not acted on,
+from outside.
 
 Leerie replaces compaction with **orchestrator-driven fresh-context handoff**,
-which achieves compaction's actual goal — bounded context with preserved
-progress — without depending on a channel that does not exist:
+achieving compaction's actual goal — bounded context with preserved
+progress — without the channel that does not exist:
 
 1. **Granular sizing is the primary defense.** Subtasks are sized so one worker
    finishes within its context. Handoff is a safety net, not the main path; if
@@ -5666,11 +5657,10 @@ handoff design stands on its own.
 
 ### Where coordination artifacts live
 
-Checkpoints and criteria are coordination state, not code. They are written to
-a coordination directory in the main repository, never inside a subtask's
-worktree. A worktree is disposable — it is removed at cleanup — so a checkpoint
-stored inside it would vanish exactly when a successor worker needs to read it.
-Coordination state must outlive the worktree that produced it.
+Checkpoints and criteria are coordination state, not code, written to a
+coordination directory in the main repository, never inside a subtask's
+worktree: a worktree is disposable — removed at cleanup — so a checkpoint
+stored inside it would vanish exactly when a successor worker needs it.
 
 Coordination state is **per-run**, rooted at `<state-root>/runs/<run-id>/`
 (where `<state-root>` is the resolved state directory — default
@@ -5693,10 +5683,10 @@ its own `runs/<run-id>/` subtree, and neither can clobber the other's
 
 ## 11. The clarification procedure
 
-The default is **zero questions**. The original goal — a fully automated run
-that does not interrupt the user — is kept. The question is when an interruption
-is genuinely unavoidable, and the answer is a strict filter applied by the
-classifier:
+The default is **zero questions** — the original goal of a fully automated
+run that does not interrupt the user is kept. The question is when an
+interruption is genuinely unavoidable, answered by a strict filter applied
+by the classifier:
 
 1. Can it be derived from the **codebase**? Conventions, patterns, integration
    points, and existing behavior are all readable. If the answer is in the
@@ -5706,11 +5696,11 @@ classifier:
 3. Ask the user **only** what neither the codebase nor research can resolve.
 
 The only thing that systematically survives this filter is **intent** — *what*
-to build, *which* behavior is wanted. The reason is structural: a decision
-nobody has made yet exists in no codebase and in no research source. The
-codebase and research answer *how* to build something; they cannot answer
-*what* to build when that has genuinely not been decided. A fully-specified
-request leaves nothing for the filter to catch, so it runs with zero questions.
+to build, *which* behavior is wanted — because a decision nobody has made
+yet exists in no codebase and in no research source. The codebase and
+research answer *how*; they cannot answer *what* when that has genuinely
+not been decided. A fully-specified request leaves nothing for the filter
+to catch, so it runs with zero questions.
 
 The exact wording presented to workers lives in
 `prompts/_clarification_filter.md`. That file is the single source of truth
@@ -5758,27 +5748,24 @@ and resume.
 
 ### Mid-execution clarification
 
-The clarification filter runs at Phase 1 — early, before any implementer
-has done work. That is the right time for *most* intent questions: they
-are visible from the task description and the codebase. But some intent
-questions surface only after partial implementation work has narrowed the
-problem to a decision point neither the codebase nor research can resolve
-— for example, whether a refactor should preserve backward compatibility
-with a deprecated client, when both choices exist as patterns elsewhere in
-the codebase and the task description does not say.
+The clarification filter runs at Phase 1 — before any implementer has done
+work, the right time for *most* intent questions since they are visible
+from the task description and the codebase. But some questions surface
+only after partial implementation has narrowed the problem to a decision
+point neither the codebase nor research can resolve — for example, whether
+a refactor should preserve backward compatibility with a deprecated
+client, when both choices exist as patterns elsewhere and the task
+description does not say.
 
 Leerie treats this as the same kind of question as a Phase-1 clarification,
-not as a different category. The filter is identical: investigate the
-codebase first; treat research as the second-line resolver; ask the user
-only what neither can settle. The only difference is *when* the question
-surfaces. The mechanism reuses the existing handoff infrastructure: the
-implementer writes a checkpoint of its work-in-progress, returns a status
-that carries the question to the orchestrator, and the orchestrator surfaces
-the question through the same interactive/non-interactive paths the Phase-1
-clarification step uses. On the user's answer (delivered either interactively
-or via a re-run with `--answers`), a fresh implementer is spawned with the
-checkpoint as a continuation and the answer added to its clarification
-answers — exactly the channel used by Phase-1 answers.
+not a different category — same filter, only the *timing* differs. The
+mechanism reuses the existing handoff infrastructure: the implementer writes
+a checkpoint of its work-in-progress, returns a status that carries the
+question to the orchestrator, and the orchestrator surfaces it through the
+same interactive/non-interactive paths the Phase-1 step uses. On the user's
+answer (interactively or via a re-run with `--answers`), a fresh implementer
+is spawned with the checkpoint as a continuation and the answer added to its
+clarification answers — exactly the channel used by Phase-1 answers.
 
 The same constraint that keeps Phase-1 questions narrow applies here: a
 question's `why_underivable` must be explicit and grounded in what the
@@ -5806,10 +5793,10 @@ The single governing principle of the whole system:
 > **Prompts are advisory. Code enforces.**
 
 A worker prompt can ask for any behavior, but a prompt is an instruction to a
-model and a model can drift, misread, or — under pressure — rationalize around
-it. Anything that *matters* and *can be checked mechanically* is therefore not
-left to the prompt. It is checked by the orchestrator, in code, with no model
-judgment involved.
+model, and a model can drift, misread, or — under pressure — rationalize
+around it. Anything that *matters* and *can be checked mechanically* is
+therefore checked by the orchestrator, in code, with no model judgment
+involved.
 
 This is why the orchestrator is a real program and not a skill (§2), and it
 recurs everywhere in the design:
@@ -5860,17 +5847,16 @@ recurs everywhere in the design:
   implemented as deterministic Python checks that the worker cannot
   override (§6½).
 
-The complementary half of the principle is just as important: **what cannot be
-checked mechanically is left to the worker, and not second-guessed by code.**
+The complementary half is just as important: **what cannot be checked
+mechanically is left to the worker, and not second-guessed by code.**
 Understanding intent, writing code, decomposing a domain, resolving the
-*semantics* of a merge conflict — these need judgment, so a worker does them.
-The orchestrator checks the *outcome* where it can, but it does not pretend to
-do the worker's reasoning.
+*semantics* of a merge conflict — these need judgment, so a worker does
+them. The orchestrator checks the *outcome* where it can, but does not
+pretend to do the worker's reasoning.
 
-A reader reasoning about *where a given guarantee comes from* should always ask:
-is this enforced by code, or only requested by a prompt? The two have different
-strengths, and the design depends on keeping them clearly separated. The
-concrete enforcement points — which function checks what, at which phase — are
+A reader reasoning about *where a given guarantee comes from* should ask: is
+this enforced by code, or only requested by a prompt? The concrete
+enforcement points — which function checks what, at which phase — are
 catalogued in `IMPLEMENTATION.md`.
 
 ### Judgment-worker isolation
@@ -5887,8 +5873,8 @@ workers cannot mutate state because they run in the real repo cwd *without*
 that "shifts trust onto the prompts." Measured: a classifier on a run with
 the flag set implemented an entire task in the operator's checkout on
 `main` (`Edit` to three files, a repo-wide `lint:fix`, a `git stash`/`pop`
-pair) and died at its turn cap. The prompt said "you run read-only"; that
-was the only thing that said so.
+pair) and died at its turn cap — the prompt said "you run read-only", and
+that was the only thing that said so.
 
 **L1 — the flag never reaches a judgment worker.** `claude_p` appends
 `--dangerously-skip-permissions` on `autonomous` alone. Probed live (claude
@@ -5904,9 +5890,8 @@ its branch — the result behind L2's caveat below.
 **L2 — they run in a disposable worktree.** A detached worktree per run,
 reset to the checkout's HEAD on entry (`scripts/planning-worktree.sh`).
 **L2 is worth nothing without L1** — a worktree is not a boundary, it is
-where the boundary lands once L1 restores one (confirmed by the probe
-above: with the flag on, the worktree did not stop the checkout being
-overwritten).
+where the boundary lands once L1 restores one (confirmed above: with the
+flag on, the worktree did not stop the checkout being overwritten).
 
 **L3 — the operator's escape hatch, re-expressed.** The flag's documented
 purpose was always tooling visibility ("repositories where the planner
@@ -5930,24 +5915,23 @@ within one worker of the damage. Untracked files are compared deliberately,
 since a worker *creating* files is exactly what a clean-tree `??`-filtered
 gate cannot see.
 
-Stated plainly, this does **not** achieve kernel-level confinement: `/work`
-is a read-write bind mount in the same container for the whole run, and
-nothing short of a read-only mount or a separate uid stops a determined
-worker. L1–L3 make the escape unlikely; L4 makes it loud.
+This does **not** achieve kernel-level confinement: `/work` is a read-write
+bind mount in the same container for the whole run, and nothing short of a
+read-only mount or a separate uid stops a determined worker. L1–L3 make the
+escape unlikely; L4 makes it loud.
 
 A further layer sits underneath all four and holds even for `autonomous`
 workers, which still carry the permission bypass: `DISALLOWED_TOOLS` via
-`--disallowedTools` on every session-starting `claude -p` invocation (the
-sole exemption is the capability probe, which passes empty stdin and exits
-before any model call). Unlike `--allowedTools` (permission-tier, bypassed
-by the flag), `--disallowedTools` with bare tool names removes tools from
-the model's context entirely, regardless of permission mode. The deny list
+`--disallowedTools` on every session-starting `claude -p` invocation (sole
+exemption: the capability probe, which passes empty stdin and exits before
+any model call). Unlike `--allowedTools` (permission-tier, bypassed by the
+flag), `--disallowedTools` with bare tool names removes tools from the
+model's context entirely, regardless of permission mode. The deny list
 targets tools that spawn untracked parallel work or set timers the
 orchestrator cannot track (`Agent`, `SendMessage`, `ScheduleWakeup`,
 `CronCreate`/`Delete`/`List`, `RemoteTrigger`, `PushNotification`, plus
 corpus-measured additions like `Workflow`, `Skill`, `Monitor`, the `Task*`
-family, `Task` itself, and the three MCP-resource tools) — a mechanical
-code-side deny that survives the permission escape hatch.
+family, `Task` itself, and the three MCP-resource tools).
 
 #### Acting-worker isolation — the same deny, scoped to a path
 
