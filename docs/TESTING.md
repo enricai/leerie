@@ -2919,18 +2919,15 @@ consuming files fail — proof they share it rather than merely import it.
 
 `tests/test_leerie_commit.py` pins the `leerie_commit` state field, which
 disambiguates `leerie_version`: `plugin.json` only moves on a
-`chore(release):` commit while `install.sh` tracks `main`, so every run
-between releases records the same version whether or not it carries a given
-fix — a bug report citing `v0.11.1` cannot be placed on either side of it.
-The launcher computes the short sha and forwards it as `LEERIE_COMMIT`; the
-orchestrator records it beside the version, adjacent in `STATE_FIELDS` (so
-one can't move without the other), reading the env var with `or None` —
-load-bearing, since an empty value arrives on a tarball install and `""`
-would render as a real-but-blank sha in the PR footer. Launcher-side, the
-`git` call carries `2>/dev/null || true` (absence is normal), is forwarded
-explicitly with `-e` (launcher-computed, not a user knob), and is **not** on
-the forwarding denylist, unlike `LEERIE_VERSION` (host-only, for the image
-tag).
+`chore(release):` commit while `install.sh` tracks `main`, so a run between
+releases records the same version whether or not it carries a given fix. The
+launcher computes the short sha and forwards it as `LEERIE_COMMIT`; the
+orchestrator stores it adjacent to the version in `STATE_FIELDS` (so one
+can't move without the other), reading the env var with `or None` — an empty
+value arrives on a tarball install and `""` would render as a
+real-but-blank sha in the PR footer. Launcher-side the `git` call carries
+`2>/dev/null || true`, is forwarded explicitly with `-e`, and is **not** on
+the forwarding denylist, unlike host-only `LEERIE_VERSION`.
 
 **Two traps this file exists to pin, both shipped broken once.**
 
@@ -2938,32 +2935,27 @@ tag).
    the fresh-run `else:`), so a key must be written in both. The original
    test compared two strings that both live in the resume branch, so it
    passed while the field was absent from every fresh run — the common
-   case. The replacement walks the AST, locates the `args.resume` `If`
-   node, and requires the key in `body` **and** `orelse`, with an
-   anti-vacuity control that the same walk finds `leerie_version` (known
-   present in both). Enforcement lives in
-   `tests/test_state_fields.py::test_no_resume_only_state_keys`, which
+   case. The replacement walks the AST, locates the `args.resume` `If` node,
+   and requires the key in `body` **and** `orelse`, with an anti-vacuity
+   control that the same walk finds `leerie_version` (known present in
+   both). `tests/test_state_fields.py::test_no_resume_only_state_keys`
    *derives* the rule (`resume_keys - fresh_keys == set()`) for every key —
-   no list to maintain; `task`, `started_at`, `worker_count` are legitimately
-   fresh-only and excluded. The walk (`_state_init_branch_keys`) has one
-   owner, enforced by `tests/test_no_duplicate_state_walks.py` (a drifted
-   copy would under-report `resume_keys`, passing the symmetry guard
-   vacuously), matches `ast.unparse(n.test) == "args.resume"` exactly, and
-   **raises** on an `st.data.update()`/`setdefault()`/augmented write inside
-   either arm rather than silently missing it. `_BOTH_BRANCH_KEYS` is a
-   frozen set of named pins for the three fields that have actually shipped
-   broken here (a new field does not go in it — the fourth time an
-   enumeration was replaced by a derivation after a missed instance, PRs
-   #180–#183 the others): the derived rule immediately found a third
-   defect a hand-built tuple missed — `skip_coverage_check`, seeded only
-   under `if args.resume:` since PR #162, silently inert on every fresh run
-   (`.get()` returned `None`) while `tests/test_phase_planning_coverage_gate.py`'s
-   `TestSkipCoverageCheck` reported full coverage because every test sets
-   the key by hand — pinning the consumer while proving nothing about the
-   producer. By contrast `dangerously_force_strict_output` (M7) is a record
-   only — its behaviour comes from `caps["force_strict_output"]` ahead of
-   the split, so both paths always honoured it and only attribution was
-   lost.
+   `task`, `started_at`, `worker_count` are legitimately fresh-only and
+   excluded. The walk (`_state_init_branch_keys`) has one owner
+   (`tests/test_no_duplicate_state_walks.py`; a drifted copy would
+   under-report `resume_keys`, passing the symmetry guard vacuously),
+   matches `ast.unparse(n.test) == "args.resume"` exactly, and **raises** on
+   an `st.data.update()`/`setdefault()`/augmented write inside either arm
+   rather than silently missing it. `_BOTH_BRANCH_KEYS` pins the three
+   fields that have actually shipped broken here (PRs #180–#183): the
+   derived rule immediately found a third defect a hand-built tuple missed —
+   `skip_coverage_check`, seeded only under `if args.resume:` since PR #162,
+   silently inert on every fresh run while
+   `tests/test_phase_planning_coverage_gate.py`'s `TestSkipCoverageCheck`
+   reported full coverage because every test sets the key by hand. By
+   contrast `dangerously_force_strict_output` (M7) is a record only — its
+   behaviour comes from `caps["force_strict_output"]` ahead of the split, so
+   both paths always honoured it and only attribution was lost.
 
 2. The local `-e` forward covers only `--runtime local`; Fly and EC2 each
    build their own `child_env = dict(os.environ)` inside their own unquoted
@@ -2973,33 +2965,31 @@ tag).
    its stray-substitution scan fails.
 
 **Both heredoc scans are derived**, over every launch block rather than the
-one Fly slice they originally hard-coded: `_launch_env_blocks()` in
-`tests/test_bedrock_bearer_token.py` feeds both the stray-`${...}` allowlist
-scan and the backtick scan. The scans used to cover only a 31-line Fly slice
-and were structurally blind to the EC2 heredoc — an unquoted `<<PY` where an
-unbound `${VAR}` anywhere in the body aborts the launcher under
-`set -euo pipefail`, and a balanced backtick pair is read as command
-substitution, silently dropping that text (`bash -n` misses it; `shellcheck
--x` catches it). Falsified in both directions: injecting either defect into
-the EC2 body fails naming `ec2`, and the old slice provably did not contain
-it.
+one Fly slice they originally hard-coded: `_launch_env_blocks()` feeds both
+the stray-`${...}` allowlist scan and the backtick scan, which used to cover
+only a 31-line Fly slice and were blind to the EC2 heredoc — an unbound
+`${VAR}` anywhere in an unquoted `<<PY` body aborts under `set -euo
+pipefail`, and a balanced backtick pair is read as command substitution,
+silently dropping that text (`bash -n` misses it; `shellcheck -x` catches
+it). Falsified both ways: injecting either defect into the EC2 body fails
+naming `ec2`, and the old slice provably did not contain it.
 
 **`_child_env_blocks()` finds every `child_env = dict(os.environ)`** in the
 launcher and requires each to forward the var, so a third runtime fails
-automatically — this exists because a hard-coded version shipped covering
-Fly only while being *named* `..._fly_ec2_path_too`, and EC2 recorded null
-until a reviewer caught it (anti-vacuity: at least two blocks must be found,
-each also setting `USER_REPO`, known present in both).
+automatically — a hard-coded version once shipped covering Fly only while
+being *named* `..._fly_ec2_path_too`, and EC2 recorded null until a reviewer
+caught it (anti-vacuity: at least two blocks must be found, each also
+setting `USER_REPO`, known present in both).
 
 ## `--dangerously-force-strict-output` context-window regression
 
 (DESIGN §7 *Forcing constrained decoding*, §6 *A client-side context
-refusal*) — covered by three files. The defect: the flag owns
-`ANTHROPIC_BASE_URL`, and the CLI treats any custom base URL as an **LLM
-gateway** — behind which it can no longer confirm the answering model and
-falls back to a conservative client-side context ceiling instead of Sonnet
-5's native 1M, refusing prompts *itself* at ~224K with a synthetic assistant
-message (`model=<synthetic>`, usage all zeros, no API call).
+refusal*) — covered by three files. The flag owns `ANTHROPIC_BASE_URL`, and
+the CLI treats any custom base URL as an **LLM gateway**, behind which it
+can no longer confirm the answering model and falls back to a conservative
+client-side context ceiling instead of Sonnet 5's native 1M, refusing
+prompts *itself* at ~224K with a synthetic assistant message
+(`model=<synthetic>`, usage all zeros, no API call).
 
 `tests/test_strict_proxy_context_window.py` pins `_model_arg`: `sonnet`/
 `opus` gain the `[1m]` suffix only while `_STRICT_PROXY` is active, `haiku`
@@ -3013,17 +3003,17 @@ proxy off, so setting it by hand only breaks `haiku`.
 `tests/test_context_overflow_classifier.py` pins `_is_context_overflow` and
 `ContextOverflow` against verbatim `result` envelopes. Both
 `terminal_reason == "blocking_limit"` **and** the result text are required —
-the reason alone is shared with other terminal arms, and the text alone can
-appear in correct output; `subtype` is a misleading `"success"` and must
-never be keyed on. Gated on `is_error`, exempting `_leerie_synthetic`,
-disjoint from both auth classifiers. `ContextOverflow` subclasses
-`BaseException`, not `WorkerError` — `_run_checked_loop` retries
-`WorkerError` for its whole round budget, pure waste for a deterministic
-client-side refusal — and routes to a resumable `EXIT_LOCKED` pause whose
-message never says "schema" (unclassified, this surfaced as *"worker failed
-schema-valid output twice: Prompt is too long,"* costing three misdiagnoses
-on 2026-08-06). Extracting the handler arm must split on `"\n    except "`,
-not a bare `"except "`, which truncates at the inner `except Exception:`.
+the reason alone is shared with other terminal arms, and `subtype` is a
+misleading `"success"` that must never be keyed on. Gated on `is_error`,
+exempting `_leerie_synthetic`, disjoint from both auth classifiers.
+`ContextOverflow` subclasses `BaseException`, not `WorkerError` —
+`_run_checked_loop` retries `WorkerError` for its whole round budget, pure
+waste for a deterministic client-side refusal — and routes to a resumable
+`EXIT_LOCKED` pause whose message never says "schema" (unclassified, this
+surfaced as *"worker failed schema-valid output twice: Prompt is too
+long,"* costing three misdiagnoses on 2026-08-06). Extracting the handler
+arm must split on `"\n    except "`, not a bare `"except "`, which
+truncates at the inner `except Exception:`.
 
 ## Task-reference globbing (`_glob_task_references`)
 
@@ -3091,43 +3081,40 @@ in a separate end-to-end tier.
 
 The inverted credential-resolution precedence in
 `_extract_claude_credentials_json` (DESIGN §6 *Credential strategy* —
-`$CLAUDE_CODE_OAUTH_TOKEN` now resolves ahead of Keychain and the on-disk
-file, since a container cannot refresh a copied subscription token) is
-tested in `tests/test_credential_precedence.py` (via `_invoke_helper` from
-`tests/test_chain_credential_transport.py`): the env var wins over both
-Keychain (Darwin-only) and the file, wins over the
-file alone on non-Darwin, matches `seed-auth.sh`'s independently-constructed
-JSON shape (extracted by regex so the two can't silently diverge), Keychain
-still wins over the file when the env var is unset, and no credential
-anywhere yields a clean rc 1.
+`$CLAUDE_CODE_OAUTH_TOKEN` resolves ahead of Keychain and the on-disk file,
+since a container cannot refresh a copied subscription token) is tested in
+`tests/test_credential_precedence.py` (via `_invoke_helper` from
+`tests/test_chain_credential_transport.py`): the env var wins over Keychain
+(Darwin-only) and the file, wins over the file alone on non-Darwin, matches
+`seed-auth.sh`'s independently-constructed JSON shape (extracted by regex so
+the two can't silently diverge), Keychain still wins over the file when the
+env var is unset, and no credential anywhere yields a clean rc 1.
 
 It also pins the shape-validation gate rejecting a syntactically valid but
-semantically empty Keychain/file blob (the documented upstream bug,
-steipete/CodexBar#1844: a background MCP-plugin OAuth flow overwrites the
-shared Keychain item with only `{"mcpOAuth": {...}}`, dropping
-`claudeAiOauth`): an mcpOAuth-only blob is rejected and falls through to a
-file; the same with no fallback yields rc 1; a blob with `claudeAiOauth` but
-an empty `accessToken` is rejected; a blob carrying both `mcpOAuth` and a
-real `accessToken` is still accepted. The synthesized blob's mandatory
-`scopes:["user:inference"]` field (CLI 2.1.210 rejects a scope-less blob as
-"Not logged in" — measured by field-ablation) is pinned byte-identical
-across all three synthesized sites (`leerie`, `seed-auth.sh`,
-`ec2-seed-auth.sh`); the always-forward `-e CLAUDE_CODE_OAUTH_TOKEN`
-injection (survives a headless run past a copied file blob's `expiresAt`,
-anthropics/claude-code#21765) sits *before* the credential-resolve
-`if`/`else`, not in the failure arm where it was previously unreachable.
+semantically empty Keychain/file blob (steipete/CodexBar#1844: a background
+MCP-plugin OAuth flow overwrites the shared Keychain item with only
+`{"mcpOAuth": {...}}`, dropping `claudeAiOauth`): an mcpOAuth-only blob
+falls through to a file, or yields rc 1 with no fallback; a blob with
+`claudeAiOauth` but an empty `accessToken` is rejected; both `mcpOAuth` and
+a real `accessToken` together is still accepted. The synthesized blob's
+mandatory `scopes:["user:inference"]` field (CLI 2.1.210 rejects a
+scope-less blob as "Not logged in") is pinned byte-identical across all
+three synthesized sites (`leerie`, `seed-auth.sh`, `ec2-seed-auth.sh`); the
+always-forward `-e CLAUDE_CODE_OAUTH_TOKEN` injection (survives a headless
+run past a copied file blob's `expiresAt`, anthropics/claude-code#21765)
+sits *before* the credential-resolve `if`/`else`, not in the failure arm
+where it was previously unreachable.
 
-The paired best-effort expiry preflight, `_check_claude_credential_ttl`
-(a no-op for the exempt long-lived-token path), is tested in
-`tests/test_credential_ttl_preflight.py`: an already-expired `expiresAt`
-refuses and names `claude /login`; inside the 90-minute threshold warns,
-naming the exact ISO-8601 expiry and `claude setup-token` (a regression case
-replays the b57027d3 incident's expiry shape); a healthy TTL is silent;
-absent, malformed, or negative (pre-1970 garbage) `expiresAt` all proceed
-silently (best-effort, not a hard gate); the threshold is pinned at exactly
-90 minutes, and the
-launcher never hard-codes an 8-hour assumption (the community-reported
-2–15h range is why `expiresAt` must be read, never assumed).
+The paired best-effort expiry preflight, `_check_claude_credential_ttl` (a
+no-op for the exempt long-lived-token path), is tested in
+`tests/test_credential_ttl_preflight.py`: already-expired refuses and names
+`claude /login`; inside the 90-minute threshold warns with the exact
+ISO-8601 expiry and `claude setup-token` (replaying the b57027d3 incident's
+expiry shape); a healthy TTL is silent; absent, malformed, or negative
+(pre-1970 garbage) `expiresAt` all proceed silently (best-effort, not a hard
+gate); the threshold is pinned at exactly 90 minutes — the launcher never
+hard-codes an 8-hour assumption, since the community-reported range is
+2–15h.
 
 ## Bedrock auth paths
 
@@ -3143,78 +3130,73 @@ it wins when both it and a settings.json flag are present; the pre-existing
 SSO/profile path is unaffected when the bearer token is absent.
 
 The Fly detached-launch heredoc has its own dedicated coverage for three
-defects, since the heredoc is unquoted (`<<PY`) and substitutes shell
-expansions inside inert-looking Python comment text:
-
-1. A raw `"${AWS_BEARER_TOKEN_BEDROCK}"` substitution let a token containing
-   `"`/`\` break out of the Python string literal and run as arbitrary code
-   remotely — fixed by JSON-encoding every heredoc-substituted value
-   host-side, pinned by `test_fly_heredoc_values_are_json_encoded_not_raw`
-   and three live end-to-end tests
-   (`test_malicious_token_with_quote_does_not_break_out_of_python_literal`,
-   `test_malicious_token_with_backslash_does_not_break_out`,
-   `test_normal_token_unaffected_by_json_encoding`) that extract the real
-   JSON-encoding lines and pipe the result through `python3 -`.
-2. A first-draft fix comment containing the literal text `${VAR}` crashed
-   the launcher with `unbound variable` under `set -u` on every Bedrock Fly
-   launch (worse than the injection defect — unconditional, not just on a
-   hostile token) — pinned by
-   `test_child_env_heredoc_body_has_no_stray_unbound_var_substitution`.
-3. A balanced backtick pair in a comment was parsed by bash as command
-   substitution — a different mechanism, unguarded by fix (1) — printing a
-   spurious syntax error and silently dropping that comment's text (caught
-   by diffing `shellcheck -x leerie` against `git stash`; `bash -n` misses
-   it) — pinned by `test_child_env_heredoc_body_has_no_backtick_characters`.
-
-All three were falsified live (reintroduce, confirm red, confirm the fix
-turns it green).
+defects, since it is unquoted (`<<PY`) and substitutes shell expansions
+inside inert-looking Python comment text: (1) a raw
+`"${AWS_BEARER_TOKEN_BEDROCK}"` substitution let a `"`/`\`-bearing token
+break out of the Python string literal and run as arbitrary code remotely —
+fixed by JSON-encoding every heredoc-substituted value host-side, pinned by
+`test_fly_heredoc_values_are_json_encoded_not_raw` and three live
+end-to-end tests (`test_malicious_token_with_quote_does_not_break_out_of_python_literal`,
+`test_malicious_token_with_backslash_does_not_break_out`,
+`test_normal_token_unaffected_by_json_encoding`) that pipe the real
+JSON-encoding lines through `python3 -`; (2) a first-draft fix comment
+containing the literal text `${VAR}` crashed the launcher with `unbound
+variable` under `set -u` on every Bedrock Fly launch — unconditional, worse
+than the injection defect — pinned by
+`test_child_env_heredoc_body_has_no_stray_unbound_var_substitution`; (3) a
+balanced backtick pair in a comment was parsed by bash as command
+substitution, a different mechanism unguarded by fix (1), silently dropping
+that comment's text (caught by diffing `shellcheck -x leerie` against `git
+stash`; `bash -n` misses it) — pinned by
+`test_child_env_heredoc_body_has_no_backtick_characters`. All three were
+falsified live (reintroduce, confirm red, confirm the fix turns it green).
 
 `tests/test_bedrock_mode.py` covers the pre-existing SSO/profile path
 (`detect_bedrock_mode()` / `bedrock_preflight()`), which shipped with zero
 coverage: the 3-file merge and truthy-value matching (`1`/`true`/`yes`/`on`,
-case-insensitive OR, tolerant of a malformed settings file); and
+case-insensitive OR, tolerant of a malformed settings file), and
 `bedrock_preflight()`'s three outcomes (missing `aws`, a failing `aws sts
-get-caller-identity`, a valid SSO session). Both extract the functions
-verbatim via source-slicing rather than reproducing them by hand.
+get-caller-identity`, a valid SSO session), both via source-slicing rather
+than reproducing the functions by hand.
 
 ## Terminal auth-failure classifier and routing
 
-The terminal auth-failure classifier and routing path — the `b57027d3…`
-incident where a container's expired OAuth session surfaced as "worker
-failed schema-valid output twice" instead of a resumable pause — is tested
-in `tests/test_terminal_auth_failure.py`: `_is_terminal_auth_failure` is
-table-driven over the measured corpus (4 real strings positive, mixed-case
-included; 8-string "API Error: …" corpus plus empty string negative; the
-verbatim incident envelope true); gating mirrors `_is_auth_or_quota_failure`
-(`False` without `is_error`; `False` for `_leerie_synthetic`; `False` for a
-successful envelope discussing OAuth legitimately; `False` for a bare
-"oauth" substring, guarding the 2919-count false-positive risk noted in the
-docstring; `False` for non-string `result`); 401/429/529 envelopes classify
-false here while true under `_is_auth_or_quota_failure`, proving the two
-classifiers partition cleanly. `claude_p()` routing tests replay the
-verbatim envelope through a stubbed `_invoke`: completes in under 5 seconds
-rather than entering the ~300s tenacity loop, raises `TerminalAuthFailure`
-not `WorkerError`; a control with 401/429/529 envelopes still exhausts the
-real backoff loop before raising `WorkerError`. Guards: an AST-based check
-(not substring — satisfied by explanatory comments alone) that `main()`'s
-`except TerminalAuthFailure` sets `exit_code = EXIT_LOCKED` (== 75) and
-mentions `resume`; `_is_terminal_auth_failure` checked before
-`_is_auth_or_quota_failure`; `TerminalAuthFailure` subclasses
-`BaseException` (propagates through `asyncio.gather`) but not `WorkerError`.
-`tests/test_terminal_auth_routing.py` covers the `claude_p`/`main()` seam
-separately (same assertions, plus `_cleanup_on_abnormal_exit(st,
-full_purge=False)` and `abnormal = False`) — the doc-conformant behavior per
-`docs/IMPLEMENTATION.md` §3 "Auth/quota backoff" after commit `2652319`
-reverted an over-application of the reroute to the transient-backoff case.
+The `b57027d3…` incident — a container's expired OAuth session surfacing as
+"worker failed schema-valid output twice" instead of a resumable pause — is
+tested in `tests/test_terminal_auth_failure.py`: `_is_terminal_auth_failure`
+is table-driven over the measured corpus (4 real strings positive,
+mixed-case included; 8-string "API Error: …" corpus plus empty string
+negative; the verbatim incident envelope true); gating mirrors
+`_is_auth_or_quota_failure` (`False` without `is_error`, for
+`_leerie_synthetic`, for a successful envelope discussing OAuth
+legitimately, for a bare "oauth" substring — guarding the 2919-count
+false-positive risk noted in the docstring — and for non-string `result`);
+401/429/529 envelopes classify false here while true under
+`_is_auth_or_quota_failure`, proving the two classifiers partition cleanly.
+`claude_p()` routing tests replay the verbatim envelope through a stubbed
+`_invoke`: completes in under 5 seconds rather than entering the ~300s
+tenacity loop, raises `TerminalAuthFailure` not `WorkerError`; a control
+with 401/429/529 envelopes still exhausts the real backoff loop before
+raising `WorkerError`. Guards: an AST-based check (not substring — satisfied
+by explanatory comments alone) that `main()`'s `except TerminalAuthFailure`
+sets `exit_code = EXIT_LOCKED` (== 75) and mentions `resume`;
+`_is_terminal_auth_failure` checked before `_is_auth_or_quota_failure`;
+`TerminalAuthFailure` subclasses `BaseException` (propagates through
+`asyncio.gather`) but not `WorkerError`. `tests/test_terminal_auth_routing.py`
+covers the `claude_p`/`main()` seam separately (same assertions, plus
+`_cleanup_on_abnormal_exit(st, full_purge=False)` and `abnormal = False`) —
+doc-conformant per `docs/IMPLEMENTATION.md` §3 "Auth/quota backoff" after
+commit `2652319` reverted an over-application of the reroute to the
+transient-backoff case.
 
 ## 2026-07-19 incident: argv E2BIG and coverage-gate freeze
 
-The 2026-07-19 incident (`argv-e2big-and-coverage-freeze`) — the combined
-argv E2BIG crash (root cause B) and coverage-gate freeze (root
-cause A) — has a dedicated end-to-end harness in
-`tests/test_incident_2026_07_19.py`, backed by synthetic, shape-matched
-fixtures (`tests/fixtures/incident_2026_07_19/{shape.json,generate.py}`):
-task 51,142B, `subtask_views` 88,201B at `indent=2`, 114 subtasks, a 15-item
+The 2026-07-19 incident (`argv-e2big-and-coverage-freeze`) — combined argv
+E2BIG crash (root cause B) and coverage-gate freeze (root cause A) — has a
+dedicated end-to-end harness in `tests/test_incident_2026_07_19.py`, backed
+by synthetic, shape-matched fixtures
+(`tests/fixtures/incident_2026_07_19/{shape.json,generate.py}`): task
+51,142B, `subtask_views` 88,201B at `indent=2`, 114 subtasks, a 15-item
 CLAUDE.md heading harvest split into 3 uncoverable convention items and 12
 other headings — the real internal-audit task file is deliberately not
 committed. `TestRootCauseB_ArgvE2BIG` pins that the generated ~150KB payload
@@ -3232,40 +3214,37 @@ halves against the same fixtures in one test.
 ## Lessons worth keeping
 
 **A handler must survive its own exception, not merely catch it.** `main()`'s
-`except DiskLowSpace` arm opened with an unguarded `st.save()` — and
+`except DiskLowSpace` arm opened with an unguarded `st.save()`, and
 `State.save()`'s own out-of-space conversion is one of the three raise
-sites, so on the disk-full path the call re-entered the failure and raised
+sites — so on the disk-full path the save re-entered the failure and raised
 again *from inside the handler*, escaping `main()` and skipping cleanup, dep
-capture, and the `EXIT_LOCKED` assignment. The arm's own comment documented
-this hazard for the `dep_capture` call ten lines below but named only one
-raise site, so `test_survives_a_save_that_is_still_failing` in
-`tests/test_disk_preflight.py` now asserts against *every* save in the arm.
-Fixing one arm was not the fix — eight other handlers carried the identical
-bare `st.save()` (including `except BaseException`, where a raise replaces
-the unhandled exception and hides the real bug in `__context__`), all now
-routed through `_save_state_best_effort` (logs, never raises — read-only run
-dirs raise `PermissionError`, measured). The test it replaced asserted only
-`issubclass(DiskLowSpace, BaseException)` and concluded no handler was
-needed — a tautology that reasoned to a false conclusion.
+capture, and the `EXIT_LOCKED` assignment. `test_survives_a_save_that_is_still_failing`
+in `tests/test_disk_preflight.py` now asserts against *every* save in the
+arm; fixing that one arm was not the fix — eight other handlers carried the
+identical bare `st.save()` (including `except BaseException`, where a raise
+hides the real bug in `__context__`), all now routed through
+`_save_state_best_effort` (logs, never raises — read-only run dirs raise
+`PermissionError`, measured). The test it replaced asserted only
+`issubclass(DiskLowSpace, BaseException)`, a tautology that reasoned to a
+false conclusion.
 
 **A timeout is infrastructure, not a leerie bug.** `_invoke` converts
-`asyncio.TimeoutError` into `subprocess.TimeoutExpired`, an `Exception` but
+`asyncio.TimeoutError` into `subprocess.TimeoutExpired` — an `Exception` but
 **not** a `WorkerError` — so every `_run_checked_loop` caller took its
 generic-bug arm and `die()`d instead of retrying, and five bare `except
-WorkerError` sites let it escape entirely. The per-worker timeout table made
+WorkerError` sites let it escape entirely (the per-worker timeout table made
 this ~4x more reachable for the 18 workers whose ceiling it lowered, though
-the stated motivation was a hung `classifier`. The retry arm and those five
+the stated motivation was a hung `classifier`). The retry arm and those five
 sites now name `subprocess.TimeoutExpired` alongside `WorkerError`. Never
 interpolate one into a message: `str()` on a `TimeoutExpired` renders `cmd`
-— the entire `claude -p` argv with an inlined system prompt, the 50 KB
-terminal dump `_run_implementer`'s handler documents.
+— the entire `claude -p` argv with an inlined system prompt.
 `_brief_worker_exc` names `exc.timeout` instead; `tests/test_checked_loop.py`
 pins both the retry and that the argv never reaches a warning line.
 
 **Derivation guards are one-directional unless you write the converse.**
 Both `TIMEOUT_DEFAULT_PER_WORKER` tests iterated the *table*, so deleting
-five entries passed the whole suite while those workers silently reverted to
-the 5400s global; `test_every_measured_worker_below_the_cap_is_IN_the_table`
+five entries passed the whole suite while those workers silently reverted
+to the 5400s global; `test_every_measured_worker_below_the_cap_is_IN_the_table`
 iterates the measured summary instead. `main()`'s caps wiring had the same
 shape: its guard asserted the value line plus `"args.worker_timeout"`, which
 appears *on* that line, so deleting the explicitness assignment left it
@@ -3274,9 +3253,8 @@ green.
 **Ablate a pattern against its corpus instead of adding alternatives.**
 `_host_finalize_is_auth_or_network_push_error` carried 11 alternatives;
 removing each in turn showed only three load-bearing for the 9 real git
-cases, and four (`could not resolve host`, `connection refused|timed out`,
-`operation timed out`, `no route to host`) were unreachable false-positive
-surface behind the `^(fatal|remote):` anchor. Dropping them kept 9/9 and
-fixed three hook misclassifications. Separately,
-`_host_finalize_ssh_transport_failure` was **provably dead**: its condition
-was a line the first arm already matched, which ran first.
+cases, and four were unreachable false-positive surface behind the
+`^(fatal|remote):` anchor. Dropping them kept 9/9 and fixed three hook
+misclassifications. `_host_finalize_ssh_transport_failure` was **provably
+dead**: its condition was a line the first arm already matched, which ran
+first.
