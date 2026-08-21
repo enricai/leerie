@@ -3237,7 +3237,8 @@ this ~4x more reachable for the 18 workers whose ceiling it lowered, though
 the stated motivation was a hung `classifier`). The retry arm and those five
 sites now name `subprocess.TimeoutExpired` alongside `WorkerError`. Never
 interpolate one into a message: `str()` on a `TimeoutExpired` renders `cmd`
-— the entire `claude -p` argv with an inlined system prompt.
+— the entire `claude -p` argv with an inlined system prompt, the 50 KB
+terminal dump `_run_implementer`'s handler documents.
 `_brief_worker_exc` names `exc.timeout` instead; `tests/test_checked_loop.py`
 pins both the retry and that the argv never reaches a warning line.
 
