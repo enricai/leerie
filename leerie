@@ -7936,43 +7936,54 @@ print(json.dumps(sys.argv[1:]))
         # seed-auth.sh staged into .credentials.json.
         _oauth_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
         _oauth_tokens_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
-        _launch_script="$(cat <<PY
-import fcntl, os, pwd, subprocess, sys, time
-argv = ${_launch_argv_json}
-run_id = argv[0]
-orch_args = argv[1:]
-run_dir = "/work/.leerie/runs/" + run_id
-os.makedirs(run_dir, exist_ok=True)
-# Make /work/.leerie, /work/.leerie/runs, and the run dir itself writable
-# by leerie — os.makedirs created them as root (this wrapper runs as
-# root via ssh-console). The orchestrator runs as leerie and may need
-# to write into /work/.leerie/runs/<run-id>/.
-leerie_pw = pwd.getpwnam("leerie")
-for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
-    try:
-        os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
-    except OSError:
-        pass
-# Refuse to spawn a second orchestrator on the same run dir. The real
-# enforcement is in State.__init__ (which acquires the same flock and
-# dies with EXIT_LOCKED=75 if held). This probe is the fast-path: it
-# avoids the cost of spawning a Python process that would just die in
-# startup. Same primitive (advisory flock on run_dir) used at both
-# layers. See DESIGN §6 *Single owner per run dir*.
-_probe_fd = os.open(run_dir, os.O_RDONLY)
-try:
-    try:
-        fcntl.flock(_probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(_probe_fd, fcntl.LOCK_UN)
-    except BlockingIOError:
-        sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
-        sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
-        sys.stderr.write("  leerie resume " + run_id + " --runtime fly\\n")
-        sys.exit(75)
-finally:
-    os.close(_probe_fd)
-log_path = run_dir + "/orchestrator.log"
-pid_path = run_dir + "/orchestrator.pid"
+        # Carry the host's IANA timezone so the in-machine orchestrator's
+        # log() ISO-8601 prefix matches the host-side remote_log() offset.
+        # Fly machines default to UTC; without this the user reads mixed
+        # offsets (host -05:00, machine +00:00) in the tailed stream and
+        # can't compare timestamps at a glance. The Dockerfile installs
+        # tzdata so /usr/share/zoneinfo/<IANA> resolves. If readlink fails
+        # (e.g. /etc/localtime not a symlink), the substitution yields ""
+        # and Python's astimezone() falls back to UTC — same as today.
+        #
+        # Recorded beside leerie_version in state.json. Forwarded here as
+        # well as on the local nerdctl path: a remote run that records only
+        # the version cannot be attributed to a commit, and remote is where
+        # that matters most.
+        #
+        # Bedrock bearer-token activation (AWS_BEARER_TOKEN_BEDROCK) --
+        # takes precedence over the SSO/profile block below, mirroring the
+        # nerdctl path's AUTH_MOUNTS ordering above. Every value is
+        # JSON-encoded host-side before substitution instead of a raw
+        # quoted-var string -- an opaque bearer token is exactly the kind
+        # of value likely to contain a double-quote or backslash that would
+        # otherwise break out of a raw Python string literal and run as
+        # arbitrary code on this remote machine (see _launch_argv_json
+        # above, which already uses this technique for argv). A
+        # JSON-encoded empty string is falsy in Python, so the truthiness
+        # checks below behave the same as the unset case. NOTE: this
+        # heredoc is unquoted (<<ENV_PY) -- never put a backtick pair in a
+        # comment here, since bash treats it as a command-substitution
+        # delimiter even inside heredoc body text.
+        #
+        # CLAUDE_CODE_OAUTH_TOKEN(S) -- forwarded unconditionally (empty
+        # JSON string is falsy, same no-op-when-unset behavior as the
+        # Bedrock vars above) so the in-machine orchestrator's multi-token
+        # probe/rotation sees the full list CLAUDE_CODE_OAUTH_TOKENS
+        # carries, not just the single token seed-auth.sh staged into
+        # .credentials.json.
+        # The chown loop, flock probe (whose duplicate-run hint is what
+        # bakes the "--runtime fly" text below into the launch script —
+        # the shared _render_launch_prefix in scripts/remote/seed-common.sh
+        # takes the runtime label as an argument rather than repeating this
+        # text per call site), Popen invocation, and pidfile-poll loop all
+        # live in scripts/remote/seed-common.sh's _render_launch_prefix /
+        # _render_launch_suffix (sourced transitively via lib.sh above) —
+        # only the child_env assembly below (TZ/LEERIE_COMMIT variable
+        # names, the Bedrock activation block) legitimately differs
+        # per runtime and stays here.
+        _launch_script="$(
+          _render_launch_prefix fly "$_launch_argv_json"
+          cat <<PY
 # Build the env from scratch — ssh-console sets HOME=/root which would
 # point claude at the wrong credentials dir. Pin HOME=/home/leerie and
 # leave PATH alone (the image's PATH includes mise + Claude Code CLI
@@ -7989,31 +8000,8 @@ child_env["LOGNAME"] = "leerie"
 # heredoc is unquoted (<<PY), so basename runs host-side and the
 # resulting literal is baked into the script piped to the Fly machine.
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
-# Carry the host's IANA timezone so the in-machine orchestrator's
-# log() ISO-8601 prefix matches the host-side remote_log() offset.
-# Fly machines default to UTC; without this the user reads mixed
-# offsets (host -05:00, machine +00:00) in the tailed stream and
-# can't compare timestamps at a glance. The Dockerfile installs
-# tzdata so /usr/share/zoneinfo/<IANA> resolves. If readlink fails
-# (e.g. /etc/localtime not a symlink), the substitution yields ""
-# and Python's astimezone() falls back to UTC — same as today.
 child_env["TZ"] = ${_host_tz_json}
-# Recorded beside leerie_version in state.json. Forwarded here as well as on
-# the local nerdctl path: a remote run that records only the version cannot be
-# attributed to a commit, and remote is where that matters most.
 child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}
-# Bedrock bearer-token activation (AWS_BEARER_TOKEN_BEDROCK) -- takes
-# precedence over the SSO/profile block below, mirroring the nerdctl path's
-# AUTH_MOUNTS ordering above. Every value is JSON-encoded host-side before
-# substitution instead of a raw quoted-var string -- an opaque bearer
-# token is exactly the kind of value likely to contain a double-quote or
-# backslash that would otherwise break out of a raw Python string literal
-# and run as arbitrary code on this remote machine (see _launch_argv_json
-# above, which already uses this technique for argv). A JSON-encoded empty
-# string is falsy in Python, so the truthiness checks below behave the
-# same as the unset case. NOTE: this heredoc is unquoted (<<PY) -- never
-# put a backtick pair in a comment here, since bash treats it as a
-# command-substitution delimiter even inside heredoc body text.
 if "${_BEDROCK_BEARER_ACTIVE}" == "true":
     child_env["AWS_BEARER_TOKEN_BEDROCK"] = ${_bedrock_bearer_token_json}
     child_env["CLAUDE_CODE_USE_BEDROCK"] = ${_bedrock_use_bedrock_json}
@@ -8029,80 +8017,13 @@ elif "${_BEDROCK_ACTIVE}" == "true":
         child_env["AWS_PROFILE"] = ${_bedrock_profile_json}
     if ${_bedrock_region_json}:
         child_env["AWS_REGION"] = ${_bedrock_region_json}
-# CLAUDE_CODE_OAUTH_TOKEN(S) -- forwarded unconditionally (empty JSON string
-# is falsy, same no-op-when-unset behavior as the Bedrock vars above) so the
-# in-machine orchestrator's multi-token probe/rotation sees the full list
-# CLAUDE_CODE_OAUTH_TOKENS carries, not just the single token seed-auth.sh
-# staged into .credentials.json.
 if ${_oauth_token_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKEN"] = ${_oauth_token_json}
 if ${_oauth_tokens_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKENS"] = ${_oauth_tokens_json}
-# Ensure the launcher's PATH includes the mise-managed claude binary.
-# (The Dockerfile installs claude into the mise-managed node prefix;
-# fly's hallpass ssh session inherits a minimal PATH that may not
-# include /usr/local/share/mise/...; add it defensively.)
-extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
-if extra_path not in child_env.get("PATH", ""):
-    child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
-with open(log_path, "ab") as log_f:
-    p = subprocess.Popen(
-        ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
-        stdin=subprocess.DEVNULL,
-        stdout=log_f,
-        stderr=log_f,
-        start_new_session=True,
-        # cwd=/work so the orchestrator's os.getcwd() returns /work
-        # regardless of the launching shell's (possibly stale) cwd.
-        cwd="/work",
-        # Run as the leerie user — the Fly image's USER leerie line only
-        # applies to the entrypoint; ssh-console sessions land as root,
-        # and any process we spawn here inherits root unless we set
-        # this explicitly. The orchestrator needs to run as leerie so
-        # claude finds creds at /home/leerie/.claude/.credentials.json
-        # and so files it creates are owned by leerie (not root).
-        user="leerie",
-        group=leerie_pw.pw_gid,
-        env=child_env,
-    )
-# Poll briefly before recording the pid. If this Popen lost the
-# State.__init__ flock race against an already-running orchestrator
-# for this run (the concurrent-spawn race described in DESIGN §6
-# *Single owner per run dir*), the child exits 75 within
-# milliseconds. Writing its pid to orchestrator.pid before the race
-# resolves would overwrite the winning orchestrator's pid with a
-# dead one — the stale-pid contagion that breaks resume's tail
-# liveness check and finalize --force's safety belt.
-#
-# Budget: 2 s (10 x 0.2 s). The realistic time from Popen to the
-# child's State.__init__ flock attempt is ~300-500 ms (Python
-# interpreter cold start + leerie.py imports + main()'s pre-State
-# config resolution); under disk pressure it could reach ~1 s.
-# State.__init__ itself is microseconds — open the run_dir fd,
-# attempt fcntl.flock, return or raise — but the relevant budget
-# is the end-to-end time from Popen to that point. 2 s leaves
-# comfortable headroom for both paths:
-#   - Winner: child reaches State.__init__ and proceeds. Poll
-#     times out, we write the pid.
-#   - Loser: child reaches State.__init__ and exits 75. We
-#     observe rc=75 and skip the pid write.
-# The reader-side /proc cross-check in lib.sh and
-# force-finalize.sh catches any residual edge case where the
-# budget is exceeded on the loser path.
-for _ in range(10):
-    if p.poll() is not None:
-        break
-    time.sleep(0.2)
-if p.poll() == 75:
-    # Stillborn flock-loser — the winner still owns the run. Do not
-    # touch the pid file. The launcher's existing rc=75 short-circuit
-    # (~30 lines below in the bash dispatcher) pivots the user's resume
-    # to the live-orchestrator attach path via container_rc=130.
-    sys.exit(75)
-with open(pid_path, "w") as pid_f:
-    pid_f.write(str(p.pid) + "\n")
 PY
-)"
+          _render_launch_suffix
+        )"
         _launch_rc=0
         _launch_stderr="$(mktemp)"
         printf '%s' "$_launch_script" \
@@ -8443,79 +8364,49 @@ print(json.dumps(sys.argv[1:]))
           _ec2_oauth_token_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKEN:-}")"
           _ec2_oauth_tokens_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${CLAUDE_CODE_OAUTH_TOKENS:-}")"
           _ec2_leerie_commit_json="$(python3 -c 'import json, sys; print(json.dumps(sys.argv[1]))' "${LEERIE_COMMIT:-}")"
-          _ec2_launch_script="$(cat <<PY
-import fcntl, os, pwd, subprocess, sys, time
-argv = ${_ec2_launch_argv_json}
-run_id = argv[0]
-orch_args = argv[1:]
-run_dir = "/work/.leerie/runs/" + run_id
-os.makedirs(run_dir, exist_ok=True)
-leerie_pw = pwd.getpwnam("leerie")
-for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
-    try:
-        os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
-    except OSError:
-        pass
-# Refuse to spawn a second orchestrator on the same run dir — same
-# fast-path probe as the Fly launch wrapper (leerie:5852-5863);
-# State.__init__'s own flock is the real enforcement.
-_probe_fd = os.open(run_dir, os.O_RDONLY)
-try:
-    try:
-        fcntl.flock(_probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        fcntl.flock(_probe_fd, fcntl.LOCK_UN)
-    except BlockingIOError:
-        sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
-        sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
-        sys.stderr.write("  leerie resume " + run_id + " --runtime ec2\\n")
-        sys.exit(75)
-finally:
-    os.close(_probe_fd)
-log_path = run_dir + "/orchestrator.log"
-pid_path = run_dir + "/orchestrator.pid"
+          # TZ is deliberately a raw quoted-var substitution here (not
+          # JSON-encoded like the Fly launch block's TZ) -- an IANA zone
+          # name from readlink/sed contains no quote/backslash bytes, so
+          # this carries no injection risk; kept as-is to preserve exact
+          # prior behavior rather than reformat an unrelated line while
+          # consolidating this scaffold.
+          #
+          # LEERIE_COMMIT: recorded beside leerie_version in state.json.
+          # Every orchestrator launch path must forward this -- local, fly
+          # AND ec2 -- or the field is null for whichever runtime is
+          # missed, which is how ec2 was skipped once already.
+          #
+          # CLAUDE_CODE_OAUTH_TOKEN(S) -- forwarded unconditionally (empty
+          # JSON string is falsy) so the in-machine orchestrator's
+          # multi-token probe/rotation (DESIGN §6 *Multi-token rotation*)
+          # sees the full list, not just the single token ec2_seed_auth
+          # staged into .credentials.json.
+          # The chown loop, flock probe (whose duplicate-run hint bakes in
+          # the "--runtime ec2" text below via the runtime-label argument
+          # to _render_launch_prefix), Popen invocation, and pidfile-poll
+          # loop all live in scripts/remote/seed-common.sh's
+          # _render_launch_prefix / _render_launch_suffix (sourced
+          # transitively via ec2-lib.sh above) — only the child_env
+          # assembly below (TZ/LEERIE_COMMIT variable names; EC2 has no
+          # Bedrock activation block) legitimately differs per runtime and
+          # stays here.
+          _ec2_launch_script="$(
+            _render_launch_prefix ec2 "$_ec2_launch_argv_json"
+            cat <<PY
 child_env = dict(os.environ)
 child_env["HOME"] = "/home/leerie"
 child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = "${_ec2_host_tz}"
-# Recorded beside leerie_version in state.json. Every orchestrator launch
-# path must forward this -- local, fly AND ec2 -- or the field is null for
-# whichever runtime is missed, which is how ec2 was skipped once already.
 child_env["LEERIE_COMMIT"] = ${_ec2_leerie_commit_json}
-# CLAUDE_CODE_OAUTH_TOKEN(S) -- forwarded unconditionally (empty JSON string
-# is falsy) so the in-machine orchestrator's multi-token probe/rotation
-# (DESIGN §6 *Multi-token rotation*) sees the full list, not just the single
-# token ec2_seed_auth staged into .credentials.json.
 if ${_ec2_oauth_token_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKEN"] = ${_ec2_oauth_token_json}
 if ${_ec2_oauth_tokens_json}:
     child_env["CLAUDE_CODE_OAUTH_TOKENS"] = ${_ec2_oauth_tokens_json}
-extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
-if extra_path not in child_env.get("PATH", ""):
-    child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
-with open(log_path, "ab") as log_f:
-    p = subprocess.Popen(
-        ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
-        stdin=subprocess.DEVNULL,
-        stdout=log_f,
-        stderr=log_f,
-        start_new_session=True,
-        cwd="/work",
-        user="leerie",
-        group=leerie_pw.pw_gid,
-        env=child_env,
-    )
-for _ in range(10):
-    if p.poll() is not None:
-        break
-    time.sleep(0.2)
-if p.poll() == 75:
-    sys.exit(75)
-with open(pid_path, "w") as pid_f:
-    pid_f.write(str(p.pid) + "\n")
 PY
-)"
+            _render_launch_suffix
+          )"
           _ec2_launch_rc=0
           printf '%s' "$_ec2_launch_script" | ec2_launch_detached || _ec2_launch_rc=$?
           if [ "$_ec2_launch_rc" = "75" ]; then

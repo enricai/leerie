@@ -118,3 +118,152 @@ _seed_branch_shallow_safe() {
     *) return 0 ;;
   esac
 }
+
+# --- _render_launch_prefix / _render_launch_suffix -------------------------
+# Shared halves of the Python heredoc both the Fly and EC2 remote branches
+# pipe over `flyctl ssh console` / `ec2_launch_detached` to spawn the
+# detached in-machine orchestrator. The launcher's own launch heredocs
+# (leerie's Fly and EC2 dispatch blocks) sandwich their own
+# `child_env = dict(os.environ)` block between a call to
+# `_render_launch_prefix` and a call to `_render_launch_suffix` — the
+# child_env block itself stays per-call-site because its TZ/LEERIE_COMMIT
+# variable names and the Fly-only Bedrock activation legitimately differ
+# per runtime (and tests/test_bedrock_bearer_token.py's stray-${...} and
+# backtick scans, plus tests/launcher_blocks.py's block splitter, are keyed
+# on finding one such block per runtime — moving it here would make those
+# scans unable to find or attribute it).
+#
+# Single definition site for the chown loop, the single-owner-per-run-dir
+# advisory-flock probe, the subprocess.Popen invocation, and the
+# 10-iteration poll-for-early-exit-then-write-pidfile loop, previously
+# duplicated verbatim across both launch blocks.
+#
+# _render_launch_prefix args:
+#   $1  runtime label ("fly" or "ec2") — spliced into the flock-probe's
+#       "leerie resume <run_id> --runtime <label>" hint text only.
+#   $2  JSON-encoded argv (built host-side via the same
+#       `json.dumps(sys.argv[1:])` technique at both call sites — no
+#       further encoding happens here).
+# Prints Python source up through `pid_path = ...`, stopping just before
+# the caller's own `child_env = dict(os.environ)` line.
+#
+# _render_launch_suffix takes no args. Prints Python source starting at
+# the PATH fixup and continuing through the Popen call, the pidfile poll,
+# and the pidfile write — run immediately after the caller's own
+# `child_env[...] = ...` lines.
+#
+# NOTE: both are themselves unquoted heredocs (<<PY) — the same
+# substitution hazards CLAUDE.md documents apply: every value substituted
+# here must be JSON-encoded (never a raw "${VAR}"), and no comment in the
+# fixed scaffold below may contain a stray ${...} or a balanced backtick
+# pair.
+_render_launch_prefix() {
+  local runtime="$1"
+  local argv_json="$2"
+  cat <<PY
+import fcntl, os, pwd, subprocess, sys, time
+argv = ${argv_json}
+run_id = argv[0]
+orch_args = argv[1:]
+run_dir = "/work/.leerie/runs/" + run_id
+os.makedirs(run_dir, exist_ok=True)
+# Make /work/.leerie, /work/.leerie/runs, and the run dir itself writable
+# by leerie — os.makedirs created them as root (this wrapper runs as
+# root via ssh-console). The orchestrator runs as leerie and may need
+# to write into /work/.leerie/runs/<run-id>/.
+leerie_pw = pwd.getpwnam("leerie")
+for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
+    try:
+        os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
+    except OSError:
+        pass
+# Refuse to spawn a second orchestrator on the same run dir. The real
+# enforcement is in State.__init__ (which acquires the same flock and
+# dies with EXIT_LOCKED=75 if held). This probe is the fast-path: it
+# avoids the cost of spawning a Python process that would just die in
+# startup. Same primitive (advisory flock on run_dir) used at both
+# layers. See DESIGN §6 *Single owner per run dir*.
+_probe_fd = os.open(run_dir, os.O_RDONLY)
+try:
+    try:
+        fcntl.flock(_probe_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(_probe_fd, fcntl.LOCK_UN)
+    except BlockingIOError:
+        sys.stderr.write("orchestrator already running for run " + run_id + "\\n")
+        sys.stderr.write("Tail the existing run instead of spawning a duplicate:\\n")
+        sys.stderr.write("  leerie resume " + run_id + " --runtime ${runtime}\\n")
+        sys.exit(75)
+finally:
+    os.close(_probe_fd)
+log_path = run_dir + "/orchestrator.log"
+pid_path = run_dir + "/orchestrator.pid"
+PY
+}
+
+_render_launch_suffix() {
+  cat <<PY
+# Ensure the launcher's PATH includes the mise-managed claude binary.
+# (The Dockerfile installs claude into the mise-managed node prefix;
+# the ssh-console/SSM session inherits a minimal PATH that may not
+# include /usr/local/share/mise/...; add it defensively.)
+extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
+if extra_path not in child_env.get("PATH", ""):
+    child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
+with open(log_path, "ab") as log_f:
+    p = subprocess.Popen(
+        ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
+        stdin=subprocess.DEVNULL,
+        stdout=log_f,
+        stderr=log_f,
+        start_new_session=True,
+        # cwd=/work so the orchestrator's os.getcwd() returns /work
+        # regardless of the launching shell's (possibly stale) cwd.
+        cwd="/work",
+        # Run as the leerie user — the image's USER leerie line only
+        # applies to the entrypoint; ssh-console/SSM sessions land as
+        # root, and any process we spawn here inherits root unless we
+        # set this explicitly. The orchestrator needs to run as leerie
+        # so claude finds creds at /home/leerie/.claude/.credentials.json
+        # and so files it creates are owned by leerie (not root).
+        user="leerie",
+        group=leerie_pw.pw_gid,
+        env=child_env,
+    )
+# Poll briefly before recording the pid. If this Popen lost the
+# State.__init__ flock race against an already-running orchestrator
+# for this run (the concurrent-spawn race described in DESIGN §6
+# *Single owner per run dir*), the child exits 75 within
+# milliseconds. Writing its pid to orchestrator.pid before the race
+# resolves would overwrite the winning orchestrator's pid with a
+# dead one — the stale-pid contagion that breaks resume's tail
+# liveness check and finalize --force's safety belt.
+#
+# Budget: 2 s (10 x 0.2 s). The realistic time from Popen to the
+# child's State.__init__ flock attempt is ~300-500 ms (Python
+# interpreter cold start + leerie.py imports + main()'s pre-State
+# config resolution); under disk pressure it could reach ~1 s.
+# State.__init__ itself is microseconds — open the run_dir fd,
+# attempt fcntl.flock, return or raise — but the relevant budget
+# is the end-to-end time from Popen to that point. 2 s leaves
+# comfortable headroom for both paths:
+#   - Winner: child reaches State.__init__ and proceeds. Poll
+#     times out, we write the pid.
+#   - Loser: child reaches State.__init__ and exits 75. We
+#     observe rc=75 and skip the pid write.
+# The reader-side /proc cross-check in lib.sh and
+# force-finalize.sh catches any residual edge case where the
+# budget is exceeded on the loser path.
+for _ in range(10):
+    if p.poll() is not None:
+        break
+    time.sleep(0.2)
+if p.poll() == 75:
+    # Stillborn flock-loser — the winner still owns the run. Do not
+    # touch the pid file. The caller's existing rc=75 short-circuit
+    # pivots the user's resume to the live-orchestrator attach path
+    # via container_rc=130.
+    sys.exit(75)
+with open(pid_path, "w") as pid_f:
+    pid_f.write(str(p.pid) + "\n")
+PY
+}
