@@ -2123,7 +2123,6 @@ import, so a file reusing another's runner needs its own. Full detail
 (including the push-output-capture and locale/byte-vs-character traps this
 gate's neighbors hit) is in docs/TESTING.md.
 
-
 Two further harness traps —
 the degrade test stubs `mktemp` to force the no-temp-dir fallback, and
 stubbing it for **every** form aborts the function at the rebase step's
