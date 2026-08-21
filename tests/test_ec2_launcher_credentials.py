@@ -37,7 +37,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from tests.ec2_stub import read_log
+from tests.ec2_stub import make_sts_only_stub_aws, read_log
 from tests.test_ec2_e2e_provision import (
     REQUIRED_PROVISION_ENV,
     extract_ec2_dispatch_block,
@@ -49,22 +49,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def _stub_aws_recording_region(aws_dir: Path) -> None:
-    """A minimal stub (mirroring test_ec2_lib_sh.py's argv-only stub)
-    that additionally records the effective AWS_REGION env value seen by
-    each invocation — the only way to observe which region `require_aws`'s
-    `sts get-caller-identity` call inherited, since require_aws never
-    passes --region on argv."""
-    aws_dir.mkdir(parents=True, exist_ok=True)
-    stub = aws_dir / "aws"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'echo "$@|region=${{AWS_REGION:-<unset>}}" >> {aws_dir}/aws.log\n'
-        'if [ "$1" = "sts" ] && [ "$2" = "get-caller-identity" ]; then\n'
-        "  exit 0\n"
-        "fi\n"
-        "exit 0\n"
-    )
-    stub.chmod(0o755)
+    """A minimal stub that additionally records the effective AWS_REGION
+    env value seen by each invocation — the only way to observe which
+    region `require_aws`'s `sts get-caller-identity` call inherited, since
+    require_aws never passes --region on argv. Thin wrapper over
+    tests/ec2_stub.py's shared builder."""
+    make_sts_only_stub_aws(aws_dir, record_region=True)
 
 
 def _region_seen_for(aws_dir: Path, argv_prefix: str) -> str | None:

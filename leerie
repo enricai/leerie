@@ -930,6 +930,36 @@ _resolve_ec2_knob() {
   fi
 }
 
+# --- _leerie_aws_creds_args_tokens -----------------------------------------
+# Emit, one token per line, the --profile/--region flags to pass to
+# resolve_aws_credentials for the 6 accept-blocked/accept-integration/
+# stop/kill/finalize/main-dispatch EC2 arms below. Reads ONLY
+# LEERIE_AWS_PROFILE/LEERIE_AWS_REGION (the launcher's own knobs, resolved
+# above) -- deliberately NOT scripts/remote/ec2-provision.sh's
+# _aws_region_profile_args, which additionally falls back to bare
+# AWS_REGION/AWS_PROFILE and emits region before profile: a different,
+# already-intentional precedence for that file's own `aws ec2`/`aws sts`
+# calls. Reusing it here would silently change these 6 sites' resolution
+# behavior.
+#
+# One-token-per-line (not a bare string), read back with the `while read`
+# idiom -- not a nameref (`local -n`), which is bash 4.3+ and fails on
+# macOS's /bin/bash 3.2 (CLAUDE.md's nameref-ban note).
+#
+# Usage:
+#   local aws_args=()
+#   while IFS= read -r _a; do aws_args+=("$_a"); done \
+#     < <(_leerie_aws_creds_args_tokens)
+_leerie_aws_creds_args_tokens() {
+  if [ -n "${LEERIE_AWS_PROFILE:-}" ]; then
+    printf '%s\n%s\n' --profile "$LEERIE_AWS_PROFILE"
+  fi
+  if [ -n "${LEERIE_AWS_REGION:-}" ]; then
+    printf '%s\n%s\n' --region "$LEERIE_AWS_REGION"
+  fi
+  return 0
+}
+
 # --- AWS region/profile prefs (leerie's own knobs, launcher-owned) --------
 # Resolve CLI > env > leerie.toml into LEERIE_AWS_REGION / LEERIE_AWS_PROFILE,
 # the vars every consumer already reads (ec2-lib.sh's require_aws,
@@ -2138,8 +2168,8 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
       _ab_aws_creds_args=()
-      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _ab_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
-      [ -n "${LEERIE_AWS_REGION:-}" ] && _ab_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      while IFS= read -r _ab_a; do _ab_aws_creds_args+=("$_ab_a"); done \
+        < <(_leerie_aws_creds_args_tokens)
       _ab_aws_creds_exports="$(resolve_aws_credentials ${_ab_aws_creds_args[@]+"${_ab_aws_creds_args[@]}"})" || exit 1
       eval "$_ab_aws_creds_exports"
       unset _ab_aws_creds_args _ab_aws_creds_exports
@@ -2437,8 +2467,8 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
       _ai_aws_creds_args=()
-      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _ai_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
-      [ -n "${LEERIE_AWS_REGION:-}" ] && _ai_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      while IFS= read -r _ai_a; do _ai_aws_creds_args+=("$_ai_a"); done \
+        < <(_leerie_aws_creds_args_tokens)
       _ai_aws_creds_exports="$(resolve_aws_credentials ${_ai_aws_creds_args[@]+"${_ai_aws_creds_args[@]}"})" || exit 1
       eval "$_ai_aws_creds_exports"
       unset _ai_aws_creds_args _ai_aws_creds_exports
@@ -2744,8 +2774,8 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/ec2-provision.sh"
       _stop_aws_creds_args=()
-      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _stop_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
-      [ -n "${LEERIE_AWS_REGION:-}" ] && _stop_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+      while IFS= read -r _stop_a; do _stop_aws_creds_args+=("$_stop_a"); done \
+        < <(_leerie_aws_creds_args_tokens)
       _stop_aws_creds_exports="$(resolve_aws_credentials ${_stop_aws_creds_args[@]+"${_stop_aws_creds_args[@]}"})" || exit 1
       eval "$_stop_aws_creds_exports"
       unset _stop_aws_creds_args _stop_aws_creds_exports
@@ -2967,8 +2997,8 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
       _kill_ec2_creds_args=()
-      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _kill_ec2_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
-      [ -n "${LEERIE_AWS_REGION:-}" ] && _kill_ec2_creds_args+=(--region "$LEERIE_AWS_REGION")
+      while IFS= read -r _kill_ec2_a; do _kill_ec2_creds_args+=("$_kill_ec2_a"); done \
+        < <(_leerie_aws_creds_args_tokens)
       _kill_ec2_creds_exports="$(resolve_aws_credentials ${_kill_ec2_creds_args[@]+"${_kill_ec2_creds_args[@]}"})"
       _kill_ec2_creds_rc=$?
       if [ "$_kill_ec2_creds_rc" -ne 0 ]; then
@@ -3356,8 +3386,8 @@ except Exception:
         exit 1
       fi
       _fin_ec2_creds_args=()
-      [ -n "${LEERIE_AWS_PROFILE:-}" ] && _fin_ec2_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
-      [ -n "${LEERIE_AWS_REGION:-}" ] && _fin_ec2_creds_args+=(--region "$LEERIE_AWS_REGION")
+      while IFS= read -r _fin_ec2_a; do _fin_ec2_creds_args+=("$_fin_ec2_a"); done \
+        < <(_leerie_aws_creds_args_tokens)
       _fin_ec2_creds_exports="$(resolve_aws_credentials ${_fin_ec2_creds_args[@]+"${_fin_ec2_creds_args[@]}"})" || exit 1
       eval "$_fin_ec2_creds_exports"
       unset _fin_ec2_creds_args _fin_ec2_creds_exports
@@ -8188,8 +8218,8 @@ elif [ "$RUNTIME" = "ec2" ]; then
   # shellcheck disable=SC1091
   . "$LEERIE_REPO/scripts/remote/ec2-lib.sh"
   _leerie_aws_creds_args=()
-  [ -n "${LEERIE_AWS_PROFILE:-}" ] && _leerie_aws_creds_args+=(--profile "$LEERIE_AWS_PROFILE")
-  [ -n "${LEERIE_AWS_REGION:-}" ] && _leerie_aws_creds_args+=(--region "$LEERIE_AWS_REGION")
+  while IFS= read -r _leerie_aws_a; do _leerie_aws_creds_args+=("$_leerie_aws_a"); done \
+    < <(_leerie_aws_creds_args_tokens)
   _leerie_aws_creds_exports="$(resolve_aws_credentials ${_leerie_aws_creds_args[@]+"${_leerie_aws_creds_args[@]}"})"
   _leerie_aws_creds_rc=$?
   if [ "$_leerie_aws_creds_rc" -ne 0 ]; then

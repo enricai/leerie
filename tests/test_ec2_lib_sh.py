@@ -20,6 +20,8 @@ import os
 import subprocess
 from pathlib import Path
 
+from tests.ec2_stub import make_sts_only_stub_aws
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
 LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
@@ -29,19 +31,10 @@ def _stub_aws(aws_dir: Path, *, identity_succeeds: bool = True) -> Path:
     """Write a stub `aws` binary handling `sts get-caller-identity`.
 
     Records argv to aws_dir/aws.log (one line per invocation) so tests can
-    assert on whether --profile was passed through.
+    assert on whether --profile was passed through. Thin wrapper over
+    tests/ec2_stub.py's shared builder.
     """
-    stub = aws_dir / "aws"
-    stub.write_text(
-        "#!/usr/bin/env bash\n"
-        f'echo "$@" >> {aws_dir}/aws.log\n'
-        'if [ "$1" = "sts" ] && [ "$2" = "get-caller-identity" ]; then\n'
-        f"  exit {0 if identity_succeeds else 1}\n"
-        "fi\n"
-        "exit 0\n"
-    )
-    stub.chmod(0o755)
-    return stub
+    return make_sts_only_stub_aws(aws_dir, identity_succeeds=identity_succeeds)
 
 
 def _run_require_aws(env: dict, *, aws_dir: Path | None = None,

@@ -329,6 +329,48 @@ if __name__ == "__main__":
 '''
 
 
+def make_sts_only_stub_aws(
+    aws_dir: Path,
+    *,
+    identity_succeeds: bool = True,
+    record_region: bool = False,
+) -> Path:
+    """Write a minimal, argv-only `aws` stub that only special-cases
+    `sts get-caller-identity`.
+
+    Unlike `_stub_aws` below (a stateful resource-tracking stub for
+    provisioning/lifecycle tests), this one tracks no state — it exists
+    for `require_aws`-focused tests that only need to observe whether
+    `sts get-caller-identity` was called, with what argv, and (optionally)
+    with what effective `AWS_REGION`. Every invocation's argv is appended
+    to `aws_dir/aws.log`, one line per call; with `record_region=True`
+    each line also carries `|region=<value-or-<unset>>` so a caller can
+    recover the `AWS_REGION` env value `require_aws`'s `sts
+    get-caller-identity` call inherited (it never passes `--region` on
+    argv itself).
+
+    Returns the path to the stub executable.
+    """
+    aws_dir = Path(aws_dir)
+    aws_dir.mkdir(parents=True, exist_ok=True)
+    stub = aws_dir / "aws"
+    log_line = (
+        f'echo "$@|region=${{AWS_REGION:-<unset>}}" >> {aws_dir}/aws.log\n'
+        if record_region
+        else f'echo "$@" >> {aws_dir}/aws.log\n'
+    )
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f"{log_line}"
+        'if [ "$1" = "sts" ] && [ "$2" = "get-caller-identity" ]; then\n'
+        f"  exit {0 if identity_succeeds else 1}\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    stub.chmod(0o755)
+    return stub
+
+
 def _stub_aws(dir: Path) -> Path:
     """Write the stateful `aws` stub binary into `dir`.
 
