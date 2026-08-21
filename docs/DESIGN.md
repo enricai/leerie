@@ -8,13 +8,12 @@
 
 **Scope of this document.** This is the *theory*: the architecture, the
 constraints that forced it, and the reasoning behind each design decision. It
-describes the intended system, not the current code. It stays correct across
-any reimplementation that honors the same architecture — a line here goes stale
-only if the *design* changes, never because a function was renamed or a
-constant retuned. Mechanism — function names, cap values, file paths, schemas,
-enforcement tables, install steps — lives in the companion `IMPLEMENTATION.md`,
-which is true only against the current code. Where the two disagree, this
-document defines what *should* be true and the code is the defect.
+describes the intended system, not the current code, and stays correct across
+any reimplementation that honors the same architecture. Mechanism — function
+names, cap values, file paths, schemas, enforcement tables, install steps —
+lives in the companion `IMPLEMENTATION.md`, which is true only against the
+current code. Where the two disagree, this document defines what *should* be
+true and the code is the defect.
 
 ---
 
@@ -22,47 +21,44 @@ document defines what *should* be true and the code is the defect.
 
 Given one task description, Leerie drives it to a validated, integrated result
 without further human input — except where input is genuinely impossible to
-derive. Every loop is bounded, every decision is made from the codebase or from
+derive. Every loop is bounded, every decision is made from the codebase or
 research, and state is kept on disk so a run is observable and resumable.
 
 ---
 
 ## 2. The two constraints that produced this architecture
 
-The architecture is not a free choice. Two platform constraints eliminate the
-obvious designs and leave essentially one.
+Two platform constraints eliminate the obvious designs and leave essentially
+one.
 
 **Constraint 1 — subagents cannot spawn subagents.** The original concept had
-three levels of delegation: orchestrator → domain subagent → granular subagent.
-Claude Code's documented rule is explicit: a subagent cannot spawn another
-subagent; only the main thread can. A three-level delegation tree therefore has
-no native implementation.
+three levels of delegation: orchestrator → domain subagent → granular
+subagent. Claude Code's rule is that only the main thread can spawn a
+subagent, so a three-level delegation tree has no native implementation.
 
 **Constraint 2 — a plugin slash-command body is advisory, not executable.** A
-plugin command is a skill: its markdown is injected into a model's context as
-instructions, not executed as deterministic code. For a long, capped,
-multi-wave run, "the model will probably follow these steps" is not a strong
-enough guarantee — control flow can drift, and the drift is silent.
+plugin command's markdown is injected into a model's context as instructions,
+not executed as deterministic code. For a long, capped, multi-wave run, "the
+model will probably follow these steps" is not a strong enough guarantee —
+control flow can drift, and the drift is silent.
 
 Both constraints are resolved by the same move: **the orchestrator is an
 ordinary program, not an in-session agent.** Every unit of LLM work is a
-separate headless process. The program owns all control flow. Subagent nesting
-is impossible because there are no subagents — only independent OS processes.
-Control-flow drift is impossible because the orchestrator is real loops and
-conditionals, not a model interpreting instructions.
+separate headless process. The program owns all control flow. Subagent
+nesting is impossible because there are no subagents — only independent OS
+processes. Control-flow drift is impossible because the orchestrator is real
+loops and conditionals, not a model interpreting instructions.
 
-**Why a headless CLI process, not an API library.** "The orchestrator is a
-program" still admits two forms. One shells out to the headless CLI binary,
-once per worker, and runs on the interactive Claude Code subscription with only
-the CLI as a dependency. The other uses an agent library whose calls return
-typed objects — less brittle, because there is no marshalling of CLI strings
-and stdout — but it authenticates against the metered API rather than the
-subscription. Running on the subscription rather than the API was a hard
-requirement, so Leerie takes the CLI-subprocess form. The brittleness that
-choice accepts (parsing process output rather than typed objects) is contained
-by two later mechanisms: worktree isolation limits the blast radius of a
-misbehaving worker, and every worker result is validated against a schema
-before the orchestrator acts on it.
+**Why a headless CLI process, not an API library.** Two forms would satisfy
+"the orchestrator is a program": shelling out to the headless CLI binary
+(running on the interactive Claude Code subscription, with only the CLI as a
+dependency), or an agent library returning typed objects (less brittle, since
+there's no marshalling of CLI strings, but it authenticates against the
+metered API rather than the subscription). Running on the subscription was a
+hard requirement, so Leerie takes the CLI-subprocess form. The brittleness
+that choice accepts is contained by two later mechanisms: worktree isolation
+limits the blast radius of a misbehaving worker, and every worker result is
+schema-validated before the orchestrator acts on it.
 
 ---
 
@@ -91,48 +87,40 @@ Orchestrator (deterministic — owns all control flow, caps, state)
              locally — the PR is the proposed integration.)
 ```
 
-**Why classification precedes clarification.** The Clarify sub-step runs
-within Phase 1, after the classifier, because Leerie cannot know what to ask
-until it knows what kind of task this is — the set of questions worth
-asking is a function of the classification. Clarify is skipped entirely for
-fully-specified tasks.
+**Why classification precedes clarification.** Clarify runs within Phase 1,
+after the classifier, because the set of questions worth asking is a function
+of the classification. Clarify is skipped entirely for fully-specified tasks.
 
-**A note on phase numbering.** The diagram shows six integer-numbered
-phases. Some phases have sub-steps shown as nested bullets — `Clarify`
-under `Phase 1`, `Reconcile` under `Phase 2`. Sub-steps that always run
-carry no qualifier; sub-steps that may be skipped are explicitly marked
-`(optional)`. The phase table in `docs/IMPLEMENTATION.md` §4 uses the
-same nesting and additionally lists `Provision` (per-repo dep detection)
-as a Phase 1 sub-step — it's an implementation-layer concern not shown
-in this architectural diagram.
+**A note on phase numbering.** Sub-steps that always run carry no qualifier;
+sub-steps that may be skipped are marked `(optional)`. The phase table in
+`docs/IMPLEMENTATION.md` §4 uses the same nesting and additionally lists
+`Provision` (per-repo dep detection) as a Phase 1 sub-step — an
+implementation-layer concern not shown in this diagram.
 
-**Why planners run before scheduling.** Decomposition (Phase 2) and scheduling
-(Phase 3) are separate because decomposition needs LLM judgment about a domain
-while scheduling is pure graph computation over the merged result. Keeping them
-separate means the non-deterministic part produces data and the deterministic
-part consumes it — the scheduler never has to trust a model's ordering.
+**Why planners run before scheduling.** Decomposition (Phase 2) needs LLM
+judgment about a domain; scheduling (Phase 3) is pure graph computation over
+the merged result. Keeping them separate means the scheduler never has to
+trust a model's ordering.
 
 **The division of labor.** Everything that requires understanding — classify,
-decompose, write code, resolve a semantic merge conflict — is done by a worker.
-Everything that can be checked mechanically — scheduling, caps, retries, state,
-integration bookkeeping — is done by the orchestrator. This line is the single
-most important idea in the system and recurs throughout: see §12.
+decompose, write code, resolve a semantic merge conflict — is done by a
+worker. Everything that can be checked mechanically — scheduling, caps,
+retries, state, integration bookkeeping — is done by the orchestrator. This
+line is the single most important idea in the system and recurs throughout:
+see §12.
 
-**Invocation.** The orchestrator is invoked directly as a command-line program;
-that terminal path is primary. A thin plugin skill is also provided as a
-convenience entry point from inside Claude Code, but it is only a wrapper — it
-launches the same orchestrator program and adds no logic of its own. All
-control flow lives in the orchestrator regardless of how it was started.
+**Invocation.** The orchestrator is invoked directly as a command-line
+program; that terminal path is primary. A thin plugin skill is also provided
+as a convenience entry point from inside Claude Code, but it is only a
+wrapper — it launches the same orchestrator program and adds no logic of its
+own.
 
-**Observability.** Workers do their work inside a single `claude -p`
-session that takes minutes; the orchestrator surfaces that activity as it
-happens. Each worker's stream of tool calls, text, and intermediate
-results is read line-by-line, written verbatim to a per-worker log file,
-and summarized inline at a user-controllable verbosity level. The
-default level shows one-line summary per worker event; the user can dial
-down to leerie's pre-streaming terse output (`-q`) or up to raw event
-payloads (`-vv`). Errors emit at every level. The per-worker file is
-the ground-truth audit trail; the inline view is the live feed.
+**Observability.** Each worker's stream of tool calls, text, and intermediate
+results is read line-by-line, written verbatim to a per-worker log file, and
+summarized inline at a user-controllable verbosity level (default: one-line
+summary per worker event; `-q` for terser output, `-vv` for raw event
+payloads). Errors emit at every level. The per-worker file is the
+ground-truth audit trail; the inline view is the live feed.
 
 ---
 
@@ -155,27 +143,23 @@ Every task is classified into one or more of:
    IAM, compute, data, messaging, observability backends, and the stack
    outputs (resource ARNs / IDs / endpoint names) the configuration-build
    work consumes. `configuration-build` and `infrastructure` form a
-   producer→consumer pair — infrastructure authors the resources;
-   configuration-build wires the app to them. The split keeps the
-   capability-tag boundary crisp: infra provides
-   `<stack>-stack-output-names`-style tags; config-build consumes them.
+   producer→consumer pair; the split keeps the capability-tag boundary
+   crisp — infra provides `<stack>-stack-output-names`-style tags,
+   config-build consumes them.
 9. **documentation** — docstrings, comments, READMEs, changelogs
 
-A task commonly spans several categories. One planner is assigned per matched
-category; the categories are domains of expertise, not mutually exclusive bins.
-The corollary is a **same-work test**: when two categories would produce the
-same deliverables — same files modified for the same reason — the classifier
-picks the single best-fitting label. The orchestrator surfaces a
-`SAME_WORK_RISK` advisory for category pairs that commonly over-classify
-(e.g. `bug-fixing` + `feature-implementation`); the classifier addresses it
-on its structured-feedback retry. This advisory is a self-check the
-classifier can act on alone, and it yields to the independent
-`classification_judge`'s (§8) authoritative finding: once the judge has
-confirmed both categories in a flagged pair are genuinely required (a task
-can legitimately need all of `bug-fixing` + `feature-implementation` +
-`testing` at once), the advisory is suppressed for that pair on later
+A task commonly spans several categories; one planner is assigned per matched
+category, since categories are domains of expertise, not mutually exclusive
+bins. The corollary is a **same-work test**: when two categories would
+produce the same deliverables, the classifier picks the single best-fitting
+label. The orchestrator surfaces a `SAME_WORK_RISK` advisory for category
+pairs that commonly over-classify (e.g. `bug-fixing` + `feature-implementation`);
+the classifier addresses it on its structured-feedback retry. This advisory
+yields to the independent `classification_judge`'s (§8) authoritative
+finding: once the judge confirms both categories in a flagged pair are
+genuinely required, the advisory is suppressed for that pair on later
 re-classify rounds rather than re-litigated — see §8 *The CRITIC retry
-pattern's oscillation guard* for the incident this prevents.
+pattern's oscillation guard*.
 
 ---
 
@@ -184,244 +168,190 @@ pattern's oscillation guard* for the incident this prevents.
 ### The sizing target
 
 Each planner decomposes its domain into subtasks. The decomposition target is
-**the smallest independently verifiable unit of change** — explicitly *not*
-"the smallest possible unit." This is a deliberate correction to the original
-specification, which asked for "the most granular possible" decomposition.
+**the smallest independently verifiable unit of change** — deliberately not
+"the smallest possible unit" (the original spec's phrasing).
 
-Over-decomposition is not free. Every subtask runs as a fresh worker that must
-re-establish its understanding of the codebase from cold context. Splitting one
-coherent change into five trivial subtasks pays that cold-start cost five times
-and adds four integration steps. The correct floor is the point below which a
-subtask can no longer be verified on its own; below that, finer granularity
-buys nothing and costs coordination overhead. The matching ceiling: a subtask
-must be small enough that one worker can finish it within its context. A
-subtask that would require reading or changing a large surface area is split
-before execution begins.
+Over-decomposition is not free: every subtask runs as a fresh worker that must
+re-establish its understanding of the codebase from cold context, so splitting
+one coherent change into five trivial subtasks pays that cold-start cost five
+times and adds four integration steps. The correct floor is the point below
+which a subtask can no longer be verified on its own. The matching ceiling: a
+subtask must be small enough that one worker can finish it within its
+context; one that would require reading or changing a large surface area is
+split before execution begins.
 
-Sizing is also the **primary defense against context exhaustion** (see §10): a
-subtask scoped to fit inside one worker's context never needs a handoff.
-Splitting a plan is cheap; handing off mid-implementation is not. Planner
-decomposition quality is therefore the load-bearing assumption of the whole
-system — if planners under-decompose, implementers degrade before they hand
-off. It is the first place to look when a run goes wrong.
+Sizing is also the **primary defense against context exhaustion** (§10): a
+subtask scoped to fit inside one worker's context never needs a handoff, and
+splitting a plan is cheap while handing off mid-implementation is not.
+Planner decomposition quality is therefore the load-bearing assumption of the
+whole system, and the first place to look when a run goes wrong.
 
 **Conceptual dominance is a planner-judgment axis, deliberately not a
-mechanical gate.** A related sizing failure is *dilution*: one subtask that is
-so much more conceptually involved than its siblings that batching it with them
-degrades the plan for everything else — the case where the right move is to
-isolate it into its own subtask cluster rather than split it or leave it. The
-planner prompt asks for exactly this judgment (§2). It is **not** backed by a
-code check, and that is a considered decision, not an omission: **sizing is the
-wrong variable — fit is the variable.** Two independent studies (Stanford/Microsoft:
-30× intrinsic same-task token variance; BAGEN: 47% estimation ceiling) plus our
-own estimator confirm that no pre-execution size predictor achieves useful
-precision. File count, planner text-length, `requires`/`provides` fan-out, and
-text-per-file density all fail the same way — they are proxies for a quantity
-(turn count) that cannot be predicted. What *can* be judged is *Task-Context
-Fit*: whether a subtask's scope and context are co-minimized (minimum necessary
-complexity, maximum relevance). That judgment is tractable; size prediction is
-not. Per §12, a signal that cannot be checked mechanically without misfiring
-belongs in the prompt, not in code, so no `_validate_plan` reject or
-`DEFAULT_CAPS` threshold is added for it. The structural mechanism that gives
-the planner the codebase knowledge needed to make this judgment well — and the
-recursive fit-judge that becomes the authoritative decomposition-quality gate,
-demoting the self-scored `decomposition_quality` axis to a non-gating advisory
-self-report (removing the self-grading bias of letting the planner grade its
-own decomposition) — is described in §5½. (Contrast `UNCOVERED_MIGRATION_SURFACE`, which *is* a
-code check because migration coverage *is* mechanically countable.)
+mechanical gate.** A related sizing failure is *dilution*: one subtask so
+much more conceptually involved than its siblings that batching it with them
+degrades the plan for everything else — the right move is to isolate it into
+its own subtask cluster rather than split it. The planner prompt asks for
+exactly this judgment (§2); it is **not** backed by a code check, because
+**sizing is the wrong variable — fit is the variable.** Two independent
+studies (Stanford/Microsoft: 30× intrinsic same-task token variance; BAGEN:
+47% estimation ceiling) plus our own estimator confirm that no pre-execution
+size predictor achieves useful precision — file count, planner text-length,
+`requires`/`provides` fan-out, and text-per-file density are all proxies for
+a quantity (turn count) that cannot be predicted. What *can* be judged is
+*Task-Context Fit*: whether a subtask's scope and context are co-minimized.
+Per §12, a signal that cannot be checked mechanically without misfiring
+belongs in the prompt, not in code. §5½ describes the structural mechanism
+that gives the planner the codebase knowledge to make this judgment well, and
+the recursive fit-judge that becomes the authoritative decomposition-quality
+gate (demoting the self-scored `decomposition_quality` axis to a non-gating
+advisory). Contrast `UNCOVERED_MIGRATION_SURFACE`, which *is* a code check
+because migration coverage *is* mechanically countable.
 
 ### Cross-domain dependencies
 
-Planners run in parallel and cannot see each other's output. Yet dependencies
-cross domains: a testing subtask may depend on the feature subtask it tests.
-That coupling has to be reconciled somewhere, and it cannot be reconciled
-inside a planner that cannot see the other planners.
-
-It is reconciled by the orchestrator with three mechanisms:
+Planners run in parallel and cannot see each other's output, yet dependencies
+cross domains (a testing subtask may depend on the feature subtask it
+tests). That coupling is reconciled by the orchestrator with three
+mechanisms:
 
 - **Intra-domain ordering** — within its own domain a planner declares which
   subtasks must precede which, because it owns and can see those subtasks.
 - **Cross-domain capability tags** — a planner cannot name another domain's
-  subtasks, so it does not try. Instead each subtask declares the capabilities
-  it *produces* and the capabilities it *requires*, as abstract tags. The
-  orchestrator matches every "requires" against every domain's "provides" and
-  adds a dependency edge from producer to consumer.
+  subtasks, so each subtask instead declares the capabilities it *produces*
+  and *requires* as abstract tags. The orchestrator matches every "requires"
+  against every domain's "provides" and adds a dependency edge from producer
+  to consumer.
 - **Reconciler worker** — capability tags are a shared vocabulary with no
-  enforced dictionary. Two planners can name the same capability with
-  different words (`event-capture-shim` vs. `capture-call-implemented`),
-  and a literal-string match would miss the equivalence. After all planners
-  finish, the orchestrator computes the set of `requires` tags that no
-  `provides` claims, and if that set is non-empty, spawns a single
-  *reconciler* worker. The reconciler reads the full task plus every
-  subtask (with their `provides`, `requires`, `depends_on`, and
-  `files_likely_touched`) and emits eight actions. Five
-  *resolution* actions — `renames` (two tags mean the same thing — rewrite
-  one to match the other), `add_provide` (an existing subtask actually
-  produces the capability but didn't declare it), `added_subtasks` (a
-  genuine gap — propose a new subtask to fill it), `conditional_drop`
-  (drop a planner-emitted consumer subtask whose own `intent` declares it
-  conditional on an unresolvable precondition — i.e. the planner authored
-  it as "no-op if X" and X turned out to be false; the capability graph
-  has no semantics for conditional subtasks, so the reconciler converts
-  the planner's prose conditionality into a structured drop),
-  `drop_require` (drop the consumer's `requires` entry when it was
-  over-specified by its planner — an aggregate, coarser synonym, or
-  authoring-time decision the same subtask itself records, rather than a
-  code artifact another subtask produces; the consumer stays in the plan,
-  only the bad edge goes — `drop_require` also plays a cycle-breaking
-  role, but its primary home is now resolution). Two *cycle-breaking-only*
-  actions for when the resolution actions would close a dependency cycle —
-  `dependency_edges` (assert an explicit `depends_on` ordering when both
-  sides legitimately need each other and one ordering is the right
-  answer), `merged_subtasks` (collapse two subtasks into one when the
-  cycle reflects a genuine authoring overlap — both edit the same file,
-  both wait on the same decision). And one *escape hatch* —
-  `unresolvable` for unmet requirements with no plausible resolution
-  (aborts the run with the reconciler's diagnosis).
-  All judgment about tag equivalence, conditional-drop eligibility, and
-  cycle resolution lives in the reconciler worker; the orchestrator computes
-  the unresolved set mechanically, runs Tarjan's SCC on the post-mutation
-  graph, and applies the worker's output mechanically.
+  enforced dictionary, so two planners can name the same capability
+  differently (`event-capture-shim` vs. `capture-call-implemented`) and a
+  literal-string match misses the equivalence. After all planners finish, the
+  orchestrator computes the set of `requires` tags no `provides` claims, and
+  if non-empty, spawns a single *reconciler* worker. It reads the full task
+  plus every subtask and emits eight actions. Five are *resolution* actions:
+  `renames` (unify two tags naming the same thing), `add_provide` (an
+  existing subtask actually produces the capability but didn't declare it),
+  `added_subtasks` (a genuine gap — propose a new subtask), `conditional_drop`
+  (drop a consumer subtask whose own `intent` declares it conditional on an
+  unresolvable precondition — converting the planner's prose conditionality
+  into a structured drop), `drop_require` (drop an over-specified `requires`
+  entry — an aggregate, coarser synonym, or authoring-time decision the
+  consumer itself records, rather than a real cross-subtask dependency; the
+  consumer stays in the plan, only the bad edge goes). Two are
+  *cycle-breaking-only*: `dependency_edges` (assert an explicit ordering when
+  both sides legitimately need each other) and `merged_subtasks` (collapse
+  two subtasks into one when the cycle reflects genuine authoring overlap).
+  One is an *escape hatch*: `unresolvable`, for unmet requirements with no
+  plausible resolution (aborts the run with the reconciler's diagnosis). All
+  judgment about tag equivalence, conditional-drop eligibility, and cycle
+  resolution lives in the reconciler worker; the orchestrator computes the
+  unresolved set mechanically, runs Tarjan's SCC on the post-mutation graph,
+  and applies the worker's output mechanically.
 
   **The wire shape is flatter than the action list reads, and deliberately
   so.** `add_provide` / `drop_require` / `conditional_drop` / `unresolvable`
   travel as one `tag_ops` array discriminated by an `op` field, and a new
   subtask's `requires` travels in a sibling `added_requires` keyed by subtask
-  id rather than nested inside the subtask. Neither is a modelling
-  preference: the natural shape — four isomorphic `{sid, tag, reason}` arrays,
-  plus an array-of-objects nested inside an array-of-objects — exceeds what
-  grammar compilation accepts under § *Forcing constrained decoding*, and was
-  refused outright. One adapter fans the wire shape back into the eight
-  arrays before anything else sees it, so the apply steps, the state fields
-  and every check below are written against the action names above, not
-  against the wire names.
+  id rather than nested inside the subtask — the natural nested shape exceeds
+  what grammar compilation accepts under § *Forcing constrained decoding* and
+  was refused outright. One adapter fans the wire shape back into the eight
+  arrays before anything else sees it, so downstream code is written against
+  the action names above, not the wire names.
 
   **Artifact-registry worker (an *advisory* shared vocabulary, upstream of
-  the reconciler).** "No enforced dictionary" (above) is what makes blind
-  parallel planning possible, and it is deliberately kept: no planner is
+  the reconciler).** "No enforced dictionary" is deliberate — no planner is
   *required* to bind to a canonical name, and the reconciler remains the
   authority that bridges whatever drift survives. But letting every planner
   invent its own tag *and* file path for the same artifact makes the
-  reconciler's job larger than it needs to be, and — worse — produces path
-  disagreements the reconciler does not even attempt (it bridges the tag
-  channel, not `files_likely_touched`; §5 *Cross-domain surface overlap*).
-  So *before* the planners run, a single read-only `artifact_registry`
-  worker reads the task plus the global repo-map (ranked to fit the token
-  budget — unlike the planner's own repo-map injection, this one carries no
-  task-file seeding, since the registry is naming artifacts broadly rather
-  than around specific files) and emits a small canonical list of the
-  artifacts the task will plainly create — each with one suggested
-  capability tag and one suggested file path. That registry is
-  injected into **every** planner's context with an instruction to *prefer*
-  the canonical tag/path when it produces or consumes a listed artifact.
-  This is strictly advisory and strictly additive: a planner may still
-  invent names for anything the registry did not foresee (the registry
-  covers only what is knowable pre-decomposition — a hook, a component, a
-  route — not the long tail a planner discovers while decomposing), the
-  reconciler still runs and still bridges the remainder, and the wiring gate
-  is still the backstop. Its only job is to raise the *rate* at which two
-  blind planners land on the same string, so the exact-string
-  `requires`↔`provides` matcher wires the edge with no reconciliation
-  needed. It does **not** enforce, gate, or die(); a planner that ignores it
-  is not penalized, only reconciled as before. (Empirically, the registry
-  alone does not prevent a missing-edge wiring death — a planner must also
-  *declare* the edge, §5 *Test subtasks must wire to their producers* — so
-  the registry's value is the reduced-drift/reduced-reconciler-load half,
-  paired with the planner-side declaration discipline.)
+  reconciler's job larger than it needs to be, and produces path
+  disagreements the reconciler does not even attempt to bridge (it works the
+  tag channel, not `files_likely_touched`; see *Cross-domain surface
+  overlap* below). So before the planners run, a read-only
+  `artifact_registry` worker reads the task plus the global repo-map (ranked
+  to fit the token budget, with no task-file seeding — it names artifacts
+  broadly, not around specific files) and emits a small canonical list of
+  artifacts the task will plainly create, each with one suggested capability
+  tag and file path. That registry is injected into every planner's context
+  with an instruction to *prefer* the canonical tag/path when applicable.
+  This is strictly advisory and additive: a planner may still invent names
+  for anything the registry didn't foresee, the reconciler still runs and
+  bridges the remainder, and the wiring gate is still the backstop. Its only
+  job is to raise the *rate* at which two blind planners land on the same
+  string, so the exact-string matcher wires the edge with no reconciliation
+  needed. It does not enforce, gate, or `die()`. (The registry alone does not
+  prevent a missing-edge wiring death — a planner must also *declare* the
+  edge, below — so its value pairs with the planner-side declaration
+  discipline.)
 
   **Test subtasks must wire to their producers (planner discipline +
-  advisory).** The registry above raises the *rate* at which two planners
-  agree on a name, but an edge only forms when the consumer actually
-  *declares* it. One recurring shape is a `testing`-domain subtask that
-  exercises a file, symbol, or behavior another subtask creates yet declares
-  neither a `requires` capability tag nor a `depends_on` id for it — so the
-  scheduler may run the test before its producer and the wiring gate (*A
-  wiring re-check on the fully-merged plan*) rejects the plan.
+  advisory).** The registry raises the rate at which two planners agree on a
+  name, but an edge only forms when the consumer actually *declares* it. One
+  recurring shape: a `testing`-domain subtask exercises a file, symbol, or
+  behavior another subtask creates yet declares neither a `requires` tag nor
+  a `depends_on` id for it, so the scheduler may run the test before its
+  producer and the wiring gate rejects the plan.
 
-  It is not the *dominant* shape, and the advisory below only catches this
-  one. Measured across the run corpus (2026-08-01), the commoner failure is a
-  subtask that declares *several* edges and is missing a *specific* few — a
-  cross-cutting verifier wired to the code subtasks it follows but not to the
-  test-rewrite subtasks whose output it consumes. A both-channels-empty
-  advisory is blind to that by construction, which is why the gate's
-  constrained repair, not this discipline, is what closes the class. This includes *indirect* guards: a
-  coverage-floor or parity test that must enumerate the new source files a
-  feature subtask adds depends on that feature subtask even though the test
-  file and the source file are different paths. The discipline is prompt-side
-  — the planner is instructed to declare a `requires`/`depends_on` on the
-  producer of every not-yet-existing artifact a test targets — because the
-  dependency is *semantic*: the test's own `files_likely_touched` need not
-  overlap the producer's, so no mechanical file-set predicate can recover the
-  edge (raw file overlap is explicitly an unreliable dependency signal;
-  *Provider-subset subtasks*), and §12 assigns such prose-only facts to a
-  worker rather than to a Python inference. A deterministic
-  `_warn_test_subtask_missing_producer_edge` surfaces the high-risk shape (a
-  `test-` subtask with no declared edge while producing subtasks exist) one
-  phase earlier as an advisory; the wiring gate remains the enforcer. This is
-  the consumer-side half the artifact registry (a producer/name-agreement aid)
-  does not by itself supply.
+  This is not the *dominant* shape — measured across the run corpus
+  (2026-08-01), the commoner failure is a subtask missing a *specific* few
+  edges out of several declared ones (e.g. a cross-cutting verifier wired to
+  the code subtasks it follows but not to the test-rewrite subtasks whose
+  output it consumes). A both-channels-empty advisory is blind to that by
+  construction, which is why the gate's constrained repair, not this
+  discipline, closes the class. This includes *indirect* guards: a
+  coverage-floor or parity test that must enumerate a feature's new source
+  files depends on that feature subtask even though the test and source
+  files differ. The discipline is prompt-side — the planner is instructed to
+  declare an edge to the producer of every not-yet-existing artifact a test
+  targets — because the dependency is *semantic* (raw file overlap is an
+  unreliable dependency signal; see *Provider-subset subtasks*) and §12
+  assigns such prose-only facts to a worker, not a Python inference. A
+  deterministic `_warn_test_subtask_missing_producer_edge` surfaces the
+  high-risk shape one phase earlier as an advisory; the wiring gate remains
+  the enforcer.
 
   **Transitive-chain wiring is not producer wiring.** A narrower,
-  repeatedly-observed failure inside the discipline above: a test subtask
-  `T` that *does* declare an edge — `depends_on: [B]`, where `B` is the
-  subtask immediately before it in the plan's chain — but `B` is not the
-  actual producer of everything `T`'s assertions exercise. If `T` also
-  exercises a fixture, UI state, or directive that an earlier subtask `A`
-  (upstream of `B`, or in a different domain's chain entirely) produces
-  directly, chaining to `B` alone is not equivalent to wiring to `A` — the
-  wiring gate has no way to see that `T` depends on `A`'s specific output
-  unless `T` declares that edge itself, because `A`'s output is not
-  guaranteed to survive as `B`'s own `provides` if `B` is later merged,
-  dropped, or re-scoped. Two real incidents (barnacle, 2026-07-31) hit this
-  exact shape: an acceptance-test subtask correctly wired to the last
-  subtask in its own chain while its assertions exercised a capability two
-  or three subtasks upstream (once within the same domain, once across a
-  different domain's chain), and the wiring gate correctly rejected both
-  plans. The planner is instructed to trace every subtask whose *output*
-  (not just its position in the chain) the test's assertions touch, and
-  wire to each directly — a chain of `depends_on` edges is not a substitute
-  for enumerating actual producers.
+  repeatedly-observed failure: a test subtask `T` declares `depends_on: [B]`
+  (the subtask immediately before it in the plan's chain), but `B` is not the
+  actual producer of everything `T`'s assertions exercise — if `T` also
+  exercises a fixture or directive an earlier subtask `A` produces directly,
+  chaining to `B` alone is not equivalent to wiring to `A`, since `A`'s
+  output is not guaranteed to survive as `B`'s own `provides` if `B` is later
+  merged, dropped, or re-scoped. Two real incidents (barnacle, 2026-07-31)
+  hit this exact shape and the wiring gate correctly rejected both plans. The
+  planner is instructed to trace every subtask whose *output* (not just its
+  chain position) the test's assertions touch, and wire to each directly.
 
   **Dead-subtask elimination (code-enforced).** A planner can emit
   `requires: {tag, extent: in_plan}` for a capability it expects another
   domain to produce. If that domain returns 0 subtasks, the requires is
-  unresolvable. The reconciler correctly surfaces this — but a subtask
-  whose *every* `in_plan` requires is unresolvable is fully speculative:
-  it tests or guards work that no domain will perform. Before `die()`,
-  the orchestrator prunes such subtasks mechanically. This mirrors dead
-  code elimination after constant folding in compilers: a domain
-  returning 0 subtasks is a constant fold; subtasks depending solely on
-  it are dead code. The prune fires only when at least one domain has 0
-  subtasks — it does not weaken the reconciler's `unresolvable` verdict
-  in the general case. After pruning, surviving subtasks with no
-  unresolvable requires proceed normally. If all domains end up empty,
-  `_detect_no_work` fires. If unresolvable entries remain after pruning,
-  the run dies as before.
+  unresolvable, and a subtask whose *every* `in_plan` requires is
+  unresolvable is fully speculative — it tests or guards work no domain will
+  perform. Before `die()`, the orchestrator prunes such subtasks
+  mechanically (mirroring dead-code elimination after constant folding: a
+  domain returning 0 subtasks is a constant fold, subtasks depending solely
+  on it are dead code). The prune fires only when at least one domain has 0
+  subtasks; it does not weaken the reconciler's `unresolvable` verdict in the
+  general case. If all domains end up empty, `_detect_no_work` fires; if
+  unresolvable entries remain after pruning, the run dies as before.
 
   Acyclicity is a first-class output property — the reconciler's job is to
-  produce an acyclic merged plan, not just to resolve unresolved capability
-  tags. If the worker's first attempt closes a cycle (each rename can be
-  individually correct yet jointly cycle-creating), the orchestrator
-  detects it with Tarjan's SCC, computes a recommended resolution from
-  structural signals (planner-declared `depends_on` orientation;
-  `files_likely_touched` overlap), and respawns the worker once with the
-  cycle data, the recommendation, and a bounded set of acceptable
-  operations. The model never has to detect cycles itself; leerie does that
-  in Python and hands the model concrete structural feedback. If the
-  second attempt still cycles, the run aborts with the SCC and the
-  offending mutations named — never a silent bad ordering.
+  produce an acyclic merged plan, not just resolve unresolved tags. If the
+  worker's first attempt closes a cycle, the orchestrator detects it with
+  Tarjan's SCC, computes a recommended resolution from structural signals
+  (planner-declared `depends_on` orientation; `files_likely_touched`
+  overlap), and respawns the worker once with the cycle data, the
+  recommendation, and a bounded set of acceptable operations — the model
+  never has to detect cycles itself. If the second attempt still cycles, the
+  run aborts with the SCC and the offending mutations named.
 
-  The same retry-with-structural-feedback pattern applies to the second
-  failure mode the post-mutation gates catch: **unresolved `requires`
-  tags that survive the reconciler's first attempt**. The common cause
-  is the model inventing a new tag in `added_subtasks` or an `add_provide`
-  without renaming the original consumer's tag to match (two synonyms
-  for the same concept that never get unified). The orchestrator
+  The same retry-with-structural-feedback pattern applies to **unresolved
+  `requires` tags that survive the reconciler's first attempt** — commonly
+  caused by the model inventing a new tag in `added_subtasks`/`add_provide`
+  without renaming the original consumer's tag to match. The orchestrator
   computes string-similarity hints over the post-mutation `provides`
-  namespace, surfaces them in the retry prompt as a *prior* (not the
-  answer — textual similarity can produce false friends), and respawns
-  the worker once. If the retry leaves the same tag unresolved, the
-  run aborts with the structured report.
+  namespace, surfaces them in the retry prompt as a *prior* (not the answer —
+  textual similarity can produce false friends), and respawns the worker
+  once. If the retry leaves the same tag unresolved, the run aborts with the
+  structured report.
 
 ### `requires.extent` — in-graph vs. external prerequisites
 
@@ -429,271 +359,214 @@ Not every prerequisite a planner identifies is satisfiable by another code
 subtask in the plan. When a planner researches its domain (especially under
 `source_of_truth = both`), it sometimes surfaces a genuine prerequisite that
 lives *outside* the build graph: a Dynamo table provisioned by another repo,
-an ops runbook the deploy depends on, a manual step in a different team's
-queue. Treating those as unresolved cross-domain edges forces the reconciler
-either to invent a connector subtask that itself has out-of-scope `requires`,
-or to abort. Neither preserves the insight.
+an ops runbook, a manual step in a different team's queue. Treating those as
+unresolved cross-domain edges forces the reconciler either to invent a
+connector subtask with its own out-of-scope `requires`, or to abort. Neither
+preserves the insight.
 
 To carry that distinction, each `requires` entry is an object — `{tag,
-extent, reason}` — rather than a bare string. The planner classifies each
-entry along one axis:
+extent, reason}` — rather than a bare string, classified along one axis:
 
 - `extent: in_plan` — satisfied by another subtask in this plan; the
-  orchestrator wires a graph edge by matching against `provides`. The
-  reconciler resolves these via the action vocabulary described in the
-  *Cross-domain dependencies* subsection above (resolution actions for
-  unmatched tags; cycle-breaking actions when its mutations close a
-  dependency cycle; `unresolvable` as the abort escape hatch).
+  orchestrator wires a graph edge by matching against `provides`, resolved
+  via the reconciler's action vocabulary above.
 - `extent: external` — a real prerequisite the planner is declaring lives
   outside *this run's* build graph. Three kinds qualify. **Outside the build
   graph entirely**: another repo's deploy, an ops runbook, a manual step in
-  another team's queue — nothing a code change here could produce.
-  **Producible by code, but owned by another run**: the task itself names a
-  sibling phase document, an earlier phase, or another run of the same
-  multi-part deck as the owner of that work. **Fenced off by the task
-  itself**: the task declares a surface out of scope ("do not modify `X`",
-  "stay within `Y`"), and the capability's only implementation site lies on
-  that surface. In every case the `reason` field
-  names the owner — for a fence, the fence itself and the task's wording.
-  The orchestrator filters these out of the matching pass
-  entirely — they never enter the reconciler's queue — and instead collects
-  them into a `preconditions` section of the assembled plan. The human sees
-  the insight as a deploy note rather than a hard edge. When leerie is used
-  as part of a run-group (§20), a sibling repo in the same group is still
-  `external` by design — it is not in *this member's* build graph, and its
-  cross-repo dependency cannot be a hard DAG edge. The `reason` field naming
-  the sibling is what finalize turns into a deploy-ordering note for that
-  member's PR.
+  another team's queue. **Producible by code, but owned by another run**: the
+  task names a sibling phase document, an earlier phase, or another run of
+  the same multi-part deck as the owner. **Fenced off by the task itself**:
+  the task declares a surface out of scope, and the capability's only
+  implementation site lies on that surface. In every case `reason` names the
+  owner. The orchestrator filters these out of the matching pass entirely and
+  collects them into a `preconditions` section of the assembled plan — the
+  human sees the insight as a deploy note rather than a hard edge. In a
+  run-group (§20), a sibling repo in the same group is still `external` by
+  design — its cross-repo dependency cannot be a hard DAG edge, and `reason`
+  naming the sibling is what finalize turns into a deploy-ordering note.
 
 The test that separates the two values is **"is it in *this run's* graph?"**
-— not "could any code produce it?". That distinction is load-bearing, and
-stating it only implicitly cost a run: the second kind above is producible by
-a code subtask, so a "could code produce this?" reading forces `in_plan`,
-which by definition has no provider and routes straight to `unresolvable`.
-On a multi-part task deck whose files reference each other, that leaves the
-planner with no correct answer available and aborts the run after the full
-planning spend. The run-group carve-out below is the same principle one scope
-wider — a sibling repo's work is producible by code too, and is `external`
-for exactly this reason.
+— not "could any code produce it?". That distinction is load-bearing: the
+second kind above is producible by a code subtask, so a "could code produce
+this?" reading forces `in_plan`, which by definition has no provider and
+routes straight to `unresolvable`. On a multi-part task deck whose files
+reference each other, that leaves the planner with no correct answer and
+aborts the run after the full planning spend. The run-group carve-out is the
+same principle one scope wider.
 
 **A task-declared fence removes a surface from this run's graph as surely as
-another run owning it does.** This is the third kind, and it cost a run the
-same way the second one did. Run `2d7527f1` (2026-08-17, 55 workers, $12.46,
+another run owning it does.** Run `2d7527f1` (2026-08-17, 55 workers, $12.46,
 no code written) carried a task that fenced off an application-source
 directory and then listed an acceptance criterion whose only implementation
 site was a constant inside it. Planners run blind, so they split: the domain
-that owned the surface obeyed the fence and recorded a finding, while the
-`testing` domain obeyed the criterion and declared `extent: in_plan` on a
-capability nobody could then provide. The reconciler had no legal resolution
-— the consumer's own prose was unconditional, so `conditional_drop` did not
-apply, and a rename would have wired a test to a documentation artifact —
-and correctly aborted. The fence is what the planner should have keyed on:
-"could a connector subtask produce this?" answers *yes* for a fenced code
-change, which is precisely why that question must not be asked first.
+that owned the surface obeyed the fence, while `testing` obeyed the criterion
+and declared `extent: in_plan` on a capability nobody could then provide. The
+reconciler had no legal resolution — the consumer's own prose was
+unconditional, so `conditional_drop` did not apply, and a rename would have
+wired a test to a documentation artifact — and correctly aborted. The fence
+is what the planner should have keyed on: "could a connector subtask produce
+this?" answers *yes* for a fenced code change, which is precisely why that
+question must not be asked first.
 
 The planner is the right classifier because it just did the research that
-surfaced the prerequisite — it can answer "is this satisfiable by a code
-change I'm describing?" The reconciler cannot, because asking it to predict
-whether some *other* domain's planner produces a capability is exactly the
-question planners cannot answer about each other.
+surfaced the prerequisite; the reconciler cannot answer "does some *other*
+domain's planner produce this?" any better than planners can answer it about
+each other.
 
 **The external twin.** Planners run blind, so two of them can classify the
-same capability differently: one recognizes the work belongs to another run
-and says `external`, another says `in_plan`. The `in_plan` one has no
-provider by construction, so it reaches `unresolvable` and kills the run —
-while the evidence that it is out-of-graph sits unread in the externals the
-orchestrator collected moments earlier. Measured on run `1178f696`, both
-fatal entries had such a twin: one exact (`invoice-payment-endpoint-fixed`),
-one differing by a single character (`webhook-event-**types**-schema-settled`
-vs `…-event-**type**-schema-settled`).
-
-So before dying, the orchestrator checks each `unresolvable` entry against
-the collected externals, matching first on the exact tag and then on a
+same capability differently: one recognizes the work belongs elsewhere and
+says `external`, another says `in_plan` — which has no provider by
+construction and reaches `unresolvable`, killing the run while the evidence
+that it is out-of-graph sits unread in the externals the orchestrator
+collected moments earlier. Measured on run `1178f696`, both fatal entries had
+such a twin (one exact match, one differing by a single character). So before
+dying, the orchestrator checks each `unresolvable` entry against the
+collected externals, matching first on the exact tag and then on a
 singularized token set. A hit rewrites the consumer's entry to `external`,
-inheriting the twin's `reason` attributed to the subtask that declared it,
-and the entry is dropped from `unresolvable`.
+inheriting the twin's `reason`, and drops it from `unresolvable`.
 
 **Placement is the safety property.** This runs *after* the reconciler has
 emitted its verdict, so it can only ever convert a `die()` into a deploy
-note — never "skip an edge the reconciler would have wired". Running it
+note — never skip an edge the reconciler would have wired. Running it
 *before* the reconciler was measured demoting three tags the reconciler went
-on to resolve successfully, which would have turned real ordering
-constraints into mere notes. The reconciler resolves far more than it
-aborts (279 resolutions against 4 aborts across the run corpus), so
-preempting it is both expensive and wrong. The normalized pass is
-deliberately narrow — set equality after singularization, never partial
-token overlap — and every demotion is recorded so a wrong pairing is
-auditable rather than silent.
+on to resolve successfully. The reconciler resolves far more than it aborts
+(279 resolutions against 4 aborts across the run corpus), so preempting it is
+both expensive and wrong. The normalized pass is deliberately narrow — set
+equality after singularization, never partial token overlap — and every
+demotion is recorded so a wrong pairing is auditable rather than silent.
 
 **Collision rule.** If any planner declares `requires: {tag: X, extent:
-external}` and another planner declares `provides: X`, the `provides` wins
-and the entry is silently promoted to `in_plan` before the matching pass.
-This prevents a planner from unilaterally bypassing a real producer that
-happens to exist in another domain's plan. The promotion is mechanical and
-needs no reconciler involvement: a real producer for the capability already
-exists in the plan, so the edge can be wired without judgment.
+external}` and another declares `provides: X`, the `provides` wins and the
+entry is silently promoted to `in_plan` before the matching pass — preventing
+a planner from unilaterally bypassing a real producer that already exists in
+another domain's plan. The promotion is mechanical and needs no reconciler
+involvement.
 
 `unresolvable` is now reserved for genuinely-broken in-plan tags — typos,
 hallucinations, or in-plan capabilities the reconciler can neither rename,
-attribute, nor connect. An external prerequisite never reaches that path;
-a planner-declared *conditional* consumer (one whose own `intent` admits
-it should be dropped if its precondition is false) routes through
-`conditional_drop`; and an *over-specified* `requires` entry (an
-aggregate or coarser synonym of what the consumer itself provides, rather
-than a real cross-subtask dependency) routes through `drop_require` —
-`unresolvable` is reserved for unconditional consumers whose required
-capability genuinely cannot be produced AND is not an over-specified
-self-reference.
+attribute, nor connect. An external prerequisite never reaches that path; a
+planner-declared *conditional* consumer routes through `conditional_drop`;
+and an *over-specified* `requires` entry routes through `drop_require`.
 
 **Accepting external-blocked subtasks.** When a subtask's only unsatisfied
 prerequisites are `extent: external`, the worker will discover the external
 dependency is missing (e.g. no Postgres server in the container) and return
 `status: blocked`. Since the orchestrator does not gate dispatch on external
 preconditions — they are informational, not graph edges — the wave dies and
-`resume` retries the same subtask, which blocks again. The `accept-blocked
-<run-id> <subtask-id>` verb lets the operator acknowledge an external block:
-it sets `subtask_status[sid]` to `complete` in state.json so `resume` skips
-that subtask. This preserves the invariant that external preconditions are
-a human concern while giving the operator an escape hatch for runs that
-would otherwise loop indefinitely.
+`resume` retries the same subtask, which blocks again. `accept-blocked
+<run-id> <subtask-id>` lets the operator acknowledge an external block: it
+sets `subtask_status[sid]` to `complete` in state.json so `resume` skips that
+subtask, preserving the invariant that external preconditions are a human
+concern while giving the operator an escape hatch for runs that would
+otherwise loop indefinitely.
 
-**The integration gate needs the same escape hatch, for a sharper
-reason.** `integrate_wave` dies on a behavioral defect reported by
-`integration_judge` — an LLM. A false positive there permanently kills a
-run *after* full planning and implementation spend, and the merge is
-already committed to staging, so `resume` re-runs the same judge against
-the same tree and reaches the same verdict. The die() message advised
-"accept the finding", which named no mechanism that existed.
-
-Two pieces make that advice real, and both are necessary. `integrate_wave`
-persists the judge's verdict to `integration_gate[sid]` *before* it dies,
-so a resume can distinguish "not yet reviewed" from "reviewed and
-rejected" from "reviewed and accepted" — `integrate.sh`'s merge is
-idempotent, so without the audit key a resume would see the branch already
-merged and skip silently past a rejected verdict. Then
-`accept-integration <run-id> <subtask-id>` flips that record's `accepted`
-flag, mirroring `accept-blocked`'s local/Fly/EC2 state-mutation machinery.
-Without the key the verb would be undone by the next resume; without the
-verb the key would only ever record a refusal. A resume with an
-unaccepted finding re-invokes the judge rather than dying on the stale
-record, so a verdict that no longer reproduces resolves itself.
+**The integration gate needs the same escape hatch, for a sharper reason.**
+`integrate_wave` dies on a behavioral defect reported by `integration_judge` —
+an LLM. A false positive there permanently kills a run *after* full planning
+and implementation spend, and since the merge is already committed to
+staging, `resume` re-runs the same judge against the same tree and reaches
+the same verdict. Two pieces make the escape hatch real. `integrate_wave`
+persists the judge's verdict to `integration_gate[sid]` *before* it dies, so
+a resume can distinguish "not yet reviewed" from "reviewed and rejected" from
+"reviewed and accepted" — `integrate.sh`'s merge is idempotent, so without
+the audit key a resume would see the branch already merged and skip silently
+past a rejected verdict. Then `accept-integration <run-id> <subtask-id>`
+flips that record's `accepted` flag, mirroring `accept-blocked`'s
+local/Fly/EC2 state-mutation machinery. A resume with an unaccepted finding
+re-invokes the judge rather than dying on the stale record, so a verdict that
+no longer reproduces resolves itself.
 
 `--skip-integration-check` disables the gate wholesale, matching the five
-other gates that already carry a bypass. It is independent of the
-acceptance path: the flag prevents the judge from running at all, while
-acceptance settles a finding the judge has already produced.
+other gates that already carry a bypass — independent of the acceptance
+path, since the flag prevents the judge from running at all while acceptance
+settles a finding it has already produced.
 
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
 independent and run in parallel; waves run in sequence. A dependency cycle is
 unsatisfiable; the reconciler's retry loop tries to break it (preferring
-`drop_require` / `dependency_edges` / `merged_subtasks` over the cycle-
-closing renames), and if that fails the run aborts with the SCC + the
-mutations that closed it named — never silently broken.
+`drop_require` / `dependency_edges` / `merged_subtasks` over cycle-closing
+renames), and if that fails the run aborts with the SCC and the mutations
+that closed it named.
 
 Cross-domain dependencies are reconciled by the orchestrator from capability
 tags (with the reconciler bridging vocabulary drift) and enforced as wave
-ordering. Planners can therefore run in parallel without coordination: the
-coupling between their outputs is recovered globally by the scheduler, and
-vocabulary mismatches that would have produced silent missing-edges are
-caught by the reconciler before they reach the scheduler.
+ordering — planners can run in parallel without coordination, since the
+coupling between their outputs is recovered globally by the scheduler.
 
 ### Cross-domain surface overlap
 
-The reconciler bridges *vocabulary* drift — two planners naming the same
-capability with different tags. There is a second class of drift the
-reconciler does not address: two planners independently proposing
-subtasks that produce **the same exported artifact** (the same component,
-the same exported function, the same primitive extraction) with
-**incompatible APIs**. Because the reconciler's mandate is unresolved
-`requires` tags, and because each planner can legitimately declare its
-own `provides` tag for the artifact (`widget-frame-component` and
-`widget-frame-adopted` describe the same `WidgetFrame` extraction), this
-class slips past every check between planning and integration. The
-collision then surfaces as an integrator merge-conflict mid-run, with
-worker budget already spent across earlier waves.
+The reconciler bridges *vocabulary* drift. A second class of drift it does
+not address: two planners independently proposing subtasks that produce
+**the same exported artifact** with **incompatible APIs**. Because each
+planner can legitimately declare its own `provides` tag for the artifact
+(`widget-frame-component` and `widget-frame-adopted` for the same
+`WidgetFrame` extraction), this class slips past every check between
+planning and integration, surfacing as an integrator merge-conflict mid-run
+with worker budget already spent across earlier waves.
 
 **A re-plan invalidates every phase that already ran.** The planning
-pipeline is `reconcile → overlap-judge → adherence-gate → coverage-gate`,
-and the two later gates can reject a plan and re-drive `phase_plan`. A
-re-plan runs one planner per category in parallel with no cross-category
-visibility, exactly like the first pass — so it reintroduces the same
-vocabulary drift the reconciler resolved *and* the same surface
-collisions the overlap judge resolved. Whatever a gate re-plans, it owes
-a re-run of every phase upstream of itself, not just the reconciler.
+pipeline is `reconcile → overlap-judge → adherence-gate → coverage-gate`, and
+the two later gates can reject a plan and re-drive `phase_plan`. A re-plan
+runs one planner per category in parallel with no cross-category visibility,
+exactly like the first pass, so it reintroduces the same vocabulary drift and
+surface collisions the earlier phases already resolved. Whatever a gate
+re-plans, it owes a re-run of every phase upstream of itself.
 
 The repair is asymmetric because the gates sit at different positions. A
-re-plan from the adherence gate must re-run reconcile and the overlap
-judge; it does not need the coverage gate, which has not run yet and will
-see the re-planned output anyway. The coverage gate itself no longer
-re-plans at all — it was demoted to advisory on 2026-08-04 (§8 *Independent
-adversarial verification*), so the obligation it would otherwise owe
-(reconcile, the overlap judge, **and** the adherence gate — it sits
-furthest downstream) is currently unexercised. It is stated here because
-the rule is positional, not gate-specific: any gate later given re-plan
-authority inherits the obligation of everything upstream of it. Nesting
-a gate inside another gate's retry loop is bounded rather than recursive:
-every gate drives its re-plans through the shared mechanical-feedback
-loop under one round budget, so the worst case is the product of two
-budgets, not an unbounded cycle.
+re-plan from the adherence gate must re-run reconcile and the overlap judge;
+it does not need the coverage gate, which has not run yet. The coverage gate
+itself no longer re-plans at all — demoted to advisory on 2026-08-04 (§8
+*Independent adversarial verification*) — so the obligation it would
+otherwise owe (reconcile, the overlap judge, **and** the adherence gate) is
+currently unexercised; it's stated here because the rule is positional, not
+gate-specific. Nesting a gate inside another gate's retry loop is bounded
+rather than recursive: every gate drives its re-plans through the shared
+mechanical-feedback loop under one round budget, so the worst case is the
+product of two budgets, not an unbounded cycle.
 
-Getting this wrong is expensive and silent. Run `19a70d96` (2026-08-01)
-had the overlap judge correctly merge 8 subtasks down to 4; the coverage
-gate then re-planned, 8 came back with every duplicate restored, nothing
-re-detected them, and all 8 executed. Two subtasks did the same
-migration, the integrator merged both into one document section, and the
-integration gate refused the result — after 4.7 hours and 164 workers.
-The plan handed to execution was one the overlap judge had already
-rejected. (The same run's task — migrating this codebase's own
-regex-over-prose sites — independently surfaced a second, unrelated
-defect during planning: see the migration-surface false-positive numbers
-cited below. One run, two distinct bugs; neither citation is a
-mis-attribution of the other.)
+Getting this wrong is expensive and silent. Run `19a70d96` (2026-08-01) had
+the overlap judge correctly merge 8 subtasks down to 4; the coverage gate
+then re-planned, all 8 duplicates came back, nothing re-detected them, and
+all 8 executed — two subtasks did the same migration, the integrator merged
+both into one document section, and the integration gate refused the result
+after 4.7 hours and 164 workers. The plan handed to execution was one the
+overlap judge had already rejected.
 
 A **plan-overlap judge** worker runs between reconcile and schedule
 specifically to catch this. It reads the full reconciled subtask list
-(title, intent, `files_likely_touched`, `provides`, `requires`) and
-emits zero or more `collisions`, each with one of four resolutions:
-`merge` (one component satisfies both intents), `drop_a`/`drop_b` (one
-intent is strictly superseded), or `unresolvable` (the intents are
-structurally contradictory and the run should die at plan time rather
-than crash at integration).
+(title, intent, `files_likely_touched`, `provides`, `requires`) and emits
+zero or more `collisions`, each with one of four resolutions: `merge` (one
+component satisfies both intents), `drop_a`/`drop_b` (one intent is strictly
+superseded), or `unresolvable` (the intents are structurally contradictory
+and the run should die at plan time rather than crash at integration).
 
 **An `unresolvable` verdict re-plans before it dies.** The judge refusing to
-merge two contradictory designs is the phase working correctly — but the
-response to it was a terminal `die()` whose own message said *"this run cannot
-be resumed"*, after the entire planning spend. Measured across the corpus: 43
-runs reached this judge and **5 (12%) died here, burning 404 workers, none
-recoverable**, while the judge resolved the other 95.5% of collisions (232 of
-243) without incident. `eb1aa53e` is the shape — one collision, where one
-planner added an `ApiKey.allowedDomains` column and another explicitly refused
-to, citing a directive in a task-referenced file that the first had not
-honoured.
-
-An unresolvable collision is a verdict about the **plan**, not about the
-judge's output quality, so it should re-drive the plan — which is what every
-other gate already does on far weaker findings. It now re-plans the implicated
-domains once, with the contradiction as feedback, and dies only if the second
-verdict is still unresolvable (bounded by `overlap_replan_done`).
+merge two contradictory designs is the phase working correctly, but a
+terminal `die()` after the entire planning spend is not the right response.
+Measured across the corpus: 43 runs reached this judge and 5 (12%) died
+here, burning 404 workers none recoverable, while the judge resolved the
+other 95.5% of collisions (232 of 243) without incident. An unresolvable
+collision is a verdict about the **plan**, not about the judge's output
+quality, so it now re-plans the implicated domains once, with the
+contradiction as feedback, and dies only if the second verdict is still
+unresolvable (bounded by `overlap_replan_done`).
 
 The re-plan is **scoped**, and this gate is the only one where that is
 currently possible: a collision names `a_sid`/`b_sid`, so the implicated
-domains are mechanically derivable, whereas `coverage_gaps` and the adherence
-judge's `violations` carry no subtask reference at all. Scope is the implicated
-domains plus `_replan_domain_closure` — the transitive set of domains depending
-on them across both the id and tag channels — so no surviving edge can dangle.
-Measured over 85 (domain, plan) re-plan simulations on real corpus plans:
-closure-scoped schedules and validates 85/85, naive single-domain 79/85.
+domains are mechanically derivable, whereas `coverage_gaps` and the
+adherence judge's `violations` carry no subtask reference at all. Scope is
+the implicated domains plus `_replan_domain_closure` — the transitive set of
+domains depending on them across both the id and tag channels — so no
+surviving edge can dangle. Measured over 85 (domain, plan) re-plan
+simulations on real corpus plans: closure-scoped schedules and validates
+85/85, naive single-domain 79/85.
 
 The artifact a collision names is very often one that does **not yet
-exist**: the canonical case is two planners that each propose to
-*create* the same component or test file. A mechanical check that
-requires the artifact to be present in the working tree therefore
-rejects the judge's primary subject matter, and — because the judge is
-told its evidence must be verifiable — pushes it to discount its own
-correct findings. Artifact existence is checked against the union of
-the plan's `files_likely_touched` as well as the repo, so a
-to-be-created file counts as real evidence and only a genuinely
+exist** — the canonical case is two planners that each propose to *create*
+the same component or test file. Artifact existence is therefore checked
+against the union of the plan's `files_likely_touched` as well as the repo,
+so a to-be-created file counts as real evidence and only a genuinely
 invented path is flagged.
 
 `artifact` is a free-text label — the judge's own description of what's
@@ -704,20 +577,17 @@ repo-relative paths the judge names explicitly, which is the only thing
 `PHANTOM_ARTIFACT`'s existence check reads. `artifact` stays purely
 descriptive for a human reading the plan.
 
-`artifact_paths` is **asked for but not schema-required**, because requiring it
-was measured to be far more destructive than the false positives it was
-introduced to prevent. Across the run corpus this phase produced valid output
-on only **40.9% of its invocations** while every other worker sat at 99.6–100%,
-and **84 of its 85 validation failures were the single error
-`'artifact_paths' is a required property`** — a whole-payload rejection of an
-otherwise-sound collision analysis, in the phase runs most often die in.
-
-Absence was already the designed-for case: the check reads
-`paths = c.get("artifact_paths") or []` and skips the collision when empty,
-precisely because a purely logical artifact has no path and there is then
-nothing to verify. Requiring the field therefore bought no additional
-verification — it converted "this collision cannot be path-checked" from a
-graceful skip into a discarded plan.
+`artifact_paths` is **asked for but not schema-required**. Requiring it was
+measured to be far more destructive than the false positives it prevented:
+across the run corpus this phase produced valid output on only **40.9% of its
+invocations** (vs. 99.6–100% for every other worker), and **84 of its 85
+validation failures were the single error `'artifact_paths' is a required
+property'`** — a whole-payload rejection of an otherwise-sound collision
+analysis, in the phase runs most often die in. Absence was already the
+designed-for case (`paths = c.get("artifact_paths") or []` skips the
+collision when empty, since a purely logical artifact has no path to check),
+so requiring the field bought no verification — only turned a graceful skip
+into a discarded plan.
 
 The judge is biased toward escalation. Before emitting `merge`, it must
 verify the two intents are compositionally consistent — no required-
@@ -800,23 +670,16 @@ default lex-smaller survivor rule (a determinism device with no
 semantic content) would silently keep an arbitrary narrower subtask
 and discard the spec the judge actually identified as broader.
 
-Membership is bare *appearance*, and the rule is exactly that literal:
-a sid is an anchor when it shows up in two or more non-`unresolvable`
-collisions, on either side, under any resolution. Merges and drops
-count alike; single drops count the same as the multi-drop clusters
-below; only `unresolvable` is excluded, because those never mutate the
-plan.
-
-Read that as a signal-strength claim, not a semantic one. Anchor
-membership does **not** mean the subtask absorbed anything — a sid the
-judge *dropped* twice is an anchor too (it simply never survives to
-use the hint). What membership says is only that the judge kept
-returning to this sid while writing its pairs, and that is a better
-tie-break for "which of these two survives the merge" than
-alphabetical order, which is what it displaces. Any richer reading —
-"the anchor is the subtask that absorbs its partners" — is false on
-roughly a third of the resolution combinations and should not be
-inferred from the name.
+Membership is bare *appearance*: a sid is an anchor when it shows up in two
+or more non-`unresolvable` collisions, on either side, under any resolution
+(merges and drops count alike; only `unresolvable` is excluded, since those
+never mutate the plan). This is a signal-strength claim, not a semantic
+one — anchor membership does **not** mean the subtask absorbed anything (a
+sid the judge *dropped* twice is an anchor too, it just never survives to
+use the hint). It only says the judge kept returning to this sid, which is a
+better tie-break than alphabetical order. The richer reading — "the anchor
+absorbs its partners" — is false on roughly a third of the resolution
+combinations and must not be inferred from the name.
 
 There is a second, narrower predicate in this neighbourhood, and
 keeping the two apart is load-bearing. The orchestrator rejects one
@@ -899,26 +762,21 @@ sid both dropped and surviving, which the keep-and-delete rule above
 already forbids. No apply order satisfies it, so it never reaches the
 apply loop.
 
-`resolution` alone is the wrong signal here, and treating any repeated
-pair as incoherent is worse: it `die()`s correct output after the full
-planning spend, at a validator that runs *after* the retry loop and
-therefore cannot be recovered from. Both failure modes were observed
-together on one run (2026-08-01) — a spurious phantom-artifact issue
-forced a retry, the retry expressed a two-file overlap as two rows, and
-the pair gate killed the run.
+`resolution` alone is the wrong signal here, and treating any repeated pair
+as incoherent is worse: it `die()`s correct output after the full planning
+spend, at a validator that runs *after* the retry loop and so cannot be
+recovered from. Both failure modes were observed together on one run
+(2026-08-01): a spurious phantom-artifact issue forced a retry, the retry
+expressed a two-file overlap as two rows, and the pair gate killed the run.
 
-The anchor rule introduces one new invariant the orchestrator must
-preserve: **merge_feasibility carry-forward**. Each `merge_feasibility`
-statement is the load-bearing unified-intent record for the pair it
-came from (see the discipline above). When subtask X is absorbed by
-subtask Y in a merge, *every* `merge_feasibility` statement that has
-ever been appended to X's intent — including ones from prior merges
-where X was itself a survivor — must be preserved in Y's intent.
-Otherwise a cluster like `merge(B,D)` followed by `merge(A,B)`
-silently loses the mf statement from the first merge as B is
-absorbed into A. This is the same silent-data-loss class the
-per-pair merge-feasibility discipline exists to prevent, applied
-across the chain of absorptions rather than within a single pair.
+The anchor rule introduces one invariant the orchestrator must preserve:
+**merge_feasibility carry-forward.** When subtask X is absorbed by subtask Y
+in a merge, *every* `merge_feasibility` statement ever appended to X's
+intent — including ones from prior merges where X was itself a survivor —
+must be preserved in Y's intent. Otherwise `merge(B,D)` followed by
+`merge(A,B)` silently loses the first merge's statement as B is absorbed
+into A — the same silent-data-loss class the per-pair discipline exists to
+prevent, applied across a chain of absorptions rather than within one pair.
 
 **Post-merge acyclicity.** A collision resolution's dependency-union — the
 survivor inheriting the absorbed subtask's `provides`/`requires`/`depends_on`,
@@ -942,14 +800,14 @@ all vanish an id. Each owes the plan two things: the vanishing subtask's
 subtask referencing the vanishing id via `depends_on` must be rewritten to reference
 those successor(s).
 
-The second half is easy to forget because the two dependency channels do not fail
-alike *under expansion*. On **expansion** the tag channel self-heals: `provides` is
-inherited by successors and `_build_predecessor_graph` resolves a `requires` tag to
-*every* provider, so a tag-expressed edge survives an id vanishing untouched. Only the
-id-expressed `depends_on` channel dangles — silently at `_schedule()`, which drops an
-unknown predecessor without a word, and then fatally at `_validate_plan`. An operation
-that gets this wrong therefore looks correct under tag-based plans and dies only when a
-planner happens to express the same intent by id.
+The two dependency channels do not fail alike *under expansion*. On
+**expansion** the tag channel self-heals: `provides` is inherited by
+successors and `_build_predecessor_graph` resolves a `requires` tag to
+*every* provider, so a tag-expressed edge survives untouched. Only the
+id-expressed `depends_on` channel dangles — silently at `_schedule()` (drops
+an unknown predecessor without a word), then fatally at `_validate_plan`. An
+operation that gets this wrong looks correct under tag-based plans and dies
+only when a planner happens to express the same intent by id.
 
 **A drop is not symmetric with an expansion on the tag channel.** The self-healing
 above holds only because a successor inherits the vanishing subtask's `provides`. A
@@ -976,22 +834,20 @@ a single "representative" successor, or dropping the id edge on the theory that 
 will cover it, is the same silent-data-loss class named above: a parent with no
 `provides` has no tag edge to fall back on.
 
-The orchestrator handles this with **per-resolution cycle avoidance** rather than
-an all-or-nothing post-hoc gate. Before applying each collision it tentatively
-applies the resolution to a throwaway copy and runs Tarjan's SCC; if the
-resolution *would* introduce a cycle, that specific resolution is **skipped**
-(`skipped_would_cycle`) and both subtasks are kept separate for the integrator to
-resolve at integration time. Every non-cycling resolution still applies. This is
-a deterministic, per-resolution degradation of the `--skip-overlap-judge` escape
-hatch, achieved locally with no extra worker round-trip. The judge is *not*
-re-prompted: the cycle is a global-graph property of the whole subtask DAG,
-outside the judge's pairwise-surface competence (its merge decision is typically
-correct — two planners genuinely producing the same artifact — and the cycle is
-an orthogonal topology side effect of unioning their dependency tags). Tarjan's
-SCC still runs on the final post-merge graph as an internal backstop assertion;
-with per-resolution avoidance in place it must never fire, so a surviving cycle
-is treated as an orchestrator logic bug (the tentative check and the real apply
-path disagreed), not a user-recoverable condition.
+The orchestrator handles this with **per-resolution cycle avoidance** rather
+than an all-or-nothing post-hoc gate. Before applying each collision it
+tentatively applies the resolution to a throwaway copy and runs Tarjan's SCC;
+if the resolution would introduce a cycle, that resolution is **skipped**
+(`skipped_would_cycle`) and both subtasks are kept separate for the
+integrator to resolve at integration time. Every non-cycling resolution
+still applies — a deterministic, per-resolution degradation of the
+`--skip-overlap-judge` escape hatch, with no extra worker round-trip: the
+cycle is a global-graph property outside the judge's pairwise competence
+(its merge decision is typically correct; the cycle is an orthogonal
+topology side effect of unioning dependency tags). Tarjan's SCC still runs
+on the final post-merge graph as an internal backstop; with per-resolution
+avoidance in place it must never fire, so a surviving cycle is an
+orchestrator logic bug, not a user-recoverable condition.
 
 **A wiring re-check on the fully-merged plan, before `_validate_plan`.** The
 per-operation rewrite discipline above is applied at each vanishing site — the
@@ -1057,29 +913,22 @@ In every case the resulting graph must still be acyclic — trialled against a c
 before it is applied, using the same cycle definition as every other site.
 
 **The residual is re-checked against the ordering the plan actually has.** The
-already-declared guard above is *channel-local* — the id arm asks whether the
-named id is in `depends_on`, the tag arm whether the named tag is in `requires` —
-and, decisively, it sits **downstream of channel selection**. A defect matching no
-channel takes the `else` arm straight to the residual, so the guard is never
-reached on the one path that reaches the `die()`. It existed and was structurally
-dead exactly where it mattered.
+already-declared guard above is *channel-local* (the id arm asks whether the
+named id is in `depends_on`, the tag arm whether the named tag is in
+`requires`) and sits **downstream of channel selection** — a defect matching
+no channel takes the `else` arm straight to the residual, so the guard is
+never reached on the one path that reaches the `die()`. It was structurally
+dead exactly where it mattered: run `05fdffb8` died on
+`WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload` even
+though `test-003` **already declared `requires: action-echoed-row-payload`**
+— the tag reported missing. That ordering makes the judge's stated failure
+impossible, but the tag had two providers in different clusters, no channel
+matched, and the plan died with the whole planning spend on a gate with no
+bypass flag.
 
-Run `05fdffb8` died there, and the finding was false on the plan as written:
-
-```
-• WIRING_DEFECT (missing_requires) test-003 / action-echoed-row-payload
-```
-
-`test-003` **already declared `requires: action-echoed-row-payload`** — the very
-tag reported missing. Requiring an in-plan tag orders a subtask behind *every*
-provider of it, so the judge's stated failure ("the scheduler can start
-`test-003` before `feat-007-2-2`") could not occur. But the tag had two providers
-in different clusters, no channel matched, and the plan died with the whole
-planning spend on a gate with no bypass flag.
-
-So after the repair loop, any residual defect whose subtask is already ordered
-behind **every** producer of the named capability is dropped. Three properties are
-load-bearing:
+So after the repair loop, any residual defect whose subtask is already
+ordered behind **every** producer of the named capability is dropped. Three
+properties are load-bearing:
 
 - **Ordering is resolved through `_build_predecessor_graph`**, not read off
   `depends_on`, for the same reason the cycle trials route through it: so
@@ -1104,29 +953,25 @@ non-repairable defect to the same residual, so `broken_by_drop` and
 the *work* is gone, and no amount of scheduling behind a subtask restores a
 capability it no longer provides.
 
-It runs after the repairs rather than before them because a defect can be mooted
-by an edge a *sibling* defect's repair added, and the judge's emission order is
-arbitrary. (The real run above did not need that — it was refutable as written —
-but the ordering is cheap and strictly more powerful.) Each dismissal is logged
-naming the responsible edges, so a judge degrading over time stays visible rather
-than being silently absorbed.
+It runs after the repairs rather than before them because a defect can be
+mooted by an edge a *sibling* defect's repair added, and the judge's
+emission order is arbitrary. Each dismissal is logged naming the responsible
+edges, so a judge degrading over time stays visible rather than being
+silently absorbed. Anything else is refused and the gate dies as before: a
+value that is neither a subtask id nor a provided tag means the plan
+genuinely lacks the capability, and several providers spanning *different*
+clusters is an ambiguity only a human can resolve. The cycle trial is
+load-bearing rather than defensive — a well-formed but wrong edge can close
+a cycle spanning the entire plan, so skipping it would convert a survivable
+planning defect into a dead run.
 
-Anything else is refused and the gate dies as before: a value that is neither a
-subtask id nor a provided tag means the plan genuinely lacks the capability rather
-than the edge, and a tag with several providers spanning *different* clusters is
-an ambiguity only a human can resolve. The cycle trial is load-bearing rather than
-defensive — a well-formed but wrong edge can close a cycle spanning the entire
-plan, so a repair that skipped the trial would convert a survivable planning
-defect into a dead run.
-
-Reading only the tag channel was the original shape of this repair, and it was the
-dominant reason a repairable run still died: measured across the corpus, **23 of
-the 24 defects refused as "no in-plan provider" named a surviving subtask id**, and
-one run died with 22 defects of which every single one was that shape. Counting
-split siblings as rival providers accounted for the rest of the refusals in a
-second run (one tag, eleven providers, all one cluster). Closing both channels
-takes the corpus from 19/27 runs clearing the gate to 21/27, and the residual
-defects are then all genuine missing work.
+Reading only the tag channel was the original shape of this repair, and was
+the dominant reason a repairable run still died: measured across the
+corpus, **23 of the 24 defects refused as "no in-plan provider" named a
+surviving subtask id** (one run died with 22 defects, all this shape);
+counting split siblings as rival providers accounted for the rest in a
+second run. Closing both channels takes the corpus from 19/27 runs clearing
+the gate to 21/27, with the residual defects then all genuine missing work.
 
 Because added edges change the wave partition, the scheduler is re-run and the
 plan snapshot rewritten after a repair, so everything downstream — the budget
@@ -1163,65 +1008,45 @@ repeat the classification/planning cost.
 
 This is enforced mechanically at two levels:
 
-- **Intra-domain (CRITIC-enforced).** The planner declares what a
-  subtask replaces as a structured `migration_targets: [{old_pattern,
-  replacement, is_real_identifier}]` field on its own schema — Python
-  never infers this from prose. `check_planner_output()` reads
-  `migration_targets` directly: for each declared `old_pattern`, the
-  check greps the repo for call sites (a symbol the planner named, not
-  one mined from `intent`/`investigation_notes`), cross-references
-  against `files_likely_touched` across the domain's subtasks, and
-  emits `UNCOVERED_MIGRATION_SURFACE` when > 5 files are uncovered.
-  This used to regex `intent`/`investigation_notes` for phrases like
-  "replaces direct `X`" — the extracted "old pattern" was whatever
-  token followed the verb, which mined ordinary English out of
-  sentences that merely described replacement (measured on run
-  `19a70d96`: every extraction was a stopword — `with` → 332 files,
-  `both` → 178, `task` → 168 — and not one was a real symbol). The
-  regex is deleted; the field is required-by-convention (the prompt
-  asks for it explicitly) though not schema-required, since most
-  subtasks replace nothing and omit it. The CRITIC loop feeds a
-  genuine finding back as structured feedback; multi-sample selection
-  deprioritizes samples that miss the surface.
+- **Intra-domain (CRITIC-enforced).** The planner declares what a subtask
+  replaces as a structured `migration_targets: [{old_pattern, replacement,
+  is_real_identifier}]` field on its own schema — Python never infers this
+  from prose. `check_planner_output()` reads `migration_targets` directly:
+  for each declared `old_pattern`, the check greps the repo for call sites
+  (a symbol the planner named, not one mined from prose), cross-references
+  against `files_likely_touched` across the domain's subtasks, and emits
+  `UNCOVERED_MIGRATION_SURFACE` when > 5 files are uncovered. This used to
+  regex `intent`/`investigation_notes` for phrases like "replaces direct
+  `X`" — measured on run `19a70d96`, every extraction was a stopword
+  (`with` → 332 files, `both` → 178, `task` → 168) and not one was a real
+  symbol. The regex is deleted; the field is required-by-convention (the
+  prompt asks for it) but not schema-required, since most subtasks replace
+  nothing.
 
-  Whether `old_pattern` is actually a real, grep-pastable identifier —
-  as opposed to a stopword like `with`/`both`/`task` restated from the
-  subtask's own prose — was initially enforced by a mechanical shape
-  check, `_BARE_LOWERCASE_WORD_RE` (`^[a-z]+$`), run against the
-  planner-populated field. That is itself a CLAUDE.md *Language-to-
-  Json* violation, just relocated: Python was still regex-classifying
-  an LLM's response, only the field being classified moved from
-  `intent`/`investigation_notes` to `old_pattern`. It is replaced by a
-  required sibling field on each `migration_targets` entry,
-  `is_real_identifier: bool` — the planner's own attestation that it
-  believes `old_pattern` will grep cleanly as a real symbol, made at
-  the same time it names the pattern. `_check_migration_surface` skips
-  any target where `is_real_identifier` is false or absent (a missing
-  attestation is never treated as implicit consent), and never
-  re-derives the judgment itself. This mirrors how `performs_replacement`
-  self-reports next to `migration_targets` and `artifact_paths`
-  self-reports next to `artifact` elsewhere in the plan-overlap judge:
-  when Python needs a fact that requires judging an LLM's own prose,
-  the LLM states the fact as structured output instead of Python
-  inferring it.
+  Whether `old_pattern` is actually a real, grep-pastable identifier — as
+  opposed to a stopword restated from the subtask's own prose — was
+  initially enforced by a mechanical shape check
+  (`_BARE_LOWERCASE_WORD_RE`), itself a *Language-to-JSON* violation just
+  relocated. It is replaced by a required sibling field,
+  `is_real_identifier: bool` — the planner's own attestation, made at the
+  same time it names the pattern. `_check_migration_surface` skips any
+  target where `is_real_identifier` is false or absent, and never
+  re-derives the judgment itself (mirroring `performs_replacement` and
+  `artifact_paths` self-reporting elsewhere: when Python needs a fact that
+  requires judging an LLM's own prose, the LLM states the fact as
+  structured output).
 
   Because `migration_targets` is optional, a planner that omits it
-  entirely (rather than declaring a wrong entry) produces silent
-  agreement — `UNCOVERED_MIGRATION_SURFACE` has nothing to check. A
-  second, narrower mechanical check closes the common case of this:
-  the schema also carries a self-reported `performs_replacement: bool`
-  sibling field, and `_check_migration_targets_declared()` flags
-  `MIGRATION_TARGETS_MISSING` when a subtask sets it true but declares
-  no `migration_targets`. This is a same-worker, same-call internal-
-  consistency check (the same shape as the overlap judge's
-  `_contradictory_drop_sids`, not a self-graded confidence score — it
-  does not reintroduce the self-grading bias §8 warns against), and it
-  is explicitly **not an independent witness**: a planner that is wrong
-  on both fields in the same direction (false + omitted, for a subtask
-  that truly replaces something) defeats it the same way omitting
-  `migration_targets` alone always could. It narrows the silent-miss
-  window to "the planner is self-consistently wrong," not "the planner
-  forgot one field" — the two fields no longer disagree unnoticed.
+  entirely produces silent agreement — nothing to check. A second,
+  narrower check closes the common case: the schema also carries a
+  self-reported `performs_replacement: bool` sibling, and
+  `_check_migration_targets_declared()` flags `MIGRATION_TARGETS_MISSING`
+  when a subtask sets it true but declares no `migration_targets`. This is
+  a same-worker, same-call internal-consistency check, not a self-graded
+  confidence score, and is explicitly **not an independent witness** — a
+  planner wrong on both fields in the same direction still defeats it. It
+  narrows the silent-miss window to "self-consistently wrong," not "forgot
+  one field."
 
 - **Cross-domain (advisory).** `_warn_layer_gaps()` runs on the
   reconciled plan before scheduling and surfaces two heuristic warnings:
@@ -1246,59 +1071,51 @@ mid-run satisfied rescue, §8) the run loops to a wave death.
 `_warn_provider_subset_subtasks()` surfaces this one phase earlier. Reusing
 `_build_predecessor_graph` (so "predecessor" matches the scheduler exactly),
 it flags any subtask whose entire `files_likely_touched` set is a subset of
-the union of its **direct** ordered predecessors' files (predecessors via
-`depends_on` or a `requires`→`provides` tag match; direct edges only, not the
-transitive closure — a subtask owned only by an indirect predecessor is left
-unflagged to keep the signal specific, and the §8 rescue catches it anyway).
-It is **advisory only — never a drop**: a subtask may make a genuinely distinct edit to a shared file, and
-silently deleting it would be a strictly worse failure than an extra worker
-round (the same safe-direction reasoning as the satisfied-probe's
-conservative default). The actual safety net is the post-execution mid-run
-satisfied rescue (§8 *The mid-run sibling case*), which settles such a
-subtask `complete` when its criteria are already met on the run-branch HEAD;
-this warning just lets the operator re-frame the plan before workers run.
+the union of its **direct** ordered predecessors' files (direct edges only —
+a subtask owned only by an indirect predecessor is left unflagged, since the
+§8 rescue catches it anyway). It is **advisory only — never a drop**: a
+subtask may make a genuinely distinct edit to a shared file, and silently
+deleting it would be a strictly worse failure than an extra worker round
+(the satisfied-probe's conservative default). The actual safety net is the
+post-execution mid-run satisfied rescue (§8 *The mid-run sibling case*),
+which settles such a subtask `complete` when its criteria are already met on
+the run-branch HEAD; this warning just lets the operator re-frame the plan
+before workers run.
 
 ### Artifact passing between subtasks
 
 Some subtasks produce a structured deliverable that a downstream subtask
-consumes — a research spec that an implementation subtask reads, a
-parameter set that a configuration subtask applies, a design summary that
-a coding subtask follows. Committing such a deliverable to the worktree
-is the wrong shape: it pollutes the merged branch with a coordination
-document users did not ask for, and it relies on the downstream worker
-inferring relevance from the commit history rather than receiving the
-deliverable through a declared contract.
+consumes — a research spec, a parameter set, a design summary. Committing
+such a deliverable to the worktree is the wrong shape: it pollutes the
+merged branch with a coordination document users did not ask for, and
+relies on the downstream worker inferring relevance from commit history
+rather than receiving it through a declared contract.
 
-The contract for cross-subtask deliverables is therefore separate from
-the contract for code changes. A producing subtask returns an
-`artifacts` field on its implementer result; the orchestrator persists
-the artifacts to `<state-root>/runs/<run-id>/artifacts/<sid>.json` and injects
-them into the prompts of subtasks whose predecessor graph names the
-producer. Code-implementation subtasks emit an absent or empty
-`artifacts` field — the deliverable mechanism does not change for them.
+The contract for cross-subtask deliverables is therefore separate from the
+contract for code changes. A producing subtask returns an `artifacts` field
+on its implementer result; the orchestrator persists them to
+`<state-root>/runs/<run-id>/artifacts/<sid>.json` and injects them into the
+prompts of subtasks whose predecessor graph names the producer.
+Code-implementation subtasks emit an absent or empty field — the mechanism
+does not change for them.
 
 The routing channel is the predecessor graph already used for wave
-ordering. A subtask B receives subtask A's artifacts when either (a) B
-declares `depends_on: ["A"]`, or (b) B declares a `requires` entry whose
-tag matches one of A's `provides`. No separate dependency mechanism is
-needed — the same edges that gate execution also route artifacts. This
-preserves tight-context discipline: a subtask sees only the artifacts of
-its declared upstream, never the run-wide artifact set.
+ordering: a subtask B receives A's artifacts when B declares
+`depends_on: ["A"]` or a `requires` entry matching one of A's `provides`. No
+separate dependency mechanism is needed, and tight-context discipline is
+preserved — a subtask sees only its declared upstream's artifacts, never
+the run-wide set.
 
-The artifacts directory is owned by the orchestrator. Workers do not
-write there directly — the artifact payload travels through the
-implementer result JSON, and the orchestrator materializes the file. The
-`.leerie/` protected boundary stays intact; the artifacts channel exists
-*instead of* widening that boundary. A producer subtask whose only
-output is artifacts is permitted to return `status: "complete"` with no
-commits — the `check_branch_has_commits` gate treats a non-empty
-`artifacts` field as a deliverable that substitutes for a code commit.
-
-This is the sanctioned channel for cross-subtask coordination data that
-should not land on the production branch. Subtasks that need to share
-production code use the existing worktree/commit/integration model; the
-artifacts channel is for the orthogonal case where the data is
-deliberately ephemeral to the run.
+The artifacts directory is owned by the orchestrator; workers never write
+there directly — the payload travels through the implementer result JSON
+and the orchestrator materializes the file, keeping the `.leerie/`
+protected boundary intact. A producer subtask whose only output is
+artifacts may return `status: "complete"` with no commits —
+`check_branch_has_commits` treats a non-empty `artifacts` field as a
+substitute deliverable. This is the sanctioned channel for cross-subtask
+coordination data that should not land on the production branch; subtasks
+sharing production code still use the ordinary worktree/commit/integration
+model.
 
 ### Why waves are sequential
 
@@ -1432,19 +1249,17 @@ split mechanism therefore separates by structural type:
   - **Oversized-file peel (a dense file bundled with a few others).** The tier-1/2
     tiling above operates only on a subtask whose `files_likely_touched` is
     *exactly one* file — a single region can be tiled, a set of files cannot. But
-    the dominant real shape of a dense-file subtask is the file **plus its test
-    file** (measured: 382 two-file subtasks across run history, 244 of them
-    impl+test; feat-005 itself was `[flow-runner.ts, flow-runner.test.ts]`, which
-    is *why* its first fix never engaged the sub-file split). For a small file-set
-    (`1 < len(files) ≤ chunk_size`) where **exactly one** file exceeds
-    `subfile_split_max_span` lines, the mechanism first *peels*: it splits the
-    subtask into a single-file child scoped to the dense file — which re-enters the
-    tier-1/2 tiling above — and a sibling child owning the remaining file(s). The
-    peel is deterministic (a line-count probe, no worker) and generalizes past
-    impl+test. It fires only when exactly one file is oversized: zero oversized
+    the dominant real shape of a dense-file subtask is the file plus its test
+    file (measured: 382 two-file subtasks across run history, 244 of them
+    impl+test). For a small file-set (`1 < len(files) ≤ chunk_size`) where
+    **exactly one** file exceeds `subfile_split_max_span` lines, the mechanism
+    first *peels*: it splits the subtask into a single-file child scoped to the
+    dense file — which re-enters the tier-1/2 tiling above — and a sibling child
+    owning the remaining file(s). The peel is deterministic (a line-count probe,
+    no worker). It fires only when exactly one file is oversized: zero oversized
     files is nothing to peel, and ≥2 oversized files is genuinely coupled
-    multi-file work the LLM splitter should own — both fall through unchanged. The
-    peeled children inherit the parent's edges exactly as the migration/tier
+    multi-file work the LLM splitter should own — both fall through unchanged.
+    The peeled children inherit the parent's edges exactly as the migration/tier
     children do, so `_schedule()`/overlap/integration are unaffected.
 
 **`_recursive_decompose(subtask, depth) → list[leaf_subtasks]`** is the loop:
@@ -1477,32 +1292,27 @@ which made the honest answer unrepresentable: across the corpus the splitter
 returned an empty array 43 times and exactly *one* child 43 more times — and a
 "split" into a single child is a no-op wearing a costume. Every one of those 43
 empty returns was rejected and retried, even though `_recursive_decompose`
-already accepted "no children" as a leaf, deliberately and with its own log
-line. The consumer was correct; the schema rejected the payload before the
-consumer could ever see it.
+already accepted "no children" as a leaf. The consumer was correct; the schema
+rejected the payload before the consumer could ever see it.
 
 **A `WorkerError` from either the `fit_judge` call or the coupled-minority
 `splitter` call degrades that node to leaf**, the same disposition the
 depth cap and the no-progress guard above already reach when they cannot
 establish a confident split: an infrastructure failure mid-decomposition
-(an auth failure, a killed session, PID exhaustion) is uncertainty about
-*this* node, not a reason to discard every fit/split decision the run
-has already paid for elsewhere in the tree. The migration-path splitter
-(label-only mode, invoked from `_label_migration_chunks`) already carried
-this guard — a crash there keeps the code-computed file partition and
-falls back to deterministic per-chunk labels, since `_partition_files`
-already owns the split and the splitter is only titling it. See
-*Credential strategy* in §6 for why this crash barrier matters in
-practice — decomposition routinely accounts for a large share of a run's
-total planning spend, so losing it to a single transient worker failure
-is expensive. `phase_plan` snapshots decomposition progress into state as
-each top-level subtask finishes expanding, mirroring how `plan_snapshot`
-already persists the plan after `_schedule()`; like `plan_snapshot`, this
-is diagnostic only — nothing reads it back. The resumable-planning cursor
-(§6 *Resumable planning*) checkpoints at the coarser `phase_plan`
-granularity (`plans_after_plan`, written only after the whole phase
-returns), so a resume that lands mid-decomposition still re-invokes
-`phase_plan` from scratch rather than rehydrating from
+is uncertainty about *this* node, not a reason to discard every fit/split
+decision the run has already paid for elsewhere in the tree. The
+migration-path splitter (label-only mode, invoked from
+`_label_migration_chunks`) already carried this guard — a crash there
+keeps the code-computed file partition and falls back to deterministic
+per-chunk labels, since `_partition_files` already owns the split and the
+splitter is only titling it. `phase_plan` snapshots decomposition progress
+into state as each top-level subtask finishes expanding, mirroring how
+`plan_snapshot` already persists the plan after `_schedule()`; like
+`plan_snapshot`, this is diagnostic only — nothing reads it back. The
+resumable-planning cursor (§6 *Resumable planning*) checkpoints at the
+coarser `phase_plan` granularity (`plans_after_plan`, written only after
+the whole phase returns), so a resume that lands mid-decomposition still
+re-invokes `phase_plan` from scratch rather than rehydrating from
 `decompose_snapshot`'s partial leaves.
 
 ### Wire-in to `phase_plan`
@@ -1868,44 +1678,28 @@ orchestrator; on local runs the host is the user's workstation. There
 is no architectural path today by which two hosts could attach to the
 same state directory simultaneously.
 
-Concurrent-spawn race between two `resume` launches and the
-stale-pid contagion: two `resume` invocations against the same run
-(an impatient user resuming a run whose orchestrator is still alive,
-a CI retry, etc.) each pass the launcher's fast-path probe — the
-probe is `LOCK_EX | LOCK_NB` then immediate `LOCK_UN`, so it tests
-and releases — and each launcher spawns a child orchestrator. The
-two `State.__init__` calls race in the kernel; the loser (B) gets
-`BlockingIOError` and exits `EXIT_LOCKED=75`. The hazard is **not**
-the duplicate spawn (that is correctly caught) but its by-product:
-the launcher writes `orchestrator.pid` *between* `Popen` and the
-child's `State.__init__`. By the time B exits 75, B's pid is already
-in the file. The winner A's pid is overwritten with a dead pid —
-silently — and every downstream reader of `orchestrator.pid` is now
-wrong about A. `leerie resume`'s in-machine tail watcher prints
-a false "orchestrator exited" banner the moment B's pid is checked
-with `kill -0`; `leerie finalize --force`'s liveness gate sees
-the same dead pid and would happily patch a `finished_at` onto A's
-state mid-run.
+**Concurrent-spawn race between two `resume` launches, and stale-pid
+contagion.** Two `resume` invocations against the same run can each pass
+the launcher's fast-path probe (`LOCK_EX | LOCK_NB` then immediate
+`LOCK_UN` — it tests and releases) and each spawn a child orchestrator.
+The two `State.__init__` calls race in the kernel; the loser (B) gets
+`BlockingIOError` and exits `EXIT_LOCKED=75`. The hazard is not the
+duplicate spawn (correctly caught) but that the launcher writes
+`orchestrator.pid` *between* `Popen` and the child's `State.__init__` —
+by the time B exits 75, B's pid is already in the file, silently
+overwriting winner A's. Every downstream reader of `orchestrator.pid`
+(the `resume` tail watcher's `kill -0` liveness check, `finalize
+--force`'s liveness gate) is then wrong about A: a false "orchestrator
+exited" banner, or a `finished_at` patched onto A's state mid-run.
 
-The fix is two-sided: the launcher's `_launch_script` polls `Popen`
-briefly for `rc=75` (B's flock-loser signal) before writing the
-pid file; if the child exited 75 the file is not touched. Readers
-do not trust the pid file as the sole liveness oracle — both the
-`resume` tail watcher and `finalize --force`'s liveness check
+The fix is two-sided: `_launch_script` polls `Popen` briefly for `rc=75`
+before writing the pid file, and readers do not trust the pid file as
+the sole liveness oracle — both the tail watcher and `finalize --force`
 cross-check via a `/proc` scan for any process whose argv contains
-`orchestrator/leerie.py` AND this run-id. Either anchor catching
-the live orchestrator is sufficient to declare "alive." This makes
-the pid file advisory rather than authoritative: even a future race
-or an unrelated cause that staled the file produces, at worst,
-a false-positive REFUSE (operator-visible) rather than silent
-corruption.
-
-The earlier proposal to reserve a separate exit code for
-`EXIT_LOCKED` (not 75) and teach `decide_teardown` to leave the
-machine alone on that code is orthogonal to this fix and remains
-deferred — once `orchestrator.pid` is no longer authoritative,
-the launcher's `decide_teardown` arms can no longer be misrouted
-by the stale-pid path.
+`orchestrator/leerie.py` AND this run-id. Either anchor catching the live
+orchestrator is sufficient to declare "alive," which makes the pid file
+advisory: even a future race produces, at worst, a false-positive REFUSE
+rather than silent corruption.
 
 ### Never a repository-global git operation
 
@@ -1918,8 +1712,8 @@ three-month `gc.worktreePruneExpire` applies to `git gc`, not to an explicit
 prune), so it drops the registration of every worktree whose path is absent
 from the pruning process's namespace — including each host-side
 `/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates, which no container
-can see. The result is a rebase worktree that git has forgotten while its
-directory still exists.
+can see. The result: a rebase worktree git has forgotten while its directory
+still exists.
 
 So no call site runs one. `prune_leerie_worktrees` (shell) and
 `_prune_leerie_worktrees` (Python) ask git what it *would* prune, attribute
@@ -1940,12 +1734,11 @@ The flock above makes a *run directory* single-owner. It says nothing about two
 runs working the same **task**, because `run_id` is the container id — two
 launches of byte-identical task text are, to each other, invisible.
 
-Measured: one brief ran twice three minutes apart, for **$72.21** across 173
-worker calls, and produced two architecturally incompatible branches — one
-dynamic test route against two static ones, no persistence against a Prisma
-migration — with 14 files in collision and two PRs whose merge order decides
-which design survives. Neither run was wrong. Nothing told either one that the
-other existed (docs/POSTMORTEM-2026-08-14.md, F10).
+Measured: one brief ran twice three minutes apart, for $72.21 across 173
+worker calls, and produced two architecturally incompatible branches with
+14 files in collision — two PRs whose merge order decides which design
+survives. Neither run was wrong; nothing told either one the other existed
+(docs/POSTMORTEM-2026-08-14.md, F10).
 
 So a run records a fingerprint of its task text (`task_sha256` on `run.json`)
 and, before spawning its first worker, refuses to start when another **live**
@@ -2084,14 +1877,13 @@ Bedrock mode (`CLAUDE_CODE_USE_BEDROCK=1` detected in any settings
 file), the launcher additionally stages `~/.aws/` read-only so the
 AWS SDK credential chain can resolve SSO tokens inside the container;
 `awsAuthRefresh` (interactive `aws sso login`) remains a host-side
-operation enforced by a preflight check before the container starts. Trying
-to bind-mount that state into the container was a leaky workaround
-for a structural mismatch: on macOS the SSH agent socket can't cross
-the Lima VM boundary, the gh token bind mount catches stale states,
-and Claude Code's OAuth token is in Keychain rather than any
-mountable file. Moving the network-y phases to the host eliminates
-all of that — the host has working auth for git, gh, and ssh
-because the user already uses them daily.
+operation enforced by a preflight check before the container starts. Bind-mounting that state into the container was a leaky workaround for a
+structural mismatch: on macOS the SSH agent socket can't cross the Lima
+VM boundary, the gh token bind mount catches stale states, and Claude
+Code's OAuth token is in Keychain rather than any mountable file. Moving
+the network-y phases to the host eliminates all of that — the host has
+working auth for git, gh, and ssh because the user already uses them
+daily.
 
 **Local runs** hand off through `run.json` on the bind-mounted host
 filesystem. The orchestrator writes `finished_at` and exits with status 0;
@@ -2105,293 +1897,232 @@ the other direction: the run branch and `.leerie/runs/<run-id>/` state live
 on the Fly Machine's filesystem, not on the host. The launcher resolves
 this with a **stream-back** step before the host-side finalize runs.
 
-The orchestration is structured as a clean-exit EXIT trap
-(`decide_teardown` in `scripts/remote/provision.sh`) so the sync and
-the destroy stay on the same atomic path — sync gates destroy, and
-push + PR sit between them on the host:
+The orchestration is a clean-exit EXIT trap (`decide_teardown` in
+`scripts/remote/provision.sh`) so sync gates destroy, and push + PR sit
+between them on the host:
 
 1. The orchestrator inside the Machine writes `finished_at` to `run.json`
    and exits 0, exactly as in local mode.
 2. The launcher's `decide_teardown` trap fires. On a clean rc
-   (`0 | 10 | 75`) it calls `scripts/remote/fetch-branch.sh`, which:
-   - discovers the completed run-id by scanning `.leerie/runs/*/run.json` on
-     the Machine for a `finished_at`-bearing, unpushed entry;
-   - creates a `git bundle` of `leerie/runs/<run-id>` **and all
-     `leerie/subtasks/<run-id>/*` branches present on the Machine** and
-     pipes it to the host, where `git fetch` materialises the branches in
-     the host's local repo;
-   - tars `.leerie/runs/<run-id>/` on the Machine and extracts it under
-     `$LEERIE_STATE_HOST_DIR/runs/` on the host.
+   (`0 | 10 | 75`) it calls `scripts/remote/fetch-branch.sh`, which
+   discovers the completed run-id by scanning `.leerie/runs/*/run.json` on
+   the Machine for a `finished_at`-bearing, unpushed entry; bundles
+   `leerie/runs/<run-id>` **and all `leerie/subtasks/<run-id>/*` branches
+   present on the Machine** and pipes it to the host, where `git fetch`
+   materialises the branches locally; and tars `.leerie/runs/<run-id>/`
+   on the Machine, extracted under `$LEERIE_STATE_HOST_DIR/runs/`.
 3. With the run dir now on the host, the trap sources
    `scripts/host-finalize.sh` and calls `host_finalize` directly — push
-   + `gh pr create` happen inline, with the host's own auth, before
-   the trap proceeds.
+   + `gh pr create` happen inline, with the host's own auth.
 4. **Only if push succeeds does the trap destroy the machine.** Push
    failure leaves the machine running and prints a recovery banner
-   pointing at `leerie finalize <run-id>`; this mirrors the
-   sync-failure recovery path (work is preserved; the user destroys
-   manually via `leerie kill <run-id>` when satisfied).
+   pointing at `leerie finalize <run-id>`, mirroring the sync-failure
+   recovery path: work is preserved; the user destroys manually via
+   `leerie kill <run-id>` when satisfied.
 
 **Controlled exits write `finished_at` eagerly.** `die()` raises
 `SystemExit`; `main()`'s `except SystemExit` handler writes
-`finished_at` to both `state.json` and `run.json` (best-effort,
-guarded by `st is not None`; `state.json` is additionally guarded by
-`st.data.get("task")` to avoid poisoning the host-side file with a
-bare `{"finished_at": …}` stub when the handler fires before state
-was loaded — e.g. a failed `resume` against an incomplete
-host-side state) before re-raising. It also writes the exit code to
-`orchestrator.exit_code` in the run directory so the tail wrapper can
-propagate it to `decide_teardown`. Without the exit code file, the
-tail wrapper falls back to exit 0 (the pre-exit-code behavior) and
-`decide_teardown` takes the clean-exit branch.
-
-The `finished_at` write remains necessary even with exit code
-propagation: `fetch_branch` needs `finished_at` to discover the run.
-Without this write, every post-setup `die()` (e.g. "unresolved
-subtasks") triggers the sync-failure banner. The value is idempotent
-on `resume`: `phase_finalize` overwrites it with the real completion
-time if the run succeeds on retry.
+`finished_at` to both `state.json` and `run.json` (best-effort, guarded
+by `st is not None`; `state.json` additionally guarded by
+`st.data.get("task")` so the handler firing before state was loaded —
+e.g. a failed `resume` against an incomplete host-side state — never
+poisons the file with a bare `{"finished_at": …}` stub) before
+re-raising, and writes the exit code to `orchestrator.exit_code` so the
+tail wrapper can propagate it to `decide_teardown` (absent that file,
+the wrapper falls back to exit 0 and `decide_teardown` takes the
+clean-exit branch). `fetch_branch` needs the `finished_at` write to
+discover the run at all — without it, every post-setup `die()` triggers
+the sync-failure banner. The value is idempotent on `resume`:
+`phase_finalize` overwrites it with the real completion time if the run
+succeeds on retry.
 
 **`finished_at` is a discovery sentinel, not a completion signal.**
-Because the `except SystemExit` handler stamps `finished_at` on *any*
-post-setup `die()` — including a mid-wave "unresolved subtasks" abort
-with `completed_waves < len(waves)` — `finished_at` alone does not mean
-the run finished its work. A run whose container was OOM-killed mid-wave
-(the orphan case above) can end up with `finished_at` set and only 1 of
-5 waves integrated. Treating `finished_at` as "done" is what makes
-`leerie list` render such a run `done` and lets a stray finalize push
-an incomplete run branch and open a premature PR. **The completion
+The `except SystemExit` handler stamps `finished_at` on *any* post-setup
+`die()`, including a mid-wave abort with `completed_waves <
+len(waves)` — so a container OOM-killed mid-wave can end up with
+`finished_at` set and only some waves integrated. **The completion
 signal is `completed_waves == len(waves)`** (or the documented
-cleared-but-empty terminal state, which sets `waves = []`). `finished_at`
-is left overloaded (the die-path stamp is still needed for run
-discovery); instead, every consumer that would treat a run as *terminal*
-cross-checks wave completion against `state.json` (which alone carries
-`completed_waves`/`waves` — `run.json` never does). Three gates enforce
-this, all reading the same signal:
+cleared-but-empty terminal state, `waves = []`); `finished_at` stays
+overloaded (the die-path stamp is still needed for discovery) and every
+consumer that treats a run as *terminal* instead cross-checks wave
+completion against `state.json`. Three gates enforce this:
 
 1. `_derive_run_status` returns `incomplete` (not `done`) when
    `finished_at` is set but `completed_waves < len(waves)` and the run is
-   neither killed nor paused — so `leerie list` never mislabels a
-   crashed run.
+   neither killed nor paused.
 2. `phase_finalize`'s entry `die()`s rather than writing the real
-   `finished_at` when `completed_waves < len(waves)` — a defensive guard,
-   since the normal wave loop only reaches finalize after all waves
-   integrate.
+   `finished_at` when `completed_waves < len(waves)` (a defensive guard —
+   the normal wave loop only reaches finalize after all waves integrate).
 3. **`host_finalize` (the load-bearing gate) refuses the push+PR** when
    `state.json` shows `completed_waves < len(waves)` and not
-   `no_work_required`. The push is host-side, and *all three* host-side
-   push paths — the launcher's auto-finalize block, the `leerie
-   finalize <id>` verb, and Fly's `decide_teardown` — funnel through
-   `host_finalize`, so this single gate covers them all. It fails open
-   when `state.json` is absent so a legitimately complete run is never
-   blocked.
+   `no_work_required`. All three host-side push paths — the launcher's
+   auto-finalize block, `leerie finalize <id>`, and Fly's
+   `decide_teardown` — funnel through `host_finalize`, so this one gate
+   covers them all. It fails open when `state.json` is absent.
 
 A genuine completion is unaffected: by the time `phase_finalize` and
-`host_finalize` run on a real completion, `completed_waves == len(waves)`.
+`host_finalize` run, `completed_waves == len(waves)`.
 
 **Recovery when the orchestrator dies before `finished_at`.** An
-uncontrolled exit — SIGKILL, OOM, power loss, or any crash that
-bypasses the `except SystemExit` handler — before `phase_finalize`
-leaves a run that `fetch-branch.sh` cannot discover (its predicate
-requires `finished_at` set + `pushed_at` unset). For these cases,
-`leerie finalize <run-id>` SSHes into the machine, verifies the
-orchestrator process is dead (via the `orchestrator.pid` file and
-`/proc/<pid>/cmdline`), patches `finished_at` into `run.json` along with
-audit fields `recovered_at` and `recovered_via="force-finalize"`, and
-then falls through to the normal finalize flow. If the orchestrator is
-still alive, the non-force path refuses with a message naming the
-live pid and suggests `--force`.
+uncontrolled exit (SIGKILL, OOM, power loss, or any crash bypassing the
+`except SystemExit` handler) before `phase_finalize` leaves a run
+`fetch-branch.sh` cannot discover (its predicate requires `finished_at`
+set + `pushed_at` unset). For these cases, `leerie finalize <run-id>`
+SSHes into the machine, verifies the orchestrator process is dead (via
+`orchestrator.pid` and `/proc/<pid>/cmdline`), patches `finished_at`
+into `run.json` with audit fields `recovered_at` and
+`recovered_via="force-finalize"`, and falls through to the normal
+finalize flow. If the orchestrator is still alive, the non-force path
+refuses with a message naming the live pid and suggests `--force`.
 
 **Subtree collection.** When the orchestrator dies mid-wave, subtask
 branches (`leerie/subtasks/<run-id>/<sid>`) may have committed work
-that was never integrated into the run branch. `finalize` detects
-un-integrated subtask branches on the machine, runs `setup-run.sh` to
-ensure the staging worktree exists, and merges each un-integrated
-branch via `integrate.sh`. Conflicts are resolved by spawning a
-`claude -p` integrator worker — the same prompt, schema, and
-verification as the orchestrator's `integrate_wave()`. The machine
-has `claude` CLI, the integrator prompt, and seeded auth. Branches
-the integrator cannot resolve (design-conflict or failed) are skipped
-and reported. The collection step runs after the `finished_at` patch
-and before `fetch_branch` streams the result to the host.
-
-**Defense in depth: bundle scope vs. subtree collection.**
-`fetch-branch.sh` bundles subtask branches alongside the run branch so
-that even if integration never ran (crash, OOM, power loss between
-subtask completion and integration), the raw work is recoverable on
-the host. `collect_subtrees_remote` remains the on-machine
-integration mechanism (merging subtask branches into the run branch
-before fetch). The two are complementary: collection integrates; the
-expanded bundle scope preserves.
+never integrated into the run branch. `finalize` detects un-integrated
+subtask branches, runs `setup-run.sh` to ensure the staging worktree
+exists, and merges each via `integrate.sh` — conflicts resolved by
+spawning a `claude -p` integrator worker (same prompt, schema, and
+verification as `integrate_wave()`). Branches the integrator cannot
+resolve are skipped and reported. This runs after the `finished_at`
+patch and before `fetch_branch` streams the result to the host.
+`fetch-branch.sh`'s bundle already carries the raw subtask branches
+independent of whether collection ran, so a crash between subtask
+completion and integration is still recoverable on the host: collection
+integrates, the bundle scope preserves.
 
 **`--force`: stop the orchestrator, then collect.** `leerie finalize
-<run-id> --force` extends the recovery path to runs where the
-orchestrator is still alive. It SIGTERMs the orchestrator process
-inside the machine (the *process*, not the machine — the machine must
-stay running for the subsequent collection and fetch steps), waits for
-it to die (polling `/proc`; escalates to SIGKILL after 30 s), then
-proceeds with the same subtree-collection and `finished_at`-patch
-flow. The orchestrator's SIGTERM handler runs
-`_cleanup_on_abnormal_exit(full_purge=False)`, which removes worktrees
-but preserves all branches — `setup-run.sh` (idempotent) recreates the
-staging worktree, and the collection step integrates from the preserved
-branches. This makes the manual "attach, hand-edit
-JSON, re-run" recovery procedure (last documented in
-`docs/IMPLEMENTATION.md` §6) unnecessary while preserving the audit
-trail of recovered runs.
+<run-id> --force` extends recovery to runs where the orchestrator is
+still alive. It SIGTERMs the orchestrator process inside the machine
+(not the machine, which must stay running for collection and fetch),
+waits for it to die (polling `/proc`, escalating to SIGKILL after 30s),
+then runs the same subtree-collection and `finished_at`-patch flow. The
+SIGTERM handler runs `_cleanup_on_abnormal_exit(full_purge=False)`,
+which removes worktrees but preserves all branches, so `setup-run.sh`
+(idempotent) recreates the staging worktree and collection integrates
+from what survived.
 
 The local-runtime path runs the same `host_finalize` block inline in
-the launcher (no trap is needed; the launcher and the pusher are the
-same process). Both paths share `scripts/host-finalize.sh`; the
-recovery command `leerie finalize <run-id>` also sources it. Three
-call sites, one finalize implementation.
+the launcher (no trap needed — launcher and pusher are the same
+process). Both paths share `scripts/host-finalize.sh`; the recovery
+command `leerie finalize <run-id>` also sources it. Three call sites,
+one finalize implementation.
 
 **`no_push`: intent vs mechanism.** The orchestrator inside the Machine
 is *always* invoked with `--no-push` because the Fly Machine has no
-GitHub auth — it cannot push regardless of user intent. This is a
-**mechanism flag**, not the user's preference. The user's actual
-launch-time intent is a separate signal: it lives in
+GitHub auth — a **mechanism flag**, not the user's preference. The
+user's actual launch-time intent lives separately in
 `fly-machine.json.host_no_push` on the host (set by `provision.sh` at
-machine creation) and is propagated *into* the Machine via a hidden
-`--host-no-push true|false` argv flag that the launcher appends to
-the orchestrator invocation. The orchestrator gates `pr_writer` and
-the `run.json.no_push` it writes on **intent**
-(`push_will_happen(no_push, host_no_push)` in `orchestrator/leerie.py`),
-not on the mechanism flag. The host's `host_finalize` reads the
-intent value from `run.json.no_push` and skips push if the user opted
-out at launch. This split is load-bearing: without it, `pr_writer`
-never runs on Fly (the mechanism flag silences it) and the LLM-written
-PR body is replaced by the deterministic fallback.
+machine creation) and is propagated into the Machine via a hidden
+`--host-no-push true|false` argv flag. The orchestrator gates
+`pr_writer` and the `run.json.no_push` it writes on **intent**
+(`push_will_happen(no_push, host_no_push)`), not the mechanism flag,
+and `host_finalize` reads that intent value to decide whether to skip
+push. This split is load-bearing: without it, `pr_writer` never runs
+on Fly and the LLM-written PR body is replaced by the deterministic
+fallback.
 
-The run branch is pushed to `origin` and a pull request is opened
-via `gh pr create` against the working branch (the branch
-HEAD-at-run-start) by default. **This PR base is overridable** —
-`--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in
-`leerie.toml` lets the user merge into a different final branch (e.g. a
-release branch) without changing where the run's diff is computed from.
-`working_branch` always remains the diff fork-point
-(`rev_range = working_branch..run_branch`) regardless of this override —
-splitting the two roles avoids corrupting the diff base if the override
-branch isn't the actual point the run forked from. The PR title and body
-are written by an LLM worker (`pr_writer`, defaults to Sonnet) that runs
-inside the container right before it exits — placed there because that is where
-`claude -p` is available and where the bind-mounted user repo is
-readable. The worker reads the target repo's PR template if one
-exists (canonical GitHub locations: `.github/pull_request_template.md`,
-`pull_request_template.md`, `docs/pull_request_template.md`, then any
-`PULL_REQUEST_TEMPLATE/` directory) and fills it out faithfully —
-preserving HTML comments, leaving checklists unticked unless the diff
-demonstrably satisfies them, honoring "delete if N/A" markers. When
-no template is present, the worker produces a default structure
-(Summary / What changed / Why / Run metadata) grounded in the run's
-actual commits.
+The run branch is pushed to `origin` and a pull request opened via
+`gh pr create` against the working branch (HEAD-at-run-start) by
+default. **This PR base is overridable** — `--pr-base-branch` /
+`LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` lets the
+user merge into a different final branch without changing where the
+diff is computed from. `working_branch` always remains the diff
+fork-point (`rev_range = working_branch..run_branch`) regardless of
+this override, so the diff base never corrupts if the override branch
+isn't the actual fork point.
 
-The worker's primary signal is the **commit log**
-(`git log --no-merges working_branch..run_branch`) — every implementer
-and conformer worker wrote those commit messages as it landed a
-subtask, so they already describe the work in domain language. A
-diff-stat, dirstat, and sampled hunks from the heaviest-changed files
-(capped to keep the prompt within budget) supplement the log.
-Subtask titles from the planner are passed through verbatim. The
-launcher prepends `leerie: ` to the worker's title so leerie-opened PRs
-stay easy to spot in lists.
+The PR title and body are written by an LLM worker (`pr_writer`,
+defaults to Sonnet) that runs inside the container right before it
+exits, where `claude -p` and the bind-mounted repo are both available.
+The worker reads the target repo's PR template if one exists (canonical
+GitHub locations, then any `PULL_REQUEST_TEMPLATE/` directory) and
+fills it out faithfully — preserving HTML comments, leaving checklists
+unticked unless the diff demonstrably satisfies them, honoring "delete
+if N/A" markers; absent a template it produces a default structure
+(Summary / What changed / Why / Run metadata). Its primary signal is
+the **commit log** (`git log --no-merges working_branch..run_branch`),
+since every implementer/conformer worker already wrote those messages
+in domain language as it landed a subtask; a capped diff-stat, dirstat,
+and sampled hunks from the heaviest-changed files supplement it.
+Subtask titles pass through verbatim; the launcher prepends `leerie: `
+to the title.
 
-The worker writes its output to `run.json` (`pr_title`, `pr_body`,
-`pr_template_used`) — the same container→host handoff channel the
-launcher already uses for `finished_at` / `pushed_at` / `pr_url`.
-The host launcher reads those fields with `jq` and passes them to
-`gh pr create`. This is a **fail-open** path: any failure (worker
-error, schema mismatch, timeout, worker budget exhausted, oversized
-payload) is logged and swallowed; the launcher falls back to a
-deterministic body composed from `state.json` fields (the shape
-documented by `compose_pr_body` in `orchestrator/leerie.py`).
-Generating a richer body must never block finalize success.
+The worker writes `pr_title`/`pr_body`/`pr_template_used` to `run.json`
+— the same container→host handoff channel used for
+`finished_at`/`pushed_at`/`pr_url` — and the host launcher passes them
+to `gh pr create` via `jq`. This is **fail-open**: any failure (worker
+error, schema mismatch, timeout, budget exhaustion, oversized payload)
+is logged and swallowed, falling back to a deterministic body composed
+from `state.json` (`compose_pr_body`). Generating a richer body must
+never block finalize success.
 
-When the target repo has multiple templates inside a
-`PULL_REQUEST_TEMPLATE/` directory, the alphabetically first `.md`
-wins by default. `--pr-template <name>` (also `LEERIE_PR_TEMPLATE`,
-`pr_template` in `leerie.toml`) overrides the choice. A selector that
-does not match an existing template is **not fatal** — leerie logs a
-warning and falls back to the alphabetical default rather than
-blocking finalize over a cosmetic preference.
+When the target repo has multiple templates inside
+`PULL_REQUEST_TEMPLATE/`, the alphabetically first `.md` wins by
+default; `--pr-template <name>` (also `LEERIE_PR_TEMPLATE`,
+`pr_template` in `leerie.toml`) overrides. A non-matching selector is
+not fatal — leerie warns and falls back to the alphabetical default.
 
 **Rebase-onto-base before push (`rebaser` worker) — a scoped, fully-agentic
 exception to §12.** A run that takes a while can finish against a
 `pr_base_branch` that has since moved, so the PR it opens conflicts at merge
-time or is stale by the time a human reviews it. `host_finalize` addresses this
-with a best-effort rebase step, inserted after the empty-branch guard and
-before the push, that is deliberately **not** driven by mechanical bash
-rebase/conflict/abort logic. Instead, a single autonomous worker (`rebaser`,
-Sonnet, `EFFORT_DEFAULT_PER_WORKER["rebaser"] = "medium"` matching
-`integrator`) is handed a disposable `git worktree add` copy of the run branch
-and told, in natural language, to fetch the latest `pr_base_branch`, rebase the
-run's own commits (`working_branch..run_branch`) onto it, resolve any
-conflicts itself — preserving the intent of *both* the run's changes and the
-upstream changes — and, if a conflict is genuinely semantically irreconcilable
-(not merely textually messy), abort the rebase itself and leave the branch
-untouched. It reports a schema-validated verdict
-(`status ∈ {rebased, irreconcilable, failed}` + `diagnosis` — the same
-trichotomy shape as `SCHEMAS["integrator"]`).
+time or is stale by review. `host_finalize` addresses this with a best-effort
+rebase step, inserted after the empty-branch guard and before the push, that
+is deliberately **not** driven by mechanical bash rebase/conflict/abort
+logic. Instead a single autonomous worker (`rebaser`, Sonnet,
+`EFFORT_DEFAULT_PER_WORKER["rebaser"] = "medium"`, matching `integrator`) is
+handed a disposable `git worktree add` copy of the run branch and told to
+fetch the latest `pr_base_branch`, rebase the run's own commits
+(`working_branch..run_branch`) onto it, resolve any conflicts itself —
+preserving the intent of both the run's changes and upstream's — and abort
+the rebase itself, leaving the branch untouched, if a conflict is genuinely
+semantically irreconcilable rather than merely textually messy. It reports a
+schema-validated verdict (`status ∈ {rebased, irreconcilable, failed}` +
+`diagnosis`, the same trichotomy shape as `SCHEMAS["integrator"]`).
 
 This is a **named, deliberately scoped exception** to §12 ("prompts are
-advisory, code enforces"), not a change to that principle. §12 already has one
-precedent for this shape of carve-out: `--dangerously-skip-permissions` is "a
-documented breach of the §12 contract for that single invocation, not a
-softening of the contract." The `rebaser` worker is the same kind of exception,
-narrower still — scoped to one worker acting inside one disposable worktree,
-not a global run-level flag. The reasoning for the carve-out here is that the
-*procedure itself* (switch branches, detect a conflict, judge whether it is
-resolvable, resolve or abort) is not usefully decomposable into mechanically
-checkable sub-steps the way, say, "did the merge commit complete" is for
-`integrator` — the abort-or-resolve judgment call *is* the task, not a
-judgment layered on top of otherwise-mechanical git plumbing. This was
-validated empirically before being adopted: two live trials (a resolvable
+advisory, code enforces"), the same shape as the existing
+`--dangerously-skip-permissions` carve-out, narrower still: scoped to one
+worker acting inside one disposable worktree, not a run-level flag. The
+carve-out is warranted because the procedure itself — switch branches, detect
+a conflict, judge whether it is resolvable, resolve or abort — is not usefully
+decomposable into mechanically checkable sub-steps the way "did the merge
+commit complete" is for `integrator`; the abort-or-resolve judgment call *is*
+the task. Validated empirically before adoption: two live trials (a resolvable
 adjacent-line conflict, and a genuinely irreconcilable same-function
-mutually-exclusive business-logic conflict) both produced the intended
-outcome on the first attempt, independently confirmed by inspecting the
-resulting git state rather than trusting the worker's self-report.
+mutually-exclusive conflict) both produced the intended outcome, confirmed by
+inspecting the resulting git state rather than trusting the worker's
+self-report.
 
 What stays mechanical, because it is cheap, objective, and losing it would be
-a regression rather than "unnecessary brittleness":
+a real regression:
 
 - **Isolation.** The worker never operates on the user's real checkout or the
   run's primary worktree — only a disposable `git worktree add` copy, matching
   the containment already used for every other `ACT_TOOLS` + `autonomous=True`
-  worker (`implementer`, `conformer`, `integrator` — see §6 above; none of
-  their call sites pass a real-repo `cwd`).
+  worker (`implementer`, `conformer`, `integrator` — see §6; none of their call
+  sites pass a real-repo `cwd`).
 - **Post-hoc mechanical verification of the claimed outcome**, not of the
   reasoning behind it: on `status: "rebased"`, `host_finalize` confirms the
-  worktree has no conflict markers and is not mid-rebase (no
-  `.git/rebase-merge` / `.git/rebase-apply`); on `status ∈ {irreconcilable,
-  failed}`, it confirms the worktree's tip is unchanged from the pre-rebase run
-  branch. This mirrors the existing discipline that "the orchestrator does not
-  trust an integrator's 'resolved' claim; it confirms the merge was actually
-  completed" (§12) — applied here as a new, small, purpose-built check (no
-  existing integrator-side check is reusable: `check_integrator_output` is a
-  no-op stub today, delegated to a separate `integration_judge` LLM gate per
-  §8, and `check_integrator_commit` verifies an unrelated invariant — that the
-  integrator's commit never touches `.leerie/` coordination files).
+  worktree has no conflict markers and is not mid-rebase; on
+  `status ∈ {irreconcilable, failed}`, it confirms the worktree's tip is
+  unchanged from the pre-rebase run branch — the same "don't trust an
+  integrator's self-report" discipline §12 already establishes.
 - **`working_branch` bookkeeping.** A rebase changes the run branch's parent
   chain, so a naive `working_branch..run_branch` diff after rebasing would
-  silently pick up unrelated upstream commits (verified directly: `git rebase
-  --onto NEWBASE UPSTREAM BRANCH` replays only `UPSTREAM..BRANCH`, and if
-  `UPSTREAM` — `working_branch` — sits behind `NEWBASE`, a later two-dot diff
-  against the stale `working_branch` includes `NEWBASE`'s own delta too). Only
-  on a verified successful rebase does `host_finalize` advance `working_branch`
-  to `origin/<pr_base_branch>`, in both the git-ref sense and in `run.json`, so
-  `rev_range`/`DIFF_BASE` keep computing the PR diff correctly. On an aborted
+  silently pick up unrelated upstream commits. Only on a verified successful
+  rebase does `host_finalize` advance `working_branch` to
+  `origin/<pr_base_branch>` (both as a git ref and in `run.json`) so
+  `rev_range`/`DIFF_BASE` keep computing the PR diff correctly; on an aborted
   or failed rebase, `working_branch` is left untouched.
 - **Routing the outcome to the right push path.** `host_finalize` reads the
   worker's schema-validated verdict and branches on it — push the rebased
-  branch, or push the original branch with the worker's `diagnosis` folded into
-  the PR body — without re-deriving or second-guessing *how* the worker
-  reached that verdict.
+  branch, or push the original branch with the worker's `diagnosis` folded
+  into the PR body — without re-deriving *how* the worker reached that
+  verdict.
 - **Never blocking the run.** Every branch of this logic (worktree-creation
-  failure, a successful rebase, a resolved conflict, an aborted rebase, a
-  worker seam failure, or a worker response that comes back malformed —
-  unparseable or missing a usable `status` field despite the seam itself
-  exiting cleanly) falls through to a push; the rebase step is strictly
-  best-effort and never returns non-zero, pauses, or blocks finalize.
+  failure, success, a resolved conflict, an aborted rebase, a worker seam
+  failure, or a malformed worker response) falls through to a push — the
+  rebase step is strictly best-effort and never returns non-zero, pauses, or
+  blocks finalize.
 
 Two flags control push and PR independently of body composition:
 
@@ -2406,76 +2137,60 @@ Two flags control push and PR independently of body composition:
 
 **A `pre-push` hook is a gate on the host, not on the run — so it is
 probed at run start.** git runs `pre-push` in the repository root against
-whatever is *checked out*. leerie never checks out the run branch: the
+whatever is *checked out*. leerie never checks out the run branch — the
 push happens from the user's own checkout, and the finalize rebase uses a
-disposable worktree. So a hook that lints, typechecks, or tests the
-working tree is measuring the host's state, and it can reject a push for
-reasons no run could have caused or prevented — a stale `node_modules`, a
-tool missing from the hook's `sh` PATH, a half-finished dependency bump.
-This is not hypothetical: every recorded push rejection in one operator's
-state directory was of exactly this shape, and the most expensive one
-arrived after 2h19m and $57 of work.
+disposable worktree — so a hook that lints, typechecks, or tests the
+working tree measures the host's state and can reject a push for reasons
+no run could have caused or prevented (a stale `node_modules`, a tool
+missing from the hook's PATH, a half-finished dependency bump). Measured:
+every recorded push rejection in one operator's state directory was of
+exactly this shape, the most expensive arriving after 2h19m and $57 of work.
 
-The design consequence is that leerie does not treat that gate as a
-verdict on the run — it already ran the equivalent checks in-container, on
-the tree that actually holds the changes — but it also cannot ignore it,
-because the push genuinely will not happen. What it can do is move the
-discovery to the cheapest moment. Because the hook reads the host
-checkout, and leerie does not modify the host checkout during a run, a
-probe at run start predicts the finalize outcome *by construction* rather
-than by luck. `git push --dry-run` runs the hook and creates no ref, so
-that probe is free of side effects; the launcher runs it during host
-preflight and warns. It warns rather than refuses: a hook can legitimately
-fail on a tree the run is about to fix, and a preflight must never become a
-new way to decline to start. A chain probes once per *wave* rather than once
-per job — its jobs share a single checkout, so N probes would compute one
-answer N times concurrently — while a group probes per member, because its
-members are separate repositories and so are genuinely separate questions.
-This is the same "fail fast at the cheapest
-moment" reasoning §13 applies to budget feasibility — spend nothing to
-learn something the end of the run would otherwise charge full price for.
+leerie does not treat that gate as a verdict on the run — it already ran
+the equivalent checks in-container — but cannot ignore it either, since the
+push genuinely will not happen. Because the hook reads the host checkout,
+which leerie never modifies during a run, a probe at run start predicts the
+finalize outcome by construction. `git push --dry-run` runs the hook and
+creates no ref, so the launcher runs it during host preflight and warns
+(never refuses — a hook can legitimately fail on a tree the run is about to
+fix, and a preflight must never become a new way to decline to start). A
+chain probes once per *wave* (its jobs share one checkout, so N probes
+would compute one answer N times concurrently); a group probes per member,
+since its members are separate repositories. Same "fail fast at the
+cheapest moment" reasoning §13 applies to budget feasibility.
 
 **Push and PR are honest about failure.** A push or PR step that fails does
 not pretend the run failed: the local work is intact and reachable on the
 run branch. The orchestrator records what was attempted and what failed in
 a per-run sidecar (`run.json` — `pushed_at`, `push_error`, `pr_url`,
-`pr_error`). Push failure exits non-zero with a multi-line message that
-names the run branch (where the work lives), the working branch
-(unchanged from run start — the diff fork-point), and the PR base branch
-(`pr_base_branch`, which defaults to `working_branch` — see
-`docs/IMPLEMENTATION.md` "PR base branch override"), shows the captured push
-output — stderr plus any pre-push hook stdout, since git forwards a hook's
-stdout to its own and that is where `tsc` and `biome` report — and gives the
-exact retry command. PR-creation failure is treated
-as non-fatal: the push has already succeeded, so the user receives a
-warning with the GitHub URL of the pushed branch and the exact `gh pr
-create` command to retry. The principle is that the user always knows
-exactly what state things are in and exactly which branch holds the work
-to be resolved.
+`pr_error`). Push failure exits non-zero with a message naming the run
+branch (where the work lives), the working branch (the diff fork-point,
+unchanged from run start), and the PR base branch (`pr_base_branch`,
+defaulting to `working_branch`), shows the captured push output — stderr
+plus any pre-push hook stdout, since git forwards a hook's stdout to its
+own and that is where `tsc`/`biome` report — and gives the exact retry
+command. PR-creation failure is non-fatal: the push already succeeded, so
+the user gets a warning with the pushed branch's URL and the exact `gh pr
+create` retry command. The user always knows exactly what state things are
+in and which branch holds the work.
 
-**`pushed_at` gates re-finalize by branch position, not by mere presence.**
-A re-invoked finalize (`leerie finalize`, a second launcher pass, or
-Fly's `decide_teardown`) must be idempotent, so a run whose `pushed_at` is
-already set is normally a no-op. But `pushed_at` records *that* a push
-happened, not *what* it pushed: a finalize that fired while the run was
-still integrating (e.g. a mid-wave `die()` stamped `finished_at` early,
-before the completion gate existed) can leave `pushed_at` set on a
-**partial** branch — and the completion gate only refuses the *first*
-premature push, not a later correct one. So the short-circuit compares the
-local run-branch tip against the pushed origin tip: **equal tips → no-op**
-(the common case, including every fully-pushed chain wave); **origin a
-strict ancestor of the local tip (or origin absent) → fast-forward
-re-push + re-open the PR**, gated behind the same completion check
-(`completed_waves == len(waves)`, which itself *fails open* on a
-missing/unreadable `state.json` — see gate #3 above — so the re-push is
-gated only when that signal is available). A *diverged* origin (has
-commits the local branch lacks) is **not** treated as a partial push: it
+**`pushed_at` gates re-finalize by branch position, not mere presence.** A
+re-invoked finalize (`leerie finalize`, a second launcher pass, Fly's
+`decide_teardown`) must be idempotent, so a run whose `pushed_at` is
+already set is normally a no-op — but `pushed_at` records *that* a push
+happened, not *what* it pushed, and a finalize that fired while the run
+was still integrating can leave it set on a **partial** branch. So the
+short-circuit compares the local run-branch tip against the pushed origin
+tip: **equal tips → no-op** (the common case); **origin a strict ancestor
+of the local tip (or origin absent) → fast-forward re-push + re-open the
+PR**, gated behind the same completion check
+(`completed_waves == len(waves)`, itself fail-open on a missing
+`state.json`). A **diverged** origin is not treated as a partial push — it
 keeps the idempotent short-circuit rather than attempting a push that
-could not fast-forward. This keeps a partial-push from permanently
-wedging a run while preserving idempotency and the chain wave-skip signal
-(which reads the `pushed_at` field, still set, not the tip). It does not
-weaken the run.json invariants: a re-push keeps `pushed_at` set and, on
-success, sets `pr_url` — `pr_url ⇒ pushed_at` still holds.
+cannot fast-forward. This prevents a partial push from permanently wedging
+a run while preserving idempotency, the chain wave-skip signal (which reads
+`pushed_at`, still set, not the tip), and the invariant `pr_url ⇒
+pushed_at`.
 
 **Why push by default.** When leerie is invoked in CI or any unattended
 context, a successful run that leaves work only on a local branch is a
@@ -2503,75 +2218,64 @@ completely scrub a finished run can do so with
 **A containerized headless run must prefer the long-lived token.** The
 host's interactive Claude Code session authenticates with a short-lived
 subscription OAuth token — corroborated at roughly 8h, though the exact
-TTL is undocumented and community reports range 2–15h, so leerie never
-hard-codes a duration; it reads the credential's own `expiresAt` field,
-which is authoritative per-token. That token is refreshable, but only by
-the interactive host session that owns it: Claude Code renews it
-silently in the background while the user is logged in.
+TTL is undocumented (community reports range 2–15h), so leerie never
+hard-codes a duration and instead reads the credential's own
+authoritative `expiresAt` field. That token is refreshable only by the
+interactive host session that owns it — Claude Code renews it silently
+in the background while the user is logged in.
 
-A leerie container cannot participate in that renewal. Per *Finalization*
-above, Keychain and `~/.claude/.credentials.json` never traverse the
-Lima VM boundary directly — the launcher instead copies whatever
-credential it resolves into a fresh `mktemp -d` staging directory and
-bind-mounts that staging dir read-through into the container. What the
-container holds is therefore a **snapshot**, not a live view: it cannot
-refresh a token whose refresh state lives in the host's Keychain, and
-Anthropic's refresh flow **rotates the refresh token on every use** — so
-even if a container-side refresh somehow succeeded, it would silently
-invalidate the host's own copy out from under the still-running
+A leerie container cannot participate in that renewal. Keychain and
+`~/.claude/.credentials.json` never traverse the Lima VM boundary
+directly — the launcher copies whatever credential it resolves into a
+fresh `mktemp -d` staging directory and bind-mounts it read-through into
+the container, so the container holds a **snapshot**, not a live view.
+It cannot refresh a token whose refresh state lives in the host's
+Keychain, and Anthropic's refresh flow **rotates the refresh token on
+every use** — a container-side refresh, even if it succeeded, would
+silently invalidate the host's own copy out from under the still-running
 interactive session. Copied subscription credentials are documented
 upstream as not refreshing at all once removed from their original
 context (anthropics/claude-code#21765). Container-side token refresh is
-therefore **architecturally impossible**, not merely unimplemented, and
-is explicitly out of scope for any fix here.
+therefore **architecturally impossible**, not merely unimplemented.
 
-The credential Anthropic's own docs prescribe for exactly this situation
-is the **long-lived OAuth token** minted by `claude setup-token` — a
-token that lasts roughly a year, is meant for CI/automation contexts
-where interactive login isn't available, and — critically — **still
-authenticates against the user's Claude subscription rather than the
-API**, so it preserves leerie's no-API-key constraint (the run continues
-to bill against the subscription plan, not pay-per-token API usage).
-Anthropic's own error reference states that sessions authenticated via
-`CLAUDE_CODE_OAUTH_TOKEN` (or an API key, or a third-party provider)
-never see the "OAuth session expired" failure at all, because they never
-depend on the saved, host-refreshed login. A container invoked with
-`$CLAUDE_CODE_OAUTH_TOKEN` set is therefore immune to the mid-run
-expiry class of failure by construction, not by any retry or backoff
-leerie adds on top.
+The credential Anthropic's own docs prescribe for this situation is the
+**long-lived OAuth token** minted by `claude setup-token` — lasting
+roughly a year, meant for CI/automation, and — critically — still
+authenticating against the user's Claude subscription rather than the
+API, preserving leerie's no-API-key constraint. Sessions authenticated
+via `CLAUDE_CODE_OAUTH_TOKEN` never see the "OAuth session expired"
+failure at all, per Anthropic's own error reference, because they never
+depend on the saved, host-refreshed login — a container invoked with it
+set is immune to the mid-run expiry class of failure by construction,
+not by any retry or backoff leerie adds on top.
 
 Consequently, credential resolution takes `$CLAUDE_CODE_OAUTH_TOKEN`
-**first**, ahead of Keychain and the credentials file. This is an
-inversion of the historical precedence (which resolved Keychain, then
-the file, then the env var) — the historical order silently preferred
-the 8h token even when a user had gone to the trouble of minting a
-durable one. A user who has set nothing is unaffected: resolution falls
-back to Keychain, then the file, exactly as before. The emitted JSON
-shape is unchanged regardless of which branch resolved the credential
+**first**, ahead of Keychain and the credentials file — an inversion of
+the historical precedence, which silently preferred the 8h token even
+when a user had minted a durable one. A user who has set nothing is
+unaffected: resolution falls back to Keychain, then the file, as before.
+The emitted JSON shape is unchanged regardless of which branch resolved
+the credential
 (`{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` — the
 `scopes` field is required by the CLI's file-auth path, which rejects a
 scope-less blob as "Not logged in"), matching what `seed-auth.sh`
-already stages into the container's `~/.claude/.credentials.json`.
+already stages into the container.
 
 **Keychain/file resolution requires a real token, not just non-empty
 JSON.** The macOS Keychain entry and `~/.claude/.credentials.json` are
 shared with Claude Code's own MCP-server OAuth state — a documented
 upstream bug (steipete/CodexBar#1844) lets a background MCP-plugin auth
-flow (e.g. the Supabase/Stripe/Vercel Claude Code plugins performing
-Dynamic Client Registration) overwrite the shared `Claude
-Code-credentials` Keychain item with only `{"mcpOAuth": {...}}`,
-dropping `claudeAiOauth` — the actual Claude session token — entirely.
-That blob is syntactically valid, non-empty JSON, so a presence-only
-check (`[ -z "$creds" ]`) accepts it, stages it into the container, and
-the CLI there fails with "Not logged in · Please run /login" despite the
-launcher having reported success. Both the Keychain and on-disk-file
-branches therefore additionally require a non-empty
-`claudeAiOauth.accessToken` in the resolved blob before accepting it; a
-blob failing that check is treated as if that source were empty and
+flow overwrite the shared `Claude Code-credentials` Keychain item with
+only `{"mcpOAuth": {...}}`, dropping `claudeAiOauth` (the actual session
+token) entirely. That blob is syntactically valid, non-empty JSON, so a
+presence-only check accepts it, stages it into the container, and the
+CLI fails with "Not logged in" despite the launcher reporting success.
+Both the Keychain and on-disk-file branches now additionally require a
+non-empty `claudeAiOauth.accessToken` before accepting the blob; a blob
+failing that check is treated as if that source were empty and
 resolution falls through the same chain (Keychain → file → the existing
-"could not extract credentials" hint), rather than short-circuiting on a
-false positive. This does not change the precedence order above, only
-what counts as "found" at the Keychain/file layer.
+"could not extract credentials" hint) rather than short-circuiting on a
+false positive.
 
 **The expiry preflight is best-effort, not a hard gate.** Before staging
 a resolved *subscription* credential (the long-lived token has no
@@ -2596,67 +2300,53 @@ the pattern already proven for AWS SSO token freshness in
 
 **Auth failures split into two classes with different remedies.**
 `_is_auth_or_quota_failure` (see *Cleanup on abnormal exit* below for
-the full rate-limit/quota taxonomy) already treats numeric 401/429/529
-statuses as **transient**: the gateway rejected one request, but a
-retry after backoff has a real chance of succeeding once the rolling
-usage window clears or gateway overload subsides. An expired or revoked
-*session* is categorically different — Claude Code's own error handling
-clears the saved credential locally and, per Anthropic's docs, **sends
-no further request at all** once it detects that state. Backing off and
-retrying against a session that will never renew itself burns the full
-`auth_retry_max_sec` budget on requests that are guaranteed to fail
-identically to the first — this is precisely the `b57027d3…` incident's
-D2 defect: two retries fired 1.2s apart, both against the same dead
-session, before the run gave up with a schema-error message that
-misattributed an auth failure to something else entirely.
+the full taxonomy) already treats numeric 401/429/529 statuses as
+**transient**: the gateway rejected one request, but a retry after
+backoff has a real chance of succeeding once the rolling usage window
+clears or gateway overload subsides. An expired or revoked *session* is
+categorically different — Claude Code's own error handling clears the
+saved credential locally and, per Anthropic's docs, sends no further
+request at all once it detects that state. Backing off and retrying
+against a session that will never renew itself burns the full
+`auth_retry_max_sec` budget on requests guaranteed to fail identically
+to the first — this was the `b57027d3…` incident's D2 defect: two
+retries fired 1.2s apart against the same dead session before the run
+gave up with a schema-error message that misattributed the failure.
 
 The fix is a **terminal** auth-failure class, checked before the
 transient classifier ever runs: envelope text carrying "failed to
 authenticate," "oauth session expired," "session expired and could not
 be refreshed," or "not logged in" (measured against 611 historical
-`is_error` envelopes: these markers matched 215 true positives and 0
-false positives) never enters the backoff loop. It raises immediately
-into the same **resumable pause** leerie already uses for
-out-of-credits (`EXIT_LOCKED`, exit 75) — worktree-only cleanup, no
-purge of state or branches, a `leerie resume <id>` hint logged. This
-is the correct disposition for exactly the same reason out-of-credits
-is: like a billing shortfall, an expired session does not resolve on a
-clock, so auto-resume would spin uselessly; unlike a `die()` for a
-genuine configuration error, the run's completed work (78 successful
-workers, in the incident that motivated this) is fully preserved and
-picked back up on `resume` once the operator runs `claude /login` or
-sets `CLAUDE_CODE_OAUTH_TOKEN` — the same long-lived-token launch this
-section already recommends structurally avoids the failure in the first
-place.
+`is_error` envelopes: 215 true positives, 0 false positives) never
+enters the backoff loop, raising immediately into the same **resumable
+pause** leerie already uses for out-of-credits (`EXIT_LOCKED`, exit
+75) — worktree-only cleanup, state and branches preserved, a `leerie
+resume <id>` hint logged. Like a billing shortfall, an expired session
+does not resolve on a clock, so auto-resume would spin uselessly; the
+run's completed work is fully preserved and picked back up on `resume`
+once the operator re-authenticates or sets `CLAUDE_CODE_OAUTH_TOKEN`.
 
 **The same refresh-vs-static distinction applies to Bedrock auth.** The
-launcher's Bedrock support (§"Finalization" above) predates this section
-and defaults to AWS SSO/profile auth: `detect_bedrock_mode()` reads
-`CLAUDE_CODE_USE_BEDROCK` out of the merged Claude `settings.json` files,
-then `bedrock_preflight()` requires the host `aws` CLI and a live `aws sts
-get-caller-identity` before staging `~/.aws/` (config + SSO token cache)
-read-only into the container. SSO access tokens are short-lived (~12h) and
-refreshed only by the host's interactive `aws sso login` browser flow — a
-non-interactive container cannot do that either, the identical
-container-cannot-refresh problem this section already solved for
-subscription auth via `CLAUDE_CODE_OAUTH_TOKEN`.
+launcher's Bedrock support defaults to AWS SSO/profile auth:
+`detect_bedrock_mode()` reads `CLAUDE_CODE_USE_BEDROCK` out of the merged
+Claude `settings.json` files, then `bedrock_preflight()` requires the
+host `aws` CLI and a live `aws sts get-caller-identity` before staging
+`~/.aws/` read-only into the container. SSO access tokens are
+short-lived (~12h) and refreshed only by the host's interactive `aws sso
+login` browser flow — the identical container-cannot-refresh problem
+this section already solved for subscription auth.
 
 `AWS_BEARER_TOKEN_BEDROCK` is the Bedrock analogue: a static bearer
-credential the Claude CLI sends as `Authorization: Bearer <token>` directly
-to the Bedrock runtime endpoint, with no refresh-token/expiry machinery
-anywhere near it (verified against the CLI's own bundled source and live
-end-to-end testing — the token alone is a no-op unless
-`CLAUDE_CODE_USE_BEDROCK` is also set, since the CLI otherwise falls
-through to its firstParty/OAuth dispatch path). Because it needs no `aws`
-CLI, no SSO session, and no `~/.aws/` staging, leerie triggers this path
-from a plain host env var (`AWS_BEARER_TOKEN_BEDROCK`), independent of the
-settings.json-driven `detect_bedrock_mode()` gate, and skips
-`bedrock_preflight()`/the `~/.aws` mount entirely when it is set — mirroring
-this section's existing precedent of preferring the credential immune to
-the expiry failure class over the one that requires host-side refresh.
-When both are present, the bearer token wins, matching the Claude CLI's own
-credential-resolution order (its Bedrock client construction short-circuits
-SSO/profile resolution once `AWS_BEARER_TOKEN_BEDROCK` is set).
+credential the Claude CLI sends directly to the Bedrock runtime endpoint,
+with no refresh-token/expiry machinery near it (verified against the
+CLI's own bundled source and live end-to-end testing — the token alone
+is a no-op unless `CLAUDE_CODE_USE_BEDROCK` is also set). Because it
+needs no `aws` CLI, no SSO session, and no `~/.aws/` staging, leerie
+triggers this path from a plain host env var, independent of the
+settings.json-driven gate, and skips `bedrock_preflight()`/the `~/.aws`
+mount entirely when set — the same precedent of preferring the
+credential immune to the expiry failure class. When both are present,
+the bearer token wins, matching the Claude CLI's own resolution order.
 
 **Multi-token rotation reduces quota exhaustion the same way the
 long-lived token above reduces expiry risk — by picking the credential
@@ -2669,89 +2359,65 @@ mid-run even though the token itself never expires. `leerie` supports
 
 - **Start-of-run smart selection.** Each token's remaining runway (5h/7d
   utilization, reset time, per-model weekly sublimits) is probed via the
-  same undocumented usage-telemetry surface Anthropic's own official
-  `/usage` view and Claude Code's statusline read internally: `GET
-  /api/oauth/usage` (`user:profile`-scoped tokens only) with a fallback,
-  for `user:inference`-scoped tokens such as a `claude setup-token` mint,
-  to reading the `anthropic-ratelimit-unified-*` headers off a minimal
-  (`max_tokens:1`) `/v1/messages` call. The token with the most runway is
-  selected before any worker spawns — not round-robin, since a
-  round-robin schedule would burn through a nearly-exhausted token at the
-  same rate as a fresh one.
+  same undocumented usage-telemetry surface Anthropic's own `/usage` view
+  and Claude Code's statusline read internally: `GET /api/oauth/usage`
+  (`user:profile`-scoped tokens) with a fallback, for
+  `user:inference`-scoped tokens such as a `claude setup-token` mint, to
+  reading the `anthropic-ratelimit-unified-*` headers off a minimal
+  `/v1/messages` call. The token with the most runway is selected before
+  any worker spawns — not round-robin, which would burn a nearly-exhausted
+  token at the same rate as a fresh one.
 - **Mid-run failover.** If the active token gets rate-limited mid-run,
   leerie rotates to another token with runway and **continues in the same
   container** — no re-exec, no restart — by threading the active token
-  through each worker spawn's environment rather than relying on a
-  container-wide credential file. If every token is currently limited,
+  through each worker spawn's environment. If every token is limited,
   leerie picks the one whose window resets soonest and falls through to
-  the existing reset-wait auto-resume path (see *Auth failures split into
-  two classes* above) rather than pausing on whichever token happened to
-  fail. This covers **both** of the ways a rate limit reaches `claude_p`:
-  a completed envelope carrying a 401/429/529/auth-message, and the
-  protocol-level `rate_limit_event` stream event that raises
-  `RateLimitedExit` directly out of the streaming loop before any
-  envelope is ever produced — both surfaces get the identical rotation
-  chance rather than only the envelope path.
+  the existing reset-wait auto-resume path rather than pausing on
+  whichever token happened to fail. This covers both surfaces a rate
+  limit can reach `claude_p` through: a completed envelope carrying a
+  401/429/529/auth-message, and the protocol-level `rate_limit_event`
+  stream event that raises `RateLimitedExit` directly out of the
+  streaming loop before any envelope is produced.
 
 **This is deliberately structured data in, deterministic Python out — no
-LLM worker** (§12, *prompts are advisory, code enforces*: this section's
-own principle). The probe endpoints return typed JSON fields and HTTP
-headers; ranking is `min(1 − 5h_utilization, 1 − 7d_utilization)` with a
-furthest-reset tie-break, computed the same way every time given the
-same inputs. There is nothing here for a judgment worker to interpret —
-introducing one would only add nondeterminism and cost to a comparison
-that plain Python already does correctly and cheaply.
+LLM worker** (§12). Ranking is `min(1 − 5h_utilization, 1 −
+7d_utilization)` with a furthest-reset tie-break, computed identically
+given the same inputs — nothing here for a judgment worker to interpret.
 
 **Both probe endpoints are undocumented and explicitly best-effort.**
-Anthropic can change or remove either one without notice; every probe
-path is designed to degrade to "use the current/first token and react to
-the next 429" rather than fail the run. A probe response missing an
-expected field (contract drift, distinct from an ordinary transient
-failure like a timeout or a 5xx) is logged loudly, at WARNING, with a
-stable marker — the two failure classes are kept visually distinct
-specifically so that a silent endpoint-shape change doesn't quietly
-degrade this feature to "always pick the first token" for weeks with no
-signal. Each token's probe result is cached for a floor of ~180 seconds
-(matching the interval community tooling around this same endpoint has
-independently converged on as safe) and identified in logs only by a
-short fingerprint — the raw token value is never written to a log line,
-`state.json` field other than the one live "currently active" slot, or
-`calls.ndjson`/`run.json`. `state.json`'s `active_oauth_token` field is
-therefore the one place the raw active token persists at rest (by the
-same rationale `state.json` already carries other operational data —
-it's local-orchestrator-owned, not published); this also travels with
-`state.json` on the existing Fly/EC2 `fetch-branch.sh` state sync, which
-is unchanged behavior for the whole file, not something this feature
-introduces.
+Anthropic can change or remove either without notice; every probe path
+degrades to "use the current/first token and react to the next 429"
+rather than fail the run. A probe response missing an expected field
+(contract drift, distinct from an ordinary transient failure) is logged
+at WARNING with a stable marker, kept visually distinct from an ordinary
+failure so a silent endpoint-shape change doesn't quietly degrade this
+feature for weeks with no signal. Each token's probe result is cached
+for a floor of ~180 seconds and identified in logs only by a short
+fingerprint — the raw token value is never written to a log line,
+`calls.ndjson`, or `run.json`. `state.json`'s `active_oauth_token` field
+is the one place the raw active token persists at rest (it is
+local-orchestrator-owned, not published), and it travels with
+`state.json` on the existing Fly/EC2 `fetch-branch.sh` state sync.
 
 **Decomposition needs the same discipline against the loss of
 in-progress spend.** §5½ (P1)'s `fit_judge` and coupled-minority
-`splitter` calls have no crash barrier today: a single `WorkerError`
-mid-decomposition (an auth failure, a transient gateway error, a PID
-exhaustion) discards every fit/split judgment already paid for on that
-planning pass, not just the one node being judged — this is the same
-class of loss D3 measured in the motivating incident, where
-decomposition was 27.8% of the run's total spend. The remedy mirrors
-two disciplines `_recursive_decompose` already applies: a `WorkerError`
-from either call degrades that node to a **leaf**, exactly as the
-existing depth-cap and no-progress-guard cases already resolve
-uncertainty by accepting the node as-is rather than raising (the
-migration-path splitter, invoked in label-only mode from
-`_label_migration_chunks`, already carried this guard — it falls back
-to deterministic per-chunk labels since the file partition itself is
-code-computed and unaffected by a labeling crash); and `phase_plan`
-snapshots decomposition progress into state as each top-level subtask
-finishes expanding, the same way `plan_snapshot`
-already persists the post-`_schedule()` plan. Like `plan_snapshot`, this
-decomposition snapshot is **diagnostic only** — nothing reads it back.
-The resumable-planning cursor (§6 *Resumable planning*) checkpoints
-`phase_plan`'s output as a whole (`plans_after_plan`), so a pause
-mid-decomposition still re-runs the entire `phase_plan` invocation
-(including `_recursive_decompose`) on resume rather than rehydrating
-from `decompose_snapshot`'s partial leaves. Wiring `resume` to that
-finer granularity is a separate, not-yet-shipped capability. Overclaiming
-resumability this change does not implement would be worse than not
-documenting the snapshot at all.
+`splitter` calls have no crash barrier: a single `WorkerError`
+mid-decomposition discards every fit/split judgment already paid for on
+that planning pass, not just the node being judged — the same class of
+loss D3 measured in the motivating incident, where decomposition was
+27.8% of the run's total spend. The remedy mirrors disciplines
+`_recursive_decompose` already applies elsewhere: a `WorkerError` from
+either call degrades that node to a **leaf**, the same way the existing
+depth-cap and no-progress-guard cases resolve uncertainty by accepting
+the node as-is; and `phase_plan` snapshots decomposition progress into
+state as each top-level subtask finishes expanding, the same way
+`plan_snapshot` persists the post-`_schedule()` plan. Like
+`plan_snapshot`, this snapshot is **diagnostic only** — nothing reads it
+back. The resumable-planning cursor (§6) checkpoints `phase_plan`'s
+output as a whole, so a pause mid-decomposition still re-runs the entire
+`phase_plan` invocation on resume rather than rehydrating from partial
+leaves; wiring `resume` to that finer granularity is a separate,
+not-yet-shipped capability.
 
 ### Cleanup on abnormal exit
 
@@ -2767,21 +2433,20 @@ resumable via `resume <id>` after any abnormal exit.
 **Auth failures split into transient and terminal, and only one of
 them benefits from backoff.** 401/429/529 — a rejected request against
 a still-valid session, whether from the rolling subscription cap or
-transient gateway overload — is **transient**: the session itself is
-fine, so retrying after backoff has a real chance of success once the
-window clears, and that case is handled by the existing auth/quota
-retry loop (`_is_auth_or_quota_failure`, see the rate-limit taxonomy
-below). An expired or revoked session — "OAuth session expired,"
-"failed to authenticate," "not logged in" — is **terminal**: per
-Anthropic's docs, once Claude Code detects this state it clears the
-saved credential and sends no further request at all, so every retry
-against it fails identically to the first and backoff only burns the
-`auth_retry_max_sec` budget for no benefit (see *Credential strategy*
-above). Terminal auth failures are therefore checked *before* the
-transient classifier and routed straight to the same resumable pause
-(`EXIT_LOCKED`, exit 75) used for out-of-credits below — worktree-only
-cleanup, state and branches preserved, `resume` picks back up once
-the operator re-authenticates.
+transient gateway overload — is **transient**: the session is fine, so
+retrying after backoff has a real chance once the window clears,
+handled by the existing auth/quota retry loop
+(`_is_auth_or_quota_failure`, taxonomy below). An expired or revoked
+session — "OAuth session expired," "failed to authenticate," "not
+logged in" — is **terminal**: per Anthropic's docs, Claude Code clears
+the saved credential and sends no further request at all once it
+detects this state, so every retry fails identically to the first and
+backoff only burns the `auth_retry_max_sec` budget for no benefit (see
+*Credential strategy* above). Terminal auth failures are checked
+*before* the transient classifier and routed straight to the same
+resumable pause (`EXIT_LOCKED`, exit 75) used for out-of-credits below
+— worktree-only cleanup, state and branches preserved, `resume` picks
+back up once the operator re-authenticates.
 
 **A mid-stream transport disconnect is a third transient class, and it
 gets the same backoff.** When the network connection carrying a worker's
@@ -2801,144 +2466,104 @@ then fails the subtask. `_is_transient_transport_failure` classifies it
 text-marker set) and
 routes it through the *same* `_is_auth_or_quota_failure` tenacity backoff
 loop, checked after the terminal-auth classifier so an expired session is
-never mistaken for a transport blip. The measured basis (a scan of 9,020
-worker logs): 58 sids hit this drop; isolating the 56 that did **not** also
-hit `max_turns` (the pure-transport population), **83% recovered on a later
-attempt and 73% on the very next one** — a network transient, not context
-exhaustion (a third of drops fire at ≤3 turns, before any context
-accumulates). The two `max_turns`-coupled sids recovered 0% — an oversized
-subtask that also drops is a *decomposition* problem (see §5½ P1
-*Sub-file*), not one backoff can fix, and `auth_retry_max_sec` correctly
-gives up on that tail. This transient path is upstream-corroborated:
-Claude Code's own remedy for a mid-stream drop is an automatic retry
-(the `claude -p` text-preservation fix landed in CLI v2.1.219); leerie's
-backoff is the fresh-session complement for when the CLI's in-session
-retries are exhausted.
+never mistaken for a transport blip. Measured over 9,020 worker logs: 58
+sids hit this drop; of the 56 that did **not** also hit `max_turns` (the
+pure-transport population), 83% recovered on a later attempt and 73% on
+the very next one — a network transient, not context exhaustion (a third
+of drops fire at ≤3 turns). The two `max_turns`-coupled sids recovered 0%
+— an oversized subtask that also drops is a *decomposition* problem (see
+§5½ P1 *Sub-file*), not one backoff can fix. This transient path mirrors
+Claude Code's own remedy for a mid-stream drop (an automatic retry, CLI
+v2.1.219); leerie's backoff is the fresh-session complement for when the
+CLI's in-session retries are exhausted.
 
 **A client-side context refusal is a fourth class, and it is terminal.**
 Claude Code enforces a context ceiling *itself*: when the assembled prompt
 exceeds the window it believes the model has, it emits a synthetic assistant
 message (`model=<synthetic>`, usage all zeros) and ends the session with
 `terminal_reason` = `"blocking_limit"` and result text `"Prompt is too long"`
-— **without issuing an API call at all**. Retrying identical input therefore
+— without issuing an API call at all. Retrying identical input therefore
 cannot succeed, which puts this in the same bucket as terminal auth rather
-than the transient classes above. `_is_context_overflow` requires *both* that
-`terminal_reason` and the result text: the reason alone is shared with other
-blocking limits, and the text alone could appear in a worker's own correct
-output. It is checked immediately after the terminal-auth classifier and
-before the generic corrective-note retry, and routed to the same resumable
+than the transient classes above. `_is_context_overflow` requires *both*
+`terminal_reason` and the result text (the reason alone is shared with other
+blocking limits; the text alone could appear in a worker's own correct
+output), is checked immediately after the terminal-auth classifier and
+before the generic corrective-note retry, and routes to the same resumable
 `EXIT_LOCKED` pause — the remedy is an operator change, not a wait.
 
-The refusal has a *precursor* worth naming, because it decides where the real
-ceiling sits. Before refusing, the CLI attempts reactive compaction — and
-compaction summarises **message groups**, so a conversation with fewer than
-two of them fails `too_few_groups` ("fewer than 2 groups, nothing to
-compact") and the refusal follows immediately. Every worker holds a multi-turn
-conversation and compacts normally. The **preflight smoke test does not**: it
-is a single exchange whose tokens are almost entirely system prompt, tool
-schemas and `CLAUDE.md` — none of which compaction can touch. So for that one
-invocation the CLI's own recovery path cannot work, and the effective limit is
-not the context ceiling but the *compaction trigger* beneath it.
+Before refusing, the CLI attempts reactive compaction, which summarises
+**message groups**; a conversation with fewer than two of them fails
+`too_few_groups` and the refusal follows immediately. Every worker holds a
+multi-turn conversation and compacts normally — the **preflight smoke
+test does not**, since it is a single exchange whose tokens are almost
+entirely system prompt, tool schemas and `CLAUDE.md`, none of which
+compaction can touch. So for that one invocation the effective limit is
+the *compaction trigger*, not the context ceiling itself.
 
-That is why the smoke test runs in an **empty working directory**. It
-validates the CLI — auth, streaming, `--json-schema` — not the repository, and
-loading the repo's own `CLAUDE.md`/skills/commands is by far the largest term:
-measured on this repo with one argv held constant, 126,022 prompt tokens in the
-repo against 17,222 in an empty directory — a difference of 108,800 attributable
-to cwd alone — where the failing run reached 183,485. The trigger's exact
-location was not measured, so this is a size attribution, not a proof that the
-cwd alone crossed it; the tool denies (16,006 tokens) may have sufficed on their
-own. The empty cwd is chosen on the structural ground below regardless. Since
-`CLAUDE.md` only grows, that margin has to be structural rather than a number
-someone re-tunes; an empty cwd is the only one
-whose prompt size is bounded by construction. The cost of that choice is
-stated plainly: preflight no longer proves the CLI can start *in this repo*
-(a malformed repo-local `.claude/settings.json`, say), which now surfaces at
-the classifier instead — acceptable precisely because the refusal is
-classified rather than printed as a bare string.
-
-Left unclassified this failure was actively misleading rather than merely
-unhandled: the envelope fell through to the two-attempt schema loop and
-surfaced as *"worker failed schema-valid output twice: Prompt is too long,"*
-blaming schema validation for a context refusal. On 2026-08-06 that wording
-cost three successive misdiagnoses before the real cause was measured, which
-is why the pause message names the actual contributors — the task text and
-the repo's CLAUDE.md are both loaded into every worker's context — and, when
-the strict-output proxy is active, names it first (see §7 *Forcing
-constrained decoding*).
+That is why the smoke test runs in an **empty working directory**: it
+validates the CLI (auth, streaming, `--json-schema`), not the repository.
+Loading the repo's own `CLAUDE.md`/skills/commands is by far the largest
+term (measured: 126,022 prompt tokens in this repo vs. 17,222 empty, a
+difference attributable to cwd alone, against a failing run that reached
+183,485). Since `CLAUDE.md` only grows, the margin has to be structural
+rather than a number someone re-tunes — an empty cwd is the only one whose
+prompt size is bounded by construction. The cost is real: preflight no
+longer proves the CLI can start *in this repo* (e.g. a malformed
+`.claude/settings.json`), which now surfaces at the classifier instead —
+acceptable because the refusal there is classified rather than printed as
+a bare string. Left unclassified, this failure was actively misleading:
+the envelope fell through to the two-attempt schema loop and surfaced as
+*"worker failed schema-valid output twice: Prompt is too long"* — blaming
+schema validation for a context refusal, which cost three misdiagnoses
+before the real cause was measured (2026-08-06). The pause message
+therefore names the actual contributors (task text, the repo's
+`CLAUDE.md`), and, when the strict-output proxy is active, names it first
+(see §7 *Forcing constrained decoding*).
 
 **Worktrees are also pruned mid-run, not only at cleanup.** Once
 `integrate_wave` reports a subtask's branch merged into staging, that
 subtask's worktree is dead weight — the commits live in the branch, which
 survives worktree removal — so `phase_execute` removes it at the end of
-that wave rather than waiting for run end. Note the granularity: the prune
-runs **once per wave**, after every subtask in it has been integrated, not
-as each one finishes. So peak worktree coexistence is the size of a wave,
-which is what any per-worktree sizing would have to account for.
-Without this, every worktree a run ever created persisted until the
-run finished: at 30–87 subtasks against a
-repo whose `node_modules` is ~1.4 GB, that is the measured 51 GB that
-killed two runs with an unhandled `ENOSPC`.
+that wave rather than waiting for run end. The prune runs **once per
+wave**, after every subtask in it has been integrated, not as each one
+finishes, so peak worktree coexistence is the size of a wave. Without
+this, every worktree a run ever created persisted until the run finished:
+at 30–87 subtasks against a repo whose `node_modules` is ~1.4 GB, that is
+the measured 51 GB that killed two runs with an unhandled `ENOSPC`.
 
 The prune is scoped to *integrated* subtasks specifically. A `blocked` or
 `failed` subtask keeps its worktree, because that tree is exactly what an
 operator inspects by hand before settling it with `accept-blocked` or
-`accept-integration`. Pruning the whole wave instead would destroy the
-evidence those verbs exist to act on.
+`accept-integration` — pruning the whole wave instead would destroy that
+evidence.
 
-**Why a worktree costs what it does.** The per-worktree figure varies by
-roughly 13x with something leerie does not control (that multiple is derived from the unreproduced figures below — see the caveat) — which is why leerie
-does *not* try to predict it, and the disk guardrail is a proportional
-free-space floor rather than a per-worktree byte budget. Package
-managers like pnpm are content-addressed and normally *hardlink* from a
-shared store into each `node_modules`, so a second checkout of the same
-dependency set costs
-almost nothing — measured on a host where the store and the tree share a
-mount, 92.60% of `node_modules` bytes were shared with that store and the
-private remainder was 102 MiB against a 1.35 GiB tree, of which roughly
-37 MiB was the directories.
+**Why a worktree costs what it does.** Package managers like pnpm are
+content-addressed and normally *hardlink* from a shared store into each
+`node_modules`, so a second checkout of the same dependency set costs
+almost nothing when store and tree share a mount (measured once, on one
+host, not reproducible from this repo after the measuring script itself
+produced defects in two reviews — treat as illustrating the regime, not
+a verified quantity: 92.6% of `node_modules` bytes shared, private
+remainder 102 MiB against a 1.35 GiB tree). But leerie bind-mounts the
+package-manager store and the state
+directory as *separate* mounts, and Linux refuses `link()` across
+different mounts even when both resolve to the same filesystem
+(`do_linkat`'s `EXDEV`) — so the store cannot hardlink into a worktree,
+pnpm falls back to copying, and each worktree pays full freight. That is
+the multiplier behind the 51 GB, and the mid-run prune bounds coexistence
+to one wave's worth of trees.
 
-**These four figures are a single measurement on one host, taken once, and
-they are NOT reproducible from this repository.** A script and fixture that
-computed them were committed and then withdrawn, because the measurement
-itself produced defects in two consecutive reviews — first the wrong
-shared/private predicate (`st_nlink > 1` counts in-tree names, so it
-over-reports sharing) and omitted directory blocks, then an omitted walk
-root and a directory split that was quoted here but absent from the
-artifact. Treat the numbers as illustrating the *regime* — near-free with a
-shared store, full price without — and not as verified quantities. Anyone
-rebuilding this should measure a `df` delta across a real second checkout in
-a real container, which is the thing neither attempt did.
-
-Two details are what make the regime real, and getting either wrong inflates
-the shared share. "Shared" means *every* link to the inode lives outside the
-walked tree — **not** `st_nlink > 1`, which counts in-tree names too. And
-directories always cost: a directory's link count is `.` plus its parent's
-entry plus one `..` per subdirectory, an artefact of the tree rather than
-evidence of an outside store, and a second worktree has to create every one
-of them. But leerie bind-mounts the
-package-manager store and the state directory as *separate* mounts, and
-Linux refuses `link()` across different mounts even when both resolve to
-the same underlying filesystem (`do_linkat`'s `old_path.mnt !=
-new_path.mnt` check returns `EXDEV`). The store therefore cannot hardlink
-into a worktree, pnpm falls back to copying, and each worktree pays full
-freight. That is the second, independent multiplier behind the 51 GB, and
-the mid-run prune bounds coexistence to one wave's worth of trees.
-
-This explains *why* worktrees are expensive; it deliberately does not drive
-a gate. A per-worktree measured bound was built on this reasoning and
-withdrawn after four failed revisions — the marginal cost of a
-not-yet-created worktree depends on a mount topology leerie does not
-control, on how many siblings exist when it is measured, and on a peak count
-that depends on scheduling. The disk guardrail is the proportional free-space
-floor plus a resumable pause; see IMPLEMENTATION.md's "Disk headroom (N30)"
-for what was tried.
-
-Colocating the store with the worktrees on one mount would collapse the
-per-worktree cost by that same ~13x — the unreproduced multiple above — and is the more fundamental fix, but
-it changes runtime behaviour across the local, Fly and EC2 runtimes and
-both privilege models, so it is deliberately held as a separate change
-rather than folded into the guardrail.
+This explains *why* worktrees are expensive; it deliberately does not
+drive a gate. A per-worktree measured bound was attempted and withdrawn
+after repeated defects, because the marginal cost of a not-yet-created
+worktree depends on mount topology leerie does not control and a peak
+count that depends on scheduling. The disk guardrail is instead a
+proportional free-space floor plus a resumable pause; see
+IMPLEMENTATION.md's "Disk headroom (N30)". Colocating the store with the
+worktrees on one mount would collapse the per-worktree cost and is the
+more fundamental fix, but it changes runtime behaviour across the local,
+Fly and EC2 runtimes and both privilege models, so it is deliberately held
+as a separate change rather than folded into the guardrail.
 
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
@@ -2953,476 +2578,374 @@ SIGTERM, SIGHUP, WorkerError, or any other exception:
   so in-flight subtasks resume from where they left off.
 
 **Worker subtree termination — kernel-enforced via the container
-boundary.** Cleanup must reach not just the direct `claude -p`
-child but every process *it* spawned (test runners, build tools,
-dev servers — whatever a `claude -p` worker invoked as a tool
-call). Signaling only the leader leaves descendants alive:
-Claude Code's Bash tool runs every command via `bash -c "…"` in
-its own POSIX session, and `run_in_background: true` deliberately
-detaches long-running commands further. PPID chains break by
-design, sessions break process-group kill, and reparenting hides
-survivors as orphans of init. POSIX gives no in-OS guarantee that
-ad-hoc lineage tracking can be made airtight against a tree that
-intentionally detaches.
+boundary.** Cleanup must reach not just the direct `claude -p` child but
+every process *it* spawned (test runners, build tools, dev servers —
+whatever a `claude -p` worker invoked as a tool call). Signaling only the
+leader leaves descendants alive: Claude Code's Bash tool runs every
+command via `bash -c "…"` in its own POSIX session, and
+`run_in_background: true` detaches long-running commands further. PPID
+chains break by design, sessions break process-group kill, and
+reparenting hides survivors as orphans of init — POSIX gives no in-OS
+guarantee that ad-hoc lineage tracking can be made airtight against a
+tree that intentionally detaches.
 
-Leerie therefore makes cleanup a **property of the runtime boundary,
-not a property of the orchestrator's signal handling**. The
-orchestrator and every worker it spawns run inside a single
-container (containerd-managed: on Linux native, on macOS via a
-Colima-managed Linux VM). When the orchestrator process exits —
-for *any* reason, including SIGKILL, segfault, OOM-kill, or power
-loss — the container's PID 1 dies and the Linux kernel reaps every
-process in the PID namespace via cgroup release. This is the same
-guarantee runc, containerd, Kubernetes, and every production
-container runtime rely on. There is no possible survivor: a process
-that detached into its own session, a daemon that double-forked,
-a vitest pool worker that reparented to init — all of them are
-inside the namespace and all of them get reaped by the kernel,
-not by any code leerie wrote.
+Leerie therefore makes cleanup a **property of the runtime boundary, not
+of the orchestrator's signal handling**. The orchestrator and every
+worker it spawns run inside a single container (containerd-managed: on
+Linux native, on macOS via a Colima-managed Linux VM). When the
+orchestrator process exits — for *any* reason, including SIGKILL,
+segfault, OOM-kill, or power loss — the container's PID 1 dies and the
+kernel reaps every process in the PID namespace via cgroup release, the
+same guarantee runc/containerd/Kubernetes rely on. There is no possible
+survivor: a process that detached into its own session, a daemon that
+double-forked, a pool worker that reparented to init — all of them are
+inside the namespace and all get reaped by the kernel, not by any code
+leerie wrote.
 
-The contract reads identically to before — every exit path
-(Ctrl-C, SIGTERM, SIGHUP, WorkerError, RateLimitedExit, any
-unhandled exception, plus the cases Python can't catch:
-SIGKILL and hard crashes) terminates the worker's *entire*
-subprocess subtree before resources are returned — but the
-mechanism is now load-bearing in a way prompt-level or
-heuristic-level cleanup never could be.
+The contract reads identically to before — every exit path (Ctrl-C,
+SIGTERM, SIGHUP, WorkerError, RateLimitedExit, any unhandled exception,
+plus SIGKILL and hard crashes) terminates the worker's *entire*
+subprocess subtree before resources are returned — but the mechanism is
+now load-bearing in a way prompt-level or heuristic-level cleanup never
+could be.
 
-The per-worker async cleanup that lives in `claude_p` (the PPID
-walk in `_terminate_proc_tree`, the `_DescendantTracker` polling
-loop) is *kept* — it is the fast happy path that reaps a single
-worker's subtree promptly on clean exit, so the next wave sees a
-quiet process table. But it is no longer the abnormal-exit
-guarantee. If it half-finishes under Ctrl-C, or fails to escalate
-SIGTERM→SIGKILL before asyncio shutdown closes the event loop,
-that is no longer a leak — the container boundary catches every
-survivor when the orchestrator exits.
+The per-worker async cleanup that lives in `claude_p` (the PPID walk in
+`_terminate_proc_tree`, the `_DescendantTracker` polling loop) is *kept*
+as the fast happy path that reaps a single worker's subtree promptly on
+clean exit, but it is no longer the abnormal-exit guarantee — if it
+half-finishes under Ctrl-C, that is no longer a leak, since the container
+boundary catches every survivor when the orchestrator exits.
 
-**The container boundary's hidden precondition: the orchestrator
-must actually exit.** The kernel reaps the PID namespace *when PID 1
-dies* — but nothing guarantees PID 1 dies just because the host-side
-`nerdctl run` client did. On the local runtime the launcher relies on
-`nerdctl run -i` forwarding the host process's terminating signal to
-container PID 1; that link is not itself enforced by leerie. The
-failure mode observed in practice: a **VM-wide OOM** (two multi-worker
-runs sharing one 8 GB Colima VM exhausted all memory) invoked the
-kernel's *global* OOM-killer, which — because every in-container
-process carries `oom_score_adj:-998` (containerd's default) — spared
-the workers and the orchestrator and instead killed the *unprotected
-host-session processes*, including the `nerdctl run` clients. The
-host CLI died (terminal shows `exit status 255`, finalize is skipped),
-but container PID 1 kept running as an **orphan**. Because the
-orchestrator is alive, it still holds the run-dir flock (§6 *Single
-owner per run dir*), so every subsequent `resume` correctly loses
-the flock race and exits `EXIT_LOCKED=75` — the run is wedged until
-the orphan is killed by hand. Three mechanisms close this gap, defense
-in depth:
+**The container boundary's hidden precondition: the orchestrator must
+actually exit.** The kernel reaps the PID namespace *when PID 1 dies* —
+but nothing guarantees PID 1 dies just because the host-side `nerdctl run`
+client did. On the local runtime the launcher relies on `nerdctl run -i`
+forwarding the host process's terminating signal to container PID 1; that
+link is not itself enforced by leerie. Observed failure mode: a
+**VM-wide OOM** (two multi-worker runs sharing one 8 GB Colima VM
+exhausted all memory) invoked the kernel's *global* OOM-killer, which —
+because every in-container process carries `oom_score_adj:-998`
+(containerd's default) — spared the workers and the orchestrator and
+instead killed the *unprotected host-session processes*, including the
+`nerdctl run` clients. The host CLI died (`exit status 255`, finalize
+skipped), but container PID 1 kept running as an orphan; because the
+orchestrator is alive, it still holds the run-dir flock (§6 *Single owner
+per run dir*), so every subsequent `resume` correctly loses the flock
+race and exits `EXIT_LOCKED=75` — the run is wedged until the orphan is
+killed by hand. Three mechanisms close this gap, defense in depth:
 
 1. **Aggregate memory cap (prevention).** `container-entry.sh` (PID 1)
    writes a container-level cap to the `leerie.slice` cgroup's
    `memory.max` — the parent of every per-worker cgroup — derived from VM
-   `MemTotal` read from `/proc/meminfo` (so it is portable across Colima
-   and native Linux; the host launcher cannot read the VM's MemTotal on
-   macOS, which is why the derivation lives in-container rather than as a
-   `nerdctl run --memory` flag). A container that exceeds its cap triggers
-   a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`), which kills a process
-   *inside that container* — where the `-998` protection is only relative
-   — rather than a global OOM that reaches out to host-session processes.
-   This converts "kill the host client → orphan → wedge" into "kill a
-   worker in the guilty container → the orchestrator observes a clean
-   worker failure." It bounds the *aggregate*; the per-worker cgroup caps
-   (below, *Memory
-   containment*) bound each worker but not their sum.
+   `MemTotal` read from `/proc/meminfo` (in-container, since the host
+   launcher cannot read the VM's MemTotal on macOS). A container that
+   exceeds its cap triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`),
+   which kills a process *inside that container* rather than a global OOM
+   reaching host-session processes — converting "kill the host client →
+   orphan → wedge" into "kill a worker in the guilty container → the
+   orchestrator observes a clean worker failure." It bounds the
+   *aggregate*; the per-worker cgroup caps (below) bound each worker but
+   not their sum.
 2. **Kill-on-exit trap (proactive cleanup).** The launcher installs
    INT/TERM traps on the local run path that `nerdctl kill` the
-   container (via its run-id / cidfile) before the launcher exits, so a
-   Ctrl-C or SIGTERM to the host CLI tears the container down instead of
-   orphaning it. *Limitation, stated honestly:* OOM and SIGKILL deliver
-   an uncatchable signal — the trap never runs in exactly the OOM case
-   above — so the trap is a complement to, not a substitute for, the
-   reaper.
+   container before the launcher exits, so a Ctrl-C or SIGTERM to the
+   host CLI tears the container down instead of orphaning it. OOM and
+   SIGKILL deliver an uncatchable signal, so the trap never runs in
+   exactly the OOM case above — it complements the reaper, not
+   substitutes for it.
 3. **Stale-container reaper (recovery).** Before spawning on the local
-   `resume` path, the launcher checks for an already-`Up` container
-   for this run whose owning launcher PID is dead (identified via a
-   `leerie.launcher_pid` label set at spawn) and `nerdctl kill`s it
-   first. This is the load-bearing fix for the OOM case: it makes
-   `resume` self-heal the orphaned-flock wedge instead of returning
-   75, regardless of *how* the orphan was created.
+   `resume` path, the launcher checks for an already-`Up` container for
+   this run whose owning launcher PID is dead (via a `leerie.launcher_pid`
+   label set at spawn) and `nerdctl kill`s it first — the load-bearing
+   fix for the OOM case, making `resume` self-heal the orphaned-flock
+   wedge regardless of how the orphan was created.
 
 The container boundary holds across both invocation modes:
 
-- **Terminal mode** — the user runs `leerie "task"` from a shell.
-  The launcher gives the container a controlling TTY (`-it`). The
-  orchestrator's `log()` lines stream live; clarification questions
-  use `input()`. Ctrl-C in the user's terminal delivers SIGINT to
+- **Terminal mode** — `leerie "task"` from a shell. The launcher gives
+  the container a controlling TTY (`-it`); `log()` streams live and
+  clarification questions use `input()`. Ctrl-C delivers SIGINT to
   container PID 1.
-- **Plugin mode** — Claude Code's Bash tool invokes the launcher
-  from inside another Claude Code session (no host TTY). The
-  launcher passes `-i` only. Inside the container,
-  `sys.stdin.isatty()` returns False, so the orchestrator's existing
-  no-TTY clarification path activates: it writes
+- **Plugin mode** — Claude Code's Bash tool invokes the launcher from
+  inside another Claude Code session (no host TTY). The launcher passes
+  `-i` only; `sys.stdin.isatty()` returns False, activating the
+  orchestrator's no-TTY clarification path, which writes
   `<state-root>/runs/<run-id>/pending-questions.json` (visible on the
   host via the `/leerie-state` bind mount) and exits with
-  `EXIT_NEEDS_ANSWERS=10`. The plugin agent reads the file, asks the
-  user in chat, writes `<state-root>/answers.json`, and re-runs the
-  container with `--answers`.
-  Same exit codes, same file passing, same kernel teardown
-  guarantee. The container is transparent to the plugin's existing
-  exit-10 dance.
+  `EXIT_NEEDS_ANSWERS=10`. The plugin agent reads the file, asks the user
+  in chat, writes `<state-root>/answers.json`, and re-runs the container
+  with `--answers`. Same exit codes, same file passing, same kernel
+  teardown guarantee.
 
-See IMPLEMENTATION.md "Container shape" for the launcher's mount
-table, image build, per-OS preflight, and the one-line `[ -t 0 ]`
-TTY adaptation that selects between the two modes; and
-"Concurrency model" for the unchanged in-container worker cleanup
-that runs as the happy path.
+See IMPLEMENTATION.md "Container shape" for the launcher's mount table,
+image build, per-OS preflight, and the `[ -t 0 ]` TTY adaptation between
+the two modes; and "Concurrency model" for the unchanged in-container
+worker cleanup that runs as the happy path.
 
-**Launcher hang on abnormal container exit (decoupled streaming).**
-There is a second way the "PID 1 must exit" precondition is subverted
-— not the container failing to die, but the *launcher* failing to
-return after it dies. In piped mode (`leerie … | tee log`, the common
-`-i` case), the container's stdout is forwarded by Colima's persistent
-SSH ControlMaster (`ControlPersist=yes`, kept alive by the
-containerd/buildkitd socket forwards). That master holds a *copy* of
-the launcher's stdout-pipe write-end for the duration of the run. On a
-**clean** container exit the master closes its copy and `tee` receives
-EOF. On an **abnormal** exit (PID-1 crash under `set -e`, OOM SIGKILL,
-a mid-run `nerdctl kill`), the master **retains** the write-end — so
-`tee` never receives EOF, the launcher never returns, its EXIT trap
+**Launcher hang on abnormal container exit (decoupled streaming).** A
+second way the "PID 1 must exit" precondition is subverted: not the
+container failing to die, but the *launcher* failing to return after it
+dies. In piped mode (`leerie … | tee log`), the container's stdout is
+forwarded by Colima's persistent SSH ControlMaster (`ControlPersist=yes`),
+which holds a *copy* of the launcher's stdout-pipe write-end for the
+run's duration. On a **clean** exit the master closes its copy and `tee`
+receives EOF; on an **abnormal** exit (PID-1 crash under `set -e`, OOM
+SIGKILL, a mid-run `nerdctl kill`), the master **retains** the write-end
+— `tee` never receives EOF, the launcher never returns, its EXIT trap
 never fires, and the `--rm` container is orphaned `Up` (holding the
-run-dir flock, wedging `resume`). This is why clean runs never hang
-and only abnormal exits do. The blast-radius-free fix is *decoupled
-streaming*: the launcher points `nerdctl`'s stdout/stderr at a run-log
-**file** (the master does not retain a plain-file fd), and streams that
-file to its own stdout via a `tail -f` the launcher owns and reaps in
-its EXIT/INT/TERM traps. The EOF gate becomes the launcher-controlled
-`tail`, never the mux — so a stuck master can no longer wedge the
-pipeline, and no concurrent group/chain run is disturbed (contrast
-`ssh -O exit`, which frees the pipe but tears down the shared master
-mid-stream). Gated to the piped (`-i`, non-TTY-stdout) case; the
-interactive `-it` path has a real pty, no `tee`, and thus no hang, and
-keeps its stdin attached for `--clarify`. The stale-container reaper on
-the next `resume` (below) remains the backstop for the uncatchable
-SIGKILL case where even the trap cannot run.
+run-dir flock, wedging `resume`). The fix is *decoupled streaming*: the
+launcher points `nerdctl`'s stdout/stderr at a run-log **file** (the
+master does not retain a plain-file fd) and streams that file to its own
+stdout via a `tail -f` the launcher owns and reaps in its EXIT/INT/TERM
+traps. The EOF gate becomes the launcher-controlled `tail`, never the
+mux, so a stuck master can no longer wedge the pipeline. Gated to the
+piped (`-i`, non-TTY-stdout) case; the interactive `-it` path has a real
+pty and thus no hang. The stale-container reaper above remains the
+backstop for the uncatchable SIGKILL case.
 
-**Worker subtree termination — Memory containment via cgroup v2.**
-The kernel reap above handles *process lifecycle*, not memory: when
-a worker's tool subtree (a `pnpm test` spawning vitest pools, a
-`tsc --noEmit` building a 1.5-2 GB V8 heap, an `npm run build`
-forking webpack workers) overshoots the container's available RAM,
-the kernel's OOM killer fires inside the container's single memcg.
-The victim it picks is whichever process in that memcg has the
-largest `oom_score`, which can land on `sshd` / `lima-guestagent` /
-the leerie orchestrator itself — collapsing infrastructure that the
-launcher relies on for SSH-tunnel survival to the macOS host. The
-observed pattern on an undersized 11 GiB Colima VM with 4
-concurrent implementers was: vitest worker (1.85 GiB anon-rss) →
-OOM-killer fires → `agetty` → `journald` → `sshd` (Mac launcher
-sees `exit status 255`) → `lima-guestagent` → only then the
-offending Node process. Leerie's own RSS sat at 36.8 MiB throughout,
-so the orchestrator wasn't leaking; the cascade was caused by all
-processes sharing one memcg.
+**Worker subtree termination — Memory containment via cgroup v2.** The
+kernel reap above handles *process lifecycle*, not memory: when a
+worker's tool subtree (a `pnpm test` spawning vitest pools, a `tsc
+--noEmit` building a 1.5–2 GB V8 heap) overshoots the container's
+available RAM, the kernel's OOM killer fires inside the container's
+single memcg and can land on `sshd` / `lima-guestagent` / the leerie
+orchestrator itself, collapsing infrastructure the launcher relies on for
+SSH-tunnel survival to the macOS host. Observed on an undersized 11 GiB
+Colima VM with 4 concurrent implementers: vitest worker (1.85 GiB
+anon-rss) → OOM-killer fires → `agetty` → `journald` → `sshd` (Mac
+launcher sees `exit status 255`) → `lima-guestagent` → only then the
+offending Node process, while leerie's own RSS sat at 36.8 MiB throughout
+— the cascade was caused by all processes sharing one memcg.
 
-Each `claude -p` worker is therefore enrolled in its own child
-cgroup at `<cgroup-root>/leerie-w-<sid>/` (where `<sid>` is the
-run-scoped composed sid — see *The per-worker cgroup name is
-run-scoped* below) with `memory.max` set to
-`caps["worker_memory_max_bytes"]` (default: a fixed isolation ceiling
-derived from the measured build peak — see *A per-worker cap is a
-ceiling, not a reservation* below) and `pids.max` set
-to `caps["worker_pids_max"]` (default 2048, overridable per-repo via
-`--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in
-leerie.toml). When the worker
-subtree blows past `memory.max`, the kernel OOM-kills *inside that
-cgroup*; sibling workers, the orchestrator, and host-side services
-in different cgroups are not eligible victims. `memory.swap.max=0`
-prevents the kernel from delaying an inevitable OOM by paging out
-worker memory to the Colima swap file.
+Each `claude -p` worker is therefore enrolled in its own child cgroup at
+`<cgroup-root>/leerie-w-<sid>/` (`<sid>` is the run-scoped composed sid,
+below) with `memory.max` set to `caps["worker_memory_max_bytes"]` (default:
+a fixed isolation ceiling derived from the measured build peak, below) and
+`pids.max` set to `caps["worker_pids_max"]` (default 2048, overridable via
+`--worker-pids-max` / `LEERIE_WORKER_PIDS_MAX`). When the worker subtree
+blows past `memory.max`, the kernel OOM-kills *inside that cgroup*;
+sibling workers, the orchestrator, and host-side services are not
+eligible victims. `memory.swap.max=0` prevents the kernel from delaying
+an inevitable OOM by paging worker memory to the Colima swap file.
 
-**The per-worker cgroup name is run-scoped.** The child cgroup is
-`leerie-w-<run-id-prefix>-<sid>`, not a bare `leerie-w-<sid>`. The
-prefix is the first 12 hex chars of the run id (the container/machine
-id) — ~48 bits, so the probability two concurrent runs share a prefix
-*and* run the same worker sid at overlapping times is negligible (≪
-1e-9 at any realistic concurrency; only local Colima runs share a slice
-at all — Fly/EC2 give each run its own VM). This is
-load-bearing whenever two runs execute concurrently on the *same* VM,
-which is the common case on Colima: the launcher passes `--cgroupns=host`
-(required — see below — so the broker can enroll worker PIDs into
-`leerie.slice/`), so every concurrent container's workers live in the
-**same physical `leerie.slice/` tree**. Worker `sid`s alone are not
-unique across runs — a phase-1 `sid="classifier"`, and every
-conformer/judge `sid` (which repeats identically across two concurrent
-runs of the *same* task, e.g. a multi-repo fan-out), collide by name.
-Absent
-the run-id prefix, two runs both in phase 1 create, enroll into, and tear
-down the *same* `leerie.slice/leerie-w-classifier` cgroup. Teardown on
-cgroup v2 is `cgroup.kill=1` (the broker's `destroy`), which SIGKILLs
-*every* process enrolled in that cgroup — so run B finishing its
-classifier SIGKILLs run A's still-running classifier `claude -p` leader
-mid-stream. The victim leader exits `-9` with no `result` event, no
-`dmesg`/journald record (a `cgroup.kill` is a userspace write, not a
-kernel OOM), and is indistinguishable from a bare crash; leerie's
-`_run_checked_loop` retries it, so it self-heals but wastes the killed
-attempt. Prefixing the cgroup name with a run-id discriminator makes each
-run's worker cgroups unreachable by any other run's teardown. (Reproduced
-live: run `example-repo`'s classifier leader died at the exact second run
-`summarizer`'s classifier tore down the shared `leerie-w-classifier`.)
-`--cgroupns=private` — which *would* give each container its own
-`leerie.slice` — is not an option: it breaks the broker's cross-scope PID
-enrollment (see the `--cgroupns=host` requirement below), so the name
-must carry the run identity instead.
+**The per-worker cgroup name is run-scoped**: `leerie-w-<run-id-prefix>-<sid>`,
+not a bare `leerie-w-<sid>`. The prefix is the first 12 hex chars of the
+run id (~48 bits, negligible collision probability). This is load-bearing
+whenever two runs execute concurrently on the same VM (the common case on
+Colima, since the launcher passes `--cgroupns=host` so the broker can
+enroll worker PIDs into `leerie.slice/`): worker `sid`s alone are not
+unique across runs (a phase-1 `sid="classifier"` repeats identically
+across two concurrent runs of the same task), and teardown on cgroup v2 is
+`cgroup.kill=1`, which SIGKILLs *every* process in that cgroup — so
+without the prefix, run B finishing its classifier would SIGKILL run A's
+still-running classifier mid-stream, indistinguishable from a bare crash
+(reproduced live). `--cgroupns=private` is not an option — it breaks the
+broker's cross-scope PID enrollment (see below) — so the name must carry
+the run identity instead.
 
 The per-worker cap must hold **both** the build/test subprocess tree
-*and* the resident `claude -p` process at the same time — `claude`
-stays alive running the build via Bash and streaming its output, so
-it shares the cgroup with whatever it launches. Live in-container
-`memory.peak` measurement on a Next.js/Turbopack build: build alone
-peaks at 4.16 GiB (identical whether the build's own concurrency is
-left at default or pinned to 2 cores — not a parallelism artifact),
-and build + resident claude peaks at 5.6–6.3 GiB. An earlier `4 GiB`
-clamp on the auto-derived value was *below* that combined peak, so no
-VM size could auto-derive a cap sufficient for a build-running
-worker — every such worker was cgroup-OOM-killed regardless of host
-RAM. Any cap below that combined peak guarantees the very OOM the cap
-exists to contain.
+*and* the resident `claude -p` process, since `claude` stays alive
+running the build via Bash and shares the cgroup with whatever it
+launches. Live in-container `memory.peak` measurement on a
+Next.js/Turbopack build: build alone peaks at 4.16 GiB, build + resident
+claude peaks at 5.6–6.3 GiB. An earlier `4 GiB` clamp was *below* that
+combined peak, so no VM size could auto-derive a sufficient cap — every
+build-running worker was cgroup-OOM-killed regardless of host RAM. Any
+cap below the combined peak guarantees the OOM it exists to contain.
 
 **Reap the worker's own subprocesses before destroying its cgroup.** The
-`finally` that tears a worker down must call
-`descendant_tracker.stop_and_reap()` *before* `_cgroup_destroy()`. Those
-backgrounded subprocesses (Claude Code's Bash tool with
-`run_in_background: true` — test runners, builds, dev servers) are still
-cgroup members while alive, so destroying first hands the broker a cgroup
-this orchestrator deliberately left populated, and its `rmdir` fails
-`EBUSY`. The timeout and abort paths always reaped first; the success path
-did not, and that asymmetry was the dominant source of leaked
-`leerie-w-*` directories.
-
-Measured over 1801 workers: conformers are **8%** of all workers but
-**88%** of destroy failures, and their median backgrounded-subprocess
-count is **984 against 12** for everything else. The failures land exactly
-where the unreaped population is largest, which is the signature of this
-ordering rather than of an unlucky kill race.
-
-The broker's drain (below) remains as the backstop for the residual race —
-a tree still dying when destroy runs — but the ordering is what removes
-the cause. It is pinned by a source-coupled test, since an ordering is
-invisible to a behavioural one.
+`finally` that tears a worker down calls
+`descendant_tracker.stop_and_reap()` *before* `_cgroup_destroy()`.
+Backgrounded subprocesses (Bash tool `run_in_background: true`) are still
+cgroup members while alive, so destroying first hands the broker a
+populated cgroup and its `rmdir` fails `EBUSY`. The timeout and abort
+paths always reaped first; the success path did not, and that asymmetry
+was the dominant source of leaked `leerie-w-*` directories. Measured over
+1801 workers: conformers are 8% of all workers but 88% of destroy
+failures, with a median backgrounded-subprocess count of 984 against 12
+for everything else — the failures land exactly where the unreaped
+population is largest. The broker's drain (below) remains the backstop
+for the residual race; the ordering fix is pinned by a source-coupled
+test, since an ordering is invisible to a behavioural one.
 
 **Prevention is not reclamation, so the broker also sweeps.** Worker
-cgroups live on the *host* hierarchy — workers run with
-`--cgroupns=host` — so they outlive the container that made them.
-Everything above stops new leaks; nothing removes the ones already on
-disk, and an orchestrator killed outright still skips its own cleanup
-entirely. The broker therefore sweeps abandoned worker cgroups once at
-startup, before it binds its socket, so no client of its own run can be
-mid-create while it walks.
-
-The sweep is **deliberately cross-run**: the pile it exists to clear
-belongs to runs that are long gone, and a run cannot clean up after a
-predecessor it never knew about. That makes its predicate a safety
-question rather than a housekeeping one, and two conditions must hold
-together — the cgroup has no processes in it, *and* it is older than a
-generous age floor. Neither alone is sufficient. Creating a cgroup and
-enrolling a process into it are separate steps, so a live cgroup is
-briefly empty, and a *concurrent* run's broker is a different process
-this one cannot serialise against; only age covers that window.
-
-Identity cannot substitute for age here, which is worth recording
-because the obvious approach is wrong: the cgroup name carries its
-owning run id, but a resumed run keeps its original id while getting a
-new container, so "is a container with this id still alive" reports
-*dead* for every resumed run — a predicate that would have deleted the
-live runs on the host where this was measured.
+cgroups live on the *host* hierarchy (`--cgroupns=host`), so they outlive
+the container that made them; an orchestrator killed outright skips its
+own cleanup entirely. The broker sweeps abandoned worker cgroups once at
+startup, before binding its socket, so no client of its own run can be
+mid-create while it walks. The sweep is **deliberately cross-run** — a
+run cannot clean up after a predecessor it never knew about — so its
+predicate must be a safety question, not a housekeeping one: a cgroup
+qualifies only when it has no processes in it *and* is older than a
+generous age floor. Neither alone is sufficient (create and enroll are
+separate steps, so a live cgroup is briefly empty; a concurrent run's
+broker cannot be serialised against, so only age covers that window).
+Identity cannot substitute for age: the cgroup name carries its owning run
+id, but a resumed run keeps its original id with a new container, so "is
+a container with this id still alive" reports *dead* for every resumed
+run — a predicate that would have deleted live runs on the host where
+this was measured.
 
 **A per-worker cap is a ceiling, not a reservation.** Writing
-`memory.max` allocates nothing; it only bounds. The real backstop
-against host-level exhaustion is the *aggregate*
-`leerie.slice/memory.max` set by `scripts/container-entry.sh`
-(`MemTotal - max(1 GiB, 12.5%)`), which bounds the whole worker fleet
-regardless of any individual worker's `memory.max`. Two consequences
-follow, and they are the load-bearing part of this design:
+`memory.max` allocates nothing; it only bounds. The real backstop against
+host-level exhaustion is the *aggregate* `leerie.slice/memory.max` set by
+`scripts/container-entry.sh` (`MemTotal - max(1 GiB, 12.5%)`), which
+bounds the whole worker fleet regardless of any individual worker's
+`memory.max`. Two consequences follow, and they are the load-bearing part
+of this design:
 
 1. Per-worker ceilings **may safely sum past the slice budget**. Eight
-   workers capped at 9.45 GiB do not reserve 75.6 GiB; they each promise
+   workers capped at 9.45 GiB do not reserve 75.6 GiB; each promises
    only "kill me before I exceed 9.45". The slice cap still binds.
-2. Therefore the per-worker cap must **never** be derived by dividing
-   the slice budget across a projected worker count. Doing so treats a
-   ceiling as a reservation and manufactures caps *below* the measured
-   build peak — the failure above, reintroduced. A run whose workers
-   were sized during a busy moment stays handicapped for its whole
-   life, since the cap is resolved once at startup.
+2. Therefore the per-worker cap must **never** be derived by dividing the
+   slice budget across a projected worker count — that treats a ceiling
+   as a reservation and manufactures caps *below* the measured build
+   peak, reintroducing the OOM above. A run whose workers were sized
+   during a busy moment stays handicapped for its whole life, since the
+   cap is resolved once at startup.
 
 The cap is therefore a fixed isolation ceiling —
 `max(build_peak, min(build_peak × 1.5, slice_max / 2))` — a function of
 the host's slice budget and the repo's own declared needs, never of
-*load*. (The declared-needs half is the reconciliation below; the point
-here is that nothing about how busy the slice is right now may enter.) The half-slice bound stops
-one worker being licensed to eat the fleet's headroom, but the build
-peak outranks it: on a slice too small to honour both, a `memory.max`
-above the slice is harmless (the aggregate cap binds first) while one
-below the build peak guarantees the OOM. Being load-independent is what
-makes resolving it once, at startup, correct.
+*load*. The half-slice bound stops one worker eating the fleet's
+headroom, but the build peak outranks it: on a slice too small to honour
+both, a `memory.max` above the slice is harmless (the aggregate cap binds
+first) while one below the build peak guarantees the OOM. Being
+load-independent is what makes resolving it once, at startup, correct.
 
 **A repo can declare its own memory needs, and the ceiling must honour
-them.** Node 20+ sizes its heap from the container it finds itself in —
+them.** Node 20+ sizes its heap from the container it finds itself in,
 but an explicit `--max-old-space-size` overrides that entirely, and the
-heap then throws OOM at its declared limit regardless of how much room the
-cgroup has. So a repo whose own build or test command declares a heap
-(most often not in the command leerie resolves, but inside the
-`package.json` script that command runs — which is why the resolver
-follows the indirection rather than scanning the literal string) has
-told leerie exactly what one of its workers needs, and a ceiling derived
-without reading that is derived from the wrong evidence: the repo's own
-number outranks any measurement leerie inherited from elsewhere.
+heap then throws OOM at its declared limit regardless of how much room
+the cgroup has. A repo whose own build or test command declares a heap
+(most often inside the `package.json` script that command runs, which is
+why the resolver follows the indirection rather than scanning the literal
+string) has told leerie exactly what one of its workers needs, and a
+ceiling derived without reading that is derived from the wrong evidence —
+the repo's own number outranks any measurement leerie inherited from
+elsewhere.
 
 The ceiling is therefore raised to `declared heap + headroom` when the
 repo declares one, where the headroom covers everything else sharing the
-cgroup — Node's non-heap memory and the resident worker process. Two
-refusals bound it. An operator who pins a smaller cap explicitly is
-refused rather than silently overridden, because issuing a cap below a
-declared heap guarantees the OOM the cap exists to prevent. And a declared
-heap that cannot fit the shared slice even alone is refused outright,
-since no per-worker arithmetic can rescue it.
-
-The same headroom figure runs in reverse elsewhere: leerie also tells Node
-how big a heap it may take given a cap. Those are one quantity viewed from
-two directions, and they must move together — they were once out of step,
-which had leerie granting a heap larger than the cage it had to live in.
+cgroup (Node's non-heap memory, the resident worker process). Two
+refusals bound it: an operator who pins a smaller cap explicitly is
+refused rather than silently overridden (a cap below a declared heap
+guarantees the OOM), and a declared heap that cannot fit the shared slice
+even alone is refused outright, since no per-worker arithmetic can rescue
+it. The same headroom figure runs in reverse elsewhere — leerie also
+tells Node how big a heap it may take given a cap — and the two must move
+together; they were once out of step, granting a heap larger than the
+cage it had to live in.
 
 **The ceiling is not the only per-worker figure: admission needs a
 *demand* estimate, and the two are different quantities.** The ceiling
 answers "how big before *this* worker is killed" and reserves nothing.
-Admission answers a different question — "is there room for another
-build right now" — and that one genuinely does reserve, so it needs a
-prediction of what a worker will actually *use*. Conflating the two is a mistake in one
-direction: reserving against the *ceiling* would throttle every run to fit
-a bound nobody is expected to reach.
+Admission answers "is there room for another build right now," which
+genuinely does reserve and so needs a prediction of what a worker will
+actually *use*. Reserving against the ceiling would throttle every run to
+fit a bound nobody is expected to reach. The two figures legitimately
+coincide when a repo declares a heap — the ceiling is raised to exactly
+`declared heap + headroom`, the same value the demand estimate takes —
+and that is not the divide-the-slice failure above: it is a *floor*
+driven by what the repo says it needs, never a *share* of the slice
+divided by a worker count.
 
-The other direction is subtler, because the two figures legitimately
-coincide. When a repo declares a heap, the ceiling is raised to exactly
-`declared heap + headroom` — the same value the demand estimate takes —
-and that is not the divide-the-slice failure above: it is a *floor* driven
-by what the repo says it needs, not a *share* of the slice divided by a
-worker count. The rule that matters is the narrow one: never derive a
-per-worker cap by dividing the slice budget across projected workers.
+The estimate defaults to the measured build peak, and becomes distinct
+from the ceiling only when a repo *declares* its own memory demand: an
+explicit `--max-old-space-size` overrides Node's container-aware default,
+so such a worker's real demand is the declared heap plus non-heap
+headroom, well above the historical peak, and admission sizes on that
+instead — deliberately only then, since raising the estimate fleet-wide
+would throttle every repo to fix a case most do not have.
 
-The estimate defaults to the same measured build peak, which is why the
-distinction stayed invisible for so long. It stops being invisible when
-a repo *declares* its own memory demand: an explicit
-`--max-old-space-size` in the build/lint/test command a repo runs
-overrides Node's container-aware default, so such a worker's real
-demand is the declared heap plus non-heap headroom, well above the
-historical peak. Admission then sizes on that instead. Deliberately
-only then — raising the estimate fleet-wide would throttle every repo
-to fix a case most do not have.
+Two consequences follow:
 
-Two consequences follow, and they replace the fixed arithmetic this
-section used to quote:
-
-1. The provable reservation ceiling is `demand × (max_parallel + 1)`,
-   not `build_peak × (max_parallel + 1)`. For a repo that declares a
-   large heap this can exceed the slice budget, and that is expected:
-   wave-entry degradation shrinks concurrency toward what fits, which is
-   the mechanism doing its job rather than a violation of the bound. It
-   floors at one worker: a wave of zero makes no progress at all.
-
-   That floor is not what handles a heap larger than the whole slice,
-   though — startup refuses first, so the wave never runs. Degradation
-   floors at one worker because a wave of zero is useless, not because
-   one oversized worker is an acceptable outcome. The refusal is also
-   narrower than "always": it is reached only when the resolved ceiling
-   is *below* `declared heap + headroom`, so a repo whose auto-derived
-   ceiling already clears that floor is admitted without the slice ever
-   being consulted. What is genuinely relied on there is the per-worker
-   cap — the slice check asks whether ONE such worker fits, never
-   `max_parallel` of them.
+1. The provable reservation ceiling is `demand × (max_parallel + 1)`, not
+   `build_peak × (max_parallel + 1)`. For a repo that declares a large
+   heap this can exceed the slice budget, and that is expected: wave-entry
+   degradation shrinks concurrency toward what fits, flooring at one
+   worker (a wave of zero makes no progress at all). A heap larger than
+   the whole slice is instead refused at startup, before the wave ever
+   runs — degradation floors at one worker because a wave of zero is
+   useless, not because one oversized worker is an acceptable outcome.
+   The refusal fires only when the resolved ceiling is *below* `declared
+   heap + headroom`, so a repo whose auto-derived ceiling already clears
+   that floor is admitted without the slice ever being consulted; the
+   slice check asks whether ONE such worker fits, never `max_parallel` of
+   them.
 2. Because degradation is the designed response, a declared heap large
-   relative to the slice buys fewer concurrent workers. The operator is
+   relative to the slice buys fewer concurrent workers — the operator is
    told so at startup rather than discovering it as unexplained
    slowness.
 
 **Contention is handled by admission in two stages, not by shrinking
 caps.** The cheap stage runs once at wave entry
 (`_degrade_max_parallel_for_wave`, called by `phase_execute`): it shrinks
-the wave's own concurrency to the largest N whose workers fit the headroom
-that actually exists, and hands N straight to the wave's
-`asyncio.Semaphore`. The expensive stage is the per-spawn gate below, which
-can block for minutes.
-
-The order matters. A wave that enters over-subscribed pays the blocking
-gate *per worker*, so sizing the wave to real headroom first means the gate
-is a backstop for what changes **during** the wave — a sibling run's
-workers arriving — rather than the routine path. Shrinking concurrency is
-also the only lever this run actually controls: it cannot shrink a sibling
-run's live worker count, and it must not shrink its own per-worker cap
-(that is the reservation error above).
-
-Both stages read the **same** signal, `slice_max - unreclaimable`. That is
-not incidental: two signals could disagree about one slice, with the
-degrade sizing a wave down against page-cache pressure the gate then
-cheerfully admits into. The degrade never feeds its own output back into a
-later headroom computation, so successive waves cannot ratchet down.
+the wave's own concurrency to the largest N whose workers fit the
+headroom that actually exists, and hands N straight to the wave's
+`asyncio.Semaphore`. The expensive stage is the per-spawn gate below,
+which can block for minutes. Sizing the wave to real headroom first means
+the gate is a backstop for what changes **during** the wave — a sibling
+run's workers arriving — rather than the routine path; shrinking
+concurrency is also the only lever this run actually controls, since it
+cannot shrink a sibling run's live worker count and must not shrink its
+own per-worker cap (the reservation error above). Both stages read the
+**same** signal, `slice_max - unreclaimable` — deliberately, since two
+signals could disagree about one slice, with the degrade sizing a wave
+down against page-cache pressure the gate then cheerfully admits into.
+The degrade never feeds its own output back into a later headroom
+computation, so successive waves cannot ratchet down.
 
 Before spawning a worker, leerie blocks while the slice lacks room for
 another build (`_await_worker_memory_admission`). The signal is measured
-headroom — `slice_max` minus *unreclaimable* usage (anon + unevictable
-+ unreclaimable slab, read from `memory.stat`), never `memory.current`,
-which counts page cache: on a live host, **10.4 GiB of 20.5 GiB in use
-was reclaimable file cache**, so gating on `memory.current` would
-under-report headroom by half and stall a fleet that had ample room.
+headroom — `slice_max` minus *unreclaimable* usage (anon + unevictable +
+unreclaimable slab, from `memory.stat`), never `memory.current`, which
+counts page cache: on a live host, 10.4 GiB of 20.5 GiB in use was
+reclaimable file cache, so gating on `memory.current` would under-report
+headroom by half and stall a fleet with ample room.
 
-The gate also **reserves** one per-worker *demand estimate* (above:
-normally the build peak, or the repo's declared heap plus headroom when
-it declares one) per worker still in flight — admitted and not yet
-exited — plus one for the worker being admitted. It
-is otherwise stateless, and `_invoke` runs under
-`Semaphore(max_parallel)` with the gate *inside* it — so a whole wave
-would evaluate identical pre-allocation headroom and all of it would
-admit. (The superseded divisor had no such gap: it read `live_siblings`,
-which counts enrolled cgroups, and enrollment happens microseconds after
-spawn.) On a slice already at 40 GiB of 54.9, the first two workers of a
-wave admit and the third waits, where a stateless gate would have let all
-five through against 14.9 GiB of headroom.
+The gate also **reserves** one per-worker demand estimate per worker
+still in flight (admitted and not yet exited) plus one for the worker
+being admitted, and is otherwise stateless; `_invoke` runs under
+`Semaphore(max_parallel)` with the gate *inside* it, so a whole wave would
+otherwise evaluate identical pre-allocation headroom and all admit at
+once. (The superseded divisor read `live_siblings`, which counts enrolled
+cgroups, and enrollment happens microseconds after spawn — no such gap.)
+On a slice already at 40 GiB of 54.9, the first two workers of a wave
+admit and the third waits, where a stateless gate would have let all five
+through against 14.9 GiB of headroom.
 
 **A reservation is bounded by the worker's lifetime, not by elapsed
 time**, and that distinction is the whole correctness argument. Most
-workers are short-lived — classifier, fit_judge, splitter and
-satisfied_probe finish in seconds — so an interval-based reservation
-outlives its worker by orders of magnitude and they accumulate. Measured
-against real runs, 13–15 workers start within any 180 s window, which
-under an interval model demands 88–101 GiB on a 54.9 GiB slice:
-unsatisfiable at *any* load, so every worker stalls the full wait and
-admits anyway. That is the same stall this mechanism exists to remove,
-reintroduced by the mechanism itself.
-
-Bounding by lifetime makes the ceiling provable rather than a guess about
-timing: in-flight workers are capped by the semaphore the spawn path
-already runs under, so reservations cannot exceed
-`demand × (max_parallel + 1)`. At the default estimate that is about
-38 GiB, which fits an idle 54.9 GiB slice and still blocks a busy one.
-A repo declaring a large heap raises the estimate and can push that
-product past the slice; wave-entry degradation then shrinks concurrency
-toward what fits (flooring at one), which is the designed response rather
-than a broken bound.
+workers are short-lived (classifier, fit_judge, splitter, satisfied_probe
+finish in seconds), so an interval-based reservation outlives its worker
+by orders of magnitude and they accumulate. Measured against real runs,
+13–15 workers start within any 180 s window, which under an interval
+model demands 88–101 GiB on a 54.9 GiB slice — unsatisfiable at any load,
+so every worker stalls the full wait and admits anyway, reintroducing the
+same stall the mechanism exists to remove. Bounding by lifetime makes the
+ceiling provable instead: in-flight workers are capped by the semaphore
+the spawn path already runs under, so reservations cannot exceed
+`demand × (max_parallel + 1)` (about 38 GiB at the default estimate,
+fitting an idle 54.9 GiB slice while still blocking a busy one). A repo
+declaring a large heap raises the estimate and can push that product past
+the slice; wave-entry degradation then shrinks concurrency toward what
+fits, flooring at one, which is the designed response rather than a
+broken bound.
 
 `_WORKER_ADMISSION_RAMP_SEC` survives only as a leak backstop, for the
-window between the gate and the spawn path's `try`/`finally`. It is also
-the right bound on its own terms: past that long, a still-running
-worker's demand is already in the `unreclaimable` reading, and reserving
-for it again would double-count.
-
-The wait is bounded (10 min) and then admits anyway: a run that never
-progresses is worse than a tight one, and because the ceiling is now
-always ≥ the build peak, a late-admitted worker is no longer doomed by
-construction. When no slice budget is readable at all (containment off,
+window between the gate and the spawn path's `try`/`finally` — past that
+long, a still-running worker's demand is already in the `unreclaimable`
+reading, and reserving for it again would double-count. The wait is
+bounded (10 min) and then admits anyway: a run that never progresses is
+worse than a tight one, and because the ceiling is now always ≥ the build
+peak, a late-admitted worker is no longer doomed by construction. When no
+slice budget is readable at all (containment off,
 `--dangerously-allow-uncapped`, no broker), admission is a no-op and
-sizing falls back to the legacy `/proc/meminfo` basis — there is no
-shared enforcement to gate against either way.
-
-This replaces the older advice to hand-tune `--max-parallel` down for
-build-heavy waves. That advice was sound under a divide-the-slice cap,
-but it asked the operator to predict contention that the orchestrator
-can now simply measure.
+sizing falls back to the legacy `/proc/meminfo` basis. This replaces the
+older advice to hand-tune `--max-parallel` down for build-heavy waves,
+which was sound under a divide-the-slice cap but asked the operator to
+predict contention the orchestrator can now simply measure.
 
 **The containment must be performed by an identity that owns (or was
 delegated) the relevant cgroup subtree — it cannot be delegated to the
@@ -3467,10 +2990,9 @@ on Fly Firecracker VMs, whose unified mount exposes no controllers) uses
 the split hierarchies (`/sys/fs/cgroup/pids/leerie.slice/...`,
 `/sys/fs/cgroup/memory/leerie.slice/...`). The `<sid>` in these path
 templates is the run-scoped composed sid (`<run-id-prefix>-<worker-sid>`,
-see *The per-worker cgroup name is run-scoped* above); the broker treats
-it as an opaque validated string. The entrypoint then drops to
-the leerie user via `runuser -u leerie --` before exec'ing the
-orchestrator (local nerdctl) or sleeping as PID 1 (Fly, where the
+above); the broker treats it as an opaque validated string. The entrypoint
+then drops to the leerie user via `runuser -u leerie --` before exec'ing
+the orchestrator (local nerdctl) or sleeping as PID 1 (Fly, where the
 orchestrator is started out-of-band by the launcher's ssh-console wrapper
 that drops via `Popen(user="leerie")`). The orchestrator's `_cgroup_*`
 helpers are thin socket clients of the broker; it never writes cgroupfs
@@ -3482,359 +3004,271 @@ there.)
 crash, `_enforce_and_record_cgroup_containment` runs once per run just
 before the first worker spawns — in `_run_phases`, *after* the resume
 short-circuits so an already-completed / no-work resume (which spawns
-zero workers — the "host launcher pushes + opens the PR" flow) is not
-gated and cannot `die()` spuriously on a containment-incapable host. It
-probes the broker end-to-end (a real create+enroll+destroy round-trip —
-the true test of the path workers use, unlike the old direct-write probe
-that false-passed) and records `{enforced, hierarchy}` in `state.json`
-(merged into the already-populated run state). If containment cannot be
-enabled (broker down, no usable cgroup hierarchy — neither a v2 unified
-mount nor v1 pids+memory controller mounts — or read-only cgroupfs), the
-run `die()`s with an actionable message —
-**unless** the operator passes `--dangerously-allow-uncapped`
-(`LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` / `leerie.toml`), which downgrades
-the fatal gate to a loud warning. Persisting the outcome is deliberate:
-the crash left no artifact of the silent failure; now it is visible.
+zero workers) is not gated and cannot `die()` spuriously on a
+containment-incapable host. It probes the broker end-to-end (a real
+create+enroll+destroy round-trip — the true test of the path workers use,
+unlike the old direct-write probe that false-passed) and records
+`{enforced, hierarchy}` in `state.json`. If containment cannot be enabled
+(broker down, no usable cgroup hierarchy, or read-only cgroupfs), the run
+`die()`s with an actionable message — **unless** the operator passes
+`--dangerously-allow-uncapped` (`LEERIE_DANGEROUSLY_ALLOW_UNCAPPED` /
+`leerie.toml`), which downgrades the fatal gate to a loud warning.
+Persisting the outcome is deliberate: the crash left no artifact of the
+silent failure; now it is visible.
 
 **Rootless exception — the systemd-delegated user slice.** Under rootless
 containerd (Linux), rootlesskit maps the host UID to container UID 0, so
-"root" inside the container IS the unprivileged host user. In this mode
-the entrypoint detects rootless via `/proc/self/uid_map` (non-zero
-host-start field) and skips both the privilege drop (`runuser`) and the
-`/work` chown (which would reassign ownership into the subuid range,
-breaking host-side access).
+"root" inside the container IS the unprivileged host user. The entrypoint
+detects rootless via `/proc/self/uid_map` (non-zero host-start field) and
+skips both the privilege drop (`runuser`) and the `/work` chown (which
+would reassign ownership into the subuid range, breaking host-side
+access).
 
 `leerie.slice` is anchored at the cgroup v2 subtree systemd already
-delegates to that UID's login session:
-`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/` — not the
-top-level `/sys/fs/cgroup`, which is root-owned (mode 0555) and off-limits
-to the mapped host UID. `pam_systemd`/logind chown that directory's own
-`cgroup.procs`, `cgroup.subtree_control`, and `cgroup.threads` to the real
-UID, and any cgroup the UID creates underneath it (via `mkdir`) inherits
-that UID's ownership on every interface file the kernel auto-populates,
-including `pids.max` and `memory.max` — so both create and limit-setting
-work directly.
-
-Cross-scope migration works too, by the same rule that requires write
-access to the destination and the nearest common ancestor (not the
-source, described above): a worker's `claude -p` process is born wherever
-the rootless containerd's own cgroup driver placed the container (a scope
-such as `user@<uid>.service/user.slice/nerdctl-<id>.scope`), and since
-both that scope and `leerie.slice` descend from `user@<uid>.service` —
-which is delegated to the real UID — migrating a worker PID from one into
-the other succeeds.
+delegates to that UID's login session
+(`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/`) — not
+the root-owned (mode 0555) top-level `/sys/fs/cgroup`. `pam_systemd`/logind
+chown that directory's `cgroup.procs`/`cgroup.subtree_control`/
+`cgroup.threads` to the real UID, so any cgroup the UID creates underneath
+it inherits ownership on every kernel-populated interface file, including
+`pids.max`/`memory.max`. Cross-scope migration works the same way: a
+worker's `claude -p` process is born under whatever scope rootless
+containerd placed the container in (e.g.
+`user@<uid>.service/user.slice/nerdctl-<id>.scope`), and since both that
+scope and `leerie.slice` descend from the delegated `user@<uid>.service`,
+migrating a worker PID between them succeeds.
 
 `HOST_UID` (the real host UID rootlesskit mapped container UID 0 to) is
 read from the second field of `/proc/self/uid_map`'s first line. The
-entrypoint passes the resolved root to the broker via the
-`LEERIE_CGROUP_V2_ROOT` environment variable (`scripts/cgroup-broker.py`'s
-`V2_ROOT` reads it, defaulting to the literal `/sys/fs/cgroup` for every
-other runtime). The broker needs no separate privileged identity here: it
-is launched by PID 1 before the privilege drop, at the same
-rootlesskit-mapped identity the whole container runs as — exactly the
-identity `CGROUP_ROOT` is delegated to.
+entrypoint passes the resolved root to the broker via
+`LEERIE_CGROUP_V2_ROOT` (`scripts/cgroup-broker.py`'s `V2_ROOT`, defaulting
+to `/sys/fs/cgroup` for every other runtime). The broker needs no separate
+privileged identity: it launches at the same rootlesskit-mapped identity
+the whole container runs as, before the privilege drop.
 
 This relies on systemd + cgroup v2 delegating `pids`/`memory` into the
-per-session slice, which is the default on modern systemd hosts. Where
-that isn't the case (a non-systemd init, or a host that doesn't delegate
-those controllers), the slice-setup writes (`|| true`) and the broker's
+per-session slice — the default on modern systemd hosts. Where that isn't
+the case, the slice-setup writes (`|| true`) and the broker's
 write-then-read-back verification in `_detect()` fail silently, and the
 fail-closed containment gate stops the run unless the operator passes
 `--dangerously-allow-uncapped`.
 
-**User-namespace remap for `--dangerously-skip-permissions`.**
-Claude Code rejects `--dangerously-skip-permissions` when
-`os.getuid() == 0`. In rootless mode the entrypoint uses
-`unshare --user --map-user=<leerie-uid> --map-group=<leerie-gid>` to
-remap outer UID 0 (the mapped host user) to inner UID leerie in a
-nested user namespace. Bind-mounted host dirs remain owned by us
-(outer UID 0 → inner UID leerie), and image dirs at
-`/opt/leerie-image/` (outer UID leerie) are traversed via their
-mode-755 bits. The orchestrator sees `getuid() == leerie` and Claude
-Code accepts `--dangerously-skip-permissions` without any escape hatch.
-The OCI default seccomp profile blocks `unshare(CLONE_NEWUSER)` inside
-containers, so the launcher passes `--security-opt seccomp=unconfined`
-for rootless runs (gated on the `containerd-rootless/child_pid`
-sentinel, not on `id -u`, so macOS/Colima runs are unaffected).
+**User-namespace remap for `--dangerously-skip-permissions`.** Claude Code
+rejects `--dangerously-skip-permissions` when `os.getuid() == 0`. In
+rootless mode the entrypoint uses
+`unshare --user --map-user=<leerie-uid> --map-group=<leerie-gid>` to remap
+outer UID 0 to inner UID leerie in a nested user namespace: bind-mounted
+host dirs stay writable (outer UID 0 → inner UID leerie), image dirs at
+`/opt/leerie-image/` (outer UID leerie) traverse via their mode-755 bits,
+and Claude Code sees `getuid() == leerie` and accepts the flag with no
+escape-hatch check. The OCI default seccomp profile blocks
+`unshare(CLONE_NEWUSER)` inside containers, so the launcher passes
+`--security-opt seccomp=unconfined` for rootless runs (gated on the
+`containerd-rootless/child_pid` sentinel, not `id -u`, so macOS/Colima runs
+are unaffected).
 
 Local nerdctl additionally needs the launcher's writable bind-mount —
 `--mount type=bind,source=/sys/fs/cgroup,target=/sys/fs/cgroup,
-bind-propagation=rshared` in the bash launcher's nerdctl invocation —
-so the in-container entrypoint can see the host VM's cgroupfs.
-The launcher also passes `--cgroupns=host` so the container shares the
-host VM's cgroup namespace. Without this, nerdctl's default private
-cgroup namespace (`--cgroupns=private`) combined with `nsdelegate` on
-the cgroupfs mount blocks process migration to `cgroup.procs` even for
-the broker — the kernel treats the namespace boundary as a delegation
-boundary. With `--cgroupns=host`, the container sees its real cgroup
-path (e.g., `/system.slice/nerdctl-<id>.scope`) and the broker can
-enroll worker PIDs into `leerie.slice/` children. Fly's Firecracker
-microVM boots its own kernel with no cgroup namespace boundary, so this
-flag only affects the local nerdctl path.
+bind-propagation=rshared` — so the entrypoint can see the host VM's
+cgroupfs, plus `--cgroupns=host`: without it, nerdctl's default private
+cgroup namespace (`--cgroupns=private`) combined with `nsdelegate` blocks
+the broker's process migration to `cgroup.procs` (the kernel treats the
+namespace boundary as a delegation boundary). With `--cgroupns=host` the
+container sees its real cgroup path and the broker can enroll worker PIDs
+under `leerie.slice/`. Fly's Firecracker microVM boots its own kernel with
+no cgroup namespace boundary, so this flag only affects local nerdctl.
 
-On macOS (Darwin) the launcher sets the mount unconditionally — Colima's
-VM always runs rootful containerd with cgroup v2 and shared propagation,
-but the macOS host has no `/sys/fs/cgroup` to probe. On native rootful
-Linux the launcher adds the same `rshared` mount unconditionally.
+On macOS (Darwin) the launcher sets the mount unconditionally — Colima's VM
+always runs rootful containerd with cgroup v2 and shared propagation, but
+the macOS host has no `/sys/fs/cgroup` to probe. On native rootful Linux
+the launcher adds the same `rshared` mount unconditionally.
 
 Rootless containerd is its own branch, gated on the
 `containerd-rootless/child_pid` sentinel, and uses a **plain** bind-mount
 with no `bind-propagation` flag: rootlesskit's `--propagation=rslave`
-demotes `/sys/fs/cgroup` to a slave mount inside its sandbox, which is
-incompatible with `bind-propagation=rshared`. Propagation of new mount
-events isn't actually needed here, though — only read/write visibility
-into the already-mounted cgroupfs, so the entrypoint can create and
-manage cgroups under the delegated user slice described above, and a
-plain bind-mount provides exactly that. When cgroup v2 isn't present at
-all (older kernel, disabled unified hierarchy) the mount is skipped and
+demotes `/sys/fs/cgroup` to a slave mount inside its sandbox, incompatible
+with `bind-propagation=rshared`. Only read/write visibility into the
+already-mounted cgroupfs is needed, which a plain bind-mount provides.
+When cgroup v2 isn't present at all, the mount is skipped and
 `_cgroup_probe` falls back to uncapped workers (and, absent
 `--dangerously-allow-uncapped`, the fail-closed gate stops the run).
-Fly's Firecracker microVM exposes cgroupfs directly with no launcher
-flag required.
+Fly's Firecracker microVM exposes cgroupfs directly with no launcher flag
+required.
 
 `_cgroup_probe` sends a `probe` request to the broker, which does a real
 create+enroll+destroy round-trip of a throwaway cgroup and returns the
-detected hierarchy (`v2`/`v1`). This is the true test of the path
-workers use — the earlier direct-write probe passed on hosts where the
-subsequent non-root enroll actually failed, which is how the containment
-silently disappeared. On v2 the broker's teardown uses `cgroup.kill`
-(kernel ≥ 5.14) as an atomic kill of any worker-subtree process that
-survived the existing `_terminate_proc_tree` proc-walk; on v1 it moves
-survivors to the parent then rmdirs. See IMPLEMENTATION.md §"Caps" for
-the resolution surface, `scripts/cgroup-broker.py` for the broker, and
-the `_cgroup_*` clients in `orchestrator/leerie.py` for the call sites.
+detected hierarchy (`v2`/`v1`) — the true test of the path workers use;
+an earlier direct-write probe passed on hosts where the subsequent
+non-root enroll actually failed, letting containment silently disappear.
+On v2 the broker's teardown uses `cgroup.kill` (kernel ≥ 5.14) as an
+atomic kill of any worker-subtree process that survived the existing
+`_terminate_proc_tree` proc-walk; on v1 it moves survivors to the parent
+then rmdirs. See IMPLEMENTATION.md §"Caps" for the resolution surface,
+`scripts/cgroup-broker.py` for the broker, and the `_cgroup_*` clients in
+`orchestrator/leerie.py` for the call sites.
 
 **Detecting PID exhaustion — the broker `stat` read-back.** The
 `pids.max` cap protects the *host* (a runaway subtree cannot exhaust the
 VM's PID table), but it has a failure mode of its own for the *worker*:
-once the cap is reached, every subsequent `fork()`/`clone()` in the
-subtree returns `EAGAIN`, so **every shell the worker's Bash tool tries
-to launch fails** — while in-process tools (`Read`/`Grep`/`Glob`) keep
-working. Observed live: a worker leaked `run_in_background` subprocesses
-(reparented to init, so they escape the descendant walk and are reaped
-either by the mid-run pressure-gated reaper below or, failing that, at
-worker *exit*), saturated `pids.max`, and then spent the rest of the run
-in a spiral where even `echo`/`true`/`pwd` returned a bare "Exit code 1".
-The worker cannot diagnose this — the CLI surfaces only a generic tool
-error, and the kernel's `EAGAIN` string usually does not survive into the
-tool-result text for trivial commands — so it mis-attributes the failure
-and burns its whole turn budget without recovering.
+once reached, every `fork()`/`clone()` in the subtree returns `EAGAIN`,
+so every shell the worker's Bash tool tries to launch fails while
+in-process tools keep working. Observed live: a worker leaked
+`run_in_background` subprocesses (reparented to init, escaping the
+descendant walk until the mid-run reaper or worker exit reaps them),
+saturated `pids.max`, and spent the rest of the run in a spiral where
+even `echo`/`pwd` returned a bare "Exit code 1" — the CLI surfaces only a
+generic tool error and the kernel's `EAGAIN` string rarely survives into
+the tool-result text, so the worker mis-attributes the failure and burns
+its turn budget without recovering.
 
 Detection is a backstop, not a substitute for a cap sized to the
 workload. There is no reliable way to *detect and refuse* "a full test
-suite run" (the command space — `pytest`, `make test`, `tox`, wrapper
-scripts — is open-ended, and a misfiring guard is worse than none), so
-the cap value itself is the enforcement surface for *legitimate* load:
-the default is set generous enough (2048) to admit a real conformance
-run, and it is overridable per-repo for suites heavier still. A runaway
-fork-bomb (thousands of PIDs) still trips the cap.
+suite run" (the command space is open-ended and a misfiring guard is
+worse than none), so the cap value itself is the enforcement surface for
+legitimate load: generous enough (2048) to admit a real conformance run,
+overridable per-repo for heavier suites. A runaway fork-bomb still trips
+it.
 
-The workload the cap is sized against is a measured quantity rather than
-a guessed one. Leerie's own suite — the canonical heavy example, 3762
-tests across 251 modules, 117 of them fanning out into stubbed-binary
-subprocesses — peaks at **33** concurrent PIDs (median 7, P99 29, sampled
-at 20 Hz against the kernel's own `pids.current` in the release image).
-The cap therefore sits ~62× above that workload, and a worker approaching
-it is almost never doing legitimate work: it is leaking. That measurement
-is what lets the mid-run reaper act on pressure at all — see *Mid-run PID
-reaping* below, whose critical tier closes the burst case this paragraph
-used to call uncatchable.
-
-The ~62× figure is deliberate slack, not a fitted multiple. The default
-was 1024 (~31×) until a *second* 1024-saturation incident — distinct from
-the wave-2 integrator death in run `879defae` described under *Mid-run PID
-reaping* below, and later than it. This one was a conformer: having
-backgrounded a test-suite run and lost track of its output file, the
-worker ran the full suite a second time, and the two runs together
-saturated the cap (`pids.current=1024/1024`, fork denials 221 — the
-integrator's count was 213, a different event with the same signature).
-Nothing in that trace needed more than 1024 PIDs to do its work — so the
-raise to 2048 buys a misbehaving worker more room before it dies, and
-does not address why it misbehaved. It is headroom against a class of
-worker error, priced in the knowledge that a genuine leak now issues
-twice as many forks before the kernel starts refusing them at `pids.max`,
-and sits under the mid-run reaper for twice as long before that point.
+The cap is sized against a measured workload, not a guess: leerie's own
+suite (3762 tests, 251 modules) peaks at **33** concurrent PIDs (median
+7, P99 29, sampled at 20 Hz against the release image's `pids.current`),
+so the cap sits ~62× above it — a worker approaching the cap is almost
+never doing legitimate work. That gap is what lets the mid-run reaper
+below act on pressure at all. The default was 1024 until a second
+1024-saturation incident (a conformer backgrounded a test run, lost
+track of its output file, and ran the suite a second time, together
+hitting the cap) — nothing in that trace needed more than 1024 PIDs, so
+the raise to 2048 buys a misbehaving worker more headroom before it dies
+without addressing why it misbehaved.
 
 Per §12 (*prompts are advisory, code enforces*), the orchestrator detects
-this mechanically rather than leaving it to the model. The broker gains a
-read-only `stat <sid>` verb returning the worker cgroup's
-`pids.current` / `pids.max` and the `pids.events` `max` counter (the
-kernel increments the latter once per denied fork — the definitive,
-unambiguous signal, distinct from a memory OOM which instead bumps
-`memory.events`). When enough of a worker's *recent tool-results* are
-errors, `_read_stream` probes the broker; if the cgroup is at its PID cap
-(or the `pids.events` `max` counter is climbing), the orchestrator logs
-the real cause, relabels the inline summary, and terminates the worker
-early via the existing abnormal-exit path (`_terminate_proc_tree` + the
-`_DescendantTracker` reap) with a `WorkerError`. That routes through the
-callers' existing handling: an implementer's PID-exhausted run becomes a
-retryable `incomplete-handoff` (a fresh worker restarts in a new worktree
-with a clean PID table, and the dead worker's leaked PIDs die with it),
-and a conformer's stays advisory (§9).
+this mechanically. The broker gains a read-only `stat <sid>` verb
+returning the worker cgroup's `pids.current`/`pids.max` and the
+`pids.events` `max` counter (incremented once per denied fork — distinct
+from a memory OOM, which bumps `memory.events` instead). When enough of a
+worker's recent tool-results are errors, `_read_stream` probes the
+broker; if the cgroup is at its PID cap (or `pids.events.max` is
+climbing), the orchestrator logs the real cause, relabels the inline
+summary, and terminates the worker early via the existing abnormal-exit
+path with a `WorkerError`. That routes through the callers' existing
+handling: an implementer's PID-exhausted run becomes a retryable
+`incomplete-handoff` (a fresh worker restarts in a clean worktree), and a
+conformer's stays advisory (§9).
 
 **Detecting memory OOM — naming the cause instead of a cryptic checkpoint
 error.** A build/test command that overshoots the worker cgroup's
 `memory.max` is killed by the kernel with a bare `Killed` (exit 137, no
-error text of its own) — unlike PID exhaustion, this leaves no failing
-tool-result for `_read_stream`'s window detector to key on: `claude -p`
-is often reaped mid-turn, before it can emit any `result` event at all.
-That symptom lands in `_invoke`'s no-envelope path indistinguishable from
-a session-limit no-op or a `--max-turns` exhaustion; downstream,
-`_validate_result` tags it `empty_handoff`, and once a run with no
-committed work burns the retry cap the operator sees only *"checkpoint
-... does not exist on disk"* — no mention of memory. On a real run this
-drove an operator through a default → 6G → 12G → 16G
-`LEERIE_WORKER_MEMORY_MAX` escalation before finding the actual cause.
+error text) — unlike PID exhaustion, this leaves no failing tool-result
+for `_read_stream`'s window detector to key on, since `claude -p` is often
+reaped mid-turn before any `result` event is emitted. That symptom lands
+in `_invoke`'s no-envelope path indistinguishable from a session-limit
+no-op or `--max-turns` exhaustion; `_validate_result` tags it
+`empty_handoff`, and once the retry cap burns with no committed work the
+operator sees only *"checkpoint ... does not exist on disk"* — no mention
+of memory (a real run drove an operator through a default → 6G → 12G →
+16G `LEERIE_WORKER_MEMORY_MAX` escalation before finding the actual
+cause).
 
-The broker's `stat <sid>` verb (extended alongside the PID-exhaustion
-counters above) also returns `memory.events`' `oom_kill` counter — the
-kernel increments it once per OOM-kill inside the cgroup, mirroring
-`pids.events`' `max` counter's role for fork denial. `_cgroup_stat`'s
-client widens to a 4-tuple accordingly:
-`(pids.current, pids.max, pids.events.max, oom_kill)`. `_invoke` reads
-the cgroup's stat once more — in its `finally`, immediately before
-`_cgroup_destroy` tears the cgroup down (destroy `rmdir`s it, so this is
-the last point a read is possible) — and, in the no-envelope branch, if
-`oom_kill > 0` it raises a `WorkerError` naming the cause: the last Bash
-command the worker launched (tracked alongside the PID-exhaustion window,
-first line only) and the cgroup's `memory.max` cap, with the same
-actionable suggestion the operator's escalation ladder already
-discovered by hand — *"worker OOM-killed on `<cmd>` (memory.max=N GiB) —
-raise `--worker-memory-max` or lower `--max-parallel`."* That message
-threads through `_run_implementer`'s existing `except WorkerError` handler
-into the synthesized `incomplete-handoff` envelope's `summary` field.
+The broker's `stat <sid>` verb also returns `memory.events`' `oom_kill`
+counter (incremented once per OOM-kill, mirroring `pids.events.max`'s role
+for fork denial); `_cgroup_stat` widens to a 4-tuple:
+`(pids.current, pids.max, pids.events.max, oom_kill)`. `_invoke` reads the
+cgroup's stat once more in its `finally`, immediately before
+`_cgroup_destroy` (`rmdir`s the cgroup, so this is the last point a read
+is possible) — and in the no-envelope branch, if `oom_kill > 0`, raises a
+`WorkerError` naming the cause: the last Bash command the worker launched
+and the cgroup's `memory.max` cap, with the actionable fix — *"worker
+OOM-killed on `<cmd>` (memory.max=N GiB) — raise `--worker-memory-max` or
+lower `--max-parallel`."* That message threads through
+`_run_implementer`'s `except WorkerError` handler into the synthesized
+`incomplete-handoff` envelope's `summary` field.
 
-`_settle_subtask`'s `empty_handoff` handling already branches on whether
-the worktree holds committed work (see the rescue above): when it does,
-the named-OOM `summary` was already preserved verbatim. The remaining
-gap is the no-commits branch, which previously discarded the worker's
-`summary` in favor of `_validate_result`'s generic checkpoint-missing
-`message` before calling `fail()`. That branch now prefers the worker's
-own `summary` when present — falling back to the generic message only
-when no worker output exists — so a genuinely OOM-killed build is named
-even when the retry cap is exhausted and the subtask terminates.
+`_settle_subtask`'s `empty_handoff` handling branches on whether the
+worktree holds committed work: when it does, the named-OOM `summary` was
+already preserved verbatim. The no-commits branch previously discarded
+the worker's `summary` in favor of `_validate_result`'s generic
+checkpoint-missing `message`; it now prefers the worker's own `summary`
+when present, falling back to the generic message only when no worker
+output exists — so a genuinely OOM-killed build is named even when the
+subtask terminates.
 
 The error signal is measured over a **sliding window of the last N
-tool-results**, NOT a run of *consecutive* ones. The stream never places
-two tool-results next to each other — a tool-result is always followed by
-the model's next assistant turn plus `system`/`rate_limit` events before
-the next tool-result — so a "consecutive tool-result" counter can never
-exceed one and would never fire. The window counts only tool-result
-outcomes (the interleaved assistant/system events are ignored, not treated
-as resets); a single ordinary failing test leaves at most one error in the
-window and never reaches the threshold, while a PID-exhausted worker —
-whose every shell-spawning call fails — fills the window quickly. Even
-then the kill only fires when the authoritative cgroup read confirms
-exhaustion, so the window merely decides *when to probe*.
+tool-results**, not a run of *consecutive* ones — the stream never places
+two tool-results adjacently, so a "consecutive" counter could never fire.
+The window counts only tool-result outcomes; a single ordinary failing
+test leaves at most one error in the window and never reaches the
+threshold, while a PID-exhausted worker (every shell-spawning call
+failing) fills it quickly. Even then the kill only fires once the
+authoritative cgroup read confirms exhaustion — the window merely decides
+*when to probe*.
 
 **Mid-run PID reaping — reducing the blast radius.** The 0.9.38 window
-detector is a backstop: it *catches* a worker that has already saturated
-`pids.max`. But the root cause — `run_in_background` subprocesses
-reparenting to init and accumulating against the cap throughout the run —
-is not addressed by detection alone. A complementary *reducer* layer sits
-UNDER the backstop inside `_DescendantTracker._poll_loop`: it probes
-`_cgroup_stat` each cycle and, when pressure rises, reaps the safest
-killable set before the cap is hit. The load-bearing safety property: **below
-the pressure gate, behavior is byte-identical to today — zero mid-run
-kills.** Both mechanisms share the same `_cgroup_stat(sid)` call as their
-authoritative source.
+detector above is a backstop: it *catches* a worker that has already
+saturated `pids.max`. But the root cause — `run_in_background`
+subprocesses reparenting to init and accumulating against the cap
+throughout the run — is not addressed by detection alone. A complementary
+*reducer* layer sits under the backstop inside
+`_DescendantTracker._poll_loop`: it probes `_cgroup_stat` each cycle and,
+when pressure rises, reaps the safest killable set before the cap is hit.
+Load-bearing safety property: below the pressure gate, behavior is
+byte-identical to today — zero mid-run kills. Both mechanisms share the
+same `_cgroup_stat(sid)` call as their authoritative source.
 
-*Trigger — pressure-gated, not timer-based.* Each `_poll_loop` cycle, the
-tracker probes `pids.current / pids.max`. Reaping is armed only when that
-ratio reaches or exceeds `_PID_REAP_HIGH_WATER` (0.90). A timer would fire
-under zero pressure — pure downside (could kill a live background test),
-zero upside. Gating at 90% means the only time any process is killed mid-run
-is when the worker is already near EAGAIN death.
+*Trigger — pressure-gated, not timer-based.* Each cycle the tracker probes
+`pids.current / pids.max`; reaping arms only at or above
+`_PID_REAP_HIGH_WATER` (0.90) — a timer would fire under zero pressure
+(pure downside, could kill a live background test, zero upside).
 
-*Target — the safest killable set.* From `_seen` (every PID the tracker has
-observed), the reaper selects those that are simultaneously (i) still alive,
-(ii) reparented to init (`ppid == 1`, i.e. no longer attached to the worker
-process chain), and (iii) older than `_PID_REAP_MIN_AGE_SEC` (60 s). PIDs
-are killed **oldest-first**, stopping as soon as `pids.current / pids.max`
-drops below `_PID_REAP_LOW_WATER` (0.75) — hysteresis so one pass does not
-over-kill. Killed PIDs are pruned from `_seen`; the exit-time
-`stop_and_reap` path is unchanged.
+*Target — the safest killable set.* From `_seen` (every PID the tracker
+has observed), the reaper selects those that are simultaneously alive,
+reparented to init (`ppid == 1`), and older than `_PID_REAP_MIN_AGE_SEC`
+(60 s). PIDs are killed oldest-first, stopping once
+`pids.current / pids.max` drops below `_PID_REAP_LOW_WATER` (0.75) —
+hysteresis so one pass does not over-kill. Killed PIDs are pruned from
+`_seen`; exit-time `stop_and_reap` is unchanged. The age floor matters
+because a background test the worker just launched has also reparented to
+init (`ppid == 1` alone cannot distinguish it from a leaked orphan), but
+it is young, so the floor protects it while a forgotten orphan (old) is
+still reaped.
 
-*Why the age floor is load-bearing.* A background test the worker just
-launched and is actively awaiting has also reparented to init (`ppid == 1`),
-so `ppid == 1` alone cannot protect it. But it is *young*, so the 60 s floor
-does. A leaked, forgotten orphan is *old*. Oldest-first + stop-at-low-water
-kills the fewest, oldest PIDs needed to relieve pressure.
-
-*Why a single 60 s floor is not enough — the critical tier.* The floor above
-protects young orphans unconditionally, and that is precisely wrong at the
-top of the range. A burst of leaked `run_in_background` trees saturates the
-cap in **seconds** — faster than the 60 s floor lets any of them become
-eligible — so the reaper arms at 90%, finds an empty candidate list, and
-watches the worker die. Reaping nothing is not safety; it is a disabled
-reducer. This is not hypothetical: it is the measured cause of the wave-2
-integrator death in run `879defae` (`pids.current=1024/1024`, fork denials
-213), which discarded a correct merge resolution and killed a 13.5-hour run.
-
-Reproduced against the real `_reparented_orphans` in a `--pids-limit 1024`
-release-image container: 20 leaked trees, each spawned by a wrapper that
-lives ~1 s and then exits (`bash -c 'sleep 300 & sleep 1'`) so the orphans
-reparent to init exactly as the real `run_in_background` path leaves them.
-All 20 are tracked in `_seen`, and at t=8 s the 60 s floor yields **0**
-candidates while a 5 s floor yields all of them. Detection was never the
-gap; *eligibility* was.
-
-The wrapper's lifetime is load-bearing in that reproduction, not incidental.
-`_DescendantTracker` can only record a PID while the PPID chain is still
-intact — a wrapper that detaches instantly (`setsid …`, tried first) is gone
-before the 0.5 s poll, so its children never enter `_seen` and no age floor
-is reachable. That models a leak the tracker cannot see, which is a
-different bug; the production `run_in_background` wrapper does survive long
-enough to be caught, which is why run `879defae` reaped 5856 orphans across
-20 workers at exit. `_seen` demonstrably populates in production, so the
-floor — not the tracking — is what stood between the reaper and the leak.
-
-The resolution is a second tier rather than a lower floor. The cap's own
-sizing measurement (see *Detecting PID exhaustion* above: the suite peaks at
-33 concurrent PIDs) supplies the discriminator. A worker sitting at 90% of a
-2048 cap holds ~1843 PIDs to do work that costs 33; there is no legitimate
-reading of that state. It is a leak, and the young orphans in it are leaked
-too. So at `_PID_REAP_CRITICAL_WATER` (0.90) the floor drops to
+*The critical tier.* A single fixed floor is not enough: a burst of
+leaked `run_in_background` trees can saturate the cap in seconds — faster
+than 60 s lets any of them become eligible — so the reaper arms, finds an
+empty candidate list, and watches the worker die. This is the measured
+cause of a wave-2 integrator death (`pids.current=1024/1024`, fork denials
+213) that discarded a correct merge resolution and killed a 13.5-hour run.
+Reproduced directly: 20 leaked orphan trees in a `--pids-limit 1024`
+container, all tracked in `_seen`; at t=8s the 60 s floor yields 0
+candidates while a 5 s floor yields all 20 — detection was never the gap,
+*eligibility* was. The fix is a second tier, not a lower single floor: the
+cap's own sizing measurement (33 concurrent PIDs for legitimate work,
+above) supplies the discriminator — a worker at 90% of a 2048 cap holds
+~1843 PIDs to do work that costs 33, which has no legitimate reading. So
+at `_PID_REAP_CRITICAL_WATER` (0.90) the floor drops to
 `_PID_REAP_CRITICAL_AGE_SEC` (5 s); below that ratio the 60 s floor stands
-unchanged. The normal tier keeps its protection; the critical tier trades it
-for the worker's life.
+unchanged. This discriminator holds only while the cap sits well above the
+33-PID measurement — a `--worker-pids-max` set near the workload (e.g. 64)
+would put the critical tier's trigger inside the range legitimate work
+occupies and break the premise.
 
-The gate is a *fraction* of `pids.max` rather than an absolute count, so it
-tracks the cap instead of needing a re-tune whenever the default moves — the
-1024 → 2048 raise widened the absolute trigger from ~922 to ~1844 without
-touching this constant. But the discriminator is the *gap* between that
-trigger and the 33-PID workload, not the ratio itself, so it is only sound
-while the cap sits well above the measurement. A per-repo
-`--worker-pids-max` set near the workload (say 64, where 90% is ~58) would
-put the critical tier's trigger inside the range legitimate work occupies,
-and the "no legitimate reading of that state" premise would no longer hold.
-Raising the cap strengthens this argument; lowering it toward 33 is what
-breaks it.
+*Accepted bounded regression.* Above the 90% gate a live background
+process older than the active floor can be killed — strictly better than
+the alternative (guaranteed total-worker-death-then-full-retry from the
+detector), since the imperfect reap is only attempted when the worker is
+already near EAGAIN death and the backstop would otherwise fire
+regardless.
 
-*Accepted bounded regression.* Above the 90% gate it is possible that a
-live background process is killed — older than 60 s in the normal tier, or
-older than 5 s once the critical tier arms. This is strictly better than the
-alternative — a guaranteed total-worker-death-then-full-retry from the
-detector. The gate is what makes the tradeoff acceptable: the imperfect
-reap is only ever attempted when the worker is already near EAGAIN death and
-the backstop would otherwise fire regardless. The critical tier does not
-widen this regression so much as make it *effective*: without it the reap is
-attempted and reaps nothing, which is not safety but a disabled reducer.
+*Composition.* Both the mid-run reaper and the window detector read
+`_cgroup_stat(sid)` as one authoritative source: if reaping keeps pressure
+below the cap, the detector never fires; if reaping stays too
+conservative, the detector catches it and retries fresh. Neither
+duplicates the other's logic.
 
-*Reducer-under-backstop composition.* Both the mid-run reaper and the 0.9.38
-window detector read `_cgroup_stat(sid)` — one authoritative exhaustion
-source. If reaping keeps pressure below the cap, the detector's window never
-confirms → never fires. If reaping stays too conservative and pressure still
-hits the cap, the detector catches it → retry-fresh. The two mechanisms are
-cleanly layered; neither duplicates the other's logic.
-
-*Rejected alternative — `cgroup.procs` broker verb.* `cgroup.procs` is a
-more precise orphan list (only PIDs actually still in the cgroup), but
-reading and killing from it would require a new `list`/`kill` verb on
-`scripts/cgroup-broker.py`, widening the single audited root surface that
-§12 principle guards. `_seen ∩ (alive, ppid==1, old)` covers the same
-population without a new root verb; the `cgroup.procs` path is noted here
-as the rejected alternative.
+*Rejected alternative.* A `cgroup.procs`-based broker verb would give a
+more precise orphan list but requires a new `list`/`kill` verb on
+`scripts/cgroup-broker.py`, widening the single audited root surface §12
+guards. `_seen ∩ (alive, ppid==1, old)` covers the same population without
+one.
 
 Earlier versions of leerie gave Ctrl-C an explicit "throw this away"
 semantic with a full purge of state + branches + run dir. That made
@@ -3845,280 +3279,214 @@ now separate: Ctrl-C stops; `scripts/cleanup.sh --run-id <id>
 
 **Zombie reaping — the container PID 1 is not an init.** The mid-run reaper
 above relieves pressure from *live* leaked processes. A second, distinct
-population also counts against a worker cgroup's `pids.max`: **zombies**
-(`<defunct>` tasks — dead processes not yet `wait()`ed). These arise because
-the leerie container's PID 1 is **not a reaping init**: on the local path PID 1
-is the entrypoint's final `exec runuser -u leerie -- … python3 leerie.py` (so
-PID 1 is `runuser`, with the orchestrator as its child); on Fly, PID 1 is the
-idle `sleep infinity` and the orchestrator is a detached `Popen` grandchild. A
-worker's tool subtree routinely orphans short-lived subprocesses — notably
-`git` and the leerie-private `ssh-agent` (`_leerie_fly_agent_ensure`
-daemonizes one), plus their children. When those orphan, they reparent to PID 1,
-which — being `runuser`/`sleep`, not `init` — never `wait()`s them, so they
-persist as zombies. Each zombie still occupies a task slot counted by the
-cgroup, so they accumulate monotonically until `pids.max` fills and every
-`fork()` in the subtree returns `EAGAIN`. This was observed live: a worker
-running its repo's own test suite accumulated **453 `<defunct>` git** tasks
-(all ppid==1) and wedged at the cap. Crucially, the mid-run reaper cannot help
-here — a zombie is already dead; SIGKILL is a no-op on it, and only `wait()`
+population also counts against `pids.max`: **zombies** (`<defunct>` tasks —
+dead processes not yet `wait()`ed). These arise because the leerie
+container's PID 1 is not a reaping init: on the local path PID 1 is
+`runuser` (the orchestrator its child); on Fly, PID 1 is an idle
+`sleep infinity` and the orchestrator a detached `Popen` grandchild. A
+worker's tool subtree routinely orphans short-lived subprocesses (notably
+`git` and the leerie-private `ssh-agent`); when those orphan they reparent
+to PID 1, which never `wait()`s them, so they persist as zombies — each
+still occupying a cgroup task slot, accumulating until `pids.max` fills.
+Observed live: a worker running its repo's test suite accumulated 453
+`<defunct> git` tasks and wedged at the cap. The mid-run reaper cannot
+help here — a zombie is already dead; SIGKILL is a no-op, only `wait()`
 clears it.
 
 The fix routes those orphans to the orchestrator and reaps them there.
-`_become_subreaper()` (called once early in `main()`, before any worker spawns)
-issues `prctl(PR_SET_CHILD_SUBREAPER)` so orphaned descendants in the
-orchestrator's subtree reparent to **it** instead of climbing to PID 1;
-`_zombie_reaper()` — a background asyncio task with the same lifecycle as
-`_memory_sampler` (spawned in `_orchestrate()`, cancelled in its `finally`) —
-reaps them roughly once a second, keeping `pids.current` flat (live processes
-only) instead of climbing. `prctl` is Linux-only and a logged no-op elsewhere
-(the orchestrator only runs for real inside the Linux container).
+`_become_subreaper()` (called once early in `main()`) issues
+`prctl(PR_SET_CHILD_SUBREAPER)` so orphaned descendants reparent to the
+orchestrator instead of climbing to PID 1; `_zombie_reaper()` — a
+background asyncio task with the same lifecycle as `_memory_sampler` —
+reaps them roughly once a second, keeping `pids.current` flat. `prctl` is
+Linux-only and a logged no-op elsewhere.
 
 **A second route to the same 255: an inherited `SIGCHLD=SIG_IGN`.** The
-disposition survives `exec`, so a parent the orchestrator does not control (an
-SSH daemon, a login shell, the Fly launch wrapper) can hand it down. Under
-`SIG_IGN` the *kernel* reaps exiting children itself, so their status is gone
-before asyncio can read it — `PidfdChildWatcher` then `waitpid`s a pid that no
-longer exists, catches `ChildProcessError`, and reports returncode 255 with
-empty output (it can also surface as a raised `ProcessLookupError`). Only the
-**first** subprocess is corrupted, which makes the symptom maximally
-misleading: whichever check happens to run first reports a bogus failure and
-every later one succeeds, so the blame lands on that check's subject rather
-than on the machinery. `main()` therefore calls `_restore_sigchld_default()`
-before anything spawns, and `preflight()` gates on `_sigchld_is_ignored()` —
-which reads the kernel's `SigIgn` mask from `/proc/self/status`, since
-`signal.getsignal()` does not reliably reflect an *inherited* disposition.
-This is one of **two** independent routes to a fabricated 255; the reaper race
-below is the other, and `_restore_sigchld_default()` does nothing to prevent it.
+disposition survives `exec`, so a parent leerie does not control (an SSH
+daemon, a login shell, the Fly launch wrapper) can hand it down. Under
+`SIG_IGN` the *kernel* reaps exiting children itself, so their status is
+gone before asyncio can read it — `PidfdChildWatcher` then `waitpid`s a
+PID that no longer exists and reports returncode 255 with empty output.
+Only the *first* subprocess is corrupted, which is maximally misleading:
+whichever check runs first reports a bogus failure and blame lands on its
+subject, not the machinery. `main()` therefore calls
+`_restore_sigchld_default()` before anything spawns, and `preflight()`
+gates on `_sigchld_is_ignored()` (reads the kernel's `SigIgn` mask from
+`/proc/self/status`, since `signal.getsignal()` doesn't reliably reflect
+an inherited disposition). This is one of two independent routes to a
+fabricated 255; the reaper race below is the other.
 
-**The reaper must reap only what it created — an allowlist, never a `/proc`
-scan.** An earlier design had the reaper scan `/proc` for its own **zombie**
-children (`state == Z`, `PPid == getpid()`) that were not in
-`_ASYNCIO_MANAGED_PIDS`, on the theory that the exclusion set distinguished a
-true orphan from an asyncio child briefly awaiting its watcher. **Measurement
-disproved this.** CPython's `PidfdChildWatcher.add_child_handler` calls
-`os.pidfd_open(pid)` *after* the fork, and `_do_wait` calls `os.waitpid(pid, 0)`
-later still, reporting `returncode = 255` when the status is gone ("may happen
-if `waitpid()` is called elsewhere" — `asyncio/unix_events.py`). Between the
-`fork()` and `pidfd_open()` the child's PID exists in **no registry the reaper
-can consult** — not `_ASYNCIO_MANAGED_PIDS`, not the watcher's tables — so *no*
-exclusion, peek, or ordering trick in a scanning reaper can be correct. Reaping
-a stranger that is really an asyncio child in that window is indistinguishable,
-by construction, from reaping a true orphan.
+**The reaper must reap only what it created — an allowlist, never a
+`/proc` scan.** An earlier design scanned `/proc` for zombie children
+(`state == Z`, `PPid == getpid()`) not in `_ASYNCIO_MANAGED_PIDS`, on the
+theory that exclusion distinguished a true orphan from an asyncio child
+briefly awaiting its watcher. Measurement disproved this: CPython's
+`PidfdChildWatcher` calls `os.pidfd_open(pid)` after the fork and
+`os.waitpid` later still, so between fork and `pidfd_open` the child's PID
+exists in *no registry the reaper can consult* — no exclusion or ordering
+trick can be correct. Measured live on Fly: the reaper `waitpid`'d the
+exact PID asyncio had spawned for `git config user.email` in 40/40 runs,
+every one misreported by `preflight` as "git user.email is not
+configured." Alternatives measured and rejected: a `waitid(WNOWAIT)` peek
+made it worse (pure overhead, doesn't close the window), and excluding
+asyncio-known PIDs still corrupted 212/300.
 
-This was not theoretical: with the real `preflight()` and the real reaper on a
-Fly `performance-16x`, the reaper `waitpid`'d the exact PID asyncio had spawned
-for `git config user.email` — **40/40 runs**, every one dying with a fabricated
-255 that `preflight` misreported as "git user.email is not configured" on a
-machine whose identity was correctly seeded. `preflight`'s first `run_proc` is
-the first subprocess after the reaper starts, so the reaper's first tick lands
-on it: the failure is deterministic, not a rare race. Measured alternatives all
-failed — a `waitid(WNOWAIT)` peek made it *worse* (the peek is pure overhead;
-the race is the window, not the consume), and excluding asyncio-known PIDs still
-corrupted 212/300.
+The reaper therefore reaps only PIDs leerie itself recorded
+(`_REAPABLE_PIDS`, published by `_DescendantTracker` — the worker subtrees
+it already tracks). Correctness is by construction: a PID in its
+fork→`pidfd_open` window was never added, so it can never be taken.
+Measured 0/300 on the arm where the scanning design failed 246/300, while
+still reaping real orphans; the trade-off is that an orphan leerie never
+observed is not reaped, with the cgroup PID cap plus the container
+boundary as backstop. Because the subreaper reparents orphans to the
+orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter
+accepts `ppid in (1, getpid())`; exit-time `stop_and_reap` is unaffected.
+This is chosen over inserting a real init (e.g. `nerdctl run --init` / tini
+as PID 1) because the subreaper covers both local and Fly runtimes
+(`--init` is nerdctl-local only) and is purely additive, changing nothing
+about the entrypoint/cgroup setup or the PID-1 teardown contract above.
 
-The reaper therefore reaps **only PIDs leerie itself recorded** (`_REAPABLE_PIDS`,
-published by `_DescendantTracker` — the worker subtrees leerie spawns and already
-tracks). Correctness is by construction: a PID in its fork→`pidfd_open` window
-was never added, so it can never be taken. Measured 0/300 on the arm where the
-scanning design failed 246/300, while still reaping real orphans. The trade-off
-is deliberate: an orphan leerie never observed is not reaped, and the cgroup PID
-cap plus the container boundary remain the real backstop. Because the subreaper
-reparents orphans to the
-orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter accepts
-`ppid in (1, getpid())`; exit-time `stop_and_reap` is unaffected (it SIGKILLs by
-PID with no ppid filter). This is chosen over inserting a real init (e.g.
-`nerdctl run --init` / tini as PID 1) because the subreaper (a) covers **both**
-the local and Fly runtimes — `--init` is a nerdctl-local flag and would leave
-the Fly path leaking — and (b) is purely additive in-process, changing neither
-the entrypoint/cgroup setup nor the "PID-1 death reaps the namespace" teardown
-contract above (the orchestrator remains a non-PID-1 process; PID-1 identity is
-unchanged). The complementary test-side leak — `_leerie_fly_agent_ensure`'s
-daemonized `ssh-agent` outliving its test — is fixed at its source in
-`tests/test_require_fly_ssh_isolation.py`'s teardown; on real Fly runs the
-in-container agent is now reaped by the subreaper when its run ends.
-
-**Rate-limited (RateLimitedExit) → auto-resume after the reset
-window.** When `claude -p` reports the subscription session-limit
-hit (delivered as assistant-text content in the verbatim format
-`"You've hit your session limit · resets <time> (<tz>)"`, or as a
-`rate_limit_event` whose `status` field reports a terminal value
-— anything outside the known-allowed set
+**Rate-limited (RateLimitedExit) → auto-resume after the reset window.**
+When `claude -p` reports the subscription session-limit hit (assistant
+text in the verbatim format `"You've hit your session limit · resets
+<time> (<tz>)"`, or a `rate_limit_event` whose `status` is outside
 `{"allowed", "allowed_warning"}`), leerie raises
 `RateLimitedExit(reset_at, raw)`.
 
-There is a second, subtler trigger: an **out-of-credits mid-stream
-kill**. When credits actually run out, a `rate_limit_event` arrives
-carrying `overageDisabledReason:"out_of_credits"` (or `out_of_overage`)
-— observed with `status:"allowed"` — and the gateway terminates the
-`claude -p` process the moment credits run out, often mid-turn, before
-a `result` event is emitted. `_invoke` latches this **exhaustion**
-state as the stream flows and, in its no-result-envelope branch, raises
-`RateLimitedExit(reset_at=None, out_of_credits=True, raw)` *only* when
-the stream truncated with no `result` event **and** an exhaustion
-reason was seen. Without this, the truncated stream surfaces as a bare
-`WorkerError`, which bypasses the auth/quota backoff (that classifier
-needs a result envelope to inspect) and `die()`s the run non-resumably.
+A second, subtler trigger: an **out-of-credits mid-stream kill**. When
+credits run out, a `rate_limit_event` arrives carrying
+`overageDisabledReason:"out_of_credits"` (or `out_of_overage`), and the
+gateway terminates `claude -p` the moment credits run out, often mid-turn,
+before any `result` event is emitted. `_invoke` latches this exhaustion
+state and, in its no-result-envelope branch, raises
+`RateLimitedExit(reset_at=None, out_of_credits=True, raw)` only when the
+stream truncated with no `result` event *and* an exhaustion reason was
+seen — otherwise a truncated stream surfaces as a bare `WorkerError`,
+bypassing the auth/quota backoff and `die()`ing the run non-resumably.
 
 The discriminator keys on `overageDisabledReason ∈
-{"out_of_credits", "out_of_overage"}`, **not** on
-`overageStatus:"rejected"`. That distinction is load-bearing:
-`overageStatus:"rejected"` is a *standing config state* for any org
-that has extra-usage (overage) disabled — such orgs emit it in
-**every** `rate_limit_event` (with `overageDisabledReason:
-"org_level_disabled"` and `status:"allowed"`), whether or not the
-worker succeeds. Keying the latch on it caused a false positive:
-plenty of base subscription quota remained, but any unrelated
-mid-stream truncation (a crash, a kill, a reaped subprocess) inherited
-the permanently-latched flag and was misreported as out-of-credits. An
-`org_level_disabled` truncation is therefore *not* an exhaustion event
-— it takes the ordinary `WorkerError` path (retryable / advisory),
-never a pause.
+{"out_of_credits", "out_of_overage"}`, **not** `overageStatus:"rejected"`
+— that field is a standing config state any org with overage disabled
+emits on *every* `rate_limit_event` regardless of success, so keying on it
+caused false positives (an unrelated crash inheriting a permanently
+latched "out of credits" flag). An `org_level_disabled` truncation takes
+the ordinary `WorkerError` path instead, never a pause.
 
-The exception propagates through the existing asyncio cancellation
-chain — `_invoke`'s `BaseException` guard terminates the in-flight
-`claude -p` worker's full subprocess subtree (including detached
-backgrounded tool subprocesses) and reaps it, sibling wave-tasks
-cancel through the same path — so no orphan subprocesses remain (the
-per-worker async cleanup is the fast happy path; the container
-PID-namespace teardown is the abnormal-exit guarantee — see "Worker
-subtree termination — kernel-enforced via the container boundary"
-above). Then:
+The exception propagates through the existing asyncio cancellation chain
+— `_invoke`'s `BaseException` guard terminates and reaps the in-flight
+worker's full subprocess subtree, sibling wave-tasks cancel through the
+same path — so no orphans remain.
 
-A **rate-limit** resets on a clock — wait long enough and it clears on its
-own — so the session-limit and terminal-`status` cases auto-resume via the
-shared `_sleep_then_reexec(st, wait_seconds, reason)`: worktree-only cleanup,
-sleep, then `os.execv` the orchestrator (`sys.executable __file__ resume
---run-id <id>`) into a fresh process. **Out-of-credits does not reset on a
+A **rate-limit** resets on a clock, so the session-limit and
+terminal-`status` cases auto-resume via `_sleep_then_reexec(st,
+wait_seconds, reason)`: worktree-only cleanup, sleep, then `os.execv` the
+orchestrator into a fresh process. **Out-of-credits does not reset on a
 clock** — it clears only when a human tops up or the billing period rolls
-over — so it does *not* auto-resume: `main()` does worktree-only cleanup,
-logs a `leerie resume <id>` hint, and exits `EXIT_LOCKED` (75). Looping a
-fixed backoff against genuine exhaustion would only spin against the wall,
-burn the persisted worker budget on retries that cannot succeed, and delay
-surfacing "you're out of credits" to the operator.
+over — so it does *not* auto-resume: `main()` cleans up worktrees, logs a
+`leerie resume <id>` hint, and exits `EXIT_LOCKED` (75). Looping a fixed
+backoff against genuine exhaustion would only spin against the wall and
+burn the persisted worker budget on retries that cannot succeed.
 
-For the auto-resume (rate-limit) path: we re-exec the orchestrator, not the
-launcher — the orchestrator already runs inside the container with state on
-disk; the launcher is not baked into the image and would try to launch a new
-container. The `--max-workers` budget persists across the re-exec
-(`worker_count` lives in state.json), so a run that repeatedly hits the
-rate-limit still respects the cap and can never run away. Cleanup runs before
-the sleep, and because
-`_cleanup_on_abnormal_exit` removes every worktree — git-registered AND orphaned
-dirs, then `_prune_leerie_worktrees` — the re-exec'd `resume` finds a clean slate.
-That is a convenience, not the guarantee: cleanup cannot run when the process is
-SIGKILLed (Fly `machine stop`), so `setup-run.sh` reclaims a stale staging
-directory itself rather than relying on a predecessor having tidied up.
-Ctrl-C during the sleep drops to a manual `resume` (exit 130); a
-SIGTERM/SIGHUP during the sleep drops to a manual `resume` with the
-signal's exit code (128 + signum → 143 / 129), matching main()'s
-top-level signal arm; and the should-never-happen case of `os.execv`
-itself failing exits `EXIT_LOCKED` (75, EX_TEMPFAIL). In every one of
-these the worktree cleanup has already run, so state and the run branch
-are intact for the manual `resume`.
+We re-exec the orchestrator, not the launcher — it already runs inside
+the container with state on disk, while the launcher is not baked into
+the image. The `--max-workers` budget persists across the re-exec
+(`worker_count` in state.json), so a repeatedly rate-limited run still
+respects the cap. Cleanup runs before the sleep and removes every
+worktree, so the re-exec'd `resume` finds a clean slate — a convenience,
+not a guarantee, since cleanup cannot run if the process is SIGKILLed
+(`setup-run.sh` reclaims a stale staging directory itself instead of
+relying on a predecessor having tidied up). Ctrl-C during the sleep drops
+to a manual `resume` (exit 130); SIGTERM/SIGHUP likewise (143/129); an
+`os.execv` failure exits `EXIT_LOCKED` (75). In each case cleanup has
+already run, so state and the run branch are intact for the manual
+`resume`.
 
-- If `reset_at` parsed cleanly from the literal message format, `wait_seconds`
-  is the time until that moment + a small margin.
-- If the reset clause didn't parse (malformed time, unknown timezone, format
-  change), `wait_seconds` is a fixed `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s). We
-  can't know when the limit refreshes, so we poll: sleep the fixed interval and
-  re-resume. A premature retry (still limited) just re-hits the same clean pause
-  and sleeps again — cheap, and bounded by the persisted worker budget.
-- If the exit is an **out-of-credits mid-stream kill**
-  (`out_of_credits=True`), there is no auto-resume at all: it does not reset on
-  a clock, so `main()` cleans up worktrees, logs a `leerie resume <id>` hint,
-  and exits `EXIT_LOCKED`. The operator adds credits, then resumes.
+- If `reset_at` parsed cleanly, `wait_seconds` is the time until that
+  moment plus a small margin.
+- If the reset clause didn't parse, `wait_seconds` is a fixed
+  `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) — we poll: sleep, re-resume. A
+  premature retry just re-hits the same clean pause and sleeps again,
+  bounded by the persisted worker budget.
+- An out-of-credits exit does not auto-resume at all: `main()` cleans up,
+  logs a `leerie resume <id>` hint, and exits `EXIT_LOCKED`. The operator
+  adds credits, then resumes.
 
-Rationale for the fixed-backoff auto-resume on rate-limits (vs. the earlier
-"parse failure → exit 75 manual resume" behavior): the old concern was that a
-*wrong-time* sleep is worse than no sleep. With a fixed backoff there is no time
-being guessed — the trade is "retry in 5 min" vs "die and require a human," and
-an early retry is a harmless
-no-op re-pause. (Out-of-credits is deliberately excluded from this reasoning: it
-has no reset at all, so no interval is ever "right" — auto-resuming it would
-spin against the wall until a human intervenes anyway. It pauses-and-surfaces
-instead; see the `out_of_credits=True` bullet above.)
+Rationale for the fixed-backoff auto-resume (vs. the earlier "parse
+failure → exit 75 manual resume"): with a fixed backoff no time is being
+guessed — the trade is "retry in 5 min" vs "die and require a human," and
+an early retry is a harmless no-op re-pause. Out-of-credits is excluded
+from this reasoning since it has no reset at all — auto-resuming it would
+spin against the wall until a human intervenes.
 
-`_cleanup_on_abnormal_exit(st, full_purge=False)` is the single
-helper for all four paths. The classification happens in `main()`'s
-try/except: SIGINT raises Python's default `KeyboardInterrupt`;
-SIGTERM and SIGHUP raise the dedicated `InterruptedBySignal`
-exception via handlers installed at program start; `RateLimitedExit`
-is raised inside the stream handler when the rate-limit message is
-detected. SIGINT and SIGHUP are POSIX-only — guarded with
-`hasattr(signal, ...)` so the orchestrator still runs on Windows
-(degraded: only SIGTERM-equivalent termination works).
+`_cleanup_on_abnormal_exit(st, full_purge=False)` is the single helper for
+all four paths. Classification happens in `main()`'s try/except: SIGINT
+raises `KeyboardInterrupt`; SIGTERM/SIGHUP raise `InterruptedBySignal` via
+handlers installed at program start; `RateLimitedExit` is raised inside
+the stream handler. SIGINT and SIGHUP are POSIX-only, guarded with
+`hasattr(signal, ...)` so the orchestrator still runs (degraded) on
+Windows.
 
 A `die()` call (the documented clean-exit mechanism for known failure
 modes) is *not* an abnormal exit. The user already got an actionable
 error message; running a worktree cleanup pass is correct (the run was
 mid-flight) but it is silent unless there were worktrees to clean.
 
-**Detached orchestrator (remote mode).** In local mode the orchestrator
-is PID 1 of the container — its lifetime *is* the run's lifetime, and
-the user's terminal owns that container directly via `nerdctl run`. In
-remote mode the same coupling would be a mistake. The actual work of a
-remote run (LLM calls, worker subprocesses, git, shell tools) happens
-entirely inside the Fly Machine; the launcher's host-side role after
-provisioning is purely **to stream the orchestrator log back for the
-user's eyes**. Binding the orchestrator's *life* to that streaming
-channel — which is what a foreground `flyctl ssh console -C "python3
-leerie.py"` would do — means a closed laptop, a dropped WiFi connection,
-or an accidental Ctrl-C kills a run that the laptop wasn't doing any
-work for.
+**Detached orchestrator (remote mode).** In local mode the orchestrator is
+PID 1 of the container — its lifetime *is* the run's lifetime, and the
+user's terminal owns that container directly via `nerdctl run`. In remote
+mode the same coupling would be a mistake: the actual work of a remote
+run happens entirely inside the Fly Machine, and the launcher's host-side
+role after provisioning is purely to stream the log back for the user's
+eyes. Binding the orchestrator's *life* to that streaming channel (a
+foreground `flyctl ssh console -C "python3 leerie.py"`) means a closed
+laptop, a dropped WiFi connection, or an accidental Ctrl-C kills a run the
+laptop wasn't doing any work for.
 
 Leerie therefore starts the orchestrator **detached** on the Fly Machine.
 The launcher pipes a small Python wrapper script via stdin to
 `flyctl ssh console --pty=false -C "python3 -"`; the wrapper does
 `subprocess.Popen(..., start_new_session=True, user="leerie",
 group=<leerie gid>, env={HOME=/home/leerie, USER=leerie, PATH=mise+bin},
-cwd="/work")` and records the resulting PID in `orchestrator.pid`.
-`start_new_session=True` is the portable equivalent of
-`setsid nohup`; running as the leerie user with explicit env is
-required because the ssh-console session lands as root with
-`HOME=/root` by default (claude would look for credentials in the
-wrong place otherwise). The ssh-console call returns immediately. A
-*second* ssh-console call then pipes a tail-wrapper script to
-`sh -s` purely for the user's terminal. The orchestrator is session
-leader inside the machine; the tail is an independent process on the
-host side. Stream death (Ctrl-C, broken pipe, laptop closing, WiFi
-dropping) breaks the tail, not the orchestrator.
+cwd="/work")` and records the PID in `orchestrator.pid`.
+`start_new_session=True` is the portable equivalent of `setsid nohup`;
+running as the leerie user with explicit env is required because the
+ssh-console session lands as root with `HOME=/root` by default. The
+ssh-console call returns immediately. A *second* ssh-console call then
+pipes a tail-wrapper script to `sh -s` purely for the user's terminal —
+the orchestrator is session leader inside the machine, the tail an
+independent process on the host side, so stream death (Ctrl-C, broken
+pipe, laptop closing, WiFi dropping) breaks the tail, not the
+orchestrator.
 
-This matches the prior-art mental model from comparable tools
-(`fly machine` itself, Claude Code's `/bg` + `claude agents`, kubectl,
-tmux): **sessions are the unit of management, not terminals**. Leerie's
-session is the run; the local terminal is just one of many ways to
-observe it.
+This matches the prior-art mental model of comparable tools (`fly
+machine`, Claude Code's `/bg` + `claude agents`, kubectl, tmux):
+**sessions are the unit of management, not terminals**. Leerie's session
+is the run; the local terminal is just one of many ways to observe it.
 
-The run-id is the bridge. With detached invocation the launcher needs
-the run-id *before* starting the orchestrator (so it knows which
-`orchestrator.log` path to tail), but today's orchestrator generates
-its run-id internally during phase 1. The launcher therefore generates
-the slug + suffix host-side using the same pattern and passes it as
-`--run-id <id>` — reusing the plumbing that `resume` already
-establishes. The orchestrator's `--run-id` short-circuit accepts the
-explicit value and skips auto-generation.
+The run-id is the bridge: the launcher needs it *before* starting the
+orchestrator (to know which `orchestrator.log` path to tail), but the
+orchestrator normally generates its run-id internally during phase 1. The
+launcher instead generates the slug + suffix host-side using the same
+pattern and passes it as `--run-id <id>` — reusing the plumbing `resume`
+already establishes — and the orchestrator's `--run-id` short-circuit
+accepts the explicit value and skips auto-generation.
 
-**Remote pause-on-failure (Fly.io).** Local mode reaps the container's
-PID namespace on every exit (success or failure) because the host
-filesystem holds the durable record. Remote mode has the same durable
-record (the run branch and `<state-root>/runs/<run-id>/`, both of which the
-stream-back finalize already understands) but the Fly Machine is *not*
-free — keeping it alive after failure has a real per-second cost, and
-destroying it after failure throws away the in-machine filesystem state
-that is useful for diagnosis (orchestrator logs, partial worktrees,
-recently-edited files that haven't yet been committed to a per-subtask
-branch).
+**Remote pause-on-failure (Fly.io).** Local mode reaps the container's PID
+namespace on every exit because the host filesystem holds the durable
+record. Remote mode has the same durable record (the run branch and
+`<state-root>/runs/<run-id>/`) but the Fly Machine is not free — keeping
+it alive after failure has a real per-second cost, and destroying it
+throws away in-machine state useful for diagnosis (logs, partial
+worktrees, uncommitted edits).
 
 The compromise: classify the orchestrator's exit code on the host side
-and route to either *stop* (preserves volume, frees compute), *destroy*
-(full reap — machine **and** its volume; see *Volume lifecycle* below,
-since Fly reaps neither for us), or *leave alone* (the user merely
-detached the local stream — the orchestrator on the machine is still
-working). With the
-detached orchestrator above, the classification is no longer "how did
-the orchestrator's run exit?" but "what just happened on the host
-side?" — because the launcher process now exits when the *tail*
-finishes, not when the orchestrator finishes. The reclassified table:
+and route to *stop* (preserves volume, frees compute), *destroy* (full
+reap — machine and volume, since Fly reaps neither for us), or *leave
+alone* (the user merely detached the local stream; the machine is still
+working). With the detached orchestrator, the classification is "what
+just happened on the host side?" rather than "how did the orchestrator's
+run exit?" — the launcher process now exits when the *tail* finishes, not
+when the orchestrator finishes. The reclassified table:
 
 | Exit | Meaning | Disposition |
 |---|---|---|
@@ -4129,119 +3497,93 @@ finishes, not when the orchestrator finishes. The reclassified table:
 | any other non-zero | worker/orchestrator failure (`die()`, etc.) | **pause: stop machine, write sidecar, notify** |
 
 The tail wrapper reads the orchestrator's exit code from
-`orchestrator.exit_code` (written by the `except SystemExit` handler
-in `main()`) and uses it as its own exit code. When the file is absent
-(OOM, SIGKILL, or a crash before the handler ran), the wrapper falls
-back to exit 0 — the same behavior as the pre-exit-code era — so
-uncontrolled exits still route through the clean-exit branch where
-`fetch_branch` bundles whatever is on the run branch (and any subtask
-branches) before destroying.
+`orchestrator.exit_code` (written by `main()`'s `except SystemExit`
+handler) and uses it as its own exit code. When the file is absent (OOM,
+SIGKILL, or a crash before the handler ran), the wrapper falls back to
+exit 0, so uncontrolled exits still route through the clean-exit branch
+where `fetch_branch` bundles whatever is on the run branch before
+destroying.
 
-The Ctrl-C row is the load-bearing change. Earlier versions of leerie
-treated rc=130 as "user cancelled, destroy the machine" — but with the
-detach, rc=130 only means "user stopped watching." The orchestrator on
-the machine has not been signalled and is still running. Destroying it
-on Ctrl-C would be exactly the behavior the detach was introduced to
-prevent. The launcher therefore prints a small banner listing the
-reattach, pause, and destroy commands and exits without touching the
-machine. The user can then come back hours or days later and either
-`leerie resume <run-id> --runtime fly` to watch progress (the
-default tails the orchestrator log; `--shell` opens a bash shell
-instead), `leerie stop --runtime fly` to pause cleanly, or
-`leerie kill --runtime fly` to explicitly destroy.
+The Ctrl-C row is the load-bearing change. Earlier versions treated
+rc=130 as "user cancelled, destroy the machine" — but with the detach,
+rc=130 only means "user stopped watching"; the orchestrator on the
+machine is still running, and destroying it would be exactly the
+behavior the detach exists to prevent. The launcher instead prints a
+banner listing the reattach/pause/destroy commands and exits without
+touching the machine: `leerie resume <run-id> --runtime fly` to watch
+progress (`--shell` opens a bash shell instead), `leerie stop --runtime
+fly` to pause cleanly, or `leerie kill --runtime fly` to destroy.
 
-The decision lives in the launcher (`scripts/remote/provision.sh`'s
-EXIT trap), not the orchestrator. Per §6 *Worker subtree termination*
-the orchestrator stays runtime-agnostic — it always exits with the same
-exit codes regardless of where it runs, and the launcher routes those
-exit codes through the runtime-appropriate teardown.
+The decision lives in the launcher (`scripts/remote/provision.sh`'s EXIT
+trap), not the orchestrator — per §6 *Worker subtree termination* the
+orchestrator stays runtime-agnostic, always exiting with the same codes,
+and the launcher routes those through runtime-appropriate teardown.
 
 `flyctl machine stop` (not destroy) on the pause branch preserves the
-machine's filesystem; the orchestrator's own state is already in
+machine's filesystem; the orchestrator's state is already in
 `<state-root>/runs/<run-id>/run.json` and the run branch holds the
-committed work, and `flyctl machine start` brings the machine back from
+committed work, so `flyctl machine start` brings the machine back from
 disk without losing anything. Memory state is not preserved across a
-pause — the contract this section relies on is that the run branch (the
-committed work) plus `<state-root>/runs/<run-id>/` (the orchestrator's
-own state) are the only durable record of a run, and both already live
-on the machine's filesystem by the time a pause fires.
+pause — the contract is that the run branch plus
+`<state-root>/runs/<run-id>/` are the only durable record, and both
+already live on the machine's filesystem by the time a pause fires.
 
 Before `stop_machine`, the pause branch syncs the machine-side
 `.leerie/runs/<run-id>/` directory to the host via the same tar-pipe
-primitive that `fetch_branch` uses. This is best-effort (bounded by
-a 60 s timeout; failure is logged but does not block the pause) and
-serves two purposes: it gives the host a copy of `state.json` so a
-subsequent `resume` against an auto-detected Fly run can read the
-task and wave state locally, and it surfaces logs and checkpoint
-artifacts for offline inspection without restarting the machine.
+primitive `fetch_branch` uses — best-effort (bounded 60 s timeout,
+failure logged but non-blocking), giving the host a local copy of
+`state.json` for a subsequent auto-detected `resume` and surfacing logs
+for offline inspection without restarting the machine.
 
 ### Remote disk policy
 
 **Every Fly-path run gets a per-machine volume by default.**
-`FLY_VM_DISK_GB` defaults to `8` when `RUNTIME=fly` and the user has
-not set it explicitly (CLI / env / toml). `provision.sh` creates the
-volume before the machine, mounts it at `/work`, and the
+`FLY_VM_DISK_GB` defaults to `8` when `RUNTIME=fly` and unset. `provision.sh`
+creates the volume before the machine, mounts it at `/work`, and the
 pause-on-failure contract is unconditional — the volume survives
-`machine stop` and reattaches on `machine start`, indefinitely. The
-mount target is `/work` because that's where the durable workload
-lives: the seeded repo, the run-state tree under
-`.leerie/runs/<run-id>/`, and the per-subtask worktrees that dominate
-the run's disk footprint. The caches under `/home/leerie/.cache/...`
-and the auth bundle at `/home/leerie/.claude` are bounded in size and
-intentionally left on the rootfs — they are not the durability
-contract's concern. `seed_auth` re-runs unconditionally on every
-resume, so the auth bundle is refreshed from the host's `$STAGE`
-regardless of whether the rootfs survived the pause window. The
-workload-vs-cache separation is empirical, not absolute: a heavy
-pnpm-store or cargo registry can still hit the rootfs cap on
-unusually large monorepos. The historical ENOSPC mode was per-
-subtask worktree accumulation, not cache growth, so prioritizing
-worktrees on the volume is the right default; runs that
-empirically exhaust caches should set `FLY_VM_DISK_GB` higher and
-treat the spillover as a rootfs problem to solve separately. The
-rootfs's throughput cap (2,000 IOPS / 8 MiB/s) compounds disk
-pressure by slowing spillover; the volume accelerates it as a
-side-effect since per-machine tiers run 4k–32k IOPS.
+`machine stop`/`start` indefinitely. `/work` holds the durable workload:
+the seeded repo, the run-state tree, and the per-subtask worktrees that
+dominate disk footprint. The caches under `/home/leerie/.cache/...` and
+the auth bundle at `/home/leerie/.claude` are bounded in size and
+intentionally left on the rootfs — `seed_auth` re-runs unconditionally on
+every resume, refreshing the auth bundle regardless of whether the rootfs
+survived. The workload-vs-cache split is empirical, not absolute: a heavy
+pnpm-store or cargo registry can still hit the rootfs cap on unusually
+large monorepos; runs that exhaust caches should set `FLY_VM_DISK_GB`
+higher and treat the spillover as a separate rootfs problem. The rootfs's
+throughput cap (2,000 IOPS / 8 MiB/s) compounds disk pressure by slowing
+spillover; the volume avoids this since per-machine tiers run 4k–32k
+IOPS.
 
 **Volume lifecycle — leerie owns the reap, because Fly does not.** A Fly
-volume is an independent resource with its own lifetime: *"a Machine can
-be destroyed without destroying its volume"*, and what survives is a
-documented **"unattached volume"** that keeps accruing per-GB-month
-charges indefinitely. There is no platform-side lifecycle hook to lean
-on — the Machines API's `auto_destroy` destroys the *machine* when its
-work completes, and says nothing about that machine's volumes; `mounts`
-has no ephemeral or destroy-on-exit mode. Since `FLY_VM_DISK_GB`
-defaults to `8`, **every** Fly run creates a volume, so an unreaped one
-is not an edge case — it is the default outcome of any teardown path
-that forgets. The obligation is therefore structural: *every* path that
-destroys a machine must also destroy its volume, and "the machine is
-already gone" is precisely when a known volume still needs reaping — not
-a reason to skip it. Gating the reap behind a live-machine check inverts
-the requirement, and did: it silently leaked the volume of every run
-whose machine died first.
+volume outlives its machine (*"a Machine can be destroyed without
+destroying its volume"*) and an orphaned one is a documented
+**"unattached volume"** that bills per-GB-month indefinitely. There is
+no platform-side lifecycle hook: `auto_destroy` only destroys the
+machine, and `mounts` has no destroy-on-exit mode. Since
+`FLY_VM_DISK_GB` defaults to `8`, every Fly run creates a volume, so an
+unreaped one is the default outcome of any teardown path that forgets
+it — every path that destroys a machine must also destroy its volume,
+and "the machine is already gone" is precisely when the reap is still
+owed, not a reason to skip it. Gating the reap behind a live-machine
+check inverts the requirement, and did: it silently leaked the volume
+of every run whose machine died first.
 
-Two platform facts fix the ordering, and they pull in opposite
-directions. The volume→machine association lives **only** on Fly (the
-volume's `attached_machine_id`, and the machine's own `config.mounts`)
-and it vanishes the instant the machine is destroyed — so anything that
-needs to *learn* a volume from its machine must do so **before** the
-destroy. But Fly refuses to destroy a volume that is still attached
-("in use by machine X") — so the reap itself must come **after**. The
-reap is thus pinned between the two: look up, destroy machine, destroy
-volume. (A *stopped* machine keeps its attachment, which is what makes
-the pause/resume contract above compatible with this: a paused run's
-volume is still owned, still attached, and must not be reaped.)
+Two platform facts fix the ordering, pulling opposite ways: the
+volume→machine association (`attached_machine_id` / `config.mounts`)
+vanishes the instant the machine is destroyed, so it must be looked up
+**before** the destroy; but Fly refuses to destroy an attached volume,
+so the reap itself must come **after**. Order: look up, destroy
+machine, destroy volume. A *stopped* machine keeps its attachment, so a
+paused run's volume stays untouched.
 
-One residue is irreducible and deliberately unsolved. If a machine is
-destroyed **and** the launcher dies before reaping the volume (SIGKILL,
-crash), the association is gone from both sides — Fly no longer links
-them, and the host sidecar may never have recorded it. Such a volume
-cannot be attributed to its run by any mechanism, since volume names are
-random and encode nothing. leerie does not guess: there is no
-reconciliation sweep, because "unattached" alone cannot distinguish a
-true orphan from a volume whose machine is seconds away from attaching.
-The operator reaps these by hand (`flyctl volumes list` + `destroy`),
-and the code says so where it gives up.
+One residue is irreducible and deliberately unsolved: if a machine is
+destroyed and the launcher dies before reaping the volume (SIGKILL,
+crash), the association is gone from both sides and the orphan cannot
+be attributed to its run (volume names are random). There is no
+reconciliation sweep — "unattached" alone can't distinguish a true
+orphan from a volume whose machine is seconds from attaching — so the
+operator reaps these by hand (`flyctl volumes list` + `destroy`).
 
 Six sidecar fields on `run.json` capture remote lifecycle state:
 
@@ -4266,11 +3608,11 @@ Six sidecar fields on `run.json` capture remote lifecycle state:
 
 These fields live on `run.json`. Since the run_id is the machine ID
 (known at provision time), the run directory is created immediately
-after `flyctl machine run` succeeds. `provision.sh` writes
-`fly-machine.json` to the run directory as a crash-recovery pointer;
-`run.json` is written later by the orchestrator. Every verb that acts
-on a known run-id (`stop`, `kill`, `finalize`, `resume`) can
-use the run_id directly as the machine ID — no lookup needed.
+after `flyctl machine run` succeeds; `provision.sh` writes
+`fly-machine.json` as a crash-recovery pointer, `run.json` is written
+later by the orchestrator, and every run-id verb (`stop`, `kill`,
+`finalize`, `resume`) can use the run_id directly as the machine ID —
+no lookup needed.
 
 `paused_at`, `pushed_at`, and `killed_at` are mutually exclusive — a
 run cannot be in more than one terminal-or-paused state.
@@ -4281,20 +3623,18 @@ against `pushed_at` (a pushed run cannot be sync-failed) and
 orchestrator's `_validate_run_json` enforces all invariants.
 
 **Sync-before-destroy (load-bearing — the "never lose work"
-contract).** The clean-exit branch (rc=0/10/75) does NOT destroy
-the machine first and hope the user runs `leerie finalize` later.
-That ordering is wrong: the orchestrator's committed work and the
-`.leerie/runs/<id>/` state directory live ONLY on the machine until
-they are streamed back. Destroying the machine while the user has
-no host-side copy throws the work away unrecoverably.
+contract).** The clean-exit branch (rc=0/10/75) must not destroy the
+machine and hope the user runs `leerie finalize` later: the
+orchestrator's committed work and `.leerie/runs/<id>/` live ONLY on
+the machine until streamed back, so destroying it with no host-side
+copy throws the work away unrecoverably.
 
-Instead, `decide_teardown` sources `fetch-branch.sh` and runs
-`fetch_branch` (git bundle of the run branch + tar of
-`.leerie/runs/<id>/`) BEFORE calling `destroy_machine`. Only on
-confirmed sync success does it destroy. On any sync failure
-(network blip, bundle creation failure, etc.), the machine is
-LEFT RUNNING — not stopped — and a multi-line WARNING points the
-user at three recovery commands:
+`decide_teardown` therefore runs `fetch_branch` (git bundle of the run
+branch + tar of `.leerie/runs/<id>/`) BEFORE calling `destroy_machine`,
+and only destroys on confirmed sync success. On any sync failure
+(network blip, bundle-creation failure), the machine is LEFT
+RUNNING — not stopped — and a multi-line WARNING points the user at
+three recovery commands:
 
   1. `leerie finalize <run-id> --runtime fly`  (retry sync + push)
   2. `leerie resume <run-id> --runtime fly`    (manual inspection —
@@ -4305,9 +3645,7 @@ user at three recovery commands:
 
 The user owns the machine in this state. leerie does NOT auto-
 destroy after a successful manual finalize either — the user must
-explicitly `kill`. The reclassified table (line 893+) already
-documented the "destroy *after* stream-back" intent; this is the
-mechanism that enforces it.
+explicitly `kill`.
 
 **The user-visible verb surface.** Four explicit verbs cover the
 remote run lifecycle, each doing exactly one thing:
@@ -4328,69 +3666,61 @@ short-circuits in the launcher and queries Fly directly via `flyctl
 machines list --json`, so it surfaces machines launched from any host
 repo (not just the cwd).
 
-This separation matches the convention every comparable tool follows:
-`fly machine start` / `stop` / `destroy` are distinct verbs;
-kubectl's `delete` is distinct from a watched stream ending;
-tmux's `kill-session` is distinct from `detach`. Ctrl-C as a
-destructive verb was an artifact of the lifetime coupling — once the
-coupling is removed, Ctrl-C reduces to its conventional meaning ("stop
-this terminal-side activity") and destruction needs its own verb.
+This separation matches the convention every comparable tool follows
+(`fly machine start`/`stop`/`destroy`; kubectl's `delete` distinct from
+a watched stream ending; tmux's `kill-session` distinct from
+`detach`). Ctrl-C as a destructive verb was an artifact of the
+lifetime coupling; with it removed, Ctrl-C reduces to its conventional
+meaning ("stop this terminal-side activity") and destruction gets its
+own verb.
 
 **Runtime auto-detection on run-id-bearing verbs.** When `resume`,
 `stop`, `kill`, `accept-blocked`, `accept-integration`, or `finalize`
-targets a run
-whose state directory contains a `fly-machine.json` or
+targets a run whose state directory contains a `fly-machine.json` or
 `ec2-instance.json` sidecar and no explicit `--runtime` was given, the
 launcher auto-promotes to `fly` or `ec2` respectively via the shared
-`_auto_detect_run_runtime` helper (`_auto_detect_fly_runtime` remains
-as a thin Fly-only wrapper for call sites not yet migrated). `stop`,
-`kill`, `accept-blocked`, `accept-integration`, `finalize` and `resume`
-all wire real EC2 actions; no verb fails closed on EC2 any more. `resume` promotes
+`_auto_detect_run_runtime` helper (`_auto_detect_fly_runtime` remains a
+thin Fly-only wrapper for call sites not yet migrated). All six verbs
+wire real EC2 actions; no verb fails closed on EC2. `resume` promotes
 `RUNTIME=ec2` exactly as it promotes `fly`, reaching the dispatch
-branch's sidecar → `resume_instance()` path. `finalize` streams the
-completed run back with `fetch_state_ec2()` and then runs the same
-`host_finalize` the Fly path uses; because a *stopped* instance has no
-reachable target and EC2 reassigns its public IP on every stop/start,
-`finalize` wakes a paused instance, fetches, and re-stops it **only if
-finalize is what woke it** — the same wake → act → restore-prior-state
-discipline `accept-blocked` uses below. `finalize --force` is the one
-EC2 gap that remains, and it is a transport boundary rather than an
-omission: the force path drives `force_finalize_remote()` and
-`collect_subtrees_remote()`, both `flyctl ssh console`-only, and
-finalizing without collecting un-integrated subtask branches would push
-an incomplete branch. `accept-blocked`'s EC2 action mirrors the Fly path's
-wake-mutate-pause dance: it resolves AWS credentials, wakes the
-instance via `resume_instance()` if it is stopped, mutates
-`state.json` on the instance over SSM (`ec2_remote_exec` — no ssh
-keypair or hallpass wait needed, unlike Fly), mirrors the mutation
-onto the host copy when one exists, and re-pauses the instance only
-if this verb was the one that woke it. `stop`'s EC2 action sources
-`aws-credentials.sh` +
-`ec2-lib.sh` + `ec2-provision.sh`, resolves AWS credentials and gates
-on `require_aws()`, resolves `LEERIE_EC2_INSTANCE_ID` from the run's
-sidecar, and calls `stop_instance()` (`aws ec2 stop-instances` —
-stop-scoped, preserves the root EBS volume, same semantics as Fly's
-`machine stop`). `kill`'s EC2 action resolves the run's
-`ec2_instance_id` from `ec2-instance.json`/`run.json`, resolves AWS
-credentials, re-resolves the instance's current SSH target (its public
-IP changes on every stop/start cycle), and calls
-`_try_fetch_state_for_ec2_teardown` — the same hook
-`decide_ec2_teardown`'s clean-exit branch uses — to sync the run branch
-and state dir back to the host BEFORE calling `terminate_instance()`
-(the one-way-ratchet invariant: destroy-then-fetch would make paid-for
-LLM work unrecoverable). A failed sync leaves the instance running
-rather than terminating it, mirroring `decide_ec2_teardown`'s own
-sync-failure behavior; `flyctl` is never invoked for an EC2 run. When
-no sidecar of either kind exists, `stop` and `kill` probe for a
-live local nerdctl container via `_is_local_container` (`nerdctl
-inspect <run-id>`). `stop` uses `nerdctl stop` (SIGTERM → grace →
-SIGKILL) so the orchestrator's signal handler can save state before
-exit, or `aws ec2 stop-instances` on the EC2 path; `kill` uses
+branch's sidecar → `resume_instance()` path. `finalize` streams the run
+back with `fetch_state_ec2()` and then runs the same `host_finalize`
+Fly uses; because a stopped instance has no reachable target and EC2
+reassigns its public IP on every stop/start, `finalize` wakes a paused
+instance, fetches, and re-stops it only if finalize itself woke it —
+the same wake → act → restore-prior-state discipline `accept-blocked`
+uses. `finalize --force` is the one EC2 gap: it's a transport
+boundary, not an omission — `force_finalize_remote()` and
+`collect_subtrees_remote()` are both `flyctl ssh console`-only, and
+finalizing without collecting un-integrated subtask branches would
+push an incomplete branch.
+
+`accept-blocked`'s EC2 action mirrors Fly's wake-mutate-pause dance:
+resolve AWS credentials, wake the instance via `resume_instance()` if
+stopped, mutate `state.json` over SSM (`ec2_remote_exec` — no ssh
+keypair or hallpass wait needed), mirror onto the host copy when one
+exists, and re-pause only if this verb woke it. `stop`'s EC2 action
+resolves credentials, gates on `require_aws()`, resolves
+`LEERIE_EC2_INSTANCE_ID` from the sidecar, and calls `stop_instance()`
+(`aws ec2 stop-instances` — preserves the root EBS volume, same
+semantics as Fly's `machine stop`). `kill`'s EC2 action resolves the
+instance id, re-resolves its current SSH target (public IP changes on
+every stop/start), and calls `_try_fetch_state_for_ec2_teardown` — the
+same hook `decide_ec2_teardown`'s clean-exit branch uses — to sync
+back BEFORE `terminate_instance()` (the one-way-ratchet invariant:
+destroy-then-fetch would make paid-for LLM work unrecoverable). A
+failed sync leaves the instance running rather than terminating it;
+`flyctl` is never invoked for an EC2 run.
+
+When no sidecar exists, `stop`/`kill` probe for a live local nerdctl
+container via `_is_local_container` (`nerdctl inspect <run-id>`).
+`stop` uses `nerdctl stop` (SIGTERM → grace → SIGKILL, letting the
+signal handler save state) or `aws ec2 stop-instances`; `kill` uses
 `nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
-(after the fetch-before-terminate sync) since the run is terminal.
-`finalize` on a local run is inline (no separate verb needed). If
-the user explicitly sets `--runtime local` on a Fly-originated run,
-`resume` warns but respects the choice.
+(after the fetch-before-terminate sync), since the run is terminal.
+`finalize` on a local run is inline. If the user explicitly sets
+`--runtime local` on a Fly-originated run, `resume` warns but respects
+the choice.
 
 **Smart resume in remote mode.** `resume` is the single verb for
 re-engaging with a remote run, regardless of the run's current state.
@@ -4404,165 +3734,115 @@ The launcher reads observed state and routes to the right behavior:
 
 The "machine running, orchestrator alive" branch is the §6 isolation
 boundary's terminal-side surface — not a new privileged channel.
-Detection is two-layered. **Early flock probe (resume path only):**
-on the `_resumed=true` path, the launcher runs a lightweight flock
-probe via `flyctl ssh console` immediately after `resume_machine`
-succeeds and *before* `seed_auth`. If the probe detects a held lock
-(rc=75), the launcher skips `seed_auth`, `re_seed`, and the launch
-wrapper entirely, going straight to the attach path — avoiding ~60 s
-of wasted seeding. SSH readiness is not a concern: when the
-orchestrator is alive, the machine was never stopped and hallpass is
-already warm. If the probe fails for any reason other than rc=75
-(SSH not ready, run directory absent), the launcher falls through
-silently to `seed_auth`. **Launch-time flock probe
-(belt-and-suspenders):** the launcher pipes a launch wrapper through
-`flyctl ssh console -C "python3 -"`; the wrapper takes a fast-path
-flock probe on the run directory (§6 *Single owner per run dir*)
-and exits 75 if the lock is held. This second probe covers fresh
-provisions and any race the early probe missed. **flyctl exit-code
-limitation:** `flyctl ssh console` does not forward the remote
-process's exit code — it returns 1 for any non-zero remote exit.
-The actual code appears only in stderr (`Error: ssh shell: Process
-exited with status <N>`). The launcher captures stderr and parses
-the real remote code via `_extract_flyctl_remote_rc` (lib.sh) so the
-rc=75 pivot fires correctly. Both probes pivot to attach behavior
-via `_attach_to_live_orchestrator` (lib.sh) instead of launching a
-duplicate. The attach channel itself
-is `flyctl ssh console` against the run's Fly Machine, proxied
-through Fly's hallpass + WireGuard mesh, giving the user a real PTY
-at `/work`. Default behavior runs `tail -F` of the orchestrator log
-(the canonical way to watch a detached run's progress); `--shell`
-opts into the bare bash shell at `/work`. No sshd in the image, no
-key management, no public exposure; isolation inherits from the same
-WireGuard mesh the launcher already uses for `flyctl machine exec`.
+Detection is two-layered. **Early flock probe (resume path only):** on
+`_resumed=true`, the launcher runs a lightweight flock probe via
+`flyctl ssh console` right after `resume_machine` and before
+`seed_auth`; a held lock (rc=75) skips seeding/launch entirely and
+goes straight to attach, avoiding ~60 s of wasted seeding (SSH is
+already warm since the machine was never stopped). Any other probe
+failure falls through silently to `seed_auth`. **Launch-time flock
+probe (belt-and-suspenders):** the launcher pipes a launch wrapper
+through `flyctl ssh console -C "python3 -"`, which takes a fast-path
+flock probe on the run directory (§6 *Single owner per run dir*) and
+exits 75 if held — covering fresh provisions and any race the early
+probe missed. Because `flyctl ssh console` collapses any non-zero
+remote exit to rc 1, the launcher parses the real code out of stderr
+(`_extract_flyctl_remote_rc`) so the rc=75 pivot fires correctly. Both
+probes pivot to `_attach_to_live_orchestrator` (lib.sh) instead of
+launching a duplicate.
 
-The orchestrator is unaware of attach — it's a launcher-host gesture
-(mirrors §6's "container/process isolation is the launcher's
-concern"). The same mechanism serves four roles:
-
-1. The "feels-local" interactive terminal — `leerie resume <run-id>
-   --shell` drops a developer at `/work` to inspect what a worker is
-   doing.
-2. The mid-run attach mechanism — open a session against a running
-   machine without disturbing PID 1 (the orchestrator). `flyctl ssh
-   console` spawns an independent process; detach signals only the
-   SSH session's own children.
-3. The failure-inspection surface — the paused-machine state from
-   the pause-on-failure path is reachable via exactly the same
-   command (`resume` wakes the machine, then tails). No second
-   mechanism is needed.
-4. **The detached-run reattach surface** — after a Ctrl-C detach or
-   a closed-laptop disconnect, `leerie resume <run-id>` picks
-   up the orchestrator log stream where it left off. The orchestrator
-   never noticed; only the local view paused.
+The attach channel is `flyctl ssh console` against the run's Fly
+Machine, proxied through Fly's hallpass + WireGuard mesh, giving a
+real PTY at `/work` — default `tail -F` of the orchestrator log,
+`--shell` for a bare bash shell. No sshd in the image, no key
+management, no public exposure. The orchestrator is unaware of attach
+(a launcher-host gesture, per §6's "isolation is the launcher's
+concern"), and the same mechanism serves the interactive-terminal
+case, the mid-run attach case, the paused-machine failure-inspection
+case, and reattaching after a Ctrl-C detach or closed-laptop
+disconnect — one command, `leerie resume <run-id>`, covers all four;
+the orchestrator never notices, only the local view paused.
 
 State contract: `scripts/remote/provision.sh` writes a PID-keyed
-record at `$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after
+record at `$LEERIE_STATE_HOST_DIR/remote/$$.json` right after
 provisioning and copies it to
-`$LEERIE_STATE_HOST_DIR/runs/<run-id>/fly-machine.json` once the
-run-id is known. The pointer is retained after `destroy_machine` so
-the chain wave loop's tagging step can read it post-wait; the
-`resume` auto-discovery path filters stale pointers via `kill -0`
-(dead-PID records are harmless). `leerie resume` resolves the
-machine via either path. Multiple concurrent remote runs in the same
-repo are disambiguated by passing a run-id; with no `--run-id` and a
-single active launcher record, `resume` resolves the run-id from
-that record.
+`.../runs/<run-id>/fly-machine.json` once the run-id is known. The
+pointer survives `destroy_machine` so the chain wave loop can read it
+post-wait; stale pointers are filtered via `kill -0`. `leerie resume`
+resolves the machine via either path — disambiguated by an explicit
+run-id, or by the single active launcher record when none is given.
 
-Local mode keeps its inline `resume` behavior by design. Local
-runs are synchronous foreground processes (`nerdctl run --rm` with no
+Local mode keeps its inline `resume` behavior by design: local runs
+are synchronous foreground processes (`nerdctl run --rm`, no
 backgrounding), so there is no detached container to attach to —
 `resume` just re-execs the orchestrator against `state.json`.
 
 **Shallow seeding for heavy repos.** The fresh-provision seed
 (`seed_repo_clone`) delivers the host's committed state as a
-`git bundle create - --all` piped to the machine over
-`flyctl ssh console`. `--all` packs the full history of every ref.
-For a repo with deep history and large committed blobs (vendored
-archives, seed-data dumps, media), that bundle can be hundreds of MB
-— a single serialized stream over the WireGuard tunnel that can
-exceed the `LEERIE_SEED_TIMEOUT_S` cap (default 600 s) and fail the
-whole run before any worker starts. The bloat is *history*, not the
-working tree: build artifacts and `node_modules` are already excluded
-(a bundle carries committed objects only), so the lever is the depth
-of committed history, not what's on disk.
+`git bundle create - --all` piped over `flyctl ssh console`. `--all`
+packs full history of every ref; for a repo with deep history or
+large committed blobs, that bundle can be hundreds of MB — enough to
+exceed `LEERIE_SEED_TIMEOUT_S` (default 600 s) and fail the run before
+any worker starts. The bloat is history, not the working tree (build
+artifacts / `node_modules` are already excluded — a bundle carries
+committed objects only), so the lever is history depth, not disk
+usage.
 
-Above a size threshold (repo `.git` larger than a bounded default),
-the seed switches to a **shallow** transport: the host makes a
-throwaway `git clone --depth=N` of the working branch, tars *only its
-`.git` directory*, pipes that over the same channel, and the machine
-untars it and `git checkout`s the working tree. This ships a fraction
-of the bytes (a depth-50 clone of a 960 MB-history repo is ~140 MB
-vs. a 420 MB full bundle) while remaining correct on every downstream
-path:
+Above a size threshold (`.git` larger than a bounded default), the
+seed switches to a **shallow** transport: the host makes a throwaway
+`git clone --depth=N` of the working branch, tars only its `.git`
+directory, pipes that over the same channel, and the machine untars +
+`git checkout`s. This ships a fraction of the bytes (a depth-50 clone
+of a 960 MB-history repo is ~140 MB vs. a 420 MB full bundle) while
+staying correct on every downstream path:
 
-- **Why tar-of-`.git`, not a shallow bundle.** `git bundle` refuses a
-  shallow repository — a shallow clone's grafted commits have parents
-  the pack cannot reach, so `bundle create --all` produces an object
-  the receiver cannot clone. Tarring the shallow clone's `.git`
-  sidesteps this: it ships the pack (including the `.git/shallow`
-  graft boundary) verbatim, and the machine materializes a valid
-  shallow repo.
-- **Why it stays NFC-safe.** Tarring `.git` preserves the same
-  filename-normalization guarantee that motivated bundles: object
-  contents (tree entries by raw bytes) never serialize filenames
-  through the transport; the receiving Linux git creates working-tree
-  filenames natively on `checkout`. (Tarring the *working tree* would
-  reintroduce the macOS BSD-tar NFC→NFD bug — so the seed tars `.git`
-  only and reconstructs the tree with `checkout`.)
-- **Why fetch-back is unaffected.** When a worker commits a run branch
-  on the shallow machine repo, `fetch-branch.sh` bundles *that branch
-  by name* (not `--all`). The bundle cites the shallow boundary commit
-  as a prerequisite; the host — which always holds the full origin
-  ancestry — has that commit, so `bundle verify` + `fetch` reassemble
-  full history and the graft never leaks host-side.
-- **Why the PR diff stays correct.** A real `git clone --depth=N`
-  keeps the working branch's true tip hash, so `git merge-base` on the
-  host resolves the run branch against the working branch and the PR
-  "Files changed" view shows only the worker's changes. (A synthetic
-  re-rooting of history would be smaller still but would break the
-  merge-base — so the seed uses a genuine shallow clone, never a
-  re-root.)
+- **Tar-of-`.git`, not a shallow bundle.** `git bundle` refuses a
+  shallow repository (its grafted commits have parents the pack can't
+  reach), so tarring the shallow clone's `.git` ships the pack —
+  including the `.git/shallow` graft boundary — verbatim instead.
+- **Stays NFC-safe.** Tarring `.git` preserves the same
+  filename-normalization guarantee bundles have: object contents never
+  serialize filenames through the transport, and the receiving Linux
+  git creates working-tree filenames natively on `checkout`. (Tarring
+  the working tree would reintroduce the macOS BSD-tar NFC→NFD bug.)
+- **Fetch-back is unaffected.** `fetch-branch.sh` bundles the worker's
+  run branch *by name*, not `--all`; it cites the shallow boundary
+  commit as a prerequisite, the host already has that commit, so
+  `bundle verify` + `fetch` reassemble full history and the graft
+  never leaks host-side.
+- **PR diff stays correct.** A real `git clone --depth=N` keeps the
+  working branch's true tip hash, so `git merge-base` on the host
+  resolves the run branch correctly and the PR diff shows only the
+  worker's changes — a synthetic re-rooting would break the merge-base,
+  so the seed uses a genuine shallow clone.
 
-Submodules are orthogonal: a `--depth` clone of the superproject does
-not populate `.git/modules`, so the existing per-submodule bundle
-machinery (each submodule bundled separately, its URL rewired on the
-machine) carries over unchanged.
+Submodules are orthogonal (a `--depth` clone doesn't populate
+`.git/modules`, so the existing per-submodule bundle machinery carries
+over unchanged). The cost is that workers see only depth-N history
+(the machine can't deepen — no origin credentials). Depth and the size
+threshold are operator-tunable; setting depth to full disables shallow
+seeding. Small repos stay on the full bundle. The shallow path also
+falls back to full bundle for a detached HEAD or a branch name outside
+a conservative shell-safe charset (the machine-side reconstruction
+interpolates the branch into a `git checkout` over `sh -c`).
 
-The cost is that workers on the machine see only depth-N history
-(`git log`/`git blame` beyond N is unavailable, and the machine
-cannot deepen — it has no origin credentials, by the finalization
-model above). The default depth is chosen to preserve useful recent
-history rather than a bare depth-1 tip. Depth and the size threshold
-are operator-tunable; setting depth to full disables shallow seeding
-and restores the full-bundle path. Small repos are unaffected — they
-stay on the full bundle, which costs nothing to ship. The shallow path
-also falls back to the full bundle when the working branch is a
-detached HEAD or has a name outside a conservative shell-safe charset
-(the machine-side reconstruction interpolates the branch into a
-`git checkout` run over `sh -c`, and the full path — which never names
-the branch — is the safe default for the rare exotic branch).
+This switch is confined to fresh provisions (`seed_repo_clone` always
+wipes `/work`); mid-run re-seed (below) never re-clones. Corollary:
+`resume` now probes whether the initial seed produced a valid `/work`
+git repo, and re-runs the full seed rather than dead-ending on a
+dirty-only re-seed if a prior seed died before completing.
 
-Because `seed_repo_clone` always wipes and repopulates `/work`, this
-switch is confined to fresh provisions. Mid-run re-seed (below) never
-re-clones and is unchanged. A corollary robustness fix: `resume`
-now probes whether the initial seed actually produced a valid `/work`
-git repo; if a prior seed died before completing (leaving no run
-state on the machine), resume re-runs the full seed instead of
-dead-ending on a dirty-only re-seed against a repo that isn't there.
+**Mid-run re-seed (remote mode).** The host's working tree keeps
+evolving after a remote run starts (new commits, dirty edits, a new
+submodule), and the machine needs a user-triggered way to pick that up
+without destroying its volume. Two surfaces share one mechanism — an
+explicit `leerie re-seed <run-id>` subcommand and an implicit
+auto-re-seed inside `leerie resume <id> --runtime fly` — both waking
+the machine if stopped, running a safety check, and calling the same
+`seed_repo_dirty` helper the fresh-provision path uses.
 
-**Mid-run re-seed (remote mode).** Once a remote run has started, the
-host's working tree keeps evolving — the user lands new commits,
-saves uncommitted edits, pulls in a new submodule. The remote machine
-needs a user-triggered way to pick that up without destroying its
-volume. leerie realises this as two surfaces sharing one mechanism:
-an explicit `leerie re-seed <run-id>` subcommand and an implicit
-auto-re-seed step inside `leerie resume <id> --runtime fly`.
-Both wake the machine if stopped, run a safety check, and call the
-same `seed_repo_dirty` helper used by the fresh-provision path.
-
-Three operations, in order, mirroring the spec's intent ("current
-laptop state" = host commits plus host dirty edits):
+Three operations, in order ("current laptop state" = host commits plus
+host dirty edits):
 
 1. `flyctl machine start` (if stopped) + `wait_for_started`.
 2. Refuse re-seed when `/work` on the machine has uncommitted
@@ -4576,41 +3856,36 @@ laptop state" = host commits plus host dirty edits):
    `lib.sh`). The full-history clone on the machine is preserved
    (never re-cloned, which would obliterate the run branch).
 
-The dirty set is computed on the host where worktree paths
-(`.leerie/runs/<run-id>/worktrees/...`) structurally cannot appear,
-because worktrees live only on the machine. A defensive filter
+The dirty set is computed on the host, where worktree paths structurally
+cannot appear (worktrees live only on the machine). A defensive filter
 excludes `.git/*` and non-whitelisted `.leerie/*` paths before handing
-the file list to rsync's `--files-from=-` — protects against a future
-change that lets host-side paths name worktree files or surfaces
-host-side `.leerie/` run state to the machine. Exception: the three
+the file list to rsync's `--files-from=-`, guarding against a future
+change letting host-side paths name worktree files. The three
 committed config files (`.leerie/config.toml`, `.leerie/Dockerfile`,
-`.leerie/.leerie-setup.sh`) are repo-owned declarations that workers
-need on the machine and pass through the filter.
+`.leerie/.leerie-setup.sh`) pass through the filter as repo-owned
+declarations workers need.
 
-The repo-local `.claude/` directory is force-included in the dirty
-set even when `.gitignore` excludes it (the common case). Workers
-need the repo's hooks, agents, skills, commands, and settings to
-function — and bundles can't carry gitignored content. Architectural
-guarantee: every fresh seed and every mid-run re-seed delivers the
+The repo-local `.claude/` directory is force-included even when
+`.gitignore` excludes it (the common case) — workers need the repo's
+hooks, agents, skills, commands, and settings, and bundles can't carry
+gitignored content. Every fresh seed and mid-run re-seed delivers the
 host's current `.claude/` to the machine.
 
-Resume auto-re-seeds by default. `--no-re-seed` opts out for the
-rate-limit auto-resume case where no host edits happened. The
-trust model matches the spec: the user picks the moment (by typing
+Resume auto-re-seeds by default; `--no-re-seed` opts out for the
+rate-limit auto-resume case where no host edits happened. The trust
+model matches the spec: the user picks the moment (by typing
 `resume`), so the seed is treated as authoritative.
 
 ### EC2 runtime lifecycle
 
 `--runtime ec2` provisions and runs the orchestrator on an AWS EC2
-instance (`scripts/remote/aws-credentials.sh`,
-the launcher's AWS region/profile resolution, the `boto3`/`botocore` pin,
-and the launcher's `RUNTIME=ec2` dispatch — see IMPLEMENTATION.md
-"Runtime mode" / "AWS region/profile prefs"). This section is the
-canonical architecture the shipped dispatch implements against — the
-EC2 counterpart to everything above in this section for Fly. It reuses
-Fly's stage names and dispositions everywhere the two platforms agree,
-and calls out explicitly where EC2's platform semantics diverge and the
-design must not copy Fly's rule blindly.
+instance (`scripts/remote/aws-credentials.sh`, the launcher's AWS
+region/profile resolution, the `boto3`/`botocore` pin, and the
+launcher's `RUNTIME=ec2` dispatch — see IMPLEMENTATION.md "Runtime
+mode" / "AWS region/profile prefs"). This is the EC2 counterpart to
+everything above for Fly: it reuses Fly's stage names and dispositions
+wherever the two platforms agree, and calls out explicitly where EC2's
+semantics diverge.
 
 **Stage mapping.** The five Fly stages above (provision → wait-ready →
 seed → detached-orchestrate → teardown) carry over one-for-one:
@@ -4630,65 +3905,43 @@ launcher routes those exit codes through the runtime-appropriate
 teardown") — EC2 needs no new table, only a new teardown implementation
 of the same three dispositions (stop / destroy / leave-alone).
 
-**Image delivery — how the leerie image reaches the instance.** The Fly
-path has a shipped, working answer: `ensure_image()` pushes a
-self-contained image (orchestrator source baked at `/opt/leerie-image/`
-via the Dockerfile's `COPY`) to `registry.fly.io/$APP:$VERSION[-$HASH]`,
-and `flyctl machine run <tag>` pulls it. EC2's `RunInstances` has no
-registry-pull equivalent for an *instance* the way `machine run` does for
-a *container* — an EC2 instance boots from an AMI (a full disk-image
-snapshot), not a per-run pulled artifact — so "what image runs" cannot be
-answered by copying the Fly mechanism verbatim. Three strategies exist,
-mirroring the shape of the EBS-volume decision above: name each, state
-its cost, and pick one plainly.
+**Image delivery — how the leerie image reaches the instance.** Fly's
+`ensure_image()` pushes a self-contained image to
+`registry.fly.io/$APP:$VERSION[-$HASH]` and `flyctl machine run <tag>`
+pulls it. EC2 has no registry-pull equivalent for an *instance* the way
+`machine run` has for a *container* — it boots from an AMI (a full
+disk-image snapshot), not a per-run pulled artifact. Three strategies:
 
-1. **Bake into the AMI.** The operator builds (once, ahead of time, out
-   of the run's critical path) a custom AMI that already has the
-   orchestrator source, Python 3.10+, and every OS-level dependency
-   `.leerie-setup.sh` would otherwise need root for. `RunInstances`
-   boots straight into a ready-to-seed instance; `LEERIE_EC2_AMI` names
-   it. No push, no pull, no build step inside the per-run critical path —
-   the instance is ready to accept `ec2_seed_repo`/`ec2_remote_exec`
-   calls the moment `wait_for_instance_ready()` returns. Cost is paid
-   once, by whoever maintains the AMI (a Packer/EC2 Image Builder
-   pipeline, out of scope for leerie itself), not per run. **This is the
-   default this design adopts.**
-2. **Push to a registry (ECR), pull at boot.** The direct analog of Fly's
-   mechanism: build a leerie image, push it to a private ECR repository,
-   and have the instance's user-data script pull and run it via a
-   container runtime (Docker/containerd) installed on a generic AMI.
-   Rejected as the default: it reintroduces the exact registry-auth
-   surface Fly already pays for (`flyctl auth docker`, token refresh) but
-   for a second, AWS-specific mechanism (`aws ecr get-login-password`),
-   requires a container runtime to exist *inside* the EC2 instance —
-   layering a container-in-a-VM model where a VM alone would do — and
-   adds a per-provision pull latency this design has no evidence is
-   necessary. It would earn reconsideration if leerie ever needs the same
-   image artifact shared verbatim across EC2 and a containerized runtime,
-   but no such requirement exists today.
-3. **User-data pull-and-build.** The instance's EC2 user-data script
-   clones the leerie repo (or downloads a release tarball) and installs
-   dependencies fresh on every boot, off a generic stock AMI (no custom
-   image maintenance at all). Rejected as the default: it pays a
-   multi-minute build/install cost on *every* `RunInstances` call (worse
-   than Fly's already-solved once-per-version cost), requires outbound
-   internet egress from the instance at boot for package installs (a
-   security-group / NAT surface the SSM-only transport decision below
-   otherwise avoids needing), and turns transient package-registry
-   flakiness into a per-run provisioning failure mode. It remains a
-   reasonable *bootstrap* path for an operator who has not yet built a
-   custom AMI — `LEERIE_EC2_AMI` could point at a stock AMI plus a
-   documented user-data script as a manual fallback — but is not the
-   default this design ships.
+1. **Bake into the AMI.** The operator builds (once, out of the run's
+   critical path) a custom AMI with the orchestrator source, Python
+   3.10+, and every OS-level dependency `.leerie-setup.sh` would
+   otherwise need root for; `RunInstances` boots straight into a
+   ready-to-seed instance, named by `LEERIE_EC2_AMI`. No push, no pull,
+   no per-run build step — cost is paid once by whoever maintains the
+   AMI (a Packer/EC2 Image Builder pipeline, out of scope for leerie
+   itself). **This is the default this design adopts.**
+2. **Push to a registry (ECR), pull at boot.** The direct Fly analog.
+   Rejected: it reintroduces registry-auth surface a second time
+   (`aws ecr get-login-password`), requires a container runtime inside
+   the EC2 instance (a container-in-a-VM layering a VM alone would
+   do), and adds per-provision pull latency with no evidence it's
+   necessary. Worth reconsidering only if leerie ever needs the same
+   image shared verbatim across EC2 and a containerized runtime.
+3. **User-data pull-and-build.** The instance clones leerie fresh on
+   every boot off a generic stock AMI. Rejected as default: multi-minute
+   build cost per `RunInstances` call, requires outbound internet
+   egress at boot (the security-group/NAT surface the SSM-only
+   transport below otherwise avoids), and turns registry flakiness into
+   a provisioning failure mode. Remains a reasonable manual bootstrap
+   fallback (`LEERIE_EC2_AMI` pointing at a stock AMI plus a documented
+   user-data script) for an operator without a custom AMI yet.
 
-**IAM actions the chosen strategy requires.** Baking into the AMI moves
-the build-time IAM surface (EC2 Image Builder or Packer's own
-`ec2:CreateImage`/`RegisterImage`/`ec2:RunInstances` for the build
-instance) outside leerie's own run-time credential path entirely — the
-AMI-build pipeline is a separate, operator-owned process with its own
-IAM role, not something leerie's per-run credentials touch. The run-time
-IAM policy leerie's own AWS identity needs is exactly the stage-mapping
-table above and nothing more:
+**IAM actions the chosen strategy requires.** Baking into the AMI keeps
+the build-time IAM surface (Packer/Image Builder's own
+`ec2:CreateImage`/`RegisterImage`/`ec2:RunInstances`) entirely outside
+leerie's per-run credential path — a separate, operator-owned pipeline
+with its own IAM role. leerie's own AWS identity needs exactly this,
+and nothing more:
 
 - `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus`
   (create, wait-ready)
@@ -4703,99 +3956,68 @@ table above and nothing more:
   named by a future `LEERIE_EC2_INSTANCE_PROFILE`-shaped knob, not to
   leerie's caller identity) for the transport-substitution stage below
 - No `ecr:*` actions and no `iam:PassRole` beyond the SSM instance
-  profile attachment implied above — bake-into-AMI needs neither a
-  registry pull permission nor a user-data role broad enough to install
-  arbitrary packages at boot, which is itself a security argument for
-  strategy 1 over strategies 2 and 3: the run-time IAM surface stays
-  minimal and auditable.
+  profile attachment above — bake-into-AMI needs neither a registry
+  pull permission nor a user-data role broad enough to install
+  arbitrary packages at boot, a security argument for strategy 1 over
+  2/3: the run-time IAM surface stays minimal and auditable.
 
 **New `LEERIE_EC2_*` knobs implied.** None beyond what IMPLEMENTATION.md
-already reserves. `LEERIE_EC2_AMI` (already spec'd) is sufficient to name
-the chosen artifact under all three strategies — it names a custom AMI
-under strategy 1 (the default) or a stock AMI under strategy 3 (the
-documented fallback); strategy 2 is rejected and introduces no knob.
-This design does not add an `LEERIE_EC2_INSTANCE_PROFILE` var now — the
-instance profile is a provisioning-subtask-level `RunInstances` parameter
-alongside the five already-reserved shape vars, not an image-delivery
-decision — but flags it here so the provisioning subtask that wires
-`IamInstanceProfile` into `run-instances` does not have to rediscover
-that SSM's instance-side role must be supplied from *somewhere*.
+already reserves. `LEERIE_EC2_AMI` names the chosen artifact under all
+three strategies (a custom AMI under 1, a stock AMI under fallback 3;
+strategy 2 introduces no knob and is rejected). No
+`LEERIE_EC2_INSTANCE_PROFILE` var is added now — that's a
+provisioning-subtask-level `RunInstances` parameter, not an
+image-delivery decision — flagged here so the subtask wiring
+`IamInstanceProfile` doesn't have to rediscover that SSM's instance-side
+role must come from somewhere.
 
 **EBS volume lifecycle — the opposite default from Fly, not the same
-discipline.** Fly's "Remote disk policy" above establishes a manual reap
-obligation because a Fly volume has no platform-side destroy-on-exit
-hook: *"a Machine can be destroyed without destroying its volume."*
-Copying that discipline verbatim onto EC2 would be wrong, because EC2's
-default behavior is the mirror image. AWS's own root-volume default is
-`DeleteOnTermination=true`: the EBS root volume of an EC2 instance is
-deleted automatically when the instance is *terminated* (not merely
-stopped). This is a platform-enforced hook Fly simply does not have —
-the reap obligation Fly's design places on leerie's own code is, for the
-default EC2 shape, AWS's problem to solve, not leerie's.
+discipline.** Fly's "Remote disk policy" places a manual reap
+obligation on leerie because a Fly volume has no destroy-on-exit hook.
+EC2's default is the mirror image: AWS's `DeleteOnTermination=true`
+deletes the root EBS volume automatically when the instance is
+*terminated* — a platform-enforced hook Fly lacks, so for the default
+EC2 shape the reap is AWS's problem, not leerie's. This collapses to
+three cases:
 
-This collapses to three cases, and the design must pick one and state it
-plainly rather than default silently:
+1. **Root volume only, default `DeleteOnTermination=true`.**
+   `RunInstances` with a single root EBS volume and no block-device
+   override; AWS reaps it on `TerminateInstances` — no leerie-side reap
+   code, no volume-orphan test surface. **This is the default this
+   design adopts.**
+2. **Stop, don't terminate, on pause.** Like Fly's `machine stop`,
+   `StopInstances` leaves the root volume attached (EC2 keeps billing
+   the attached EBS volume while stopped, mirroring Fly) and never
+   touches `DeleteOnTermination` — that attribute is
+   termination-scoped, not stop-scoped. Fly's stop/start-preserves-
+   filesystem contract carries over unchanged: an EC2 pause uses
+   `StopInstances`, never `TerminateInstances`.
+3. **A future secondary EBS volume** would reintroduce Fly's exact
+   problem — additional (non-root) volumes default
+   `DeleteOnTermination=false` — and would need the same reap
+   discipline and ordering (look up while attached, destroy instance,
+   destroy volume) Fly's "Remote disk policy" pins. Not built now since
+   no secondary volume exists; flagged so a future subtask doesn't
+   assume EC2 is exempt from the discipline Fly needed.
 
-1. **Root volume only, default `DeleteOnTermination=true`.** This is the
-   simple, recommended default for the EC2 runtime: `RunInstances` with
-   a single root EBS volume and no explicit block-device override. On
-   `TerminateInstances`, AWS reaps the volume itself — no leerie-side
-   reap code is needed, and no `test_provision_volume.py`-style
-   volume-orphan test surface exists to write, because there is no
-   orphan case to test. **This is the default this design adopts.**
-2. **Stop, don't terminate, on pause.** Exactly like Fly's `machine
-   stop` (preserves the volume, frees compute — EC2 continues to bill
-   for the attached EBS volume while stopped, mirroring Fly's per-GB
-   volume charge while a machine is stopped), `StopInstances` leaves the
-   root volume attached and never invokes `DeleteOnTermination` at all —
-   that attribute is termination-scoped, not stop-scoped. The
-   stop/start-preserves-filesystem contract that "Remote pause-on-
-   failure" establishes for Fly (`run.json` + the run branch are the
-   only durable record leerie relies on; the machine's own filesystem
-   is a bonus, not the contract) carries over unchanged: an EC2 pause
-   uses `StopInstances`, never `TerminateInstances`.
-3. **A future secondary EBS volume** (if a later subtask adds one, e.g.
-   to give `/work` a device independent of root-volume resizing) reintroduces
-   exactly Fly's problem: additional (non-root) EBS volumes default
-   `DeleteOnTermination=false`, so a leftover secondary volume *would*
-   need the same "every path that destroys the instance must also
-   reap the volume" discipline DESIGN's "Remote disk policy" section
-   pins for Fly, including the same ordering constraint (the
-   volume↔instance association is queryable while attached; detach/
-   reap must happen before or as part of termination, mirroring the
-   Fly ordering: look up, destroy machine, destroy volume). Since this
-   design does not introduce a secondary volume, that discipline is
-   deliberately **not** built now — it is flagged here so a future
-   subtask proposing a secondary volume does not silently assume EC2
-   is exempt from the discipline Fly needed.
+**Transport substitution for `flyctl ssh console`.** Two roles need
+replacing: piping the detached-orchestrator launch wrapper, and
+opening a session for `resume`/`--shell` attach and log tailing. This
+design picks SSM Session Manager over SSH:
 
-**Transport substitution for `flyctl ssh console`.** Two roles need a
-replacement: (a) piping the detached-orchestrator launch wrapper to the
-instance, and (b) opening a session for `resume`/`--shell` attach and
-log tailing. AWS offers two candidate transports; this design picks SSM
-Session Manager over SSH and states why:
-
-- **SSM Session Manager** (`aws ssm start-session`,
-  `send_command`/`start_session` via `boto3`) needs no inbound security
-  group rule, no key-pair distribution, and no public IP — the SSM Agent
-  (preinstalled on Amazon Linux / most current AMIs) calls out to the
-  SSM service over HTTPS, the same "no sshd in the image, no key
-  management, no public exposure" property the Fly section calls out for
-  hallpass + WireGuard (line 2509-2511). Authentication and authorization
-  flow through the same AWS credential chain and IAM already established
-  for the rest of the EC2 runtime (`aws-credentials.sh`,
-  the launcher's `LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` resolution)
-  rather than a
-  parallel key-pair-management surface — one credential model for the
-  whole EC2 runtime, matching the "reuses Fly's ... dispositions
-  everywhere the two platforms agree" framing above.
-- **SSH** (a managed key pair, `LEERIE_EC2_KEY_NAME`, inbound security
-  group rule on port 22) is the closer textual analog to `flyctl ssh
-  console`, but requires provisioning and rotating a key pair and
-  opening network ingress — exactly the surface SSM avoids. It remains
-  available as a fallback transport for operators whose account policy
-  disallows the SSM Agent or Session Manager IAM permissions, but is not
-  the default.
+- **SSM Session Manager** (`aws ssm start-session`) needs no inbound
+  security group rule, no key-pair distribution, and no public IP —
+  the preinstalled SSM Agent calls out to the SSM service over HTTPS,
+  the same "no sshd, no key management, no public exposure" property
+  Fly gets from hallpass + WireGuard. Auth flows through the same AWS
+  credential chain and IAM already established for the rest of the EC2
+  runtime, rather than a parallel key-pair-management surface.
+- **SSH** (a managed key pair, `LEERIE_EC2_KEY_NAME`, inbound port-22
+  rule) is the closer textual analog to `flyctl ssh console`, but
+  requires provisioning/rotating a key pair and opening network
+  ingress — exactly what SSM avoids. Remains available as a fallback
+  for operators whose account policy disallows SSM, but is not the
+  default.
 
 `aws ssm start-session --target <instance-id> --document-name
 AWS-StartInteractiveCommand --parameters command="python3 -"` is the SSM
@@ -4809,48 +4031,38 @@ carries over unchanged from the Fly design (lines 2185-2206 above).
 
 **Pause/resume semantics.** EC2 `stop`/`start` maps directly onto Fly's
 `machine stop`/`machine start`: `StopInstances` preserves the root EBS
-volume (case 1 above) and the instance's private/public IP may change
-on restart unless an Elastic IP or the instance is in a VPC with a
-persistent ENI — a detail the provisioning subtask must pin down
-(likely: don't rely on the public IP surviving a stop/start cycle;
-resolve the instance's current address via `describe_instances` on every
-resume rather than caching it, mirroring how Fly resolves machine
-state fresh on every `resume` rather than trusting a cached IP).
-`TerminateInstances` is the `kill` / clean-exit-after-sync-success
-counterpart to `flyctl machine destroy`. The existing sidecar fields
-(`paused_at`, `pause_reason`, `killed_at`, `sync_failed_at`,
-`sync_fail_reason`) are runtime-agnostic in shape — they describe
-*when* and *why*, not *how* — and the EC2 path reuses them verbatim; a
-new `ec2_instance_id` field (see below) plays the role `fly_machine_id`
-plays today, present whenever the corresponding EC2 sidecar state is
-set.
+volume (case 1 above), and the instance's public IP may change on
+restart unless an Elastic IP or a persistent ENI is used — so the
+instance's current address is resolved via `describe_instances` on
+every resume rather than cached, mirroring Fly. `TerminateInstances` is
+the `kill` / clean-exit-after-sync-success counterpart to `flyctl
+machine destroy`. The existing sidecar fields (`paused_at`,
+`pause_reason`, `killed_at`, `sync_failed_at`, `sync_fail_reason`) are
+runtime-agnostic in shape (they describe *when* and *why*, not *how*)
+and the EC2 path reuses them verbatim; `ec2_instance_id` plays the role
+`fly_machine_id` plays today.
 
-**Run identifier.** DESIGN's "The run identifier" states the invariant
-plainly: `run_id` is "the container/machine ID assigned by the container
-runtime." An EC2 instance ID (`i-0123456789abcdef0`) fills exactly the
-same role — known at `RunInstances` time, before the orchestrator starts,
-with no deferred computation and no rename, satisfying the same
-constraint the run-id-before-orchestrator-start ordering above depends
-on. Two coupling points that hardcode the Fly-specific sidecar name will
-need generalizing when EC2 provisioning actually lands (out of scope for
-this subtask, flagged here so the next one doesn't have to rediscover
-it): `scripts/remote/provision.sh` writes `fly-machine.json` as the
-crash-recovery pointer, and `orchestrator/leerie.py`'s `_discover_runs`
-(DESIGN §6 multi-run resume) looks for that exact filename to recognize
-a pre-`state.json` crash-recoverable orphan run.
-The natural generalization is a same-shaped `ec2-instance.json` sidecar
-(instance id, region, created-at) plus widening the orphan scan to check
-for either sidecar file — not renaming or repurposing
-`fly-machine.json`, which stays exactly as-is for Fly runs.
+**Run identifier.** `run_id` is "the container/machine ID assigned by
+the container runtime" (DESIGN's "The run identifier"). An EC2 instance
+ID (`i-0123456789abcdef0`) fills the same role — known at
+`RunInstances` time, before the orchestrator starts, no deferred
+computation, no rename. Two Fly-specific coupling points needed
+generalizing when EC2 provisioning landed: `provision.sh` writing
+`fly-machine.json` as the crash-recovery pointer, and
+`_discover_runs`'s (DESIGN §6) lookup for that exact filename to
+recognize a pre-`state.json` crash-recoverable orphan. The
+generalization is a same-shaped `ec2-instance.json` sidecar (instance
+id, region, created-at) plus widening the orphan scan to check either
+sidecar — `fly-machine.json` itself is unchanged for Fly runs.
 
 ---
 
 ## 6½. Per-repo dependency provisioning
 
-The container image ships a fixed base toolchain. Every target repo
-ships its own — different language versions, different package
-managers, different lockfiles. Two distinct things go wrong if the
-orchestrator just runs workers against a fresh checkout:
+The container image ships a fixed base toolchain; every target repo
+ships its own — different language versions, package managers,
+lockfiles. Two distinct things go wrong if the orchestrator just runs
+workers against a fresh checkout:
 
 - **Dependencies are missing.** A Next.js repo needs `pnpm install`
   before any worker can `pnpm lint` or `pnpm test`. A Django repo
@@ -4865,37 +4077,34 @@ orchestrator just runs workers against a fresh checkout:
   later, the user sees a confusing failure.
 
 A third compounding factor: `git worktree add` checks out tracked
-files only. Untracked artifacts — `node_modules`, `.venv`, build
-outputs — are *not* copied from the main checkout. Even if the host
-repo were fully installed, every per-subtask worktree would start
-empty. The orchestrator handles this in two layers: runtime
-versions and the optional setup hook are pre-installed *in* the
-container before any worker runs, because they're cross-cutting
-state every worker shares; dependency installs (pnpm, pip, cargo,
-etc.) happen per worktree, against shared package-manager caches.
+files only — untracked artifacts (`node_modules`, `.venv`, build
+outputs) are not copied from the main checkout, so every per-subtask
+worktree starts empty even if the host repo were fully installed. The
+orchestrator handles this in two layers: runtime versions and the
+optional setup hook are pre-installed *in* the container before any
+worker runs (cross-cutting state every worker shares); dependency
+installs (pnpm, pip, cargo, etc.) happen per worktree, against shared
+package-manager caches.
 
 **Who runs that install.** Both the orchestrator and the workers do,
-for different trees and at different moments. Since the orchestrator
-took over build/lint/test execution (§9), it needs deps present in a
-worktree before it can measure anything there, so it applies the
-recipe itself — **lazily, on the first axis it actually measures for
-that worktree, and at most once per worktree per process**. Workers
-still install for their own targeted work, and the recipe stays in
-their prompt for that reason.
+for different trees and moments. Since the orchestrator took over
+build/lint/test execution (§9), it needs deps present in a worktree
+before it can measure anything there, so it applies the recipe itself
+**lazily, on the first axis it actually measures for that worktree, and
+at most once per worktree per process**. Workers still install for
+their own targeted work, and the recipe stays in their prompt for that
+reason.
 
-Lazy rather than eager at worktree creation, and the distinction is
-not cosmetic: a config-only or docs-only subtask correctly skips the
-install today, and pre-installing for every worktree would hand that
-cost back. Measured on the run that motivated this work, 44 of 91
-subtasks touched zero source files. What the ownership removes is the
-*repeat*: 263 installs ran across 161 worker logs — roughly 2.8 per
-worktree, since a subtask's implementer and conformer share one — to
-converge on the same state each time.
-
-The memo is keyed on the resolved absolute worktree path and lives in
-the process, not in run state: it records a filesystem fact, and
-re-installing once after a `resume` is correct, because a fresh
-container starts with an empty worktree.
+Lazy rather than eager at worktree creation is not cosmetic: a
+config-only or docs-only subtask correctly skips the install (measured,
+44 of 91 subtasks touched zero source files), and pre-installing for
+every worktree would hand that cost back. What laziness removes is the
+*repeat*: 263 installs ran across 161 worker logs — ~2.8 per worktree,
+since a subtask's implementer and conformer share one — converging on
+the same state each time. The memo is keyed on the resolved absolute
+worktree path and lives in the process, not in run state — it records
+a filesystem fact, and re-installing once after a `resume` is correct
+since a fresh container starts with an empty worktree.
 
 The orchestrator addresses both with a dedicated phase between
 classification and planning, layered top-to-bottom by determinism:
@@ -4978,36 +4187,28 @@ classification and planning, layered top-to-bottom by determinism:
    build time.** Neither `cargo fetch`/`cargo build` nor `go
    build` will populate their respective build-artifact caches
    (`CARGO_TARGET_DIR` / `GOCACHE`) against a manifest-only build
-   context (just the lockfile and manifest, no real source) —
-   `cargo` refuses to parse a manifest with no build target at
-   all ("no targets specified"), and `go build ./...` against
-   zero `.go` files is a silent no-op that warms neither cache
-   (only `go mod download`'s module cache, `GOMODCACHE`, warms
+   context — `cargo` refuses to parse a manifest with no build
+   target at all, and `go build ./...` against zero `.go` files
+   is a silent no-op (only `go mod download`'s `GOMODCACHE` warms
    without one). This is a well-documented Cargo/Go Docker-layer-
    caching workaround (no `cargo build --dependencies-only`
    exists): emit a throwaway `src/main.rs` (`fn main() {}`) or
-   `main.go` (a minimal valid package) into the build scratch
-   dir, run the fetch/build step against it to force the
-   dependency graph to compile, then discard the dummy file —
-   never `COPY` it into `/work`. Verified: a real worktree's
-   subsequent build against real source then gets a genuine
-   cache hit from the same baked `CARGO_TARGET_DIR`/`GOCACHE`,
-   fully offline, from a different directory.
+   `main.go` into the build scratch dir, run the fetch/build step
+   against it to force the dependency graph to compile, then
+   discard the dummy file — never `COPY` it into `/work`. Verified:
+   a real worktree's subsequent build against real source then
+   gets a genuine cache hit from the same baked cache, fully
+   offline, from a different directory.
 
    **The Rust bake step must NOT use `cargo build --release`.**
    Cargo keys its build cache by profile — `debug/` and
    `release/` are separate subtrees under `CARGO_TARGET_DIR` —
    so a `--release` bake produces **zero cache benefit** for a
    plain `cargo build`/`cargo test`, both of which default to
-   the debug profile (the profile implementer/conformer workers
-   actually use). Reproduced live as a real defect during this
-   feature's implementation: baking with `--release` left a real
+   the debug profile. Reproduced live: a `--release` bake left a
    worktree's subsequent `cargo build` recompiling every
-   dependency from scratch (`Compiling serde`, not `Fresh
-   serde`); dropping `--release` from the bake fixed it
-   (`Fresh serde_core`/`Fresh serde`, confirmed for both `cargo
-   build` and `cargo test`). Go has no equivalent profile split,
-   so this trap is Rust-specific.
+   dependency from scratch; dropping `--release` fixed it. Go has
+   no equivalent profile split, so this trap is Rust-specific.
 
    **Immutability invariant:** The baked layer is shared and
    read-only across up to `max_parallel` (default 5) concurrent
@@ -5021,45 +4222,33 @@ classification and planning, layered top-to-bottom by determinism:
    stores or input-hash-keyed caches, so concurrent access is
    read-only by design.
 
-   **Python requires a clone-then-delta approach.** A
-   `.pth`-file overlay or a `--system-site-packages` venv does not
-   correctly handle dependency *removal* (uninstalling a package
-   from the overlay leaves it visible in the base) or a fresh
-   venv's isolation from another venv's packages (site-packages
-   leaks across environments). The correct mechanism is `cp -r
-   /opt/venv` into a private copy, then apply the dependency
-   delta via `pip install`/`pip uninstall`. **No `pyvenv.cfg`
-   editing or `bin/` shebang relocation is needed** — verified
-   live: `pyvenv.cfg`'s `home =` line points at the system Python
-   install, not the venv itself, and is unaffected by moving the
-   clone to an arbitrary path. The one real trap is invoking the
-   clone's `bin/pip` directly: that script's shebang is hardcoded
-   to the *original* `/opt/venv`'s python binary, so `bin/pip
-   install`/`bin/pip uninstall` silently operate on the shared
-   `/opt/venv` instead of the clone — corrupting the bake for
-   every other concurrent worktree (reproduced live: an install
-   and an uninstall both leaked through a naive `cp -r` clone).
-   The fix is an invocation convention, not a relocation script:
-   always run `<clone>/bin/python3 -m pip install|uninstall`,
-   never `<clone>/bin/pip`. `python3` resolves correctly via its
-   own relative symlink regardless of where the clone lives, and
-   `-m pip` runs pip as a module inside that interpreter's own
-   `sys.prefix` — sidestepping the shebang trap entirely. This
-   materializes a full private environment only when a worktree's
-   subtask actually mutates dependencies — the common case (no
-   mutation) consumes the shared `/opt/venv` directly with zero
-   clone cost. `uv`/`poetry`/`pipenv` (as opposed to plain `pip`)
-   have their own, less reliable active-venv detection — `uv
-   sync` silently ignores `VIRTUAL_ENV` unless `--active` is
-   passed (verified live: without it, `uv` creates its own
-   `.venv` in the current directory instead of using the baked
-   venv), and `pipenv` has long-standing open bugs about not
-   respecting an already-active venv at all. The bake sidesteps
-   this by installing the tool itself into `/opt/venv` via pip at
-   build time, so the tool's own `/opt/venv/bin/<tool>` binary
-   resolves `sys.prefix` correctly by construction, the same
-   interpreter-path mechanism as the `python3 -m pip` convention
-   above — not environment-variable-based active-venv detection.
+   **Python requires a clone-then-delta approach.** A `.pth`-file
+   overlay or a `--system-site-packages` venv does not correctly
+   handle dependency *removal* or a fresh venv's isolation from
+   another venv's packages. The correct mechanism is `cp -r
+   /opt/venv` into a private copy, then apply the dependency delta
+   via `pip install`/`pip uninstall`. No `pyvenv.cfg` editing or
+   `bin/` shebang relocation is needed — `pyvenv.cfg`'s `home =`
+   line points at the system Python install and is unaffected by
+   moving the clone. The one real trap is invoking the clone's
+   `bin/pip` directly: that script's shebang is hardcoded to the
+   *original* `/opt/venv`'s python binary, so `bin/pip
+   install`/`uninstall` silently operate on the shared `/opt/venv`
+   instead of the clone, corrupting the bake for every other
+   concurrent worktree (reproduced live). The fix is an invocation
+   convention: always run `<clone>/bin/python3 -m pip
+   install|uninstall`, never `<clone>/bin/pip` — `-m pip` runs pip
+   as a module inside that interpreter's own `sys.prefix`,
+   sidestepping the shebang. This materializes a full private
+   environment only when a worktree's subtask actually mutates
+   dependencies — the common case consumes the shared `/opt/venv`
+   directly with zero clone cost. `uv sync` silently ignores
+   `VIRTUAL_ENV` unless `--active` is passed, and `pipenv` has
+   long-standing bugs about not respecting an already-active venv
+   at all — the bake sidesteps both by installing the tool itself
+   into `/opt/venv` via pip at build time, so the tool's own
+   `/opt/venv/bin/<tool>` resolves `sys.prefix` correctly by
+   construction.
 
    **Cache invalidation is preserved.** The existing
    rebuild-decision mechanism — SHA-256 of every
@@ -5495,16 +4684,13 @@ result afterwards, re-prompting on mismatch; its own reference calls the flag
 outbound request carries `tools[n].name == "StructuredOutput"` with **`strict`
 absent** and no `output_config`.
 
-The consequence is measured, not theoretical. Across the run corpus — every
-`StructuredOutput` submission in every run — **2,861 of 9,924 submissions
-(28.8%) are malformed**, in exactly the three shapes the vendor documents as the
-cost of omitting strict mode: the payload wrapped in a protocol-vocabulary
-container key (`{"input": …}`, `{"output": …}`, 1,648), the decoder flipping to
-legacy XML mid-value (136), bytes the CLI cannot parse at all (261), and
-required fields simply absent (752). None of these is a model being unable to do
-the work — the answers are usually correct and merely unreachable, which is why
-the CLI's own re-prompt loop recovers most of them at the cost of regenerating
-the payload.
+The consequence is measured: across the run corpus, **28.8% of `StructuredOutput`
+submissions are malformed**, in the shapes the vendor documents as the cost of
+omitting strict mode — the payload wrapped in a container key, the decoder
+flipping to legacy XML mid-value, unparseable bytes, and required fields simply
+absent. None of these is a model being unable to do the work — the answers are
+usually correct and merely unreachable, which is why the CLI's own re-prompt
+loop recovers most of them at the cost of regenerating the payload.
 
 **Optional counter-measure: grammar-constrained decoding.** The API can compile
 a schema into a grammar that restricts token sampling, making every one of those
@@ -5571,12 +4757,10 @@ operator gains nothing by setting by hand a value that is inert whenever the
 proxy is off.
 
 Measured across five arms on one 225 KB worker payload, varying only
-`ANTHROPIC_BASE_URL`: direct sustained 235,805 tokens over 20 requests with no
-refusal; a *passthrough* proxy that rewrites nothing refused after 224,127,
-and the real strict proxy after 224,247 — two reproductions 120 tokens apart,
-which is what establishes the base-URL override rather than the schema
-rewriting as the cause. Adding `[1m]` cleared both paths (261,014 and 276,579
-tokens, the latter completing successfully), with the proxy's
+`ANTHROPIC_BASE_URL`: direct sustained 235,805 tokens with no refusal; both a
+passthrough proxy and the real strict proxy refused around ~224K (120 tokens
+apart, which is what establishes the base-URL override rather than the schema
+rewriting as the cause). Adding `[1m]` cleared both paths, with the proxy's
 rewritten/passed-through/fell-back counters identical under either alias — so
 the window is bought back without giving up the constrained decoding the flag
 exists for.
@@ -5617,687 +4801,482 @@ the work, a crash is a fact about the machine.
 ### Forcing constrained decoding
 
 `--dangerously-force-strict-output` converts the schema contract above from
-checked-afterwards into enforced-during-generation. It is off by default.
+checked-afterwards into enforced-during-generation. Off by default.
 
 The mechanism is a **loopback proxy, one per run, started by the orchestrator**.
 Because the orchestrator is PID 1 inside the container and every worker is its
 child (§6 *Worker subtree termination*), they share a network namespace: a
-listener on `127.0.0.1` is reachable by workers with no port mapping and no host
-networking, and the container boundary reaps it if the run dies abnormally. The
-port is chosen by binding to `0` and reading back what the OS assigned, so
-concurrent leerie runs on one host never collide and no port scan is needed.
+listener on `127.0.0.1` needs no port mapping or host networking, and the
+container boundary reaps it on an abnormal exit. The port is chosen by binding
+to `0` and reading back what the OS assigned, so concurrent runs never collide.
 
 The guarantee is per-*call*, not per-orchestrator-process. Three entrypoints
-invoke workers without ever reaching `_orchestrate()`, so each opens its own
-proxy around its own calls rather than sharing the main run's:
+invoke workers without reaching `_orchestrate()`, so each opens its own proxy:
+`run_rebaser` and `run_recapture_deps` (host-seam entrypoints, §6
+*Finalization*, §6½, running in their own short-lived `python3` process and
+reading the flag `_orchestrate()` already resolved and persisted onto the
+run's state, since it never crosses that process boundary), and `--phase
+heal` (returns before `_orchestrate()` is reached). Before this, all three
+silently ran unconstrained regardless of the flag. Because they are
+best-effort paths that must never block a push, abort a multi-run loop, or
+fail a heal, their proxies fail *soft* rather than following the fail-closed
+startup rule below: a listener that cannot bind costs the guarantee for that
+call, not the call itself.
 
-- `run_rebaser` and `run_recapture_deps` — host-seam entrypoints (§6
-  *Finalization*, §6½) that run in their own separate, short-lived `python3`
-  process. They cannot re-derive the flag from CLI args, which never cross
-  that process boundary, so they read the value `_orchestrate()` already
-  resolved and persisted onto the run's own state.
-- `--phase heal` — returns before `_orchestrate()` is reached, so the replays
-  its heal loop drives would otherwise be unconstrained. It runs inside
-  `main()`, where the resolved flag is already in hand.
-
-Before this, all three silently ran unconstrained regardless of the flag: the
-guarantee held for every worker `_orchestrate()` itself drove, and for none
-of the workers reached any other way. Because these three are best-effort
-paths — none may block a push, abort a multi-run loop, or fail a heal — their
-proxies fail *soft* rather than following §7's fail-closed startup rule
-below: a listener that cannot bind costs the guarantee for that call, not the
-call itself.
-
-The proxy rewrites exactly one thing: on a request carrying a single tool named
-`StructuredOutput`, it sets `strict: true` and normalises the schema to the
-subset grammar compilation accepts — `additionalProperties: false` on every
-object, and removal of the keywords strict cannot express. Of that keyword set,
-only four occur in leerie's own schemas today (`minLength`, `maxLength`,
-`minimum`, `maximum`); the rest are stripped defensively against future schema
-edits. Everything else in the request is forwarded untouched.
+The proxy rewrites exactly one thing: on a request carrying a single tool
+named `StructuredOutput`, it sets `strict: true` and normalises the schema to
+the subset grammar compilation accepts — `additionalProperties: false` on
+every object, and removal of keywords strict cannot express (only
+`minLength`/`maxLength`/`minimum`/`maximum` occur in leerie's own schemas
+today; the rest are stripped defensively). Everything else is forwarded
+untouched.
 
 Two properties make that safe to run in the path of every worker call.
 
-**It fails open.** If the tool is renamed, duplicated, or shaped unexpectedly —
-all of which an upstream release may do without notice — the request is
-forwarded unmodified. The run continues exactly as it would without the flag;
-the guarantee is lost, not the run. That loss is reported, because the
-dangerous failure here is a silent one.
+**It fails open.** If the tool is renamed, duplicated, or shaped unexpectedly
+by an upstream release, the request is forwarded unmodified — the guarantee
+is lost, not the run, and that loss is reported. A request that simply
+carries no such tool is *not* a loss and is not reported: the CLI injects the
+tool only on turns that ask for structured output, so a multi-turn worker
+routinely makes some requests without it (measured, roughly a quarter to a
+third). The rename case is indistinguishable per-request from that ordinary
+traffic, but not across a run — every worker is invoked with a schema, so a
+run that rewrote *nothing* is reported once, at the end, as a probable
+rename.
 
-A request that simply carries no such tool is **not** one of those losses, and
-is deliberately not reported: the CLI injects the tool only on turns that ask
-for structured output, so a multi-turn worker always makes some requests
-without it — measured, roughly a quarter to a third of them. Treating those as
-suspected upstream changes made a healthy run describe itself as broken.
+**It fails closed at startup.** If the listener cannot bind, the run dies
+rather than proceeding unconstrained, so an operator who asked for the
+guarantee is never quietly given the old behaviour.
 
-The rename case needs its own mechanism, because per request it is
-indistinguishable from that ordinary traffic: both yield no matching tool.
-Across a run it is not — every worker is invoked with a schema, so if anything
-was proxied at all, something must have carried the tool. A run that rewrote
-*nothing* is therefore reported as a probable rename, once, at the end.
+**Two distinct limits, both undocumented.** The API refuses an over-large
+schema two ways — *"Schema is too complex for compilation"* and *"The
+compiled grammar is too large"* — with no numeric bound documented anywhere.
+Measured drivers: **optional properties** (strict mode must admit every
+subset of them in any order — 2^k paths per node, multiplied per array
+element) and **free-form strings** (the expensive element per path — 20
+string properties are refused where 20 enums/booleans/integers/arrays
+compile). Nesting array-of-objects inside array-of-objects compounds both.
 
-**It fails closed at startup.** If the listener cannot bind, the run dies rather
-than proceeding unconstrained, so an operator who asked for the guarantee is
-never quietly given the old behaviour.
+leerie answers each at the layer that owns it: the proxy forces every
+optional `required` on the wire only, collapsing the subset explosion without
+touching the schema the CLI validates against; and the two schemas that still
+didn't fit were restructured — the planner's by that transform alone, the
+reconciler's by lifting its nested `requires` array into a sibling keyed by
+id and collapsing four isomorphic `{sid, tag, reason}` arrays into one
+enum-discriminated `tag_ops`. Seven lesser in-place reductions ($defs
+dedup, stripping descriptions, dropping subtrees, trimming properties,
+identifiers-to-enums) were tried against the live API first and all refused;
+only the restructure worked.
 
-**Two distinct limits, and both are undocumented.** The API refuses an
-over-large schema two different ways — *"Schema is too complex for
-compilation"* and *"The compiled grammar is too large"* — and neither string,
-nor any numeric bound, appears in its own documentation. Measured, the drivers
-are: **optional properties**, because strict mode must admit every subset of
-them in any order (2^k paths per node, multiplied per array element); and
-**free-form strings**, which are the expensive element per path (20 string
-properties are refused where 20 enums, booleans, integers or arrays compile).
-Nesting an array-of-objects inside an array-of-objects compounds both.
+**A schema that still cannot be constrained is survivable.** Measured against
+the API across all 23 schemas (2026-08-04), two are refused outright — the
+planner's and the reconciler's, both driven by optional properties inside
+array items (twelve each), not size (the conformer's larger schema compiles
+fine). The fix is not to make those fields required — that already failed
+once, for a different reason: requiring fields is what made workers fail to
+produce schema-valid output at all (see *Findings carry a severity*, and the
+overlap judge's `artifact_paths`). So the proxy fails open on the *response*
+too: a rejection of the hardened request is answered by re-sending the
+untouched one, and that worker falls back to ordinary post-hoc validation
+while every other worker still gets constrained decoding. Logged at every
+verbosity and counted in the end-of-run summary, since a silently lost
+guarantee is the one outcome this design refuses.
 
-leerie answers each at the layer that owns it. The proxy forces every optional
-`required` **on the wire only** — collapsing the subset explosion without
-touching the schema the CLI validates against. And the two schemas that still
-would not fit were restructured: the planner's by that transform alone, the
-reconciler's by lifting its nested `requires` array into a sibling keyed by id
-and collapsing four isomorphic `{sid, tag, reason}` arrays into one
-enum-discriminated `tag_ops`. Seven in-place reductions were measured against
-the live API first — `$defs` deduplication, stripping descriptions, dropping
-subtrees, trimming properties, converting identifiers to enums — and every one
-was still refused. Only the restructure worked.
-
-**A schema that still cannot be constrained is survivable.** Not every
-schema compiles into a grammar. Measured against the API across all 23 (2026-08-04),
-two are refused outright — the planner's ("Schema is too complex") and the
-reconciler's ("The compiled grammar is too large"). Size is not the cause: the
-conformer's schema is larger on every count and compiles fine. The cause is
-*optional properties inside array items* — strict mode must accept every subset
-of them in any order, so grammar size multiplies per array element, and those
-two carry twelve each.
-
-The fix is not to make those fields required. That was tried and rejected for a
-different reason and would be a regression here: requiring fields is what made
-workers fail to produce schema-valid output at all (§ *Findings carry a
-severity*, and the same lesson in the overlap judge's `artifact_paths`). Trading
-a lost guarantee for a lost worker is the wrong direction.
-
-So the proxy fails open on the *response* as well as the request: a rejection of
-the hardened request is answered by re-sending the untouched one. That worker
-keeps ordinary post-hoc validation — exactly what it had before the flag existed
-— while every other worker still gets constrained decoding. The alternative is a
-run that cannot plan, which is strictly worse than the problem the flag set out
-to solve. The degradation is logged at every verbosity and counted in the
-end-of-run summary, because a silently lost guarantee is the one outcome this
-design refuses.
-
-The normalisation has a real cost: those stripped keywords were carrying
-validation. Sixteen of the twenty-one are string-length bounds (fifteen
-`minLength`, one `maxLength`) on strings whose consumers already test
-truthiness, so nothing changes. The remaining five are numeric bounds that
-**fail permissively** if dropped — `fit_judge`'s score is compared against a
-threshold with no range check, so an out-of-range value would read as well-fit —
-and leerie therefore re-checks those in Python. That re-check is
-*unconditional*, not gated on the flag: a value outside its declared range was
-always a worker bug, and distrusting it is right whether or not strict mode is
-what removed the bound. The trade is deliberate: structural malformation is what
-actually breaks runs, and value-range violations are both rarer and cheaply
-re-checked.
+The normalisation has a real cost: stripped keywords were carrying
+validation. Sixteen of twenty-one are string-length bounds on strings whose
+consumers already test truthiness, so nothing changes. The remaining five are
+numeric bounds that fail *permissively* if dropped (e.g. `fit_judge`'s score
+compared against a threshold with no range check would read an out-of-range
+value as well-fit), so leerie re-checks those in Python — unconditionally,
+not gated on the flag, since a value outside its declared range was always a
+worker bug regardless of what removed the schema-level bound.
 
 ---
 
 ## 8. The evidence-gated loop
 
-The original specification asked each worker to self-report a 1–10 confidence
-score and loop until it reached 9. The intent — force the worker to be sure
-before it acts — is right. The mechanism is not: a self-reported number is not
-a measurement. Models are systematically overconfident and will state high
-confidence on a wrong root cause without hesitation. Looping on that number
-just loops on the same vibe.
+The original design asked each worker to self-report a 1–10 confidence score
+and loop until it reached 9. The intent — force the worker to be sure before
+it acts — is right; the mechanism is not, since a self-reported number is not
+a measurement and models are systematically overconfident on a wrong root
+cause. Looping on that number just loops on the same vibe.
 
 Leerie keeps the loop and the high-confidence bar but **anchors the score to
-evidence**. Before an implementer writes any code it must clear a set of
-domain-specific *evidence gates*, and each gate must carry a concrete artifact
-— a file-and-line citation, a reproduction, a measurement, a cited research
-source — not an assertion. The confidence score is then a *summary of which
-gates carry hard evidence*, not an independent feeling. A bug-fixing task, for
-instance, must show a deterministic reproduction, a test that fails because of
-this specific bug, a traced symptom-to-cause path, and a mechanistic
-explanation of why the fix addresses the cause. Other domains have their own
-gate sets.
+evidence**. Before an implementer writes any code it must clear domain-specific
+*evidence gates*, each carrying a concrete artifact — a file-and-line
+citation, a reproduction, a measurement, a cited research source — not an
+assertion. The confidence score is a *summary of which gates carry hard
+evidence*, not an independent feeling. A bug-fixing task, for instance, must
+show a deterministic reproduction, a test that fails because of this specific
+bug, a traced symptom-to-cause path, and a mechanistic explanation of the fix.
+Other domains have their own gate sets.
 
-Three further disciplines apply at every scoring step, regardless of domain.
-They are the mechanisms by which the confidence score becomes load-bearing
-rather than ornamental.
+Three further disciplines apply at every scoring step, and are what make the
+score load-bearing rather than ornamental:
 
-- **Falsification.** For each major claim — a chosen root cause, a chosen
-  solution — the worker explicitly looks for evidence that would *disprove*
-  it: a probe, a counter-example, a research source that contradicts. A claim
-  earns high confidence only when its falsifier was tested and failed. Looking
-  only for confirming evidence is how a wrong hypothesis acquires high
-  confidence; the falsification step is the structural defense.
+- **Falsification.** For each major claim, the worker explicitly looks for
+  evidence that would *disprove* it — a probe, a counter-example, a
+  contradicting source — and earns high confidence only when the falsifier
+  was tested and failed. Looking only for confirming evidence is how a wrong
+  hypothesis acquires high confidence.
 - **Drift reconciliation.** Before scoring, the worker re-reads its own prior
-  statements in the same session. Any current claim that contradicts an
-  earlier one — or any earlier position the worker has quietly retreated from
-  — is named and resolved with evidence for the kept version. An
-  unreconciled contradiction blocks the high-confidence bar. This is the
-  defense against a worker confidently asserting X early and confidently
-  asserting ¬X later without flagging the change.
-- **Gap surfacing.** When a score is below the bar, the worker must enumerate
-  the specific *artifact* that would raise it — a citation, a measurement, a
-  probe output, a research source — and then go obtain that artifact on the
-  next iteration. A gap phrased as an activity ("look into it more", "verify
-  the design") does not terminate; a gap phrased as an artifact does. This
-  converts an open-ended "try harder" loop into a directed search whose next
-  move is deterministic.
+  statements in the session; any contradiction with an earlier claim, or
+  quiet retreat from one, is named and resolved with evidence. An
+  unreconciled contradiction blocks the high-confidence bar.
+- **Gap surfacing.** Below the bar, the worker must name the specific
+  *artifact* that would raise the score — not an activity ("look into it
+  more"). This converts an open-ended "try harder" loop into a directed
+  search with a deterministic next move.
 
-The loop is bounded. If the gates cannot be cleared within the bound, the
-subtask stops and reports itself as *blocked*, stating precisely what evidence
-is missing and whether obtaining it needs something only the user can supply —
-for example a credential that exists nowhere in the codebase. This is the
-narrow, legitimate exception to "never ask the user" (see §11).
+The loop is bounded. If the gates cannot be cleared within it, the subtask
+reports itself `blocked`, stating precisely what evidence is missing and
+whether obtaining it needs something only the user can supply — the narrow,
+legitimate exception to "never ask the user" (§11).
 
-**The disciplines are asked for; they are not schema-required.** All three
-disciplines above are carried by the prompts. Falsification and drift
-reconciliation keep an optional property each (`falsifiers_tested`,
-`contradictions_reconciled`); gap surfacing keeps none — the gap is stated in
-`basis`, which is required, so a below-bar score still has to say in writing
-what would raise it. What the schema does not do is list any of the three in
-`required`. That is a deliberate reversal of the original design, forced by
-measurement.
+**The disciplines are asked for; they are not schema-required.** Falsification
+and drift reconciliation keep an optional property each
+(`falsifiers_tested`/`contradictions_reconciled`); gap surfacing has none —
+the gap lives in the required `basis` field. None of the three is `required`
+in the schema, a deliberate reversal forced by measurement: requiring them
+made the confidence block a five-required-field object with two arrays, a
+paragraph string, and a nested object — field for field the trigger profile
+in upstream [anthropics/claude-code#49747](https://github.com/anthropics/claude-code/issues/49747),
+where the decoder flips from JSON to legacy XML mid-argument on tool calls
+with many required parameters and verbose string/array mixes. A controlled
+A/B (real `fit_judge` schema, n=8 per arm) measured 8/8 first attempts
+corrupted with the block present, 0/8 without; corpus-wide, 48.9% of all
+worker calls were wasted retries. Requiring the field destroyed the entire
+payload including the score itself — a constraint that annihilates the
+response it validates enforces nothing. leerie keeps the numeric score axes
+and `basis` required, so every gate still reads a real number anchored to a
+stated basis, and asks for falsifiers/contradictions/gaps in the prompt where
+a missing one costs a judgment rather than the whole answer.
 
-Requiring them made the confidence block a five-required-field object
-containing two arrays, a paragraph-length string, and a nested object — which
-is, field for field, the trigger profile in upstream
-[anthropics/claude-code#49747](https://github.com/anthropics/claude-code/issues/49747):
-the model's decoder flips from JSON to legacy XML *mid-argument* on tool calls
-with many required parameters and verbose string/array mixes. A controlled A/B
-against the live CLI (real `fit_judge` schema, same prompt and model, n=8 per
-arm) measured **8 of 8 first attempts corrupted with the block present, 0 of 8
-without it** — every with-block run needing exactly one retry. Corpus-wide,
-**48.9% of all worker calls were wasted retries**.
+`gap_to_close` (the block's only nested object, the sharpest edge of the
+#49747 profile) is removed outright — its sole consumer, a diagnostic log
+line, now reads `confidence.basis` instead.
 
-The trade is therefore not "discipline versus laxity." Requiring the field did
-not buy enforcement — it destroyed the entire payload, *including* the score
-the gate reads, and the worker's correct answer was discarded wholesale. A
-constraint that reliably annihilates the response it is validating enforces
-nothing. Leerie keeps the numeric score axes and `basis` required, so every §8
-gate still reads a real number anchored to a stated evidential basis, and asks
-for falsifiers, contradictions and gaps in the prompt where a missing one costs
-a judgment rather than the whole answer.
-
-`gap_to_close` is removed outright rather than merely relaxed: it was the
-block's only nested object — the sharpest edge of the #49747 profile — and its
-sole consumer was a diagnostic log line naming a blocked planner's gap, which
-now reads `confidence.basis` instead. Nothing decided anything on it.
-
-This is not a retreat from "code enforces" (§12). It is the recognition that a
-*schema* is not the enforcement layer for a discipline whose absence Python can
-check directly on the returned object, at a moment when the object still
-exists.
+This is not a retreat from "code enforces" (§12): a schema is not the
+enforcement layer for a discipline whose absence Python can check directly on
+the returned object, at a moment when the object still exists.
 
 ### The planner gate
 
-The same discipline applies one layer up. A planner that decomposes a domain
-into subtasks self-gates on two axes — *task understanding* (does the planner
-genuinely understand what the user wants and how it lands in this codebase)
-and *decomposition quality* (are these subtasks the right cut, sized for one
-worker, with real dependencies). The same three disciplines — falsification,
-drift reconciliation, gap surfacing — apply. A planner whose gate cannot
-clear emits `status: "blocked"` with the gap analysis instead of subtasks,
-matching the implementer's blocked-with-evidence exit. The principle is the
-same at both layers: a worker that cannot justify its confidence in evidence
-hands the decision back to a layer that can, rather than fabricating one.
+The same discipline applies one layer up. A planner self-gates on two axes —
+*task understanding* and *decomposition quality* — using the same three
+disciplines (falsification, drift reconciliation, gap surfacing). A planner
+whose gate cannot clear emits `status: "blocked"` with the gap analysis
+instead of subtasks, matching the implementer's blocked-with-evidence exit: a
+worker that cannot justify its confidence in evidence hands the decision back
+to a layer that can.
 
-**The cleared-but-empty terminal state.** Symmetric with the blocked exit
-above: a planner whose gate *does* clear can legitimately return zero
-subtasks. The contract reads "I understand the task, I investigated this
-domain, the work is already satisfied on HEAD" — distinct from blocked
-("I could not clear the gate"). When *every* planner returns
-`status: "ready"` with an empty `subtasks` array, the run has nothing to
-schedule: there is no decomposition to feed phase 3, no work to execute
-in phase 5, no run branch to integrate or push in phase 6. The
-orchestrator records `no_work_required=true` in state.json with each
-domain's `confidence.basis` quoted, writes `finished_at`, skips phases
-3–6, and exits 0. The run renders as `done` in `leerie list` (no
-push, no PR — there is no commit to propose). A mixed outcome (some
-ready+empty, some ready+nonempty) proceeds normally; the empty domains
-simply contribute nothing (dead-subtask elimination can also produce a
-mixed outcome by pruning fully-speculative subtasks from a non-empty
-domain — see §5 *Dead-subtask elimination*). The all-blocked case still dies — a blocker
-is a gate failure that the user must see.
+**The cleared-but-empty terminal state.** Symmetric with the blocked exit: a
+planner whose gate *does* clear can legitimately return zero subtasks — "I
+investigated this domain, the work is already satisfied on HEAD," distinct
+from blocked. When *every* planner returns `status: "ready"` with an empty
+`subtasks` array, there is nothing to schedule: the orchestrator records
+`no_work_required=true` in state.json with each domain's `confidence.basis`
+quoted, writes `finished_at`, skips phases 3–6, and exits 0. The run renders
+as `done` in `leerie list` (no push, no PR). A mixed outcome (some
+ready+empty, some ready+nonempty) proceeds normally, the empty domains simply
+contributing nothing. The all-blocked case still dies — a blocker is a gate
+failure the user must see.
 
 **Reaching the cleared-but-empty state from classification, before any
-planner runs.** The mechanism above is triggered post-plan, by
-`_detect_no_work` reading every planner's `status`/`subtasks`. But an
-already-satisfied task can make the classification gate itself unable to
-converge on a category set, before a planner is ever spawned: the
-classifier's `check_classifier_output` and the independent
-`classification_judge` (phase 1's own adversarial-verification pair — see
-*Independent adversarial verification* below) can pull in opposite
-directions round after round when the classifier's investigation keeps
-surfacing that the task's deliverable is already present, because a
-category set is being fitted to a diff that doesn't actually exist. The
-classifier schema carries an optional, additive
-`likely_already_satisfied`/`likely_already_satisfied_evidence` pair for
-exactly this — the classifier already investigates the codebase to
-classify at all, so this only structures a claim it could previously only
-make as prose the pipeline discarded. If the classification-gate retry
-loop exhausts without converging, and `st.data["likely_already_satisfied"]`
-is `True` with evidence, `phase_classification_gate` routes directly to
-`_finish_no_work_run` — the identical terminal state `_detect_no_work`
-produces, reached one phase earlier for this specific case. This field is
-OR-accumulated across re-classify rounds within one gate call, not
-last-write-wins: each re-classify round is a fresh classifier invocation
-whose prompt is entirely focused on fixing the category set the judge
-rejected, so a round can legitimately fail to restate a true
-already-satisfied finding an earlier round in the same gate call already
-made — that omission is not evidence the earlier finding was wrong, since
-the repo tree hasn't changed between rounds. A fresh `True` + evidence
-claim always wins; a falsy/absent claim only clears a prior `True` if
-there was no prior `True` to begin with. (A real production incident hit
-exactly the un-accumulated version of this: one round found the
-deliverable already on HEAD, a later round's category-focused re-classify
-silently dropped the claim, and the gate died instead of routing to the
-no-work exit.) This is not a new trust boundary: it extends the same one
-`_detect_no_work` already accepts (a worker's own investigation,
-un-double-checked by a second judge) from "the planner found nothing to
-do" to "the classifier independently found the same thing, and
-classification could not otherwise converge anyway." A classifier that
-never sets the field on any round (the common case — everything that
-isn't already-done work) sees zero behavior change; the gate still dies
-on genuine miscategorization exhaustion.
+planner runs.** An already-satisfied task can make the classification gate
+itself unable to converge on a category set: `check_classifier_output` and
+the independent `classification_judge` (phase 1's adversarial-verification
+pair) can pull in opposite directions round after round when the
+classifier's investigation keeps surfacing that the deliverable is already
+present, since a category set is being fitted to a diff that doesn't exist.
+The classifier schema carries an optional, additive
+`likely_already_satisfied`/`likely_already_satisfied_evidence` pair for this
+— structuring a claim it could previously only make as discarded prose. If
+the classification-gate retry loop exhausts without converging and
+`st.data["likely_already_satisfied"]` is `True` with evidence,
+`phase_classification_gate` routes directly to `_finish_no_work_run`, the
+same terminal state reached one phase earlier. The field is OR-accumulated
+across re-classify rounds within one gate call, not last-write-wins: a fresh
+`True`+evidence claim always wins, and a falsy/absent claim only clears a
+prior `True` if there was none. (A production incident hit exactly the
+un-accumulated version: one round found the deliverable already on HEAD, a
+later category-focused re-classify silently dropped the claim, and the gate
+died instead of routing to no-work.) This extends the same trust boundary
+`_detect_no_work` already accepts — an investigation un-double-checked by a
+second judge — to "classification could not otherwise converge anyway." A
+classifier that never sets the field sees zero behavior change.
 
 Reaching this state from classification instead of post-plan meant a run
-could hit `_finish_no_work_run` earlier than the pipeline previously ever
-called it — earlier, in fact, than `run.json`'s own run-identity fields
-(`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`,
-`task`) used to be written. `_finish_no_work_run` writes only
-`{finished_at, no_push, no_verify}`, so a run routed here before that
-identity write would produce a `run.json` the launcher's local-runtime
-auto-finalize scan cannot distinguish from one that crashed before
-`phase_classify` ever completed (that scan explicitly treats a missing
-`branch`/`working_branch` as exactly that signal). The identity write is
-therefore hoisted to run immediately at run start — before `phase_classify`
-itself, not just before the gate — so every early-exit path reachable from
-classification, present or future, sees a `run.json` that already
-correctly identifies the run.
+could hit `_finish_no_work_run` earlier than `run.json`'s own run-identity
+fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`,
+`task`) used to be written — and `_finish_no_work_run` writes only
+`{finished_at, no_push, no_verify}`, so such a run would produce a
+`run.json` the launcher's auto-finalize scan cannot distinguish from a crash
+before `phase_classify` completed. The identity write is therefore hoisted
+to run immediately at run start, before `phase_classify` itself, so every
+early-exit path sees a correctly-identified `run.json`.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
 classification-gate, reconciler, provision, overlap-judge, and integrator
-checks — does not accumulate feedback across rounds: each round's
-worker invocation sees only that round's issues, never the history of
-what an earlier round already tried and the check subsequently flagged
-again. That makes a 2-round cycle reachable and observed in production: a
-round-0 fix for issue A can introduce issue B, whose round-1 fix
-reintroduces A, so the loop cycles between two "fixes" that individually
-resolve the flagged issue without ever converging, burning every
-remaining round before the caller's own exhaustion `die()` fires. The
-loop tracks each round's issue set (keyed by a stable `LABEL: subject`
-signature, not the full issue string — free-form evidence prose
-regenerated each round would otherwise defeat exact-match comparison even
-for byte-identical underlying defects) and breaks early the moment a
-round's signature set is **exactly equal to** one already seen, rather
-than retrying blind through the remaining budget.
+checks — does not accumulate feedback across rounds, so a round-0 fix for
+issue A can introduce issue B, whose round-1 fix reintroduces A: the loop
+cycles between two "fixes" that individually resolve the flagged issue
+without ever converging, burning the round budget before the caller's own
+exhaustion `die()` fires. The loop now tracks each round's issue set (keyed
+by a stable `LABEL: subject` signature, not the free-form evidence prose,
+which regenerates each round and would defeat exact-match comparison) and
+breaks early the moment a round's signature set **exactly equals** one
+already seen.
 
-The guard compares by exact equality, not by subset containment. An
-earlier version compared with `issue_set <= seen` (a round's signature
-set is a subset of — including equal to — some earlier round's), on the
-theory that "a genuinely shrinking or strictly different signature set is
-never a subset of a prior one." That theory is false: a round that fixes
-some of a prior round's issues and leaves the rest open produces a
-signature set that is *both* strictly shrinking *and* a proper subset of
-the prior round's — the ordinary shape of incremental convergence when a
-check reports more than one issue at once. Under the subset comparison,
-this legitimate partial progress was indistinguishable from a true
-repeat and aborted the loop mid-convergence. Reproduced and root-caused
-against a real incident (barnacle, 2026-07-31): a classification-gate run
-needing three categories at once (`bug-fixing` + `feature-implementation`
-+ `testing`) never held all three simultaneously and died at gate
-exhaustion, even though each round was making genuine forward progress.
-Exact-equality comparison still catches the true A→B→A 2-round cycle
-(round 2's signature set exactly reproduces round 0's) while allowing a
-proper subset — strictly less information than a still-open prior round,
-which is progress, not a repeat — to keep retrying, bounded as always by
-`max_rounds`.
+The comparison is exact equality, not subset containment. An earlier version
+used `issue_set <= seen`, on the theory that a shrinking signature set is
+never a subset of a prior one — false: a round that fixes some issues and
+leaves others open produces a set that is *both* shrinking *and* a proper
+subset of the prior round's, the ordinary shape of incremental convergence.
+That version aborted mid-convergence on real incremental progress
+(root-caused against a 2026-07-31 incident where a classification-gate run
+needing three categories simultaneously never held all three and died at
+exhaustion despite genuine forward progress each round). Exact-equality still
+catches the true A→B→A cycle while letting a proper subset keep retrying,
+bounded as always by `max_rounds`.
 
-The same incident also surfaced a second, compounding defect fixed
-alongside the guard: `check_classifier_output`'s `SAME_WORK_RISK`/
-`TEST_OWNERSHIP_RISK` advisories (§4, same-work test) fire unconditionally
-inside `phase_classify`'s own inner retry loop and could strip a category
-the independent `classification_judge` (§8) had just confirmed was
-required, because `phase_classification_gate`'s re-classify re-invokes
-`phase_classify` from scratch with no memory of what the judge had
-already vetted. `check_classifier_output` now accepts an accumulated
-`judge_confirmed` set (categories the judge has reviewed without a
-*concrete, evidenced* objection, or explicitly asked to add, across every
-round of the current gate call) and suppresses a same-work/test-ownership
-pair only when both its categories are judge-confirmed — the classifier's
-own self-check yields to the independent judge's authoritative finding
-(§8) instead of re-litigating it every round. "Without objection" applies
-the same anti-gaming evidence discipline as the gate's own `issues`
-list (a `spurious_category` entry with empty `concrete_work_evidence` is
-a vague claim the gate itself never gates on, so it must not silently
-exclude that category from confirmation either — a category the gate
-effectively ignored this round is still reviewed-without-real-objection).
+The same incident surfaced a compounding defect: `check_classifier_output`'s
+`SAME_WORK_RISK`/`TEST_OWNERSHIP_RISK` advisories fire unconditionally inside
+`phase_classify`'s own inner retry loop and could strip a category the
+independent `classification_judge` had just confirmed required, since
+`phase_classification_gate`'s re-classify re-invokes `phase_classify` from
+scratch with no memory of what the judge already vetted.
+`check_classifier_output` now accepts an accumulated `judge_confirmed` set
+(categories reviewed without a *concrete, evidenced* objection, or
+explicitly requested, across the gate call) and suppresses a
+same-work/test-ownership pair only when both categories are judge-confirmed
+— the classifier's self-check yields to the independent judge instead of
+re-litigating every round.
 
 **Already-satisfied subtask elimination (the per-subtask sibling).** The
-cleared-but-empty state above is *whole-run*: it fires only when every planner
-natively returned zero subtasks. But a planner does not always know that a
-deliverable already exists — it is given the task and the codebase, not a
-manifest of what a *sibling run* merged to the base branch an hour ago. So a
-planner can, in good faith, emit a subtask whose success criteria are already
-met on the seeded base (e.g. two runs derive from the same request; the first
-merges its PR; the second is seeded from a base that now contains that work).
-Left alone, such a subtask reaches an implementer, which correctly reports
-`complete` while committing nothing — and the mechanical no-commits backstop
-(the `check_branch_has_commits` gate, §5 *Artifact passing between subtasks*)
-then fails it as a retryable no-op, burning the retry budget and pausing the
-run. The honest answer ("already done upstream") is exactly the one the
-backstop cannot represent.
+cleared-but-empty state above is *whole-run*. A planner does not know what a
+*sibling run* merged to the base branch an hour ago, so it can, in good
+faith, emit a subtask whose success criteria are already met on the seeded
+base. Left alone, that subtask reaches an implementer, which correctly
+reports `complete` while committing nothing — and the mechanical no-commits
+backstop (`check_branch_has_commits`, §5 *Artifact passing between
+subtasks*) fails it as a retryable no-op, burning the retry budget. The
+honest answer ("already done upstream") is exactly what the backstop can't
+represent.
 
-The fix is the per-subtask analogue of the cleared-but-empty check: before
-scheduling, a read-only **satisfied-probe** evaluates each subtask's
-`success_criteria_seed` against the base tree and soft-drops the ones already
-met — the same pre-schedule per-subtask soft-drop shape as dead-subtask
-elimination (§5) and the off-tree `files_likely_touched` filter, recorded in
-the same `dropped_subtasks` audit. If all subtasks drop, the run routes to the same
-`no_work_required` terminal state as the native cleared-but-empty case. This
-is a *soft, advisory* prune: it is subordinate to the mechanical no-commits
-backstop, which stays as the last line of defense for anything the probe
-misses (per §12, the code check is the guarantee; the LLM probe only reduces
-how often it fires on already-done work). Two disciplines are load-bearing and
-were established by calibration, not assumption: (1) the probe must judge the
-**base tree only** — never `git log --all` or another branch/ref, because a
-worktree shares the repo's full object DB and a history-spanning probe will
-"find" the deliverable on an unrelated branch and false-positive; (2) the
-probe defaults to *not satisfied* on any uncertainty, because a false "already
-done" silently deletes real work — a strictly worse failure than a false
-"still needed" (which merely costs one implementer round the backstop already
-tolerates).
+The fix is the per-subtask analogue: before scheduling, a read-only
+**satisfied-probe** evaluates each subtask's `success_criteria_seed` against
+the base tree and soft-drops the ones already met (same shape as
+dead-subtask elimination, §5, recorded in `dropped_subtasks`). If all
+subtasks drop, the run routes to `no_work_required`. This is a soft,
+advisory prune subordinate to the no-commits backstop, which remains the
+last line of defense (per §12, the code check is the guarantee; the LLM
+probe only reduces how often it fires). Two disciplines, established by
+calibration: (1) the probe judges the **base tree only**, never
+`git log --all` or another ref — a worktree shares the object DB, so a
+history-spanning probe "finds" the deliverable on an unrelated branch; (2)
+the probe defaults to *not satisfied* on any uncertainty, since a false
+"already done" silently deletes real work, strictly worse than a false
+"still needed."
 
-**The mid-run sibling case (why the base-tree probe is not enough).** The
-pre-schedule probe judges the **base tree** — the checkout as it stood when the
-run began. That is the correct discipline for the cross-run case above, but it
-is *structurally blind* to a subtask that becomes satisfied **during this run**,
-because a sibling subtask in an earlier wave committed the shared deliverable.
-Concretely: a code subtask declares `files_likely_touched` that includes a test
-file and commits its matching test update in the same commit, while a separate
-test-only subtask — scheduled a wave later, whose entire deliverable is that
-same test file — `requires` a capability the code subtask `provides`. By the
-time the test subtask runs, its work is already on the run branch. It correctly
-reports `complete` with nothing to commit, and the no-commits backstop fails it.
-The base-tree probe never had a chance: the overlap did not exist at plan time.
-The retry then reproduces the identical no-op — the subtask cannot re-do work
-that already exists on the branch it is measured against — so the retry cap is
-exhausted and the wave dies. A `resume` re-runs the same doomed subtask and
-dies the same way: a deterministic loop, not a transient failure.
+**The mid-run sibling case.** The pre-schedule probe judges the base tree as
+it stood at run start, so it is *structurally blind* to a subtask that
+becomes satisfied **during this run** by an earlier-wave sibling. Concretely:
+a code subtask commits a test file's update as a byproduct, while a
+separate, later-wave test-only subtask `requires` that same capability. By
+the time it runs, its work is already on the run branch — it reports
+`complete` with nothing to commit, the no-commits backstop fails it, and the
+retry reproduces the identical no-op deterministically until the retry cap
+exhausts and the wave dies.
 
-The resolution is the post-execution analogue of the pre-schedule probe: on a
-no-commits result, before failing, the orchestrator re-runs the satisfied-probe
-against the subtask's `success_criteria_seed` on the **run-branch HEAD** (the
-current integration state, which *does* contain the sibling's commit). If the
-criteria are already met there, the subtask is settled as satisfied — a
-legitimate terminal success, recorded in the same `dropped_subtasks` audit with
-reason `already_satisfied_mid_run` — rather than routed to the retry cap. If the
-probe is *not* satisfied (a genuine lazy/broken no-op, the case the backstop was
-built for), the existing retryable-failure path is unchanged. The same
-base-tree-only-vs-HEAD distinction is deliberate: the pre-schedule probe must
-not span history, but the post-execution probe measures against exactly the ref
-the commit-presence gate itself uses (`_compute_run_branch`), so it cannot
-"find" the deliverable on an unrelated branch.
+The resolution is the post-execution analogue: on a no-commits result,
+before failing, the orchestrator re-runs the satisfied-probe against
+`success_criteria_seed` on the **run-branch HEAD** (which *does* contain the
+sibling's commit). If met there, the subtask settles as satisfied (recorded
+as `already_satisfied_mid_run`) rather than routed to the retry cap; a
+genuinely unsatisfied probe leaves the existing retryable-failure path
+unchanged. The base-tree-only-vs-HEAD distinction is deliberate: the
+pre-schedule probe must not span history, while the post-execution probe
+measures against exactly the ref the commit-presence gate uses
+(`_compute_run_branch`).
 
-**Scope: sibling-committed *or* base-tree-already-satisfied.** The probe judges
-*whether* the criteria are met on HEAD, not *who* met them — so this rescue also
-covers a subtask that was already satisfied on the seeded base (e.g. the
-pre-schedule probe was skipped via `--skip-satisfied-check`, or returned a false
-negative). That is intended, not a leak: a subtask whose criteria are genuinely
-met on the run branch is legitimately complete regardless of provenance, and it
-has no commits to make either way. The mid-run *sibling* case is the one that
-motivated the fix; the base-satisfied case is the same code path with the same
-correct outcome.
+**Scope: sibling-committed *or* base-tree-already-satisfied.** The probe
+judges *whether* criteria are met on HEAD, not *who* met them, so this
+rescue also covers a subtask satisfied on the seeded base whose pre-schedule
+probe was skipped or false-negatived. That's intended: such a subtask is
+legitimately complete regardless of provenance.
 
 **Probing a flagged subtask before it spends.** The rescue above is correct
-but its *ordering* is wasteful. The redundancy it settles is, for a whole class
-of subtasks, predictable one phase earlier: `_warn_provider_subset_subtasks`
-(§5 *Provider-subset subtasks*) already flags, at plan time, every subtask
-whose entire `files_likely_touched` surface belongs to an ordered predecessor.
-That advisory was *right and inert* — measured across the corpus, all three of
-one run's flagged subtasks ran a full implementer and committed nothing, and
-twelve subtasks corpus-wide reached this rescue only after their whole spend.
+but wasteful in ordering: `_warn_provider_subset_subtasks` (§5
+*Provider-subset subtasks*) already flags, at plan time, every subtask whose
+entire `files_likely_touched` surface belongs to an ordered predecessor —
+measured always right and inert (a run's three flagged subtasks all ran a
+full implementer and committed nothing; twelve corpus-wide reached this
+rescue only after their whole spend). So the flagged sids are persisted
+(`provider_subset_sids`) and `_settle_subtask` runs the same HEAD probe
+against staging *before* spawning the implementer — staging sits at
+run-branch HEAD, and a provider-subset predecessor is by construction
+already merged there. A hit settles on one read-only probe instead of a
+full implementer (one run's three cost ≈18 worker-minutes/≈$2.6 combined). A
+miss costs one probe. This does **not** become a drop — the plan-time signal
+stays advisory (a subtask may make a genuinely distinct edit to a shared
+file) and the decision stays the probe's, judged against a real tree; only
+*when* it's asked changes.
 
-So the flagged sids are persisted (`provider_subset_sids`) and `_settle_subtask`
-runs the **same** HEAD probe against the staging worktree *before* spawning the
-implementer. Staging sits at the run-branch HEAD, and a provider-subset
-predecessor is by construction in an earlier wave and therefore already merged
-there, so the reference is exactly the one the post-hoc rescue would use. A hit
-settles the subtask on one read-only probe instead of a full implementer — that
-run's three cost ≈18 worker-minutes and ≈$2.6 between them. A miss costs one
-probe and the subtask proceeds untouched.
+**A settle without an implementer still owes the wave a branch.**
+`integrate_wave` filters only on `status == "complete"`, never on whether
+`leerie/subtasks/<run-id>/<sid>` exists. The post-execution rescue is safe
+because its implementer ran and created the branch (zero commits, a true
+`git merge --no-ff` no-op). The pre-spawn probe returns *before*
+`_run_implementer`, so no branch exists and `integrate.sh` exits 2 on every
+probe hit. So the pre-spawn path creates the branch itself, at the
+run-branch tip, before settling — the general invariant: **any path that
+marks a subtask complete must leave behind the branch integration will look
+for.** If the branch cannot be created, the subtask falls through to its
+implementer.
 
-This deliberately does **not** become a drop. The plan-time signal alone stays
-advisory for the reason it always was — a subtask may make a genuinely distinct
-edit to a shared file — and the decision is still the probe's, judged against a
-real tree. What changes is only *when* the probe is asked. The post-execution
-rescue is unchanged and remains the backstop for every subtask the plan-time
-flag does not cover (the transitive case it deliberately excludes, and any
-sibling overlap the file surfaces never predicted).
+**The sibling-invalidation case.** A third, opposite hazard: a subtask whose
+criteria are met on the base tree *now*, but which a **surviving sibling in
+the same plan will invalidate** — e.g. a coverage-floor test passes on the
+seeded base and gets soft-dropped, but a surviving feature subtask later
+adds the keys the test guards, turning it red, with no survivor owning that
+file. The base-tree-only discipline is exactly what makes the probe blind to
+this. The resolution keeps the base-tree rule but hands the probe the
+**surviving siblings' declared surface** (`provides` and
+`files_likely_touched`) as context, and asks it whether any surviving
+sibling's work would invalidate the criteria it just judged met — declining
+the drop (defaulting to *not satisfied*) if so. A mechanical
+file-overlap rule was considered and rejected: the motivating case has
+disjoint file sets (`nav-parity.test.ts` vs `messages/*.json`) whose
+dependency lives only in intent, which a file-overlap predicate would miss
+entirely — the judgment is left to the worker as the sole mechanism.
 
-**A settle without an implementer still owes the wave a branch.** `integrate_wave`
-filters on one thing — a subtask's `status == "complete"` — and never asks
-whether `leerie/subtasks/<run-id>/<sid>` exists. The post-execution rescue is
-safe because its implementer ran: `new-worktree.sh` created the branch, it
-carries zero commits, and `git merge --no-ff` of a branch that is already an
-ancestor is a true no-op ("Already up to date", no commit). The pre-spawn probe
-returns *before* `_run_implementer`, so no branch was ever created, and
-`integrate.sh` exits 2 on a missing branch — taking the run down on every probe
-hit.
+**Why this is §12-compliant.** `check_branch_has_commits` fires first and
+unchanged; the probe can only *rescue*, never turn a committed subtask into
+a failure, and fails safe to *not satisfied* on any crash or uncertainty.
+"Are these success criteria semantically met on this tree" is exactly the
+judgment §12's complementary half assigns to a worker — no new carve-out.
 
-So the pre-spawn path creates the branch itself, at the run-branch tip, before
-settling. The invariant is the general one and worth stating as such: **any path
-that marks a subtask complete must leave behind the branch integration will look
-for**, and the cheapest way to satisfy that is to produce the same artifact the
-implementer path produces rather than to teach integration a second meaning of
-"complete". If the branch cannot be created the subtask falls through to its
-implementer, because a settle that integration cannot merge is worse than the
-spend it saves.
-
-**The sibling-invalidation case (why a pre-schedule drop must weigh
-survivors).** The two sibling cases above both concern a sibling that
-*satisfies* a subtask. There is a third, opposite hazard the pre-schedule probe
-was originally blind to: a subtask whose criteria are met on the base tree
-*now*, but which a **surviving sibling in the same plan will invalidate**.
-Concretely: a parity/coverage-floor test passes on the seeded base, so the
-probe soft-drops it as `already_satisfied` — but a surviving feature subtask
-adds the keys/files the test guards, turning it red, and no survivor owns that
-test file. The drop silently removes the only subtask that would have kept the
-suite green. This is not the same as the safe base-satisfied case: there the
-dropped subtask's deliverable already exists and nothing in the plan disturbs
-it; here a *committed sibling* will break the dropped subtask's guarantee
-mid-run.
-
-The base-tree-only discipline (correct for the cross-run case) is exactly what
-makes the probe blind to this: judging only the current checkout, it cannot see
-that a *sibling's* pending work will change that checkout. The resolution keeps
-the base-tree rule but gives the probe the one piece of plan-level context it
-needs to reason about invalidation: the **surviving siblings' declared
-surface** (`provides` and `files_likely_touched`). The probe is asked, as part
-of its verdict, whether any surviving sibling's work would invalidate the
-criteria it just judged met — and if so, it declines the drop (defaults to
-*not satisfied*, the same safe direction as every other uncertainty). This is
-strictly additive to the base-tree judgment: the probe still measures the tree
-only; the sibling surface is context for a *keep* decision, never a substitute
-for reading other branches. A mechanical `files_likely_touched`-intersection
-rule was considered and rejected: the motivating case has none — the test owns
-`nav-parity.test.ts` while the feature edits `messages/*.json`, disjoint file
-sets whose dependency lives only in the test's intent — so a file-overlap
-predicate would silently miss exactly the case this fix exists for. The
-judgment (does a survivor invalidate this?) is left to the worker entirely; it
-is the sole mechanism, not one signal among several.
-
-**Why this is §12-compliant, not an LLM breaching a mechanical gate.** The
-guarantee "a lazy/broken worker that did nothing is caught" stays mechanical:
-`check_branch_has_commits` fires first and unchanged, and the probe can only
-*rescue* — it never turns a committed subtask into a failure, and it fails safe
-to *not satisfied* on any crash or uncertainty, so an unavailable/undecided probe
-leaves the mechanical no-commits failure intact. What the probe decides —
-"are these success criteria semantically met on this tree?" — is exactly the
-kind of judgment §12's *complementary half* assigns to a worker: it cannot be
-checked mechanically (it requires matching criteria prose against file content),
-which is precisely why the pre-schedule `_filter_satisfied_subtasks` uses the same
-worker. This adds no new §12 carve-out; it is the outcome-checked-where-possible,
-judgment-left-to-the-worker split the principle already prescribes.
-
-The structural contract of these disciplines is mechanically enforced — the
+The structural contract of the §8 disciplines is mechanically enforced: the
 worker's output schema requires the falsification, reconciliation, and gap
-fields to be present, so a worker that skipped them fails its own JSON gate
-before the orchestrator ever reads it (see §12). The *quality* of the
-artifacts each field names is model-judged; the *presence* of the discipline
+fields present, so a worker that skipped them fails its own JSON gate before
+the orchestrator reads it. Their *quality* is model-judged; their *presence*
 is not.
 
-**Self-graded confidence is advisory; an independent verifier gates.**
-A worker's confidence score is a self-report, and a self-report has a
-structural ceiling that no amount of adversarial-falsification instruction
-can raise: you cannot disprove a failure mode you cannot conceive, and the
-mind that produced an incomplete solution bounds the failure modes it can
-imagine. Adversarial self-grading is a contradiction in exactly the cases
-that matter — the shallow-evidence case, where a real subtask scored itself
-`solution 9.5` with maximal confidence while every falsifier it "tested" was
-about its own test plumbing, and shipped three latent behavioral defects that
-later re-runs of the same task had to fix. The implementer prompt *already*
-commands maximal adversarial falsification; the implementer followed it and
-still missed the gaps, because it was grading itself.
+**Self-graded confidence is advisory; an independent verifier gates.** A
+self-report has a structural ceiling no adversarial-falsification
+instruction can raise — you cannot disprove a failure mode you cannot
+conceive, and the mind that produced an incomplete solution bounds the
+failure modes it can imagine. A real subtask scored itself `solution 9.5`
+with maximal confidence, every falsifier it "tested" about its own test
+plumbing, and shipped three latent behavioral defects a later re-run had to
+fix — despite the prompt already commanding maximal adversarial
+falsification. The fix is to change *who* runs the check, generalizing the
+`fit_judge` precedent below: an independent judge finds cuts the
+self-grader was blind to *because it did not produce the artifact*. So the
+load-bearing gate for each self-graded axis becomes an **independent
+adversarial verifier**, and the self-score is demoted to advisory.
 
-The fix is not more adversarial instruction — it is to change *who* runs the
-check. This generalizes the planner precedent (`fit_judge`, below): the
-independent judge finds cuts the self-grader was blind to *because* it did not
-produce the artifact, not because it is "more adversarial." So the load-bearing
-gate for each self-graded axis is an **independent adversarial verifier**, and
-the self-score is demoted to advisory. See *Independent adversarial
-verification* immediately below.
-
-Tests passing, lint clean, build green, per-criterion satisfaction in a
-written criteria file remain **best-effort signals** — surfaced as warnings,
-never gating. That is deliberate and unchanged: any code-enforced "tests must
-pass" gate invites a stuck model to weaken the test rather than fix the code
-(§9 *Post-work conformance* flags the same incentive). What replaces the
-self-graded confidence gate does *not* reintroduce that bar — see how
-independence dissolves the gaming incentive below. The structural schema
-enforcement is also unchanged: the worker's output schema still requires the
-falsification/reconciliation/gap fields to be present, so a worker that skipped
-the discipline fails its own JSON gate; the orchestrator just no longer treats
-the *score* those fields carry as the gate.
+Tests passing, lint clean, build green, and per-criterion satisfaction
+remain **best-effort signals**, surfaced as warnings, never gating — any
+code-enforced "tests must pass" gate invites a stuck model to weaken the
+test instead (§9). Independence dissolves the gaming incentive without
+reintroducing that bar.
 
 #### Independent adversarial verification
 
-The planner already demonstrated the pattern. The planner's
-`decomposition_quality` self-score is retained as advisory but does not gate —
-the independent `fit_judge` is the authoritative decomposition-quality gate
-(§5½), and `plan_overlap_judge` / `adherence_judge` gate other planner
-dimensions the same way. `fit_judge` works because it is a *separate* worker
-that did not produce the decomposition, so it sees cuts the planner was blind
-to.
+The planner demonstrated the pattern first: `decomposition_quality`
+self-score is retained as advisory, while the independent `fit_judge` is the
+authoritative decomposition-quality gate (§5½), and `plan_overlap_judge` /
+`adherence_judge` gate other planner dimensions the same way — `fit_judge`
+works because it is a separate worker that did not produce the
+decomposition, so it sees cuts the planner was blind to.
 
-The same discipline now covers every ungated self-grader. Each of the four
-remaining self-graded axes gets an independent verifier that (a) did not
-produce the artifact, (b) is handed only the artifact plus the task, and (c) is
-told to **attack** it — enumerate concrete unhandled inputs, paths, cases, or
+The same discipline now covers every ungated self-grader. Each remaining
+self-graded axis gets an independent verifier that (a) did not produce the
+artifact, (b) is handed only the artifact plus the task, and (c) is told to
+**attack** it — enumerate concrete unhandled inputs, paths, cases, or
 mis-wirings:
 
 - **implementer `solution`** → verified by the **conformer's `solution_defects`
   axis**. The conformer already runs independently after the implementer's
-  success path and reviews the implementer's committed diff (it did not write
-  that diff — its own conformance edits are a separate, later layer). Its remit
-  is extended to adversarially attack the implementer's diff for the behavioral
-  gaps the self-grade missed (the decoy click, the unhandled error path, the
-  missing exit-guard, the sibling data-path site left unedited). This axis
-  **gates** in `_settle_subtask`; the conformer's existing build/lint/test and
-  drift/docs/rule work stays advisory (below).
+  success path and reviews its committed diff (it did not write that diff —
+  its own conformance edits are a separate, later layer), attacking it for
+  behavioral gaps the self-grade missed. Gates in `_settle_subtask`; the
+  conformer's existing build/lint/test and drift/docs/rule work stays
+  advisory (below).
 - **classifier** → an independent verifier of the category set against the
-  task + codebase: does the chosen set cover the actual work, and does it
-  exclude none it needs? A miscategorization here is not cosmetic — the same
-  task classified one way produced ten subtasks and another way produced *zero*
-  (accomplished nothing), and a "landing page feature" classified as
-  documentation shipped only markdown. Gates on a found miscategorization.
+  task + codebase. A miscategorization here is not cosmetic — the same task
+  classified one way produced ten subtasks, another way zero, and a "landing
+  page feature" classified as documentation shipped only markdown. Gates on
+  a found miscategorization.
 - **reconciler / plan wiring** → the deterministic `check_plan_wiring` plus the
   independent `wiring_judge` described in §5 *A wiring re-check on the
   fully-merged plan*.
 - **provision** → an independent verifier of the detected recipe against the
-  actual image/runtime: does a `pip install` recipe carry
-  `--break-system-packages` on the externally-managed Debian image; does the
-  detected package manager match the lockfiles present? A recipe self-graded
-  9.3 that omitted `--break-system-packages` caused twelve real install
+  actual image/runtime — e.g. does a `pip install` recipe carry
+  `--break-system-packages` on the externally-managed Debian image, does the
+  package manager match the lockfiles present. A recipe self-graded 9.3
+  that omitted `--break-system-packages` caused twelve real install
   failures. Gates on a recipe that would fail.
-- **planner `task_understanding`** → an independent `task_coverage_judge`
-  that did not write the plan, handed only the task plus the reconciled
-  subtask set: does the plan actually address what the user asked for — is
-  any required piece of work missing entirely, or is any subtask off-task
-  (drifted onto work the user did not ask for)? This is distinct from
-  `fit_judge` (is each subtask sized/scoped correctly — a *decomposition*
-  question) and from `wiring_judge` (are the subtasks correctly wired to
-  each other — a *graph* question): `task_coverage_judge` is the one check
-  asking whether the union of subtasks, correctly wired and correctly sized
-  or not, actually *covers the task*. A planner can self-report high
-  `task_understanding` while a whole required piece of work never became a
-  subtask, because a decomposition self-review is anchored to the
-  decomposition the planner already committed to, not to the task
-  independently re-read. Gates on a non-empty array of concretely-named
-  coverage gaps. The planner **can** mechanically act on a found gap (add
-  or revise a subtask), so this gate **re-drives** `phase_plan`, mirroring
-  `classification_judge`. Since a re-plan runs one planner per category in
-  parallel with no cross-category visibility into another category's
-  already-declared `provides`/`requires` tags, it can reintroduce the
-  exact cross-domain tag drift `phase_reconcile` already resolved on the
-  first pass — so the re-drive is followed by a second `phase_reconcile`
-  call before the loop's next judge round (§5 *Bridge cross-domain
-  capability-tag mismatches*). **This does not reopen the falsified attempt
-  described above** ("`task_understanding` does **not** independently gate
-  the planner" / §12 *Instruction adherence is code-enforced*): that finding
-  was specific to an *understanding*-framed judge asked to score whether the
-  plan correctly read the task, which cannot distinguish "understood and
-  disobeyed" from "understood and obeyed." `task_coverage_judge` is framed
-  differently — it does not score understanding or adherence at all, only
-  whether the union of subtasks is complete against the task — a question
-  the falsified attempt never tested and instruction-adherence enforcement
-  (the deterministic floor + `adherence_judge`, §12) does not cover either,
-  since a plan can honor every prescribed instruction and still omit
-  unprescribed required work.
+- **planner `task_understanding`** → an independent `task_coverage_judge`,
+  handed only the task plus the reconciled subtask set: does the union of
+  subtasks actually *cover the task* — any required work missing entirely,
+  any subtask off-task? Distinct from `fit_judge` (is each subtask
+  sized/scoped correctly) and `wiring_judge` (are subtasks correctly wired to
+  each other). A planner can self-report high `task_understanding` while a
+  whole required piece of work never became a subtask, since a decomposition
+  self-review is anchored to the decomposition already committed to, not the
+  task independently re-read. Gates on a non-empty array of concretely-named
+  coverage gaps, and **re-drives** `phase_plan` (mirroring
+  `classification_judge`) since the planner can mechanically act on a found
+  gap. A re-plan runs one planner per category with no cross-category
+  visibility, so it can reintroduce cross-domain tag drift `phase_reconcile`
+  already resolved — the re-drive is followed by a second `phase_reconcile`
+  call before the next judge round (§5 *Bridge cross-domain capability-tag
+  mismatches*). This does not reopen the earlier falsified attempt at gating
+  `task_understanding` directly (§12 *Instruction adherence is
+  code-enforced*): that finding was specific to an *understanding*-framed
+  judge, which cannot distinguish "understood and disobeyed" from
+  "understood and obeyed." `task_coverage_judge` scores neither — only
+  whether the subtask union is complete against the task, a question neither
+  that finding nor instruction-adherence enforcement (§12) covers, since a
+  plan can honor every prescribed instruction and still omit unprescribed
+  required work.
 
-  `task_coverage_judge` is pure judgment with no code-level floor of its
-  own — unlike the instruction-adherence gate's two-layer composition
-  (§12), it originally had no PRIMARY deterministic check, only this
-  SECONDARY judge. That gap was closed by a deterministic floor,
-`check_required_items_coverage`, which was **deleted on 2026-08-04**: measured
-across every run that ever carried `required_items`, it passed **0 of 102
-items** — a 100% false-positive rate with no true negative in its history. It
-also violated the *Language-to-JSON* rule, since the items are LLM-written
-sentences and the check token-matched them against subtask titles.
+  `task_coverage_judge` originally had no deterministic PRIMARY check, only
+  this SECONDARY judge. A floor, `check_required_items_coverage`, was tried
+  and **deleted on 2026-08-04**: measured across every run that ever carried
+  `required_items`, it passed 0 of 102 items — a 100% false-positive rate —
+  and violated the *Language-to-JSON* rule (token-matching LLM-written
+  sentences against subtask titles).
 
-The judge above it is retained but **advisory**. Re-invoked on identical input
-it returned a different finding set 85% of the time (n=20), and the
-intersection across repeated samples was empty — no finding survived a
-re-sample. A finding a judge cannot reproduce on unchanged input is not a
-stable property of that input, and cannot justify discarding a plan.
+  The judge itself is retained but **advisory**: re-invoked on identical
+  input it returned a different finding set 85% of the time (n=20), with an
+  empty intersection across repeated samples — not a stable property of the
+  input, so it cannot justify discarding a plan. The principle: **a judge's
+  terminal authority must be proportional to its measured reproducibility,
+  and a judgment layer with no mechanical backstop should not be terminal at
+  all.** `wiring_judge` keeps its authority (99% of findings verify true,
+  69/70) and `plan_overlap_judge` keeps its (impossible-assertion catches);
+  coverage has neither, since no mechanical check can verify "the plan
+  misses work X" without reading prose.
 
-The principle this establishes: **a judge's terminal authority must be
-proportional to its measured reproducibility, and a judgment layer with no
-mechanical backstop should not be terminal at all.** `wiring_judge` keeps its
-authority (99% of its findings verify true against the plan graph, 69/70) and
-`plan_overlap_judge` keeps its (`NO_FILE_OVERLAP` / `PHANTOM_ARTIFACT` catch
-it asserting the impossible). Coverage has neither — no mechanical check can
-verify "the plan misses work X" without reading prose.
-
-  The floor cannot be satisfied by a planner that never saw the
-  checklist: `phase_plan` injects `required_items` verbatim into every
-  planner's context (only when non-empty), mirroring the instruction-
-  adherence gate's `prescribed_procedure` injection above — the same
-  PREVENT-half pattern, so the planner can echo a required item's
-  wording into a subtask's `title`/`success_criteria_seed` at birth
-  instead of the floor discovering the omission only after the fact.
+  `phase_plan` injects `required_items` verbatim into every planner's
+  context (only when non-empty), mirroring the instruction-adherence gate's
+  `prescribed_procedure` injection, so the planner can echo a required
+  item's wording into a subtask at birth instead of the omission surfacing
+  only after the fact.
 - **integrator `resolution`** → an independent `integration_judge` that did
   not perform the merge, handed the merged result plus both parent diffs and
   the conflicting subtasks' intents: did the merge actually resolve the
   conflict *behaviorally*, not just remove `<<<<<<<` markers? The existing
   conflict-marker scan plus `check_merge_committed` catch the mechanical
-  failure (markers left in, or no commit made); they cannot see a
-  syntactically clean merge that silently drops one side's behavior — e.g.
-  a merge that keeps side A's function signature but side B's call sites,
-  compiling but breaking at runtime. Gates on a non-empty array of
+  failure; they cannot see a syntactically clean merge that silently drops
+  one side's behavior — e.g. a merge that keeps side A's function signature
+  but side B's call sites, compiling but breaking at runtime. Gates on a
+  non-empty array of
   concretely-named behavioral defects in the merged result. An integrator
   cannot always mechanically fix a semantic finding it didn't itself reason
   through the same way a planner can add a subtask, so this gate is
@@ -6307,115 +5286,85 @@ verify "the plan misses work X" without reading prose.
   **Location is not coverage.** A merge that drops a *duplicate* is textually
   indistinguishable from one that drops the only copy — both remove content
   present in a parent — so reasoning from the parent diffs alone cannot tell
-  them apart. Measured: this gate killed a run at wave 3 with 28 subtasks
-  complete and two waves integrated, over a dropped `describe` block whose
-  assertions were a strict *subset* of a separate test file written 4h45m
-  earlier. The textual claim was true and the behavioral claim was false.
-  `dropped_change` is 10 of the 14 findings this gate has ever emitted, and it
-  has no bypass flag, so this is the failure mode with the most exposure.
-
-  A `dropped_change` is therefore only behavioral if the behavior is absent
-  from the **merged tree**, not merely from the side the merge chose. The judge
-  already holds inspection tools, so it is asked to search the merged tree for
-  equivalent coverage and cite it concretely (file + assertion). A defect
-  carrying a specific citation is advisory; one without still gates. This is
-  the same correction applied to the on-HEAD satisfied-probe — judge by
-  *coverage*, not by *location*.
+  them apart. A `dropped_change` is therefore only behavioral if the behavior
+  is absent from the **merged tree**, not merely from the side the merge
+  chose. The judge already holds inspection tools, so it is asked to search
+  the merged tree for equivalent coverage and cite it concretely (file +
+  assertion). A defect carrying a specific citation is advisory; one without
+  still gates — judge by *coverage*, not by *location*, the same correction
+  applied to the on-HEAD satisfied-probe.
 
   The citation is **asked for and never required**. Requiring a field on a
-  judge's schema has three times in this codebase produced a worker that emits
-  no schema-valid output at all, and a gate that never runs catches nothing
-  (§8 *Findings carry a severity* — the default is gating). Absence therefore
-  gates: the exception narrows this gate only when the judge does the extra
-  work and shows it, which keeps the failure direction conservative on the one
-  gate that has no operator bypass.
+  judge's schema has repeatedly produced a worker that emits no schema-valid
+  output at all, and a gate that never runs catches nothing (§8 *Findings
+  carry a severity* — the default is gating). Absence therefore gates: the
+  exception narrows this gate only when the judge does the extra work and
+  shows it.
 - **`plan_overlap_judge`'s own `judgment` self-score is dropped, with no new
   independent verifier.** This worker is already the independent adversarial
   check for cross-planner surface collisions — layering a second judge on
-  top of a judge would be self-scoring one level removed, not a case this
-  pattern generalizes to (there is no "artifact" here that a fresh mind
-  reviews with fresh eyes; the judge's own output IS the finding). Its
-  existing deterministic validators — `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`,
+  top of a judge would be self-scoring one level removed. Its existing
+  deterministic validators — `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`,
   `DROP_BREAKS_GRAPH`, `DUPLICATE_PAIR` (`check_overlap_judge_output`, §5
   *Cross-domain surface overlap*), and `_validate_overlap_judge_output`'s
   `merge_feasibility`-presence backstop — already catch the concrete,
-  checkable failure modes (a hallucinated artifact, a collision with no
-  shared file evidence, a drop that orphans a still-required capability, a
-  merge with no stated feasibility). What remains ungated by dropping the
-  self-score is purely a *quality-of-judgment* concern (did the judge use
-  good taste in choosing `merge` vs `drop_a` vs `drop_b`) with no
-  mechanically-attackable "artifact" for a second worker to find concrete
-  defects in — the same reason the implementer's `solution` axis is
-  verified by a *different-role* worker (the conformer) rather than a
-  second implementer grading the first. The deterministic validators become
-  this worker's sole gate; `check_overlap_judge_output` no longer gates on
-  the judge's self-reported `judgment` confidence, and the `confidence`
-  object stays emitted as an advisory record only.
+  checkable failure modes. What remains ungated by dropping the self-score is
+  purely a *quality-of-judgment* concern with no mechanically-attackable
+  "artifact" for a second worker to find concrete defects in — the same
+  reason the implementer's `solution` axis is verified by a *different-role*
+  worker (the conformer) rather than a second implementer grading the first.
+  The deterministic validators become this worker's sole gate; the
+  `confidence` object stays emitted as an advisory record only.
 
 **Why this does not reintroduce the gameable bar §9 removed.** The old
-criteria-lock / "tests must pass" gate was gameable because the *same* worker
-controlled the bar — it authored the criteria and could lower them, or weaken a
-test to clear them. Independence dissolves that incentive at the root. An
-independent verifier that (a) did not write the artifact and (b) gates on "here
-is a concrete input this artifact mishandles" — never on "a test passed" or
-"the criteria say met" — presents no bar for the graded worker to lower, and
-cannot be defeated by weakening a test, because the verifier constructs *new*
-adversarial inputs the graded worker never anticipated. So every one of these
-gates keys on an **independently-found concrete defect in the artifact's
-behavior**, never on a self-assertable or lowerable signal. That is precisely
-why `fit_judge` gates the planner without being gameable, and it is the invariant
-each new verifier must preserve: a verdict is a list of concrete found defects,
-not a score crossing a threshold.
+criteria-lock / "tests must pass" gate was gameable because the *same*
+worker controlled the bar. Independence dissolves that incentive: an
+independent verifier that (a) did not write the artifact and (b) gates on
+"here is a concrete input this artifact mishandles" — never on "a test
+passed" or "the criteria say met" — presents no bar for the graded worker to
+lower, and cannot be defeated by weakening a test, because the verifier
+constructs *new* adversarial inputs the graded worker never anticipated. A
+verdict is a list of concrete found defects, not a score crossing a
+threshold — the invariant every new verifier must preserve.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 
 Research shows that LLMs cannot self-correct reasoning without external
-feedback (Huang et al., ICLR 2024) and that self-bias amplifies when
-reviewing their own output (ACL 2024). But self-correction WITH
-external tool-verified feedback works — the CRITIC framework (ICLR
-2024) showed 7.7 F1 gains grounded in search-API signals.
+feedback (Huang et al., ICLR 2024), and that self-correction WITH
+tool-verified feedback works (the CRITIC framework, ICLR 2024).
 
-Leerie applies this finding: every worker (except the PR writer) runs
-inside a code-enforced loop (`_run_checked_loop`) where the
-orchestrator computes **deterministic structural checks** on the
-worker's output — file-existence, dependency-graph cycles, lockfile
-consistency, protected-path violations, **confidence-axis gates** — and
-re-invokes the worker with the check results as external feedback if
-issues are found. The feedback is mechanically derived (no LLM).
-Confidence gating (threshold 9.0 on every worker's schema-defined axes)
-is code-enforced for all workers, not just the implementer — a worker
-that self-reports low confidence triggers re-invocation just like a
-worker that hallucinates a file path.
+Leerie applies this: every worker (except the PR writer) runs inside a
+code-enforced loop (`_run_checked_loop`) where the orchestrator computes
+**deterministic structural checks** on the worker's output — file-existence,
+dependency-graph cycles, lockfile consistency, protected-path violations,
+**confidence-axis gates** — and re-invokes the worker with the check results
+as external feedback if issues are found. The feedback is mechanically
+derived (no LLM). Confidence gating (threshold 9.0 on every worker's
+schema-defined axes) is code-enforced for all workers, not just the
+implementer.
 
-The conformer loop (`_run_conformance_phase`) is the original instance
-of this pattern — it loops on observable build/lint/test signals. The
-generic `_run_checked_loop` extends it to all workers.
+The conformer loop (`_run_conformance_phase`) is the original instance of
+this pattern — it loops on observable build/lint/test signals. The generic
+`_run_checked_loop` extends it to all workers.
 
 #### Findings carry a severity; only gating findings re-invoke
 
 A check function's findings are not all the same kind of thing. Some name a
 defect that makes the output **unusable** — a dependency on a subtask that
 does not exist, a cycle, a subtask with no success criteria. Others are
-**advice** about a judgement call that is frequently correct as it stands: two
-subtasks touching one file is often legitimate, and a path with no existing
-ancestor directory is exactly what a subtask that *creates* a new module looks
-like.
+**advice** about a judgement call that is frequently correct as it stands.
 
-Treating both as retry triggers is a mistake with two distinct costs, both
-measured on the 2026-08-03 runs:
+Treating both as retry triggers is a mistake with two distinct costs:
 
 - **Advice cannot converge, so it burns the whole retry budget.**
-  `INTRA_DOMAIN_OVERLAP`'s own text is *"consider merging or splitting"*. It
-  went 43 → 12 → 6 across every planner in both runs and never reached zero,
-  exhausting the round cap every time — because there was frequently nothing
-  wrong to fix.
+  `INTRA_DOMAIN_OVERLAP`'s own text is *"consider merging or splitting"* — it
+  never reliably reaches zero, because there is frequently nothing wrong to
+  fix.
 - **Per-subtask advice turns the retry count into a proxy for plan size.**
-  Findings like `PHANTOM_PATH` fire once per offending subtask, so issue count
-  scales ~1:1 with subtask count. Since multi-sample selection ranks on fewest
-  issues, a large plan must be flawless to beat a small plan with one flaw —
-  and an *empty* plan, having nothing to inspect, scores a perfect zero. That
-  is the same defect the sample validity gate addresses at its extreme; the
-  severity split addresses the general case.
+  Findings like `PHANTOM_PATH` fire once per offending subtask, so a large
+  plan must be flawless to beat a small plan with one flaw, and an *empty*
+  plan scores a perfect zero — the same defect the sample validity gate
+  addresses at its extreme.
 
 So each finding declares a severity. `_run_checked_loop` re-invokes only on
 **gating** findings; **advisory** findings are surfaced once, in the returned
@@ -6424,606 +5373,481 @@ gating findings only, so plan size stops being a scoring penalty.
 
 **The default is gating.** A finding whose severity nobody declared keeps
 today's behaviour, so the classification can be incomplete without silently
-weakening a real gate — an advisory misfiling is a deliberate act, not an
-omission. The advisory set is an explicit allowlist for exactly this reason.
+weakening a real gate — the advisory set is an explicit allowlist.
 
-This does not weaken enforcement, because advisory findings were never
-enforcing anything: a check that cannot be satisfied is not a gate, it is a
-tax on every run that trips it. Where a genuine guarantee is wanted, §12
-applies unchanged — write a real check with a satisfiable condition.
-
-**A mechanical floor is not thereby an independent one.** The same
-investigation found `check_prescribed_command_coverage` gating on
-`runs_commands`, a planner self-report field populated on **4.9%** of subtasks
-(24 of 486 across 38 plans; 74% of plans have none at all). Being pure Python
-made it deterministic, not independent — it reads a field the planner can
-simply omit, so it fires on nearly every task that prescribes a command. This
-repeats the trap already documented for `migration_targets` in §8 (*"both
-signals come from the same non-adversarial planner self-report"*). Generalised:
-a floor must either read something the planner cannot omit — the repository,
+**A mechanical floor is not thereby an independent one.** A pure-Python
+check can still gate on a planner self-report field the planner is free to
+omit (`check_prescribed_command_coverage` on `runs_commands`, measured
+populated on under 5% of subtasks) — being deterministic is not the same as
+being independent, the same trap documented for `migration_targets` in §8. A
+floor must either read something the planner cannot omit — the repository,
 the diff, the dependency graph — or repair the omission itself rather than
 re-driving the worker that made it.
 
-**Repairing an omitted self-report beats re-driving for it.** The floor above
-*is* satisfiable: told explicitly, planners do fill the field — run
-`d8a764f3…` went from 0 of 35 subtasks carrying `runs_commands` (8 floor
-issues) to 14 of 36 (0 issues) after its re-plan. What is wrong is the price.
-That re-plan cost ~125 of the run's 201 spawns — twice the entire first
-planning pass — and the run then died of budget exhaustion having written no
-code.
-
-leerie already holds the prescribed commands as structured classifier output,
-so `_repair_prescribed_commands` synthesises a subtask that runs them, at zero
+**Repairing an omitted self-report beats re-driving for it.** The floor
+above *is* satisfiable — told explicitly, planners fill the field — but a
+full re-plan to fix it once cost roughly the entire first planning pass and
+the run then died of budget exhaustion having written no code. leerie
+already holds the prescribed commands as structured classifier output, so
+`_repair_prescribed_commands` synthesises a subtask that runs them, at zero
 worker cost, before the floor is evaluated. A repairable gap therefore never
-reaches the re-plan path. This is the wiring gate's *detect → repair what is
-unambiguous → re-drive only what is not* contract applied to the gate whose
-remedy was the most expensive in the system.
+reaches the re-plan path.
 
-The repair **synthesises rather than picking an owner**. Attaching the
-commands to "the subtask that owns verification" was prototyped and rejected:
-against `d8a764f3`'s real plan a verification-shaped matcher hits 32 of 36
-subtasks, so an exactly-one-owner rule would never fire and a looser one would
-attach arbitrarily. A dedicated subtask whose entire content is running the
-prescribed commands cannot be wrong about intent. It depends on the plan's
-current sinks, so it is acyclic by construction and schedules alone in the
-final wave. Validated across every corpus run carrying a prescribed procedure:
-5 of 5 repaired to a clean floor with `_schedule()` and `_validate_plan()`
-passing, 3 already-clean runs correctly untouched.
+The repair **synthesises rather than picking an owner**: attaching the
+commands to "the subtask that owns verification" was prototyped and
+rejected, since a verification-shaped matcher hits most subtasks in a real
+plan, making an exactly-one-owner rule never fire and a looser one attach
+arbitrarily. A dedicated subtask whose entire content is running the
+prescribed commands cannot be wrong about intent, depends on the plan's
+current sinks (acyclic by construction), and schedules alone in the final
+wave.
 
 ### Task-referenced file extraction
 
 When the task string references files (detectable by globbing), the
 orchestrator mechanically resolves the paths (`_glob_task_references`) and
 names them for the planner, which reads them itself; whether the plan
-covers what they require is the `task_coverage_judge`'s call (§8). This
-is deliberately just a list of paths — an external reference the planner
-did not generate, grounded in files the user explicitly pointed to —
-naming the files is mechanical, but judging whether a document's
-requirements are met is a judgment about meaning, which is a worker's
-job, not Python's.
+covers what they require is the `task_coverage_judge`'s call (§8). This is
+deliberately just a list of paths — naming the files is mechanical, but
+judging whether a document's requirements are met is a judgment about
+meaning, which is a worker's job, not Python's.
 
-leerie used to harvest the referenced files' headings with regex (H3+
-markdown headings, YAML keys, numbered items), classify the harvested
-prose with another regex, and gate on substring overlap between the
-result and the plan text — three layers of prose parsing over one
-mechanism, and the mechanism behind the 2026-07-19 freeze (33 identical
-feedback rounds on a ratio no planner could move, because backtick+MUST
-convention headings like CLAUDE.md's own coding-standard imperatives
-cannot appear verbatim in a subtask by construction). It is deleted;
-`task_coverage_judge` reads the referenced files itself and judges
-substance rather than string overlap.
+An earlier version harvested the referenced files' headings with regex,
+classified the harvested prose with another regex, and gated on substring
+overlap between the result and the plan text — three layers of prose
+parsing over one mechanism, and the source of a real freeze incident
+(identical feedback rounds on a ratio no planner could move, because
+backtick+MUST convention headings cannot appear verbatim in a subtask by
+construction). It is deleted; `task_coverage_judge` reads the referenced
+files itself and judges substance rather than string overlap.
 
 ### Multi-sample planning
 
 Multiple independent planner invocations per domain, each a fresh
-`claude -p` session (Cross-Context Review, arxiv 2603.12123, 2026:
-context separation is the mechanism). Mechanical selection by issue
-count and subtask count avoids self-bias (a novel extension beyond the
-paper, which tested single fresh-session review only). Controlled by
-the `planner_samples` cap (default 3).
+`claude -p` session (Cross-Context Review, arxiv 2603.12123, 2026: context
+separation is the mechanism). Mechanical selection by issue count and
+subtask count avoids self-bias (a novel extension beyond the paper, which
+tested single fresh-session review only). Controlled by the
+`planner_samples` cap (default 3).
 
 ---
 
 ## 9. Success criteria (informational; historical lock)
 
 Each implementer's first step is to turn its assigned seed into a brief
-success-criteria file describing what success looks like for the
-subtask — the explicit success condition plus any regression guards
-worth naming. The file is **informational**. It is written for the
-implementer's own clarity, read by the conformance phase (§9
-*Post-work conformance*) for context on what the subtask was about,
-and useful as a reference for human reviewers. The orchestrator does
-not gate on whether the file's individual criteria are satisfied; that
-is what the confidence gate at §8 is for.
+success-criteria file describing what success looks like for the subtask —
+the explicit success condition plus any regression guards worth naming. The
+file is **informational**: written for the implementer's own clarity, read
+by the conformance phase for context, and useful for human reviewers. The
+orchestrator does not gate on whether the file's individual criteria are
+satisfied; that is what the confidence gate at §8 is for. The implementer
+may update the file freely — there is no lock.
 
-The implementer may update the file freely as its understanding
-evolves. There is no lock. This is a reversal of an earlier discipline
-in leerie that locked the criteria file by sha256 hash on first write
-and used a worker-initiated `criteria_revision_proposal` channel to
-thread any later edits through orchestrator approval. The lock was
-introduced to guard against a stuck model lowering its own bar to
-clear a hard gate. With the confidence gate as the sole load-bearing
-signal (§8), the bar is the model's *anchored confidence in the
-solution*, not the contents of a text file — there is no longer a
-fixed bar to lower. The lock and the proposal channel were removed in
-the same change that consolidated build/lint/test under the conformance
-phase.
+This is a reversal of an earlier discipline that locked the criteria file by
+sha256 hash on first write and threaded any later edit through orchestrator
+approval, to guard against a stuck model lowering its own bar. With the
+confidence gate as the sole load-bearing signal (§8), the bar is the model's
+*anchored confidence in the solution*, not the contents of a text file —
+there is no longer a fixed bar to lower. The lock and its proposal channel
+were removed in the same change that consolidated build/lint/test under the
+conformance phase.
 
-The criteria file remains useful as input to the conformance phase and
-as PR-time documentation, but it does not produce `failed` or `blocked`
-outcomes. A worker that wants to record "this criterion isn't met"
-does so via `criteria_results[].met: false` in its result — the value
-is recorded and surfaces as a warning, but does not change the
-subtask's terminal status.
+A worker that wants to record "this criterion isn't met" does so via
+`criteria_results[].met: false` in its result — recorded and surfaced as a
+warning, but it does not change the subtask's terminal status.
 
 ### Post-work conformance
 
-The §8 confidence gate says whether the work landed; the
-implementer's criteria notes describe what it was aimed at. Neither
-says whether the *change* is in good standing with the repo it lives
-in: whether documentation that describes the touched surface is still accurate,
-whether tests for the touched code were updated, whether the change still
-honors whatever rules the repo declares for itself (CLAUDE.md, AGENTS.md,
-`.cursorrules`, a section of the README, a `docs/` file — the location is
-repo-specific, and some repos declare nothing). These are real obligations of
-a finished change, but they are not part of the assigned criteria and would be
-the wrong thing to bake into them: criteria are scoped to the subtask, and the
-repo's rules are an environmental fact that survives across subtasks.
+The §8 confidence gate says whether the work landed; the implementer's
+criteria notes describe what it was aimed at. Neither says whether the
+*change* is in good standing with the repo it lives in: whether
+documentation that describes the touched surface is still accurate, whether
+tests for the touched code were updated, whether the change still honors
+whatever rules the repo declares for itself (CLAUDE.md, AGENTS.md,
+`.cursorrules`, a section of the README, a `docs/` file). These are real
+obligations of a finished change, but the wrong thing to bake into the
+assigned criteria: criteria are scoped to the subtask, and the repo's rules
+are an environmental fact that survives across subtasks.
 
-So a separate phase runs once a subtask's work has settled:
-the **conformer**. It triggers only on the success path — implementer reports
+So a separate phase runs once a subtask's work has settled: the
+**conformer**. It triggers only on the success path — implementer reports
 `status: "complete"`, commits are present, the worktree is clean, no
-protected path was written. None of the other terminal statuses
-(handoff, clarification, failed, blocked) invoke it. The conformer
-reads the diff the subtask just produced, reads whatever rules files the
-orchestrator located in the repo, and is empowered to commit fixes to the same
-worktree branch — updating documentation, adding or amending tests, repairing
-a rule violation it spotted.
+protected path was written. It reads the diff the subtask just produced,
+reads whatever rules files the orchestrator located in the repo, and is
+empowered to commit fixes to the same worktree branch — updating
+documentation, adding or amending tests, repairing a rule violation it
+spotted.
 
-Where the rule files live varies, so the location is not the worker's problem.
-The orchestrator does discovery in code: a fixed, capped allowlist of paths
-in the repo root and `docs/` is checked for existence, and the surviving paths
-are handed to the conformer as inputs. The worker reads only what it was
-given; "what counts as a rules file" is not a judgment call. If discovery
-finds nothing, the phase still runs — the conformer focuses on whether the
-diff touched a surface the README or a `docs/` file describes, and whether
-tests for the touched code were updated — and silently skips the
-rule-conformance axis. A repo with no docs and no tests gets a near-no-op.
+Where the rule files live varies, so location discovery is code, not the
+worker's problem: a fixed, capped allowlist of paths in the repo root and
+`docs/` is checked for existence, and the surviving paths are handed to the
+conformer as inputs. If discovery finds nothing, the phase still runs — the
+conformer focuses on whether the diff touched a surface the README or a
+`docs/` file describes, and whether tests were updated — and silently skips
+the rule-conformance axis.
 
-The same discovered set is surfaced to the *implementer* at write time, not
-only to the conformer post-hoc. Convention drift is cheaper to prevent than to
-catch: a component written against the repo's design-system doc matches on the
-first try, where a conformer that only *reads* the diff afterward can flag a
-rule violation but cannot re-derive an unwritten visual convention. So the
-implementer's prompt names the discovered convention docs as paths (it reads
-the ones relevant to its subtask; it already has the full worktree checkout),
-and its evidence gate asks it to reconcile the pattern it followed against
-them. This is advisory — matching an existing design is judgment, not a
-mechanically checkable invariant — but the *discovery* is code, so the doc
-list itself cannot silently drift. The discovery allowlist therefore includes
-the repo's design-system doc (e.g. `docs/DESIGN-SYSTEM.md`), which specifies
-component/color/banner conventions a UI subtask must follow.
+The same discovered set is surfaced to the *implementer* at write time too,
+not only to the conformer post-hoc: convention drift is cheaper to prevent
+than to catch, since a conformer that only reads the diff afterward can flag
+a rule violation but cannot re-derive an unwritten visual convention. The
+implementer's prompt names the discovered convention docs as paths, and its
+evidence gate asks it to reconcile the pattern it followed against them —
+advisory, since matching an existing design is judgment, but the discovery
+itself is code so the doc list cannot silently drift. The allowlist
+therefore includes the repo's design-system doc (e.g.
+`docs/DESIGN-SYSTEM.md`).
 
-Two further disciplines apply, and they sit at the §12 axis:
+Two further disciplines sit at the §12 axis:
 
 - **Highest effort, never required.** Building, linting, and the test suite
-  passing are *desired* outcomes of the phase but never gating ones. The
-  conformer is told to attempt them and to report what it found, honestly,
-  in structured output: each of build, lint, and tests resolves to *ran and
-  passed*, *ran and failed*, or *not applicable*. A failure surfaces as an
-  advisory warning on the subtask result; it never escalates the subtask to
-  `failed` or `blocked`. The reason is the same failure mode §9 guards
-  against from the other side: making "tests pass" a hard requirement of
-  this phase invites the conformer to weaken a test, comment out an
-  assertion, or skip a lint rule to clear the bar. Keeping the phase
-  advisory removes that incentive while still surfacing the residual to the
-  human and to telemetry.
+  passing are *desired* outcomes but never gating ones: each of build, lint,
+  and tests resolves to *ran and passed*, *ran and failed*, or *not
+  applicable*, and a failure surfaces only as an advisory warning. Making
+  "tests pass" a hard requirement here invites the conformer to weaken a
+  test or skip a lint rule to clear the bar — the same failure mode §9
+  guards against from the other side.
 - **The one gating axis: solution completeness.** The conformer carries a
-  single gating axis, `solution_defects`, and it is gating for the exact
-  reason build/lint/test are not: it is not a self-assertable bar the
-  conformer can lower, but an adversarial attack on an artifact the conformer
-  did not write. The conformer reviews the *implementer's* committed diff
-  (§8 *Independent adversarial verification*) and enumerates concrete
-  behavioral gaps it does not handle — an unhandled input, a missing guard, a
-  decoy shortcut, a sibling call site left unedited. A non-empty set of
-  concretely-named defects gates the subtask: the found gaps become mandatory
-  additional criteria and the subtask retries the implementer with them folded
-  in (bounded by `completeness_retry_rounds`; on exhaustion the subtask blocks
-  with the residual defects named, fix + `resume`). This is *independent* of
-  `--strict-conformer`, which governs the advisory build/lint/test/residual
-  axes above. It does not reintroduce the gameable bar because there is no bar
-  to lower — the conformer cannot weaken a test to make a concrete
-  unhandled-input defect disappear; it can only report the input it constructed
-  or not. A defect without a concrete case is dropped as non-actionable, so the
-  axis cannot gate on vague "looks incomplete" prose. When the diff is empty or
-  unreadable the axis fails open (advisory, never gates) — there is nothing to
-  attack.
+  single gating axis, `solution_defects` — gating for the exact reason
+  build/lint/test are not: it is not a self-assertable bar the conformer can
+  lower, but an adversarial attack on an artifact the conformer did not
+  write (§8 *Independent adversarial verification*). It enumerates concrete
+  behavioral gaps — an unhandled input, a missing guard, a decoy shortcut, a
+  sibling call site left unedited. A non-empty set of concretely-named
+  defects gates the subtask: the found gaps become mandatory additional
+  criteria and the subtask retries the implementer with them folded in
+  (bounded by `completeness_retry_rounds`; on exhaustion the subtask blocks
+  with the residual defects named, fix + `resume`). This is independent of
+  `--strict-conformer`, which governs the advisory axes above. It does not
+  reintroduce the gameable bar because there is no bar to lower — a defect
+  without a concrete case is dropped as non-actionable. When the diff is
+  empty or unreadable the axis fails open.
 - **Evidence must be production-grounded: a fix that never fires is not a
-  fix.** Every gate described above asks whether the code matches its
-  specification. None asks whether the specification matches reality, and a
-  wrong specification propagates cleanly through implementer, criteria,
-  conformer, and the final whole-tree pass. Measured on run `fa979580` (2026-
-  08-10): four fixes shipped inert, six conformers reported zero defects, the
-  final conformer certified the tree at confidence 8.5, and the run exited 0.
-  The clearest instance resolved a repo's declared Node heap by scanning the
-  BLT command strings, verified against a `.leerie/config.toml` fixture
-  declaring the heap inline — a shape **0 of the 5 repos leerie manages
-  use**, while 2 of 5 declare it in `package.json`. Executed against the real
-  repos, the shipped resolver returned `None` where the corrected one returns
-  8192 and 4096 MiB. Every criterion was met; the mechanism never ran once in
+  fix.** Every gate above asks whether the code matches its specification.
+  None asks whether the specification matches reality, and a wrong
+  specification propagates cleanly through implementer, criteria, conformer,
+  and the final whole-tree pass. Measured on one run: four fixes shipped
+  inert, six conformers reported zero defects, and the run exited 0 at
+  confidence 8.5. The clearest instance resolved a repo's declared Node heap
+  against a `.leerie/config.toml` fixture shape **0 of the 5 repos leerie
+  manages use** — every criterion was met; the mechanism never ran once in
   production.
 
   The response is a `production_evidence` field on the implementer and
   conformer results: the worker must exercise the path it just wrote against
-  the repo **as it actually is**, and record the command and what it observed.
-  The requirement is not proof of correctness — a fixture can be right and a
-  real repo still take a different branch. It is that *"I could not make this
-  fire here"* becomes a recorded, gating outcome instead of silence. A worker
-  that cannot exercise the path must say so and why; absence of the field
-  gates, matching *Findings carry a severity* below.
+  the repo **as it actually is**, and record the command and what it
+  observed. The requirement is not proof of correctness — a fixture can be
+  right and a real repo still take a different branch — it is that *"I could
+  not make this fire here"* becomes a recorded, gating outcome instead of
+  silence. Absence of the field gates, matching *Findings carry a severity*
+  above.
 
-  Two adjacent disciplines follow from the same measurement and are prompt-
-  level rather than mechanical, because neither can be checked in general.
-  **A new decision point logs which branch it took, including the branch that
-  does nothing** — the one finding in that run whose mechanism logged its own
-  failure (`cgroup destroy failed …; dir may be leaked`) was discovered from
-  that line, while the resolver with zero `log()` calls was found only by a
-  later manual audit. And **when a test forces a constant to be duplicated,
-  the test is the defect** — an AST check pinning a literal `2048` led an
-  implementer to correctly refuse to break it and instead declare a second
-  constant, writing the divergence into the spec as a rule; the two figures
-  then disagreed by 384 MiB, which is precisely what a shared constant exists
-  to prevent.
+  Two adjacent prompt-level disciplines follow from the same measurement,
+  because neither can be checked in general: **a new decision point logs
+  which branch it took, including the branch that does nothing** (a
+  mechanism with zero `log()` calls was found only by manual audit, while
+  one that logged its own failure was caught from the log line); and **when
+  a test forces a constant to be duplicated, the test is the defect** — an
+  implementer that instead declared a second constant to keep a pin green
+  produced two figures that then silently disagreed by 384 MiB.
 
   Two candidate gates were tested against the same run and **refused**.
   *Red-before-green* — requiring the new tests to fail on the base tree — is
-  free and worthless here: measured, all four findings already satisfied it (9
-  of 13 for the heap fix), because a new test against new code trivially
-  fails before the code exists. What has value is reproducing the reported
-  *symptom*, which is a different and much stronger requirement, and which
-  would have caught the one finding in that run that had already been fixed by
-  an earlier PR before the run began. *Producer-branch coverage* — requiring
-  tests to exercise both branches of the producer feeding the fix — also fails:
-  instrumented, the inference branch executed even under the defective
-  fixture, so the gate passes while the defect stands.
+  free and worthless: a new test against code that doesn't exist yet
+  trivially fails, so all four findings already satisfied it. What has value
+  is reproducing the reported *symptom*, a stronger requirement that would
+  have caught the one finding that had already been fixed by an earlier PR.
+  *Producer-branch coverage* — requiring tests to exercise both branches of
+  the producer feeding the fix — also fails: instrumented, the defective
+  branch executed under the defective fixture too, so the gate passes while
+  the defect stands.
 - **A stale finding is not a bug.** The evidence contract above asks whether
-  a fix fires; this asks whether the failure it fixes still happens. On run
-  `fa979580` a subtask "fixed" a cgroup leak that an earlier PR had already
-  fixed **before the run began**, and shipped an event-loop stall doing it.
-  Nothing asked. A subtask whose planner entry declares
-  `fixes_reported_symptom: true` therefore records a `symptom_evidence`
-  object — did the reported symptom reproduce on the base tree, how, and what
-  was observed — and a subtask that could not reproduce it says so.
+  a fix fires; this asks whether the failure it fixes still happens. On one
+  run a subtask "fixed" a cgroup leak an earlier PR had already fixed before
+  the run began, and shipped an event-loop stall doing it — nothing asked. A
+  subtask whose planner entry declares `fixes_reported_symptom: true`
+  therefore records a `symptom_evidence` object — did the reported symptom
+  reproduce on the base tree, how, and what was observed — and a subtask
+  that could not reproduce it says so.
 
   **Advisory, and the asymmetry with the evidence gate is deliberate.** A
-  retry cannot make a stale finding un-stale: it asks the same worker the
-  same question, so gating would spend budget without changing the answer,
-  and a second gating evidence field would stack retry pressure on the
-  first. What is wanted here is *surfacing* — "this may already be done" is
-  the most valuable thing such a subtask can report, and it only has to be
-  visible once.
-
-  Note what this is **not**: "the new tests fail on the base tree" is free
-  and proves nothing. Measured on that run, all four findings' tests already
-  failed on base (9 of 13 for one of them), because a new test against code
-  that does not yet exist trivially fails. The claim wanted is behavioural,
-  which is why the field asks for a command and an observation rather than a
-  boolean the worker can assert for nothing.
+  retry cannot make a stale finding un-stale — it asks the same worker the
+  same question — so gating would spend budget without changing the answer.
+  "This may already be done" is the most valuable thing such a subtask can
+  report, and it only has to be visible once. Note what this is **not**:
+  "the new tests fail on the base tree" is free and proves nothing, since a
+  new test against code that does not yet exist trivially fails — the claim
+  wanted is behavioural, which is why the field asks for a command and an
+  observation rather than a boolean.
 - **No backsliding.** The conformer can add commits but must not write to
-  protected paths. The diff-scope check — no writes to `.leerie/`,
-  `.git/`, or `.claude/` *except for the user-deliverable subtrees*
-  `.claude/agents/`, `.claude/commands/`, and `.claude/skills/` — is
-  re-run against the conformer's commits, on the same protected paths
-  and with the same terminality as it ran against the implementer's
-  commits. The `.claude/` carve-out exists because those three subtrees
-  are the documented Claude Code customization locations: refusing to
-  write them would make leerie unable to produce a subagent or
-  slash-command as a legitimate deliverable, even though `.claude/`
-  top-level files (`settings.json`, `settings.local.json`) are
-  coordination and must stay protected. (Earlier iterations of this
-  phase also re-verified the criteria-file hash and rolled back
-  conformer commits that touched it; that check was removed when the
-  criteria lock was retired — §8.)
+  protected paths. The diff-scope check — no writes to `.leerie/`, `.git/`,
+  or `.claude/` *except for the user-deliverable subtrees*
+  `.claude/agents/`, `.claude/commands/`, and `.claude/skills/` — is re-run
+  against the conformer's commits, on the same protected paths and with the
+  same terminality as against the implementer's. The `.claude/` carve-out
+  exists because those subtrees are the documented Claude Code
+  customization locations; top-level files (`settings.json`,
+  `settings.local.json`) stay protected as coordination state.
 - **No clobbering the implementer's work.** The conformer's charter is
-  *additive* — fix drift, add tests, repair rule violations — never to
-  undo what the implementer built. But it runs with full Bash in the
-  worktree, and a conformer that reaches for the base tree to attribute a
-  pre-existing failure (`git checkout <base-ref> -- .`, `git reset
-  --hard`) can revert or delete the implementer's committed files; if it
-  then commits that state, integration (which merges the committed
-  branch) carries the loss forward silently. So the orchestrator snapshots
-  the implementer's committed HEAD *once, before the first conformer
-  round*, and after the conformer runs computes the implementer's owned
-  set (`git diff --name-only <run-branch>..<impl-HEAD>`) and checks, per
-  owned file, whether the conformer reverted it to the base version or
-  deleted it — a three-way blob comparison of base / implementer /
-  post-conformer content, because a *legitimate* conformer edit leaves a
-  distinct third state and must not be flagged. A detected clobber is
-  surfaced as a loud advisory warning always; under `--strict-conformer`
-  the conformer's commits are rolled back to the implementer HEAD **and
-  the subtask is blocked** (the final-tree pass blocks the run) — a
-  clobber is the severest residual, so it blocks like any other strict
-  residual (fix + `resume`), even when the conformer's own build/lint/
-  test came back clean. It is *not* silently auto-rolled-back in advisory
-  mode: a legitimate
-  revert-to-base (the implementer's change was wrong and the conformer
-  undid it) is indistinguishable from a clobber by git state alone, and
-  the phase is advisory by design. The same guard applies to the
-  final-tree pass, using **a snapshot SHA** as the base and the staging HEAD
-  captured before that pass as the implementer-work snapshot. The base must be
-  the point the run branch forked from the working branch, resolved as a SHA —
-  emphatically *not* the run branch itself. The staging worktree has the run
-  branch **checked out**, so naming that branch as the base makes the base and
-  `HEAD` the same ref: the blob comparison then reports every file the final
-  conformer touched as reverted-to-base, and under `--strict-conformer` rolls
-  those legitimate fixes back. That is not a hypothetical — it is what the
-  spec said here until 2026-08-14, and it fired on every run whose final
-  conformer committed anything (docs/POSTMORTEM-2026-08-14.md, F2). Any ref
-  used as a comparison base in a worktree must be a snapshot, because a branch
-  name moves when that worktree commits. This is the
-  §12 boundary again: the guarantee that matters (committed implementer
-  work survives the conformer) is a code check, not a prompt rule.
+  *additive* — fix drift, add tests, repair rule violations — never to undo
+  what the implementer built. But it runs with full Bash in the worktree,
+  and a conformer that reaches for the base tree to attribute a pre-existing
+  failure (`git checkout <base-ref> -- .`, `git reset --hard`) can revert or
+  delete the implementer's committed files, and if it then commits that
+  state, integration carries the loss forward silently. So the orchestrator
+  snapshots the implementer's committed HEAD *once, before the first
+  conformer round*, and afterward computes the implementer's owned set
+  (`git diff --name-only <run-branch>..<impl-HEAD>`) and checks, per owned
+  file, whether the conformer reverted it to the base version or deleted it
+  — a three-way blob comparison of base / implementer / post-conformer
+  content, since a *legitimate* conformer edit leaves a distinct third state
+  and must not be flagged. A detected clobber is surfaced as a loud advisory
+  warning always; under `--strict-conformer` the conformer's commits are
+  rolled back to the implementer HEAD **and the subtask is blocked**. It is
+  *not* silently auto-rolled-back in advisory mode, since a legitimate
+  revert-to-base is indistinguishable from a clobber by git state alone.
 
-- **Committed work survives a mid-turn worker death.** The clobber guard above
-  protects committed work from the *conformer*; a symmetric threat is the
-  *implementer* worker dying mid-turn. A worker that backgrounds an expensive
-  final verification step (a `pnpm run build`, a heavy test suite) and then has
-  that step OOM-killed gets its `claude -p` session reaped before it writes a
+  The same guard applies to the final-tree pass, using **a snapshot SHA** as
+  the base and the staging HEAD captured before that pass as the
+  implementer-work snapshot — emphatically not the run branch itself, since
+  the staging worktree has that branch checked out and naming it as the base
+  makes base and `HEAD` the same ref, reporting every file the final
+  conformer touched as reverted-to-base. Any ref used as a comparison base
+  in a worktree must be a snapshot, because a branch name moves when that
+  worktree commits — the §12 boundary again: the guarantee that matters
+  (committed implementer work survives the conformer) is a code check, not a
+  prompt rule.
+- **Committed work survives a mid-turn worker death.** The clobber guard
+  above protects committed work from the *conformer*; a symmetric threat is
+  the *implementer* worker dying mid-turn — e.g. backgrounding an expensive
+  final verification step that then gets OOM-killed before it can write a
   checkpoint. The synthesized result is an `incomplete-handoff` whose
-  `checkpoint_path` does not exist — `_validate_result` tags it `empty_handoff`.
-  Naively this is treated as a retryable no-op: `_settle_subtask` calls `fail()`,
-  which `_reset_subtask_worktree`s away the worktree (destroying any committed
-  diff) and burns `failed_retries` until the whole run dies. But the worker may
-  have *already committed a complete, green diff* and died only at a
-  container-environmental verification step (the build OOMs the same way for
-  sibling subtasks whose criteria don't gate on it — they return before dying
-  and settle `complete`). So before failing an `empty_handoff`, the orchestrator
-  runs the positive-polarity `_branch_has_commits_ahead` gate: **if the branch has
-  commits ahead of the run branch, the worker produced a real deliverable** and
-  the result is settled as `complete` — routed through the advisory conformance
-  phase, which records the unfinished verification as a warning — rather than
-  discarded. Only a genuine no-op (no commits) stays retryable, and the
-  commit-presence test is a *positive* proof (`_branch_has_commits_ahead`, as
-  distinct from the `check_branch_has_commits` no-op gate on the `complete`
-  path): a
-  worktree that is gone or on which git fails counts as "no proven commits" and
-  is **not** rescued, so an indeterminate git state can never be mistaken for a
-  real deliverable. This is the §12 boundary once more: whether committed work
-  exists is a deterministic git check, not a judgment the prompt could be
-  trusted to make about how the worker died. The prompt half is the *advisory*
-  complement (§12's inverse): the implementer is instructed to commit in-scope
-  work **before** running any verification step, precisely so that a reaped
-  worker's diff is already committed and this code-enforced rescue has something
-  to keep — the prompt reduces how often the rescue must fire, the code
-  guarantees the outcome when it does. One class of "genuine no-op" is not a
-  failure at all: a subtask whose deliverable a *sibling subtask* already
-  committed to the run branch this run. That case is caught separately, on the
-  `complete`-path no-commits gate, by re-probing the success criteria against
-  the run-branch HEAD before failing — see §8 *The mid-run sibling case*.
+  `checkpoint_path` does not exist (`empty_handoff`), naively treated as a
+  retryable no-op that discards the worktree and burns retries. But the
+  worker may have already committed a complete, green diff and died only at
+  a container-environmental verification step. So before failing an
+  `empty_handoff`, the orchestrator runs the positive-polarity
+  `_branch_has_commits_ahead` gate: **if the branch has commits ahead of the
+  run branch, the worker produced a real deliverable** and the result is
+  settled as `complete` — routed through the advisory conformance phase,
+  which records the unfinished verification as a warning — rather than
+  discarded. Only a genuine no-op (no commits) stays retryable; a worktree
+  that is gone or on which git fails counts as "no proven commits" and is
+  **not** rescued. This is the §12 boundary once more: whether committed
+  work exists is a deterministic git check, not a judgment the prompt could
+  be trusted to make. The prompt half is the advisory complement: the
+  implementer is instructed to commit in-scope work **before** running any
+  verification step, so a reaped worker's diff is already committed. One
+  class of "genuine no-op" is not a failure at all — a subtask whose
+  deliverable a *sibling subtask* already committed to the run branch — and
+  is caught separately by re-probing success criteria against the run-branch
+  HEAD before failing (§8 *The mid-run sibling case*).
 
 The phase is bounded by a separate cap from the evidence loop: the conformer
-gets a small number of orchestrator-level rounds (default 3) in which to
-detect and fix drift. Exhausting the cap with residuals still present does
-*not* fail the subtask — the residuals become warnings, the subtask still
-returns `complete`, and the work moves on to integration. This is consistent
-with the rest of §12: what cannot be guaranteed in code (a model genuinely
-catching every documentation drift) is not promoted to a hard guarantee by
-prompt; what *can* be guaranteed (protected paths stayed untouched, the
-worker's structured output is well-formed) is enforced in code.
+gets a small number of orchestrator-level rounds (default 3) to detect and
+fix drift. Exhausting the cap with residuals still present does *not* fail
+the subtask — the residuals become warnings, the subtask still returns
+`complete`, and the work moves on to integration. What cannot be guaranteed
+in code (a model genuinely catching every documentation drift) is not
+promoted to a hard guarantee by prompt; what *can* be guaranteed (protected
+paths stayed untouched, structured output is well-formed) is enforced in
+code.
 
-**Orchestrator-run build/lint/test is bounded, not contained.** A BLT command
-the orchestrator starts is not a worker. It does not pass through the
-memory-admission gate and it is not enrolled in a cgroup, so unlike a worker it
-has no `memory.max` and no `pids.max` of its own — §6 *Memory containment*
-covers the worker path only. That gap predates the handover (the base-health
-baseline always ran this way), but the handover multiplies it: what was one
-serial pre-wave run becomes one per subtask per round.
+**Orchestrator-run build/lint/test is bounded, not contained.** A BLT
+command the orchestrator starts is not a worker: it does not pass through
+the memory-admission gate and is not enrolled in a cgroup, so unlike a
+worker it has no `memory.max` and no `pids.max` of its own (§6 *Memory
+containment* covers the worker path only). What was one serial pre-wave run
+becomes one per subtask per round.
 
-Two things bound it. The default `scoped` mode keeps each measurement small —
-a couple of test files, seconds — so the uncontained footprint is negligible.
-And `blt_parallel` (default 2) caps how many run at once, which matters most
-under `--subtask-tests full`, where a whole suite sits behind every subtask and
-`max_parallel` of them at once is the shape that once saturated a worker's
-cgroup badly enough to raise `worker_pids_max` to 2048. Reaping is already
-handled: these run in their own session and are torn down as a process tree on
-timeout or exception.
-
-Enrolling them in a cgroup is the architecturally consistent answer and is not
-done yet; it would have to go through the broker, whose wire contract drifts
-silently enough to warrant its own guard.
+Two things bound it. The default `scoped` mode keeps each measurement small,
+so the uncontained footprint is negligible. And `blt_parallel` (default 2)
+caps how many run at once, which matters most under `--subtask-tests full`.
+Reaping is already handled: these run in their own session and are torn
+down as a process tree on timeout or exception. Enrolling them in a cgroup
+is the architecturally consistent answer and is not done yet — it would
+have to go through the broker, whose wire contract needs its own guard
+against silent drift.
 
 **The signal that continues the loop is a delta, not a verdict.** The round
-cap above bounds the loop; what *ends* it early is the orchestrator's judgment
-that the conformer has nothing left to do. That judgment must be relative to
-the base tree, or the loop becomes unsatisfiable on any repo whose base is not
-already green — and then every subtask spends its entire round budget
-rediscovering debt it did not create.
+cap above bounds the loop; what *ends* it early is the orchestrator's
+judgment that the conformer has nothing left to do. That judgment must be
+relative to the base tree, or the loop becomes unsatisfiable on any repo
+whose base is not already green — every subtask would spend its entire
+round budget rediscovering debt it did not create. Measured on a 91-subtask
+run whose base was RED on tests: only 6 of 79 subtasks were clean at round
+1, and 57 ran the full 3-round cap, each round re-running the whole suite to
+re-observe a failure the baseline had already recorded.
 
-That is not hypothetical. Measured on a 91-subtask run whose base tree was RED
-on tests, **only 6 of 79 subtasks were clean at round 1**, and **57 ran exactly
-3 rounds** — the cap, precisely. Each of those rounds ran the repo's full test
-suite, at ~8 minutes a time, to re-observe a failure the orchestrator had
-already recorded in the baseline before the first wave started.
+The pre-existing failure reaches the loop through *two* channels, and both
+must be closed: the **axis** channel (an axis reporting `ran && !passed`),
+and the **residual** channel (a `rule_violations_residual` entry — measured,
+most residuals in that run carried the single rule `build/lint/tests must
+pass`, with `why_not_fixed` explicitly citing the pre-existing baseline; the
+conformer read the baseline, obeyed it, and was re-spawned anyway).
 
-The pre-existing failure reaches the loop through *two* channels, and both must
-be closed or the fix is half a fix:
-
-- the **axis** channel — an axis reporting `ran && !passed`;
-- the **residual** channel — a `rule_violations_residual` entry. Measured, 125
-  of 139 residuals in that run carried the single rule `build/lint/tests must
-  pass`, with a `why_not_fixed` that explicitly cited the baseline: *"consistent
-  with the orchestrator-supplied BASELINE which recorded the base tree already
-  RED on tests … pre-existing and out of this diff's scope."* The conformer
-  read the baseline, obeyed it, and reported honestly; the orchestrator then
-  re-spawned it to rediscover the same thing.
-
-So the loop-continuation predicate consults the baseline directly. An axis that
-was red on the base tree is not a reason to spend another round, and neither is
-a residual that labels itself as being about such an axis. Anything else is
-unchanged: a residual about something other than build/lint/test, an unlabelled
+So the loop-continuation predicate consults the baseline directly. An axis
+that was red on the base tree is not a reason to spend another round, and
+neither is a residual that labels itself as being about such an axis.
+Anything else is unchanged: a residual about something else, an unlabelled
 one, a *newly* introduced one, or a failure on an axis that was **green** at
-baseline all continue the loop exactly as before — those are regressions this
-change must stay able to see.
+baseline all continue the loop exactly as before.
 
-**An axis that could not be measured is a third state, and it is not clean.**
-The baseline already distinguishes it: an axis whose command never produced a
-verdict is recorded `measured: False` and excluded from `red_axes`, because
-"could not measure" is not "RED". But that distinction was defined only for the
-*baseline*, and every later measurement can hit the same condition — a command
-whose runner is missing on this tree, or one the container's resource limits
-killed before it could report. When it does, the loop predicate must treat it as
-unresolved rather than silently clean: no evidence is not evidence of green.
-Reading the axis as clean is how a run shipped a PR whose entire test axis never
-ran, because the axis was also in `red_axes` from the baseline and the
-exclusion swallowed a *second*, different unmeasurability
-(docs/POSTMORTEM-2026-08-14.md, F6). This is rare by construction — measured, 1
-of 46 final axes that ran — so treating it as unresolved costs almost nothing
-and buys the guarantee that a green verdict means something was actually run.
+**An axis that could not be measured is a third state, and it is not
+clean.** An axis whose command never produced a verdict is recorded
+`measured: False` and excluded from `red_axes` — "could not measure" is not
+"RED". That distinction was originally defined only for the baseline, but
+every later measurement can hit the same condition. When it does, the loop
+predicate must treat it as unresolved rather than silently clean: reading an
+unmeasured axis as clean is how a run once shipped a PR whose test axis
+never ran at all — its unmeasurability was swallowed by the same
+`red_axes` exclusion meant for the baseline
+(docs/POSTMORTEM-2026-08-14.md, F6). This is rare by construction, so
+treating it as unresolved costs almost nothing.
 
-This is the same principle as the baseline itself (*Base-tree health baseline*
-below), applied one layer down. The baseline was already being handed to the
-*worker* as prose in a `BASELINE:` block, asking it to scope its judgment to the
-delta. But the orchestrator's own predicate never read it — the guarantee lived
-in a prompt while the code that could enforce it looked away. §12 says that is
+The baseline was already handed to the *worker* as prose in a `BASELINE:`
+block, asking it to scope its judgment to the delta — but the
+orchestrator's own predicate never read it, so the guarantee lived in a
+prompt while the code that could enforce it looked away. §12 says that is
 backwards.
 
 Which axis a residual is about is read from a **schema field the conformer
-fills** (`axis`, one of `build`/`lint`/`tests`), never inferred from the `rule`
-or `why_not_fixed` prose. Inferring it would be regex over an LLM's response,
-which *Language-to-JSON: natural-language interpretation is never regex*
-forbids — and the prose is not stable enough to compare anyway: measured, only
-21% of consecutive round transitions repeat a byte-identical residual set. Where
-a check needs a fact that lives in natural language, the owning worker surfaces
-it as a field; that is the rule, and this is an ordinary application of it.
+fills** (`axis`, one of `build`/`lint`/`tests`), never inferred from the
+`rule` or `why_not_fixed` prose — inferring it would be regex over an LLM's
+response, which *Language-to-JSON* forbids, and the prose is not stable
+enough to compare anyway (measured, only a fifth of consecutive round
+transitions repeat a byte-identical residual set).
 
-The field is **optional in the schema and gating on absence**, and that is one
-decision rather than two. Requiring it would cost the entire submission rather
-than the single field — the same trade already measured on `plan_overlap_judge`,
-where one required field held valid output to 40.9% — while treating an
-unlabelled residual as excusable would let a worker silently switch the loop
-off. So an unlabelled residual blocks: the conservative direction, matching
-*Findings carry a severity* in §8.
+The field is **optional in the schema and gating on absence**, and that is
+one decision rather than two: requiring it would cost the entire submission
+rather than the single field (the same trade measured on
+`plan_overlap_judge`), while treating an unlabelled residual as excusable
+would let a worker silently switch the loop off — so an unlabelled residual
+blocks, matching *Findings carry a severity* in §8.
 
-This splits the fix's guarantee in two, and the halves are worth distinguishing.
-The axis channel is pure code enforcement — the orchestrator measured the
-baseline itself and compares its own record, with no worker cooperation
-involved. The residual channel depends on the conformer labelling its output.
-Replaying the motivating run's real round-1 output through the shipped
-predicate: **6 of 79 subtasks clean today, 37 on the axis channel alone, 53 once
-residuals carry a label.** The floor is code; the rest is the prompt earning it.
+This splits the fix's guarantee in two. The axis channel is pure code
+enforcement — the orchestrator measured the baseline itself and compares
+its own record. The residual channel depends on the conformer labelling its
+output. Replaying the motivating run's real round-1 output through the
+shipped predicate: 6 of 79 subtasks clean today, most of the rest recovered
+across the two channels. The floor is code; the rest is the prompt earning
+it.
 
 **The orchestrator measures; the conformer consumes.** Build, lint and test
 are executed by the orchestrator, not by the conformer. The worker receives
-*results* — the exact command, the exit-code verdict, and an output tail — in a
-`BLT_RESULTS:` block, and is told it did not run them and must not re-run a
-full axis.
+*results* — the exact command, the exit-code verdict, and an output tail —
+in a `BLT_RESULTS:` block, and is told it did not run them and must not
+re-run a full axis. This is §12 applied to the axis that was costing the
+most: whether a suite ran, with what command, in which tree, at what scope,
+is mechanically knowable, so it belongs in `leerie.py`; whether a resulting
+failure is worth fixing is judgment, so it stays with the worker.
 
-This is §12 applied to the axis that was costing the most. Whether a suite ran,
-with what command, in which tree, at what scope, is mechanically knowable, so
-it belongs in `leerie.py`; whether a resulting failure is worth fixing is
-judgment, so it stays with the worker.
+Two things make it a real transfer rather than a request. The command
+strings are no longer injected, so running a full axis now requires the
+worker to synthesise one. And the orchestrator's measurement **overwrites**
+the conformer's self-reported `build`/`lint`/`tests` before any consumer
+reads them — the loop-continuation predicate, the residual summary, and the
+persisted `conformance` entry all see what was measured, never what was
+claimed; the worker's own report survives only as telemetry. The overwrite
+happens twice per round, deliberately: once at the tail for the ordinary
+case, and once immediately after the worker returns for the three gates
+that abandon a round early (a malformed result, a protected-path violation,
+a strict-mode clobber), which is also the accurate answer there since two
+of those three exits roll the worktree back toward the state that earlier
+measurement describes.
 
-Two things make it a real transfer rather than a request. The command strings
-are no longer injected, so running a full axis now requires the worker to
-synthesise one. And the orchestrator's measurement **overwrites** the
-conformer's self-reported `build`/`lint`/`tests` before any consumer reads
-them — the loop-continuation predicate, the residual summary, and the persisted
-`conformance` entry all see what was measured, never what was claimed. The
-worker's own report survives only as telemetry.
+Worth being precise about what this does *not* fix: conformers were not
+over-firing (measured, implementers ran the full suite zero times and
+conformers ran it almost exactly once per round as prompted). Moving
+execution into the orchestrator therefore saves little by itself — it is
+what makes the next two paragraphs possible. The conformer keeps
+**targeted falsifiers**, promoted from exception to primary tool:
+`production_evidence` (§9) requires exercising the path the diff actually
+changed against the repo as it is, scoped work by construction and not a
+suite run.
 
-"Before any consumer" is not free: it takes **two** applications per round, and
-the pairing is deliberate rather than defensive. One at the tail covers the
-ordinary case. One immediately after the worker returns covers the three gates
-that abandon a round early — a malformed result, a protected-path violation, a
-strict-mode clobber — because each of those `break`s past the tail while still
-handing `last_res` to a consumer. The early one uses the *pre*-round
-measurement, which is also the accurate answer there: two of those three exits
-roll the worktree back toward the state that measurement describes.
+**Per-subtask scope: a delta proxy, not the suite.** A subtask's conformer
+does not need to know whether the repo's whole suite is green — the
+whole-tree pass (§6) is where that question is asked, and it is the only
+place cross-subtask interaction can be answered. What the per-subtask pass
+needs is whether *this diff* broke something.
 
-Worth being precise about what this does *not* fix. Conformers were not
-over-firing: measured, 219 full-suite runs across 229 conformer calls, almost
-exactly the one-per-round the prompt asked for, and implementers ran the full
-suite zero times. The prompts were being followed. Moving execution into the
-orchestrator therefore saves little by itself — it is what makes the next two
-paragraphs possible.
-
-The conformer keeps **targeted falsifiers**, and they are promoted from
-exception to primary tool: `production_evidence` (§9) requires exercising the
-path the diff actually changed against the repo as it is, which is scoped work
-by construction and is not a suite run.
-
-**Per-subtask scope: a delta proxy, not the suite.** A subtask's conformer does
-not need to know whether the repo's whole suite is green. The whole-tree pass
-(§6) is where that question is asked, and it is the only place it can be
-answered about cross-subtask interaction. What the per-subtask pass needs is
-whether *this diff* broke something.
-
-So the per-subtask axes may run a **delta proxy** — a cheaper command scoped to
-the changed files — while the canonical command runs exactly twice per run:
-once at the base-health baseline and once (per round) on the integrated tree.
-The proportions that motivate this: the median subtask in the measured run
-touched **one** source file, yet every conformer round ran all 990 test files
-at ~499 s a time, against ~23 s for a scoped run of the same repo.
+So the per-subtask axes may run a **delta proxy** — a cheaper command
+scoped to the changed files — while the canonical command runs exactly
+twice per run: once at the base-health baseline and once (per round) on the
+integrated tree. Measured, the median subtask in one run touched a single
+source file, yet every conformer round ran the whole ~990-file suite at
+~499s a time against ~23s for a scoped run of the same repo.
 
 A proxy is repo-declared (`test_scoped` / `build_scoped` in
-`.leerie/config.toml`) or inferred from two narrow signals, and is rendered
-from a template with `{files}` and `{base}`. It is **not a subset** of the
+`.leerie/config.toml`) or inferred from two narrow signals, rendered from a
+template with `{files}` and `{base}`. It is **not a subset** of the
 canonical command and is not expected to be — `tsc --noEmit` catches a
-different set than `next build`. It is a cheap falsifier run once per subtask,
-backed by an expensive oracle run twice.
+different set than `next build`. It is a cheap falsifier run once per
+subtask, backed by an expensive oracle run twice.
 
-**Not every runner can map source to tests, and the ones that cannot need the
-file list filtered.** `vitest related` and `jest --findRelatedTests` take
-*source* files and resolve the tests that import them through the runner's own
-module graph, so `{files}` can be handed to them whole. pytest has no such
-mechanism: it takes paths and collects what is under them. Handing it a source
-or docs path is not merely uninformative — it is an error. Measured against a
-real repo: `pytest orchestrator/leerie.py` exits 5 (nothing collected),
-`pytest docs/DESIGN.md` exits 4 (no collectors), and — the case that decides
-the design — `pytest docs/DESIGN.md tests/test_blt_semaphore.py` also exits 4,
-because **one non-test path poisons an otherwise-valid invocation**. Since a
-real subtask diff almost always mixes source and docs with its tests, a
-`{files}` template on such a repo reports RED on nearly every subtask.
+**Not every runner can map source to tests, and the ones that cannot need
+the file list filtered.** `vitest related` and `jest --findRelatedTests`
+take *source* files and resolve their tests through the runner's own module
+graph, so `{files}` can be handed to them whole. pytest has no such
+mechanism — it takes paths and collects what is under them, so a source or
+docs path is not merely uninformative, it is an error: `pytest
+orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4, and mixing
+one bad path with a good one still exits 4 — one non-test path poisons an
+otherwise-valid invocation. Since a real subtask diff almost always mixes
+source and docs with its tests, a `{files}` template on such a repo reports
+RED on nearly every subtask.
 
-So a template may instead ask for `{test_files}`, which substitutes only the
-test-shaped members of the changed-file set. This is a narrower proxy than the
-import-graph kind — it runs the tests the diff *touched*, not the tests the
-diff *affects* — and that narrowing is the price of working at all on a runner
-with no impact analysis. The absence rule below applies unchanged and is what
-makes it safe: a diff with no test file in it renders nothing and falls back to
-the canonical command. Measured over 36 real subtask diffs on this repo, 34
-carried a test file and 2 did not, so the fallback is the exception rather than
-the common path.
+So a template may instead ask for `{test_files}`, which substitutes only
+the test-shaped members of the changed-file set — a narrower proxy than the
+import-graph kind, running the tests the diff *touched* rather than the
+tests it *affects*, which is the price of working at all on a runner with
+no impact analysis. The absence rule below makes it safe: a diff with no
+test file renders nothing and falls back to the canonical command, which
+measured over a real corpus is the exception rather than the common path.
 
 Absence is the default in every direction: an axis with no resolvable proxy
 falls back to the canonical command rather than being skipped; a changed
-file set that is empty skips the axis rather than rendering a bare runner —
-which would run everything, the exact inversion of the feature; and a template
-naming a placeholder this version cannot substitute is likewise an absence
-rather than a command to run, since shipping the literal brace to a shell is a
-hard error on every subtask.
+file set that is empty skips the axis rather than rendering a bare
+runner (which would run everything, the exact inversion of the feature);
+and a template naming a placeholder this version cannot substitute is
+likewise an absence rather than a command to run, since shipping the
+literal brace to a shell is a hard error on every subtask.
 `--subtask-tests full|scoped|off` lets an operator force either end.
 
-**The round signal is a regression, not a verdict.** Because a scoped result
-and a full baseline are not comparable, the base-health baseline cannot
-attribute a scoped failure to a subtask. Nor should it: the question is
-narrower. The orchestrator measures each axis immediately **before** a
-conformer round and again **after** it, with the identical command and scope,
-and compares those two. An axis green before and red after is a regression the
-conformer just introduced — attributable, with no output parsing and no
-framework knowledge. That is what continues the loop on a build/lint/test
-signal. Differing command strings are never compared, which is what stops a
-scoped `pre` being weighed against a canonical `post`.
+**The round signal is a regression, not a verdict.** Because a scoped
+result and a full baseline are not comparable, the base-health baseline
+cannot attribute a scoped failure to a subtask, nor should it — the
+question is narrower. The orchestrator measures each axis immediately
+**before** a conformer round and again **after** it, with the identical
+command and scope, and compares those two. An axis green before and red
+after is a regression the conformer just introduced — attributable, with no
+output parsing and no framework knowledge. Differing command strings are
+never compared, which is what stops a scoped `pre` being weighed against a
+canonical `post`.
 
 **Opt-in strict mode.** `--strict-conformer` (also `LEERIE_STRICT_CONFORMER`
 env var, `strict_conformer` in `leerie.toml`) replaces the advisory framing
 with a blocking one: when conformer residuals remain after the round cap is
 exhausted, the subtask returns `blocked` instead of `complete`. The user
-fixes the residuals manually and runs `resume`. The same check applies to
-the final-tree pass — if residuals remain, the run pauses before the PR
-opens. This is an explicit trade-off: the operator accepts the risk described
-above (that the conformer may weaken work to clear the bar, or that
-pre-existing environmental failures will block unrelated subtasks) in exchange
-for the guarantee that no subtask passes with known conformance failures.
-Off by default; the advisory framing remains the recommended default for
-most repos.
+fixes the residuals manually and runs `resume`; the same check applies to
+the final-tree pass. Explicit trade-off: the operator accepts the risk that
+the conformer may weaken work to clear the bar, or that pre-existing
+environmental failures block unrelated subtasks, in exchange for the
+guarantee that no subtask passes with known conformance failures. Off by
+default; advisory framing is the recommended default for most repos.
 
 Within a round, the conformer is expected to invoke each build/lint/test axis
-**exactly once** (with a targeted-falsifier exception when verifying a single
-file's behavior). The orchestrator distinguishes two patterns: (a) running
-the same axis multiple times with different scopes (targeted test → full
-suite → verification grep) is legitimate progressive testing and is surfaced
-as an advisory only; (b) a Bash-tool-auto-backgrounded BLT command followed
-by a fresh BLT invocation rather than a temp-file `Read` recovery is the
-"retry-instead-of-recover" pattern — this is wasteful and the orchestrator
-injects it as structured CRITIC-pattern feedback into the next conformer
-round so the conformer can correct the behavior. General "ran N times"
-advisories remain observability-only. The expectation pairs with explicit
-prompt guidance to pass `timeout: 600000` on long-running test/build commands
-so the auto-background trap is avoided in the first place. This is the same
-§12 boundary as the rest of the phase: the discipline is checked
-mechanically (by parsing the per-worker JSONL log), the response is
-advisory.
+**exactly once** (a targeted-falsifier exception applies when verifying a
+single file's behavior). Running the same axis multiple times with different
+scopes (targeted test → full suite → verification grep) is legitimate
+progressive testing and surfaces as advisory only. A Bash-tool-auto-backgrounded
+BLT command followed by a fresh BLT invocation, rather than a temp-file `Read`
+recovery, is the "retry-instead-of-recover" pattern; the orchestrator injects
+it as structured CRITIC-pattern feedback into the next conformer round.
+Prompt guidance pairs with this: pass `timeout: 600000` on long-running
+test/build commands so the auto-background trap is avoided in the first
+place. Same §12 boundary as the rest of the phase — checked mechanically by
+parsing the per-worker JSONL log, response is advisory.
 
 The same conformer runs once more after every wave has integrated, on
 the staging worktree, with `DIFF_BASE` set to the working branch (§6,
@@ -7038,73 +5862,47 @@ lands at `st.data["conformance"]["_final"]` and is threaded into the
 `pr_writer` payload so its residuals surface as an advisory section
 in the PR body alongside the wave-by-wave summary.
 
-**Base-tree health baseline.** Until this baseline was added, the
-conformer was *the first place the repo's build/lint/test suite ran
-at all* — the orchestrator itself executed no BLT command. That made a
-whole class of failure invisible until too late: when the seeded base
-tree is already red — because the repo's own tests are red on the
-developer's branch, **or** because leerie's container/provisioning
-cannot run the suite (a missing dependency surfacing as a
-module-not-found, an out-of-memory kill on a heavy test process) — the
-conformer runs the suite, observes the failures, and (correctly, since
-they are not in its diff) labels them *pre-existing technical debt*,
-records an advisory residual, and the run ships a PR on top of a
-baseline leerie never established was green. The two causes are
-indistinguishable to a conformer that has no notion of the base state,
-so a genuine provisioning defect is laundered as inherited debt. In
-chain/group flows the effect compounds: the base is often a prior
-run's branch, so an environment-induced red baseline propagates
-forward.
+**Base-tree health baseline.** Before this existed, the conformer was the
+first place the repo's build/lint/test suite ran at all, so a red base tree
+(the repo's own tests red on the developer's branch, or leerie's own
+container/provisioning unable to run the suite — a missing dep, an OOM kill)
+was indistinguishable from a genuine regression: the conformer labels
+pre-existing failures "technical debt" and ships a PR on a baseline nobody
+established was green. In chain/group flows this compounds, since the base
+is often a prior run's branch.
 
-The fix is a **base-health checkpoint**, code-computed and advisory
-(never a gate — the same §12 reasoning as the conformer's own
-build/lint/test axes). Once per run, after the staging worktree is
-created off the base HEAD but **before any wave mutates it**, the
-orchestrator installs the provision recipe into staging and runs the
-resolved build/lint/test commands there directly. Deps must be present
-for the suite to run, and per §6½ they live only in worktrees (the
-orchestrator never installs into the bind-mounted `repo_root`), so the
-staging worktree — unmodified at this point — is the earliest tree
-where an accurate baseline can be taken. The verdict is **exit-code
-based** (a non-zero exit is RED, zero is GREEN): this is 100% reliable
-and needs no per-framework output parsing, which is deliberate — the
-suite's own summary format varies by tool and cannot be relied on.
+The fix is a **base-health checkpoint**, code-computed and advisory (never a
+gate — same §12 reasoning as the conformer's own axes). Once per run, after
+the staging worktree is created off the base HEAD but **before any wave
+mutates it**, the orchestrator installs the provision recipe into staging
+and runs the resolved build/lint/test commands there directly — the
+earliest tree where an accurate baseline can be taken, since deps live only
+in worktrees (§6½). The verdict is **exit-code based** (non-zero = RED,
+zero = GREEN) — deliberately not output-parsed, since summary format varies
+by tool.
 
-The one thing an exit code cannot distinguish is *the command never got to
-run*, so that case is classified separately and recorded `measured: False`.
-It has two causes and both must be covered, because leerie owns the
-environment in which the command runs and is therefore the author of both:
-the runner is absent from this tree (the recipe's install failed, so the
-test binary is missing), **or** the container's own limits killed it — a
-build that cannot spawn a worker thread against `pids.max` reports failure
-without having measured anything. Leaving the second uncovered pushed the
-judgment into the workers, which adjudicated it in prose: measured across a
-run corpus, **37 worker calls** reasoned about `OS can't spawn worker
-thread: Resource temporarily unavailable (os error 11)` and decided for
-themselves that it was environmental. §12 says that decision belongs in
-code (docs/POSTMORTEM-2026-08-14.md, F5).
+An exit code cannot distinguish *the command never got to run* from a real
+failure, so that case is classified separately and recorded
+`measured: False`. It has two causes leerie must cover, since it owns the
+environment: the runner is absent (install failed) or the container's own
+limits killed it (e.g. `pids.max` blocking a worker-thread spawn). Leaving
+the second uncovered pushed the judgment into workers, which then
+adjudicated it in prose — measured across a run corpus, 37 worker calls
+reasoned about `os error 11` and decided for themselves it was
+environmental (docs/POSTMORTEM-2026-08-14.md, F5). §12 says that decision
+belongs in code.
 
-A RED base is surfaced **loudly** (a `log()` warning plus a
-`run.json.health.base_suite` record) rather than silently absorbed,
-because it usually means *leerie could not make this repo green before
-starting* — the operator's signal to suspect provisioning, memory
-limits, or missing deps, distinct from a genuinely red base branch.
-The baseline is then passed to every conformer (per-subtask and
-final-tree) as a `BASELINE:` context line so the conformer scopes its
-build/lint/test judgment to the **delta** — failures the change
-introduced — rather than re-deriving "these are pre-existing" from
-scratch on each pass. The result also feeds a one-line advisory in the
-PR body ("builds ✓/✗; +N test failures vs base, or clean net of
-base") so the human reviewer sees whether the assembled change builds
-and passes its tests relative to the base without checking out the
-branch. None of this gates: the confidence gate (§8) remains the only
-load-bearing signal.
+A RED base is surfaced loudly (`log()` warning plus `run.json.health.base_suite`)
+rather than silently absorbed, since it usually means leerie could not make
+the repo green before starting. It is passed to every conformer as a
+`BASELINE:` context line so build/lint/test judgment scopes to the **delta**
+rather than re-deriving "pre-existing" from scratch each pass, and feeds a
+one-line PR-body advisory. None of this gates — the confidence gate (§8)
+remains the only load-bearing signal.
 
-Because the baseline runs the full suite once (the test run, not the
-install, is the cost — measured at tens of seconds to a few minutes on
-real repos), it is **skippable** for operators who know their base is
-green or who don't want the up-front cost, and each BLT command is
-bounded by the same per-command timeout the provision recipe uses.
+The baseline runs the full suite once (tens of seconds to a few minutes on
+real repos), so it is **skippable**, and each BLT command is bounded by the
+same per-command timeout the provision recipe uses.
 
 ---
 
@@ -7143,32 +5941,26 @@ progress — without depending on a channel that does not exist:
    after retry is forced into the same `incomplete-handoff` shape by the
    orchestrator.
 
-   That ceiling is **per worker type**, not one number for everything. A
+   That ceiling is **per worker type**, not one number for everything — a
    single global cap has to be sized for the slowest worker, so a hung
-   `classifier` — real work measured at a p99 of about 7 minutes — held its
-   phase for the same 90 minutes a full `implementer` legitimately needs.
-   The ceilings are therefore derived from the observed duration
-   distribution of the run corpus rather than chosen, with headroom over
-   each worker's slowest *observed* call, not merely its p99: a rule
-   anchored only to a percentile can sit under the tail it was derived
-   from, which for the planner it demonstrably did. Workers whose derived
-   ceiling reaches the global cap are simply left at it, as are workers the
-   corpus never observed at all — an unmeasured worker gets no invented
-   number.
+   `classifier` (p99 ~7 min) would hold its phase for the same 90 minutes a
+   full `implementer` legitimately needs. Ceilings are derived from the
+   observed duration distribution of the run corpus, with headroom over
+   each worker's slowest *observed* call rather than merely its p99 (a
+   percentile-anchored rule can sit under its own tail, which the planner's
+   demonstrably did). A worker whose derived ceiling reaches the global cap
+   stays there; an unmeasured worker gets no invented number.
 
-   Because that distribution comes from one host, an operator can bypass
-   the whole table with an explicit global override — `caps["worker_timeout_sec"]`
-   (default 5400 s / 90 min, overridable per-repo via `--worker-timeout` /
-   `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec` in leerie.toml).
-   Necessarily a bypass rather than a bound: the operator who needs it is
-   the one whose worker is being killed at a ceiling measured on a faster
-   machine, so a `min()` against the table would leave them no way up.
-
-   The bypass keys on **whether the operator set anything**, not on whether
-   the resolved number differs from the default. Comparing values made
-   explicitly passing the default — the first thing someone debugging a
-   timeout tries — indistinguishable from passing nothing, silently leaving
-   every listed worker on its table ceiling.
+   An operator can bypass the whole table with an explicit global override
+   — `caps["worker_timeout_sec"]` (default 5400 s / 90 min, via
+   `--worker-timeout` / `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec`) —
+   necessarily a bypass rather than a bound, since the corpus is measured
+   on one host and the operator needing it is the one being killed at a
+   ceiling measured on a faster machine. The bypass keys on **whether the
+   operator set anything**, not on whether the resolved value differs from
+   the default — otherwise explicitly passing the default (the first thing
+   someone debugging a timeout tries) would be indistinguishable from
+   passing nothing.
 
    When a worker is killed at whichever ceiling applied, the successor is
    spawned exactly as for a voluntary handoff and validates whatever partial
@@ -7248,23 +6040,14 @@ system has to push back against, not ride.
 When a feature task's request leaves the source of truth ambiguous, leerie
 resolves it from a preference: `codebase` (build from existing patterns only),
 `research` (build from researched best-practice standards), or `both` (codebase
-first; research only where the codebase is insufficient). The preference is
-read, in order, from a CLI flag on the invocation, from an environment
-variable, from a per-repo config file committed at the repo root, and
-otherwise defaults to `both`. The CLI flag and env var outrank the file
-because they are session-scoped knobs — a user reaching for either is making
-a one-off override of the repo default. The preference is never surfaced as
-an interactive question: any explicit setting overrides the default, and a
-caller who sets nothing has implicitly accepted `both`. A request that
-already names its own source of truth, or a non-feature task where the
-question does not apply, runs without the *question* — the classifier does
-not flag it, and nobody is asked. That is a statement about the question,
-never about the setting: whichever path resolved the preference, its value
-becomes a setting carried to every planner and implementer on every run,
-whatever the classifier decided, so the whole run draws from one consistent
-source of truth. There is no state in which a worker receives some other
-value instead; a run that skipped the question still carries the resolved
-preference, because the resolver always yields one of the three real values
+first; research only where the codebase is insufficient). Read, in order,
+from a CLI flag, an environment variable, a per-repo config file committed
+at the repo root, else defaults to `both` — CLI/env outrank the file since
+they are session-scoped overrides. The preference is never surfaced as a
+question: whichever path resolved it, its value becomes a setting carried to
+every planner and implementer on the run, independent of what the classifier
+decided — a run that skipped the question still carries the resolved
+preference, since the resolver always yields one of the three real values
 and never an "unset".
 
 Under `both`, planners may legitimately surface prerequisites from research
@@ -7406,225 +6189,154 @@ checkout by **four layers**, in order of how much each actually buys. Acting
 workers cannot be given L1 at all: they get L2, plus L4 per wave and a
 path-scoped write denial — see *Acting-worker isolation* below.
 
-This used to be one layer, and it failed. The old guarantee read "judgment
+This used to be one layer, and it failed. The old guarantee was "judgment
 workers cannot mutate state because they run in the real repo cwd *without*
-`--dangerously-skip-permissions`", with that flag as a documented opt-out that
-"shifts trust onto the prompts". Measured outcome: a classifier on a run with
-the flag set implemented an entire task in the operator's checkout on `main` —
-`Edit` calls to three files, a repo-wide `lint:fix`, and a `git stash`/`pop`
-pair — and then died at its turn cap. The prompt said "you run read-only". It
+`--dangerously-skip-permissions`", with that flag as a documented opt-out
+that "shifts trust onto the prompts." Measured: a classifier on a run with
+the flag set implemented an entire task in the operator's checkout on
+`main` (`Edit` to three files, a repo-wide `lint:fix`, a `git stash`/`pop`
+pair) and died at its turn cap. The prompt said "you run read-only"; that
 was the only thing that said so.
 
 **L1 — the flag never reaches a judgment worker.** `claude_p` appends
-`--dangerously-skip-permissions` on `autonomous` alone. This is the layer that
-does the work, and it is worth stating why rather than asserting it. Probed
-live (claude 2.1.237, four runs, ground truth taken from the filesystem):
+`--dangerously-skip-permissions` on `autonomous` alone. Probed live (claude
+2.1.237, ground truth from the filesystem): with the flag set, a worker
+holding only `INSPECT_TOOLS` used `Write` — a tool absent from that
+allowlist — to create a file outside its cwd; with the flag absent, the CLI
+rejected every such attempt, naming the allowed working directory. **The
+working-directory boundary is real; the flag is what erases it.** A
+separate probe combined cwd = detached worktree with the flag still on, and
+the worker overwrote a tracked file in the real checkout and committed on
+its branch — the result behind L2's caveat below.
 
-| configuration | Write in cwd | Write *outside* cwd | Bash write outside cwd |
-|---|---|---|---|
-| `INSPECT_TOOLS`, flag on | succeeded | succeeded | succeeded |
-| `INSPECT_TOOLS`, flag off | rejected | rejected | rejected |
-
-With the flag set, a worker holding only `INSPECT_TOOLS` used `Write` — a tool
-absent from that allowlist — to create a file outside its cwd. With the flag
-absent, the CLI rejected every one of those attempts, naming the allowed
-working directory. **The working-directory boundary is real; the flag is what
-erases it.**
-
-A separate probe put the two together in the exact shape this feature ships —
-cwd set to a detached worktree, flag still on — and the worker overwrote a
-tracked file in the real checkout *and* committed on its branch. That is the
-result behind L2's caveat below.
-
-**L2 — they run in a disposable worktree.** A detached worktree per run, reset
-to the checkout's HEAD on entry (`scripts/planning-worktree.sh`). Note the
-ordering dependency: probed in the *exact* configuration of cwd = detached
-worktree with the flag still set, the worker overwrote the real checkout and
-committed on the branch anyway. **L2 is worth nothing without L1** — a
-worktree is not a boundary, it is where the boundary lands once L1 restores
-one.
+**L2 — they run in a disposable worktree.** A detached worktree per run,
+reset to the checkout's HEAD on entry (`scripts/planning-worktree.sh`).
+**L2 is worth nothing without L1** — a worktree is not a boundary, it is
+where the boundary lands once L1 restores one (confirmed by the probe
+above: with the flag on, the worktree did not stop the checkout being
+overwritten).
 
 **L3 — the operator's escape hatch, re-expressed.** The flag's documented
-purpose was always tooling visibility, "repositories where the planner needs
-`pnpm`/`tsc`/`vitest`" — never write access; write access was collateral, and
-the collateral is what rewrote a branch. `--dangerously-skip-permissions` now
-*widens the allowlist* with the repo's own declared build/lint/test verbs
-(`_widen_inspect_tools`) instead of bypassing permissions. The planner gets its
-tooling; the boundary stays.
-
-The residual is real and is not hidden: a build verb runs arbitrary code, so an
-allowlisted `pnpm`/`node`/`python3` can write outside the cwd. Measured — with
-permissions on and `python3` allowlisted, `python3 -c "open('<outside>','w')"`
-succeeded while the `Write` tool aimed at the same path was rejected. This is a
-strictly narrower hole than the flag it replaces, and L4 covers it.
+purpose was always tooling visibility ("repositories where the planner
+needs `pnpm`/`tsc`/`vitest`"), never write access — write access was
+collateral, and the collateral is what rewrote a branch.
+`--dangerously-skip-permissions` now *widens the allowlist* with the repo's
+own declared build/lint/test verbs (`_widen_inspect_tools`) instead of
+bypassing permissions. The planner gets its tooling; the boundary stays.
+The residual is real: a build verb runs arbitrary code, so an allowlisted
+`pnpm`/`node`/`python3` can still write outside the cwd (measured:
+`python3 -c "open('<outside>','w')"` succeeded while `Write` at the same
+path was rejected) — a strictly narrower hole than the flag it replaces,
+and L4 covers it.
 
 **L4 — the sentinel, which is the actual guarantee.** `_snapshot_repo_state`
 records the real checkout's HEAD, porcelain status and refs before phase 1;
-`_assert_repo_unchanged` re-checks after every planning phase and `die()`s on
-any delta. Same discipline as `check_rebaser_worktree_state` — trust the
-worker, then mechanically re-check the claim — and run per-phase rather than
-once at the end so it fires within one worker of the damage. Untracked files
-are compared deliberately: `_preflight_repo`'s clean-tree gate filters `??`
-lines, so a worker *creating* files is precisely what it cannot see.
+`_assert_repo_unchanged` re-checks after every planning phase and `die()`s
+on any delta — same discipline as `check_rebaser_worktree_state` (trust the
+worker, then mechanically re-check the claim), run per-phase so it fires
+within one worker of the damage. Untracked files are compared deliberately,
+since a worker *creating* files is exactly what a clean-tree `??`-filtered
+gate cannot see.
 
-What this does **not** achieve, stated plainly: kernel-level confinement.
-`/work` is a read-write bind mount in the same container for the whole run, and
-nothing short of a read-only mount or a separate uid would make a determined
-worker unable to reach it. L1–L3 make the escape unlikely; L4 makes it loud.
+Stated plainly, this does **not** achieve kernel-level confinement: `/work`
+is a read-write bind mount in the same container for the whole run, and
+nothing short of a read-only mount or a separate uid stops a determined
+worker. L1–L3 make the escape unlikely; L4 makes it loud.
 
-A further enforcement layer sits underneath all four, and is the one that holds
-even for `autonomous` workers, which *do* still carry the permission bypass:
-`DISALLOWED_TOOLS` is passed via `--disallowedTools` on every `claude -p`
-invocation that starts a session. (The sole exemption is
-`_append_system_prompt_file_supported`'s capability probe, which passes empty
-stdin and exits before any model call — `tests/test_claude_argv_containment.py`
-encodes it as the one allowed hand-rolled argv.) Unlike `--allowedTools`
-(permission-tier, bypassed by `--dangerously-skip-permissions`),
-`--disallowedTools` with bare tool names
-removes tools from the model's context entirely — the model cannot see or call
-them regardless of permission mode. The deny list targets tools that spawn
-untracked parallel work or set timers the orchestrator cannot track: `Agent`,
-`SendMessage`, `ScheduleWakeup`, `CronCreate`, `CronDelete`, `CronList`,
-`RemoteTrigger`, `PushNotification`, plus (corpus measurement) `Workflow`,
-`ReportFindings`, `Skill`, `Monitor`, `TaskCreate`, `TaskGet`, `TaskList`,
-`TaskUpdate`, `TaskOutput`, `TaskStop`, `ListAgents`, `EnterWorktree`,
-`ExitWorktree`, `DesignSync`, and `ToolSearch`, plus `Task` and the three MCP-resource
-tools (`ListMcpResourcesTool`, `ReadMcpResourceTool`, `ReadMcpResourceDirTool`). This
-is the §12-correct direction: a mechanical code-side deny that survives the permission
-escape hatch.
+A further layer sits underneath all four and holds even for `autonomous`
+workers, which still carry the permission bypass: `DISALLOWED_TOOLS` via
+`--disallowedTools` on every session-starting `claude -p` invocation (the
+sole exemption is the capability probe, which passes empty stdin and exits
+before any model call). Unlike `--allowedTools` (permission-tier, bypassed
+by the flag), `--disallowedTools` with bare tool names removes tools from
+the model's context entirely, regardless of permission mode. The deny list
+targets tools that spawn untracked parallel work or set timers the
+orchestrator cannot track (`Agent`, `SendMessage`, `ScheduleWakeup`,
+`CronCreate`/`Delete`/`List`, `RemoteTrigger`, `PushNotification`, plus
+corpus-measured additions like `Workflow`, `Skill`, `Monitor`, the `Task*`
+family, `Task` itself, and the three MCP-resource tools) — a mechanical
+code-side deny that survives the permission escape hatch.
 
 #### Acting-worker isolation — the same deny, scoped to a path
 
-L1–L4 above are scoped to `PLANNING_WORKER_TYPES`. Before this change acting
-workers (implementer, conformer, integrator, rebaser) had **only L2**, and this
-section already states what that is worth: *L2 is worth nothing without L1*.
-They cannot be given L1 — writing files unprompted is the job — so
-`claude_p` appends `--dangerously-skip-permissions` on `autonomous` alone,
-and the working-directory boundary is gone for the whole execute phase.
+L1–L4 above are scoped to `PLANNING_WORKER_TYPES`. Acting workers
+(implementer, conformer, integrator, rebaser) had only L2, and *L2 is worth
+nothing without L1*: they cannot be given L1 (writing files unprompted is
+the job), so `claude_p` appends `--dangerously-skip-permissions` on
+`autonomous` alone and the working-directory boundary is gone for the whole
+execute phase. Measured across the state-dir corpus: 146 `Edit`/`Write`
+calls whose `file_path` was under the user's real checkout (36 runs, 4
+repos, 8.8% of runs then present) — the judgment-worker share of the same
+measurement stopped dead at 0.25.0 (proof L1 works), the acting-worker
+share did not.
 
-Measured, by parsing `tool_use` blocks out of every run log in the state
-root: **146 `Edit`/`Write` calls whose `file_path` was under the user's real
-checkout, across 36 runs, 4 repos and 13 leerie versions** — 8.8% of the 411
-runs then present, leerie's own checkout among them. (Measured 2026-08-20
-across every state dir; the corpus grows with every run, so this is a dated
-measurement rather than a constant.) The judgment-worker share of that
-(`classifier` ×11, `planner-*` ×11) stops dead at 0.25.0, which is the
-evidence L1 works; the acting-worker share does not.
+The fix reuses the same insight — deny rules survive the bypass — scoped to
+a path rather than a bare tool name. `_repo_write_denials(repo_root,
+run_dir)` renders `Edit(//<root>/**)` (`//` is the CLI's anchor for an
+absolute path) and `claude_p` appends it to `DISALLOWED_TOOLS` per call,
+derived from `repo_root` rather than hard-coding `/work` so it cannot
+silently guard nothing if the mount moves. It denies both the given path
+and its realpath when they differ, since `repo_root` is a host path (not
+`os.getcwd()`) for `run_rebaser`/`run_recapture_deps`, which run against a
+real user checkout whose path may contain a symlink. Probed live: with no
+path deny, writes outside cwd succeed; with the deny in place, writes
+outside cwd are rejected while writes inside cwd still succeed (containment
+that also broke a worker's own worktree would be useless). `Edit(...)`
+subsumes `Write`, `NotebookEdit`, `MultiEdit`, and covers `sed -i` (the CLI
+models that as an edit).
 
-The fix reuses the insight already stated above — deny rules survive the
-bypass — but scoped to a path rather than a bare tool name.
-`_repo_write_denials(repo_root, run_dir)` renders `Edit(//<root>/**)`, where
-`//` is the CLI's anchor for an absolute filesystem path, and `claude_p`
-appends it to `DISALLOWED_TOOLS` per call. It is derived from `repo_root`
-rather than hard-coding `/work`, so it cannot silently guard nothing if the
-mount moves.
+**The residual, measured rather than assumed.** Bash is not covered by a
+file-tool deny — a shell redirect, `rm -f`, `touch`, `mkdir -p` all still
+write to the denied path, and the corpus shows real Bash writes and `cd
+/work` invocations inside the user's checkout. So **L4 now runs during
+execute too**, after every wave, closing the phase that previously had no
+check at all — passing `porcelain_only` (dropping HEAD/ref comparisons,
+since the execute phase runs for hours and an operator legitimately pulls
+their own checkout mid-run; a `HEAD moved` false alarm there is worse than
+the escape). Its own blind spot: `git status --porcelain` never lists
+gitignored paths, so in-checkout `node_modules/` installs stay invisible —
+closing that needs the underlying motive fixed (a worktree with no
+dependencies), not a wider guard.
 
-It denies **both** the given path and its realpath when they differ. The CLI
-matches the pattern against the path the worker was handed, not its realpath,
-and `repo_root` is `os.getcwd()` only for the in-container orchestrator —
-`run_rebaser` (`scripts/host-finalize.sh`) and `run_recapture_deps` (the
-launcher's `config --recapture` arm) take it as a parameter and receive the
-host's `$USER_REPO`. The rebaser is `autonomous` with `ACT_TOOLS`, i.e. exactly
-this worker class, running against a real user checkout whose path may contain
-a symlink; denying only the resolved form would leave that silently uncovered.
+**Two further non-coverages, recorded rather than hidden.** The denial is
+skipped when run state lives inside the checkout (`resolve_leerie_root`
+falling back to `repo_root / ".leerie"` when `LEERIE_STATE_DIR` is unset —
+the direct-invocation/test path; the launcher always sets
+`/leerie-state`), since a blanket deny there would deny each worker its own
+worktree; `_repo_write_denials` returns `""` in that layout and logs once,
+since silent false confidence would be worse. And the remote integrator
+(`scripts/remote/collect-subtrees.sh`) cannot import the orchestrator, so
+it carries its own duplicated deny list (like its duplicated
+`SCHEMAS["integrator"]`) — its blast radius is the seeded machine and the
+branch it pushes, not the laptop, which is the argument against adding a
+third copy of a value the orchestrator owns.
 
-Probed live (claude 2.1.237, cwd a worktree, flag ON, ground truth from the
-filesystem — same methodology as the L1 table):
+`Task` is the live CLI's name for subagent spawning, `Agent` the retired
+one — until `Task` was added, the "no subagent spawning" constraint (§2,
+Constraint 1) was enforced only against a name current builds no longer
+ship (found in the preflight smoke test's own then-uncontained surface;
+contained workers never leaked it, so this entry is defense-in-depth).
 
-| configuration | write outside cwd | write inside cwd |
-|---|---|---|
-| no path deny | succeeded | succeeded |
-| `Edit(//<root>/**)` denied | **rejected** | succeeded |
+**A plain file writer does not belong on this list**, which is why
+`NotebookEdit` is classified into `ACT_TOOLS` rather than denied — denying
+it would not have closed the original leak (the escape was `Bash`, not
+`NotebookEdit`), and the deny list is a single global constant, so denying
+a writer would remove it from every acting worker in every repo while
+`Bash`/`Write`/`Edit` stayed allowed regardless.
 
-The second column is load-bearing: containment that also broke a worker's own
-worktree would be useless. `Edit(...)` subsumes `Write`, `NotebookEdit` and
-`MultiEdit`, and the same probe showed it also covering `sed -i` — the CLI
-models that as an edit.
-
-**The residual, measured rather than assumed.** With the rule in place, a
-shell redirect, `rm -f`, `touch` and `mkdir -p` all still wrote to the denied
-path; Bash is not covered by a file-tool deny. The corpus shows this is not
-hypothetical — 48 Bash commands writing directly to a `/work` path across 22
-runs, and 1,328 `cd /work` invocations across 87 runs, including 16 dependency
-installs and 105 build/test runs inside the user's checkout (measured
-2026-08-20 across every state dir). So **L4 now runs during execute too**,
-after every wave, closing the phase that previously had no check at all.
-
-The execute-phase call passes `porcelain_only`, dropping the HEAD and ref
-comparisons. Planning phases take minutes; the execute phase runs for hours
-(p90 285 min, n=87), and an operator legitimately pulls their own checkout
-mid-run. `HEAD moved` would then be a correct observation about an innocent
-act, and killing a five-hour run over it is worse than the escape — a guard
-that cries wolf gets switched off. File mutation is the damage class that
-matters.
-
-Its own blind spot, stated rather than assumed away: `git status --porcelain`
-never lists gitignored paths, so the in-checkout `node_modules/` installs
-above remain invisible to it. Closing that needs the motive fixed — workers
-reach into `/work` because their worktree has no dependencies — not a wider
-guard.
-
-**Two further non-coverages, recorded for the same reason.**
-
-*The denial is skipped when run state lives inside the checkout.*
-`resolve_leerie_root` falls back to `repo_root / ".leerie"` whenever
-`LEERIE_STATE_DIR` is unset — the direct-invocation and test path; the
-launcher always sets `/leerie-state`. Worker worktrees then sit *inside* the
-checkout, and a blanket deny under it would deny each worker its own worktree,
-failing every implementer silently. A deny rule cannot carry a carve-out (deny
-wins in every mode, and allow rules are inert under the bypass), so
-`_repo_write_denials` returns `""` in that layout and `log()`s once saying so.
-Silence there would be the worse failure: an operator would believe acting
-workers are confined when they are not.
-
-*The remote integrator does not carry it.* `scripts/remote/collect-subtrees.sh`
-invokes `claude -p` directly from bash — it cannot import the orchestrator, so
-it carries its own duplicated deny list, the same reason it embeds a copy of
-`SCHEMAS["integrator"]`. It is sourced only on the flyctl transport path, where
-`/work` is a *seeded copy* of the developer's tree rather than the developer's
-checkout, so the blast radius is the machine and the branch it pushes, not the
-laptop. Adding the rule there means a third copy of a value the orchestrator
-owns; the schema duplication next door has already drifted in production once,
-which is the argument against a fourth.
-
-`Task` is the live CLI's name for subagent spawning; `Agent` is the retired one, so
-until `Task` was added the "no subagent spawning" constraint (§2, Constraint 1) was
-enforced only against a name current builds no longer ship. It was measured in the
-preflight smoke test's own (then uncontained) surface; contained workers never reported
-it, which makes the entry defense-in-depth rather than a fix for an observed leak.
-
-**A plain file writer does not belong on this list**, which is why `NotebookEdit` is
-classified into `ACT_TOOLS` rather than denied. The tempting argument for denying it —
-that `--allowedTools` is only a permission tier, so a judgment worker can reach a writer
-anyway — was true while the escape hatch handed those workers the flag, and that
-is precisely the hole L1 closes: judgment workers are never `autonomous` and can
-no longer receive `--dangerously-skip-permissions` at any setting, so the
-allowlist holds for them unconditionally rather than only by default. Note the
-conclusion here was right for the wrong reason and survives the correction
-intact — denying a writer would not have helped either, because the escape was
-`Bash`, not `NotebookEdit`. Meanwhile the deny list is
-a single global constant, so denying a writer removes it from every acting worker in
-every repository leerie is pointed at, and `Bash`/`Write`/`Edit` — the same class — stay
-allowed regardless, so the deny never produced the read-only property it was justified
-by. `NotebookEdit` is therefore classified into `ACT_TOOLS` alongside `Write` and `Edit`.
-
-**Containment comes from one builder, not from each call site remembering it.** Every
-session-starting `claude -p` argv the *orchestrator* constructs is produced by
-`_contained_claude_argv` (the capability probe above being the one exemption),
-so a new call site inherits the deny list and `--strict-mcp-config` by construction. One
-site is necessarily outside that: `scripts/remote/collect-subtrees.sh` invokes the CLI
-directly on a remote machine and cannot import the orchestrator, so it duplicates both
-tool lists as shell constants, guarded for drift by
-`tests/test_collect_subtrees_integrator_schema.py` — the same arrangement the integrator
-schema already uses. This replaces a per-site discipline that had already failed: the
-change that introduced `--strict-mcp-config` audited the invocation sites by hand, fixed
-that shell one and missed the Python one — `preflight`'s smoke test — which then ran with
-the CLI's full default surface. Measured on one such run: 78 tools and 4 MCP servers, of
-which 46 were `mcp__claude_ai_*` (`send_message`, `forward`, `trash_thread`,
-`slack_send_message` among them). The same audit also left `--disallowedTools` off the
-shell integrator entirely. A derived test (`tests/test_claude_argv_containment.py`) now
-enforces the rule across the orchestrator module and `scripts/**/*.sh` rather than naming
-the sites.
+**Containment comes from one builder, not from each call site remembering
+it.** Every session-starting `claude -p` argv the orchestrator constructs
+goes through `_contained_claude_argv` (the capability probe is the one
+exemption), so a new call site inherits the deny list and
+`--strict-mcp-config` by construction. This replaces a per-site discipline
+that had already failed once: introducing `--strict-mcp-config` was audited
+by hand, fixed the shell integrator, and missed `preflight`'s smoke test,
+which then ran with the CLI's full default surface (measured: 78 tools, 4
+MCP servers, 46 `mcp__claude_ai_*` including `send_message`,
+`slack_send_message`) — and left `--disallowedTools` off the shell
+integrator entirely. `tests/test_claude_argv_containment.py` now derives
+and enforces the rule across the module and `scripts/**/*.sh` rather than
+naming call sites by hand.
 
 ### Instruction adherence is code-enforced
 
@@ -7700,81 +6412,51 @@ deterministic signal, not trusted as an unconditional self-report.
 
 ### Language-to-JSON: natural-language interpretation is never regex
 
-A second sibling principle, made explicit by the same incident review: **all
-interpretation of natural language is done by an LLM worker, returned as
-schema-validated structured JSON — never by pattern-matching or hand-parsing
-prose in the orchestrator.** Python operates only on already-structured
-data: set membership, string equality on typed fields, arithmetic. It never
-infers meaning from prose.
+A second sibling principle: **all interpretation of natural language is
+done by an LLM worker, returned as schema-validated structured JSON —
+never by pattern-matching or hand-parsing prose in the orchestrator.**
+Python operates only on already-structured data: set membership, string
+equality on typed fields, arithmetic. It never infers meaning from prose.
 
-This is the input-side twin of the worker-output contract already
-established in §7 and re-stated at the top of this section — a worker's
-*output* must be schema-validated JSON before the orchestrator acts on it.
-The same discipline applies symmetrically to a worker's *input* processing:
-if a check needs a fact that only exists in natural language (does the task
-prescribe a specific command; does a subtask's own description reference a
-sibling's output), the fact is extracted by the LLM that already reads that
-prose, returned as a structured field, and the orchestrator's code compares
-structured fields to structured fields. A regex over task text, planner
-prose, or a worker's free-text response is not a shortcut — it is a
-model of natural-language understanding written by hand, and it fails
-exactly the way §12 predicts anything unverified-by-code fails: silently,
-on inputs the author didn't anticipate. Regex remains legitimate only where
-the string being matched is itself mechanical rather than natural language —
-a semver, a shell command, a fixed CLI output string, a file path — never
-prose a human wrote to communicate intent.
+This is the input-side twin of the worker-output contract in §7 — a
+worker's *output* must be schema-validated JSON before the orchestrator
+acts on it, and the same discipline applies to a worker's *input*
+processing. If a check needs a fact that only exists in natural language
+(does the task prescribe a specific command; does a subtask's own
+description reference a sibling's output), the fact is extracted by the
+LLM that already reads that prose, returned as a structured field, and the
+orchestrator's code compares structured fields to structured fields. A
+regex over task text, planner prose, or a worker's free-text response is
+not a shortcut — it is a hand-written model of natural-language
+understanding, and it fails silently on inputs the author didn't
+anticipate. Regex remains legitimate only where the string being matched
+is itself mechanical rather than natural language — a semver, a shell
+command, a fixed CLI output string, a file path — never prose a human
+wrote to communicate intent.
 
-This principle was not observed cleanly from the start: a targeted audit
-found several orchestrator sites that regexed natural-language prose (task
-text, planner intent, README/markdown section headings) to infer meaning
-from it, a pre-existing violation of the same class this section exists to
-prevent. Those sites have since been migrated: the task-file coverage
-harvest is deleted outright (coverage judgment now belongs entirely to
-`task_coverage_judge`, an LLM worker — see §"Task-referenced file
-extraction"), the migration-surface signal reads a planner-schema field
-instead of regexing `intent`/`investigation_notes` (see §"Migration-surface
-completeness"), the README
-section pre-filter is gone in favor of an unfiltered size-bounded slice the
-provision worker judges itself, and PHANTOM_ARTIFACT reads a structured
-`artifact_paths` field instead of hand-parsing the `artifact` prose label
-(see §5 *Cross-domain surface overlap*). The principle governing new work
-is stated here so no new site repeats the pattern.
+An earlier audit found several orchestrator sites that violated this by
+regexing natural-language prose (task text, planner intent,
+README/markdown headings). All have since been migrated to LLM-worker
+extraction: the task-file coverage harvest, the migration-surface signal
+(now a planner-schema field), the README section pre-filter, and
+`PHANTOM_ARTIFACT` (now reads a structured `artifact_paths` field — see §5
+*Cross-domain surface overlap*).
 
 ### Opus-judgment, sonnet-workhorse (historical) — now sonnet for both
 
-A third sibling principle **used to** apply, with direct empirical support
-from an incident investigation: **a worker that makes a *decision* —
-classify, plan, reconcile, judge, verify, gate — defaults to the stronger
-judgment model tier; a worker that *does* the work — implement, conform,
-write a PR — defaults to the faster workhorse tier.** This was the
-implemented default split (classifier, planner, reconciler,
-`plan_overlap_judge`, provision, integrator, `fit_judge`, splitter all
-defaulted to the judgment tier; implementer, conformer, and the PR writer
-defaulted to the workhorse tier).
-
-The original evidence was direct, not assumed: the same adherence-judge
-prompt, run against the same incident plan, produced **opposite verdicts**
-on the two model tiers available at the time. On the workhorse tier the
-judge caught the incident but also condemned a legitimate plan it was
-shown as a false-positive control — a coin flip dressed as judgment. On
-the judgment tier, the same prompt correctly separated the two: low score
-on the incident, high score on the legitimate control. That gap was real
-for the model generation it was measured on.
-
-**This finding is superseded for Sonnet 5.** Sonnet 5's judgment quality on
-these same decision-shaped tasks has been externally verified to match
-Opus 4.8 — the tier that was the working judgment baseline — closing the
-gap that motivated the split. The standing rule is now: **every worker,
-judgment or workhorse, defaults to Sonnet 5.** (`implementer` and
-`conformer` additionally default to `low` reasoning effort — see
-IMPLEMENTATION.md §2 "Effort selection" — but that is a separate,
-cost-motivated effort-tier decision, not a model-tier one.)
-
-This section is retained as the historical record of *why* the
-judgment/workhorse model split existed, and as a reference point should a
-future model swap reopen the same question: if a verdict-flip-with-tier
-regression is ever observed again, re-run this same adherence-judge
-incident/control pair before reintroducing a tier split.
+Judgment workers (classify, plan, reconcile, judge, verify, gate) and
+workhorse workers (implement, conform, write a PR) both default to
+Sonnet 5. This was not always true: an earlier model generation showed the
+same adherence-judge prompt produce opposite verdicts on the judgment vs.
+workhorse tier for the same input, which required pinning judgment workers
+to the stronger tier. Sonnet 5's judgment quality on these decision-shaped
+tasks has been externally verified to match the prior judgment-tier
+baseline, closing that gap — so the split no longer applies. (`implementer`
+and `conformer` additionally default to `low` reasoning effort — a
+separate, cost-motivated decision; see IMPLEMENTATION.md §2 "Effort
+selection".) If a verdict-flip-with-tier regression is ever observed again
+on a future model swap, re-run the adherence-judge incident/control pair
+before reintroducing a tier split.
 
 ---
 
@@ -7875,86 +6557,61 @@ the *principle* — correctable-mistake versus broken-worker — is the design.
 ### Budget feasibility — fail fast at the cheapest moment
 
 `max_total_workers` is a hard ceiling on the number of `claude -p`
-invocations a single run may spawn. The cheap, late check is
-`State.bump_workers()` — it raises `WorkerError` the moment the
-counter would exceed the cap. That check is necessary as a backstop,
-but it fires *during execution*, after some — sometimes most — of the
-run's compute has already been spent. A 63-subtask run against a cap of
-200 (the default before N4 raised it to 2000) cannot finish; the late
-check discovers this around
-subtask 38, leaving the run branch with the first few waves' worth of
-integrated commits and the rest unrunnable.
+invocations a single run may spawn. The late check, `State.bump_workers()`,
+raises `WorkerError` the moment the counter would exceed the cap — a
+necessary backstop, but it fires *during execution*, after some or most of
+the run's compute is already spent, discovering infeasibility mid-run and
+leaving only a partial set of integrated waves.
 
-The corresponding *early* check belongs at the plan/execute boundary.
-By the time `_schedule()` returns its `(subtasks, waves)` pair, every
-unknown that determines how much budget the rest of the run will
-consume is resolved: the final subtask count is fixed, the wave count
-is computed (deterministically, by Kahn's algorithm over the
-dependency graph — no LLM call), the planner-domain count is settled,
-and every upstream phase has already been billed into `worker_count`
-— classify, provision, plan, reconcile, overlap-judge, *and* the
-per-subtask phases that are easy to forget: the P1 decomposition
-(`fit_judge` / `splitter`) and the phase-3 `satisfied_probe`. Those
-two are often the *majority* of upstream spend: one measured run
-billed 10 `fit_judge` + 10 `satisfied_probe` calls out of 25 total. A
-feasibility check at this point can estimate the remaining cost
-(implementer + conformer per subtask, integrator per wave, finalize)
-with no free variables beyond the per-subtask call multiplier, which
-is well-bounded empirically.
+The corresponding *early* check runs once at the plan/execute boundary. By
+the time `_schedule()` returns its `(subtasks, waves)` pair, every unknown
+that determines remaining budget is resolved: subtask count is fixed, wave
+count is computed deterministically (Kahn's algorithm, no LLM call), and
+every upstream phase — including the easy-to-forget per-subtask ones (P1
+decomposition's `fit_judge`/`splitter`, phase-3 `satisfied_probe`) — is
+already billed into `worker_count`. A feasibility check here estimates the
+remaining cost (implementer + conformer per subtask, integrator per wave,
+finalize) with no free variables beyond an empirically-bounded
+per-subtask call multiplier.
 
-**A re-plan needs its own preflight.** The gate above runs *once*, after
-`_schedule()`. But a gate that re-plans (`phase_adherence_gate`,
+**A re-plan needs its own preflight.** The gate above runs once, after
+`_schedule()`. A gate that re-plans (`phase_adherence_gate`,
 `phase_planning_coverage_gate`) authorises the single largest budget event
-in a run, and did so with no budget check at all. A re-plan is also far more
-expensive than "re-running the planners": `phase_plan` re-runs the entire P1
-decomposition behind them, and that decomposition is the larger half.
-Measured on run `d8a764f3…`, `fit_judge` was 118 of 201 spawns (59%) against
-the planners' 62 (31%), and the adherence-gate re-plan cost ~125 of 201 —
-almost twice the entire first planning pass, against a subtask set the
-re-plan itself had inflated 35 → 65. The run then died of budget exhaustion
-mid-decomposition, having written no code and produced nothing recoverable.
-
-So `check_replan_affordable` runs before each re-plan, projecting the
-re-plan's cost from the domain count and the *already-known* subtask count
-(the decomposition term dominates, so subtask count is what it scales on) and
-`die()`ing early when it cannot fit. Dying at the gate costs nothing and names
-the real cause; dying at the worker cap costs the whole run. It honours the same
-`skip_budget_check` opt-out, and `State.bump_workers()` remains the
-load-bearing backstop either way.
+in a run — `phase_plan` re-runs the entire P1 decomposition, which
+historically dominates total spend — and previously ran with no budget
+check at all, able to exhaust the cap mid-decomposition with no code
+written and nothing recoverable. `check_replan_affordable` now runs
+before each re-plan, projecting its cost from the domain count and the
+already-known subtask count (the term the decomposition cost scales on)
+and `die()`ing early when it cannot fit. Dying at the gate costs nothing
+and names the real cause; dying at the worker cap costs the whole run. It
+honours the same `skip_budget_check` opt-out, with `State.bump_workers()`
+remaining the load-bearing backstop either way.
 
 **Why the gate cannot move earlier, even though the satisfied-probe
 spends first.** The probe runs before `_schedule()`, so its per-subtask
-calls are billed before this gate can fire — which reads oddly against
-"cheapest moment". Moving the gate earlier, or adding a pre-probe
-guard, was measured and rejected: the probe *drops* subtasks, and
-`_schedule()` merges the post-drop plans, so anything running before it
-sees a **pre-drop** count. Measured across real runs, drops shrink a
-plan by a median ~32% (up to 50%), so a pre-probe guard systematically
-over-estimates and would abort runs the real gate passes — a sweep
-found 29 such configurations. A guard conservative enough to be safe
-(assume every subtask is dropped) only fires when upstream spend alone
-nearly exhausts the cap, which is almost never. The ordering is
-therefore deliberate: the gate accepts the probe's spend as the price
-of an accurate post-drop estimate. The `WorkerError` backstop still
-bounds the run either way.
+calls are billed before this gate can fire. Moving the gate earlier was
+considered and rejected: the probe *drops* subtasks and `_schedule()`
+merges the post-drop plans, so anything running before it sees a
+pre-drop, systematically inflated count — a guard conservative enough to
+be safe there would only fire when upstream spend alone nearly exhausts
+the cap, which is almost never. The ordering is deliberate: the gate
+accepts the probe's spend as the price of an accurate post-drop estimate.
+The `WorkerError` backstop still bounds the run either way.
 
-The principle is the same one §12 enumerates: any guarantee that
-matters and can be checked mechanically lives in code. The runtime
-`WorkerError` will remain — a worker that goes wildly over its
-expected call count must still hit a wall — but it stops being the
-*primary* discovery mechanism for "this run was unwinnable from the
-start." Fail-fast at planner-output time saves the most compute (the
-implementers and conformers have not yet been spawned) and surfaces
-the actionable fix (a recommended `--max-workers` value, or a hint to
-split the task) at the moment the user can still trivially apply it.
+This is the §12 principle applied: a mechanically-checkable guarantee
+lives in code. `WorkerError` remains the ultimate backstop, but fail-fast
+at planner-output time saves the most compute (implementers/conformers
+have not yet been spawned) and surfaces the actionable fix — a
+recommended `--max-workers`, or a hint to split the task — while the user
+can still trivially apply it.
 
-The estimate is intentionally conservative — it covers the worst
-observed per-subtask ratio plus a safety margin — and exposes a
-documented escape hatch (`--skip-budget-check`) for runs whose
-operator knows the conformer phase will degrade heavily to advisory
-warnings or otherwise come in under the estimate. The escape hatch
-matches the same precedence chain as `--skip-smoke` and
-`--skip-overlap-judge`: a deliberate opt-out, not a default.
+The estimate is intentionally conservative (worst observed per-subtask
+ratio plus margin), with a documented escape hatch
+(`--skip-budget-check`, same precedence chain as `--skip-smoke` and
+`--skip-overlap-judge`) for operators who know the conformer phase will
+degrade heavily to advisory warnings or otherwise come in under the
+estimate.
 
 **This gate firing is not a dead end.** Because `_schedule()`'s output is
 one of the per-phase planning checkpoints (§6 *Resumable planning*), a
@@ -8194,93 +6851,48 @@ what the architecture can guarantee.
 ## 16. Verification status
 
 A design document should be honest about how much of the system has been
-*demonstrated* to work, as opposed to *reasoned* to work. The distinction is
-the first thing anyone running Leerie needs.
+*demonstrated* to work, as opposed to *reasoned* to work.
 
-**Demonstrated.** The deterministic scaffolding has been exercised. The git
-worktree mechanics — branch setup, per-subtask worktrees, wave-to-wave
-dependency layering, conflict detection, finalization, cleanup — have been run
-against real repositories. The orchestrator's control flow — classification,
-planning, scheduling, wave execution, integration, validation, finalize, and
-resume — has been exercised end to end against a stubbed worker, including the
-failure and retry paths. The deterministic enforcement points have unit tests.
+**Demonstrated.** The deterministic scaffolding: git worktree mechanics
+(branch setup, per-subtask worktrees, wave-to-wave dependency layering,
+conflict detection, finalization, cleanup) against real repositories; the
+orchestrator's control flow (classification, planning, scheduling, wave
+execution, integration, validation, finalize, resume) end to end against a
+stubbed worker, including failure/retry paths; the deterministic
+enforcement points have unit tests.
 
-**Not demonstrated.** No worker has been run against a live model. The contract
-with the headless CLI is taken from documentation, not from observed behavior;
-first contact with the real CLI is the genuine test. The behavioral quality of
-the workers — whether the evidence gates, the handoff, and the conflict
-resolution actually work as intended — cannot be known until the prompts run
-against a live model. The deterministic surface is sound by construction and
-by test; the worker behavior is the unverified surface.
+**Not demonstrated as a matter of principle.** The behavioral quality of
+workers — whether the evidence gates, handoff, and conflict resolution
+work as *intended* rather than merely as *coded* — is inherently
+unverifiable by inspection; it can only be observed by running the prompts
+against a live model and reading the outcome. The deterministic surface is
+sound by construction and by test; worker behavior is validated by
+production usage over time, not by this document.
 
-Two parts of the surface described in this document are *new* and have not
-yet been exercised end-to-end: the per-run namespacing (run-id derivation,
-`<state-root>/runs/<run-id>/` layout, parallel-run coexistence, multi-run
-resume), and the push-and-PR finalization step (`gh pr create`, run.json
-sidecar with `pushed_at`/`pr_url`/error fields, `--no-push` and
-`--no-verify`). The single-run, local-finalize design described in earlier
-revisions of this document has been exercised; the broader design here
-becomes verified only after the corresponding code lands and a first run
-exercises it.
+Remote-mode features (`--runtime fly`, git-aware host-to-machine seeding,
+stream-back finalize, remote pause-on-failure) stack on the host-side
+finalize path in §6 *Finalization* and depend on the run-branch-as-
+durable-record contract; the local-mode finalize path is the foundation
+they build on.
 
-Remote-mode features stack on the host-side finalize path described
-in §6 *Finalization*. `--runtime fly` provisioning, git-aware
-host-to-machine seeding, stream-back finalize (sync-before-destroy),
-and remote pause-on-failure all depend on the run-branch-as-durable-
-record contract. Verifying them
-end-to-end requires the local-mode finalize to be exercised first;
-stacking new features on an unproven foundation is the failure mode
-this section is meant to surface.
-
-Chain orchestration (§19) is implemented as a **laptop-side wave
-sequencer** and **not yet observed in a live deploy**. The
-architecture is described in §19: each `leerie chain` submission
-runs a foreground bash loop on the laptop that, per wave, fans out
-N background `./leerie --runtime fly` invocations (one per prompt
-file) and waits for all to finalize on the laptop via the existing
-single-run path (`provision_machine` → `seed-auth.sh` →
-`seed-repo.sh` → orchestrator → `decide_teardown` →
-`fetch_branch` → `host_finalize` → `destroy_machine`). Between
-waves, the laptop runs `chain.git_ops.synth_merge_branches` against
-`$USER_REPO` to build the next wave's staging branch and pushes it
-to origin.
-
-The launcher's `chain` verb is wired end-to-end. The ID-dispatched
-single-run verbs (`status`, `stop`, `kill`, `resume`, `finalize`,
-`attach`, `list chains`) operate on chains by iterating
-`$LEERIE_STATE_HOST_DIR/runs/*/run.json` filtered by the `chain_id`
-field, dispatching the existing single-run verb per discovered run.
-The five deprecated dash-prefixed chain aliases have been
-hard-removed — there is no shim.
-
-**GitHub credentials are never on a Fly machine.** Each per-job
-`host_finalize` runs on the laptop using the user's `gh auth` and
-`~/.git-credentials` — identical to today's single-run flow.
-Workers have no GitHub credentials by construction
-(`scripts/remote/seed-auth.sh:149-158` excludes them from the seed
-tar). The earlier v3/v4 design that placed a coordinator on Fly
-with `GH_DISPATCH_PAT` has been removed in favor of this
-laptop-only model.
-
-Verification today is purely unit-level: the chain subsystem's
-behavior is mechanically tested across `tests/test_chain_*` (about
-50 tests covering credential transport, git operations, ID-
-dispatched verb routing, and the wave-sequencer wave loop with
-stubs for the per-job `./leerie --runtime fly` invocation, git
-operations, and `chain.git_ops.synth_merge_branches`). Live-deploy
-verification — running an end-to-end chain against real Fly with
-real worker machines — has not been done. Under v7 Shape A there
-are no longer Fly coordinator failure modes (heartbeat staleness,
-coordinator-volume restart, stale-creds resume) to test; the
-relevant failure modes are now those of the underlying single-run
-`--runtime fly` path applied N times per wave (which the existing
-single-run tests + production usage already cover) plus two
-chain-specific ones: a wave-job failure (handled by the wave loop's
-`wait`-rc detection + paused-on-failure semantics inherited from
-`decide_teardown`) and a synth-merge conflict at a wave boundary
-(handled by `chain.git_ops.SynthMergeConflict` + the wave-loop
-chain-paused exit). Both chain-specific paths are unit-tested with
-stubs; neither has been observed in production.
+**Chain orchestration (§19)** is a laptop-side wave sequencer: each
+`leerie chain` submission runs a foreground bash loop that, per wave, fans
+out N background `./leerie --runtime fly` invocations and waits for each
+to finalize via the existing single-run path. Between waves, the laptop
+runs `chain.git_ops.synth_merge_branches` to build the next wave's staging
+branch and pushes it to origin. The launcher's `chain` verb and the
+ID-dispatched single-run verbs (`status`/`stop`/`kill`/`resume`/
+`finalize`/`attach`/`list chains`) are wired end-to-end, operating on
+chains by filtering `run.json` by `chain_id`. GitHub credentials are never
+on a Fly machine: each per-job `host_finalize` runs on the laptop using
+the user's `gh auth` and `~/.git-credentials`, and workers have no GitHub
+credentials by construction (`scripts/remote/seed-auth.sh:149-158`
+excludes them from the seed tar) — an earlier design that placed a
+coordinator machine on Fly holding a GitHub token has been removed in
+favor of this laptop-only model. Chain verification today is unit-level
+only (`tests/test_chain_*`, covering credential transport, git
+operations, verb routing, and the wave loop with stubs); an end-to-end
+run against real Fly worker machines has not been observed.
 
 **Recommended first step.** Run Leerie once on a throwaway repository with a
 small, fully-specified task before trusting it on real work.
@@ -8498,23 +7110,13 @@ laptop:
 
 ### Why this is the right scope for model judgment vs determinism
 
-Per-job behavior — classification, planning, implementation, healing —
-remains model-governed within each single run. The chain envelope is
-purely deterministic:
-
-- **Wave fan-out** is a bash for-loop, not a model decision.
-- **Inter-wave dependencies** are encoded in the `--wave` flag
-  ordering, not inferred by a model.
-- **Synth-merge** is `git merge --no-ff --no-edit` in
-  `chain.git_ops.synth_merge_branches`. A conflict is a bash exit
-  code, not a prompt instruction to "resolve conflicts carefully."
-- **Chain status** is a `jq` filter over run.json files, not a
-  model judgment.
-
-The task content passed to each per-job worker — what the leerie run
-should do — is a user-authored prompt file, and the worker's behavior
-is model-governed as in any single leerie run. That is the right
-scope for model judgment; the sequencing envelope around it is not.
+Per-job behavior stays model-governed within each single run, per §12's
+central principle. The chain envelope itself is purely deterministic: wave
+fan-out is a bash for-loop, inter-wave ordering comes from `--wave` flag
+order, synth-merge is `git merge --no-ff --no-edit`
+(`chain.git_ops.synth_merge_branches`, a conflict is a bash exit code), and
+chain status is a `jq` filter over `run.json` files. None of this is
+inferred or judged by a model.
 
 ### Relation to run-groups
 
@@ -8602,54 +7204,48 @@ The group layer adds four thin capabilities on top:
 
 ### Why the lean shape
 
-An alternative design would fold N repositories into one run: N run-branches
-in one state, a per-repo namespace inside `state.json`, a shared dependency
-graph that crosses repo boundaries. That design was rejected because it
-rewrites leerie's single most load-bearing invariant — the run-branch as the
-resume contract (§6). The resume guarantees, the per-run flock, and the flat
-state layout are all predicated on one run = one repo. Touching any of them
-risks cascading breakage across the entire orchestrator for a capability (
-cross-repo atomicity) that GitHub does not support anyway.
-
-The lean shape reaches the same user value — a coordinated, contract-accurate
-feature across two repos — because the value comes from the **shared plan**,
-not from atomic joint execution. Two PRs across two repos cannot merge
-atomically on GitHub regardless of design. Keeping each member as an ordinary
-run means resume, state, isolation, and finalize mechanics are untouched.
+The rejected alternative folds N repositories into one run — N run-branches
+in one state, a per-repo namespace inside `state.json`, a dependency graph
+crossing repo boundaries. That rewrites leerie's single most load-bearing
+invariant, the run-branch as the resume contract (§6): resume guarantees,
+the per-run flock, and the flat state layout are all predicated on one
+run = one repo, for a capability (cross-repo atomicity) GitHub doesn't
+support anyway — two PRs across two repos can never merge atomically
+regardless of design. The lean shape reaches the same user value through
+the **shared plan**, not atomic joint execution, so resume, state,
+isolation, and finalize mechanics stay untouched.
 
 ### State isolation is free
 
-Per-repo state isolation is a consequence of the existing basename-keyed state
+Per-repo state isolation falls out of the existing basename-keyed state
 directory design (§6 *Single owner per run dir*): a member that `cd`s into
-`../frontend` resolves `$HOME/.leerie/frontend/` independently of any sibling.
-The `.owner` sidecar guarantees that two concurrent members with distinct
-basenames never collide. The only guard the group launcher must add is a
-rejection of any `--state-dir` / `LEERIE_STATE_DIR` override that would pin
-all members to one shared directory — the same mechanism that works correctly
-for chains (one repo, shared dir is correct) would produce a `.owner`
-collision for a group (N repos, N dirs required).
+`../frontend` resolves `$HOME/.leerie/frontend/` independently of any
+sibling, and the `.owner` sidecar prevents two concurrent members with
+distinct basenames from colliding. The one guard the group launcher must
+add: reject any `--state-dir` / `LEERIE_STATE_DIR` override that would pin
+all members to one shared directory — correct for a chain (one repo) but a
+`.owner` collision for a group (N repos, N dirs required).
 
 ### Cross-repo visibility is enforced, not advisory
 
-The `--inspect-dir` mechanism mounts a sibling repo read-only into the
-worker's filesystem (`/inspect/<name>`). Locally, this is a kernel-enforced
-`:ro` bind mount. On the Fly runtime, it is convention-enforced (the sibling
-is seeded without the leerie user's write credentials). In both cases,
-`_filter_offtree_subtasks` (§12) soft-drops any subtask whose files fall
-outside the member's repository root. This is the same enforcement that
-prevents a single-run worker from writing outside its worktree; the group
-adds no new mechanism, it just applies the existing one to a new directory.
+`--inspect-dir` mounts a sibling repo read-only into the worker's
+filesystem (`/inspect/<name>`) — a kernel-enforced `:ro` bind mount
+locally, convention-enforced on Fly (the sibling is seeded without write
+credentials). `_filter_offtree_subtasks` (§12) soft-drops any subtask whose
+files fall outside the member's repo root, the same mechanism that already
+stops a single-run worker writing outside its worktree, applied to a new
+directory.
 
 ### The laptop is the sequencer; no coordinator machine
 
-The group launcher runs on the laptop (the same node that runs chain fan-out,
-per §19). It mints a `group_id`, fans out one leerie invocation per member
-(each `cd`'d into the member's repo), and waits. After all members complete,
-it tags each member's `run.json` with the shared `group_id` — discovering
-each member's run directory from its basename-keyed state dir using the same
-newest-`finished_at` scan the local finalize already uses. No coordinator
-machine, no in-container group state, no cross-machine protocol. GitHub is
-touched only host-side, per member, by each member's existing `host_finalize`.
+The group launcher runs on the laptop (the same node as chain fan-out,
+§19): it mints a `group_id`, fans out one leerie invocation per member
+(each `cd`'d into the member's repo), waits, then tags each member's
+`run.json` with the shared `group_id` — discovered from each member's
+basename-keyed state dir via the same newest-`finished_at` scan local
+finalize already uses. No coordinator machine, no in-container group
+state, no cross-machine protocol; GitHub is touched only host-side, per
+member, by that member's own `host_finalize`.
 
 ### Single-repo is the N=1 degenerate case
 

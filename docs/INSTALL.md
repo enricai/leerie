@@ -1,117 +1,66 @@
 # Installing Leerie
 
 Leerie runs entirely inside a container. The cleanup guarantee — when you
-Ctrl-C, every `claude -p` worker and every test runner / build / dev
-server they spawned is reaped — comes from the Linux kernel tearing down
-the container's PID namespace, not from heuristics in Python. See
-[`DESIGN.md` §6 *Worker subtree termination*](DESIGN.md) for the
-architectural reasoning and [`IMPLEMENTATION.md` §0.5 *Container
-shape*](IMPLEMENTATION.md) for the launcher / image / mount details.
+Ctrl-C, every `claude -p` worker and everything it spawned is reaped — comes
+from the kernel tearing down the container's PID namespace, not from Python
+heuristics. See [`DESIGN.md` §6 *Worker subtree
+termination*](DESIGN.md) and [`IMPLEMENTATION.md` §0.5 *Container
+shape*](IMPLEMENTATION.md) for the reasoning.
 
-This document covers one-time setup of the container runtime per OS,
-then how to install leerie itself.
+This document covers one-time container-runtime setup per OS, then
+installing leerie itself.
 
 ## macOS
 
-The one-line installer **auto-installs and starts** the container runtime
-for you (`brew install colima` + `colima start --runtime containerd
---mount-type virtiofs --cpu N --memory M`). The `--cpu` / `--memory`
-values are auto-detected from your host: half of the host's logical
-cores (clamped to 2–8) and half of the host's RAM in GB (clamped to
-4–16). On an 8-core / 16-GB Mac you'd get a 4-CPU / 8-GB VM; on a
-16-core / 64-GB Mac you'd get the 8-CPU / 16-GB ceiling.
-
-This replaces Colima's 2-CPU / 2-GB default, which is not enough for
-leerie's parallel-worker workload (concurrent `claude -p` workers plus
-toolchain processes blow through 2 GB, triggering a kernel OOM in the
-VM that manifests as `exit 255` on the launcher with no diagnostic).
-
-If you'd rather install the runtime yourself — common in CI or with
-dotfiles managers — pass `--no-runtime-install` or set
-`LEERIE_NO_RUNTIME_INSTALL=1` and the installer will print the manual
-commands and exit 1.
+The one-line installer auto-installs and starts Colima (`brew install
+colima` + `colima start --runtime containerd --mount-type virtiofs`), sized
+to half your host's CPU/RAM (clamped 2–8 cores / 4–16 GB — Colima's 2-CPU /
+2-GB default OOMs under leerie's parallel-worker load).
 
 ```bash
-# One-line installer — auto-installs Colima + starts the VM, then installs leerie.
 curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 ```
 
-Or, to do the runtime install by hand:
+To install the runtime yourself first (common in CI / dotfiles setups),
+pass `--no-runtime-install` (or `LEERIE_NO_RUNTIME_INSTALL=1`):
 
 ```bash
 brew install colima
-# Pick `--cpu N --memory M` matching half your host CPU/RAM (bounds
-# 2..8 / 4..16 GB — same as the installer's auto-sizing above). On an
-# 8/16 host: --cpu 4 --memory 8. Colima's 2/2 default is not enough.
-# Also paste the swap-provision YAML block from "Memory pressure: swap
-# configuration" (below) into ~/.colima/default/colima.yaml BEFORE the
-# first `colima start` — that way swap is live on the first boot
-# without a follow-up restart.
+# --cpu/--memory: half your host CPU/RAM, bounded 2-8 / 4-16 GB.
 colima start --runtime containerd --mount-type virtiofs --cpu 4 --memory 8
-
-# Then run the installer with the opt-out flag (or env var):
 curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash -s -- --no-runtime-install
 ```
 
 Notes:
 
-- **Do not** `brew install nerdctl`. The Homebrew formula has
-  `Requires: Linux` because the nerdctl binary itself talks to a
-  containerd Unix socket — which doesn't exist on macOS. Colima provides
-  nerdctl *inside its VM* and ships a host-side shim
-  (`colima nerdctl install`) that proxies every invocation to the VM.
-  Leerie's launcher auto-runs `colima nerdctl install` on first use, so
-  you don't have to run it yourself.
-- `--mount-type virtiofs` is the fastest mount and gives correct UID
-  semantics for bind mounts. It's the default on recent Colima.
-- The Colima VM persists across reboots — `colima start` again is
-  enough to bring it back up. To autostart at login:
-  `brew services start colima`.
-- The installer auto-sizes the VM (half-of-host CPU/RAM, bounded
-  2–8 cores / 4–16 GB; see the macOS section above). To override —
-  e.g. you want more or less than the auto-sized default:
-  `colima stop && colima start --cpu 6 --memory 12 --runtime containerd --mount-type virtiofs`.
-- If you have Colima already running with a smaller-than-recommended
-  VM, re-running the installer will leave the VM alone but log a
-  one-line hint with the resize command.
+- **Do not** `brew install nerdctl` — it requires Linux. Colima provides
+  nerdctl inside its VM and the launcher runs `colima nerdctl install`
+  (a host-side shim) automatically.
+- `--mount-type virtiofs` gives the fastest mount and correct bind-mount UID
+  semantics; it's the default on recent Colima.
+- The VM persists across reboots (`colima start` brings it back). Autostart
+  at login: `brew services start colima`.
+- To resize an already-running VM: `colima stop && colima start --cpu 6
+  --memory 12 --runtime containerd --mount-type virtiofs`.
 
 ### Memory pressure: swap configuration
 
-Colima's default VM has **zero swap**. Under leerie's parallel-implementer
-workload — concurrent `claude -p` workers (~300 MB each) plus toolchain
-processes (Vitest workers can spike to 2 GB RSS, `tsc`/`pnpm install`
-add another GB each) — RAM exhausts faster than the kernel can react.
-With no swap, the OOM killer fires immediately, and it tends to hit the
-host-side `nerdctl` / `lima-guestagent` daemons first. That collapses
-the Mac launcher's connection to the VM and you see `FATA[NNNN] exit
-status 255` with no orchestrator diagnostic — the container's stdout
-just stops mid-stream.
+Colima's default VM has **zero swap**, so leerie's parallel workers can
+exhaust RAM faster than the kernel can react — the OOM killer then hits
+`nerdctl`/`lima-guestagent` first, which manifests as `FATA[NNNN] exit
+status 255` with no orchestrator diagnostic.
 
-**The fix:** add 4 GB of swap at `/var/swapfile` and tune
-`vm.swappiness=10` so the kernel uses swap only under genuine memory
-pressure (default 60 reaches for swap eagerly). Colima's `provision:`
-hook runs on every VM boot with root privileges; we drop an idempotent
-script in there.
+**The fix:** 4 GB of swap plus `vm.swappiness=10`, applied via Colima's
+`provision:` hook. On a fresh install the leerie installer writes this for
+you automatically (only when `~/.colima/default/colima.yaml` doesn't already
+exist — an existing file is never mutated; the installer instead logs the
+block to paste in).
 
-**On a fresh install**, the leerie installer writes this for you — the
-`scripts/install.sh` path detects an absent `~/.colima/default/colima.yaml`
-and writes the canonical block before the first `colima start`, so
-swap is live on day 1. If a `colima.yaml` already exists, the installer
-deliberately does NOT mutate it (it might contain your custom mounts /
-CPU type / disk size). Instead, the next `bash scripts/install.sh`
-invocation logs a one-line hint with the YAML block to paste in.
-
-**On an existing setup**, paste this into `~/.colima/default/colima.yaml`
-(replace any existing `provision: null` / `provision: []` line with the
-whole block) and run `colima stop && colima start` to apply:
+To add it to an existing `colima.yaml` by hand, replace any `provision:
+null`/`provision: []` line with:
 
 ```yaml
 # leerie:swap-provision-v1 BEGIN
-# Auto-managed by leerie's installer (scripts/runtime-install.sh).
-# Adds 4 GB of swap at /var/swapfile and tunes vm.swappiness to 10
-# so the kernel uses swap only under real memory pressure (default
-# 60 is too eager for our safety-net use). Provision scripts run
-# every VM boot; the script is idempotent.
 provision:
   - mode: system
     script: |
@@ -130,385 +79,201 @@ provision:
 # leerie:swap-provision-v1 END
 ```
 
-The block above must match what the installer writes byte-for-byte —
-authoritative copy lives in `_runtime_colima_swap_yaml` in
-`scripts/runtime-install.sh`. To verify after restart:
+then `colima stop && colima start` to apply. Authoritative copy of this
+block lives in `_runtime_colima_swap_yaml` in `scripts/runtime-install.sh` —
+it must match byte-for-byte. Verify with:
 
 ```bash
-colima ssh -- free -h           # Swap: 4.0Gi   0B   4.0Gi
+colima ssh -- free -h                # Swap: 4.0Gi   0B   4.0Gi
 colima ssh -- sysctl vm.swappiness   # vm.swappiness = 10
-colima ssh -- ls -lh /var/swapfile   # -rw------- 1 root root 4.0G
 ```
 
-The 4 GB swapfile lives on Colima's persistent VM disk and survives
-`colima stop`/`colima start`. Only `colima delete` removes it — and
-the next `colima start` would re-create it via the provision script.
+The swapfile lives on Colima's persistent VM disk and survives `colima
+stop`/`start`; only `colima delete` removes it.
 
 ### macOS-specific: bind-mount scope
 
-Colima auto-shares only paths under `/Users/$USER` into the VM by
-default. Any path outside that range (an external volume, a system
-path) appears as an *empty* directory inside the container — with no
-error. Leerie's launcher warns at preflight if `$USER_REPO` or any
-`--inspect-dir` falls outside `/Users/$USER`.
-
-To allow paths outside the default scope: edit
-`~/.colima/default/colima.yaml`, add the path under `mounts:`, then
-`colima restart`.
+Colima auto-shares only paths under `/Users/$USER`. A path outside that
+range appears as an *empty* directory inside the container, with no error —
+leerie's launcher warns at preflight if `$USER_REPO` or any `--inspect-dir`
+falls outside `/Users/$USER`. To widen it: edit
+`~/.colima/default/colima.yaml`, add the path under `mounts:`, then `colima
+restart`.
 
 ## Linux
 
 Containerd runs natively — no VM needed. Leerie runs it **rootless**
-(DESIGN §6 *Rootless exception*): the runtime, workers, and cgroup
-containment all live under your user's systemd slice, no root daemon
-required.
+(DESIGN §6 *Rootless exception*): runtime, workers, and cgroup containment
+all live under your user's systemd slice, no root daemon required.
 
-On **Debian/Ubuntu**, the one-line installer **auto-installs and starts the
-full rootless stack** — containerd, RootlessKit, slirp4netns, uidmap, the
-pinned nerdctl binary (v2.3.1), CNI plugins, BuildKit, the rootless
-setuptool + BuildKit containerd-worker — and then verifies the runtime is
-reachable (`nerdctl info`). It refuses to report success on a runtime it
-can't reach.
-
-On **Fedora/RHEL and Arch**, auto-install is not wired yet — the installer
-prints a hint pointing here and exits 1. Follow the manual **Rootless mode**
-steps below (they're the same shape, with your distro's package manager),
-then re-run the installer with `--no-runtime-install`.
+On **Debian/Ubuntu**, the one-line installer auto-installs and verifies the
+full rootless stack (containerd, RootlessKit, slirp4netns, uidmap, pinned
+nerdctl v2.3.1, CNI plugins, BuildKit):
 
 ```bash
-# One-line installer — Debian/Ubuntu: auto-installs the rootless stack, then leerie.
 curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 ```
 
-Or, to do the runtime install by hand (sections below show the per-distro
-commands), then pass `--no-runtime-install`:
-
-```bash
-# After running the per-distro setup below:
-curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash -s -- --no-runtime-install
-```
-
-### Debian / Ubuntu (manual)
-
-On Debian/Ubuntu the one-line installer above does all of this for you.
-The manual steps are the **Rootless mode** sequence below — a bare
-`apt-get install containerd` alone is **not** enough: an unprivileged
-`nerdctl` can't reach the rootful socket, and you still need CNI plugins
-(for `nerdctl run`) and BuildKit (for leerie's image build). Follow
-**Rootless mode** directly.
-
-### Fedora / RHEL and Arch
-
-Auto-install is Debian/Ubuntu-only for now, so set the rootless stack up by
-hand using the **Rootless mode** sequence below with your package manager in
-place of `apt-get`:
+On **Fedora/RHEL and Arch**, auto-install isn't wired yet — do the
+**Rootless mode** steps below by hand (swap `apt-get` for `dnf`/`pacman`),
+then re-run with `--no-runtime-install`:
 
 - Fedora/RHEL: `sudo dnf install -y containerd rootlesskit slirp4netns shadow-utils`
 - Arch: `sudo pacman -S containerd nerdctl rootlesskit slirp4netns buildkit cni-plugins`
 
-Then re-run the installer with `--no-runtime-install`.
+### Rootless mode (manual)
 
-### Rootless mode (recommended)
-
-Running containerd as root is unnecessary for leerie — it doesn't need
-privileged operations. The full sequence below is exactly what the
-Debian/Ubuntu auto-install runs; do it by hand on other distros (swap the
-`apt-get` line for your package manager, per the section above). Versions
-are pinned; bump them together with `scripts/runtime-install.sh`.
-
-**1. Runtime + rootless prerequisites.** RootlessKit needs
-`newuidmap`/`newgidmap` (from `uidmap`), a port driver (`slirp4netns`), and
-a systemd user session (`dbus-user-session`):
+The sequence below is exactly what the Debian/Ubuntu auto-install runs.
+Versions are pinned; bump them together with `scripts/runtime-install.sh`.
 
 ```bash
+# 1. Runtime + rootless prerequisites
 sudo apt-get update
 sudo apt-get install -y containerd rootlesskit slirp4netns uidmap dbus-user-session
-```
 
-**2. nerdctl** (also ships `containerd-rootless-setuptool.sh` +
-`containerd-rootless.sh`, which step 5 needs on PATH):
-
-```bash
+# 2. nerdctl (also ships containerd-rootless-setuptool.sh, used in step 6)
 NERDCTL_VERSION=2.3.1
 ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
 curl -L "https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${ARCH}.tar.gz" \
   | sudo tar -C /usr/local/bin -xz
-```
 
-**3. CNI plugins → `/opt/cni/bin`** (the `CNI_PATH` nerdctl looks in; without
-them `nerdctl run` fails with `needs CNI plugin "bridge" to be installed in
-CNI_PATH`):
-
-```bash
+# 3. CNI plugins -> /opt/cni/bin (nerdctl run needs these)
 CNI_VERSION=v1.9.1
+sudo mkdir -p /opt/cni/bin
 curl -L "https://github.com/containernetworking/plugins/releases/download/${CNI_VERSION}/cni-plugins-linux-${ARCH}-${CNI_VERSION}.tgz" \
-  | sudo tar -C /opt/cni/bin -xz   # sudo mkdir -p /opt/cni/bin first if absent
-```
+  | sudo tar -C /opt/cni/bin -xz
 
-**4. BuildKit → `~/.local`** (puts `buildctl`/`buildkitd` on your PATH). This
-**must** precede step 5: `install-buildkit-containerd` exits with
-`` `buildctl` needs to be installed and `buildkitd` needs to be running ``
-unless `buildkitd` is already on PATH:
-
-```bash
+# 4. BuildKit -> ~/.local (must precede step 6's install-buildkit-containerd)
 BUILDKIT_VERSION=v0.31.2
 curl -L "https://github.com/moby/buildkit/releases/download/${BUILDKIT_VERSION}/buildkit-${BUILDKIT_VERSION}.linux-${ARCH}.tar.gz" \
   | tar -C "$HOME/.local" -xz
 command -v buildkitd   # must print a path before continuing
-```
 
-**5. Subuid/subgid** (RootlessKit prerequisite; idempotent — skip if
-`grep "^$(id -un):" /etc/subuid` already returns a line):
-
-```bash
+# 5. Subuid/subgid (idempotent — skip if `grep "^$(id -un):" /etc/subuid` already matches)
 sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 "$(id -un)"
-```
 
-**6. Rootless containerd + BuildKit worker** (run as your user, **not** sudo).
-`install-buildkit-containerd` is the containerd-worker variant leerie needs —
-its `ensure_base_in_buildkit_ns` copies the base image into the `buildkit`
-containerd namespace, which the OCI-worker variant can't read:
-
-```bash
+# 6. Rootless containerd + BuildKit worker (run as your user, NOT sudo).
+#    install-buildkit-containerd is the containerd-worker variant leerie
+#    needs: its ensure_base_in_buildkit_ns copies the base image into the
+#    buildkit containerd namespace, which the OCI-worker variant can't read.
 containerd-rootless-setuptool.sh install
 CONTAINERD_NAMESPACE=default containerd-rootless-setuptool.sh install-buildkit-containerd
 sudo loginctl enable-linger "$(id -un)"   # survive logout
-```
 
-After this, nerdctl's default context points at the rootless socket
-(`unix:///run/user/$UID/containerd/containerd.sock`); leerie's launcher uses
-whatever context nerdctl resolves to, so no extra flags are needed.
-
-**7. Verify:**
-
-```bash
+# 7. Verify
 nerdctl run --rm hello-world
-# rootless buildkitd listens on its own socket, so point buildctl at it:
 buildctl --addr unix:///run/user/$(id -u)/buildkit-default/buildkitd.sock debug workers
 ```
 
-Both should succeed (a "Hello from Docker!" and a worker row). Then re-run the
-installer with `--no-runtime-install`.
+Both step-7 commands should succeed (a "Hello from Docker!" and a worker
+row). Then re-run the installer with `--no-runtime-install`.
 
 ## Verifying the runtime
-
-Before running leerie, confirm the runtime works:
 
 ```bash
 nerdctl run --rm hello-world
 ```
 
-You should see "Hello from Docker!" (containerd uses the same image).
-If that fails, leerie will too.
+You should see "Hello from Docker!" (containerd uses the same image format).
+If this fails, leerie will too.
 
 ## Optional host tools
 
-These are not required to run leerie, but unlock additional automation:
-
-**`gh` (GitHub CLI)** — enables automatic PR creation at the end of each
-run. Without it, leerie pushes the run branch and prints a `gh pr create`
-command for you to run manually. Install from https://cli.github.com, then
-authenticate:
-
-```bash
-gh auth login
-```
+**`gh` (GitHub CLI)** — enables automatic PR creation at the end of a run.
+Without it, leerie pushes the run branch and prints a `gh pr create`
+command to run manually. Install from https://cli.github.com, then `gh auth
+login`.
 
 ## Fly.io runtime (optional)
 
-By default leerie runs workers locally via `nerdctl`. Passing `--runtime fly`
-(or setting `LEERIE_RUNTIME=fly` or `runtime = fly` in `leerie.toml`) routes
-each worker through Fly.io Machines instead — useful when you want to off-load
-worker compute from your local machine.
+`--runtime fly` (or `LEERIE_RUNTIME=fly` / `runtime = fly` in
+`leerie.toml`) routes each worker through Fly.io Machines instead of local
+`nerdctl` — no local container runtime needed.
 
-Prerequisites for the fly runtime:
+Prerequisites:
 
-1. **`flyctl` installed and authenticated** — `flyctl auth login` must
-   succeed. Install from https://fly.io/docs/flyctl/install/ (or
-   `brew install flyctl` on macOS). The launcher auto-installs `flyctl`
-   on first `--runtime fly` invocation if it's missing.
-2. **A Fly.io account with billing set up** — Fly Machines bill
-   per-second; you need a credit card on file. There is no free tier
-   for the kind of always-on compute leerie spins up.
+1. `flyctl` installed and authenticated (`flyctl auth login`) — the
+   launcher auto-installs it on first `--runtime fly` invocation if
+   missing. Install manually from https://fly.io/docs/flyctl/install/ or
+   `brew install flyctl`.
+2. A Fly.io account with billing set up (Machines bill per-second; no
+   free tier for this workload).
 
-That's it. The launcher handles everything else automatically on first
-`--runtime fly` invocation:
+The launcher then handles everything else on first use: creates the Fly app
+(set its name via `LEERIE_FLY_APP` / `--fly-app`, globally unique),
+builds+pushes the leerie image on Fly's remote builder (~3-5 min first
+time, cached after), and provisions a Machine per worker.
 
-- **Auto-creates the Fly app** (`flyctl apps create $LEERIE_FLY_APP`)
-  if it doesn't exist yet. Fly app names are globally unique — set yours
-  via `export LEERIE_FLY_APP=my-app` or `--fly-app my-app`. Idempotent.
-- **Builds the leerie image on Fly's remote builder** (no host Docker
-  daemon required) and pushes it to `registry.fly.io/$LEERIE_FLY_APP`.
-  This step takes ~3-5 min the first time per leerie version; subsequent
-  runs reuse the cached tag.
-- **Provisions a Fly Machine** per worker, seeds repo + Claude auth,
-  and runs the orchestrator detached.
-
-The local `nerdctl` setup above is **not required** when using
-`--runtime fly`; leerie's launcher skips the local container preflight
-and delegates the entire worker lifecycle to the Fly.io API. The
-local container runtime (Colima on macOS, containerd on Linux) is
-only needed for the default `local` runtime.
-
-**Disk sizing.** Every `--runtime fly` run gets a per-machine Fly
-volume (default 8 GB) mounted at `/work` — the path that holds the
-seeded repo, `.leerie/runs/<id>/` state, and the per-subtask worktrees
-that dominate disk growth. The volume survives `machine stop` so the
-pause-on-failure contract holds across arbitrarily long pauses. If a
-run errors out with `ENOSPC: no space left on device` (typically
-during parallel waves when many `claude -p` workers accumulate
-session-env state and per-subtask worktrees at once), increase the
-volume size via `FLY_VM_DISK_GB` (or `--fly-disk-gb N`, or
-`fly_disk_gb = N` in `leerie.toml`):
+**Disk sizing.** Each run gets a per-machine Fly volume (default 8 GB) at
+`/work`. On `ENOSPC: no space left on device`, raise it:
 
 ```bash
-FLY_VM_DISK_GB=30 leerie 'task' --runtime fly
-# or:
-leerie 'task' --runtime fly --fly-disk-gb 50
+leerie 'task' --runtime fly --fly-disk-gb 50   # or FLY_VM_DISK_GB=50, or fly_disk_gb in leerie.toml
 ```
 
-The volume is created at machine-provision time and destroyed when the
-machine is destroyed (clean exit or `leerie kill`), so steady-state
-storage cost is zero. While a paused run is on its volume, Fly charges
-per-GB-month — minimal at typical sizes but non-zero.
+The volume survives `machine stop` (so paused runs keep their state) and is
+destroyed with the machine on clean exit or `leerie kill`.
 
-**Recovery if an orchestrator dies mid-run.** If a run errors out and
-the post-run sync fails (e.g. the machine ran out of disk before the
-orchestrator could write `finished_at`), `leerie finalize <run-id>
---force` recovers the work. The launcher SSHes into the machine,
-verifies the orchestrator process is dead, patches `finished_at`, and
-proceeds with the normal fetch + push + PR flow. `--force` refuses if
-the orchestrator is still alive, so it is safe to use proactively when
-in doubt. See `docs/IMPLEMENTATION.md` §7 *Detached run finalization*
-for the full semantics.
+**Recovery if the orchestrator dies mid-run.** `leerie finalize <run-id>
+--force` SSHes in, verifies the orchestrator is dead, patches
+`finished_at`, and proceeds with the normal fetch + push + PR flow. Refuses
+if the orchestrator is still alive. See `docs/IMPLEMENTATION.md` §7
+*Detached run finalization*.
 
-**`--local-build` opt-in** (most users should NOT use this). Pass
-`--local-build` or set `LEERIE_LOCAL_BUILD=1` to build the leerie image
-locally with `nerdctl`/`docker` and push to Fly's registry from your
-host. This path only works when your host's Docker daemon can
-authenticate to `registry.fly.io` — practically, that means **Docker
-Desktop on macOS** (with `flyctl auth docker` having run within the
-last 5 minutes — the token expires) or **Linux with Docker installed
-via apt/dnf** + `flyctl auth docker`. **It does NOT work with
-nerdctl-in-Colima on macOS** because nerdctl cannot reach macOS
-Keychain (where Docker Desktop's `credsStore: desktop` helper stores
-the credential). The default remote-builder path works for everyone
-with `flyctl auth login` succeeded and avoids this auth dance
-entirely; use `--local-build` only if you have a specific reason
-(e.g. you need to build an image variant the remote builder can't
-produce, or you're testing the build pipeline locally).
+**`--local-build`** (most users should not use this) builds the image
+locally instead of on Fly's remote builder. Only works when your host
+Docker daemon can authenticate to `registry.fly.io` — Docker Desktop on
+macOS, or Docker-on-Linux with `flyctl auth docker` run. It does **not**
+work with nerdctl-in-Colima (no macOS Keychain access). Use the default
+remote-builder path unless you have a specific reason not to.
 
 ## EC2 runtime
 
 `--runtime ec2` provisions an AWS EC2 instance, seeds it, runs the
-orchestrator on it (detached), and tears it down on exit — the EC2
-counterpart to `--runtime fly`. This section documents credential
-resolution and the required instance-shape vars.
+orchestrator detached, and tears it down on exit — the EC2 counterpart to
+`--runtime fly`.
 
-> **AMI prerequisite:** `LEERIE_EC2_AMI` must name an AMI with the
-> leerie orchestrator source already baked in at `/opt/leerie-image/`
-> (DESIGN §6 *EC2 runtime lifecycle*, "Image delivery" — the adopted
-> default is bake-into-AMI, the same artifact shape
-> `scripts/remote/build-push.sh` produces for Fly, not a stock AMI).
-> Building that AMI is an operator-owned, out-of-band step (Packer /
-> EC2 Image Builder); leerie does not build or publish one for you.
-
-Passing `--runtime ec2` (or setting `LEERIE_RUNTIME=ec2` or
-`runtime = ec2` in `leerie.toml`) selects the EC2 execution backend as
-an alternative to the default `local` runtime and to `--runtime fly`
-above.
+> **AMI prerequisite:** `LEERIE_EC2_AMI` must name an AMI with the leerie
+> orchestrator source already baked in at `/opt/leerie-image/` (DESIGN §6
+> *EC2 runtime lifecycle*, "Image delivery"). Building that AMI (Packer /
+> EC2 Image Builder) is an operator-owned, out-of-band step — leerie does
+> not build or publish one.
 
 ### Prerequisites
 
-1. **AWS CLI v2 installed.** Unlike the Fly runtime, leerie does not
-   auto-install this — the official installers commonly need `sudo`,
-   which is out of scope for an unattended preflight. Install from
+1. AWS CLI v2 installed (not auto-installed — official installers commonly
+   need `sudo`). Install from
    https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
-   or `brew install awscli` on macOS.
-2. **AWS credentials that resolve successfully**, checked via `aws sts
-   get-caller-identity`. If credentials are expired or missing, the
-   preflight prints `aws sso login --profile <profile>` (or bare `aws
-   sso login` when no profile is set) and exits.
+   or `brew install awscli`.
+2. AWS credentials that resolve via `aws sts get-caller-identity`. If
+   expired/missing, the preflight prints the `aws sso login` hint and exits.
 
-### Credential resolution order
+### Credential resolution
 
-Leerie resolves AWS credentials/region using the same precedence order
-the AWS CLI and SDKs use, so the EC2 runtime authenticates as the
-identity you already expect from `aws` commands run in the same shell:
+Same precedence as the AWS CLI/SDKs: env vars
+(`AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY`) > named profile
+(`AWS_PROFILE`, static or SSO) > EC2 instance role (only meaningful once
+already running on an instance). Region: `AWS_REGION` > `AWS_DEFAULT_REGION`
+> the profile's `region` key > actionable error.
 
-1. **`AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY`** (+ optional
-   `AWS_SESSION_TOKEN`) environment variables — always wins when set.
-2. **Named profile** (`AWS_PROFILE`, else `default`) in
-   `~/.aws/config` / `~/.aws/credentials`:
-   - Static `aws_access_key_id`/`aws_secret_access_key` in
-     `~/.aws/credentials`, or
-   - SSO (`sso_session` reference or legacy inline `sso_start_url`),
-     resolved via the cached token in `~/.aws/sso/cache/*.json`. An
-     expired or never-logged-in SSO session produces the
-     `aws sso login --profile <profile>` hint above.
-3. **EC2 instance role via IMDS** — only meaningful once code is
-   running *on* an EC2 instance. On your host (the only place this
-   preflight runs today) there is no instance role, so the chain ends
-   here with an actionable error rather than silently failing.
-
-Region resolves separately: `AWS_REGION` > `AWS_DEFAULT_REGION` >
-the profile's `region` key in `~/.aws/config` > an actionable error.
-
-### `LEERIE_AWS_REGION` / `LEERIE_AWS_PROFILE` vs. `AWS_REGION` / `AWS_PROFILE`
-
-These are two distinct things — leerie does not collapse them:
-
-- **`LEERIE_AWS_REGION`** / **`LEERIE_AWS_PROFILE`** (also
-  `--aws-region` / `--aws-profile`, or `aws_region` / `aws_profile` in
-  `leerie.toml`) are **leerie's own knobs** for which AWS region/profile
-  *leerie itself* uses when provisioning `--runtime ec2` machines.
-  Free-form strings, no validation. Unset by default — leaving
-  region/profile selection entirely to the credential chain above.
-- **`AWS_REGION`** / **`AWS_PROFILE`** are the **AWS SDK's own
-  credential-chain env vars**, resolved independently by the standard
-  AWS precedence order described above.
+`LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` (also `--aws-region`/
+`--aws-profile`, or `leerie.toml`) are **leerie's own** knobs for which
+region/profile *leerie* uses to provision `--runtime ec2` machines —
+distinct from the SDK's own `AWS_REGION`/`AWS_PROFILE` credential-chain
+vars, which resolve independently:
 
 ```bash
 export LEERIE_AWS_REGION=us-east-1
 export LEERIE_AWS_PROFILE=my-aws-profile
 leerie "task" --runtime ec2 --aws-region us-east-1 --aws-profile my-aws-profile
-# …or commit a leerie.toml at the repo root with:
-#   aws_region = us-east-1
-#   aws_profile = my-aws-profile
 ```
 
 ### Required instance-shape vars
 
-Five `LEERIE_EC2_*` vars name the AWS `RunInstances` parameters the
-provisioning step needs. Unlike Fly, where
-`FLY_VM_CPUS`/`FLY_VM_MEMORY_MB` have working defaults, these describe
-AWS account resources leerie cannot choose on your behalf — there is
-no default tier. `--runtime ec2` without all five resolved fails the
-same way `--runtime fly` without `LEERIE_FLY_APP` fails: an actionable
-`die()` naming the missing var, before any AWS API call.
-
-Each resolves via the same **CLI flag > env var > `leerie.toml` key**
-precedence as every other leerie knob:
-
-```bash
-export LEERIE_EC2_AMI=ami-0abcdef1234567890
-export LEERIE_EC2_INSTANCE_TYPE=t3.large
-export LEERIE_EC2_KEY_NAME=my-ec2-keypair
-export LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
-export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
-leerie "task" --runtime ec2
-# …or commit a leerie.toml at the repo root with:
-#   ec2_ami = ami-0abcdef1234567890
-#   ec2_instance_type = t3.large
-#   ec2_key_name = my-ec2-keypair
-#   ec2_security_group = sg-0123456789abcdef0
-#   ec2_subnet_id = subnet-0123456789abcdef0
-# …or pass them as CLI flags per run:
-leerie "task" --runtime ec2 \
-  --ec2-ami ami-0abcdef1234567890 --ec2-instance-type t3.large \
-  --ec2-key-name my-ec2-keypair --ec2-security-group sg-0123456789abcdef0 \
-  --ec2-subnet-id subnet-0123456789abcdef0
-```
+Five vars name the AWS `RunInstances` parameters — no defaults exist, since
+these describe AWS account resources leerie cannot choose for you.
+`--runtime ec2` fails fast (before any AWS API call) if any is unresolved.
+Each follows the usual **CLI flag > env var > `leerie.toml` key** precedence:
 
 | Var | CLI flag | `leerie.toml` key | Meaning |
 |---|---|---|---|
@@ -518,190 +283,91 @@ leerie "task" --runtime ec2 \
 | `LEERIE_EC2_SECURITY_GROUP` | `--ec2-security-group` | `ec2_security_group` | Security group id to attach. |
 | `LEERIE_EC2_SUBNET_ID` | `--ec2-subnet-id` | `ec2_subnet_id` | Subnet id to launch into. |
 
-## What leerie mounts into the container
+```bash
+export LEERIE_EC2_AMI=ami-0abcdef1234567890
+export LEERIE_EC2_INSTANCE_TYPE=t3.large
+export LEERIE_EC2_KEY_NAME=my-ec2-keypair
+export LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
+export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
+leerie "task" --runtime ec2
+```
 
-When the container starts, the launcher mounts the following:
+## What leerie mounts into the container
 
 | Host path | Container path | Mode | Purpose |
 |---|---|---|---|
-| `$(pwd)` (your repo) | `/work` | rw | Leerie operates on the repo here. Worktrees are written under the repo; the repo itself stays clean — no `.leerie/` directory accumulates inside it. |
-| `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | Per-repo run state (`state.json`, `runs/`, `logs/`, worktrees). Defaults to `$HOME/.leerie/<basename>/`; overridable via `LEERIE_STATE_DIR` env var, `state_dir =` in `leerie.toml`, or `--state-dir`. Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Lives outside the repo so target projects need no `.gitignore` entry. `resume` works across container runs because state persists on the host at this path. |
-| `$LEERIE_HOME` (leerie install) | `/opt/leerie-image` | ro | Leerie's source and Dockerfile. Edit `orchestrator/leerie.py` on the host; next run picks it up without rebuilding the image. |
-| Per-run host scratch dir (`~/.cache/leerie/cfg-…/.claude.json`) | `/home/leerie/.claude.json` | rw | Per-container copy of `~/.claude.json` with `projects[]` stripped. The shared host file is never directly mounted — it's a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226) that hangs workers in a recovery loop. Each container writes only its private copy. |
-| Per-run host scratch dir (`~/.cache/leerie/cfg-…/.claude/`) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/`, `settings.json`, `mcp-needs-auth-cache.json`, `local/`, `statsig/`, `cache/`) ride along. |
-| `$CLAUDE_CODE_OAUTH_TOKEN` / Keychain / `~/.claude/.credentials.json` → staged `.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | The launcher resolves whichever credential is available, preferring the long-lived `$CLAUDE_CODE_OAUTH_TOKEN` (`claude setup-token`) first when set, since a container can't refresh a copied subscription token; otherwise Keychain on macOS (an IPC service the container can't reach — extracted via `security find-generic-password -s "Claude Code-credentials" -w`), then falls back to `~/.claude/.credentials.json` on disk. All three resolve to the same JSON shape written to the staged credentials file — the same path the Linux CLI reads — so authentication works identically on both platforms. See `docs/DESIGN.md` §6 *Credential strategy*. |
-| Per-run host scratch copies of `~/.gitconfig`, `~/.gitconfig.local`, `~/.gitignore`, `~/.gitignore_global`, `~/.git-credentials`, `~/.netrc`, `~/.config/git/`, `~/.ssh/`, `~/.gnupg/` | `/home/leerie/.<same>` | rw | Per-container copies of every present host config / auth file the worker might need. SSH and GPG copies exclude agent sockets (`agent/`, `S.*`, `*.sock`) — sockets are host-bound and not reachable from the container. Workers can `git config --local`, push over SSH, or `git commit -S` if signing is configured, all against private copies that vanish on container exit. |
-| Each `--inspect-dir` path | `/inspect/<basename>` | ro | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) need read access to. |
+| `$(pwd)` (your repo) | `/work` | rw | Leerie operates here; worktrees are written under the repo, which itself stays clean. |
+| Resolved host state dir | `/leerie-state` | rw | Per-repo run state (`state.json`, `runs/`, `logs/`, worktrees). Defaults to `$HOME/.leerie/<basename>/`; override via `LEERIE_STATE_DIR` / `state_dir` / `--state-dir`. Outside the repo, so no `.gitignore` entry is needed; `resume` works because state persists here across container runs. |
+| `$LEERIE_HOME` (leerie install) | `/opt/leerie-image` | ro | Leerie's source and Dockerfile — edits are picked up next run without a rebuild. |
+| Per-run scratch copy of `~/.claude.json` | `/home/leerie/.claude.json` | rw | Private, `projects[]`-stripped copy — the shared host file is never mounted directly (avoids a documented `claude-code` corruption race). |
+| Per-run scratch copy of `~/.claude/` | `/home/leerie/.claude` | rw | Bulky/history paths skipped; CLI capability dirs (agents, skills, commands, hooks, plugins, settings) ride along. |
+| Resolved Claude credential → staged `.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | Preferring `$CLAUDE_CODE_OAUTH_TOKEN`, then macOS Keychain, then `~/.claude/.credentials.json` on disk. See `docs/DESIGN.md` §6 *Credential strategy*. |
+| Per-run scratch copies of git/SSH/GPG config (`~/.gitconfig*`, `~/.ssh/`, `~/.gnupg/`, etc., agent sockets excluded) | `/home/leerie/.<same>` | rw | Lets a worker push/sign against private copies that vanish on exit. |
+| Each `--inspect-dir` path | `/inspect/<basename>` | ro | Extra read-only context for inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision). |
 
-Per-container isolation is the key design choice: each container sees
-a private copy of your Claude + git + SSH + GPG config at the default
-paths the CLI and git already look at, so nothing inside the container
-knows or cares that the files are private rather than the shared host
-originals. Container-side writes (incremented startup counters, new
-session transcripts, refreshed auth state) are intentionally lost when
-the container exits — leerie's own telemetry (`<state-root>/runs/<id>/`,
-mounted at `/leerie-state`) is the source of truth for run cost and
-structure. The host scratch dir is
-reaped on container exit; your host `~/.claude.json` and `~/.claude/`
-are never modified by a worker.
+Every container sees a private copy of your config at the paths the CLI and
+git already expect; container-side writes are intentionally lost on exit.
+Leerie's own telemetry under `/leerie-state` is the source of truth for run
+cost and structure.
 
 ## Troubleshooting
 
-**Skip auto-install of the container runtime** — pass
-`--no-runtime-install` to `install.sh`, or set
-`LEERIE_NO_RUNTIME_INSTALL=1`. The installer falls back to printing the
-manual hint and exits 1 if the runtime is missing. Useful for CI,
-dotfiles managers, or any environment where package installs are
-tracked elsewhere.
-
-**Skip auto-install of the claude CLI** — pass `--no-claude-install` to
-`install.sh`, or set `LEERIE_NO_CLAUDE_INSTALL=1`. By default a missing
-`claude` is installed via Anthropic's official native installer
-(`curl -fsSL https://claude.ai/install.sh | bash` — a self-contained
-binary in `~/.local/bin`, no Node/npm). With the opt-out set, a missing
-`claude` falls back to a hint and exits 1. Leerie shells out to
-`claude -p` for every unit of LLM work, so a missing `claude` is a hard
-stop either way.
-
-**Linux: `` `buildctl` needs to be installed and `buildkitd` needs to be
-running ``** (at `leerie --help` / image build) — the rootless BuildKit
-worker isn't set up. Install the BuildKit binary onto your PATH (step 4 of
-**Rootless mode** above), then
-`CONTAINERD_NAMESPACE=default containerd-rootless-setuptool.sh
-install-buildkit-containerd`. Note the setuptool refuses (exit 1) unless
-`buildkitd` is already on PATH, so the binary install must come first.
-
-**Linux: `needs CNI plugin "bridge" to be installed in CNI_PATH
-("/opt/cni/bin")`** (at `nerdctl run`) — CNI plugins aren't installed. The
-rootless setuptool does not install them; add them explicitly (step 3 of
-**Rootless mode** above).
-
-**Linux: `rootlesskit: not found` / `RootlessKit failed`** (at
-`containerd-rootless-setuptool.sh install`) — a rootless prerequisite is
-missing. Install `rootlesskit slirp4netns uidmap dbus-user-session` (step 1),
-and if `RootlessKit failed` persists, ensure your user has subuid/subgid
-ranges (step 5: `sudo usermod --add-subuids 100000-165535 --add-subgids
-100000-165535 "$(id -un)"`).
-
-**"Colima VM is not running"** (macOS) — start it:
-`colima start --runtime containerd --mount-type virtiofs --cpu 4 --memory 8`
-(pick `--cpu` / `--memory` matching half your host CPU/RAM; see the
-auto-sizing section at the top of this doc for the bounds). If this
-is your first start after editing `~/.colima/default/colima.yaml`
-to add the swap-provision block from "Memory pressure: swap
-configuration", the provision script runs automatically on boot.
-
-**"nerdctl cannot reach the container runtime"** — on macOS, you
-probably started Colima with the default `docker` runtime. Restart
-with containerd: `colima stop && colima start --runtime containerd
---mount-type virtiofs --cpu 4 --memory 8` (carry your half-of-host
-sizing through the restart; the bare command would re-default to
-2/2). The swap-provision YAML block in `~/.colima/default/colima.yaml`
-re-applies on every boot, so swap is preserved through this restart.
-On Linux (rootless), check the *user* service —
-`systemctl --user status containerd` — not the system one, and make sure
-`~/.local/bin` and `/usr/local/bin` are on your PATH so `nerdctl` and the
-rootless helpers resolve. A bare `sudo apt-get install containerd` alone
-leaves a *rootful* daemon an unprivileged `nerdctl` can't reach; follow the
-**Rootless mode** steps above instead.
-
-**`FATA[NNNN] exit status 255` with no orchestrator diagnostic** — the
-leerie run died because Colima's host-side `nerdctl` / `lima-guestagent`
-daemon was OOM-killed inside the VM (not your container's PID 1). Check
-`colima ssh -- sudo dmesg | grep oom-killer` for evidence. The fix is
-to add 4 GB of swap via the YAML block in "Memory pressure: swap
-configuration" above.
-
-**"worker cgroup containment could not be enabled"** — leerie stops
-before running any worker when it cannot enforce per-worker memory/PID
-limits (DESIGN §6 *Memory containment*). Enforcement is done by a broker
-(`scripts/cgroup-broker.py`) launched by the container entrypoint; the
-run dies if that broker can't operate. Common causes:
-- **no usable cgroup hierarchy** — the broker handles both a cgroup v2
-  unified mount (Colima, and rootless containerd via the delegated user
-  slice below) and cgroup v1/hybrid split `pids/` + `memory/` controller
-  mounts (some Fly.io Firecracker VMs), but fails if none is present —
-  e.g. a host exposing only a partial/hybrid layout without both
-  controllers, or an unusual container cgroup setup.
-- **rootless containerd (Linux) on a systemd + cgroup v2 host** — leerie
-  anchors the broker's cgroup slice at the systemd-delegated user slice
-  (`/sys/fs/cgroup/user.slice/user-<uid>.slice/user@<uid>.service/`)
-  rather than the top-level `/sys/fs/cgroup` (which the rootlesskit-mapped
-  host UID has no privilege over). No host reconfiguration is needed —
-  this delegation already exists on any systemd host with cgroup v2. If
-  you hit this gate on a rootless host anyway, check that
+- **Skip runtime/CLI auto-install** — `--no-runtime-install` /
+  `LEERIE_NO_RUNTIME_INSTALL=1`, or `--no-claude-install` /
+  `LEERIE_NO_CLAUDE_INSTALL=1`. Both fall back to printing a manual hint
+  and exiting 1.
+- **Linux: `buildctl`/`buildkitd` not found** — install BuildKit (step 4
+  above) before running `install-buildkit-containerd` (step 6); the
+  setuptool refuses unless `buildkitd` is already on PATH.
+- **Linux: `needs CNI plugin "bridge"...`** — install CNI plugins (step 3).
+- **Linux: `rootlesskit: not found` / `RootlessKit failed`** — install
+  `rootlesskit slirp4netns uidmap dbus-user-session` (step 1); if it
+  persists, check subuid/subgid ranges (step 5).
+- **"Colima VM is not running"** — `colima start --runtime containerd
+  --mount-type virtiofs --cpu 4 --memory 8` (sizing per the macOS section).
+- **"nerdctl cannot reach the container runtime"** — on macOS, restart
+  Colima with `--runtime containerd` (the default `docker` runtime won't
+  work). On Linux, check `systemctl --user status containerd` (the *user*
+  service, not system) and that `~/.local/bin`/`/usr/local/bin` are on PATH.
+- **`FATA[NNNN] exit status 255` with no diagnostic** — Colima's
+  `nerdctl`/`lima-guestagent` was OOM-killed in the VM; check `colima ssh --
+  sudo dmesg | grep oom-killer`. Fix: add swap (see *Memory pressure* above).
+- **"worker cgroup containment could not be enabled"** — leerie refuses to
+  run workers without enforceable per-worker memory/PID limits (DESIGN §6
+  *Memory containment*), enforced by a broker
+  (`scripts/cgroup-broker.py`). Common causes: no usable cgroup hierarchy;
+  on rootless Linux + systemd + cgroup v2, the broker anchors at the
+  systemd-delegated user slice — no host reconfig needed, but confirm
   `/sys/fs/cgroup/user.slice/user-$(id -u).slice/user@$(id -u).service/cgroup.subtree_control`
-  contains `pids` and `memory` (`systemctl --user show containerd
-  -p Slice` confirms the daemon lives under that tree).
-- **rootless containerd on a non-systemd init, or cgroup v1** — there is
-  no equivalent delegated subtree, so containment genuinely cannot be
-  enabled; pass `--dangerously-allow-uncapped` (below) to proceed anyway.
-- **read-only or missing `/sys/fs/cgroup`** — a read-only cgroupfs or an
-  absent mount leaves the broker unable to create cgroups.
-- **broker didn't start** — check the container log for a
-  `[cgroup-broker] listening` line; its absence means PID 1 couldn't
-  launch `python3 /opt/leerie-image/scripts/cgroup-broker.py`.
-
-To run anyway *without* containment (workers can then exhaust the VM's
-thread/PID table — the failure this gate prevents), pass
-`--dangerously-allow-uncapped` (or set `LEERIE_DANGEROUSLY_ALLOW_UNCAPPED=1`,
-or `dangerously_allow_uncapped = true` in `leerie.toml`). The
-`cgroup_containment` field in the run's `state.json` records whether
-containment was enforced and which hierarchy (`v2`/`v1`) was detected.
-
-**"$HOME/.claude not found"** — you haven't run `claude` yet on this
-machine. Run `claude --version` at least once so the directory is
-created.
-
-**Permission denied on `.leerie/`** — UID mismatch. The launcher passes
-`--build-arg HOST_UID=$(id -u)` so the in-container `leerie` user matches
-your host user. If you copied the image from another machine with a
-different UID, rebuild: `nerdctl image rm leerie:<version>` and re-run
-leerie.
-
-**Slow `npm install` / `vitest`** on macOS — ensure Colima is using
-VirtioFS (the documented setup uses `--mount-type virtiofs`). Bump the
-VM's RAM if needed: `colima stop && colima start --cpu 6 --memory 12
---runtime containerd --mount-type virtiofs`.
-
-**"$path may appear empty in the container"** warning (macOS) — Colima
-only auto-shares paths under `/Users/$USER`. Edit
-`~/.colima/default/colima.yaml`, add the path under `mounts:`, then
-`colima restart`.
-
-**Git push fails with `/opt/homebrew/bin/gh: command not found`** —
-your `~/.gitconfig` has a credential helper line that hard-codes the
-macOS Homebrew path for `gh`, but inside the Debian container `gh` is
-at `/usr/bin/gh`. Older `gh auth setup-git` versions wrote the absolute
-path; recent versions write the relative form `helper = !gh auth
-git-credential` (uses `$PATH`). To fix, either re-run `gh auth
-setup-git` on the host (overwrites with the relative form), or
-manually edit `~/.gitconfig` to drop the `/opt/homebrew/bin/`
-prefix from the `helper = !... gh auth git-credential` line.
-
-**Git errors at run start when invoking leerie from a git worktree** —
-if your repo cwd is itself a `git worktree add`-created worktree (not
-the main checkout), the worktree's `.git` file points at a parent
-path that lives outside the container's `/work` bind mount. Setup
-fails with a "cannot access path" git error. Workaround: invoke leerie
-from the main checkout, not from a worktree. (Leerie itself creates
-worktrees under `.leerie/runs/<run-id>/worktrees/` inside the bind
-mount — those work normally; this limitation only affects leerie being
-*invoked from* a host-side worktree.)
+  contains `pids` and `memory`; on non-systemd/cgroup v1 hosts there's no
+  equivalent, so pass `--dangerously-allow-uncapped` to proceed without
+  containment (workers can then exhaust the VM's PID table). `state.json`'s
+  `cgroup_containment` field records what was detected/enforced.
+- **"$HOME/.claude not found"** — run `claude --version` once first.
+- **Permission denied on `.leerie/`** — UID mismatch after copying the
+  image from another machine; `nerdctl image rm leerie:<version>` and
+  re-run leerie (it rebuilds with your host UID via `--build-arg HOST_UID`).
+- **Slow `npm install`/`vitest` on macOS** — confirm Colima uses
+  `--mount-type virtiofs`; bump VM RAM if needed.
+- **"$path may appear empty in the container" (macOS)** — outside
+  Colima's auto-shared `/Users/$USER` scope; add it under `mounts:` in
+  `~/.colima/default/colima.yaml` and `colima restart`.
+- **Git push fails with `.../gh: command not found`** — `~/.gitconfig`'s
+  credential helper hard-codes a macOS Homebrew path for `gh`, which
+  doesn't exist in the Debian container. Re-run `gh auth setup-git` on the
+  host (writes the `$PATH`-relative form), or edit the helper line by hand.
+- **Git errors invoking leerie from a git worktree** — if your repo cwd is
+  itself a `git worktree add` checkout, its `.git` file points outside the
+  container's `/work` mount. Invoke leerie from the main checkout instead.
 
 ## Uninstalling
 
 ```bash
-# Remove the cached leerie image.
 nerdctl image rm leerie:<version>   # or: nerdctl image rm $(nerdctl images -q leerie)
-
-# Remove leerie itself.
 rm -rf ~/.leerie
 rm -f ~/.local/bin/leerie
 
 # Optional: remove the runtime.
-# macOS:
-brew uninstall colima
-rm -rf ~/.colima
+brew uninstall colima && rm -rf ~/.colima   # macOS
 # Linux: use your distro's package manager to remove containerd + nerdctl.
 ```

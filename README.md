@@ -6,18 +6,7 @@ Most tools that call themselves autonomous still require you: to confirm a direc
 
 It runs entirely on the **Claude Code CLI and your existing subscription** — no Anthropic API key, no per-call billing. If you have Claude Code installed and logged in, you have everything it needs.
 
-**Why it actually finishes without you:**
-
-Most AI "orchestrators" let the model pilot: the model decides what to do next, declares when it's done, and judges whether it succeeded. That's where drift, hallucinated completion, and silent failures come from — and why you end up steering.
-
-Leerie inverts the relationship. **The model writes code. The program runs everything else.** Phases, wave scheduling, retries, caps, merge logic, and success-criteria enforcement are ordinary Python — real loops and conditionals that cannot drift.
-
-- **No silent failures.** Every worker output is JSON-schema-validated before the orchestrator acts on it. A worker cannot, by malformed output or confident hallucination, cause the system to do something undefined.
-- **An independent verifier is the hard gate, not self-report.** The implementer self-scores evidence-anchored confidence in `root_cause` and `solution` (target ≥9 on both, see DESIGN.md §8) — falsifiers tested, contradictions reconciled, gaps named with concrete artifacts — and a worker that cannot justify the score exits `blocked` with the gap analysis. But that self-score is advisory: a self-report has a structural ceiling (you cannot disprove a failure mode you cannot conceive), so the load-bearing check is an independent adversarial verifier — the conformer's `solution_defects` completeness axis — that did not produce the diff and can see gaps the implementer's own grading could not (DESIGN.md §8/§9). Everything else — tests passing, lint clean, build green, per-criterion satisfaction — is best-effort: surfaced as advisory warnings on the subtask result, never escalated to `failed` or `blocked` by the orchestrator. The criteria file is the implementer's working note, not a gate.
-- **Workers must justify confidence with evidence, not feelings.** Before writing code, an implementer clears domain-specific evidence gates — file-and-line citations, reproductions, falsification attempts. A self-reported score without hard artifacts doesn't clear the bar, even though the score itself is advisory.
-- **Parallel work that's actually safe.** Each implementer gets an isolated git worktree. Parallel writes never collide. Conflicts surface one wave at a time, close to the work that caused them.
-- **Resumable by design.** A reboot, network blip, budget cap, the Claude Code subscription rate-limit, Ctrl-C, or an external kill (SIGTERM from CI / systemd / a closed terminal) all lose nothing — the run branch is the durable record, worktrees are torn down, and `resume` picks up from the last completed wave. When the subscription rate-limit hits and the reset time is unambiguously parseable, leerie even auto-resumes after the reset window without manual intervention. The explicit "throw this away" gesture is `scripts/cleanup.sh --run-id <id> --branches`, not Ctrl-C.
-- **Parallel-safe across runs.** Multiple `./leerie` invocations in the same repository each get a unique `run_id` (a derived branch + state directory). Their branches, worktrees, and per-run state directories never collide. Launch a fix and a feature in parallel without coordination.
+**Why it actually finishes without you:** most AI "orchestrators" let the model pilot — decide what to do next, declare when it's done, judge whether it succeeded. That's where drift, hallucinated completion, and silent failures come from. Leerie inverts the relationship: **the model writes code, the program runs everything else.** Phases, wave scheduling, retries, caps, merge logic, and success-criteria enforcement are ordinary Python — real loops and conditionals that cannot drift. Every worker output is JSON-schema-validated before the orchestrator acts on it, and the load-bearing completion gate is an independent adversarial verifier, not the implementer's own self-report. See *How it works* below and [`docs/DESIGN.md`](docs/DESIGN.md) for the full rationale.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/downloads/)
@@ -30,61 +19,32 @@ Leerie inverts the relationship. **The model writes code. The program runs every
 
 The orchestrator is a Python program — not an in-session agent. It shells out
 to `claude -p` (headless mode) for each unit of LLM work. Each call is a
-separate process, so there is no subagent nesting anywhere. Control flow lives
-in real Python: `for` loops, `if` statements, counters. It cannot drift.
+separate process, so there is no subagent nesting anywhere.
 
 ```
 leerie "<task>"
    ├─ Phase 1  Classify into 1..9 categories                    → 1 claude -p
-   │             ↓ derive run_id (category + slug + start-hex)
-   │           • Clarify — intent-only questions (optional; skipped for fully-specified tasks)
-   ├─ Phase 2  Plan — one planner per category (parallel)        → N×3 claude -p (multi-sampled)
-   │           • Decompose — repo-map-grounded recursive split into
-   │             right-sized leaf subtasks (P6 + P1)             → fit_judge / splitter
-   │           • Reconcile — cross-domain capability-tag bridging (0 or 1 claude -p, when needed)
-   │           • Overlap-judge — cross-planner surface collisions (multi-planner runs only)
-   ├─ Phase 3  Schedule — global dependency graph → topo waves   (topo-sort pure Python;
-   │             a satisfied-probe drops already-done criterion-bearing subtasks → 1 claude -p each)
-   ├─ Phase 4  Create leerie/runs/<run-id> branch + worktree (per-run unique)
-   ├─ Phase 5  Per wave:
-   │   ├─ Implement each subtask (parallel, isolated worktrees)  → claude -p each
-   │   │     • self-scores evidence-anchored confidence (advisory)
-   │   │     • Conform — post-work doc/test/lint/build pass (advisory) plus an
-   │   │       independent completeness verifier (gating) → 1 conformer claude -p
-   │   ├─ Integrate the wave into the run branch; on conflict    → 1 integrator claude -p
-   │   └─ Validate the integrated run branch (conflict-marker scan)
-   │         (after the final wave: one more conformer pass on the whole tree)
+   ├─ Phase 2  Plan — one planner per category (parallel)        → N×3 claude -p
+   ├─ Phase 3  Schedule — global dependency graph → topo waves   (pure Python)
+   ├─ Phase 4  Create leerie/runs/<run-id> branch + worktree
+   ├─ Phase 5  Per wave: implement (parallel, isolated worktrees) → integrate
+   │             → validate the integrated run branch
    └─ Phase 6  Push run branch; open PR against working branch; cleanup
-               (working branch not modified locally)
 ```
 
-For the full rationale — why the orchestrator is a script rather than a plugin
-command, all architectural decisions, and the complete enforcement surface —
-read [`docs/DESIGN.md`](docs/DESIGN.md).
+For the full phase-by-phase breakdown, the evidence-gated confidence loop,
+and every architectural decision, read [`docs/DESIGN.md`](docs/DESIGN.md).
 
 ## Requirements
 
-- `claude` CLI on `PATH`, logged in interactively
-- For long or unattended runs, a long-lived `claude setup-token` OAuth
-  token is recommended: export it as `CLAUDE_CODE_OAUTH_TOKEN` before
-  launching. A container can't refresh a copied subscription token, so
-  an interactive login alone can expire mid-run; the setup-token still
-  bills against your subscription, not the API. See
-  [`docs/DESIGN.md` §6 *Credential strategy*](docs/DESIGN.md) for why.
-- `git`
-- A git repository with `user.email` and `user.name` configured
-- A reasonably clean working tree
-- A container runtime (one-time setup — see *Install* below)
-- `gh` CLI logged in (`gh auth status` succeeds), or pass `--no-push` to skip the finalize PR step
-
-**Leerie runs inside a container** to give cleanup a hard kernel
-guarantee: when you Ctrl-C, the Linux PID namespace is torn down and
-every worker / build / test runner is reaped, even ones that detached
-into their own POSIX sessions. See
-[`docs/DESIGN.md` §6](docs/DESIGN.md) and
-[`docs/IMPLEMENTATION.md` §0.5](docs/IMPLEMENTATION.md) for the
-reasoning and mechanics. Python is provisioned *inside* the container
-by the image; you don't need it on the host.
+- `claude` CLI on `PATH`, logged in interactively (a `claude setup-token`
+  OAuth token is recommended for long/unattended runs — see
+  [`docs/DESIGN.md` §6 *Credential strategy*](docs/DESIGN.md))
+- `git`, with a repo that has `user.email`/`user.name` configured and a
+  reasonably clean working tree
+- A container runtime (one-time setup — see *Install* below). Leerie runs
+  inside a container so Ctrl-C gives cleanup a hard kernel guarantee.
+- `gh` CLI logged in, or pass `--no-push` to skip the finalize PR step
 
 ## Install
 
@@ -92,462 +52,46 @@ by the image; you don't need it on the host.
 curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash
 ```
 
-The installer auto-installs and starts the container runtime per OS
-(Colima on macOS via `brew`; containerd + pinned `nerdctl` on
-Debian/Ubuntu, Fedora/RHEL, and Arch via the distro package manager)
-and then clones leerie into `~/.leerie` + symlinks `leerie` into
-`~/.local/bin`. Sudo prompts apply on Linux. Full per-OS details and
-the rootless / unsupported-distro paths live in
-[`docs/INSTALL.md`](docs/INSTALL.md).
+Auto-installs the container runtime per OS, clones leerie into `~/.leerie`,
+and symlinks `leerie` onto `~/.local/bin`. For per-OS details, the rootless
+path, manual runtime setup, or a clone-and-run install with no installer at
+all, see [`docs/INSTALL.md`](docs/INSTALL.md).
 
-### Inside Claude Code (recommended for chat-based use)
+**Inside Claude Code** (chat-based use):
 
 ```
 /plugin marketplace add enricai/leerie
 /plugin install leerie@enricai-leerie
 ```
 
-Then in any Claude Code session:
-
-```
-/leerie Fix the login timeout bug and add a regression test
-```
-
-### Inspect before installing
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh -o install.sh
-bash install.sh --dry-run            # print actions without executing
-bash install.sh                       # then run for real
-```
-
-Customize with `--prefix DIR` (default `~/.leerie`), `--bin-dir DIR`
-(default `~/.local/bin`), or `--ref REF` (default `main`).
-
-### Manual container-runtime setup
-
-If you'd rather install the runtime yourself (CI, dotfiles managers,
-or you want to pin a different `nerdctl` version), do the runtime
-steps manually then pass `--no-runtime-install` (or set
-`LEERIE_NO_RUNTIME_INSTALL=1`):
-
-**macOS** (Colima manages a Linux VM):
-
-```bash
-brew install colima
-# Size the VM at ~half your host's CPU/RAM (Colima's 2-CPU / 2-GB
-# default OOMs under parallel leerie workloads — see docs/INSTALL.md
-# for the auto-sizing the installer applies). On an 8/16 host:
-colima start --runtime containerd --mount-type virtiofs --cpu 4 --memory 8
-# Also add 4 GB of swap (paste the YAML block from docs/INSTALL.md
-# "Memory pressure: swap configuration" into ~/.colima/default/colima.yaml,
-# then colima stop && colima start). This step is optional but strongly
-# recommended — without swap the VM OOMs under heavy parallel load.
-curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash -s -- --no-runtime-install
-```
-
-(Do not `brew install nerdctl` — the formula requires Linux. Leerie
-auto-installs the host-side `nerdctl` shim from Colima on first run.)
-
-**Linux** (Debian/Ubuntu — see [`docs/INSTALL.md`](docs/INSTALL.md)
-for Fedora, Arch, and rootless setups):
-
-```bash
-sudo apt-get install -y containerd
-NERDCTL_VERSION=2.3.1
-ARCH="$(dpkg --print-architecture 2>/dev/null || uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')"
-curl -L "https://github.com/containerd/nerdctl/releases/download/v${NERDCTL_VERSION}/nerdctl-${NERDCTL_VERSION}-linux-${ARCH}.tar.gz" \
-  | sudo tar -C /usr/local/bin -xz nerdctl
-sudo systemctl enable --now containerd
-curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install.sh | bash -s -- --no-runtime-install
-```
-
-### Manual (clone + run)
-
-If you'd rather not run any installer at all:
-
-```bash
-git clone https://github.com/enricai/leerie.git
-./leerie/leerie "your task"   # or symlink onto PATH
-```
-
-The first invocation builds the container image (~60–120s); subsequent
-runs reuse it. The container runtime must already be set up — see
-[`docs/INSTALL.md`](docs/INSTALL.md) for per-OS instructions.
-
-## Usage
+## Quickstart
 
 ```bash
 # From the root of the target git repository:
 leerie "Fix the login timeout bug and add a regression test"
-# (substitute leerie if you used the manual install)
 
-# Or pass a path to a .txt / .md file whose contents are the task —
-# useful for multi-paragraph briefs that are awkward to quote on the shell:
-leerie path/to/task.md
-
-# Resume an interrupted or budget-capped run. Auto-picks if exactly one
-# in-flight run exists; otherwise pass the run-id (see `list`).
+# Resume an interrupted or budget-capped run:
 leerie resume
-leerie resume fix-login-timeout-bug-b81e90
 
 # List in-flight and completed runs in this repository:
 leerie list
 
-# Skip the default push + PR at finalize (run completes with the run
-# branch local-only; your working branch is unchanged):
+# Skip the default push + PR at finalize:
 leerie "task" --no-push
-
-# Skip pre-push hooks at finalize (the user's explicit override; defaults
-# off). Affects only the final `git push`; worker commits still run hooks.
-leerie "task" --no-verify
-
-# Opt into intent questions (default: no questions are surfaced).
-leerie "task" --clarify
-
-# Pre-supply clarification answers (JSON object):
-# Keys are question ids from the classifier, plus "source_of_truth"
-# set to "codebase", "research", or "both".
-leerie "task" --answers answers.json
-
-# Override caps (defaults: 2000 total workers, 5 in parallel per wave).
-# --max-workers also reads LEERIE_MAX_WORKERS or max_workers in
-# leerie.toml; --max-parallel also reads LEERIE_MAX_PARALLEL or
-# max_parallel in leerie.toml.
-leerie "task" --max-workers 80 --max-parallel 4
-export LEERIE_MAX_WORKERS=80
-
-# Dial how persistent the planner and implementer are at building
-# confidence before they exit blocked (default 8 evidence-gate rounds
-# inside each worker; see DESIGN §8):
-leerie "task" --confidence-rounds 12
-export LEERIE_CONFIDENCE_ROUNDS=12
-
-# Override the default source-of-truth preference (`both`) — pass
-# --source-of-truth on the command line for a one-off, set
-# LEERIE_SOURCE_OF_TRUTH for the session, or commit a leerie.toml
-# at the repo root with the line `source_of_truth = codebase` (or
-# research / both).
-# Precedence (highest first): --source-of-truth > env > leerie.toml.
-export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
-leerie "task" --source-of-truth codebase
-
-# Choose the model. Without overrides, every worker — judgment (classifier /
-# planner / reconciler / plan_overlap_judge / provision / integrator) and
-# acting (implementer, conformer) alike — defaults to sonnet — see
-# docs/IMPLEMENTATION.md §2 "Model selection" for the full env-var /
-# CLI-flag / TOML-key table.
-export LEERIE_MODEL=sonnet                # or: opus, haiku
-leerie "task" --model opus
-leerie "task" --model-implementer opus --model-classifier haiku
-
-# Optional but recommended — lower the auto-compaction threshold
-# for worker processes (default is 95%):
-export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
-
-# Chain orchestration: submit and track multi-run chains. A chain is
-# N parallel `leerie --runtime fly` invocations per wave, with
-# synth-merge between waves to build the next wave's base branch.
-# The laptop is the sequencer; no Fly coordinator machine. No chain-
-# specific env vars required — each per-job `--runtime fly`
-# invocation has its own env requirements unchanged.
-
-# Submit a new chain. Each --wave defines one wave (comma-separated
-# prompt files). Waves execute in order; runs within a wave execute
-# in parallel as separate Fly machines. N waves supported. The chain
-# operates against $USER_REPO directly.
-leerie chain \
-  --wave prompts/fetch.md,prompts/lint.md \
-  --wave prompts/publish.md
-
-# ID-dispatched verbs: UUID positional → chain scope (iterates
-# run.json filtered by chain_id); Fly machine id → existing
-# single-run scope.
-leerie status   <chain-id>   # render per-run states from run.json
-leerie attach   <chain-id>   # poll run.json files every 5s
-leerie stop     <chain-id>   # pause every running chain run
-leerie kill     <chain-id>   # destroy every chain run's machine
-leerie resume   <chain-id>   # resume every paused chain run
-leerie finalize <chain-id>   # push + open PR for every unpushed run
-leerie list chains         # group runs by chain_id
-
-# Run-groups: launch N single-repo leerie runs together as a coordinated
-# unit. Each member runs in its own state dir (basename-keyed), its own
-# branch, and opens its own PR. Members share a group_id and read-only
-# cross-repo visibility via --inspect-dir; the optional --brief file is
-# prepended to every member's prompt.
-leerie group \
-  --repo ../api     "add /volumes endpoint" \
-  --repo ../frontend "add-disk dialog" \
-  --brief group-brief.md          # optional shared brief
-
-# Resubmit with an existing group_id (keeps the same group):
-leerie group --group-id <prior-group-id> \
-  --repo ../api     "add /volumes endpoint" \
-  --repo ../frontend "add-disk dialog"
-
-# Group-scoped verbs (UUID → group scope across member state dirs):
-leerie status   <group-id>   # render per-member run states
-leerie stop     <group-id>   # pause every running member (Fly runtime only)
-leerie resume   <group-id>   # resume every paused member run
-leerie kill     <group-id>   # destroy every member run
-leerie finalize <group-id>   # push + open PR for every unpushed member
-leerie list --groups         # list all groups across state dirs
 ```
 
-Inside Claude Code (after `/plugin install leerie@enricai-leerie`):
+Or from inside Claude Code, after `/plugin install leerie@enricai-leerie`:
 
 ```
 /leerie Fix the login timeout bug and add a regression test
 ```
 
-## Configuration
-
-Complete reference for every CLI flag, environment variable, and
-`leerie.toml` key the orchestrator reads.
-
-### CLI flags
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `task` (positional) | — | The task description (literal string, or path to a `.txt`/`.md` file). Required unless the `resume` / `list` verbs or `--phase` is given. |
-| `resume` (verb) | off | Resume an interrupted run. Auto-picks if exactly one run exists; pass the run-id if multiple. |
-| `--run-id ID` | — | Select a specific run by id (e.g., for `resume` or `--phase` when multiple runs are in flight). |
-| `list` (verb) | off | Enumerate in-flight and completed runs in this repository (run id, started, status, cost, branch). |
-| `--no-push` | off | Skip the default push + PR at finalize. The run completes with the run branch local-only; your working branch is unchanged. Overrides `LEERIE_NO_PUSH` / `leerie.toml`. |
-| `--no-verify` | off | Pass `--no-verify` to the finalize `git push` only (skips pre-push hooks). Worker commits inside worktrees still run all hooks. The user's explicit override per CLAUDE.md's hooks principle. |
-| `--answers FILE` | — | JSON object of pre-supplied clarification answers (keyed by question `id`; may include `source_of_truth`). |
-| `--clarify` | off | Opt into surfacing intent questions to the user. Default: questions are dropped after the classifier's codebase→research filter, and the implementer makes a documented best-effort decision. Also `LEERIE_CLARIFY` env var or `clarify = true` in `leerie.toml`. |
-| `--max-workers N` | `2000` | Cap on total `claude -p` invocations across the run. Also `LEERIE_MAX_WORKERS` env var or `max_workers` in `leerie.toml`. |
-| `--max-parallel N` | `5` | Cap on concurrent workers within a wave. Per-worker cgroup containment keeps an OOM inside one worker's cgroup; users on smaller VMs can opt down. Also `LEERIE_MAX_PARALLEL` env var or `max_parallel` in `leerie.toml`. |
-| `--worker-memory-max SIZE` | auto | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Bounds RAM the worker subtree may consume; OOMs stay inside the worker cgroup rather than cascading to sshd / orchestrator. Auto-derived when unset from the shared `leerie.slice` budget (`/proc/meminfo` only when no slice budget is readable). Raised automatically when the repo's own build/lint/test command declares a Node heap via `--max-old-space-size`; if you pin an explicit value **below** that declared heap plus headroom, leerie refuses at startup rather than issuing a cap that guarantees an in-cgroup OOM. Also `LEERIE_WORKER_MEMORY_MAX` or `worker_memory_max` in `leerie.toml`. |
-| `--worker-timeout SEC` | `5400` (90 min) | Global per-worker wall-clock ceiling. Setting it **bypasses** the measured per-worker table (`TIMEOUT_DEFAULT_PER_WORKER`), which otherwise lowers the ceiling for fast worker types — e.g. `classifier` to 1236 s — using a duration distribution measured on one host. Raise it when a worker is being killed at a ceiling derived on a faster machine. A bypass rather than a bound, so an explicit value wins outright in both directions; explicitly passing the default counts as setting it. Also `LEERIE_WORKER_TIMEOUT` or `worker_timeout_sec` in `leerie.toml`. |
-| `--confidence-rounds N` | `8` | Evidence-gate rounds the planner and implementer may run before exiting blocked (DESIGN §8). Overrides `LEERIE_CONFIDENCE_ROUNDS` and `leerie.toml`. |
-| `--skip-smoke` | off | Skip the live `claude -p` preflight smoke test. |
-| `--source-of-truth VALUE` | `both` | `codebase` / `research` / `both`. Overrides `LEERIE_SOURCE_OF_TRUTH` and `leerie.toml`. |
-| `--runtime VALUE` | `local` | `local` / `fly` / `ec2`. Execution backend for per-subtask worker containers. Overrides `LEERIE_RUNTIME` and `leerie.toml`. `--runtime ec2` provisions an EC2 instance, seeds it, and runs the orchestrator on it, mirroring `--runtime fly`; see `docs/INSTALL.md` "EC2 runtime" (requires `LEERIE_EC2_AMI` to name an AMI with the orchestrator already baked in). |
-| `--aws-region VALUE` | none | AWS region leerie itself uses when provisioning `--runtime ec2` machines. Distinct from the AWS SDK's own `AWS_REGION` credential-chain var. Also `LEERIE_AWS_REGION` env var or `aws_region` in `leerie.toml`. |
-| `--aws-profile VALUE` | none | AWS profile leerie itself uses when provisioning `--runtime ec2` machines. Distinct from the AWS SDK's own `AWS_PROFILE` credential-chain var. Also `LEERIE_AWS_PROFILE` env var or `aws_profile` in `leerie.toml`. |
-| `--ec2-ami VALUE` | none (required for `--runtime ec2`) | AMI id for the `RunInstances` call. Also `LEERIE_EC2_AMI` env var or `ec2_ami` in `leerie.toml`. |
-| `--ec2-instance-type VALUE` | none (required for `--runtime ec2`) | EC2 instance type (e.g. `t3.large`). Also `LEERIE_EC2_INSTANCE_TYPE` env var or `ec2_instance_type` in `leerie.toml`. |
-| `--ec2-key-name VALUE` | none (required for `--runtime ec2`) | EC2 key-pair name for SSH access. Also `LEERIE_EC2_KEY_NAME` env var or `ec2_key_name` in `leerie.toml`. |
-| `--ec2-security-group VALUE` | none (required for `--runtime ec2`) | Security group id to attach. Also `LEERIE_EC2_SECURITY_GROUP` env var or `ec2_security_group` in `leerie.toml`. |
-| `--ec2-subnet-id VALUE` | none (required for `--runtime ec2`) | Subnet id to launch into. Also `LEERIE_EC2_SUBNET_ID` env var or `ec2_subnet_id` in `leerie.toml`. |
-| `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
-| `--model ALIAS` | per-worker (every worker → `sonnet`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
-| `--model-<worker> ALIAS` | per-worker default (every worker → `sonnet`) | Per-worker override. `<worker>` is one of `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`. Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
-| `--effort LEVEL` | per-worker (judgment: `medium`; implementer/conformer: `low`) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift); implementer/conformer are pinned to `low` for cost/latency. IMPLEMENTATION.md §2 "Effort selection". |
-| `--effort-<worker> LEVEL` | per-worker default (judgment workers → `medium`; implementer/conformer → `low`) | Per-worker override. `<worker>` is one of the orchestrator workers (same set as `--model-<worker>`). Overrides `--effort`, `LEERIE_EFFORT`, and `leerie.toml`. |
-| `--judge-model ALIAS` | `sonnet` | Model alias for the post-run judge skill (absent from `MODEL_DEFAULT_PER_WORKER`, falls through to the global `MODEL_DEFAULT`). Also `LEERIE_MODEL_JUDGE` or `model_judge` in `leerie.toml`. |
-| `--heal-model ALIAS` | `sonnet` | Model alias for the post-run self-heal skill. Also `LEERIE_MODEL_HEAL` or `model_heal` in `leerie.toml`. |
-| `--heal-max-rounds N` | `10` | Maximum heal-loop iterations per `call_type`. Also `LEERIE_HEAL_MAX_ROUNDS` or `heal_max_rounds` in `leerie.toml`. |
-| `--heal-success-threshold RATE` | `0.9` | Pass-rate threshold for the heal-loop SUCCESS verdict. Also `LEERIE_HEAL_SUCCESS_THRESHOLD` or `heal_success_threshold` in `leerie.toml`. |
-| `--verbosity LEVEL` | `stream` | `quiet` / `normal` / `stream` / `debug`. Controls inline per-worker activity output; full per-worker stream is always saved to `<state-root>/logs/<sid>.log` (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/<basename>/`). |
-| `-v` / `-vv` | `0` (off) | Shortcuts that anchor to `normal`: `-v` = `stream`, `-vv` = `debug`. With no `-v` and no `--verbosity`, falls through to `LEERIE_VERBOSITY` / `leerie.toml` / default `stream`. |
-| `-q` / `-qq` | `0` (off) | Shortcuts that anchor to `normal`: `-q` = `normal` (pre-streaming behavior), `-qq` = `quiet`. With no `-q` and no `--verbosity`, falls through to the same chain as `-v`. |
-| `--judge-dir DIR` | `judge-out` | Subdirectory name under the run dir for LLM judge output. Also `LEERIE_JUDGE_DIR` or `judge_dir` in `leerie.toml`. |
-| `--heal-dir DIR` | `heal-out` | Subdirectory name under the run dir for LLM self-heal output. Also `LEERIE_HEAL_DIR` or `heal_dir` in `leerie.toml`. |
-| `--phase PHASE` | — | Run a post-run skill phase (`judge` or `heal`) against an existing run's captured LLM calls instead of starting a new run. Use `--run-id` to select when multiple runs exist. |
-| `--report [RUN_ID]` | — | Print a read-only telemetry report for a run: per-call-type token/cost/latency/failure breakdown plus memory peak. Pass a run id, or omit to auto-pick when exactly one run exists. Exits without running orchestrate. |
-| `--status STATE` | — | With `list`, restrict the table to runs whose derived status matches STATE. One of: `seed-failed`, `corrupt-sidecar`, `in-progress`, `done`, `done-pushed-no-pr`, `done-pushed-pr`, `push-failed`, `pr-failed`, `paused`, `killed`, `sync-failed`. |
-| `--skip-overlap-judge` | off | Skip the phase 2¾ plan-overlap judge (DESIGN §5). Auto-skipped on single-planner runs; this flag disables it on multi-planner runs. Also `LEERIE_SKIP_OVERLAP_JUDGE` or `skip_overlap_judge` in `leerie.toml`. |
-| `--skip-budget-check` | off | Skip the post-schedule budget-feasibility preflight (DESIGN §13). The runtime backstop in `State.bump_workers()` still fires. Also `LEERIE_SKIP_BUDGET_CHECK` or `skip_budget_check` in `leerie.toml`. |
-| `--skip-repo-map` | off | Skip the P6 repo-map structural context (DESIGN §5½ (P6)): suppresses `_build_repo_map()` and the ranked subgraph injection into planner/splitter context; the planner degrades gracefully to the prior grep/glob-only path. Use on repos where tree-sitter cannot parse the primary language. Also `LEERIE_SKIP_REPO_MAP` or `skip_repo_map` in `leerie.toml`. |
-| `--skip-adherence-check` | off | Skip the instruction-adherence gate: the deterministic prescribed-command-coverage floor and the `adherence_judge` worker in `phase_adherence_gate` (a whole-plan gate, "Phase 2⅞", run after `phase_overlap_judge` and before `_schedule()`). A plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. Also `LEERIE_SKIP_ADHERENCE_CHECK` or `skip_adherence_check` in `leerie.toml`. |
-| `--skip-integration-check` | off | Skip the `integration_judge` behavioral-defect gate (DESIGN §8) entirely: no worker spawn for any subtask in this run. Independent of the accept-integration/audit-key mechanism, which only accepts a finding the judge already produced. Also `LEERIE_SKIP_INTEGRATION_CHECK` or `skip_integration_check` in `leerie.toml`. |
-| `--dangerously-skip-permissions` | off | Pass `--dangerously-skip-permissions` to every `claude -p` worker, including judgment workers that run in the real repo cwd. Waives DESIGN §12 read-only enforcement. Also `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` or `dangerously_skip_permissions` in `leerie.toml`. |
-| `--pr-template NAME` | none | When the target repo has multiple PR templates in `PULL_REQUEST_TEMPLATE/`, pick this one by basename (with or without `.md`). Also `LEERIE_PR_TEMPLATE` or `pr_template` in `leerie.toml`. |
-| `--pr-base-branch BRANCH` | `working_branch` | Override the final branch this run's PR merges into (passed to `gh pr create --base`). The diff fork-point used to compute the PR diff is unaffected and always stays `working_branch`. Also `LEERIE_PR_BASE_BRANCH` or `pr_base_branch` in `leerie.toml`. |
-| `--pr-writer-model ALIAS` | `sonnet` | Model alias for the finalize-time PR title + body writer. Also `LEERIE_MODEL_PR_WRITER` or `model_pr_writer` in `leerie.toml`. |
-
-### Launcher verbs
-
-These bare subcommands are handled by the bash launcher before the
-container starts. A summary appears in the `leerie --help` epilog; see
-below for full details and modifier flags.
-
-**Per-repo configuration (no container required):**
-
-`leerie config` is a host-only fast path — it exits before `nerdctl run` and never starts a container.
-
-| Verb | Description |
-|------|-------------|
-| `config` | Print the effective build/lint/test config for this repo, with `[config]` or `[inference]` provenance for each axis. Also shows `leerie.toml` operational knobs when present. |
-| `config --init` | Create `.leerie/config.toml` with auto-detected BLT commands (uncommented) and a commented `setup_packages` example. Errors if the file already exists. Prints the path and suggests `git add .leerie/`. |
-| `config --chat` | Open an interactive `claude` session with a config-generation system prompt and `--add-dir` pointing at the current repo. The model can read the repo and write `.leerie/config.toml` (and optionally `.leerie/Dockerfile`). |
-| `config --recapture` | Host-only (no container). Consolidates across **all** finished runs' logs (not just the newest) and writes merged `setup_packages` / language-dep installs to `.leerie/config.toml` via the dep_capture LLM worker. Never-clobber union: already-captured runs (sentinel present) are skipped and only new packages/managers are added. |
-| `config --recapture --force` | Re-runs the worker over runs already captured (drops the `dep_capture.done` sentinel) **and** wholesale-replaces the persisted `setup_packages` / `language_installs` from the fresh capture — deps no longer captured are dropped. An empty capture leaves the existing config untouched (never blanks a good config). Use to re-derive deps from current run history. |
-
-**Lifecycle (remote mode):**
-
-| Verb | Description |
-|------|-------------|
-| `stop <run-id> [--runtime local\|fly\|ec2]` | Pause a run — a remote Fly machine, an EC2 instance (`stop-instances`, preserving the root EBS volume), or a local container. Resumable via `resume` (EC2 `resume` calls `resume_instance()` and re-resolves the reassigned public IP). |
-| `kill <run-id> [--force]` | Destroy a remote machine permanently. `--force` skips confirmation. Also accepts `--machine-id <id> [--app <app>]` for orphan cleanup. |
-| `finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]` | Post-detach finalization: collect un-integrated subtask branches on the machine, fetch the run branch, then push + open PR on the host. Without `--force`, requires the orchestrator to be dead. `--force` SIGTERMs a live orchestrator first, then collects and fetches. |
-| `re-seed <run-id> [--force]` | Mid-run host→machine re-rsync of dirty delta. `--force` bypasses the safety check that refuses to clobber machine-side uncommitted edits. |
-| `status <run-id\|chain-id\|group-id>` | Render run/chain/group state from `run.json`. |
-| `attach <run-id\|chain-id>` | Poll `run.json` files every 5s. |
-| `accept-blocked <run-id> <subtask-id> [--force]` | Accept a blocked subtask so `resume` skips it. `--force` also settles one abandoned mid-flight (e.g. after a crash), where neither status field records it as blocked. |
-| `accept-integration <run-id> <subtask-id>` | Accept a recorded `integration_judge` finding for a subtask so `resume` stops re-invoking the judge for it. |
-| `chain [--chain-id <uuid>] --wave <files> [--wave <files>] ...` | Submit or resume a multi-run chain. `status`/`kill`/`resume`/`finalize`/`attach <chain-id>` and `list --chains` also operate on chains (see `docs/IMPLEMENTATION.md` "Chain verbs"). |
-| `group --repo <path> "<prompt>" [--repo ...] [--brief <file>] [--group-id <uuid>]` | Fan-out launcher for N single-repo runs sharing a `group_id`. `status`/`kill`/`resume`/`finalize <group-id>` and `list --groups` also operate on groups (see `docs/IMPLEMENTATION.md` "Run-group verbs"). |
-| `version` | Print `leerie <version>` and exit. |
-
-`resume` and `list` are documented in the "CLI flags" table above (they interact with the `task` positional and `--run-id`/`--phase`); the rest of the bare verbs are listed here.
-
-**Resume modifiers (used with `resume`):**
-
-| Flag | Description |
-|------|-------------|
-| `--shell` | Drop into a bash shell at `/work` on the machine instead of tailing the orchestrator log. |
-| `--auto-finalize` | On clean orchestrator exit, automatically run `leerie finalize`. |
-| `--no-re-seed` | Skip the automatic re-seed of dirty delta on resume. |
-
-**Build and runtime:**
-
-| Flag | Description |
-|------|-------------|
-| `--state-dir PATH` | Override the per-repo state directory. Also `LEERIE_STATE_DIR` env var or `state_dir` in `leerie.toml`. |
-| `--fly-app NAME` | Fly.io app name (required for `--runtime fly`; globally unique). Also `LEERIE_FLY_APP` env var. |
-| `--fly-disk-gb N` | Provision a Fly volume of N GB mounted at `/home/leerie`. Also `FLY_VM_DISK_GB` env var. |
-| `--no-runtime-install` | Skip auto-install of container runtime (Colima / nerdctl / containerd). Also `LEERIE_NO_RUNTIME_INSTALL`. |
-| `--no-auto-publish` | Skip the image-publish probe on startup. Also `LEERIE_NO_AUTO_PUBLISH`. |
-| `--local-build` | Force local `nerdctl build` instead of the Fly remote builder. Also `LEERIE_LOCAL_BUILD`. |
-
-### Environment variables and `leerie.toml` keys
-
-| Env var | `leerie.toml` key | Description |
-|---------|---------------------|-------------|
-| `LEERIE_STATE_DIR` | `state_dir` | Override the per-repo run state directory. Unset → default `$HOME/.leerie/<basename>/` (outside the repo; no `.gitignore` entry needed in target projects). Cross-repo basename collisions are caught at use time via an `.owner` sidecar inside the dir. Set once in your shell profile for a global directory across all repos. |
-| `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
-| `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
-| `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → every worker defaults to `sonnet`. |
-| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`. Unset → every worker → `sonnet`. |
-| `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, implementer/conformer `low`, everything else inherits Claude default. |
-| `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `medium`; implementer/conformer `low`. |
-| `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
-| `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
-| `LEERIE_VERBOSITY` | `verbosity` | Inline-output verbosity (`quiet` / `normal` / `stream` / `debug`). Overridden by `--verbosity`. `-v` / `-vv` / `-q` / `-qq` shortcuts override both. Unset → default `stream`. |
-| `LEERIE_NO_PUSH` | `no_push` | Sticky opt-out from push + PR at finalize (truthy → skip). Overridden by `--no-push`. `--no-verify` has no env/TOML mirror — it is a per-invocation override only. Unset → default `false` (push + PR happen). |
-| `LEERIE_CLARIFY` | `clarify` | Sticky opt-in to surfacing intent questions to the user (truthy → on). Overridden by `--clarify`. Unset → default `false`. |
-| `LEERIE_MODEL_JUDGE` | `model_judge` | Model alias for the post-run judge skill. Overridden by `--judge-model`. Unset → default `sonnet` (absent from `MODEL_DEFAULT_PER_WORKER`, falls through to the global `MODEL_DEFAULT`). |
-| `LEERIE_MODEL_HEAL` | `model_heal` | Model alias for the post-run self-heal skill. Overridden by `--heal-model`. Unset → default `sonnet`. |
-| `LEERIE_HEAL_MAX_ROUNDS` | `heal_max_rounds` | Maximum heal-loop iterations per `call_type`. Overridden by `--heal-max-rounds`. Unset → default `10`. |
-| `LEERIE_HEAL_SUCCESS_THRESHOLD` | `heal_success_threshold` | Pass-rate threshold for the heal-loop SUCCESS verdict. Overridden by `--heal-success-threshold`. Unset → default `0.9`. |
-| `LEERIE_JUDGE_DIR` | `judge_dir` | Subdirectory name under the run dir for LLM judge output. Overridden by `--judge-dir`. Unset → default `judge-out`. |
-| `LEERIE_HEAL_DIR` | `heal_dir` | Subdirectory name under the run dir for LLM self-heal output. Overridden by `--heal-dir`. Unset → default `heal-out`. |
-| `LEERIE_MAX_WORKERS` | `max_workers` | Total worker-invocation budget. Overridden by `--max-workers`. Unset → default `2000`. |
-| `LEERIE_MAX_PARALLEL` | `max_parallel` | Concurrent workers per wave. Overridden by `--max-parallel`. Unset → default `5`. |
-| `LEERIE_WORKER_MEMORY_MAX` | `worker_memory_max` | Per-worker cgroup memory cap (e.g. `4G`, `512M`). Overridden by `--worker-memory-max`. Unset → auto-derived from the shared `leerie.slice` budget (`/proc/meminfo` only as a fallback), and raised automatically when the repo declares a Node heap — see the `--worker-memory-max` row above. |
-| `LEERIE_WORKER_TIMEOUT` | `worker_timeout_sec` | Global per-worker wall-clock ceiling in seconds. Overridden by `--worker-timeout`. Setting it at any tier bypasses the measured per-worker timeout table — see the `--worker-timeout` row above. Unset → default `5400` and the table applies. |
-| `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` | `dangerously_skip_permissions` | Waive §12 read-only enforcement on judgment workers (truthy → on). Overridden by `--dangerously-skip-permissions`. Unset → default `false`. |
-| `LEERIE_SKIP_OVERLAP_JUDGE` | `skip_overlap_judge` | Skip the phase 2¾ plan-overlap judge on multi-planner runs (truthy → skip). Overridden by `--skip-overlap-judge`. Unset → default `false`. |
-| `LEERIE_SKIP_BUDGET_CHECK` | `skip_budget_check` | Skip the post-schedule budget-feasibility preflight (truthy → skip). Overridden by `--skip-budget-check`. Unset → default `false`. |
-| `LEERIE_SKIP_REPO_MAP` | `skip_repo_map` | Skip the P6 repo-map structural context injection (truthy → skip). Overridden by `--skip-repo-map`. Unset → default `false`. |
-| `LEERIE_SKIP_ADHERENCE_CHECK` | `skip_adherence_check` | Skip the instruction-adherence gate (deterministic command-coverage floor + `adherence_judge`) (truthy → skip). Overridden by `--skip-adherence-check`. Unset → default `false`. |
-| `LEERIE_SKIP_INTEGRATION_CHECK` | `skip_integration_check` | Skip the `integration_judge` behavioral-defect gate entirely (truthy → skip). Overridden by `--skip-integration-check`. Unset → default `false`. |
-| `LEERIE_PR_TEMPLATE` | `pr_template` | PR template basename for repos with multiple templates. Overridden by `--pr-template`. Unset → alphabetically first `.md`. |
-| `LEERIE_PR_BASE_BRANCH` | `pr_base_branch` | Final branch this run's PR merges into. Overridden by `--pr-base-branch`. Unset → default `working_branch`. |
-| `LEERIE_MODEL_PR_WRITER` | `model_pr_writer` | Model alias for the finalize-time PR writer. Overridden by `--pr-writer-model`. Unset → default `sonnet`. |
-| `LEERIE_MODEL_DEP_CAPTURE` | *(none)* | Model alias for the finalize-time dep_capture worker. Env var only — no per-worker CLI flag and no `leerie.toml` key (it still honors the global `model` key / `--model`). Unset → default `sonnet`. |
-| `LEERIE_CAPTURE_DEPS` | `capture_deps` (`.leerie/config.toml` only — not `leerie.toml`) | Enable finalize-time dependency capture (truthy → on). Precedence: `LEERIE_CAPTURE_DEPS` > `.leerie/config.toml` > default `true`. Set to `false` / `0` to disable entirely. |
-| `LEERIE_BAKE_LANGUAGE_DEPS` | `bake_language_deps` | Include a language-dep `COPY`+`RUN` layer in the auto-generated `.leerie/Dockerfile` (truthy → on). Precedence: `LEERIE_BAKE_LANGUAGE_DEPS` > `leerie.toml` > `.leerie/config.toml` > default `true`. Set to `false` for an apt-only bake. |
-| `LEERIE_WORKER_DEBUG` | — | Enable debug-level logging injection (`DEBUG=*`, `ANTHROPIC_LOG=debug`) into worker processes. Truthy → on. |
-| `LEERIE_FLY_APP` | — | Fly.io app name (globally unique). Required when `--runtime fly`. Set via env or `--fly-app`. Launcher-only. |
-| `LEERIE_REGION` | — | Fly region used by per-job `--runtime fly` machines (including those spawned by `leerie chain`). Unset → default `iad`. Launcher-only. |
-| `LEERIE_AWS_REGION` | `aws_region` | AWS region leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_REGION` credential-chain env var. Overridden by `--aws-region`. Unset → default `None` (region selection left to the AWS credential chain). |
-| `LEERIE_AWS_PROFILE` | `aws_profile` | AWS profile leerie itself uses when provisioning `--runtime ec2` machines — distinct from the AWS SDK's own `AWS_PROFILE` credential-chain env var. Overridden by `--aws-profile`. Unset → default `None`. |
-| `LEERIE_EC2_AMI` | `ec2_ami` | AMI id for the `--runtime ec2` `RunInstances` call. Overridden by `--ec2-ami`. Required for `--runtime ec2`, no default. Launcher-only. |
-| `LEERIE_EC2_INSTANCE_TYPE` | `ec2_instance_type` | EC2 instance type (e.g. `t3.large`). Overridden by `--ec2-instance-type`. Required for `--runtime ec2`, no default. Launcher-only. |
-| `LEERIE_EC2_KEY_NAME` | `ec2_key_name` | EC2 key-pair name for SSH access. Overridden by `--ec2-key-name`. Required for `--runtime ec2`, no default. Launcher-only. |
-| `LEERIE_EC2_SECURITY_GROUP` | `ec2_security_group` | Security group id to attach. Overridden by `--ec2-security-group`. Required for `--runtime ec2`, no default. Launcher-only. |
-| `LEERIE_EC2_SUBNET_ID` | `ec2_subnet_id` | Subnet id to launch into. Overridden by `--ec2-subnet-id`. Required for `--runtime ec2`, no default. Launcher-only. |
-| `LEERIE_SEED_TIMEOUT_S` | — | Timeout in seconds for `seed_auth` / `seed_repo` bulk transfers over `flyctl ssh console`. Unset → default `600` (10 min). Launcher-only. |
-| `LEERIE_PROGRESS_INTERVAL_S` | — | Heartbeat cadence in seconds for "still streaming" lines during bulk transfers. Set to `0` to suppress. Unset → default `10`. Launcher-only. |
-| `LEERIE_MACHINE_START_TIMEOUT` | — | Timeout in seconds for Fly machine start. Unset → default `120`. Launcher-only. |
-| `LEERIE_PAUSE_NOTIFY_CMD` | — | Shell command to `eval` when a Fly machine pauses on failure. Unset → no notification. Launcher-only. |
-| `LEERIE_NO_RUNTIME_INSTALL` | — | Skip auto-install of container runtime (truthy → skip). Also `--no-runtime-install`. Launcher-only. |
-| `LEERIE_NO_AUTO_PUBLISH` | — | Skip image publish probe (truthy → skip). Also `--no-auto-publish`. Launcher-only. |
-| `LEERIE_LOCAL_BUILD` | — | Force local image build instead of Fly remote builder (truthy → local). Also `--local-build`. Launcher-only. |
-| `LEERIE_NONINTERACTIVE` | — | Suppress interactive prompts in runtime-install and auth flows (truthy → non-interactive). Launcher-only. |
-| `FLY_VM_DISK_GB` | — | Provision a Fly volume of this many GB. Also `--fly-disk-gb`. Launcher-only. |
-| `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` | — | **Claude Code CLI variable**, not consumed by leerie. Set to `70` to backstop worker auto-compaction. |
-
-### Precedence
-
-- **Source-of-truth** (highest first): `--source-of-truth` →
-  `LEERIE_SOURCE_OF_TRUTH` → `leerie.toml` → default `both`.
-- **Model** (per worker, highest first): `--model-<worker>` →
-  `--model` → `LEERIE_MODEL_<WORKER>` → `LEERIE_MODEL` →
-  `model_<worker>` in `leerie.toml` → `model` in `leerie.toml` →
-  per-worker default → global default (every worker resolves to
-  `sonnet` today). To opt a specific worker into Opus-grade reasoning,
-  set `LEERIE_MODEL_<WORKER>=opus` or pass `--model-<worker> opus`.
-- **Confidence rounds** (highest first): `--confidence-rounds` →
-  `LEERIE_CONFIDENCE_ROUNDS` → `confidence_rounds` in
-  `leerie.toml` → default `8`.
-- **Verbosity** (highest first): `--verbosity` → `-v`/`-vv`/`-q`/`-qq`
-  shortcuts (anchored to `normal`, not to the resolved default) →
-  `LEERIE_VERBOSITY` → `verbosity` in `leerie.toml` → default
-  `stream`.
-
-See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2 for the
-rationale behind these orders and the full validation contract.
-
-## Worker types
-
-Leerie spawns sixteen kinds of `claude -p` worker. Each is a separate
-subprocess; there is no in-session agent nesting.
-
-| Worker | Prompt source | Default model | Runs per task | Returns |
-|--------|---------------|---------------|---------------|---------|
-| `classifier` | `prompts/classifier.md` | sonnet | 1 | category set + intent questions |
-| `classification_judge` | `prompts/classification_judge.md` | sonnet | 0 or 1 (phase 1½, adversarial re-check of the classifier's category set) | `{covers_task: bool, missing_categories[], rationale}` — independent verification the classifier's category set covers the task. DESIGN §8 *Independent adversarial verification* |
-| `artifact_registry` | `prompts/artifact_registry.md` | sonnet | 0 or 1 (phase 2, before planning) | canonical `{description, tag, path}` artifact vocabulary shared across every planner |
-| `planner` | `prompts/planner.md` | sonnet | one per category (parallel) | subtask list with deps |
-| `reconciler` | `prompts/reconciler.md` | sonnet | 0, 1, or up to 3 (retried up to twice when its first attempt closes a dependency cycle or leaves unresolved tags) | eight arrays — `renames` / `added_provides` / `added_subtasks` / `conditional_drops` / `dropped_requires` (resolution; `conditional_drops` drops a planner-emitted consumer subtask whose own intent declares it conditional on an unresolvable in_plan precondition; `dropped_requires` removes an over-specified `requires` entry — an aggregate or coarser synonym of what the consumer itself provides — and ALSO plays a cycle-breaking role on retry); `dependency_edges` / `merged_subtasks` (cycle-breaking-only, used on retry when leerie's gates detect a cycle); `unresolvable` (escape hatch). DESIGN §5 |
-| `plan_overlap_judge` | `prompts/plan_overlap_judge.md` | sonnet | 0 or 1 (phase 2¾, multi-planner runs only; auto-skipped on single-planner runs) | cross-domain surface overlap analysis. DESIGN §5 |
-| `satisfied_probe` | `prompts/satisfied_probe.md` | sonnet | 0 or 1 per subtask (phase 3, before scheduling; skipped when `--skip-satisfied-check`) | `{satisfied: bool, evidence: str}` — soft-drops subtasks already met on the base tree. DESIGN §8 |
-| `provision` | `prompts/provision.md` | sonnet | 0 or 1 (spawned only when the deterministic lockfile-detection table abstains — Java/Gradle, bare `pyproject.toml`, polyglot Makefile) | install recipe (argv-allowlisted) executed via `mise exec --`. See DESIGN §6½ |
-| `provision_judge` | `prompts/provision_judge.md` | sonnet | 0 or 1 (adversarial re-check of a spawned provision recipe) | `{recipe_would_succeed: bool, defects[], rationale}` — independent verification the recipe would actually install. DESIGN §6½, §8 |
-| `wiring_judge` | `prompts/wiring_judge.md` | sonnet | 0 or 1 (phase 2¾ or later, "A wiring re-check on the fully-merged plan" — semantic check of the reconciled plan's cross-subtask edges) | `{plan_reviewed: bool, wiring_defects[] (each carrying severity: live_defect\|latent_risk — only live_defect gates), rationale}` — independent verification declared edges are the right ones, not just structurally resolvable. DESIGN §5, §8 |
-| `implementer` | `prompts/implementer.md` | sonnet | one per subtask (per wave, parallel) | commits on a `leerie/subtasks/<run-id>/<subtask-id>` branch |
-| `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
-| `integrator` | `prompts/integrator.md` | sonnet | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
-| `fit_judge` | `prompts/fit_judge.md` | sonnet | 0 or more per subtask (P1 recursive decomposition — one per `_recursive_decompose()` call) | P1 Task-Context Fit score (0–1) with rationale and diffuse analysis. DESIGN §5½ (P1) |
-| `splitter` | `prompts/splitter.md` | sonnet | 0 or more per subtask (P1 recursive decomposition — coupled-minority path only; migration sweeps use deterministic `_partition_files()`) | child subtask list with ids, titles, and success criteria. DESIGN §5½ (P1) |
-| `adherence_judge` | `prompts/adherence_judge.md` | sonnet | 0 or 1 per `phase_adherence_gate` retry round (whole-plan gate, "Phase 2⅞" — only when `prescribed_procedure.is_prescribed=true`), bounded by `judgment_check_rounds` | plan-instruction-adherence score: `{user_prescribed_a_procedure, instruction_adherence (0–10), violations[], rationale}` |
-
-Additionally, two post-run workers run outside the main orchestrate loop and are not in `WORKER_TYPES`:
-
-- `pr_writer` (`prompts/pr_writer.md`, default sonnet) runs at finalize when the run will push — it produces the PR title and body. Overridable via `--pr-writer-model` / `LEERIE_MODEL_PR_WRITER`.
-- `dep_capture` (`prompts/dep_capture.md`, default sonnet) runs at finalize (and on `--recapture` / next-run backstop) — it reads worker logs, decides what the repo needs across all languages, and writes `setup_packages` / `language_installs` to `.leerie/config.toml`. Overridable via `LEERIE_MODEL_DEP_CAPTURE`. See DESIGN §6½.
-
-**Per-worker model defaults:** every worker — judgment (classifier,
-classification_judge, artifact_registry, planner, reconciler,
-plan_overlap_judge, provision, provision_judge, wiring_judge, integrator,
-fit_judge, splitter, adherence_judge) and acting (implementer, conformer,
-satisfied_probe) alike — defaults to Sonnet. This was previously split
-(judgment workers defaulted to Opus), but Sonnet 5's judgment quality has
-been externally verified to match the prior Opus 4.8 baseline on these
-same decision-shaped tasks, closing the gap that motivated the split —
-see [`docs/DESIGN.md`](docs/DESIGN.md) §"Opus-judgment, sonnet-workhorse
-(historical)". To opt a specific worker into Opus, set
-`LEERIE_MODEL_<WORKER>=opus` or pass `--model-<worker> opus`. See
-[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §2 *Model selection*
-for the full precedence table.
-
-See [`docs/DESIGN.md`](docs/DESIGN.md) §7 for the worker contract and
-[`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §3 for the invocation
-surface (flags, timeouts, schema enforcement).
-
-## Walkthrough
-
-For worked end-to-end examples — from invocation through clarification,
-wave execution, run-branch review, and merge; and for chain orchestration
-(submitting, monitoring, and cancelling a multi-run chain) — see
-[`docs/USAGE.md`](docs/USAGE.md).
+For a worked end-to-end walkthrough (invocation through clarification, wave
+execution, run-branch review, merge, and multi-run chain orchestration), see
+[`docs/USAGE.md`](docs/USAGE.md). For the complete inventory of every CLI
+flag, environment variable, `leerie.toml` key, launcher verb, and the sixteen
+`claude -p` worker types, see
+[`docs/IMPLEMENTATION.md` §2½ *Configuration reference*](docs/IMPLEMENTATION.md).
 
 ## Documentation
 
@@ -557,10 +101,10 @@ surface:
 - [`docs/DESIGN.md`](docs/DESIGN.md) — architecture, constraints, phase
   flow, the evidence-gated loop, deterministic enforcement
 - [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) — code-surface
-  reference (functions, caps, schemas, model / effort selection)
+  reference (CLI flags, env vars, worker types, functions, caps, schemas)
 - [`docs/USAGE.md`](docs/USAGE.md) — worked end-to-end example
-- [`docs/INSTALL.md`](docs/INSTALL.md) — per-OS container runtime setup
-  (Colima on macOS, containerd + nerdctl on Linux), Fly.io prerequisites
+- [`docs/INSTALL.md`](docs/INSTALL.md) — per-OS container runtime setup,
+  Fly.io and EC2 runtime prerequisites
 
 Policy and process:
 
@@ -578,9 +122,10 @@ itself):
 - [`skills/llm-self-heal/SKILL.md`](skills/llm-self-heal/SKILL.md) —
   autonomous prompt-patch loop for failing call types
 
-## Development
+Repository layout (every file's role) is in
+[`docs/IMPLEMENTATION.md` §1 *Repository layout*](docs/IMPLEMENTATION.md).
 
-Tests:
+## Development
 
 ```bash
 pip install -r requirements.txt   # runtime deps — the suite imports them
@@ -588,81 +133,11 @@ pip install pytest jsonschema     # pytest is the only dev dependency
 pytest tests/                     # from the repo root
 ```
 
-The suite runs on the host Python and imports the orchestrator directly,
-so the pinned *runtime* deps must be installed too — without them, tests
-that exercise the auth/quota backoff fail with `ModuleNotFoundError: No
-module named 'tenacity'`. This mirrors what CI installs
-(`.github/workflows/test.yml`).
-
-The suite covers the deterministic enforcement functions, including a
-coupling test that the retry-policy markers match the live check-function
-strings. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §10 for
-the test layout. The worker invocation path is not unit-tested (a stub or
-live `claude` binary would be needed; out of scope for the current suite).
-
-## Files
-
-| Path | What it is |
-|------|------------|
-| `orchestrator/leerie.py` | The orchestrator — all phases, waves, caps, retries |
-| `leerie` | Executable bash launcher — runtime preflight + `nerdctl run` (or Fly Machine provisioning when `--runtime fly`) |
-| `Dockerfile` | Container image recipe — Debian 13 + Node + pnpm + `claude` CLI + baked orchestrator source. Built locally on first run, tagged `leerie:<VERSION>` |
-| `fly.toml` | Fly.io Machine configuration — app name, region, vm sizing (4 cpu / 8 GB), `min_machines_running=0` (no warm pool) |
-| `prompts/classifier.md` | System prompt: classify task + surface intent questions |
-| `prompts/planner.md` | System prompt: decompose one category into a subtask plan |
-| `prompts/reconciler.md` | System prompt: reconcile cross-domain capability-tag drift between planner outputs |
-| `prompts/provision.md` | System prompt: LLM-fallback install recipe synthesis when the deterministic lockfile table misses (DESIGN §6½) |
-| `prompts/implementer.md` | System prompt: execute one subtask end to end |
-| `prompts/conformer.md` | System prompt: post-work doc/test/lint conformance pass (advisory; DESIGN §9) |
-| `prompts/integrator.md` | System prompt: resolve merge conflicts behaviorally |
-| `prompts/judge.md` | System prompt: 3-dimensional accuracy rubric for the post-run judge skill |
-| `prompts/patch_generator.md` | System prompt: minimal prompt-patch proposal for the post-run self-heal loop |
-| `prompts/pr_writer.md` | System prompt: finalize-time PR title + body author (invoked by `phase_finalize` when the run will push) |
-| `prompts/fit_judge.md` | System prompt: P1 Task-Context Fit scorer — judges whether a subtask's scope and context are co-minimized (DESIGN §5½ (P1)); calibrated to 0.70 threshold |
-| `prompts/splitter.md` | System prompt: P1 structural splitter — labels pre-partitioned migration chunks or emits structural seams for the coupled-minority case (DESIGN §5½ (P1)) |
-| `prompts/adherence_judge.md` | System prompt: plan-instruction-adherence gate — scores whether a plan obeys a user-prescribed procedure (ADHERENCE, not comprehension); empirically calibrated |
-| `prompts/config_chat.md` | System prompt: interactive `leerie config --chat` session — reads the repo's CI config and manifests, generates `.leerie/config.toml` and optionally `.leerie/Dockerfile` |
-| `prompts/_clarification_filter.md` | Shared include (codebase→research→ask filter) inlined by `classifier.md` and `implementer.md` via `_load_prompt`'s `{{include: …}}` expansion |
-| `scripts/install.sh` | One-command `curl \| bash` installer (preflight → runtime preflight → clone → symlink → verify) |
-| `scripts/runtime-install.sh` | Per-OS auto-install of the container runtime (Colima on macOS; containerd + nerdctl on Debian / Fedora / Arch). Sourced by `install.sh` and the launcher |
-| `scripts/container-entry.sh` | Container PID 1 entrypoint — `cd /work` then either `exec sleep infinity` (no argv: remote/Fly path, the launcher exec's the orchestrator separately via `flyctl ssh console`) or `exec python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (with argv: local nerdctl path) |
-| `scripts/setup-run.sh` | Create per-run branch + worktree (`leerie/runs/<run-id>`) |
-| `scripts/new-worktree.sh` | Create per-subtask branch + worktree off the run branch |
-| `scripts/integrate.sh` | Merge a subtask branch into the run branch |
-| `scripts/finalize.sh` | Verify the run branch is non-empty and ready to push. The working branch is never modified locally. The push + `gh pr create` step lives in the **host launcher** (bash + `jq`) and runs after `nerdctl run` exits cleanly, using the host's own auth state — see [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Host-side finalize*. Skipped when `--no-push` is set. |
-| `scripts/host-finalize.sh` | Host-side push + PR creation block. Sourced by three call sites: the local-runtime post-run code path in the launcher, `decide_teardown` in `scripts/remote/provision.sh` (Fly clean-exit auto-finalize), and `leerie finalize <run-id>` (recovery fast-path). Provides `host_finalize <run-dir>`; uses `pr_title` / `pr_body` from `run.json` when the `pr_writer` worker populated them, otherwise falls back to a deterministic body. |
-| `scripts/cleanup.sh` | Remove worktrees for one run (default `--run-id`) or all runs (`--all-runs`). State dir always preserved as audit. `--branches` also deletes the matching `leerie/runs/<id>` run branch *and* `leerie/subtasks/<id>/*` subtask branches. `--subtask-branches` deletes only the subtask branches and keeps `leerie/runs/<id>` (the post-finalize default — the run branch is the PR head). |
-| `scripts/remote/_log.sh` | Shared `remote_log()` helper — timestamped, repo-tagged stderr lines. Sourced by every other `scripts/remote/*.sh` file so all Fly-mode output is uniformly labeled. |
-| `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry (source baked in at `/opt/leerie-image/`). Default mode is Fly's remote builder (no host Docker daemon required); `--local-build` / `LEERIE_LOCAL_BUILD=1` opts into the legacy nerdctl/docker path. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §0.5 *Registry publish path*. |
-| `scripts/remote/provision.sh` | Fly Machine lifecycle helper (sourced by the launcher's `RUNTIME=fly` branch). Provides `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, and `decide_teardown()` (classifies `$LEERIE_REMOTE_EXIT_RC`; on clean exit runs `fetch_branch` BEFORE `destroy_machine` so no work is lost; on sync failure leaves the machine RUNNING with `sync_failed_at` written for user-driven recovery; on pause-worthy non-zero rc stops the machine). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Machine lifecycle*. |
-| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, and `re-seed.sh`. Provides `update_run_json()` (atomic merge into the run sidecar) and `wait_for_started()` (poll Fly Machine status until ready). |
-| `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs. Reads `fly_machine_id` from the sidecar, runs `flyctl machine start`, waits for `started`, and clears `paused_at`/`pause_reason`. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7. |
-| `scripts/remote/seed-auth.sh` | Worker auth + config seeding (sourced by the launcher after `provision_machine()` returns). Provides `seed_auth()`, which tar-pipes `~/.claude.json` + `~/.claude/` (with `.claude/local` excluded — duplicates the Dockerfile-installed claude CLI) to `/home/leerie/` via `flyctl ssh console -C "tar -xC ..."`, writes git identity to `/home/leerie/.gitconfig`, and pre-warms `claude --version` once so the orchestrator's preflight call hits warm caches. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Worker auth + config seeding*. |
-| `scripts/remote/seed-repo.sh` | Single-channel git-aware repo seeding helper (sourced by the launcher after `provision_machine()` succeeds). Provides `seed_repo()`: wipe `/work` contents (preserving the inode), then tar-pipe a git-aware payload — `git ls-files -z --cached --others --exclude-standard` (honors `.gitignore`) + `.git/` verbatim + the repo's local `.claude/` verbatim (force-included) − `.leerie/` (defensively excluded; run state lives outside the repo at `$LEERIE_STATE_HOST_DIR`, not in-repo) — to `/work` on the machine. No in-machine `git clone`; the host has the repo, and Fly machines deliberately receive no GitHub credentials. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Repo seeding*. |
-| `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Wakes a paused machine, runs a safety check, and re-runs `seed_repo_dirty`. Invoked by `leerie re-seed <run-id>` and the auto-re-seed step on `resume --runtime fly`. |
-| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie finalize` fast-path). Provides `fetch_branch()`: discovers the completed run-id on the machine, probes whether the run branch actually exists (skipping the bundle for cleared-but-empty terminal-state runs), streams the `leerie/runs/<run-id>` git bundle to the host via `git fetch`, tars `.leerie/runs/<run-id>/` back, and strips the mechanism-flag `no_push` from the host-side run.json (the user's intent lives in `fly-machine.json` as `host_no_push`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §7 *Run branch stream-back*. |
-| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Provides `resolve_aws_credentials()`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials or cached SSO token, ending with an actionable error rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Pure file I/O against `~/.aws/config`, `~/.aws/credentials`, and `~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent in the launcher. Sourced by the launcher's `RUNTIME=ec2` branch and by `leerie stop --runtime ec2`, both of which call `resolve_aws_credentials` and export its resolved credentials/region before `ec2-lib.sh`'s `require_aws()` preflight runs. |
-| `scripts/remote/ec2-lib.sh` | Shared bash helpers for the EC2 lifecycle, parallel to `scripts/remote/lib.sh`'s role for the Fly path. Provides `require_aws()`: the host-side preflight the launcher's `RUNTIME=ec2` branch calls before provisioning (also called by `leerie stop --runtime ec2` before pausing), modeled on `require_flyctl()`'s two-stage shape (binary present? → authenticated?) — checks `command -v aws` (actionable install hint if missing, no auto-install) and probes `aws sts get-caller-identity` (with a resolved `--profile`), reusing `bedrock_preflight()`'s exact `aws sso login --profile <profile>` recovery-hint vocabulary on failure. Also provides `resolve_ami()`/`resolve_instance_type()`/`resolve_key_name()`/`resolve_security_group()`/`resolve_subnet_id()`, one required-var read per `LEERIE_EC2_*` var. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `scripts/remote/ec2-seed-repo.sh` | EC2 counterpart to `scripts/remote/seed-repo.sh` (DESIGN.md §6 *EC2 runtime lifecycle*, "Seed" row). Same `.gitignore`-aware payload logic (bundle for committed state + porcelain-filtered dirty-delta rsync, `.leerie/` excluded except the three whitelisted config files, shallow-vs-full-bundle threshold) as the Fly path — only the transport differs: `ec2_tar_pipe` (plain `ssh`) for bulk bundle/tar data, `ec2_remote_exec` (SSM Session Manager) for small instance-side commands. Provides `ec2_seed_repo_clone()`, `ec2_seed_repo_dirty()`, and the wrapper `ec2_seed_repo()`. Consumes a new `LEERIE_EC2_SSH_TARGET` env var (the resolved `ssh`-destination for the instance, populated by `ec2-provision.sh`). See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `scripts/remote/ec2-provision.sh` | The `provision.sh` counterpart for the EC2 lifecycle (DESIGN.md §6 *EC2 runtime lifecycle*). Exports `provision_instance()`, `wait_for_instance_ready()`, `stop_instance()`, `terminate_instance()`, `decide_ec2_teardown()`. Sourced by the launcher's `RUNTIME=ec2` run-launch dispatch and by the `leerie stop --runtime ec2` (`stop_instance()`) and `leerie kill --runtime ec2` (`terminate_instance()`, with fetch-before-terminate ordering) paths. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `scripts/remote/ec2-resume-instance.sh` | Resume helper for paused EC2 runs — the EC2 counterpart to `scripts/remote/resume-machine.sh`. Exports `resume_instance()`: starts a `stopped` instance (idempotent no-op if already `running`), waits on `wait_for_instance_ready()`, re-resolves `LEERIE_EC2_SSH_TARGET` from the instance's current public IP (EC2 assigns a new one on every stop/start cycle), re-arms the `decide_ec2_teardown` trap, and clears `paused_at`/`pause_reason` on the run sidecar. Never terminates the instance or deletes its volume on any path. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `scripts/remote/ec2-fetch-branch.sh` | EC2 counterpart to `scripts/remote/fetch-branch.sh`, sourced by `ec2-provision.sh`'s `_try_fetch_state_for_ec2_teardown()` hook before `terminate_instance()`. Exports `fetch_state_ec2()`: same four steps as `fetch_branch()` (run discovery, git-bundle stream-back, run-state tar stream-back, best-effort never-clobbering `.leerie/config.toml`/`Dockerfile` stream-back) — transport substituted to `ec2_remote_exec` (SSM, small commands) plus a private binary-safe `ssh` download helper (`_ec2_fetch_ssh`) for bulk data, since `ec2_tar_pipe` is upload-only. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `scripts/remote/ec2-ssm.sh` | SSM Session Manager transport substitution for `flyctl ssh console`'s launch/attach roles (DESIGN.md §6 *EC2 runtime lifecycle*; the stream-back role is `ec2-fetch-branch.sh`, already shipped). Wired into the launcher's `RUNTIME=ec2` dispatch. Exports `ec2_launch_detached()` / `ec2_attach()`: both bootstrap a short `python3 -`/`sh -s` invocation via `AWS-StartInteractiveCommand` and pipe the real (potentially multi-KB) payload through the session's stdin, since SSM's `--parameters` document parameter is capped at ~4 KB. See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md)'s Files table. |
-| `commands/leerie.md` | Thin plugin skill — reachable as `/leerie` from Claude Code; relays the `--clarify` Q-and-A flow |
-| `commands/chain.md` | Thin plugin skill — reachable as `/chain` from Claude Code; relays the multi-run chain verbs (submit/status/list/kill/stop/resume/finalize/attach) to `leerie chain` and the ID-dispatched verbs (DESIGN §19) |
-| `skills/judge-llm-batch/SKILL.md` | Post-run skill — scores captured `claude -p` calls against a 3-dimensional accuracy rubric (schema, factual grounding, hallucination-freeness) |
-| `skills/llm-self-heal/SKILL.md` | Post-run skill — autonomous self-heal loop that proposes prompt patches against failing call types, replays under judge scoring, and reports the best-found patch |
-| `chain/Dockerfile` | leerie-chain container image — Debian 13-slim + git + gh + flyctl + stdlib Python3. Leaner than the root Dockerfile: omits mise, claude-code, and build-essential (the chain app runs the HTTP API, not worker tasks). Entrypoint: `python3 -m chain`. |
-| `chain/fly.toml` | Fly app config for the persistent leerie-chain HTTP service — `min_machines_running=1`, `[http_service]` on port 8080, `[mounts]` SQLite volume at `/data`. Provision once with `fly launch config chain/fly.toml`. |
-| `CLAUDE.md` | Repo-local guidance for Claude Code working in this codebase (the three-layer rule, mandatory requirements, code style) |
-| `CONTRIBUTING.md` | Development setup, task-completion checklist, PR conventions |
-| `SECURITY.md` | Threat model, supported versions, vulnerability reporting policy |
-| `CODE_OF_CONDUCT.md` | Contributor Covenant Code of Conduct |
-| `docs/DESIGN.md` | Full design document and rationale (theory) |
-| `docs/IMPLEMENTATION.md` | Current code-surface spec — functions, caps, schemas (mechanism) |
-| `docs/INSTALL.md` | Per-OS container runtime setup and the Fly.io runtime prerequisites |
-| `docs/USAGE.md` | End-to-end walkthrough of one Leerie run + chain orchestration example |
-| `docs/TESTING.md` | Per-feature / per-incident test coverage inventory; `CLAUDE.md`'s `## Testing` section covers only the operational rules for running the suite |
+The suite covers the deterministic enforcement functions. The worker
+invocation path itself is not unit-tested (a stub or live `claude` binary
+would be needed). See [`docs/IMPLEMENTATION.md` §10](docs/IMPLEMENTATION.md)
+for the test layout, and [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full
+development setup and PR checklist.
 
 ## Safety
 
@@ -671,143 +146,29 @@ surface — it is what makes the run unattended. It is bounded by **two
 isolation layers**: (1) worktree isolation — each worker operates in its
 own isolated git checkout, not your main working tree; (2) the container
 the orchestrator runs in — PID-namespace + cgroups bound every worker
-subprocess inside the per-run container (see
-[`docs/DESIGN.md`](docs/DESIGN.md) §6 and [`SECURITY.md`](SECURITY.md)).
-These bound the blast radius; they do not eliminate it. **Run on
-repositories you trust and review the run branch (`leerie/runs/<run-id>`)
-before relying on the result.** Push + PR at finalize is the natural
-review surface; you can also pass `--no-push` to keep finalize fully
-local.
-
-The run writes only to `<state-root>/runs/<run-id>/` (where `<state-root>`
-is the resolved state directory — default `$HOME/.leerie/<basename>/`,
-overridable via `LEERIE_STATE_DIR` / `--state-dir` / `leerie.toml state_dir`;
-never inside the repo itself) and to `leerie/runs/<run-id>` plus
-`leerie/subtasks/<run-id>/<subtask-id>` branches. Phase 6 (unless
-`--no-push`) pushes the run branch to `origin` and opens a PR against
-your working branch — your working branch itself is never modified
-locally. After a run, the run branch (`leerie/runs/<run-id>`) is kept
-as an audit trail; per-subtask branches are auto-deleted at finalize,
-but each worker's commits remain reachable from the run branch's
-`--no-ff` merge graph (`git log leerie/runs/<run-id> --graph`). Remove
-the run branch (and any leftover subtask branches) with
-`scripts/cleanup.sh --run-id <id> --branches` (or `--all-runs --branches`
-for an audit cleanup across every past run).
+subprocess (see [`docs/DESIGN.md`](docs/DESIGN.md) §6 and
+[`SECURITY.md`](SECURITY.md)). These bound the blast radius; they do not
+eliminate it. **Run on repositories you trust and review the run branch
+(`leerie/runs/<run-id>`) before relying on the result.** Push + PR at
+finalize is the natural review surface; `--no-push` keeps finalize fully
+local. The run writes only to `<state-root>/runs/<run-id>/` (default
+`$HOME/.leerie/<basename>/`, never inside the repo) and to
+`leerie/runs/<run-id>` / `leerie/subtasks/<run-id>/<subtask-id>` branches.
 
 ## Troubleshooting
 
-- **`claude: command not found`** — Leerie shells out to the Claude Code
-  CLI; install it from https://claude.ai/code and confirm with
-  `claude --version`. There is no fallback path.
+Common cases — resume mechanics after an interruption or rate-limit,
+expired OAuth sessions, blocked subtasks, worktree/branch conflicts, and
+failed pushes — along with their exact recovery commands, are covered in
+[`docs/USAGE.md`](docs/USAGE.md) under "What happens when something goes
+wrong". A quick pointer for the two most common ones:
 
-- **Exits with code 10** — not an error. Leerie needs clarification
-  answers and you are running non-interactively. Read
-  `<state-root>/pending-questions.json`, write the answers to
-  `<state-root>/answers.json`, then `./leerie resume --answers <state-root>/answers.json`
-  (where `<state-root>` is the resolved state directory — default `$HOME/.leerie/<basename>/`).
-  The plugin skill at `commands/leerie.md` handles this relay
-  automatically when invoked as `/leerie`.
-
-- **Run interrupted (Ctrl-C, SIGTERM, SIGHUP, CI cancel, terminal close, reboot)** —
-  worktrees are torn down but state.json + branches are preserved.
-  Resume with `./leerie resume` (auto-picks the most recent resumable
-  run) or `./leerie resume <id>`. Run `leerie list` to see
-  what's in flight. The explicit "throw this away" command is
-  `scripts/cleanup.sh --run-id <id> --branches` — Ctrl-C alone is
-  always safely resumable.
-
-- **Run hit the Claude Code subscription rate-limit** — leerie detects
-  the session-limit message from `claude -p` and exits cleanly.
-  Worktrees are torn down; state and branches are preserved. A
-  rate-limit resets on a clock, so leerie auto-resumes: when the reset
-  time can be parsed unambiguously it sleeps until the reset window;
-  when it cannot (malformed time, unfamiliar timezone, or a future
-  format change) it sleeps a fixed backoff (5 min) and re-resumes,
-  polling until the limit clears. Ctrl-C during the wait drops to a
-  manual `resume`. Auto-resume passes only `resume <id>`; CLI-only
-  overrides (`--model`, `--max-workers`, etc.) on the original launch
-  are *not* preserved across an auto-resume. Set those via env
-  (`LEERIE_*`) or `leerie.toml` if you want them to survive — both
-  channels are re-resolved on every `resume`.
-
-- **Run hit an expired OAuth session ("OAuth session expired")** — the
-  host's interactive login token expired mid-run and a container can't
-  refresh a copied one. Leerie detects this as terminal (distinct from
-  the rolling rate-limit above) and pauses resumably at exit code 75
-  rather than dying: worktrees are torn down, state and branches are
-  preserved. Fix it immediately with `claude /login`, then
-  `./leerie resume <id>`. To avoid this class of failure entirely on
-  long or unattended runs, mint a durable token with
-  `claude setup-token` and export it as `CLAUDE_CODE_OAUTH_TOKEN` before
-  launching — see *Requirements* above.
-
-- **Run ran out of credits** — distinct from a rate-limit: credits
-  don't reset on a clock (they return on a top-up or billing cycle), so
-  leerie does *not* auto-resume. It tears down worktrees, preserves
-  state and branches, prints an `out of credits — leerie resume <id>`
-  hint, and exits with code 75. Add credits, then re-run that `resume`
-  command. (An org with "extra usage" disabled at the org level is *not*
-  out of credits — that's a benign standing state and never triggers
-  this pause.)
-
-- **A subtask reports `blocked`** — the implementer hit something it
-  cannot resolve and bailed before integration. Read the blocker reason in
-  `<state-root>/runs/<run-id>/state.json` under `blocked[<subtask-id>]`, address the
-  upstream cause, then resume. See [`docs/DESIGN.md`](docs/DESIGN.md) §8
-  for the evidence-gated loop.
-
-- **Worktree or branch conflicts on a re-run** — `scripts/cleanup.sh --run-id <id> --branches`
-  removes that run's worktrees and deletes its branches so a fresh run
-  with the same task starts clean. For a global sweep across every past
-  run, use `--all-runs --branches`. Then re-invoke as normal.
-
-- **Push or PR failed at finalize** — the run completed locally. Check
-  `leerie list` for the run's status (`push-failed` / `pr-failed`)
-  and read `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` for the captured stderr.
-  The error message at finalize names the exact retry command. Local
-  commits are intact on the run branch.
-
-## FAQ
-
-**Do I need an Anthropic API key?**
-No. Leerie runs entirely on the Claude Code CLI and your existing
-subscription. The orchestrator shells out to `claude -p` workers; no API
-key is read or sent.
-
-**Can I run multiple Leerie instances in the same repository?**
-Yes. Each invocation derives a unique `run_id` and namespaces all of its
-state under `$LEERIE_STATE_HOST_DIR/runs/<run-id>/` and its branches under
-`leerie/runs/<run-id>` (run branch) and `leerie/subtasks/<run-id>/<sid>`
-(subtask branches) — so parallel runs in the same clone never collide.
-Use `list` to see what's in flight and `resume <id>` to
-resume a specific one.
-
-**Does Leerie work outside a git repository?**
-No. Per-subtask isolation is provided by `git worktree`; the worktree
-mechanism is load-bearing, not optional.
-
-**What if my project has no test runner?**
-That's fine — running tests is advisory only (DESIGN §9 *Post-work
-conformance*). When `_infer_build_lint_test()` finds no test command,
-the conformance phase reports the test axis as not-applicable and
-surfaces no warning. The subtask's terminal status is determined by the
-implementer's confidence gate (DESIGN §8), not by whether tests ran.
-See [`docs/IMPLEMENTATION.md`](docs/IMPLEMENTATION.md) §5 for the
-conformance phase's advisory contract.
-
-**Can I see what each worker did?**
-Yes. Every worker commits to its own `leerie/subtasks/<run-id>/<subtask-id>`
-branch during the run; at finalize, those branches are auto-deleted, but
-the integrator merges each one into the run branch with `--no-ff`, so
-every worker's commits remain reachable from `leerie/runs/<run-id>` as a
-named merge bubble. `git log leerie/runs/<run-id> --graph` is your
-per-worker audit trail. When you no longer need the run branch either,
-`scripts/cleanup.sh --run-id <id> --branches` removes it (and any
-leftover subtask branches); `--all-runs --branches` removes all of them.
-
-**Why not use the Claude Code SDK or the in-session Agent tool?**
-Two platform constraints make subprocess workers the right shape. See
-[`docs/DESIGN.md`](docs/DESIGN.md) §2.
+- **Run interrupted (Ctrl-C, SIGTERM, reboot, rate-limit)** — nothing is
+  lost. `leerie resume` (auto-picks the most recent resumable run) or
+  `leerie resume <id>`. `leerie list` shows what's in flight.
+- **Exits with code 10** — not an error; leerie needs clarification answers
+  non-interactively. Read `<state-root>/pending-questions.json`, write
+  `<state-root>/answers.json`, then `leerie resume --answers <path>`.
 
 ## Contributing
 
@@ -821,7 +182,6 @@ MIT — see [`LICENSE`](LICENSE).
 
 ## Status
 
-See [GitHub Releases](https://github.com/enricai/leerie/releases) for the current release. The orchestrator's phase flow, wave scheduling, cross-domain dependency
-resolution, and git worktree mechanics are all tested. First contact with a live
-`claude -p` session is the remaining verification step. Limitations and planned
-work are in [`docs/DESIGN.md`](docs/DESIGN.md).
+See [GitHub Releases](https://github.com/enricai/leerie/releases) for the
+current release. Limitations and planned work are in
+[`docs/DESIGN.md`](docs/DESIGN.md).
