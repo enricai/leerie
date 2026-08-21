@@ -221,13 +221,13 @@ truth for run cost and structure.
   `.../user@$(id -u).service/cgroup.subtree_control` has `pids`/`memory`,
   else `--dangerously-allow-uncapped` (DESIGN §6).
 - **"$HOME/.claude not found"** — run `claude --version` once first.
-  **Permission denied on `.leerie/`** — UID mismatch after copying the
+- **Permission denied on `.leerie/`** — UID mismatch after copying the
   image elsewhere; `nerdctl image rm leerie:<version>` and re-run.
 - **Slow `npm install`/`vitest` on macOS** — confirm `--mount-type
   virtiofs`; see *bind-mount scope* above if a path appears empty.
 - **`gh: command not found` on push** — `~/.gitconfig`'s helper hard-codes
   a macOS Homebrew path; `gh auth setup-git` on the host fixes it.
-  **Invoking leerie from a git worktree** — its `.git` points outside
+- **Invoking leerie from a git worktree** — its `.git` points outside
   `/work`; invoke from the main checkout instead.
 
 ## Uninstalling
