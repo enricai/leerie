@@ -104,6 +104,25 @@ def extract_ec2_dispatch_block() -> str:
     return src[s:e]
 
 
+def extract_aws_creds_args_tokens_fn() -> str:
+    """Pull `_leerie_aws_creds_args_tokens` verbatim.
+
+    The dispatch block (and the other 5 accept-blocked/accept-integration/
+    stop/kill/finalize arms) now call this shared helper rather than
+    inlining the --profile/--region precedence logic themselves. It's
+    defined much earlier in the launcher than the dispatch block this
+    module extracts, so any harness driving the dispatch block standalone
+    must also carry this definition — otherwise "command not found".
+    """
+    src = LAUNCHER.read_text()
+    start_marker = "_leerie_aws_creds_args_tokens() {"
+    s = src.index(start_marker)
+    e = src.index("\n}\n", s) + len("\n}")
+    assert s != -1 and e != -1, (
+        "could not locate _leerie_aws_creds_args_tokens in the launcher")
+    return src[s:e]
+
+
 def stub_aws_env(aws_dir: Path, *, identity_succeeds: bool = True,
                   extra: dict | None = None, home: Path | None = None,
                   stub_transport: bool = True) -> dict:
@@ -246,6 +265,7 @@ def run_ec2_dispatch(env: dict, *, run_provision: bool = True,
         "USER_REPO=${USER_REPO:-$PWD}",
         'LEERIE_STATE_HOST_DIR="${LEERIE_STATE_HOST_DIR:-$USER_REPO}"',
         "container_rc=0",
+        extract_aws_creds_args_tokens_fn(),
     ]
     if extra_preamble:
         script_lines.append(extra_preamble)
