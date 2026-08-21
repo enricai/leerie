@@ -916,18 +916,20 @@ export LEERIE_LOG_FILE_RESOLVED
 # block must run ahead of the accept-blocked/stop/kill/finalize arms that
 # consume LEERIE_AWS_* (see that block's comment). Depends only on
 # $USER_REPO, resolved at the top of this script.
+#
+# The CLI>env>toml ladder itself lives in a nested helper (identical in
+# shape to _resolve_seed_knob far below, minus the trailing default) rather
+# than a top-level shared function, because tests/test_resolve_ec2_vars.py
+# and tests/test_launcher_seed_depth_resolution.py each extract their own
+# function's body VERBATIM and source it standalone (see those files'
+# docstrings) -- a top-level helper defined outside either window would be
+# undefined in both isolated tests. Nesting keeps this function's own
+# extraction self-contained while still moving the ladder out of the
+# top-level body: this wrapper's own text no longer re-implements the
+# grep/sed lookup inline, it delegates to the nested helper.
 _resolve_ec2_knob() {
-  local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval
-  if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi
-  eval "_envval=\"\${$_envname:-}\""
-  if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi
-  if [ -f "$USER_REPO/leerie.toml" ]; then
-    _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" \
-                        "$USER_REPO/leerie.toml" 2>/dev/null \
-                      | head -1 \
-                      | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"
-    if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi
-  fi
+  _resolve_cli_env_toml_knob() { local _cli="$1" _envname="$2" _tomlkey="$3" _envval _tomlval; if [ -n "$_cli" ]; then printf '%s' "$_cli"; return; fi; eval "_envval=\"\${$_envname:-}\""; if [ -n "$_envval" ]; then printf '%s' "$_envval"; return; fi; if [ -f "$USER_REPO/leerie.toml" ]; then _tomlval="$( { grep -E "^[[:space:]]*${_tomlkey}[[:space:]]*=" "$USER_REPO/leerie.toml" 2>/dev/null | head -1 | sed -E "s/^[[:space:]]*${_tomlkey}[[:space:]]*=[[:space:]]*//; s/[[:space:]]*\$//; s/^\"//; s/\"\$//" ; } || true)"; if [ -n "$_tomlval" ]; then printf '%s' "$_tomlval"; return; fi; fi; }
+  _resolve_cli_env_toml_knob "$1" "$2" "$3"
 }
 
 # --- _leerie_aws_creds_args_tokens -----------------------------------------
