@@ -8717,18 +8717,13 @@ like `list` it exits without running orchestrate. Run selection reuses
 `resolve_run_id` (exact-match a passed id, else auto-pick the most recent
 run, else die). Unlike `resume`, `--report` does not pass
 `resumable_only=True` — reporting on a finished run is the normal case. It
-prints:
-
-- a header (status, duration, `state.json`'s `telemetry` aggregate — calls,
-  `$cost`, in/out tokens);
-- a per-`call_type` breakdown from `calls.ndjson` — count, input/output
-  tokens, average latency, failure count — sorted by call count descending
-  (`_aggregate_calls`);
-- a `failures by kind` rollup of `failure_kind` values, when any failed; and
-- a memory-peak line (peak `rss_kb`, max `open_fds`/`thread_count`) from
-  `memory.ndjson`, via `_memory_peak`.
-
-All inputs already exist on disk; `--report` adds no new telemetry.
+prints a header (status, duration, `state.json`'s `telemetry` aggregate —
+calls, `$cost`, in/out tokens); a per-`call_type` breakdown from
+`calls.ndjson` (count, tokens, average latency, failure count, sorted by
+call count via `_aggregate_calls`); a `failures by kind` rollup when any
+failed; and a memory-peak line (peak `rss_kb`, max `open_fds`/`thread_count`)
+from `memory.ndjson` via `_memory_peak`. All inputs already exist on disk;
+`--report` adds no new telemetry.
 
 ### call_type → prompt-resolution table
 
@@ -8786,60 +8781,23 @@ baseline vs patched) build on this primitive.
 
 Mirrors `DESIGN.md` §15, at the code level.
 
-**Tested.** A pytest suite under `tests/` exercises the deterministic
-enforcement functions. No coverage target is set. Selected files, grouped by
-subsystem:
-
-**Core resolvers and validation:** `test_resolve_leerie_root.py`,
-`test_resolve_source_of_truth.py`, `test_resolve_runtime.py`,
-`test_resolve_models.py`, `test_resolve_dep_capture_model.py`,
-`test__read_toml_key.py`, `test_gather_answers_validation.py`,
-`test_retryable_failure.py`, `test_state_fields.py` (`STATE_FIELDS` parity
-against both the §8 field table and every `st.data[...]` write —
-the mechanism §8's "this table is canonical" claim relies on),
-`test_blocked_clear_on_complete.py`, `test_validate_plan.py`,
-`test_validate_result.py`, `test_check_merge_committed.py`.
-
-**Planning — P6 repo map, P1 recursive decomposition:**
-`test_rank_repo_map.py`, `test_repo_map.py`, `test_build_repo_map.py`
-(HAS_TREESITTER-gated), `test_tree_sitter_probe.py`,
-`test_resolve_fit_judge_model.py`, `test_resolve_fit_judge_splitter_model.py`,
-`test_fit_judge_schema.py`, `test_splitter_schema.py`,
-`test_recursive_decompose.py` (`_partition_files()` coverage/overlap
-invariants; `_recursive_decompose()` leaf/split/depth-cap/no-progress
-behavior; migration-path label-only splitter use; `claude_p` full-signature
-call sites), `test_phase_plan_repo_map_ctx.py`,
-`test_phase_plan_prescribed_procedure_ctx.py`,
-`test_phase_plan_recursion_wiring.py`, `test_recursive_decompose_parallel.py`
-(bounded-concurrency expansion loop, `decompose_snapshot` per-completion
-persistence).
-
-**Worker isolation, prompts, tool scoping:** `test_inspect_tools.py`
-(`INSPECT_TOOLS` grants `Bash(<verb>:*)` patterns but never `Write`/`Edit`/bare
-`Bash`), `test_resolve_inspect_dirs.py`, `test_resolve_prompt.py`,
-`test_judgment_worker_isolation.py` (judgment workers never receive
-`--dangerously-skip-permissions`; `claude_p` refuses a judgment-worker cwd
-resolving to `st.repo_root`), `test_work_sentinel.py` (HEAD/porcelain/refs
-snapshot before/after planning phases), `test_planning_worktree_script.py`,
-`test_ensure_planning_worktree.py`.
-
-**Orchestrator wiring:** `test_orchestrate_call_sites.py` (source-text
-coupling guards for `_run_phases`/`_settle_subtask` call ordering),
-`test_claude_p_call_sites.py` (every `claude_p` call site statically checked
-against the real signature — all-keyword, every required param present, no
-unknown keyword, `model=` never a defaultless `.get()`), `test_no_dead_functions.py`,
-`test_no_undefined_names.py` (whole-module `symtable` scan for undefined
-names — ruff F821 without the dependency).
-
-**Conformance (DESIGN §9):** `test_discover_rules_files.py`,
-`test_validate_conformance_result.py`, `test_run_conformance_phase.py`,
-`test_run_final_conformance.py`, `test_infer_build_lint_test.py`,
-`test_conformance_clean_delta.py` (`_conformance_clean` / `_baseline_red_axes`
-delta-not-verdict discipline), `test_measure_blt.py`,
-`test_ensure_worktree_deps.py`, `test_blt_memo.py` (memo hit issues zero
-subprocess calls), `test_scoped_axes.py`, `test_orchestrator_owns_blt.py`,
-`test_round_axis_regressions.py`, `test_resolve_blt.py`, and the three
-`{test_files}`-proxy files detailed below.
+enforcement functions. No coverage target is set. It covers, by subsystem:
+core resolvers and validation (incl. `test_state_fields.py`, pinning
+`STATE_FIELDS` parity against both the §8 field table and every
+`st.data[...]` write); planning (P6 repo map, P1 recursive decomposition);
+worker isolation/prompts/tool scoping (incl. `test_judgment_worker_isolation.py`,
+which pins that judgment workers never receive
+`--dangerously-skip-permissions`); orchestrator wiring (incl.
+`test_no_undefined_names.py`, a whole-module `symtable` scan for undefined
+names — ruff F821 without the dependency); conformance (DESIGN §9, incl.
+`test_conformance_clean_delta.py`'s delta-not-verdict discipline and the
+three `{test_files}`-proxy files detailed below); container image/provisioning;
+the `leerie config` verb; judge/heal skills; the group verb (DESIGN §20); and
+finalize/host-side bash (`test_host_finalize_sh.py`'s no-push/already-pushed
+idempotency and PR-base-branch-override contract). The full per-file,
+per-incident inventory — which test covers which surface, and the specific
+traps each one pins against regressing — is in `docs/TESTING.md`, not
+duplicated here.
 
 The `{test_files}`-proxy files carry the per-file detail a reader scans to
 find what is already covered:
@@ -8849,25 +8807,6 @@ find what is already covered:
 | `test_test_files_proxy.py` | `_is_test_file` / `_render_scoped`'s `{test_files}` tier / `_select_subtask_axes`' fallback (DESIGN §9). The load-bearing case is the empty-AFTER-filter one: `files` is NON-empty so the pre-existing empty-list guard does not fire, yet every member is a non-test path — rendering there yields a bare `pytest`, which runs EVERYTHING, the same inversion the `{files}` rule forbids reached by a different route. Also pins that the shipped vitest/jest `{files}` templates take SOURCE files on purpose, the `lstrip("./")`-vs-`removeprefix` case, and declared `test_file_globs` REPLACING rather than extending the built-ins. |
 | `test_scoped_proxy_corpus.py` | The measured basis for the `{test_files}` tier, frozen against `tests/fixtures/scoped_proxy_corpus/corpus.json` — 36 REAL per-subtask diffs recovered from leerie's own run branches. Exists because the ratio was first taken from the planner's `files_likely_touched` and was badly wrong (40% test-touching predicted vs 94% real). Each row must be ONE subtask's work (an integration merge's FIRST-PARENT diff, not a cumulative two-dot diff), and the fixture must retain its source-only rows or the canonical-fallback safety property goes untested. |
 | `test_scoped_degrade_warning.py` | `_warn_scoped_degraded_once` (DESIGN §9): `scoped` is the default and an unresolvable proxy falls back to canonical, so a pytest repo paid the full oracle once per subtask with nothing saying so. The anti-vacuity partner `test_silent_when_a_proxy_resolves` is mandatory: without it a warning that fired unconditionally would pass, turning the signal into noise on the ~99% of repos where scoping works. Two wiring guards — the call precedes the baseline block, and an AST check that it is NOT nested under the `skip_base_baseline` guard (sentinel-skipped on resume, i.e. silent on exactly the runs that most need telling). |
-
-**Container image / provisioning:** `test_resolve_repo_image_tag.py`,
-`test_launcher_cache_mounts.py`, `test_launcher_per_repo_image.py`,
-`test_dockerfile_autogen.py` (no trailing `USER leerie` — PID-1 stays root,
-DESIGN §6), `test_dockerfile_bake_from_capture.py`,
-`test_base_dockerfile_chromium.py`.
-
-**`leerie config` verb:** `test_config_verb.py`, `test_config_recapture.py`.
-
-**Judge/heal skills:** `test_replay_capture.py`, `test_phase_judge.py`,
-`test_heal_loop.py`.
-
-**Group verb (DESIGN §20):** `test_group_launcher.py`,
-`test_group_launcher_verbs.py`, `test_group_launcher_fanout.py`,
-`test_group_run_json.py`, `test_group_state_dir_guard.py`.
-
-**Finalize / host-side bash:** `test_host_finalize_sh.py` (`host_finalize`
-contract — no-push/already-pushed idempotency, PR-base-branch override,
-⚠ Deploy-ordering fallback rendering).
 
 **CI workflows:**
 
