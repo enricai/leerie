@@ -7112,7 +7112,7 @@ Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
 #### Chain orchestration (cross-reference)
 
 The chain orchestration code surface is documented in
-[**§7 *Chain verbs***](#chain-verbs) earlier in this file (the launcher
+[**§2 *Chain verbs***](#chain-verbs) earlier in this file (the launcher
 verbs, coordinator endpoints, state schema, and worker-side hooks).
 DESIGN.md §19 holds the architecture rationale.
 
