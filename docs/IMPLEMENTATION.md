@@ -2002,26 +2002,26 @@ judgment/workhorse split once existed and why it no longer applies.
 | classifier   | sonnet  | global judgment over the task description |
 | planner      | sonnet  | decomposition is the load-bearing judgment step |
 | reconciler   | sonnet  | cross-domain tag equivalence is judgment |
-| plan_overlap_judge | sonnet | surface-overlap detection over the reconciled plan is judgment (two planners independently extracting the same artifact with incompatible APIs — DESIGN §5 *Cross-domain surface overlap*) |
-| satisfied_probe | sonnet | per-subtask "is this already met on the base tree?" check (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask so throughput/cost dominates — a **deliberate, documented cost tradeoff** (see the comment at `MODEL_DEFAULT_PER_WORKER["satisfied_probe"]`), not a claim that the check needs no judgment. The false-positive risk is contained by the base-tree-only tool scope + conservative-default prompt, not by model tier |
-| provision    | sonnet  | fallback when the deterministic lockfile-detection table returns empty (DESIGN §6½); reads README + configs to emit an install recipe — judgment over arbitrary repo shapes |
+| plan_overlap_judge | sonnet | surface-overlap detection over the reconciled plan is judgment (two planners extracting the same artifact with incompatible APIs — DESIGN §5 *Cross-domain surface overlap*) |
+| satisfied_probe | sonnet | per-subtask "already met on base tree?" check (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask so throughput dominates — a **deliberate, documented cost tradeoff**, not a claim it needs no judgment. False-positive risk is contained by base-tree-only tool scope + conservative prompt, not model tier |
+| provision    | sonnet  | fallback when the deterministic lockfile-detection table returns empty (DESIGN §6½); judgment over arbitrary repo shapes |
 | integrator   | sonnet  | behavioral conflict resolution; a wrong merge silently corrupts integrated state |
 | implementer  | sonnet  | concrete subtask execution; also pinned to `low` effort (see "Effort selection" below) — cost/latency, not a judgment-tier change |
-| conformer    | sonnet  | reads a diff and runs commands; also pinned to `low` effort (see "Effort selection" below) — same cost/latency rationale as implementer |
+| conformer    | sonnet  | reads a diff and runs commands; also pinned to `low` effort — same rationale as implementer |
 | judge        | sonnet  | scoring a batch of captured calls against a 3-dimensional rubric |
 | heal (patch) | sonnet  | patch generation and replay; throughput matters more than broad judgment |
-| pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise; throughput-shaped one-shot call |
+| pr_writer    | sonnet  | finalize-time PR title + body; fills repo template when present, summarizes commits otherwise |
 | dep_capture  | sonnet  | finalize-time dep inference from worker logs; broad judgment over arbitrary shell command sets |
 | fit_judge    | sonnet  | P1 Task-Context Fit scoring is judgment |
 | splitter     | sonnet  | LLM-driven structural partition (coupled-minority path) is judgment |
-| adherence_judge | sonnet | plan-instruction-adherence scoring is judgment; empirically calibrated per-worker (goal-only task ⇒ high score, prescribed-and-violated ⇒ low score). If adherence gating regresses under the sonnet default, re-run the calibration and consider `--model-adherence-judge opus` as a per-worker override before reintroducing a blanket tier split |
-| classification_judge | sonnet | independent adversarial verifier of the classifier's category set against the task + codebase (DESIGN §8 *Independent adversarial verification*); like every verifier it is *itself* the independent check |
-| wiring_judge | sonnet | independent adversarial verifier of the reconciled plan's semantic wiring — the tag/dep dangles a structural `check_plan_wiring` scan cannot see (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8) |
-| provision_judge | sonnet | independent adversarial verifier of the detected install recipe against the actual image/runtime (missing `--break-system-packages`, wrong package manager vs lockfiles — DESIGN §6½, §8) |
-| artifact_registry | sonnet | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) — decides one canonical tag+path per artifact the task creates, judgment |
-| task_coverage_judge | sonnet | independent adversarial verifier of the reconciled plan's coverage of the task (DESIGN §8 *Independent adversarial verification*); wired into `phase_planning_coverage_gate` — see §8 "The final two independent adversarial verifiers" |
-| integration_judge | sonnet | independent adversarial verifier of the integrator's merge for behavioral (not just textual) correctness (DESIGN §8); wired into `integrate_wave` as a post-merge-commit detect-and-die gate (attacks for behavioral breakage the conflict-marker scan cannot see, `die()`s on non-empty `defects`) |
-| rebaser      | sonnet  | finalize-time rebase-onto-base worker (DESIGN §6 *Finalization* "Rebase-onto-base before push") — a scoped, fully-agentic exception to §12: does the entire rebase workflow itself (fetch, rebase, conflict resolution, abort-if-irreconcilable judgment), mirroring `integrator` in every other respect |
+| adherence_judge | sonnet | plan-instruction-adherence scoring is judgment; empirically calibrated (goal-only task ⇒ high score, prescribed-and-violated ⇒ low score). If gating regresses, re-run calibration and consider `--model-adherence-judge opus` before reintroducing a blanket tier split |
+| classification_judge | sonnet | independent adversarial verifier of the classifier's category set (DESIGN §8 *Independent adversarial verification*) |
+| wiring_judge | sonnet | independent adversarial verifier of the plan's semantic wiring — dangles a structural `check_plan_wiring` scan cannot see (DESIGN §5, §8) |
+| provision_judge | sonnet | independent adversarial verifier of the detected install recipe vs. the actual image/runtime (DESIGN §6½, §8) |
+| artifact_registry | sonnet | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) — decides one canonical tag+path per artifact |
+| task_coverage_judge | sonnet | independent adversarial verifier of plan-vs-task coverage (DESIGN §8); wired into `phase_planning_coverage_gate` |
+| integration_judge | sonnet | independent adversarial verifier of the integrator's merge for behavioral correctness (DESIGN §8); wired into `integrate_wave` as a post-merge-commit detect-and-die gate (`die()`s on non-empty `defects`) |
+| rebaser      | sonnet  | finalize-time rebase worker (DESIGN §6 *Finalization*) — a scoped, fully-agentic exception to §12: does the entire rebase workflow itself, mirroring `integrator` |
 
 `MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
 lists `implementer`, `conformer`, `heal`, `pr_writer`, and `satisfied_probe`
@@ -2044,41 +2044,23 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`sonnet`)
 
-Twenty worker types (plus the global override), each independently overridable:
+Twenty worker types (plus the global override), each independently
+overridable via the mechanical pattern `LEERIE_MODEL_<WORKER>` (env) /
+`--model-<worker>` (CLI) / `model_<worker>` (TOML): classifier, planner,
+reconciler, plan_overlap_judge, satisfied_probe, provision, implementer,
+integrator, conformer, fit_judge, splitter, adherence_judge,
+classification_judge, wiring_judge, provision_judge, task_coverage_judge,
+integration_judge, artifact_registry, rebaser. Global override:
+`LEERIE_MODEL` / `--model` / `model`.
 
-| Worker             | env var                           | CLI flag                     | TOML key                  |
-|--------------------|-----------------------------------|------------------------------|---------------------------|
-| (global)           | `LEERIE_MODEL`                  | `--model`                    | `model`                   |
-| classifier         | `LEERIE_MODEL_CLASSIFIER`       | `--model-classifier`         | `model_classifier`        |
-| planner            | `LEERIE_MODEL_PLANNER`          | `--model-planner`            | `model_planner`           |
-| reconciler         | `LEERIE_MODEL_RECONCILER`       | `--model-reconciler`         | `model_reconciler`        |
-| plan_overlap_judge | `LEERIE_MODEL_PLAN_OVERLAP_JUDGE`| `--model-plan_overlap_judge` | `model_plan_overlap_judge`|
-| satisfied_probe    | `LEERIE_MODEL_SATISFIED_PROBE`  | `--model-satisfied_probe`    | `model_satisfied_probe`   |
-| provision          | `LEERIE_MODEL_PROVISION`        | `--model-provision`          | `model_provision`         |
-| implementer        | `LEERIE_MODEL_IMPLEMENTER`      | `--model-implementer`        | `model_implementer`       |
-| integrator         | `LEERIE_MODEL_INTEGRATOR`       | `--model-integrator`         | `model_integrator`        |
-| conformer          | `LEERIE_MODEL_CONFORMER`        | `--model-conformer`          | `model_conformer`         |
-| fit_judge          | `LEERIE_MODEL_FIT_JUDGE`        | `--model-fit_judge`          | `model_fit_judge`         |
-| splitter           | `LEERIE_MODEL_SPLITTER`         | `--model-splitter`           | `model_splitter`          |
-| adherence_judge    | `LEERIE_MODEL_ADHERENCE_JUDGE`  | `--model-adherence_judge`    | `model_adherence_judge`   |
-| classification_judge | `LEERIE_MODEL_CLASSIFICATION_JUDGE` | `--model-classification_judge` | `model_classification_judge` |
-| wiring_judge       | `LEERIE_MODEL_WIRING_JUDGE`     | `--model-wiring_judge`       | `model_wiring_judge`      |
-| provision_judge    | `LEERIE_MODEL_PROVISION_JUDGE`  | `--model-provision_judge`    | `model_provision_judge`   |
-| task_coverage_judge | `LEERIE_MODEL_TASK_COVERAGE_JUDGE` | `--model-task_coverage_judge` | `model_task_coverage_judge` |
-| integration_judge  | `LEERIE_MODEL_INTEGRATION_JUDGE` | `--model-integration_judge` | `model_integration_judge` |
-| artifact_registry  | `LEERIE_MODEL_ARTIFACT_REGISTRY` | `--model-artifact_registry` | `model_artifact_registry` |
-| rebaser            | `LEERIE_MODEL_REBASER`          | `--model-rebaser`            | `model_rebaser`           |
-| judge              | `LEERIE_MODEL_JUDGE`            | `--judge-model`              | `model_judge`             |
-| heal               | `LEERIE_MODEL_HEAL`             | `--heal-model`               | `model_heal`              |
-| pr_writer          | `LEERIE_MODEL_PR_WRITER`        | `--pr-writer-model`          | `model_pr_writer`         |
-| dep_capture        | `LEERIE_MODEL_DEP_CAPTURE`      | *(none)*                     | *(none)*                  |
-
-Note: `judge`, `heal`, `pr_writer`, and `dep_capture` do not follow the
-`--model-<W>` CLI flag pattern used by orchestrator workers, because they
-are post-run / finalize-time workers invoked outside the main orchestrate loop.
-`judge`, `heal`, and `pr_writer` have dedicated CLI flags; `dep_capture` has
-**neither a CLI flag nor a `leerie.toml` key** — it supports the env-var
-`LEERIE_MODEL_DEP_CAPTURE` override only. All four still honor the global
+`judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
+workers invoked outside the main orchestrate loop, so they don't follow that
+pattern: `judge`/`heal`/`pr_writer` have dedicated CLI flags instead
+(`--judge-model`, `--heal-model`, `--pr-writer-model`, with env vars
+`LEERIE_MODEL_JUDGE`/`LEERIE_MODEL_HEAL`/`LEERIE_MODEL_PR_WRITER` and TOML
+keys `model_judge`/`model_heal`/`model_pr_writer`); `dep_capture` has
+**neither a CLI flag nor a `leerie.toml` key** — env var
+`LEERIE_MODEL_DEP_CAPTURE` only. All four still honor the global
 `--model` / `LEERIE_MODEL` override.
 
 An invalid value in env or file is rejected at startup via `die()`. CLI
@@ -2111,19 +2093,12 @@ available; it does not eliminate run-to-run variance but does remove the
 
 **Per-worker defaults: `medium` for judgment workers, `low` for the
 code-writing acting workers, unset for post-run skill workers.**
-The judgment / finalize workers (classifier, planner, reconciler,
-plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge,
-splitter, adherence_judge, classification_judge, wiring_judge, provision_judge,
-task_coverage_judge, integration_judge, artifact_registry, rebaser)
-default to `medium`. `implementer` and `conformer` — the workers that
-actually write code — default to `low`, a deliberate cost/latency call
-(distinct from the judgment workers' `medium`, which is about determinism,
-not cost): these previously defaulted to *unset* (inheriting Claude's own
-default reasoning depth) so their effort stayed bounded by their own
-evidence gates (DESIGN §8) rather than a global dial; that tradeoff is now
-overridden in favor of a fixed low-effort ceiling. The post-run skill
-workers `judge` and `heal` remain *unset* — when no effort is resolved, no
-`--effort` flag is passed and the worker inherits Claude's default.
+`implementer`/`conformer` previously defaulted to *unset* (inheriting
+Claude's own reasoning depth) so their effort stayed bounded by their own
+evidence gates (DESIGN §8); that tradeoff is now overridden in favor of a
+fixed low-effort ceiling. `judge`/`heal` remain *unset* — when no effort is
+resolved, no `--effort` flag is passed and the worker inherits Claude's
+default.
 
 `medium` (rather than `high`) keeps per-run OTPM (output tokens per minute)
 rate-limit pressure down; Leerie's downstream checks (confidence gate,
@@ -2132,45 +2107,27 @@ the small per-worker quality reduction. `high`/`xhigh`/`max` remain available
 per-worker via the override chain below when a specific worker needs deeper
 reasoning.
 
-| Worker       | Default | Why |
+Per-worker rationale mirrors the "Why" column of the model-selection table
+above (same judgment-vs-throughput reasoning); only the resolved depth
+differs:
+
+| Worker       | Default | Notes (where it diverges from the model-table rationale) |
 |--------------|---------|-----|
-| classifier   | medium  | category choice is judgment over the whole task |
-| planner      | medium  | decomposition granularity is the load-bearing judgment step (DESIGN §8 planner gate) |
-| reconciler   | medium  | cross-domain tag equivalence is judgment |
-| plan_overlap_judge | medium | surface-overlap detection over the reconciled plan is judgment (DESIGN §5 *Cross-domain surface overlap*); merge-feasibility discipline rewards pinning reasoning depth |
-| satisfied_probe | unset | per-subtask advisory prune (DESIGN §8 *Already-satisfied subtask elimination*); runs once per subtask, same unset profile as conformer/judge — the base-tree-only tool scope and conservative default carry the correctness, not pinned depth |
-| provision    | medium  | recipe synthesis over arbitrary repo shapes is judgment |
-| integrator   | medium  | behavioral conflict resolution; a wrong merge corrupts state |
-| implementer  | low     | code-writing worker; pinned low for cost/latency — a deliberate override of the prior "bounded by §8 evidence gate" unset default, since the conformer/confidence-gate loops downstream absorb the quality tradeoff |
-| conformer    | low     | code-writing worker; same cost/latency rationale as implementer — the phase is advisory, so a borderline judgment call costs at most a warning |
-| judge        | unset   | post-run scoring; no need to pin |
-| heal         | unset   | post-run patch generation; no need to pin |
-| pr_writer    | medium  | one-shot finalize call; pin reasoning to keep template-fill discipline (preserve HTML comments, do not invent ticked checkboxes) consistent across runs |
-| dep_capture  | medium  | finalize-time dep inference; broad judgment over shell command sets benefits from pinned reasoning depth |
-| fit_judge    | medium  | P1 Task-Context Fit score is judgment over scope+context co-minimization; calibrated threshold (0.70) makes pinned depth the reproducibility dial |
-| splitter     | medium  | LLM-driven structural partition (coupled-minority path) is judgment over seam detection; wrong split corrupts downstream implementer context |
-| adherence_judge | medium | plan-instruction-adherence scoring is judgment; empirically calibrated (goal-only task ⇒ ≥8.5, prescribed-and-violated ⇒ ≤3). If adherence gating regresses, raise back to `high` via `effort_adherence_judge` before reintroducing a blanket tier split |
-| classification_judge | medium | independent adversarial verification of the classifier's category set (DESIGN §8); raise via `effort_classification_judge` if the gate regresses |
-| wiring_judge | medium | independent semantic-wiring verification of the reconciled plan (DESIGN §5, §8) |
-| provision_judge | medium | independent recipe verification against the image/runtime (DESIGN §6½, §8) |
-| artifact_registry | medium | pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry worker*) |
-| task_coverage_judge | medium | independent adversarial verification of plan-vs-task coverage (DESIGN §8); wired into `phase_planning_coverage_gate` |
-| integration_judge | medium | independent adversarial verification of the integrator's merge for behavioral correctness (DESIGN §8); wired into `integrate_wave` as a post-merge-commit detect-and-die gate |
-| rebaser      | medium  | finalize-time rebase-onto-base worker (DESIGN §6 *Finalization* "Rebase-onto-base before push"); judgment-adjacent — decides abort-vs-resolve per conflict, not just resolution content, so it gets `integrator`'s profile |
+| classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge, splitter, adherence_judge, classification_judge, wiring_judge, provision_judge, task_coverage_judge, integration_judge, artifact_registry, rebaser | medium | judgment/finalize workers; `medium` is the reproducibility dial, not a cost one |
+| implementer, conformer | low | code-writing workers; pinned low for cost/latency — a deliberate override of the prior "bounded by §8 evidence gate" unset default, since the conformer/confidence-gate loops downstream absorb the quality tradeoff |
+| satisfied_probe | unset | per-subtask advisory prune; base-tree-only tool scope + conservative default carry correctness, not pinned depth |
+| judge, heal  | unset   | post-run scoring/patching; no need to pin |
+
+Two calibrated thresholds worth noting: `adherence_judge` (goal-only task ⇒
+≥8.5, prescribed-and-violated ⇒ ≤3) and `fit_judge` (0.70) — raise the
+relevant worker's effort via its override (e.g. `effort_adherence_judge`)
+before reintroducing a blanket tier split if a gate regresses under `medium`.
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
-`EFFORT_DEFAULT_PER_WORKER` overrides it to `"medium"` for the seventeen
-judgment / finalize workers in the table above: the six core judgment workers
-(classifier, planner, reconciler, plan_overlap_judge, provision, integrator),
-the finalize-time `pr_writer`, `dep_capture`, and `rebaser` workers, the P1
-decomposition workers `fit_judge` and `splitter`, the plan-instruction-adherence
-worker `adherence_judge`, the five independent adversarial verifiers
-`classification_judge`, `wiring_judge`, `provision_judge`,
-`task_coverage_judge`, and `integration_judge`, and the pre-planning
-shared-vocabulary worker `artifact_registry`. It separately
-overrides `implementer` and `conformer` to `"low"` — a distinct,
-cost-motivated pin rather than a judgment-reproducibility one, so it is
-called out separately from the `"medium"` judgment cohort above.
+`EFFORT_DEFAULT_PER_WORKER` overrides it per the table above — `"medium"`
+for the seventeen judgment/finalize workers, `"low"` for `implementer` and
+`conformer` (a distinct, cost-motivated pin rather than a
+judgment-reproducibility one).
 
 Resolution order for each worker type `W` (highest priority first), mirroring
 model selection:
@@ -2184,34 +2141,12 @@ model selection:
 7. **Per-worker default** from `EFFORT_DEFAULT_PER_WORKER`
 8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
 
-| Worker             | env var                            | CLI flag                      | TOML key                   |
-|--------------------|------------------------------------|-------------------------------|----------------------------|
-| (global)           | `LEERIE_EFFORT`                  | `--effort`                    | `effort`                   |
-| classifier         | `LEERIE_EFFORT_CLASSIFIER`       | `--effort-classifier`         | `effort_classifier`        |
-| planner            | `LEERIE_EFFORT_PLANNER`          | `--effort-planner`            | `effort_planner`           |
-| reconciler         | `LEERIE_EFFORT_RECONCILER`       | `--effort-reconciler`         | `effort_reconciler`        |
-| plan_overlap_judge | `LEERIE_EFFORT_PLAN_OVERLAP_JUDGE`| `--effort-plan_overlap_judge` | `effort_plan_overlap_judge`|
-| satisfied_probe    | `LEERIE_EFFORT_SATISFIED_PROBE`  | `--effort-satisfied_probe`    | `effort_satisfied_probe`   |
-| provision          | `LEERIE_EFFORT_PROVISION`        | `--effort-provision`          | `effort_provision`         |
-| implementer        | `LEERIE_EFFORT_IMPLEMENTER`      | `--effort-implementer`        | `effort_implementer`       |
-| integrator         | `LEERIE_EFFORT_INTEGRATOR`       | `--effort-integrator`         | `effort_integrator`        |
-| conformer          | `LEERIE_EFFORT_CONFORMER`        | `--effort-conformer`          | `effort_conformer`         |
-| fit_judge          | `LEERIE_EFFORT_FIT_JUDGE`        | `--effort-fit_judge`          | `effort_fit_judge`         |
-| splitter           | `LEERIE_EFFORT_SPLITTER`         | `--effort-splitter`           | `effort_splitter`          |
-| adherence_judge    | `LEERIE_EFFORT_ADHERENCE_JUDGE`  | `--effort-adherence_judge`    | `effort_adherence_judge`   |
-| classification_judge | `LEERIE_EFFORT_CLASSIFICATION_JUDGE` | `--effort-classification_judge` | `effort_classification_judge` |
-| wiring_judge       | `LEERIE_EFFORT_WIRING_JUDGE`     | `--effort-wiring_judge`       | `effort_wiring_judge`      |
-| provision_judge    | `LEERIE_EFFORT_PROVISION_JUDGE`  | `--effort-provision_judge`    | `effort_provision_judge`   |
-| task_coverage_judge | `LEERIE_EFFORT_TASK_COVERAGE_JUDGE` | `--effort-task_coverage_judge` | `effort_task_coverage_judge` |
-| integration_judge  | `LEERIE_EFFORT_INTEGRATION_JUDGE` | `--effort-integration_judge` | `effort_integration_judge` |
-| artifact_registry  | `LEERIE_EFFORT_ARTIFACT_REGISTRY` | `--effort-artifact_registry` | `effort_artifact_registry` |
-| rebaser            | `LEERIE_EFFORT_REBASER`          | `--effort-rebaser`            | `effort_rebaser`           |
-| judge              | *(none)*                         | *(none)*                      | *(none)*                   |
-| heal               | *(none)*                         | *(none)*                      | *(none)*                   |
-| pr_writer          | *(none)*                         | *(none)*                      | *(none)*                   |
-| dep_capture        | *(none)*                         | *(none)*                      | *(none)*                   |
+Same mechanical pattern as model selection: `LEERIE_EFFORT_<WORKER>` (env) /
+`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same nineteen
+worker names listed above under model selection. Global override:
+`LEERIE_EFFORT` / `--effort` / `effort`.
 
-Note: `judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
+`judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
 workers not in `WORKER_TYPES`; they receive no per-worker effort override (no
 dedicated env var, CLI flag, or TOML key). They do honor the global
 `--effort` / `LEERIE_EFFORT` override.
@@ -2280,28 +2215,15 @@ invocations have their own env requirements unchanged.
 
 Each wave job is a normal single-run `--runtime fly` invocation:
 
-1. **Provision.** `scripts/remote/provision.sh::provision_machine` creates a
-   Fly machine, writes `fly-machine.json` + `$LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json`
-   immediately after `flyctl machine run` succeeds.
-2. **Seed.** `scripts/remote/seed-auth.sh` + `seed-repo.sh` ship the
-   laptop's Claude credentials + git identity + working tree to the
-   worker via `flyctl ssh console` tar pipe. `seed-auth.sh:149-158`
-   excludes git-push credentials by design — workers never see them.
-3. **Orchestrate.** The orchestrator runs the standard
-   classify → plan → execute → finalize phases on the worker.
-4. **Decide teardown.** When the orchestrator exits, the launcher's
-   `decide_teardown` trap fires on the LAPTOP (it's a trap on the
-   bash process that sourced provision.sh; the worker's exit
-   propagates via the SSH session's tail wrapper). The trap calls
-   `fetch_branch` (pulls bundle + run-state), `host_finalize`
-   (pushes branch + opens PR), `destroy_machine` (Fly DELETE).
+1. **Provision.** `scripts/remote/provision.sh::provision_machine` creates a Fly machine, writes `fly-machine.json` + `$LEERIE_STATE_HOST_DIR/remote/<launcher-pid>.json` right after `flyctl machine run` succeeds.
+2. **Seed.** `scripts/remote/seed-auth.sh` + `seed-repo.sh` ship the laptop's Claude credentials + git identity + working tree via `flyctl ssh console` tar pipe. `seed-auth.sh:149-158` excludes git-push credentials by design — workers never see them.
+3. **Orchestrate.** The orchestrator runs the standard classify → plan → execute → finalize phases on the worker.
+4. **Decide teardown.** When the orchestrator exits, the launcher's `decide_teardown` trap fires on the LAPTOP (the worker's exit propagates via the SSH session's tail wrapper). The trap calls `fetch_branch` (pulls bundle + run-state), `host_finalize` (pushes branch + opens PR), `destroy_machine` (Fly DELETE).
 
-The chain wave loop catches each per-job exit via `wait` and
-captures the rc. The launcher_pid recorded in
-`$LEERIE_STATE_HOST_DIR/remote/<pid>.json` is `$!` from the parent's
-background spawn, which lets the wave loop discover each child's
-`fly_machine_id` (= run_id) and tag the run with `chain_id` /
-`wave_idx`.
+The chain wave loop catches each per-job exit via `wait`. The launcher_pid
+recorded in `$LEERIE_STATE_HOST_DIR/remote/<pid>.json` is `$!` from the
+parent's background spawn, letting the wave loop discover each child's
+`fly_machine_id` (= run_id) and tag the run with `chain_id` / `wave_idx`.
 
 #### chain_id discovery for chain-scoped verbs
 
@@ -2311,15 +2233,12 @@ completes for that run. The launcher's `update_run_json` bash
 helper (`scripts/remote/lib.sh:42`) merges the field atomically into
 the existing JSON.
 
-The tagging loop discovers each child's machine ID via two paths
-(tried in order):
-
-1. **Primary:** `remote/<child-pid>.json` — the PID-keyed pointer
-   written by `provision.sh` during provisioning.
-2. **Fallback:** scan `runs/*/fly-machine.json` for a matching
-   `launcher_pid` field. This path fires when the pointer file is
-   absent (e.g., older images whose `destroy_machine()` deleted
-   it before the parent could read it).
+The tagging loop discovers each child's machine ID via two paths (tried in
+order): **primary** `remote/<child-pid>.json` — the PID-keyed pointer
+written by `provision.sh` during provisioning; **fallback** scan
+`runs/*/fly-machine.json` for a matching `launcher_pid` field, for when the
+pointer file is absent (e.g. older images whose `destroy_machine()` deleted
+it before the parent could read it).
 
 All chain-scoped verbs operate by iterating
 `$LEERIE_STATE_HOST_DIR/runs/*/run.json`, parsing each with
@@ -2357,39 +2276,33 @@ prior wave.
 
 ##### Resuming a chain via `chain --chain-id <uuid>`
 
-`leerie chain --chain-id <prior-uuid> --wave …` pins the chain_id
-to a prior chain's UUID instead of minting fresh. The wave loop's
-`_wave_already_done` check then matches the prior chain's runs and
-skips fan-out for already-pushed waves, advancing `current_base`
-through any wave-staging branches already pushed to origin. This is
-the load-bearing recovery path after `leerie resume <chain-id>`
-unpauses every paused run: the user re-submits with `--chain-id
-<prior-uuid>` and the chain picks up at the first not-yet-done
-wave.
+`leerie chain --chain-id <prior-uuid> --wave …` pins the chain_id to a
+prior chain's UUID instead of minting fresh. The wave loop's
+`_wave_already_done` check then matches the prior chain's runs and skips
+fan-out for already-pushed waves, advancing `current_base` through any
+wave-staging branches already pushed to origin — the load-bearing recovery
+path after `leerie resume <chain-id>` unpauses every paused run: the user
+re-submits with `--chain-id <prior-uuid>` and the chain picks up at the
+first not-yet-done wave.
 
-The launcher normalizes the user-supplied chain_id to lowercase via
-`tr '[:upper:]' '[:lower:]'` after UUID format validation. The
-validation regex (`UUID_PATTERN`, defined near the top of the
-launcher) is case-insensitive (`grep -qiE`) so uppercase input
-passes; but the wave-loop helpers compare against `run.json`'s
-`chain_id` field case-sensitively, and `uuid.uuid4()` always emits
-lowercase. Without normalization, uppercase `--chain-id` input
-would silently bypass idempotency and fork the chain into two
-chain_ids — the v8 audit's S1 finding.
+The launcher normalizes the user-supplied chain_id to lowercase via `tr
+'[:upper:]' '[:lower:]'` after UUID format validation (`UUID_PATTERN` is
+case-insensitive, `grep -qiE`, so uppercase input passes validation; but
+the wave-loop helpers compare `run.json`'s `chain_id` case-sensitively, and
+`uuid.uuid4()` always emits lowercase). Without normalization, uppercase
+`--chain-id` input would silently bypass idempotency and fork the chain
+into two chain_ids — the v8 audit's S1 finding.
 
 ##### Synth-merge idempotency probe
 
-Before invoking `chain.git_ops.synth_merge_branches` for wave
-N → N+1, the wave loop probes origin via `git ls-remote
---exit-code origin leerie/stage/<chain-id>-wave-<N+1>`. If the
-stage branch already exists (e.g., the user manually resolved a
-prior synth-merge conflict and pushed), the wave loop fetches +
-checks out the existing branch and skips synth-merge entirely.
-Without this probe, `synth_merge_branches`'s `git checkout -B`
-would force-recreate the stage branch from `$current_base`,
-discarding the user's resolved state, and then re-merge the same
-wave-N branches — re-conflicting in exactly the same way that
-prompted the resume.
+Before invoking `chain.git_ops.synth_merge_branches` for wave N → N+1,
+the wave loop probes origin via `git ls-remote --exit-code origin
+leerie/stage/<chain-id>-wave-<N+1>`. If the stage branch already exists
+(e.g. the user manually resolved a prior synth-merge conflict and
+pushed), the wave loop fetches + checks out the existing branch instead
+of re-running synth-merge — otherwise `synth_merge_branches`'s `git
+checkout -B` would force-recreate the stage branch from `$current_base`,
+discarding the resolved state and re-conflicting the same way.
 
 #### Synth-merge between waves
 
@@ -2420,20 +2333,13 @@ so wave-N+1 workers can see it as their starting base.
 
 #### Idempotent resume
 
-If the user Ctrl-Cs mid-chain or any job fails, the wave loop
-exits non-zero with a resume hint. To resume:
-
-1. `leerie resume <chain-id>` resumes every paused run (existing
-   single-run resume per discovered run).
-2. After paused runs complete, the user re-invokes
-   `leerie chain --wave ...`. The wave loop's idempotency check
-   (waves whose runs are all already `pushed_at` are skipped) lets
-   the chain pick up from where it stopped.
-
-The canonical "this run is done, don't re-spawn" sentinel is
-`pushed_at` being set on the run.json — written by `host_finalize`
-after `git push -u origin <branch>` succeeds. This is the same
-sentinel `host_finalize` itself uses for push idempotency.
+If the user Ctrl-Cs mid-chain or any job fails, the wave loop exits
+non-zero with a resume hint: `leerie resume <chain-id>` resumes every
+paused run, then re-invoking `leerie chain --wave ...` picks the chain
+back up (the idempotency check above skips waves whose runs are already
+`pushed_at`). `pushed_at` is the canonical "this run is done, don't
+re-spawn" sentinel — the same one `host_finalize` uses for push
+idempotency, set after `git push -u origin <branch>` succeeds.
 
 #### chain.git_ops surface (laptop-side)
 
@@ -2492,39 +2398,34 @@ leerie group \
   [<per-member-flags>]
 ```
 
-Modeled on the `chain` arm (`leerie:2033`). The `group` arm:
+Modeled on the `chain` arm (`leerie:2033`). The `group` arm parses repeated
+`--repo <path> "<prompt>"` pairs and an optional `--brief <file>`; fails
+fast if any repo path is not a git repository (mirrors the chain
+prompt-file check at `leerie:2136`); mints a `_group_id` (UUID, same
+mechanism as `chain`'s `_ch_id`); then per member builds the prompt as
+`<brief>\n\n<member prompt>`, appends `--inspect-dir <sibling-repo>` for
+every other member, and backgrounds:
 
-1. Parses repeated `--repo <path> "<prompt>"` pairs and an optional
-   `--brief <file>`.
-2. Fails fast if any repo path is not a git repository (mirrors
-   the chain prompt-file check at `leerie:2136`).
-3. Mints a `_group_id` (UUID, same mechanism as `chain`'s `_ch_id`).
-4. **State-dir guard (mandatory).** Rejects or per-member-namespaces
-   any `--state-dir` / `LEERIE_STATE_DIR` override in the calling
-   environment. These override `_state_dir_default` (`:431`) and would
-   pin every member to one shared state directory, causing a `.owner`
-   collision on member 2. Chains (one repo) forward these safely;
-   groups (N repos) must not. The guard must fire before any member
-   is backgrounded.
-5. Per member: builds the prompt as `<brief>\n\n<member prompt>`,
-   appends `--inspect-dir <sibling-repo>` for every other member
-   (reusing the inspect-dir translation at `leerie:3337`+), and
-   backgrounds:
-   ```bash
-   # resolved once, before any cd, to an absolute path:
-   _grp_self_cmd="${LEERIE_SELF_CMD:-$_grp_leerie_dir/$(basename "$0")}"
-   ( cd <repo> && "$_grp_self_cmd" "<prompt>" <flags> \
-       --group-id "$_group_id" ) &
-   ```
-   (mirrors `leerie:2237-2246` for chains). Each `cd` makes the member
-   resolve its own `USER_REPO` and basename-keyed state directory
-   independently. The self-command **must** be absolutized *before* the
-   `cd`: a relative `$0` (e.g. `./leerie`, the documented quick-start
-   form) would not resolve from the member's cwd once the subshell has
-   `cd`'d into the member repo. Unlike chains — which never `cd`, so a
-   relative `$0` still resolves — the group fan-out changes directory,
-   so it anchors `$0` to the launcher's own resolved dir first.
-6. Waits for all members (`wait`), then runs group tag-back (below).
+```bash
+# resolved once, before any cd, to an absolute path:
+_grp_self_cmd="${LEERIE_SELF_CMD:-$_grp_leerie_dir/$(basename "$0")}"
+( cd <repo> && "$_grp_self_cmd" "<prompt>" <flags> \
+    --group-id "$_group_id" ) &
+```
+
+(mirrors `leerie:2237-2246` for chains). Each `cd` makes the member resolve
+its own `USER_REPO` and basename-keyed state directory independently. The
+self-command **must** be absolutized *before* the `cd`: a relative `$0`
+(e.g. `./leerie`) would not resolve once the subshell has `cd`'d into the
+member repo — unlike chains, which never `cd`. Finally, waits for all
+members (`wait`) and runs group tag-back (below).
+
+**State-dir guard (mandatory).** The arm rejects or per-member-namespaces
+any `--state-dir` / `LEERIE_STATE_DIR` override in the calling environment,
+before any member is backgrounded. These override `_state_dir_default`
+(`:431`) and would pin every member to one shared state directory, causing
+a `.owner` collision on member 2. Chains (one repo) forward these safely;
+groups (N repos) must not.
 
 Per-member flags are forwarded like `_ch_passthrough` for chains.
 `LEERIE_SELF_CMD` is the same test seam used by chain verbs — it still
@@ -2547,13 +2448,10 @@ state dir), so the discovery is:
 | **Fly** | The existing `remote/<child-pid>.json` / `fly-machine.json` pointer path (`leerie:2263-2289`), applied per-member using the member's own state dir. The child's PID is `$!`; the member's state dir is resolved from its basename. |
 
 After discovering each member's `run.json`, the launcher calls
-`update_run_json … group_id "$_group_id"` (the same
-runtime-agnostic atomic merge used by the chain wave loop,
-`scripts/remote/lib.sh:70`).
-
-No new per-child pointer file is required: the durable
-`run.json`-on-disk is the coordination artifact, consistent with how
-chains discover their members.
+`update_run_json … group_id "$_group_id"` (the same runtime-agnostic
+atomic merge used by the chain wave loop, `scripts/remote/lib.sh:70`). No
+new per-child pointer file is required: the durable `run.json`-on-disk is
+the coordination artifact, consistent with how chains discover members.
 
 #### Group-scoped verbs
 
@@ -2582,11 +2480,11 @@ given `group_id`. Signature:
 _group_runs_filter <group_id> <verb> <state_dir_1> [<state_dir_2> ...]
 ```
 
-Emits matching run-ids one per line, filtered by the same per-verb
-logic as `_chain_runs_filter` (`stop` / `kill` / `finalize` / `resume`
-/ `running`). The key difference: `_chain_runs_filter` iterates
-`$LEERIE_STATE_HOST_DIR/runs/*/run.json` (one directory); `_group_runs_filter`
-iterates `<state_dir_N>/runs/*/run.json` for each supplied directory.
+Emits matching run-ids one per line, filtered by the same per-verb logic as
+`_chain_runs_filter` (`stop` / `kill` / `finalize` / `resume` / `running`).
+Key difference: `_chain_runs_filter` iterates one directory
+(`$LEERIE_STATE_HOST_DIR/runs/*/run.json`); `_group_runs_filter` iterates
+`<state_dir_N>/runs/*/run.json` for each supplied directory.
 
 #### Deploy-ordering notes
 
@@ -2597,47 +2495,37 @@ in `State.data["external_preconditions"]` (written at plan time,
 `{tag, reasons:[{sid, reason}], originating_subtasks}`.
 
 The deploy-note plumbing threads `external_preconditions` from State
-into the finalize path at three points:
+into the finalize path at three points, so the note survives regardless
+of which finalize path fires:
 
 1. **`_compose_pr_via_llm` payload** (`orchestrator/leerie.py:14590`):
-   `external_preconditions` is added as a field in the JSON payload
-   passed to the `pr_writer` worker, alongside `task`, `commit_log`,
-   etc. The pr_writer prompt instructs the worker to render a
+   added as a field in the JSON payload passed to `pr_writer`, alongside
+   `task`, `commit_log`, etc. The pr_writer prompt renders a
    "⚠ Deploy-ordering" section when the field is non-empty.
-
-2. **`compose_pr_body` fallback** (`orchestrator/leerie.py:2119`):
-   The deterministic Python fallback PR body is extended to render a
-   "⚠ Deploy-ordering" section from `external_preconditions` when
-   present in state. This ensures the deploy note appears even when
-   the `pr_writer` LLM worker fails or is skipped.
-
-3. **`host-finalize.sh` bash fallback** (`scripts/host-finalize.sh`):
-   the pure-bash deterministic PR body (used when neither `pr_body`
-   from the `pr_writer` worker nor the Python `compose_pr_body` output
-   reached `run.json` — the LLM-less host-side finalize path) renders
-   the same "⚠ Deploy-ordering" section from
-   `state.json.external_preconditions` via `jq`. Its output is
-   byte-for-byte identical to the Python renderer's section shape
-   (`- **<tag>** — <reason>`, reasons `"; "`-joined; nothing emitted
-   when the field is absent or empty), so the note survives even the
-   LLM-less path. No `run.json` persistence is needed —
-   `external_preconditions` is already a `STATE_FIELDS` key in
-   `state.json`.
+2. **`compose_pr_body` fallback** (`orchestrator/leerie.py:2119`): the
+   deterministic Python fallback PR body renders the same section from
+   state, covering the case where the `pr_writer` LLM worker fails or is
+   skipped.
+3. **`host-finalize.sh` bash fallback**: the pure-bash deterministic PR
+   body (the LLM-less host-side finalize path, used when neither
+   `pr_body` nor the Python fallback reached `run.json`) renders the
+   identical section via `jq` — byte-for-byte matching the Python
+   renderer's shape (`- **<tag>** — <reason>`, reasons `"; "`-joined,
+   nothing emitted when absent/empty). No `run.json` persistence is
+   needed — `external_preconditions` is already a `STATE_FIELDS` key.
 
 #### Run-summary cost line
 
 Both deterministic renderers also emit a `- Cost:` line in the
-`## Run summary` block (after `- Workers:`), sourced from
-`state.json`'s `telemetry` block: `- Cost: $X.XX (N calls, I in / O out
-tokens)`. Rendered only when the telemetry block is present (omitted on
-pre-classify orphans), matching the deploy-note guard. Both renderers —
-`compose_pr_body` (`orchestrator/leerie.py`, `${x:,.2f}` + `,`-grouped
-tokens) and the `host-finalize.sh` `jq` fallback (`money`/`group`
-helpers reproducing the same 2-decimal, thousands-grouped output) — are
-format-identical except for a sub-cent rounding difference on an exact
-half-cent `cost_usd` that never arises on a real summed cost. Like the
-deploy note, no `run.json` persistence is needed — the `telemetry`
-block is a `STATE_FIELDS` key.
+`## Run summary` block (after `- Workers:`), sourced from `state.json`'s
+`telemetry` block: `- Cost: $X.XX (N calls, I in / O out tokens)`.
+Rendered only when the telemetry block is present (omitted on
+pre-classify orphans), matching the deploy-note guard.
+`compose_pr_body` and the `host-finalize.sh` `jq` fallback both produce
+2-decimal, thousands-grouped output and are format-identical except for
+a sub-cent rounding difference on an exact half-cent `cost_usd` that
+never arises on a real summed cost. No `run.json` persistence is needed
+— `telemetry` is already a `STATE_FIELDS` key.
 
 **Key design note:** `reason` in `external_preconditions` is
 unstructured free text (`required` is only `[tag, extent]`,
@@ -2650,24 +2538,19 @@ parsing planner free-text.
 
 When a group member's planner receives a group brief (a shared context
 block prepended by the launcher, marked `## Group brief` or similar),
-`prompts/planner.md` contains a positive instruction directing it to:
-
-1. **Read the sibling's contract.** Use `Read`, `Grep`, and `Glob`
-   under `/inspect/<name>/` to locate and read the sibling's API
-   surface, type definitions, schema, or interface files — not just
-   the brief.
-2. **Honor the interface.** Subtasks must conform to the sibling's
-   actual types, field names, and endpoints as found in the code.
-3. **Declare the dependency.** Add a `requires` entry with
-   `extent: "external"` whose `reason` names the sibling repo and the
-   specific contract item, for every subtask that depends on a
-   sibling-owned contract.
+`prompts/planner.md` directs it to: (1) **read the sibling's contract** —
+`Read`/`Grep`/`Glob` under `/inspect/<name>/` to locate the sibling's API
+surface, types, schema, or interface files, not just the brief; (2)
+**honor the interface** — subtasks must conform to the sibling's actual
+types/field names/endpoints as found in the code; (3) **declare the
+dependency** — add a `requires` entry with `extent: "external"` whose
+`reason` names the sibling repo and the specific contract item, for every
+subtask depending on a sibling-owned contract.
 
 This is advisory steering per DESIGN.md §12 ("prompts advisory, code
 enforces"): the write-confinement guarantee stays code
 (`_filter_offtree_subtasks`), not the prompt. The instruction lifts
-reliable cross-repo-aware planning from emergent (task-text-driven) to
-dependable (explicit prompt rule).
+reliable cross-repo-aware planning from emergent to dependable.
 
 The planner prompt also documents the runtime asymmetry: inspect-dir
 read-only is kernel-enforced locally (`:ro` bind-mount) but
