@@ -4037,7 +4037,8 @@ away). Neither alone is sufficient.
    instead disambiguates with `_pid_still_exists(pid)` (a `/proc`
    existence check kept in its own function so `_zombie_reaper`'s own
    source never mentions `/proc`): alive → retain and retry; gone →
-   discard. Retention is bounded by `_ECHILD_RETRY_MAX_SEC` (60s), safe
+   discard. Retention is bounded by `_ECHILD_RETRY_MAX_SEC` (60s,
+   first-ECHILD timestamps in `_REAPABLE_PID_FIRST_ECHILD`), safe
    only because `_DescendantTracker._poll_loop` re-marks every observed
    descendant every `_DESCENDANT_POLL_SEC` (0.5s), so an aged-out pid is
    re-added with a fresh window (both constants pinned together in
