@@ -29,19 +29,19 @@ inside the container (DESIGN §6 / §0.5 below).
 | `scripts/install.sh` | The `curl \| bash` shell installer. Preflight (git/curl checked; `claude` auto-installed via the official native installer if missing, opt-out `--no-claude-install`) → runtime install (colima on macOS; rootless containerd stack on Debian/Ubuntu — Fedora/Arch fall back to a docs hint) → clone → symlink → verify. Self-contained bash; deps: `bash`, `curl`, `git`. |
 | `leerie` (launcher) | Portable bash. Symlink-walks to its own location, runs the per-OS runtime preflight, builds the leerie image once per version, and execs `nerdctl run` with TTY flags adapted via `[ -t 0 ]` (see §0.5). Passes `--cgroupns=host` so the container shares the host VM's cgroup namespace — required for cgroup v2 process enrollment (nerdctl's default `--cgroupns=private` + `nsdelegate` blocks non-root `cgroup.procs` writes; see DESIGN §6 *Memory containment*). Fast paths for `version` and `config` skip container startup. Per-run auth/config is staged into a fresh `mktemp -d "$HOME/.cache/leerie/cfg-XXXXXX"` (`$STAGE`); a `rm -rf "$STAGE"` EXIT trap is registered **immediately after the mktemp** (before the ~250-line stage-assembly block, which contains an `exit 1`) so an early exit can't leak the dir, and a best-effort startup sweep (`find "$HOME/.cache/leerie" -maxdepth 1 -type d -name 'cfg-*' -mtime +1 -exec rm -rf`) reclaims dirs leaked by trap-bypassing exits (SIGKILL / OOM / `nerdctl kill`). Because `-mtime` tests the cfg dir's own top-level mtime — which freezes at staging-completion (the running container's writes into `$STAGE/.claude/*` do NOT bump it) — a background keepalive (`while :; do touch "$STAGE"; sleep 3600; done &`, killed by the same EXIT trap) freshens the live dir hourly so a genuinely long-running run (e.g. one auto-resuming across rate-limit backoffs) is never mistaken for stale and deleted by a concurrent launch's sweep. |
 | `Dockerfile` | Image recipe (Debian 13 + Node + pnpm + claude CLI + baked orchestrator source). Built locally on first run, tagged `leerie:<VERSION>`. |
-| `scripts/container-entry.sh` | Container PID 1. Runs as **root** (rootful runtimes) or the **rootlesskit-mapped host UID** (rootless containerd — see DESIGN §6 *Rootless exception*); the Dockerfile intentionally omits `USER leerie` so the entrypoint can set up cgroup containment before privilege drop. It resolves `CGROUP_ROOT` (the literal `/sys/fs/cgroup`, or — rootless — the systemd-delegated `user.slice/user-$HOST_UID.slice/user@$HOST_UID.service` subtree), creates `$CGROUP_ROOT/leerie.slice` and enables the memory+pids controllers (needed for the aggregate `memory.max` cap), then — the load-bearing step — launches the **cgroup broker** (`LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py &`) at the same identity, before privilege drop, because worker cgroup enrollment and limit-setting cannot be done by the dropped-privilege orchestrator (see `scripts/cgroup-broker.py` below and DESIGN §6). `ulimit -c 0`, the cgroup slice setup, the broker launch, `cd /work`, `chown leerie: /work`, `chown leerie: /home/leerie` + `chown -R leerie: /home/leerie/.local /home/leerie/.cache /home/leerie/.gnupg`, and `chown -R leerie: /tmp/.cache` + `chmod -R a+rwX /tmp/.cache` + `chmod 1777 /tmp/.cache` all run at this pre-drop identity (skipped in rootless mode, along with the `runuser` drop itself). Under rootless containerd's `unshare --user --map-user=<leerie-uid>` privilege drop, only outer UID 0 remaps to inner leerie — a directory chowned to leerie's own (non-zero) UID appears owned by nobody to the remapped process, traversable but not writable. The Dockerfile leaves `/home/leerie`, `.local`, `.cache`, and `.gnupg` root-owned at build time for exactly this reason (outer UID 0 is the one value that does remap correctly, the same mechanism that makes bind-mounted host dirs writable with no chown at all); the rootful path needs literal `leerie` ownership instead (a real `runuser -u leerie` UID switch, no remap involved), which is what the runtime chown here restores. `/tmp/.cache` gets the stronger `chmod 1777` treatment rather than a plain chown-back because arbitrary tools create their own subdirs under `XDG_CACHE_HOME` there at runtime (corepack, `tree-sitter-language-pack`) — a fixed set of pre-created dirs like `.local`/`.cache`/`.gnupg` doesn't need that, a chown-back suffices. The final exec drops to leerie via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...`: if invoked with no argv (remote/Fly path — the launcher exec's the orchestrator via `flyctl ssh console -C "python3 -"` separately, which also drops via `Popen(user="leerie")`), the runuser exec wraps `sleep infinity` to keep the namespace alive; otherwise it wraps `python3 /opt/leerie-image/orchestrator/leerie.py "$@"` (local path — nerdctl always passes argv). The explicit `env` form is used instead of `runuser --login` because the login form would chdir to `/home/leerie` and override the `cd /work` invariant. |
-| `scripts/cgroup-broker.py` | Cgroup broker (DESIGN §6 *Memory containment*). Launched by `container-entry.sh` at PID 1 before the privilege drop; the dropped-privilege orchestrator drives it over a Unix socket at `/run/leerie-cgroup.sock`. Handles `ping` / `probe` / `create <sid> <mem> <pids>` / `enroll <sid> <pid>` / `destroy <sid>` / `stat <sid>` / `slice`. The orchestrator must call `descendant_tracker.stop_and_reap()` **before** `_cgroup_destroy` — a worker's backgrounded subprocesses are still cgroup members while alive, so destroying first hands the broker a cgroup that's still populated and its `rmdir` fails EBUSY (pinned by `tests/test_cgroup_helpers.py::test_invoke_finally_reaps_before_destroying_cgroup`, source-coupled since the ordering is invisible to a behavioural test). `destroy` writes `cgroup.kill` and **polls `cgroup.procs` until it drains** before `rmdir`, retrying the `rmdir` on `EBUSY`, bounded by `_DESTROY_DRAIN_TIMEOUT_SEC` on v2 and the much shorter `_V1_DRAIN_TIMEOUT_SEC` on v1 (v2's `cgroup.kill` is asynchronous so the wait is real; v1 has no `cgroup.kill` and migrates survivors to the parent first, so its outcome is already settled by the time the drain runs). Still returns the error string once the budget is exhausted, so a genuine failure is not silently swallowed by the retry. The orchestrator's own client-side socket timeout for `destroy` (`_CGROUP_DESTROY_TIMEOUT_SEC`, 15.0s) must stay ≥ `_DESTROY_DRAIN_TIMEOUT_SEC` (the broker's 10.0s budget) — a shorter client timeout lets the client abandon a still-draining destroy while the broker keeps polling regardless, and because workers run with `--cgroupns=host` the cgroup directory lives on the host cgroupfs and outlives the container, so an abandoned client leaves nothing waiting and container teardown can kill the broker mid-drain, permanently orphaning the `leerie-w-<sid>` directory. Because the client blocks for the whole drain, `_cgroup_destroy` is dispatched via `asyncio.to_thread` from `_invoke`'s finally rather than inline, unlike every other `_cgroup_*` round-trip, so one worker's teardown can't stall every concurrently streaming worker. Dirs that leak anyway (pre-fix images, a SIGKILLed orchestrator) are swept at broker startup — before the socket is bound, only for dirs that are both empty and older than `_ORPHAN_MIN_AGE_SEC` (1 h); both guards matter because `create`/`enroll` are separate round-trips (a live cgroup is briefly empty) and a concurrent run's broker must not be swept by this one. `stat <sid>` is read-only → `OK <pids.current> <pids.max> <pids.events.max> <memory.events.oom_kill>`, used by `_cgroup_stat` (a 4-tuple client mirroring the wire response) for both PID-exhaustion detection and memory-OOM naming (DESIGN §6). `slice` is read-only, no args → `OK <leerie.slice memory.max, -1 if unset> <live sibling leerie-w-* worker cgroups> <unreclaimable bytes, -1 if unreadable>`, used by `_cgroup_slice_info` to gate worker admission on measured slice headroom. The third field is **unreclaimable** usage (v2: `memory.stat`'s `anon + unevictable + slab_unreclaimable`; v1: `total_rss + total_unevictable`) — deliberately not `memory.current`, which counts reclaimable page cache and under-reports headroom. `-1` means unreadable and the caller admits (fail-open, matching the whole-tuple `None` contract). The second field ("live") means a non-empty `cgroup.procs` — finished runs' worker cgroups persist empty, so a bare directory count would overcount — and is reported for diagnostics only; it is **not** an input to per-worker sizing, which is load-independent (see the `worker_memory_max_bytes` row). The `memory.events` `oom_kill` counter (v2's `<sid-dir>/memory.events`, v1's memory-controller `mdir/memory.events`, both parsed by `_memory_events_oom`; missing/unreadable file degrades to 0) is the definitive memory-OOM signal, mirroring the `pids.events` `max` counter's role for fork denial. The broker exists because worker cgroup enrollment and limit-setting cannot be done from the orchestrator's own dropped-privilege identity (a subtree merely `chown`ed after creation keeps its controller limit files root-owned, and cross-scope task migration needs write on the common-ancestor cgroup the leerie user doesn't own). Detects and handles cgroup **v2** (unified `<V2_ROOT>/leerie.slice/leerie-w-<sid>/{pids,memory}.max` — `V2_ROOT` defaults to `/sys/fs/cgroup` but is overridden via `LEERIE_CGROUP_V2_ROOT` to the systemd-delegated user slice under rootless containerd, DESIGN §6 *Rootless exception*) vs **v1/hybrid** (split `pids/`+`memory/` hierarchies at the fixed `V1_ROOT`, observed on Fly Firecracker VMs, never rootless). Validates every `<sid>` against `^[A-Za-z0-9._-]+$` (no path traversal) and requires integer pids/limits — it is the single most-privileged surface, kept minimal and auditable. The orchestrator composes a **run-scoped** cgroup sid (`<run-id[:12]>-<sid>`, via `_cgroup_worker_sid(run_id, sid)`) before handing it to `create`/`enroll`/`destroy`, so two concurrent runs sharing one VM's `leerie.slice/` never collide on a bare `leerie-w-classifier` and one run's `destroy` (a v2 `cgroup.kill=1`) cannot SIGKILL another run's worker leader. `phase_plan`'s `replan_round` parameter (default 0) similarly makes each `plan_one` worker's bare sid round-scoped (`planner-<category>-r<N>` for round N>0), since a re-plan re-invokes `phase_plan` for every category in the same run. `_cgroup_enroll` returns the broker's failure reason (`str | None`, not a bare bool) so `_invoke` can name an enroll failure as a probable contributing cause if that worker later crashes. |
-| `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines without any bind mount. Default mode is Fly's remote builder (no host Docker daemon required); the local-build path (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder uses a tmp fly.toml with the `[build] image = ...` line stripped to avoid flyctl#1686 (where flyctl skips the build step in favor of fetching the pre-pinned image). |
-| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the `leerie` launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `destroy_volume()`, `_try_fetch_branch_for_teardown()`, and `decide_teardown()`. `destroy_volume()` reaps `$LEERIE_VOLUME_ID` **independently of any machine id** and is deliberately not nested inside `destroy_machine`'s `[ -z "$mid" ]` early return: Fly volumes outlive their machines by design (*"a Machine can be destroyed without destroying its volume"* — Fly docs; the leftover is a documented "unattached volume"), and there is no platform-side lifecycle hook, so the machine already being gone is precisely when a known volume still needs reaping. `destroy_machine` calls it last, preserving the machine-then-volume order (Fly refuses to destroy an attached volume: *"in use by machine X"*). Best-effort: a failed volume destroy logs a warning and returns 0 — an orphan volume is a billing issue, a teardown that aborts is a correctness issue. The trap fires on EXIT, INT, and TERM; `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` and routes to one of three dispositions: **sync-then-finalize-then-destroy** (genuine terminal exits: 0, EXIT_NEEDS_ANSWERS=10, EX_TEMPFAIL=75 — note: `EXIT_LOCKED=75` from the orchestrator is remapped to `container_rc=130` by the launcher's rc=75 branch before `LEERIE_REMOTE_EXIT_RC` is exported, so the only `rc=75` that *does* reach `decide_teardown` is genuine EX_TEMPFAIL from worker rate-limit / parse-fail surfaces, not the single-owner-per-run-dir refusal; see §Single-owner-per-run-dir enforcement below — `_try_fetch_branch_for_teardown` runs `fetch_branch` FIRST; on success, source `scripts/host-finalize.sh` and call `host_finalize <run-dir>` to push + open the PR with the host's auth; **only if push succeeds** does `destroy_machine` run; on push failure leave the machine RUNNING with a recovery banner pointing at `leerie finalize <run-id> --runtime fly`; on sync failure same recovery pattern with `sync_failed_at` written to the sidecar), **detach** (host-side SIGINT=130/SIGTERM=143: user stopped watching, orchestrator on the machine is still running — leave machine alone, print reattach hints), or **pause-on-failure** (other non-zero rc: sync run state directory from machine to host via tar-pipe bounded by a 60 s timeout, then stop machine, write `paused_at`/`pause_reason` to the run sidecar; the state sync is best-effort — failure is logged but does not block the pause, and the machine-side state is preserved on the volume). With the tail wrapper now propagating the orchestrator's exit code via `orchestrator.exit_code`, `die()` exits (rc=1) reach the pause branch rather than the clean-exit branch, so partial-failure runs are paused (machine stopped, filesystem preserved) rather than destroyed. |
-| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `_extract_flyctl_remote_rc()` (parses the actual remote exit code from a captured `flyctl ssh console` stderr file — flyctl returns 1 for any non-zero remote exit; the real code is in stderr as `Error: ssh shell: Process exited with status <N>`; falls back to the original flyctl rc when the pattern is absent), `update_run_json()` (atomic merge of fields into `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` on the host), `wait_for_started()` (poll `flyctl machine status` until the machine reaches `started`, with timeout), `require_flyctl()` (detect `flyctl` on PATH; if missing AND not `--no-runtime-install`, prompt to install via `brew install flyctl` on macOS or `curl -L https://fly.io/install.sh | sh` on Linux; check `flyctl auth status` and prompt for `flyctl auth login` if unauthenticated), `render_tail_wrapper()` (emits a POSIX-sh wrapper script that tails `orchestrator.log` and watches orchestrator liveness via OR of pid-file `kill -0` and `/proc/[0-9]*/cmdline` scan for `orchestrator/leerie.py`+run-id — the cross-check closes the stale-pid contagion of DESIGN §6 *Single owner per run dir*; when the orchestrator exits, the wrapper reads `orchestrator.exit_code` from the run directory — written by `main()`'s `except SystemExit` handler before every controlled exit — and uses it as its own exit code so `decide_teardown` can route failed runs to the pause branch; when the file is absent (OOM, SIGKILL, crash before the handler ran), the wrapper falls back to exit 0 for backward compatibility), and `tail_with_optional_autofinalize()` (wraps `render_tail_wrapper` + `flyctl ssh console` with optional `AUTO_FINALIZE_TOKEN` plumbing: on clean exit, captures stderr through `tee`, greps for the token to extract the final run-id, then `exec`s `leerie finalize <id>` on the host — used by both the fresh-launch tail and the `resume` rc=75 pivot). Replaces four duplicated detection blocks across the remote scripts. |
-| `scripts/remote/seed-common.sh` | Transport-agnostic seeding helpers shared by both the Fly path (`lib.sh` → `seed-repo.sh`) and the EC2 path (`ec2-lib.sh` → `ec2-seed-repo.sh`) — single definition site for `_seed_timeout_prefix()`, `_seed_use_shallow()`, `_seed_branch_shallow_safe()`, `_seed_dirty_filter()`, and `_seed_auth_tar_excludes()` (previously duplicated verbatim in both `lib.sh`/`ec2-lib.sh` and `seed-repo.sh`/`ec2-seed-repo.sh`, or — for `_seed_auth_tar_excludes()` — in `seed-auth.sh`/`ec2-seed-auth.sh` directly). `_seed_auth_tar_excludes()` echoes the space-separated `tar --exclude=...` flags (`.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, `.config`) guarding git/ssh/gnupg auth material — which lives on the host per DESIGN §6 *Finalization* — from the `$STAGE` tar both `seed-auth.sh` and `ec2-seed-auth.sh` ship to the remote machine; both callers consume it via `$(_seed_auth_tar_excludes)` on an unquoted `tar` command line. `_seed_dirty_filter()` shells out to the sibling `seed_dirty_filter.py` (the single-owner implementation of the dirty-file transfer filter — editor-temp detection, the `.git`/`.leerie` exclusion + whitelist, the worktree-path defense, and the vanished-entry check — both transports previously carried a byte-identical inline `python3 -c` copy of), reading `USER_REPO` from the environment the caller already exported. Sourced by `lib.sh` and `ec2-lib.sh`, so neither seed script needs to source it directly. Bash 3.2 portable. |
-| `scripts/remote/seed_dirty_filter.py` | Single-owner Python implementation of the dirty-file transfer filter invoked by `seed-common.sh`'s `_seed_dirty_filter()`. Reads newline-delimited candidate paths on stdin, writes the surviving paths NUL-delimited to stdout (the shape `rsync --files-from=-` needs). `USER_REPO` in the environment anchors the `os.path.lexists()` vanished-entry check; skipped when unset. Runs host-side only — never shipped to the remote machine. Tested directly (subprocess, no bash harness) in `tests/test_seed_dirty_filter.py`. |
-| `scripts/remote/resume-machine.sh` | Resume helper for paused remote runs (sourced by the launcher's `RUNTIME=fly` branch — the run-id IS the machine ID, so no lookup is needed). Exports `resume_machine()`: compares the `image_tag` stored in the run sidecar against the current `$FLY_IMAGE_TAG` — if they differ (leerie was upgraded between provision and resume), runs `flyctl machine update --image $FLY_IMAGE_TAG --skip-start -y` to update the stopped machine's image before starting it (volumes at `/work` survive the update; `seed_auth` re-provisions the ephemeral rootfs on every resume); fail-open — if the update fails, logs a warning and proceeds with the old image. Then runs `flyctl machine start` (idempotent on already-running machines via the `flyctl machine status` fallback), waits for `started`, and clears `paused_at`/`pause_reason` from `run.json` if it exists. The launcher then runs the orchestrator inside the resumed machine with `resume <id>` (the orchestrator's own internal argparse flag — unaffected by the launcher's bare-verb dispatch). When `image_tag` is absent from `run.json` (runs provisioned before the field existed), the update always fires (empty stored tag != current tag), ensuring legacy machines pick up the latest image on resume. |
-| `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). Exports `re_seed()`: reads `fly_machine_id` from the run sidecar, wakes the machine via `flyctl machine start` if stopped, runs a safety check that refuses re-seed when machine-side `/work` has uncommitted tracked changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty` from `seed-repo.sh`. Invoked by the launcher's `leerie re-seed <run-id>` fast-path and by the auto-re-seed step in the `leerie resume <run-id> --runtime fly` flow. |
-| `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the provisioned Fly Machine. Tar-pipes the host's `$STAGE` (Keychain-extracted OAuth credentials + projects-stripped `~/.claude.json` + `.claude/` subdirs, with `.claude/local`, `.claude/plugins/cache`, and `.claude/plugins/marketplaces` skipped; `~/.aws/` also included when Bedrock mode is enabled — see `$STAGE/.aws` mount row above; `.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, and `.config` are explicitly excluded from the tar — those are git/push auth that lives on the host per DESIGN §6 *Finalization* — ~408 MB host npm install duplicated by the Dockerfile's globally-installed claude binary, plus the bulky plugin cache that's rebuilt on the remote post-tar via `claude plugin marketplace add` + `claude plugin install` from the seeded `installed_plugins.json` / `known_marketplaces.json`) to `/home/leerie/` via `flyctl ssh console -C "tar -xzC /home/leerie"` (gzip on both ends). The tar pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts that have GNU `timeout`; no-op fallback otherwise) so a stalled `flyctl ssh console` session — observed mode where flyctl never exits even though the remote tar made progress — produces a clean rc 124/137 instead of hanging forever. rc 124/137 triggers a one-shot `flyctl agent restart` retry; if the retry also stalls, the function returns 1 and leerie's existing PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*). A background heartbeat (`_seed_progress_bg`) logs "seed_auth: still streaming (Ns elapsed)" every `LEERIE_PROGRESS_INTERVAL_S` seconds (default 10) so the user sees activity rather than a silent multi-minute wait. Writes git identity to `/home/leerie/.gitconfig` (not `--global`, which would land in `/root/.gitconfig` under the ssh-console session's default root user). Pre-warms `claude --version` once as the leerie user so the orchestrator's preflight call hits warm caches (the FIRST claude invocation on a cold Fly machine takes ~17 s — Node + statsig cold start — and would otherwise exceed the orchestrator's preflight timeout). |
-| `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding helper (sourced by the `leerie` launcher after `provision_machine()` succeeds). Exports `seed_repo_clone` (wipe `/work` contents but preserve the inode; create `git bundle` for the parent and each submodule; pipe each bundle via `flyctl ssh console -C "sh -c 'cat > /tmp/...'"` — `sh -c` is required because bare `cat > ...` fails on flyctl's `-C`; have the machine `git clone` from the parent bundle, wire submodule URLs to their per-submodule bundles, run `git -c protocol.file.allow=always submodule update --recursive` — `protocol.file.allow` is required by git 2.38+ for file://-style submodule URLs per CVE-2022-39253 — then chown to leerie; clean up the bundle tmpfiles), `seed_repo_dirty` (rsync the dirty/untracked delta plus force-included `.claude/`, used by both fresh-seed delta and the Phase 4 `re-seed.sh` flow), and the wrapper `seed_repo`. Bundles sidestep macOS BSD tar's NFC→NFD filename normalization, which corrupted submodule working trees containing non-ASCII filenames on the Linux receiver. No in-machine `git clone` from origin — Fly machines deliberately receive no GitHub credentials. The parent-bundle pipe is wrapped with `$(_seed_timeout_prefix)` (`timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` on hosts with GNU `timeout`; no-op fallback otherwise) and surrounded by a `_seed_progress_bg` background heartbeat; on rc 124/137 (timeout fired) the function returns 1 with a "flyctl ssh console likely stalled" diagnosis so leerie's PAUSED-on-failure path takes over (DESIGN §6 *Pause on failure*) matching the seed_auth pattern. A second `_seed_progress_bg` covers the submodule-bundle `git submodule foreach --recursive` batch so the user sees activity across multi-submodule transfers instead of a silent pause. **Shallow-seed path (heavy repos, DESIGN §6 *Shallow seeding for heavy repos*):** when the host repo's `.git` exceeds `LEERIE_SEED_SHALLOW_THRESHOLD_MB` (default `200`) AND the resolved seed depth is non-zero, `seed_repo_clone` skips the full `--all` bundle for the *parent* and instead: makes a throwaway `git clone --depth="$LEERIE_SEED_DEPTH" --no-local --branch <cur-branch> "file://$USER_REPO"`; `tar -cf -`s **only that clone's `.git`**; pipes the tar over the identical `$(_seed_timeout_prefix)`-wrapped `flyctl ssh console -C "sh -c 'cat > /tmp/leerie-seed-git.tar'"` channel (same heartbeat, same `PIPESTATUS[1]` + rc 124/137 handling); and the machine-side heredoc script (same pattern as `_seed_one_inspect_dir_clone`) empties `/work` inode-preservingly, untars `.git`, `git checkout -f`s the branch, `git remote remove origin` (the stale `file://<laptop>` origin is inert but removed defensively), runs the **unchanged** per-submodule bundle wiring, and `chown -R leerie: /work` last. Tarring `.git`-only (never the working tree) preserves the NFC→NFD safety property. `git bundle` cannot ship a shallow repo (grafted parents), which is why the shallow path uses tar rather than a shallow bundle. `LEERIE_SEED_DEPTH=0` (or a `.git` under threshold) keeps the full-bundle path. The shallow checkout yields a byte-identical tracked tree to the bundle clone, so `seed_repo_dirty` layers on unchanged. The shallow path additionally requires a shell-safe working-branch name (`_seed_branch_shallow_safe`: `^[A-Za-z0-9/._-]+$`, no placeholder tokens) because the branch is interpolated into the machine-side `git checkout -f <branch>` inside a `sh -c '…'` wrapper; a branch with `'`/`$`/backtick/space falls back to the full-bundle path (which never interpolates the branch). Detached HEAD likewise falls back. |
-| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper (sourced by `decide_teardown` BEFORE `destroy_machine` on clean exit, and by the `leerie finalize` fast-path). Exports `fetch_branch()`: (1) discovers the completed run-id by scanning `.leerie/runs/*/run.json` on the machine for a `finished_at`-bearing, unpushed entry (stderr is captured to a tmpfile, NOT merged via `2>&1`, because `flyctl ssh console`'s "Connecting to ..." stderr would shift parsed-line indices and corrupt the discovered branch name); (2) probes whether the run branch actually exists on the machine via `git rev-parse --verify refs/heads/<branch>` — only then bundles; the bundle includes **all `leerie/subtasks/<run-id>/*` branches** present on the machine alongside the run branch (defense-in-depth: if integration never ran — crash, OOM, or `die()` before integration in older images — the raw subtask work is recoverable on the host; `git for-each-ref` discovers subtask branches dynamically; on any bundle failure the script retries with the run branch alone). A missing run branch is the cleared-but-empty terminal-state case (DESIGN §6); when the run branch is absent but subtask branches exist, they are bundled independently. The `no_push` flag on `run.json` is NOT used as a proxy because it's a mechanism flag the launcher forces (the in-Fly orchestrator can't push), not a user-intent flag; (3) tars `.leerie/runs/<run-id>/` from the machine and extracts it on the host; (4) **defense-in-depth, conditional on branch presence**: when a run branch *was* fetched, strips a stray mechanism-flag `no_push=true` from the host-side `run.json` (defense against in-flight old-image runs that wrote the mechanism flag before the `--host-no-push` intent split). When no branch was fetched (the cleared-but-empty terminal-state case — DESIGN §8), preserves `_finish_no_work_run`'s `no_push=true` intent so `host_finalize` short-circuits cleanly instead of attempting a `git push` against a non-existent ref; (5) **best-effort `.leerie/` stream-back**: iterates `config.toml` and `Dockerfile`; for each, skips if the host target already exists (never clobbers), checks remote existence via `_fetch_machine_exec test -f`, then streams via `_fetch_machine_exec cat` directly to the host target; failure removes any partial write and logs a warning but does not affect the function's return code. The destination root is `$LEERIE_STATE_HOST_DIR` when set, otherwise `$USER_REPO/.leerie`. |
-| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolution helper for the EC2 runtime. Exports `resolve_aws_credentials [--profile NAME] [--region NAME]`: resolves credentials and region host-side in the same precedence order the AWS CLI/SDKs use — explicit `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` (+ optional `AWS_SESSION_TOKEN`) env vars first, then a named profile (`--profile` / `AWS_PROFILE` / `default`) via static credentials in `~/.aws/credentials` or a cached SSO token in `~/.aws/sso/cache/*.json` (both the modern `sso_session`-reference form and the legacy inline `sso_start_url`/`sso_region` form), ending with an actionable `aws sso login --profile <p>` / `aws configure` hint rather than a silent fallthrough (no IMDS instance-role fallback — this runs on the operator's host, not on an EC2 instance). Region resolves `AWS_REGION` > `AWS_DEFAULT_REGION` > profile `region` > die-with-hint; a `--region`/`--profile` CLI flag is treated as explicit-wins over its env-var equivalent. On success prints `export KEY=value` lines to stdout for sourcing; on failure prints nothing to stdout and an actionable error to stderr, returning 1. Pure file I/O against `~/.aws/config`/`~/.aws/credentials`/`~/.aws/sso/cache/*.json` + bash/python3 stdlib — no `aws` binary or boto3 dependency, mirroring the existing `detect_bedrock_mode()`/`bedrock_preflight()` precedent (see the `$STAGE/.aws` mount row in the Bind-mount table below, "Staged when `detect_bedrock_mode()`..."). Wired into the launcher's `RUNTIME=ec2` branch: the branch sources this file, calls `resolve_aws_credentials` (passing `--profile`/`--region` when `LEERIE_AWS_PROFILE`/`LEERIE_AWS_REGION` are set) and `eval`s its `export` lines into the launcher's environment, *before* sourcing `ec2-lib.sh` and calling `require_aws` — so the resolved identity is what `require_aws`'s `sts get-caller-identity` probe and every subsequent `aws ec2 ...` call inherit. An unresolvable credential chain aborts with this script's own `aws sso login --profile <p>` hint and never reaches `require_aws` (`tests/test_ec2_e2e_provision.py` pins the ordering and the fail-closed abort; `tests/test_ec2_launcher_credentials.py` pins the region axis and the `--profile` argv seam). The branch also resolves the `--aws-region`/`--aws-profile` and `--ec2-*` instance-shape knobs (config-001/002). After preflight passes, the branch dispatches to `ec2-provision.sh`'s `provision_instance()` / `resume_instance()`, `ec2-seed-auth.sh`'s `ec2_seed_auth()`, `ec2-seed-repo.sh`'s `ec2_seed_repo()`, and `ec2-ssm.sh`'s `ec2_launch_detached()`/`ec2_attach()` — the full create → seed → launch → tail/attach → teardown lifecycle (feat-003; see the "Runtime mode" section below for the dispatch shape). This credential helper (config-004) and the AWS SDK dependency pin (config-005) have also shipped. |
+| `scripts/container-entry.sh` | Container PID 1. Runs as **root** (rootful runtimes) or the **rootlesskit-mapped host UID** (rootless containerd — DESIGN §6 *Rootless exception*); the Dockerfile omits `USER leerie` so cgroup containment can be set up before privilege drop. Resolves `CGROUP_ROOT` (`/sys/fs/cgroup`, or the systemd-delegated user slice under rootless), creates `$CGROUP_ROOT/leerie.slice`, enables the memory+pids controllers, then launches the **cgroup broker** (`cgroup-broker.py`) at the same pre-drop identity — worker cgroup enrollment can't be done post-drop (see `scripts/cgroup-broker.py`, DESIGN §6). Also at pre-drop identity: `ulimit -c 0`, `cd /work`, and chowning `/work`, `/home/leerie` (+ `.local`/`.cache`/`.gnupg`), and `/tmp/.cache` (`chmod 1777`, since tools create their own subdirs there at runtime) — skipped under rootless, where only outer UID 0 remaps to inner leerie, so leerie-owned dirs must stay root-owned at build time (the rootful path instead needs literal `leerie` ownership via a real UID switch, restored by this chown). Drops privilege via `runuser -u leerie -- env HOME=/home/leerie USER=leerie LOGNAME=leerie ...` (explicit `env`, not `--login`, which would `cd` away from `/work`): execs `python3 .../leerie.py "$@"` when given argv (local/nerdctl path), or wraps `sleep infinity` when invoked with none (remote/Fly path, where the orchestrator is dropped in separately via `Popen(user="leerie")`). |
+| `scripts/cgroup-broker.py` | Cgroup broker (DESIGN §6 *Memory containment*), launched by `container-entry.sh` before the privilege drop; the dropped-privilege orchestrator drives it over a Unix socket at `/run/leerie-cgroup.sock`. Handles `ping` / `probe` / `create <sid> <mem> <pids>` / `enroll <sid> <pid>` / `destroy <sid>` / `stat <sid>` / `slice`. The orchestrator calls `descendant_tracker.stop_and_reap()` **before** `_cgroup_destroy` (else a still-populated cgroup fails `rmdir` with EBUSY). `destroy` writes `cgroup.kill`, polls `cgroup.procs` until it drains (bounded by `_DESTROY_DRAIN_TIMEOUT_SEC` on v2, shorter on v1), then `rmdir`s, retrying on EBUSY and returning the error once the budget is exhausted. The client-side `_CGROUP_DESTROY_TIMEOUT_SEC` (15.0s) must stay ≥ the broker's drain budget, or an abandoned client can leave a `leerie-w-<sid>` dir orphaned on the host cgroupfs (workers run with `--cgroupns=host`). `_cgroup_destroy` runs via `asyncio.to_thread` so one worker's teardown can't stall others. Leaked dirs (pre-fix images, a SIGKILLed orchestrator) are swept at broker startup, restricted to dirs both empty and older than `_ORPHAN_MIN_AGE_SEC` (1h) so a live or concurrent run isn't swept. `stat <sid>` → `OK <pids.current> <pids.max> <pids.events.max> <memory.events.oom_kill>` for PID-exhaustion/OOM detection. `slice` → `OK <leerie.slice memory.max> <live sibling worker cgroups> <unreclaimable bytes>`, used by `_cgroup_slice_info` to gate admission on measured headroom; the third field is deliberately **unreclaimable** usage, not `memory.current` (which counts reclaimable page cache); `-1` on either numeric field means unreadable and the caller fails open. The "live" count is diagnostic only, not an input to per-worker sizing (load-independent — see `worker_memory_max_bytes`). The `memory.events` `oom_kill` counter is the definitive OOM signal, mirroring `pids.events`' `max` for fork denial. The broker exists because enrollment/limit-setting needs cgroup ownership the dropped-privilege orchestrator lacks. Detects cgroup **v2** (unified `<V2_ROOT>/leerie.slice/leerie-w-<sid>/{pids,memory}.max`, `V2_ROOT` overridden via `LEERIE_CGROUP_V2_ROOT` under rootless) vs **v1/hybrid** (split `pids/`+`memory/` at `V1_ROOT`, seen on Fly Firecracker VMs). Validates every `<sid>` against `^[A-Za-z0-9._-]+$` and requires integer limits. The orchestrator composes a **run-scoped** sid (`<run-id[:12]>-<sid>`, `_cgroup_worker_sid`) so concurrent runs never collide; `phase_plan`'s `replan_round` similarly round-scopes re-plan sids (`planner-<category>-r<N>`). `_cgroup_enroll` returns the broker's failure reason (`str | None`) so `_invoke` can name it as a probable crash cause. |
+| `scripts/remote/build-push.sh` | Build and push a self-contained leerie image to Fly.io's registry. The baked source at `/opt/leerie-image/` lets the image run on Fly Machines with no bind mount. Default mode is Fly's remote builder (no host Docker daemon needed); local-build (nerdctl/docker on the host) is opt-in via `--local-build` or `LEERIE_LOCAL_BUILD=1`. The remote builder strips the `[build] image = ...` line from a tmp fly.toml to avoid flyctl#1686 (flyctl otherwise fetches the pre-pinned image instead of rebuilding). |
+| `scripts/remote/provision.sh` | Fly.io machine lifecycle helper (sourced by the launcher's `RUNTIME=fly` branch). Exports `provision_machine()` (create → wait-started → register `decide_teardown` trap), `stop_machine()`, `destroy_machine()`, `destroy_volume()`, `_try_fetch_branch_for_teardown()`, `decide_teardown()`. `destroy_volume()` reaps `$LEERIE_VOLUME_ID` independently of any machine id, since Fly volumes outlive their machines and there's no platform teardown hook; `destroy_machine` calls it last (Fly refuses to destroy an attached volume) and treats a failed volume destroy as a logged, non-fatal billing issue. The EXIT/INT/TERM trap's `decide_teardown` classifies `$LEERIE_REMOTE_EXIT_RC` into three dispositions: **sync-then-finalize-then-destroy** (terminal exits: 0, `EXIT_NEEDS_ANSWERS=10`, genuine `EX_TEMPFAIL=75`) — fetches the branch, pushes + opens the PR via `host_finalize`, and only destroys the machine if the push succeeds (else leaves it running with a recovery banner pointing at `leerie finalize <run-id> --runtime fly`); **detach** (host-side SIGINT/SIGTERM: orchestrator keeps running, machine left alone, reattach hints printed); or **pause-on-failure** (other non-zero rc: best-effort state sync via a 60s-bounded tar-pipe, then stop the machine and write `paused_at`/`pause_reason` to the sidecar). `die()` exits (rc=1) route to pause, not clean-exit, so partial failures are paused rather than destroyed. |
+| `scripts/remote/lib.sh` | Shared bash helpers sourced by `provision.sh`, `resume-machine.sh`, `re-seed.sh`, `fetch-branch.sh`, `seed-repo.sh`. Exports `_extract_flyctl_remote_rc()` (parses the real remote exit code out of `flyctl ssh console`'s stderr, since flyctl itself returns 1 for any non-zero remote exit), `update_run_json()` (atomic merge into the host's `run.json`), `wait_for_started()` (poll `flyctl machine status` until `started`, with timeout), `require_flyctl()` (detect/install `flyctl`, check `flyctl auth status`), `render_tail_wrapper()` (a POSIX-sh wrapper that tails `orchestrator.log`, cross-checks liveness via pid-file `kill -0` OR a `/proc` cmdline scan — closing the stale-pid contagion of DESIGN §6 *Single owner per run dir* — and on exit propagates `orchestrator.exit_code` as its own exit code so `decide_teardown` can route failures to pause; falls back to exit 0 if that file is absent), and `tail_with_optional_autofinalize()` (wraps the tail wrapper + `flyctl ssh console` with optional `AUTO_FINALIZE_TOKEN` plumbing: on clean exit, greps captured stderr for the token and `exec`s `leerie finalize <id>` on the host). Replaces four duplicated detection blocks across the remote scripts. |
+| `scripts/remote/seed-common.sh` | Transport-agnostic seeding helpers shared by the Fly path (`lib.sh`→`seed-repo.sh`) and EC2 path (`ec2-lib.sh`→`ec2-seed-repo.sh`): `_seed_timeout_prefix()`, `_seed_use_shallow()`, `_seed_branch_shallow_safe()`, `_seed_dirty_filter()`, `_seed_auth_tar_excludes()` (single owner, replacing prior per-transport duplicates). `_seed_auth_tar_excludes()` echoes the `tar --exclude=...` flags guarding git/ssh/gnupg auth material (`.gitconfig`, `.git-credentials`, `.netrc`, `.ssh`, `.gnupg`, `.config`, etc. — that material lives on the host per DESIGN §6 *Finalization*) from the `$STAGE` tar shipped to the remote machine. `_seed_dirty_filter()` shells out to `seed_dirty_filter.py`. Bash 3.2 portable. |
+| `scripts/remote/seed_dirty_filter.py` | Single-owner dirty-file transfer filter invoked by `_seed_dirty_filter()`. Reads newline-delimited candidate paths on stdin, writes surviving paths NUL-delimited to stdout (the shape `rsync --files-from=-` needs); `USER_REPO` anchors the vanished-entry check. Host-side only. Tested directly in `tests/test_seed_dirty_filter.py`. |
+| `scripts/remote/resume-machine.sh` | Resume helper for paused Fly runs (run-id IS the machine ID). `resume_machine()` compares the sidecar's stored `image_tag` against the current `$FLY_IMAGE_TAG`; on mismatch, updates the stopped machine's image before starting it (fail-open on update failure; `/work` volume survives; `seed_auth` re-provisions the ephemeral rootfs on every resume). Starts the machine, waits for `started`, clears `paused_at`/`pause_reason`. A missing `image_tag` (pre-field runs) always triggers the update. |
+| `scripts/remote/re-seed.sh` | Mid-run re-rsync helper (Phase 4). `re_seed()` wakes the machine if stopped, refuses to re-seed over uncommitted machine-side changes (unless `LEERIE_RE_SEED_FORCE=1`), then calls `seed_repo_dirty`. Used by `leerie re-seed <run-id>` and the auto-re-seed step of `leerie resume --runtime fly`. |
+| `scripts/remote/seed-auth.sh` | Seeds Claude config + git identity into the Fly Machine. Tar-pipes the host's `$STAGE` (OAuth credentials, `~/.claude.json`, `.claude/` minus caches, `~/.aws/` under Bedrock; git/ssh/gnupg auth excluded, per DESIGN §6 *Finalization*) to `/home/leerie/` via `flyctl ssh console`, wrapped with `$(_seed_timeout_prefix)` (default 600s) so a stalled ssh-console session produces a clean rc 124/137 instead of hanging — which triggers a one-shot `flyctl agent restart` retry, then the PAUSED-on-failure path (DESIGN §6). A `_seed_progress_bg` heartbeat logs progress every `LEERIE_PROGRESS_INTERVAL_S` (default 10s). Writes git identity to `/home/leerie/.gitconfig` explicitly (not `--global`, which would land under root). Pre-warms `claude --version` since a cold Fly machine's first invocation takes ~17s (Node + statsig cold start). |
+| `scripts/remote/seed-repo.sh` | Two-phase bundle + delta repo seeding, run after `provision_machine()`. `seed_repo_clone` wipes `/work`, creates a `git bundle` per parent+submodule, pipes each to the machine, clones/wires submodules (`protocol.file.allow=always` for git 2.38+'s file:// restriction, CVE-2022-39253), chowns to leerie. `seed_repo_dirty` rsyncs the dirty/untracked delta plus `.claude/`. Bundles avoid macOS BSD tar's NFC→NFD filename corruption on non-ASCII submodule paths; no in-machine `git clone` from origin (no GitHub creds shipped). Timeout/heartbeat/pause-on-stall handling mirrors `seed-auth.sh`. **Shallow-seed path** (DESIGN §6 *Shallow seeding for heavy repos*): when `.git` exceeds `LEERIE_SEED_SHALLOW_THRESHOLD_MB` (default 200) and depth is non-zero, ships a `git clone --depth=N` `.git`-only tar instead of a full bundle (git bundles can't carry grafted/shallow history), then checks out the branch machine-side and removes the stale origin. Requires a shell-safe branch name (`_seed_branch_shallow_safe`); unsafe names or detached HEAD fall back to the full-bundle path. `LEERIE_SEED_DEPTH=0` also forces full-bundle. |
+| `scripts/remote/fetch-branch.sh` | Post-run stream-back helper, run before `destroy_machine` on clean exit and by `leerie finalize`. `fetch_branch()`: discovers the completed run-id from the machine's `run.json`; if the run branch exists, bundles it plus all `leerie/subtasks/<run-id>/*` branches (recovering raw subtask work even if integration never ran); tars back `.leerie/runs/<run-id>/`; when a branch was fetched, strips any stray mechanism `no_push=true`, else preserves `_finish_no_work_run`'s intended `no_push=true` so `host_finalize` short-circuits instead of pushing a non-existent ref; best-effort streams back `config.toml`/`Dockerfile` without clobbering existing host copies. Destination root is `$LEERIE_STATE_HOST_DIR` or `$USER_REPO/.leerie`. |
+| `scripts/remote/aws-credentials.sh` | Standalone AWS credential/profile/region resolver for the EC2 runtime. `resolve_aws_credentials [--profile NAME] [--region NAME]` follows the AWS CLI/SDK precedence (explicit env vars → named profile via static credentials or cached SSO token → actionable `aws sso login`/`aws configure` hint; no IMDS fallback, since this runs host-side). Region: `AWS_REGION` > `AWS_DEFAULT_REGION` > profile `region` > die-with-hint. Prints `export KEY=value` lines on success for sourcing; pure file I/O + bash/python3 stdlib, no `aws` binary or boto3 needed. The launcher's `RUNTIME=ec2` branch sources this, evals its exports before `require_aws`, and then dispatches to `ec2-provision.sh`, `ec2-seed-auth.sh`, `ec2-seed-repo.sh`, and `ec2-ssm.sh` for the full create → seed → launch → tail/attach → teardown lifecycle. |
 | `scripts/remote/ec2-lib.sh` | Shared bash helpers for the EC2 lifecycle, parallel to `scripts/remote/lib.sh`'s role for the Fly path. Exports `require_aws()`: the host-side preflight the launcher's `RUNTIME=ec2` branch calls before provisioning, modeled directly on `require_flyctl()`'s two-stage shape (binary-present? → authenticated?). Checks `command -v aws`; if missing, prints an actionable AWS CLI v2 install hint and returns 1 (no auto-install — unlike `require_flyctl`, the AWS CLI's official installers commonly need `sudo`, which is out of scope for an unattended preflight). If present, resolves a profile (`--profile`-equivalent precedence: `LEERIE_AWS_PROFILE` > `AWS_PROFILE` > unset, where `LEERIE_AWS_PROFILE` is resolved by the launcher's own CLI > env > `leerie.toml` ladder — see "AWS region/profile prefs" below) and probes `aws sts get-caller-identity` (with `--profile` when resolved); on failure prints the `aws sso login --profile <profile>` (or bare `aws sso login`) recovery hint and returns 1 — reusing `bedrock_preflight()`'s exact credential-error vocabulary (`leerie:4903-4907`) rather than inventing a second one. Also exports `resolve_ami()` / `resolve_instance_type()` / `resolve_key_name()` / `resolve_security_group()` / `resolve_subnet_id()`, one per `LEERIE_EC2_*` var (see "EC2 instance-lifecycle vars" below): each a thin required-var read (`_resolve_ec2_var`) that prints the value on success, or an actionable error naming the missing var on stderr and returns 1 (not a bare `${VAR:?}`, which would kill the whole sourcing shell with bash's generic "parameter null or not set" message under `set -u`). These stay in `ec2-lib.sh` (shared) rather than `ec2-provision.sh` (lifecycle-specific) because `ec2-ssm.sh`'s transport helpers also need `resolve_key_name`/`resolve_security_group` for the SSH-fallback path (DESIGN §6 "SSH ... remains available as a fallback transport"). |
 | `scripts/remote/ec2-seed-repo.sh` | EC2 counterpart to `scripts/remote/seed-repo.sh` (DESIGN §6 *EC2 runtime lifecycle*, "Seed" row: "same two steps, transport substituted"). The payload logic — `.gitignore`-aware content via the bundle (committed tracked files) plus the porcelain-filtered dirty-delta rsync, unconditional `.leerie/` exclusion except the three whitelisted config files, the shallow-vs-full-bundle decision, submodule bundling — is IDENTICAL to `seed-repo.sh`; only the wire transport differs: `ec2_tar_pipe` (plain `ssh`, from `ec2-lib.sh`) for bulk data (the parent bundle/shallow `.git` tar and each submodule bundle) instead of `flyctl ssh console -C "sh -c 'cat > ...'"`, and `ec2_remote_exec` (SSM Session Manager, the default transport) for small instance-side commands (the `/work` reset, the machine-side clone/checkout script, `chown`) instead of the same `flyctl ssh console -C` calls. Since `ec2_tar_pipe`'s receiver is `tar -xzC <dir>` (not a bare `cat > file`), each bundle/tar payload is wrapped in a one-entry gzipped tar by the private helper `_ec2_pipe_file_via_tar` before going over the wire. Exports `ec2_seed_repo_clone` (same wipe-`/work`-preserve-inode step; full `git bundle create - --all` for the parent, or — above `LEERIE_SEED_SHALLOW_THRESHOLD_MB` with a non-zero `LEERIE_SEED_DEPTH` and a shell-safe branch name, gated by the `_seed_use_shallow`/`_seed_branch_shallow_safe` functions shared with `seed-repo.sh` via the single definition site `scripts/remote/seed-common.sh` — a `git clone --depth=N --no-local` tarred `.git`-only; per-submodule bundles; instance-side `git clone`/untar+`checkout`, submodule URL rewiring, `git -c protocol.file.allow=always submodule update --recursive`, `chown -R leerie: /work`), `ec2_seed_repo_dirty` (the dirty-set computation and `.leerie/`-whitelist/`.claude/`-force-include filter are the same `_seed_dirty_filter()` (`scripts/remote/seed-common.sh` → `seed_dirty_filter.py`) `seed_repo_dirty` calls, so the two transports share a single implementation rather than a byte-identical copy; transport is plain `rsync -e <ssh-wrapper>` directly against the resolved `LEERIE_EC2_SSH_TARGET` — no `flyctl`-console-tunneled `rsync --server` indirection needed, since SSH is a real, directly-usable transport for EC2 per DESIGN §6), and the wrapper `ec2_seed_repo`. New env var `LEERIE_EC2_SSH_TARGET`: the `ssh`(1) destination for the instance (e.g. `ec2-user@<public-ip>` or an `ssh_config` Host alias) that `ec2_tar_pipe`/the dirty-delta rsync consume verbatim — resolving an `LEERIE_EC2_INSTANCE_ID` to a reachable address is `ec2-provision.sh`'s job, populated by `provision_instance()`. Preflight (`_ec2_seed_repo_preflight`) requires `LEERIE_EC2_INSTANCE_ID`, `LEERIE_EC2_SSH_TARGET`, `USER_REPO`, and `require_aws` (from `ec2-lib.sh`). |
 | `scripts/remote/ec2-seed-auth.sh` | EC2 counterpart to `scripts/remote/seed-auth.sh` (DESIGN §6 *EC2 runtime lifecycle*, "Seed" row). The payload logic — what gets seeded (`~/.claude.json`, `~/.claude/` minus `plugins/cache`/`plugins/marketplaces`, the `CLAUDE_CODE_OAUTH_TOKEN` credentials-JSON fallback, git identity, the Claude CLI pre-warm, the plugin-cache rebuild) and why — is IDENTICAL to `seed-auth.sh`; only the wire transport differs, following the same split `ec2-seed-repo.sh` already established: `ec2_tar_pipe` (plain `ssh`, from `ec2-lib.sh`) for the bulk `$STAGE` tar, and `ec2_remote_exec` (SSM Session Manager) for every small remote command (the post-tar `chown -R leerie:`, the token-fallback credentials write, git identity, the CLI pre-warm, the plugin-cache rebuild script). Exports `ec2_seed_auth()`: preflight requires `LEERIE_EC2_INSTANCE_ID`, `LEERIE_EC2_SSH_TARGET`, `STAGE`, and `require_aws` (from `ec2-lib.sh`); the tar-pipe step retries once on a non-timeout transport failure (mirroring `seed-auth.sh`'s tunnel-unavailable retry, minus the Fly-specific `flyctl agent restart`) and is wrapped in `$(_seed_timeout_prefix)` via `ec2_tar_pipe` so a stalled SSH session yields rc 124/137 instead of hanging; the unconditional post-tar `chown -R leerie: /home/leerie` (over `ec2_remote_exec`) exists because, unlike `flyctl ssh console` (always root), `ec2_tar_pipe`'s ssh target may land as the AMI default user. |
@@ -54,78 +54,35 @@ inside the container (DESIGN §6 / §0.5 below).
 ### Python runtime — provisioned inside the container
 
 Leerie requires Python 3.10+. The container image installs Debian 13's
-`python3` (currently 3.13), which satisfies the requirement. The host
-needs no Python at all. The orchestrator's source is baked into the
-image at `/opt/leerie-image/` via the Dockerfile's `COPY` instructions.
-On local runs the launcher's bind mount (`-v $LEERIE_REPO:/opt/leerie-image:ro`)
-shadows the baked copy, so iterating on `orchestrator/leerie.py` still
-does not require an image rebuild — the host file is used on the next run.
+`python3` (3.13), so the host needs no Python at all. The orchestrator's
+source is baked into the image at `/opt/leerie-image/`; on local runs
+the launcher's bind mount (`-v $LEERIE_REPO:/opt/leerie-image:ro`)
+shadows the baked copy, so iterating on `orchestrator/leerie.py` needs
+no image rebuild.
 
 The orchestrator prefers stdlib. Third-party runtime libraries are
-permitted when they (a) replace non-trivial logic with a widely-used,
-stable implementation, (b) earn their distribution cost (image size,
-build time, dependency tracking), and (c) are documented here. Pins
-live in `requirements.txt` at the repo root; the Dockerfile runs
-`pip3 install --break-system-packages --no-cache-dir -r requirements.txt`
-once per image build. There is no `pyproject.toml` and no PyPI release.
+permitted only when they replace non-trivial logic with a widely-used
+implementation, earn their distribution cost, and are documented here.
+Pins live in `requirements.txt`, installed once per image build
+(`pip3 install --break-system-packages --no-cache-dir -r requirements.txt`).
+No `pyproject.toml`, no PyPI release.
 
 Current runtime deps:
 
-- `tenacity` — exponential backoff for transient `claude -p` envelope
-  errors (auth / rate-limit). See §3 *Auth/quota backoff*.
-- `tree-sitter` — incremental parser core, required by the P6 repo-map
-  (`_build_repo_map`). Deliberate exception to the stdlib-preferred
-  policy: tree-sitter's mtime-cached symbol/reference graph is the
-  structural foundation that prevents shallow planner splits
-  (DESIGN §5½ *P6 — codebase structural map*). Ships a
-  prebuilt manylinux wheel; no C build needed.
-- `tree-sitter-language-pack` — prebuilt grammar collection (Python,
-  TypeScript, JavaScript, Ruby, Go, Rust, …) for `tree-sitter`. Paired
-  with the `tree-sitter` pin; the `cp310-abi3` ABI tag means one wheel
-  covers Python 3.10 through 3.13 (the container's Debian 13 Python).
-- `boto3` / `botocore` — the maintained AWS SDK for Python. Deliberate
-  exception to the stdlib-preferred policy: EC2 provisioning
-  (the `--runtime ec2` counterpart to the existing Fly.io runtime)
-  needs AWS's own credential-resolution chain (env vars → shared
-  config/credentials files → SSO → EC2 instance profile/IMDS →
-  container credentials), which is maintained upstream as AWS's
-  auth surface evolves; hand-parsing `aws` CLI output would mean
-  reimplementing and re-chasing that chain. `botocore` is pinned
-  explicitly alongside `boto3` (rather than left as an implicit
-  transitive resolve) to match how `tree-sitter-language-pack` is
-  pinned alongside `tree-sitter` — an exact pin on both the
-  high-level SDK and the library that actually implements
-  credential/region resolution and request signing. See "Remote
-  execution mode" below for the `--runtime local|fly|ec2` resolution
-  order and `scripts/remote/aws-credentials.sh`'s row above for the
-  operator-host credential precedence chain the SDK mirrors.
-
-  **boto3 usage boundary (DESIGN §6 *EC2 runtime lifecycle*).** This
-  pin is installed by the Dockerfile's `pip3 install -r requirements.txt`
-  step and is therefore available only **inside the container image** —
-  the host has no pip/venv surface at all (§0 above: "the host needs
-  neither Python nor `uv`"; host-side `python3` invocations across
-  `scripts/remote/*.sh` are stdlib-only by design, e.g.
-  `aws-credentials.sh`'s explicit "no `aws` binary or boto3 dependency").
-  DESIGN §6's stage-mapping table names `boto3` as the API surface for
-  `RunInstances` / `describe_instances` / SSM `start_session`, but those
-  calls are the outer host-side lifecycle — created and polled by the
-  launcher *before* any container or instance exists, the same ordering
-  constraint that puts `flyctl machine run` in the bash launcher rather
-  than a Fly Go-SDK import. Since the host cannot run boto3, the code
-  surface that actually implements DESIGN §6's stage table
-  (`scripts/remote/ec2-provision.sh` / `ec2-ssm.sh`, per the Files
-  table above) shells out to the **`aws` CLI** for every host-side EC2 API
-  call — mirroring how the Fly path shells out to the `flyctl` binary
-  rather than importing a Go SDK, and reusing `require_aws()`'s existing
-  host dependency (`ec2-lib.sh`) rather than introducing a host-side pip
-  install that would break the "portable bash, stdlib-only host python3"
-  invariant. `boto3`/`botocore` remain reserved for future in-container
-  orchestrator-side AWS calls (none exist yet); this pin and the
-  credential helper (`aws-credentials.sh`) are the currently-landed
-  pieces, alongside `scripts/remote/ec2-provision.sh` and
-  `ec2-ssm.sh`; the launcher's `RUNTIME=ec2` branch now dispatches to
-  both (see "Runtime mode" below).
+- `tenacity` — exponential backoff for transient `claude -p` auth/rate-limit
+  errors (§3 *Auth/quota backoff*).
+- `tree-sitter` + `tree-sitter-language-pack` — parser core and prebuilt
+  grammars (Python, TypeScript, JavaScript, Ruby, Go, Rust, …) powering the
+  P6 repo-map (`_build_repo_map`, DESIGN §5½). Prebuilt manylinux wheels,
+  no C build needed.
+- `boto3` / `botocore` — AWS SDK for the `--runtime ec2` path, needed for
+  AWS's credential-resolution chain (env → shared config/creds → SSO →
+  instance profile/IMDS). Available only **inside the container image**
+  — the host has no pip/venv surface at all, so every host-side EC2 API
+  call instead shells out to the **`aws` CLI** via `ec2-provision.sh` /
+  `ec2-ssm.sh` (mirroring how the Fly path shells out to `flyctl` rather
+  than importing a Go SDK). `boto3`/`botocore` are reserved for future
+  in-container AWS calls; none exist yet.
 
 `pytest` remains the sole dev dependency, run on the host against the
 bind-mounted source.
@@ -155,31 +112,22 @@ curl -fsSL https://raw.githubusercontent.com/enricai/leerie/main/scripts/install
 
 The script:
 
-1. **Preflight**: verifies `git` and `curl` are on `PATH` (missing → hint +
-   non-zero exit). `claude` is **auto-installed** if missing, via Anthropic's
-   official native installer (`curl -fsSL https://claude.ai/install.sh | bash`
-   — a self-contained binary in `~/.local/bin`, no Node/npm), then re-verified;
-   opt out with `--no-claude-install` / `LEERIE_NO_CLAUDE_INSTALL=1` (falls back
-   to a hint + non-zero exit). Leerie shells out to `claude -p` for every unit
-   of LLM work, so a missing `claude` is a hard stop.
-2. **Runtime install**: per `uname -s`. On macOS: installs Colima via brew (if
-   missing) and starts the VM. On **Debian/Ubuntu**: installs and starts the
-   full **rootless** containerd stack — containerd + rootlesskit/slirp4netns/
-   uidmap (apt), pinned nerdctl, CNI plugins, BuildKit, the rootless setuptool +
-   BuildKit containerd-worker — then verifies reachability (`nerdctl info`); it
-   never reports success on an unreachable runtime. On **Fedora/RHEL and Arch**,
-   auto-install is not wired yet — prints a hint pointing at `docs/INSTALL.md`
-   "Rootless mode" and exits non-zero. Opt out of runtime auto-install entirely
+1. **Preflight**: verifies `git`/`curl` on `PATH`. Auto-installs `claude` if
+   missing via Anthropic's native installer (opt out: `--no-claude-install` /
+   `LEERIE_NO_CLAUDE_INSTALL=1`) — a hard stop otherwise, since leerie shells
+   out to `claude -p` for all LLM work.
+2. **Runtime install**: per `uname -s`. macOS installs Colima via brew and
+   starts the VM; Debian/Ubuntu installs and starts the full **rootless**
+   containerd stack (containerd, rootlesskit/slirp4netns/uidmap, nerdctl, CNI,
+   BuildKit) and verifies reachability via `nerdctl info`; Fedora/RHEL and
+   Arch print a hint to `docs/INSTALL.md` and exit non-zero. Opt out entirely
    with `--no-runtime-install` / `LEERIE_NO_RUNTIME_INSTALL=1`.
-3. **Clones** `enricai/leerie` to `$LEERIE_HOME` (default `~/.leerie`).
-   `git clone --depth 1` for fresh installs; `git pull --ff-only` for
-   upgrades.
-4. **Symlinks** `$LEERIE_HOME/leerie` → `~/.local/bin/leerie`. Creates
-   `~/.local/bin` if missing. Does not touch system directories.
-5. **PATH check**: if `~/.local/bin` is not in `$PATH`, prints (does
-   not silently edit) the exact shell-rc line to add, based on `$SHELL`.
-6. **Verifies** by invoking `leerie version` (the launcher's fast path
-   answers without spinning up a container — see below).
+3. **Clones** `enricai/leerie` to `$LEERIE_HOME` (default `~/.leerie`) —
+   shallow for fresh installs, `git pull --ff-only` for upgrades.
+4. **Symlinks** `$LEERIE_HOME/leerie` → `~/.local/bin/leerie`.
+5. **PATH check**: prints the shell-rc line to add if `~/.local/bin` is
+   missing from `$PATH` (never edits it silently).
+6. **Verifies** via `leerie version` (fast path, no container startup).
 
 Supports `--dry-run` (prints actions without executing), `--prefix DIR`
 (overrides `LEERIE_HOME`), `--no-runtime-install`
@@ -209,34 +157,18 @@ The installed checkout at `$LEERIE_REPO` is never updated by running
 so an install can sit arbitrarily far behind `origin` while the operator
 believes they're running current code.
 
-`_warn_if_leerie_stale()` runs in the host preflight (beside the git/`gh`/`jq`
-checks) and **warns, never blocks**:
+`_warn_if_leerie_stale()` runs in the host preflight and **warns, never
+blocks**:
 
-- Skips silently when `$LEERIE_REPO` is not a git checkout, when HEAD is
-  detached (`git symbolic-ref -q HEAD`), or when the branch has no upstream.
-- Compares `git rev-list --count HEAD..@{upstream}`; on a non-zero count it
-  reports both `plugin.json` versions — local, and `git show
-  @{upstream}:.claude-plugin/plugin.json` — plus the update command. Version
-  strings are a far more actionable message than a commit count.
-- **A throttled fetch is mandatory, not an optimization.** `HEAD..@{upstream}`
-  reads the *cached* remote-tracking ref, which on a never-fetched install is
-  exactly as stale as the checkout, so a fetch-free guard stays silent through
-  the precise failure it exists to catch. The check therefore fetches at most
-  once per 24h, gated by an `mtime` stamp file at
-  `$LEERIE_STATE_HOST_DIR/.fetch-stamp`, under `timeout 5`, backgrounded and
-  fully non-fatal.
-- Every git invocation is `|| true`-guarded: an offline host, a missing
-  remote, or a slow network must never fail a run.
-
-Note `$LEERIE_REPO` doubles as the default state root
-(`$HOME/.leerie/<basename>/`), so the check must tolerate untracked
-directories inside the checkout — it only ever reads refs, never the
-work tree.
-
-Maps to `DESIGN.md`: §2 (no plugin-spawned subagents — the launcher is
-plain process exec, not in-session orchestration). §6 *Worker subtree
-termination* and §0.5 of this document describe what runs inside the
-container the launcher starts.
+- Skips silently when `$LEERIE_REPO` isn't a git checkout, HEAD is detached,
+  or the branch has no upstream.
+- Compares `git rev-list --count HEAD..@{upstream}`; on non-zero, reports
+  both `plugin.json` versions (local and upstream) plus the update command.
+- Fetches at most once per 24h (gated by an mtime stamp file, `timeout 5`,
+  backgrounded, non-fatal) since a never-fetched checkout's cached
+  remote-tracking ref is otherwise as stale as the checkout itself.
+- Every git call is `|| true`-guarded — offline/slow-network must never
+  fail a run.
 
 ### In-repo tee-log warning (N5)
 
@@ -278,37 +210,27 @@ claims a state directory. Four sub-modes:
   with `--system-prompt-file $LEERIE_REPO/prompts/config_chat.md` and
   `--add-dir $USER_REPO`. No container started. Exits 1 if
   `prompts/config_chat.md` is missing.
-- **`leerie config --recapture [--force]`**: host-only (no container). Calls
-  `run_recapture_deps()` from the orchestrator module, which consolidates
-  across **all** finished runs with `logs/` under the state dir (not just the
-  newest — each run's commands inform the dep decision). With an explicit
-  `--run-id`, only that run is targeted. Without `--force`, runs that already
-  have a `dep_capture.done` sentinel are skipped and the write is a never-clobber
-  **union** (only new packages/managers added). `--force` drops the sentinel on
-  each target run so the worker re-fires unconditionally **and** switches the
-  write to a wholesale **replace** (`capture_repo_deps(replace=True)`) — the
-  fresh capture is authoritative and deps no longer captured are dropped; an
-  empty capture leaves the existing config untouched. Each run's `State` is
-  flocked (skipped, not fatal, on
-  `StateLockedError`). Exits 1 if no runs directory or no finished run found.
-  The seam `exec_module()`s `orchestrator/leerie.py` on the **host**, whose
-  `python3` is not guaranteed to have `requirements.txt` deps (§0), so the
-  orchestrator's sole third-party import (`tenacity`) is deferred into
-  `claude_p()` rather than module scope — the run-discovery guards above are
-  pure pathlib checks and print their diagnostic even when `tenacity` is absent.
+- **`leerie config --recapture [--force]`**: host-only. Calls
+  `run_recapture_deps()`, which consolidates across all finished runs with
+  `logs/` under the state dir (or just `--run-id` if given). Without
+  `--force`, runs already carrying a `dep_capture.done` sentinel are skipped
+  and the write is a never-clobber **union**. `--force` drops the sentinel
+  and switches to a wholesale **replace** (`capture_repo_deps(replace=True)`)
+  — an empty capture leaves the config untouched. Each run's `State` is
+  flocked (skipped, not fatal, on `StateLockedError`). Exits 1 if no runs
+  directory or no finished run found. `orchestrator/leerie.py`'s sole
+  third-party import (`tenacity`) is deferred into `claude_p()` rather than
+  module scope, since the host `python3` isn't guaranteed to have
+  `requirements.txt` deps (§0).
 
 All four sub-modes share an inline BLT inferrer (`_config_read_key`,
-`_infer_axis`, `_axis_source`) implemented directly in the launcher bash
-so the verb requires no container and no orchestrator import. `_infer_axis`
-mirrors `_infer_build_lint_test()`'s precedence and family coverage
-(§4 *Phase walkthrough*, below) by hand, since the verb cannot import the
-orchestrator. `tests/test_config_verb.py`'s per-mode unit tests still run
-against a self-contained bash harness (kept in sync with `_infer_axis` by
-hand) for speed and isolation, but a separate parity guard in that file
-extracts the real `config)` case arm verbatim from the shipped launcher
-and diffs its inference output against `_infer_build_lint_test()` across
-a fixture matrix, so the launcher inferrer can no longer silently diverge
-from the Python table.
+`_infer_axis`, `_axis_source`) implemented directly in launcher bash so the
+verb needs no container or orchestrator import; `_infer_axis` mirrors
+`_infer_build_lint_test()`'s precedence by hand (§4, below).
+`tests/test_config_verb.py` runs per-mode unit tests against a
+self-contained bash harness plus a parity guard that diffs the real
+`config)` case arm's inference output against `_infer_build_lint_test()`
+across a fixture matrix, so the two can't silently diverge.
 
 Maps to `DESIGN.md`: §6½ *Declared BLT commands* (the `.leerie/config.toml`
 format and resolution); §6½ *Per-repo container image* (`setup_packages`,
@@ -333,21 +255,17 @@ which is the abnormal-exit cleanup guarantee.
 | Linux (Debian/Ubuntu) | rootless containerd (native) | `nerdctl` from upstream (+ CNI/BuildKit/RootlessKit) | No |
 | Linux (Fedora/RHEL, Arch) | rootless containerd (manual) | `nerdctl` — set up by hand per `docs/INSTALL.md` | No |
 
-The launcher detects `uname -s` and runs the right preflight. On macOS:
-require `colima` on `PATH`, check `colima status`, auto-install the
-`nerdctl` shim if missing (via `colima nerdctl install`), then check
-`nerdctl info` reaches the runtime. On Linux: if `nerdctl` is missing and
-runtime auto-install is not opted out, `runtime_install_linux`
+The launcher detects `uname -s` and runs the right preflight. macOS:
+requires `colima` on `PATH`, checks `colima status`, auto-installs the
+`nerdctl` shim if missing, then checks `nerdctl info`. Linux: if `nerdctl`
+is missing and auto-install isn't opted out, `runtime_install_linux`
 (`scripts/runtime-install.sh`) stands up the full rootless stack on
-**Debian/Ubuntu** — invoking `apt-get` for containerd + the rootless
-prerequisites, downloading nerdctl/CNI/BuildKit, and running the rootless
-setuptool — then verifies `nerdctl info` succeeds. **Fedora/RHEL and Arch**
-are not auto-installed yet: the launcher prints a copy-pasteable hint
-(`docs/INSTALL.md` "Rootless mode") and exits non-zero. On macOS leerie does
-not invoke `brew` for the runtime beyond Colima, and on non-Debian Linux it
-does not invoke `dnf`/`pacman` — those remain the user's choice. Pass
-`--no-runtime-install` (`LEERIE_NO_RUNTIME_INSTALL=1`) to skip the Debian/Ubuntu
-auto-install and fall back to the hint.
+**Debian/Ubuntu** (containerd + rootless prerequisites via apt, nerdctl/CNI/
+BuildKit, the rootless setuptool) and verifies `nerdctl info`. **Fedora/RHEL
+and Arch** aren't auto-installed yet — the launcher prints a hint to
+`docs/INSTALL.md` "Rootless mode" and exits non-zero. Pass
+`--no-runtime-install` (`LEERIE_NO_RUNTIME_INSTALL=1`) to skip the
+Debian/Ubuntu auto-install and fall back to the hint.
 
 `brew install nerdctl` does NOT work on macOS — the Homebrew formula
 has `Requires: Linux` because the nerdctl binary talks directly to a
@@ -370,84 +288,52 @@ Base layers (top-down):
   `python3`, `python3-pip`, `build-essential`, plus dev libraries
   (`zlib1g-dev`, `libyaml-dev`, `libreadline-dev`, `libffi-dev`,
   `libssl-dev`, `libpq-dev`, `libsqlite3-dev`, `libgdbm-dev`,
-  `default-libmysqlclient-dev`). The build tools and
-  dev headers cover native-extension compilation: `node-gyp` (sharp,
-  bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`, `mysql2`, `ffi`), and
-  Python C extensions.
+  `default-libmysqlclient-dev`) covering native-extension compilation:
+  `node-gyp` (sharp, bcrypt), Ruby C gems (`nokogiri`, `pg`, `sqlite3`,
+  `mysql2`, `ffi`), Python C extensions.
 - `libc6` + `chromium` + `chromium-driver` + `fonts-liberation` — headless
-  Chrome for browser-based testing (Selenium, Capybara, Playwright, Puppeteer,
-  or any tool that drives a real browser). Installed from Debian's own repos at
-  image build time so the browser and chromedriver versions are always in sync;
-  Selenium Manager has nothing to download at runtime.
-  `libc6` is listed explicitly so apt upgrades it in the same transaction as
-  chromium: the `debian:13-slim` base image snapshot can lag the current trixie
-  glibc, causing chromium to fail at load time with
-  `undefined symbol: localtime64_r (fatal)` — a glibc ABI mismatch that
-  produces a SIGTRAP before Chrome executes a single instruction.
-  `/home/leerie/.cache/selenium` is pre-created (root-owned at build time,
-  chowned to `leerie` at runtime on the rootful path — see the
-  `container-entry.sh` row above) so Selenium Manager cache writes don't
-  fail even if a download is attempted.
-  Workers run as the non-root `leerie` user — Chrome's SUID sandbox won't work
-  in this container configuration; the required flags are baked in via
-  `/etc/chromium.d/leerie-container-flags` (see *Browser-based testing* note
-  below).
-- LTS Node **and** Python 3.12 baked via a single
-  `mise install --system node@lts python@3.12` (`Dockerfile`), landing under
-  `/usr/local/share/mise/installs/<tool>/<version>/`; a stable
-  `.../installs/node/lts-current` symlink is then created so `ENV PATH` and the
-  `claude` global-install don't need to know the concrete version. These are
-  the LTS fallback mise's resolver drops to when a repo declares no version of
-  its own (DESIGN §6½).
-- corepack activated via `MISE_NODE_COREPACK=true`, so a repo's
-  `package.json` `packageManager` field selects its own pnpm/yarn version —
-  no globally pinned pnpm is baked. `npm install -g
-  '@anthropic-ai/claude-code@>=2.1.219'` installs the `claude` CLI workers
-  invoke (against the LTS Node above; leerie enforces ≥ 2.1.22 at runtime for
-  `--json-schema`, and the image install is pinned ≥ 2.1.219 for the `claude
-  -p` mid-stream-drop fix — see the Dockerfile comment and IMPLEMENTATION §3
-  "Transient transport disconnect").
-- `ENV PATH` is set to
-  `<system mise shims>:<LTS Node bin>:<MISE_DATA_DIR/shims>:$PATH:/home/leerie/.local/bin`
-  (concretely `/usr/local/share/mise/shims` :
-  `/usr/local/share/mise/installs/node/lts-current/bin` :
-  `/home/leerie/.local/share/mise/shims` : `$PATH` :
-  `/home/leerie/.local/bin`). The ordering is load-bearing: image-baked
-  tooling (the LTS Node that hosts `claude` itself) comes first, so a repo
-  pinning its own Node/Python version can never shadow it; the per-repo
-  `MISE_DATA_DIR/shims` (populated at runtime by `phase_provision`'s
-  `mise install` — DESIGN §6½ *Persistent out-of-repo dependency bake*)
-  comes next, so a worker's own ad-hoc Bash commands (e.g. `bin/rails test`)
-  reach a repo-pinned runtime by name without an explicit `mise exec --`; and
-  `/home/leerie/.local/bin` (where `pip install --user` lands console
-  scripts) is deliberately **last**, so a user-installed package can never
-  shadow a baked-in binary. Pinned by `tests/test_dockerfile_path.py`.
+  Chrome for browser-based testing, installed from Debian's own repos so
+  browser/chromedriver stay in sync (Selenium Manager has nothing to
+  download at runtime). `libc6` is upgraded in the same transaction since a
+  lagging base-image glibc otherwise makes chromium fail with
+  `undefined symbol: localtime64_r`. `/home/leerie/.cache/selenium` is
+  pre-created (chowned to `leerie` at runtime). Workers run as non-root
+  `leerie`, so Chrome's SUID sandbox is disabled via baked flags in
+  `/etc/chromium.d/leerie-container-flags`.
+- LTS Node **and** Python 3.12 baked via `mise install --system node@lts
+  python@3.12`, with a stable `.../installs/node/lts-current` symlink so
+  `ENV PATH` doesn't need the concrete version. These are the fallback
+  versions mise's resolver uses when a repo declares none of its own
+  (DESIGN §6½).
+- corepack activated via `MISE_NODE_COREPACK=true` so a repo's
+  `package.json` `packageManager` field selects its own pnpm/yarn (no
+  globally pinned pnpm baked). `npm install -g
+  '@anthropic-ai/claude-code@>=2.1.219'` installs the `claude` CLI
+  (leerie enforces ≥2.1.22 at runtime for `--json-schema`; the image pin
+  is ≥2.1.219 for the `claude -p` mid-stream-drop fix — §3 "Transient
+  transport disconnect").
+- `ENV PATH` order is load-bearing: `<system mise shims>` : `<LTS Node
+  bin>` : `<MISE_DATA_DIR/shims>` : `$PATH` : `/home/leerie/.local/bin`.
+  Baked tooling (LTS Node hosting `claude`) comes first so a repo's own
+  pinned Node/Python can't shadow it; per-repo `MISE_DATA_DIR/shims`
+  (populated at runtime by `phase_provision`, DESIGN §6½) comes next so a
+  worker's ad-hoc Bash commands reach a repo-pinned runtime by name; `pip
+  install --user` console scripts land last, so they can never shadow a
+  baked-in binary. Pinned by `tests/test_dockerfile_path.py`.
 - Non-root `leerie` user created with `--build-arg HOST_UID/HOST_GID`
-  matching the host user. This is what makes files the container
-  writes into `/work` (worktrees) and `/leerie-state` (run state) keep
-  the host user's ownership.
-- `git config --system --add safe.directory '*'` is set in the image
-  (writes to `/etc/gitconfig`). The container is single-tenant (one
-  user) and `/work` is its only repo, so blanket-allow is the standard
-  mitigation — Colima/virtiofs presents `/work`'s mount-root inode with
-  a gid that does not match the in-container `leerie` user, which trips
-  git's CVE-2022-24765 check on worker bash tools that run
-  `git -C <worktree-subdir> ...`. Without the relaxation, those calls
-  return non-zero with
-  `fatal: detected dubious ownership in repository at '/work/.leerie/...'`.
-  System-wide config (vs. per-user `--global`) avoids any HOME-handling
-  risk from `su leerie -c "git config --global"` and matches the posture
-  of every major CI image.
+  matching the host user, so container writes into `/work` and
+  `/leerie-state` keep the host user's ownership.
+- `git config --system --add safe.directory '*'` (in `/etc/gitconfig`):
+  the container is single-tenant with `/work` its only repo, so
+  blanket-allow is the standard mitigation for Colima/virtiofs presenting
+  a mismatched gid that would otherwise trip git's CVE-2022-24765 check on
+  worker `git -C <worktree-subdir> ...` calls.
 - `WORKDIR /work`, `ENTRYPOINT ["/opt/leerie-image/scripts/container-entry.sh"]`.
   **No `USER leerie` directive** — ENTRYPOINT runs as PID 1 at the
-  slice-owning identity (real root rootful; the rootlesskit-mapped host
-  UID rootless) so the entrypoint can create the
-  `/sys/fs/cgroup/leerie.slice` cgroup and launch the **cgroup broker**
-  (which performs per-worker enrollment/limit-setting the dropped-privilege
-  orchestrator cannot) before dropping privilege via
-  `runuser -u leerie -- ...` to invoke the orchestrator (the `runuser`
-  drop is skipped in rootless mode — DESIGN §6 *Rootless exception*).
-  See DESIGN §6 *Memory containment* for the full mechanism.
+  slice-owning identity so it can create `/sys/fs/cgroup/leerie.slice` and
+  launch the **cgroup broker** before dropping privilege via `runuser -u
+  leerie -- ...` (skipped in rootless mode — DESIGN §6 *Rootless
+  exception*). See DESIGN §6 *Memory containment* for the full mechanism.
 
 ### Per-repo derived image (local nerdctl)
 
@@ -466,9 +352,9 @@ relevant bash surface:
 | `REPO_IMAGE_TAG` | after base-build block | Set to `resolve_repo_image_tag()` output when a Dockerfile exists; empty string otherwise |
 | `$LEERIE_STATE_HOST_DIR/.dockerfile-hash` | after base-build block | Stores `<LEERIE_VERSION>:<sha256>` of the last-built Dockerfile; rebuild fires on mismatch or image absence |
 
-**Rebuild triggers** (checked in order): (1) `nerdctl image inspect "$REPO_IMAGE_TAG"` fails, OR (2) `<LEERIE_VERSION>:<sha256>` of the current Dockerfile differs from the stored hash. Second run with unchanged Dockerfile hits the skip path ("per-repo image up-to-date; skipping build"). Before the build fires, `ensure_base_in_buildkit_ns` copies the base into the `buildkit` namespace (idempotent) so the derived `FROM $BASE_IMAGE` resolves against the local image store rather than the registry.
+**Rebuild triggers** (checked in order): (1) `nerdctl image inspect "$REPO_IMAGE_TAG"` fails, OR (2) `<LEERIE_VERSION>:<sha256>` of the current Dockerfile differs from the stored hash — else skipped. Before a build fires, `ensure_base_in_buildkit_ns` copies the base into the `buildkit` namespace (idempotent) so `FROM $BASE_IMAGE` resolves locally.
 
-**Auto-generation triggers**: when no `.leerie/Dockerfile` exists, the launcher generates one at `.leerie/Dockerfile` (atomic write via temp file + `mv`) before the build-decision block if **any** of the following are present: (1) `.leerie/config.toml` declares `setup_packages`, (2) a dependency lockfile exists (`package-lock.json`, `pnpm-lock.yaml`, `requirements.txt`, `Pipfile.lock`, `Gemfile.lock`, `Cargo.lock`, `go.sum`, etc.), or (3) `.leerie/config.toml` declares `language_installs`. A committed Dockerfile always takes precedence — the auto-generation logic is bypassed entirely when one exists.
+**Auto-generation triggers**: when no `.leerie/Dockerfile` exists, the launcher generates one (atomic write via temp file + `mv`) if **any** of: (1) `.leerie/config.toml` declares `setup_packages`, (2) a dependency lockfile exists, or (3) `.leerie/config.toml` declares `language_installs`. A committed Dockerfile always takes precedence.
 
 **`nerdctl run` image arg**: `"${REPO_IMAGE_TAG:-$IMAGE_TAG}"` — falls back to the base image transparently when no repo Dockerfile is present.
 
@@ -487,59 +373,41 @@ ecosystem:
 | Go | Baked cache + warmed modules | `GOCACHE`, `GOMODCACHE` (warmed) | `go build` network-free, reuses module cache. Requires a discardable dummy `.go` file at build time — `go mod download` alone warms only `GOMODCACHE`, not `GOCACHE` (see DESIGN §6½). |
 | Node/pnpm | Warmed content-addressable store | pnpm store path, `frozenStore` set | Residual per-run: `pnpm install --offline --frozen-lockfile` relinks only |
 
-**`PROVISION_RECIPE` contract (updated):** For baked ecosystems
-(Python/Ruby/Rust/Go), the recipe injected into implementer/conformer prompts
-is **informational only** — it shows what was baked but does **not** instruct a
-per-run install, since the bake already satisfied the dependencies. For
-Node/pnpm repos, the recipe carries the residual offline-relink command (`pnpm
-install --offline --frozen-lockfile`), which workers run when their subtask
-needs built dependencies (e.g., running tests or linting). A config-only or
-docs-only subtask skips the residual step.
+**`PROVISION_RECIPE` contract:** For baked ecosystems (Python/Ruby/Rust/Go),
+the recipe injected into implementer/conformer prompts is **informational
+only** — the bake already satisfied the dependencies. For Node/pnpm repos,
+it carries the residual offline-relink command (`pnpm install --offline
+--frozen-lockfile`), run by workers whose subtask needs built dependencies;
+a config/docs-only subtask skips it.
 
-`_filter_residual_deps` decides what counts as that residual. A Node entry
-is kept only when **both** hold: its subcommand is in
-`_NODE_INSTALL_SUBCOMMANDS` (`install` / `i` / `ci`), and it carries
-`--offline` **or** `--frozen-lockfile` as a `shlex` token. The flag test is
-an OR by necessity — the three managers spell offline-relink differently
-(`pnpm install --offline --frozen-lockfile`, `npm install --offline`,
-`yarn install --frozen-lockfile`), so requiring both would drop two of the
-three. The subcommand test is what stops a flag alone from qualifying:
-`pnpm add left-pad --frozen-lockfile` carries a pinned flag but mutates the
-dependency set over the network, so re-running it per worktree is the
-opposite of a relink; `remove` / `up` / `dlx` are excluded for the same
-reason. Token matching (not substring) keeps `--offline` inside a package
-name from counting, and a command `shlex` cannot parse (an unbalanced quote
-in a captured log line) is dropped rather than raising.
+`_filter_residual_deps` decides what counts as that residual: a Node entry
+qualifies only when its subcommand is in `_NODE_INSTALL_SUBCOMMANDS`
+(`install`/`i`/`ci`) **and** it carries `--offline` or `--frozen-lockfile`
+as a `shlex` token (OR, since the three managers spell offline-relink
+differently; token match, not substring, so a package name containing
+`--offline` doesn't count). The subcommand check excludes
+`add`/`remove`/`up`/`dlx`, which mutate the dependency set over the
+network rather than relinking. An unparseable command is dropped, not
+raised.
 
-**`capture_repo_deps` contract (updated):** The `dep_capture` worker **always
-runs** at finalize time — it is **not skipped** when a committed
-`.leerie/Dockerfile` exists. The worker writes only **residual** dependencies
-to `.leerie/config.toml` (`setup_packages` for apt packages workers had to
-install, `language_installs` entries for commands that cannot be baked). For
-fully-baked ecosystems (Python/Ruby/Rust/Go), the captured output is typically
-empty or minimal. For Node/pnpm, it may carry the offline-relink note. The
-worker still writes the `dep_capture.done` sentinel to
-`<run_dir>/dep_capture.done` and sets `dep_capture_done = True` in
-`state.json` after a successful write.
+**`capture_repo_deps` contract:** The `dep_capture` worker always runs at
+finalize time, even with a committed `.leerie/Dockerfile` — it writes only
+**residual** dependencies (`setup_packages`, `language_installs` entries
+for commands that can't be baked). Fully-baked ecosystems typically yield
+an empty or minimal capture; Node/pnpm may carry the offline-relink note.
+On success it writes the `dep_capture.done` sentinel and sets
+`dep_capture_done = True` in `state.json`.
 
-**Dockerfile-emitter gating (spec-level fix):** The auto-generated
-`.leerie/Dockerfile` bake must fire when `setup_packages` is empty but a
-lockfile or `language_installs` entry is present. The existing gating
-(generation body conditioned on `setup_packages` non-empty) is a spec/code
-mismatch: a repo with only language dependencies and no apt packages would
-skip the bake entirely, forcing per-run installs. The corrected spec: generate
-the Dockerfile when **any** of the following are present: (1)
-`setup_packages` non-empty, (2) a dependency lockfile exists (`package-lock.json`,
-`pnpm-lock.yaml`, `yarn.lock`, `uv.lock`, `poetry.lock`, `Pipfile.lock`,
-`Gemfile.lock`, `Cargo.lock`, `go.mod`+`go.sum` together, `composer.lock`,
-`packages.lock.json`), or (3) `language_installs` is non-empty. This aligns
-the emitter with the design intent (DESIGN §6½ *Persistent out-of-repo
-dependency bake*). Bare `requirements.txt` (no lockfile) is deliberately
-EXCLUDED from this list, mirroring `_lockfile_table_entries`'s existing,
-deliberate exclusion of the same file — it's the ambiguous tail that goes to
-the LLM-driven `dep_capture` fallback, not the deterministic table, so it
-must not trigger a bake either (a bake based on a guessed install command is
-worse than no bake).
+**Dockerfile-emitter gating:** the auto-generated `.leerie/Dockerfile` bake
+fires when **any** of: (1) `setup_packages` non-empty, (2) a dependency
+lockfile exists (`package-lock.json`, `pnpm-lock.yaml`, `yarn.lock`,
+`uv.lock`, `poetry.lock`, `Pipfile.lock`, `Gemfile.lock`, `Cargo.lock`,
+`go.mod`+`go.sum`, `composer.lock`, `packages.lock.json`), or (3)
+`language_installs` non-empty — so a repo with only language deps and no
+apt packages still gets baked (DESIGN §6½). Bare `requirements.txt` (no
+lockfile) is deliberately excluded, mirroring `_lockfile_table_entries`: it
+goes to the LLM-driven `dep_capture` fallback rather than triggering a
+bake on a guessed install command.
 
 ### Registry publish path (fly.io / remote Machines)
 
@@ -552,13 +420,10 @@ as-is — no UID matching required.
 
 **Baked source.** The Dockerfile's `COPY` instructions bake
 `orchestrator/`, `scripts/`, `prompts/`, and `.claude-plugin/` into the
-image at `/opt/leerie-image/`. A Fly Machine that pulls this image can
-run the orchestrator without any bind mount — the ENTRYPOINT
-(`/opt/leerie-image/scripts/container-entry.sh`) and the orchestrator
-(`/opt/leerie-image/orchestrator/leerie.py`) are already present. On
-local runs the launcher's `-v $LEERIE_REPO:/opt/leerie-image:ro` bind
-mount shadows the baked copy, so development iteration (edit a file,
-run leerie) still works without rebuilding the image.
+image at `/opt/leerie-image/`, so a Fly Machine that pulls it can run the
+orchestrator with no bind mount. Local runs' `-v
+$LEERIE_REPO:/opt/leerie-image:ro` bind mount shadows the baked copy, so
+development iteration works without rebuilding.
 
 `scripts/remote/build-push.sh` provides the build-and-push path. By
 default it uses Fly's remote builder (no host Docker daemon required):
@@ -584,18 +449,15 @@ flyctl deploy --build-only --push --remote-only \
   --image-label <VERSION>
 ```
 
-`<DOCKERFILE>` defaults to `$LEERIE_REPO/Dockerfile`; pass `--dockerfile
-<path>` to override (used by `ensure_image()` for per-repo images). Pass
-`--build-arg KEY=VAL` one or more times to forward build arguments to
-flyctl; this flag is repeatable and accumulated before forwarding.
+`<DOCKERFILE>` defaults to `$LEERIE_REPO/Dockerfile`; `--dockerfile <path>`
+overrides it (used by `ensure_image()` for per-repo images). `--build-arg
+KEY=VAL` is repeatable.
 
-The `<tmp-fly.toml>` is a copy of the repo's `fly.toml` with the
-`[build] image = "..."` line stripped. That line is correct for
-`flyctl machine run` (leerie uses it elsewhere) but wrong for
-`flyctl deploy --build-only`: it tells flyctl "the image already
-exists, fetch it" → flyctl skips the build step → deploy fails with
-"Could not find image" ([flyctl#1686](https://github.com/superfly/flyctl/issues/1686)).
-The awk-based strip works around it.
+The `<tmp-fly.toml>` is a copy of the repo's `fly.toml` with the `[build]
+image = "..."` line stripped — that line tells flyctl "fetch the existing
+image", which makes `flyctl deploy --build-only` skip the build step and
+fail with "Could not find image"
+([flyctl#1686](https://github.com/superfly/flyctl/issues/1686)).
 
 **Opt-in: `--local-build`** (or `LEERIE_LOCAL_BUILD=1`). Builds with
 host `nerdctl`/`docker` and pushes from the host. Requires a working
@@ -608,13 +470,10 @@ completeness; most users should leave it off.
 #### Auto-publish on first remote run (`ensure_image()` in the launcher)
 
 A remote run requires the image at `$FLY_IMAGE_TAG` to already exist in
-`registry.fly.io`. Without auto-publish the operator must run
-`scripts/remote/build-push.sh --push` once before the first remote run,
-and again after every version bump — otherwise `flyctl machine run`
-fails at provision time with an unfriendly "manifest unknown" error.
-
-The launcher closes that gap with `ensure_image()` in the `RUNTIME=fly`
-branch, run before `provision_machine`. Two variants:
+`registry.fly.io`, or `flyctl machine run` fails at provision time with
+an unfriendly "manifest unknown" error. `ensure_image()` in the
+launcher's `RUNTIME=fly` branch closes that gap, run before
+`provision_machine`. Two variants:
 
 **Base image path** (no `.leerie/Dockerfile`):
 
@@ -641,10 +500,10 @@ The relevant bash surface:
 | `_FLY_BASE_TAG` | module-level (set by `_set_fly_per_repo_image`) | Base Fly tag (`registry.fly.io/$APP:$VERSION`) passed as `BASE_IMAGE` build-arg |
 
 Before `resolve_fly_image_tag()` is called, `_set_fly_per_repo_image()`
-detects `.leerie/Dockerfile`, computes a 12-character hex hash of its
-content, and sets `LEERIE_FLY_IMAGE=registry.fly.io/$APP:$VERSION-$HASH`.
-`resolve_fly_image_tag()` returns that value (via the existing
-`LEERIE_FLY_IMAGE` override hook). `ensure_image()` then:
+detects `.leerie/Dockerfile`, hashes its content (12 hex chars), and sets
+`LEERIE_FLY_IMAGE=registry.fly.io/$APP:$VERSION-$HASH`, which
+`resolve_fly_image_tag()` returns via the existing override hook.
+`ensure_image()` then:
 
 1. Cache check on the per-repo tag — skip if already in
    `published-tags.txt`.
@@ -656,18 +515,13 @@ content, and sets `LEERIE_FLY_IMAGE=registry.fly.io/$APP:$VERSION-$HASH`.
    BASE_IMAGE=registry.fly.io/$APP:$VERSION --tag <per-repo-tag>`.
 4. Append the per-repo tag to the positive cache.
 
-The per-repo tag format is `registry.fly.io/$APP:$VERSION-$HASH` where
-`$HASH` is the first 12 hex characters of `sha256($LEERIE_DOCKERFILE)`.
 A rebuild fires automatically when the Dockerfile content or the leerie
-version changes — the hash changes, a cache miss occurs, and
-ensure_image re-runs build-push.sh.
+version changes, since either changes the hash and causes a cache miss.
 
-Results are cached at `$XDG_CACHE_HOME/leerie/published-tags.txt` (default
-`~/.cache/leerie/published-tags.txt`), one line per `<tag>` known to be
-present. Cache hits skip the probe entirely; cache misses fall through
-to the probe and on success append the tag. The cache is a *positive*
-list only — a missing entry means "probe", not "absent" — so manual
-`flyctl image` deletions are self-healing on the next run.
+Results are cached at `$XDG_CACHE_HOME/leerie/published-tags.txt`
+(default `~/.cache/leerie/published-tags.txt`), one line per known-present
+`<tag>`. It's a *positive* list only — a missing entry means "probe", not
+"absent" — so manual `flyctl image` deletions are self-healing.
 
 Flags:
 
@@ -678,24 +532,18 @@ Flags:
 The flag is consumed by the launcher and not forwarded to the
 orchestrator (same convention as `--no-runtime-install`).
 
-Note the key paths inside the container:
+Key paths inside the container:
 
-- **`/leerie-state/`** is the run-state directory (state.json, logs,
-  worktrees, telemetry). It lives on the host filesystem via the
-  `/leerie-state` bind mount (`LEERIE_STATE_HOST_DIR`) and persists
-  across container runs. In *local mode*, worktrees land under
-  `/leerie-state/runs/<run-id>/worktrees/` — outside `/work`.
-- **`/opt/leerie-image/`** is the orchestrator source tree. On local
-  runs it is a read-only bind mount of `$LEERIE_HOME` on the host; on
-  Fly Machines it is the baked copy from the Dockerfile's `COPY`
-  instructions. Both paths resolve identically at runtime — the
-  ENTRYPOINT and orchestrator code always live at
-  `/opt/leerie-image/{scripts,orchestrator}/`.
+- **`/leerie-state/`** — the run-state directory (state.json, logs,
+  worktrees, telemetry), bind-mounted from the host (`LEERIE_STATE_HOST_DIR`)
+  and persistent across runs. In local mode, worktrees land under
+  `/leerie-state/runs/<run-id>/worktrees/`, outside `/work`.
+- **`/opt/leerie-image/`** — the orchestrator source tree: a read-only
+  bind mount of `$LEERIE_HOME` locally, or the Dockerfile's baked `COPY`
+  on Fly Machines. Both resolve identically at runtime.
 
-The container's PID 1 (the entry script) reads from `.leerie-image/`
-and writes to `/leerie-state/` (the state bind mount). Confusing the
-two would either break runs (writing to the read-only mount) or
-corrupt the install (writing to the source tree).
+PID 1 reads from `/opt/leerie-image/` and writes to `/leerie-state/`;
+confusing the two either breaks runs or corrupts the install.
 
 ### Entrypoint and source mounting
 
