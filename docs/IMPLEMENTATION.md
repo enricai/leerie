@@ -4330,13 +4330,12 @@ than the worker's echoed `result["subtask_id"]`. Pinned by
 
 Two shape decisions are load-bearing. The field is **optional in the schema
 and gating in the check**: requiring it costs the entire submission on a miss
-rather than the one field (`_confidence_schema`'s docstring records a measured
-40.9%-valid outcome on `plan_overlap_judge` from exactly this mistake), while
-gating on absence is what stops optional from meaning ignorable. And the
-object is **flat with one required inner field, a bare bool** — the verbose
-`how`/`observed` strings are optional, since anthropics/claude-code#49747's
-decoder corruption is triggered by many required parameters mixed with
-verbose strings. `tests/test_production_evidence.py` pins both.
+(measured 40.9%-valid on `plan_overlap_judge` from exactly this mistake), and
+gating on absence is what stops optional from meaning ignorable. The object
+is **flat with one required inner field, a bare bool** — `how`/`observed`
+strings stay optional, since many required params mixed with verbose strings
+triggers anthropics/claude-code#49747's decoder corruption.
+`tests/test_production_evidence.py` pins both.
 
 `PHANTOM_ARTIFACT` resolves a collision's `artifact` against the union of
 every subtask's `files_likely_touched` **as well as** the working tree, not
@@ -4355,27 +4354,27 @@ file and nothing is flagged; `minLength: 1` on the items makes a blank
 entry a schema-gate retry rather than something the check filters at read
 time. `artifact_paths` is **asked for but NOT in `collisions[].required`**
 (changed 2026-08-03): requiring it drove `plan_overlap_judge`'s valid-output
-rate to 40.9% (27/66) against 99.6–100% for every other worker, with 84 of
-85 failures the single error `'artifact_paths' is a required property` — a
+rate to 40.9% against 99.6–100% for every other worker, almost all failures
+the single error `'artifact_paths' is a required property` — a
 whole-payload rejection of otherwise-sound collision analysis. Absence is
 the designed-for case (`paths = c.get("artifact_paths") or []`; `if not
 paths: continue`). See DESIGN §5 *Cross-domain surface overlap*.
 `tests/test_phase_overlap_judge.py`'s `TestProsePathParsingAbsent` pins that
-neither of two earlier hand-parsing shapes (whole-string path-checking,
-then whitespace tokenizing) has returned.
+neither earlier hand-parsing shape (whole-string checking, whitespace
+tokenizing) has returned.
 
 `DUPLICATE_PAIR` covers two collisions naming the same `{a_sid, b_sid}`
 pair. This is **coherent** when the pair genuinely overlaps on more than one
-artifact (one row per artifact instead of one row listing every path), and
-`_apply_overlap_collisions` absorbs the repeat via its `skipped_redundant`
-branch. What matters is not the `resolution` *string* but the resolved
-**effect** (dropped sid for a `drop_*`, or the sorted endpoint pair for a
-`merge`): identical-effect rows are coalesced by
-`_validate_overlap_judge_output` into one collision (artifacts joined,
-`artifact_paths` unioned) and applied; rows whose effects genuinely
-*differ* (e.g. the same pair emitted twice as `drop_a` with swapped
-endpoints, dropping both subtasks) surface as a `DUPLICATE_PAIR` issue from
-`check_overlap_judge_output`, giving the judge a retry round.
+artifact (one row per artifact rather than one row listing every path), and
+`_apply_overlap_collisions` absorbs the repeat via `skipped_redundant`.
+What matters is the resolved **effect** (dropped sid for a `drop_*`, or the
+sorted endpoint pair for a `merge`), not the `resolution` string:
+identical-effect rows are coalesced by `_validate_overlap_judge_output`
+into one collision (artifacts joined, `artifact_paths` unioned) and
+applied; rows whose effects genuinely *differ* (e.g. the same pair emitted
+twice as `drop_a` with swapped endpoints, dropping both subtasks) surface
+as `DUPLICATE_PAIR` from `check_overlap_judge_output`, giving the judge a
+retry round.
 
 `LOW_CONFIDENCE` no longer exists. It was emitted by
 `_confidence_issues(conf, axes, threshold=9.0)` from a worker's own
@@ -4408,18 +4407,18 @@ DESIGN.md §8 for the full rationale).
 **Freeze guard (2026-07-19 incident, root cause A) — resolved by deletion.**
 A single incidental dotted token (e.g. `CLAUDE.md` mentioned once in a
 task's Verification section) used to make `extract_task_file_structure`
-harvest the repo's real CLAUDE.md as spec items, including imperatives
-that could never appear verbatim in a subtask — a literal-substring gate
-that fired identically every round, burning ~35% of the run's spend on a
-signal that could not move. The whole mechanism — `extract_task_file_structure`,
+harvest the repo's real CLAUDE.md as spec items, including imperatives that
+could never appear verbatim in a subtask — a literal-substring gate that
+fired identically every round, burning ~35% of the run's spend on a signal
+that could not move. The whole mechanism (`extract_task_file_structure`,
 `_is_uncoverable_convention_item`, `_BACKTICK_SPAN_RE`,
 `check_task_file_coverage`, `_dedup_frozen_coverage_issues`,
-`_format_task_file_structure`, `_MAX_COVERAGE_ITEMS` — is deleted, along
-with the `LOW_COVERAGE` issue kind. `phase_plan` now names the referenced
-files via `_format_task_file_references` and lets the planner read them;
-coverage of what those files require belongs to `task_coverage_judge`
-(phase 2⅞½). `tests/test_task_file_coverage_freeze.py` and
-`TestProseHarvestAbsent` pin that none of the deleted symbols return.
+`_format_task_file_structure`, `_MAX_COVERAGE_ITEMS`, and the
+`LOW_COVERAGE` issue kind) is deleted. `phase_plan` now names the
+referenced files via `_format_task_file_references` and lets the planner
+read them; coverage of what those files require belongs to
+`task_coverage_judge` (phase 2⅞½). `tests/test_task_file_coverage_freeze.py`
+and `TestProseHarvestAbsent` pin that none of the deleted symbols return.
 
 No-op when the task doesn't reference files.
 
@@ -4531,12 +4530,11 @@ threshold avoids false positives from comments, type definitions, and
 test fixtures.
 
 An earlier version inferred the old pattern from prose
-(`_MIGRATION_SIGNAL_RE` matching phrases like "replaces direct `X`"
-against `intent`/`investigation_notes`) — the reading-meaning-out-of-prose
-CLAUDE.md *Language-to-JSON* forbids, and it did not work: measured on run
-`19a70d96`, all 27 extractions were stopwords that grepped to hundreds of
-files and always cleared the threshold. Python now greps a symbol the
-planner handed it directly.
+(`_MIGRATION_SIGNAL_RE` matching phrases like "replaces direct `X`" against
+`intent`/`investigation_notes`) — forbidden by CLAUDE.md *Language-to-JSON*,
+and it did not work: measured on run `19a70d96`, all 27 extractions were
+stopwords that grepped to hundreds of files and always cleared the
+threshold. Python now greps a symbol the planner handed it directly.
 
 Because `migration_targets` is optional, an omitted field (not a wrong
 entry) silently disables `UNCOVERED_MIGRATION_SURFACE` for that subtask.
@@ -4549,13 +4547,12 @@ an independent verifier: a planner wrong on both fields together (false +
 omitted) is not caught.
 
 Whether `old_pattern` is shaped like a real identifier used to be enforced
-by `_BARE_LOWERCASE_WORD_RE` (`^[a-z]+$`), a regex Python ran against the
-planner-populated field — itself a relocated *Language-to-JSON* violation.
-It is retired; each `migration_targets` entry now carries a required
+by `_BARE_LOWERCASE_WORD_RE` (`^[a-z]+$`) — a regex Python ran against the
+planner-populated field, itself a relocated *Language-to-JSON* violation.
+It is retired: each `migration_targets` entry now carries a required
 `is_real_identifier: bool` field the planner sets itself, and
-`_check_migration_surface` trusts that attestation directly (skipping
-an entry when it's `false` or absent) rather than re-deriving the
-judgment.
+`_check_migration_surface` trusts that attestation directly (skipping an
+entry when it's `false` or absent) rather than re-deriving the judgment.
 
 | Function/constant | Purpose |
 |----------|---------|
@@ -4648,9 +4645,9 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | budget-preflight safety margin | 1.15 (`budget_safety_margin`) | not a runtime gate; consumed by `check_budget_feasibility()` as the multiplier on `total_estimate` before comparison to `max_total_workers`. |
 | concurrent workers within a wave | 5 (`--max-parallel`, also `LEERIE_MAX_PARALLEL` env or `max_parallel` in `leerie.toml`) | throughput throttle. Per-worker cgroup memory containment (see row below) keeps an OOM inside one worker's cgroup, so the wave-level parallelism can be high without risking cascade to sshd / lima-guestagent. |
 | turns per `claude -p` call | per worker (below) | worker stops; implementer → `incomplete-handoff` |
-| per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) global cap, **lowered per worker type by `TIMEOUT_DEFAULT_PER_WORKER` via `resolve_worker_timeout(worker, caps)`** | worker killed; implementer → `incomplete-handoff`. **Two tiers.** With no explicit global — detected by `resolve_worker_timeout_explicit()`, which re-walks the CLI/env/TOML tiers rather than comparing the resolved int to the default — `resolve_worker_timeout(worker, caps)` applies the table, bounded by the global; a worker absent from it keeps the full 5400 s (`conformer`/`implementer`/`planner`, whose derived ceilings reach the cap, plus `judge`/`patch_generator` and anything new). With an **explicit** global — `--worker-timeout SEC` / `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec` in `leerie.toml` — that value wins outright and the table is **bypassed**. The explicit/implicit bit travels as its own cap, `caps["worker_timeout_explicit"]`, since the resolver returns a plain `int` and "5400 because the operator asked" is otherwise indistinguishable from "5400 because nothing was set." Mirrors `resolve_worker_memory_max`, where an explicit value likewise bypasses the derivation. The three timeout log/handoff messages (`_run_implementer`, `_run_conformer`, `_run_final_conformance`) report `resolve_worker_timeout(...)`, not the global. **Values are derived, never chosen:** each is `min(cap, max(_WORKER_TIMEOUT_FLOOR_SEC=600, ceil(p99*3), ceil(max*1.2)))` computed from `tests/fixtures/worker_duration/summary.json` — the measured distribution of 15,951 real calls across 21 worker types, regenerated by `scripts/measure/worker_durations.py <state-root>`. `tests/test_worker_duration_distribution.py` re-executes the rule against the committed summary. The `max*1.2` term is load-bearing: `planner`'s p99*3 is 5,091 s while its observed maximum is 5,247.6 s, so a p99-only rule would kill a run contained in the corpus it was derived from — the guard pushes planner to the cap, where it is omitted. A fired timeout is retried, but only `_TIMEOUT_RETRY_MAX = 1` time, unlike a `WorkerError` which keeps the full round budget. |
+| per-worker wall-clock (`worker_timeout_sec`) | 5400 s (90 min) global cap, **lowered per worker type by `TIMEOUT_DEFAULT_PER_WORKER` via `resolve_worker_timeout(worker, caps)`** | worker killed; implementer → `incomplete-handoff`. **Two tiers.** With no explicit global (`resolve_worker_timeout_explicit()` re-walks CLI/env/TOML, not a comparison to the default), `resolve_worker_timeout(worker, caps)` applies the table, bounded by the global; a worker absent from it keeps the full 5400 s. With an **explicit** global (`--worker-timeout SEC` / `LEERIE_WORKER_TIMEOUT` / `worker_timeout_sec`), that value wins outright and the table is **bypassed** — tracked as its own cap, `caps["worker_timeout_explicit"]`, mirroring `resolve_worker_memory_max`. The three timeout log/handoff messages (`_run_implementer`, `_run_conformer`, `_run_final_conformance`) report `resolve_worker_timeout(...)`, not the global. **Values are derived, never chosen:** each is `min(cap, max(_WORKER_TIMEOUT_FLOOR_SEC=600, ceil(p99*3), ceil(max*1.2)))` computed from `tests/fixtures/worker_duration/summary.json` (15,951 real calls across 21 worker types, regenerated by `scripts/measure/worker_durations.py <state-root>`; re-executed by `tests/test_worker_duration_distribution.py`). The `max*1.2` term is load-bearing: `planner`'s p99*3 is 5,091 s while its observed maximum is 5,247.6 s, so a p99-only rule would kill a run inside its own derivation corpus — the guard pushes planner to the cap instead. A fired timeout retries once (`_TIMEOUT_RETRY_MAX = 1`), unlike a `WorkerError`, which keeps the full round budget. |
 | per-worker idle-event warning (`worker_idle_warn_sec`) | 300 s (5 min) | log a `no stdout events in <gap>s` warning naming the worker, its PID, and any stderr tail. Observation-only — the worker is NOT killed. |
-| per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived via `_auto_worker_memory_max` → `_worker_memory_ceiling(slice_max)` from the shared `leerie.slice/memory.max` budget alone (broker `slice` verb; `_cgroup_slice_info`): `max(_WORKER_BUILD_PEAK_BYTES, min(_WORKER_BUILD_PEAK_BYTES * _WORKER_MEMORY_CEILING_MULTIPLIER, slice_max // 2))` — a **fixed isolation ceiling**, deliberately **independent of the live sibling count and of `max_parallel`**, since `memory.max` is a ceiling, not a reservation (DESIGN §6). Falls back to the legacy `/proc/meminfo`-derived basis (`_auto_worker_memory_max_legacy`, VM RAM split across `max_parallel + 1` slots, floored at 8 GiB) only when no broker/slice budget is readable. Contention is handled by admission in **two stages**, never by shrinking caps. Stage 1, `_degrade_max_parallel_for_wave(max_parallel, build_peak_bytes=None)`, runs once at wave entry and is synchronous: it returns the largest N in `[1, max_parallel]` with `slice_max - unreclaimable >= demand * N` and sizes the wave's `asyncio.Semaphore` accordingly; it is never fed back into a later computation. Stage 2 is the per-spawn gate: before spawning, `_await_worker_memory_admission` blocks (polling every 5s, up to 10 min) while measured slice headroom (`slice_max - unreclaimable`, never `memory.current`) is below `demand * (1 + in-flight workers)`. Reservations are bounded by worker LIFETIME, not by elapsed time — the gate returns a token from `_active_admissions` and `_invoke_admitted` (a thin admission wrapper around `_invoke`) releases it in a `finally`. Both stages read the same signal deliberately, so they cannot disagree about one slice's headroom. Pinned by `tests/test_memory_admission_degrade.py`. Overridable via `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml` (bypasses the derivation only — the admission gate still runs). Suffixes K/M/G/T accepted. **Reconciled against the repo's own declared Node heap (`resolve_worker_memory_max`, `_declared_node_heap_bytes`).** Node 20+ derives its default V8 heap ceiling from the host, but an explicit `--max-old-space-size` overrides that regardless of container size, and a repo's build/lint/test command commonly sets it, most often **inside a `package.json` script**. `_declared_node_heap_bytes` follows a package-manager indirection one level through `package.json`'s `scripts` map, matching all four V8 spellings, via candidates from `_pm_script_candidates` (splits the command on shell separators before tokenising — testing whitespace-split tokens against a separator set alone misses `"build&&node"`). The matcher is deliberately over-inclusive: a missed script under-sizes the cage and the worker OOMs, while an extra candidate costs nothing. A declared heap overrides whatever `NODE_OPTIONS` leerie itself injects for that subprocess (P9), so a declared heap bigger than the per-worker cgroup ceiling would otherwise guarantee an in-cgroup OOM. The headroom constant is `_NODE_HEAP_HEADROOM_BYTES` = 2432 MiB, shared with P9's own injection — both compute mirror images of one quantity and must read the same name, not a duplicated literal (`tests/test_resolve_worker_memory_max.py` AST-pins the subtrahend to a name; `test_node_heap_headroom_is_2432_mib` pins the value). When the resolved cap undershoots `declared heap + _NODE_HEAP_HEADROOM_BYTES`: an auto-derived cap is raised to that floor unclamped; an explicit override is left alone but refused with an actionable `die()`; when even the whole slice budget cannot fit the declared heap, `die()`s naming the shortfall. Regression: `tests/test_worker_heap_ceiling_reconcile.py` and `tests/test_worker_memory_heap_reconcile.py` | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services are not eligible victims. Enforcement goes through the **cgroup broker** (`scripts/cgroup-broker.py`), which the dropped-privilege orchestrator drives over a Unix socket. The broker creates `<V2_ROOT>/leerie.slice/leerie-w-<sid>` (cgroup **v2** — `V2_ROOT` is `/sys/fs/cgroup` rootful/Fly, or the systemd-delegated user slice under rootless containerd via `LEERIE_CGROUP_V2_ROOT`) or the split `pids/`+`memory/` hierarchies at the fixed `V1_ROOT` (cgroup v1/hybrid, never rootless) and sets its `memory.max`. Local nerdctl needs the launcher's cgroup bind-mount (`bind-propagation=rshared` rootful, a plain bind rootless) + `--cgroupns=host`; Fly's microVM exposes cgroupfs directly. `_cgroup_probe` asks the broker to round-trip a create+enroll+destroy, and `_enforce_and_record_cgroup_containment` `die()`s before the first worker if it fails (unless `--dangerously-allow-uncapped`). See DESIGN §6 *Memory containment*. |
+| per-worker cgroup memory cap (`worker_memory_max_bytes`) | auto-derived via `_auto_worker_memory_max` → `_worker_memory_ceiling(slice_max)` from the shared `leerie.slice/memory.max` budget alone (broker `slice` verb; `_cgroup_slice_info`): `max(_WORKER_BUILD_PEAK_BYTES, min(_WORKER_BUILD_PEAK_BYTES * _WORKER_MEMORY_CEILING_MULTIPLIER, slice_max // 2))` — a **fixed isolation ceiling**, deliberately **independent of the live sibling count and of `max_parallel`**, since `memory.max` is a ceiling, not a reservation (DESIGN §6). Falls back to the legacy `/proc/meminfo`-derived basis (`_auto_worker_memory_max_legacy`, VM RAM split across `max_parallel + 1` slots, floored at 8 GiB) only when no broker/slice budget is readable. Contention is handled by admission in **two stages**, never by shrinking caps. Stage 1, `_degrade_max_parallel_for_wave(max_parallel, build_peak_bytes=None)`, runs once at wave entry and is synchronous: it returns the largest N in `[1, max_parallel]` with `slice_max - unreclaimable >= demand * N` and sizes the wave's `asyncio.Semaphore` accordingly. Stage 2 is the per-spawn gate: before spawning, `_await_worker_memory_admission` blocks (polling every 5s, up to 10 min) while measured slice headroom (`slice_max - unreclaimable`, never `memory.current`) is below `demand * (1 + in-flight workers)`. Reservations are bounded by worker LIFETIME — the gate returns a token from `_active_admissions` and `_invoke_admitted` releases it in a `finally`. Pinned by `tests/test_memory_admission_degrade.py`. Overridable via `--worker-memory-max SIZE` / `LEERIE_WORKER_MEMORY_MAX` / `worker_memory_max` in `leerie.toml` (bypasses the derivation only — the admission gate still runs). Suffixes K/M/G/T accepted. **Reconciled against the repo's own declared Node heap** (`resolve_worker_memory_max`, `_declared_node_heap_bytes`): an explicit `--max-old-space-size` in a `package.json` script overrides Node's host-derived default regardless of container size, so `_declared_node_heap_bytes` follows the package-manager indirection through `scripts`, matching all four V8 spellings via `_pm_script_candidates` (splits on shell separators first — a whitespace split alone misses `"build&&node"`). Deliberately over-inclusive: a missed script under-sizes the cage and OOMs the worker; an extra candidate costs nothing. A declared heap overrides whatever `NODE_OPTIONS` leerie injects for that subprocess (P9), sharing the headroom constant `_NODE_HEAP_HEADROOM_BYTES` = 2432 MiB with P9's own injection so both read one name, not a duplicated literal (`tests/test_resolve_worker_memory_max.py` AST-pins it; `test_node_heap_headroom_is_2432_mib` pins the value). When the resolved cap undershoots `declared heap + headroom`: an auto-derived cap is raised unclamped; an explicit override is refused with an actionable `die()`; when even the whole slice can't fit the declared heap, `die()`s naming the shortfall. Regression: `tests/test_worker_heap_ceiling_reconcile.py`, `tests/test_worker_memory_heap_reconcile.py` | the kernel OOM-kills inside the worker's cgroup; sibling workers, the orchestrator, and host-side services are not eligible victims. Enforcement goes through the **cgroup broker** (`scripts/cgroup-broker.py`), driven over a Unix socket by the dropped-privilege orchestrator. It creates `<V2_ROOT>/leerie.slice/leerie-w-<sid>` (cgroup **v2** — `V2_ROOT` is `/sys/fs/cgroup` rootful/Fly, or the systemd-delegated user slice under rootless containerd via `LEERIE_CGROUP_V2_ROOT`) or the split `pids/`+`memory/` hierarchies at the fixed `V1_ROOT` (v1/hybrid, never rootless) and sets its `memory.max`. Local nerdctl needs the launcher's cgroup bind-mount (`bind-propagation=rshared` rootful, plain bind rootless) + `--cgroupns=host`; Fly's microVM exposes cgroupfs directly. `_cgroup_probe` asks the broker to round-trip a create+enroll+destroy, and `_enforce_and_record_cgroup_containment` `die()`s before the first worker if it fails (unless `--dangerously-allow-uncapped`). See DESIGN §6 *Memory containment*. |
 | per-worker memory demand estimate (`worker_demand_estimate_bytes`) | resolved once at run start by `resolve_worker_demand_estimate()`: `_WORKER_BUILD_PEAK_BYTES` unless the repo declares a Node heap, else `declared_heap + _NODE_HEAP_HEADROOM_BYTES`. Threaded to both admission surfaces as a parameter, not module state. **Distinct from the ceiling above** — that bounds one worker, this predicts what one will use. | `_degrade_max_parallel_for_wave` shrinks the wave; `_await_worker_memory_admission` blocks the spawn. Both fall back to `_WORKER_BUILD_PEAK_BYTES` when the key is absent, so the three entrypoints that build their own caps (`run_recapture_deps`, `run_rebaser`, `_replay_capture`) are unchanged. |
 | per-worker cgroup PIDs cap (`worker_pids_max`) | 2048, or `--worker-pids-max N` / `LEERIE_WORKER_PIDS_MAX` / `worker_pids_max` in `leerie.toml` (positive integer; `resolve_worker_pids_max` `die()`s on bad input) | kernel rejects further `fork()` from any process in the worker cgroup once the count is reached. Sized against measurement (DESIGN §6 *Detecting PID exhaustion*): leerie's own suite peaks at 33 concurrent PIDs, so 2048 sits well above the workload and a worker near it is leaking rather than testing. Raise it per-repo for suites heavier than the default. |
 | aggregate container memory cap (`leerie.slice/memory.max`) | auto-derived in `scripts/container-entry.sh` (PID 1) from VM `MemTotal` in `/proc/meminfo`: `MemTotal - max(1 GiB, 12.5%)`, reserving headroom for PID 1 + VM daemons (sshd, lima-guestagent, containerd). Overridable via `LEERIE_CONTAINER_MEMORY_MAX_BYTES` (raw bytes); `0`/`max` opts out. No CLI flag / `leerie.toml` key / `DEFAULT_CAPS` entry — the cap is applied by the shell entrypoint before the Python orchestrator starts. Best-effort: any read/write failure leaves the slice uncapped. Sets `memory.max` (RAM) only, not `memory.swap.max`. | when the slice's aggregate RSS exceeds the cap the kernel triggers a *cgroup-scoped* OOM (`CONSTRAINT_MEMCG`) that kills a process *inside the container*, instead of a VM-wide *global* OOM that would kill unprotected host-session processes and orphan the container. See DESIGN §6 *container boundary's hidden precondition*. |
@@ -4813,13 +4810,12 @@ the gate exists to remove.
 
 Registered in `WORKER_TYPES` and `EFFORT_DEFAULT_PER_WORKER` (`"medium"`),
 absent from `MODEL_DEFAULT_PER_WORKER` (sonnet via the global `MODEL_DEFAULT`
-fallback). **History:** this worker was previously pinned to opus as a
-required override, after an earlier Sonnet generation false-positived a
-legitimate plan here. That gap has since closed for Sonnet 5 (externally
-verified against Opus 4.8, DESIGN §5 *Opus-judgment, sonnet-workhorse*), so
-the worker now follows the global sonnet default; `--model-adherence-judge
-opus` remains available as a per-worker override if this gate is ever
-observed to regress. Prompt at `prompts/adherence_judge.md` carries the
+fallback). **History:** previously pinned to opus after an earlier Sonnet
+generation false-positived a legitimate plan here; that gap has since
+closed for Sonnet 5 (verified against Opus 4.8, DESIGN §5
+*Opus-judgment, sonnet-workhorse*), so it now follows the global sonnet
+default — `--model-adherence-judge opus` remains available if this gate
+is ever observed to regress. Prompt at `prompts/adherence_judge.md` carries the
 calibration: a goal-only task scores `instruction_adherence >= 8.5`; a plan
 that substitutes hand-authored/manual work for an explicitly prescribed
 procedure scores `<= 3`. The prompt is framed on **ADHERENCE** (does the
