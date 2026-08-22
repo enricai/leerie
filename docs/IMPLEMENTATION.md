@@ -573,11 +573,11 @@ exec runuser -u leerie -- \
 ```
 
 **Rootless containerd.** Under rootless containerd (Linux), rootlesskit
-maps the host UID to container UID 0. The entrypoint detects this by
-checking `/proc/self/uid_map` (non-zero host-start field on the first
-line → `ROOTLESS=true`) and, when true, also extracts `HOST_UID` (that
-line's second field — the real host UID rootlesskit mapped container UID
-0 to). When rootless:
+maps the host UID to container UID 0. The entrypoint detects this via
+`/proc/self/uid_map` (non-zero host-start field on the first line →
+`ROOTLESS=true`) and, when true, also extracts `HOST_UID` (that line's
+second field — the real host UID rootlesskit mapped container UID 0 to).
+When rootless:
 
 - The `chown leerie: /work` and `runuser -u leerie --` steps are
   skipped — container "root" IS the host user, so privilege drop would
@@ -586,21 +586,21 @@ line's second field — the real host UID rootlesskit mapped container UID
   `/sys/fs/cgroup/user.slice/user-$HOST_UID.slice/user@$HOST_UID.service`
   instead of the top-level `/sys/fs/cgroup` — the mapped host UID has no
   privilege over the true top level (root-owned, mode 0555), but systemd
-  already delegates this subtree to that UID's login session. Any cgroup
-  the UID creates underneath it (via `mkdir`) inherits that UID's
+  already delegates this subtree to that UID's login session, so any
+  cgroup the UID creates underneath it (via `mkdir`) inherits that UID's
   ownership on every auto-created interface file, including `pids.max` /
   `memory.max` — unlike a directory merely `chown`ed after creation. This
   is passed to `cgroup-broker.py` via `LEERIE_CGROUP_V2_ROOT` (its
   `V2_ROOT`, default `/sys/fs/cgroup` when unset — every non-rootless
   case); the v1/hybrid split-hierarchy path (`V1_ROOT`, Fly-only) is
-  never overridden. The broker itself needs no separate privileged
-  identity here: it's launched at the same rootlesskit-mapped identity
-  the whole container runs as, which is exactly what `CGROUP_ROOT` is
-  delegated to. Cross-scope worker-PID migration into `leerie.slice`
-  still works because cgroup v2 only requires write access to the
-  destination and the nearest common ancestor (not the source), and that
-  ancestor — `user@$HOST_UID.service` — is what's delegated. See DESIGN
-  §6 *Rootless exception* for the full mechanism.
+  never overridden. The broker needs no separate privileged identity
+  here: it's launched at the same rootlesskit-mapped identity the whole
+  container runs as, which is exactly what `CGROUP_ROOT` is delegated
+  to. Cross-scope worker-PID migration into `leerie.slice` still works
+  because cgroup v2 only requires write access to the destination and
+  the nearest common ancestor (not the source), and that ancestor —
+  `user@$HOST_UID.service` — is what's delegated. See DESIGN §6
+  *Rootless exception* for the full mechanism.
 - On hosts where this delegation doesn't hold (non-systemd rootless init,
   or a systemd host that doesn't delegate `pids`/`memory` into the
   per-session slice), the slice-setup writes (`|| true`) and the broker's
@@ -608,18 +608,17 @@ line's second field — the real host UID rootlesskit mapped container UID
   any other containment-incapable host — and the fail-closed containment
   gate stops the run unless the operator passes
   `--dangerously-allow-uncapped`.
-- On macOS (Darwin), the launcher unconditionally sets the `rshared`
-  bind-mount — Colima's VM always runs rootful containerd with cgroup
-  v2 and shared propagation, but the host has no `/sys/fs/cgroup` to
-  probe. On native rootful Linux the launcher adds the same `rshared`
-  mount unconditionally. Rootless containerd is its own branch, gated on
-  the `containerd-rootless/child_pid` sentinel, and uses a **plain**
-  bind-mount with no `bind-propagation` flag: rootlesskit's
-  `--propagation=rslave` demotes `/sys/fs/cgroup` to a slave mount, which
-  is incompatible with `bind-propagation=rshared`. Only read/write
-  visibility into the already-mounted cgroupfs is needed here — not
-  propagation of new mount events — so the plain bind-mount is
-  sufficient. When cgroup v2 isn't present at all, the mount is skipped,
+- On macOS, the launcher unconditionally sets the `rshared` bind-mount —
+  Colima's VM always runs rootful containerd with cgroup v2 and shared
+  propagation, but the host has no `/sys/fs/cgroup` to probe. Native
+  rootful Linux gets the same `rshared` mount unconditionally. Rootless
+  containerd is its own branch, gated on the `containerd-rootless/child_pid`
+  sentinel, and uses a **plain** bind-mount with no `bind-propagation`
+  flag: rootlesskit's `--propagation=rslave` demotes `/sys/fs/cgroup` to a
+  slave mount, incompatible with `bind-propagation=rshared`. Only
+  read/write visibility into the already-mounted cgroupfs is needed —
+  not propagation of new mount events — so the plain bind-mount
+  suffices. When cgroup v2 isn't present at all, the mount is skipped,
   the broker probe fails, and the fail-closed gate
   (`_enforce_and_record_cgroup_containment`) stops the run unless
   `--dangerously-allow-uncapped` is set.
@@ -656,15 +655,15 @@ The launcher passes the following mounts to `nerdctl run`:
 | `$(pwd -P)` (user repo) | `/work` | rw | The repo leerie operates on. Git worktrees live here. Writes flow back to the host so `resume` works across container runs. Run state (`.leerie/`) is mounted separately via `/leerie-state` (see below). |
 | `$LEERIE_STATE_HOST_DIR` (resolved host state dir) | `/leerie-state` | rw | *Local mode only.* Leerie run state (state.json, runs/, logs/, worktrees/). Mounted at a top-level container path distinct from `/work` so the repo checkout stays pristine — no `.leerie/` dir accumulates inside the project. The orchestrator reads the container path from `LEERIE_STATE_DIR=/leerie-state` (passed as `-e` in the same `nerdctl run` invocation). `LEERIE_STATE_HOST_DIR` is resolved on the host by the launcher before launch; see §2 "Host-side per-repo state directory". |
 | `$LEERIE_HOME` (leerie install dir) | `/opt/leerie-image` | ro | *Local mode only.* Orchestrator source + Dockerfile + prompts. Read-only because the container has no business mutating the install. Shadows the baked COPY layer so edits to `orchestrator/leerie.py` take effect without an image rebuild. Absent in registry / fly.io mode — the baked COPY layer is used directly. |
-| `$STAGE` (per-run host scratch — the same tree seed-auth.sh/ec2-seed-auth.sh tar-pipe to Fly/EC2) | `/opt/leerie-claude-json-src` | **ro** | The per-container copy of `~/.claude.json` (with the `projects[]` block stripped) lives at `$STAGE/.claude.json`. `$STAGE` is bind-mounted read-only in its entirety at this staging path — `.claude.json` is never bind-mounted directly onto `/home/leerie/.claude.json`. Directly mounting the host file as the live target has two failure modes: a shared mount is a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226) that hangs workers in a recovery loop, and the CLI's rename()-based atomic write returns `EBUSY` on a bind-mounted single file, forcing a non-atomic truncate-in-place fallback with a demonstrated empty-file corruption window under concurrent workers. `scripts/container-entry.sh` copies `leerie-claude-json-src/.claude.json` to `/home/leerie/.claude.json` as a real file inside the container's own filesystem at container start — root-owned under rootless (correct under the single-entry `unshare --map-user` remap), explicitly `chown`ed to `leerie:` under rootful — mirroring the tar-copy pattern `scripts/remote/seed-auth.sh`/`scripts/remote/ec2-seed-auth.sh` already use for the remote runtimes. |
+| `$STAGE` (per-run host scratch — the same tree seed-auth.sh/ec2-seed-auth.sh tar-pipe to Fly/EC2) | `/opt/leerie-claude-json-src` | **ro** | The per-container copy of `~/.claude.json` (with `projects[]` stripped) lives at `$STAGE/.claude.json`. `$STAGE` is bind-mounted read-only in its entirety at this staging path — `.claude.json` is never bind-mounted directly onto `/home/leerie/.claude.json`. Mounting the host file as the live target has two failure modes: a shared mount is a documented `claude-code` corruption race (anthropics/claude-code issues #28847, #29217, #29395, #40226) that hangs workers in a recovery loop, and the CLI's rename()-based atomic write returns `EBUSY` on a bind-mounted single file, forcing a non-atomic truncate-in-place fallback with a demonstrated empty-file corruption window under concurrent workers. `scripts/container-entry.sh` instead copies it to `/home/leerie/.claude.json` as a real file at container start — root-owned under rootless (correct under the single-entry `unshare --map-user` remap), explicitly `chown`ed to `leerie:` under rootful — mirroring the tar-copy pattern `scripts/remote/seed-auth.sh`/`scripts/remote/ec2-seed-auth.sh` use for the remote runtimes. |
 | `$STAGE/.claude` (per-run host scratch) | `/home/leerie/.claude` | rw | Per-container copy of `~/.claude/` with bulky, prior-session, and history paths skipped (`history.jsonl`, `projects/`, `sessions/`, `tasks/`, `plans/`, `todos/`, `file-history/`, `paste-cache/`, `shell-snapshots/`, `session-env/`, `telemetry/`, `stats-cache.json`, `debug/`, `downloads/`, `backups/`, `chrome/`, `ralph-state/`, `.last-cleanup`, `settings.json.*`, `plugins/cache/`, `plugins/marketplaces/`). CLI capability dirs (`agents/`, `skills/`, `commands/`, `hooks/`, `plugins/installed_plugins.json` + sibling JSON, `mcp-needs-auth-cache.json`, `settings.json`, `local/`, `statsig/`, `cache/`, `package.json`, `policy-limits.json`) ride along. `plugins/cache/` and `plugins/marketplaces/` are rebuilt on the remote in the fly runtime; see `scripts/remote/seed-auth.sh` step 4 (`# --- 4. Rebuild plugin cache`). |
-| `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | The launcher's `_extract_claude_credentials_json` helper resolves which Claude OAuth credential to use, in order: `$CLAUDE_CODE_OAUTH_TOKEN` (the long-lived `claude setup-token` token) first when set, synthesized into `{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` (the `scopes` field is mandatory — the CLI's file-auth path rejects a scope-less blob); then Keychain (service `Claude Code-credentials`, via `security find-generic-password -w`, macOS only); then `$HOME/.claude/.credentials.json` on disk. A container cannot refresh a copied token, which is why the long-lived token wins over the file-based sources (DESIGN §6 *Credential strategy*). The Keychain and on-disk branches are shape-checked via `_claude_creds_has_oauth_token` (requires a non-empty `claudeAiOauth.accessToken`) before acceptance, guarding against an upstream Claude Code CLI bug (steipete/CodexBar#1844) where the Keychain item can hold only `{"mcpOAuth": {...}}` with no usable session token even while the host CLI works fine — `claude /login` does not repair this. A source failing the shape check is treated as empty and resolution falls through the chain; the rejected source and reason are written to a PID-scoped temp file (`$_CLAUDE_CREDS_REJECT_REASON_FILE`) rather than a shell variable, since the caller invokes the helper via `$(...)` subshell substitution where an internally-set variable would not survive. All three branches (and `seed-auth.sh`/`ec2-seed-auth.sh` on Fly/EC2) write the same JSON shape to the staged path at mode 600. Independently, when `$CLAUDE_CODE_OAUTH_TOKEN` is set the launcher also forwards it as a container env var (`-e CLAUDE_CODE_OAUTH_TOKEN`, unconditionally) since that auth path is permissive/long-lived and survives past the file blob's `expiresAt`. The same helper populates `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` key for the `chain` arm. **Call-site failure behavior:** when extraction fails and no Bedrock auth mechanism (`$AWS_BEARER_TOKEN_BEDROCK` or `detect_bedrock_mode`) is active, the STAGE-assembly block `die()`s immediately rather than continuing into a container run doomed to fail at the in-container smoke test; the message names the mcpOAuth-only upstream bug and recommends `claude setup-token` when that shape is the rejection reason, or the standard `/login`/Keychain-access guidance otherwise. The guard exempts both Bedrock auth modes since they need no Claude subscription credential at all. |
+| `_extract_claude_credentials_json` → `$STAGE/.claude/.credentials.json` | `/home/leerie/.claude/.credentials.json` | rw | The launcher's `_extract_claude_credentials_json` helper resolves which Claude OAuth credential to use, in order: `$CLAUDE_CODE_OAUTH_TOKEN` (the long-lived `claude setup-token` token) first when set, synthesized into `{"claudeAiOauth":{"accessToken":…,"scopes":["user:inference"]}}` (the `scopes` field is mandatory — the CLI's file-auth path rejects a scope-less blob); then Keychain (service `Claude Code-credentials`, via `security find-generic-password -w`, macOS only); then `$HOME/.claude/.credentials.json` on disk. A container cannot refresh a copied token, which is why the long-lived token wins over the file-based sources (DESIGN §6 *Credential strategy*). The Keychain and on-disk branches are shape-checked via `_claude_creds_has_oauth_token` (requires a non-empty `claudeAiOauth.accessToken`) before acceptance, guarding against an upstream Claude Code CLI bug (steipete/CodexBar#1844) where the Keychain item can hold only `{"mcpOAuth": {...}}` with no usable session token even while the host CLI works fine — `claude /login` does not repair this. A source failing the shape check is treated as empty and resolution falls through the chain; the rejected source and reason go to a PID-scoped temp file (`$_CLAUDE_CREDS_REJECT_REASON_FILE`) rather than a shell variable, since the caller invokes the helper via `$(...)` subshell substitution where an internally-set variable would not survive. All three branches (and `seed-auth.sh`/`ec2-seed-auth.sh` on Fly/EC2) write the same JSON shape to the staged path at mode 600. Independently, when `$CLAUDE_CODE_OAUTH_TOKEN` is set the launcher also forwards it as a container env var (`-e CLAUDE_CODE_OAUTH_TOKEN`, unconditionally) since that auth path is permissive/long-lived and survives past the file blob's `expiresAt`. The same helper populates `LEERIE_WORKER_ENV_JSON`'s `LEERIE_CLAUDE_CREDS_B64` key for the `chain` arm. **Call-site failure behavior:** when extraction fails and no Bedrock auth mechanism (`$AWS_BEARER_TOKEN_BEDROCK` or `detect_bedrock_mode`) is active, the STAGE-assembly block `die()`s immediately rather than continuing into a container run doomed to fail the in-container smoke test; the message names the mcpOAuth-only upstream bug and recommends `claude setup-token` when that shape is the rejection reason, or standard `/login`/Keychain-access guidance otherwise. The guard exempts both Bedrock auth modes, which need no Claude subscription credential at all. |
 | `$STAGE/.gitconfig`, `.gitconfig.local`, `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc` (per-run host scratch) | `/home/leerie/.<same>` | rw | Per-container copies of each present host `~/.git*` sibling and `~/.netrc`. Worker can `git config --local` / mutate freely without affecting host state. |
 | `$STAGE/.config/git` (per-run host scratch) | `/home/leerie/.config/git` | rw | XDG-style git config (`~/.config/git/config`, `~/.config/git/ignore`) copied per-container. |
 | `$STAGE/.ssh` (per-run host scratch) | `/home/leerie/.ssh` | rw | Per-container copy of `~/.ssh/` with `agent/`, `S.*`, and `*.sock` excluded — host UNIX sockets aren't reachable from inside the container and `cp -a` on them is pointless. Keys and `known_hosts` ride along so workers can SSH-push if needed. Permissions set to `0700`. |
 | `$STAGE/.gnupg` (per-run host scratch) | `/home/leerie/.gnupg` | rw | Per-container copy of `~/.gnupg/` with agent socket files (`S.gpg-agent*`, `S.scdaemon`, `S.keyboxd`) excluded and `use-keyboxd` stripped from `common.conf` (the container cannot reach the host keyboxd daemon; stripping the directive makes gpg fall back to file-based `pubring.kbx` lookup — on keyboxd-only hosts signing keys become unfindable, which is acceptable since commit signing is best-effort). Keyrings + `trustdb.gpg` ride along so workers can `git commit -S` if signing is configured. Permissions set to `0700`. |
-| `$STAGE/.aws` (per-run host scratch, **Bedrock SSO/profile mode only**) | `/home/leerie/.aws` | **ro** | Staged when `detect_bedrock_mode()` finds `CLAUDE_CODE_USE_BEDROCK` set to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive — matching Claude CLI's `isEnvTruthy`) in the `env` block of any of the three settings files the Claude CLI merges (`~/.claude/settings.json` (userSettings), `<USER_REPO>/.claude/settings.json` (projectSettings), `<USER_REPO>/.claude/settings.local.json` (localSettings)) — and only when `AWS_BEARER_TOKEN_BEDROCK` (see below) is **not** set on the host; the bearer-token path needs none of this. The Claude CLI's AWS SDK resolves credentials via pure file I/O — reads `~/.aws/config` (profile + SSO session config) and `~/.aws/sso/cache/*.json` (SSO access tokens, ~12 h TTL) directly; no `aws` binary is needed inside the container. `~/.aws/cli/cache` is excluded (CLI result cache; large, irrelevant to auth). Mounted **read-only** because workers never write credentials. The `aws` binary (`awsAuthRefresh`) is a host-only concern: `aws sso login` requires an interactive TTY/browser and cannot run inside a non-interactive container; `bedrock_preflight()` catches an expired SSO token on the host before the container starts and prints the recovery hint (`aws sso login --profile <profile>`). On the Fly.io path, `$STAGE/.aws/` is included in the tar pipe to `seed_auth` automatically (`.aws` is not in the seed-auth exclude list) and lands at `/home/leerie/.aws/` on the remote machine. Belt-and-suspenders: when Bedrock SSO/profile mode is active, the launcher also injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE`, and `AWS_REGION` as explicit env vars — via `AUTH_MOUNTS` `-e` flags on the local nerdctl path and via `child_env` in the Fly detached-launch heredoc — so workers activate Bedrock through `process.env` independently of how the in-container claude binary handles `settings.json` env blocks. The same `AUTH_MOUNTS` block (local nerdctl path only — not yet wired into the Fly `child_env` heredoc) also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` when set on the host: leerie always invokes `claude -p` with an explicit `--model <tier>` alias (never a raw model ID), and on Bedrock the Claude CLI's own alias table can lag the Anthropic-API alias table by a model generation or more (e.g. `sonnet` resolving to Sonnet 4.5 instead of Sonnet 5) — these are the CLI's own documented env vars for repointing what an alias resolves to, read as plain process env vars at CLI startup. |
-| `AWS_BEARER_TOKEN_BEDROCK` (host env var, **Bedrock bearer-token mode**) | forwarded as `-e`/`child_env` only — **no bind mount** | n/a | The static-bearer-token analogue of `CLAUDE_CODE_OAUTH_TOKEN`, triggered by a plain host env var independently of `detect_bedrock_mode()`'s settings.json scan, and taking precedence over the SSO/profile path above when both are present (matching the Claude CLI's own credential-resolution order — verified live against the CLI, v2.1.220: its Bedrock client construction short-circuits SSO/profile resolution once `AWS_BEARER_TOKEN_BEDROCK` is set). No `aws` CLI, no SSO session, no `~/.aws` staging — `bedrock_preflight()` is skipped entirely on this path. The launcher forwards `AWS_BEARER_TOKEN_BEDROCK` verbatim, `CLAUDE_CODE_USE_BEDROCK` (defaulting to `1` if the host didn't set it — confirmed live that the bearer token alone is a no-op without this flag, since the CLI otherwise falls through to firstParty/OAuth dispatch), and `AWS_REGION` when set (optional — the CLI defaults to `us-east-1`) as explicit `-e` flags on the local nerdctl path and `child_env` entries in the Fly detached-launch heredoc, mirroring the `CLAUDE_CODE_OAUTH_TOKEN` forwarding pattern above rather than the SSO path's settings.json extraction. The same local-nerdctl `-e` block (not yet extended to the Fly `child_env` heredoc) also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, and `ANTHROPIC_DEFAULT_HAIKU_MODEL` when set on the host — the Claude CLI's documented mechanism for repointing what the `--model <tier>` alias leerie always passes resolves to, since Bedrock's alias table can lag the Anthropic-API one; see the SSO/profile row above for the same rationale in full. On the Fly path specifically, every value substituted into the detached-launch heredoc (the bearer token, region, and use-bedrock flag, plus the pre-existing `_BEDROCK_PROFILE`/`_BEDROCK_REGION`/host-TZ values) is JSON-encoded host-side first (`python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))'`, the same technique `_launch_argv_json` already uses for orchestrator argv) rather than substituted as a raw `"${VAR}"` string — an opaque bearer token is exactly the kind of value likely to contain a `"` or `\` that would otherwise break out of the Python string literal and execute as arbitrary code on the remote machine. |
+| `$STAGE/.aws` (per-run host scratch, **Bedrock SSO/profile mode only**) | `/home/leerie/.aws` | **ro** | Staged when `detect_bedrock_mode()` finds `CLAUDE_CODE_USE_BEDROCK` set to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive — matching Claude CLI's `isEnvTruthy`) in the `env` block of any of the three settings files the Claude CLI merges (`~/.claude/settings.json` userSettings, `<USER_REPO>/.claude/settings.json` projectSettings, `<USER_REPO>/.claude/settings.local.json` localSettings) — and only when `AWS_BEARER_TOKEN_BEDROCK` (below) is **not** set on the host; the bearer-token path needs none of this. The Claude CLI's AWS SDK resolves credentials via pure file I/O — reads `~/.aws/config` (profile + SSO session config) and `~/.aws/sso/cache/*.json` (SSO access tokens, ~12 h TTL) directly; no `aws` binary is needed inside the container. `~/.aws/cli/cache` is excluded (large CLI result cache, irrelevant to auth). Mounted **read-only** because workers never write credentials. The `aws` binary itself is a host-only concern: `aws sso login` needs an interactive TTY/browser, so `bedrock_preflight()` catches an expired SSO token on the host before the container starts and prints the recovery hint (`aws sso login --profile <profile>`). On Fly.io, `$STAGE/.aws/` rides the tar pipe to `seed_auth` automatically and lands at `/home/leerie/.aws/` on the remote machine. Belt-and-suspenders: when this mode is active, the launcher also injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE`, and `AWS_REGION` as explicit env vars (`AUTH_MOUNTS` `-e` flags locally, `child_env` on Fly) so workers activate Bedrock via `process.env` regardless of how the in-container claude binary handles `settings.json`. The same local `AUTH_MOUNTS` block (not yet wired into the Fly heredoc) also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`/`_OPUS_MODEL`/`_HAIKU_MODEL` when set — see the bearer-token row below for why. |
+| `AWS_BEARER_TOKEN_BEDROCK` (host env var, **Bedrock bearer-token mode**) | forwarded as `-e`/`child_env` only — **no bind mount** | n/a | The static-bearer-token analogue of `CLAUDE_CODE_OAUTH_TOKEN`, triggered independently of `detect_bedrock_mode()`'s settings.json scan and taking precedence over the SSO/profile row above when both are present (matches the Claude CLI's own resolution order — verified live, v2.1.220: Bedrock client construction short-circuits SSO/profile once this is set). No `aws` CLI, no SSO session, no `~/.aws` staging — `bedrock_preflight()` is skipped entirely. The launcher forwards the token verbatim, `CLAUDE_CODE_USE_BEDROCK` (defaulting to `1` if unset — confirmed live the token alone is a no-op without it), and `AWS_REGION` when set (optional, CLI defaults to `us-east-1`) as `-e`/`child_env` entries, mirroring `CLAUDE_CODE_OAUTH_TOKEN`'s forwarding rather than the SSO row's settings.json extraction. The same local-nerdctl block also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`/`_OPUS_MODEL`/`_HAIKU_MODEL` when set: leerie always invokes `claude -p` with an explicit `--model <tier>` alias, never a raw model ID, and on Bedrock the CLI's alias table can lag the Anthropic-API one by a generation (e.g. `sonnet` resolving to Sonnet 4.5 instead of Sonnet 5) — these are the CLI's documented env vars for repointing what an alias resolves to. On the Fly path, every value substituted into the detached-launch heredoc (bearer token, region, use-bedrock flag, plus the pre-existing `_BEDROCK_PROFILE`/`_BEDROCK_REGION`/host-TZ values) is JSON-encoded host-side first (same technique `_launch_argv_json` uses for orchestrator argv) rather than substituted as a raw `"${VAR}"` string — an opaque bearer token can contain a `"` or `\` that would otherwise break out of the Python string literal. |
 
 The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`,
 `$SSH_AUTH_SOCK`) that earlier versions of leerie bind-mounted **no longer
@@ -856,18 +855,17 @@ receiving git.
 
 ### Browser-based testing
 
-Chromium and its matching chromedriver are baked into the image (see *Image
-build* above), so workers that need a real browser have one available without
-any runtime installation. The Selenium cache directory
-(`/home/leerie/.cache/selenium`) is pre-created (root-owned at build time,
-chowned to `leerie` at runtime on the rootful path) so Selenium Manager
-cache writes succeed if it ever runs.
+Chromium and its matching chromedriver are baked into the image, so workers
+needing a real browser have one with no runtime installation. The Selenium
+cache directory (`/home/leerie/.cache/selenium`) is pre-created (root-owned
+at build time, chowned to `leerie` at runtime on the rootful path) so
+Selenium Manager cache writes succeed if it ever runs.
 
-**Container flags — baked in, no project changes required.** Three flags are
-needed to run Chromium in a rootless container:
+**Container flags — baked in, no project changes required.** Three flags run
+Chromium in a rootless container:
 
-- `--no-sandbox` — disables Chrome's user-namespace sandbox, which is
-  unavailable in unprivileged containers.
+- `--no-sandbox` — disables Chrome's user-namespace sandbox, unavailable in
+  unprivileged containers.
 - `--disable-setuid-sandbox` — suppresses the SUID sandbox-helper lookup.
   Without this, Chrome finds `/usr/lib/chromium/chrome-sandbox` and tries to
   exec it; SUID is stripped in rootless containers, so the exec fails and
@@ -877,13 +875,11 @@ needed to run Chromium in a rootless container:
   is typically 64 MB in containers and Chrome's renderer can exceed it.
 
 These are written to `/etc/chromium.d/leerie-container-flags` at image build
-time, so the `/usr/bin/chromium` wrapper picks them up automatically on every
-invocation. **No project-level Chrome flag configuration is required** — the
-image handles it.
-
-Projects that construct a `ChromeOptions` / `Options` object and add these
-flags explicitly are fine; the flags are idempotent. Projects that don't touch
-Chrome options at all also work, because the wrapper sets them globally.
+time, so `/usr/bin/chromium` picks them up automatically. **No project-level
+Chrome flag configuration is required.** Projects that construct a
+`ChromeOptions`/`Options` object and add these flags explicitly are fine
+(idempotent); projects that don't touch Chrome options also work, since the
+wrapper sets them globally.
 
 ### macOS-specific: Colima auto-share scope
 
@@ -1090,112 +1086,57 @@ termination*.
 leerie/
 ├── .claude-plugin/plugin.json     plugin manifest
 ├── .claude-plugin/marketplace.json single-plugin marketplace manifest (Claude Code `/plugin marketplace add` entry point)
-├── leerie                        executable entry-point wrapper (chmod +x);
-│                                   portable bash; runtime preflight + nerdctl run
-│                                   (DESIGN §6 / §0.5)
-├── Dockerfile                  container image recipe; built locally on first
-│                                   run, tagged `leerie:<VERSION>` (§0.5)
-├── fly.toml                    Fly.io Machine config — app, image, vm sizing
-│                                   (4 cpu / 8 GB midpoint), zero warm-pool
-│                                   (min_machines_running=0). See §0.5.
+├── leerie                        executable entry-point wrapper (chmod +x); portable bash; runtime preflight + nerdctl run (DESIGN §6 / §0.5)
+├── Dockerfile                  container image recipe; built locally on first run, tagged `leerie:<VERSION>` (§0.5)
+├── fly.toml                    Fly.io Machine config — app, image, vm sizing (4 cpu / 8 GB midpoint), zero warm-pool (min_machines_running=0). See §0.5.
 ├── orchestrator/leerie.py        the orchestrator — all control flow (chmod +x)
 ├── prompts/
-│   ├── _clarification_filter.md   shared include (codebase→research→ask filter)
-│   │                              inlined by classifier.md / implementer.md via
-│   │                              _load_prompt's {{include: …}} expansion
+│   ├── _clarification_filter.md   shared include (codebase→research→ask filter); inlined by classifier.md / implementer.md via _load_prompt's {{include: …}} expansion
 │   ├── classifier.md              Phase 1 worker system prompt
 │   ├── planner.md                 Phase 2 worker system prompt
-│   ├── reconciler.md              Phase 2½ worker — resolve cross-domain
-│   │                              capability-tag drift between planners
+│   ├── reconciler.md              Phase 2½ worker — resolve cross-domain capability-tag drift between planners
 │   ├── provision.md               §6½ LLM-fallback install-recipe worker
 │   ├── implementer.md             Phase 5 implementer worker system prompt
 │   ├── conformer.md               Phase 5 post-work conformance worker (DESIGN §9)
 │   ├── integrator.md              conflict-resolution worker system prompt
-│   ├── rebaser.md                 finalize-time rebase-onto-base worker
-│   │                              (DESIGN §6 "Rebase-onto-base before push";
-│   │                              scoped, fully-agentic §12 exception)
+│   ├── rebaser.md                 finalize-time rebase-onto-base worker (DESIGN §6 "Rebase-onto-base before push"; scoped, fully-agentic §12 exception)
 │   ├── pr_writer.md               Phase 6 PR title + body author worker
-│   ├── patch_generator.md         post-run self-heal worker — proposes minimal
-│   │                              system-prompt patches against failing call_types
-│   └── judge.md                   LLM judge worker — 3-dimensional rubric for
-│                                  reviewing captured call records
+│   ├── patch_generator.md         post-run self-heal worker — proposes minimal system-prompt patches against failing call_types
+│   └── judge.md                   LLM judge worker — 3-dimensional rubric for reviewing captured call records
 ├── scripts/
 │   ├── setup-run.sh               create per-run branch + worktree (idempotent)
 │   ├── new-worktree.sh            create/reuse a per-subtask worktree (per-run scoped)
-│   ├── worktree-lib.sh            prune_leerie_worktrees(): a SCOPED replacement for
-│   │                              `git worktree prune`, sourced by setup-run.sh,
-│   │                              new-worktree.sh and cleanup.sh
+│   ├── worktree-lib.sh            prune_leerie_worktrees(): a SCOPED replacement for `git worktree prune`, sourced by setup-run.sh, new-worktree.sh and cleanup.sh
 │   ├── integrate.sh               merge a subtask branch into the per-run branch
 │   ├── finalize.sh                verify the run branch exists and is non-empty; ready for push
-│   ├── host-finalize.sh           host-side push + PR creation block; sourced by
-│   │                              the local-runtime post-run path in leerie,
-│   │                              decide_teardown's Fly clean-exit branch,
-│   │                              `leerie finalize <run-id>` (§7 Host-side finalize),
-│   │                              and the launcher's host preflight, for
-│   │                              host_prepush_preflight alone
+│   ├── host-finalize.sh           host-side push + PR creation block; sourced by the local-runtime post-run path in leerie, decide_teardown's Fly clean-exit branch, `leerie finalize <run-id>` (§7 Host-side finalize), and the launcher's host preflight, for host_prepush_preflight alone
 │   ├── cgroup-broker.py           cgroup broker, runs at the slice-owning identity (create/enroll/destroy over a Unix socket; v1+v2); the dropped-privilege orchestrator drives it
 │   ├── verify-strict-schemas.py   maintainer tool: sends every hardened SCHEMAS entry to the real API and reports which compile under strict mode (live creds; outside pytest's testpaths)
 │   ├── measure/
 │   │   └── worker_durations.py  maintainer tool: derives the per-worker-type duration distribution from a state root's calls.ndjson, feeding TIMEOUT_DEFAULT_PER_WORKER (writes tests/fixtures/worker_duration/summary.json; outside pytest's testpaths)
 │   ├── cleanup.sh                 remove worktrees / branches (default: scoped to one run)
 │   ├── container-entry.sh         container PID 1 (root rootful / mapped-UID rootless): create leerie.slice + launch cgroup broker + cd /work + drop to leerie via runuser (rootful)
-│   ├── install.sh                 one-command installer (curl | bash); preflight git/curl + auto-install
-│   │                               claude + runtime install (colima / rootless containerd) + clones + symlinks
-│   ├── runtime-install.sh         per-OS auto-install of the container runtime (Colima on macOS;
-│   │                              rootless containerd stack on Debian/Ubuntu — Fedora/Arch: docs hint).
-│   │                              Sourced by install.sh and the launcher.
+│   ├── install.sh                 one-command installer (curl | bash); preflight git/curl + auto-install claude + runtime install (colima / rootless containerd) + clones + symlinks
+│   ├── runtime-install.sh         per-OS auto-install of the container runtime (Colima on macOS; rootless containerd stack on Debian/Ubuntu — Fedora/Arch: docs hint). Sourced by install.sh and the launcher.
 │   └── remote/
-│       ├── _log.sh                shared remote_log() helper (timestamped, repo-tagged
-│       │                          stderr) sourced by every other scripts/remote/*.sh file
-│       ├── build-push.sh          build and push a self-contained image for Fly.io Machines;
-│       │                           the baked /opt/leerie-image/ lets the image run without
-│       │                           a bind mount (§0.5 "Registry publish path")
-│       ├── provision.sh           Fly Machine lifecycle (sourced by launcher RUNTIME=fly branch);
-│       │                           provision_machine() create→started→trap; stop_machine();
-│       │                           destroy_machine(); decide_teardown() classifies exit-rc
-│       │                           and routes to stop (pause-on-failure) or destroy
-│       ├── lib.sh                 shared bash helpers (_extract_flyctl_remote_rc stderr
-│       │                           rc-parse; update_run_json atomic merge; iso_now;
-│       │                           render_tail_wrapper; tail_with_optional_autofinalize);
-│       │                           sourced by provision.sh, resume-machine.sh, and re-seed.sh
-│       ├── resume-machine.sh      Resume helper for paused remote runs (DESIGN §6 *Remote
-│       │                           pause-on-failure*); resume_machine() flyctl machine start
-│       │                           + wait_for_started + clear paused_at sentinels
-│       ├── re-seed.sh               Mid-run re-rsync (Phase 4) — wakes paused machine,
-│       │                           runs safety check, calls seed_repo_dirty. Used by
-│       │                           `leerie re-seed <run-id>` and auto on `resume`
-│       ├── seed-auth.sh           Worker auth + config seeding (sourced by launcher after
-│       │                           provision_machine() returns); seed_auth() tar-pipes
-│       │                           ~/.claude.json + ~/.claude/ (minus .claude/local) + git identity
-│       │                           to /home/leerie/ via `flyctl ssh console -C "tar -xC ..."`,
-│       │                           then pre-warms `claude --version` for orchestrator preflight
-│       ├── seed-repo.sh           Two-phase bundle + delta repo seeding (sourced by launcher after
-│       │                           provision); seed_repo(): git bundle parent + submodules
-│       │                           piped via ssh-console → machine clones from bundles on disk,
-│       │                           then rsync's dirty delta + .claude/ — no in-machine git clone
-│       ├── collect-subtrees.sh     Subtree collection (sourced by `leerie finalize`);
-│       │                           collect_subtrees_remote(): SSHes a bash payload that runs
-│       │                           setup-run.sh + integrate.sh for un-merged subtask branches
-│       │                           on the machine; conflicts are skipped and reported via sentinels
-│       └── fetch-branch.sh        Post-run stream-back (sourced by decide_teardown BEFORE
-│                                   destroy_machine on clean exit, and by `leerie finalize`);
-│                                   fetch_branch(): git bundle pipe + state tar-pipe → host repo
+│       ├── _log.sh                shared remote_log() helper (timestamped, repo-tagged stderr) sourced by every other scripts/remote/*.sh file
+│       ├── build-push.sh          build and push a self-contained image for Fly.io Machines; the baked /opt/leerie-image/ lets the image run without a bind mount (§0.5 "Registry publish path")
+│       ├── provision.sh           Fly Machine lifecycle (sourced by launcher RUNTIME=fly branch); provision_machine() create→started→trap; stop_machine(); destroy_machine(); decide_teardown() classifies exit-rc and routes to stop (pause-on-failure) or destroy
+│       ├── lib.sh                 shared bash helpers (_extract_flyctl_remote_rc stderr rc-parse; update_run_json atomic merge; iso_now; render_tail_wrapper; tail_with_optional_autofinalize); sourced by provision.sh, resume-machine.sh, and re-seed.sh
+│       ├── resume-machine.sh      Resume helper for paused remote runs (DESIGN §6 *Remote pause-on-failure*); resume_machine() flyctl machine start + wait_for_started + clear paused_at sentinels
+│       ├── re-seed.sh               Mid-run re-rsync (Phase 4) — wakes paused machine, runs safety check, calls seed_repo_dirty. Used by `leerie re-seed <run-id>` and auto on `resume`
+│       ├── seed-auth.sh           Worker auth + config seeding (sourced by launcher after provision_machine() returns); seed_auth() tar-pipes ~/.claude.json + ~/.claude/ (minus .claude/local) + git identity to /home/leerie/ via `flyctl ssh console -C "tar -xC ..."`, then pre-warms `claude --version` for orchestrator preflight
+│       ├── seed-repo.sh           Two-phase bundle + delta repo seeding (sourced by launcher after provision); seed_repo(): git bundle parent + submodules piped via ssh-console → machine clones from bundles on disk, then rsync's dirty delta + .claude/ — no in-machine git clone
+│       ├── collect-subtrees.sh     Subtree collection (sourced by `leerie finalize`); collect_subtrees_remote(): SSHes a bash payload that runs setup-run.sh + integrate.sh for un-merged subtask branches on the machine; conflicts are skipped and reported via sentinels
+│       └── fetch-branch.sh        Post-run stream-back (sourced by decide_teardown BEFORE destroy_machine on clean exit, and by `leerie finalize`); fetch_branch(): git bundle pipe + state tar-pipe → host repo
 ├── commands/leerie.md            thin plugin skill — launches the orchestrator
 ├── skills/
-│   ├── judge-llm-batch/SKILL.md  post-run judge skill — scores a batch of captured
-│   │                              LLM calls against a 3-dimensional accuracy rubric
-│   └── llm-self-heal/SKILL.md    post-run self-heal skill — autonomous loop that
-│                                  proposes and measures prompt patches for failing
-│                                  call_types; uses judge verdicts as the signal
-├── chain/                         Laptop-side chain helpers (DESIGN §19).
-│   │                              A chain is N parallel single-run `--runtime fly`
-│   │                              invocations per wave, sequenced by the launcher's
-│   │                              `chain` arm. The laptop drives everything; no Fly
-│   │                              coordinator machine.
+│   ├── judge-llm-batch/SKILL.md  post-run judge skill — scores a batch of captured LLM calls against a 3-dimensional accuracy rubric
+│   └── llm-self-heal/SKILL.md    post-run self-heal skill — autonomous loop that proposes and measures prompt patches for failing call_types; uses judge verdicts as the signal
+├── chain/                         Laptop-side chain helpers (DESIGN §19). A chain is N parallel single-run `--runtime fly` invocations per wave, sequenced by the launcher's `chain` arm. The laptop drives everything; no Fly coordinator machine.
 │   ├── __init__.py                exports __version__ = "0.1.0"
 │   ├── _log.py                    log()/die() helpers — shared with git_ops.
-│   └── git_ops.py                 synth_merge_branches (used between waves) +
-│                                  create_stage_branch.
+│   └── git_ops.py                 synth_merge_branches (used between waves) + create_stage_branch.
 ├── docs/DESIGN.md                 the theory (architecture and rationale)
 ├── docs/IMPLEMENTATION.md         this document
 ├── tests/                         pytest suite (see §10)
@@ -1214,7 +1155,7 @@ Maps to `DESIGN.md`: §3 (architecture / phases), §2 (why a program, not a skil
 leerie "Fix the login timeout bug and add a regression test"
 
 # Or pass a path to a .txt / .md file whose contents are the task — useful
-# for multi-paragraph briefs that are awkward to quote on the shell:
+# for multi-paragraph briefs awkward to quote on the shell:
 leerie path/to/task.md
 
 # Resume an interrupted run. Auto-picks if exactly one in-flight run exists;
@@ -1230,22 +1171,21 @@ leerie list
 leerie "task" --no-push
 export LEERIE_NO_PUSH=1
 
-# Route to remote execution (e.g. Fly.io) instead of local nerdctl run:
+# Route to remote execution (e.g. Fly.io) instead of local nerdctl run.
+# Or commit `runtime = fly` to leerie.toml for a per-repo default:
 leerie "task" --runtime fly
 export LEERIE_RUNTIME=fly
-# Or commit to leerie.toml for a per-repo default:
-#   runtime = fly
 
-# Skip pre-push hooks at finalize (the user's explicit override; defaults off).
+# Skip pre-push hooks at finalize (user's explicit override; defaults off).
 # Affects only the final `git push`; worker `git commit` operations inside
 # worktrees continue to run all hooks normally.
 leerie "task" --no-verify
 
-# Opt into clarification (DESIGN §11). Without --clarify (the default),
-# the classifier's intent questions are filtered and dropped — the
-# implementer makes a best-effort decision documented in its notes.
-# Pass --clarify to surface the surviving questions to the user
-# (interactively if a TTY, otherwise via pending-questions.json).
+# Opt into clarification (DESIGN §11). Without --clarify (the default), the
+# classifier's intent questions are filtered and dropped — the implementer
+# makes a best-effort decision documented in its notes. Pass --clarify to
+# surface the surviving questions (interactively if a TTY, otherwise via
+# pending-questions.json).
 leerie "task" --clarify
 
 # Pre-supply clarification answers:
@@ -1256,39 +1196,36 @@ leerie "task" --max-workers 80 --max-parallel 6
 export LEERIE_MAX_WORKERS=80
 export LEERIE_MAX_PARALLEL=6
 
-# Dial how persistent workers are at building confidence before they exit
+# Dial how persistent workers are at building confidence before exiting
 # blocked (default: 8 rounds inside each planner / implementer):
 leerie "task" --confidence-rounds 12
 export LEERIE_CONFIDENCE_ROUNDS=12
 
-# Verbosity controls how much per-worker activity surfaces inline.
-# Default is `stream`: one-line summary per worker event. -q drops to
-# leerie's pre-streaming terse output; -qq is fully quiet (errors
-# still emit). -vv adds raw payloads. Per-worker <state-root>/logs/<sid>.log
-# files are always written regardless of level.
-leerie "task"        # default: stream
-leerie "task" -q      # normal (pre-streaming)
-leerie "task" -qq     # quiet (errors only)
-leerie "task" -vv     # debug
+# Verbosity controls how much per-worker activity surfaces inline. Default
+# `stream`: one-line summary per worker event. -q: pre-streaming terse
+# output. -qq: fully quiet (errors still emit). -vv: raw payloads.
+# Per-worker <state-root>/logs/<sid>.log files always write regardless.
+leerie "task"          # default: stream
+leerie "task" -q       # normal (pre-streaming)
+leerie "task" -qq      # quiet (errors only)
+leerie "task" -vv      # debug
 leerie "task" --verbosity normal
 export LEERIE_VERBOSITY=stream
 
 # Override the default source-of-truth preference (`both`). CLI flag and
-# env var are session-scoped overrides; commit `source_of_truth = ...` in
-# leerie.toml for a per-repo default.
+# env var are session-scoped; commit `source_of_truth = ...` in leerie.toml
+# for a per-repo default.
 export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
 leerie "task" --source-of-truth codebase
 
 # Override the host-side per-repo state directory (default:
-# $HOME/.leerie/<basename>/). Each repo gets its own subtree under
-# $HOME so Colima auto-shares it. Cross-repo basename collisions are
-# caught at use time via the .owner sidecar (see §2 "Host-side per-repo
-# state directory"). Precedence:
-# default < leerie.toml state_dir < LEERIE_STATE_DIR env < --state-dir CLI.
+# $HOME/.leerie/<basename>/ — Colima auto-shares under $HOME). Cross-repo
+# basename collisions are caught at use time via the .owner sidecar (see
+# §2 "Host-side per-repo state directory"). Precedence: default <
+# leerie.toml state_dir < LEERIE_STATE_DIR env < --state-dir CLI.
 export LEERIE_STATE_DIR=~/.leerie/myproject
 leerie "task" --state-dir ~/.leerie/myproject
-# Or commit a per-repo default in leerie.toml:
-#   state_dir = ~/.leerie/myproject
+# Or commit a per-repo default in leerie.toml: state_dir = ~/.leerie/myproject
 
 # Select the execution runtime (default: local). `fly` routes each worker
 # through Fly.io machines instead of local nerdctl containers.
@@ -1297,10 +1234,9 @@ leerie "task" --runtime fly
 
 # Choose the model. Without overrides, every worker — judgment (classifier,
 # planner, reconciler, plan_overlap_judge, provision, integrator) and acting
-# (implementer, conformer) alike — defaults to sonnet. Use the env var
-# for a sticky preference, the CLI flag for a one-off, or leerie.toml
-# for the committed repo default. Per-worker overrides also exist —
-# see §2.
+# (implementer, conformer) alike — defaults to sonnet. Env var for a sticky
+# preference, CLI flag for a one-off, leerie.toml for the committed repo
+# default. Per-worker overrides also exist — see §2.
 export LEERIE_MODEL=sonnet                # or: opus, haiku
 leerie "task" --model opus
 leerie "task" --model-implementer opus --model-classifier haiku
