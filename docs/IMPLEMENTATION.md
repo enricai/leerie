@@ -3098,12 +3098,11 @@ those text markers, and a false match would divert the retry into the
 auth backoff below and burn the whole `auth_retry_max_sec` budget.
 Pinned by `tests/test_no_result_event_retry.py`.
 
-This is the **last** arm of `_invoke()`'s no-envelope block, and
-deliberately so: every arm above it (out-of-credits, OOM, nonzero exit
-code) is a named, non-retryable condition and still raises. The nonzero-rc
-arm in particular covers leerie's own deliberate kills (SIGTERM/SIGKILL),
-which must never be retried — and the worker-timeout path raises
-`subprocess.TimeoutExpired` before the block is reached at all.
+This is the **last** arm of `_invoke()`'s no-envelope block: every arm
+above it (out-of-credits, OOM, nonzero exit code) is a named,
+non-retryable condition and still raises — the nonzero-rc arm covers
+leerie's own deliberate kills (SIGTERM/SIGKILL) — and the worker-timeout
+path raises `subprocess.TimeoutExpired` before the block is reached.
 
 #### Auth/quota backoff
 
@@ -3117,53 +3116,46 @@ until the user's rolling usage window clears (401/429) or the overload
 (529) subsides.
 
 The text markers are skipped for envelopes carrying `_leerie_synthetic`
-(the numeric `api_error_status` check still applies, and still wins). They
-exist to sniff a gateway message out of an envelope whose provenance is
-unknown; leerie synthesizes its own envelopes and knows what they mean, so
+(the numeric `api_error_status` check still applies and still wins) —
+leerie synthesizes its own envelopes and knows what they mean, so
 text-matching them is wrong by construction. Concretely: the no-result
 envelope interpolates the worker's **raw stderr** into `result`, and
 stderr can legitimately contain `Invalid authentication` or `rate limit`
-without the request having been auth-rejected — which would divert the
-retry into this loop and burn the whole `auth_retry_max_sec` budget on a
-non-auth failure. Pinned by
-`tests/test_no_result_event_retry.py::test_worker_stderr_cannot_trip_the_auth_classifier`. On budget exhaustion the raised `WorkerError` names the
-subscription cap for 401/429/auth-text and the transient overload for
-529, so the user isn't told to wait for a usage window that isn't the
-actual cause.
+without the request having been auth-rejected, which would burn the
+whole `auth_retry_max_sec` budget on a non-auth failure. Pinned by
+`tests/test_no_result_event_retry.py::test_worker_stderr_cannot_trip_the_auth_classifier`.
+On budget exhaustion the raised `WorkerError` names the subscription cap
+for 401/429/auth-text and the transient overload for 529.
 
 `_is_auth_or_quota_failure` only ever consults `api_error_status` or the
-result text when the envelope's own `is_error` is truthy. A successful,
-schema-valid envelope never enters the backoff loop, no matter what its
-`result` text says — a worker whose task legitimately discusses API auth
-or rate limiting (e.g. planning a rate-limited endpoint) would otherwise
-trip the text markers on its own correct output, and `claude_p()` would
-burn the full backoff budget re-running an already-successful worker
-before eventually raising a false subscription-cap `WorkerError`.
+result text when the envelope's own `is_error` is truthy, so a
+successful, schema-valid envelope never enters the backoff loop no
+matter what its `result` text says (otherwise a worker legitimately
+discussing API auth/rate limiting would trip the text markers on its
+own correct output).
 
 Because `_is_auth_or_quota_failure` requires a *result envelope*, it
-cannot classify an **out-of-credits mid-stream kill** — the case where
-the `claude -p` process is terminated the instant credits run out, before
-a `result` event is emitted (`_invoke` returns `envelope is None`). That
-truncation is caught earlier, in `_invoke` itself: as events stream, a
-`nonlocal overage_blocked` flag latches when a `rate_limit_event` carries
-`overageDisabledReason in {"out_of_credits", "out_of_overage"}` — an
-**exhaustion** reason. In the no-envelope branch, if `overage_blocked` is
-set, `_invoke` raises `RateLimitedExit(reset_at=None, out_of_credits=True,
-raw)` instead of a bare `WorkerError`, routing the failure into `main()`'s
-pause-and-surface arm (worktree cleanup, `resume` hint, `EXIT_LOCKED`;
-DESIGN §6). The latch does **not** key on `overageStatus == "rejected"`:
-that is a standing state emitted by every `rate_limit_event` from an org
-with overage disabled (`overageDisabledReason:"org_level_disabled"`,
-`status:"allowed"`) and does not mean credits ran out — keying on it
-misclassified unrelated mid-stream truncations as out-of-credits. The
-overage event alone is *not* treated as terminal — it is a benign warning
-most workers survive; only an exhaustion reason coinciding with a missing
-`result` event triggers the pause. Covered by
-`test_invoke_overage_block_plus_truncation_raises_ratelimited` (raises,
-`out_of_credits=True`), `test_invoke_overage_block_with_result_returns_envelope`
-(the benign control), and
-`test_invoke_org_level_disabled_truncation_raises_workererror` (the
-false-positive regression pin) in `tests/test_invoke_streaming.py`.
+cannot classify an **out-of-credits mid-stream kill** — `claude -p`
+terminated the instant credits run out, before any `result` event
+(`_invoke` returns `envelope is None`). That truncation is caught
+earlier, in `_invoke` itself: a `nonlocal overage_blocked` flag latches
+when a streamed `rate_limit_event` carries `overageDisabledReason in
+{"out_of_credits", "out_of_overage"}` (an **exhaustion** reason). In the
+no-envelope branch, if `overage_blocked` is set, `_invoke` raises
+`RateLimitedExit(reset_at=None, out_of_credits=True, raw)` instead of a
+bare `WorkerError`, routing into `main()`'s pause-and-surface arm
+(worktree cleanup, `resume` hint, `EXIT_LOCKED`; DESIGN §6). The latch
+does **not** key on `overageStatus == "rejected"`, a standing state every
+org with overage disabled emits (`overageDisabledReason:
+"org_level_disabled"`, `status:"allowed"`) that does not mean credits ran
+out — keying on it misclassified unrelated truncations as
+out-of-credits. The overage event alone is a benign warning most workers
+survive; only an exhaustion reason coinciding with a missing `result`
+event triggers the pause. Covered by
+`test_invoke_overage_block_plus_truncation_raises_ratelimited`,
+`test_invoke_overage_block_with_result_returns_envelope` (benign
+control), and `test_invoke_org_level_disabled_truncation_raises_workererror`
+(false-positive regression pin) in `tests/test_invoke_streaming.py`.
 
 When `_is_auth_or_quota_failure(envelope)` matches, `claude_p()` enters a
 `tenacity.AsyncRetrying` loop with `wait_exponential_jitter(initial=15,
@@ -3178,18 +3170,15 @@ error), the loop exits and normal handling resumes — a schema-invalid
 non-auth envelope still gets one corrective retry under the existing
 2-attempt loop.
 
-The first tenacity iteration runs without a pre-sleep — tenacity
-sleeps *between* iterations, not before the first — so the effective
-sequence is one immediate retry followed by waits of roughly 15 s,
-30 s, 60 s, 120 s, 120 s up to the 300 s budget. Each `_invoke`
-produces one `calls.ndjson` row, so a single logical `claude_p()`
-call can write up to ~7 rows when the first outer schema-loop
-attempt's backoff exhausts the budget (initial `_spawn` + ~6
-tenacity iterations before exhaust), and up to ~13 rows in the rare
-case where the first attempt's backoff resolves to a non-auth error
-and the second outer attempt also enters backoff and exhausts. The
-budget resets per outer schema-loop attempt; in that rare
-double-burst case, total wait can reach ~10 minutes.
+The first tenacity iteration runs without a pre-sleep (tenacity sleeps
+*between* iterations, not before the first), so the effective sequence
+is one immediate retry followed by waits of roughly 15 s, 30 s, 60 s,
+120 s, 120 s up to the 300 s budget. Each `_invoke` produces one
+`calls.ndjson` row, so a single logical `claude_p()` call can write up
+to ~7 rows when the first outer schema-loop attempt's backoff exhausts
+the budget, and up to ~13 rows in the rare double-burst case where the
+second outer attempt also enters and exhausts backoff (budget resets
+per outer attempt; total wait can then reach ~10 minutes).
 
 The classifier and the budget constant (`auth_retry_max_sec`) live in
 `leerie.py`; the budget is in §6 *Code-enforced caps*. The non-auth
@@ -3251,21 +3240,18 @@ resumable `EXIT_LOCKED` pause and names the likely remedy — dropping
 
 Two call sites share `_disk_free_ratio(path)` (walks up to the nearest
 existing ancestor of `path`, then `shutil.disk_usage(p).free / .total`)
-against a module constant `DISK_MIN_FREE_RATIO = 0.05` (5% free). It scales
-with disk size without pretending to know per-run byte cost, and it is
-available before any worktree exists — which matters, because it is the
-only disk rule there is.
+against a module constant `DISK_MIN_FREE_RATIO = 0.05` (5% free). It
+scales with disk size without pretending to know per-run byte cost, and
+is available before any worktree exists.
 
 **The proportional ratio is the whole rule.** A per-worktree *measured*
 bound was tried and withdrawn — the marginal cost of a not-yet-created
 worktree depends on package-manager-store hardlinking (a mount topology
-leerie does not control — DESIGN §6's `EXDEV` note), on sibling count at
-measurement time, and on scheduling-dependent peak coexistence, so no
-in-process accounting scheme converged on a stable figure. It is
-measurable only from *outside* — a `df` delta across a real second
-checkout in a real container — which is the only basis on which it
-should be rebuilt. DESIGN's figures survive, labelled as a single
-unreproduced measurement.
+leerie does not control — DESIGN §6's `EXDEV` note), sibling count, and
+scheduling-dependent peak coexistence, so no in-process accounting
+scheme converged on a stable figure; it's measurable only from
+*outside* (a `df` delta across a real second checkout). DESIGN's
+figures survive, labelled as a single unreproduced measurement.
 
 `tests/test_disk_preflight.py` guards the withdrawal by function name;
 `tests/test_no_dead_functions.py` (a whole-module AST sweep) catches any
@@ -3274,68 +3260,57 @@ reintroduced-but-uncalled private helper regardless of name.
 Signals whose reappearance means a specific already-fixed defect is back are collected in DESIGN §14½ *Regression tripwires*, guarded by `tests/test_regression_tripwires.py` — which distinguishes signals leerie EMITS (checked against the source, so a tripwire cannot quote a string the code never prints) from upstream messages it merely observes.
 
 **What the floor alone still guarantees.** N30 was filed because disk
-exhaustion "surfaces as a raw `OSError: [Errno 28]` from whatever happened to
-be writing." Four mechanisms answer that, none of which needed the measured
-bound. Note the coverage is *good, not total*: these convert every write
-leerie owns, but a third-party `OSError` raised inside a worker's own
-subprocess is still that worker's to report.
+exhaustion "surfaces as a raw `OSError: [Errno 28]` from whatever
+happened to be writing." Four mechanisms answer that (coverage is
+*good, not total*: they convert every write leerie owns, but a
+third-party `OSError` inside a worker's own subprocess is still that
+worker's to report):
 
-1. **Preflight** (`preflight(leerie_dir, ...)`, check "0.5", before the git
-   identity checks and before the live smoke test — i.e. before any
-   worker spawns): `_disk_free_ratio(leerie_dir)` below the threshold
-   `die()`s with an actionable message (`_disk_headroom_message`) naming
-   the measured free/total GB and the filesystem path. `leerie_dir` here
-   is `st.run_dir`, already created by `main()` before `preflight` runs,
-   so it resolves to the state-dir filesystem.
-2. **Mid-run** (`phase_execute`'s wave loop, once per wave — before that
-   wave's memory-admission/settle work begins): the same check raises
-   `DiskLowSpace` (a `BaseException`, same shape as `ContextOverflow` —
-   never a `WorkerError`, so `_run_checked_loop` cannot swallow it into a
-   retry) rather than `die()`ing, since workers have already spawned and
-   there is state worth preserving. `main()` catches it in its own arm
-   (mirroring the `ContextOverflow` arm immediately above it): worktree-
-   only cleanup (`_cleanup_on_abnormal_exit(st, full_purge=False)`),
-   best-effort `capture_repo_deps`, a resume hint, and `EXIT_LOCKED` — the
-   same resumable-pause convention documented above for rate-limiting.
-   `DiskLowSpace` was added to every existing `except (Exception,
-   TerminalAuthFailure, RateLimitedExit, ContextOverflow)` dep_capture
-   guard alongside its siblings, since those tuples exist to catch the
-   whole `BaseException` exit-signal family.
-3. **`State.save()` itself** is the first of two *reactive* checkpoints,
-   alongside the two proactive ones above: a disk can cross zero between one
-   periodic check and the next write, so `save()`'s `tmp.write_text()` /
-   `os.replace()` pair is wrapped in a `try/except OSError` that reraises
-   an out-of-space failure as the same `DiskLowSpace`, caught by the same
-   `main()` arm described above. "Out of space" is `_OUT_OF_SPACE_ERRNOS` =
-   `{ENOSPC, EDQUOT}`: a state root on a quota'd home or an NFS mount
-   reports `EDQUOT` where a local disk reports `ENOSPC`, and a site that
-   converts one must convert both or the same exhaustion surfaces as a bare
-   `OSError` on exactly those hosts. Any other `OSError` (permissions, a
-   read-only mount unrelated to capacity) propagates unchanged.
-4. **`_invoke`'s prompt staging** is the second reactive one, and closes the
-   gap the wave-granularity of (2) leaves open. Each worker invocation writes
-   its prompt to a temp file, once per attempt — the largest disk write
-   leerie makes per worker — and its reap-then-reraise guard converts
-   `_OUT_OF_SPACE_ERRNOS` to `DiskLowSpace` on the same terms as (3). The
-   `tempfile.mkstemp()` call is INSIDE that guard, which is not cosmetic:
-   block exhaustion lets `mkstemp` succeed (an empty file needs no data
-   blocks) and fails the later write, while **inode** exhaustion fails
-   `mkstemp` itself — two real conditions reach the create, and with it
-   outside the guard both escaped as a bare `OSError`. The proactive check
-   in (2) runs once per wave and cannot see a disk that crosses zero
-   mid-wave, which is exactly when this fires.
+1. **Preflight** (`preflight(leerie_dir, ...)`, check "0.5", before git
+   identity checks and the live smoke test): `_disk_free_ratio(leerie_dir)`
+   below threshold `die()`s with an actionable message
+   (`_disk_headroom_message`) naming free/total GB and the path.
+   `leerie_dir` here is `st.run_dir`, already created by `main()`.
+2. **Mid-run** (`phase_execute`'s wave loop, once per wave, before
+   memory-admission/settle work): raises `DiskLowSpace` (a
+   `BaseException`, same shape as `ContextOverflow` — never a
+   `WorkerError`, so `_run_checked_loop` cannot swallow it into a retry)
+   rather than `die()`ing, since workers have already spawned and state
+   is worth preserving. `main()` catches it (mirroring the
+   `ContextOverflow` arm): worktree-only cleanup
+   (`_cleanup_on_abnormal_exit(st, full_purge=False)`), best-effort
+   `capture_repo_deps`, resume hint, `EXIT_LOCKED`. `DiskLowSpace` was
+   added alongside its siblings to every existing
+   `except (Exception, TerminalAuthFailure, RateLimitedExit, ContextOverflow)`
+   dep_capture guard.
+3. **`State.save()` itself** — the first reactive checkpoint: a disk can
+   cross zero between checks, so `save()`'s `tmp.write_text()` /
+   `os.replace()` pair is wrapped in `try/except OSError` reraising as
+   `DiskLowSpace`, caught by the same `main()` arm. "Out of space" is
+   `_OUT_OF_SPACE_ERRNOS = {ENOSPC, EDQUOT}` — a quota'd home/NFS mount
+   reports `EDQUOT` where a local disk reports `ENOSPC`, so a site
+   converting one must convert both. Any other `OSError` propagates
+   unchanged.
+4. **`_invoke`'s prompt staging** — the second reactive checkpoint,
+   closing the gap (2)'s wave-granularity leaves open. Each worker
+   invocation writes its prompt to a temp file per attempt (the largest
+   disk write leerie makes per worker); its reap-then-reraise guard
+   converts `_OUT_OF_SPACE_ERRNOS` to `DiskLowSpace` on the same terms as
+   (3). `tempfile.mkstemp()` sits INSIDE that guard deliberately: block
+   exhaustion lets `mkstemp` succeed and fails the later write, while
+   **inode** exhaustion fails `mkstemp` itself — both must be inside the
+   guard or escape as a bare `OSError`.
 
-**Saving from inside a handler.** Every terminating arm in `main()` persists
-state so the run stays resumable, and each does it through
-`_save_state_best_effort(st, where)` rather than a bare `st.save()`. A raise
-from inside an `except` block escapes `main()` unnoticed by any sibling arm
-— skipping cleanup and the `exit_code` assignment, so a resumable pause
-becomes an exit-1 traceback — and in the catch-all `except BaseException`
-arm the new exception REPLACES the unhandled one, leaving the real bug
-reachable only as `__context__`. Both triggers are real: `State.save()`
-converts an out-of-space errno to `DiskLowSpace`, and a read-only run dir
-raises `PermissionError`. The helper logs the failure rather than
-swallowing it, and `tests/test_disk_preflight.py` sweeps `main()` for any
+**Saving from inside a handler.** Every terminating arm in `main()`
+persists state through `_save_state_best_effort(st, where)` rather than a
+bare `st.save()`. A raise inside an `except` block escapes `main()`
+unnoticed by any sibling arm — skipping cleanup and `exit_code`, turning
+a resumable pause into an exit-1 traceback — and in the catch-all
+`except BaseException` arm the new exception REPLACES the unhandled one,
+leaving the real bug reachable only as `__context__`. Both triggers are
+real: `State.save()` converts an out-of-space errno to `DiskLowSpace`,
+and a read-only run dir raises `PermissionError`. The helper logs rather
+than swallows, and `tests/test_disk_preflight.py` sweeps `main()` for any
 arm that regresses to a bare save.
 
 A healthy disk is a no-op at all four checkpoints. Pinned in
@@ -3350,39 +3325,32 @@ as-is.
 #### Terminal auth failure
 
 `_is_terminal_auth_failure(envelope)` is checked in `claude_p()` **before**
-`_is_auth_or_quota_failure` — an expired or revoked session is a
-different failure class from a rejected-but-recoverable request, and
-must never enter the tenacity backoff loop above at all (see DESIGN §6
-*Credential strategy* / *Cleanup on abnormal exit*'s transient-vs-terminal
-split for the rationale: Claude Code sends no further request once it
-detects an expired session, so retrying is guaranteed to fail
-identically every time and only burns the `auth_retry_max_sec` budget).
+`_is_auth_or_quota_failure` — an expired or revoked session must never
+enter the tenacity backoff loop at all (DESIGN §6 *Credential strategy* /
+*Cleanup on abnormal exit*'s transient-vs-terminal split: Claude Code
+sends no further request once it detects an expired session, so
+retrying only burns the `auth_retry_max_sec` budget).
 
-It mirrors `_is_auth_or_quota_failure`'s gating discipline: `False` unless
-`envelope["is_error"]` is truthy; `False` for any envelope carrying
-`_leerie_synthetic` (worker prose can never reach `result` on those —
-only the no-result-event synthetic path can, and that is handled
-separately above; text-matching a leerie-authored envelope for a
-gateway-shaped message is wrong by construction, same reasoning as the
-auth/quota classifier). On a genuine (non-synthetic) `is_error`
-envelope, it lowercases `result` and matches any of four substrings:
-`"failed to authenticate"`, `"oauth session expired"`, `"session expired
-and could not be refreshed"`, `"not logged in"`. The second marker is
-intentionally the full phrase `"oauth session expired"` rather than the
-shorter `"oauth"`, which appears often in worker `tool_result` blocks
-discussing OAuth and would misclassify ordinary worker output.
+It mirrors `_is_auth_or_quota_failure`'s gating discipline: `False`
+unless `envelope["is_error"]` is truthy; `False` for any envelope
+carrying `_leerie_synthetic`. On a genuine `is_error` envelope, it
+lowercases `result` and matches any of four substrings: `"failed to
+authenticate"`, `"oauth session expired"`, `"session expired and could
+not be refreshed"`, `"not logged in"`. The second marker is
+deliberately the full phrase rather than the shorter `"oauth"`, which
+appears often in worker `tool_result` blocks discussing OAuth and would
+misclassify ordinary worker output.
 
-A match raises immediately (never entering `_is_auth_or_quota_failure`'s
-tenacity loop) into the same resumable-pause arm out-of-credits already
-uses: `main()` runs `_cleanup_on_abnormal_exit(st, full_purge=False)`
-(worktree-only cleanup, state and branches preserved), logs a `leerie
-resume <id>` hint, and exits `EXIT_LOCKED` (75) rather than `WorkerError`
-→ exit 1. This also replaces the prior behavior at the auth-exhaustion
-exit point (§3 above, `claude_p()`'s budget-exhausted `WorkerError`):
-that path previously surfaced as "worker failed schema-valid output
-twice," misattributing an auth failure to a schema problem, and exited
-non-resumably. `_is_terminal_auth_failure` and the budget constant live
-alongside `_is_auth_or_quota_failure` in `leerie.py`.
+A match raises immediately (never entering the tenacity loop) into the
+same resumable-pause arm out-of-credits already uses: `main()` runs
+`_cleanup_on_abnormal_exit(st, full_purge=False)`, logs a `leerie resume
+<id>` hint, and exits `EXIT_LOCKED` (75) rather than `WorkerError` →
+exit 1. This replaces the prior behavior at the auth-exhaustion exit
+point (`claude_p()`'s budget-exhausted `WorkerError`, which previously
+surfaced as "worker failed schema-valid output twice," misattributing
+an auth failure to a schema problem, and exited non-resumably).
+`_is_terminal_auth_failure` and the budget constant live alongside
+`_is_auth_or_quota_failure` in `leerie.py`.
 
 `WorkerError` handling by worker type — per DESIGN §7's salvage rule
 ("salvage if there is something to salvage; abort cleanly otherwise"):
@@ -3411,32 +3379,30 @@ single-element list behaves exactly like the singular var.
 **Launcher.** Before the existing `_extract_claude_credentials_json` call,
 if `CLAUDE_CODE_OAUTH_TOKENS` is set and non-empty after parsing, `leerie`
 reassigns `CLAUDE_CODE_OAUTH_TOKEN` to the list's first element — a plain
-env-var reassignment, not a parallel credential-construction path, so the
-existing mcpOAuth-guard, die()-fast diagnosis, and
-`_check_claude_credential_ttl` in `_extract_claude_credentials_json`
-(above) apply unchanged to whichever token seeds the mounted
-`.credentials.json`. The launcher also forwards the raw
-`CLAUDE_CODE_OAUTH_TOKENS` value into the container as its own `-e
-CLAUDE_CODE_OAUTH_TOKENS=...`, alongside the existing single-token `-e`,
-so the orchestrator can probe/select across the full list independently
-of which token seeded the file. `scripts/remote/seed-auth.sh` and
-`scripts/remote/ec2-seed-auth.sh` mirror the same plural-forwarding as a
-sibling condition to their existing single-token fallback block.
+env-var reassignment, so the existing mcpOAuth-guard, die()-fast
+diagnosis, and `_check_claude_credential_ttl` apply unchanged to whichever
+token seeds the mounted `.credentials.json`. The launcher also forwards
+the raw `CLAUDE_CODE_OAUTH_TOKENS` value into the container as its own
+`-e CLAUDE_CODE_OAUTH_TOKENS=...` alongside the existing single-token
+`-e`, so the orchestrator can probe/select across the full list
+independently of which token seeded the file. `scripts/remote/seed-auth.sh`
+and `scripts/remote/ec2-seed-auth.sh` mirror the same plural-forwarding
+as a sibling condition to their existing single-token fallback block.
 
-**Orchestrator — per-invocation env threading (the mechanism that makes
-rotation possible without a container restart).** `_invoke` takes an
+**Orchestrator — per-invocation env threading** (the mechanism that
+makes rotation possible without a container restart). `_invoke` takes an
 explicit `active_token: str | None = None` parameter. When given, it
 builds `worker_env = os.environ.copy()` (independent of the pre-existing
 `LEERIE_WORKER_DEBUG`-gated debug env, which still applies its own
 overrides on top) and sets
 `worker_env["CLAUDE_CODE_OAUTH_TOKEN"] = active_token` before
-`create_subprocess_exec(..., env=worker_env)`. Per the Claude CLI's own
+`create_subprocess_exec(..., env=worker_env)`. Per the Claude CLI's
 documented authentication precedence (`CLAUDE_CODE_OAUTH_TOKEN`
 outranks `.credentials.json`/Keychain subscription credentials
 unconditionally — see `code.claude.com/docs/en/authentication`,
-"Authentication precedence"), this env var alone is sufficient to steer
-which credential a given `claude -p` spawn uses; no rewrite of the
-mounted `.credentials.json` is needed on token switch. `claude_p`'s
+"Authentication precedence"), this env var alone steers which credential
+a given `claude -p` spawn uses; no rewrite of the mounted
+`.credentials.json` is needed on token switch. `claude_p`'s
 `_spawn` passes `active_token=st.data.get("active_oauth_token")` on
 every `_invoke` call; when unset (singular-var-only runs), `None` is
 passed and behavior is byte-identical to before this feature (the
@@ -3451,25 +3417,25 @@ logs or telemetry.
 
 **`NODE_OPTIONS` heap-cap injection (P9).** Node/V8 derives its default
 heap ceiling (~4.2 GiB) from *host* memory, not the worker's cgroup
-`memory.max` — so a build on a Node repo can abort with a V8 heap OOM
-while most of leerie's (larger) per-worker memory allowance sits unused.
+`memory.max`, so a build on a Node repo can abort with a V8 heap OOM
+while most of leerie's (larger) per-worker allowance sits unused.
 `_invoke` detects a Node repo via `_is_node_repo(cwd)` (presence of
-`package.json`, `pnpm-lock.yaml`, `package-lock.json`, or `yarn.lock` at
-the worker's cwd) and, when `worker_memory_max_bytes` is set, injects
+`package.json`, `pnpm-lock.yaml`, `package-lock.json`, or `yarn.lock`)
+and, when `worker_memory_max_bytes` is set, injects
 `NODE_OPTIONS=--max-old-space-size=<N>` into `worker_env` as a fourth
-sibling conditional block alongside the debug/token/strict-proxy blocks
-above. `N = max(worker_memory_max_bytes // (1024*1024) - reserve, 256)`,
-where `reserve` is `_NODE_HEAP_HEADROOM_BYTES // (1024*1024)` — read from
-that one constant, never retyped, so this injection and
-`resolve_worker_memory_max`'s heap reconciliation (which computes the
-mirror image, heap → cap) cannot drift. The reserve covers Node's own
-non-heap RSS plus the resident `claude -p` process sharing the same
-cgroup; the `max(..., 256)` clamp guards the explicit-override path
+sibling conditional block alongside debug/token/strict-proxy. `N =
+max(worker_memory_max_bytes // (1024*1024) - reserve, 256)`, where
+`reserve` is `_NODE_HEAP_HEADROOM_BYTES // (1024*1024)` — read from that
+one constant, never retyped, so this and
+`resolve_worker_memory_max`'s heap reconciliation (the mirror-image
+heap → cap computation) cannot drift. The reserve covers Node's own
+non-heap RSS plus the resident `claude -p` process sharing the cgroup;
+the `max(..., 256)` clamp guards the explicit-override path
 (`--worker-memory-max` / `LEERIE_WORKER_MEMORY_MAX` / leerie.toml
 `worker_memory_max`, none of which share the auto-derive path's 8 GiB
 floor) from handing V8 a non-positive or degenerately small ceiling. The
-variable is absent entirely for a non-Node repo or when
-`worker_memory_max_bytes` is `None`.
+variable is absent for a non-Node repo or when `worker_memory_max_bytes`
+is `None`.
 
 **Start-of-run probe + selection.** After `preflight()` returns and before
 `phase_classify`, if `CLAUDE_CODE_OAUTH_TOKENS` is present, each token is
@@ -3478,89 +3444,73 @@ probed for remaining runway and the winner becomes
 
 - **Probe A** (tried first): `GET https://api.anthropic.com/api/oauth/usage`
   with `Authorization: Bearer <token>`, `anthropic-beta: oauth-2025-04-20`,
-  and `User-Agent: claude-code/<version>` — omitting the User-Agent places
-  the request in an aggressively rate-limited bucket (persistent 429s);
-  with it, ~180s polling is safe (both behaviors externally corroborated,
-  not merely assumed). Returns `five_hour`/`seven_day` objects with
+  and `User-Agent: claude-code/<version>` (omitting the User-Agent places
+  the request in an aggressively rate-limited bucket; with it, ~180s
+  polling is safe). Returns `five_hour`/`seven_day` objects with
   `utilization` on a **0–100** scale and `resets_at` as ISO-8601 with a
   UTC offset, plus optional `seven_day_opus`/`seven_day_sonnet` sublimit
-  objects (`null` when no usage of that model has been recorded — treated
-  as zero usage, i.e. full runway, not as missing data). Requires
-  `user:profile` scope; a `user:inference`-scoped token (e.g. a `claude
-  setup-token` mint, which is what leerie itself uses) gets **403** here.
+  objects (`null` treated as full runway, not missing data). Requires
+  `user:profile` scope; a `user:inference`-scoped token (e.g. `claude
+  setup-token`, what leerie itself uses) gets **403** here.
 - **Probe B** (403 fallback): `POST /v1/messages` with `max_tokens: 1` and
   a one-character user message, reading the
   `anthropic-ratelimit-unified-5h-utilization` / `-5h-reset` /
   `-7d-utilization` / `-7d-reset` / `-5h-status` response headers.
-  **These headers use a different representation than Probe A's JSON
-  body**: utilization is a **0.0–1.0 fraction** and reset is **Unix epoch
-  seconds**, not the 0–100/ISO-8601 shape Probe A returns.
-  `_probe_token_usage` normalizes both probes onto one internal
-  representation (0.0–1.0 fraction, `datetime` reset) before returning, so
-  ranking never has to know which probe produced a given result.
-  `/v1/messages/count_tokens` does **not** carry these headers — a real
-  inference call is required.
+  **These use a different representation than Probe A**: utilization is a
+  **0.0–1.0 fraction** and reset is **Unix epoch seconds**.
+  `_probe_token_usage` normalizes both onto one internal representation
+  (0.0–1.0 fraction, `datetime` reset). `/v1/messages/count_tokens` does
+  **not** carry these headers — a real inference call is required.
 - **Ranking** (`_rank_tokens`): sorts by `min(1 − five_hour_util, 1 −
   seven_day_util)` descending (accounting for the Opus sublimit, since
   leerie's judgment workers default to Opus), tie-broken by furthest
-  `resets_at`. A token whose probe failed entirely (as opposed to a `null`
-  sub-field) sorts last but remains eligible.
+  `resets_at`. A token whose probe failed entirely sorts last but remains
+  eligible.
 - **Cache**: each token's probe result is cached, keyed by
   `_token_fingerprint(token)` (never the raw token), for
-  `caps["token_probe_cache_sec"]` (default 180s) — both the start-of-run
-  selection and mid-run failover below share this cache and never
-  re-probe a token whose cached result is still fresh.
+  `caps["token_probe_cache_sec"]` (default 180s) — shared by both
+  start-of-run selection and mid-run failover below.
 - **Best-effort, never a hard gate**: if every probe fails, the first
-  token in the list is selected and the run proceeds — probing never
-  `die()`s. A transient probe failure (timeout, connection error, 5xx, a
-  429 on the probe itself) logs quietly; a 2xx response missing an
-  expected field (endpoint contract drift — these are undocumented,
-  unstable endpoints) logs loudly at WARNING with the stable marker
-  `token-probe: endpoint contract drift` plus the missing field name, so
-  a silent shape change doesn't quietly degrade this feature to
-  "always pick the first token" with no signal. A 401/expired token is
-  logged as a real per-token dead-token signal, distinct from both of the
-  above.
+  token in the list is selected and the run proceeds. A transient probe
+  failure (timeout, connection error, 5xx, a 429 on the probe itself)
+  logs quietly; a 2xx response missing an expected field (endpoint
+  contract drift — these are undocumented, unstable endpoints) logs
+  loudly at WARNING with the stable marker `token-probe: endpoint
+  contract drift` plus the missing field name. A 401/expired token is
+  logged as a distinct per-token dead-token signal.
 
 **Mid-run failover.** A rate-limited active token can reach `claude_p`
-through TWO independent surfaces, and both are covered by one shared
-helper, `_rotate_oauth_token_or_raise(st, caps, *, known_reset_at,
-raw_message, retry_fn)`:
+through TWO independent surfaces, both covered by one shared helper,
+`_rotate_oauth_token_or_raise(st, caps, *, known_reset_at, raw_message,
+retry_fn)`:
 
 1. **Protocol-level**: a `rate_limit_event` stream event (an unexpected
-   `status`, i.e. outside the known-allowed set) is detected inside
-   `_invoke`'s own streaming loop and raises `RateLimitedExit` directly —
-   `_spawn` never returns an envelope at all for this case. `claude_p`'s
-   retry loop wraps `await _spawn(retry_note)` in
-   `try/except RateLimitedExit`, catching it *before* it can propagate to
+   `status`) is detected inside `_invoke`'s own streaming loop and raises
+   `RateLimitedExit` directly — `_spawn` never returns an envelope.
+   `claude_p`'s retry loop wraps `await _spawn(retry_note)` in
+   `try/except RateLimitedExit`, catching it before it can propagate to
    `main()`'s single-token pause/auto-resume path. `out_of_credits=True`
-   bypasses rotation entirely and re-raises immediately unchanged — an
-   account-level exhaustion is not a per-token rate limit, and rotating
-   tokens would not help.
+   bypasses rotation entirely and re-raises immediately — account-level
+   exhaustion is not a per-token rate limit.
 2. **Envelope-level**: once `_spawn` returns a completed envelope, if it
    is a rate-limit/quota failure (`_is_auth_or_quota_failure`, not
    terminal-auth) and `CLAUDE_CODE_OAUTH_TOKENS` has more than one token,
-   the same helper is called again (checked between the terminal-auth
-   check and the tenacity backoff loop's entry).
+   the same helper runs again (checked between the terminal-auth check
+   and the tenacity backoff loop's entry).
 
-In both cases the helper: probes/ranks the *other* tokens (respecting the
+In both cases the helper probes/ranks the *other* tokens (respecting the
 shared cache); if one has runway, switches `active_oauth_token` and
-retries the invocation immediately via the caller-supplied `retry_fn` —
-no re-exec, no container restart, strictly before any of
-`auth_retry_max_sec` is spent on a token already known to be exhausted.
-If every token is currently rate-limited, it picks the one with the
-soonest `resets_at` — preferring a live signal (`known_reset_at`, e.g. a
-just-caught `RateLimitedExit.reset_at` for the protocol-level path, which
-has no probe-cache entry to fall back on for the active token since it is
-deliberately excluded from the fresh probe/rank call) over a possibly
-stale or absent `_TOKEN_PROBE_CACHE` entry — and raises the existing
-`RateLimitedExit`, which the pre-existing `_sleep_then_reexec` reset-wait
-path picks up unchanged. A probe failure, or no probe data for any token,
-never raises from the helper itself (returns `None`); each call site
-falls through to its own pre-existing behavior (re-raising the caught
-exception, or continuing into the tenacity backoff loop, respectively).
-Terminal-auth failures are entirely unaffected by this feature — a
-dead/expired credential is not a rate limit and is never rotated.
+retries immediately via the caller-supplied `retry_fn` — no re-exec, no
+container restart, strictly before any `auth_retry_max_sec` is spent on
+a token already known exhausted. If every token is rate-limited, it
+picks the one with the soonest `resets_at` — preferring a live signal
+(`known_reset_at`, e.g. a just-caught `RateLimitedExit.reset_at`) over a
+possibly stale `_TOKEN_PROBE_CACHE` entry — and raises the existing
+`RateLimitedExit`, picked up unchanged by `_sleep_then_reexec`. A probe
+failure, or no probe data for any token, never raises from the helper
+itself (returns `None`); each call site falls through to its own
+pre-existing behavior. Terminal-auth failures are unaffected — a
+dead/expired credential is never rotated.
 
 Maps to `DESIGN.md`: §6 *Multi-token rotation*.
 
@@ -3570,7 +3520,7 @@ Maps to `DESIGN.md`: §6 *Multi-token rotation*.
 
 | Phase | Function(s) | What it does |
 |-------|-------------|--------------|
-| Preflight | `preflight` | disk headroom on the state-dir filesystem (N30 — see "Disk headroom" above), git identity, clean working tree, external `leerie` branch collision (DESIGN §3 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. The smoke test uses the shared contained argv (`_contained_claude_argv`, so tool denies + `--strict-mcp-config` apply), `SMOKE_MAX_TURNS`=5 against a measured happy path of 3, and the **resolved `classifier` model** — the tier the run's first worker actually spawns with, and the value `_model_arg` needs in order to restore `[1m]` behind the strict proxy. It runs in an **empty cwd with no repository ancestor** — a stable path under the system temp dir, named from a hash of the state root (the CLI resolves project context by walking UP from cwd, so a directory under `<repo>/.leerie` would reload the very CLAUDE.md this avoids; the state root takes that shape whenever `LEERIE_STATE_DIR` is unset). Not cleaned up: it is empty by construction, and two runs of one state root share it, so removing it would unlink a concurrent run's live cwd. It validates the CLI, not the repo, and a single-exchange conversation cannot be rescued by the CLI's own reactive compaction (`too_few_groups`), so its prompt must stay structurally below the compaction trigger. A client-side context refusal is classified via `_is_context_overflow` and **raises `ContextOverflow`** (resumable `EXIT_LOCKED` pause) rather than printing a bare `Prompt is too long`. Run-id collisions are detected at two points: filesystem side in `State.__init__` (the run dir is created at container start since the run-id is the container/machine ID); git side in `setup-run.sh`'s branch-creation step. `setup-run.sh` repeats the external-branch check as defense-in-depth for `resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `resume` |
+| Preflight | `preflight` | disk headroom on the state-dir filesystem (N30 — see "Disk headroom" above), git identity, clean working tree, external `leerie` branch collision (DESIGN §3 *External collision hazard*), `claude` CLI version, live `claude -p` smoke test. The smoke test uses the shared contained argv (`_contained_claude_argv`, so tool denies + `--strict-mcp-config` apply), `SMOKE_MAX_TURNS`=5 against a measured happy path of 3, and the **resolved `classifier` model** — the tier the run's first worker actually spawns with. It runs in an **empty cwd with no repository ancestor** — a stable path under the system temp dir, named from a hash of the state root (the CLI resolves project context by walking UP from cwd, so a directory under `<repo>/.leerie` would reload the very CLAUDE.md this avoids). Not cleaned up: it is empty by construction and two runs of one state root share it. It validates the CLI, not the repo. A client-side context refusal is classified via `_is_context_overflow` and **raises `ContextOverflow`** (resumable `EXIT_LOCKED` pause) rather than printing a bare `Prompt is too long`. Run-id collisions are detected at two points: filesystem side in `State.__init__`; git side in `setup-run.sh`'s branch-creation step, which repeats the check as defense-in-depth for `resume`. Smoke test bypassed by `--skip-smoke`; preflight skipped entirely on `resume` |
 | 1 Classify | `phase_classify` | one classifier worker → categories + questions. Returned categories are filtered against the 9-name whitelist in `CATEGORIES` (mirrors DESIGN §4); `die()` if none survive. On a fresh (non-resumed) run, `run.json`'s identity fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`, `task`) are written immediately BEFORE this phase runs — not after, as originally implemented — so any early-exit path reachable from classification (including the classification gate's no-work routing, below) sees a fully-identified `run.json` rather than one carrying only `_finish_no_work_run`'s own `{finished_at, no_push, no_verify}` (DESIGN §8 *Reaching the cleared-but-empty state from classification*) |
 |   • Classification gate | `phase_classification_gate` | independent adversarial verifier of the classifier's category set (DESIGN §8 *Independent adversarial verification*). One `classification_judge` worker attacks the chosen categories against the task + codebase; a non-empty `miscategorizations` array (a missing category the work requires, or a spurious one) re-drives `phase_classify` via `_run_checked_loop` (bounded by `judgment_check_rounds`, and cut short earlier by `_run_checked_loop`'s own oscillation guard when a round's issues repeat an earlier round's exactly — DESIGN §8 *The CRITIC retry pattern's oscillation guard*). Across rounds, the gate accumulates a `judge_confirmed` set — every category the judge has reviewed without objection or explicitly asked to add — and passes it into the re-invoked `phase_classify`, so `check_classifier_output`'s `SAME_WORK_RISK`/`TEST_OWNERSHIP_RISK` self-check never strips a category the judge has already vetted. On exhaustion, `die()`s with the residuals named — UNLESS `st.data["likely_already_satisfied"]` is `True` with non-empty evidence, in which case it routes to `_finish_no_work_run` (the same terminal state `_detect_no_work` produces post-plan; DESIGN §8 *Reaching the cleared-but-empty state from classification*) and returns `True`, signaling the caller (`_run_phases`) to stop the pipeline. Gates before provision/plan spend. Runs inside the `plans_after_classify` checkpoint block (DESIGN §6 "Resumable planning"), so a resume past classify skips it. Persists to `state.data["classification_coverage_gate"]`. |
 |   • Provision | `phase_provision` | per-repo dep **detection** (DESIGN §6½ *Persistent out-of-repo dependency bake*). Always runs; runs after classify so a docs-only run can short-circuit to `kind: none`. Five steps: `.leerie-setup.sh` hook if present → `_synth_mise_go_override()` if `go.mod` lacks a `.go-version` / mise.toml go pin → `mise install` at the repo root (reads `.tool-versions` natively; `.nvmrc` / `.python-version` / `.ruby-version` / `rust-toolchain.toml` via image-set `MISE_IDIOMATIC_VERSION_FILE_ENABLE_TOOLS`) → version capture via `mise ls --current --json` → `_detect_recipe_from_lockfiles()` table-first, falls back to a `provision` worker on table miss. The recipe is **persisted to `st.data["provision"]["recipe"]` and injected into implementer/conformer prompts as a `PROVISION_RECIPE:` block** — for baked ecosystems (Python/Ruby/Rust/Go), the block is informational only; for Node, it carries the residual offline-relink command (not run by the orchestrator at `repo_root`, which would clobber the host's bind-mounted checkout). The synth-go-pin env var `MISE_OVERRIDE_CONFIG_FILENAMES` is exported to `os.environ` so all downstream worker subprocesses inherit it. `mise install` and `.leerie-setup.sh` run through `_run_streaming` so their output is visible live. Skipped on `resume` when `st.data["provision"]["recipe"]` is already present (key-presence, not truthiness — an empty recipe is a valid completed state; DESIGN §6 "Resumable planning"); the env var is re-exported from persisted state on resume. |
@@ -3592,29 +3542,29 @@ Maps to `DESIGN.md`: §6 *Multi-token rotation*.
 on the classification.
 
 Between Phase 3 and Phase 4, `_write_plan()` persists the merged plan
-(`<state-root>/runs/<run-id>/plan.json`, which carries the full task text
+(`<state-root>/runs/<run-id>/plan.json`, carrying the full task text
 under its top-level `"task"` key) and per-subtask spec files
 (`<state-root>/runs/<run-id>/subtasks/<id>.json`). It also writes
 `<state-root>/runs/<run-id>/task.md`, the task text verbatim as plain
-markdown. Each spec file carries `_task_ref` — the path to that
-`task.md` — plus `_task_ref_bytes`, its size, rather than a second copy
-of the task text: no prompt reads a `_task` field, and inlining the full
-task into every subtask spec was measured to bloat briefs significantly
-on large task documents, spilling past the CLI's Read cap.
+markdown. Each spec file carries `_task_ref` — the path to `task.md` —
+plus `_task_ref_bytes`, its size, rather than a second copy of the task
+text: inlining the full task into every subtask spec was measured to
+bloat briefs significantly on large task documents, spilling past the
+CLI's Read cap.
 
 `_task_ref` points at `task.md` and **not** at `plan.json`, which is by
-construction the task text plus every subtask body — strictly larger than
-any single brief it replaced — so referencing it relocates the Read-cap
-failure instead of removing it. Format carries the rest: the cap is
-25,000 **tokens**, and markdown measures meaningfully more bytes/token
-than JSON, so the same text can sit over the cap inside `plan.json` but
-under it as markdown. On large task documents that alone isn't enough;
-the implementer prompt's `offset`/`limit` guidance, keyed on
-`_task_ref_bytes`, is what keeps the read from failing. The conformance
-phase derives its advisory build/lint/test commands separately via
-`_infer_build_lint_test(repo_root)`, which performs best-effort
-discovery by checking for configuration files and lockfiles. Supported
-families (checked in this order; first match wins per axis via
+construction the task text plus every subtask body — strictly larger
+than any single brief it replaced — so referencing it relocates the
+Read-cap failure instead of removing it. Format carries the rest: the
+cap is 25,000 **tokens**, and markdown measures meaningfully more
+bytes/token than JSON, so the same text can sit over the cap inside
+`plan.json` but under it as markdown. On large task documents that
+alone isn't enough; the implementer prompt's `offset`/`limit` guidance,
+keyed on `_task_ref_bytes`, is what keeps the read from failing. The
+conformance phase derives its advisory build/lint/test commands
+separately via `_infer_build_lint_test(repo_root)`, best-effort
+discovery via config/lockfiles. Supported families (checked in this
+order; first match wins per axis via
 `out[axis] = out[axis] or "..."`):
 
 - **Makefile** → `make` (build)
@@ -3655,26 +3605,19 @@ exists.
 `.leerie/config.toml` with explicit `build`, `lint`, and/or `test` keys
 that override the corresponding axis from inference. Missing keys fall
 through to `_infer_build_lint_test()`. An empty-string value means "not
-applicable" — same convention as inference — and is preserved rather than
-replaced by inference. The file also accepts a `setup_packages` key
-(comma-separated apt package names) that triggers per-repo Dockerfile
-auto-generation (see §6½ *Auto-capture of repo dependencies*); it is
-not consumed by BLT resolution.
+applicable" (same convention as inference) and is preserved rather than
+replaced. The file also accepts a `setup_packages` key (comma-separated
+apt package names) that triggers per-repo Dockerfile auto-generation
+(§6½ *Auto-capture of repo dependencies*); not consumed by BLT resolution.
 
-Resolution is implemented by two functions:
-
-- **`_load_blt_config(repo_root: Path) -> dict[str, str] | None`** — reads
-  `.leerie/config.toml` via `_read_toml_key()` for each of `build`, `lint`,
-  `test`, `setup_packages`. Returns `None` when the file is absent; returns a
-  dict containing only the keys present in the file (no defaults for absent
-  keys).
-
-- **`resolve_blt(repo_root: Path) -> dict[str, str]`** — calls
-  `_load_blt_config()`; for each axis, uses the declared value if present
-  (including empty string), otherwise falls through to
-  `_infer_build_lint_test()`. Logs which axes came from config vs inference.
-  This is the function called by both `_run_conformance_phase` and
-  `_run_final_conformance` — neither calls `_infer_build_lint_test` directly.
+Resolution: **`_load_blt_config(repo_root)`** reads `.leerie/config.toml`
+via `_read_toml_key()` for each of `build`/`lint`/`test`/`setup_packages`,
+returning `None` when absent or a dict of only the present keys.
+**`resolve_blt(repo_root)`** calls it; for each axis, uses the declared
+value if present (including empty string), else falls through to
+`_infer_build_lint_test()`. This is the function `_run_conformance_phase`
+and `_run_final_conformance` both call — neither calls
+`_infer_build_lint_test` directly.
 
 `.leerie/config.toml` format (flat key = value, same parser as `leerie.toml`):
 
@@ -3750,33 +3693,28 @@ The run-id is the container/machine ID (DESIGN §6), known at container creation
 | post-unresolved-retry cycle gate re-run | the retry's revised output reintroduces a cycle (e.g., a rename closes a loop). Same Tarjan check as the primary acyclicity gate; on cycle, `die()` with the SCC report. |
 
 **Size-resolution retry loop.** When the size gate fires on the first
-reconciler attempt (any `added_subtask` with `size: large`), `phase_reconcile`
-deep-copies the pre-mutation plans, reverts the failed mutations, builds a
-retry prompt (in `_build_size_retry_prompt`) that names each offending sid,
-its `provides`/`requires`/`depends_on`, and the explicit decomposition rule
-("emit one subtask per `provides` tag, or smaller groupings that share state"),
-then respawns the reconciler worker once with that prompt. Maximum two
-attempts total — mirrors the cycle-retry shape. Cost: one extra reconciler
-spawn on oversize runs only; non-oversize runs pay nothing extra.
-
-No recommendation heuristic is computed (unlike the cycle loop): the
-mechanical guarantee — "split it into N subtasks each providing one
-`provides` tag" — is rendered directly into the retry prompt, and is
-also documented in `prompts/reconciler.md` on the first attempt; the
-retry is the enforcement.
-
-The size gate runs *before* the acyclicity gate because oversize
-authoring is an upstream defect — a `large` subtask bundling several
-capabilities is also more likely to produce a cycle, so splitting first
-lets the cycle gate evaluate the cleaner graph.
+reconciler attempt (any `added_subtask` with `size: large`),
+`phase_reconcile` deep-copies the pre-mutation plans, reverts the failed
+mutations, builds a retry prompt (`_build_size_retry_prompt`) naming each
+offending sid, its `provides`/`requires`/`depends_on`, and the explicit
+decomposition rule ("emit one subtask per `provides` tag, or smaller
+groupings that share state"), then respawns the reconciler once. Maximum
+two attempts total — mirrors the cycle-retry shape; one extra reconciler
+spawn on oversize runs only. No recommendation heuristic is computed
+(unlike the cycle loop): the mechanical guarantee is rendered directly
+into the retry prompt (and documented in `prompts/reconciler.md` on the
+first attempt) — the retry is the enforcement. The size gate runs
+*before* the acyclicity gate because oversize authoring is an upstream
+defect — a `large` subtask bundling several capabilities is also more
+likely to produce a cycle, so splitting first gives the cycle gate a
+cleaner graph.
 
 **Retry composition (snapshot refresh).** When multiple retries fire on
 the same run (e.g., size retry succeeds and then the cycle gate fires),
 each successful retry refreshes `pre_plans_snapshot` to the post-retry
 state, so the next retry's revert restores the most recent good state
 rather than undoing an already-successful split. The unresolved retry
-doesn't refresh because it's the last gate before `phase_reconcile`
-returns.
+doesn't refresh — it's the last gate before `phase_reconcile` returns.
 
 **Cycle-resolution retry loop.** When the acyclicity gate fires on the first
 reconciler attempt, `phase_reconcile` deep-copies the pre-mutation plans,
