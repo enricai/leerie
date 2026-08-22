@@ -6851,40 +6851,36 @@ reach; the boundary is structural).
 
 The launcher's finalize block in `leerie` (bash) does, in order:
 
-1. **Skip if `--no-push`.** Same opt-out as before.
+1. **Skip if `--no-push`.**
 2. **Read run state** via `jq` from `$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json` and
    `state.json` (run branch, working branch, finished_at).
 3. **Push the run branch.** `git push -u origin leerie/runs/<run-id>`
-   (with `--no-verify` if the flag was set). On failure: print the
-   same multi-line message as the old Python path (names run branch +
-   working branch, the captured push output — stderr plus any pre-push
-   hook stdout — and the exact retry command), update `run.json` with
-   `push_error`, exit non-zero.
+   (with `--no-verify` if the flag was set). On failure: print a
+   multi-line message (run branch + working branch, captured push
+   output — stderr plus any pre-push hook stdout — and the exact retry
+   command), update `run.json` with `push_error`, exit non-zero.
 4. **Compose PR title + body.** Primary path: read `pr_title` /
-   `pr_body` from `run.json` — these are written by the `pr_writer`
-   worker that `phase_finalize` invokes when `push_will_happen` is
-   true (see DESIGN §6 *Finalization* and §9 *Structured-output
-   schemas* `pr_writer` entry). Fallback path (pr_writer skipped or
-   crashed): a bash heredoc reads `state.json` fields with `jq` and
-   emits the deterministic body shape that `compose_pr_body` produces
-   (task, category, source-of-truth, run timestamps, wave + subtask +
-   worker counts, and — when `external_preconditions` is non-empty — a
-   `⚠ Deploy-ordering` section rendered from it via `jq`, byte-identical
-   to the Python renderer; see "Deploy-ordering notes"). The launcher
-   branches on whether `pr_title_llm` / `pr_body_llm` are non-empty.
+   `pr_body` from `run.json` — written by the `pr_writer` worker that
+   `phase_finalize` invokes when `push_will_happen` is true (see
+   DESIGN §6 *Finalization* and §9 *Structured-output schemas*
+   `pr_writer` entry). Fallback path (pr_writer skipped or crashed): a
+   bash heredoc reads `state.json` fields with `jq` and emits the
+   deterministic body shape `compose_pr_body` produces (task, category,
+   source-of-truth, run timestamps, wave + subtask + worker counts, and
+   — when `external_preconditions` is non-empty — a `⚠ Deploy-ordering`
+   section rendered via `jq`, byte-identical to the Python renderer;
+   see "Deploy-ordering notes"). The launcher branches on whether
+   `pr_title_llm` / `pr_body_llm` are non-empty.
 5. **Open PR.** Before calling `gh pr create`, validate that
    `working_branch` still exists on origin via `git ls-remote
-   --exit-code --heads`. If the branch was deleted (common when a
-   stacked run's parent was squash-merged while this run was in
-   flight), fall back to the repo's default branch (`git remote show
-   origin | sed 's/.*HEAD branch: //'`). Then:
+   --exit-code --heads`. If deleted (a stacked run's parent squash-
+   merged mid-flight), fall back to the repo's default branch (`git
+   remote show origin | sed 's/.*HEAD branch: //'`). Then:
    `gh pr create --base <working-branch> --head
    leerie/runs/<run-id> --title "leerie: <pr_title>" --body-file -`
    with the composed body piped on stdin. On failure: log a warning
-   with the pushed-branch URL and a retry command (using the
-   resolved base — original or fallback); update `run.json` with
-   `pr_error`. **Non-fatal** — exit 0 (the run is complete; only
-   the PR is missing).
+   with the pushed-branch URL and a retry command (using the resolved
+   base); update `run.json` with `pr_error`. **Non-fatal** — exit 0.
 
 **Local runtime only.** The inline finalize block above runs only when
 `LEERIE_RUNTIME != "fly"`. On Fly the run dir is not yet on the host
@@ -6895,26 +6891,24 @@ different call site — see *Remote execution mode* below.
 
 **Preflight (`leerie` bash, before `nerdctl run`):** the launcher
 checks `git rev-parse --is-inside-work-tree`, `shutil.which gh`,
-`gh auth status`, and `git remote get-url origin` BEFORE spinning up
-the container. Each failure dies with the same actionable message
-actionable messages about each failure, plus the `--no-push`
-escape hatch. The orchestrator no longer runs these checks; they
-moved to the host where the auth state actually lives.
+`gh auth status`, and `git remote get-url origin` before spinning up
+the container, with actionable messages plus the `--no-push` escape
+hatch. The orchestrator no longer runs these checks; they moved to the
+host where the auth state actually lives.
 
 `--no-push` skips the entire push + PR step. CLI flag, `LEERIE_NO_PUSH`
 env, `no_push = true` in `leerie.toml`. **Both the launcher (bash) and
 the in-container orchestrator (Python) resolve `no_push` from all three
 sources** so they agree on intent: the orchestrator's
-`resolve_no_push()` and the launcher's
-inline TOML fallback (mirroring `_read_toml_key`'s flat grep — no
-`tomllib` dependency, since the launcher runs on the user's host where
-Python 3.9 is still common) both check CLI → env → TOML. Disagreement
-on a TOML-only opt-out would make the Fly auto-finalize path push
-against user intent (the launcher seeds `fly-machine.json.host_no_push`
-and the `--host-no-push` argv; the orchestrator gates `pr_writer` and
-writes `run.json.no_push`). `--no-verify` is CLI-only and only
-affects the push step (worker `git commit`s inside worktrees still
-run all hooks).
+`resolve_no_push()` and the launcher's inline TOML fallback (mirroring
+`_read_toml_key`'s flat grep — no `tomllib` dependency, since the
+launcher runs on the user's host where Python 3.9 is still common)
+both check CLI → env → TOML. Disagreement on a TOML-only opt-out would
+make the Fly auto-finalize path push against user intent (the launcher
+seeds `fly-machine.json.host_no_push` and the `--host-no-push` argv;
+the orchestrator gates `pr_writer` and writes `run.json.no_push`).
+`--no-verify` is CLI-only and only affects the push step (worker
+`git commit`s inside worktrees still run all hooks).
 
 ### Remote execution mode
 
@@ -6923,8 +6917,8 @@ execution to Fly.io Machines instead of the local `nerdctl run`. The
 Colima/containerd preflight block is gated on `RUNTIME=local` and skipped
 entirely when `RUNTIME=fly`. `--runtime` flows through `REWRITTEN_ARGS`
 to the orchestrator's argparse. The launcher's bash-side resolution block
-also accepts `ec2` so `--runtime ec2` is not rejected by the launcher
-before a container/instance starts; EC2 provisioning itself, and the
+also accepts `ec2` so `--runtime ec2` is not rejected before a
+container/instance starts; EC2 provisioning itself, and the
 orchestrator-side argparse enum, are out of this launcher knob's scope.
 
 Resolution order (highest priority first):
@@ -7006,7 +7000,7 @@ invocation, and instead calls the remote dispatch path via
 
 The provision script is **sourced** (not exec'd) by the launcher so the
 machine ID and destroy trap live in the launcher's process. It provides
-two functions:
+four functions:
 
 - **`provision_machine()`** — creates a Fly Machine from `$FLY_IMAGE_TAG`
   (set by the launcher; see below), polls `flyctl machine status` until the
@@ -7015,18 +7009,17 @@ two functions:
   destroys the machine and returns 1 on failure. Writes `fly_machine_id`
   and `image_tag` (from `$FLY_IMAGE_TAG`) to the run sidecar
   (`$LEERIE_STATE_HOST_DIR/runs/<run-id>/run.json`) when `$LEERIE_RUN_ID`
-  is set in the environment — written immediately after provision succeeds
-  so a launcher crash before classification still leaves a recoverable
-  pointer. The `image_tag` field enables `resume_machine()` to detect
-  version drift on `resume` and update the machine's image before
-  starting it.
+  is set — written immediately after provision succeeds so a launcher
+  crash before classification still leaves a recoverable pointer. The
+  `image_tag` field lets `resume_machine()` detect version drift on
+  `resume` and update the machine's image before starting it.
 - **`stop_machine()`** — runs `flyctl machine stop $LEERIE_MACHINE_ID
   --app $FLY_APP`, tolerant of already-stopped machines. Preserves the
   machine's filesystem on its Fly volume so `resume-machine.sh` can wake
   it later.
 - **`destroy_machine()`** — runs `flyctl machine destroy $LEERIE_MACHINE_ID
   --app $FLY_APP --force`, with a stop-then-destroy fallback for machines
-  that are already in a terminal state.
+  already in a terminal state.
 - **`decide_teardown()`** — the trap entry point. Classifies
   `$LEERIE_REMOTE_EXIT_RC` (set by the launcher just before exit) and
   dispatches one of three ways:
@@ -7034,16 +7027,16 @@ two functions:
     EX_TEMPFAIL=75): the orchestrator exited cleanly and the machine has no
     further value.
   - **Detach** for rc=130/143 (host-side SIGINT/SIGTERM): the user pressed
-    Ctrl-C or the local stream broke (laptop closed, WiFi dropped). Since the
-    orchestrator on the machine was started detached (Python
-    `subprocess.Popen(start_new_session=True, user="leerie", ...)`,
-    see *Worker auth + config seeding* below), it is still running. The function
+    Ctrl-C or the local stream broke (laptop closed, WiFi dropped). Since
+    the orchestrator on the machine was started detached (Python
+    `subprocess.Popen(start_new_session=True, user="leerie", ...)`, see
+    *Worker auth + config seeding* below), it is still running. The function
     leaves the machine alone, prints a one-line "detached" banner with the
     reattach / pause / kill commands, and returns.
-  - `stop_machine` for unknown non-zero failures (worker error,
-    orchestrator exception): preserves the machine's filesystem on its Fly
-    volume so the user can attach to inspect and then `leerie resume`. On the
-    stop branch, writes `paused_at` and `pause_reason` to the run sidecar.
+  - `stop_machine` for unknown non-zero failures (worker error, orchestrator
+    exception): preserves the machine's filesystem on its Fly volume so the
+    user can attach to inspect and then `leerie resume`. Writes `paused_at`
+    and `pause_reason` to the run sidecar.
 
   Idempotent (the trap fires on every exit, including success).
 
@@ -7093,19 +7086,19 @@ This isolation matters because `flyctl ssh issue --agent` is
 deletes prior certs. With multiple `require_fly_ssh` callers per
 leerie run (seed-auth + two seed-repo paths), aiming flyctl at the
 user's main agent accumulates dozens of certs, which OpenSSH then
-offers to every ssh destination (including `github.com`). After
-~5 failed auth attempts per connection, GitHub rate-limits the
-account. Containing all Fly certs in a private agent reachable only
-by leerie's process tree eliminates the failure mode.
+offers to every ssh destination (including `github.com`); after
+~5 failed auth attempts per connection GitHub rate-limits the account.
+Containing all Fly certs in a private agent reachable only by leerie's
+process tree eliminates the failure mode.
 
-The private agent is persistent (lazy-spawned, never auto-killed)
-so the 24h cert is fully reused across leerie runs — re-issuing on
-every invocation was what produced the original accumulation. Reboot
-wipes the socket inode; the next run lazy-spawns fresh. Parallel
-leerie invocations serialize on `~/.cache/leerie/agent/.spawn.lock`
-via `mkdir`-as-mutex (portable across darwin/linux without the
-non-stdlib `flock` binary that macOS lacks); only the first spawn
-wins, the rest see a live socket and reuse it.
+The private agent is persistent (lazy-spawned, never auto-killed) so
+the 24h cert is reused across leerie runs — re-issuing on every
+invocation was what produced the original accumulation. Reboot wipes
+the socket inode; the next run lazy-spawns fresh. Parallel leerie
+invocations serialize on `~/.cache/leerie/agent/.spawn.lock` via
+`mkdir`-as-mutex (portable across darwin/linux without the non-stdlib
+`flock` binary macOS lacks); only the first spawn wins, the rest see a
+live socket and reuse it.
 
 The reuse check probes the socket with `ssh-add -l` and reuses it on any
 exit code **other than 2**: rc 0 (has keys) and rc 1 (reachable, no keys
@@ -7114,11 +7107,11 @@ socket is stale. Treating rc 1 like rc 2 would unlink a live agent's
 socket out from under the still-running process.
 
 Any newly-spawned agent carries `-t 24h`, matching the 24h Fly cert
-(`flyctl ssh issue --agent`). This bounds only the lifetime of
+(`flyctl ssh issue --agent`) — this bounds only the lifetime of
 **identities** added to the agent (`man ssh-agent`), not the agent
-process itself — killing the agent is the separate `ssh-agent -k`. An
-orphaned agent therefore leaks indefinitely, holding an empty keyring;
-there is no reaper for it today.
+process itself (killing it is the separate `ssh-agent -k`). An
+orphaned agent leaks indefinitely holding an empty keyring; there is
+no reaper for it today.
 
 #### Worker auth + config seeding (`scripts/remote/seed-auth.sh`)
 
@@ -7134,119 +7127,112 @@ as a single string AND forwards host stdin.)
 
 `seed_auth()` performs six steps:
 
-1. **Hallpass readiness probe.** Call `require_fly_ssh` (ensures the
+1. **Hallpass readiness probe.** Calls `require_fly_ssh` (ensures the
    leerie-private ssh-agent — see above — holds a valid Fly cert,
-   issuing only if no cert exists) and `wait_for_fly_ssh_ready` (poll
-   `flyctl ssh console --pty=false -C true` against the target
-   machine until success; hallpass takes 5-30 s to come up after
-   `flyctl machine start` reports "started"). This is the *only*
-   hallpass probe in a run — subsequent transports (`seed_repo_clone`
-   parent + submodule bundles, `seed_repo_dirty` rsync) rely on each
-   pipe's own `LEERIE_SEED_TIMEOUT_S` wrapper (rc 124/137) as the
-   authoritative failure detector. An extra probe before each pipe
-   would only manufacture false-positives — the channel is
-   demonstrably warm by the time seed_auth's multi-MB tar-pipe and
-   plugin-cache rebuild have finished. Bound: ~175 s total (12
-   attempts × 10 s per-probe timeout + 11 × 5 s sleep); on success
-   emits `remote: hallpass ready on <machine>`; on the rare exit-137
-   exhaustion (timeout's SIGKILL fire OR external SIGKILL like macOS
-   Jetsam under host pressure), the warning includes the "killed
+   issuing only if none exists) and `wait_for_fly_ssh_ready` (polls
+   `flyctl ssh console --pty=false -C true` until success; hallpass
+   takes 5-30 s to come up after `flyctl machine start` reports
+   "started"). This is the *only* hallpass probe in a run — subsequent
+   transports (`seed_repo_clone` parent + submodule bundles,
+   `seed_repo_dirty` rsync) rely on each pipe's own
+   `LEERIE_SEED_TIMEOUT_S` wrapper (rc 124/137) as the authoritative
+   failure detector; an extra probe before each pipe would only
+   manufacture false-positives once the channel is warm. Bound: ~175 s
+   total (12 attempts × 10 s per-probe timeout + 11 × 5 s sleep); on
+   success emits `remote: hallpass ready on <machine>`; on the rare
+   exit-137 exhaustion (timeout's SIGKILL or an external SIGKILL like
+   macOS Jetsam under host pressure), the warning includes a "killed
    externally" diagnostic so the operator can distinguish client-side
    pressure from a real Fly outage.
 
 2. **Tar-pipe delivery of `$STAGE` to /home/leerie.** `tar -czC $STAGE`
-   (gzip-compressed; excluding `.gitconfig`, `.gitconfig.local`, `.gitignore`,
-   `.gitignore_global`, `.git-credentials`, `.netrc`, `.ssh`,
-   `.gnupg`, `.config`; with `COPYFILE_DISABLE=1` on the host-side
-   tar to silence macOS BSD tar's per-file
-   `LIBARCHIVE.xattr.com.apple.provenance` warnings on the remote
-   GNU tar) is piped to `flyctl ssh console --pty=false -C "sh -c
+   (gzip-compressed; excluding `.gitconfig`, `.gitconfig.local`,
+   `.gitignore`, `.gitignore_global`, `.git-credentials`, `.netrc`,
+   `.ssh`, `.gnupg`, `.config`; with `COPYFILE_DISABLE=1` host-side to
+   silence macOS BSD tar's per-file
+   `LIBARCHIVE.xattr.com.apple.provenance` warnings on the remote GNU
+   tar) is piped to `flyctl ssh console --pty=false -C "sh -c
    'tar -xzC /home/leerie && chown -R leerie: /home/leerie'"`. The
    `chown -R leerie:` is necessary because the ssh-console session
    lands as root with default umask; without it the orchestrator
-   (which runs as leerie) couldn't read its own credentials. The
+   (running as leerie) couldn't read its own credentials. The
    `leerie:` (trailing colon, no group name) uses leerie's numeric
-   primary group rather than hard-coding a literal group name —
-   leerie's primary GID is `HOST_GID` (defaults to 20 / staff on
-   macOS hosts) and the group is not necessarily called `leerie`.
+   primary group rather than a hard-coded group name — leerie's
+   primary GID is `HOST_GID` (defaults to 20 / staff on macOS) and the
+   group is not necessarily called `leerie`.
 
    The launcher's `$STAGE` build skips `.claude/local` (the host npm
-   install of `@anthropic-ai/claude-code` — the leerie image installs
-   claude globally via the Dockerfile, so shipping the host's local
-   install is dead weight) plus `.claude/plugins/cache/` and
+   install of `@anthropic-ai/claude-code` — the image installs claude
+   globally via the Dockerfile, so shipping the host's local install
+   is dead weight) plus `.claude/plugins/cache/` and
    `.claude/plugins/marketplaces/` (rebuilt on the remote in step 6
-   from the small JSON metadata files that ride along). This keeps
-   the stage well under the size where the `ssh console -C` stdin
-   pipe starts hitting EOFs.
+   from the small JSON metadata files that ride along). This keeps the
+   stage well under the size where the `ssh console -C` stdin pipe
+   starts hitting EOFs.
 
    On transient "tunnel unavailable" failure from a freshly-spawned
    flyctl agent, the seed retries once after `flyctl agent restart`.
 
-3. **Token fallback.** If `$STAGE/.claude/.credentials.json` was
-   not written (Linux, or macOS Keychain extraction failure) but
+3. **Token fallback.** If `$STAGE/.claude/.credentials.json` was not
+   written (Linux, or macOS Keychain extraction failure) but
    `$CLAUDE_CODE_OAUTH_TOKEN` is set, `seed_auth()` writes a
    credentials JSON
    `{"claudeAiOauth":{"accessToken":"<token>","scopes":["user:inference"]}}`
    (the `scopes` field is mandatory — CLI 2.1.210's file-auth rejects a
-   scope-less blob; see the `_extract_claude_credentials_json` row above)
-   directly to
-   `/home/leerie/.claude/.credentials.json` on the machine via
+   scope-less blob; see the `_extract_claude_credentials_json` row
+   above) directly to `/home/leerie/.claude/.credentials.json` via
    `flyctl ssh console -C "sh -c 'cat > .../credentials.json
    && chmod 600 ... && chown leerie: ...'"`. If neither source is
    available, `seed_auth()` returns 1 with an actionable error.
 
 4. **Git identity.** Reads `user.name` and `user.email` from the
-   host's git config and writes them to
-   `/home/leerie/.gitconfig` on the machine via
-   `flyctl ssh console -C "sh -c 'IFS= read -r n; IFS= read -r e;
-   git config --file /home/leerie/.gitconfig user.name \"\$n\" &&
-   git config --file /home/leerie/.gitconfig user.email \"\$e\" &&
-   chown leerie: /home/leerie/.gitconfig'"` with the two values piped
-   on stdin. Note: NOT `git config --global` — under the
-   ssh-console session's default root user that would write to
-   `/root/.gitconfig` where the leerie user can't read it. Worker
-   commits carry the host user's identity.
+   host's git config and writes them to `/home/leerie/.gitconfig` on
+   the machine via `flyctl ssh console -C "sh -c 'IFS= read -r n;
+   IFS= read -r e; git config --file /home/leerie/.gitconfig user.name
+   \"\$n\" && git config --file /home/leerie/.gitconfig user.email
+   \"\$e\" && chown leerie: /home/leerie/.gitconfig'"` with the two
+   values piped on stdin — NOT `git config --global`, which under the
+   ssh-console session's default root user would write to
+   `/root/.gitconfig` where leerie can't read it. Worker commits carry
+   the host user's identity.
 
 5. **Pre-warm `claude --version`** once as the leerie user via
    `flyctl ssh console -C "su leerie -c 'HOME=/home/leerie PATH=... claude
-   --version'"`. The FIRST `claude --version` on a freshly-booted
-   Fly machine takes ~17 s (Node runtime + statsig client cold-start);
+   --version'"`. The first `claude --version` on a freshly-booted Fly
+   machine takes ~17 s (Node runtime + statsig client cold-start);
    subsequent calls return in <0.2 s. Paying this upfront means the
-   orchestrator's preflight `_check_claude_cli_version` call hits
-   warm caches.
+   orchestrator's preflight `_check_claude_cli_version` call hits warm
+   caches.
 
-6. **Rebuild plugin cache.** The tar pipe excludes
-   `plugins/cache/` and `plugins/marketplaces/` (see step 2); the
-   small JSON metadata files (`installed_plugins.json`,
-   `known_marketplaces.json`) ride along and are the source of
-   truth for rebuilding. Inside one `flyctl ssh console` invocation
-   (running as the leerie user via `runuser -u leerie -- env HOME=...
-   PATH=... sh -s` — not `su -c 'sh -s'`, which has implementation-
-   specific stdin-forwarding under util-linux) a shell heredoc runs
-   two phases: (a) read `known_marketplaces.json` with a python3
-   one-liner — jq isn't in the image — emit each `source.repo` and
-   run `claude plugin marketplace add <owner>/<repo>`; (b) read
-   `installed_plugins.json` keys (e.g., `vercel@claude-plugins-official`)
-   and run `claude plugin install` per entry. Output is appended to
+6. **Rebuild plugin cache.** The tar pipe excludes `plugins/cache/`
+   and `plugins/marketplaces/` (step 2); the small JSON metadata files
+   (`installed_plugins.json`, `known_marketplaces.json`) ride along
+   and are the source of truth for rebuilding. Inside one
+   `flyctl ssh console` invocation (running as the leerie user via
+   `runuser -u leerie -- env HOME=... PATH=... sh -s` — not
+   `su -c 'sh -s'`, which has implementation-specific stdin-forwarding
+   under util-linux) a shell heredoc runs two phases: (a) read
+   `known_marketplaces.json` with a python3 one-liner (jq isn't in the
+   image), emit each `source.repo`, and run `claude plugin marketplace
+   add <owner>/<repo>`; (b) read `installed_plugins.json` keys (e.g.
+   `vercel@claude-plugins-official`) and run `claude plugin install`
+   per entry. Output is appended to
    `/home/leerie/.cache/leerie/plugin-install.log`. Per-plugin
    failures are logged (`WARN: <spec> install failed (continuing)`)
    but non-fatal — a missing plugin only matters if a user-supplied
-   task explicitly invokes it, in which case the Claude CLI's
-   existing "plugin not found in cache" skip-with-warning behavior
-   is the appropriate surface. The invocation is bracketed with the
-   same `$(_seed_timeout_prefix)` + `_seed_progress_bg
-   "plugin_rebuild"` heartbeat the main tar pipe uses (step 2 above),
-   so a stalled `flyctl ssh console` produces a clean rc 124/137
-   instead of an indefinite hang and the user sees `plugin_rebuild:
-   still streaming (Ns elapsed)` lines on the happy path. The rc is
-   captured via `|| _rebuild_rc=$?` (which both grabs the rc and
-   suppresses the file-level `set -e` on failure); the trailing
-   `remote_log` line branches on rc — `complete` on 0, "timed out
-   after Ns" on 124/137, "rc=N — continuing" on any other non-zero
-   — so the launcher log honestly reports failure surface without
-   aborting the run. Replaces shipping ~200 MB of plugin contents
-   over the WireGuard pipe with ~30–90 s of public-egress git-clone
-   + bun-install on the Fly machine.
+   task explicitly invokes it, in which case the Claude CLI's existing
+   "plugin not found in cache" skip-with-warning behavior applies. The
+   invocation is bracketed with the same `$(_seed_timeout_prefix)` +
+   `_seed_progress_bg "plugin_rebuild"` heartbeat the main tar pipe
+   uses (step 2), so a stalled `flyctl ssh console` produces a clean rc
+   124/137 instead of hanging, and the user sees `plugin_rebuild: still
+   streaming (Ns elapsed)` lines on the happy path. The rc is captured
+   via `|| _rebuild_rc=$?` (grabs the rc and suppresses file-level
+   `set -e`); the trailing `remote_log` line branches on rc —
+   `complete` on 0, "timed out after Ns" on 124/137, "rc=N —
+   continuing" otherwise. Replaces shipping ~200 MB of plugin contents
+   over the WireGuard pipe with ~30–90 s of public-egress git-clone +
+   bun-install on the Fly machine.
 
 Git-push auth (SSH keys, `.netrc`, `~/.config/gh`) is **not** seeded — that
 auth lives on the host per DESIGN §6 *Finalization* and is not needed inside
@@ -7265,8 +7251,8 @@ The detach is done by piping a Python wrapper script via stdin to
 `flyctl ssh console -C "python3 -"`:
 
 ```bash
-# Build the wrapper script host-side with the argv JSON literal
-# embedded (so no remote shell quoting touches the orchestrator argv).
+# Wrapper script built host-side with the argv JSON literal embedded
+# (so no remote shell quoting touches the orchestrator argv).
 _launch_argv_json="$(python3 -c '
 import json, sys
 print(json.dumps(sys.argv[1:]))
@@ -7279,8 +7265,7 @@ orch_args = argv[1:]
 run_dir = "/work/.leerie/runs/" + run_id
 os.makedirs(run_dir, exist_ok=True)
 leerie_pw = pwd.getpwnam("leerie")
-# /work/.leerie and /work/.leerie/runs were created as root by
-# os.makedirs above; chown all three so the orchestrator
+# os.makedirs above created these as root; chown so the orchestrator
 # (running as leerie) can write state files later.
 for d in ("/work/.leerie", "/work/.leerie/runs", run_dir):
     try: os.chown(d, leerie_pw.pw_uid, leerie_pw.pw_gid)
@@ -7289,40 +7274,23 @@ child_env = dict(os.environ)
 child_env["HOME"] = "/home/leerie"   # ssh-console default is /root
 child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
-# host-side $(basename "$USER_REPO") expansion — the heredoc is
-# unquoted so this becomes a literal basename in the script piped
-# to the Fly machine. Keeps orchestrator log() prefix consistent
-# with host-side remote_log() (else log() falls back to cwd=/work).
+# Host-side $(basename "$USER_REPO") expansion (heredoc is unquoted) —
+# keeps orchestrator log() prefix consistent with host-side remote_log().
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
-# Host IANA TZ baked in so the in-machine log() ISO-8601 offset
-# matches host-side remote_log() (else mixed -05:00 / +00:00 in
-# the tailed stream). _host_tz is computed in outer bash via
-# `readlink /etc/localtime | sed 's|.*/zoneinfo/||'` (works on
-# macOS and Linux). Dockerfile installs `tzdata` so the IANA name
-# resolves; empty value → Python astimezone() falls back to UTC.
+# Host IANA TZ so in-machine log() offsets match host-side remote_log();
+# _host_tz computed via `readlink /etc/localtime | sed 's|.*/zoneinfo/||'`.
+# Empty value -> Python astimezone() falls back to UTC.
 child_env["TZ"] = ${_host_tz_json}
-# Bedrock bearer-token activation (when _BEDROCK_BEARER_ACTIVE=true on the
-# host): takes precedence over the SSO/profile block below, mirroring the
-# nerdctl path's AUTH_MOUNTS ordering. Every value below is JSON-encoded
-# host-side (via a `python3 -c 'import json,sys; print(json.dumps(...))'`
-# call per variable, same technique _launch_argv_json above already uses
-# for argv) rather than substituted as a raw quoted-var string — a raw
-# substitution is not injection-safe: an opaque secret like a bearer token
-# is exactly the kind of value likely to contain a double-quote or
-# backslash that would otherwise break out of the Python string literal
-# and run as arbitrary code on this remote machine. A JSON-encoded empty
-# string is falsy in Python, so the truthiness checks below behave the
-# same as unset. NOTE: this heredoc is unquoted (<<PY) -- never put a
-# backtick pair in a comment here, since bash treats it as a
-# command-substitution delimiter even inside heredoc body text.
+# Bedrock activation. Every value is JSON-encoded host-side (not a raw
+# quoted-var substitution — a bearer token could contain a quote/backslash
+# that breaks out of the Python string literal). Bearer-token block takes
+# precedence over the SSO/profile block. NOTE: heredoc is unquoted (<<PY) —
+# never put a backtick pair in a comment here (command-substitution delimiter).
 if "${_BEDROCK_BEARER_ACTIVE}" == "true":
     child_env["AWS_BEARER_TOKEN_BEDROCK"] = ${_bedrock_bearer_token_json}
     child_env["CLAUDE_CODE_USE_BEDROCK"] = ${_bedrock_use_bedrock_json}
     if ${_bedrock_bearer_region_json}:
         child_env["AWS_REGION"] = ${_bedrock_bearer_region_json}
-# Belt-and-suspenders Bedrock SSO/profile activation (when
-# _BEDROCK_ACTIVE=true on the host), skipped when the bearer-token block
-# above already activated:
 elif "${_BEDROCK_ACTIVE}" == "true":
     child_env["CLAUDE_CODE_USE_BEDROCK"] = "1"
     if ${_bedrock_profile_json}:
@@ -7338,35 +7306,25 @@ with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
         ["python3", "/opt/leerie-image/orchestrator/leerie.py",
          "--no-push", *orch_args],   # --host-no-push is in orch_args
-                                     # (appended by the launcher; see below)
         stdin=subprocess.DEVNULL, stdout=log_f, stderr=log_f,
         start_new_session=True,    # bash setsid equivalent; portable
         cwd="/work",                # avoid stale-cwd ENOENT cascades
-        user="leerie",                # Python 3.9+ user= param
-        group=leerie_pw.pw_gid,
+        user="leerie", group=leerie_pw.pw_gid,
         env=child_env,
     )
 # Poll briefly before recording the pid. If this Popen lost the
-# State.__init__ flock race against an already-running orchestrator
-# for this run (the concurrent-spawn race described in DESIGN §6
-# *Single owner per run dir*), the child exits 75. Writing its pid
-# to orchestrator.pid before the race resolves would overwrite the
-# winning orchestrator's pid with a dead one — see the stale-pid
-# contagion in DESIGN §6. Budget 2 s: the realistic time from Popen
-# to State.__init__'s flock attempt is ~300-500 ms (Python startup
-# + leerie.py imports + main()'s pre-State config resolution), up
-# to ~1 s under disk pressure. State.__init__ itself is microseconds.
-# The reader-side /proc cross-check catches any residual case where
-# the budget is exceeded on the loser path.
+# State.__init__ flock race against an already-running orchestrator for
+# this run (DESIGN §6 *Single owner per run dir*), the child exits 75;
+# writing its pid before the race resolves would overwrite the winner's
+# pid with a dead one (the stale-pid contagion in DESIGN §6). Budget 2 s
+# (Popen -> flock attempt is ~300-500 ms normally, ~1 s under disk
+# pressure); the reader-side /proc cross-check catches any residual case.
 for _ in range(10):
     if p.poll() is not None:
         break
     time.sleep(0.2)
 if p.poll() == 75:
-    # Stillborn — winner still owns the run; do not touch the pid file.
-    # The launcher's existing rc=75 short-circuit (~30 lines below)
-    # pivots into the resume smart-router's attach-tail behavior.
-    # Container-rc 130 (detach banner) leaves the live machine alone.
+    # Stillborn — winner still owns the run; leave the pid file alone.
     sys.exit(75)
 with open(pid_path, "w") as pid_f:
     pid_f.write(str(p.pid) + "\n")
@@ -7376,9 +7334,9 @@ printf '%s' "$_launch_script" \
   | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
       --pty=false -C "python3 -"
 
-# Separately tail the orchestrator log via a second ssh-console
-# session (its death — Ctrl-C, broken pipe, laptop disconnect —
-# does NOT propagate to the orchestrator).
+# Separately tail the orchestrator log via a second ssh-console session
+# (its death — Ctrl-C, broken pipe, laptop disconnect — does NOT
+# propagate to the orchestrator).
 printf '%s' "$_tail_invocation" \
   | flyctl ssh console --app "$FLY_APP" --machine "$LEERIE_MACHINE_ID" \
       --pty=false -C "sh -s"
@@ -7434,13 +7392,11 @@ If classify never ran (no `state.json` exists), the orchestrator's
 `resume` branch needs a `task` positional, which is gone from the
 user's resume argv. The launcher persists the user's original task
 argument to `$LEERIE_STATE_HOST_DIR/runs/$LEERIE_RUN_ID/task.txt` on
-first launch (the run dir already exists — `provision_machine()` wrote
-`fly-machine.json` there first), and on pre-classify resume — when
-`LEERIE_TASK_ARG` is empty in this invocation's argv — reads it back
-and appends to `REWRITTEN_ARGS`. Both writes are idempotent (`! -f`
-and "no task in argv" guards), so an explicit re-supplied task on the
-resume command line wins. `task.txt` is launcher-side; the orchestrator
-never reads it.
+first launch, and on pre-classify resume — when `LEERIE_TASK_ARG` is
+empty in this invocation's argv — reads it back and appends to
+`REWRITTEN_ARGS`. Both writes are idempotent (`! -f` and "no task in
+argv" guards), so an explicit re-supplied task on the resume command
+line wins. `task.txt` is launcher-side; the orchestrator never reads it.
 
 The launcher's task extractor walks `$@` once at startup, skipping
 the value of any `--flag` that takes one. The list of value-taking
@@ -7471,8 +7427,8 @@ no GitHub credentials (DESIGN §6 *Finalization*: the host pushes via
 1. **Parent repo bundle.** Host runs `git -C "$USER_REPO" bundle
    create - --all 2>/dev/null` and pipes the output stream straight to
    `flyctl ssh console --pty=false -C "sh -c 'cat > /tmp/leerie-seed.bundle'"`
-   on the machine. `--all` packs every ref into one pack-format binary
-   stream. The `sh -c '...'` wrapper is load-bearing — bare
+   on the machine (`--all` packs every ref into one pack-format binary
+   stream). The `sh -c '...'` wrapper is load-bearing — bare
    `-C "cat > /tmp/..."` is parsed by flyctl as if `>` were a `cat`
    argument and fails with `cat: invalid option -- 'c'`.
 
@@ -7480,8 +7436,8 @@ no GitHub credentials (DESIGN §6 *Finalization*: the host pushes via
    foreach --recursive 'git bundle create - --all | flyctl ssh
    console -C "sh -c '\''cat > /tmp/leerie-subs/<flat-displaypath>.bundle'\''"'`
    so each submodule's pack data lands as its own file on the machine.
-   The flat-displaypath name (`/` → `_`) gives unambiguous filenames
-   for nested submodules.
+   The flat-displaypath name (`/` → `_`) gives unambiguous filenames for
+   nested submodules.
 
 3. **Machine-side clone + submodule update.** A single
    `flyctl ssh console -C "sh -c '<script>'"` call:
@@ -7489,13 +7445,12 @@ no GitHub credentials (DESIGN §6 *Finalization*: the host pushes via
      like a remote; recreates `.git/` and checks out HEAD).
    - For each submodule, `git config submodule.<name>.url
      /tmp/leerie-subs/<bn>.bundle` (sets the URL in `.git/config`, NOT
-     `.gitmodules` — we never modify the committed file).
+     `.gitmodules` — the committed file is never modified).
    - `git -c protocol.file.allow=always submodule update --recursive`
      (clones each submodule from its bundle file). The
      `protocol.file.allow=always` flag is load-bearing — git 2.38+
      blocks the `file` protocol by default per CVE-2022-39253, which
-     would otherwise abort the submodule clone with `fatal: transport
-     'file' not allowed`.
+     would otherwise abort with `fatal: transport 'file' not allowed`.
    - `chown -R leerie: /work` (orchestrator runs as leerie).
    - `rm -rf /tmp/leerie-seed.bundle /tmp/leerie-subs` (bundles served
      their purpose; tmpfs space reclaimed).
