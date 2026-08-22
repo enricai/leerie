@@ -2044,8 +2044,8 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`sonnet`)
 
-Twenty worker types (plus the global override), each independently
-overridable via the mechanical pattern `LEERIE_MODEL_<WORKER>` (env) /
+Nineteen worker types (`WORKER_TYPES`, plus the global override), each
+independently overridable via the mechanical pattern `LEERIE_MODEL_<WORKER>` (env) /
 `--model-<worker>` (CLI) / `model_<worker>` (TOML): classifier, planner,
 reconciler, plan_overlap_judge, satisfied_probe, provision, implementer,
 integrator, conformer, fit_judge, splitter, adherence_judge,
