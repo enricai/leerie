@@ -7780,8 +7780,8 @@ DESIGN.md §19 holds the architecture rationale.
 
 State lives under the resolved state root — by default
 `$HOME/.leerie/<basename>/`, or the path set via `LEERIE_STATE_DIR` /
-`--state-dir` / `leerie.toml state_dir` (see §2 *State directory* for the
-full resolution order). The state root is always outside the target repo,
+`--state-dir` / `leerie.toml state_dir` (see §2 *Host-side per-repo state
+directory* for the full resolution order). The state root is always outside the target repo,
 so no `.leerie/` directory accumulates in project checkouts and no
 `.gitignore` entry is needed. Worktrees are
 disposable; the coordination directory outlives them.
