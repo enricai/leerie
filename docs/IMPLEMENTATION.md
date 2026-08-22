@@ -7486,9 +7486,9 @@ dirty set from `git status --porcelain` on the host:
 The dirty set is rsync'd over `flyctl ssh console -C "rsync --server
 ..."` via `fly_rsync_wrapper` (lib.sh). NFC byte preservation is
 free with rsync; the bundle path doesn't need it (filenames don't
-transit at all), but the delta does.
+transit), but the delta does.
 
-The script is **sourced** (not exec'd) by the launcher — the same
+The script is **sourced** (not exec'd) by the launcher — same
 pattern as `provision.sh` — so `seed_repo()` runs in the launcher's
 process after `provision_machine()` exports `$LEERIE_MACHINE_ID`.
 
@@ -7529,64 +7529,48 @@ The mechanism is the same in both contexts:
 
 1. **Discover the completed run** — scans `.leerie/runs/*/run.json`
    on the machine via a python -c snippet through
-   `flyctl ssh console -C`. The python script picks the entry
-   with `finished_at` set, no `pushed_at`, and the most recent
-   mtime, then prints four lines on stdout: run_id, branch,
-   working_branch, no_push.
+   `flyctl ssh console -C`. Picks the entry with `finished_at` set,
+   no `pushed_at`, and the most recent mtime, then prints four lines
+   on stdout: run_id, branch, working_branch, no_push.
 
-   CRITICAL: stderr is captured to a separate tmpfile, NOT
-   merged into stdout via `2>&1`. `flyctl ssh console` prints
-   "Connecting to fdaa:..." to stderr; merging it would shift
-   every parsed line by one and corrupt the discovered run_id
-   into the "Connecting to..." string, then the branch name
-   becomes what should have been the run_id, etc. Downstream
-   `git bundle create` would silently produce an empty bundle
-   against a nonexistent branch.
+   CRITICAL: stderr is captured to a separate tmpfile, NOT merged
+   into stdout via `2>&1`. `flyctl ssh console` prints "Connecting
+   to fdaa:..." to stderr; merging it would shift every parsed line
+   by one, corrupting the discovered run_id and branch name.
+   Downstream `git bundle create` would silently produce an empty
+   bundle against a nonexistent branch.
 
-2. **Probe branch existence** — `git -C /work rev-parse --verify
-   refs/heads/<run_branch>` via ssh console. If the branch does
-   not exist (the cleared-but-empty terminal-state case described
-   in DESIGN §8 — the orchestrator exited cleanly because the
-   task was already satisfied on HEAD; setup-run.sh never ran),
-   skip step 3.
-
-   We do NOT use the `no_push` flag from `run.json` as a proxy
-   for "no branch was materialized." `no_push=true` is a
-   *mechanism* flag the launcher always forces on the in-Fly
-   orchestrator (the machine can't push), not a *user-intent*
-   flag and not a "no branch" signal. The user's actual no-push
-   intent lives in `fly-machine.json`'s `host_no_push`.
+   We do NOT use the `no_push` flag from `run.json` as a proxy for
+   "no branch was materialized." `no_push=true` is a *mechanism*
+   flag the launcher always forces on the in-Fly orchestrator (the
+   machine can't push), not a "no branch" signal — the user's actual
+   no-push intent lives in `fly-machine.json`'s `host_no_push`.
 
 3. **Run branch via git bundle** — `git -C /work bundle create -
    leerie/runs/<run-id>` on the machine, piped to a host tempfile,
    then fetched via `git fetch <bundle> +<branch>:<branch>` into
-   the host repo. The bundle resolves cleanly because both repos
-   share the same origin history.
+   the host repo. Resolves cleanly because both repos share the
+   same origin history.
 
 4. **Run state directory** — tars `/work/.leerie/runs/<run-id>`
    on the machine and extracts it under `$LEERIE_STATE_HOST_DIR/runs/`
-   on the host. After extraction, `run.json` and `state.json`
-   are present on the host exactly as they would be after a
-   local run.
+   on the host, so `run.json` and `state.json` end up present exactly
+   as after a local run.
 
 5. **Strip mechanism `no_push` from synced run.json — conditional
-   on branch presence.** After the tar extracts, if a run branch
-   was actually fetched in step 3 AND the host-side run.json has
-   `no_push=true`, remove the field. This is defense against
-   in-flight old-image runs that wrote the mechanism flag; the
-   user's intent is stored elsewhere (see
-   `fly-machine.json.host_no_push`).
+   on branch presence.** After the tar extracts, if a run branch was
+   fetched in step 3 AND the host-side run.json has `no_push=true`,
+   remove the field — defense against in-flight old-image runs that
+   wrote the mechanism flag; the user's intent lives in
+   `fly-machine.json.host_no_push` instead.
 
    When step 2's branch probe returned absent (the cleared-but-empty
    terminal-state case — DESIGN §8), the stripper is **skipped**.
    `_finish_no_work_run` deliberately writes `no_push=true` to
    `run.json` as **intent** ("nothing to push — no branch exists"),
    and `host_finalize`'s `no_push` gate reads that intent to
-   short-circuit cleanly (the rev-parse defense-in-depth guard is
-   a backstop for the same case). Stripping `no_push` here would
-   disarm the gate; host_finalize would fall through to the
-   rev-parse guard and still return cleanly, but the on-disk
-   run.json would no longer reflect the orchestrator's intent.
+   short-circuit cleanly (the rev-parse guard backstops the same
+   case). Stripping `no_push` here would disarm the gate.
 
 The script is **sourced** (not exec'd) by the launcher and exports
 `LEERIE_REMOTE_RUN_ID` on success (the discovered run-id, in case the caller
@@ -7621,42 +7605,36 @@ of state. The launcher routes by observation:
 The "alive orchestrator" case is detected by a two-layered flock probe.
 **Early probe (resume path only):** on the `_resumed=true` path, the
 launcher runs a lightweight Python flock snippet via `flyctl ssh console`
-immediately after `resume_machine` — before `seed_auth`. If the probe
-returns rc=75 (lock held), the launcher skips `seed_auth`, `re_seed`,
-and the launch wrapper entirely, pivoting straight to
-`_attach_to_live_orchestrator` (lib.sh). SSH readiness is not a concern:
-when the orchestrator is alive, the machine was never stopped and
-hallpass is already warm; if the probe fails for any non-75 reason, the
-launcher falls through to `seed_auth`. **Launch-time probe
-(belt-and-suspenders):** the launcher's in-machine Python launch
-wrapper takes a fast-path flock probe (DESIGN §6 *Single owner per run
-dir*) and exits 75 when the run-directory lock is held. This covers
-fresh provisions and any race the early probe missed. Because `flyctl
-ssh console` does not forward remote exit codes (see
-§Single-owner-per-run-dir enforcement, *flyctl exit-code workaround*),
-the launcher parses the real code from stderr via
-`_extract_flyctl_remote_rc`. Both probes pivot via
-`_attach_to_live_orchestrator` (lib.sh): it invokes
-`tail_with_optional_autofinalize()` (default) or a `flyctl ssh console`
-bash payload (`--shell`) against the live machine, and sets
+immediately after `resume_machine` — before `seed_auth`. rc=75 (lock
+held) skips `seed_auth`/`re_seed`/launch entirely, pivoting straight to
+`_attach_to_live_orchestrator` (lib.sh) — SSH readiness is not a concern
+since an alive orchestrator means the machine was never stopped and
+hallpass is already warm; any other rc falls through to `seed_auth`.
+**Launch-time probe (belt-and-suspenders):** the in-machine Python
+launch wrapper takes its own fast-path flock probe (DESIGN §6 *Single
+owner per run dir*) and exits 75 when the lock is held, covering fresh
+provisions and any race the early probe missed. `flyctl ssh console`
+doesn't forward remote exit codes, so the launcher parses the real code
+from stderr via `_extract_flyctl_remote_rc`. Both probes pivot via
+`_attach_to_live_orchestrator`: `tail_with_optional_autofinalize()`
+(default) or a `flyctl ssh console` bash payload (`--shell`), and set
 `container_rc=130` so `decide_teardown` leaves the machine alone. The
 attach transport is `flyctl ssh console` proxied through Fly's
-hallpass + WireGuard mesh — no sshd in the image, no key management,
-no public exposure. Auth inherits from `flyctl auth status`.
+hallpass + WireGuard mesh — no sshd, no key management, no public
+exposure. Auth inherits from `flyctl auth status`.
 
 Run-id resolution:
 
 1. `leerie resume <id>` → look up
    `$LEERIE_STATE_HOST_DIR/runs/<id>/fly-machine.json` first, then
    `$LEERIE_STATE_HOST_DIR/runs/<id>/run.json` (which carries
-   `fly_machine_id` per Phase 2). If neither yields a value, exit
-   with the per-id "no Fly machine pointer found" error.
+   `fly_machine_id` per Phase 2). Neither → per-id "no Fly machine
+   pointer found" error.
 2. `leerie resume` (no run-id) → scan
-   `$LEERIE_STATE_HOST_DIR/remote/*.json` for active records (records
-   whose filename is a launcher PID that still exists). Exactly one
-   → resolve the run-id from the record and continue. Multiple →
-   print the list and exit 1. None → fall through to the existing
-   per-id "no Fly machine pointer found" error path.
+   `$LEERIE_STATE_HOST_DIR/remote/*.json` for active records (filename
+   is a launcher PID that still exists). Exactly one → resolve and
+   continue. Multiple → print the list and exit 1. None → fall through
+   to the per-id error path.
 
 `provision.sh` writes the PID-keyed record at
 `$LEERIE_STATE_HOST_DIR/remote/$$.json` immediately after creating the
@@ -7665,8 +7643,8 @@ machine, and also writes the run-keyed pointer
 in the same call — before returning to the launcher — so `resume`
 survives a Ctrl-C between `provision_machine()` returning and the
 launcher's deferred copy. `destroy_machine` removes the PID-keyed
-record on full reap. The launcher's copy (guarded by `[ ! -f ]`) is a
-no-op fallback for compatibility with older images.
+record on full reap; the launcher's own copy (guarded by `[ ! -f ]`)
+is a no-op fallback for older images.
 
 Schema for the record (both paths):
 
@@ -7692,11 +7670,10 @@ Both flags are launcher-only — the filter loop strips them from
 `REWRITTEN_ARGS` before exec into the orchestrator (same convention as
 `--no-re-seed`, `--no-runtime-install`).
 
-Local-runtime `resume` is unaffected by this smart router. Local
-runs are synchronous foreground processes (`nerdctl run --rm` with no
-backgrounding), so there is no detached container to attach to; local
-`resume` keeps its existing inline-re-exec behavior. The smart
-router branches live inside the `RUNTIME=fly` guard.
+Local-runtime `resume` is unaffected: local runs are synchronous
+foreground processes (`nerdctl run --rm`, no backgrounding), so there's
+no detached container to attach to — local `resume` keeps its inline
+re-exec behavior. The smart router branches live inside `RUNTIME=fly`.
 
 Maps to `DESIGN.md`: §6 *Smart resume in remote mode*.
 
@@ -7704,52 +7681,42 @@ Maps to `DESIGN.md`: §6 *Smart resume in remote mode*.
 
 Two user-visible surfaces share one mechanism:
 
-1. **`leerie re-seed <run-id> [--force]`** — explicit fast-path
-   before runtime preflight. Wakes the machine if stopped, runs the
-   safety check, runs `seed_repo_dirty`, exits. No orchestrator
-   exec — for the case where the user wants to attach via Phase 3
-   to inspect before resuming.
-2. **Auto-re-seed on `leerie resume <run-id> --runtime fly`** —
-   inside the `RUNTIME=fly` branch, when `resume_machine` runs
-   (i.e., the dual-file resolver — `fly-machine.json` first, then
-   `run.json` — yielded a `fly_machine_id` for the run-id), the
-   launcher calls `re_seed` between `seed_auth` and the orchestrator
-   exec. `--no-re-seed` opts out (rate-limit case where nothing
-   changed host-side). `--force` bypasses the safety check.
+1. **`leerie re-seed <run-id> [--force]`** — explicit fast-path before
+   runtime preflight. Wakes the machine if stopped, runs the safety
+   check, runs `seed_repo_dirty`, exits — no orchestrator exec, for
+   when the user wants to attach via Phase 3 to inspect before resuming.
+2. **Auto-re-seed on `leerie resume <run-id> --runtime fly`** — inside
+   the `RUNTIME=fly` branch, when `resume_machine` runs (the dual-file
+   resolver yielded a `fly_machine_id`), the launcher calls `re_seed`
+   between `seed_auth` and the orchestrator exec. `--no-re-seed` opts
+   out (nothing changed host-side); `--force` bypasses the safety check.
 
-   The dispatch is strict on `resume`: if no machine pointer is
-   found in either sidecar, the launcher dies with a diagnostic
-   pointing at `leerie list` rather than silently provisioning a
-   fresh machine (which would orphan the original on Fly). Likewise,
-   if `resume_machine` returns non-zero (machine destroyed or
-   unstart-able), the launcher exits with the failure instead of
-   falling through to `provision_machine`. Without `resume`,
-   behavior is unchanged — fresh runs always provision.
+   The dispatch is strict on `resume`: no machine pointer in either
+   sidecar dies with a diagnostic pointing at `leerie list` rather than
+   silently provisioning a fresh machine (which would orphan the
+   original on Fly). A non-zero `resume_machine` (destroyed/unstart-able)
+   exits with the failure rather than falling through to
+   `provision_machine`. Without `resume`, fresh runs always provision.
 
 Three operations in `re_seed`, in order:
 
 1. **Wake the machine if needed.** `flyctl machine status` → if
-   `stopped`, `flyctl machine start` + `wait_for_started`. Other
-   states (`destroyed`, `replacing`, …) abort with an actionable
-   message.
+   `stopped`, `flyctl machine start` + `wait_for_started`. Other states
+   (`destroyed`, `replacing`, …) abort with an actionable message.
 2. **Safety check (unless `LEERIE_RE_SEED_FORCE=1`).** Run
-   `flyctl machine exec git -C /work status --porcelain` and filter
-   out paths under `.leerie/` (worker state is expected to change
-   there). If any tracked file is dirty, refuse with a message
-   listing the first 10 paths and pointing at `leerie resume
-   <run-id> --shell` and the `--force` bypass. Prevents silent
-   clobbering of in-flight worker edits that haven't yet been
-   committed to a per-subtask branch.
-3. **`seed_repo_dirty`.** Recompute the host's `git status
-   --porcelain` dirty set, append every file under the repo-local
-   `.claude/` directory (force-included even when gitignored — workers
-   need its hooks/agents/skills/commands), filter the combined list
-   (drop `.git/*`, non-whitelisted `.leerie/*` paths, and `.leerie/runs/*/worktrees/*` defensive
-   entries), then rsync the result to `/work` on the machine via
-   `fly_rsync_wrapper` from `lib.sh` (transports `rsync --server` over
-   `flyctl ssh console -C`). The full-history clone on the machine is
-   preserved — re-seed must never re-clone, because that would
-   obliterate the run branch and per-subtask branches.
+   `flyctl machine exec git -C /work status --porcelain`, filtering out
+   `.leerie/` paths (worker state is expected to change there). Any
+   dirty tracked file refuses with a message listing the first 10 paths
+   and pointing at `leerie resume <run-id> --shell` and `--force` —
+   prevents clobbering in-flight worker edits not yet committed.
+3. **`seed_repo_dirty`.** Recompute the host's `git status --porcelain`
+   dirty set, append every file under `.claude/` (force-included even
+   when gitignored — workers need its hooks/agents/skills/commands),
+   filter the combined list (drop `.git/*`, non-whitelisted `.leerie/*`
+   paths, `.leerie/runs/*/worktrees/*`), then rsync to `/work` via
+   `fly_rsync_wrapper` (lib.sh). The full-history clone on the machine
+   is preserved — re-seed must never re-clone, which would obliterate
+   the run branch and per-subtask branches.
 
 Launcher flag consumption:
 
@@ -7779,47 +7746,40 @@ Two new launcher flags, routed at the top of `leerie` alongside
   `ec2-instance.json` → Fly/EC2 path; (2) `_is_local_container` probes
   `nerdctl inspect <run-id>` → local path; (3) neither → error.
   `--runtime` accepts `local`/`fly`/`ec2` explicitly, validated by the
-  launcher (bash). `_auto_detect_fly_runtime` is retained as a
-  back-compat Fly-only wrapper around `_auto_detect_run_runtime` for
-  call sites that have not yet grown EC2 handling.
+  launcher (bash). `_auto_detect_fly_runtime` is a back-compat Fly-only
+  wrapper around `_auto_detect_run_runtime` for call sites that have
+  not yet grown EC2 handling.
   - **Fly path:** sources `provision.sh`, exports `LEERIE_MACHINE_ID`
     and `FLY_APP`, calls `stop_machine()`.
   - **EC2 path:** sources `aws-credentials.sh` + `ec2-lib.sh` +
     `ec2-provision.sh`, resolves AWS credentials via
     `resolve_aws_credentials()` and gates on `require_aws()` (same
     ordering as the `RUNTIME=ec2` dispatch branch — see "Remote
-    execution mode"), resolves `LEERIE_EC2_INSTANCE_ID` from the run's
-    sidecar via `_resolve_ec2_instance_id_from_run_dir` (checks
-    `ec2-instance.json` first, then `run.json` — mirrors
-    `_resolve_volume_id_from_run_dir`'s fallback order), then calls
-    `stop_instance()`. `StopInstances` preserves the root EBS volume
-    (DESIGN §6 *EC2 runtime lifecycle*, "EBS volume lifecycle" case 2
-    — stop-scoped, never `DeleteOnTermination`). Fails closed with an
-    actionable message if no `ec2_instance_id` is found in the
-    sidecar, and via `require_aws`'s existing `aws sso login` hint if
-    credentials don't resolve — before any `aws ec2 ...` call is made.
+    execution mode"), resolves `LEERIE_EC2_INSTANCE_ID` via
+    `_resolve_ec2_instance_id_from_run_dir` (checks `ec2-instance.json`
+    first, then `run.json`), then calls `stop_instance()`.
+    `StopInstances` preserves the root EBS volume (DESIGN §6 *EC2
+    runtime lifecycle*, "EBS volume lifecycle" case 2 — stop-scoped,
+    never `DeleteOnTermination`). Fails closed if no `ec2_instance_id`
+    is in the sidecar, and via `require_aws`'s `aws sso login` hint if
+    credentials don't resolve — before any `aws ec2 ...` call.
   - **Local path:** sources `lib.sh`, calls `nerdctl stop <run-id>`
-    (SIGTERM first — the orchestrator's `InterruptedBySignal` handler
-    saves state before exit — then SIGKILL after grace period; `--rm`
-    on the original `nerdctl run` auto-removes the container).
+    (SIGTERM first — `InterruptedBySignal` saves state before exit —
+    then SIGKILL after grace period; `--rm` auto-removes the container).
   - All three paths call `update_run_json` to set `paused_at =
-    <iso_now>` and `pause_reason = "user-requested"` on the sidecar
-    (the EC2 path also writes `ec2_instance_id`, mirroring how the Fly
-    path writes `fly_machine_id`). The run is resumable via `leerie
-    resume <id>` — the `RUNTIME=ec2` dispatch branch resolves a
-    paused instance id from the sidecar and calls `resume_instance()`
-    (see the `scripts/remote/ec2-resume-instance.sh` row above and
-    `tests/test_ec2_launcher_resume.py`).
+    <iso_now>` and `pause_reason = "user-requested"` (EC2 also writes
+    `ec2_instance_id`, mirroring Fly's `fly_machine_id`). Resumable via
+    `leerie resume <id>` (see `scripts/remote/ec2-resume-instance.sh`
+    and `tests/test_ec2_launcher_resume.py`).
   - **Test coverage:** `tests/test_ec2_launcher_stop.py` — EC2
     autodetect and explicit `--runtime ec2`, `stop-instances` called
     and never `terminate-instances`, missing-instance-id and
-    credential-failure fail-closed paths (asserting zero `aws ec2`
-    calls reach the stub), and a regression pin that the local/Fly
-    fallthrough error text still fires unchanged when no sidecar of
-    any kind is present.
+    credential-failure fail-closed paths, and a regression pin that the
+    local/Fly fallthrough error text still fires unchanged with no
+    sidecar present.
 - **`leerie kill <run-id> [--force]`** — destroy. Same runtime
-  detection as `stop`. Prompts the user to type the run-id to
-  confirm (unless `--force` / `LEERIE_FORCE_KILL=1`).
+  detection as `stop`. Prompts the user to type the run-id to confirm
+  (unless `--force` / `LEERIE_FORCE_KILL=1`).
   - **Fly path:** calls `destroy_machine()`, sets `killed_at` and
     `fly_machine_id` on the sidecar.
   - **Local path:** calls `nerdctl kill <run-id>` (immediate SIGKILL),
@@ -7827,16 +7787,15 @@ Two new launcher flags, routed at the top of `leerie` alongside
   - The run is no longer resumable.
 
   Recovery path for the orphan case: `leerie kill --machine-id <id>
-  --app <app>` allows destruction by machine-id directly when the
-  sidecar is missing or unreadable (e.g., `.leerie/` was deleted but
-  the machine is still running on Fly). This path is Fly-only.
+  --app <app>` destroys by machine-id directly when the sidecar is
+  missing or unreadable (e.g., `.leerie/` deleted but the machine is
+  still running on Fly). Fly-only.
 
-Both verbs route before any runtime preflight (fast-path dispatch)
-and exit without ever sourcing `seed-auth.sh` / `seed-repo.sh`. The
-Fly path calls `require_flyctl` from `lib.sh`; the local path only
-sources `lib.sh` (for `update_run_json` / `iso_now`). Both are
-read-only with respect to the local repo (except for the sidecar
-update).
+Both verbs route before any runtime preflight and exit without ever
+sourcing `seed-auth.sh` / `seed-repo.sh`. The Fly path calls
+`require_flyctl` from `lib.sh`; the local path only sources `lib.sh`
+(for `update_run_json` / `iso_now`). Both are read-only with respect
+to the local repo (except for the sidecar update).
 
 The `killed_at` field is added to `RUN_STATUSES` in `orchestrator/leerie.py`
 as a new terminal state (`killed`); `_derive_run_status` reads it
@@ -7849,301 +7808,309 @@ pattern as today's `paused_at` vs `pushed_at`).
 DESIGN §6 *`finished_at` is a discovery sentinel, not a completion
 signal*. Because `main()`'s `except SystemExit` handler stamps
 `finished_at` on any post-setup `die()` (needed for `fetch_branch`
-discovery), `finished_at` does not by itself mean the run's waves all
-integrated. A run OOM-killed mid-wave can carry `finished_at` with
-`completed_waves < len(waves)`. Three code-surface elements gate on real
-completion, all reading the same signal from `state.json` (`run.json`
-never carries `completed_waves`/`waves`):
+discovery), `finished_at` alone does not mean the run's waves all
+integrated — a run OOM-killed mid-wave can carry `finished_at` with
+`completed_waves < len(waves)`. Three code-surface elements gate on
+real completion, all reading the same signal from `state.json`
+(`run.json` never carries `completed_waves`/`waves`):
 
-- **`_derive_run_status`** takes `state_json` (already passed) and, when
-  `finished_at` is set but `completed_waves < len(state_json["waves"])`
-  and neither `killed_at` nor `paused_at` is set, returns the new status
-  `incomplete` instead of `done`/`done-pushed-*`. The check fires after
-  the push/PR-error checks (a real push/PR error still surfaces as
-  itself) but before the `finished_at`→`done` check. `incomplete` is
-  added to the derived-status set and is a valid `list status`
+- **`_derive_run_status`** takes `state_json` and, when `finished_at`
+  is set but `completed_waves < len(state_json["waves"])` and neither
+  `killed_at` nor `paused_at` is set, returns the new status
+  `incomplete` instead of `done`/`done-pushed-*`. Fires after the
+  push/PR-error checks but before `finished_at`→`done`. `incomplete`
+  is added to the derived-status set and is a valid `list status`
   filter value. The cleared-but-empty terminal state
   (`no_work_required`, `waves == []`) is exempt — `completed_waves (0)
-  < len([]) (0)` is false, so it still reads `done`. This gates only the
+  < len([]) (0)` is false, so it still reads `done`. Gates only the
   `list` *display*, not the push.
-- **`phase_finalize`** guards its entry: if
-  `completed_waves < len(waves)`, it `die()`s with a "refusing to
-  finalize: N of M waves complete" message rather than writing the real
-  `finished_at`. Belt-and-suspenders — the normal wave loop only reaches
-  `phase_finalize` after all waves integrate (the no-work path returns
-  before it), but a stray finalize-only invocation is blocked here. Note
-  this is the *in-container* orchestrator; it does not itself push.
-- **`host_finalize`** (`scripts/host-finalize.sh`) is the **load-bearing
-  gate**, because the push+PR is host-side. After the `no_push` and
-  `pushed_at` early-returns, it reads `$run_dir/state.json` (already in
-  scope for the PR-body fallback) and `return 1`s with an actionable
-  resume hint when `no_work_required != true` and `completed_waves <
-  (.waves | length)`. All three host-side push entry points funnel
-  through `host_finalize` — the launcher's auto-finalize block
-  (`leerie`), the `leerie finalize <id>` verb, and Fly's
-  `decide_teardown` (`scripts/remote/provision.sh`) — so this one gate
-  covers them all. Fail-open: absent/non-numeric wave fields skip the
-  gate so a legitimately complete run is never blocked over a missing
-  file. Without this gate, `_derive_run_status` and `phase_finalize`
-  alone would still let a stray `finalize` push a partial branch (the
+- **`phase_finalize`** guards its entry: `completed_waves < len(waves)`
+  `die()`s with a "refusing to finalize: N of M waves complete"
+  message rather than writing the real `finished_at`.
+  Belt-and-suspenders — the wave loop only reaches `phase_finalize`
+  after all waves integrate (no-work returns before it), but a stray
+  finalize-only invocation is blocked here. This is the *in-container*
+  orchestrator; it does not itself push.
+- **`host_finalize`** (`scripts/host-finalize.sh`) is the
+  **load-bearing gate**, because the push+PR is host-side. After the
+  `no_push`/`pushed_at` early-returns, it reads `$run_dir/state.json`
+  and `return 1`s with an actionable resume hint when
+  `no_work_required != true` and `completed_waves < (.waves | length)`.
+  All three host-side push entry points funnel through `host_finalize`
+  — the launcher's auto-finalize block, `leerie finalize <id>`, and
+  Fly's `decide_teardown` — so this one gate covers them all.
+  Fail-open: absent/non-numeric wave fields skip the gate so a
+  legitimately complete run is never blocked over a missing file.
+  Without this gate, `_derive_run_status` and `phase_finalize` alone
+  would still let a stray `finalize` push a partial branch (the
   PR-#22 incident).
 
 #### `_create_empty_subtask_branch(repo_root, run_id, sid)`
 
 A settle that never ran an implementer still owes the wave a branch.
-`integrate_wave` filters on `status == "complete"` alone and never asks whether
-`leerie/subtasks/<run-id>/<sid>` exists; `scripts/integrate.sh` exits 2 on a
-missing branch, and `integrate_wave` turns rc 2 into a `die()`.
+`integrate_wave` filters on `status == "complete"` alone and never asks
+whether `leerie/subtasks/<run-id>/<sid>` exists; `scripts/integrate.sh`
+exits 2 on a missing branch, and `integrate_wave` turns rc 2 into a
+`die()`.
 
-The post-execution rescue is safe because its implementer ran: the branch
-exists with zero commits, and `git merge --no-ff` of a branch already an
-ancestor is a true no-op. The pre-spawn probe (DESIGN §8 *Probing a flagged
-subtask before it spends*) returns first, so this helper creates the same
-artifact at the run-branch tip before settling.
+The post-execution rescue is safe because its implementer ran: the
+branch exists with zero commits, and `git merge --no-ff` of a branch
+already an ancestor is a true no-op. The pre-spawn probe (DESIGN §8
+*Probing a flagged subtask before it spends*) returns first, so this
+helper creates the same artifact at the run-branch tip before settling.
 
-Idempotent — an existing branch is never repointed, since on resume it may
-carry commits — and the settle is gated on it: if the branch cannot be created
-the subtask falls through to its implementer, because a settle integration
-cannot merge is worse than the spend it saves. A failure names the git error
-rather than reporting an unactionable "could not be created".
+Idempotent — an existing branch is never repointed, since on resume it
+may carry commits — and the settle is gated on it: if the branch can't
+be created the subtask falls through to its implementer, because a
+settle integration cannot merge is worse than the spend it saves. A
+failure names the git error rather than an unactionable "could not be
+created".
 
 #### Scoped worktree pruning (`worktree-lib.sh`, `_prune_leerie_worktrees`)
 
-`scripts/worktree-lib.sh` exports `prune_leerie_worktrees <leerie-root>`, sourced by `setup-run.sh`,
-`new-worktree.sh` and `cleanup.sh`, which previously each ran a bare
-`git worktree prune`.
+`scripts/worktree-lib.sh` exports `prune_leerie_worktrees <leerie-root>`,
+sourced by `setup-run.sh`, `new-worktree.sh` and `cleanup.sh`, which
+previously each ran a bare `git worktree prune`.
 
-The repo is bind-mounted whole into every container, so `.git` is SHARED with
-the host and with any other container. A bare prune is repository-global and
-has **no grace period** — the 3-month `gc.worktreePruneExpire` applies to
-`git gc`, not to an explicit `prune` — so it drops the registration of any
-worktree whose path is absent from the pruning process's namespace. That
-includes every host-side `/tmp/tmp.*/rebase-<run-id>` worktree the finalize
-rebase creates, which no container can see.
+The repo is bind-mounted whole into every container, so `.git` is
+SHARED with the host and any other container. A bare prune is
+repository-global with **no grace period** (`gc.worktreePruneExpire`
+applies to `git gc`, not an explicit `prune`), so it drops the
+registration of any worktree whose path is absent from the pruning
+process's namespace — including every host-side
+`/tmp/tmp.*/rebase-<run-id>` worktree the finalize rebase creates,
+which no container can see.
 
-The replacement asks git what it would prune (`git worktree prune -n -v`,
-whose output is on **stderr**), maps each reported admin name back to its path
-via `$GIT_DIR/worktrees/<name>/gitdir`, and prunes only registrations under the
-root it is GIVEN. The two callers pass different roots and that is deliberate:
-the shell helper is called with `$LEERIE_ROOT` (the state root), so it may reap
-a sibling run's stale registrations, while the Python port is called with the
-run directory and cannot. Host registrations — every
-`/tmp/tmp.*/rebase-<run-id>` the finalize rebase creates — are out of scope
-either way, which is the whole point. Removing the prune entirely is not an option — it is what
-clears the stale `.git/worktrees/` metadata a SIGKILLed run leaves behind, the
-failure `new-worktree.sh` documents.
+The replacement asks git what it would prune (`git worktree prune -n
+-v`, output on **stderr**), maps each reported admin name back to its
+path via `$GIT_DIR/worktrees/<name>/gitdir`, and prunes only
+registrations under the given root. The two callers pass different
+roots deliberately: the shell helper is called with `$LEERIE_ROOT`
+(the state root), so it may reap a sibling run's stale registrations,
+while the Python port is called with the run directory and cannot.
+Host registrations are out of scope either way, which is the point —
+removing the prune entirely is not an option, since it's what clears
+the stale `.git/worktrees/` metadata a SIGKILLed run leaves behind.
 
 The orchestrator's own four call sites — `_cleanup_on_abnormal_exit`,
-`_reset_subtask_worktree`, `_prune_subtask_worktree` and `phase_execute`'s
-post-`setup-run.sh` prune — go through `_prune_leerie_worktrees`, the Python
-port of the same mechanism at run-dir granularity (see above). Two of the four
-(`_reset_subtask_worktree` and `_prune_subtask_worktree`) dispatch it via
-`asyncio.to_thread`, because both are awaited from inside the wave and the
-call shells out to git — both share that rmtree-fallback+`to_thread`-prune
-tail through one helper, `_rmtree_fallback_and_prune`, rather than each
-inlining it; `_cleanup_on_abnormal_exit` runs synchronously off
-`st.run_dir` on a path where there is no loop left to block. The probe itself
-runs under `LC_ALL=C LANGUAGE=` — `git worktree prune -n -v` wraps its output
-in `_()`, so parsing English prefixes under another locale matches nothing
-(`tests/test_worktree_prune_scoping.py` pins the property, not the spelling).
+`_reset_subtask_worktree`, `_prune_subtask_worktree` and
+`phase_execute`'s post-`setup-run.sh` prune — go through
+`_prune_leerie_worktrees`, the Python port at run-dir granularity. Two
+of the four (`_reset_subtask_worktree`, `_prune_subtask_worktree`)
+dispatch it via `asyncio.to_thread` since both are awaited from inside
+the wave and shell out to git — sharing the rmtree-fallback+
+`to_thread`-prune tail through one helper, `_rmtree_fallback_and_prune`;
+`_cleanup_on_abnormal_exit` runs synchronously off `st.run_dir` where
+there's no loop left to block. The probe runs under `LC_ALL=C
+LANGUAGE=` — `git worktree prune -n -v` wraps its output in `_()`, so
+parsing English prefixes under another locale matches nothing
+(`tests/test_worktree_prune_scoping.py` pins the property).
 
 `tests/test_worktree_prune_scoping.py` guards against a bare-prune
-regression at any of these sites. It derives its surface from
+regression at any of these sites, deriving its surface from
 `scripts/**/*.sh` + `scripts/**/*.py` + `orchestrator/**/*.py` +
-`chain/**/*.py` + the launcher, including Python embedded in a shell
-heredoc, via an `ast` walk over call names, argument shapes and
-languages, backstopped by a coarse textual floor underneath.
+`chain/**/*.py` + the launcher (including Python embedded in a shell
+heredoc) via an `ast` walk over call names/argument shapes/languages,
+backstopped by a coarse textual floor underneath.
 
 #### Prune verb (`leerie prune`)
 
 Reclaims state that nothing else reaps — run directories, repo-map-cache
-entries, and stale `leerie/subtasks/*` branches accumulate unbounded, while
-`preflight()` already refuses to start a run on low disk headroom and tells
-the operator to prune by hand.
+entries, and stale `leerie/subtasks/*` branches accumulate unbounded,
+while `preflight()` already refuses to start a run on low disk headroom
+and tells the operator to prune by hand.
 
 Host-only (no container). `leerie prune [--older-than DAYS] [--apply]`;
-`--older-than` accepts both the space-separated and `=` forms and defaults to
-**14**. **Dry-run is the default** and `--apply` is required to delete anything:
-this removes directories that may hold the only record of a paid-for run, so the
-safe mode is the one you get without asking.
+`--older-than` accepts both the space-separated and `=` forms and
+defaults to **14**. **Dry-run is the default** and `--apply` is
+required to delete anything: this removes directories that may hold
+the only record of a paid-for run, so the safe mode is the default.
 
-Three categories. Run directories and cache entries are subject to the age cutoff; **branches are not** — they are scoped by run-dir liveness, so a branch whose run dir was deleted by hand is in scope regardless of age:
+Three categories. Run directories and cache entries are subject to the
+age cutoff; **branches are not** — they're scoped by run-dir liveness,
+so a branch whose run dir was deleted by hand is in scope regardless
+of age:
 
 - **terminal run directories** — only those whose `run.json` carries
-  `finished_at` or `killed_at`. A paused or in-flight run is resumable and
-  survives regardless of age.
-- **repo-map cache entries** under `<state-root>/repo-map-cache/` — regenerated
-  on demand.
-- **orphaned subtask branches** — `leerie/subtasks/<run-id>/*` whose run-id is
-  not among the runs this pass left alive (`run_id not in live`), which is a
-  different set from "run directory absent from `<state-root>/runs/`": a run
-  dir removed by this very pass is gone from disk yet still in scope, and a
-  surviving dir keeps its branches whatever their age. `docs/USAGE.md`
-  already states it this way. Scoped to that namespace, so a user branch is
-  never in scope.
+  `finished_at` or `killed_at`. A paused or in-flight run is resumable
+  and survives regardless of age.
+- **repo-map cache entries** under `<state-root>/repo-map-cache/` —
+  regenerated on demand.
+- **orphaned subtask branches** — `leerie/subtasks/<run-id>/*` whose
+  run-id is not among the runs this pass left alive (`run_id not in
+  live`), distinct from "run directory absent from
+  `<state-root>/runs/`": a run dir removed by this very pass is gone
+  from disk yet still in scope, and a surviving dir keeps its branches
+  whatever their age (`docs/USAGE.md` already states it this way).
+  Scoped to that namespace, so a user branch is never in scope.
 
-**Branch reaping needs positive evidence.** "No run dir in this state root" is
-not evidence a branch is orphaned — a state root is silent about every run it
-never owned, so pruning from the wrong `--state-dir` would read every branch as
-dead. Checking `runs.is_dir()` does not help: the orchestrator creates that
-directory unconditionally, so the guard can never fire.
+**Branch reaping needs positive evidence.** "No run dir in this state
+root" is not evidence a branch is orphaned — a state root is silent
+about every run it never owned, so pruning from the wrong
+`--state-dir` would read every branch as dead. Checking `runs.is_dir()`
+doesn't help: the orchestrator creates that directory unconditionally.
 
 Three tiers, in order:
 
 1. a run dir **this prune just removed** is known terminal and old → `-D`;
-2. the branch is an **ancestor of its own run branch**, so its commits are
-   already reachable from the integrated history → `-D`. This tier is what
-   keeps the feature useful: `git branch -d` checks merged-into-HEAD, and a
-   subtask branch is merged into `leerie/runs/<id>`, never into `main`, so
-   without it a fully integrated, long-pushed branch is refused exactly like
-   one holding unique work;
-3. everything else → `git branch -d`, which git refuses when the branch is
-   unmerged.
+2. the branch is an **ancestor of its own run branch**, so its commits
+   are already reachable from the integrated history → `-D`. This tier
+   keeps the feature useful: `git branch -d` checks merged-into-HEAD,
+   and a subtask branch merges into `leerie/runs/<id>`, never `main`,
+   so without it a fully integrated, long-pushed branch is refused
+   exactly like one holding unique work;
+3. everything else → `git branch -d`, which git refuses when unmerged.
 
-Stale merged branches are still reclaimed (F22's 64); unmerged work cannot be
-lost whatever this root does or does not know. Kept branches are reported
-(`kept N subtask branch(es) with unmerged commits`), and a delete that fails for
-any *other* reason is reported as itself — `-D` never refuses for unmergedness,
-and saying it did is what kept the next defect invisible.
+Stale merged branches are still reclaimed (F22's 64); unmerged work
+cannot be lost regardless of what this root knows. Kept branches are
+reported (`kept N subtask branch(es) with unmerged commits`), and a
+delete that fails for any *other* reason is reported as itself — `-D`
+never refuses for unmergedness, and saying it did is what kept the
+next defect invisible.
 
 **Worktree registrations are dropped before the run dir is deleted.**
 `shutil.rmtree` removes `<run>/worktrees/<sid>/` but leaves
-`.git/worktrees/<sid>`, and git then refuses `git branch -D` with "cannot delete
-branch … used by worktree at …" — so registrations must be dropped first.
+`.git/worktrees/<sid>`, and git then refuses `git branch -D` with
+"cannot delete branch … used by worktree at …" — so registrations
+must be dropped first.
 
 Attribution is by **host** path, and the `gitdir` file may hold either
-spelling: a subtask worktree is created *inside* the container, where the
-state root is bind-mounted at `/leerie-state`, so `new-worktree.sh` writes
-`/leerie-state/runs/<id>/…` while prune runs on the host. `_host_spelling`
-translates the container prefix — the same mapping `_operator_path` performs
-for operator-facing text — before any comparison. Without it the whole
-deregistration was a no-op in the only runtime that produces the defect.
-A relative `gitdir` (git ≥ 2.48 with `worktree.useRelativePaths=true`) is
-resolved against the *entry* directory, not the process cwd, and an empty one
-is unattributable rather than resolving to the cwd.
+spelling: a subtask worktree is created *inside* the container, where
+the state root is bind-mounted at `/leerie-state`, so `new-worktree.sh`
+writes `/leerie-state/runs/<id>/…` while prune runs on the host.
+`_host_spelling` translates the container prefix — the same mapping
+`_operator_path` performs for operator-facing text — before any
+comparison; without it the whole deregistration was a no-op in the
+only runtime that produces the defect. A relative `gitdir` (git ≥ 2.48
+with `worktree.useRelativePaths=true`) is resolved against the *entry*
+directory, not the process cwd, and an empty one is unattributable
+rather than resolving to the cwd.
 
-It is scoped by construction to registrations pointing inside the state root,
-so a sibling checkout's or the operator's own worktrees are never touched, and
-git's `locked` marker is honoured. Within that scope it sweeps **every**
-orphaned registration, not only the directories this pass removed: one removed
-by an earlier prune, by `cleanup.sh` or by hand leaves a registration no later
-prune would consult, and its branch is then unreapable forever.
+It's scoped by construction to registrations pointing inside the state
+root, so a sibling checkout's or the operator's own worktrees are
+never touched, and git's `locked` marker is honoured. Within that
+scope it sweeps **every** orphaned registration, not only the
+directories this pass removed: one removed by an earlier prune, by
+`cleanup.sh` or by hand leaves a registration no later prune would
+consult, and its branch is then unreapable forever.
 
 **Reaping requires liveness, not just timestamps.** Nothing clears
-`finished_at`, so a run that die()d once reads as terminal on every later
-prune, leaving `mtime < cutoff` as the only protection — and `--older-than 0`
-is accepted. `_is_live` probes the run-directory flock (`State.__init__` holds
-it for the life of the orchestrator, it is an inode lock, and the container
-bind-mounts that directory, so a host-side probe sees a container-side holder)
-and then `nerdctl inspect`, which covers a crashed orchestrator that released
-the lock while its container is still up. It fails **closed**: any probe that
-cannot complete reads as live.
+`finished_at`, so a run that die()d once reads as terminal on every
+later prune, leaving `mtime < cutoff` as the only protection — and
+`--older-than 0` is accepted. `_is_live` probes the run-directory
+flock (`State.__init__` holds it for the life of the orchestrator, an
+inode lock; the container bind-mounts that directory, so a host-side
+probe sees a container-side holder) and then `nerdctl inspect`, which
+covers a crashed orchestrator that released the lock while its
+container is still up. Fails **closed**: any probe that cannot
+complete reads as live.
 
-Dry run classifies branches the same way `--apply` does — it previously
-appended every candidate without probing mergedness, so the default mode
-overstated the result and never printed the `kept` line, the one thing an
-operator needs before choosing `--apply`. The two modes are not identical: a
-dry run performs no deregistration, so it has no `branches_blocked` equivalent
-and cannot report a delete that `--apply` would find blocked.
+Dry run classifies branches the same way `--apply` does — it
+previously appended every candidate without probing mergedness, so
+the default mode overstated the result and never printed the `kept`
+line, the one thing an operator needs before choosing `--apply`. The
+two modes are not identical: a dry run performs no deregistration, so
+it has no `branches_blocked` equivalent and cannot report a delete
+that `--apply` would find blocked.
 
-`prune` is a launcher-only verb and appears in the `REWRITTEN_ARGS` guard arm,
-so a misplaced `leerie <task> prune` errors rather than reaching the
-orchestrator's argparse.
+`prune` is a launcher-only verb and appears in the `REWRITTEN_ARGS`
+guard arm, so a misplaced `leerie <task> prune` errors rather than
+reaching the orchestrator's argparse.
 
 #### Accept-blocked verb (`leerie accept-blocked`)
 
 When a subtask returns `status: blocked` due to unsatisfied `extent:
 external` prerequisites (DESIGN §5), `resume` retries it — which
-blocks again indefinitely. The `accept-blocked` verb lets the
-operator acknowledge the external block so `resume` skips that
-subtask.
+blocks again indefinitely. The `accept-blocked` verb lets the operator
+acknowledge the external block so `resume` skips that subtask.
 
 - **`leerie accept-blocked <run-id> <subtask-id> [--runtime fly|local|ec2] [--force]`**
-  — sets `subtask_status[sid]` to `"complete"` in state.json and removes
-  the sid from the `blocked` dict (if present). On `resume`,
-  `phase_execute`'s wave-skip filters subtasks whose `subtask_status` is
-  `"complete"`, so the accepted subtask never re-dispatches.
+  — sets `subtask_status[sid]` to `"complete"` in state.json and
+  removes the sid from the `blocked` dict (if present). On `resume`,
+  `phase_execute`'s wave-skip filters subtasks whose `subtask_status`
+  is `"complete"`, so the accepted subtask never re-dispatches.
 
   The gate resolves the `blocked` registry **before** testing
-  `subtask_status`, because that registry — not the status string — is the
-  authoritative record, and the two can disagree by **absence** (a sid in
-  `blocked` with no `subtask_status` entry at all, because its checkpoint
-  was rejected before a status was written) as well as by value.
+  `subtask_status`, because that registry — not the status string — is
+  the authoritative record, and the two can disagree by **absence** (a
+  sid in `blocked` with no `subtask_status` entry at all, because its
+  checkpoint was rejected before a status was written) as well as by
+  value.
 
-  `--force` settles a subtask abandoned **mid-flight** — `in_progress` with
-  no registry entry, what a hard crash (ENOSPC, SIGKILL) leaves behind and
-  which neither field can express as blocked. It bypasses both status
-  checks, so it validates the sid against the scheduled set (`waves`) to
-  stop a typo minting a bogus `subtask_status` entry — **when `waves` is
-  present**, which is every run where a subtask can be blocked or
-  abandoned, since `waves` is populated at scheduling and nothing can be
-  abandoned before then. Legacy or pre-scheduling state carries no `waves`
-  and degrades open rather than refusing a legitimate accept. The default
+  `--force` settles a subtask abandoned **mid-flight** — `in_progress`
+  with no registry entry, what a hard crash (ENOSPC, SIGKILL) leaves
+  behind and which neither field can express as blocked. It bypasses
+  both status checks, so it validates the sid against the scheduled
+  set (`waves`) to stop a typo minting a bogus `subtask_status` entry
+  — **when `waves` is present**, which is every run where a subtask
+  can be blocked or abandoned, since `waves` is populated at
+  scheduling. Legacy or pre-scheduling state carries no `waves` and
+  degrades open rather than refusing a legitimate accept. The default
   stays strict, keeping `--force` a deliberate operator act. Pinned in
-  `tests/test_accept_blocked.py` (absent-key accepted, neither-field still
-  refused, forced-abandoned accepted, forced-typo refused).
+  `tests/test_accept_blocked.py` (absent-key accepted, neither-field
+  still refused, forced-abandoned accepted, forced-typo refused).
 
-  Without an explicit `--runtime`, the verb auto-detects via the shared
-  `_auto_detect_run_runtime` helper (which probes `fly-machine.json`
-  then `ec2-instance.json` — the same sidecar-probe order `stop`
-  uses), falling back to `local` only when neither sidecar is present.
+  Without an explicit `--runtime`, the verb auto-detects via the
+  shared `_auto_detect_run_runtime` helper (probes `fly-machine.json`
+  then `ec2-instance.json` — same order `stop` uses), falling back to
+  `local` only when neither sidecar is present.
   - **Input validation (all runtimes):** both positionals are checked
     against `^[A-Za-z0-9._-]+$` immediately after parsing, before they
-    reach any filesystem path or remote shell. The run-id is interpolated
-    into the host state-dir path (traversal risk) and, on Fly, into the
-    `flyctl ssh console -C` string; the sid is interpolated into that same
-    `-C` string. Since `-C` is parsed by a **remote shell**, an unvalidated
-    metacharacter would be a command-injection vector (SECURITY.md); the
-    allowlist is the mechanical enforcement (DESIGN §12).
+    reach any filesystem path or remote shell. The run-id is
+    interpolated into the host state-dir path (traversal risk) and, on
+    Fly, into the `flyctl ssh console -C` string; the sid into that
+    same `-C` string. Since `-C` is parsed by a **remote shell**, an
+    unvalidated metacharacter would be command-injection (SECURITY.md);
+    the allowlist is the mechanical enforcement (DESIGN §12).
   - **Local path:** runs the mutation program (`python3 -c "$_ab_mutate"`)
     against `$LEERIE_STATE_HOST_DIR/runs/<id>/state.json` directly
     (bind-mounted into containers).
   - **Fly path:** inspects `flyctl machine status`; refuses on
-    `destroyed`/missing; if `stopped`, wakes the machine (`flyctl machine
-    start` + `wait_for_started`, fatal on failure) and records that it did
-    so. Waits for hallpass via `wait_for_fly_ssh_ready "$FLY_APP"
-    "$machine_id"` (gated on the return). Pipes the mutation program over
-    **stdin** to `python3 -` on the machine (`printf '%s' "$_ab_mutate" |
-    flyctl ssh console ... -C "python3 - '<remote-state>' '<sid>'"`) so the
-    multi-line script body never round-trips through a shell quoter (same
-    idiom as `force-finalize.sh`). The `-C` string itself IS parsed by a
-    remote shell, so the two positional args are single-quoted and the
-    run-id/sid inside them are the validated tokens above. The program
-    prints an `ACCEPTED:` / `NOOP:` / `ERROR:` sentinel that the launcher
-    greps (flyctl flattens the remote exit code). The host-side copy is
-    mirrored best-effort. Teardown is **conditional**: the machine is
-    paused again (with `paused_at`/`pause_reason`/`fly_machine_id`
-    re-written via `update_run_json`) only if this verb woke a stopped
-    machine — a machine that was already running is left running.
+    `destroyed`/missing; if `stopped`, wakes the machine (`flyctl
+    machine start` + `wait_for_started`, fatal on failure) and records
+    that it did so. Waits for hallpass via `wait_for_fly_ssh_ready
+    "$FLY_APP" "$machine_id"`. Pipes the mutation program over
+    **stdin** to `python3 -` on the machine (`printf '%s' "$_ab_mutate"
+    | flyctl ssh console ... -C "python3 - '<remote-state>' '<sid>'"`)
+    so the multi-line script body never round-trips through a shell
+    quoter (same idiom as `force-finalize.sh`). The `-C` string itself
+    IS parsed by a remote shell, so the two positional args are
+    single-quoted and the run-id/sid inside them are the validated
+    tokens above. The program prints an `ACCEPTED:` / `NOOP:` /
+    `ERROR:` sentinel that the launcher greps (flyctl flattens the
+    remote exit code); the host-side copy is mirrored best-effort.
+    Teardown is **conditional**: the machine is paused again (with
+    `paused_at`/`pause_reason`/`fly_machine_id` re-written via
+    `update_run_json`) only if this verb woke a stopped machine — one
+    already running is left running.
   - **EC2 path:** resolves credentials (`resolve_aws_credentials`,
     `require_aws`) and the instance id via
-    `_resolve_ec2_instance_id_from_run_dir`, failing closed with an
-    actionable message if `ec2_instance_id` is absent from the sidecar.
-    Inspects instance state via `_describe_instance_state`; refuses on
+    `_resolve_ec2_instance_id_from_run_dir`, failing closed if
+    `ec2_instance_id` is absent from the sidecar. Inspects instance
+    state via `_describe_instance_state`; refuses on
     `terminated`/`shutting-down`/missing; if not `running`, wakes it
     (`resume_instance`, fatal on failure) and records that it did so.
-    Pipes the same mutation program over **stdin** to `python3 -` on the
-    instance via `ec2_remote_exec` (SSM — no ssh keypair or hallpass wait
-    needed, unlike Fly) and greps the same `ACCEPTED:`/`NOOP:`/`ERROR:`
-    sentinel. The host-side copy is mirrored best-effort. Teardown is
-    **conditional** the same way as Fly: `stop_instance` +
-    `paused_at`/`pause_reason`/`ec2_instance_id` re-written via
-    `update_run_json`, only if this verb woke a stopped instance.
-  - The mutation program validates that the subtask's current status is
+    Pipes the same mutation program over **stdin** to `python3 -` via
+    `ec2_remote_exec` (SSM — no ssh keypair or hallpass wait needed)
+    and greps the same sentinels; host-side copy mirrored
+    best-effort. Teardown is **conditional** the same way as Fly.
+  - The mutation program validates the subtask's current status is
     `"blocked"` or `"failed"` before mutating (atomic temp-file +
-    `os.replace`). No-ops with a `NOOP:` sentinel if already `"complete"`.
-  - **Test coverage:** `tests/test_accept_blocked.py` — local-path tests
-    (mutation, no-op, error paths, blocked-dict cleanup), Fly-path tests
-    with a stubbed `flyctl` that parses both `-C` positionals and routes
-    the stdin-piped `python3 -` to a local fixture, and injection-rejection
-    tests asserting a metacharacter-bearing run-id/sid is refused with a
-    nonzero exit and no mutation. `tests/test_ec2_launcher_readonly_verbs.py`
-    covers the EC2 path: runtime auto-detection over the pre-fix silent
-    `local` default, the widened `fly|local|ec2` validator (with a control
-    that a genuinely bogus value is still rejected), the accept-record
-    mutation landing on both the remote (SSM) state.json and the mirrored
-    host copy, the wake/re-pause discipline (and its already-running
-    no-op counterpart), and the missing-`ec2_instance_id` fail-closed path.
+    `os.replace`). No-ops with `NOOP:` if already `"complete"`.
+  - **Test coverage:** `tests/test_accept_blocked.py` — local-path
+    tests (mutation, no-op, error paths, blocked-dict cleanup),
+    Fly-path tests with a stubbed `flyctl` parsing both `-C`
+    positionals and routing the stdin-piped `python3 -` to a local
+    fixture, and injection-rejection tests asserting a
+    metacharacter-bearing run-id/sid is refused with no mutation.
+    `tests/test_ec2_launcher_readonly_verbs.py` covers the EC2 path:
+    runtime auto-detection over the pre-fix silent `local` default,
+    the widened `fly|local|ec2` validator (with a control that a
+    genuinely bogus value is still rejected), the accept-record
+    mutation landing on both the remote (SSM) state.json and the
+    mirrored host copy, the wake/re-pause discipline (and its
+    already-running no-op counterpart), and the missing-`ec2_instance_id`
+    fail-closed path.
 
 Maps to `DESIGN.md`: §5 *`requires.extent` — in-graph vs. external
 prerequisites*, *Accepting external-blocked subtasks*.
@@ -8153,26 +8120,26 @@ user-visible verb surface*.
 
 #### Unified `leerie list` (cost column + `status` + `--runtime` filters)
 
-`_list_runs()` in `orchestrator/leerie.py` is extended to surface remote
-runs alongside local runs in a single table. Status and runtime are
-**orthogonal axes**: status describes lifecycle (`paused`, `killed`,
-`done`, `sync-failed`, `in-progress`, `done-pushed-pr`,
+`_list_runs()` in `orchestrator/leerie.py` is extended to surface
+remote runs alongside local runs in a single table. Status and runtime
+are **orthogonal axes**: status describes lifecycle (`paused`,
+`killed`, `done`, `sync-failed`, `in-progress`, `done-pushed-pr`,
 `done-pushed-no-pr`, `push-failed`, `pr-failed`, `corrupt-sidecar`,
 `seed-failed`); runtime describes where the run executed (`local` or
-`fly`). The `seed-failed` status covers run dirs that have a
-`fly-machine.json` (launcher wrote it the moment Fly provision
-succeeded) but no `state.json` (the orchestrator never wrote one,
-typically because `seed_auth` aborted before `phase_classify`).
-`_discover_runs()` synthesizes a row dict with `_orphan=True` and
-`started_at` from the fly sidecar; `_derive_run_status()` returns
-`seed-failed` for them (earliest precedence, before the run.json
-corrupt-sidecar check). `resolve_run_id()` accepts orphan ids
-transitively (no special-casing needed once `_discover_runs` returns
-them), so `./leerie resume <orphan-id> --runtime fly` works against a
-seed-failed run. An **explicit** id is exempt from the resumable-status
-filter below, so this keeps working; `seed-failed` is excluded from the
-bare-`resume` *auto-pick* only (it needs an operator decision first,
-and its rows carry no `started_at` to rank by).
+`fly`). `seed-failed` covers run dirs with a `fly-machine.json`
+(launcher wrote it the moment Fly provision succeeded) but no
+`state.json` (orchestrator never wrote one, typically because
+`seed_auth` aborted before `phase_classify`). `_discover_runs()`
+synthesizes a row dict with `_orphan=True` and `started_at` from the
+fly sidecar; `_derive_run_status()` returns `seed-failed` for them
+(earliest precedence, before the run.json corrupt-sidecar check).
+`resolve_run_id()` accepts orphan ids transitively (no special-casing
+needed once `_discover_runs` returns them), so `./leerie resume
+<orphan-id> --runtime fly` works against a seed-failed run. An
+**explicit** id is exempt from the resumable-status filter below;
+`seed-failed` is excluded from the bare-`resume` *auto-pick* only (it
+needs an operator decision first, and its rows carry no `started_at`
+to rank by).
 
 **EC2 counterpart (`list`'s Python-layer view, not `_discover_runs()`'s
 orphan scan).** `_collect_run_rows()` (below) now tracks an `is_ec2`
