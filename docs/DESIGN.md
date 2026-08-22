@@ -292,12 +292,12 @@ reason}` rather than a bare string:
 - `extent: in_plan` — satisfied by another subtask in this plan; the
   orchestrator wires a graph edge by matching against `provides`.
 - `extent: external` — a real prerequisite the planner declares lives
-  outside *this run's* build graph. Three kinds qualify: **outside the
-  build graph entirely** (another repo's deploy, an ops runbook, a manual
-  step elsewhere); **producible by code but owned by another run** (a
+  outside *this run's* build graph. Three kinds qualify. **Outside the
+  build graph entirely**: another repo's deploy, an ops runbook, a manual
+  step elsewhere. **Producible by code, but owned by another run**: a
   sibling phase document, an earlier phase, another run of the same
-  multi-part deck); **fenced off by the task itself** (the task declares a
-  surface out of scope whose only implementation site lies there).
+  multi-part deck. **Fenced off by the task itself**: the task declares a
+  surface out of scope whose only implementation site lies there.
   `reason` always names the owner; the orchestrator filters these out of
   matching and collects them into a `preconditions` section of the
   assembled plan — the human sees the insight as a deploy note, not a

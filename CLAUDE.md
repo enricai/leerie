@@ -307,6 +307,19 @@ One-time runtime setup (leerie runs in a container) and install steps are in
 ./leerie config --init      # auto-detect BLT commands
 ./leerie config             # print effective config with provenance
 ./leerie config --chat      # interactive configuration session
+
+# Force constrained decoding on worker structured output (off by default;
+# `--json-schema` only validates AFTER generation and re-prompts on a miss).
+# Starts a per-run loopback proxy, points workers at it via
+# ANTHROPIC_BASE_URL, and rewrites the CLI's injected StructuredOutput tool
+# to carry `strict: true`. DANGEROUS: it edits requests leerie does not own
+# — the injected tool is a private interface with no compatibility
+# guarantee, and schema keywords the grammar cannot express are stripped
+# (full disclosure in docs/IMPLEMENTATION.md §2½). Fail-open; die()s on a
+# pre-set ANTHROPIC_BASE_URL or on Bedrock rather than silently running
+# without the guarantee. Also LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT=1 or
+# `dangerously_force_strict_output = true` in leerie.toml:
+./leerie "task" --dangerously-force-strict-output
 ```
 
 ## Testing

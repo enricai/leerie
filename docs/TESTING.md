@@ -956,8 +956,9 @@ layer down, in the consumers** (`phase_plan` / `_write_plan` /
 targets — its spec-file check loops over `research` too, and its
 `_effective_source_of_truth` table carries a row where `answers` and the
 preference *disagree* (an agreeing-only table passes a helper that
-ignores `answers`). The file also source-couples three of the four
-`State`-holding consumers to `_effective_source_of_truth(st)` (only the
+ignores `answers`). The delivery file also source-couples three of the
+four `State`-holding consumers (`phase_plan`, `_write_plan`,
+`_compose_pr_via_llm`) to `_effective_source_of_truth(st)` (only the
 first two ever carried a `"codebase"` default, so the third only fails
 on presence — parametrized anyway as a forward guard). The fourth reader
 is `phase_reconcile`'s, nested in the `_check_unresolvable` closure and
