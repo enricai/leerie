@@ -311,271 +311,127 @@ One-time runtime setup (leerie runs in a container) and install steps are in
 
 ## Testing
 
-**Never run two copies of this suite concurrently on one host.** It has dense
-timing-sensitive coverage — real `fork()`s, PID reaping, subreaper races,
-cgroup probes, stalled-transport `timeout` paths — and CPU starvation makes
-dozens of them fail nondeterministically. Measured 2026-08-01 across six full
-runs: serial with the host to itself gave **0 failures** four times out of four
-(`main` twice, a feature branch twice), while two runs overlapping another
-pytest container gave **78** and then **57** failures. The counts are unstable
-and the individual tests pass in isolation — e.g.
-`tests/test_worktree_failure_not_fatal.py` is 3/3 alone. Treat any failure list
-gathered under concurrent load as unusable, and re-run alone before believing
-it. `-n 4` (xdist) is fine on an otherwise-idle host and matches the serial
-totals exactly; what breaks is *two suites at once*, not parallelism itself.
+Full per-feature/per-incident test inventory lives in `docs/TESTING.md`; this
+section is the operational rules plus the traps worth remembering, not the
+inventory itself.
 
-**A local pass is not evidence until the host lacks `claude`.** The binary is
-on a developer's PATH and **not** on the CI runner's, so any test that reaches
-`preflight()` → `_check_claude_cli_version()` passes here and fails there with
-`FileNotFoundError: 'claude'`. That is not hypothetical: PR #211 reported
-"7114 passed, 0 failed" while CI was red on seven tests of exactly this shape.
-Before claiming a suite green, re-run the affected files with the directory
-holding `claude` removed from PATH:
+- **Never run two copies of the suite concurrently on one host.** Real
+  `fork()`s, PID reaping, subreaper races, cgroup probes, and stalled-transport
+  `timeout` paths make CPU starvation flake dozens of tests (measured
+  2026-08-01: serial 0 failures across four runs; two suites overlapping gave
+  78 and 57). `-n 4` (xdist) matches serial on an idle host — the hazard is
+  concurrent *suites*, not parallelism. Treat any failure list gathered under
+  concurrent load as unusable; re-run alone.
+- **A local pass isn't evidence until the host lacks `claude`.** CI's
+  `preflight()` → `_check_claude_cli_version()` fails with
+  `FileNotFoundError: 'claude'` there (PR #211: green locally, seven red on
+  CI). Re-run affected files with `claude`'s directory stripped from PATH
+  (not a minimal `env -i` — tests need `git`/`jq`/coreutils):
+  ```bash
+  CLAUDE_DIR=$(dirname "$(command -v claude)")
+  PATH=$(echo "$PATH" | tr ':' '\n' | grep -vFx "$CLAUDE_DIR" | paste -sd:) \
+    pytest tests/<affected>.py
+  ```
+  A test whose subject *is* the gate should **stub** `_check_claude_cli_version`
+  rather than skip (`tests/test_append_system_prompt_file.py` has the skip
+  form, for when the CLI itself is the subject).
+- **A test driving real `main()` needs a stub `claude` on PATH** — the gate is
+  in `main()`'s `shutil.which("claude")`, ahead of `_check_claude_cli_version`,
+  and `die()` always exits 1 regardless of intended code (14 of
+  `tests/test_main_exception_arms.py` shipped red this way).
+  `tests/conftest.py::fake_claude_on_path` is the single owner; use it, not a
+  per-harness stub.
+- **`main()` mutates the pytest process itself**: `_become_subreaper()` runs
+  before argparse, so a test driving real `main()` leaves
+  `prctl(PR_SET_CHILD_SUBREAPER, 1)` set for the rest of the session — an
+  orphan reparents to pytest instead of PID 1, zombies, and `os.kill(pid, 0)`
+  keeps reporting it alive (three `tests/test_signal_cleanup.py` assertions
+  went red on CI purely from alphabetical collection order). Fix:
+  `tests/conftest.py`'s autouse `_restore_child_subreaper`, delegating to the
+  public `child_subreaper_restored` context manager — drive that manager
+  directly in any restore-test (pytest 9's fixture wrapper has no
+  `__pytest_wrapped__`), and pin the flag to 0 *before* asserting, or an
+  earlier test's leftover 1 makes a broken fixture pass by coincidence.
+- `shellcheck` runs in CI but isn't on every dev host, and catches things
+  `bash -n` cannot (SC1007 on a bare `LANGUAGE=` prefix; see
+  `tests/test_launcher_integrity.py`).
+- **Do not edit `orchestrator/leerie.py` (or any file under test) while the
+  suite is running.** Guards using `inspect.getsource`/`ast.parse` re-read via
+  `linecache`, which notices mtime changes mid-run. A single-line docstring
+  edit ~3 minutes into a run produced 38 spurious failures
+  (`test_subreaper`, `test_wave_integration_instrumentation`, every
+  `test_terminal_auth_routing` pin), all green against a frozen tree. Same
+  tell as the concurrency hazard: a failure list dominated by
+  source-coupling tests is unusable.
+- `tests/test_warn_test_missing_producer_edge.py` pins the dominant root
+  cause behind one incident batch — a `test-` subtask declaring no
+  `requires`/`depends_on` edge to the feature subtask whose not-yet-created
+  output it targets — via the `_warn_test_subtask_missing_producer_edge`
+  advisory (mirrors `_warn_provider_subset_subtasks`); deliberately advisory,
+  since no mechanical file-overlap signal reliably catches the real failure
+  shapes (`phase_wiring_gate` remains the actual enforcer).
+- **Host-only tests are gated on `jq`** (`HAS_JQ` in `tests/conftest.py`,
+  mirroring `HAS_TREESITTER`) — host-owned bash
+  (`scripts/host-finalize.sh`, `provision.sh`'s `decide_teardown`, launcher
+  `finalize`/`no_push`) parses `run.json` with real `jq`, deliberately absent
+  from the container image (in-container code uses python3 instead — see
+  `scripts/remote/seed-auth.sh`). Do not "fix" a skip by adding `jq` to the
+  Dockerfile: those scripts can never succeed in-container anyway (gh auth,
+  ssh-agent, Keychain are host-side) per DESIGN §6 *Finalization*.
+  `tests/test_jq_gate_wiring.py` guards every such module both imports
+  `HAS_JQ` and carries its own `skipif` (a module-level `skipif` doesn't
+  propagate through an import).
+- **A conftest autouse fixture (`_no_real_planning_worktree`) stubs
+  `_ensure_planning_worktree` for every test**, opt-out via
+  `@pytest.mark.real_planning_worktree`. Absent it, a test driving real
+  `_run_phases` shells a real `git worktree add` rooted at
+  `resolve_leerie_root()` (`<repo>/.leerie` when `LEERIE_STATE_DIR` is unset),
+  creating a full checkout of this repo inside itself — invisible because
+  `.leerie/*` is gitignored and the dirs outlive the session (measured: 2
+  worktrees, 25 MB, one CI-only red test with no visible link to the change).
+  Assume the state root is inside the repo unless a test pins it elsewhere.
+- `leerie resume <run-id>` (the documented positional form) is pinned by
+  `tests/test_resume_positional_run_id.py`. It silently ignored the run-id on
+  every runtime until 2026-08-05: `main()` popped only `argv[0]`, so the
+  run-id bound to argparse's `task` positional instead, `--run-id` stayed
+  `None`, and `resolve_run_id` auto-picked a different run — saved only by
+  the run-directory flock. `_extract_resume_run_id()` now takes the
+  positional **before** `parse_args` (order is the contract), scoped to
+  `resume` only, `die()`ing when a positional and `--run-id` disagree.
+- **The fresh-run branch of `_run_phases` had no execution coverage at all**
+  until `tests/test_run_phases_fresh_init.py` — every test path exercised it
+  with `resume=True`, so v0.20.0 shipped a `NameError` (`repo_root`) in the
+  untested `resume=False` branch that killed every non-resume run. A
+  key-presence AST walk passed against the broken code: presence of a dict
+  key says nothing about whether its value expression evaluates.
+- **A test asserting STRUCTURE must be paired with one asserting SUBSTANCE.**
+  Four measured instances from one change (2026-08-17):
 
-```bash
-CLAUDE_DIR=$(dirname "$(command -v claude)")
-PATH=$(echo "$PATH" | tr ':' '\n' | grep -vFx "$CLAUDE_DIR" | paste -sd:) \
-  pytest tests/<affected>.py
-```
+  | structural assertion | what passed it |
+  |---|---|
+  | payload has key `scope_note` | `"scope_note": ""` — key shipped, text discarded |
+  | `phase_plan` calls `_effective_source_of_truth` | ctx reads the preference directly, bypassing it |
+  | abort message contains every remediation phrase | the fallback hoisted back to lead — the wording an A/B measured as misrouting 5/5 operators |
+  | `die(_unresolvable_die_message(...))` exists in source | the gate never calls it, and 140 tests stay green |
 
-Prefer removing that one directory over a minimal `env -i PATH=/usr/bin:/bin`:
-several tests legitimately need `git`, `jq` and coreutils, and a too-small PATH
-produces failures that look like regressions and are not. A test whose subject
-is the gate rather than the CLI should **stub** `_check_claude_cli_version`
-rather than skip — skipping on CI removes the coverage instead of the
-dependency (`tests/test_append_system_prompt_file.py` shows the skip form, for
-the case where the CLI genuinely *is* the subject).
-
-**A test that drives the real `main()` needs a stub `claude` on PATH, and the
-gate is in `main()` itself — not `preflight()`.** `main()`'s
-`if not shutil.which("claude"): die(...)` fires 87 lines before `State(...)`
-mints the run dir and long before the top-level try/except, so
-`_check_claude_cli_version` (which lives under `_orchestrate`, routinely
-stubbed) is never reached and stubbing it does nothing. `die()` exits 1, which
-is the tell: *every* expected exit code collapses to 1 at once
-(`1 == 75`, `1 == 130`, `1 == 143`, `1 == 7`). A test whose expected code is
-itself 1 passes that assertion by coincidence and then fails one line later on
-a missing sidecar. Measured: 14 of `tests/test_main_exception_arms.py` shipped
-red this way while its sibling `tests/test_main_cli_wiring.py` — the same
-harness plus one call — was green. `tests/conftest.py::fake_claude_on_path` is
-the single owner; import it rather than copying it, and install it in the
-*fixture* every test in the file shares, not in the harness function — three
-tests there call `leerie.main()` directly and a harness-attached prerequisite
-misses them silently.
-
-**`main()` mutates the pytest process, and one of those mutations changes what
-"alive" means.** `_become_subreaper()` is `main()`'s SECOND statement, before
-argparse, so any test driving the real `main()` leaves
-`prctl(PR_SET_CHILD_SUBREAPER, 1)` set on the pytest process for the rest of
-the session. An orphan that would reparent to PID 1 and be reaped then
-reparents to pytest, which never `wait()`s it; it lingers as a zombie, a zombie
-still owns its PID slot, and `os.kill(pid, 0)` keeps succeeding — so a liveness
-probe reports a process that was in fact killed. Measured: three
-`tests/test_signal_cleanup.py` orphan-reaping assertions went red on CI with
-both that file and `orchestrator/leerie.py` byte-identical to `main`. Collection
-is alphabetical, so `test_main_*` poisons `test_signal_cleanup`, and
-`tests/test_subreaper.py` escaped only by sorting *after* it — an accident of
-filename, not a fix. Hence `tests/conftest.py`'s autouse
-`_restore_child_subreaper` (delegating to the public `child_subreaper_restored`
-context manager) rather than a per-file fixture. Note the failure is
-**deterministic** — the same 17 IDs on all three Python versions — which is how
-it is told apart from the CPU-starvation flake class above.
-
-**The obvious test for that fixture is vacuous, and the vacuity only shows
-under falsification.** The natural shape is an ordered pair: one test sets the
-flag, the next asserts it was restored. With the fixture broken, an earlier
-test in the same file has already left the flag at 1, so the second test's
-baseline *is* 1, it observes 1, and it passes — confirmed live, where it
-skipped instead of failing. Drive the context manager directly with a
-`prctl(…, 0)` first so the starting value is pinned and the assertion is
-unconditional. Drive the **public** context manager, not the fixture object:
-pytest 9 wraps fixtures in `FixtureFunctionDefinition` with no
-`__pytest_wrapped__`, so reaching for the raw function is version-coupled. That
-split needs its own guard — the behavioural test only proves the fixture works
-if the fixture actually delegates, so `test_conftest_defines_the_autouse_restore_fixture`
-pins `autouse=True` *and* the delegation.
-
-`shellcheck` is likewise not installed on every dev host but does run in CI, so
-a `scripts/*.sh` change is unverified until pushed — and it catches things
-`bash -n` cannot (SC1007 on a bare `LANGUAGE=` prefix, and the backtick class
-CLAUDE.md records under `tests/test_launcher_integrity.py`).
-
-**Do not edit `orchestrator/leerie.py` (or any file under test) while the
-suite is running.** A great many guards here assert via
-`inspect.getsource` / `ast.parse` on the module read from disk, and Python's
-`linecache` re-reads a file whose mtime changed — so an edit mid-run makes
-those guards see shifted or half-written source and fail en masse for reasons
-that have nothing to do with the change. Measured once during the BLT work: a
-single-line docstring edit ~3 minutes into a run produced **38 spurious
-failures** (`test_subreaper`, `test_warnings_before_die`,
-`test_wave_integration_instrumentation`, every `test_terminal_auth_routing`
-handler pin, …), all of which passed 70/70 when re-run against a frozen tree.
-This is a *separate* hazard from the concurrency one above and has the same
-tell: a failure list dominated by source-coupling tests. Treat any such list
-gathered while the tree was moving as unusable, exactly as with a list
-gathered under concurrent load.
-
-`pytest tests/` runs the full suite. For the full per-feature / per-incident
-test coverage inventory (which test file covers which surface, and the
-specific traps pinned against regressing), see `docs/TESTING.md`.
-The dominant real cause behind that same incident batch — a `test-`-domain
-subtask declaring no `requires`/`depends_on` edge to the feature subtask whose
-not-yet-created output it targets — is pinned in
-`tests/test_warn_test_missing_producer_edge.py`: the new
-`_warn_test_subtask_missing_producer_edge` advisory (mirrors
-`_warn_provider_subset_subtasks`) fires when a `test-` subtask has empty
-`requires`+`depends_on` while another subtask in the plan is a producer
-(`provides` or `files_likely_touched` non-empty), and stays silent when the
-subtask declares either edge, when no other subtask is a producer, on a
-single-subtask plan, and on a non-`test-` subtask (never the advisory's
-target). `test_disjoint_paths_shape_fires` is a regression pin reproducing the
-real sibling-service failure shape (a coverage-floors test subtask with disjoint
-file paths from the feature subtasks it must register — the case a mechanical
-file-overlap rule would miss, but a declaration-absence check catches). The
-fix is deliberately advisory, not auto-wiring: research proved no mechanical
-signal (exact-path or basename-stem overlap) reliably wires the real failure
-cases, so the wiring gate (`phase_wiring_gate`, see below) remains the actual
-enforcer. The full per-feature/per-incident test-coverage narrative for
-this stretch of the codebase (artifact_registry, conformer/baseline
-hardening, EC2 lifecycle/transport/credential surfaces, the worker-prompt-
-over-stdin and appended-system-prompt transports, the no-result-event retry
-and `_run_checked_loop` crash policy, the integrator-crash rescue path, and
-`resume` auto-pick) has moved to docs/TESTING.md; see that file for the
-underlying test names and measured claims.
-
-**Host-only tests are gated on `jq`** (`HAS_JQ` in `tests/conftest.py`,
-mirroring the `HAS_TREESITTER` pattern). Tests that source bash the host
-owns (`scripts/host-finalize.sh`, `provision.sh`'s `decide_teardown`, the
-launcher's `finalize`/`no_push` paths) parse `run.json` with real `jq` and
-must skip under `HAS_JQ`, since the leerie container image deliberately
-omits `jq` (code running *inside* the container uses python3 instead — see
-`scripts/remote/seed-auth.sh`). **Do not "fix" a skip here by adding `jq`
-to the Dockerfile**: per DESIGN §6 *Finalization*, those scripts can never
-succeed in-container anyway (gh auth, ssh-agent, and Keychain are
-host-side), so installing jq buys a green tick, not working code, and
-erodes the host/container boundary. `tests/test_jq_gate_wiring.py` guards
-that every such module both imports `HAS_JQ` and carries a `skipif`
-referencing it — a module-level `skipif` does not propagate through an
-import, so a file reusing another's runner needs its own. Full detail
-(including the push-output-capture and locale/byte-vs-character traps this
-gate's neighbors hit) is in docs/TESTING.md.
-Raising bought diagnostics only, at the price of a precondition every
-hand-built `State` must know about: measured, **141 tests red**, and 8 test
-files still needed a fixture seed after the fallback landed.
-**A conftest autouse fixture (`_no_real_planning_worktree`) stubs
-`_ensure_planning_worktree` for every test**, opt-out via
-`@pytest.mark.real_planning_worktree`. It shells out to a real
-`git worktree add` rooted at `resolve_leerie_root()`, which with
-`LEERIE_STATE_DIR` unset is `<repo>/.leerie` — so every test driving the real
-`_run_phases` created a full checkout of this repo inside this repo. Silent
-three ways over: `.leerie/*` is gitignored so `git status` stayed clean, the
-directories outlived the session, and the damage surfaced in
-`tests/test_helper_naming_convention.py`, whose `tests/` exclusion is a
-relative-path prefix that a nested
-`.leerie/…/worktrees/planning/tests/…` copy does not match. Measured before
-the guard: 2 worktrees, 25 MB, and one red test on CI with no visible link to
-the change that caused it — local runs were green because the pollution only
-bites a later scanner. When adding a fixture that shells out to git, assume
-the state root is inside the repo unless the test pins it elsewhere.
-
-`leerie resume <run-id>` — the documented positional form — is pinned by
-`tests/test_resume_positional_run_id.py`. It silently ignored the run-id on
-every runtime until 2026-08-05: `main()` popped only `argv[0]` (the verb), so
-a run-id in `argv[1]` bound to argparse's `task` positional, `--run-id` stayed
-`None`, and `resolve_run_id` **auto-picked a different run** — measured live
-against a *running* one, where only the run-directory flock prevented a second
-orchestrator (an idle run would have been resumed silently). `resume` is the
-only verb exposed to this: `stop` / `kill` / `accept-blocked` / `finalize` /
-`status` all `exit` inside the launcher and never reach that argparse.
-`_extract_resume_run_id()` now takes the positional **before** `parse_args`
-(the ordering IS the contract — afterwards `task` has already swallowed it),
-scoped to `resume` because `list` has its own positionals
-(`list status paused`, `list chains`), with a `die()` when a positional and
-`--run-id` disagree. **No existing test could catch it** —
-`test_resolve_run_id*.py` call `resolve_run_id` directly *with* an id, so they
-passed against broken plumbing; nothing crossed the launcher→argparse
-boundary, the same shape as the coverage-gate bug above. Two traps recorded in
-that file: reverting only the *wiring* (helper defined but uncalled) must fail
-— a present-but-inert fix is the failure mode that let the coverage gate ship
-— and the safety proof that `args.task` is read only on the non-resume branch
-walks the AST of `_run_phases`, because the obvious
-`"args.task" not in getsource(main)` passes trivially (the reads are in
-`_run_phases`, not `main`) and proved nothing.
-
-**The fresh-run branch of `_run_phases` had no execution coverage at all**
-until `tests/test_run_phases_fresh_init.py`, and v0.20.0 shipped a
-`NameError` in it that killed every non-resume run. Two structural reasons,
-both worth remembering when adding a guard here. First, **every path that
-executed `_run_phases` did so with `resume=True`** — `resume=False` appeared
-nowhere under `tests/`, so the branch that every real run takes was never
-run. Second, the guard that did exist was a key-presence AST walk, and **it
-passed against the broken code**: the key was in the dict literal, only its
-value expression was unevaluatable. Presence is not evaluation: a walk that
-checks a key exists says nothing about whether that key's value resolves,
-which takes either execution or scope resolution. See `docs/TESTING.md` for
-the full detail (which test files, which harness quirks made the gap read
-as covered).
-
-**The general rule: a test asserting STRUCTURE must be paired with one
-asserting SUBSTANCE.** Structure is a dict key, a source substring, an AST
-node, a phrase in a prompt. Substance is the value that flows through it,
-the result of executing it, or the order it appears in. Structure-only
-assertions are necessary and never sufficient, and the gap is invisible
-because they pass. Four measured instances, all from one change
-(2026-08-17):
-
-| structural assertion | what passed it |
-|---|---|
-| the reconciler payload has key `scope_note` | `"scope_note": ""` — key shipped, planner's text discarded |
-| `phase_plan` calls `_effective_source_of_truth` | ctx reads the preference directly, or omits the key entirely |
-| the abort message contains every remediation phrase | the fallback hoisted back to lead — the wording the A/B measured as misrouting 5/5 operators |
-| `die(_unresolvable_die_message(...))` exists in source | the gate reads `out.get("unresolved")`, never fires, and **140 tests stay green** |
-
-The cheapest discriminating test per shape: **execute the consumer** (not read
-its source); **assert the value** (not the key); **assert the order** (not the
-presence). Where the subject is prose, none of those reach semantic inversion
-— a phrase can be present and negated — so the guard there is a behavioural
-probe, not another substring. And when parametrizing a value test, make the
-inputs **disagree**: a row where two sources of a value are equal cannot tell
-a correct read from a bypass.
-
-For the per-feature/per-incident test inventory that used to sit here
-(planning-worktree isolation, resume-positional-run-id, the fresh-run
-`_run_phases` NameError, launcher-block duplication guards, `leerie_commit`
-state-field wiring, EC2 resume/list/accept-blocked coverage, the
-context-overflow/terminal-auth-failure classifiers, the 2026-07-19
-argv-E2BIG-and-coverage-freeze incident harness, and the
-DiskLowSpace-handler-reraise fix) — see `docs/TESTING.md`.
-re-raiser went unguarded because the comment named only one of the raise
-sites, which is why `test_survives_a_save_that_is_still_failing` in
-`tests/test_disk_preflight.py` asserts against *every* save in the arm
-rather than pinning one call. Second, fixing one arm is never the fix if
-the pattern (a bare `st.save()`) is repeated — eight other handlers in
-`main()` carried the identical bare `st.save()`; all now route through
-`_save_state_best_effort`, which logs and never raises. Third,
-`issubclass(X, BaseException)` proves nothing about whether a handler is
-reachable or safe — the test it replaced asserted only
-`issubclass(DiskLowSpace, BaseException)` and concluded no separate
-handler was required, a tautology that reasoned its way to a false
-conclusion. Full incident detail: docs/TESTING.md.
-
-**A timeout is infrastructure, not a leerie bug**, and must be classified
-alongside `WorkerError` in every retry/escalation path, not treated as "a
-bug in leerie itself" — and never interpolated into a message verbatim
-(`str()` on a `TimeoutExpired` includes the full invoking argv). See
-`tests/test_checked_loop.py` and docs/TESTING.md.
-
-**Derivation guards are one-directional unless you write the converse.**
-A test that iterates a table only proves every table entry is reproducible,
-not that every entry that *should* be in the table is. See docs/TESTING.md
-for the `TIMEOUT_DEFAULT_PER_WORKER` and `main()` caps-wiring instances.
-
-**Ablate a pattern against its corpus instead of adding alternatives.**
-Remove each alternative in a matching pattern in turn and check it against
-real cases — unreachable alternatives are false-positive surface, not
-defense in depth. See docs/TESTING.md for the
-`_host_finalize_is_auth_or_network_push_error` case, including a
-provably-dead companion arm found the same way.
+  Cheapest discriminating test per shape: execute the consumer (not read its
+  source); assert the value (not the key); assert the order (not presence).
+  Use a behavioural probe on prose, not a substring (a phrase can be present
+  and negated). Parametrized value tests should make inputs *disagree* — two
+  equal sources of a value can't tell a correct read from a bypass.
+- Three more lessons, detailed in `docs/TESTING.md`: a handler must survive
+  its own exception, not merely catch it
+  (`test_survives_a_save_that_is_still_failing`,
+  `tests/test_disk_preflight.py`); a timeout is infrastructure, not a leerie
+  bug, and must be classified alongside `WorkerError` in every
+  retry/escalation path, never interpolated into a message verbatim
+  (`tests/test_checked_loop.py`); and ablate a pattern against its corpus
+  instead of adding alternatives — unreachable alternatives are false-positive
+  surface, not defense in depth (`_host_finalize_is_auth_or_network_push_error`).
+  Derivation guards are one-directional unless you write the converse: a test
+  iterating a table only proves every entry is reproducible, not that every
+  entry that should be there is (`TIMEOUT_DEFAULT_PER_WORKER`, `main()`
+  caps-wiring).
 
 ## Commit messages are the permanent record
 
