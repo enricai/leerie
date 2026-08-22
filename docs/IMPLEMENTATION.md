@@ -852,120 +852,37 @@ leerie "task" --no-verify
 # Pass --clarify to surface the surviving questions to the user
 # (interactively if a TTY, otherwise via pending-questions.json).
 leerie "task" --clarify
+leerie "task" --answers answers.json     # pre-supply clarification answers
 
-# Pre-supply clarification answers:
-leerie "task" --answers answers.json
-
-# Override caps. Both also read LEERIE_* env vars and leerie.toml keys.
-leerie "task" --max-workers 80 --max-parallel 6
-export LEERIE_MAX_WORKERS=80
-export LEERIE_MAX_PARALLEL=6
-
-# Dial how persistent workers are at building confidence before they exit
-# blocked (default: 8 rounds inside each planner / implementer):
-leerie "task" --confidence-rounds 12
-export LEERIE_CONFIDENCE_ROUNDS=12
-
-# Verbosity controls how much per-worker activity surfaces inline.
-# Default is `stream`: one-line summary per worker event. -q drops to
-# leerie's pre-streaming terse output; -qq is fully quiet (errors
-# still emit). -vv adds raw payloads. Per-worker <state-root>/logs/<sid>.log
-# files are always written regardless of level.
-leerie "task"        # default: stream
-leerie "task" -q      # normal (pre-streaming)
-leerie "task" -qq     # quiet (errors only)
-leerie "task" -vv     # debug
-leerie "task" --verbosity normal
-export LEERIE_VERBOSITY=stream
-
-# Override the default source-of-truth preference (`both`). CLI flag and
-# env var are session-scoped overrides; commit `source_of_truth = ...` in
-# leerie.toml for a per-repo default.
-export LEERIE_SOURCE_OF_TRUTH=codebase    # or: research, both
-leerie "task" --source-of-truth codebase
-
-# Override the host-side per-repo state directory (default:
-# $HOME/.leerie/<basename>/). Each repo gets its own subtree under
-# $HOME so Colima auto-shares it. Cross-repo basename collisions are
-# caught at use time via the .owner sidecar (see §2 "Host-side per-repo
-# state directory"). Precedence:
-# default < leerie.toml state_dir < LEERIE_STATE_DIR env < --state-dir CLI.
-export LEERIE_STATE_DIR=~/.leerie/myproject
-leerie "task" --state-dir ~/.leerie/myproject
-# Or commit a per-repo default in leerie.toml:
-#   state_dir = ~/.leerie/myproject
-
-# Select the execution runtime (default: local). `fly` routes each worker
-# through Fly.io machines instead of local nerdctl containers.
-export LEERIE_RUNTIME=local               # or: fly
-leerie "task" --runtime fly
-
-# Choose the model. Without overrides, every worker — judgment (classifier,
-# planner, reconciler, plan_overlap_judge, provision, integrator) and acting
-# (implementer, conformer) alike — defaults to sonnet. Use the env var
-# for a sticky preference, the CLI flag for a one-off, or leerie.toml
-# for the committed repo default. Per-worker overrides also exist —
-# see §2.
-export LEERIE_MODEL=sonnet                # or: opus, haiku
-leerie "task" --model opus
-leerie "task" --model-implementer opus --model-classifier haiku
-
-# Override judge/heal output subdirectories:
-leerie "task" --judge-dir my-judge --heal-dir my-heal
-export LEERIE_JUDGE_DIR=my-judge
-export LEERIE_HEAL_DIR=my-heal
-
-# Judge and heal model overrides (default: sonnet):
-leerie "task" --judge-model opus --heal-model opus
-export LEERIE_MODEL_JUDGE=sonnet
-export LEERIE_MODEL_HEAL=sonnet
-
-# Heal-loop convergence knobs (defaults shown):
-leerie "task" --heal-max-rounds 10 --heal-success-threshold 0.9
-export LEERIE_HEAL_MAX_ROUNDS=10
-export LEERIE_HEAL_SUCCESS_THRESHOLD=0.9
-
-# Diagnostic toggle: every `claude -p` worker subprocess inherits DEBUG=*
-# and ANTHROPIC_LOG=debug so its internal state surfaces on stderr; the
-# idle watchdog (worker_idle_warn_sec, see §Caps) flushes a tail of that
-# stderr alongside its silence warning. Off by default (noisy on healthy
-# runs).
-export LEERIE_WORKER_DEBUG=1
-leerie "task"
+# Caps, confidence rounds, verbosity — see "## 2½. Configuration reference"
+# for the full flag/env/toml table (max-workers, max-parallel,
+# confidence-rounds, verbosity levels, source-of-truth, state-dir, model
+# selection incl. per-worker overrides, judge/heal dirs and models,
+# heal-loop convergence knobs, LEERIE_WORKER_DEBUG).
 
 # Run post-run skill phases against an existing run's captured LLM calls.
-# --phase judge: score every call in calls.ndjson with the 3-dim judge rubric
-#   and write verdict files to <run-dir>/<judge-dir>/.
-# --phase heal: read the judge index for failing call_types and run the
-#   self-heal loop for each; if no judge index exists yet, runs judge first.
-# Use --run-id to select a specific run; otherwise auto-picks the most
-# recent resumable one.
+# --phase judge scores every call in calls.ndjson with the 3-dim judge
+# rubric and writes verdicts to <run-dir>/<judge-dir>/; --phase heal reads
+# the judge index for failing call_types and self-heals each (running
+# judge first if no index exists). --run-id selects a run; omitted,
+# auto-picks the most recent resumable one.
 leerie --phase judge --run-id bugfix-login-timeout-bug-b81e90
-leerie --phase heal  --run-id bugfix-login-timeout-bug-b81e90
-# Combine with heal-loop knobs:
 leerie --phase heal --heal-max-rounds 5 --heal-success-threshold 0.8
 
-# Read-only telemetry report for a run: per-call_type token/cost/latency/
-# failure breakdown + memory peak. Pass a run id, or omit to auto-pick the
-# sole run. Exits without running orchestrate.
+# Read-only per-call_type token/cost/latency/failure + memory-peak report;
+# exits without orchestrating. Omit the run id to auto-pick the sole run.
 leerie --report bugfix-login-timeout-bug-b81e90
-leerie --report            # auto-picks when exactly one run exists
 
 # Recommended backstop for worker auto-compaction
 # (Claude Code CLI variable — not consumed by leerie itself):
 export CLAUDE_AUTOCOMPACT_PCT_OVERRIDE=70
 
-# Chain verbs: submit, inspect, pause, and destroy multi-run chains.
-# A chain is N parallel single-run `--runtime fly` invocations per wave,
+# Chain verbs: submit, inspect, pause, and destroy multi-run chains. A
+# chain is N parallel single-run `--runtime fly` invocations per wave,
 # with synth-merge between waves (DESIGN §19). The laptop is the
-# sequencer; no Fly coordinator machine. No chain-specific env vars are
-# required — the underlying `./leerie --runtime fly` invocations have
-# their own env requirements unchanged.
-
-# Submit a new chain. Each --wave flag defines one sequential wave
-# (comma-separated prompt-file paths). Waves execute in order; runs
-# within a wave execute in parallel. N waves are supported. The chain
-# operates against $USER_REPO directly (the laptop's current repo).
+# sequencer; no Fly coordinator machine. Each --wave flag is one
+# sequential wave (comma-separated prompt-file paths); waves run in
+# order, runs within a wave run in parallel, against $USER_REPO directly.
 leerie chain \
   --wave prompts/fetch.txt,prompts/lint.txt \
   --wave prompts/publish.txt
@@ -983,8 +900,8 @@ leerie finalize <chain-id>        # push + open PR for every unpushed run
 leerie list chains               # group runs by chain_id
 
 # The five deprecated dash-prefixed chain-verb aliases (submit / status /
-# kill / attach, plus the separate --list-chains flag) have been hard-removed
-# entirely — no shim, no back-compat. Use the bare verbs above.
+# kill / attach, plus the separate --list-chains flag) are hard-removed —
+# no shim, no back-compat. Use the bare verbs above.
 ```
 
 Requirements: the `claude` CLI on `PATH` and logged in interactively (no API
@@ -1065,25 +982,25 @@ Acting workers (implementer, conformer, integrator, rebaser) run in isolated
 worktrees with the broader `ACT_TOOLS` allowlist and the skip-permissions flag;
 their blast radius is the worktree they own.
 
-The reason the flag is unreachable for judgment workers is measured, not
-stylistic: it removes the CLI's working-directory boundary as well as the
-prompts. Probed live (claude 2.1.237, filesystem-verified), a worker holding
-only `INSPECT_TOOLS` and carrying the flag used `Write` — absent from that
-allowlist — to overwrite a tracked file outside its cwd and `git commit` on the
-user's branch, and did so *even with its cwd already set to a detached
-worktree*. With the flag absent, every one of those attempts was rejected.
+The reason the flag is unreachable for judgment workers is measured: it
+removes the CLI's working-directory boundary as well as the prompts.
+Probed live (claude 2.1.237, filesystem-verified), a worker holding only
+`INSPECT_TOOLS` plus the flag used `Write` — absent from that allowlist —
+to overwrite a tracked file outside its cwd and `git commit` on the user's
+branch, even from a detached worktree. With the flag absent, every such
+attempt was rejected.
 
-`--dangerously-skip-permissions` therefore no longer bypasses permissions for
-these workers; it **widens their allowlist** (`_widen_inspect_tools`) with the
-leading verbs of the repo's own declared build/lint/test commands, as
-`Bash(<verb>:*)` patterns. That is the visibility the flag was always
-documented to buy — Node/TS repos where the planner reaches for
-`pnpm`/`tsc`/`biome`/`vitest`/`npx`, ~18-19% of whose Bash calls otherwise fail
-with "requires approval" in headless mode — without the write access that was
-never the point. Residual, stated rather than hidden: a build verb executes
-arbitrary code, so an allowlisted `pnpm`/`node`/`python3` *can* still write
-outside the cwd; `_assert_repo_unchanged()` is what catches that. See DESIGN
-§12 *Judgment-worker isolation* for the full four-layer argument.
+So `--dangerously-skip-permissions` no longer bypasses permissions for
+these workers; it **widens their allowlist** (`_widen_inspect_tools`) with
+the leading verbs of the repo's own declared build/lint/test commands, as
+`Bash(<verb>:*)` patterns — the visibility the flag was documented to buy
+(Node/TS repos where the planner reaches for `pnpm`/`tsc`/`biome`/`vitest`/
+`npx`, ~18-19% of whose Bash calls otherwise fail "requires approval" in
+headless mode) without the write access that was never the point.
+Residual: a build verb executes arbitrary code, so an allowlisted
+`pnpm`/`node`/`python3` can still write outside the cwd;
+`_assert_repo_unchanged()` catches that. See DESIGN §12 *Judgment-worker
+isolation* for the full four-layer argument.
 
 Resolution order (highest priority first):
 
@@ -1106,15 +1023,16 @@ is engaged.
 Worker cgroup containment (DESIGN §6 *Memory containment*) is enforced by
 a cgroup broker (`scripts/cgroup-broker.py`) running at the slice-owning
 identity; the dropped-privilege orchestrator can neither enroll workers
-nor set their limits itself. Just before the first worker
-spawns (in `_run_phases`, past the resume short-circuits so zero-worker
-completed/no-work resumes are not gated), `_enforce_and_record_cgroup_containment`
-probes the broker end-to-end and records `{enforced, hierarchy}` in
-`state.json` (the `cgroup_containment` field). If containment cannot be enabled — broker
-down, no usable cgroup hierarchy (neither a cgroup-v2 unified mount nor
-v1 pids+memory controller mounts), or read-only cgroupfs — leerie
-`die()`s by default, because a silently-uncapped run is what let a
-runaway subtree exhaust the VM thread/PID table (a Bun `EAGAIN` crash).
+nor set their limits itself. Just before the first worker spawns (in
+`_run_phases`, past the resume short-circuits so zero-worker
+completed/no-work resumes are not gated),
+`_enforce_and_record_cgroup_containment` probes the broker end-to-end and
+records `{enforced, hierarchy}` in `state.json`'s `cgroup_containment`
+field. If containment cannot be enabled — broker down, no usable cgroup
+hierarchy (neither a cgroup-v2 unified mount nor v1 pids+memory
+controller mounts), or read-only cgroupfs — leerie `die()`s by default,
+because a silently-uncapped run is what let a runaway subtree exhaust the
+VM thread/PID table (a Bun `EAGAIN` crash).
 
 `--dangerously-allow-uncapped` is the escape hatch: it downgrades the
 fatal gate to a loud warning and runs workers without memory/PID limits.
@@ -1166,38 +1084,28 @@ Resolution order for the opt-out (highest priority first):
 4. **Default `False`.** The check runs.
 
 Skipped on a `resume` that already reached `waves`: the resume path
-enters `_run_phases` past `_schedule()` (the `waves` field is loaded from
+enters `_run_phases` past `_schedule()` (`waves` loads from
 `state.json`), so the preflight has nothing left to gate. A run that
-died on the preflight *is* resumable (DESIGN §6 "Budget-check resume"):
-`_schedule()` had already returned by the time `check_budget_feasibility`
-ran, so `subtasks`/`waves` are recoverable from `plan_snapshot`, which is
-written immediately after `_schedule()` and before this check (DESIGN §6
-"Resumable planning"). `resume` rehydrates `subtasks`/`waves` from
-`plan_snapshot` and re-runs only the budget check — under a higher
-`--max-workers` or `--skip-budget-check` — instead of dying "Plans are
-not persisted." The user re-runs `resume` with the recommended
-`--max-workers` value (or `--skip-budget-check`), rather than starting a
-fresh run from scratch.
+died on the preflight is itself resumable (DESIGN §6 "Budget-check
+resume"): `plan_snapshot` — written immediately after `_schedule()`
+and before this check (DESIGN §6 "Resumable planning") — lets `resume`
+rehydrate `subtasks`/`waves` and re-run only the budget check, under a
+higher `--max-workers` or `--skip-budget-check`, instead of a fresh run
+from scratch.
 
 Exit code `EXIT_BUDGET_INFEASIBLE = 11` on `die()`, distinct from
-`EXIT_NEEDS_ANSWERS = 10` (deferred-clarification structured exit)
-and the generic `die()` error code 1. The Fly runtime's `decide_teardown`
-trap (`scripts/remote/provision.sh`) routes `11` through the same
-case-arm as `0|10|75` (genuine terminal exits): the trap calls
-`_try_fetch_branch_for_teardown` to pull whatever state landed on
-the machine back to the host, then takes the `_run_finished_at == ""`
-fallback (the run never reached finalize, so no `host_finalize` is
-attempted) and `destroy_machine` runs cleanly. A code-11-specific
-recovery hint is printed: "re-run with the recommended --max-workers
-value" — distinct from the code-10 hint which suggests `finalize`.
-The machine is still destroyed rather than paused: even though
-`plan_snapshot` now makes the *host-side* `resume` recoverable
-(DESIGN §6 "Budget-check resume"), the Fly Machine itself has no
-further use once `decide_teardown` runs — the recommended fix is a
-higher `--max-workers` or `--skip-budget-check` on a fresh remote
-launch, not resuming the same (now-destroyed) machine. This routing
-keeps the user from paying for a Fly volume indefinitely once the
-budget check has already fired.
+`EXIT_NEEDS_ANSWERS = 10` and the generic error code 1. The Fly
+runtime's `decide_teardown` trap (`scripts/remote/provision.sh`) routes
+`11` through the same case-arm as `0|10|75` (genuine terminal exits):
+it fetches whatever state landed on the machine back to the host, then
+destroys the machine cleanly (the `_run_finished_at == ""` fallback, no
+`host_finalize`) with a code-11-specific recovery hint — "re-run with
+the recommended --max-workers value" — distinct from code-10's
+`finalize` hint. The machine is destroyed rather than paused: even
+though `plan_snapshot` makes the host-side `resume` recoverable, the
+Fly Machine has no further use once `decide_teardown` runs — the fix is
+a higher `--max-workers` on a fresh remote launch, not resuming the
+same (now-destroyed) machine.
 
 ### Decomposition budget partition
 
@@ -1209,28 +1117,25 @@ address this together:
 
 1. **`DEFAULT_CAPS["decompose_budget_share"] = 0.40`** — the fraction of
    `max_total_workers` recursive decomposition may spend. Enforced by
-   `_bump_decompose_workers(st, caps)`, which every fit_judge/splitter
+   `_bump_decompose_workers(st, caps)`, called by every fit_judge/splitter
    spawn site in `_recursive_decompose` (including the label-only
-   migration-chunk splitter) calls instead of a bare `st.bump_workers`.
-   It **checks before it bumps** — `decompose_worker_count >=
+   migration-chunk splitter) instead of a bare `st.bump_workers`. It
+   **checks before it bumps** — `decompose_worker_count >=
    decompose_budget_share * max_total_workers` raises
-   `DecompositionBudgetExceeded` (a `WorkerError` subclass) *before*
-   touching either counter, so a refused call cannot itself eat into the
-   execution budget the partition protects — and otherwise bumps
-   `st.data["worker_count"]` (via `st.bump_workers`, so the pre-existing
-   global-cap `WorkerError` still fires first and unchanged) and
-   `st.data["decompose_worker_count"]`. Callers catch it and accept the
-   node as a leaf (fit_judge/splitter sites) or fall back to the
-   pre-existing deterministic chunk labels (label-only migration site)
-   without spawning the call. Each of the three spawn sites has its own
-   `try/except DecompositionBudgetExceeded` closing before its `claude_p`
-   call.
+   `DecompositionBudgetExceeded` (a `WorkerError` subclass) before
+   touching either counter, so a refused call cannot eat into the
+   execution budget it protects — otherwise it bumps both
+   `st.data["worker_count"]` (via `st.bump_workers`, preserving the
+   pre-existing global-cap check) and `decompose_worker_count`. Callers
+   catch the exception and accept the node as a leaf, or fall back to
+   deterministic chunk labels (label-only migration site), without
+   spawning the call.
 
-   This is a runaway backstop, not a score gate: it does not consult the
+   This is a runaway backstop, not a score gate — it ignores the
    fit_judge score, since stopping early on projected cost would ship
    exactly the low-scoring nodes `decompose_fit_threshold` exists to keep
    splitting. `_warn_decomposition_share` records the realized share in
-   `state.json`'s `decompose_share` after expansion for calibration.
+   `state.json`'s `decompose_share` for calibration.
 2. **`DEFAULT_CAPS["max_total_workers"] = 2000`** — the global runaway
    ceiling across the whole run. Runaway detection at the per-subtask
    level (8 separate retry-round caps — `failed_retries`,
@@ -1290,14 +1195,15 @@ The lock primitive itself:
 - `State.save`'s locking behavior is unchanged: the flock is on the run
   directory inode, not the state.json inode, so the
   `os.replace(tmp, self.path)` swap inside `save()` does not affect the
-  lock. `save()`'s body also catches an `OSError(ENOSPC, ...)` from
-  either half of the write and reraises it as `DiskLowSpace` — see
-  §"Disk headroom (N30)". The rename uses `os.replace()` rather than
-  `Path.replace()`: on Python 3.10, `pathlib`'s accessor binds
-  `os.replace` at class-definition time, so patching the `os` module's
-  `replace` attribute would not affect `Path.replace()` — only Python
-  3.12's rewritten pathlib looks it up dynamically. `os.replace()` keeps
-  the behavior version-independent.
+  lock. `save()` also catches an `OSError(ENOSPC, ...)` from either half
+  of the write and reraises it as `DiskLowSpace` — see §"Disk headroom
+  (N30)". The rename uses `os.replace()` rather than `Path.replace()`:
+  on Python 3.10, `pathlib`'s accessor binds `os.replace` at
+  class-definition time, so patching the `os` module's `replace`
+  attribute would not affect `Path.replace()` (only 3.12's rewritten
+  pathlib looks it up dynamically) — `os.replace()` keeps the behavior
+  version-independent.
+
 Two checked construction sites that catch `StateLockedError`:
 
 - `main()` at the `State(leerie_root, run_id, repo_root=repo_root)` call:
@@ -1404,43 +1310,17 @@ bind-mount volume argument once resolved. Tested by
 > The CLI/env > file order follows the same session-scoped vs.
 > committed-default split as `--source-of-truth` and `--runtime`.
 
-### State directory
-
-Controls where leerie writes all run state (`state.json`, `runs/`, `logs/`,
-etc.). By default, state is written to a per-repo subtree under `$HOME` —
-never inside the repo itself — so target projects do not accumulate a
-`.leerie/` directory and do not need to add anything to their `.gitignore`.
-The default path is `$HOME/.leerie/<basename>/`, giving each repo an
-isolated subtree keyed by basename. Cross-repo basename collisions are
-caught at use time via an `.owner` sidecar (see
-*Host-side per-repo state directory* above for the full check).
-
-Resolution order (lowest → highest priority):
-
-1. **Default** `$HOME/.leerie/<basename>/`. The basename of the
-   absolute repo path.
-
-2. **`leerie.toml` at the repo root** with key `state_dir`. Plain
-   `key=value` syntax; bare `~` and `~/`-prefixed values are expanded to
-   `$HOME`.
-
-3. **`LEERIE_STATE_DIR`** environment variable — any non-empty value is
-   expanded (`~/` → `$HOME/`) and used verbatim. Set once in your shell
-   profile to keep all repos under a common directory.
-
-4. **`--state-dir PATH`** / `--state-dir=PATH` CLI flag. Highest priority;
-   overrides everything. Launcher-only (stripped from `REWRITTEN_ARGS`;
-   the orchestrator never sees it). Bare `~` and `~/`-prefixed values
-   are expanded.
-
-Code counterpart: `resolve_leerie_root(repo_root)` in `leerie.py`;
-constant `STATE_DIR_ENV = "LEERIE_STATE_DIR"`. All three `leerie_root`
-assignments in `main()` call `resolve_leerie_root(Path(os.getcwd()))`.
-The launcher resolves `LEERIE_STATE_HOST_DIR` (the same value, before
-container launch) via `_state_dir_default()` and passes it as the
-`/leerie-state` bind-mount argument and via `-e LEERIE_STATE_DIR=/leerie-state`
-so the orchestrator inside the container always writes to the mounted state
-dir. See §0.5 *Bind-mount table* for the full mount specification.
+The **container-side** counterpart is `resolve_leerie_root(repo_root)`
+in `leerie.py` (constant `STATE_DIR_ENV = "LEERIE_STATE_DIR"`), which
+every `leerie_root` assignment in `main()` calls via
+`resolve_leerie_root(Path(os.getcwd()))`. It mirrors the same resolution
+order and default path above, evaluated inside the container rather
+than by the launcher: the launcher resolves `LEERIE_STATE_HOST_DIR`
+before container launch via `_state_dir_default()`, passes it as the
+`/leerie-state` bind-mount argument, and sets
+`-e LEERIE_STATE_DIR=/leerie-state` so the orchestrator inside the
+container always writes to the mounted state dir. See §0.5 *Bind-mount
+table* for the full mount specification.
 
 ### Runtime mode
 
@@ -1471,36 +1351,35 @@ substituted:
 
 1. **Create/resume.** When `--run-id`/`LEERIE_RUN_ID` names a run whose
    `ec2-instance.json`/`run.json` sidecar carries an `ec2_instance_id`,
-   `resume_instance()` wakes that instance; otherwise `provision_instance()`
-   creates a fresh one and `LEERIE_RUN_ID` is set to the new instance id
-   (run_id = instance_id, mirroring Fly's run_id = machine_id rule — DESIGN
-   §6 "Run identifier"). Unlike Fly, bare `resume` with no `--run-id`
-   does not auto-discover an EC2 instance from a PID-record scan yet —
-   the operator passes `--run-id` explicitly.
+   `resume_instance()` wakes it; otherwise `provision_instance()` creates
+   a fresh one and sets `LEERIE_RUN_ID` to the new instance id (run_id =
+   instance_id, mirroring Fly's run_id = machine_id rule — DESIGN §6
+   "Run identifier"). Unlike Fly, bare `resume` does not yet
+   auto-discover an EC2 instance — the operator passes `--run-id`
+   explicitly.
 2. **Wait-ready** is `provision_instance()`'s/`resume_instance()`'s own
-   `wait_for_instance_ready()` call (already internal to those functions).
-3. **Seed.** `LEERIE_EC2_SSH_TARGET` is resolved from the instance's
-   public IP (via `ec2-resume-instance.sh`'s `_resolve_ssh_target_from_instance`,
-   reused for the fresh-provision path too), then `ec2_seed_auth()`
-   followed by `ec2_seed_repo()` — mirroring `seed_auth`+`seed_repo` on
-   the Fly path. An early flock probe (over `ec2_remote_exec`) mirrors
-   the Fly branch's resume-only optimization: when the run directory's
-   flock is already held, seeding is skipped entirely and the launcher
-   attaches to the live orchestrator instead.
+   internal `wait_for_instance_ready()` call.
+3. **Seed.** `LEERIE_EC2_SSH_TARGET` resolves from the instance's public
+   IP (`ec2-resume-instance.sh`'s `_resolve_ssh_target_from_instance`,
+   reused for fresh provisions too), then `ec2_seed_auth()` followed by
+   `ec2_seed_repo()` — mirroring `seed_auth`+`seed_repo` on the Fly path.
+   An early flock probe over `ec2_remote_exec` mirrors Fly's
+   resume-only optimization: if the run directory's flock is already
+   held, seeding is skipped and the launcher attaches to the live
+   orchestrator instead.
 4. **Orchestrate.** A detached-`Popen` Python launch wrapper (same shape
-   as the Fly launch script, `/opt/leerie-image/orchestrator/leerie.py`
-   under `runuser`-equivalent `user="leerie"`) is piped to
-   `ec2_launch_detached()`. rc=75 (the flock-loser smart-resume pivot)
-   routes to `_attach_to_live_orchestrator_ec2()` (`ec2-ssm.sh`) instead
-   of provisioning a duplicate orchestrator — `container_rc=130` so
-   `decide_ec2_teardown`'s detach arm leaves the instance alone, exactly
-   like the Fly branch's identical rc=75 routing. On a clean launch, the
-   launcher tails the log via `render_tail_wrapper()` (from `lib.sh`,
-   transport-agnostic POSIX sh) piped through `ec2_attach()`.
+   as the Fly launch script) is piped to `ec2_launch_detached()`. rc=75
+   (flock-loser smart-resume) routes to
+   `_attach_to_live_orchestrator_ec2()` instead of provisioning a
+   duplicate — `container_rc=130` so `decide_ec2_teardown`'s detach arm
+   leaves the instance alone, exactly like Fly's identical rc=75
+   routing. On a clean launch, the launcher tails the log via
+   `render_tail_wrapper()` (`lib.sh`, transport-agnostic) through
+   `ec2_attach()`.
 5. **Teardown** is `ec2-provision.sh`'s own `decide_ec2_teardown()` EXIT
-   trap, registered by `provision_instance()`/re-armed by
-   `resume_instance()`; the launcher only sets `LEERIE_REMOTE_EXIT_RC`
-   before exiting, same as the Fly branch.
+   trap, registered/re-armed by `provision_instance()`/`resume_instance()`;
+   the launcher only sets `LEERIE_REMOTE_EXIT_RC` before exiting, same as
+   the Fly branch.
 
 Not yet wired for EC2 (documented gaps, not required for an end-to-end
 run): bare `resume` PID-record auto-discovery (an explicit
