@@ -547,10 +547,7 @@ confusing the two either breaks runs or corrupts the install.
 
 ### Entrypoint and source mounting
 
-`scripts/container-entry.sh` is exec'd as PID 1, running as **root**
-(the Dockerfile intentionally omits `USER leerie` — see DESIGN §6
-*Memory containment* for why root at PID 1 is required to launch the
-cgroup broker). Sketch of the relevant final exec:
+`scripts/container-entry.sh` is exec'd as PID 1, running as **root** (the Dockerfile intentionally omits `USER leerie` — see DESIGN §6 *Memory containment* for why root at PID 1 is required to launch the cgroup broker). Sketch of the relevant final exec:
 
 ```sh
 #!/bin/sh
@@ -572,79 +569,19 @@ exec runuser -u leerie -- \
   python3 /opt/leerie-image/orchestrator/leerie.py "$@"
 ```
 
-**Rootless containerd.** Under rootless containerd (Linux), rootlesskit
-maps the host UID to container UID 0. The entrypoint detects this via
-`/proc/self/uid_map` (non-zero host-start field on the first line →
-`ROOTLESS=true`) and, when true, also extracts `HOST_UID` (that line's
-second field — the real host UID rootlesskit mapped container UID 0 to).
-When rootless:
+**Rootless containerd.** Under rootless containerd (Linux), rootlesskit maps the host UID to container UID 0. The entrypoint detects this via `/proc/self/uid_map` (non-zero host-start field on the first line → `ROOTLESS=true`) and, when true, also extracts `HOST_UID` (that line's second field — the real host UID rootlesskit mapped container UID 0 to). When rootless:
 
-- The `chown leerie: /work` and `runuser -u leerie --` steps are
-  skipped — container "root" IS the host user, so privilege drop would
-  break bind-mount access and chown would reassign to the subuid range.
-- `CGROUP_ROOT` is anchored at
-  `/sys/fs/cgroup/user.slice/user-$HOST_UID.slice/user@$HOST_UID.service`
-  instead of the top-level `/sys/fs/cgroup` — the mapped host UID has no
-  privilege over the true top level (root-owned, mode 0555), but systemd
-  already delegates this subtree to that UID's login session, so any
-  cgroup the UID creates underneath it (via `mkdir`) inherits that UID's
-  ownership on every auto-created interface file, including `pids.max` /
-  `memory.max` — unlike a directory merely `chown`ed after creation. This
-  is passed to `cgroup-broker.py` via `LEERIE_CGROUP_V2_ROOT` (its
-  `V2_ROOT`, default `/sys/fs/cgroup` when unset — every non-rootless
-  case); the v1/hybrid split-hierarchy path (`V1_ROOT`, Fly-only) is
-  never overridden. The broker needs no separate privileged identity
-  here: it's launched at the same rootlesskit-mapped identity the whole
-  container runs as, which is exactly what `CGROUP_ROOT` is delegated
-  to. Cross-scope worker-PID migration into `leerie.slice` still works
-  because cgroup v2 only requires write access to the destination and
-  the nearest common ancestor (not the source), and that ancestor —
-  `user@$HOST_UID.service` — is what's delegated. See DESIGN §6
-  *Rootless exception* for the full mechanism.
-- On hosts where this delegation doesn't hold (non-systemd rootless init,
-  or a systemd host that doesn't delegate `pids`/`memory` into the
-  per-session slice), the slice-setup writes (`|| true`) and the broker's
-  write-then-read-back check in `_detect()` both fail silently — same as
-  any other containment-incapable host — and the fail-closed containment
-  gate stops the run unless the operator passes
-  `--dangerously-allow-uncapped`.
-- On macOS, the launcher unconditionally sets the `rshared` bind-mount —
-  Colima's VM always runs rootful containerd with cgroup v2 and shared
-  propagation, but the host has no `/sys/fs/cgroup` to probe. Native
-  rootful Linux gets the same `rshared` mount unconditionally. Rootless
-  containerd is its own branch, gated on the `containerd-rootless/child_pid`
-  sentinel, and uses a **plain** bind-mount with no `bind-propagation`
-  flag: rootlesskit's `--propagation=rslave` demotes `/sys/fs/cgroup` to a
-  slave mount, incompatible with `bind-propagation=rshared`. Only
-  read/write visibility into the already-mounted cgroupfs is needed —
-  not propagation of new mount events — so the plain bind-mount
-  suffices. When cgroup v2 isn't present at all, the mount is skipped,
-  the broker probe fails, and the fail-closed gate
-  (`_enforce_and_record_cgroup_containment`) stops the run unless
-  `--dangerously-allow-uncapped` is set.
+- The `chown leerie: /work` and `runuser -u leerie --` steps are skipped — container "root" IS the host user, so privilege drop would break bind-mount access and chown would reassign to the subuid range.
+- `CGROUP_ROOT` is anchored at `/sys/fs/cgroup/user.slice/user-$HOST_UID.slice/user@$HOST_UID.service` instead of the top-level `/sys/fs/cgroup` — the mapped host UID has no privilege over the true top level (root-owned, mode 0555), but systemd already delegates this subtree to that UID's login session, so any cgroup the UID creates underneath it (via `mkdir`) inherits that UID's ownership on every auto-created interface file, including `pids.max` / `memory.max` — unlike a directory merely `chown`ed after creation. This is passed to `cgroup-broker.py` via `LEERIE_CGROUP_V2_ROOT` (its `V2_ROOT`, default `/sys/fs/cgroup` when unset — every non-rootless case); the v1/hybrid split-hierarchy path (`V1_ROOT`, Fly-only) is never overridden. The broker needs no separate privileged identity here: it's launched at the same rootlesskit-mapped identity the whole container runs as, which is exactly what `CGROUP_ROOT` is delegated to. Cross-scope worker-PID migration into `leerie.slice` still works because cgroup v2 only requires write access to the destination and the nearest common ancestor (not the source), and that ancestor — `user@$HOST_UID.service` — is what's delegated. See DESIGN §6 *Rootless exception* for the full mechanism.
+- On hosts where this delegation doesn't hold (non-systemd rootless init, or a systemd host that doesn't delegate `pids`/`memory` into the per-session slice), the slice-setup writes (`|| true`) and the broker's write-then-read-back check in `_detect()` both fail silently — same as any other containment-incapable host — and the fail-closed containment gate stops the run unless the operator passes `--dangerously-allow-uncapped`.
+- On macOS, the launcher unconditionally sets the `rshared` bind-mount — Colima's VM always runs rootful containerd with cgroup v2 and shared propagation, but the host has no `/sys/fs/cgroup` to probe. Native rootful Linux gets the same `rshared` mount unconditionally. Rootless containerd is its own branch, gated on the `containerd-rootless/child_pid` sentinel, and uses a **plain** bind-mount with no `bind-propagation` flag: rootlesskit's `--propagation=rslave` demotes `/sys/fs/cgroup` to a slave mount, incompatible with `bind-propagation=rshared`. Only read/write visibility into the already-mounted cgroupfs is needed — not propagation of new mount events — so the plain bind-mount suffices. When cgroup v2 isn't present at all, the mount is skipped, the broker probe fails, and the fail-closed gate (`_enforce_and_record_cgroup_containment`) stops the run unless `--dangerously-allow-uncapped` is set.
 
-**User-namespace remap.** Claude Code rejects
-`--dangerously-skip-permissions` from UID 0. The rootless entrypoint
-uses `unshare --user --map-user --map-group` to remap outer UID 0 to
-the `leerie` user in a nested user namespace, so the orchestrator runs
-as non-root and the flag is accepted. The OCI default seccomp profile
-blocks `unshare(CLONE_NEWUSER)`, so the launcher passes
-`--security-opt seccomp=unconfined` for rootless runs (gated on
-`containerd-rootless/child_pid`). See DESIGN.md §6.
+**User-namespace remap.** Claude Code rejects `--dangerously-skip-permissions` from UID 0. The rootless entrypoint uses `unshare --user --map-user --map-group` to remap outer UID 0 to the `leerie` user in a nested user namespace, so the orchestrator runs as non-root and the flag is accepted. The OCI default seccomp profile blocks `unshare(CLONE_NEWUSER)`, so the launcher passes `--security-opt seccomp=unconfined` for rootless runs (gated on `containerd-rootless/child_pid`). See DESIGN.md §6.
 
-The orchestrator's source lives at `/opt/leerie-image/`. It is present
-in two ways depending on execution mode:
+The orchestrator's source lives at `/opt/leerie-image/`. It is present in two ways depending on execution mode:
 
-- **Local runs:** the launcher bind-mounts `$LEERIE_HOME` read-only at
-  `/opt/leerie-image`. Iterating on `orchestrator/leerie.py` does not
-  need an image rebuild — the bind mount shadows the baked copy and
-  the host file is picked up on the next `leerie` invocation.
-- **Fly.io Machines (remote):** there is no bind mount. The Dockerfile
-  `COPY` instructions bake `orchestrator/`, `scripts/`, `prompts/`,
-  and `.claude-plugin/` into the image at `/opt/leerie-image/` so the
-  entrypoint resolves without any host-side path. A new leerie version
-  requires rebuilding and pushing the image (see §0.5 "Registry publish
-  path").
+- **Local runs:** the launcher bind-mounts `$LEERIE_HOME` read-only at `/opt/leerie-image`. Iterating on `orchestrator/leerie.py` does not need an image rebuild — the bind mount shadows the baked copy and the host file is picked up on the next `leerie` invocation.
+- **Fly.io Machines (remote):** there is no bind mount. The Dockerfile `COPY` instructions bake `orchestrator/`, `scripts/`, `prompts/`, and `.claude-plugin/` into the image at `/opt/leerie-image/` so the entrypoint resolves without any host-side path. A new leerie version requires rebuilding and pushing the image (see §0.5 "Registry publish path").
 
 ### Bind-mount table
 
@@ -665,12 +602,7 @@ The launcher passes the following mounts to `nerdctl run`:
 | `$STAGE/.aws` (per-run host scratch, **Bedrock SSO/profile mode only**) | `/home/leerie/.aws` | **ro** | Staged when `detect_bedrock_mode()` finds `CLAUDE_CODE_USE_BEDROCK` set to a truthy value (`1`, `true`, `yes`, or `on`, case-insensitive — matching Claude CLI's `isEnvTruthy`) in the `env` block of any of the three settings files the Claude CLI merges (`~/.claude/settings.json` userSettings, `<USER_REPO>/.claude/settings.json` projectSettings, `<USER_REPO>/.claude/settings.local.json` localSettings) — and only when `AWS_BEARER_TOKEN_BEDROCK` (below) is **not** set on the host; the bearer-token path needs none of this. The Claude CLI's AWS SDK resolves credentials via pure file I/O — reads `~/.aws/config` (profile + SSO session config) and `~/.aws/sso/cache/*.json` (SSO access tokens, ~12 h TTL) directly; no `aws` binary is needed inside the container. `~/.aws/cli/cache` is excluded (large CLI result cache, irrelevant to auth). Mounted **read-only** because workers never write credentials. The `aws` binary itself is a host-only concern: `aws sso login` needs an interactive TTY/browser, so `bedrock_preflight()` catches an expired SSO token on the host before the container starts and prints the recovery hint (`aws sso login --profile <profile>`). On Fly.io, `$STAGE/.aws/` rides the tar pipe to `seed_auth` automatically and lands at `/home/leerie/.aws/` on the remote machine. Belt-and-suspenders: when this mode is active, the launcher also injects `CLAUDE_CODE_USE_BEDROCK=1`, `AWS_PROFILE`, and `AWS_REGION` as explicit env vars (`AUTH_MOUNTS` `-e` flags locally, `child_env` on Fly) so workers activate Bedrock via `process.env` regardless of how the in-container claude binary handles `settings.json`. The same local `AUTH_MOUNTS` block (not yet wired into the Fly heredoc) also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`/`_OPUS_MODEL`/`_HAIKU_MODEL` when set — see the bearer-token row below for why. |
 | `AWS_BEARER_TOKEN_BEDROCK` (host env var, **Bedrock bearer-token mode**) | forwarded as `-e`/`child_env` only — **no bind mount** | n/a | The static-bearer-token analogue of `CLAUDE_CODE_OAUTH_TOKEN`, triggered independently of `detect_bedrock_mode()`'s settings.json scan and taking precedence over the SSO/profile row above when both are present (matches the Claude CLI's own resolution order — verified live, v2.1.220: Bedrock client construction short-circuits SSO/profile once this is set). No `aws` CLI, no SSO session, no `~/.aws` staging — `bedrock_preflight()` is skipped entirely. The launcher forwards the token verbatim, `CLAUDE_CODE_USE_BEDROCK` (defaulting to `1` if unset — confirmed live the token alone is a no-op without it), and `AWS_REGION` when set (optional, CLI defaults to `us-east-1`) as `-e`/`child_env` entries, mirroring `CLAUDE_CODE_OAUTH_TOKEN`'s forwarding rather than the SSO row's settings.json extraction. The same local-nerdctl block also forwards `ANTHROPIC_DEFAULT_SONNET_MODEL`/`_OPUS_MODEL`/`_HAIKU_MODEL` when set: leerie always invokes `claude -p` with an explicit `--model <tier>` alias, never a raw model ID, and on Bedrock the CLI's alias table can lag the Anthropic-API one by a generation (e.g. `sonnet` resolving to Sonnet 4.5 instead of Sonnet 5) — these are the CLI's documented env vars for repointing what an alias resolves to. On the Fly path, every value substituted into the detached-launch heredoc (bearer token, region, use-bedrock flag, plus the pre-existing `_BEDROCK_PROFILE`/`_BEDROCK_REGION`/host-TZ values) is JSON-encoded host-side first (same technique `_launch_argv_json` uses for orchestrator argv) rather than substituted as a raw `"${VAR}"` string — an opaque bearer token can contain a `"` or `\` that would otherwise break out of the Python string literal. |
 
-The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`,
-`$SSH_AUTH_SOCK`) that earlier versions of leerie bind-mounted **no longer
-exist** — finalize moved to the host (DESIGN §6 *Finalization*), so
-`git push` and `gh pr create` run with the host's working auth state and
-don't need to be forwarded into the container. The macOS-only "SSH agent
-forwarding is not available" note is gone for the same reason.
+The four host-auth mounts (`~/.config/gh`, `~/.git-credentials`, `~/.ssh`, `$SSH_AUTH_SOCK`) that earlier versions of leerie bind-mounted **no longer exist** — finalize moved to the host (DESIGN §6 *Finalization*), so `git push` and `gh pr create` run with the host's working auth state and don't need to be forwarded into the container. The macOS-only "SSH agent forwarding is not available" note is gone for the same reason.
 | `~/.cache/leerie/mise-data` | `/home/leerie/.local/share/mise` | rw | Mise's `MISE_DATA_DIR` (per-repo runtime installs, plugins, cache). Lives in the user dir so the resolver checks it first then falls through to the image-baked `MISE_SYSTEM_DATA_DIR=/usr/local/share/mise` for the LTS fallback (DESIGN §6½). Its `shims` subdir is on the image's `ENV PATH` (see §0.5 "Image build") so a worker's own ad-hoc Bash commands can reach a repo-pinned runtime (e.g. Ruby via `.ruby-version`) without an explicit `mise exec --`. |
 | `~/.cache/leerie/pnpm-store` | `/home/leerie/.cache/leerie/pnpm-store` | rw | pnpm content-addressable store. Pointed at via `npm_config_store_dir` (the pnpm-respected env var; `PNPM_STORE_PATH` doesn't exist and would be silently ignored). Safe for concurrent installs across worktrees (pnpm/discussions#10702). |
 | `~/.cache/leerie/pip` | `/home/leerie/.cache/leerie/pip` | rw | pip HTTP + wheels cache. Each worker that needs Python deps runs `pip install` / `uv sync` itself in its own worktree against this shared cache; after the first install of a package the cache is warm and subsequent workers' installs are fast. Wheel-build race pypa/pip#9034 is still a theoretical concern but in practice rare given leerie's small worker concurrency (DESIGN §6½). |
@@ -682,401 +614,132 @@ forwarding is not available" note is gone for the same reason.
 
 ### `LEERIE_*` env-var forwarding (local `nerdctl run`)
 
-The orchestrator runs **inside** the container and reads every override from
-`os.environ` — which only inherits what `nerdctl run` forwards. The launcher
-forwards **every `LEERIE_*` var in its environment except a deny-list** of
-launcher/host-only vars (the `_leerie_env_denylist` array in the `nerdctl run`
-block). A `for` loop over `compgen -v | grep '^LEERIE_'` appends a bare
-`-e "$name"` (host value passed through) for each non-deny-listed var with a
-non-empty value. Empty/unset vars are skipped.
+The orchestrator runs **inside** the container and reads every override from `os.environ` — which only inherits what `nerdctl run` forwards. The launcher forwards **every `LEERIE_*` var in its environment except a deny-list** of launcher/host-only vars (the `_leerie_env_denylist` array in the `nerdctl run` block). A `for` loop over `compgen -v | grep '^LEERIE_'` appends a bare `-e "$name"` (host value passed through) for each non-deny-listed var with a non-empty value. Empty/unset vars are skipped.
 
-**`LEERIE_STATE_HOST_DIR_DISPLAY` — a deliberate, narrow exception.** The
-orchestrator sees the state root bind-mounted at `/leerie-state`, so a bare
-`die()` naming `<state-root>/runs/<id>/state.json` would print a path the
-operator cannot open on the host. The launcher therefore forwards the *host*
-side of that mount explicitly, as
-`-e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"`, and
-`_operator_path()` uses it to rewrite the prefix in operator-facing text.
+**`LEERIE_STATE_HOST_DIR_DISPLAY` — a deliberate, narrow exception.** The orchestrator sees the state root bind-mounted at `/leerie-state`, so a bare `die()` naming `<state-root>/runs/<id>/state.json` would print a path the operator cannot open on the host. The launcher therefore forwards the *host* side of that mount explicitly, as `-e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"`, and `_operator_path()` uses it to rewrite the prefix in operator-facing text.
 
-The `_DISPLAY` suffix is load-bearing. `LEERIE_STATE_HOST_DIR` itself stays on
-the deny-list, and must: a host path is meaningless *as a path* inside the
-container, and nothing may open this value. It may only be printed. The
-separate name is what keeps that restriction legible at the use site, and
-`tests/test_operator_path_translation.py` pins both halves — that the launcher
-forwards the display copy, and that the un-suffixed original remains denied.
+The `_DISPLAY` suffix is load-bearing. `LEERIE_STATE_HOST_DIR` itself stays on the deny-list, and must: a host path is meaningless *as a path* inside the container, and nothing may open this value. It may only be printed. The separate name is what keeps that restriction legible at the use site, and `tests/test_operator_path_translation.py` pins both halves — that the launcher forwards the display copy, and that the un-suffixed original remains denied.
 
-Deny-list = forward-all-minus-known-host-only, not an allow-list, so the
-dynamic per-worker names (`LEERIE_MODEL_<WORKER>`, `LEERIE_EFFORT_<WORKER>`,
-built at runtime from `f"{MODEL_ENV}_{worker.upper()}"`) forward automatically
-and a future override cannot silently be stranded at the container boundary.
-Deny-listed vars are the launcher/host-only ones: `LEERIE_STATE_DIR` and
-`LEERIE_INSPECT_DIRS` (remapped separately to container-internal values —
-`-e LEERIE_STATE_DIR=/leerie-state`, `-e LEERIE_INSPECT_DIRS=`), `LEERIE_HOME`
-/ `LEERIE_REPO` / `LEERIE_STATE_HOST_DIR` / `LEERIE_SELF_CMD` (self-location +
-host paths), `LEERIE_NO_PUSH` (orchestrator always gets `--no-push`; host does
-the push), `LEERIE_RUNTIME` (decided launcher-side before launch), the
-Fly/EC2/remote/chain/wave machinery — including the EC2 instance-lifecycle
-vars `LEERIE_EC2_INSTANCE_ID` / `LEERIE_EC2_AMI` / `LEERIE_EC2_INSTANCE_TYPE`
-/ `LEERIE_EC2_KEY_NAME` / `LEERIE_EC2_SECURITY_GROUP` / `LEERIE_EC2_SUBNET_ID`,
-launcher-only like their Fly counterparts (`LEERIE_FLY_APP` /
-`LEERIE_FLY_IMAGE` / `LEERIE_MACHINE_ID`). `tests/test_launcher_env_forwarding.py`
-extracts the loop verbatim and includes a coupling guard asserting no
-orchestrator-read override is deny-listed except four justified exceptions
-(`LEERIE_STATE_DIR`, `LEERIE_INSPECT_DIRS`, `LEERIE_NO_PUSH`, `LEERIE_RUNTIME`).
-On the Fly path the equivalent forwarding is via `child_env` in the
-detached-launch heredoc, not this loop.
+Deny-list = forward-all-minus-known-host-only, not an allow-list, so the dynamic per-worker names (`LEERIE_MODEL_<WORKER>`, `LEERIE_EFFORT_<WORKER>`, built at runtime from `f"{MODEL_ENV}_{worker.upper()}"`) forward automatically and a future override cannot silently be stranded at the container boundary. Deny-listed vars are the launcher/host-only ones: `LEERIE_STATE_DIR` and `LEERIE_INSPECT_DIRS` (remapped separately to container-internal values — `-e LEERIE_STATE_DIR=/leerie-state`, `-e LEERIE_INSPECT_DIRS=`), `LEERIE_HOME` / `LEERIE_REPO` / `LEERIE_STATE_HOST_DIR` / `LEERIE_SELF_CMD` (self-location + host paths), `LEERIE_NO_PUSH` (orchestrator always gets `--no-push`; host does the push), `LEERIE_RUNTIME` (decided launcher-side before launch), the Fly/EC2/remote/chain/wave machinery — including the EC2 instance-lifecycle vars `LEERIE_EC2_INSTANCE_ID` / `LEERIE_EC2_AMI` / `LEERIE_EC2_INSTANCE_TYPE` / `LEERIE_EC2_KEY_NAME` / `LEERIE_EC2_SECURITY_GROUP` / `LEERIE_EC2_SUBNET_ID`, launcher-only like their Fly counterparts (`LEERIE_FLY_APP` / `LEERIE_FLY_IMAGE` / `LEERIE_MACHINE_ID`). `tests/test_launcher_env_forwarding.py` extracts the loop verbatim and includes a coupling guard asserting no orchestrator-read override is deny-listed except four justified exceptions (`LEERIE_STATE_DIR`, `LEERIE_INSPECT_DIRS`, `LEERIE_NO_PUSH`, `LEERIE_RUNTIME`). On the Fly path the equivalent forwarding is via `child_env` in the detached-launch heredoc, not this loop.
 
-**`USER_REPO` (non-`LEERIE_*`, both runtimes).** `log()` renders its
-`[leerie] [<repo>]` prefix from `Path(os.environ.get("USER_REPO") or
-os.getcwd()).name`. The container's cwd is `/work`, so without an injected
-`USER_REPO` the fallback fires and every line reads `[leerie] [work]`. Both
-runtimes therefore inject it, each outside the `LEERIE_*` loop (the name
-does not match `^LEERIE_`):
+**`USER_REPO` (non-`LEERIE_*`, both runtimes).** `log()` renders its `[leerie] [<repo>]` prefix from `Path(os.environ.get("USER_REPO") or os.getcwd()).name`. The container's cwd is `/work`, so without an injected `USER_REPO` the fallback fires and every line reads `[leerie] [work]`. Both runtimes therefore inject it, each outside the `LEERIE_*` loop (the name does not match `^LEERIE_`):
 
-- **Local:** an explicit `-e "USER_REPO=$(basename "$USER_REPO")"` in the
-  `_run_argv` array, next to the other explicit `-e` lines.
-- **Fly:** `child_env["USER_REPO"] = "$(basename "$USER_REPO")"` in the
-  detached-launch heredoc (reproduced verbatim under §"Worker auth +
-  config seeding", `seed-auth.sh`).
+- **Local:** an explicit `-e "USER_REPO=$(basename "$USER_REPO")"` in the `_run_argv` array, next to the other explicit `-e` lines.
+- **Fly:** `child_env["USER_REPO"] = "$(basename "$USER_REPO")"` in the detached-launch heredoc (reproduced verbatim under §"Worker auth + config seeding", `seed-auth.sh`).
 
-Both pass the **basename**, never the host path: `$USER_REPO` is a host
-absolute path that does not resolve inside the container (the repo is at
-`/work`), and `Path(x).name` is identity for a bare name. `log()` is the
-only in-container reader, so nothing treats the value as a path. The two
-mechanisms are independent — a change to one that is not mirrored in the
-other regresses that runtime to `[work]`.
+Both pass the **basename**, never the host path: `$USER_REPO` is a host absolute path that does not resolve inside the container (the repo is at `/work`), and `Path(x).name` is identity for a bare name. `log()` is the only in-container reader, so nothing treats the value as a path. The two mechanisms are independent — a change to one that is not mirrored in the other regresses that runtime to `[work]`.
 
 ### `--inspect-dir` path translation
 
-Inspect dirs (`--add-dir` forwarded to `claude -p` for cross-repo
-context) come from CLI flags, the `LEERIE_INSPECT_DIRS` env var, or
-`leerie.toml`'s `inspect_dirs` key. They are *host* paths. The launcher:
+Inspect dirs (`--add-dir` forwarded to `claude -p` for cross-repo context) come from CLI flags, the `LEERIE_INSPECT_DIRS` env var, or `leerie.toml`'s `inspect_dirs` key. They are *host* paths. The launcher:
 
 1. Collects all three sources before any container is started.
-2. For each host path: resolves it on the host (`cd -P "$path" && pwd`,
-   so symlinks and `~` are expanded), bind-mounts it read-only at
-   `/inspect/<basename>` inside the container, and rewrites the
-   corresponding CLI flag to point at the in-container path.
-3. Passes only the rewritten flags into the container, and clears
-   `LEERIE_INSPECT_DIRS` in the container env so the in-container
-   resolver doesn't see any host paths.
+2. For each host path: resolves it on the host (`cd -P "$path" && pwd`, so symlinks and `~` are expanded), bind-mounts it read-only at `/inspect/<basename>` inside the container, and rewrites the corresponding CLI flag to point at the in-container path.
+3. Passes only the rewritten flags into the container, and clears `LEERIE_INSPECT_DIRS` in the container env so the in-container resolver doesn't see any host paths.
 
-This honors the orchestrator's precedence rules in `resolve_inspect_dirs`
-(CLI > env > TOML) by emitting only CLI args — the env and TOML pre-passes
-in the launcher synthesize CLI flags.
+This honors the orchestrator's precedence rules in `resolve_inspect_dirs` (CLI > env > TOML) by emitting only CLI args — the env and TOML pre-passes in the launcher synthesize CLI flags.
 
-A host path *inside* `$USER_REPO` (already visible at `/work/<subpath>`)
-collides with the launcher's `/inspect/<basename>` target. The launcher
-warns and skips the redundant mount.
+A host path *inside* `$USER_REPO` (already visible at `/work/<subpath>`) collides with the launcher's `/inspect/<basename>` target. The launcher warns and skips the redundant mount.
 
 #### Remote runtime (Fly.io) transport
 
-Under `--runtime fly`, the launcher additionally ships each
-`--inspect-dir` host path to `/inspect/<basename>` on the Fly machine
-via `scripts/remote/seed-repo.sh:seed_inspect_dirs`. The rewritten
-`--inspect-dir /inspect/<basename>` CLI flag already carries the
-in-machine view to the orchestrator via `REWRITTEN_ARGS`; this step
-makes the path actually exist on the machine's filesystem.
+Under `--runtime fly`, the launcher additionally ships each `--inspect-dir` host path to `/inspect/<basename>` on the Fly machine via `scripts/remote/seed-repo.sh:seed_inspect_dirs`. The rewritten `--inspect-dir /inspect/<basename>` CLI flag already carries the in-machine view to the orchestrator via `REWRITTEN_ARGS`; this step makes the path actually exist on the machine's filesystem.
 
-Per inspect dir, transport is two-phase, mirroring the
-`seed_repo_clone` + `seed_repo_dirty` strategy used for `/work`:
+Per inspect dir, transport is two-phase, mirroring the `seed_repo_clone` + `seed_repo_dirty` strategy used for `/work`:
 
-- **Git repos** — `git bundle create - --all` packs every reachable
-  object into one pack-format binary stream, piped via
-  `flyctl ssh console -C "sh -c 'cat > /tmp/leerie-inspect-<base>.bundle'"`.
-  Submodules are bundled the same way into
-  `/tmp/leerie-inspect-<base>-subs/`. The machine then `git clone`s
-  from the local bundle file into `/inspect/<base>` (with
-  `protocol.file.allow=always` for the submodule update;
-  CVE-2022-39253 mitigation). A second pass (`_seed_one_inspect_dir_dirty`)
-  rsyncs the uncommitted-edit delta on top via `fly_rsync_wrapper` so
-  workers see your in-flight changes for inspect dirs, the same way
-  they do for the main repo.
-- **Non-git directories** (docs folders, etc.) — fall back to plain
-  `rsync -a -H` via `fly_rsync_wrapper` (the v1 path; kept for the
-  no-`.git/` case).
+- **Git repos** — `git bundle create - --all` packs every reachable object into one pack-format binary stream, piped via `flyctl ssh console -C "sh -c 'cat > /tmp/leerie-inspect-<base>.bundle'"`. Submodules are bundled the same way into `/tmp/leerie-inspect-<base>-subs/`. The machine then `git clone`s from the local bundle file into `/inspect/<base>` (with `protocol.file.allow=always` for the submodule update; CVE-2022-39253 mitigation). A second pass (`_seed_one_inspect_dir_dirty`) rsyncs the uncommitted-edit delta on top via `fly_rsync_wrapper` so workers see your in-flight changes for inspect dirs, the same way they do for the main repo.
+- **Non-git directories** (docs folders, etc.) — fall back to plain `rsync -a -H` via `fly_rsync_wrapper` (the v1 path; kept for the no-`.git/` case).
 
-Why bundle for git repos: plain rsync over `flyctl ssh console` is
-unworkable for non-trivial trees — a large working tree with
-`node_modules`/build output can hang indefinitely, while the same
-repo's bundle (source only, no gitignored artifacts) is orders of
-magnitude smaller and ships in one pipe in under a second.
+Why bundle for git repos: plain rsync over `flyctl ssh console` is unworkable for non-trivial trees — a large working tree with `node_modules`/build output can hang indefinitely, while the same repo's bundle (source only, no gitignored artifacts) is orders of magnitude smaller and ships in one pipe in under a second.
 
-Resume probe: before the bundle phase, `seed_inspect_dirs` runs one
-`flyctl ssh console -C "test -d /inspect/<base>/.git"` per inspect
-dir. If the directory was already seeded on a prior run, the bundle
-is skipped and only the dirty delta refreshes — typical resume cost
-is a few seconds per inspect dir, not a few minutes. New inspect
-dirs added at `resume` time take the full fresh path.
+Resume probe: before the bundle phase, `seed_inspect_dirs` runs one `flyctl ssh console -C "test -d /inspect/<base>/.git"` per inspect dir. If the directory was already seeded on a prior run, the bundle is skipped and only the dirty delta refreshes — typical resume cost is a few seconds per inspect dir, not a few minutes. New inspect dirs added at `resume` time take the full fresh path.
 
-Each `/inspect/<basename>` is chowned `leerie:leerie` after every
-transport phase so the orchestrator (which runs as `leerie`) and
-its workers can read the tree — same ownership-handover pattern
-`seed_repo_clone` / `seed_repo_dirty` use for `/work`.
+Each `/inspect/<basename>` is chowned `leerie:leerie` after every transport phase so the orchestrator (which runs as `leerie`) and its workers can read the tree — same ownership-handover pattern `seed_repo_clone` / `seed_repo_dirty` use for `/work`.
 
-The launcher serializes its `INSPECT_HOST_TARGETS` bash array (parallel
-to `INSPECT_MOUNTS`, populated by `collect_inspect_path` for every
-out-of-repo inspect dir) into the `LEERIE_INSPECT_HOST_TARGETS` env var
-before each call. In-repo inspect dirs (the skip-redundant-mount branch)
-are not appended to `INSPECT_HOST_TARGETS` — they arrive on the machine
-via `seed_repo` at `/work/<subpath>` and need no separate transport.
+The launcher serializes its `INSPECT_HOST_TARGETS` bash array (parallel to `INSPECT_MOUNTS`, populated by `collect_inspect_path` for every out-of-repo inspect dir) into the `LEERIE_INSPECT_HOST_TARGETS` env var before each call. In-repo inspect dirs (the skip-redundant-mount branch) are not appended to `INSPECT_HOST_TARGETS` — they arrive on the machine via `seed_repo` at `/work/<subpath>` and need no separate transport.
 
 Called at two points inside the `--runtime fly` block:
 
-1. **Fresh provision** — after `seed_repo` lands `/work`, before the
-   detached orchestrator launches.
-2. **Resume / re-seed** — after `re_seed` lands the dirty delta, on
-   every resume. This honors the documented property that inspect
-   dirs are re-resolved fresh on every run including `resume`
-   (§2 *Inspect directories*); the user can add `--inspect-dir <path>`
-   at resume time and expect it to land on the machine.
+1. **Fresh provision** — after `seed_repo` lands `/work`, before the detached orchestrator launches.
+2. **Resume / re-seed** — after `re_seed` lands the dirty delta, on every resume. This honors the documented property that inspect dirs are re-resolved fresh on every run including `resume` (§2 *Inspect directories*); the user can add `--inspect-dir <path>` at resume time and expect it to land on the machine.
 
-A failure of `seed_inspect_dirs` is fatal — the run aborts before the
-orchestrator launches, in the same class as `seed_repo` / `seed_auth`
-failures. Workers cannot do their job with `--add-dir` flags pointing
-at non-existent paths, so silent continuation would yield wrong
-classifier / planner output.
+A failure of `seed_inspect_dirs` is fatal — the run aborts before the orchestrator launches, in the same class as `seed_repo` / `seed_auth` failures. Workers cannot do their job with `--add-dir` flags pointing at non-existent paths, so silent continuation would yield wrong classifier / planner output.
 
-Read-only contract: inspect-bucket workers only `Read`/`Grep`/`Glob`
-inspect dirs (DESIGN §12). No rsync `--delete` or two-way sync is
-used.
+Read-only contract: inspect-bucket workers only `Read`/`Grep`/`Glob` inspect dirs (DESIGN §12). No rsync `--delete` or two-way sync is used.
 
-Inspect dirs are **not** `git clone`d *from origin* on the machine
-because the machine deliberately holds no GitHub credentials (DESIGN §6
-*Finalization*). The bundle approach above ships the host's local git
-state directly — no remote auth ever needed in-machine.
+Inspect dirs are **not** `git clone`d *from origin* on the machine because the machine deliberately holds no GitHub credentials (DESIGN §6 *Finalization*). The bundle approach above ships the host's local git state directly — no remote auth ever needed in-machine.
 
-Same rsync-vs-tar rationale as `seed_repo_dirty` (applies to the
-fallback path and the dirty-delta phase): macOS BSD `tar -c`
-normalizes filenames NFC → NFD (libarchive); rsync preserves filename
-bytes verbatim. Bundles sidestep the problem entirely — filenames
-travel as pack-format binary objects, materialized natively by the
-receiving git.
+Same rsync-vs-tar rationale as `seed_repo_dirty` (applies to the fallback path and the dirty-delta phase): macOS BSD `tar -c` normalizes filenames NFC → NFD (libarchive); rsync preserves filename bytes verbatim. Bundles sidestep the problem entirely — filenames travel as pack-format binary objects, materialized natively by the receiving git.
 
 ### Browser-based testing
 
-Chromium and its matching chromedriver are baked into the image, so workers
-needing a real browser have one with no runtime installation. The Selenium
-cache directory (`/home/leerie/.cache/selenium`) is pre-created (root-owned
-at build time, chowned to `leerie` at runtime on the rootful path) so
-Selenium Manager cache writes succeed if it ever runs.
+Chromium and its matching chromedriver are baked into the image, so workers needing a real browser have one with no runtime installation. The Selenium cache directory (`/home/leerie/.cache/selenium`) is pre-created (root-owned at build time, chowned to `leerie` at runtime on the rootful path) so Selenium Manager cache writes succeed if it ever runs.
 
-**Container flags — baked in, no project changes required.** Three flags run
-Chromium in a rootless container:
+**Container flags — baked in, no project changes required.** Three flags run Chromium in a rootless container:
 
-- `--no-sandbox` — disables Chrome's user-namespace sandbox, unavailable in
-  unprivileged containers.
-- `--disable-setuid-sandbox` — suppresses the SUID sandbox-helper lookup.
-  Without this, Chrome finds `/usr/lib/chromium/chrome-sandbox` and tries to
-  exec it; SUID is stripped in rootless containers, so the exec fails and
-  Chrome crashes with `SIGTRAP` before fully initializing — *even when
-  `--no-sandbox` is present*. This is the most common silent failure mode.
-- `--disable-dev-shm-usage` — redirects shared-memory to `/tmp`; `/dev/shm`
-  is typically 64 MB in containers and Chrome's renderer can exceed it.
+- `--no-sandbox` — disables Chrome's user-namespace sandbox, unavailable in unprivileged containers.
+- `--disable-setuid-sandbox` — suppresses the SUID sandbox-helper lookup. Without this, Chrome finds `/usr/lib/chromium/chrome-sandbox` and tries to exec it; SUID is stripped in rootless containers, so the exec fails and Chrome crashes with `SIGTRAP` before fully initializing — *even when `--no-sandbox` is present*. This is the most common silent failure mode.
+- `--disable-dev-shm-usage` — redirects shared-memory to `/tmp`; `/dev/shm` is typically 64 MB in containers and Chrome's renderer can exceed it.
 
-These are written to `/etc/chromium.d/leerie-container-flags` at image build
-time, so `/usr/bin/chromium` picks them up automatically. **No project-level
-Chrome flag configuration is required.** Projects that construct a
-`ChromeOptions`/`Options` object and add these flags explicitly are fine
-(idempotent); projects that don't touch Chrome options also work, since the
-wrapper sets them globally.
+These are written to `/etc/chromium.d/leerie-container-flags` at image build time, so `/usr/bin/chromium` picks them up automatically. **No project-level Chrome flag configuration is required.** Projects that construct a `ChromeOptions`/`Options` object and add these flags explicitly are fine (idempotent); projects that don't touch Chrome options also work, since the wrapper sets them globally.
 
 ### macOS-specific: Colima auto-share scope
 
-Colima auto-shares only paths under `/Users/$USER` into the VM by
-default. A bind mount of a path outside that range will silently
-appear empty inside the container. The launcher warns at preflight
-when `$USER_REPO` or any `--inspect-dir` falls outside, and points
-the user at `~/.colima/default/colima.yaml`'s `mounts:` section as
-the workaround.
+Colima auto-shares only paths under `/Users/$USER` into the VM by default. A bind mount of a path outside that range will silently appear empty inside the container. The launcher warns at preflight when `$USER_REPO` or any `--inspect-dir` falls outside, and points the user at `~/.colima/default/colima.yaml`'s `mounts:` section as the workaround.
 
-VirtioFS is the mount type leerie documents (`colima start
---runtime containerd --mount-type virtiofs`) — it's the fastest
-option and gives correct UID semantics for bind mounts.
+VirtioFS is the mount type leerie documents (`colima start --runtime containerd --mount-type virtiofs`) — it's the fastest option and gives correct UID semantics for bind mounts.
 
 ### Logging, signal flow, and TTY adaptation
 
-**`log()` and `die()` never raise.** Both wrap their `print` in
-`contextlib.suppress(OSError, ValueError)`. This matters because on the
-remote runtime `sys.stdout` **is** `<run_dir>/orchestrator.log` — the
-launcher redirects fd1 there and `_install_run_log_tee` skips installing its
-guarded tee in that case — so `print(..., flush=True)` performs a real write
-to the state filesystem, which can raise `ENOSPC` when full. Every
-terminating arm in `main()` logs *before* assigning `exit_code`, so an
-unguarded write failure there would turn a resumable pause
-(`ContextOverflow`, `TerminalAuthFailure`, `RateLimitedExit`,
-`KeyboardInterrupt`, `InterruptedBySignal`) into an exit-1 traceback. For
-`die()` the exit **code** is the load-bearing part — an unwritable stderr
-must not convert a deliberate coded exit into an unhandled `OSError`.
+**`log()` and `die()` never raise.** Both wrap their `print` in `contextlib.suppress(OSError, ValueError)`. This matters because on the remote runtime `sys.stdout` **is** `<run_dir>/orchestrator.log` — the launcher redirects fd1 there and `_install_run_log_tee` skips installing its guarded tee in that case — so `print(..., flush=True)` performs a real write to the state filesystem, which can raise `ENOSPC` when full. Every terminating arm in `main()` logs *before* assigning `exit_code`, so an unguarded write failure there would turn a resumable pause (`ContextOverflow`, `TerminalAuthFailure`, `RateLimitedExit`, `KeyboardInterrupt`, `InterruptedBySignal`) into an exit-1 traceback. For `die()` the exit **code** is the load-bearing part — an unwritable stderr must not convert a deliberate coded exit into an unhandled `OSError`.
 
-`OSError`/`ValueError` only, never `BaseException`: a `KeyboardInterrupt`
-arriving during the write must still propagate. `_save_state_best_effort`
-uses the same "everything that is not a real interrupt" tuple (`Exception`
-plus the four exit-signal classes) rather than catching everything, for the
-same reason. `_TeeStream`'s log-copy guard carries the same two exceptions;
-guarding `log()` extends that discipline to the real stream too, covering
-`_TeeStream`'s own `_orig.write` / `_orig.flush`. The cost is deliberate: a
-failed write is silently lost rather than losing the whole run.
+`OSError`/`ValueError` only, never `BaseException`: a `KeyboardInterrupt` arriving during the write must still propagate. `_save_state_best_effort` uses the same "everything that is not a real interrupt" tuple (`Exception` plus the four exit-signal classes) rather than catching everything, for the same reason. `_TeeStream`'s log-copy guard carries the same two exceptions; guarding `log()` extends that discipline to the real stream too, covering `_TeeStream`'s own `_orig.write` / `_orig.flush`. The cost is deliberate: a failed write is silently lost rather than losing the whole run.
 
-The launcher invokes `nerdctl run --rm $TTY_FLAGS …` where `TTY_FLAGS`
-is chosen by a one-line `[ -t 0 ]` test:
+The launcher invokes `nerdctl run --rm $TTY_FLAGS …` where `TTY_FLAGS` is chosen by a one-line `[ -t 0 ]` test:
 
 ```sh
 TTY_FLAGS="-i"
 [ -t 0 ] && TTY_FLAGS="-it"
 ```
 
-That single test is **the entire branch** between terminal mode and
-plugin mode. Everything else (mounts, image, env, entrypoint, signal
-handling) is identical.
+That single test is **the entire branch** between terminal mode and plugin mode. Everything else (mounts, image, env, entrypoint, signal handling) is identical.
 
 **Terminal mode (`-it`)**:
 
-- `-i` + `-t` give the orchestrator a controlling TTY → its existing
-  `log(...)` and stream-event summarizers write directly to the user's
-  terminal with no aggregation layer.
-- `--clarify` prompts use `input()` interactively — the user types
-  answers at the host terminal, characters flow through the pty to
-  Python inside the container.
-- Ctrl-C in the host terminal sends SIGINT to the container's PID 1
-  (the orchestrator). Python's `KeyboardInterrupt` fires, the
-  existing `except KeyboardInterrupt` handler runs the worktree-only
-  cleanup, the orchestrator exits — and the kernel reaps everything
-  else in the PID namespace.
+- `-i` + `-t` give the orchestrator a controlling TTY → its existing `log(...)` and stream-event summarizers write directly to the user's terminal with no aggregation layer.
+- `--clarify` prompts use `input()` interactively — the user types answers at the host terminal, characters flow through the pty to Python inside the container.
+- Ctrl-C in the host terminal sends SIGINT to the container's PID 1 (the orchestrator). Python's `KeyboardInterrupt` fires, the existing `except KeyboardInterrupt` handler runs the worktree-only cleanup, the orchestrator exits — and the kernel reaps everything else in the PID namespace.
 
 **Plugin mode (`-i` only)**:
 
-- Claude Code's Bash tool spawns the launcher without a TTY on stdin.
-  `[ -t 0 ]` returns false; the launcher passes only `-i`, no pty
-  allocated inside the container.
-- Inside the container, `sys.stdin.isatty()` returns False. The
-  orchestrator's `gather_answers()` and the mid-execution
-  clarification path (`_surface_clarification()`) both detect this and trigger
-  the canonical no-TTY signal: write `<state-root>/runs/<run-id>/pending-questions.json`
-  to disk and `sys.exit(EXIT_NEEDS_ANSWERS)` (= 10).
-- `<state-root>/runs/<run-id>/pending-questions.json` is visible on the
-  host because `/leerie-state` is bind-mounted from `LEERIE_STATE_HOST_DIR`.
-  The plugin agent at `commands/leerie.md` reads it directly, asks the
-  user via the chat UI, writes the matching `<state-root>/answers.json`,
-  and re-runs the container with `--answers <state-root>/answers.json`
-  and `resume`.
-- Stdout/stderr stream back through the Bash tool to the agent's
-  chat session — possibly in 30s-ish chunks per the harness's
-  buffering, which is acceptable for the streaming UX.
-- The kernel teardown guarantee applies the same way as in terminal
-  mode: when the orchestrator exits (clean exit, exit 10, or any
-  signal the harness sends), PID 1 dies and the namespace is reaped.
+- Claude Code's Bash tool spawns the launcher without a TTY on stdin. `[ -t 0 ]` returns false; the launcher passes only `-i`, no pty allocated inside the container.
+- Inside the container, `sys.stdin.isatty()` returns False. The orchestrator's `gather_answers()` and the mid-execution clarification path (`_surface_clarification()`) both detect this and trigger the canonical no-TTY signal: write `<state-root>/runs/<run-id>/pending-questions.json` to disk and `sys.exit(EXIT_NEEDS_ANSWERS)` (= 10).
+- `<state-root>/runs/<run-id>/pending-questions.json` is visible on the host because `/leerie-state` is bind-mounted from `LEERIE_STATE_HOST_DIR`. The plugin agent at `commands/leerie.md` reads it directly, asks the user via the chat UI, writes the matching `<state-root>/answers.json`, and re-runs the container with `--answers <state-root>/answers.json` and `resume`.
+- Stdout/stderr stream back through the Bash tool to the agent's chat session — possibly in 30s-ish chunks per the harness's buffering, which is acceptable for the streaming UX.
+- The kernel teardown guarantee applies the same way as in terminal mode: when the orchestrator exits (clean exit, exit 10, or any signal the harness sends), PID 1 dies and the namespace is reaped.
 
 Common to both modes:
 
-- **Orchestrator stdout/stderr are persisted to
-  `<state-root>/runs/<run-id>/orchestrator.log`.** Once `main()` has the run
-  dir, `_install_run_log_tee()` wraps `sys.stdout`/`sys.stderr` with a
-  `_TeeStream` that mirrors every write to that file (flushed per write, so a
-  crash still leaves a complete trail). This is the local-runtime counterpart
-  of the Fly/EC2 path's `Popen(stdout=log_f)` → `orchestrator.log`: on those
-  runtimes the orchestrator's fd1 already *is* that file, so
-  `_install_run_log_tee` no-ops there (an inode check via
-  `_stdout_already_targets` prevents double-writing). It exists because the
-  local runtime otherwise keeps no state-dir copy of the orchestrator's own
-  phase logs — stdout goes only to nerdctl → the launcher's decoupled tail →
-  the user's `tee` — so an abnormal exit or a lost pipe erased them (run
-  26fd0fa5's `leerie.log` was 0 bytes, which is why its integration skip
-  could not be diagnosed post-hoc). Best-effort: a log-open failure logs and
-  proceeds with terminal-only output; a mid-run write failure to the log copy
-  is swallowed so the terminal stream never breaks. Since `log()`/`die()`
-  became total (see *Logging, signal flow, and TTY adaptation* above), a
-  failure of the **terminal** stream is swallowed too — that asymmetry is
-  gone, and deliberately: on the remote runtime that stream IS the log file.
-  Per-worker `<state-root>/logs/<sid>.log` files (the raw event streams) are
-  unaffected and orthogonal.
-- **`die()` announces the run id on every terminal exit path.**
-  `State.__init__` calls `_set_current_run_id(run_id)`, which stashes the id
-  in the module-level `_CURRENT_RUN_ID` — the only channel available to
-  `die()`, since most call sites run at module scope with no `State` in
-  hand. Once a `State` has been constructed, every subsequent `die("...")`
-  appends `(run <id>)` to its message; a `die()` before any `State` exists
-  (e.g. an early preflight failure) prints its plain message unaffected.
-  Pinned in `tests/test_run_id_terminal_emit.py`. The paired
-  `log(f"run id: …")` announcement is the **first statement of
-  `_run_phases`**, at function-body depth with no enclosing `if`, so it
-  fires on both fresh runs and every resume regardless of which phase
-  checkpoint is being resumed from.
-- `--rm` removes the stopped container automatically so they don't
-  accumulate. Worktrees and state on the bind-mounted host
-  filesystem survive for `resume`.
-- `--name leerie-<ts>-<pid>` makes `nerdctl ps` legible and
-  `nerdctl logs <name>` targetable for the rare diagnostic case.
-- `--label leerie.launcher_pid=<pid>` records the owning launcher's
-  PID (`$$`) on the container. The stale-container reaper (below) reads
-  it back via `nerdctl inspect` to test owner liveness without parsing
-  the `--name` suffix. `<pid>` is the same `$$` used in `--name`.
-- Aggregate memory cap: **not a `nerdctl run` flag.** `container-entry.sh`
-  (PID 1) writes `leerie.slice/memory.max` (the parent cgroup of every
-  per-worker cgroup), derived from VM `MemTotal` read from
-  `/proc/meminfo` (portable across Colima and native Linux; the host
-  launcher cannot read the VM's MemTotal on macOS, so a `nerdctl
-  --memory` flag is not used). This bounds the sum across all concurrent
-  workers, distinct from the per-worker cgroup caps in §6 (*Memory
-  containment*) which bound each worker individually. See DESIGN §6
-  *container boundary's hidden precondition* and the caps table in §6.
+- **Orchestrator stdout/stderr are persisted to `<state-root>/runs/<run-id>/orchestrator.log`.** Once `main()` has the run dir, `_install_run_log_tee()` wraps `sys.stdout`/`sys.stderr` with a `_TeeStream` that mirrors every write to that file (flushed per write, so a crash still leaves a complete trail). This is the local-runtime counterpart of the Fly/EC2 path's `Popen(stdout=log_f)` → `orchestrator.log`: on those runtimes the orchestrator's fd1 already *is* that file, so `_install_run_log_tee` no-ops there (an inode check via `_stdout_already_targets` prevents double-writing). It exists because the local runtime otherwise keeps no state-dir copy of the orchestrator's own phase logs — stdout goes only to nerdctl → the launcher's decoupled tail → the user's `tee` — so an abnormal exit or a lost pipe erased them (run 26fd0fa5's `leerie.log` was 0 bytes, which is why its integration skip could not be diagnosed post-hoc). Best-effort: a log-open failure logs and proceeds with terminal-only output; a mid-run write failure to the log copy is swallowed so the terminal stream never breaks. Since `log()`/`die()` became total (see *Logging, signal flow, and TTY adaptation* above), a failure of the **terminal** stream is swallowed too — that asymmetry is gone, and deliberately: on the remote runtime that stream IS the log file. Per-worker `<state-root>/logs/<sid>.log` files (the raw event streams) are unaffected and orthogonal.
+- **`die()` announces the run id on every terminal exit path.** `State.__init__` calls `_set_current_run_id(run_id)`, which stashes the id in the module-level `_CURRENT_RUN_ID` — the only channel available to `die()`, since most call sites run at module scope with no `State` in hand. Once a `State` has been constructed, every subsequent `die("...")` appends `(run <id>)` to its message; a `die()` before any `State` exists (e.g. an early preflight failure) prints its plain message unaffected. Pinned in `tests/test_run_id_terminal_emit.py`. The paired `log(f"run id: …")` announcement is the **first statement of `_run_phases`**, at function-body depth with no enclosing `if`, so it fires on both fresh runs and every resume regardless of which phase checkpoint is being resumed from.
+- `--rm` removes the stopped container automatically so they don't accumulate. Worktrees and state on the bind-mounted host filesystem survive for `resume`.
+- `--name leerie-<ts>-<pid>` makes `nerdctl ps` legible and `nerdctl logs <name>` targetable for the rare diagnostic case.
+- `--label leerie.launcher_pid=<pid>` records the owning launcher's PID (`$$`) on the container. The stale-container reaper (below) reads it back via `nerdctl inspect` to test owner liveness without parsing the `--name` suffix. `<pid>` is the same `$$` used in `--name`.
+- Aggregate memory cap: **not a `nerdctl run` flag.** `container-entry.sh` (PID 1) writes `leerie.slice/memory.max` (the parent cgroup of every per-worker cgroup), derived from VM `MemTotal` read from `/proc/meminfo` (portable across Colima and native Linux; the host launcher cannot read the VM's MemTotal on macOS, so a `nerdctl --memory` flag is not used). This bounds the sum across all concurrent workers, distinct from the per-worker cgroup caps in §6 (*Memory containment*) which bound each worker individually. See DESIGN §6 *container boundary's hidden precondition* and the caps table in §6.
 
-**Abnormal-exit cleanup (traps + reaper).** The container boundary
-guarantees namespace teardown *when PID 1 exits*, but a host CLI that
-dies without forwarding a stop signal (OOM-killed `nerdctl` client,
-uncatchable SIGKILL) leaves the container orphaned and holding the
-run-dir flock — every later `resume` then exits `EXIT_LOCKED=75`
-(DESIGN §6). Two launcher mechanisms close this:
+**Abnormal-exit cleanup (traps + reaper).** The container boundary guarantees namespace teardown *when PID 1 exits*, but a host CLI that dies without forwarding a stop signal (OOM-killed `nerdctl` client, uncatchable SIGKILL) leaves the container orphaned and holding the run-dir flock — every later `resume` then exits `EXIT_LOCKED=75` (DESIGN §6). Two launcher mechanisms close this:
 
-- **Kill-on-exit trap.** INT/TERM traps on the local run path
-  `nerdctl kill` the container (via its run-id, which equals the
-  container ID — see *Single-owner enforcement*) before the launcher
-  exits, and the EXIT trap performs the same kill *before* it removes
-  the cidfile. Reliable for Ctrl-C/SIGTERM; does NOT help under
-  SIGKILL/OOM (uncatchable) — that is the reaper's job.
-- **Stale-container reaper.** On the local `resume` path, before the
-  `nerdctl run` spawn, the launcher looks up any container whose ID
-  equals the resume run-id (`nerdctl inspect`), and if it is still
-  running but its owning launcher (`leerie.launcher_pid` label) is dead
-  (`kill -0` fails), `nerdctl kill`s it first — making `resume`
-  self-heal the orphaned-flock wedge instead of returning 75.
-- **Decoupled output streaming (piped mode only).** In piped mode
-  (`leerie … | tee log`, i.e. `TTY_FLAGS="-i"` and stdout is not a TTY),
-  the launcher does NOT let `nerdctl run` write straight to its stdout
-  pipe — Colima's persistent SSH ControlMaster can retain a copy of the
-  pipe write-end on an abnormal container exit, so `tee` never gets EOF
-  and the launcher hangs (orphaning the container). Instead the launcher
-  points `nerdctl run > "$_run_log" 2>&1` (a regular file — the mux does
-  not retain a plain-file fd) and starts `tail -n +1 -f "$_run_log"` in
-  the background, streaming the file to its own stdout. `_reap_tail`
-  (called after the run and from all three EXIT/INT/TERM traps) briefly
-  sleeps so `tail` drains the final write, then `kill`s it and `rm`s the
-  log — no post-kill `cat`, which would duplicate the whole log. The
-  `nerdctl` argv is assembled once into a `_run_argv` array and invoked
-  in two spelled-out branches (redirected vs. direct), since bash cannot
-  build a redirection through variable expansion. Container exit-code
-  capture (`|| container_rc=$?`) is unaffected — `> file` is not a pipe.
-  Interactive `-it` runs skip the decouple entirely (real pty, no `tee`,
-  no hang, stdin needed for `--clarify`). See DESIGN §6 *Launcher hang on
-  abnormal container exit*.
+- **Kill-on-exit trap.** INT/TERM traps on the local run path `nerdctl kill` the container (via its run-id, which equals the container ID — see *Single-owner enforcement*) before the launcher exits, and the EXIT trap performs the same kill *before* it removes the cidfile. Reliable for Ctrl-C/SIGTERM; does NOT help under SIGKILL/OOM (uncatchable) — that is the reaper's job.
+- **Stale-container reaper.** On the local `resume` path, before the `nerdctl run` spawn, the launcher looks up any container whose ID equals the resume run-id (`nerdctl inspect`), and if it is still running but its owning launcher (`leerie.launcher_pid` label) is dead (`kill -0` fails), `nerdctl kill`s it first — making `resume` self-heal the orphaned-flock wedge instead of returning 75.
+- **Decoupled output streaming (piped mode only).** In piped mode (`leerie … | tee log`, i.e. `TTY_FLAGS="-i"` and stdout is not a TTY), the launcher does NOT let `nerdctl run` write straight to its stdout pipe — Colima's persistent SSH ControlMaster can retain a copy of the pipe write-end on an abnormal container exit, so `tee` never gets EOF and the launcher hangs (orphaning the container). Instead the launcher points `nerdctl run > "$_run_log" 2>&1` (a regular file — the mux does not retain a plain-file fd) and starts `tail -n +1 -f "$_run_log"` in the background, streaming the file to its own stdout. `_reap_tail` (called after the run and from all three EXIT/INT/TERM traps) briefly sleeps so `tail` drains the final write, then `kill`s it and `rm`s the log — no post-kill `cat`, which would duplicate the whole log. The `nerdctl` argv is assembled once into a `_run_argv` array and invoked in two spelled-out branches (redirected vs. direct), since bash cannot build a redirection through variable expansion. Container exit-code capture (`|| container_rc=$?`) is unaffected — `> file` is not a pipe. Interactive `-it` runs skip the decouple entirely (real pty, no `tee`, no hang, stdin needed for `--clarify`). See DESIGN §6 *Launcher hang on abnormal container exit*.
 
-The plugin mode flow above is exactly what `commands/leerie.md` already
-documents — it works through the container with zero new mechanism
-because the state dir lives on the bind-mounted `/leerie-state` host filesystem.
+The plugin mode flow above is exactly what `commands/leerie.md` already documents — it works through the container with zero new mechanism because the state dir lives on the bind-mounted `/leerie-state` host filesystem.
 
 ### What does NOT change in the orchestrator
 
-`orchestrator/leerie.py` is unmodified by this design. It runs as PID 1
-inside the container; everything it currently does — the asyncio
-event loop, the signal handlers, `claude -p` spawn via
-`asyncio.create_subprocess_exec`, the per-worker `_terminate_proc_tree`
-and `_DescendantTracker` (kept as the fast happy path for clean exits
-— see DESIGN §6), worktree management, telemetry — works unchanged.
-Container/process isolation is the launcher's concern, not the
-orchestrator's.
+`orchestrator/leerie.py` is unmodified by this design. It runs as PID 1 inside the container; everything it currently does — the asyncio event loop, the signal handlers, `claude -p` spawn via `asyncio.create_subprocess_exec`, the per-worker `_terminate_proc_tree` and `_DescendantTracker` (kept as the fast happy path for clean exits — see DESIGN §6), worktree management, telemetry — works unchanged. Container/process isolation is the launcher's concern, not the orchestrator's.
 
-Maps to `DESIGN.md`: §6 *Cleanup on abnormal exit / Worker subtree
-termination*.
+Maps to `DESIGN.md`: §6 *Cleanup on abnormal exit / Worker subtree termination*.
 
 ---
 
