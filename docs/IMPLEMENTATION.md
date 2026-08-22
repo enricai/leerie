@@ -8150,29 +8150,25 @@ correctly and a plain `list` renders an EC2 run's status without
 `fly-machine.json` and not yet widened to `ec2-instance.json` for
 pre-`state.json` orphan discovery — separate, not-yet-landed work.
 
-Changes:
-
-- `_collect_run_rows()` returns `(run_id, started_at, status, branch, is_fly,
-  cost, is_ec2)`. `is_fly`/`is_ec2` are bools derived from `run.json` or the
-  matching sidecar file (mirrors `_auto_detect_run_runtime`), **filter-only**
-  (never rendered as columns); `is_fly` stays at index 4 for existing `r[4]`
-  consumers, `is_ec2` is appended at index 6. `cost` is the run's aggregate
-  `$X.XX` from `state.json`'s `telemetry.cost_usd`, or `—` when absent.
-- `_render_run_table()` renders `run_id, started_at, status, cost, branch`
-  (right-aligned cost, auto-sized widths).
-- `status <state>` on `list` filters rows to a matching derived status
-  (any `RUN_STATUSES` value; invalid values error listing the allowed set).
-- `--runtime` on `list` accepts `local`/`fly`/`ec2` (`RUNTIME_VALUES`,
-  argparse `choices=`); `local` restricts to rows with **neither** Fly nor
-  EC2 artifacts.
-- `list --runtime fly` is intercepted by the launcher (bash) before
-  orchestrator dispatch and queries Fly directly (`flyctl machines list
-  --app <FLY_APP> --json`), rendering `machine_id | state | region |
-  created_at | run_id (local)` for every machine under the app. `run_id` is
-  best-effort filled by scanning local sidecars; machines from another repo
-  show `run_id=?`. Falls back to the orchestrator-side local-sidecar list
-  when `flyctl` is missing or auth fails. Any other `--runtime` value falls
-  through unchanged.
+Changes: `_collect_run_rows()` returns `(run_id, started_at, status, branch,
+is_fly, cost, is_ec2)` — `is_fly`/`is_ec2` are bools derived from `run.json`
+or the matching sidecar file (mirrors `_auto_detect_run_runtime`),
+**filter-only** (never rendered as columns; `is_fly` stays at index 4 for
+existing `r[4]` consumers, `is_ec2` appended at index 6), and `cost` is the
+run's aggregate `$X.XX` from `state.json`'s `telemetry.cost_usd` or `—` when
+absent. `_render_run_table()` renders `run_id, started_at, status, cost,
+branch` (right-aligned cost, auto-sized widths). `status <state>` on `list`
+filters rows to a matching derived status (any `RUN_STATUSES` value; invalid
+values error listing the allowed set). `--runtime` on `list` accepts
+`local`/`fly`/`ec2` (`RUNTIME_VALUES`, argparse `choices=`); `local`
+restricts to rows with **neither** Fly nor EC2 artifacts. `list --runtime
+fly` is intercepted by the launcher (bash) before orchestrator dispatch and
+queries Fly directly (`flyctl machines list --app <FLY_APP> --json`),
+rendering `machine_id | state | region | created_at | run_id (local)` for
+every machine under the app — `run_id` is best-effort filled by scanning
+local sidecars (machines from another repo show `run_id=?`), falling back
+to the orchestrator-side local-sidecar list when `flyctl` is missing or
+auth fails. Any other `--runtime` value falls through unchanged.
 
 Verbs `kill`, `stop`, and `accept-blocked` accept an optional
 `--runtime <local|fly|ec2>` flag, validated against the same `RUNTIME_VALUES`
@@ -8210,14 +8206,14 @@ address this together:
    `leerie resume`'s in-machine tail watcher checks liveness via two ORed
    signals — pid-file `kill -0` and a `/proc/[0-9]*/cmdline` scan for
    `orchestrator/leerie.py` + run-id — alongside the `tail -F`; both must
-   agree the orchestrator is dead before the watcher prints its
-   syncing-to-host message and exits. The `/proc` scan closes the stale-pid
-   contagion from DESIGN §6: if the pid file went stale, the scan still
-   finds the real orchestrator and keeps tailing.
+   agree the orchestrator is dead before it prints its syncing-to-host
+   message and exits. The `/proc` scan closes the stale-pid contagion from
+   DESIGN §6: a stale pid file still leaves the real orchestrator found by
+   the scan.
 2. **`leerie finalize <run-id>`** — launcher fast-path running the
    post-orchestrator block inline: source `fetch-branch.sh`, call
    `fetch_branch`, then the host-side finalize block (push + `gh pr
-   create`). Idempotent — a run already pushed short-circuits with
+   create`). Idempotent — an already-pushed run short-circuits with
    "already finalized."
 
 `leerie finalize` resolves `<run-id>` directly against
@@ -8237,23 +8233,22 @@ is still alive, it refuses with a hint to use `--force`.
 `/proc`, escalating to SIGKILL after 30s), patches `finished_at`, then runs
 `collect_subtrees_remote` and `fetch_branch`.
 
-**Liveness checks** (`scripts/remote/force-finalize.sh`):
-
-1. Lists `/work/.leerie/runs/` for the single run dir (fails on multi-match).
-2. Reads `run.json`; if `finished_at` already set, no-op (idempotent).
-3. Checks liveness via two signals: a `/proc` cross-check (authoritative —
-   scans `/proc/[0-9]*/cmdline` for `orchestrator/leerie.py` + run-id) and a
-   defensive `orchestrator.pid` check (`kill -0` + `cmdline` containing
-   `python` — `cmdline` not `comm`, since `comm` on a pip-installed shim can
-   read `"pytest"` and slip an alive orchestrator past the guard). Either
-   signal alive → **REFUSE-ALIVE[-SCAN]** (or **STOPPED** under
-   `FORCE_STOP=1`); both dead → safe to proceed; pid file missing → refuse,
-   pointing at `leerie resume <run-id> --shell --runtime fly`. The `/proc`
-   scan exists because the pid file is written *between* `Popen` and the
-   child's `State.__init__`, so a stillborn flock-loser can stamp a dead pid
-   before the winner claims authority (stale-pid contagion, DESIGN §6).
-4. Patches `run.json` with `finished_at`, `no_push=false`, `recovered_at`,
-   `recovered_via="force-finalize"`, then falls through to `fetch_branch`.
+**Liveness checks** (`scripts/remote/force-finalize.sh`): lists
+`/work/.leerie/runs/` for the single run dir (fails on multi-match); reads
+`run.json` and no-ops if `finished_at` is already set; checks liveness via
+two ORed signals — an authoritative `/proc/[0-9]*/cmdline` scan for
+`orchestrator/leerie.py` + run-id, and a defensive `orchestrator.pid` check
+(`kill -0` + `cmdline` containing `python`, not `comm`, since `comm` on a
+pip-installed shim can read `"pytest"` and slip an alive orchestrator past
+the guard). Either signal alive → **REFUSE-ALIVE[-SCAN]** (or **STOPPED**
+under `FORCE_STOP=1`); both dead → safe to proceed; pid file missing →
+refuse, pointing at `leerie resume <run-id> --shell --runtime fly`. The
+`/proc` scan exists because the pid file is written *between* `Popen` and
+the child's `State.__init__`, so a stillborn flock-loser can stamp a dead
+pid before the winner claims authority (stale-pid contagion, DESIGN §6).
+On success, patches `run.json` with `finished_at`, `no_push=false`,
+`recovered_at`, `recovered_via="force-finalize"`, then falls through to
+`fetch_branch`.
 
 Sentinels: `OK:<run_id>`, `STOPPED:<run_id>:<pid>`, `STOP-FAILED:<run_id>:<pid>`,
 `REFUSE-ALIVE-SCAN:*`, `REFUSE-ALIVE:*`, `REFUSE-NOPID:*`, `REFUSE-MULTI:*`,
@@ -8320,52 +8315,19 @@ Two concurrent runs in the same repository share no coordination state.
         ├── run.json                 sidecar — see field table below
         ├── working-branch           the branch HEAD-at-run-start; used as the PR base (leerie does not merge into it locally)
         ├── plan.json                merged planner output
-        ├── task.md                  the task document verbatim, as plain
-        │                            markdown. `_task_ref` in every subtask
-        │                            spec points here (N6) — NOT at plan.json,
-        │                            which also carries every subtask body and
-        │                            so exceeds the CLI's Read cap on a large
-        │                            task where this does not
+        ├── task.md                  the task document verbatim, as plain markdown
         ├── subtasks/<id>.json       per-subtask spec handed to each implementer
         ├── criteria/<id>.md         informational success-criteria notes (DESIGN §9)
-        ├── artifacts/<id>.json      structured deliverables returned by an
-        │                            implementer's `artifacts` result field
-        │                            (DESIGN §5 *Artifact passing between
-        │                            subtasks*). Orchestrator-owned: written
-        │                            by `_settle_subtask` on a successful
-        │                            `complete` result with non-empty
-        │                            `artifacts`, read by `_run_implementer`
-        │                            to inject upstream deliverables into the
-        │                            prompts of subtasks whose predecessor
-        │                            graph names this subtask. Absent for
-        │                            code-implementation subtasks.
+        ├── artifacts/<id>.json      structured deliverables from an implementer's `artifacts` field (DESIGN §5); absent for code-implementation subtasks
         ├── checkpoints/<id>.md      handoff checkpoints (7-section schema)
-        ├── logs/<sid>.log           per-worker raw stream-json event log (one file
-        │                            per claude_p invocation by sid; always written
-        │                            regardless of verbosity; append-only across
-        │                            handoffs / clarifications)
+        ├── logs/<sid>.log           per-worker raw stream-json event log, one file per claude_p invocation by sid
         ├── worktrees/staging        the run-branch worktree
         ├── worktrees/<id>           per-subtask worktrees
         ├── pending-questions.json   written when clarification needs a non-interactive relay
-        ├── pending-clarifications.json  written when an implementer hits a §11
-        │                                mid-execution clarification (non-interactive)
-        ├── answers.json             written by the plugin skill when relaying
-        │                            clarification answers; passed back via --answers
-        ├── calls.ndjson             per-run NDJSON telemetry — one JSON object per
-        │                            line, one line per claude_p call; opened for
-        │                            append at run start; written immediately after
-        │                            each call returns (DESIGN §14)
-        ├── memory.ndjson            orchestrator memory telemetry — one JSON object
-        │                            per line, one line per ~30 s while _orchestrate()
-        │                            is alive; written by `_memory_sampler`. Keys per
-        │                            line: `ts`, `rss_kb`, `phase` (mirrors
-        │                            `state.current_phase`), `worker_count`, `open_fds`
-        │                            (from `/proc/self/fd`; `-1` off Linux), `thread_count`
-        │                            (from `threading.active_count`). Final sample is
-        │                            flushed on sampler cancellation, so the file always
-        │                            captures last-known state at orchestrator exit.
-        │                            Used to distinguish a natural heavy run from a
-        │                            real orchestrator memory leak post-mortem
+        ├── pending-clarifications.json  written when an implementer hits a §11 mid-execution clarification
+        ├── answers.json             written by the plugin skill when relaying clarification answers; passed back via --answers
+        ├── calls.ndjson             per-run NDJSON telemetry, one line per claude_p call (DESIGN §14)
+        ├── memory.ndjson            orchestrator memory telemetry, one line per ~30s while _orchestrate() is alive (written by `_memory_sampler`)
         └── <heal_subdir>/           heal-loop on-disk state (default: "heal-out/")
             └── <call_type>/         one directory per call_type being healed
                 ├── state.json       heal orchestrator state (history, best, baseline)
@@ -8381,6 +8343,14 @@ The `<run-id>` is the container/machine ID assigned by the container
 runtime at creation time (DESIGN §6). There is no temporary directory
 or rename step — the run directory is created with its final name from
 the start.
+
+`_task_ref` in every subtask spec points at `task.md` (N6), not `plan.json`
+— the latter also carries every subtask body and can exceed the CLI's Read
+cap on a large task. `memory.ndjson` lines carry `ts`, `rss_kb`, `phase`
+(mirrors `state.current_phase`), `worker_count`, `open_fds` (`-1` off
+Linux), `thread_count`; the final sample flushes on sampler cancellation so
+the file always captures last-known state at exit, useful for
+distinguishing a natural heavy run from a real orchestrator memory leak.
 
 `run.json` fields (a minimal sidecar enabling `leerie list` and resume
 discovery without parsing the full `state.json`):
@@ -8662,18 +8632,17 @@ Required fields, current shape:
   `completeness_retry_rounds`), or blocks on exhaustion.
 
   `rule_violations`/`file_updates` are wire-flattened discriminated arrays
-  (mirroring `SCHEMAS["reconciler"]`'s `tag_ops` technique) to keep the schema
-  small for the strict-output proxy's grammar compiler.
+  (mirroring `SCHEMAS["reconciler"]`'s `tag_ops` technique) to keep the
+  schema small for the strict-output proxy's grammar compiler.
   `_expand_conformer_output()` fans them back into `rule_violations_fixed`,
   `rule_violations_residual`, `docs_updates`, `tests_updates` right after the
-  worker call; an unrecognised `status`/`kind` is dropped. Pinned by
-  `tests/test_conformer_schema_shrink.py`.
-
-  `_validate_conformance_result()` enforces cross-field invariants on the
-  expanded shape: residuals require non-empty `rules_files_read`, every
-  `rule_violations_fixed` cites a `rule`, every `docs_updates`/`tests_updates`
-  `path` exists in the worktree, every `solution_defects` item carries
-  non-empty `concrete_case`/`where`. `confidence`: `conformance` (1–10), `basis`.
+  worker call (an unrecognised `status`/`kind` is dropped; pinned by
+  `tests/test_conformer_schema_shrink.py`). `_validate_conformance_result()`
+  then enforces cross-field invariants on the expanded shape: residuals
+  require non-empty `rules_files_read`, every `rule_violations_fixed` cites
+  a `rule`, every `docs_updates`/`tests_updates` `path` exists in the
+  worktree, every `solution_defects` item carries non-empty
+  `concrete_case`/`where`. `confidence`: `conformance` (1–10), `basis`.
 - **judge** — required: `passed` (bool, true only when all three dimensions
   are true), `dimensions` (`{schema_ok, factual_ok, hallucination_ok}`),
   `rationale` (1–3 sentences), `suggested_fixes` (empty when `passed: true`).
