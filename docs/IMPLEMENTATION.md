@@ -8142,227 +8142,147 @@ needs an operator decision first, and its rows carry no `started_at`
 to rank by).
 
 **EC2 counterpart (`list`'s Python-layer view, not `_discover_runs()`'s
-orphan scan).** `_collect_run_rows()` (below) now tracks an `is_ec2`
-axis the same way it tracks `is_fly`, so `--runtime ec2`/`--runtime
-local` filter EC2 runs correctly and a plain `list` renders an EC2
-run's status column without `LEERIE_FLY_APP` set. This is distinct from
-`_discover_runs()`'s orphan scan (DESIGN §6 *EC2 runtime lifecycle*, "Run
-identifier"), which is still hardcoded to the literal filename
-`fly-machine.json` and has not yet been widened to also check
-`ec2-instance.json` for pre-`state.json` orphan discovery — that
-remains a separate, not-yet-landed piece of work, and should not
-repurpose or rename `fly-machine.json`, which stays exactly as-is for
-Fly runs.
+orphan scan).** `_collect_run_rows()` tracks an `is_ec2` axis the same way it
+tracks `is_fly`, so `--runtime ec2`/`--runtime local` filter EC2 runs
+correctly and a plain `list` renders an EC2 run's status without
+`LEERIE_FLY_APP` set. Distinct from `_discover_runs()`'s orphan scan (DESIGN
+§6 *EC2 runtime lifecycle*, "Run identifier"), still hardcoded to
+`fly-machine.json` and not yet widened to `ec2-instance.json` for
+pre-`state.json` orphan discovery — separate, not-yet-landed work.
 
 Changes:
 
-- `_collect_run_rows()` returns a per-run tuple `(run_id, started_at,
-  status, branch, is_fly, cost, is_ec2)`. `is_fly` is a bool derived
-  from `fly_machine_id` in `run.json` or a present `fly-machine.json`;
-  `is_ec2` is a bool derived from `ec2_instance_id` in `run.json` or a
-  present `ec2-instance.json` (mirrors `_auto_detect_run_runtime`'s
-  sidecar probe in the launcher). Both are **filter-only** (consumed by
-  the `--runtime` filter), never rendered as columns. `is_fly` stays at
-  index 4 so existing `r[4]` consumers are unaffected; `is_ec2` is
-  appended at index 6, after `cost`. `cost` is the run's aggregate
-  `$X.XX` from `state.json`'s `telemetry.cost_usd` (present in the state
-  summary `_discover_runs` passes through — no extra disk read), or `—`
-  when telemetry is absent (orphans / pre-classify runs).
-- `_render_run_table()` renders columns in the order `run_id,
-  started_at, status, cost, branch` (the filter-only `is_fly`/`is_ec2`
-  are not columns). The `cost` column is right-aligned; widths
-  auto-size.
-- `status <state>` argparse flag on `list` filters rows to only
-  those whose derived status matches. `<state>` accepts any value in
-  `RUN_STATUSES` (see list above). Invalid values produce an
-  argparse error listing the allowed set.
-- `--runtime` on `list` accepts `local`/`fly`/`ec2` (the
-  `RUNTIME_VALUES` enum, validated by argparse `choices=`). `fly`
-  restricts to rows with Fly artifacts; `ec2` restricts to rows with EC2
-  artifacts; `local` restricts to rows with **neither** (not just
-  "not fly").
+- `_collect_run_rows()` returns `(run_id, started_at, status, branch, is_fly,
+  cost, is_ec2)`. `is_fly`/`is_ec2` are bools derived from `run.json` or the
+  matching sidecar file (mirrors `_auto_detect_run_runtime`), **filter-only**
+  (never rendered as columns); `is_fly` stays at index 4 for existing `r[4]`
+  consumers, `is_ec2` is appended at index 6. `cost` is the run's aggregate
+  `$X.XX` from `state.json`'s `telemetry.cost_usd`, or `—` when absent.
+- `_render_run_table()` renders `run_id, started_at, status, cost, branch`
+  (right-aligned cost, auto-sized widths).
+- `status <state>` on `list` filters rows to a matching derived status
+  (any `RUN_STATUSES` value; invalid values error listing the allowed set).
+- `--runtime` on `list` accepts `local`/`fly`/`ec2` (`RUNTIME_VALUES`,
+  argparse `choices=`); `local` restricts to rows with **neither** Fly nor
+  EC2 artifacts.
 - `list --runtime fly` is intercepted by the launcher (bash) before
-  the orchestrator dispatch and queries Fly directly via `flyctl
-  machines list --app <FLY_APP> --json`. Renders a `machine_id |
-  state | region | created_at | run_id (local)` table covering every
-  machine under the app, regardless of which host repo launched them.
-  `run_id` is best-effort filled by scanning `<state-root>/runs/*/{fly-
-  machine.json,run.json}` for the current repo; machines launched from
-  another repo show `run_id=?`. Falls back to the orchestrator-side
-  local-sidecar list when `flyctl` is missing or auth fails. Any other
-  `list --runtime` value (including `ec2`) falls through unchanged
-  into the orchestrator's argparse dispatch above. Plain `list` (no
-  `--runtime fly`) is unchanged.
+  orchestrator dispatch and queries Fly directly (`flyctl machines list
+  --app <FLY_APP> --json`), rendering `machine_id | state | region |
+  created_at | run_id (local)` for every machine under the app. `run_id` is
+  best-effort filled by scanning local sidecars; machines from another repo
+  show `run_id=?`. Falls back to the orchestrator-side local-sidecar list
+  when `flyctl` is missing or auth fails. Any other `--runtime` value falls
+  through unchanged.
 
 Verbs `kill`, `stop`, and `accept-blocked` accept an optional
-`--runtime <local|fly|ec2>` flag — validated by the launcher (bash)
-against `local`/`fly`/`ec2`, matching the top-level `RUNTIME_VALUES`
-enum (`local|fly|ec2` — see "Remote execution mode" below) that gates
-the `--runtime` flag for launching a new run. See "Explicit pause and
-destroy verbs" above and "Accept-blocked verb" above for their
-respective EC2 paths. `finalize` remains narrower: it still
-validates only `local`/`fly` (rejecting `ec2` with an error) since
-`finalize --runtime ec2` has not shipped.
+`--runtime <local|fly|ec2>` flag, validated against the same `RUNTIME_VALUES`
+enum that gates launching a new run. `finalize` remains narrower — it
+validates only `local`/`fly` (rejecting `ec2`) since `finalize --runtime ec2`
+has not shipped.
 
-The launcher's `RUNTIME=ec2` branch dispatches the full create → seed
-→ launch → teardown cycle for *launching* a run (see "Runtime mode"
-above); `stop --runtime ec2` routes to `stop_instance()` for pausing
-one; and `kill --runtime ec2` routes to `terminate_instance()` with
-fetch-before-terminate ordering (see "`kill`'s EC2 action" above).
-`finalize --runtime ec2` has not shipped. Fly runs route to `flyctl
-machine stop`/`flyctl machine destroy`; EC2 runs route to `aws ec2
-stop-instances`/`terminate-instances` (via `stop_instance()`/
-`terminate_instance()`); local runs route to `nerdctl stop`/`nerdctl
-kill` via the `_is_local_container` probe (`nerdctl inspect
-<run-id>`). `stop` uses `nerdctl stop` (SIGTERM first, allowing
-graceful state save) or `aws ec2 stop-instances`; `kill` uses
-`nerdctl kill` (immediate SIGKILL) or `aws ec2 terminate-instances`
-(after the fetch-before-terminate sync). `finalize --runtime local`
-still errors — local finalization is inline. Without the flag, the
-verbs infer the runtime from the sidecar (`fly-machine.json` presence
-for Fly, `ec2-instance.json` presence for EC2, `nerdctl inspect` for
-local — in that probe order, via `_auto_detect_run_runtime`).
-`resume` accepts `--runtime` directly (the smart router branches by
-runtime: fly takes the smart-attach path, local takes the inline
+The launcher's `RUNTIME=ec2` branch dispatches the full create → seed →
+launch → teardown cycle for launching a run; `stop --runtime ec2` routes to
+`stop_instance()`; `kill --runtime ec2` routes to `terminate_instance()` with
+fetch-before-terminate ordering. Fly runs route to `flyctl machine
+stop`/`destroy`; EC2 to `aws ec2 stop-instances`/`terminate-instances`; local
+to `nerdctl stop`/`kill` via `_is_local_container` (`nerdctl inspect
+<run-id>`). `stop` uses SIGTERM-equivalents (graceful state save); `kill`
+uses immediate destroy (EC2 after the fetch-before-terminate sync).
+`finalize --runtime local` still errors — local finalization is inline.
+Without the flag, verbs infer runtime from the sidecar (Fly, then EC2, then
+`nerdctl inspect`, via `_auto_detect_run_runtime`). `resume` accepts
+`--runtime` directly (fly takes the smart-attach path, local the inline
 re-exec path).
 
 Maps to `DESIGN.md`: §6 *The user-visible verb surface*.
 
 #### Detached run finalization (`leerie finalize <run-id>`)
 
-With the detached orchestrator, the launcher cannot synchronously wait
-for orchestrator completion and call `fetch_branch` — the tail's exec
-session ends before (or independent of) the orchestrator's actual exit.
-Two surfaces address this together:
+With the detached orchestrator, the launcher cannot synchronously wait for
+orchestrator completion and call `fetch_branch` — the tail's exec session
+ends before (or independent of) the orchestrator's actual exit. Two surfaces
+address this together:
 
 1. **`orchestrator.pid` on the machine.** The detached-launch sh wrapper
    records the orchestrator's pid in
    `/work/.leerie/runs/<run-id>/orchestrator.pid` after the post-`Popen`
-   poll has cleared the flock-loser case (see the launcher
-   `_launch_script` listing above and DESIGN §6 *Single owner per
-   run dir*). `leerie resume`'s in-machine tail watcher checks
-   liveness via two ORed signals — pid-file `kill -0` and a
-   `/proc/[0-9]*/cmdline` scan for `orchestrator/leerie.py` + run-id
-   — alongside the `tail -F`. Both must agree the orchestrator is
-   dead before the watcher prints
-   `<ISO-8601> [leerie] remote: orchestrator exited — syncing run branch + state to host...`.
-   The tail then exits. The `/proc` scan is what closes the
-   stale-pid contagion described in DESIGN §6: even if the pid file
-   went stale (concurrent-spawn race, future cause), the scan finds
-   the real orchestrator and the watcher keeps tailing.
-2. **`leerie finalize <run-id>`** — new launcher fast-path that runs the
-   post-orchestrator block the launcher used to run inline: source
-   `fetch-branch.sh`, call `fetch_branch`, source the host-side
-   finalize block (push + `gh pr create`). The verb is idempotent — if
-   the run branch is already pushed (`pushed_at` set), it short-
-   circuits with "already finalized."
+   poll clears the flock-loser case (DESIGN §6 *Single owner per run dir*).
+   `leerie resume`'s in-machine tail watcher checks liveness via two ORed
+   signals — pid-file `kill -0` and a `/proc/[0-9]*/cmdline` scan for
+   `orchestrator/leerie.py` + run-id — alongside the `tail -F`; both must
+   agree the orchestrator is dead before the watcher prints its
+   syncing-to-host message and exits. The `/proc` scan closes the stale-pid
+   contagion from DESIGN §6: if the pid file went stale, the scan still
+   finds the real orchestrator and keeps tailing.
+2. **`leerie finalize <run-id>`** — launcher fast-path running the
+   post-orchestrator block inline: source `fetch-branch.sh`, call
+   `fetch_branch`, then the host-side finalize block (push + `gh pr
+   create`). Idempotent — a run already pushed short-circuits with
+   "already finalized."
 
-**`leerie finalize` resolves the run-id directly.** The launcher
-resolves `<run-id>` against `$LEERIE_STATE_HOST_DIR/runs/<run-id>/`
-locally to pick up `fly-machine.json` and the partial sidecar. Since
-the run-id IS the machine ID (DESIGN §6), no fallback lookup is
-needed. No-match falls through to an error augmented with a hint to
-run `leerie list`.
+`leerie finalize` resolves `<run-id>` directly against
+`$LEERIE_STATE_HOST_DIR/runs/<run-id>/` (the run-id IS the machine id, DESIGN
+§6, so no fallback lookup is needed); no match errors with a hint to run
+`leerie list`.
 
-**`leerie finalize <run-id>`** (non-force) first tries
-`fetch_branch` (the normal clean-exit case: orchestrator wrote
-`finished_at`). If that fails, the launcher auto-recovers: it calls
-`force_finalize_remote` (which checks whether the orchestrator is dead
-and patches `finished_at` — see liveness checks below), then
-`collect_subtrees_remote` to integrate un-merged subtask branches on
-the machine, then retries `fetch_branch`. If the orchestrator is still
-alive, the launcher refuses with a hint to use `--force`.
+**Non-force** first tries `fetch_branch` (clean-exit case). On failure it
+auto-recovers: `force_finalize_remote` (checks orchestrator liveness, patches
+`finished_at` — see below), then `collect_subtrees_remote` to integrate
+un-merged subtask branches, then retries `fetch_branch`. If the orchestrator
+is still alive, it refuses with a hint to use `--force`.
 
-**`leerie finalize <run-id> --force`** extends the recovery to runs
-where the orchestrator is still alive. The launcher calls
-`force_finalize_remote` with `FORCE_STOP=1`, which SIGTERMs the
-orchestrator process *inside the machine* (the process, NOT the
-machine — the machine must stay running for the subsequent collection
-and fetch steps), waits for it to die (polling `/proc`; escalates to
-SIGKILL after 30 s), patches `finished_at`, then falls through.
-The launcher then calls `collect_subtrees_remote` and `fetch_branch`.
+**`--force`** extends recovery to a still-alive orchestrator:
+`force_finalize_remote` with `FORCE_STOP=1` SIGTERMs the orchestrator process
+*inside the machine* (not the machine itself), waits for death (polling
+`/proc`, escalating to SIGKILL after 30s), patches `finished_at`, then runs
+`collect_subtrees_remote` and `fetch_branch`.
 
 **Liveness checks** (`scripts/remote/force-finalize.sh`):
 
-1. Lists `/work/.leerie/runs/` for the single run dir
-   (fails clearly on multi-match).
-2. Reads `run.json`; if `finished_at` is already set, no-op (idempotent).
-3. Checks orchestrator liveness via two complementary signals:
-   - `/proc` cross-check (authoritative): scan `/proc/[0-9]*/cmdline`
-     for any process whose NUL-separated argv contains both the
-     literal string `orchestrator/leerie.py` AND the run-id. If
-     found → orchestrator alive → **REFUSE-ALIVE-SCAN** (or
-     **STOPPED** if `FORCE_STOP=1`).
-   - `orchestrator.pid` check (defensive, kept for pid-reuse audit):
-     - Pid file present + `kill -0 <pid>` succeeds + `/proc/<pid>/cmdline`
-       contains `python` → orchestrator alive → **REFUSE-ALIVE** (or
-       **STOPPED** if `FORCE_STOP=1`). (`cmdline` not `comm`
-       because `comm` is the basename of the script-launcher binary —
-       for a pip-installed `pytest` shim it is `"pytest"`, which does
-       not contain `"python"` and would let an alive orchestrator
-       slip through the guard. `cmdline` is the full execve argv,
-       which always names the interpreter explicitly.)
-     - Pid file present + `kill -0` fails (`ESRCH`) + `/proc` scan
-       also empty → orchestrator dead; safe to proceed.
-     - Pid file missing → refuse; tell the user to inspect manually
-       via `leerie resume <run-id> --shell --runtime fly`.
+1. Lists `/work/.leerie/runs/` for the single run dir (fails on multi-match).
+2. Reads `run.json`; if `finished_at` already set, no-op (idempotent).
+3. Checks liveness via two signals: a `/proc` cross-check (authoritative —
+   scans `/proc/[0-9]*/cmdline` for `orchestrator/leerie.py` + run-id) and a
+   defensive `orchestrator.pid` check (`kill -0` + `cmdline` containing
+   `python` — `cmdline` not `comm`, since `comm` on a pip-installed shim can
+   read `"pytest"` and slip an alive orchestrator past the guard). Either
+   signal alive → **REFUSE-ALIVE[-SCAN]** (or **STOPPED** under
+   `FORCE_STOP=1`); both dead → safe to proceed; pid file missing → refuse,
+   pointing at `leerie resume <run-id> --shell --runtime fly`. The `/proc`
+   scan exists because the pid file is written *between* `Popen` and the
+   child's `State.__init__`, so a stillborn flock-loser can stamp a dead pid
+   before the winner claims authority (stale-pid contagion, DESIGN §6).
+4. Patches `run.json` with `finished_at`, `no_push=false`, `recovered_at`,
+   `recovered_via="force-finalize"`, then falls through to `fetch_branch`.
 
-   The `/proc` scan exists because `orchestrator.pid` is not a
-   reliable liveness oracle on its own: the launcher writes it
-   *between* `Popen` and the child's `State.__init__`, so a
-   stillborn flock-loser stamps its dead pid before the winner can
-   claim authority (see DESIGN §6 *Single owner per run dir* —
-   stale-pid contagion). The pid-file branch is retained because
-   when it speaks (pid-reuse + matching cmdline) it is more precise
-   than the scan, and a `REFUSE-ALIVE` distinct from
-   `REFUSE-ALIVE-SCAN` makes the source of the refusal observable
-   in audit logs.
-4. Patches `run.json` in-place with `finished_at = <now>`,
-   `no_push = false`, `recovered_at = <now>`,
-   `recovered_via = "force-finalize"`, and falls through to the normal
-   `fetch_branch` flow.
-
-Sentinels: `OK:<run_id>`, `STOPPED:<run_id>:<pid>` (killed then
-patched), `STOP-FAILED:<run_id>:<pid>`, `REFUSE-ALIVE-SCAN:*`,
-`REFUSE-ALIVE:*`, `REFUSE-NOPID:*`, `REFUSE-MULTI:*`, `REFUSE-NONE`,
-`ERROR:*`.
+Sentinels: `OK:<run_id>`, `STOPPED:<run_id>:<pid>`, `STOP-FAILED:<run_id>:<pid>`,
+`REFUSE-ALIVE-SCAN:*`, `REFUSE-ALIVE:*`, `REFUSE-NOPID:*`, `REFUSE-MULTI:*`,
+`REFUSE-NONE`, `ERROR:*`.
 
 **Subtree collection** (`scripts/remote/collect-subtrees.sh`):
-`collect_subtrees_remote` SSHes a bash payload that discovers
-un-integrated subtask branches on the machine and merges them into the
-run branch via `setup-run.sh` (idempotent) + `integrate.sh`.
-Conflicts are resolved by spawning `claude -p` with the integrator
-prompt and schema (same invocation as `integrate_wave()` in the
-orchestrator). That direct invocation puts this script **outside** the
-`--dangerously-force-strict-output` path: `collect_subtrees_remote` runs only
-after the orchestrator — which owns the proxy — has exited, so there is no
-listener left to reach. Output is still schema-validated by the script's
-embedded `SCHEMAS["integrator"]` copy; it is not constrained during
-generation. See DESIGN §7 *Forcing constrained decoding*. The integrator runs in the staging worktree with the
-merge left in-progress. On success, the merge commit is verified
-(`MERGE_HEAD` must not exist, no staged-but-uncommitted changes). On
-failure, the merge is aborted and the branch is skipped. Wave ordering from
-`state.json` is used when available (earlier waves first); falls back
-to alphabetical. Sentinels: `COLLECTED-ALL:<run_id>:<count>`,
+`collect_subtrees_remote` SSHes a bash payload that discovers un-integrated
+subtask branches and merges them via `setup-run.sh` (idempotent) +
+`integrate.sh`, resolving conflicts by spawning `claude -p` with the
+integrator prompt/schema (same invocation as `integrate_wave()`). This runs
+only after the orchestrator has exited, so it sits outside the
+`--dangerously-force-strict-output` path — output is still schema-validated
+by the script's embedded `SCHEMAS["integrator"]` copy, just not constrained
+during generation (DESIGN §7 *Forcing constrained decoding*). On success the
+merge commit is verified (`MERGE_HEAD` absent, nothing staged); on failure
+the merge aborts and the branch is skipped. Wave ordering comes from
+`state.json` when available, else alphabetical. Sentinels:
+`COLLECTED-ALL:<run_id>:<count>`,
 `COLLECTED:<run_id>:<integrated>:<skipped>:<skipped_sids>`,
 `COLLECTED-NONE:<run_id>`, `COLLECT-ERROR:<message>`.
 
-The synthesized audit fields (`recovered_at`, `recovered_via`) preserve
-provenance of forced recoveries so post-mortems can distinguish them
-from naturally-finalized runs.
+`finalize` logs its action before SSHing in
+(`finalize: machine=<id> run=<id> action=<fetch|force-stop+collect+fetch|already-synced>`),
+matching the convention that destructive/side-effecting actions are explicit
+verbs (DESIGN §6), not implicit consequences of stream timing.
 
-`finalize` logs the action it took before SSHing in:
-`finalize: machine=<id> run=<id> action=<fetch|force-stop+collect+fetch|already-synced>`
-so post-mortems of future failures are shorter.
-
-Matches the convention that destructive/side-effecting actions are
-explicit verbs (DESIGN §6 *The user-visible verb surface*), not implicit
-consequences of stream timing.
-
-`leerie resume <run-id> --auto-finalize` runs `leerie finalize`
-automatically when the pid-watch detects clean exit, for zero-touch
-finalization; the same plumbing applies to the fresh-launch tail
-(`leerie "task" --runtime fly --auto-finalize`).
+`leerie resume <run-id> --auto-finalize` runs `leerie finalize` automatically
+on clean-exit detection, for zero-touch finalization; the same plumbing
+applies to the fresh-launch tail (`--runtime fly --auto-finalize`).
 
 Maps to `DESIGN.md`: §6 *Detached orchestrator (remote mode)*,
 *Finalization* (recovery sub-paragraph).
@@ -8470,34 +8390,34 @@ discovery without parsing the full `state.json`):
 | `run_id` | str | the run identifier (matches the directory name and the branch suffix) |
 | `branch` | str | the run branch — always `leerie/runs/<run_id>` |
 | `working_branch` | str | the branch HEAD-at-run-start; the diff fork-point (leerie does not merge into it locally). Also the PR base by default — see `pr_base_branch` below for the override. |
-| `pr_base_branch` | str | the final branch this run's PR merges into; defaults to `working_branch`, overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (see "PR base branch override" above). `scripts/host-finalize.sh` reads this field for `gh pr create --base`, falling back to `working_branch` when absent (a run finalized before this field existed). |
+| `pr_base_branch` | str | the final branch this run's PR merges into; defaults to `working_branch`, overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (see "PR base branch override" above). |
 | `started_at` | ISO-8601 str | wall-clock start time (also mirrored in `state.json`) |
-| `finished_at` | ISO-8601 str \| null | wall-clock end time. Set at finalize success on the normal path; also set by the `except SystemExit` handler in `main()` for `die()` exits that fire after the run directory exists (on Fly, the tail wrapper propagates the orchestrator's exit code via `orchestrator.exit_code` when present, falling back to 0 when absent; either way `fetch_branch`'s discovery script needs `finished_at` to find the run). Idempotent on `resume` — `phase_finalize` overwrites it with the real completion time if the run succeeds on retry. |
+| `finished_at` | ISO-8601 str \| null | wall-clock end time. Set at finalize success, or by the `except SystemExit` handler in `main()` for `die()` exits after the run directory exists (on Fly, the tail wrapper propagates the exit code). Idempotent on `resume`. |
 | `task` | str | the task description (mirrored from `state.json`) |
-| `task_sha256` | str | sha256 of the resolved task text, written at run start. `run_id` is the container id, so two launches of byte-identical task text are otherwise invisible to each other, and can produce architecturally incompatible branches (docs/POSTMORTEM-2026-08-14.md, F10). `_live_duplicate_runs` scans sibling sidecars for the same hash on a run that has not finished, paused or been killed, and `_run_phases` refuses before the first worker. Set `LEERIE_ALLOW_DUPLICATE_TASK=1` to run the same brief twice deliberately — an env var rather than a CLI flag, so it is stated rather than discovered. |
+| `task_sha256` | str | sha256 of the resolved task text, written at run start. Two launches of byte-identical task text are otherwise invisible to each other and can produce incompatible branches; `_live_duplicate_runs` refuses a duplicate unless `LEERIE_ALLOW_DUPLICATE_TASK=1`. |
 | `pushed_at` | ISO-8601 str \| null | when the run branch was pushed to `origin`; null until push runs |
-| `push_error` | str \| null | captured `git push` output if the push failed — stderr plus any pre-push hook **stdout** under a `--- pre-push hook output (stdout) ---` marker, tail-bounded to 32 KiB (see the `scripts/host-finalize.sh` row: the value is a single `jq --arg` argument and cannot approach `MAX_ARG_STRLEN`); mutually exclusive with `pushed_at` being set |
+| `push_error` | str \| null | captured `git push` output if the push failed — stderr plus any pre-push hook stdout under a marker, tail-bounded to 32 KiB; mutually exclusive with `pushed_at`. |
 | `pr_url` | str \| null | the PR URL `gh` returned; null until PR creation succeeds |
 | `pr_error` | str \| null | captured `gh` stderr if PR creation failed; logical invariant — `pr_error` can be set only after `pushed_at` is set |
-| `fly_machine_id` | str \| null | Fly Machine ID for a remote (`--runtime fly`) run; written by `scripts/remote/provision.sh` immediately after `flyctl machine run` succeeds, so a launcher that crashes before classifying still leaves a recoverable pointer. Null for local runs. |
-| `paused_at` | ISO-8601 str \| null | when the remote run was paused — either on failure (set by the launcher's EXIT trap on the pause branch) or by explicit user request (`leerie stop <run-id>`). Null for successful runs, killed runs, and runs the user merely detached from. **Cleared at finalize**: `fetch_branch`'s `tar -xC` (scripts/remote/fetch-branch.sh:225) overwrites the host sidecar with the machine's `run.json`, which has no `paused_at` set because the machine isn't aware of the user's pause action. Intentional — the post-finalize status should be `done-pushed-pr`, not `paused`. Pause/resume forensics are not preserved across finalize. |
+| `fly_machine_id` | str \| null | Fly Machine ID for a remote (`--runtime fly`) run; written immediately after `flyctl machine run` succeeds, so a launcher crash before classifying still leaves a recoverable pointer. Null for local runs. |
+| `paused_at` | ISO-8601 str \| null | when the remote run was paused — on failure or by explicit `leerie stop <run-id>`. Cleared at finalize. |
 | `pause_reason` | str \| null | short tag identifying which path set `paused_at` (`worker-error`, `orchestrator-exception`, `finalize-failed`, `user-requested`). Null when `paused_at` is null. Cleared with `paused_at` at finalize (see above). |
 | `killed_at` | ISO-8601 str \| null | when the remote run was explicitly destroyed by `leerie kill <run-id>`. The Fly Machine has been destroyed and the run is no longer resumable. Null for any other terminal state. |
-| `sync_failed_at` | ISO-8601 str \| null | when the clean-exit branch of `decide_teardown` ran `fetch_branch` and it failed. The orchestrator finished cleanly on the machine, but the run branch + state directory could not be pulled back to the host. The machine is LEFT RUNNING (not stopped) so the user can recover manually via `leerie finalize --runtime fly` (retry sync + push), `leerie resume --runtime fly` (inspect — tails the log by default, `--shell` opens a bash session), or `leerie kill --runtime fly` (destroy only after work is safely on host). Orthogonal to `paused_at`/`pushed_at`/`killed_at` — the machine is neither paused nor destroyed. Mutex-checked against `pushed_at` (a successfully pushed run can't be sync-failed) and `killed_at` (a destroyed machine can't be sync-failed). Requires `fly_machine_id` to be set (the running machine needs a pointer). |
+| `sync_failed_at` | ISO-8601 str \| null | when `fetch_branch` failed on the clean-exit path — the orchestrator finished but state couldn't be pulled back to host. The machine is left running for recovery via `finalize`/`resume`/`kill`. |
 | `sync_fail_reason` | str \| null | short tag accompanying `sync_failed_at` (currently always `sync-failed-on-clean-exit`). Null when `sync_failed_at` is null. |
-| `recovered_at` | ISO-8601 str \| null | when `leerie finalize <run-id> --force` patched this run's `finished_at` after the orchestrator died before its natural finalize. Set by `scripts/remote/force-finalize.sh` together with `finished_at` and `no_push=false`. A non-null value means the run reached host-side finalize via the recovery path rather than the natural one. Orthogonal to all terminal-state fields. Written **once** on the first successful `--force` run; subsequent `--force` invocations short-circuit on the now-set `finished_at` and leave `recovered_at` unchanged (the recovery timestamp records the original recovery, not the most recent verb invocation). |
+| `recovered_at` | ISO-8601 str \| null | when `leerie finalize --force` patched this run's `finished_at` after the orchestrator died before its natural finalize. Written once, on the first successful `--force` recovery. |
 | `recovered_via` | str \| null | short tag accompanying `recovered_at`; currently always `"force-finalize"`. Null when `recovered_at` is null. |
-| `volume_id` | str \| null | Fly volume ID (e.g. `vol_…`) when the machine was provisioned with a volume (the default on `--runtime fly` since `FLY_VM_DISK_GB` defaults to `8`). Mounted at `/work` on the machine (the path that holds the seeded repo, `.leerie/runs/<id>/` state, and per-subtask worktrees). Destroyed when the machine is destroyed (clean exit or `leerie kill`). Null for local-runtime runs or legacy Fly runs created before the default was introduced. If non-null, `fly_machine_id` must also be non-null — a volume without a machine to attach it to is invalid (enforced by `_validate_run_json`). |
-| `image_tag` | str \| null | Full Fly registry image tag (e.g. `registry.fly.io/leerie:0.6.7`) recorded at provision time. Used by `resume_machine()` to detect version drift: if the current `$FLY_IMAGE_TAG` differs from the stored value (or the stored value is absent), the machine's image is updated via `flyctl machine update --image --skip-start` before starting. Updated in place on successful image update. Null for local-runtime runs or legacy Fly runs provisioned before the field was introduced (legacy machines always get the update on resume since empty != current). |
-| `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix — the launcher prepends it before `gh pr create`). Null when the worker errored, was skipped because the user opted out of pushing (`push_will_happen(no_push, host_no_push)` is False — local `--no-push` or Fly `host_no_push=true`), or had not yet run; `host_finalize` uses its deterministic fallback in that case. |
+| `volume_id` | str \| null | Fly volume ID when the machine was provisioned with one (default on `--runtime fly`). Mounted at `/work`; destroyed with the machine. Requires `fly_machine_id` non-null. |
+| `image_tag` | str \| null | Full Fly registry image tag recorded at provision time; `resume_machine()` updates the machine's image on resume if `$FLY_IMAGE_TAG` has drifted from the stored value. |
+| `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix; the launcher prepends it). Null when the worker errored or was skipped (no-push); `host_finalize` falls back to a deterministic title. |
 | `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
-| `rebase_disposition_status` | str \| null | set to `"unusable"` by `scripts/host-finalize.sh`'s rebase case statement `*)` fallback arm (reachable when the rebaser python seam returns rc=0 but the JSON is empty, unparseable, or lacks a usable `status` field). Null when the rebase never reached that arm (worktree-add failure, a resolved `rebased`/`irreconcilable`/`failed` status, or no rebase attempted at all). |
-| `rebase_disposition_jq_rc` | str \| null | the `jq -e` exit code from attempting to parse `$_rebaser_json` in that same fallback arm — non-zero means the payload itself was unparseable JSON, not merely missing `.status`. Null under the same conditions as `rebase_disposition_status`. |
-| `rebase_disposition_raw_json` | str \| null | `$_rebaser_json` (the contents of the seam's verdict file — **not** its stdout, which carries the worker's log stream), **tail**-truncated to 2000 bytes, from the same fallback arm — the artifact that identifies why the rebase degraded. Null under the same conditions as `rebase_disposition_status`. |
-| `chain_id` | str \| null | UUID of the chain this run is part of. Written twice: (1) early-write by the child process immediately after `provision_machine` succeeds (so chain-scoped verbs can discover the run while the orchestrator is still running); (2) re-written by the parent's post-wait tagging loop after `fetch_branch` overwrites run.json with the orchestrator's copy. Null for runs not spawned as part of a chain. Used by chain-scoped verbs (`list chains`, `status`, `kill`, `attach`, `resume`) to discover chain runs. |
+| `rebase_disposition_status` | str \| null | set to `"unusable"` by the rebase fallback arm when the rebaser seam returns rc=0 but its JSON is empty, unparseable, or lacks `status`. |
+| `rebase_disposition_jq_rc` | str \| null | the `jq -e` exit code from parsing `$_rebaser_json` in that fallback arm — non-zero means the payload was unparseable JSON, not merely missing `.status`. Null under the same conditions as `rebase_disposition_status`. |
+| `rebase_disposition_raw_json` | str \| null | `$_rebaser_json` (the seam's verdict file, not its stdout), tail-truncated to 2000 bytes — the artifact identifying why the rebase degraded. Null under the same conditions as `rebase_disposition_status`. |
+| `chain_id` | str \| null | UUID of the chain this run is part of. Written early by the child process after `provision_machine` succeeds, and re-written by the parent post-wait. Null for non-chain runs. |
 | `wave_idx` | int \| null | Zero-based wave index within the chain (set alongside `chain_id`). Used by the chain wave-sequencer to group runs by wave for synth-merge between waves. Null when `chain_id` is null. |
-| `health` | dict \| null | Advisory run-health signals (DESIGN §9). Written by two seams and merged, never mutually exclusive: (1) `_capture_conformance_baseline` writes `base_suite` `{status: "green"\|"red", red_axes: list[str]}` at the start of `phase_execute` — the build/lint/test exit-code verdict on the unmodified base tree; (2) `_record_run_health` writes `slowest_worker_sid` (str \| null), `slowest_worker_min` (float — the largest summed per-worker `duration_ms`, in minutes), and `truncated_worker_count` (int — worker logs that ended a result with `terminal_reason="max_turns"`) at finalize, preserving any existing `base_suite`. Purely informational — never gates; `_validate_run_json` imposes no invariant on it. Null when neither seam ran (e.g. a no-work run, or `--skip-base-baseline` on a run that also never reached finalize). |
+| `health` | dict \| null | Advisory run-health signals (DESIGN §9), merged from two seams: `_capture_conformance_baseline` writes `base_suite` `{status, red_axes}` at `phase_execute` start; `_record_run_health` writes `slowest_worker_sid`/`_min`/`truncated_worker_count` at finalize. Never gates. |
 
 `_validate_run_json(data)` enforces these invariants on read:
 - `pushed_at` and `push_error` are mutually exclusive (at most one is non-null).
@@ -8519,8 +8439,8 @@ A corrupt sidecar is flagged but does not block the rest of the system; `leerie 
 | `pr-failed` | `pr_error` is set (and push succeeded) | re-run `gh pr create` manually using the command logged at finalize |
 | `done-pushed-pr` | `pr_url` is set | the happy path: PR open, work merged locally |
 | `done-pushed-no-pr` | `pushed_at` set but `pr_url` not | rare: push succeeded, PR wasn't attempted (e.g., gh removed between push and PR) |
-| `sync-failed` | `sync_failed_at` set (and no `killed_at`) | the orchestrator finished but `fetch_branch` failed; the Fly machine is still running with un-synced work. Run `leerie finalize <id>` to retry sync + push, or `leerie resume <id>` to inspect manually (default tails the log; `--shell` opens a bash session); only `leerie kill <id>` once work is safely on host. (DESIGN §6 *Remote pause-on-failure* — sync-before-destroy contract.) |
-| `done` | `finished_at` set, no `pushed_at` | the user passed `--no-push`, or the orchestrator exited via `die()` after the run directory was created (e.g. unresolved subtasks). In the latter case, `resume` re-enters `phase_execute` normally — `finished_at` is overwritten on success. |
+| `sync-failed` | `sync_failed_at` set (and no `killed_at`) | the orchestrator finished but `fetch_branch` failed; the Fly machine is still running with un-synced work. Run `leerie finalize <id>` to retry, `leerie resume <id>` to inspect, or `leerie kill <id>` once work is safely on host. |
+| `done` | `finished_at` set, no `pushed_at` | the user passed `--no-push`, or the orchestrator exited via `die()` after the run directory was created. `resume` re-enters `phase_execute` normally on the latter. |
 | `paused` | `paused_at` is set | inspect/attach to the Fly Machine, then `leerie resume <id> --runtime fly` (DESIGN §6 *Remote pause-on-failure*) |
 | `killed` | `killed_at` is set | terminal state — the machine was destroyed by `leerie kill`. Not resumable; start a new run instead. |
 | `in-progress` | none of the above | the run is still active (or died very early); resume with `leerie resume <id>` |
@@ -8542,88 +8462,89 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `task` | str | the task description passed on the command line |
 | `started_at` | ISO-8601 str | wall-clock time at run start |
 | `finished_at` | ISO-8601 str | wall-clock time at successful finalize |
-| `plan_snapshot` | dict | `{subtasks, waves}` captured immediately after `_schedule()` returns and **before** `check_budget_feasibility` / `_validate_plan` — both of which `die()`. Without it a plan that fails either gate is lost entirely (`_write_plan` never runs), discarding the planner/fit_judge/splitter spend that produced it. It is deliberately *not* `_write_plan`, which would also emit per-subtask spec files and seed the execution scaffolding for a run that cannot start. `resume` reads this back to rehydrate `subtasks`/`waves` and re-run only the budget check when a run stopped at the post-`_schedule()` budget-feasibility gate (DESIGN §6 "Budget-check resume"), instead of dying "Plans are not persisted." |
-| `decompose_snapshot` | dict | `plan_snapshot`'s sibling for §5½ (P1) recursive decomposition: `phase_plan` writes the accumulated leaves after each top-level subtask finishes expanding under `_recursive_decompose`, so a mid-decomposition `WorkerError` (from either the `fit_judge` call or the coupled-minority `splitter` call — an auth failure, PID exhaustion) does not discard fit/split judgments already paid for on subtasks that already finished expanding — decomposition is routinely a large share of a run's total planning spend (DESIGN §6 *Credential strategy*). Since the M2 perf fix (top-level subtasks' `_recursive_decompose` calls run under bounded concurrency, `asyncio.Semaphore(caps["max_parallel"])` + `_gather_or_cancel`, mirroring `_filter_satisfied_subtasks`), completion order across subtasks — and therefore the order of successive snapshot writes — is nondeterministic; the invariant (a finished subtask's leaves are captured before a later crash) is unaffected. Diagnostic/audit only: mid-decomposition rehydration on `resume` is out of scope for the per-phase checkpoint cursor (DESIGN §6 "Resumable planning"), which re-enters at `phase_plan` as a whole via `plans_after_plan` rather than resuming inside a single phase's recursive decomposition. |
-| `plans_after_classify` | list[dict] | per-phase planning checkpoint (DESIGN §6 "Resumable planning — a per-phase checkpoint cursor, not a `waves` gate"): the `plans` list as it stood immediately after `phase_classify` completed and `st.save()`'d. `resume` treats the *presence* of this key — not `current_phase` — as proof the phase's output is safely persisted, and skips re-invoking `phase_classify` when present, reusing this value as the next phase's input. Absent for a run that has not yet completed classification, or has already progressed past this checkpoint to a later `plans_after_*` key / `waves`. Every `plans_after_*` assignment stores a **`copy.deepcopy(plans)`**, never the live list: later phases (`phase_reconcile`'s renames, `phase_overlap_judge`'s merges/drops, both phase-3 soft-drop filters) mutate `plans` **in place**, so storing the reference would make the next `st.save()` retroactively rewrite every earlier checkpoint with the post-mutation plan. |
+| `plan_snapshot` | dict | `{subtasks, waves}` captured immediately after `_schedule()` returns and **before** `check_budget_feasibility` / `_validate_plan` — both of which `die()`. |
+| `decompose_snapshot` | dict | `plan_snapshot`'s sibling for §5½ (P1) recursive decomposition: `phase_plan` writes the accumulated leaves after each top-level subtask finishes expanding under `_recursive_decompose`, so a mid-decomposition `WorkerError` (from either the `fit_judge` call or the coupled-minority `splitter` call — an auth failure, PID exhaustion) does not discard fit/split judgments already paid for on subtasks that already finished expanding — decomposition is routinely a large share of a run's total planning spend (DESIGN §6 *Credential strategy*). |
+| `plans_after_classify` | list[dict] | per-phase planning checkpoint (DESIGN §6 "Resumable planning — a per-phase checkpoint cursor, not a `waves` gate"): the `plans` list as it stood immediately after `phase_classify` completed and `st.save()`'d. |
 | `plans_after_plan` | list[dict] | the per-phase planning checkpoint for `phase_plan` (post-recursive-decompose `plans`, DESIGN §6). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
 | `plans_after_reconcile` | list[dict] | the per-phase planning checkpoint for `phase_reconcile` (reconciled `plans`, DESIGN §6). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
 | `plans_after_overlap_judge` | list[dict] | the per-phase planning checkpoint for `phase_overlap_judge` (post-collision-resolution `plans`, DESIGN §6 *Cross-domain surface overlap*). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
 | `plans_after_adherence_gate` | list[dict] | the per-phase planning checkpoint for `phase_adherence_gate` (post-instruction-adherence-gate `plans`, DESIGN §6, §12 sibling). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
 | `plans_after_coverage_gate` | list[dict] | the per-phase planning checkpoint for `phase_planning_coverage_gate` (post-task-coverage-gate `plans`, DESIGN §8 *Independent adversarial verification*). Same absence/presence and resume-cursor semantics as `plans_after_classify`. |
-| `plans_after_filters` | list[dict] | the per-phase planning checkpoint written after the off-tree (`_filter_offtree_subtasks`) and already-satisfied (`_filter_satisfied_subtasks`) phase-3 filters both complete — the filtered `plans` immediately before `_schedule()`. Same absence/presence and resume-cursor semantics as `plans_after_classify`; this is the last `plans_after_*` checkpoint before `plan_snapshot`/`waves` take over as the resume cursor. |
-| `satisfied_probe_cache` | dict[str, dict] | per-subtask `satisfied_probe` verdicts (DESIGN §6 "The satisfied-probe sweep needs finer-than-phase granularity"; §8 *Already-satisfied subtask elimination*), keyed by subtask id. Each value is `{satisfied: bool, evidence: str, checked: [str], base_sha: str}` — `base_sha` is the base commit sha (`git rev-parse HEAD`) recorded at probe time. Written by `probe_one` as soon as its own verdict returns, for both `satisfied` and not-satisfied outcomes — not only in aggregate after the whole sweep's `gather` completes, so a pause mid-sweep does not lose already-decided subtasks. **Correctness-critical:** on `resume`, a cached entry whose `base_sha` no longer matches the current `HEAD` is treated as absent and that subtask is re-probed — the base tree can move between a pause and a resume (e.g. a sibling run merging its own PR into the same base branch), and a stale hit could wrongly keep a subtask that is no longer satisfied or drop one that now is. A probe that crashes (`WorkerError`) is deliberately never cached — no verdict was actually reached, and caching "kept" for a crash would wrongly skip re-probing a subtask that was never really judged. |
-| `planning_worktree` | str | absolute path to this run's disposable judgment-worker worktree (DESIGN §12 *Judgment-worker isolation*), created and reset by `scripts/planning-worktree.sh` via `_ensure_planning_worktree()`. Every worker in `PLANNING_WORKER_TYPES` runs with this as its `cwd`; `_judgment_cwd()` is the single accessor and raises rather than falling back to the real checkout. Written before `phase_classify` and again immediately before the satisfied-probe sweep (the probe judges whatever tree its cwd points at, so a tree an earlier judgment worker dirtied would produce false `satisfied=true` drops). Deliberately **not** used as a resume skip check — the worktree is a filesystem fact, so it is re-established unconditionally on every entry; the field exists for attribution (which tree a worker's Bash calls landed in), the same argument `leerie_commit` carries. |
-| `repo_state_before_planning` | dict | `{head: str, porcelain: [str], refs: [str]}` for the USER'S REAL CHECKOUT, captured once before `phase_classify` and re-checked after every planning phase **and after every execute wave** by `_assert_repo_unchanged()`. The execute-phase call passes `porcelain_only=True`, dropping the HEAD and ref axes: that phase runs for hours (p90 285 min, n=87) and an operator legitimately pulls their own checkout mid-run, so a HEAD-sensitive check there would kill runs over an innocent act. Its blind spot is a gitignored write — `git status --porcelain` never lists `node_modules/`, so in-checkout dependency installs stay invisible. This is the mechanical half of the §12 judgment-worker guarantee: the worktree makes an escape unlikely, this makes it loud, and it `die()`s naming the changed paths/refs and the phase window. Includes untracked files on purpose — `_preflight_repo`'s clean-tree gate filters `??` lines, so a worker *creating* files is exactly what that gate cannot see. Paths under `.leerie/` and refs under `refs/heads/leerie/` are exempt (leerie's own bookkeeping). Persisted so a resume compares against the ORIGINAL baseline rather than a tree an earlier planning pass may already have moved. |
-| `active_oauth_token` | str \| None | the raw `CLAUDE_CODE_OAUTH_TOKEN` value currently selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token rotation*; IMPLEMENTATION.md §3 *Multi-token rotation*). Set by `_select_active_oauth_token` (the start-of-run probe/ranking sweep, run only when `CLAUDE_CODE_OAUTH_TOKENS` is present) and mutated by `claude_p`'s mid-run failover on a rate-limited active token. Absent/`None` when only the singular `CLAUDE_CODE_OAUTH_TOKEN` is in play — no rotation, and `_invoke`'s `active_token` param stays `None` (behavior byte-identical to before this feature). **The one sanctioned exception to this feature's secrets-hygiene rule**: the raw token is never written to `calls.ndjson`, `run.json`, or any log line (only its fingerprint is), but `state.json` is local-orchestrator-owned and already carries other operational data, so this field is the one place the raw active token persists at rest. |
+| `plans_after_filters` | list[dict] | the per-phase planning checkpoint written after the off-tree (`_filter_offtree_subtasks`) and already-satisfied (`_filter_satisfied_subtasks`) phase-3 filters both complete — the filtered `plans` immediately before `_schedule()`. |
+| `satisfied_probe_cache` | dict[str, dict] | per-subtask `satisfied_probe` verdicts (DESIGN §6 "The satisfied-probe sweep needs finer-than-phase granularity"; §8 *Already-satisfied subtask elimination*), keyed by subtask id. |
+| `planning_worktree` | str | absolute path to this run's disposable judgment-worker worktree (DESIGN §12 *Judgment-worker isolation*), created and reset by `scripts/planning-worktree.sh` via `_ensure_planning_worktree()`. |
+| `repo_state_before_planning` | dict | `{head: str, porcelain: [str], refs: [str]}` for the USER'S REAL CHECKOUT, captured once before `phase_classify` and re-checked after every planning phase **and after every execute wave** by `_assert_repo_unchanged()`. |
+| `active_oauth_token` | str \| None | the raw `CLAUDE_CODE_OAUTH_TOKEN` value currently selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token rotation*; IMPLEMENTATION.md §3 *Multi-token rotation*). |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `_schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
-| `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... state.json", and the mutation used to set `complete`, pop the `blocked` registry and write nothing else -- leaving a waived subtask byte-indistinguishable from one that genuinely succeeded, with the blocker it was waived for deleted (docs/POSTMORTEM-2026-08-14.md, F16). `accept-integration` records the same way, on its own `integration_gate` entry (`accepted_at`, `accepted_defects`). |
+| `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
 | `worker_count` | int | running total of `claude -p` invocations against `max_total_workers` |
-| `decompose_worker_count` | int | running total of `claude -p` invocations spent inside `_recursive_decompose` (fit_judge + splitter, including the label-only migration splitter), against `decompose_budget_share * max_total_workers`. Bumped by `_bump_decompose_workers` alongside `worker_count` (which it also bumps). N3+N4: decomposition is a subset of the total worker budget, so this field never exceeds `worker_count` |
-| `decompose_share` | float | decomposition's share of the run's realized spend (`decompose_worker_count / worker_count`), recorded by `_warn_decomposition_share` after `phase_plan`'s expansion loop completes. **Not once per run**: each re-plan (adherence/wiring gate feedback) re-enters `phase_plan` and overwrites it with that pass's figure, and a resume past `plans_after_plan` skips it entirely, keeping the last completed pass's value. **Advisory telemetry, never a gate.** The hard gate in `_bump_decompose_workers` is sized against `max_total_workers` and does not fire on observed workloads; this records the figure the 40% was originally derived from — share of *realized* spend — which cannot itself be a live gate, since during planning the denominator is still tiny and the ratio starts near 1.0. Exists so a future threshold can be derived from unbiased data: runs that die during planning never write a `plan.json`, so the leaf-count corpus is survivor-biased |
-| `current_phase` | str | the orchestrator's active phase string (e.g. `"phase 2: planning"`, `"phase 4-5: implementing"`); written at each phase entry and read by `_memory_sampler` so each `memory.ndjson` sample can be correlated with the phase that produced it. Empty string before phase 1 fires |
+| `decompose_worker_count` | int | running total of `claude -p` invocations spent inside `_recursive_decompose` (fit_judge + splitter, including the label-only migration splitter), against `decompose_budget_share * max_total_workers`. |
+| `decompose_share` | float | decomposition's share of the run's realized spend (`decompose_worker_count / worker_count`), recorded by `_warn_decomposition_share` after `phase_plan`'s expansion loop completes. |
+| `current_phase` | str | the orchestrator's active phase string (e.g. |
 | `telemetry` | dict | calls, cost_usd, input_tokens, output_tokens — printed at run end |
 | `categories` | list[str] | classifier output, post-whitelist filtering |
 | `classifier_questions` | list[dict] | intent questions the classifier surfaced |
-| `prescribed_procedure` | dict | classifier's language→JSON signal declaring whether the user prescribed an explicit procedure/command-sequence: `{is_prescribed, commands, forbid_manual, evidence}`. Empty dict when the classifier omitted the field. `phase_plan` injects this dict verbatim into the planner `ctx_dict` under the same key — but only when `is_prescribed` is true, so a goal-only task carries no false framing — mirroring the conditional `repo_map` injection in the same function (the PREVENT half of the instruction-adherence gate; DESIGN §12 sibling) |
-| `required_items` | list[dict] | classifier's language→JSON signal declaring the task's explicit, enumerable requirements: `[{item, source_ref}]`. Empty list when the classifier found nothing genuinely enumerable (the common case). **Nothing gates on it.** It fed `check_required_items_coverage`, the task-coverage gate's PRIMARY deterministic floor, until that floor was deleted on 2026-08-04 for passing 0 of 102 items across every run that ever carried this field — a 100% false-positive rate, and a violation of the *Language-to-JSON* rule since the items are LLM-written sentences. Also injected verbatim into the planner `ctx_dict` under the same key — but only when non-empty, so a task with no enumerable requirements carries no false framing — mirroring the conditional `prescribed_procedure` injection in the same function, since `check_required_items_coverage` cannot be satisfied by a planner that never saw the checklist |
-| `likely_already_satisfied` | bool | classifier's additive signal that the task's deliverable already appears present on HEAD (DESIGN §8). Written on every `phase_classify` invocation, default `False`. OR-accumulated (not overwritten) across `phase_classification_gate`'s re-classify rounds within one gate call: a fresh `True` + evidence always wins, but a round that comes back `False`/absent does not clear a prior `True` — only a genuinely fresh contradicting claim with its own evidence overrides it. Consulted by `phase_classification_gate` on retry-loop exhaustion to route to `_finish_no_work_run` instead of `die()` |
+| `prescribed_procedure` | dict | classifier's language→JSON signal declaring whether the user prescribed an explicit procedure/command-sequence: `{is_prescribed, commands, forbid_manual, evidence}`. Empty dict when the classifier omitted the field. |
+| `required_items` | list[dict] | classifier's language→JSON signal declaring the task's explicit, enumerable requirements: `[{item, source_ref}]`. Empty list when the classifier found nothing genuinely enumerable (the common case). |
+| `likely_already_satisfied` | bool | classifier's additive signal that the task's deliverable already appears present on HEAD (DESIGN §8). Written on every `phase_classify` invocation, default `False`. |
 | `likely_already_satisfied_evidence` | str | required non-empty whenever `likely_already_satisfied` is `True` (`EMPTY_EVIDENCE` check); default `""` |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
-| `artifact_registry` | list[dict] | shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*). Written once by `phase_artifact_registry` after classify, before `phase_plan`; each entry is `{description, tag, path}` — a canonical capability tag + file path for an artifact the task will plainly create. `phase_plan` injects it verbatim into every planner's `ctx_dict` under the same key (only when non-empty), so blind parallel planners prefer the same tag/path and the exact-string `requires`↔`provides` matcher wires the cross-domain edge. Advisory: planners are asked to prefer it, never forced. `[]` is a valid completed state (empty registry / worker degraded), not a resume-redo signal — its own resume checkpoint keys on key presence, mirroring `plans_after_*`. |
-| `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation. **Recorded only, with no readers** — nothing in `orchestrator/`, `chain/`, `scripts/` or `prompts/` consumes it; it survives as an audit record of the classifier's judgement and does not gate delivery of the value. `gather_answers` writes `answers["source_of_truth"]` on every run regardless (DESIGN §11: the question is skipped, never the setting) |
+| `artifact_registry` | list[dict] | shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*). |
+| `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation. |
 | `source_of_truth_pref` | str | resolved preference (`codebase` / `research` / `both`) |
 | `clarify` | bool | whether asking the user is allowed for this run (resolved from `--clarify` / `LEERIE_CLARIFY` / `leerie.toml` / default `False`) |
-| `dangerously_skip_permissions` | bool | the operator's tooling escape hatch. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. It no longer grants judgment workers the CLI flag of the same name — that is unreachable for them (DESIGN §12 *Judgment-worker isolation*, L1). When `True` it instead WIDENS their allowlist via `_widen_inspect_tools()` with the leading verbs of the repo's declared build/lint/test commands, so a planner can run `pnpm`/`tsc`/`vitest` without gaining write access. Acting workers carry the CLI flag regardless, from `autonomous=True`. |
-| `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` in leerie.toml). Mirrored from `caps["force_strict_output"]`. Recorded because the flag changes worker behaviour invisibly — it owns `ANTHROPIC_BASE_URL`, which makes the CLI treat the session as gateway-routed and apply a conservative client-side context ceiling instead of the model's native window (see `_model_arg`). Originally attribution-only ("without this field a run's failure cannot be attributed to the flag after the fact"); now also load-bearing — `run_rebaser` and `run_recapture_deps` read it back from `st.data` to decide whether to wire their own per-call proxy instance, since they run in a separate process the original CLI flag never reaches (§ *Forced constrained decoding*). |
-| `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). Resolved from `--skip-overlap-judge` / `LEERIE_SKIP_OVERLAP_JUDGE` / `leerie.toml` / default `False`. The cheap-skip on single-planner / <2-subtask runs is automatic and not gated by this field — this flag only affects runs where the worker would otherwise fire. |
-| `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the `adherence_judge` worker in the planner check loop) is suppressed. Resolved from `--skip-adherence-check` / `LEERIE_SKIP_ADHERENCE_CHECK` / `skip_adherence_check` in `leerie.toml` / default `False`. When True, a plan that diverges from an explicitly prescribed procedure is not caught before `phase_execute` spends. |
-| `skip_coverage_check` | bool | whether the phase 2⅞½ task-coverage gate (a single advisory `task_coverage_judge` invocation since 2026-08-04; the deterministic `check_required_items_coverage` floor it used to compose with was deleted) is suppressed. Resolved from `--skip-coverage-check` / `LEERIE_SKIP_COVERAGE_CHECK` / `skip_coverage_check` in `leerie.toml` / default `False`. When True, the review does not run at all — no gap is surfaced before `phase_execute` spends. Since the gate is advisory, this suppresses the report and its worker call, not a block — the escape hatch for a task item the judge counts as `missing_work` when the task itself deferred it, which is unsatisfiable by any planner with no operator override otherwise. |
-| `skip_completeness_check` | bool | whether the conformer's gating `solution_defects` completeness axis (DESIGN §9 *The one gating axis: solution completeness*) is demoted to advisory. Resolved from `--skip-completeness-check` / `LEERIE_SKIP_COMPLETENESS_CHECK` / `skip_completeness_check` in `leerie.toml` / default `False`. When True, `_settle_subtask` and `_run_final_conformance` surface found defects as warnings but never re-drive the implementer, block a subtask, or `die()` the final-tree pass — the escape hatch for a hallucinated completeness defect blocking finalize on every `resume`. |
-| `skip_integration_check` | bool | whether `integrate_wave`'s `integration_judge` behavioral-defect gate (DESIGN §8 *Independent adversarial verification*) is suppressed entirely — no worker spawn for any subtask in this run. Resolved from `--skip-integration-check` / `LEERIE_SKIP_INTEGRATION_CHECK` / `skip_integration_check` in `leerie.toml` / default `False`. Independent of the accept-integration/audit-key mechanism, which only accepts a finding the judge already produced — this is a full-phase skip, not a per-finding acceptance. `_run_integration_judge_gate` checks it first and logs "integration gate skipped" without invoking the worker when set. |
-| `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml` / default `False`. The runtime backstop in `State.bump_workers()` is independent of this field — it always fires when the counter actually exceeds `max_total_workers`; this flag only suppresses the *early* die() that catches mathematically-unwinnable runs at the plan/execute boundary. On `resume` the preflight is moot regardless — the resume path enters past `_schedule()` so the check has nothing to gate |
-| `skip_satisfied_check` | bool | whether `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) is suppressed. Resolved from `--skip-satisfied-check` / `LEERIE_SKIP_SATISFIED_CHECK` / `leerie.toml` / default `False`. When set, no `satisfied_probe` worker spawns and every subtask proceeds to `_schedule()`; the mechanical `check_branch_has_commits` backstop then still catches an already-satisfied subtask post-execution — on a no-commits `complete`, `_settle_subtask` re-probes the criteria against the run-branch HEAD (`_probe_criteria_satisfied_on_head`) and settles it `complete` if met (DESIGN §8 *The mid-run sibling case*), rather than failing it as a retryable no-op. Re-resolved fresh on every run; on `resume` the phase-3 filter is past, so the flag only affects fresh runs. |
-| `strict_conformer` | bool | whether the conformer phase is blocking instead of advisory (DESIGN §9 *Post-work conformance*, "Opt-in strict mode" paragraph). Resolved from `--strict-conformer` / `LEERIE_STRICT_CONFORMER` / `leerie.toml` / default `False`. When True, conformer residuals (failed build/lint/test axes or unresolved rule violations) cause the subtask to return `blocked` instead of `complete`; the final-tree pass also blocks the run if residuals remain. The user fixes the residuals and runs `resume`. |
-| `subtask_tests` | str | How much of the repo's suite each per-subtask conformance round measures (DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*). One of `scoped` (default) / `full` / `off`, resolved from `--subtask-tests` / `LEERIE_SUBTASK_TESTS` / `leerie.toml` via `resolve_subtask_tests`. `scoped` uses a diff-scoped proxy for any axis whose template resolves (`test_scoped` / `build_scoped` in `.leerie/config.toml`, else the two narrow inferences in `resolve_blt_scoped`) and the canonical command otherwise — an axis is never silently skipped. A declared template may use `{test_files}` instead of `{files}` on a runner with no impact analysis (pytest); when the diff carries no test file that template renders nothing and the axis falls back to canonical, so the narrowing is never silent. The canonical command always runs at the base-health baseline and on the final integrated tree regardless of this setting, since the final pass exists for cross-subtask interaction breakage that no diff-scoped selection can see. Seeded in BOTH `_run_phases` branches (a resume-only seed is the `skip_coverage_check` defect) |
-| `skip_base_baseline` | bool | whether the base-tree health baseline (DESIGN §9 *Base-tree health baseline*) is suppressed. Resolved from `--skip-base-baseline` / `LEERIE_SKIP_BASE_BASELINE` / `leerie.toml` / default `False`. When True, `_capture_conformance_baseline` does not run at the start of `phase_execute`, so no `conformance._baseline` is recorded and the conformer receives no `BASELINE:` context (falling back to self-judging "pre-existing" failures). Skips the once-per-run install-into-staging + full-suite-run cost. |
-| `skip_repo_map` | bool | whether the P6 repo-map structural context (DESIGN §5½ (P6) *Codebase structural map*) is suppressed. Resolved from `--skip-repo-map` / `LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml` / default `False`. When True, `_build_repo_map()` is not called and the planner/splitter receive no ranked-subgraph injection, degrading gracefully to the prior grep/glob-only planning path. Use on repos where tree-sitter cannot parse the primary language, or to opt out of structural context. |
-| `cgroup_containment` | dict | recorded by the fail-closed gate (`_enforce_and_record_cgroup_containment`, in `_run_phases` just before the first worker spawns) (DESIGN §6 *Memory containment*): `{enforced: bool, hierarchy: "v2"\|"v1"\|null}`. `enforced` is the result of the root-broker probe round-trip (create+enroll+destroy of a throwaway cgroup); `hierarchy` is the cgroup version the broker detected. When `enforced` is `False` the run only proceeds if `--dangerously-allow-uncapped` was set (else the gate `die()`s). Persisted so the containment state is visible in `state.json` — the crash that motivated the broker left no artifact of the silent containment failure |
+| `dangerously_skip_permissions` | bool | the operator's tooling escape hatch. Resolved from `--dangerously-skip-permissions` / `LEERIE_DANGEROUSLY_SKIP_PERMISSIONS` / `leerie.toml` / default `False`. |
+| `dangerously_force_strict_output` | bool | whether this run forced constrained decoding via the per-run loopback proxy (`--dangerously-force-strict-output` / `LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT` / `dangerously_force_strict_output` in leerie.toml). |
+| `skip_overlap_judge` | bool | whether the phase 2¾ `plan_overlap_judge` worker is suppressed even on multi-planner runs (DESIGN §5 *Cross-domain surface overlap*). |
+| `skip_adherence_check` | bool | whether the instruction-adherence gate (the deterministic prescribed-command-coverage floor + the `adherence_judge` worker in the planner check loop) is suppressed. |
+| `skip_coverage_check` | bool | whether the phase 2⅞½ task-coverage gate (a single advisory `task_coverage_judge` invocation since 2026-08-04; the deterministic `check_required_items_coverage` floor it used to compose with was deleted) is suppressed. |
+| `skip_completeness_check` | bool | whether the conformer's gating `solution_defects` completeness axis (DESIGN §9 *The one gating axis: solution completeness*) is demoted to advisory. |
+| `skip_integration_check` | bool | whether `integrate_wave`'s `integration_judge` behavioral-defect gate (DESIGN §8 *Independent adversarial verification*) is suppressed entirely — no worker spawn for any subtask in this run. |
+| `skip_budget_check` | bool | whether `check_budget_feasibility()` (DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*) is suppressed. Resolved from `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml` / default `False`. |
+| `skip_satisfied_check` | bool | whether `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) is suppressed. Resolved from `--skip-satisfied-check` / `LEERIE_SKIP_SATISFIED_CHECK` / `leerie.toml` / default `False`. |
+| `strict_conformer` | bool | whether the conformer phase is blocking instead of advisory (DESIGN §9 *Post-work conformance*, "Opt-in strict mode" paragraph). Resolved from `--strict-conformer` / `LEERIE_STRICT_CONFORMER` / `leerie.toml` / default `False`. |
+| `subtask_tests` | str | How much of the repo's suite each per-subtask conformance round measures (DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*). |
+| `skip_base_baseline` | bool | whether the base-tree health baseline (DESIGN §9 *Base-tree health baseline*) is suppressed. Resolved from `--skip-base-baseline` / `LEERIE_SKIP_BASE_BASELINE` / `leerie.toml` / default `False`. |
+| `skip_repo_map` | bool | whether the P6 repo-map structural context (DESIGN §5½ (P6) *Codebase structural map*) is suppressed. Resolved from `--skip-repo-map` / `LEERIE_SKIP_REPO_MAP` / `skip_repo_map` in `leerie.toml` / default `False`. |
+| `cgroup_containment` | dict | recorded by the fail-closed gate (`_enforce_and_record_cgroup_containment`, in `_run_phases` just before the first worker spawns) (DESIGN §6 *Memory containment*): `{enforced: bool, hierarchy: "v2"\|"v1"\|null}`. |
 | `verbosity` | str | resolved verbosity level (`quiet` / `normal` / `stream` / `debug`); re-resolved fresh on every run, including `resume`, so the user can dial up or down without editing state |
-| `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) via `--add-dir`. Resolved from `--inspect-dir` / `LEERIE_INSPECT_DIRS` / `inspect_dirs` in `leerie.toml`; re-resolved fresh on every run, including `resume`, so the user can add or remove paths without editing state. Empty list when nothing is configured |
+| `inspect_dirs` | list[str] | extra absolute paths granted to inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) via `--add-dir`. |
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
-| `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). Keys are subtask ids *or* the literal `_final` sentinel; values are `{result, warnings}` where `result` is the last conformer payload (or null on crash) and `warnings` is the list of advisory strings produced across all conformance rounds. The `_final` entry holds the post-integration whole-tree conformer pass's output (DESIGN §6 *Worktree and integration model*, final-tree pass paragraph); the leading-underscore convention guarantees no collision with subtask ids, which always start with a `<verb>-` prefix per `_ID_PREFIXES`. The per-subtask entries are populated only on subtasks whose implementer reached `status: "complete"`; the `_final` entry is populated whenever `_run_final_conformance` ran (skipped only when the staging worktree or `working_branch` is absent, or on `resume` after the pass already recorded a result). See DESIGN §9 *Post-work conformance* |
-| `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). Key: `_blt_memo_key(axis, cmd, tree_sha)` = `sha256(axis \| cmd \| tree_sha)[:32]`, where `tree_sha` is `git rev-parse HEAD^{tree}` of the measured worktree — content-addressed, so an empty conformer commit, a rebase, or two worktrees that converge all hit. Value: the axis dict `{ran, measured, passed, command, summary}`. Deliberately carries **no** dependency fingerprint: lockfiles are tracked files and already inside `tree_sha`, and the provision recipe and image are constant within a run. An entry is written only when it describes a reproducible fact — never for a dirty worktree (`_worktree_tree_sha` returns None, meaning neither serve nor store, since `HEAD^{tree}` cannot see uncommitted changes and the conformance phase tolerates them), and never for a crash, a timeout, or a `measured: False` runner-missing result, mirroring `satisfied_probe_cache`'s refusal to cache a crashed probe. Exists because measuring an axis before and after a conformer round would otherwise double the cost: measured, 182 of 224 conformer rounds (81%) committed nothing, so the post-round tree is usually identical to the pre-round one. No eviction: the dict grows one entry per (axis, command, tree sha) for the life of the run, each carrying a ≤400-char summary — a 91-subtask run accumulates a few hundred (~100 KB), re-serialised on every `State.save()`. Bounded in practice by the number of distinct trees a run produces; if that ever stops holding, cap it rather than widening the key |
-| `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. Written beside the `conformance` entry, which also gains a `reviewed` bool. Recorded rather than promoted to a blocking status: the phase is advisory by design (DESIGN §9), so an unreviewed subtask is usually fine — what it must not be is invisible. See DESIGN §9 *Post-work conformance* |
-| `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). Written on the success path beside `unreviewed_subtasks`, and cleared for a sid whose later attempt reports cleanly, so a re-driven subtask does not carry a stale entry. Persisted rather than left on the result because `phase_execute` keeps results in memory and writes only `blocked` reasons out of them — and `SYMPTOM_DID_NOT_REPRODUCE` ("this bugfix may be re-fixing something an earlier change already fixed") is precisely what belongs in the run record rather than in a 600 KB log. `phase_finalize` surfaces only that finding, not `NO_SYMPTOM_EVIDENCE`, which is worker hygiene and would fire on most runs until the field is adopted. |
-| `provision` | dict | output of `phase_provision` (DESIGN §6½). Keys: `source` (`table` / `llm` / `skipped-docs-only`), `recipe` (list of validated install entries, persisted for worker prompt injection — NOT executed by the orchestrator), `sh_hook_ran` (bool, set by `_run_setup_hook`), `mise_versions` (raw blob from `mise ls --current --json`), `override_file` (absolute path to a synthesized mise override when `phase_provision` had to bridge a polyglot Go repo; `None` otherwise — re-exported as `MISE_OVERRIDE_CONFIG_FILENAMES` on `resume`). Read by `_format_provision_recipe_section()` so implementer/conformer prompts can inject the recipe as a `PROVISION_RECIPE:` advisory block. |
-| `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. Read by `_write_plan()` and persisted as the `preconditions` section of `plan.json`. Empty list when no planner declared any external requirement (the common case). |
-| `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. Two producers, distinguished by shape: `_filter_offtree_subtasks()` drops subtasks whose `files_likely_touched` resolved outside the run's repo root (value `{reasons: [str], files: [str]}`); `_filter_satisfied_subtasks()` (DESIGN §8 *Already-satisfied subtask elimination*) drops subtasks the `satisfied_probe` judged already met on the base tree (value `{reason: "already_satisfied", evidence: str, checked: [str]}`); and the post-execution no-commits re-probe in `_settle_subtask` records a subtask whose criteria are already met on the run-branch HEAD (value `{reason: "already_satisfied_mid_run", evidence: str, checked: [str]}` — same shape, judged against the run-branch HEAD instead of the base tree; DESIGN §8 *The mid-run sibling case*). The `mid_run` label names the moment the rescue fires (post-execution, this run), not the provenance: it covers both a sibling committing the deliverable this run and a subtask already satisfied on the base tree (DESIGN §8 *Scope*). A fourth producer, `_settle_subtask`'s **pre-spawn** probe of a `provider_subset_sids`-flagged subtask, records the same shape with `reason: "already_satisfied_pre_spawn"` (DESIGN §8 *Probing a flagged subtask before it spends*) — same verdict as the mid-run rescue, reached before any implementer ran, and kept distinct so the audit shows which settlements cost a probe and which cost a worker first. Absent when no drop fired. Audit trail only — the run proceeds with the surviving subtasks; no orchestrator code reads back from this field. |
-| `provider_subset_sids` | list[str] | sids flagged at plan time by `_warn_provider_subset_subtasks()` — every file in the subtask's `files_likely_touched` is already owned by an ordered predecessor it depends on (DESIGN §5 *Provider-subset subtasks*). Still advisory and never a drop, but persisted rather than only logged because `_settle_subtask` reads it: a flagged subtask gets one read-only `satisfied_probe` against the run-branch HEAD **before** its implementer is spawned (DESIGN §8 *Probing a flagged subtask before it spends*), so a redundancy that only became real when the predecessor committed costs a probe instead of a full implementer. Empty list when nothing was flagged. |
-| `conditional_drops` | dict[str, dict] | planner-emitted consumer subtasks dropped by the reconciler's `conditional_drop` resolution op (DESIGN §5) — i.e. the planner authored the subtask as "no-op if X" and X turned out to be unresolvable. Each value is `{reason: str, from_unresolved_tag: str}` where `reason` quotes the consumer's conditional intent + names why the precondition is false (the reconciler emits this) and `from_unresolved_tag` records which unresolved tag's resolution motivated the drop (looked up from the unresolved set at apply time). Absent when no conditional_drop fired. Distinct audit field from `dropped_subtasks` (off-tree soft drops, phase 3) so the two causes stay separately auditable. |
-| `external_twin_demotions` | list[dict] | `unresolvable` entries rescued by `_demote_unresolvable_with_external_twin` (DESIGN §5 *The external twin*) — a consumer declared a tag `in_plan` while another subtask declared the same capability `extent: external`. Each item is `{sid, tag, match: "exact"｜"singularized", twin_tag, twin_subtasks}`. Recorded so a wrong singularized pairing is auditable rather than a silent reshaping of the dependency graph. Absent when no demotion fired. |
-| `speculative_collapse_drops` | list[str] | subtask sids mechanically pruned by dead-subtask elimination (DESIGN §5) — fully-speculative subtasks whose every `in_plan` requires was unresolvable because the provider domain returned 0 subtasks. Recorded before `_check_unresolvable` runs so the audit trail survives even when `die()` fires for remaining unresolvable entries. Absent when no dead-subtask elimination fired. Distinct from `conditional_drops` (LLM-judged, based on conditional prose in intent) and `dropped_subtasks` (off-tree soft drops, phase 3). |
-| `overlap_replan_done` | bool | set once when `phase_overlap_judge` answers an `unresolvable` collision with a **scoped re-plan** instead of `die()`ing (DESIGN §5). Written **after** `check_replan_affordable` passes, never before: the flag records an ATTEMPT, not an intention. Setting it first persisted it while the `plans_after_overlap_judge` checkpoint was never written, so `resume --max-workers N` — the remedy that die() recommends — re-entered the gate, saw the flag and died immediately without ever attempting the re-plan the raised budget afforded. Pinned by `tests/test_scoped_replan.py::test_budget_die_does_not_consume_the_recovery`. Bounds that recovery to a single attempt: a second unresolvable verdict after re-planning dies, since the contradiction is then not something re-planning resolves. Absent on runs that never hit an unresolvable collision — which is 88% of runs reaching the judge (5 of 43 hit one). |
-| `plan_overlap_judge` | dict | full output of the phase 2¾ `plan_overlap_judge` worker (DESIGN §5 *Cross-domain surface overlap*) — `{collisions: [{a_sid, b_sid, artifact, resolution, reason, merge_feasibility?}, …]}`. Persisted before the apply step (so if a `die()` fires on `unresolvable` or the merge-feasibility backstop the audit record survives). Absent when `phase_overlap_judge` cheap-skipped (single-planner / <2-subtask runs / `--skip-overlap-judge`) or when the judge returned `{collisions: []}`. |
-| `plan_overlap_applied` | list[dict] | post-apply mutation summary for the phase 2¾ judge. Each entry is either `{action: merge|drop_a|drop_b, artifact: str, surviving_sid: str, dropped_sid: str, reason: str}` recording a mutation against the plan, or `{action: skipped_redundant, artifact: str, collapsed_to: str, original_a_sid: str, original_b_sid: str, merge_feasibility: str, reason: str}` recording a redundant pair whose endpoints had already collapsed to the same survivor via an earlier resolution (the closing edge of a connected cluster — kept in the audit trail so resume-time inspection sees every collision the judge emitted). The anchor-survivor rule may make the `surviving_sid` differ from `_apply_overlap_merge`'s default lex-smaller pick when the merge participates in a cluster — see "Phase 2¾ checks" above. Useful for resume-time replay debugging — `state.data["plan_overlap_judge"]` records what the judge said, this records what the orchestrator did. Empty list when the judge returned no collisions; absent when the phase cheap-skipped. |
-| `duplicate_provider_merge_applied` | list[dict] | post-apply mutation summary for merges the deterministic `check_duplicate_providers` floor synthesized and applied via `_duplicate_provider_merge_collisions` + `_apply_overlap_collisions` (M11 DECISION — see "Phase 2¾ checks" above). Same entry shapes as `plan_overlap_applied` (`merge` / `skipped_redundant` / `skipped_would_cycle`), but independent of it: this key is written even on paths where `plan_overlap_judge` itself never ran (single-planner plans, `--skip-overlap-judge`). Absent when the floor found nothing to merge. |
-| `adherence_gate` | dict | audit record from the phase 2⅞ instruction-adherence gate (`phase_adherence_gate` — see "Instruction-adherence gate" above) — `{judge: <adherence_judge output>, floor_issues: list[str]}`. Written once the gate clears (either immediately, or after re-planning). Absent when the gate cheap-skipped (`skip_adherence_check` / no prescribed procedure) or when the judge crashed every round (the degrade path returns without persisting this key). |
-| `coverage_gate` | dict | audit record from the phase 2⅞½ task-coverage gate (`phase_planning_coverage_gate`, DESIGN §8 *Independent adversarial verification*) — the final `task_coverage_judge` output `{task_covered, coverage_gaps, rationale}`. Written once, immediately after the gate's single direct `task_coverage_judge` invocation — the gate is advisory and never re-plans. Absent when that invocation raised `WorkerError` or an `OSError` from process spawn (the degrade path returns without persisting this key); any other exception propagates rather than degrading. Replaces the planner's self-graded `task_understanding` confidence axis, which no longer gates in `check_planner_output`. |
-| `classification_coverage_gate` | dict | audit record from `phase_classification_gate` (DESIGN §8 *Independent adversarial verification*) — the final `classification_judge` output `{categories_reviewed, miscategorizations, rationale}`. Written once the gate clears (immediately, or after re-classifying). Absent when the judge crashed every round (degrade path returns without persisting). |
-| `wiring_gate` | dict | audit record from `phase_wiring_gate` (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8) — the final `wiring_judge` output `{plan_reviewed, wiring_defects, rationale}` plus a `repairs` array of `{sid, tag, provider, channel}` for every edge the gate added (`channel` is `"tag"`, `"id"`, or `"cofile_cluster"`; on the id channel `tag` and `provider` are both the named subtask id). Single pass (no `make_feedback_prompt` — see §5½ *Mechanical-feedback loops*): the judge's defects are passed through `_repair_missing_requires` and only the unrepaired residual `die()`s. Written only when the gate CLEARS (no residual), which is also what makes it the correct resume key — `plan_snapshot` is written before the gate runs and is therefore present even on a run the gate killed, so keying the skip on it silently bypassed a failed gate. `repairs` is `[]` on a plan that needed none. Absent when the judge crashed every round, or when the gate died. The deterministic `check_plan_wiring` that runs alongside it does not persist — it `die()`s or passes silently. |
-| `provision_recipe_gate` | dict | audit record from `phase_provision_gate` (DESIGN §8, §6½) — the final `provision_judge` output `{recipe_reviewed, recipe_failures, rationale}`. Detect-and-die, single pass (no `make_feedback_prompt`): written once the judge's first round clears; a found recipe failure `die()`s immediately instead of re-provisioning. Absent when no recipe was detected (`kind: none`) or the judge crashed every round. |
-| `integration_gate` | dict[str, dict] | per-sid audit record from `integrate_wave`'s `integration_judge` gate — `{sid: {defects: list[str], advisories: list[str], merge_commit_sha: str, accepted: bool}}`. Unlike `wiring_gate`, written BEFORE `die()`ing, not only on a clean pass — `accepted` is `not defects` on a fresh verdict (True for clean, False for a gating finding) and is flipped to `True` by `leerie accept-integration <run-id> <sid>`. `integrate_wave` consults this key BEFORE re-driving `integrate.sh`/the integrator for a sid: a present, not-yet-`accepted` entry re-invokes the judge directly against the already-committed merge (`integrate.sh` alone is idempotent and would just see the branch already merged, short-circuiting past the judge entirely); a present, `accepted` entry skips straight to `integrated.append`. Absent for a sid whose merge never needed the integrator (the judge only runs post-integrator-merge, on a conflict) and for a sid the judge has never reviewed at all. |
-| `integration_defects` | dict[str, list[str]] | per-sid flat mirror of `integration_gate[sid]["defects"]` for the sids with a currently-gating (not-yet-accepted) finding — the record `accept-integration` clears (popped, along with the whole key when it empties, once accepted or once a re-invoked judge comes back clean). Kept as a separate key alongside `integration_gate` per the audit-key contract this field pair was specified against. Absent when no sid currently has a gating defect. |
-| `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). When `True`, the orchestrator wrote `finished_at`, skipped phases 3–6, and exited 0 — the task was already satisfied on HEAD, no run branch was materialized, no PR will be opened. `leerie list` renders the run as `done` (no push, no PR, distinct from `done-pushed-no-pr` and `done-pushed-pr`). Absent on every normal run. |
-| `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. Keys are domain names (e.g. `"bug-fixing"`, `"testing"`); values are the `basis` string the planner emitted explaining why no work was needed. Absent on every normal run. |
-| `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). Captured once and mirrored to three locations: `run.json.working_branch`, `<state-root>/runs/<id>/working-branch` (written later by `setup-run.sh`), and `state.json` via this field. Read by `_compose_pr_via_llm` as the `git diff` base for the PR-writer payload and by `_run_final_conformance` as the `DIFF_BASE` for the post-integration whole-tree pass. Empty string when the host `git` invocation failed (interactive fallback path); the readers tolerate this. |
-| `pr_base_branch` | str | the final branch this run's PR merges into — overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (resolved by `resolve_pr_base_branch`, CLI > env > file precedence, mirroring `resolve_pr_template`). Defaults to `working_branch` when unset (`resolve_pr_base_branch(...) or working_branch`, computed once at run start alongside `working_branch`). Mirrored to `run.json.pr_base_branch`. This is the PR base ONLY — never the diff fork-point, which stays `working_branch` (`rev_range = working_branch..run_branch`; `_run_final_conformance`'s `DIFF_BASE`); overloading `working_branch` for both roles would corrupt the diff base if the override branch isn't the actual fork point. |
-| `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json`, seeded once at the run's original start and **immutable across resumes** (N38) — a resume no longer overwrites it with whatever is installed at resume time, since doing so made a resumed run's failures read as attributable to the wrong release. Persisted so the PR footer and Run metadata block can show the exact version that produced the run. |
-| `leerie_commit` | str \| null | short sha of `$LEERIE_REPO`'s HEAD, forwarded by the launcher as `LEERIE_COMMIT`, seeded once at the run's original start and **immutable across resumes** (N38), same rationale as `leerie_version`. `null` when leerie was installed from a tarball rather than a git checkout — a normal state, never an error (the launcher's `rev-parse` is local-only and its failure can never fail a run). Recorded because `leerie_version` alone cannot attribute a run: `plugin.json` only moves on a `chore(release):` commit while `install.sh` tracks `main` (`DEFAULT_REF`), so every run between releases reports the same version whether or not it carries a given fix. Rendered beside the version in the PR footer / Run-metadata block as `v0.11.1 (abc1234)`. |
-| `leerie_versions` | list[dict] | append-only resume history (N38), distinct from the immutable `leerie_version`/`leerie_commit` pair above. Seeded as a one-entry list at run start and gets one `{version, commit, at}` entry appended on every `resume` — the actual install seen at that moment, so a failure that only reproduces after an install upgrade between resumes is still attributable. |
-| `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. Combined with the sibling sentinel file `<run_dir>/dep_capture.done`, this makes the next-run backstop idempotent: the backstop skips runs whose sentinel file is present, and the cancel-arm capture skips already-captured runs. Absent on runs where capture was skipped or has not yet run. |
+| `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). |
+| `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). |
+| `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. |
+| `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
+| `provision` | dict | output of `phase_provision` (DESIGN §6½). |
+| `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
+| `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. |
+| `provider_subset_sids` | list[str] | sids flagged at plan time by `_warn_provider_subset_subtasks()` — every file in the subtask's `files_likely_touched` is already owned by an ordered predecessor it depends on (DESIGN §5 *Provider-subset subtasks*). |
+| `conditional_drops` | dict[str, dict] | planner-emitted consumer subtasks dropped by the reconciler's `conditional_drop` resolution op (DESIGN §5) — i.e. the planner authored the subtask as "no-op if X" and X turned out to be unresolvable. |
+| `external_twin_demotions` | list[dict] | `unresolvable` entries rescued by `_demote_unresolvable_with_external_twin` (DESIGN §5 *The external twin*) — a consumer declared a tag `in_plan` while another subtask declared the same capability `extent: external`. |
+| `speculative_collapse_drops` | list[str] | subtask sids mechanically pruned by dead-subtask elimination (DESIGN §5) — fully-speculative subtasks whose every `in_plan` requires was unresolvable because the provider domain returned 0 subtasks. |
+| `overlap_replan_done` | bool | set once when `phase_overlap_judge` answers an `unresolvable` collision with a **scoped re-plan** instead of `die()`ing (DESIGN §5). |
+| `plan_overlap_judge` | dict | full output of the phase 2¾ `plan_overlap_judge` worker (DESIGN §5 *Cross-domain surface overlap*) — `{collisions: [{a_sid, b_sid, artifact, resolution, reason, merge_feasibility?}, …]}`. |
+| `plan_overlap_applied` | list[dict] | post-apply mutation summary for the phase 2¾ judge. |
+| `duplicate_provider_merge_applied` | list[dict] | post-apply mutation summary for merges the deterministic `check_duplicate_providers` floor synthesized and applied via `_duplicate_provider_merge_collisions` + `_apply_overlap_collisions` (M11 DECISION — see "Phase 2¾ checks" above). |
+| `adherence_gate` | dict | audit record from the phase 2⅞ instruction-adherence gate (`phase_adherence_gate` — see "Instruction-adherence gate" above) — `{judge: <adherence_judge output>, floor_issues: list[str]}`. |
+| `coverage_gate` | dict | audit record from the phase 2⅞½ task-coverage gate (`phase_planning_coverage_gate`, DESIGN §8 *Independent adversarial verification*) — the final `task_coverage_judge` output `{task_covered, coverage_gaps, rationale}`. |
+| `classification_coverage_gate` | dict | audit record from `phase_classification_gate` (DESIGN §8 *Independent adversarial verification*) — the final `classification_judge` output `{categories_reviewed, miscategorizations, rationale}`. |
+| `wiring_gate` | dict | audit record from `phase_wiring_gate` (DESIGN §5 *A wiring re-check on the fully-merged plan*, §8) — the final `wiring_judge` output `{plan_reviewed, wiring_defects, rationale}` plus a `repairs` array of `{sid, tag, provider, channel}` for every edge the gate added (`channel` is `"tag"`, `"id"`, or `"cofile_cluster"`; on the id channel `tag` and `provider` are both the named subtask id). |
+| `provision_recipe_gate` | dict | audit record from `phase_provision_gate` (DESIGN §8, §6½) — the final `provision_judge` output `{recipe_reviewed, recipe_failures, rationale}`. |
+| `integration_gate` | dict[str, dict] | per-sid audit record from `integrate_wave`'s `integration_judge` gate — `{sid: {defects: list[str], advisories: list[str], merge_commit_sha: str, accepted: bool}}`. |
+| `integration_defects` | dict[str, list[str]] | per-sid flat mirror of `integration_gate[sid]["defects"]` for the sids with a currently-gating (not-yet-accepted) finding — the record `accept-integration` clears (popped, along with the whole key when it empties, once accepted or once a re-invoked judge comes back clean). |
+| `no_work_required` | bool | set to `True` by `_finish_no_work_run` when every planner returns `status: "ready"` with `subtasks: []` (DESIGN §8 *The cleared-but-empty terminal state*). |
+| `no_work_reasons` | dict[str, str] | per-domain `confidence.basis` quoted from each planner's empty-but-ready output, recorded alongside `no_work_required` for audit. |
+| `working_branch` | str | the user's branch at the moment `phase_classify` runs (`git rev-parse --abbrev-ref HEAD`). |
+| `pr_base_branch` | str | the final branch this run's PR merges into — overridable via `--pr-base-branch` / `LEERIE_PR_BASE_BRANCH` / `pr_base_branch` in `leerie.toml` (resolved by `resolve_pr_base_branch`, CLI > env > file precedence, mirroring `resolve_pr_template`). |
+| `leerie_version` | str | the leerie version string from `.claude-plugin/plugin.json`, seeded once at the run's original start and **immutable across resumes** (N38) — a resume no longer overwrites it with whatever is installed at resume time, since doing so made a resumed run's failures read as attributable to the wrong release. |
+| `leerie_commit` | str \| null | short sha of `$LEERIE_REPO`'s HEAD, forwarded by the launcher as `LEERIE_COMMIT`, seeded once at the run's original start and **immutable across resumes** (N38), same rationale as `leerie_version`. |
+| `leerie_versions` | list[dict] | append-only resume history (N38), distinct from the immutable `leerie_version`/`leerie_commit` pair above. |
+| `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. |
+
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
 the plugin skill in `commands/leerie.md`):
@@ -8643,26 +8564,17 @@ the plugin skill in `commands/leerie.md`):
 The checkpoint schema — seven required sections, enforced by
 `_validate_checkpoint()`: *Frozen success criteria*, *Current status*, *Files
 touched*, *Decisions made*, *Evidence gate status*, *Next action*, *Open
-unknowns*. `_validate_checkpoint()` enforces three layers: (a) every section
-header must be present; (b) every section must carry non-whitespace content; (c)
-the five "must carry handoff context" sections reject single-token
-placeholder content (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`) — the two
-"nothing-to-report-is-OK" sections (*Decisions made*, *Open unknowns*)
-accept these. Trailing punctuation (`.`/`!`/`?`/`…`) is stripped before
-the comparison and repeated `?` is collapsed, so `None.`, `TBD!`, and
-`???` are caught alongside the bare tokens. When a `worktree_root` is passed, `_validate_checkpoint()`
-also runs a freshness check: every path listed under *Files touched* must
-either still exist in the worktree or carry a `[deleted]` annotation,
-catching stale checkpoints whose paths were removed by partial work after
-the snapshot was written.
+unknowns*. Three layers: (a) every header present; (b) every section
+non-whitespace; (c) the five handoff-context sections reject single-token
+placeholders (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`,
+trailing punctuation stripped first) — *Decisions made* and *Open unknowns*
+accept them. When `worktree_root` is passed, a freshness check also requires
+every *Files touched* path to still exist or carry a `[deleted]` annotation.
 
-`claude_p()`'s CLI-reported `num_turns` is unreliable as a comparison against
-`--max-turns` — the CLI computes it from two different counters depending on
-whether the cap-enforcement path or the success path was taken, and only one
-is commensurable with the flag. The `terminal_reason` the CLI reports is the
-trustworthy cap signal; `num_turns` is still printed alongside it but never
-compared against the cap. `tests/test_turn_cap_signal.py` enforces that no
-code re-introduces the comparison.
+`claude_p()`'s CLI-reported `num_turns` is unreliable against `--max-turns`
+(computed from two different counters depending on which exit path fired).
+`terminal_reason` is the trustworthy cap signal; `tests/test_turn_cap_signal.py`
+guards against reintroducing the `num_turns` comparison.
 
 Maps to `DESIGN.md`: §10 (handoff, coordination-artifact location), §9 (criteria
 locking).
@@ -8672,133 +8584,105 @@ locking).
 ## 9. Structured-output schemas
 
 `claude_p()` validates each worker's payload against a schema keyed by worker
-type. `confidence` is optional on every worker schema (declared in
-`properties`, not required — required object shape would corrupt payloads
-under anthropics/claude-code#49747) but when present follows
-`_confidence_schema(...)`: axis score(s) 1–10, `basis` (string, required),
-`falsifiers_tested` / `contradictions_reconciled` (arrays of strings,
-optional). There is no `gap_to_close` field; a low score's gap is stated in
-`basis`.
+type. `confidence` is optional on every worker schema (a required object
+shape would corrupt payloads under anthropics/claude-code#49747) but when
+present follows `_confidence_schema(...)`: axis score(s) 1–10, `basis`
+(string, required), `falsifiers_tested` / `contradictions_reconciled` (arrays
+of strings, optional). There is no `gap_to_close` field — a low score's gap
+is stated in `basis`.
 
 Required fields, current shape:
 
 - **classifier** — required: `categories` (array). Optional: `questions`
-  (array of `{id, question, why_underivable?}` — only `id`/`question`
-  required), `source_of_truth_question` (bool — the classifier only flags
-  relevance; the orchestrator's preference resolution supplies the value,
-  default `both`). Optional: `prescribed_procedure`
-  (`{is_prescribed (bool), commands (array of strings), forbid_manual (bool),
-  evidence (string)}`) — a language→JSON signal for whether the task
-  prescribes an explicit procedure vs. a goal description;
-  `check_classifier_output` enforces non-empty `evidence` when
-  `is_prescribed` is true (`EMPTY_EVIDENCE`). `phase_classify` persists it to
-  `st.data["prescribed_procedure"]` (default `{}`). Optional:
-  `likely_already_satisfied` (bool), `likely_already_satisfied_evidence`
-  (string, required non-empty when the bool is true) — signals the task's
-  deliverable already appears present on HEAD (DESIGN §8); OR-preserved
-  across re-classify rounds within `phase_classification_gate` so a later
-  round's silence never clears an earlier round's true finding.
-- **planner** — required: `domain`, `subtasks`, `status` (enum `ready` /
-  `blocked` — DESIGN §8 planner gate). A `ready` plan may carry an empty
-  `subtasks` list (the cleared-but-empty terminal state). `confidence`
-  required keys when present: `task_understanding` (1–10),
-  `decomposition_quality` (1–10), `basis`. Each subtask:
-  `{id, title, success_criteria_seed (all required), intent, scope_note,
-  files_likely_touched, depends_on, requires, provides, size,
-  investigation_notes, runs_commands}`. `requires` is an array of
-  `{tag (required string), extent (required enum: "in_plan" | "external"),
-  reason (string, required and non-empty when extent == "external")}`.
-  `extent: in_plan` is satisfied by another subtask's `provides` (a graph
-  edge); `extent: external` is a planner-declared prerequisite outside *this
-  run's* graph — either outside the build graph entirely (another repo, ops
-  runbook, manual step), or producible by code but owned by another run the
-  task names (sibling phase document, earlier phase), or fenced off by the
-  task itself (the task declares a surface out of scope and the capability's
-  only implementation site lies on it) — and surfaces in `plan.json` as a
-  `preconditions` entry. In every case `reason` must name the owner; the
-  discriminating test is "is it in this run's graph?", not "could any code
-  produce it?". See DESIGN §5 `requires.extent`.
-  `provides` is an array of bare strings. `size` is an enum `small` /
-  `medium` / `large` — `large` triggers the size-resolution retry loop and,
-  if it survives, `_validate_plan` dies with an OVERSIZED error. `runs_commands`
-  (array of strings, optional) declares every command a subtask actually
-  invokes — structured data feeding
+  (`{id, question, why_underivable?}[]`), `source_of_truth_question` (bool —
+  flags relevance only; the orchestrator's preference resolution supplies the
+  value, default `both`), `prescribed_procedure` (`{is_prescribed, commands[],
+  forbid_manual, evidence}` — language→JSON signal for an explicit procedure
+  vs. a goal description; `check_classifier_output` requires non-empty
+  `evidence` when `is_prescribed`; persisted to `st.data["prescribed_procedure"]`,
+  default `{}`), `likely_already_satisfied` (bool) + `likely_already_satisfied_evidence`
+  (required non-empty when true — DESIGN §8; OR-preserved across
+  `phase_classification_gate` re-classify rounds so a silent round never
+  clears an earlier true finding).
+- **planner** — required: `domain`, `subtasks`, `status` (`ready` / `blocked`
+  — DESIGN §8 planner gate; a `ready` plan may carry empty `subtasks`, the
+  cleared-but-empty terminal state). `confidence` keys when present:
+  `task_understanding`, `decomposition_quality` (1–10), `basis`. Each subtask:
+  `{id, title, success_criteria_seed, intent, scope_note, files_likely_touched,
+  depends_on, requires, provides, size, investigation_notes, runs_commands}`.
+  `requires` is `{tag, extent: "in_plan"|"external", reason (required
+  non-empty when external)}[]` — `in_plan` is satisfied by a sibling's
+  `provides` (a graph edge); `external` is a planner-declared prerequisite
+  outside *this run's* graph — either outside the build graph entirely
+  (another repo, ops runbook, manual step), or producible by code but owned
+  by another run the task names (sibling phase document, earlier phase), or
+  fenced off by the task itself (the task declares a surface out of scope
+  and the capability's only implementation site lies on it) — surfaced in
+  `plan.json`'s `preconditions` (DESIGN §5 `requires.extent`). In every case
+  `reason` must name the owner; the discriminating test is "is it in this
+  run's graph?", not "could any code produce it?".
+  `provides` is bare strings. `size` is `small`/`medium`/`large` — `large`
+  triggers the size-resolution retry loop, `_validate_plan` OVERSIZED-dies if
+  it survives. `runs_commands` (optional strings) feeds
   `check_prescribed_command_coverage(prescribed_procedure, subtasks) ->
-  list[str]`, the deterministic PRIMARY layer of the instruction-adherence
-  gate: `prescribed.commands − ⋃(subtask.runs_commands)` under normalized
-  (lowercased, stopword-filtered) token-subset matching, returning a
-  `PRESCRIBED_CMD_UNRUN: ...` string per uncovered command; short-circuits to
-  `[]` when `prescribed_procedure` is absent/falsy/empty. Tested in
-  `tests/test_prescribed_cmd_coverage.py` and (advisory-vs-gating outcome)
-  `tests/test_check_functions.py::TestAdherenceGateAdvisoryVsGating`. Wired
-  into `phase_adherence_gate` (see "Instruction-adherence gate" above).
+  list[str]`, the deterministic primary layer of the instruction-adherence
+  gate (token-subset match of `prescribed.commands` against the union of
+  `runs_commands`, emitting `PRESCRIBED_CMD_UNRUN: ...`; short-circuits to
+  `[]` with no prescribed procedure). Tested in
+  `tests/test_prescribed_cmd_coverage.py`; wired into `phase_adherence_gate`.
 - **implementer** — required: `subtask_id`, `status` (`complete` /
   `incomplete-handoff` / `blocked` / `failed` / `needs-clarification`).
-  `confidence` shape when present: `root_cause`, `solution` (1–10), `basis`.
-  Optional: `branch`, `criteria_results` (array of `{criterion, met,
-  evidence}` — recorded for telemetry, does not gate), `checkpoint_path`,
-  `blocker`, `summary`, `clarification_question` (DESIGN §11 mid-execution
-  exception: `{id, question, why_underivable}`, all three required when
-  present, requires `checkpoint_path` too), `artifacts` (DESIGN §5 *Artifact
-  passing between subtasks*: array of `{name, kind (enum "markdown" | "json"
-  | "text"), content, summary?}` — structured deliverables for downstream
-  subtasks).
+  `confidence`: `root_cause`, `solution` (1–10), `basis`. Optional: `branch`,
+  `criteria_results` (`{criterion, met, evidence}[]` — telemetry only, does
+  not gate), `checkpoint_path`, `blocker`, `summary`, `clarification_question`
+  (DESIGN §11: `{id, question, why_underivable}`, all required together with
+  `checkpoint_path`), `artifacts` (DESIGN §5: `{name, kind: "markdown"|"json"|"text",
+  content, summary?}[]` — deliverables for downstream subtasks).
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
-  `design-conflict` / `failed`). `confidence` shape when present:
-  `_confidence_schema(["resolution"])`. Optional: `resolution_summary`,
-  `diagnosis` (fallback for `resolution_summary` on a non-`resolved`
-  outcome).
+  `design-conflict` / `failed`). `confidence`: `_confidence_schema(["resolution"])`.
+  Optional: `resolution_summary`, `diagnosis` (fallback on non-`resolved`).
 - **rebaser** — required: `status` (`rebased` / `irreconcilable` / `failed`),
-  `final_branch_state`. `confidence` shape when present:
-  `_confidence_schema(["resolution"])`, mirroring `integrator`. Optional:
-  `resolution_summary`, `diagnosis` (required in practice when `status` is
-  `irreconcilable`). DESIGN §6 *Finalization* "Rebase-onto-base before push":
-  a scoped, fully-agentic exception to §12 — the worker performs the whole
-  rebase workflow itself. `check_rebaser_worktree_state()` mechanically
-  re-verifies the claimed `status` against the worktree's actual git state
-  before `run_rebaser()` returns it.
-- **conformer** — required: `subtask_id`, `rules_files_read` (array of
-  strings, empty when none found), `rule_violations` (array of `{status:
-  enum[fixed, residual], rule, fix, evidence, why_not_fixed}` — `status`
-  discriminates which optional fields are populated), `file_updates` (array
-  of `{kind: enum[docs, tests], path, reason}`), `build`, `lint`, `tests`
-  (each `{ran (bool), passed (bool), command (string), summary (optional)}`
-  — `ran: false` when not applicable to the repo), `summary`, and
-  `solution_defects` (array of `{kind: enum[unhandled_input, unhandled_path,
-  missing_guard, sibling_site_unedited, wrong_selector, decoy_or_shortcut],
-  concrete_case (minLength 1), where (minLength 1), why_ships_a_defect
-  (minLength 1)}`). `solution_defects` is the **gating** axis (DESIGN §9 *The
-  one gating axis: solution completeness*) — the conformer's independent
-  adversarial attack on the implementer's committed diff; non-empty retries
-  the implementer with the defects folded in as mandatory criteria (bounded
-  by `completeness_retry_rounds`), or blocks on exhaustion.
+  `final_branch_state`. `confidence` mirrors `integrator`. Optional:
+  `resolution_summary`, `diagnosis` (required in practice when
+  `irreconcilable`). A scoped, fully-agentic §12 exception (DESIGN §6
+  *Finalization* "Rebase-onto-base before push") — the worker performs the
+  whole rebase workflow itself, and `check_rebaser_worktree_state()`
+  mechanically re-verifies the claimed status against actual git state.
+- **conformer** — required: `subtask_id`, `rules_files_read` (strings, empty
+  when none found), `rule_violations` (`{status: fixed|residual, rule, fix,
+  evidence, why_not_fixed}[]`), `file_updates` (`{kind: docs|tests, path,
+  reason}[]`), `build`/`lint`/`tests` (each `{ran, passed, command, summary?}`
+  — `ran: false` when not applicable), `summary`, and `solution_defects`
+  (`{kind: unhandled_input|unhandled_path|missing_guard|sibling_site_unedited|
+  wrong_selector|decoy_or_shortcut, concrete_case, where, why_ships_a_defect}[]`,
+  all three fields non-empty). `solution_defects` is the **gating** axis
+  (DESIGN §9 *The one gating axis: solution completeness*) — the conformer's
+  independent adversarial attack on the diff; non-empty retries the
+  implementer with the defects as mandatory criteria (bounded by
+  `completeness_retry_rounds`), or blocks on exhaustion.
 
   `rule_violations`/`file_updates` are wire-flattened discriminated arrays
-  (mirroring `SCHEMAS["reconciler"]`'s `tag_ops` technique) rather than four
-  separate arrays, to keep the schema small enough for the strict-output
-  proxy's grammar compiler. `_expand_conformer_output()` fans the wire shape
-  back into the four original arrays (`rule_violations_fixed`,
-  `rule_violations_residual`, `docs_updates`, `tests_updates`) immediately
-  after the worker call, at both call sites; an entry with an unrecognised
-  `status`/`kind` is dropped. Pinned by `tests/test_conformer_schema_shrink.py`.
+  (mirroring `SCHEMAS["reconciler"]`'s `tag_ops` technique) to keep the schema
+  small for the strict-output proxy's grammar compiler.
+  `_expand_conformer_output()` fans them back into `rule_violations_fixed`,
+  `rule_violations_residual`, `docs_updates`, `tests_updates` right after the
+  worker call; an unrecognised `status`/`kind` is dropped. Pinned by
+  `tests/test_conformer_schema_shrink.py`.
 
-  Cross-field invariants enforced by `_validate_conformance_result()` against
-  the expanded shape: residuals require non-empty `rules_files_read`, every
-  `rule_violations_fixed` item cites a non-empty `rule`, every
-  `docs_updates`/`tests_updates` `path` exists in the worktree, and every
-  `solution_defects` item carries non-empty `concrete_case` and `where`.
-  `confidence` shape when present: `conformance` (1–10), `basis`.
+  `_validate_conformance_result()` enforces cross-field invariants on the
+  expanded shape: residuals require non-empty `rules_files_read`, every
+  `rule_violations_fixed` cites a `rule`, every `docs_updates`/`tests_updates`
+  `path` exists in the worktree, every `solution_defects` item carries
+  non-empty `concrete_case`/`where`. `confidence`: `conformance` (1–10), `basis`.
 - **judge** — required: `passed` (bool, true only when all three dimensions
-  are true), `dimensions` (`{schema_ok, factual_ok, hallucination_ok}`,
-  booleans), `rationale` (1–3 sentences), `suggested_fixes` (array of
-  strings, empty when `passed: true`). Used by `phase_judge()` /
-  `_judge_capture()` — post-run, not the main workflow. `prompts/judge.md`
+  are true), `dimensions` (`{schema_ok, factual_ok, hallucination_ok}`),
+  `rationale` (1–3 sentences), `suggested_fixes` (empty when `passed: true`).
+  Used by `phase_judge()` / `_judge_capture()`, post-run. `prompts/judge.md`
   carries the rubric.
 - **patch_generator** — required: `anchor` (exact substring of the current
-  system prompt the patch replaces — validated against the live prompt text
-  before applying), `replacement`. Optional: `strategy`, `pivot_reason` (str
-  | null). Used by the self-heal skill's patch-generation worker; post-run,
-  not the main `claude_p()` loop.
+  system prompt, validated against live prompt text before applying),
+  `replacement`. Optional: `strategy`, `pivot_reason`. Used by the self-heal
+  skill's patch-generation worker, post-run.
 
 Schemas are embedded as Python dicts in `leerie.py` and serialized inline.
 
