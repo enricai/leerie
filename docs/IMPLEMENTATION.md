@@ -2033,12 +2033,16 @@ diverge again later). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `rebaser` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
 defaults come from the global `MODEL_DEFAULT` fallback.
 
-Resolution for each worker type `W` (highest priority first): `--model-<W>`
-CLI (e.g. `--model-implementer opus`) > `--model` CLI (sets the global
-default) > `LEERIE_MODEL_<W>` env (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`) >
-`LEERIE_MODEL` env (global default) > `model_<w>` key in `leerie.toml` >
-`model` key in `leerie.toml` > per-worker default from
-`MODEL_DEFAULT_PER_WORKER` > global default `MODEL_DEFAULT` (`sonnet`).
+Resolution order for each worker type `W` (highest priority first):
+
+1. **`--model-<W>`** CLI flag (e.g. `--model-implementer opus`)
+2. **`--model`** CLI flag (sets the global default for this run)
+3. **`LEERIE_MODEL_<W>`** env var (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`)
+4. **`LEERIE_MODEL`** env var (sets the global default)
+5. **`model_<w>`** key in `leerie.toml`
+6. **`model`** key in `leerie.toml`
+7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
+8. **Global default `MODEL_DEFAULT`** (`sonnet`)
 
 Twenty worker types (plus the global override), each independently overridable:
 
@@ -2098,10 +2102,12 @@ reasoning depth. Leerie pins effort per worker so judgment workers think to a
 consistent depth across runs — the previous behavior (no `--effort` flag,
 worker inherits whatever the user's Claude settings happen to default to)
 was a hidden source of cross-run variance in subtask count and other
-judgment-shaped outputs. The CLI exposes **no `--temperature` and no
-`--seed`**, so sampling stochasticity cannot be pinned; effort is the
-strongest available dial, removing the "this run thought harder than that
-one" axis without eliminating run-to-run variance entirely.
+judgment-shaped outputs.
+
+The `claude -p` CLI exposes **no `--temperature` and no `--seed`**, so
+sampling stochasticity cannot be pinned. Effort is the strongest dial
+available; it does not eliminate run-to-run variance but does remove the
+"this run thought harder than that one" axis.
 
 **Per-worker defaults: `medium` for judgment workers, `low` for the
 code-writing acting workers, unset for post-run skill workers.**
@@ -2166,13 +2172,17 @@ overrides `implementer` and `conformer` to `"low"` — a distinct,
 cost-motivated pin rather than a judgment-reproducibility one, so it is
 called out separately from the `"medium"` judgment cohort above.
 
-Resolution for each worker type `W` (highest priority first, mirroring model
-selection): `--effort-<W>` CLI (e.g. `--effort-planner max`) > `--effort`
-CLI (global default) > `LEERIE_EFFORT_<W>` env (e.g.
-`LEERIE_EFFORT_PLANNER=max`) > `LEERIE_EFFORT` env (global default) >
-`effort_<w>` key in `leerie.toml` > `effort` key in `leerie.toml` >
-per-worker default from `EFFORT_DEFAULT_PER_WORKER` > global default
-`EFFORT_DEFAULT` (`None` — flag omitted).
+Resolution order for each worker type `W` (highest priority first), mirroring
+model selection:
+
+1. **`--effort-<W>`** CLI flag (e.g. `--effort-planner max`)
+2. **`--effort`** CLI flag (sets the global default for this run)
+3. **`LEERIE_EFFORT_<W>`** env var (e.g. `LEERIE_EFFORT_PLANNER=max`)
+4. **`LEERIE_EFFORT`** env var (sets the global default)
+5. **`effort_<w>`** key in `leerie.toml`
+6. **`effort`** key in `leerie.toml`
+7. **Per-worker default** from `EFFORT_DEFAULT_PER_WORKER`
+8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
 
 | Worker             | env var                            | CLI flag                      | TOML key                   |
 |--------------------|------------------------------------|-------------------------------|----------------------------|
