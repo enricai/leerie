@@ -1441,26 +1441,22 @@ Resolution order (highest priority first), identical for both knobs:
 4. **Default `None`.** Unset knobs leave region/profile selection to the
    AWS credential chain `aws-credentials.sh` resolves independently.
 
-**Resolved by the launcher, not the orchestrator** (changed 2026-08-10).
-The `_resolve_ec2_knob` helper in `leerie` runs the whole ladder and
-assigns back into `LEERIE_AWS_REGION` / `LEERIE_AWS_PROFILE`, which every
-consumer already reads: `ec2-lib.sh`'s `require_aws()`, `ec2-ssm.sh`, and
-`ec2-provision.sh`'s `_aws_region_profile_args()`. Both flags are
+**Resolved by the launcher, not the orchestrator.** `_resolve_ec2_knob` in
+`leerie` runs the ladder and assigns back into `LEERIE_AWS_REGION` /
+`LEERIE_AWS_PROFILE`, read by `ec2-lib.sh`'s `require_aws()`, `ec2-ssm.sh`,
+and `ec2-provision.sh`'s `_aws_region_profile_args()`. Both flags are
 **launcher-only inputs** — stripped from `REWRITTEN_ARGS`, allowlisted in
-`tests/test_launcher_value_flags_coupling.py`, and deny-listed from the
-container env forwarding, exactly like the `LEERIE_EC2_*` vars below.
+`tests/test_launcher_value_flags_coupling.py`, and deny-listed from
+container env forwarding, like the `LEERIE_EC2_*` vars below.
 
-The block sits **above** the launcher's top-level verb dispatch, because
-`accept-blocked`, `stop`, `kill` and `finalize` each read `LEERIE_AWS_*`
-inside their own arms; resolving beside the `--ec2-*` knobs further down
-would leave those four on the env tier alone.
+Resolved **above** the launcher's verb dispatch, since `accept-blocked`,
+`stop`, `kill` and `finalize` each read `LEERIE_AWS_*` independently.
 
-These knobs have no orchestrator-side counterpart: `args.aws_region` /
-`args.aws_profile` and their `resolve_aws_region()` / `resolve_aws_profile()`
-resolvers do not exist in `orchestrator/leerie.py` — a host-side
-provisioning region is meaningless inside the container.
+No orchestrator-side counterpart exists (`args.aws_region` /
+`resolve_aws_region()` etc. are absent from `orchestrator/leerie.py`) — a
+host-side provisioning region is meaningless inside the container.
 `tests/test_no_dead_resolutions.py` fails any `args.X = resolve_Y(...)`
-whose result goes unread, guarding against reintroducing an inert copy.
+whose result goes unread.
 
 ### EC2 instance-lifecycle vars
 
@@ -1469,27 +1465,21 @@ Six `LEERIE_EC2_*` vars name the `RunInstances` parameters
 (DESIGN §6 *EC2 runtime lifecycle*, "Create" row):
 `LEERIE_EC2_AMI`, `LEERIE_EC2_INSTANCE_TYPE`, `LEERIE_EC2_KEY_NAME`,
 `LEERIE_EC2_SECURITY_GROUP`, `LEERIE_EC2_SUBNET_ID`, and
-`LEERIE_EC2_INSTANCE_ID`. All six are **launcher-only inputs**, not
-orchestrator-read prefs — they are already deny-listed from the
-`LEERIE_*` container-forwarding loop (`leerie:6284-6297`; see
-"`LEERIE_*` env-var forwarding" above) for exactly this reason: the
-orchestrator runs *inside* the already-provisioned instance and has
-no use for the parameters that created it, mirroring how
-`LEERIE_FLY_APP`/`LEERIE_FLY_IMAGE`/`LEERIE_MACHINE_ID` are deny-listed
-for the Fly path (`tests/test_launcher_env_forwarding.py` pins the
-five instance-shape vars plus `LEERIE_EC2_INSTANCE_ID` on the
-deny-list). No Python-side `resolve_*()` counterpart exists — same as
-`LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` above. Both groups are consumed
+`LEERIE_EC2_INSTANCE_ID`. All six are **launcher-only inputs**, already
+deny-listed from the `LEERIE_*` container-forwarding loop
+(`leerie:6284-6297`) — the orchestrator runs *inside* the
+already-provisioned instance and has no use for the parameters that
+created it, mirroring `LEERIE_FLY_APP`/`LEERIE_FLY_IMAGE`/`LEERIE_MACHINE_ID`
+on the Fly path (`tests/test_launcher_env_forwarding.py` pins all six on
+the deny-list). No Python-side `resolve_*()` counterpart exists, same as
+`LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` above — both groups are consumed
 exclusively by the host-side launcher/`ec2-provision.sh` before any
 container or instance exists.
 
-Five are per-instance `RunInstances` parameters, each brought up to
-the same **CLI > env > `leerie.toml` > (no default)** precedence every
-other leerie knob has (mirroring `FLY_VM_DISK_GB` and the shallow-seed
-knobs — `LEERIE_SEED_DEPTH`/`LEERIE_SEED_SHALLOW_THRESHOLD_MB`), resolved
-by the launcher itself (`leerie:3644-3710`, `_resolve_ec2_knob`) before
-`ec2-lib.sh` is sourced, then exported and stripped from
-`REWRITTEN_ARGS` so the flag doesn't leak through as the task string:
+Five are per-instance `RunInstances` parameters, each on the standard
+**CLI > env > `leerie.toml` > (no default)** precedence, resolved by the
+launcher (`leerie:3644-3710`, `_resolve_ec2_knob`) before `ec2-lib.sh` is
+sourced, then exported and stripped from `REWRITTEN_ARGS`:
 
 1. **`--ec2-ami`** / **`--ec2-instance-type`** / **`--ec2-key-name`** /
    **`--ec2-security-group`** / **`--ec2-subnet-id`** CLI flag.
@@ -1498,81 +1488,65 @@ by the launcher itself (`leerie:3644-3710`, `_resolve_ec2_knob`) before
    **`LEERIE_EC2_SUBNET_ID`** environment variable.
 3. **`leerie.toml`** at the repo root, keys `ec2_ami` / `ec2_instance_type`
    / `ec2_key_name` / `ec2_security_group` / `ec2_subnet_id`.
-4. **(no default)** — unlike `runtime`/`source_of_truth`, these describe
-   AWS account resources leerie cannot choose on the operator's behalf
-   (unlike Fly, where `FLY_VM_CPUS`/`FLY_VM_MEMORY_MB` have working
-   defaults today). Once all three tiers are exhausted, the var is
-   exported empty; `ec2-lib.sh`'s `resolve_ami()` / `resolve_instance_type()`
-   / `resolve_key_name()` / `resolve_security_group()` / `resolve_subnet_id()`
-   (see the `ec2-lib.sh` Files-table row above) each read their one var
+4. **(no default)** — these describe AWS account resources leerie cannot
+   choose on the operator's behalf (unlike Fly, where
+   `FLY_VM_CPUS`/`FLY_VM_MEMORY_MB` have working defaults). Once all
+   tiers are exhausted, the var exports empty; `ec2-lib.sh`'s
+   `resolve_ami()` / `resolve_instance_type()` / `resolve_key_name()` /
+   `resolve_security_group()` / `resolve_subnet_id()` each read their var
    via `_resolve_ec2_var` — a required-var check that `die()`s with an
-   actionable message naming the missing var, run host-side after the
-   launcher's own resolution ladder rather than a bare `${VAR:?}` (which
-   would kill the whole sourcing shell with bash's generic "parameter
-   null or not set" message under `set -u`). `RUNTIME=ec2` without all
-   five resolved fails the same way `RUNTIME=fly` without
+   actionable message naming the missing var, run host-side rather than
+   a bare `${VAR:?}` (which would kill the sourcing shell with bash's
+   generic "parameter null or not set" under `set -u`). `RUNTIME=ec2`
+   without all five resolved fails the same way `RUNTIME=fly` without
    `LEERIE_FLY_APP` fails: `die()` with setup instructions before any
-   AWS API call. `tests/test_resolve_ec2_vars.py` covers the launcher-side
-   ladder (CLI > env > `leerie.toml` precedence, per-var isolation, unset
-   stays empty).
+   AWS API call. `tests/test_resolve_ec2_vars.py` covers the ladder.
 
 The sixth, **`LEERIE_EC2_INSTANCE_ID`**, is not a provisioning input —
-it is the launcher's read of the just-created instance id back into
-the environment after `provision_instance()` returns, mirroring how
+it is the launcher's read of the just-created instance id back into the
+environment after `provision_instance()` returns, mirroring how
 `LEERIE_MACHINE_ID`/`LEERIE_RUN_ID` are set launcher-side after
-`flyctl machine run` for the Fly path (see the denylist comment at
-`leerie:6281`, "Fly/EC2/remote/chain/wave machinery: consumed
-launcher-side only"). It is written to the crash-recovery sidecar
-`ec2-instance.json` (see the `ec2-provision.sh` Files-table row above)
-rather than read from an operator-set env var.
+`flyctl machine run` for the Fly path. It is written to the
+crash-recovery sidecar `ec2-instance.json` rather than read from an
+operator-set env var.
 
 A seventh var, **`LEERIE_EC2_SSH_TARGET`**, is consumed by
-`scripts/remote/ec2-seed-repo.sh` (see the Files table row above): the
-`ssh`(1) destination for the instance (e.g. `ec2-user@<public-ip>` or an
-`ssh_config` Host alias) that `ec2_tar_pipe` and the dirty-delta rsync
-consume verbatim. Like `LEERIE_EC2_INSTANCE_ID`, this is not an
-operator-set provisioning input — resolving an instance id to a
-reachable SSH address is `ec2-provision.sh`'s job (not yet
-implemented); the launcher is expected to set it the same way it sets
-`LEERIE_EC2_INSTANCE_ID`, once provisioning lands.
+`scripts/remote/ec2-seed-repo.sh`: the `ssh`(1) destination for the
+instance (e.g. `ec2-user@<public-ip>` or an `ssh_config` Host alias) that
+`ec2_tar_pipe` and the dirty-delta rsync consume verbatim. Like
+`LEERIE_EC2_INSTANCE_ID`, resolving an instance id to a reachable SSH
+address is `ec2-provision.sh`'s job (not yet implemented); the launcher
+is expected to set it the same way once provisioning lands.
 
 ### EC2 image delivery
 
 DESIGN §6 *EC2 runtime lifecycle* → "Image delivery" settles how the
 leerie image reaches an EC2 instance: **bake into the AMI**, the direct
 analog of Fly's shipped `ensure_image()` push-to-registry answer but for
-a boot-from-snapshot target rather than a pulled container. The operator
-builds a custom AMI, out of the per-run critical path (a Packer / EC2
-Image Builder pipeline, out of scope for leerie itself), with the
-orchestrator source, Python 3.10+, and every OS-level dependency
-`.leerie-setup.sh` would otherwise need root for already present.
-`ec2-provision.sh`'s `provision_instance()` (see the Files table above)
-reflects this today: `run-instances` carries no explicit block-device
-mapping and no per-run build/push/pull step — the instance is ready to
-accept `ec2_seed_repo`/`ec2_remote_exec` calls the moment
+a boot-from-snapshot target. The operator builds a custom AMI out of the
+per-run critical path (a Packer / EC2 Image Builder pipeline, out of
+scope for leerie itself) with the orchestrator source, Python 3.10+, and
+every OS-level dependency `.leerie-setup.sh` would otherwise need root
+for already present. `ec2-provision.sh`'s `provision_instance()` reflects
+this: `run-instances` carries no explicit block-device mapping and no
+per-run build/push/pull step — the instance is ready to accept
+`ec2_seed_repo`/`ec2_remote_exec` calls the moment
 `wait_for_instance_ready()` returns.
 
-**No new `LEERIE_EC2_*` knob.** `LEERIE_EC2_AMI` (already spec'd under
-"EC2 instance-lifecycle vars" above, same CLI > env > `leerie.toml` >
-(no default) precedence) is sufficient to name the chosen artifact: a
-custom AMI under the bake-into-AMI default, or a stock AMI paired with a
-documented user-data fallback script for an operator who has not yet
-built one (DESIGN §6 names and rejects the two alternatives — ECR-push
-and user-data pull-and-build — as the default; user-data pull remains a
-documented manual fallback, not a second code path leerie implements).
-No `resolve_*()` counterpart, no denylist change: `LEERIE_EC2_AMI` is
-already a launcher-only input and already on the container
-env-forwarding deny-list for the same reason the other five
-instance-shape vars are (see "EC2 instance-lifecycle vars" above) — the
-image-delivery decision does not change which side consumes the var.
+**No new `LEERIE_EC2_*` knob.** `LEERIE_EC2_AMI` (already spec'd above)
+is sufficient to name the chosen artifact: a custom AMI under the
+bake-into-AMI default, or a stock AMI paired with a documented user-data
+fallback script for an operator who has not yet built one (DESIGN §6
+rejects ECR-push and user-data pull-and-build as the default; user-data
+pull remains a documented manual fallback, not a second code path). No
+`resolve_*()` counterpart, no denylist change — `LEERIE_EC2_AMI` is
+already launcher-only and already deny-listed for container forwarding.
 
 **Future knob flagged, not added.** DESIGN §6 flags that an instance
 profile (`IamInstanceProfile`, carrying the SSM managed-instance role
 `ssm:StartSession` et al. need) is a `RunInstances` parameter the
-provisioning subtask will have to supply from somewhere, alongside the
-five already-reserved shape vars — shaped like a future
-`LEERIE_EC2_INSTANCE_PROFILE` knob. This design does not add that knob
-now; it is out of scope for image delivery and belongs to whichever
+provisioning subtask will have to supply — shaped like a future
+`LEERIE_EC2_INSTANCE_PROFILE` knob. Not added here; belongs to whichever
 subtask wires `IamInstanceProfile` into `run-instances`.
 
 ### Fly app name
@@ -1686,67 +1660,46 @@ reads it), mirroring the `--state-dir` resolution block: CLI flag > env var
   `LEERIE_LOG_FILE` env > `leerie.toml` `log_file = "..."` > default
   `$LEERIE_STATE_HOST_DIR/logs/leerie-<pid>.log`.
 
-Operators commonly run `leerie task | tee leerie-<task>.log`, and a log left
-inside `$USER_REPO` is bind-mounted whole into every worker's container —
-letting a worker read its own orchestration log, including gate/judge
-vocabulary, and defeat judge independence (the failure mode the N5 startup
-warning at `_warn_if_log_in_repo` detects). The default therefore lands
-under `LEERIE_STATE_HOST_DIR` — never under `$USER_REPO` — settling N5's
-own stated residual (whether "outside the repo" should specifically mean
-the state dir) in favor of the state dir: it already exists, is never
-bind-mounted into a worker container, and is the convention every other
-per-run artifact (`state.json`, per-worker logs) already uses.
+A log left inside `$USER_REPO` (e.g. via manual `leerie task | tee
+leerie-<task>.log`) is bind-mounted whole into every worker's container,
+letting a worker read its own orchestration log and defeat judge
+independence (`_warn_if_log_in_repo` detects this). The default lands
+under `LEERIE_STATE_HOST_DIR` instead — never under `$USER_REPO` — since
+it already exists, is never bind-mounted into a worker container, and is
+the convention every other per-run artifact already uses.
 
 `--log-file` is registered in the launcher's `_value_flags` list (so the
-task-argument-extraction walk does not mistake its value for the task
-string) and is stripped (flag + value) from `REWRITTEN_ARGS` before
-forwarding to the orchestrator's `parse_args()`, the same way
-`--seed-depth` / `--seed-shallow-threshold-mb` are — the orchestrator
-declares no argument for it and would otherwise error `unrecognized
-arguments`.
+task-argument-extraction walk doesn't mistake its value for the task
+string) and stripped (flag + value) from `REWRITTEN_ARGS` before
+forwarding to `parse_args()`, same as `--seed-depth` /
+`--seed-shallow-threshold-mb`.
 
-**Teeing (local runtime).** The launcher itself now writes its combined
-stdout+stderr to `LEERIE_LOG_FILE_RESOLVED`, so the operator no longer
-needs to run the manual `| tee` that created the N5 leak in the first
-place. Wired into the existing decoupled-streaming mechanism (DESIGN §6
-*Launcher hang on abnormal container exit*): in the piped/non-TTY local
-case (`TTY_FLAGS=-i` and stdout is not a TTY), `nerdctl run` already
-redirects into a launcher-owned `$_run_log` file that a `tail -f` WE own
-streams to our own stdout, so the SSH mux (Colima) never holds our stdout
-pipe. That `tail` is now piped through `tee -a "$LEERIE_LOG_FILE_RESOLVED"`
-when the target is writable (probed with a throwaway `: >> ...` append,
-after a best-effort `mkdir -p` of its parent directory) — `$_run_log`
-itself is a scratch file removed at exit; `LEERIE_LOG_FILE_RESOLVED` is
-the durable copy. No enclosing subshell around the pipeline: `$!` names
-tee (the pipeline's last process) when teeing, or tail itself when not —
-identical to the pre-teeing behavior in the non-teeing case. When teeing,
-`$_tail_pid` names only `tee`; `tail` itself is a distinct process in the
-pipeline that does not reliably exit on its own — a `tail -f` on a
-since-deleted file never gets the write that would trigger a `SIGPIPE`
-once its stdout pipe is broken, so it would otherwise survive `_reap_tail`
-and orphan under init. `_reap_tail` therefore also recovers `tail`'s PID
-from the job table (`jobs -l %%`) at reap time and kills it alongside
-`$_tail_pid`.
+**Teeing (local runtime).** The launcher writes its combined
+stdout+stderr to `LEERIE_LOG_FILE_RESOLVED` itself, so the operator no
+longer needs the manual `| tee`. In the piped/non-TTY local case
+(`TTY_FLAGS=-i`), `nerdctl run` redirects into a launcher-owned
+`$_run_log` file that a `tail -f` streams to our own stdout (so the SSH
+mux never holds our stdout pipe); that `tail` is now piped through
+`tee -a "$LEERIE_LOG_FILE_RESOLVED"` when the target is writable.
+`$_run_log` is a scratch file removed at exit; `LEERIE_LOG_FILE_RESOLVED`
+is the durable copy. `tail` does not reliably exit on its own when teeing
+(a `tail -f` on a since-deleted file never gets a write to trigger
+`SIGPIPE`), so `_reap_tail` recovers `tail`'s PID from the job table
+(`jobs -l %%`) and kills it alongside `$_tail_pid` (which names only
+`tee` in this path).
 
-**Interactive/-it path.** `$_run_log`/`tail`+`tee` is gated to the piped
-case only — piping nerdctl's own stdout there would defeat `-t`, the same
-reason the launcher itself drops to `-i` when the operator's own stdout is
-piped (see the TTY_FLAGS comment above the local execution branch). For
-the real-tty case, the `-it` branch is instead wrapped in `script`(1) when
-a `--log-file` target is writable and `script` is on `PATH`: `script`
-allocates its own pty for the `nerdctl run` child, so nerdctl still gets a
-real console for `--clarify`'s interactive prompt — TTY_FLAGS and
-nerdctl's own argv/redirection are untouched — while `script` itself
-duplicates that pty's bytes into the log file on the side. util-linux
-`script` (Linux) only accepts a command via `-c <string>` run through
-`$SHELL -c`, so the `nerdctl run` argv is `%q`-quoted into one string;
-BSD `script` (macOS) takes the command as trailing positional args and
-execs it directly. Falls back to nerdctl inheriting stdout directly,
-unchanged, when no `--log-file` target is writable or `script` is
-unavailable. The documented piped-mode/TTY-flag hazards at
-`leerie:7580-7702` are unaffected either way. Remote runtimes (Fly, EC2)
-are out of scope for this teeing wiring — the `$USER_REPO` bind-mount
-leak N5 targets is a local-runtime-only condition.
+**Interactive/-it path.** Piping nerdctl's own stdout would defeat `-t`,
+so for the real-tty case the `-it` branch is instead wrapped in
+`script`(1) when a `--log-file` target is writable and `script` is on
+`PATH`: `script` allocates its own pty for the `nerdctl run` child (so
+nerdctl still gets a real console for `--clarify`'s interactive prompt)
+while duplicating that pty's bytes into the log file. util-linux
+`script` (Linux) takes a command via `-c <string>` (`nerdctl run` argv
+`%q`-quoted into one string); BSD `script` (macOS) takes trailing
+positional args directly. Falls back to nerdctl inheriting stdout
+directly when no target is writable or `script` is unavailable. Remote
+runtimes (Fly, EC2) are out of scope — the bind-mount leak this targets
+is local-runtime-only.
 
 ### Verbosity
 
@@ -1773,90 +1726,66 @@ Streaming log lines for Phase 5 work carry an activity prefix:
 [wave 1 of 1 · 5 subtasks done]                            # wave fully settled
 ```
 
-The prefix is built from three per-wave counters, each rendered as its
-own ` · `-separated segment when non-zero (segments with a zero count
-are omitted entirely, so `0/M`-style fragments never appear):
+The prefix is built from three per-wave counters, each its own
+` · `-separated segment when non-zero (zero-count segments are omitted,
+so `0/M`-style fragments never appear):
 
 - **`running N subtask(s)`** — implementer not yet at terminal status
   (no entry in `subtask_status[sid]`, or value not in
   `_TERMINAL_STATUSES = {complete, failed, blocked}`).
 - **`N subtask(s) in conformer`** — implementer reached `complete` and
-  the advisory conformer phase is still in flight. The signal is
-  `subtask_status[sid] == "complete"` *and* `conformance[sid]` absent —
-  the conformance dict is written by `_settle_subtask` exactly when the
-  conformer settles, so this is a precise live indicator (DESIGN §9
-  *Post-work conformance*).
-- **`N subtask(s) done`** — implementer settled *and*, if `complete`,
-  the conformer has also wrapped; or implementer hit `failed` /
-  `blocked` (terminal regardless of conformer). Always rendered last so
-  rising progress reads on the right side of the prefix.
+  the advisory conformer phase is still in flight (`subtask_status[sid]
+  == "complete"` and `conformance[sid]` absent).
+- **`N subtask(s) done`** — implementer settled and, if `complete`, the
+  conformer has also wrapped; or implementer hit `failed`/`blocked`
+  (terminal regardless of conformer). Always rendered last.
 
 The wave header `wave W of V` is the 1-based current wave index and
 total wave count. Counts are restricted to the current wave's
-membership (`waves[completed_waves]`), not the whole run — that's what
-keeps `running 5 subtasks` meaningful at wave start.
+membership (`waves[completed_waves]`), not the whole run. Singular/plural
+is rendered on the count (`1 subtask` vs `5 subtasks`).
 
-Singular/plural is rendered on the count (`1 subtask` vs `5 subtasks`).
+Built by `_get_progress`; emitted only after Phase 3 schedules the
+waves, which is why classifier/planner/reconciler log lines have no
+prefix. Post-wave-loop workers (`summarizer`, `pr_writer`,
+`_run_final_conformance`) also emit no prefix.
 
-Built by `_get_progress` (`orchestrator/leerie.py`); emitted only after
-Phase 3 schedules the waves, which is why classifier / planner /
-reconciler log lines have no prefix. Post-wave-loop workers
-(`summarizer`, `pr_writer`, `_run_final_conformance`) also emit no prefix:
-`_get_progress` returns `None` once `completed_waves >= len(waves)`,
-since there is no in-flight wave to count.
-
-`_invoke` takes `progress` as a callable (`Callable[[], tuple[...] |
-None] | None`), not a spawn-time snapshot, and calls it per stream
-event. This is so a long-running worker's prefix advances as siblings
-complete — two workers logging at the same wall-clock instant agree on
-the count instead of carrying frozen snapshots from their respective
-spawn moments.
+`_invoke` takes `progress` as a callable, not a spawn-time snapshot, and
+calls it per stream event — so a long-running worker's prefix advances
+as siblings complete rather than carrying a frozen snapshot.
 
 #### Rejected-payload diagnostic
 
 `_read_stream` latches the input of every `StructuredOutput` tool_use into
 `last_structured_payload` (rendered by `_format_payload_for_log`, capped at
 `_REJECTED_PAYLOAD_LOG_MAX = 4000` chars, degrading to `repr` if
-`json.dumps` raises — a diagnostic must never kill the run it is explaining).
-When a subsequent tool_result is an errored **schema** rejection —
-`_is_schema_rejection`, matching `does not match required schema` or
-`inputvalidationerror` case-insensitively — the latched payload is logged
-beside the rejection, then cleared so a later unrelated failure cannot
+`json.dumps` raises). When a subsequent tool_result is an errored **schema**
+rejection (`_is_schema_rejection`, matching `does not match required schema`
+or `inputvalidationerror` case-insensitively), the latched payload is logged
+beside the rejection, then cleared so a later unrelated failure can't
 re-print a stale payload.
 
-Emitted at every verbosity (it is a failure diagnostic, not per-event
-activity). The gate is deliberately narrow: an ordinary tool failure (a
-failing test, a missing file) must never drag an unrelated structured payload
-into the log beside it.
-
-Why this exists: the rejection text names the offending fields but never
-echoes what was submitted, and the payload lives in a preceding event the
-error text cannot reach — so the commonest worker failure signature was
-undiagnosable from a log. The `InputValidationError` (unparseable JSON) path
-already logged its payload; this closes the gap for the parseable-but-invalid
-case.
+Emitted at every verbosity (a failure diagnostic, not per-event
+activity), gated narrowly so an ordinary tool failure never drags an
+unrelated structured payload into the log. Rationale: the rejection text
+names offending fields but never echoes what was submitted, so the
+commonest worker failure signature was undiagnosable from a log; the
+`InputValidationError` (unparseable JSON) path already logged its
+payload, this closes the gap for the parseable-but-invalid case. Pinned
+by `tests/test_rejected_payload_logging.py`.
 
 #### Blocked-planner gap diagnostic
 
-`_format_blocked_gap(confidence) -> str` renders a blocked planner's stated
-gap for `phase_plan`'s per-category summary line, capped at
-`_BLOCKED_GAP_LOG_MAX = 400` chars with a visible `… [truncated; see log]`
-marker — never a silent cut, matching `_format_payload_for_log` above.
-
-Two transforms, both because the value is free prose. Whitespace is collapsed
-so an embedded newline cannot split a one-line summary across several rows,
-and the result is truncated: `confidence.basis` runs a **median of ~1.1k
-characters and up to 4.3k** across real planner submissions — so an
-untruncated line would put multiple KB on one row of the operator's
-terminal. The full text stays in the per-worker log, which the scheduling
-gate's own blocked-domain message already points at.
-
-Returns `""` rather than `None` for absent, empty or malformed input, so the
-caller interpolates an empty gap instead of the string `"None"`. The cap is
-much smaller than `_REJECTED_PAYLOAD_LOG_MAX` because this is one line inside a
-routine summary rather than a standalone failure dump. Pinned by
-`tests/test_schedule_blocked.py`.
-Pinned by `tests/test_rejected_payload_logging.py`.
+`_format_blocked_gap(confidence) -> str` renders a blocked planner's
+stated gap for `phase_plan`'s per-category summary line, capped at
+`_BLOCKED_GAP_LOG_MAX = 400` chars with a visible `… [truncated; see
+log]` marker. Whitespace is collapsed (an embedded newline could split a
+one-line summary across rows) and the result truncated —
+`confidence.basis` runs a median of ~1.1k characters and up to 4.3k
+across real planner submissions. The full text stays in the per-worker
+log. Returns `""` rather than `None` for absent/empty/malformed input,
+so the caller interpolates an empty gap instead of the string `"None"`.
+Pinned by `tests/test_schedule_blocked.py`.
 
 Resolution order (highest priority first):
 
@@ -1883,14 +1812,13 @@ can dial up or down at resume time without editing state.
 ### Inspect directories
 
 Extra directories the inspect-bucket workers (classifier, planner,
-reconciler, plan_overlap_judge, provision) may read. Forwarded to each `claude -p` invocation as
-one `--add-dir` flag per entry. Use this when a task references a
-sibling repo outside the current repo cwd — for example, "compare
-how beacon and leerie handle X, beacon is at `~/src/enric/beacon`":
-without `--inspect-dir ~/src/enric/beacon`, the classifier and
-planner cannot `Read`/`Grep`/`Glob` that path, and an attempt to
-fall back to `ls`/`find` is blocked by the workspace sandbox even
-though `INSPECT_TOOLS` allowlists those verbs.
+reconciler, plan_overlap_judge, provision) may read. Forwarded to each
+`claude -p` invocation as one `--add-dir` flag per entry. Use this when a
+task references a sibling repo outside the current repo cwd — without
+`--inspect-dir ~/src/enric/beacon`, the classifier and planner can't
+`Read`/`Grep`/`Glob` that path, and the workspace sandbox blocks a
+fallback to `ls`/`find` even though `INSPECT_TOOLS` allowlists those
+verbs.
 
 Resolution order (highest priority first):
 
@@ -1978,11 +1906,10 @@ Resolution order (highest priority first):
 
 ### PR-writer model
 
-The `claude` model alias used at finalize time by the `pr_writer` worker
-that composes the PR title and body. The worker reads the target repo's
-PR template (if any), the run's commit log, and a sampled diff, then
-emits a JSON object with `title`, `body`, and `used_template`. The host
-launcher reads the result from `run.json` and passes it to
+The `claude` model alias used at finalize time by the `pr_writer` worker,
+which reads the target repo's PR template (if any), the run's commit
+log, and a sampled diff, then emits `{title, body, used_template}`. The
+host launcher reads the result from `run.json` and passes it to
 `gh pr create`.
 
 Resolution order (highest priority first):
@@ -2015,11 +1942,10 @@ warning and falls back to the alphabetical default.
 ### PR base branch override
 
 The final branch a run's PR merges into defaults to `working_branch`
-(the branch checked out when the run started). This is distinct from
-the diff fork-point, which always stays `working_branch` regardless of
-this override — overloading `working_branch` for both roles would
-corrupt the diff base if the override branch weren't the actual fork
-point.
+(the branch checked out when the run started). Distinct from the diff
+fork-point, which always stays `working_branch` regardless of this
+override — overloading `working_branch` for both roles would corrupt the
+diff base if the override branch weren't the actual fork point.
 
 Resolution order (highest priority first), via `resolve_pr_base_branch`
 (mirrors `resolve_pr_template`'s `_resolve_str_pref` delegation):
@@ -2033,27 +1959,25 @@ The resolved value is written to `state.json` and `run.json` as
 `pr_base_branch`, alongside the unmodified `working_branch`.
 
 `scripts/host-finalize.sh`'s `host_finalize` (the sole `gh pr create`
-call site — see the Files table above) reads `run.json.pr_base_branch`
-and passes it to `gh pr create --base`, falling back to
-`working_branch` when the field is absent (a run finalized before this
-field existed). The origin-nonexistence default-branch fallback (base
-branch deleted/renamed on origin) operates on this resolved base, same
-as it always did for `working_branch`.
+call site) reads `run.json.pr_base_branch` and passes it to
+`gh pr create --base`, falling back to `working_branch` when the field
+is absent (a run finalized before this field existed). The
+origin-nonexistence default-branch fallback (base branch
+deleted/renamed on origin) operates on this resolved base, same as it
+always did for `working_branch`.
 
 ### PR-writer payload caps
 
-The `pr_writer` worker is invoked with its entire user prompt (task
-text, classification, subtask titles, full commit log, diff
-stat/dirstat, sampled diff, and the PR template body — all serialized
-as one JSON string) passed as `claude_p`'s `user_prompt`, which
-`_invoke` feeds to `claude -p` over stdin rather than argv (§3 "User
-prompt transport — stdin, not argv") — so this payload is not bound by
-Linux's per-argument `MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`)
-the way an argv-passed prompt would be.
+The `pr_writer` worker's entire user prompt (task text, classification,
+subtask titles, full commit log, diff stat/dirstat, sampled diff, and
+the PR template body, serialized as one JSON string) is fed to
+`claude -p` over stdin, not argv (§3 "User prompt transport"), so it's
+not bound by Linux's per-argument `MAX_ARG_STRLEN` (131,071 bytes) the
+way an argv-passed prompt would be.
 
 Three constants in `orchestrator/leerie.py` still cap the unbounded
-fields, now purely to bound the worker's LLM context rather than to
-defend an argv ceiling. Each capped field gets an in-band `... [<label>
+fields, purely to bound the worker's LLM context rather than to defend
+an argv ceiling. Each capped field gets an in-band `... [<label>
 truncated at ~N KB; remainder omitted — rely on the commit log] ...`
 sentinel so the worker can see the truncation and avoid fabricating
 detail past the cut-off.
@@ -2065,39 +1989,31 @@ detail past the cut-off.
 | `PR_WRITER_DIFF_SAMPLE_MAX_LINES`| 500    | sampled `git diff` hunks (line-capped because individual diff lines can be long and breaking one mid-line would render the surrounding hunk unreadable) |
 | `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES` | 8,000 | serialized JSON length of the `final_conformance` payload field. Enforced inside `_final_conformance_payload` by trimming `warnings` (then `residuals`) from the tail; at least one of each is preserved and a `truncated: true` marker is added when trimming fired |
 
-These are **module constants, not `DEFAULT_CAPS` entries**, by
-design. `DEFAULT_CAPS` is the surface for run-wide operational caps
-that are intended to be user-tunable through CLI / env / TOML
-(`max_total_workers`, `worker_timeout_sec`, `worker_memory_max_bytes`,
-etc.). The PR-writer caps are internal protocol limits bounding a
-single worker invocation's LLM context: lowering them silently
-degrades summaries, and raising them risks overwhelming the worker's
-context rather than an OS-imposed argv ceiling (the payload travels
-over stdin, not argv — see above).
-`tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
-pins the values so any future change goes through code review.
+These are **module constants, not `DEFAULT_CAPS` entries**, by design.
+`DEFAULT_CAPS` is the surface for run-wide operational caps intended to
+be user-tunable (`max_total_workers`, `worker_timeout_sec`,
+`worker_memory_max_bytes`, etc.). The PR-writer caps are internal
+protocol limits bounding a single worker invocation's LLM context:
+lowering them silently degrades summaries, raising them risks
+overwhelming the worker's context rather than defending an argv
+ceiling. `tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
+pins the values.
 
-Multi-byte UTF-8 safety: `_cap_text` slices at the byte boundary,
-then back-decodes with `errors="ignore"` so the trimmed prefix never
-ends mid-codepoint.
+Multi-byte UTF-8 safety: `_cap_text` slices at the byte boundary, then
+back-decodes with `errors="ignore"` so the trimmed prefix never ends
+mid-codepoint.
 
 **`final_conformance` payload field** — when `_run_final_conformance`
 produced a result, `_compose_pr_via_llm` reads
 `st.data["conformance"]["_final"]` and adds a compact
-`final_conformance` object to the pr_writer payload with
-`{residuals: [...], failed_axes: [...], warnings: [...]}` (plus an
-optional `truncated: true` marker). Omitted when the final pass was
-skipped, crashed, or returned a fully clean result (no residuals,
-every axis `ran:false` or `passed:true`, no warnings) — the absence
-of the field is the cue that there is nothing advisory to say. The
-serialized JSON is bounded by
-`PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES` (8 KB), enforced in
+`final_conformance` object with `{residuals, failed_axes, warnings}`
+(plus an optional `truncated: true` marker). Omitted when the final
+pass was skipped, crashed, or returned a fully clean result — absence
+of the field is the cue that there's nothing advisory to say. Bounded
+by `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES` (8 KB), enforced in
 `_final_conformance_payload` by trimming `warnings` (then `residuals`)
-from the tail until the field fits; at least one of each is
-preserved and the `truncated` marker is set so the prompt can
-mention the cut-off honestly. The cap bounds the worker's LLM context
-alongside the other `PR_WRITER_*` caps above, not an argv-size
-constraint — the payload travels over stdin, not argv.
+from the tail until it fits; at least one of each is preserved and the
+`truncated` marker set.
 
 ### Heal-loop convergence parameters
 
