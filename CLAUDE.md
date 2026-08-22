@@ -435,45 +435,34 @@ inventory itself.
 
 ## Commit messages are the permanent record
 
-This repo **squash-merges**, and the repository setting is
-`squash_merge_commit_message: COMMIT_MESSAGES`. So the squash body on `main`
-is the branch's **commit messages, concatenated** — a four-commit PR lands
-all four, in order, each prefixed with `*`. **The PR description is
-discarded.** Verify with `git log -1 <squash-sha> --format=%b` on any recent
-merge.
+This repo **squash-merges** with `squash_merge_commit_message:
+COMMIT_MESSAGES` — the squash body on `main` is the branch's commit messages
+concatenated (a four-commit PR lands all four, each prefixed `*`). **The PR
+description is discarded.** Verify with `git log -1 <squash-sha> --format=%b`
+on any recent merge.
 
-Three consequences, each learned the hard way:
-
-- A correction belongs in a **commit message**, not only in the PR
-  description. A description rewritten before merge reaches nobody.
+- A correction belongs in a **commit message**, not only the PR description —
+  a description rewritten before merge reaches nobody.
 - A branch that supersedes its own earlier work must say so in its **final**
-  commit message, because the superseded ones remain on `main` verbatim. PR
-  #203 landed with a body that opens by presenting a feature the same body
-  later withdraws — accurate in sequence, misleading at a glance.
-- A single-commit PR is the case where the two happen to look identical
-  (its lone message is the whole body). Do not generalise from it; that
-  inference is what produced the previous bullet.
-
-**Verify counts and claims in a commit message the way you verify code.**
-Four of five consecutive commit messages on one branch carried an unverified
-number — "16 tests deleted" (20), "all four are corrected" (three), "as it
-was before this branch" (the feature came from the previous PR), "three
-alternatives are load-bearing" (four). Every one was a figure measured
-against an earlier state and carried forward after the state changed. If a
-message states a count, re-derive it against the diff you are about to push.
-
-**Re-deriving is not enough on its own: the command's scope must match the
-sentence's scope.** #208 — whose subject was *correcting* a claim written into
-CLAUDE.md without being derived — then carried two more underived numbers of a
-different shape. One was never measured at all ("21 of its 24 keys" — the
-function has 21, the copy had 25, and 24 is neither). The other was measured
-correctly and then described wrongly: "the three existing harness consumers
-plus the two new files pass together (61 tests)" — 61 was the output of a
-*six*-file pytest invocation, and the five files the sentence names collect 44.
-A number lifted from a command with a wider scope than the claim reads as
-verified and is not. So: run the command whose scope is exactly the sentence's
-scope, at the moment of writing, and if the sentence names a set of files, name
-that same set on the command line.
+  commit message, since superseded ones remain on `main` verbatim (PR #203
+  landed with a body presenting a feature the same body later withdraws).
+- A single-commit PR is the case where the two look identical (its lone
+  message is the whole body) — don't generalise from it.
+- **Verify counts and claims the way you verify code.** Four of five
+  consecutive commit messages on one branch carried an unverified number
+  ("16 tests deleted" — actually 20; "as it was before this branch" — the
+  feature came from the previous PR). Each was measured against an earlier
+  state and carried forward stale. Re-derive any count against the diff
+  you're about to push.
+- **Re-deriving isn't enough — the command's scope must match the sentence's
+  scope.** PR #208 corrected one unverified claim and then shipped two more
+  of a different shape: one never measured at all ("21 of its 24 keys" — the
+  function has 21, the copy had 25, 24 is neither); the other measured
+  correctly but described with the wrong scope ("three existing consumers
+  plus two new files pass together (61 tests)" — 61 was a six-file
+  invocation; the five files the sentence names collect 44). Run the command
+  whose scope is exactly the sentence's scope, and if the sentence names a
+  set of files, name that same set on the command line.
 
 ## Task completion checklist
 
@@ -488,30 +477,24 @@ Before marking a change complete:
 - [ ] `python3 -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"`
       as a static check.
 - [ ] `pytest tests/test_no_undefined_names.py` — the undefined-name scan.
-      **`ast.parse` does not subsume this**: an undefined name parses
-      perfectly and raises `NameError` only when its line executes. v0.20.0
-      shipped one (`repo_root` in `_run_phases`' fresh-run branch) past a
-      green `ast.parse` and a green 6751-test suite, and it killed every
-      fresh run.
+      `ast.parse` does not subsume this: an undefined name parses fine and
+      raises `NameError` only when its line executes (v0.20.0 shipped one,
+      `repo_root` in `_run_phases`' fresh-run branch, past a green
+      `ast.parse` and a green 6751-test suite).
 - [ ] `grep -rn <removed-string> .` — confirm no stragglers if the change
       renamed or removed a string used elsewhere.
 - [ ] `git diff --stat` — confirm the diff is scoped to what the change
       intended; no collateral edits.
 - [ ] `python3 -c 'import json; json.load(open(".claude-plugin/plugin.json")); json.load(open(".claude-plugin/marketplace.json"))'`
-      — if either manifest in `.claude-plugin/` was touched, confirm both
-      are valid JSON and all referenced skill/command paths still exist.
-      The `version` field is duplicated across the two manifests;
-      `tests/test_version_flag.py` guards them from drifting.
+      — if either `.claude-plugin/` manifest was touched, confirm both are
+      valid JSON and referenced skill/command paths exist. `version` is
+      duplicated across both; `tests/test_version_flag.py` guards drift.
 - [ ] `python3 -c 'import json; [json.loads(l) for l in open("<state-root>/runs/<run>/calls.ndjson")]'`
-      — if the telemetry writer (`_capture_call`) was touched, confirm a
-      representative run produces a well-formed `calls.ndjson` (each line
-      valid JSON with at least `call_type`, `system_prompt`, and
-      `response_content` keys). Replace `<state-root>` with the resolved
-      state directory (default: `$HOME/.leerie/<basename>/`).
+      — if `_capture_call` was touched, confirm a representative run
+      produces well-formed `calls.ndjson` (each line valid JSON with at
+      least `call_type`, `system_prompt`, `response_content`).
 - [ ] `grep -qE '^\s*chain\)|^\s*status\)|^\s*attach\)|^\s*kill\)|^\s*list\)' leerie`
-      — if chain launcher verbs were touched, confirm the bare-verb arms
-      (`chain`, `status`, `attach`, `kill`, `list`) are present and the five
-      deprecated dash-prefixed chain aliases stay hard-removed (no shim);
-      see DESIGN.md §19 and IMPLEMENTATION.md "Chain verbs";
-      `pytest tests/test_chain_launcher_id_dispatch.py` for the
-      ID-dispatch contract test.
+      — if chain launcher verbs were touched, confirm the bare-verb arms are
+      present and the five deprecated dash-prefixed aliases stay
+      hard-removed (no shim); see DESIGN.md §19,
+      `pytest tests/test_chain_launcher_id_dispatch.py`.
