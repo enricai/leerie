@@ -514,45 +514,68 @@ dropped by several collisions is an anchor by appearance though nothing
 claims it survives) that killed those runs unrecoverably.
 
 **Multi-drop.** A single sid may legitimately be the dropped side of
-several collisions at once — coherent output that must not `die()`, but
-that can't be applied by replaying pairs through the apply loop's
-transitive rewrite: a `drop_*` *deliberately discards* the dropped
-subtask's title, intent, and criteria, so replaying pair two after pair
-one has rewritten the endpoint silently drops a **live, wanted** subtask
-and fabricates a supersedure claim between subtasks never compared.
+several collisions at once: the judge found its surface jointly
+covered by several siblings, which is the drop-shaped analogue of the
+anchor cluster above and is exactly what the judge prompt instructs
+when a shared endpoint genuinely should be dropped. This is coherent
+output and must not `die()`.
 
-Multi-drop is instead applied as one operation over the whole cluster: the
-dropped subtask's `provides` are unioned into **every** named survivor,
-and inbound `depends_on` fans out to all of them. Because the fan-out
-*adds* edges it can close a cycle none of the individual pairs would, so
-it is guarded by the same trial-apply check every other resolution uses,
+It cannot, however, be applied by replaying the pairs through the
+apply loop's transitive `survivor_of` rewrite. Chasing that pointer is
+safe for a `merge` — the absorbed subtask's intent carries forward, so
+nothing is lost — but a `drop_*` *deliberately discards* the dropped
+subtask's title, intent, and success criteria. Replaying pair two
+after pair one has already rewritten the endpoint therefore drops a
+**live, wanted** subtask the judge never named, silently, and
+fabricates a supersedure claim between two subtasks the judge never
+compared. The damage scales with cluster size: a sid dropped by three
+collisions destroys three of the four subtasks involved.
+
+Multi-drop is instead applied as a single operation over the whole
+cluster. The dropped subtask's `provides` are unioned into **every**
+named survivor and inbound `depends_on` references fan out to all of
+them (mirroring the id-vanishing fan-out rule — a dropped sid's work
+is genuinely split across its survivors, so a consumer depends on all
+of them). Because the fan-out *adds* graph edges it can close a
+dependency cycle that none of the individual pairs would, so it is
+guarded by the same trial-apply check every other resolution uses,
 degrading rather than dying:
 
 1. **`multi_drop_fanout`** — the full fan-out, when it stays acyclic.
 2. **`multi_drop_degraded_single`** — fan-out would cycle: fall back
-   to the lex-smallest survivor alone, deterministic by sort order.
+   to the lex-smallest survivor alone. Deterministic by sort order,
+   never by collision order.
 3. **`skipped_would_cycle`** — both would cycle: keep the subtask and
    leave the overlap for the integrator, exactly as a cyclic merge
    does today.
 
-Whole-cluster application makes the result independent of the order the
-judge happened to emit its pairs in — a determinism requirement the
-scheduler's contract depends on.
+The whole-cluster application is what makes the result independent of
+the order the judge happened to emit its pairs in — a determinism
+requirement the scheduler's contract depends on.
 
 **Multi-artifact pair.** The third coherent shape, alongside the anchor
-cluster and multi-drop: one *pair* colliding on several artifacts. The
-judge may encode this as a single row listing every overlapping file, or
-one row per artifact. In the split-row case, the question is whether the
-rows agree on what they *do* to the plan (the resolved dropped sid for a
-`drop_*`, the unordered endpoint pair for a `merge`). Identical-effect
-rows are coalesced into one collision keeping every artifact name,
-`artifact_paths` entry, and `merge_feasibility` statement. Rows whose
-effect *differs* cannot all hold — the same pair emitted twice as
-`drop_a` with endpoints swapped deletes both subtasks — and are fed back
-to the judge as a retryable issue: a contradictory duplicate surviving
-the retry budget is still refused, since on a two-subtask pair any effect
-difference necessarily makes one sid both dropped and surviving, which
-the keep-and-delete rule above already forbids.
+cluster and multi-drop above: one *pair* colliding on several artifacts.
+The judge may encode this either way — a single row whose `artifact_paths`
+lists every overlapping file, or one row per artifact — since
+`artifact_paths` is itself a list (`prompts/plan_overlap_judge.md`:
+"Naming several artifacts in one row is equally fine"). This section
+covers the split-row case: when the judge does emit one row per artifact,
+the distinguishing question is not whether the pair repeats but whether
+the rows agree on what they *do* to the plan: the resolved dropped sid for
+a `drop_*`, the unordered endpoint pair for a `merge`. Rows whose effect is
+identical are the same decision stated once per surface, and are
+coalesced into one collision that keeps every artifact name, every
+`artifact_paths` entry, and every `merge_feasibility` statement (the
+carry-forward invariant below applies unchanged). Rows whose effect
+*differs* cannot all hold — the same pair
+emitted twice as `drop_a` with the endpoints swapped deletes both
+subtasks — and are fed back to the judge as a retryable issue. The retry
+is an opportunity to fix a contradiction, never an escape from one: a
+contradictory duplicate that survives the retry budget is still refused,
+because on a two-subtask pair any effect difference necessarily makes one
+sid both dropped and surviving, which the keep-and-delete rule above
+already forbids. No apply order satisfies it, so it never reaches the
+apply loop.
 
 `resolution` alone is the wrong signal here, and treating any repeated pair
 as incoherent is worse: it `die()`s correct output after the full planning
