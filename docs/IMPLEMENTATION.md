@@ -1433,13 +1433,11 @@ standard AWS precedence order (see that file's row in the Files table
 above). Free-form strings, no enum validation — mirrors `resolve_pr_template`,
 not `resolve_runtime`.
 
-Resolution order (highest priority first), identical for both knobs:
-
-1. **CLI value** — `--aws-region` / `--aws-profile` flag.
-2. **`LEERIE_AWS_REGION`** / **`LEERIE_AWS_PROFILE`** environment variable.
-3. **`leerie.toml`** at the repo root, keys `aws_region` / `aws_profile`.
-4. **Default `None`.** Unset knobs leave region/profile selection to the
-   AWS credential chain `aws-credentials.sh` resolves independently.
+Resolution (identical for both knobs): `--aws-region`/`--aws-profile` CLI >
+`LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` env > `leerie.toml`
+`aws_region`/`aws_profile` > default `None` (unset knobs leave
+region/profile selection to the AWS credential chain `aws-credentials.sh`
+resolves independently).
 
 **Resolved by the launcher, not the orchestrator.** `_resolve_ec2_knob` in
 `leerie` runs the ladder and assigns back into `LEERIE_AWS_REGION` /
@@ -1480,27 +1478,22 @@ Five are per-instance `RunInstances` parameters, each on the standard
 **CLI > env > `leerie.toml` > (no default)** precedence, resolved by the
 launcher (`leerie:3644-3710`, `_resolve_ec2_knob`) before `ec2-lib.sh` is
 sourced, then exported and stripped from `REWRITTEN_ARGS`:
-
-1. **`--ec2-ami`** / **`--ec2-instance-type`** / **`--ec2-key-name`** /
-   **`--ec2-security-group`** / **`--ec2-subnet-id`** CLI flag.
-2. **`LEERIE_EC2_AMI`** / **`LEERIE_EC2_INSTANCE_TYPE`** /
-   **`LEERIE_EC2_KEY_NAME`** / **`LEERIE_EC2_SECURITY_GROUP`** /
-   **`LEERIE_EC2_SUBNET_ID`** environment variable.
-3. **`leerie.toml`** at the repo root, keys `ec2_ami` / `ec2_instance_type`
-   / `ec2_key_name` / `ec2_security_group` / `ec2_subnet_id`.
-4. **(no default)** — these describe AWS account resources leerie cannot
-   choose on the operator's behalf (unlike Fly, where
-   `FLY_VM_CPUS`/`FLY_VM_MEMORY_MB` have working defaults). Once all
-   tiers are exhausted, the var exports empty; `ec2-lib.sh`'s
-   `resolve_ami()` / `resolve_instance_type()` / `resolve_key_name()` /
-   `resolve_security_group()` / `resolve_subnet_id()` each read their var
-   via `_resolve_ec2_var` — a required-var check that `die()`s with an
-   actionable message naming the missing var, run host-side rather than
-   a bare `${VAR:?}` (which would kill the sourcing shell with bash's
-   generic "parameter null or not set" under `set -u`). `RUNTIME=ec2`
-   without all five resolved fails the same way `RUNTIME=fly` without
-   `LEERIE_FLY_APP` fails: `die()` with setup instructions before any
-   AWS API call. `tests/test_resolve_ec2_vars.py` covers the ladder.
+`--ec2-ami`/`--ec2-instance-type`/`--ec2-key-name`/`--ec2-security-group`/
+`--ec2-subnet-id` CLI > `LEERIE_EC2_AMI`/`LEERIE_EC2_INSTANCE_TYPE`/
+`LEERIE_EC2_KEY_NAME`/`LEERIE_EC2_SECURITY_GROUP`/`LEERIE_EC2_SUBNET_ID` env >
+`leerie.toml` keys `ec2_ami`/`ec2_instance_type`/`ec2_key_name`/
+`ec2_security_group`/`ec2_subnet_id` > **(no default)** — these describe AWS
+account resources leerie cannot choose on the operator's behalf (unlike Fly,
+where `FLY_VM_CPUS`/`FLY_VM_MEMORY_MB` have working defaults). Once all tiers
+are exhausted, the var exports empty; `ec2-lib.sh`'s `resolve_ami()` /
+`resolve_instance_type()` / `resolve_key_name()` / `resolve_security_group()`
+/ `resolve_subnet_id()` each read their var via `_resolve_ec2_var` — a
+required-var check that `die()`s with an actionable message naming the
+missing var, run host-side rather than a bare `${VAR:?}` (which would kill
+the sourcing shell with bash's generic "parameter null or not set" under
+`set -u`). `RUNTIME=ec2` without all five resolved fails the same way
+`RUNTIME=fly` without `LEERIE_FLY_APP` fails: `die()` with setup instructions
+before any AWS API call. `tests/test_resolve_ec2_vars.py` covers the ladder.
 
 The sixth, **`LEERIE_EC2_INSTANCE_ID`**, is not a provisioning input —
 it is the launcher's read of the just-created instance id back into the
@@ -1554,14 +1547,9 @@ subtask wires `IamInstanceProfile` into `run-instances`.
 Fly.io app names are globally unique. `LEERIE_FLY_APP` is required when
 `RUNTIME=fly`; the launcher `die()`s with setup instructions when unset.
 
-Resolution order (highest priority first):
-
-1. **`--fly-app NAME`** / `--fly-app=NAME` CLI flag. Launcher-only
-   (stripped from `REWRITTEN_ARGS`; the orchestrator never sees it).
-
-2. **`$LEERIE_FLY_APP`** environment variable.
-
-3. **(none)** — no default, no `leerie.toml` key. Required.
+Resolution: `--fly-app NAME`/`--fly-app=NAME` CLI (launcher-only, stripped
+from `REWRITTEN_ARGS`; the orchestrator never sees it) > `$LEERIE_FLY_APP`
+env > **(none)** — no default, no `leerie.toml` key. Required.
 
 The resolved value is exported as `LEERIE_FLY_APP` and assigned to
 `FLY_APP` before any remote script is sourced. Verb paths (`stop`,
@@ -1589,13 +1577,9 @@ Default 8. Increase if the user wants workers to push harder on hard
 diagnoses; decrease for cheaper, faster runs that accept earlier
 escalations.
 
-Resolution order (highest priority first):
-
-1. **`--confidence-rounds N`** CLI flag. Argparse rejects non-positive
-   integers.
-2. **`LEERIE_CONFIDENCE_ROUNDS`** environment variable, same value set.
-3. **`leerie.toml` at the repo root**, `confidence_rounds = N`.
-4. **Default `8`** (`DEFAULT_CAPS["confidence_rounds"]`).
+Resolution: `--confidence-rounds N` CLI (argparse rejects non-positive
+integers) > `LEERIE_CONFIDENCE_ROUNDS` env > `leerie.toml`
+`confidence_rounds = N` > default `8` (`DEFAULT_CAPS["confidence_rounds"]`).
 
 An invalid value in env or file is rejected at startup via `die()`. The
 resolved value is written into `caps["confidence_rounds"]` and passed in
@@ -1664,9 +1648,8 @@ A log left inside `$USER_REPO` (e.g. via manual `leerie task | tee
 leerie-<task>.log`) is bind-mounted whole into every worker's container,
 letting a worker read its own orchestration log and defeat judge
 independence (`_warn_if_log_in_repo` detects this). The default lands
-under `LEERIE_STATE_HOST_DIR` instead — never under `$USER_REPO` — since
-it already exists, is never bind-mounted into a worker container, and is
-the convention every other per-run artifact already uses.
+under `LEERIE_STATE_HOST_DIR` instead, since it is never bind-mounted into
+a worker container.
 
 `--log-file` is registered in the launcher's `_value_flags` list (so the
 task-argument-extraction walk doesn't mistake its value for the task
@@ -1693,13 +1676,11 @@ so for the real-tty case the `-it` branch is instead wrapped in
 `script`(1) when a `--log-file` target is writable and `script` is on
 `PATH`: `script` allocates its own pty for the `nerdctl run` child (so
 nerdctl still gets a real console for `--clarify`'s interactive prompt)
-while duplicating that pty's bytes into the log file. util-linux
-`script` (Linux) takes a command via `-c <string>` (`nerdctl run` argv
-`%q`-quoted into one string); BSD `script` (macOS) takes trailing
-positional args directly. Falls back to nerdctl inheriting stdout
+while duplicating that pty's bytes into the log file. util-linux `script`
+(Linux) takes a command via `-c <string>`; BSD `script` (macOS) takes
+trailing positional args directly. Falls back to nerdctl inheriting stdout
 directly when no target is writable or `script` is unavailable. Remote
-runtimes (Fly, EC2) are out of scope — the bind-mount leak this targets
-is local-runtime-only.
+runtimes (Fly, EC2) are out of scope — local-runtime-only.
 
 ### Verbosity
 
@@ -1727,27 +1708,23 @@ Streaming log lines for Phase 5 work carry an activity prefix:
 ```
 
 The prefix is built from three per-wave counters, each its own
-` · `-separated segment when non-zero (zero-count segments are omitted,
-so `0/M`-style fragments never appear):
+` · `-separated segment when non-zero (zero-count segments omitted, so
+`0/M`-style fragments never appear): **`running N subtask(s)`** (implementer
+not yet at terminal status — no entry in `subtask_status[sid]`, or value not
+in `_TERMINAL_STATUSES = {complete, failed, blocked}`); **`N subtask(s) in
+conformer`** (implementer reached `complete`, advisory conformer phase still
+in flight); **`N subtask(s) done`** (implementer settled and, if `complete`,
+conformer also wrapped; or implementer hit `failed`/`blocked` — always
+rendered last).
 
-- **`running N subtask(s)`** — implementer not yet at terminal status
-  (no entry in `subtask_status[sid]`, or value not in
-  `_TERMINAL_STATUSES = {complete, failed, blocked}`).
-- **`N subtask(s) in conformer`** — implementer reached `complete` and
-  the advisory conformer phase is still in flight (`subtask_status[sid]
-  == "complete"` and `conformance[sid]` absent).
-- **`N subtask(s) done`** — implementer settled and, if `complete`, the
-  conformer has also wrapped; or implementer hit `failed`/`blocked`
-  (terminal regardless of conformer). Always rendered last.
+The wave header `wave W of V` is the 1-based current wave index and total
+wave count, restricted to the current wave's membership
+(`waves[completed_waves]`), not the whole run. Singular/plural is rendered
+on the count (`1 subtask` vs `5 subtasks`).
 
-The wave header `wave W of V` is the 1-based current wave index and
-total wave count. Counts are restricted to the current wave's
-membership (`waves[completed_waves]`), not the whole run. Singular/plural
-is rendered on the count (`1 subtask` vs `5 subtasks`).
-
-Built by `_get_progress`; emitted only after Phase 3 schedules the
-waves, which is why classifier/planner/reconciler log lines have no
-prefix. Post-wave-loop workers (`summarizer`, `pr_writer`,
+Built by `_get_progress`; emitted only after Phase 3 schedules the waves,
+which is why classifier/planner/reconciler log lines have no prefix.
+Post-wave-loop workers (`summarizer`, `pr_writer`,
 `_run_final_conformance`) also emit no prefix.
 
 `_invoke` takes `progress` as a callable, not a spawn-time snapshot, and
@@ -1765,14 +1742,13 @@ or `inputvalidationerror` case-insensitively), the latched payload is logged
 beside the rejection, then cleared so a later unrelated failure can't
 re-print a stale payload.
 
-Emitted at every verbosity (a failure diagnostic, not per-event
-activity), gated narrowly so an ordinary tool failure never drags an
-unrelated structured payload into the log. Rationale: the rejection text
-names offending fields but never echoes what was submitted, so the
-commonest worker failure signature was undiagnosable from a log; the
-`InputValidationError` (unparseable JSON) path already logged its
-payload, this closes the gap for the parseable-but-invalid case. Pinned
-by `tests/test_rejected_payload_logging.py`.
+Emitted at every verbosity (a failure diagnostic, not per-event activity),
+gated narrowly so an ordinary tool failure never drags an unrelated
+structured payload into the log. The rejection text names offending fields
+but never echoes what was submitted, so this closes that gap for the
+parseable-but-invalid case (the unparseable-JSON `InputValidationError`
+path already logged its payload). Pinned by
+`tests/test_rejected_payload_logging.py`.
 
 #### Blocked-planner gap diagnostic
 
@@ -1787,18 +1763,13 @@ log. Returns `""` rather than `None` for absent/empty/malformed input,
 so the caller interpolates an empty gap instead of the string `"None"`.
 Pinned by `tests/test_schedule_blocked.py`.
 
-Resolution order (highest priority first):
-
-1. **`--verbosity LEVEL`** CLI flag, values `quiet` / `normal` /
-   `stream` / `debug`. Argparse rejects anything else.
-2. **`-v` / `-vv` / `-q` / `-qq`** shortcuts. These anchor to
-   `normal` (not to the resolved default), so `-v` always means
-   "show me the streaming feature" and `-q` always means "back to
-   the pre-streaming terse output", independent of what
-   env-var / TOML defaults are set to.
-3. **`LEERIE_VERBOSITY`** environment variable.
-4. **`leerie.toml`**, `verbosity = "stream"`.
-5. **Default `stream`** (`VERBOSITY_DEFAULT`).
+Resolution: `--verbosity LEVEL` CLI (`quiet`/`normal`/`stream`/`debug`;
+argparse rejects anything else) > `-v`/`-vv`/`-q`/`-qq` shortcuts (these
+anchor to `normal`, not to the resolved default, so `-v` always means "show
+me the streaming feature" and `-q` always means "back to the pre-streaming
+terse output", independent of env-var/TOML defaults) > `LEERIE_VERBOSITY`
+env > `leerie.toml` `verbosity = "stream"` > default `stream`
+(`VERBOSITY_DEFAULT`).
 
 An invalid value in env or file is rejected at startup via `die()`.
 Errors always emit at every level (clig.dev "errors emit at every
@@ -1820,13 +1791,10 @@ task references a sibling repo outside the current repo cwd — without
 fallback to `ls`/`find` even though `INSPECT_TOOLS` allowlists those
 verbs.
 
-Resolution order (highest priority first):
-
-1. **`--inspect-dir PATH`** CLI flag, repeatable.
-2. **`LEERIE_INSPECT_DIRS`** environment variable, colon-separated.
-3. **`leerie.toml`**, `inspect_dirs = "/abs/path/a,/abs/path/b"`
-   (a comma-separated string, parsed by `_read_toml_key`).
-4. **Default** `[]` (no extra directories).
+Resolution: `--inspect-dir PATH` CLI (repeatable) > `LEERIE_INSPECT_DIRS`
+env (colon-separated) > `leerie.toml` `inspect_dirs =
+"/abs/path/a,/abs/path/b"` (comma-separated, parsed by `_read_toml_key`) >
+default `[]` (no extra directories).
 
 Paths are expanded (`~` → `$HOME`) and resolved to absolute form at
 startup. Duplicates are removed. The resolved list lives on
@@ -1859,22 +1827,16 @@ are written.
 
 Resolution order (highest priority first):
 
-1. **`--judge-dir DIR`** CLI flag.
-2. **`LEERIE_JUDGE_DIR`** environment variable.
-3. **`leerie.toml`**, `judge_dir = "judge-out"`.
-4. **Default `"judge-out"`** (`JUDGE_DIR_DEFAULT`).
+Resolution: `--judge-dir DIR` CLI > `LEERIE_JUDGE_DIR` env > `leerie.toml`
+`judge_dir = "judge-out"` > default `"judge-out"` (`JUDGE_DIR_DEFAULT`).
 
 ### Heal output directory
 
-The subdirectory name (relative to `<run-dir>`) where LLM self-heal loop output
-files are written.
+The subdirectory name (relative to `<run-dir>`) where LLM self-heal loop
+output files are written.
 
-Resolution order (highest priority first):
-
-1. **`--heal-dir DIR`** CLI flag.
-2. **`LEERIE_HEAL_DIR`** environment variable.
-3. **`leerie.toml`**, `heal_dir = "heal-out"`.
-4. **Default `"heal-out"`** (`HEAL_DIR_DEFAULT`).
+Resolution: `--heal-dir DIR` CLI > `LEERIE_HEAL_DIR` env > `leerie.toml`
+`heal_dir = "heal-out"` > default `"heal-out"` (`HEAL_DIR_DEFAULT`).
 
 ### Judge model
 
@@ -1884,25 +1846,18 @@ from `MODEL_DEFAULT_PER_WORKER` and falls through to the global
 `MODEL_DEFAULT` (`sonnet`), same as every other worker per CLAUDE.md's
 model-default policy.
 
-Resolution order (highest priority first):
-
-1. **`--judge-model MODEL`** CLI flag.
-2. **`LEERIE_MODEL_JUDGE`** environment variable.
-3. **`leerie.toml`**, `model_judge = "opus"`.
-4. **Default `"sonnet"`** (`MODEL_DEFAULT`; `judge` is absent from
-   `MODEL_DEFAULT_PER_WORKER`).
+Resolution: `--judge-model MODEL` CLI > `LEERIE_MODEL_JUDGE` env >
+`leerie.toml` `model_judge = "opus"` > default `"sonnet"` (`MODEL_DEFAULT`;
+`judge` is absent from `MODEL_DEFAULT_PER_WORKER`).
 
 ### Heal model
 
-The `claude` model alias used when the self-heal skill spawns workers for patch
-generation and patched-arm replay.
+The `claude` model alias used when the self-heal skill spawns workers for
+patch generation and patched-arm replay.
 
-Resolution order (highest priority first):
-
-1. **`--heal-model MODEL`** CLI flag.
-2. **`LEERIE_MODEL_HEAL`** environment variable.
-3. **`leerie.toml`**, `model_heal = "sonnet"`.
-4. **Default `"sonnet"`** (`MODEL_DEFAULT_PER_WORKER["heal"]`).
+Resolution: `--heal-model MODEL` CLI > `LEERIE_MODEL_HEAL` env >
+`leerie.toml` `model_heal = "sonnet"` > default `"sonnet"`
+(`MODEL_DEFAULT_PER_WORKER["heal"]`).
 
 ### PR-writer model
 
@@ -1912,12 +1867,9 @@ log, and a sampled diff, then emits `{title, body, used_template}`. The
 host launcher reads the result from `run.json` and passes it to
 `gh pr create`.
 
-Resolution order (highest priority first):
-
-1. **`--pr-writer-model MODEL`** CLI flag.
-2. **`LEERIE_MODEL_PR_WRITER`** environment variable.
-3. **`leerie.toml`**, `model_pr_writer = "sonnet"`.
-4. **Default `"sonnet"`** (`MODEL_DEFAULT_PER_WORKER["pr_writer"]`).
+Resolution: `--pr-writer-model MODEL` CLI > `LEERIE_MODEL_PR_WRITER` env >
+`leerie.toml` `model_pr_writer = "sonnet"` > default `"sonnet"`
+(`MODEL_DEFAULT_PER_WORKER["pr_writer"]`).
 
 ### PR template selector
 
@@ -1928,12 +1880,9 @@ When the target repo has multiple PR templates inside a
 single top-level template (e.g. `.github/pull_request_template.md`) or
 no template at all.
 
-Resolution order (highest priority first):
-
-1. **`--pr-template NAME`** CLI flag.
-2. **`LEERIE_PR_TEMPLATE`** environment variable.
-3. **`leerie.toml`**, `pr_template = "bug"`.
-4. **Default**: alphabetically first `.md` in the discovered directory.
+Resolution: `--pr-template NAME` CLI > `LEERIE_PR_TEMPLATE` env >
+`leerie.toml` `pr_template = "bug"` > default: alphabetically first `.md`
+in the discovered directory.
 
 An override that does not match an existing template is **not fatal** —
 finalize must not block over a cosmetic preference — leerie logs a
@@ -1947,13 +1896,10 @@ fork-point, which always stays `working_branch` regardless of this
 override — overloading `working_branch` for both roles would corrupt the
 diff base if the override branch weren't the actual fork point.
 
-Resolution order (highest priority first), via `resolve_pr_base_branch`
-(mirrors `resolve_pr_template`'s `_resolve_str_pref` delegation):
-
-1. **`--pr-base-branch BRANCH`** CLI flag.
-2. **`LEERIE_PR_BASE_BRANCH`** environment variable.
-3. **`leerie.toml`**, `pr_base_branch = "release/1.0"`.
-4. **Default**: `working_branch`.
+Resolution (via `resolve_pr_base_branch`, mirroring `resolve_pr_template`'s
+`_resolve_str_pref` delegation): `--pr-base-branch BRANCH` CLI >
+`LEERIE_PR_BASE_BRANCH` env > `leerie.toml` `pr_base_branch =
+"release/1.0"` > default: `working_branch`.
 
 The resolved value is written to `state.json` and `run.json` as
 `pr_base_branch`, alongside the unmodified `working_branch`.
@@ -1989,14 +1935,12 @@ detail past the cut-off.
 | `PR_WRITER_DIFF_SAMPLE_MAX_LINES`| 500    | sampled `git diff` hunks (line-capped because individual diff lines can be long and breaking one mid-line would render the surrounding hunk unreadable) |
 | `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES` | 8,000 | serialized JSON length of the `final_conformance` payload field. Enforced inside `_final_conformance_payload` by trimming `warnings` (then `residuals`) from the tail; at least one of each is preserved and a `truncated: true` marker is added when trimming fired |
 
-These are **module constants, not `DEFAULT_CAPS` entries**, by design.
-`DEFAULT_CAPS` is the surface for run-wide operational caps intended to
-be user-tunable (`max_total_workers`, `worker_timeout_sec`,
-`worker_memory_max_bytes`, etc.). The PR-writer caps are internal
-protocol limits bounding a single worker invocation's LLM context:
-lowering them silently degrades summaries, raising them risks
-overwhelming the worker's context rather than defending an argv
-ceiling. `tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
+These are **module constants, not `DEFAULT_CAPS` entries**, by design:
+`DEFAULT_CAPS` is the surface for user-tunable run-wide operational caps
+(`max_total_workers`, `worker_timeout_sec`, `worker_memory_max_bytes`,
+etc.), while the PR-writer caps are internal protocol limits bounding a
+single worker invocation's LLM context.
+`tests/test_pr_writer_payload_cap.py::test_pr_writer_byte_budgets_defined`
 pins the values.
 
 Multi-byte UTF-8 safety: `_cap_text` slices at the byte boundary, then
@@ -2089,16 +2033,12 @@ diverge again later). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `rebaser` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
 defaults come from the global `MODEL_DEFAULT` fallback.
 
-Resolution order for each worker type `W` (highest priority first):
-
-1. **`--model-<W>`** CLI flag (e.g. `--model-implementer opus`)
-2. **`--model`** CLI flag (sets the global default for this run)
-3. **`LEERIE_MODEL_<W>`** env var (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`)
-4. **`LEERIE_MODEL`** env var (sets the global default)
-5. **`model_<w>`** key in `leerie.toml`
-6. **`model`** key in `leerie.toml`
-7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
-8. **Global default `MODEL_DEFAULT`** (`sonnet`)
+Resolution for each worker type `W` (highest priority first): `--model-<W>`
+CLI (e.g. `--model-implementer opus`) > `--model` CLI (sets the global
+default) > `LEERIE_MODEL_<W>` env (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`) >
+`LEERIE_MODEL` env (global default) > `model_<w>` key in `leerie.toml` >
+`model` key in `leerie.toml` > per-worker default from
+`MODEL_DEFAULT_PER_WORKER` > global default `MODEL_DEFAULT` (`sonnet`).
 
 Twenty worker types (plus the global override), each independently overridable:
 
@@ -2158,12 +2098,10 @@ reasoning depth. Leerie pins effort per worker so judgment workers think to a
 consistent depth across runs — the previous behavior (no `--effort` flag,
 worker inherits whatever the user's Claude settings happen to default to)
 was a hidden source of cross-run variance in subtask count and other
-judgment-shaped outputs.
-
-The `claude -p` CLI exposes **no `--temperature` and no `--seed`**, so
-sampling stochasticity cannot be pinned. Effort is the strongest dial
-available; it does not eliminate run-to-run variance but does remove the
-"this run thought harder than that one" axis.
+judgment-shaped outputs. The CLI exposes **no `--temperature` and no
+`--seed`**, so sampling stochasticity cannot be pinned; effort is the
+strongest available dial, removing the "this run thought harder than that
+one" axis without eliminating run-to-run variance entirely.
 
 **Per-worker defaults: `medium` for judgment workers, `low` for the
 code-writing acting workers, unset for post-run skill workers.**
@@ -2228,17 +2166,13 @@ overrides `implementer` and `conformer` to `"low"` — a distinct,
 cost-motivated pin rather than a judgment-reproducibility one, so it is
 called out separately from the `"medium"` judgment cohort above.
 
-Resolution order for each worker type `W` (highest priority first), mirroring
-model selection:
-
-1. **`--effort-<W>`** CLI flag (e.g. `--effort-planner max`)
-2. **`--effort`** CLI flag (sets the global default for this run)
-3. **`LEERIE_EFFORT_<W>`** env var (e.g. `LEERIE_EFFORT_PLANNER=max`)
-4. **`LEERIE_EFFORT`** env var (sets the global default)
-5. **`effort_<w>`** key in `leerie.toml`
-6. **`effort`** key in `leerie.toml`
-7. **Per-worker default** from `EFFORT_DEFAULT_PER_WORKER`
-8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
+Resolution for each worker type `W` (highest priority first, mirroring model
+selection): `--effort-<W>` CLI (e.g. `--effort-planner max`) > `--effort`
+CLI (global default) > `LEERIE_EFFORT_<W>` env (e.g.
+`LEERIE_EFFORT_PLANNER=max`) > `LEERIE_EFFORT` env (global default) >
+`effort_<w>` key in `leerie.toml` > `effort` key in `leerie.toml` >
+per-worker default from `EFFORT_DEFAULT_PER_WORKER` > global default
+`EFFORT_DEFAULT` (`None` — flag omitted).
 
 | Worker             | env var                            | CLI flag                      | TOML key                   |
 |--------------------|------------------------------------|-------------------------------|----------------------------|
