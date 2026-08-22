@@ -3731,74 +3731,61 @@ runs only; non-cycling runs pay nothing extra.
 The recommendation heuristic is deterministic:
 
 1. **Exactly one edge in the SCC is a planner-declared `depends_on`** →
-   recommend `drop_require` on the rename that closes the reverse
-   direction (planner ordering wins; the reconciler's rename is the drift).
-2. **Else SCC members share `files_likely_touched`** → recommend
-   `merged_subtasks(into, from)` where `into` is the smaller subtask by
-   `success_criteria_seed` length (tie-break: lexicographic sid) — they
-   author the same file, so one commit does both pieces of work.
-3. **Else** → recommend `drop_require` on the rename whose `from` tag
-   had no planner-declared producer in the pre-reconcile graph (the
-   rename was speculative — dropping the requirement is structurally honest).
+   `drop_require` on the rename that closes the reverse direction
+   (planner ordering wins).
+2. **Else SCC members share `files_likely_touched`** → `merged_subtasks(into,
+   from)`, `into` = smaller subtask by `success_criteria_seed` length
+   (tie-break: lexicographic sid).
+3. **Else** → `drop_require` on the rename whose `from` tag had no
+   planner-declared producer pre-reconcile (speculative rename).
 4. **Tie-breaker of last resort** → drop the lexicographically later rename.
 
-The retry prompt presents the recommendation as the answer, not as one of
+The retry prompt presents the recommendation as the answer, not one of
 several options, and explicitly forbids `unresolvable` for cycle
-resolution — the model must commit to one of the bounded operations or
-echo the recommendation. The mechanical floor (gate + must-include) is
-the guarantee; the recommendation primes the model toward the correct answer.
+resolution — the mechanical floor (gate + must-include) is the
+guarantee; the recommendation primes the model toward it.
 
-**Unresolved-requires retry loop.** Symmetric architecture to the
-cycle-resolution loop, fired by a different gate. When the post-mutation
-`_compute_unresolved_requires` set is non-empty (after the cycle gate
-has already cleared), `phase_reconcile` deep-copies the pre-mutation
-plans, computes a string-similarity recommendation per unresolved entry
-(in `_recommend_unresolved_resolution`), builds a retry prompt (in
-`_build_unresolved_retry_prompt`) that surfaces the unresolved
-`(sid, tag)` pairs, the top-3 candidate `provides` ranked by Jaccard,
-the recommendation (if computed), and the bounded must-include set,
-then respawns the reconciler once. Maximum two attempts total; cost
-mirrors the cycle retry.
+**Unresolved-requires retry loop.** Symmetric architecture, fired by a
+different gate: when post-mutation `_compute_unresolved_requires` is
+non-empty (cycle gate already clear), `phase_reconcile` deep-copies the
+pre-mutation plans, computes a string-similarity recommendation per
+unresolved entry (`_recommend_unresolved_resolution`), builds a retry
+prompt (`_build_unresolved_retry_prompt`) naming the unresolved `(sid,
+tag)` pairs, top-3 candidate `provides` ranked by Jaccard, the
+recommendation (if any), and the must-include set, then respawns the
+reconciler once (max two attempts). Two guards filter candidates before
+scoring — a self-loop guard (skip the consumer's own sid) and an
+extent-aware guard (`in_plan` only). Cases (first match wins):
 
-The recommendation heuristic is deterministic but framed as a *hint*
-(not the answer), since the underlying signal is textual string
-similarity and can produce false friends. Two guards filter candidates
-before scoring: a **self-loop guard** skips candidates whose provider is
-the consumer's own sid, and an **extent-aware** guard admits only
-`extent: in_plan` entries. Cases (first match after guards wins):
+1. Unique top match, Jaccard ≥ 0.5 → `rename(sid, from=tag, to=top.tag)`.
+2. Top match, Jaccard ≥ 0.7 (even if not unique) → same.
+3. Else → no recommendation; model picks unaided (the common case).
 
-1. **Unique top match with Jaccard ≥ 0.5** → recommend
-   `rename(sid, from=tag, to=top.tag)`.
-2. **Top match with Jaccard ≥ 0.7 (even if not unique)** → same.
-3. **Else** → no recommendation; model picks unaided (the common case —
-   most post-mutation unresolved entries lack a strong-similarity
-   candidate).
-
-`unresolvable` IS valid for this retry (unlike the cycle retry's
-strict forbid) — if no real producer exists for the tag, surfacing
-that cleanly is the right answer. The mechanical floor (must-include
-validator + post-retry unresolved + cycle re-check) catches every
-malformed revision; the recommendation is best-effort.
+`unresolvable` IS valid for this retry (unlike the cycle retry's strict
+forbid) — if no real producer exists, surfacing that cleanly is right.
+The mechanical floor (must-include validator + post-retry unresolved +
+cycle re-check) catches every malformed revision; the recommendation is
+best-effort.
 
 ### Phase 2¾ checks — `phase_overlap_judge`
 | Check | Catches |
 |-------|---------|
-| **deterministic duplicate-provider floor** (`check_duplicate_providers(plans) -> list[str]`, `DUPLICATE_PROVIDER`) — runs **before** the cheap-skip and independently of `--skip-overlap-judge`, so it is evaluated on every path including single-planner runs and a `plan_overlap_judge` `WorkerError` | two subtasks that declare the **same `provides` tag** AND whose `files_likely_touched` intersect (paths canonicalized with `_normalize_artifact_path`, the same helper `check_overlap_judge_output`'s `NO_FILE_OVERLAP` uses — it strips a leading `/`, which `os.path.normpath` keeps, so `/src/x.ts` and `src/x.ts` are not read as distinct files) — i.e. two subtasks doing the same work to the same file. Pure set logic over structured planner fields; no prose is read (DESIGN *Language-to-JSON*). **Exclusion (load-bearing):** pairs sharing a non-`None` `_cofile_cluster` are the deliberate sub-file region splits of one file (§5½ (P1) *Sub-file*) and are never flagged — without it the rule floods the corpus with false positives on legitimate sub-file splits, drowning the genuine duplicate-work cases it exists to catch. An "already ordered by `depends_on`" exemption is deliberately **not** implemented — no such pairs have been observed, so adding it would be untested speculation. `check_duplicate_providers` itself remains advisory (`log()` only) and unchanged — see the routing row below for the M11 resolution step. |
-| **duplicate-provider merge routing** (`_duplicate_provider_merge_collisions(plans) -> list[dict]`, applied via `_apply_overlap_collisions`) — M11 DECISION: the floor's detections are resolved, not just logged | a standalone mirror of `check_duplicate_providers`'s detection logic (same `_cofile_cluster` exclusion, same `_normalize_artifact_path` file-overlap test) that synthesizes one `resolution: "merge"` collision per flagged pair and feeds them through the **same** `_apply_overlap_collisions` the judge's own output uses — reusing its per-resolution `_would_cycle_after` guard, `skipped_redundant` dedup, and (for the N-way case) its anchor + transitive `survivor_of` cluster resolution, rather than reimplementing any of that. Runs immediately after the advisory log lines, above every cheap-skip, so it fires on single-planner plans and `--skip-overlap-judge` runs too — exactly the paths where the judge itself never gets a chance to resolve the collision. Safe for the 3-participant (or larger) case specifically because `_apply_overlap_collisions`'s transitive chase is a *merge* chase: unlike the `_apply_multidrop` cluster path (a separate mechanism for `drop_*`, not reused here), a merge's intent assembly carries the absorbed subtask's full intent forward, so no live subtask's intent is silently discarded — a triangle of duplicate-provider pairs (A↔B, A↔C, B↔C) collapses to one survivor with the closing edge recorded as `skipped_redundant`, never a dangling dependency target. Persists the post-apply mutation summary (same shape as `plan_overlap_applied`) to `state.data["duplicate_provider_merge_applied"]`, absent when the floor found nothing to merge. |
-| **cheap-skip when impossible** (fewer than 2 planners contributed subtasks, OR total subtask count < 2) | spurious worker spawn on single-planner / trivial runs. No `plan_overlap_judge` call in `calls.ndjson`; log line `phase 2¾: overlap-judge skipped (single planner)` or `… (< 2 subtasks)` at normal verbosity. |
-| judge output validated against `SCHEMAS["plan_overlap_judge"]` | malformed judge response (caught by `claude_p`'s schema gate; structurally invalid output retried once, then escalated per the standard policy). |
-| **merge-feasibility backstop** (`_validate_overlap_judge_output`) — every collision with `resolution == "merge"` must carry non-empty `merge_feasibility` | the judge skipping the merge-feasibility discipline section in `prompts/plan_overlap_judge.md`. Per `DESIGN.md §12` (prompts advisory, code enforces): the prompt asks for `merge_feasibility` whenever `merge` is emitted, and Python rejects a `merge` without it. `die()` with the offending pair (`a_sid`/`b_sid`/`artifact`). |
-| **`merge` apply step** (`_apply_overlap_merge`) | collapse the two subtasks: surviving sid is the lexicographically smaller id by default (a determinism device — same merged plan regardless of pair argument order) OR the value of the optional `survivor_hint` parameter when the caller is applying the anchor-survivor rule for a cluster. Surviving subtask gets the union of `files_likely_touched`, `provides`, `requires`, `depends_on` (with self-references removed); `title` becomes `"{survivor.title} + {dropped.title}"`; `intent` is the concatenation of the survivor's existing intent, the absorbed subtask's full existing intent (under a `--- Absorbed intent from {dropped.id} ---` marker), and a trailing `"Merged with {dropped.id} by plan-overlap-judge:\n{judge.merge_feasibility}"` note. Carrying the absorbed subtask's intent is required by the DESIGN §5 *merge_feasibility carry-forward* invariant: any merge_feasibility statement previously appended to the absorbed subtask's intent (from an earlier merge where it was a survivor) must be preserved. `success_criteria_seed` becomes `"{survivor.criteria} AND {dropped.criteria}"`. Downstream subtasks whose `depends_on` referenced the dropped sid are rewritten to point at the surviving sid. Records the mutation in `state.data["plan_overlap_applied"]`. |
-| **`drop_a` / `drop_b` apply step** (`_apply_overlap_drop`) | remove the dropped sid; union the dropped subtask's `provides` tags into the survivor's `provides` (deduped, order-preserving — without this union, any downstream `requires` that matched the dropped subtask's tags would orphan into a confusing `_validate_plan` error rather than resolving cleanly against the survivor); drop any survivor `extent: in_plan` requires whose tag is now in the post-union provides (would-be graph self-loop, mirrors `_apply_overlap_merge`); rewrite downstream `depends_on` references from the dropped sid to the survivor. Title / intent / success_criteria_seed are NOT copied from the dropped subtask — the judge said one intent supersedes the other, so the survivor's intent is the intent that wins; only the capability-graph wiring is unioned. |
-| **anchor-survivor rule** (`_apply_overlap_collisions` + `_compute_overlap_anchors`) — pairwise collisions resolve into a coherent cluster decision | shared-endpoint clusters where one subtask appears in 2+ non-`unresolvable` collisions (an *anchor*, e.g. judge emits both `merge(A, B)` and `merge(A, C)` because A overlaps with B on one artifact and with C on another). The apply loop passes `survivor_hint=anchor_sid` into `_apply_overlap_merge` when exactly one of the pair's endpoints is in the anchor set, so the anchor survives that merge (overriding the default lex-smaller rule, which is a determinism device with no semantic content). In the all-merge cluster above the anchor is indeed the broader subtask, but that is a property of *that shape*, not of anchor membership — membership is bare appearance count and a sid dropped twice is an anchor too (see `:3194`). When both endpoints are anchors — legitimate within a single connected cluster, e.g. the closing edge of a triangle — the rule falls through to lex-smaller; the merged subtask still carries forward every prior `merge_feasibility` via the absorbed-intent block (DESIGN §5 carry-forward invariant). A `survivor_of: dict[str, str]` map rewrites later pairs against earlier survivors so a partner already absorbed into the anchor isn't looked up as a stale endpoint. Pairs whose endpoints have both rewritten to the same survivor (the redundant closing edge of a connected cluster) are recorded as `skipped_redundant` entries in `state.data["plan_overlap_applied"]`. Every emitted collision is accounted for in that audit trail, though **not** always one-entry-per-collision: a multi-drop cluster (next row) collapses its N collisions into a single `multi_drop_*` entry whose `surviving_sids` names every partner the judge paired against the dropped sid. Anchors are computed over **all** non-`unresolvable` collisions — every resolution type, either side of the pair, single drops and multi-drop clusters alike, including the cluster collisions the pairwise loop then skips (DESIGN §5). Membership is bare appearance count and carries **no** semantic claim: a sid the judge dropped twice is an anchor too, it simply never survives to use the hint. Do not read it as "the subtask that absorbs its partners" — that is false on roughly a third of the resolution combinations (e.g. `merge(S,P)` + `drop_a(S,Q)` makes S an anchor while S survives only one of the two). The pairwise judge protocol stays simple; cluster decisions are enforced in code, not in the prompt (DESIGN §12). `_apply_overlap_drop` has a `dropped_sid == surviving_sid` self-loop guard as defense in depth against future callers reaching it with a self-collapsed pair. |
-| **keep-and-delete consistency gate** (`_validate_overlap_judge_output` + `_contradictory_drop_sids`) — self-contradictory output die()s before any mutation | a `drop_*` whose `dropped_sid` *survives* another collision in the same output — kept as a merge endpoint, or as the non-dropped side of another `drop_*`. One claim deletes the subtask, another keeps it (X must both survive and vanish), and no apply order satisfies both. die() with the sid, the partner sid, the artifact, and the suggested resolution (refine task or downgrade to `unresolvable`). **The predicate is `_contradictory_drop_sids` (survives-somewhere ∧ dropped-somewhere), NOT `_compute_overlap_anchors`** — the two sets are deliberately distinct and conflating them is the defect this gate was rewritten to remove. `_compute_overlap_anchors` stays appearance-based because its one consumer, the merge `survivor_hint` rule (previous row), needs it that way. A sid dropped by 2+ collisions therefore *is* an anchor by appearance, but is **not** a contradiction — nothing claims it survives — and must not die() here; that is the multi-drop shape (next row), coherent output explicitly sanctioned by `prompts/plan_overlap_judge.md`. Gating on anchor membership instead killed runs whose judge output was correct, after full planner spend, unrecoverably (this phase precedes `_write_plan()`). (Earlier iterations also gated `merge`-between-two-anchors, but the apply loop's natural semantics — fall-through to lex-smaller with absorbed-intent carry-forward — handles every observed multi-anchor shape cleanly, so the check was removed as over-aggressive.) |
-| **duplicate-pair rule** (`check_overlap_judge_output` `DUPLICATE_PAIR` + `_validate_overlap_judge_output` coalescing, keyed on `_collision_effect`) — a pair may repeat only when every row has the same *effect* | one pair colliding on **several artifacts**. The judge may encode this either way: a single row whose `artifact_paths` lists every overlapping file, or one row per artifact (DESIGN §5 *Multi-artifact pair*). When it emits one row per artifact, `_apply_overlap_collisions` already absorbs the repeat as `skipped_redundant`. Effect-identical rows (same resolved dropped sid, or same unordered merge pair) are coalesced into one collision keeping every `artifact` and `merge_feasibility`. Rows whose effects **differ** — `drop_a` on (A,B) plus `drop_a` on (B,A) deletes both subtasks; a `drop` mixed with a `merge` on one pair keeps and deletes the same sid — surface as a `DUPLICATE_PAIR` issue *inside* the retry loop, so the judge gets a round to fix it, and are terminal at the keep-and-delete gate above if it does not (on a two-sid pair any effect difference necessarily makes one sid both dropped and surviving, so that gate covers every conflicting shape; `tests/test_phase_overlap_judge.py` freezes the full 4×3 matrix). **`resolution` alone is the wrong signal** — swapped-endpoint `drop_a` rows share a resolution string and delete opposite subtasks. Gating on bare pair repetition (the pre-fix behavior) `die()`d coherent output at a validator that runs *after* `_run_checked_loop` and therefore cannot be retried — a real run was killed this way after significant planning spend. |
-| **multi-drop cluster apply** (`_apply_multidrop` inside `_apply_overlap_collisions`) — one sid dropped by 2+ collisions is applied as a single whole-cluster operation, never by replaying the pairs | the judge finding one subtask's surface jointly covered by several siblings (DESIGN §5 *Multi-drop*). Replaying the pairs through the `survivor_of` transitive rewrite is **silent corruption**: pair 2's `_resolve` maps the already-dropped endpoint onto pair 1's survivor, so the loop drops *that* subtask instead — a live, wanted subtask the judge never named — fabricating a supersedure claim between two subtasks the judge never compared. `_apply_overlap_drop` discards title/intent/success_criteria_seed by design, so the loss is unrecoverable; damage scales with cluster size (a 3-collision cluster destroys 3 of 4 subtasks). Instead: union the dropped subtask's `provides` into **every** named survivor, drop each survivor's now-self-looping `extent: in_plan` requires, remove the dropped subtask once, and fan inbound `depends_on` references out to **all** survivors (deduped, self-refs removed) — the same fan-out rule `_remap_vanished_deps` uses, and semantically right because the dropped subtask's work is genuinely split across its survivors. Because the fan-out *adds* edges it can close a cycle no individual pair would, so it is guarded by `_would_cycle_after` with a three-tier ladder: `multi_drop_fanout` (acyclic, full fan-out) → `multi_drop_degraded_single` (fan-out would cycle; fall back to `sorted(survivors)[0]` alone via `_apply_overlap_drop`) → `skipped_would_cycle` (both would cycle; keep the subtask, leave the overlap to the integrator). Survivors are sorted so the outcome is independent of the order the judge emitted its pairs, satisfying `_schedule()`'s determinism contract. Each tier records its action in `state.data["plan_overlap_applied"]`. Tier 3 records `action: "skipped_would_cycle"` with `resolution: "multi_drop"` — the action alone is indistinguishable from a pairwise merge/drop skip, so the phase-summary counters key on the `resolution` field to attribute it to the multi-drop bucket. The counters must partition: every emitted `(action, resolution)` shape lands in exactly one bucket and the parts sum to `len(applied)`. Single-drop collisions and merges are unaffected and continue through the existing loop, including legitimate transitive chains (X dropped for A, then A genuinely dropped for B) which still apply both drops. |
-| **`unresolvable` → `die()`** at plan time | genuine API contradictions the judge correctly refuses to silently auto-merge. The abort message names both sids, the colliding artifact, the judge's reason, and the suggested next step (revise the task and re-run: either disambiguate the disputed surface, or narrow the task so a single planner owns it). The message must not suggest `resume`: this phase precedes `_write_plan()`, so `<run-dir>/subtasks/` is still empty and `state.json` has no `waves` key — `_run_phases()` dies on any resume attempt. Strictly better than the multi-hour wave-N integrator design-conflict crash this phase exists to prevent. |
-| **per-resolution cycle avoidance** (`_would_cycle_after` inside `_apply_overlap_collisions`) — checked before each `merge` / `drop_a` / `drop_b` apply | a collision resolution's dependency-union (survivor inherits the absorbed subtask's `provides`/`requires`/`depends_on` plus downstream `depends_on` rewrites) can introduce a transitive cycle absent from the post-reconcile graph (phase 2½'s acyclicity gate passed before these resolutions ran). Before applying each resolution, `_would_cycle_after(plans, apply_fn)` deep-copies `plans`, applies the resolution to the copy, rebuilds the predecessor graph via `_build_predecessor_graph`, and runs `_tarjan_sccs`. If the resolution *would* cycle, it is skipped (`skipped_would_cycle`; see next row) and both subtasks are kept separate for the integrator. The check is side-effect-free (operates on the copy) and runs against the *current live* `plans` so it sees every earlier-applied resolution. Covers `drop_*` too, because `_apply_overlap_drop` also unions `provides` and rewrites `depends_on`. |
-| **post-merge acyclicity backstop** — Tarjan SCC on the final post-merge graph, immediately after `_apply_overlap_collisions` returns | with per-resolution avoidance above in place, this gate must never fire. It rebuilds the predecessor graph via `_build_predecessor_graph`, runs `_tarjan_sccs`, and on a surviving cycle `die()`s with `_format_cycle_diagnostic` output — but framed as an **orchestrator logic bug** (the tentative check and the real apply path disagreed), *not* a user-recoverable condition (per-resolution skipping already exhausted the `--skip-overlap-judge` lever). Retained as defense-in-depth against future drift between `_would_cycle_after` and the real apply, mirroring `_apply_overlap_merge`'s defensive missing-sid `die()`. |
-| **`skipped_would_cycle` audit action** (`_apply_overlap_collisions`) | a `merge` / `drop_*` whose apply would close a dependency cycle. Recorded in `state.data["plan_overlap_applied"]` as `{"action": "skipped_would_cycle", …}` with both sids, the artifact, and `resolution`; logged at normal verbosity. Crucially, `survivor_of` is **not** updated on a skip — both endpoints stay live, so later collisions referencing either endpoint resolve against a present sid (mirrors how a merge would otherwise repoint them). The judge is not re-prompted; the cycle is a global-graph property outside its pairwise-surface competence (DESIGN §5 *Cross-domain surface overlap* → *Post-merge acyclicity*). |
-| **state persistence** | full judge output written to `state.data["plan_overlap_judge"]` (for audit / replay); post-apply mutation summary written to `state.data["plan_overlap_applied"]`. Persisted before `phase_overlap_judge` returns; visible in `state.json` for resume-time replay debugging. |
+| **deterministic duplicate-provider floor** (`check_duplicate_providers(plans) -> list[str]`, `DUPLICATE_PROVIDER`) — runs **before** the cheap-skip and independently of `--skip-overlap-judge`, so it fires on every path including single-planner runs and a `plan_overlap_judge` `WorkerError` | two subtasks declaring the **same `provides` tag** whose `files_likely_touched` intersect (canonicalized via `_normalize_artifact_path`, same helper `NO_FILE_OVERLAP` uses) — duplicate work on the same file. Pure set logic (DESIGN *Language-to-JSON*). **Exclusion (load-bearing):** pairs sharing a non-`None` `_cofile_cluster` (§5½ (P1) *Sub-file*) are never flagged — otherwise legitimate sub-file splits flood the corpus with false positives. `check_duplicate_providers` remains advisory (`log()` only) — see the routing row below for the M11 resolution step. |
+| **duplicate-provider merge routing** (`_duplicate_provider_merge_collisions(plans) -> list[dict]`, applied via `_apply_overlap_collisions`) — M11: the floor's detections are resolved, not just logged | mirrors the floor's detection logic, synthesizes one `resolution: "merge"` collision per flagged pair, and feeds them through the **same** `_apply_overlap_collisions` the judge's output uses (its `_would_cycle_after` guard, `skipped_redundant` dedup, anchor + transitive `survivor_of` cluster resolution). Runs above every cheap-skip, so single-planner and `--skip-overlap-judge` runs still get collisions resolved. Safe for the 3+-participant case because the merge chase carries every absorbed subtask's intent forward — a triangle of duplicate-provider pairs collapses to one survivor with the closing edge `skipped_redundant`. Persists to `state.data["duplicate_provider_merge_applied"]`, absent when nothing merged. |
+| **cheap-skip when impossible** (fewer than 2 planners contributed subtasks, OR total subtask count < 2) | spurious worker spawn on single-planner / trivial runs. Log line `phase 2¾: overlap-judge skipped (single planner)` or `… (< 2 subtasks)`. |
+| judge output validated against `SCHEMAS["plan_overlap_judge"]` | malformed judge response (retried once, then escalated). |
+| **merge-feasibility backstop** (`_validate_overlap_judge_output`) — every `resolution == "merge"` must carry non-empty `merge_feasibility` | the judge skipping that discipline in `prompts/plan_overlap_judge.md` (§12 prompts advisory, code enforces). `die()` with the offending pair (`a_sid`/`b_sid`/`artifact`). |
+| **`merge` apply step** (`_apply_overlap_merge`) | collapses the two subtasks: surviving sid is lex-smaller by default, or the `survivor_hint` when applying the anchor-survivor rule. Surviving subtask gets the union of `files_likely_touched`/`provides`/`requires`/`depends_on` (self-refs removed); `title` becomes `"{survivor.title} + {dropped.title}"`; `intent` concatenates survivor + absorbed intent (under an `--- Absorbed intent from {dropped.id} ---` marker) + a trailing merge-feasibility note (DESIGN §5 carry-forward invariant, so an already-once-merged intent chain isn't lost). `success_criteria_seed` becomes `"{survivor.criteria} AND {dropped.criteria}"`. Downstream `depends_on` referencing the dropped sid rewritten to the survivor. Recorded in `state.data["plan_overlap_applied"]`. |
+| **`drop_a` / `drop_b` apply step** (`_apply_overlap_drop`) | removes the dropped sid; unions its `provides` into the survivor's (deduped, order-preserving, so downstream `requires` still resolve); drops any survivor `extent: in_plan` requires now self-looping; rewrites downstream `depends_on`. Title/intent/criteria are NOT copied — only capability-graph wiring is unioned. |
+| **anchor-survivor rule** (`_apply_overlap_collisions` + `_compute_overlap_anchors`) | shared-endpoint clusters where one sid appears in 2+ non-`unresolvable` collisions (an *anchor*) survive every merge they participate in via `survivor_hint=anchor_sid`, overriding the lex-smaller default. Membership is bare appearance count with **no** semantic claim — a sid dropped twice is an anchor too and simply never uses the hint; do not read it as "the subtask that absorbs its partners" (false on roughly a third of resolution combinations). When both endpoints of a pair are anchors (e.g. a triangle's closing edge), falls through to lex-smaller. A `survivor_of` map rewrites later pairs against earlier survivors; fully-redundant closing edges are recorded `skipped_redundant`. A multi-drop cluster (below) collapses its N collisions into one `multi_drop_*` entry rather than one-per-collision. `_apply_overlap_drop` has a self-loop guard as defense in depth. |
+| **keep-and-delete consistency gate** (`_validate_overlap_judge_output` + `_contradictory_drop_sids`) — self-contradictory output die()s before any mutation | a `drop_*` whose `dropped_sid` also *survives* another collision (kept as a merge endpoint or the non-dropped side of another `drop_*`) — no apply order satisfies both. die() names the sid, partner, artifact, and suggested resolution. **The predicate is `_contradictory_drop_sids` (survives-somewhere ∧ dropped-somewhere), NOT `_compute_overlap_anchors`** — conflating the two was the defect this gate was rewritten to remove; a sid dropped by 2+ collisions is an anchor by appearance but not a contradiction (that's the multi-drop shape below, sanctioned output). Gating on anchor membership instead killed runs whose judge output was correct, after full planner spend, unrecoverably. |
+| **duplicate-pair rule** (`check_overlap_judge_output` `DUPLICATE_PAIR` + `_validate_overlap_judge_output` coalescing, keyed on `_collision_effect`) — a pair may repeat only when every row has the same *effect* | one pair colliding on several artifacts (one row listing every path, or one row per artifact — DESIGN §5 *Multi-artifact pair*; the per-artifact form is absorbed as `skipped_redundant`). Effect-identical rows are coalesced keeping every `artifact`/`merge_feasibility`. Rows whose effects **differ** (e.g. swapped-endpoint `drop_a` deleting opposite subtasks, or a `drop`+`merge` on one pair) surface as `DUPLICATE_PAIR` inside the retry loop, terminal at the keep-and-delete gate if unfixed (`tests/test_phase_overlap_judge.py` freezes the full 4×3 matrix). `resolution` alone is the wrong signal — swapped-endpoint rows share a resolution string. Gating on bare pair repetition instead `die()`d coherent output past the retry loop; a real run was killed this way after significant planning spend. |
+| **multi-drop cluster apply** (`_apply_multidrop` inside `_apply_overlap_collisions`) — one sid dropped by 2+ collisions applies as a single whole-cluster operation, never by replaying the pairs | one subtask's surface jointly covered by several siblings (DESIGN §5 *Multi-drop*). Replaying pairs through `survivor_of` is **silent corruption** — pair 2 would drop a live sid the judge never named, and `_apply_overlap_drop` discards title/intent/criteria, so the loss is unrecoverable (damage scales with cluster size). Instead: union the dropped subtask's `provides` into **every** named survivor, drop each survivor's now-self-looping requires, remove the dropped subtask once, fan `depends_on` out to **all** survivors (dedup, self-refs removed — mirrors `_remap_vanished_deps`). Guarded by `_would_cycle_after` with a three-tier ladder: `multi_drop_fanout` (acyclic) → `multi_drop_degraded_single` (fan-out would cycle; fall back to `sorted(survivors)[0]`) → `skipped_would_cycle` (both would cycle). Survivors sorted for determinism. Each tier recorded in `state.data["plan_overlap_applied"]`; tier 3 keys on `resolution: "multi_drop"` to attribute it to this bucket rather than a pairwise skip — every `(action, resolution)` shape partitions and sums to `len(applied)`. |
+| **`unresolvable` → `die()`** at plan time | genuine API contradictions the judge refuses to auto-merge. Names both sids, the artifact, the reason, and the next step (disambiguate or narrow the task). Message must not suggest `resume`: this precedes `_write_plan()`, so `state.json` has no `waves` key and `_run_phases()` dies on resume. Strictly better than the multi-hour wave-N integrator crash this phase prevents. |
+| **per-resolution cycle avoidance** (`_would_cycle_after` inside `_apply_overlap_collisions`) — checked before each `merge`/`drop_a`/`drop_b` apply | a resolution's dependency-union can introduce a transitive cycle absent from the post-reconcile graph. Deep-copies `plans`, applies to the copy, rebuilds the predecessor graph, runs `_tarjan_sccs`; a would-cycle resolution is skipped (next row) and both subtasks kept separate for the integrator. Side-effect-free; sees every earlier-applied resolution. Covers `drop_*` too. |
+| **post-merge acyclicity backstop** — Tarjan SCC immediately after `_apply_overlap_collisions` returns | with per-resolution avoidance in place this must never fire; a surviving cycle `die()`s with `_format_cycle_diagnostic`, framed as an orchestrator logic bug, not user-recoverable. Defense-in-depth against future drift, mirroring `_apply_overlap_merge`'s defensive missing-sid `die()`. |
+| **`skipped_would_cycle` audit action** | a `merge`/`drop_*` whose apply would close a cycle. Recorded with both sids, artifact, resolution; `survivor_of` is **not** updated on a skip (both endpoints stay live for later collisions). The judge is not re-prompted — a global-graph property outside its pairwise competence. |
+| **state persistence** | full judge output → `state.data["plan_overlap_judge"]`; post-apply mutations → `state.data["plan_overlap_applied"]`. Persisted before the phase returns; visible for resume-time replay debugging. |
 
 The complementary `_warn_cross_planner_file_overlap()` check at phase 3
 is **kept as-is** — it now serves as a complementary signal for file-
@@ -3808,74 +3795,58 @@ permissive same-file-different-surface class).
 ### Plan validation — `_validate_plan` (after scheduling, before persisting the plan)
 | Check | Catches |
 |-------|---------|
-| **budget feasibility** — `check_budget_feasibility()` runs at the same layer as `_validate_plan`, immediately after `_schedule()` returns and before `_write_plan()` persists. Estimates remaining `claude -p` calls (implementers + conformers + integrators per wave + finalize) added to `worker_count` already spent on upstream phases, multiplied by `budget_safety_margin`, compared to `max_total_workers`. | a planner output that is mathematically too large to fit the configured `--max-workers` cap. The pre-existing runtime backstop is `State.bump_workers()` which raises `WorkerError` partway through execution; this earlier check `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value at the cheapest possible moment (no implementer has spawned yet, only the integrated commits from upstream judgment phases are sunk). Opt-out via `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml`. See §"Budget feasibility preflight" above and DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*. |
-| ids match domain prefix (`bugfix-`, `feat-`, `refactor-`, `perf-`, `test-`, `deps-`, `config-`, `docs-`) | cross-domain collisions, audit ambiguity. The planner's user prompt receives the prefix directly as `ID_PREFIX = CATEGORY_ABBREV[domain] + "-"`, so the prompt cannot drift from the validator's allowlist — both derive from the same `CATEGORY_ABBREV` map (in `leerie.py`). |
-| no `size: large` subtasks | planner OR reconciler violated the sizing constraint. The error message names the actual author via the `_added_by_reconciler` flag — "planner must split it further" for planner-authored, "reconciler must split it further (size-retry exhausted)" for reconciler-added subtasks that survived the size-resolution retry loop. The reconciler path is exercised through the phase 2½ size gate first; this row is the post-merge backstop for the planner case and the exhaustion case. |
+| **budget feasibility** — `check_budget_feasibility()` runs at the same layer, immediately after `_schedule()` and before `_write_plan()`. Estimates remaining `claude -p` calls (implementers + conformers + integrators per wave + finalize), added to `worker_count` already spent, multiplied by `budget_safety_margin`, compared to `max_total_workers`. | a planner output too large for the configured `--max-workers` cap. `State.bump_workers()` is the runtime backstop (raises `WorkerError` mid-execution); this earlier check `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` at the cheapest possible moment. Opt-out via `--skip-budget-check` / `LEERIE_SKIP_BUDGET_CHECK` / `leerie.toml`. See §"Budget feasibility preflight" and DESIGN §13. |
+| ids match domain prefix (`bugfix-`, `feat-`, `refactor-`, `perf-`, `test-`, `deps-`, `config-`, `docs-`) | cross-domain collisions, audit ambiguity. The prompt receives the prefix directly as `ID_PREFIX = CATEGORY_ABBREV[domain] + "-"`, so it cannot drift from the validator's allowlist. |
+| no `size: large` subtasks | planner OR reconciler violated the sizing constraint. Error names the actual author via `_added_by_reconciler` ("planner must split it further" vs. "reconciler must split it further (size-retry exhausted)"). This row is the post-merge backstop for both cases; the reconciler path is exercised through the phase 2½ size gate first. |
 | no empty `success_criteria_seed` | implementer has no criteria starting point |
 | every `depends_on` id exists | dangling edges silently dropped by the scheduler |
-| every `requires` entry is an object `{tag, extent, reason?}`; `extent ∈ {in_plan, external}`; `reason` non-empty when `extent: external` | malformed planner output (caught at JSON-schema validation in `claude_p`; this row is the post-merge defensive re-check) |
-| every `requires` entry with `extent: in_plan` has a provider in some subtask's `provides` | unresolvable cross-domain dependency (only `in_plan` is checked; `external` entries are explicitly out-of-graph by planner declaration) |
-| no `files_likely_touched` entry matches `_is_protected_path()` (`.leerie/`, `.git/`, or top-level `.claude/` outside the deliverable subtrees) | planner named a protected meta-directory as an implementer deliverable — the implementer would either fail `check_diff_scope` mid-run or work around the gitignore and still be rejected. Catching this at plan-validation time gives the planner a corrective-retry round instead of burning an implementer invocation. For coordination artifacts (research specs, design summaries) the planner should use `provides`/`depends_on` and the implementer's `artifacts` result field — see DESIGN §5 *Artifact passing between subtasks* — not `files_likely_touched`. |
+| every `requires` entry is `{tag, extent, reason?}`; `extent ∈ {in_plan, external}`; `reason` non-empty when `extent: external` | malformed planner output (JSON-schema-caught; this is the post-merge re-check) |
+| every `requires` entry with `extent: in_plan` has a provider in some `provides` | unresolvable cross-domain dependency (`external` entries are declared out-of-graph) |
+| no `files_likely_touched` entry matches `_is_protected_path()` (`.leerie/`, `.git/`, top-level `.claude/` outside the deliverable subtrees) | planner named a protected meta-directory as a deliverable — would fail `check_diff_scope` mid-run. Catching it here gives the planner a corrective-retry round instead of burning an implementer. Coordination artifacts should use `provides`/`depends_on` + the implementer's `artifacts` field (DESIGN §5), not `files_likely_touched`. |
 
-`_warn_cross_planner_file_overlap()` runs immediately after
-`phase_reconcile` (before `_validate_plan` and the scheduler) and **logs a
-warning, never fails**, when two planners' subtasks both list the same
-path in `files_likely_touched`. The reconciler now consumes the same shared-files signal as one input to
-the recommendation heuristic (above) when a cycle requires resolution
-— SCC members that share `files_likely_touched` get a `merged_subtasks`
-recommendation. The warning itself remains as runtime visibility for the
-user; it complements the recommendation heuristic rather than replacing
-it.
+`_warn_cross_planner_file_overlap()` runs immediately after `phase_reconcile`
+(before `_validate_plan` and the scheduler) and **logs a warning, never
+fails**, when two planners' subtasks share a `files_likely_touched` path. The
+reconciler also consumes this signal as one input to the cycle-resolution
+heuristic above (shared-file SCC members get a `merged_subtasks`
+recommendation); the warning complements rather than replaces it.
 
-`_warn_layer_gaps(plans)` runs at the same layer and surfaces two
-heuristic warnings (DESIGN §5 *Migration-surface completeness*):
-(1) any subtask's `files_likely_touched` includes a `schema.prisma`
-path but no subtask across the full plan touches seed or migration
-files — database-initialization gap; (2) any subtask's `provides`
-tags contain env/bootstrap/secret/credential keywords but no subtask
-touches `.env.example` or env documentation — env-contract gap.
+`_warn_layer_gaps(plans)` runs at the same layer, two heuristic warnings
+(DESIGN §5 *Migration-surface completeness*): (1) a `schema.prisma` path
+touched with no subtask touching seed/migration files — database-init gap;
+(2) `provides` tags with env/bootstrap/secret/credential keywords but no
+subtask touching `.env.example`/env docs — env-contract gap.
 
 `_filter_offtree_subtasks()` runs at the same layer (after
 `_warn_cross_planner_file_overlap`, before `_schedule()`) and **soft-drops
-any subtask whose `files_likely_touched` contains a path that does not
-resolve under the run's primary repo root** — the common case is a leak
-into an inspect-dir mount (`/inspect/<repo>/...`), where the planner
-named a file the implementer cannot modify because the mount is
-read-only. Drops are recorded in `state.data["dropped_subtasks"]` and
-logged per-subtask. The drop must run before `_schedule()` because
-`phase_execute` iterates `state.data["waves"]` (not the in-memory
-`subtasks` dict), and `waves` is computed by `_schedule()` — a drop
-after that point leaves `waves` referencing a sid with no spec on disk.
-A soft drop is the right shape because a `die()` here is unrecoverable:
-the resume branch in `_run_phases` does not re-run the planner pipeline
-and requires `state.data["waves"]` (only written by `_write_plan` after
-this point). When a dropped subtask provides a tag a survivor requires,
-`_validate_plan`'s existing unresolvable-requires check (above) catches
-it and dies with `<sid>: requires '<tag>' but nothing provides it —
-dependency is unresolvable and will be silently dropped` — the user
-sees both messages and re-frames the task.
+any subtask whose `files_likely_touched` resolves outside the run's primary
+repo root** — typically a leak into a read-only inspect-dir mount. Drops are
+recorded in `state.data["dropped_subtasks"]`. Must run before `_schedule()`
+since `phase_execute` iterates `state.data["waves"]` (computed by
+`_schedule()`) and a later drop would leave `waves` referencing a sid with no
+spec on disk. A soft drop, not `die()`, because resume does not re-run the
+planner pipeline and needs `state.data["waves"]`. A dropped subtask whose
+`provides` a survivor `requires` is caught by the unresolvable-requires check
+above.
 
 ### Per-subtask checks — in `_settle_subtask`, every worker result
 | Check | Catches | On failure |
 |-------|---------|-----------|
-| `_validate_result()` — `incomplete-handoff` with missing checkpoint file | session-limit no-op; `--max-turns` with no checkpoint written; **worker reaped mid-turn** (e.g. it backgrounded an expensive final step like a build that OOM-died, so `claude -p` was killed before writing a checkpoint) | **Rescued when the worktree holds commits, else Retryable** (`failure_kind="empty_handoff"`). Before failing, `_settle_subtask` calls `_branch_has_commits_ahead` (a positive-polarity bool — True only when the worktree exists, git succeeds, and there are commits; distinct from the `check_branch_has_commits` no-op gate, whose indeterminate states return `None`); **if the branch has commits ahead of the run branch the worker produced a real deliverable** — it is settled as `complete` (with the advisory conformance phase recording whatever verification step didn't finish) instead of being discarded. `fail()` would `_reset_subtask_worktree` and destroy the committed diff, then burn `failed_retries` until the run dies; the positive commit-proof keeps green work while a gone worktree / git failure is **not** rescued (never mistaken for a real deliverable). Only when there are **no** commits (a genuine no-op) does it stay retryable. The confidence gate and dirty-worktree fail are skipped for a rescued result (a reaped worker returned no confidence envelope and may have left uncommitted debris, which is discarded). See DESIGN §9. |
+| `_validate_result()` — `incomplete-handoff` with missing checkpoint file | session-limit no-op; `--max-turns` with no checkpoint written; **worker reaped mid-turn** (e.g. an OOM-killed backgrounded build before the checkpoint was written) | **Rescued when the worktree holds commits, else Retryable** (`failure_kind="empty_handoff"`). `_settle_subtask` calls `_branch_has_commits_ahead` (True only when the worktree exists, git succeeds, and there are commits ahead of the run branch — distinct from `check_branch_has_commits`'s indeterminate `None`); if there are commits ahead, the worker produced a real deliverable and is settled `complete` (advisory conformance records whatever step didn't finish) instead of discarded — `fail()` would `_reset_subtask_worktree` and destroy the committed diff. Only a genuine no-op (no commits) stays retryable; a gone worktree / git failure is never mistaken for a real deliverable. Confidence gate and dirty-worktree fail are skipped for a rescued result. See DESIGN §9. |
 | `_validate_result()` — other cross-field invariants | `handoff` with null `checkpoint_path`; `blocked` with no blocker; `failed` with no summary; `needs-clarification` with no `clarification_question` / invalid `checkpoint_path` | **Terminal** (`failure_kind="broken"`) |
-| `check_branch_has_commits()` | `complete` claim, nothing committed *and* no `artifacts` returned. A non-empty `artifacts` array on the result is a substitute deliverable (DESIGN §5 *Artifact passing between subtasks*) — research-style subtasks whose only output is structured data for downstream subtasks pass this gate without commits. | **Rescued when the criteria are already met on the run-branch HEAD, else Retryable.** Before failing a no-commits `complete`, `_settle_subtask` re-runs the `satisfied_probe` (same prompt/schema as `_filter_satisfied_subtasks`) against the subtask's `success_criteria_seed`, this time on the **run-branch HEAD** (`_compute_run_branch(st.run_id)`), not the base tree — because a sibling subtask in an earlier wave may have committed this subtask's entire deliverable during the run (DESIGN §8 *The mid-run sibling case*). (this also covers a subtask already satisfied on the base tree — the probe judges *whether* the criteria are met, not *who* met them; DESIGN §8 *Scope*). If the probe returns `satisfied`, the subtask is settled `complete` and recorded in `state.data["dropped_subtasks"]` with `reason: "already_satisfied_mid_run"` (evidence + `checked` list, same shape as the pre-schedule drop); `_settle_subtask` also writes a `state.data["conformance"][sid]` sentinel (`{result: None, warnings: [...]}`) so `_get_progress` classifies the rescued subtask as `done` rather than perpetually `in_conformer` (the real conformer is correctly skipped — a zero-commit subtask has no diff to conform). Only a subtask with a non-empty `success_criteria_seed` is probed; without a criterion there is nothing to judge, so it stays retryable. If the probe is not satisfied (a genuine lazy/broken no-op) the existing `"no_commits"` retryable path is unchanged. The probe is subordinate to the mechanical gate per DESIGN §12 and defaults to *not satisfied* on any error/uncertainty, so it can only *rescue* a real no-op, never mask one. |
+| `check_branch_has_commits()` | `complete` claim, nothing committed *and* no `artifacts` returned. A non-empty `artifacts` array (DESIGN §5 *Artifact passing*) is a substitute deliverable — research-style subtasks pass without commits. | **Rescued when the criteria are already met on the run-branch HEAD, else Retryable.** Before failing a no-commits `complete`, re-runs the `satisfied_probe` against `success_criteria_seed` on the **run-branch HEAD** (not the base tree) — a sibling subtask in an earlier wave may have committed this subtask's deliverable mid-run (DESIGN §8 *The mid-run sibling case*; also covers already-satisfied-on-base, since the probe judges *whether*, not *who*). If satisfied: settled `complete`, recorded in `state.data["dropped_subtasks"]` with `reason: "already_satisfied_mid_run"`; a `state.data["conformance"][sid]` sentinel keeps `_get_progress` from classifying it as stuck `in_conformer`. Only probed when `success_criteria_seed` is non-empty. The probe defaults to *not satisfied* on any error, so it can only rescue, never mask, a real no-op (DESIGN §12). |
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
-| `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path *except* `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented Claude Code user-deliverable subtrees — implementers may write a subagent/command/skill file there as a legitimate deliverable, but never `settings.json` or any top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (triggered when `files_likely_touched` is non-empty *and* touched > max(3× expected, 5), or when touched > 15 regardless of the planner's estimate) |
-| `_validate_checkpoint()` — on `incomplete-handoff` | required section missing; required section empty/whitespace; required section contains only a placeholder token (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing `.`/`!`/`?`/`…` ignored and repeated `?` collapsed); a path listed under `## Files touched` no longer exists in the worktree and is not flagged `[deleted]` | returns `blocked` |
-| `_retryable_failure(kind)` — on `status='failed'` returned by the worker itself | worker self-report of failure | routed through the retry policy with `failure_kind="broken"` (worker self-report has no producer to tag a more specific kind, and a self-reported failure is broken-worker territory by default); **terminal** on first occurrence |
+| `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path except `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented user-deliverable subtrees — never `settings.json` or a top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (touched > max(3× expected, 5), or > 15 regardless) |
+| `_validate_checkpoint()` — on `incomplete-handoff` | required section missing/empty/whitespace/placeholder-only (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing punctuation ignored); a `## Files touched` path no longer exists and isn't flagged `[deleted]` | returns `blocked` |
+| `_retryable_failure(kind)` — on `status='failed'` from the worker | worker self-report of failure | `failure_kind="broken"`; **terminal** on first occurrence |
 
-`_validate_result()` accepts a `complete` status regardless of what
-`criteria_results` carries — empty, missing, or with `met:false`
-entries are all valid. Per DESIGN §8 the criteria file is
-informational, not a gate. A worker's unmet-criterion self-report is
-recorded on the result for telemetry and surfaces as a warning in
-`state.json["conformance"]` alongside the conformance-phase residuals,
-but does not affect the subtask's terminal status. The criteria-file
-lock (`lock_criteria` / `verify_criteria_lock`) and the
-worker-initiated `criteria_revision_proposal` channel were both removed
-when the criteria file's load-bearing role retired — see DESIGN §9.
+`_validate_result()` accepts `complete` regardless of what
+`criteria_results` carries — empty, missing, or `met:false` entries are all
+valid (DESIGN §8: the criteria file is informational). An unmet-criterion
+self-report is recorded for telemetry and surfaces as a warning, never
+affecting terminal status. The criteria-file lock and the
+`criteria_revision_proposal` channel were both removed when the criteria
+file's load-bearing role retired (DESIGN §9).
 
 ### Per-subtask post-work conformance — in `_settle_subtask`, success path only
 
@@ -3887,73 +3858,64 @@ Implements DESIGN §9 *Post-work conformance*.
 
 | Step | Function | Behavior |
 |------|----------|----------|
-| Discover rules files | `_discover_rules_files(repo_root)` | Returns existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `docs/DESIGN-SYSTEM.md`, `docs/DESIGN_SYSTEM.md`, `docs/UI.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises. Empty list when nothing matches. The design-system candidates (`docs/DESIGN-SYSTEM.md` and spelling variants) exist so a repo's component/color/banner conventions reach both the conformer and the implementer (DESIGN §9). |
-| Run conformer | `_run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Accepts optional `extra_feedback: str \| None` — when non-None, appended to the user prompt (used for Pattern B backgrounding-retry feedback from prior round). Catches `WorkerError` and returns `None` (surfaced as a warning). The raw structured output is passed through `_expand_conformer_output()` (N29) before returning, restoring the flattened wire shape into the four arrays every downstream step below expects. |
-| Validate output | `_validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` item must cite a non-empty `rule` string; each `docs_updates` / `tests_updates` item must cite a `path` that exists. On failure → warning, loop breaks. |
-| Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions used on the implementer, re-applied to any new commits the conformer added. A scope-protected-path violation triggers `_rollback_conformer_commits()` (reset to `before_sha`) and is recorded as a warning, **not** as `failed` / `blocked`. |
-| Clobber-survival check | `_clobbered_owned_files(worktree, run_branch, impl_head_sha)` + `_blob_sha` | DESIGN §9 *No clobbering the implementer's work*. `impl_head_sha` is snapshotted **once before the round loop** (a per-round HEAD would fold in prior conformer commits and miss a round-0 clobber). Owned set = `git diff --name-only <run_branch>..<impl_head_sha>`; for each owned file, a clobber is a deletion at HEAD or a blob reverted to the base version (three-way blob compare via `_blob_sha`, which uses `git rev-parse --verify -q` to avoid the bare-`rev-parse` missing-path footgun) while a legit conformer edit leaves a distinct third blob and is not flagged. Warns **always**; under `--strict-conformer` also `_rollback_conformer_commits()` to the implementer HEAD **and blocks** — a `clobbered_files` flag threaded to the post-loop `blocked_reason` (per-subtask) / `final_blocked` (final) sets a block even when `_conformance_clean(last_res)` is True, so a clobber is never silently completed. Not auto-rolled-back in advisory mode — a legitimate revert-to-base is git-indistinguishable from a clobber. The final-tree pass applies the same guard with `base=` **a snapshot SHA** — `_merge_base_sha(staging, working_branch, staging_before_sha)`, the point the run branch forked from the working branch — and `impl_head=staging HEAD snapshotted before that pass`. **It must not be `run_branch`.** The staging worktree has the run branch checked out (`setup-run.sh`: `git worktree add "${STAGING_WT}" "${BRANCH}"`), so passing that branch name makes `_blob_sha(base_ref, f)` and `_blob_sha("HEAD", f)` resolve the same ref, `b_head == b_base` is unconditionally true, and every file the final conformer edits is reported `(reverted-to-base)`, driving `_rollback_conformer_commits` under `--strict-conformer` and reverting every legitimate final-conformer fix. The per-subtask call site is correct with `base=run_branch`: a subtask worktree sits on `leerie/subtasks/<run-id>/<sid>`, a genuinely different ref from the run branch, so the two blob lookups do not collapse. |
-| Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs the conformer if its output is malformed or residuals remain. Exhausting the cap with residuals still present is a warning, not a failure. |
-| Loop-continuation predicate | `_conformance_clean(conf_res, baseline)` + `_baseline_red_axes(baseline)` | DESIGN §9 *The signal that continues the loop is a delta, not a verdict*. Returns True (ends the loop) when nothing is left that this subtask is responsible for. `baseline` is `st.data["conformance"]["_baseline"]` or `None`, read once per phase by the caller so the predicate stays a pure function of its arguments. **Checked ahead of the red-axis exclusion (1) below: an axis with `ran && !measured` returns False.** A command that produced no verdict at all — the runner is absent, or the process died to resource exhaustion (`_axis_unmeasurable` = `_runner_missing` OR `_is_fork_exhaustion`) — is a third state, not a pass; an unmeasurable axis is not "red at baseline and therefore not ours", it is unknown. Then two exclusions, both keyed on the `_baseline_red_axes()` set (which admits only names in `_BLT_AXES`, so a junk entry cannot widen it): (1) an axis with `ran && !passed` whose name is red at baseline does not block; (2) a `rule_violations_residual` entry whose **`axis` field** is red at baseline does not block. Everything else blocks exactly as before — a residual under any other rule, an *unlabelled* residual, and a failure on an axis that was *green* at baseline (a real regression). The axis is read from the schema field, never inferred from the `rule`/`why_not_fixed` prose: that would be regex on an LLM's response (*Language-to-JSON*), and `why_not_fixed` is not stable enough to compare anyway. `axis` is optional on the schema and gating on absence (one decision, not two — see the schema comment and `check_production_evidence`'s precedent), normalised in `_expand_conformer_output` so this stays a plain set test. `baseline=None` (skipped via `--skip-base-baseline`, not yet captured, or malformed) reproduces the pre-change absolute-verdict behaviour byte-for-byte. |
-| Axis selection | `resolve_blt_scoped(repo_root)` + `_changed_files(worktree, run_branch)` + `_select_subtask_axes(blt, scoped, files, base_ref, mode, test_globs)` | DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*. Resolved ONCE per subtask, before the round loop — the changed-file set is the implementer's diff, and a conformer's own commits do not widen what the subtask is responsible for. `mode` is `st.data["subtask_tests"]`. `resolve_blt_scoped` reads `test_scoped`/`build_scoped` from `.leerie/config.toml` (added to `_load_blt_config`'s key tuple), else infers exactly two: `npx vitest related --run {files} --passWithNoTests` when a `vitest.config.*`/`vitest.workspace.*` exists, `npx jest --findRelatedTests {files} --passWithNoTests` for `jest.config.*`, and `npx tsc --noEmit` as `build_scoped` when a `tsconfig.json` exists and the canonical build is not already `tsc`-shaped. Kept in a SEPARATE function from `_infer_build_lint_test` so the launcher's mirrored bash inference and its parity guard (`tests/test_config_verb.py`) stay untouched. No pytest inference (a `{files}` render of a changed `orchestrator/leerie.py` collects nothing) and no lint tier (lint measured at 0.4 h across a 51 h run). `_changed_files` uses `git diff -z --name-only <base>..HEAD`: `-z` because git C-quotes paths containing spaces or non-ASCII, so `splitlines()` returns a literal that does not exist on disk. `_render_scoped` `shlex.quote`s each path and returns None when a `{files}` template has no files — rendering the bare runner would run EVERYTHING. A template may instead ask for `{test_files}`, which substitutes only the members of the changed set satisfying `_is_test_file` and applies the SAME absence rule — a diff carrying no test file renders nothing and falls back to canonical. That tier exists for runners with no source→test impact analysis: pytest takes paths and collects under them, so a non-test path is an ERROR, not a no-op (`pytest docs/DESIGN.md` exits 4, and one such path poisons an otherwise-valid invocation — `pytest docs/DESIGN.md tests/test_blt_semaphore.py` also exits 4). `_is_test_file(path, globs)` matches a `tests/`|`test/`|`spec/` path segment or a `test_*.py`|`*_test.*`|`*.test.*`|`*.spec.*` basename; `test_file_globs` in `.leerie/config.toml` (space-separated `fnmatch` patterns, added to `_load_blt_config`'s key tuple) REPLACES the built-ins when set. `resolve_test_file_globs(repo_root)` reads that key and is what `_run_conformance_phase` passes as `test_globs`. `_render_scoped` also hard-skips a template naming a placeholder this version cannot substitute (`_UNKNOWN_PLACEHOLDER_RE`, once-per-process warning via `_warn_unknown_placeholder_once`), falling back to canonical rather than shipping a literal brace to the shell — `pytest '{test_files}'` exits 4, so an unguarded skew between a newer committed `.leerie/config.toml` and an older installed orchestrator (`/opt/leerie-image`, updated only by install.sh) turns EVERY subtask RED. The scan runs against the TEMPLATE with known placeholders stripped, never the rendered command: a changed-file path may legitimately contain braces, and scanning after substitution both disables the proxy and misdiagnoses the cause as install skew. Any axis whose proxy does not resolve falls back to the canonical command; the returned scope label is `scoped` only if at least one axis actually used a proxy |
-| Measure (pre / post) | `_measure_axes(worktree, axes, st, caps, ...)` | Run immediately before the conformer round (its results become the prompt's `BLT_RESULTS:` block) and again immediately after (its results overwrite the worker's self-report). Memoised via `blt_results`, so the post measurement is free whenever the round committed nothing — measured, 182 of 224 rounds. `--subtask-tests off` yields `{}` and skips both. Each axis command is bounded by `caps["worker_timeout_sec"]` (5400 s default) — there is no tighter per-axis ceiling, so a hung command blocks the subtask for that long; previously the conformer's own worker timeout bounded it |
-| Worktree deps | `_ensure_worktree_deps(tree, st, caps, ...)`, called from inside `_measure_axes` | DESIGN §6½ *Who runs that install*. Applies the provision recipe's `install`/`build` entries on the FIRST axis actually measured for a worktree — not at worktree creation. Lazy on purpose: `_run_implementer:25018-25021` declines to pre-install because a config-only / docs-only subtask correctly skips it (44 of 91 subtasks in the motivating run touched zero source files), and an eager install would hand that cost back. A memo hit and an absent command both skip it, since neither needs deps. Memoised on the resolved absolute path in the module-level `_DEPS_INSTALLED` — a per-process filesystem fact, not run state. Non-fatal: a failed install surfaces as whatever the subsequent BLT command reports, which `_runner_missing` already classifies. Removes the repeat, not the install: 263 installs across 161 worker logs (~2.8 per worktree, since a subtask's implementer and conformer share one) become one |
-| Apply (twice per round) | `_apply_measured_axes(conf_res, pre)` then `_apply_measured_axes(conf_res, post)` | Replaces `conf_res["build"\|"lint"\|"tests"]` with the orchestrator's measurement, returning a NEW dict so the raw worker payload stays as-emitted for telemetry. **Both applications are load-bearing and neither is redundant.** The `post` apply at the loop tail is the ordinary case. The `pre` apply runs as soon as there is a dict to apply it to — before `_validate_conformance_result` — because three gates `break` out of the round before the tail is ever reached: a malformed result, a protected-path violation, and a strict-mode clobber. Without it those paths carry the conformer's *claimed* axes into `_summarize_residuals`, into the persisted `conformance` entry, and into the post-loop `_conformance_clean` that decides whether `--strict-conformer` blocks the subtask — i.e. strict mode gating on a self-report, the exact thing this phase stopped doing. `pre` is also the *accurate* measurement on those paths: the protected-path and clobber exits both roll the worktree back toward its pre-round state. Safe before validation because `_validate_conformance_result` inspects `rules_files_read`, `rule_violations_*` and the update paths, never the axes. Pinned by `test_the_overwrite_is_applied_twice_per_round` and by per-path behavioural tests in `tests/test_run_conformance_phase.py`; the guard this replaced compared source *indexes*, which a `break` jumps over, and demonstrably still passed with the fix reverted |
-| Round delta | `_round_axis_regressions(pre, post)` | An axis measured green before the round and red after it — a regression the conformer just introduced, attributable with no output parsing. Appended to `warnings`, fed into the next round via `_format_check_feedback`, and ANDed into the loop-exit condition (`_conformance_clean(...) and not regressions`) so a self-inflicted break earns another round. Refuses to fire when either side is unmeasured (no evidence is not evidence of green), when the command strings differ (which is what stops a scoped `pre` being compared against a canonical `post`), and on red→red (inherited debt) |
-| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | After each round, parses the per-worker JSONL log at `<state-root>/runs/<id>/logs/<sid>-conformer.log` (or `final-conformer-r<N>.log` for the final pass) and surfaces two types, both feedback-injected: (1) **multi-invocation** (Pattern A) — `conformer round N: ran <AXIS>_CMD K times in one round` — legitimate progressive testing (targeted → full suite → grep) is a common cause, but a worker that keeps re-running the same axis on a provably unchanged tree wastes an expensive install/lint/build/test cycle, so this class is fed back too. (2) **retry-after-backgrounded** (Pattern B) — `conformer round N: <AXIS>_CMD auto-backgrounded (bash_id=<id>) and was followed by another <AXIS>_CMD invocation` — the "retry-instead-of-recover" pattern. Both classes are collected after each round (matched via `"auto-backgrounded" in w or "times in one round" in w`) and, if non-empty, formatted via `_format_check_feedback()` and passed as `extra_feedback` to the next round's `_run_conformer()` call (or inlined into the next round's prompt for the final-conformer call site) so the conformer can correct the behavior. Helpers `_count_bash_axis_invocations()` and `_count_orphaned_bg_axis()` are pure log-parsing — never raise. `_BLT_AXIS_RES` is a `dict[str, re.Pattern[str]]` containing compiled regexes for the test, build, and lint axes: test matches `pnpm/npm/yarn/bun/npx test` (and `vitest`), `vitest run`, `bin/rails test`; build matches `pnpm/npm/yarn/bun build`, `tsc`, `next build`; lint matches `pnpm/npm/yarn/bun lint`, `biome check`, `eslint`, `rubocop`. The `_count_orphaned_bg_axis` detection logic also accepts `BashOutput shell_id=<id>` polls as a valid recovery path — forward-compatible with future tool-surface changes. |
-| Attach result | — | `res["conformance"]` (worker output blob) and `res["conformance_warnings"]` (list of strings) are added to the implementer's result. The subtask still returns `complete`. |
+| Discover rules files | `_discover_rules_files(repo_root)` | Existing paths from a fixed, capped allowlist (`CLAUDE.md`, `AGENTS.md`, `.agent.md`, `.cursorrules`, `.windsurfrules`, `docs/CLAUDE.md`, `docs/AGENTS.md`, `docs/CONVENTIONS.md`, `docs/STYLE.md`, `docs/DESIGN-SYSTEM.md`, `docs/DESIGN_SYSTEM.md`, `docs/UI.md`, `README.md`, `CONTRIBUTING.md`, `docs/DESIGN.md`, `docs/IMPLEMENTATION.md`), deterministic order, never raises, `[]` when nothing matches. The design-system candidates exist so a repo's component/color/banner conventions reach both conformer and implementer (DESIGN §9). |
+| Run conformer | `_run_conformer()` | One `claude -p` invocation with `ACT_TOOLS`, `--dangerously-skip-permissions`, `SCHEMAS["conformer"]`. Optional `extra_feedback` appended to the user prompt (Pattern B backgrounding-retry feedback). `WorkerError` → `None` (warning). Output passed through `_expand_conformer_output()` (N29), restoring the flattened wire shape into the four arrays downstream steps expect. |
+| Validate output | `_validate_conformance_result()` | Cross-field invariants — `rule_violations_residual` non-empty requires `rules_files_read` non-empty; each `rule_violations_fixed` cites a non-empty `rule`; each `docs_updates`/`tests_updates` cites an existing `path`. Failure → warning, loop breaks. |
+| Re-run gates | `check_branch_has_commits`, dirty-worktree check, `check_diff_scope` | Same functions as the implementer, re-applied to conformer commits. A protected-path violation triggers `_rollback_conformer_commits()` (reset to `before_sha`), recorded as a warning, **not** `failed`/`blocked`. |
+| Clobber-survival check | `_clobbered_owned_files(worktree, run_branch, impl_head_sha)` + `_blob_sha` | DESIGN §9 *No clobbering the implementer's work*. `impl_head_sha` snapshotted **once before the round loop** (a per-round HEAD would miss a round-0 clobber). Owned set = `git diff --name-only <run_branch>..<impl_head_sha>`; a clobber is a deletion at HEAD or a blob reverted to base (three-way `_blob_sha` compare via `git rev-parse --verify -q`); a legit conformer edit leaves a distinct third blob, not flagged. Warns always; under `--strict-conformer` also rolls back to the implementer HEAD **and blocks** — a `clobbered_files` flag forces a block even when `_conformance_clean` is True. Not auto-rolled-back in advisory mode (a legitimate revert-to-base is git-indistinguishable from a clobber). The final-tree pass uses `base=` a **snapshot SHA** (`_merge_base_sha(staging, working_branch, staging_before_sha)`), never `run_branch` — the staging worktree has the run branch checked out, so passing that name collapses the two blob lookups and reports every final-conformer edit as `(reverted-to-base)`. The per-subtask call site is correct with `base=run_branch` since a subtask worktree sits on a genuinely different ref. |
+| Loop bound | `caps["conformance_rounds"]` (default 3) | Re-runs on malformed output or remaining residuals; exhausting the cap is a warning, not a failure. |
+| Loop-continuation predicate | `_conformance_clean(conf_res, baseline)` + `_baseline_red_axes(baseline)` | DESIGN §9 *The signal that continues the loop is a delta, not a verdict*. True (ends loop) when nothing left is this subtask's responsibility. `baseline` is `st.data["conformance"]["_baseline"]` or `None`. **Checked ahead of the red-axis exclusion: `ran && !measured` returns False** — an unmeasurable axis (runner absent, or `_is_fork_exhaustion`) is a third state, not "red at baseline." Then two exclusions keyed on `_baseline_red_axes()` (admits only `_BLT_AXES` names): (1) `ran && !passed` red at baseline doesn't block; (2) a `rule_violations_residual` whose **`axis` field** is red at baseline doesn't block. Everything else blocks — an unlabelled residual, or a failure on an axis green at baseline (a real regression). `axis` is read from the schema field, never inferred from `rule`/`why_not_fixed` prose (*Language-to-JSON*); optional on the schema, absence gates. `baseline=None` reproduces the pre-change absolute-verdict behaviour byte-for-byte. |
+| Axis selection | `resolve_blt_scoped(repo_root)` + `_changed_files(worktree, run_branch)` + `_select_subtask_axes(blt, scoped, files, base_ref, mode, test_globs)` | DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*. Resolved once per subtask before the round loop — the changed-file set is the implementer's diff; conformer commits don't widen scope. `mode` is `st.data["subtask_tests"]`. `resolve_blt_scoped` reads `test_scoped`/`build_scoped` from `.leerie/config.toml`, else infers two: `npx vitest related --run {files} --passWithNoTests` (vitest config present), `npx jest --findRelatedTests {files} --passWithNoTests` (jest config), and `npx tsc --noEmit` as `build_scoped` when `tsconfig.json` exists and canonical build isn't already `tsc`-shaped. Kept separate from `_infer_build_lint_test` so the launcher's mirrored bash inference stays untouched. No pytest inference, no lint tier. `_changed_files` uses `git diff -z --name-only` (`-z` avoids git's C-quoting of non-ASCII paths breaking `splitlines()`). `_render_scoped` `shlex.quote`s each path, returns `None` (falls back to canonical) when a `{files}` template has no files — rendering bare would run EVERYTHING. A `{test_files}` variant substitutes only `_is_test_file`-matching members with the same absence rule, for runners with no source→test impact analysis (pytest treats a non-test path as an ERROR, exit 4, and poisons the whole invocation). `_is_test_file` matches a `tests/`/`test/`/`spec/` segment or `test_*.py`/`*_test.*`/`*.test.*`/`*.spec.*`; `test_file_globs` in `.leerie/config.toml` replaces the built-ins. `_render_scoped` also hard-skips an unsubstitutable placeholder (`_UNKNOWN_PLACEHOLDER_RE`, warned once) rather than shipping a literal brace — an unguarded skew between a newer `.leerie/config.toml` and an older installed orchestrator would otherwise turn every subtask RED. The scan runs against the TEMPLATE with placeholders stripped, never the rendered command (a changed path may legitimately contain braces). Any axis whose proxy doesn't resolve falls back to canonical; the scope label is `scoped` only if at least one axis used a proxy. |
+| Measure (pre / post) | `_measure_axes(worktree, axes, st, caps, ...)` | Run immediately before the round (feeds `BLT_RESULTS:`) and again after (overwrites the worker's self-report). Memoised via `blt_results`, so the post measurement is free when the round committed nothing (measured, 182/224 rounds). `--subtask-tests off` yields `{}` and skips both. Each axis is bounded by `caps["worker_timeout_sec"]` (5400s default) — no tighter per-axis ceiling. |
+| Worktree deps | `_ensure_worktree_deps(tree, st, caps, ...)`, from inside `_measure_axes` | DESIGN §6½ *Who runs that install*. Applies the provision recipe's install/build on the FIRST axis actually measured — not at worktree creation, since a config/docs-only subtask (44/91 in the motivating run) correctly skips it. Memoised on the resolved absolute path in module-level `_DEPS_INSTALLED` (per-process fact, not run state). Non-fatal: a failed install surfaces as whatever the BLT command reports, classified by `_runner_missing`. Collapses 263 installs across 161 worker logs into one per worktree. |
+| Apply (twice per round) | `_apply_measured_axes(conf_res, pre)` then `(conf_res, post)` | Replaces `conf_res["build"\|"lint"\|"tests"]` with the orchestrator's measurement into a NEW dict (raw worker payload stays as-emitted for telemetry). **Both applications are load-bearing.** `post` is the ordinary tail case. `pre` runs as soon as there's a dict — before `_validate_conformance_result` — because three gates `break` before the tail: malformed result, protected-path violation, strict-mode clobber. Without it those paths would carry the conformer's *claimed* axes into `_conformance_clean`'s `--strict-conformer` decision — gating on a self-report, the exact thing this phase stopped doing. `pre` is also the *accurate* measurement there, since both exits roll the worktree back toward pre-round state. Pinned by `test_the_overwrite_is_applied_twice_per_round`. |
+| Round delta | `_round_axis_regressions(pre, post)` | An axis green before the round, red after — a regression the conformer just introduced. Appended to `warnings`, fed into next round's feedback, ANDed into the loop-exit condition so a self-inflicted break earns another round. Never fires when either side is unmeasured, when command strings differ, or on red→red (inherited debt). |
+| BLT-axis observability + feedback | `_emit_bash_axis_warnings()` | Parses the per-worker JSONL conformer log after each round for two feedback-injected patterns: (1) **multi-invocation** — `ran <AXIS>_CMD K times in one round` (progressive testing is legitimate, but a provably-redundant re-run wastes an expensive cycle); (2) **retry-after-backgrounded** — `<AXIS>_CMD auto-backgrounded … followed by another <AXIS>_CMD invocation`, the "retry-instead-of-recover" pattern. Both formatted via `_format_check_feedback()` and passed to the next round. `_BLT_AXIS_RES` holds compiled per-axis regexes (test/build/lint runner invocations); `_count_orphaned_bg_axis` also accepts `BashOutput shell_id=<id>` polls as a valid recovery path. |
+| Attach result | — | `res["conformance"]` and `res["conformance_warnings"]` added to the implementer's result; the subtask still returns `complete`. |
 
-The phase is advisory: **no path through the conformance phase produces a
-`failed` or `blocked` subtask status.** Build/lint/test failures, malformed
-conformer output, conformer crashes, gate violations on conformer commits,
-and exhausted rounds all surface as entries in `conformance_warnings` and as
-non-fatal log lines. This is the §12 enforcement boundary for the phase:
-*discovery* of rule files, *schema validity* of the conformer's output, and
-the *protected-path invariance* across conformer commits are code-enforced;
-whether the conformer made the right docs/tests/rule-violation calls is left
-to the worker and not second-guessed.
+The phase is advisory: **no path through it produces a `failed` or `blocked`
+subtask status.** Build/lint/test failures, malformed conformer output,
+crashes, gate violations, and exhausted rounds all surface as
+`conformance_warnings` and non-fatal log lines. Per §12: *discovery* of rule
+files, *schema validity* of conformer output, and *protected-path
+invariance* are code-enforced; whether the conformer made the right
+docs/tests/rule-violation calls is left to the worker.
 
 ### Wave-level checks (after integration)
 | Check | Catches |
 |-------|---------|
 | `_scan_conflict_markers()` | unresolved `<<<<<<<` markers in the run-branch worktree after integration — deterministic safety net |
 
-There is no LLM wave-level re-validation. An earlier version of
-`validate_wave` ran a deterministic test-runner fast-path and an LLM
-validator over per-subtask criteria, with a re-spawn loop bounded by
-`wave_revalidation_rounds`; all of that was removed when the criteria
-file's load-bearing role retired (DESIGN §8, §9). Per-subtask quality
-is the implementer's confidence gate; the wave-level safety net is the
-deterministic conflict-marker scan.
+There is no LLM wave-level re-validation. An earlier `validate_wave` ran a
+deterministic test-runner fast-path and an LLM validator over per-subtask
+criteria with a re-spawn loop; removed when the criteria file's load-bearing
+role retired (DESIGN §8, §9). Per-subtask quality is the implementer's
+confidence gate; the wave-level safety net is the conflict-marker scan.
 
 ### Post-integrator checks (after an integrator handles a conflict)
-These verify the integrator honored DESIGN §6's *behavioral* conflict-
-resolution contract — the integrator prompt itself
-(`prompts/integrator.md`) carries the behavioral spec (read every
-involved subtask's intent, preserve each side's intent, call
-irreconcilable cases a `design-conflict`); the orchestrator only checks
-the outcome.
+Verify the integrator honored DESIGN §6's *behavioral* conflict-resolution
+contract — the integrator prompt (`prompts/integrator.md`) carries the
+behavioral spec (read every involved subtask's intent, preserve each side's
+intent, call irreconcilable cases a `design-conflict`); the orchestrator
+only checks the outcome.
 
 | Check | Catches |
 |-------|---------|
-| `check_merge_committed()` | integrator returned `resolved` but left the worktree mid-merge (`MERGE_HEAD` present) or with staged-uncommitted changes — **terminal**: merge aborted, run stops |
-| `check_integrator_commit()` | integrator merge commit touched `.leerie/` files — non-fatal warning, recorded to `state.json` |
-| integrator status `design-conflict` / `failed` | unresolvable conflict — **terminal**: in-progress merge aborted, the run branch left clean at the last good wave, diagnosis saved, run stops |
-| integrator **crash** (`_run_checked_loop` returns `None`) | infrastructure failure, not a verdict — `_rescue_integrator_work()` captures the in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>` **before** the merge is aborted, `blocked[sid]` is recorded, and the die message names the ref plus its `cherry-pick --no-commit` recovery command. `resume` retries the integration |
+| `check_merge_committed()` | integrator returned `resolved` but left the worktree mid-merge (`MERGE_HEAD` present) or staged-uncommitted — **terminal**: merge aborted, run stops |
+| `check_integrator_commit()` | integrator merge commit touched `.leerie/` files — non-fatal warning |
+| integrator status `design-conflict` / `failed` | unresolvable conflict — **terminal**: in-progress merge aborted, run branch left clean at the last good wave, diagnosis saved |
+| integrator **crash** (`_run_checked_loop` returns `None`) | infrastructure failure, not a verdict — `_rescue_integrator_work()` captures the in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>` **before** the merge is aborted, `blocked[sid]` recorded, die message names the ref + its `cherry-pick --no-commit` recovery command. `resume` retries the integration |
 
 `_rescue_integrator_work(staging, sid, run_id) -> str | None` returns the rescue
-ref, or `None` when there was nothing to save (captured tree identical to
-`HEAD^{tree}`) or the capture failed. It is **not** gated on
-`check_merge_committed`: a crashed integrator typically dies mid-resolution with
-no merge commit, which is exactly the case worth rescuing (DESIGN §12). It stages
+ref, or `None` when nothing to save or the capture failed. **Not** gated on
+`check_merge_committed`: a crashed integrator typically dies mid-resolution
+with no merge commit, exactly the case worth rescuing (DESIGN §12). Stages
 into a throwaway `GIT_INDEX_FILE` seeded from HEAD (`read-tree` → `add -A` →
-`write-tree` → `commit-tree`) because both `git stash push` and `git stash
-create` refuse a conflicted tree ("Cannot save the current index state") — the
-unmerged index is the exact state an integrator crash leaves behind. The real
-index and working tree are never touched, and untracked files are captured. Every
-git failure degrades to `None`: a rescue failure must never mask the crash.
-`run_proc` gained an `env: dict[str, str] | None = None` parameter for this (the
-default inherits the orchestrator's environment, so existing call sites are
-unchanged).
+`write-tree` → `commit-tree`) because `git stash` refuses a conflicted tree;
+the real index/working tree are never touched, untracked files are
+captured. Every git failure degrades to `None` — a rescue failure must
+never mask the crash. `run_proc` gained an `env: dict[str, str] | None`
+param for this.
 
 ### Resume integrity — `_validate_resume_state()`
 Enforces (one half of) DESIGN §6's "the run branch is the resume contract"
@@ -3963,16 +3925,14 @@ every prior wave produced. Both must be coherent for resume to be safe.
 
 On `resume`: asserts `task` is present and non-empty; asserts `waves`,
 `completed_waves`, `subtask_status` are well-formed *if present*. `waves` is
-intentionally optional — a run interrupted before scheduling has none. In
-that case `main()` no longer treats the absence of `waves` as unresumable:
+intentionally optional — a run interrupted before scheduling has none, and
 per DESIGN §6 "Resumable planning — a per-phase checkpoint cursor, not a
 `waves` gate," `_run_phases` walks the planning-phase sequence (classify →
 plan → reconcile → overlap-judge → adherence-gate → off-tree/satisfied
 filters → schedule) and re-enters at the first phase whose `plans_after_*`
-checkpoint key is absent, reusing the persisted `plans` from the last
-completed phase as that phase's input rather than re-deriving it from
-scratch. Rejects corrupt or hand-edited state without rejecting a
-legitimately-early interruption.
+checkpoint key is absent, reusing the last completed phase's persisted
+`plans` rather than re-deriving from scratch. Rejects corrupt/hand-edited
+state without rejecting a legitimately-early interruption.
 
 The `except SystemExit` handler in `main()` guards `st.save()` behind
 `st.data.get("task")` so that a failed `resume` (which `die()`s before
@@ -3993,216 +3953,150 @@ takes effect immediately on resume.
 
 ### Concurrency model
 The orchestrator runs on a single `asyncio` event loop. Each `claude -p`
-worker is spawned via `asyncio.create_subprocess_exec` (wrapped by the
-`run_proc` helper) and awaited; both spawn sites pass
-`start_new_session=True` so each worker becomes its own POSIX session and
-process-group leader (PGID == PID), isolating it from the orchestrator's
-own group. Parallel workers within a wave run concurrently via
-`_gather_or_cancel` — a small `asyncio.gather` wrapper that, on the first
-exception, cancels every other in-flight task and awaits its finalization
-before re-raising — under an `asyncio.Semaphore` bounded by
-`max_parallel`. Because every mutator runs on the single loop, `State`
-carries no lock — coroutines only interleave at `await` points, which
-never fall inside a `st.data[k] = v; st.save()` pair. `State.save()`
-still writes to a temp file then `os.replace()` for atomicity against
-process crash.
+worker is spawned via `asyncio.create_subprocess_exec` (wrapped by
+`run_proc`) with `start_new_session=True`, so each worker is its own
+POSIX session and process-group leader. Parallel workers within a wave run
+via `_gather_or_cancel` (an `asyncio.gather` wrapper that on the first
+exception cancels every other in-flight task and awaits finalization
+before re-raising) under an `asyncio.Semaphore(max_parallel)`. `State`
+carries no lock — coroutines interleave only at `await` points, never
+inside a `st.data[k] = v; st.save()` pair. `State.save()` writes a temp
+file then `os.replace()`s for atomicity against a process crash.
 
-Subprocess cleanup is three-layered, addressing two distinct leak classes plus mid-run pressure reduction:
+Subprocess cleanup is four-layered, addressing two leak classes plus mid-run pressure reduction:
 
 1. **Lifetime descendant tracking (`_DescendantTracker`).** A per-worker
-   asyncio task started at spawn polls `_enumerate_descendants(proc.pid)`
-   every ~0.5s and accumulates every PID ever observed as a descendant
-   of the worker. On every exit path — success AND failure — the
-   tracker's `stop_and_reap()` SIGKILLs the accumulated set. This is
-   the load-bearing fix for Claude Code's Bash tool with
-   `run_in_background: true`: the tool wrapper spawns its user command
-   in a detached POSIX session, then the wrapper itself can exit while
-   the user command keeps running. By the time `claude -p` exits, the
-   backgrounded command has been reparented to PID 1 and is no longer
-   reachable via post-hoc PPID walk from the worker — but the tracker
-   observed it mid-flight and has its PID. Without lifetime tracking,
-   the descendant is invisible to cleanup.
+   asyncio task polls `_enumerate_descendants(proc.pid)` every ~0.5s and
+   accumulates every PID ever observed as a descendant. On every exit
+   path, `stop_and_reap()` SIGKILLs the accumulated set. This is the
+   load-bearing fix for Claude Code's Bash tool with `run_in_background:
+   true`: the tool wrapper spawns the user command in a detached POSIX
+   session and can exit while the command keeps running; by the time
+   `claude -p` exits the backgrounded command has reparented to PID 1 and
+   is invisible to a post-hoc PPID walk — but the tracker observed it
+   mid-flight and has its PID.
 
 2. **Abnormal-exit subtree termination (`_terminate_proc_tree`).** On
-   `KeyboardInterrupt`, `SIGTERM`, `RateLimitedExit`, or any other
-   `BaseException`, `run_proc`'s and `_invoke`'s catch-all handlers
-   call `_terminate_proc_tree(proc)`. The helper sends SIGTERM to the
-   worker's process group (`os.killpg`) AND to every descendant
-   currently reachable via PPID walk (`_enumerate_descendants`), waits
-   `_PROC_TREE_GRACE_SEC = 2.0` for graceful shutdown, then SIGKILLs
-   the survivors via the same two mechanisms. The PPID walk is needed
-   because Claude Code's Bash tool subprocesses are in a *different*
-   POSIX session than `claude -p` — `killpg(claude_p_pgid)` does not
-   reach them, so the walk is the only way to enumerate them while
-   the parent chain is still intact. Exception paths run the tracker
-   reap *after* `_terminate_proc_tree`, catching any backgrounded
-   subprocess that was orphaned during the run.
+   `KeyboardInterrupt`/`SIGTERM`/`RateLimitedExit`/any other
+   `BaseException`, `run_proc`'s and `_invoke`'s catch-all handlers call
+   `_terminate_proc_tree(proc)`: SIGTERM to the worker's process group
+   (`os.killpg`) AND every descendant via PPID walk, wait
+   `_PROC_TREE_GRACE_SEC = 2.0`, then SIGKILL survivors via both
+   mechanisms. The PPID walk is needed because Bash-tool subprocesses sit
+   in a *different* POSIX session than `claude -p`, so `killpg` alone
+   misses them. Exception paths run the tracker reap *after* this,
+   catching anything orphaned during the run.
 
-Layers 1 and 2 compose: `_terminate_proc_tree` is broad and
-synchronous (one call, kills attached subtree), the tracker is narrow
-and historical (kills only what it observed, including processes
-that have since reparented away). Neither alone is sufficient; both
-together close the leak.
+Layers 1 and 2 compose: `_terminate_proc_tree` is broad and synchronous
+(kills the attached subtree), the tracker is narrow and historical (kills
+only what it observed, including processes that have since reparented
+away). Neither alone is sufficient.
 
 3. **Mid-run PID reaping (`_poll_loop` + `_reparented_orphans`).** A
-   pressure-gated reducer that sits under the PID-exhaustion-detection
-   backstop (see below) and proactively reaps orphaned subprocesses before
-   `pids.max` is reached. `_DescendantTracker` gains a `cgroup_sid: str | None = None`
-   parameter (default `None` so existing direct constructors in the test
-   suite keep working and the reaper is inert without a cgroup). `_invoke`
-   threads the in-scope `cgroup_sid` into the constructor call. Each
-   `_poll_loop` cycle, when `cgroup_sid` is set, the tracker calls
-   `_cgroup_stat(cgroup_sid)` and computes the pressure ratio
-   `pids.current / pids.max`. Reaping is armed only when that ratio reaches
-   or exceeds `_PID_REAP_HIGH_WATER = 0.90`; when armed, it calls
-   `_reparented_orphans(self._seen, min_age)` to obtain the killable set and
-   sends `SIGKILL` oldest-first (via the existing `_signal_pids`), stopping as
-   soon as the ratio drops below `_PID_REAP_LOW_WATER = 0.75`. Killed PIDs
-   are pruned from `_seen`; the exit-time `stop_and_reap` path is unchanged.
-   `_reparented_orphans(seen: set[int], min_age: int | None = None)
-   -> list[int]` runs one `ps -eo pid,ppid,etimes` snapshot (with
-   `check=True`, so a failing `ps` raises into the `except` and returns `[]`
-   through the documented path rather than silently parsing unusable output)
-   and returns, sorted oldest-first, the PIDs from `seen` that are
-   simultaneously alive, reparented to init (`ppid == 1`, or to the
-   orchestrator itself once `_become_subreaper` has run), and at least
-   `min_age` seconds old. `min_age` is a **sentinel default**: `None`
-   resolves to `_PID_REAP_MIN_AGE_SEC` *at call time*, so a caller omitting
-   it gets the normal-tier floor and monkeypatching the constant moves the
-   floor. A literal `min_age: int = _PID_REAP_MIN_AGE_SEC` default would bind
-   once at def time, silently pinning 60 regardless of the constant — a trap
-   for any future test that patches it and calls this bare.
+   pressure-gated reducer under the PID-exhaustion-detection backstop
+   (below) that proactively reaps orphans before `pids.max` is reached.
+   `_DescendantTracker` takes an optional `cgroup_sid`; each `_poll_loop`
+   cycle, when set, computes the pressure ratio `pids.current / pids.max`
+   via `_cgroup_stat`. Reaping arms at `_PID_REAP_HIGH_WATER = 0.90`, then
+   `_reparented_orphans(self._seen, min_age)` SIGKILLs the killable set
+   oldest-first until the ratio drops below `_PID_REAP_LOW_WATER = 0.75`.
+   `_reparented_orphans(seen, min_age=None) -> list[int]` snapshots `ps
+   -eo pid,ppid,etimes` (raises on failure → `[]`, never parses garbage)
+   and returns, oldest-first, PIDs from `seen` that are alive, reparented
+   to init or the orchestrator (post-`_become_subreaper`), and at least
+   `min_age` seconds old. `min_age`'s `None` sentinel resolves
+   `_PID_REAP_MIN_AGE_SEC` *at call time* rather than binding once at def
+   time, so patching the constant moves the floor.
 
-   **Two-tier age floor (DESIGN §6 *Why a single 60 s floor is not enough*).**
-   `_poll_loop` selects the floor from the same pressure ratio it already
-   computed: at or above `_PID_REAP_CRITICAL_WATER = 0.90` it passes
-   `_PID_REAP_CRITICAL_AGE_SEC = 5`; below it, `_PID_REAP_MIN_AGE_SEC = 60`.
-   Without the critical tier the reaper arms at 90% and finds an empty
-   candidate list — every orphan in a fresh burst is younger than 60 s —
-   which is a disabled reducer, not a safe one. DESIGN §6 carries the
-   measurement the tier rests on and is the source of truth for it; do not
-   restate the numbers here. `_PID_REAP_CRITICAL_WATER` is deliberately equal
-   to `_PID_REAP_HIGH_WATER` (both 0.90) and kept as a separate named
-   constant: the arming threshold and the floor-escalation threshold answer
-   different questions and may diverge.
-   Module-level constants (placed next to `_DESCENDANT_POLL_SEC` /
-   `_PID_EXHAUSTION_WINDOW`): `_PID_REAP_HIGH_WATER = 0.90`,
-   `_PID_REAP_LOW_WATER = 0.75`, `_PID_REAP_MIN_AGE_SEC = 60`,
-   `_PID_REAP_CRITICAL_WATER = 0.90`, `_PID_REAP_CRITICAL_AGE_SEC = 5`.
+   **Two-tier age floor (DESIGN §6 *Why a single 60s floor is not
+   enough*).** `_poll_loop` selects the floor from the same pressure
+   ratio: at or above `_PID_REAP_CRITICAL_WATER = 0.90` it passes
+   `_PID_REAP_CRITICAL_AGE_SEC = 5`; below it, `_PID_REAP_MIN_AGE_SEC =
+   60`. Without the critical tier the reaper arms at 90% and finds every
+   candidate younger than 60s — a disabled reducer. `_PID_REAP_CRITICAL_WATER`
+   equals `_PID_REAP_HIGH_WATER` (both 0.90) but stays a separate named
+   constant since arming and floor-escalation answer different questions.
+   (DESIGN §6 carries the measurement behind the tier.)
 
-4. **Zombie reaping (`_become_subreaper` + `_zombie_reaper`).** The reaper
-   above handles *live* leaked processes; **zombies** (`<defunct>` tasks not
-   yet `wait()`ed) also count against the cgroup `pids.max`, and the container
-   PID 1 (`runuser` locally / idle `sleep infinity` on Fly) is not a reaping
-   init, so orphaned `git`/`ssh-agent` descendants reparent to it and rot
-   (DESIGN §6 *Zombie reaping*). `_become_subreaper()` — called once early in
-   `main()` before any worker spawns — issues
-   `ctypes.CDLL(None).prctl(_PR_SET_CHILD_SUBREAPER=36, 1, 0, 0, 0)` so
-   orphaned descendants reparent to the orchestrator; Linux-guarded
-   (`sys.platform`), a logged no-op elsewhere; returns `bool`. `_zombie_reaper()`
-   is a background asyncio task spawned in `_orchestrate()` next to `sampler_task`
-   and cancelled in the same `finally` — mirroring `_memory_sampler`'s lifecycle.
-   It is an **allowlist, never a `/proc` scan**: the reaper
-   `os.waitpid(pid, WNOHANG)`s only PIDs in `_REAPABLE_PIDS` (~1 s).
+4. **Zombie reaping (`_become_subreaper` + `_zombie_reaper`).** Handles
+   *zombies* (`<defunct>`, not yet `wait()`ed), which also count against
+   `pids.max`; the container PID 1 is not a reaping init, so orphaned
+   `git`/`ssh-agent` descendants reparent to it and rot (DESIGN §6
+   *Zombie reaping*). `_become_subreaper()` — called once early in
+   `main()` — issues `prctl(PR_SET_CHILD_SUBREAPER, 1)` (Linux-guarded, a
+   logged no-op elsewhere) so orphans reparent to the orchestrator.
+   `_zombie_reaper()` is a background asyncio task, same lifecycle as
+   `_memory_sampler`. It is an **allowlist, never a `/proc` scan**:
+   `os.waitpid(pid, WNOHANG)`s only PIDs in `_REAPABLE_PIDS`.
 
    **`ChildProcessError` (ECHILD) does NOT discard the PID (N36).** For a
-   live *grandchild* — the dominant case, since `_mark_reapable` is fed
-   `_enumerate_descendants(leader_pid)`, i.e. descendants of a *worker* —
-   ECHILD means "not ours **yet**", not "gone": while the worker lives the
-   orchestrator is not the pid's parent. Discarding there drops the pid
-   permanently, so when the worker exits and the orphan reparents (via
-   `_become_subreaper`) it is no longer on the allowlist and nothing ever
-   waits it.
+   live grandchild, ECHILD means "not ours **yet**" — while the worker
+   lives the orchestrator isn't the pid's parent yet. Discarding would
+   drop it permanently, so when the worker exits and the orphan reparents
+   it's no longer on the allowlist and nothing ever waits it. The arm
+   instead disambiguates with `_pid_still_exists(pid)` (a `/proc`
+   existence check kept in its own function so `_zombie_reaper`'s own
+   source never mentions `/proc`): alive → retain and retry; gone →
+   discard. Retention is bounded by `_ECHILD_RETRY_MAX_SEC` (60s), safe
+   only because `_DescendantTracker._poll_loop` re-marks every observed
+   descendant every `_DESCENDANT_POLL_SEC` (0.5s), so an aged-out pid is
+   re-added with a fresh window (both constants pinned together in
+   `tests/test_subreaper.py`). Any other `OSError` discards immediately.
 
-   The arm instead disambiguates with `_pid_still_exists(pid)` (a one-pid
-   `/proc` existence check, deliberately its own function so
-   `_zombie_reaper`'s source never literally mentions `/proc` — see
-   `test_zombie_reaper_never_scans_proc_for_zombies`): still alive → retain
-   and retry next tick; confirmed gone → discard. Retention is bounded by
-   `_ECHILD_RETRY_MAX_SEC` (60 s, first-ECHILD timestamps in
-   `_REAPABLE_PID_FIRST_ECHILD`) so a pid that never reparents cannot grow
-   the set without limit. That bound is safe only because
-   `_DescendantTracker._poll_loop` re-marks every observed descendant each
-   `_DESCENDANT_POLL_SEC` (0.5 s) for the worker's whole life, so a pid aged
-   out mid-run is re-added within a tick with a fresh window; both constants
-   are pinned together in `tests/test_subreaper.py`. Any other `OSError`
-   (e.g. ESRCH) still discards immediately.
-
-   `_mark_reapable(pids)` populates that set, minus
-   anything in `_ASYNCIO_MANAGED_PIDS`, and is called from
-   `_DescendantTracker._poll_loop` with each `_enumerate_descendants` snapshot —
-   the worker subtrees leerie observed and therefore owns.
-   `_orphan_zombie_children()` **no longer exists**: any reaper that *discovers*
-   PIDs is wrong regardless of how it filters, because a PID between `fork()`
-   and asyncio's `os.pidfd_open()` is in no registry, so every exclusion has a
-   hole (DESIGN §6 *Zombie reaping*; the scanning design took `preflight`'s own
-   `git config` PID on 40/40 real runs → fabricated rc=255 → bogus "git
-   user.email is not configured"). `_invoke` still adds `proc.pid` to
-   `_ASYNCIO_MANAGED_PIDS` at spawn and `discard`s it in its `finally`, but that
-   set is **not** the reaper's safety mechanism — the allowlist is; it serves
-   telemetry and `_reparented_orphans` (which must not SIGKILL a live worker).
-   `_signal_pids` deliberately does NOT `waitpid` (it only SIGKILLs); the central
-   `_zombie_reaper` is the single reaping point. Because orphans now reparent to
-   the orchestrator (not PID 1), `_reparented_orphans` accepts
-   `ppid in (1, os.getpid())`. `_PR_GET_CHILD_SUBREAPER = 37` exists for the test
-   read-back.
+   `_mark_reapable(pids)` populates that set (minus
+   `_ASYNCIO_MANAGED_PIDS`), fed from `_DescendantTracker._poll_loop`'s
+   `_enumerate_descendants` snapshots — subtrees leerie observed and
+   therefore owns. `_orphan_zombie_children()` **no longer exists**: any
+   reaper that *discovers* PIDs is wrong, because a PID between `fork()`
+   and asyncio's `os.pidfd_open()` is in no registry (DESIGN §6 *Zombie
+   reaping*; the scanning design once killed `preflight`'s own `git
+   config` PID on 40/40 real runs, fabricating rc=255). `_signal_pids`
+   deliberately does not `waitpid` — `_zombie_reaper` is the single
+   reaping point. `_reparented_orphans` accepts `ppid in (1,
+   os.getpid())` since orphans now reparent to the orchestrator.
 
 **PID-exhaustion detection (`_cgroup_stat` + `_read_stream` probe).** The
-above cleanup runs at worker *exit*; leaked `run_in_background`
-subprocesses accumulate against the worker cgroup's `pids.max` (default
-`worker_pids_max = 2048`, resolved by `resolve_worker_pids_max`:
-`--worker-pids-max` > `LEERIE_WORKER_PIDS_MAX` > `worker_pids_max` in
-`leerie.toml` > `DEFAULT_CAPS["worker_pids_max"]`) *during* the run.
-Once the cap is hit every
-`fork()` in the subtree returns `EAGAIN`, so every `Bash` tool-call fails
-(in-process tools are unaffected) and the worker spirals without
-diagnosing the cause (DESIGN §6 *Detecting PID exhaustion*). The broker
-gains a read-only `stat <sid>` verb → `OK <pids.current> <pids.max>
-<pids.events.max> <memory.events.oom_kill>` (or `ERR <msg>`); its client is
-`_cgroup_stat(sid) -> tuple[int,int,int,int] | None` (the 4th element is
-`oom_kill`, consumed by the memory-OOM diagnostic below; None when the
-broker is down or containment is off). `_read_stream` keeps a bounded
-`deque(maxlen=_PID_EXHAUSTION_WINDOW)` of recent tool-result outcomes
-(True=errored) via `_tool_result_outcome(event)` — which returns None for
-non-tool-result events (assistant/system/rate_limit) so they are skipped,
-NOT counted as resets. When the window holds `≥_PID_EXHAUSTION_ERROR_THRESHOLD`
-(3) errors **and the latest result is itself an error** (so the synchronous
-broker probe is not re-issued on the interleaved successes of a
-healthy-but-failing worker), it calls `_cgroup_stat`, and if `current >= max` or
-`pids.events.max` is climbing it `log()`s the cause, relabels the inline
-`tool-fail` summary (`_summarize_stream_event`) to name the PID cap, and
-raises `WorkerError` — which the existing `except BaseException` in
-`_invoke` turns into a `_terminate_proc_tree` + tracker-reap, routing to
-the callers' normal handling (implementer → retryable `incomplete-handoff`;
-conformer → advisory `None`). `_is_fork_exhaustion(text)` is a cheap
-fast-path that also matches the `EAGAIN` string when it survives into the
-tool-result, but the cgroup probe is authoritative. A window (not a
-*consecutive* counter) is required because tool-results are never adjacent
-in the stream — the model's assistant turn always sits between them — so a
-consecutive counter could never exceed one. The window still leaves an
-ordinary failing test (≤1 error) well below the threshold.
+above runs at worker *exit*; leaked `run_in_background` subprocesses
+accumulate against the worker cgroup's `pids.max` (default
+`worker_pids_max = 2048`, resolved `--worker-pids-max` >
+`LEERIE_WORKER_PIDS_MAX` > `leerie.toml` > `DEFAULT_CAPS`) *during* the
+run. Once hit, every `fork()` in the subtree returns `EAGAIN`, so every
+`Bash` tool-call fails and the worker spirals without diagnosing the cause
+(DESIGN §6 *Detecting PID exhaustion*). The broker's read-only `stat <sid>`
+verb → `OK <pids.current> <pids.max> <pids.events.max>
+<memory.events.oom_kill>`; client `_cgroup_stat(sid) ->
+tuple[int,int,int,int] | None`. `_read_stream` keeps a bounded
+`deque(maxlen=_PID_EXHAUSTION_WINDOW)` of recent tool-result outcomes via
+`_tool_result_outcome(event)` (non-tool-result events return `None`, not
+counted). When the window holds `≥_PID_EXHAUSTION_ERROR_THRESHOLD` (3)
+errors **and the latest result is itself an error** (so a healthy-but-failing
+worker's interleaved successes don't re-trigger the probe), it calls
+`_cgroup_stat`; if `current >= max` or `pids.events.max` is climbing it
+logs the cause, relabels the tool-fail summary, and raises `WorkerError`
+routed through `_terminate_proc_tree` + tracker-reap to the callers'
+normal handling (implementer → retryable `incomplete-handoff`; conformer →
+advisory `None`). `_is_fork_exhaustion(text)` is a cheap `EAGAIN`-string
+fast-path; the cgroup probe is authoritative. A window (not a consecutive
+counter) is required because tool-results are never adjacent — the
+model's assistant turn always sits between them.
 
 **Memory-OOM naming (`_invoke`'s no-envelope path + `_settle_subtask`,
-DESIGN §6 *Detecting memory OOM*).** A build/test command that overshoots
-`memory.max` is killed with a bare `Killed` — no tool-result error for the
-window detector above to key on, and often no `result` event at all before
-`claude -p` is reaped. `_read_stream` tracks `last_bash_cmd` (the most
-recent `Bash` tool_use's command, first line only) alongside the
-PID-exhaustion window state. In `_invoke`'s `finally`, `final_stat =
-_cgroup_stat(cgroup_sid)` is read immediately before `_cgroup_destroy`
-(the last point a read is possible — destroy `rmdir`s the cgroup). When
-`envelope is None`, if `final_stat[3]` (`oom_kill`) is `> 0`, `_invoke`
-raises `WorkerError(f"worker {sid} was OOM-killed on \`{last_bash_cmd}\`
-(memory.max={cap} GiB) — raise --worker-memory-max or lower
---max-parallel")` instead of the generic no-result-event message.
-`_run_implementer`'s existing `except WorkerError` handler threads that
-text into the synthesized `incomplete-handoff` envelope's `summary`
-unchanged. `_settle_subtask`'s `empty_handoff` handling (the rescue branch
-that keeps committed work, and the no-commits branch that calls `fail()`)
-both now prefer `res.get("summary")` — the worker's own diagnostic, when
-present — over `_validate_result`'s generic "checkpoint ... does not
-exist" `message`, so a named OOM survives even when the subtask
-ultimately terminates via the retry cap.
+DESIGN §6 *Detecting memory OOM*).** A command that overshoots `memory.max`
+is killed with a bare `Killed` — no tool-result error, often no `result`
+event before `claude -p` is reaped. `_read_stream` tracks `last_bash_cmd`
+(the most recent `Bash` command, first line) alongside the PID-exhaustion
+window. In `_invoke`'s `finally`, `final_stat = _cgroup_stat(cgroup_sid)`
+is read immediately before `_cgroup_destroy` (the last point a read is
+possible). When `envelope is None` and `final_stat[3]` (`oom_kill`) is `>
+0`, `_invoke` raises `WorkerError(f"worker {sid} was OOM-killed on
+\`{last_bash_cmd}\` (memory.max={cap} GiB) — raise --worker-memory-max or
+lower --max-parallel")` instead of the generic message.
+`_run_implementer`'s `except WorkerError` threads that text into the
+synthesized `incomplete-handoff` envelope's `summary` unchanged.
+`_settle_subtask`'s `empty_handoff` handling (rescue and no-commits
+branches alike) prefers `res.get("summary")` — the worker's own
+diagnostic — over `_validate_result`'s generic message, so a named OOM
+survives even when the subtask ultimately terminates via the retry cap.
 
 ### Abnormal exit and rate-limit contract (DESIGN §6 *Cleanup on abnormal exit*)
 
@@ -4213,117 +4107,78 @@ run branch, per-subtask branches, and implementer checkpoints all
 survive**; only worktrees are removed (and re-created idempotently on
 `resume` via `scripts/new-worktree.sh`).
 
-Per-worktree removal has a 240s timeout, sized for a large worktree
-(hundreds of MB, tens of thousands of files after an npm install +
-build) under N-way concurrent disk contention. Per-worktree failures (timeout or OS error) are
-non-fatal and counted; if any failed, the cleanup emits one closing
-log line pointing the user at `scripts/cleanup.sh --run-id <id>` to
-finish manually. The pass is best-effort: a stale worktree on disk is
-the worst case, not a corrupted run.
+Per-worktree removal has a 240s timeout (a large worktree can be hundreds
+of MB / tens of thousands of files under N-way concurrent disk
+contention). Failures are non-fatal and counted; if any failed, cleanup
+logs a pointer to `scripts/cleanup.sh --run-id <id>` to finish manually —
+best-effort, a stale worktree is the worst case, not a corrupted run.
 
-Per-worker `subprocess.TimeoutExpired` from `_invoke` (raised when the
-worker hits `worker_timeout_sec`, default 5400s / 90 min) is caught
-by both `_run_implementer` (returns an `incomplete-handoff` envelope,
-matching the WorkerError handoff path so _settle_subtask's existing
-machinery handles it) and `_run_conformer` (logs + returns None,
-matching the WorkerError advisory-phase semantics). Without these
-catches the timeout escapes through the asyncio cancellation chain
-into `main()`'s catch-all and dumps a multi-KB traceback — including
-the entire `claude -p` command line — to the user's terminal.
+Per-worker `subprocess.TimeoutExpired` from `_invoke` (`worker_timeout_sec`,
+default 5400s/90min) is caught by both `_run_implementer` (returns an
+`incomplete-handoff` envelope, same path as WorkerError) and
+`_run_conformer` (logs + returns `None`). Without these catches the
+timeout escapes through asyncio cancellation into `main()`'s catch-all and
+dumps a multi-KB traceback — including the full `claude -p` command line
+— to the terminal.
 
 `RateLimitedExit` is raised by `_detect_session_limit(text)` inside
-`_summarize_stream_event` when a worker stream contains the verbatim
-Claude Code subscription message
-`"You've hit your session limit · resets <h>:<mm><am|pm> (<IANA TZ>)"`,
-or by the same function's `rate_limit_event` branch when the
-protocol-level event's `status` field falls outside the known-allowed
-set `{"allowed", "allowed_warning"}` — a defensive match against
-future terminal status strings (Anthropic's terminal value, e.g.
-"exceeded" / "denied" / "blocked", is internal and unobserved by us;
-matching everything-not-allowed avoids hardcoding a guess that could
-go stale). The protocol-level path parses `resetsAt` (a Unix timestamp
-in seconds) into a UTC `reset_at`; the text path parses the wall-clock
-time + IANA tz. A **third** raise site lives outside `_summarize_stream_event`: the
-`_invoke` no-result-envelope branch. When a worker stream truncates
-with no `result` event *and* the account hit credit exhaustion (a
-`rate_limit_event` seen mid-stream with `overageDisabledReason in
-{"out_of_credits", "out_of_overage"}`, latched into a `nonlocal
-overage_blocked`), `_invoke` raises `RateLimitedExit(reset_at=None,
-out_of_credits=True, raw)` instead of a bare `WorkerError` — the
-out-of-credits-mid-stream-kill case described under §3 *Auth/quota
-backoff*. It is deliberately raised here, not in `_summarize_stream_event`,
-because the latch must survive to the post-stream no-envelope check even
-at quiet verbosity (where the summarizer returns `None`). The latch keys
-on `overageDisabledReason`, **not** on `overageStatus == "rejected"`:
-the latter is a standing state emitted by every `rate_limit_event` from
-an org with overage disabled (`overageDisabledReason:
-"org_level_disabled"`, `status:"allowed"`) and is *not* exhaustion —
-keying on it misclassified unrelated truncations as out-of-credits. An
-`org_level_disabled` truncation therefore takes the ordinary
+`_summarize_stream_event` on the verbatim Claude Code subscription message
+`"You've hit your session limit · resets <h>:<mm><am|pm> (<IANA TZ>)"`, or
+by the same function's `rate_limit_event` branch when the protocol-level
+`status` falls outside `{"allowed", "allowed_warning"}` — matching
+everything-not-allowed avoids hardcoding a terminal-status guess that
+could go stale. The protocol path parses `resetsAt` (Unix timestamp) into
+a UTC `reset_at`; the text path parses wall-clock + IANA tz. A **third**
+raise site is the `_invoke` no-result-envelope branch: when a stream
+truncates with no `result` event *and* a mid-stream `rate_limit_event`
+shows `overageDisabledReason in {"out_of_credits", "out_of_overage"}`
+(latched via `nonlocal overage_blocked`), `_invoke` raises
+`RateLimitedExit(reset_at=None, out_of_credits=True, raw)` — raised here,
+not in `_summarize_stream_event`, so the latch survives to the post-stream
+check even at quiet verbosity. The latch keys on `overageDisabledReason`,
+**not** `overageStatus == "rejected"` (a standing, non-exhaustion state for
+orgs with overage disabled) — keying on the latter misclassified unrelated
+truncations. An `org_level_disabled` truncation takes the ordinary
 `WorkerError` path.
 
-Either source produces a `reset_at: datetime | None`
-(parse failure → `None`, never a wrong-time guess) and the raw
-message. `main()`'s `except RateLimitedExit` arm: when `reset_at` is
-set, run worktree cleanup, sleep until the moment + 30s margin, then
-`os.execv(sys.executable, [sys.executable, __file__, "resume",
-"--run-id", <id>])` to re-exec the orchestrator itself (NOT the
-launcher — the launcher is not baked into the container image and
-its `resume` path would attempt to spawn a new container; the
-orchestrator already runs inside the container with state on disk
-and accepts `resume --run-id`). The `--max-workers` budget is NOT
-reset across the re-exec: `worker_count` persists in state.json,
-so a run that repeatedly hits the rate-limit still respects the
-user's cap;
-when `reset_at` is None because of an unparseable session-limit
-message, sleep a fixed `RATE_LIMIT_RETRY_BACKOFF_SEC` (300 s) and
-re-exec `resume` the same way — we can't compute a wake time, so we
-poll; a premature retry re-hits the same clean pause. Both of these
-(clock-based) arms route through the shared `_sleep_then_reexec(st,
-wait_seconds, reason) -> int | None` helper (cleanup → sleep →
-`os.execv`). It returns `None` when the `os.execv` succeeds (the process
-is replaced, so the return is unreachable), and an **exit code** when
-the sleep or re-exec was interrupted/failed instead: `130` on Ctrl-C
-(SIGINT), `128 + signum` on SIGTERM/SIGHUP (143 / 129, matching main()'s
-top-level signal arm), and `EXIT_LOCKED` (75) on the should-never-happen
-`os.execv` failure. The caller does `rc = _sleep_then_reexec(...); if rc
-is not None: exit_code = rc` and leaves `abnormal = False` (the helper
-already ran cleanup, so the `finally` must not re-run it).
+Either source produces a `reset_at: datetime | None` (parse failure →
+`None`, never a wrong-time guess). `main()`'s `except RateLimitedExit`:
+when `reset_at` is set, cleanup → sleep until the moment + 30s margin →
+`os.execv(sys.executable, [sys.executable, __file__, "resume", "--run-id",
+<id>])` to re-exec the orchestrator itself (not the launcher, which isn't
+baked into the image). `worker_count` persists across the re-exec, so a
+repeatedly-limited run still respects `--max-workers`. When `reset_at` is
+`None` (unparseable message), sleep a fixed `RATE_LIMIT_RETRY_BACKOFF_SEC`
+(300s) and re-exec the same way. Both clock-based arms route through
+`_sleep_then_reexec(st, wait_seconds, reason) -> int | None`: `None` when
+`os.execv` succeeds (return unreachable), else an exit code — `130`
+(Ctrl-C), `128 + signum` (SIGTERM/SIGHUP), `EXIT_LOCKED` (75, the
+should-never-happen `os.execv` failure). The caller sets `abnormal = False`
+(the helper already ran cleanup).
 
-The `out_of_credits=True` arm does **not** auto-resume: out-of-credits
-has no reset clock (it clears only on a top-up / billing cycle), so
-`main()` runs `_cleanup_on_abnormal_exit(st, full_purge=False)`
-directly, logs a `leerie resume <id>` hint, sets `exit_code =
-EXIT_LOCKED` and `abnormal = False`, and falls through to the `finally`
-(which must not re-run cleanup). This is checked *before* the
-`reset_at` branch. `_sleep_then_reexec` is never called for this case.
-The old `reset_at=None → exit 75 manual-resume` behavior is gone for
-rate-limits (they auto-resume), but out-of-credits deliberately
-preserves the surface-and-pause semantics for the reason above.
+The `out_of_credits=True` arm does **not** auto-resume — no reset clock
+(clears only on top-up/billing cycle). `main()` runs
+`_cleanup_on_abnormal_exit` directly, logs a `leerie resume <id>` hint,
+sets `exit_code = EXIT_LOCKED`, `abnormal = False`. Checked *before* the
+`reset_at` branch; `_sleep_then_reexec` never called here. Out-of-credits
+deliberately keeps the surface-and-pause semantics rate-limits no longer
+use.
 
-A terminal auth failure (`_is_terminal_auth_failure`, §3 *Terminal auth
-failure*) copies this exact arm verbatim: `_cleanup_on_abnormal_exit(st,
-full_purge=False)`, a `resume` hint, `exit_code = EXIT_LOCKED`,
-`abnormal = False`. Like out-of-credits, an expired session has no
-clock-based reset, so it takes the surface-and-pause disposition rather
-than `_sleep_then_reexec`'s auto-resume path.
+A terminal auth failure (`_is_terminal_auth_failure`, §3) copies this arm
+verbatim — an expired session has no clock-based reset either.
 
-**Auto-resume override persistence.** The re-exec passes only
-`resume <id>` as argv — any CLI overrides on the original
-launch (`--model`, `--max-workers`, `--max-parallel`, `--confidence-rounds`,
-`--source-of-truth`, `--clarify`, `--no-push`) are **not** propagated
-to the fresh process. They fall back to env vars (`LEERIE_*`) and
-`leerie.toml` settings, which are re-resolved on every `resume`
-(see "Resume integrity" above). Users who rely on a non-default
-setting should configure it via env or `leerie.toml` rather than a
-single CLI flag, so an auto-resume preserves it. A manual `resume`
-(invoked by the user after they Ctrl-C the auto-resume wait, or after
-the rare interrupt/execv-failure exit) can re-supply CLI overrides as
-needed.
+**Auto-resume override persistence.** The re-exec passes only `resume
+<id>` as argv — CLI overrides on the original launch (`--model`,
+`--max-workers`, `--max-parallel`, `--confidence-rounds`,
+`--source-of-truth`, `--clarify`, `--no-push`) are **not** propagated;
+they fall back to `LEERIE_*` env vars and `leerie.toml`, re-resolved on
+every `resume`. Configure non-default settings via env/`leerie.toml`
+rather than a single CLI flag if they must survive an auto-resume; a
+manual `resume` can re-supply CLI overrides.
 
-Ctrl-C (SIGINT) is **resumable** — same contract as every other
-abnormal exit. The explicit "throw this away" gesture is
-`scripts/cleanup.sh --run-id <id> --branches`, not Ctrl-C.
+Ctrl-C (SIGINT) is **resumable** — same contract as every other abnormal
+exit. The explicit "throw this away" gesture is `scripts/cleanup.sh
+--run-id <id> --branches`, not Ctrl-C.
 
 ---
 
@@ -4337,75 +4192,71 @@ are found. The pattern is grounded in the CRITIC framework (ICLR 2024):
 self-correction works only with external tool-verified feedback, not
 intrinsic self-review.
 
-Three callers — `wiring_judge`, `provision_judge`, and
-`integration_judge` — are "detect-and-die, single pass": they pass no
-`make_feedback_prompt`, because none can mechanically act on a found
-semantic defect the way a planner can add a subtask or a classifier can
-add a category. For these, a round that finds issues stops the loop
-immediately rather than retrying — a further round would attack the
-identical unchanged input with only a fresh, non-deterministic judge
-session, which can only ever *lose* the first round's finding (on a
-re-roll that happens not to reproduce it), never gain real information.
-The oscillation guard below does not apply to this path (it has no
-meaning without a re-drive between rounds). The `WorkerError`
-infrastructure-crash retry (a fresh session recovering from e.g. a
-saturated PID table) is orthogonal and still applies to all callers
-regardless of `make_feedback_prompt`.
+Three callers — `wiring_judge`, `provision_judge`, and `integration_judge`
+— are "detect-and-die, single pass": they pass no `make_feedback_prompt`,
+because none can mechanically act on a found semantic defect the way a
+planner can add a subtask or a classifier can add a category. A round
+that finds issues stops the loop immediately — a further round would
+attack the identical input with only a fresh, non-deterministic judge
+session, which can only *lose* the finding on a lucky re-roll, never gain
+information. The oscillation guard below doesn't apply here (no re-drive
+between rounds). The `WorkerError` infrastructure-crash retry is
+orthogonal and still applies to all callers regardless of
+`make_feedback_prompt`.
 
 ### Core functions
 
 | Function | Purpose |
 |----------|---------|
-| `_replan_domain_closure(plans, targets)` | Domains that must be re-planned together with `targets` — the transitive closure of domains depending on them across BOTH the id (`depends_on`) and tag (`requires`→`provides`) channels. A re-plan vanishes every id the domain used, so any other domain holding an edge into it would dangle; re-planning the whole closure makes that vacuous rather than merely checked. Domains are subtask-id prefixes. Consumed by `phase_overlap_judge`'s unresolvable recovery; `phase_plan(..., domains=…)` takes the result. Pinned by `tests/test_scoped_replan.py`. |
-| `_repair_prescribed_commands(plans, prescribed)` | Mechanical plan repair for the adherence floor (DESIGN §CRITIC *Repairing an omitted self-report beats re-driving for it*). Synthesises one subtask carrying every prescribed command, `depends_on` = the plan's current sinks (acyclic by construction, schedules alone in the final wave), and returns its id — or `None` when the floor is already clean, there are no commands, or no plan can supply a valid id prefix (a `_reconciler` pseudo-plan's `domain` is not a real category). Mutates `plans` in place; never raises; declines rather than guessing, mirroring `_repair_missing_requires`. Called from `_check_adherence` **before** `check_prescribed_command_coverage`, so a repairable gap never reaches the ~125-spawn re-plan path. Deliberately does not attach to an existing subtask: a verification-shaped matcher hits 32 of 36 subtasks on the real incident plan. Pinned by `tests/test_prescribed_command_repair.py`. |
-| `check_replan_affordable(st, caps, gate, plans)` | Budget preflight before a re-plan (DESIGN §13). `check_budget_feasibility` runs once after `_schedule()`, but a re-plan is the largest budget event in a run and was previously authorised unchecked — it re-runs the whole P1 decomposition, not just the planners. Estimates `n_domains × planner_samples + n_subtasks × replan_decompose_estimate` from the **plans the caller passes in** — NOT from `plan_snapshot`, which `_run_phases` writes only after `_schedule()` while both gates run before it. The recommended `--max-workers` is `int()`-cast, since the estimate is fractional and the flag is `type=_positive_int`. `die()`s with `EXIT_BUDGET_INFEASIBLE` when it exceeds what is left. Called at the top of the re-planning `_on_feedback` callback in `phase_adherence_gate`, and in `phase_overlap_judge`, BEFORE `phase_plan`. (`phase_planning_coverage_gate` no longer calls it — that gate is advisory and no longer re-plans, so it has no `_on_feedback`.) Honours `skip_budget_check`. Pinned by `tests/test_replan_budget_preflight.py`. |
-| `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. Re-invokes on **gating** findings only — see *Finding severity* below. Oscillation guard aborts a round only when its issue-signature set is EXACTLY EQUAL to an earlier round's — a proper subset (fewer, still-open issues) is genuine partial progress and is allowed to keep retrying (DESIGN §8 *The CRITIC retry pattern's oscillation guard*). |
-| `_partition_issues_by_severity(issues)` | Splits findings into `(gating, advisory)`, order preserved. Used by `_run_checked_loop` and `_select_best_planner_sample`. |
-| `_issue_is_advisory(issue)` | True when the issue's `LABEL` prefix is in `_ADVISORY_ISSUE_LABELS`. Unknown labels and non-strings are gating. |
-| `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis in `conf` is a number ≥ threshold. Used by the loop and by `_settle_subtask`'s implementer confidence check. |
-| `_format_check_feedback(issues, rnd, max_rounds)` | Formats issue list into the structured feedback block injected on re-invocation. |
-| `_confidence_schema(axes)` | DRY helper: builds the §8 confidence sub-schema for the given score axes. Used by 10 worker schemas — `classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` (**not** `splitter`, whose output — required `children` only — carries no confidence axis). Current shape: `required: [*axes, "basis"]`; `falsifiers_tested` and `contradictions_reconciled` are **optional** properties; there is no `gap_to_close` field and no `maxLength` caps — both were removed as part of a decoder-corruption mitigation for a required-fields-heavy schema (`anthropics/claude-code#49747`; DESIGN §8 *The disciplines are asked for; they are not schema-required*). The prompts still ask for all three disciplines, directing the gap into `basis` instead. `confidence` itself is **not** in any of these 10 schemas' top-level `required` array (still declared in `properties`, so a worker that does emit it is still recorded) — a worker that omits the whole self-gate block still validates; see each worker's own entry for its current required-field list. Pinned by `tests/test_confidence_not_required.py`; `tests/test_confidence_length_caps.py` covers the sub-schema shape for callers that do emit it. |
-| `_subtask_item_schema(*, include_requires, include_migration_targets, include_runs_commands, include_fixes_reported_symptom)` | DRY helper (same pattern as `_confidence_schema`/`_REQUIRES_ITEM`): builds the child-subtask item schema shared by `SCHEMAS["planner"]["subtasks"]`, `SCHEMAS["reconciler"]["added_subtasks"]`, and `SCHEMAS["splitter"]["children"]`, which previously repeated the `id`/`title`/`intent`/`scope_note`/`files_likely_touched`/`depends_on`/`provides`/`success_criteria_seed`/`size`/`investigation_notes` property block as three independently-written literals. The three call sites emit structurally overlapping but not identical objects — `reconciler.added_subtasks` (narrowest: no `requires`, no `migration_targets`/`performs_replacement`, no `runs_commands`, no `fixes_reported_symptom`, since bridging work the reconciler adds is not itself planner-authored original scope), `splitter.children` (`requires` only), and `planner.subtasks` (all four flags) each pass their own `include_*` set rather than converging on one shape — so a future field addition/removal at the builder is explicit about which call sites it reaches instead of silently landing on only one or two. Pinned by `tests/test_shared_subtask_item_schema.py`, including an anti-vacuity check that the narrower call sites do NOT accept the wider ones' optional fields. |
+| `_replan_domain_closure(plans, targets)` | Domains that must re-plan together with `targets` — the transitive closure across both the id (`depends_on`) and tag (`requires`→`provides`) channels, so a re-plan vanishing every id a domain used never dangles a still-live edge into it. Domains are subtask-id prefixes. Consumed by `phase_overlap_judge`'s unresolvable recovery; `phase_plan(..., domains=…)` takes the result. Pinned by `tests/test_scoped_replan.py`. |
+| `_repair_prescribed_commands(plans, prescribed)` | Mechanical plan repair for the adherence floor (DESIGN §CRITIC *Repairing an omitted self-report beats re-driving for it*). Synthesises one subtask carrying every prescribed command, `depends_on` = the plan's current sinks, returns its id — or `None` when the floor is clean, there are no commands, or no plan supplies a valid id prefix. Mutates `plans` in place; never raises; declines rather than guessing (mirrors `_repair_missing_requires`). Called before `check_prescribed_command_coverage` so a repairable gap never reaches the ~125-spawn re-plan path. Deliberately doesn't attach to an existing subtask (a verification-shaped matcher hits 32/36 subtasks on the real incident plan). Pinned by `tests/test_prescribed_command_repair.py`. |
+| `check_replan_affordable(st, caps, gate, plans)` | Budget preflight before a re-plan (DESIGN §13) — a re-plan re-runs the whole P1 decomposition and was previously authorised unchecked. Estimates `n_domains × planner_samples + n_subtasks × replan_decompose_estimate` from the **plans the caller passes in** (not `plan_snapshot`, written only after `_schedule()`). `die()`s with `EXIT_BUDGET_INFEASIBLE` when it exceeds what's left. Called at the top of the re-planning `_on_feedback` callback in `phase_adherence_gate`, and in `phase_overlap_judge` before `phase_plan`. Honours `skip_budget_check`. Pinned by `tests/test_replan_budget_preflight.py`. |
+| `_run_checked_loop(invoke, check, name, max_rounds, make_feedback_prompt)` | Generic loop: call → check → feedback → retry. Returns `(result, warnings)`. Re-invokes on **gating** findings only (see below). Oscillation guard aborts only when a round's issue-signature set is EXACTLY EQUAL to an earlier round's — a proper subset (genuine partial progress) keeps retrying (DESIGN §8). |
+| `_partition_issues_by_severity(issues)` | Splits into `(gating, advisory)`, order preserved. Used by `_run_checked_loop` and `_select_best_planner_sample`. |
+| `_issue_is_advisory(issue)` | True when the `LABEL` prefix is in `_ADVISORY_ISSUE_LABELS`. Unknown labels/non-strings are gating. |
+| `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis is a number ≥ threshold. Used by the loop and `_settle_subtask`'s implementer confidence check. |
+| `_format_check_feedback(issues, rnd, max_rounds)` | Formats issues into the structured feedback block injected on re-invocation. |
+| `_confidence_schema(axes)` | DRY helper building the §8 confidence sub-schema. Used by 10 worker schemas (`classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` — not `splitter`, whose output carries no confidence axis). Shape: `required: [*axes, "basis"]`; `falsifiers_tested`/`contradictions_reconciled` optional; no `gap_to_close` field, no `maxLength` caps (both removed as a decoder-corruption mitigation, `anthropics/claude-code#49747`; DESIGN §8). `confidence` is **not** in any of these schemas' top-level `required` — a worker omitting it still validates. Pinned by `tests/test_confidence_not_required.py`; `tests/test_confidence_length_caps.py` covers callers that do emit it. |
+| `_subtask_item_schema(*, include_requires, include_migration_targets, include_runs_commands, include_fixes_reported_symptom)` | DRY helper (same pattern as `_confidence_schema`) building the child-subtask item schema shared by `SCHEMAS["planner"]["subtasks"]`, `SCHEMAS["reconciler"]["added_subtasks"]`, `SCHEMAS["splitter"]["children"]` — previously three independently-written literals. Each call site passes its own `include_*` set (`reconciler.added_subtasks` narrowest — no `requires`/`migration_targets`/`runs_commands`/`fixes_reported_symptom`; `splitter.children` — `requires` only; `planner.subtasks` — all four) rather than converging on one shape, so a future field change is explicit about which sites it reaches. Pinned by `tests/test_shared_subtask_item_schema.py`, including an anti-vacuity check that narrower sites reject the wider ones' fields. |
 
 ### Finding severity — gating vs advisory
 
-`_run_checked_loop` partitions each round's findings with
+`_run_checked_loop` partitions each round's findings via
 `_partition_issues_by_severity(issues) -> (gating, advisory)` and re-invokes
-**only on gating findings**. Advisory findings are appended to `warnings` (so
-nothing is hidden) and logged once, but never consume a round, never enter
-`_format_check_feedback`, and never enter the oscillation guard's signature
-set. `_select_best_planner_sample` likewise ranks on the gating subset only.
+**only on gating findings**. Advisory findings go to `warnings` (never
+hidden) and are logged once, but never consume a round, enter
+`_format_check_feedback`, or enter the oscillation guard's signature set.
+`_select_best_planner_sample` likewise ranks on the gating subset only.
 
-`_issue_is_advisory(issue)` keys on the mechanical `LABEL` prefix — the same
-prefix `_issue_signature` parses, generated by leerie's own check functions,
-not LLM prose, so this is not the natural-language parsing CLAUDE.md forbids.
-A `LABEL (subtype):` parenthetical is stripped before lookup.
+`_issue_is_advisory(issue)` keys on the mechanical `LABEL` prefix (the same
+one `_issue_signature` parses, generated by leerie's own check functions,
+not LLM prose — not the natural-language parsing CLAUDE.md forbids). A
+`LABEL (subtype):` parenthetical is stripped before lookup.
 
-`_ADVISORY_ISSUE_LABELS` is a **frozenset allowlist**, and the default is
-therefore **gating**: a finding nobody classified keeps today's behaviour, so
-an incomplete classification cannot silently disarm a real gate.
+`_ADVISORY_ISSUE_LABELS` is a **frozenset allowlist**, so the default is
+**gating**: an unclassified finding cannot silently disarm a real gate.
 
 | Advisory label | Why it is advice, not a defect |
 |---|---|
-| `INTRA_DOMAIN_OVERLAP` | Its own text is "consider merging or splitting". Two subtasks touching one file is frequently legitimate — measured 43 → 12 → 6 across every planner in both 2026-08-03 runs, never reaching zero. |
-| `PHANTOM_PATH` | Fires when no ancestor dir exists for a planned path — exactly what a subtask that *creates* a new module looks like. Also the dominant driver of the issue-count/plan-size coupling. |
-| `OVERSIZED` | "size='large' — split it" grades a planner self-report, but the independent `fit_judge` in `_recursive_decompose` is the authoritative decomposition gate (DESIGN §5½, §8). |
+| `INTRA_DOMAIN_OVERLAP` | Its own text is "consider merging or splitting" — two subtasks touching one file is frequently legitimate (measured 43 → 12 → 6 across both 2026-08-03 runs, never zero). |
+| `PHANTOM_PATH` | Fires when no ancestor dir exists for a planned path — exactly what a subtask that *creates* a new module looks like; the dominant driver of the issue-count/plan-size coupling. |
+| `OVERSIZED` | Grades a planner self-report, but `fit_judge` in `_recursive_decompose` is the authoritative decomposition gate (DESIGN §5½, §8). |
 | `MANY_CATEGORIES` | "typical tasks span 1–3" is a heuristic, not a correctness property. |
-| `SAME_WORK_RISK`, `TEST_OWNERSHIP_RISK` | Both end by telling the classifier to apply a judgement test and keep both categories if the deliverables genuinely differ. A finding whose own remedy may be "change nothing" cannot gate. |
+| `SAME_WORK_RISK`, `TEST_OWNERSHIP_RISK` | Both end by telling the classifier to apply judgement and keep both categories if deliverables genuinely differ — a remedy that may be "change nothing" cannot gate. |
 
 Everything else — `DANGLING_DEP`, `INTRA_DOMAIN_CYCLE`, `EMPTY_CRITERIA`,
 `PROTECTED_PATH`, `MIGRATION_TARGETS_MISSING`, `UNCOVERED_MIGRATION_SURFACE`,
 `PRESCRIBED_CMD_UNRUN`, `REQUIRED_ITEM_UNCOVERED`, and every other worker's
 codes — remains gating.
 
-Pinned by `tests/test_issue_severity.py`, whose most important test is
-`test_unknown_labels_default_to_gating`: if that default ever inverts, every
-future check silently stops gating until someone remembers to classify it.
+Pinned by `tests/test_issue_severity.py`; its most important test is
+`test_unknown_labels_default_to_gating` — if that default ever inverts,
+every future check silently stops gating until reclassified.
 
 ### Per-worker mechanical checks
 
-Each returns `list[str]` — empty when clean. Pure Python, no LLM. Severity is
-resolved from the issue code per the table above, not from the check function.
+Each returns `list[str]` — empty when clean. Pure Python, no LLM. Severity
+is resolved from the issue code per the table above, not the function.
 
 | Worker | Check function | Issue codes | Max rounds cap |
 |--------|---------------|-------------|----------------|
@@ -4415,16 +4266,16 @@ resolved from the issue code per the table above, not from the check function.
 | Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `DUPLICATE_PAIR` | `judgment_check_rounds` (3) |
 | Adherence gate | `check_prescribed_command_coverage(prescribed_procedure, subtasks)` (deterministic floor) + inline `LOW_ADHERENCE` check on the `adherence_judge` result | `PRESCRIBED_CMD_UNRUN`, `LOW_ADHERENCE` | `judgment_check_rounds` (3) |
 | Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE` | `judgment_check_rounds` (3) |
-| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED` (advisory — reported but excluded from the retry decision by `_gating_issues`), `UNMET_CRITERION`, plus `check_production_evidence`'s four (below) | `implementer_confidence_retries` (2) |
+| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED` (advisory — excluded from retry by `_gating_issues`), `UNMET_CRITERION`, plus `check_production_evidence`'s four (below) | `implementer_confidence_retries` (2) |
 | Integrator | `check_integrator_output(result)` | — | `judgment_check_rounds` (3) |
-| Conformer | (unchanged: `_conformance_clean` on observable signals) | — | `conformance_rounds` (3) |
+| Conformer | (`_conformance_clean` on observable signals) | — | `conformance_rounds` (3) |
 
 **`UNMET_CRITERION` must not fire on a criterion the implementer was never
-responsible for.** `prompts/implementer.md` tells the worker that a criterion
-naming the build is a *conformance-phase* signal — the conformer runs the build,
-and a build inside a worker's turn budget can OOM the container and get it reaped
-mid-turn. With only `{criterion, met, evidence}` on the schema, an obedient
-implementer had no way to say so and every such report became a re-drive.
+responsible for.** A criterion naming the build is a *conformance-phase*
+signal — the conformer runs the build, and one inside a worker's turn
+budget can OOM the container and get it reaped mid-turn. With only
+`{criterion, met, evidence}` on the schema, an obedient implementer had no
+way to say so and every such report became a re-drive.
 
 `SCHEMAS["implementer"]`'s `criteria_results` items therefore carry an optional
 `not_applicable` bool, and `check_implementer_output` skips any criterion where
