@@ -2872,132 +2872,81 @@ quoted into the prompt; a second failure raises `WorkerError`.
 #### Forced constrained decoding — `--dangerously-force-strict-output`
 
 Off by default. Resolved by `resolve_dangerously_force_strict_output(repo_root,
-cli_value)` with
-the standard CLI > env (`LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT`) > `leerie.toml`
+cli_value)` with the standard CLI > env
+(`LEERIE_DANGEROUSLY_FORCE_STRICT_OUTPUT`) > `leerie.toml`
 (`dangerously_force_strict_output`) precedence.
 
 **Why it exists.** `--json-schema` is *validated*, not constrained: the CLI
-injects the schema as a synthetic `StructuredOutput` tool with **no
-`strict: true`** and no `output_config`. A meaningful fraction of
-submissions are malformed as a result. Setting `strict: true` compiles
-the schema into a sampling grammar and makes those shapes unrepresentable.
+injects the schema as a synthetic `StructuredOutput` tool with no
+`strict: true` and no `output_config`, so a meaningful fraction of
+submissions come back malformed. Setting `strict: true` compiles the schema
+into a sampling grammar and makes those shapes unrepresentable.
 
-**Context-window side effect (`_model_arg`).** Owning `ANTHROPIC_BASE_URL`
-makes the CLI treat the session as gateway-routed, so it applies a
-conservative client-side context ceiling instead of the model's native
-window. `_model_arg(model)` therefore appends `[1m]` — the documented
-gateway-side selector for the 1M window — to any alias in
-`_ONE_M_CONTEXT_MODELS` (`sonnet`, `opus`; **not** `haiku`, which has no 1M
-variant and rejects the suffix) whenever `_STRICT_PROXY` is active. Inert on
-the direct path, where `sonnet` already resolves to Sonnet 5's native 1M.
+**Context-window side effect.** Owning `ANTHROPIC_BASE_URL` makes the CLI
+treat the session as gateway-routed, applying a conservative client-side
+context ceiling instead of the model's native window. `_model_arg(model)`
+compensates by appending `[1m]` (the gateway 1M-window selector) to any
+alias in `_ONE_M_CONTEXT_MODELS` (`sonnet`, `opus`; not `haiku`, which has no
+1M variant) whenever `_STRICT_PROXY` is active; inert on the direct path.
 
-**Mechanism.** `_StrictOutputProxy` — an `asyncio.start_server` listener on
-`127.0.0.1`, **one per run**, started in `_orchestrate()` before the first
-worker and closed in its `finally` — which covers normal completion, `die()`,
-and SIGINT. There is deliberately no `_cleanup_on_abnormal_exit` hook: on
-SIGKILL the container boundary reaps the listener (DESIGN §6), which is the same
-guarantee every other worker resource relies on. Workers
-reach it via `ANTHROPIC_BASE_URL` injected into `worker_env`. The orchestrator
-is PID 1 in the container and workers are its children, so loopback needs no
-port mapping.
+**Mechanism.** `_StrictOutputProxy` is an `asyncio.start_server` loopback
+listener, one per run, started in `_orchestrate()` before the first worker
+and closed in its `finally` (covering normal completion, `die()`, and
+SIGINT — no separate abnormal-exit hook is needed since SIGKILL is reaped by
+the container boundary, DESIGN §6). Workers reach it via `ANTHROPIC_BASE_URL`
+injected into `worker_env`; no port mapping is needed since the orchestrator
+is PID 1 and workers are its children.
 
-**Three entrypoints get their own instance, not `_orchestrate()`'s.** The
-module-level `_STRICT_PROXY` global is what `_invoke` actually gates on
-(`if _STRICT_PROXY is not None` — never `caps["force_strict_output"]`, which
-only `_orchestrate` and `main`'s collision guards read). Any path that
-invokes a worker without `_orchestrate` having run therefore sees no proxy:
+**Three entrypoints construct their own instance rather than reusing
+`_orchestrate()`'s**, because `_invoke` gates on the module-level
+`_STRICT_PROXY` global, which only `_orchestrate()` populates:
 
 | entrypoint | why it misses `_orchestrate` | where the flag comes from |
 |---|---|---|
 | `run_rebaser` | separate `python3` process (`scripts/host-finalize.sh`'s heredoc, §6) | `st.data["dangerously_force_strict_output"]` |
 | `run_recapture_deps` | separate `python3` process (`./leerie config --recapture`'s seam, §6½) | same, re-read per `target_run_dir` |
-| `main()`'s `--phase heal` branch | `return`s before `_orchestrate()` is called | `caps` — already resolved in `main()` |
+| `main()`'s `--phase heal` branch | `return`s before `_orchestrate()` is called | `caps`, already resolved in `main()` |
 
-All three wrap their worker call in the shared
-`_strict_output_proxy(caps, label)` async context manager (defined beside
-`_StrictOutputProxy`), which constructs, starts, and tears down one
-short-lived instance scoped to that call. The two host-seam entrypoints
-cannot call `resolve_dangerously_force_strict_output` meaningfully — the CLI
-flag never crosses the process boundary, only `state.json` does — so they
-read the value `_orchestrate()` already persisted for that exact run
-(§ *State fields*), falling back to a CLI-blind resolve only for a
-`state.json` predating that field. The heal branch needs no such read: it is
-still inside `main()`, which resolved the flag (and passed `main()`'s
-`ANTHROPIC_BASE_URL`/Bedrock collision guards) before the branch runs.
-`_replay_capture`, which the heal loop drives, deliberately needs **no**
-wiring of its own: it inherits whatever proxy is ambient, which is why
-rebuilding its `caps` from `DEFAULT_CAPS` is harmless here.
+All three wrap their worker call in the shared `_strict_output_proxy(caps,
+label)` async context manager, which constructs, starts, and tears down one
+short-lived instance scoped to that call. The two host-seam entrypoints read
+the value `_orchestrate()` already persisted to `state.json` for that run
+rather than re-resolving the CLI flag, which never crosses the process
+boundary; a `state.json` predating that field falls back to a CLI-blind
+resolve. The proxy fails **soft** in both directions here (a `start()`
+`OSError` logs and proceeds unconstrained; a `stop()` failure is caught and
+swallowed) because all three callers are best-effort paths that must never
+block a push, abort multi-run consolidation, or fail a heal — a deliberate
+departure from `_orchestrate`'s fail-closed startup rule (DESIGN §7).
+`tests/test_strict_output_proxy.py`'s `TestStrictOutputReachesEveryEntrypoint`
+pins all three entrypoints structurally.
 
-The helper fails **soft in both directions**, deliberately departing from
-`_orchestrate`'s fail-closed startup rule (DESIGN §7) because all three
-callers are best-effort paths that must never block a push (`run_rebaser`'s
-own contract), abort multi-run consolidation, or fail a heal: a `start()`
-`OSError` logs and proceeds unconstrained, and a `stop()` failure is caught,
-logged, and swallowed rather than escaping the `finally`. The global is
-reset unconditionally either way, which `run_recapture_deps` depends on per
-loop iteration: a stale non-`None` value would silently route the next
-target run through the previous run's closed proxy. `run_recapture_deps`
-additionally keeps a broad guard *around* `asyncio.run` as well as inside
-it, since proxy construction sits outside the inner guard and a setup
-failure must not abort the whole consolidation.
-
-Before this wiring, all three built their own `caps` with no
-`force_strict_output` key, so every worker they invoked ran unconstrained
-regardless of the flag. `SCHEMAS["rebaser"]["diagnosis"]` is also narrowed
-from `["string", "null"]` to plain `"string"` (the prompt's own convention
-is "empty string" for "nothing to diagnose"), independent of and composing
-with the proxy-wiring fix. `tests/test_strict_output_proxy.py`'s
-`TestStrictOutputReachesEveryEntrypoint` pins all three entrypoints
-structurally.
-
-**Upstream read timeout.** `_StrictOutputProxy(max_parallel, verbosity,
-upstream_timeout_sec)`, applied to the `urlopen` that forwards each request
-and floored at the module constant `_STRICT_PROXY_TIMEOUT_SEC`.
-`_orchestrate()` passes the **resolved** `caps["worker_timeout_sec"]`, not the
-frozen default: that constant is `DEFAULT_CAPS["worker_timeout_sec"]`
-evaluated at import, so once `--worker-timeout` could raise the ceiling above
-it the proxy became able to give up before the worker — the exact outcome the
-constant's own comment says it exists to prevent ("a shorter bound would kill
-requests the worker is still legitimately waiting on, converting a slow call
-into an unexplained worker failure"). The floor keeps a *lowered* worker cap
-from making the proxy the first to quit either. Note the two bound different
-things — the proxy bounds one upstream request, the cap bounds the whole
-worker process — so this is an invariant repair rather than a reachable
-failure.
+**Upstream read timeout** is floored at the module constant
+`_STRICT_PROXY_TIMEOUT_SEC` but otherwise uses the *resolved*
+`caps["worker_timeout_sec"]` (not the frozen default), so a raised
+`--worker-timeout` ceiling can't leave the proxy giving up on a request the
+worker is still legitimately waiting on.
 
 | property | value | why |
 |---|---|---|
-| port | bind `0`, read back from `server.sockets[0].getsockname()[1]` | no scan, no race, concurrent runs never collide |
+| port | bind `0`, read back from the socket | no scan, no race, concurrent runs never collide |
 | executor | dedicated `ThreadPoolExecutor(max_parallel + 8)` | the default pool saturates under concurrent load |
-| socket | `reuse_address=True`, `backlog=256` | without it the port is not rebindable after shutdown |
-| shutdown | close listener, drain tracked writers, `_pool.shutdown(wait=False, cancel_futures=True)` | port is rebindable afterwards. `wait=False` keeps Ctrl-C responsive — a blocking join could hold the finally open for a full upstream timeout. `ThreadPoolExecutor` registers an atexit join, so an in-flight upstream call can delay the interpreter by up to `_STRICT_PROXY_TIMEOUT_SEC`; in the container the boundary reaps first |
-| `ConnectionResetError` / `BrokenPipeError` | caught per connection, non-fatal | normal client hang-up |
+| socket | `reuse_address=True`, `backlog=256` | port stays rebindable after shutdown |
+| shutdown | close listener, drain writers, `_pool.shutdown(wait=False, cancel_futures=True)` | keeps Ctrl-C responsive; the container boundary reaps any still-in-flight call |
 | upstream | executor-bridged `urllib` | leerie has no async HTTP dependency |
-| method | parsed from the request line and threaded to `_upstream` | only POST bodies are rewritten; every other verb the CLI issues must reach upstream as itself |
-| chunked request body | decoded by `_read_chunked`, never rewritten | a chunked body carries no `content-length`, so a length-driven read forwards only the first packet — a silently truncated request, which reads downstream as a model error rather than a proxy bug |
+| chunked request body | decoded by `_read_chunked`, never rewritten | a chunked body has no `content-length`, so a length-driven read would forward only the first packet |
 
-**Logging reports categories, never a merged total.** The proxy runs in the
-orchestrator process, so `log()` from the handler interleaves with every other
-leerie line — there is no separate proxy log to go find.
-
-Four counters, deliberately not merged: `passed_through` (no `StructuredOutput`
-tool in the request — ordinary multi-turn traffic, measured at ~25-30% of POSTs
-because the CLI injects the tool only on turns that want structured output),
-`unexpected_tool_shape` (the tool IS present but duplicated or missing its
-`input_schema` — the only pass-through worth warning about), `schema_errors`
-(400s, the flag's own failure mode) and `transient_errors` (429/5xx, unrelated
-to the rewrite). Echo budgets are **per class**.
-
-A **renamed** tool is caught separately, at run level: it yields no matching
-tool per request, exactly like an ordinary turn that never asked for structured
-output, so it cannot be classified where the other shape problems are. If a run
-ends having rewritten nothing while requests were proxied, the summary reports
-a probable rename — once, so it cannot reintroduce per-request false positives.
-
-The counters are deliberately not merged into one total: a merged count on a
-healthy run can read as "the rewrite may be being rejected" even when the real
-cause was a few transient errors consuming the shared echo budget, sending the
-operator chasing nothing. Three levels, emitted by `_log_exchange`:
+**Logging reports categories, never a merged total** — a merged count on a
+healthy run can misleadingly read as "the rewrite is being rejected" when the
+real cause is a few unrelated transient errors. Four counters:
+`passed_through` (no `StructuredOutput` tool in the request — ordinary
+multi-turn traffic, ~25-30% of POSTs), `unexpected_tool_shape` (tool present
+but malformed — the only pass-through worth warning about), `schema_errors`
+(400s, the flag's own failure mode), `transient_errors` (429/5xx, unrelated).
+A renamed `--append-system-prompt-file`-style tool is caught separately at
+run level (no matching tool per request is indistinguishable from an
+ordinary non-structured turn), reported once as a probable rename if the run
+proxied requests but rewrote nothing.
 
 | when | verbosity | line |
 |---|---|---|
@@ -3006,264 +2955,129 @@ operator chasing nothing. Three levels, emitted by `_log_exchange`:
 | upstream < 400 | `debug` (`-vv`) only | `strict-output proxy: <method> <path> -> <status> (<what was changed>)` |
 | run ends | all | rewritten / passed-through / upstream-error counts |
 
-The error line is deliberately not verbosity-gated. This proxy is the only thing
-in the path that rewrites a request, so a 4xx is most likely leerie's own edit
-being rejected — and the response body names the offending schema path. Without
-it the operator sees only workers retrying, which is precisely the
-misattribution this flag's failure mode consists of. Echoes are capped at
-`_STRICT_PROXY_ERROR_LOG_MAX` (3) bodies of `_STRICT_PROXY_ERROR_BODY_MAX` (400)
-chars, because a rejected rewrite is systematic — every worker call fails the
-same way — after which they are counted, not echoed. The count is complete
-regardless, so the end-of-run summary never under-reports.
+The error line is never verbosity-gated: a 4xx here is most likely leerie's
+own edit being rejected, and the response body names the offending schema
+path — without it the operator only sees workers retrying, the exact
+misattribution this flag risks. Echoes cap at `_STRICT_PROXY_ERROR_LOG_MAX`
+(3) bodies of `_STRICT_PROXY_ERROR_BODY_MAX` (400) chars; further failures
+are counted, not echoed (a rejected rewrite is systematic, so the pattern
+repeats identically).
 
-**Transform** (`_strictify_request(body) -> tuple[bytes, str] | None` — the
-second element describes what changed and is what the log lines below report),
-applied only when
-exactly one tool is named `StructuredOutput` and carries an `input_schema`:
-sets `strict: true`; adds `additionalProperties: false` to every object node
-including inside array `items`; strips `minLength` / `maxLength` / `minimum` /
-`maximum`; clamps `minItems > 1` to `1`. Verified against all entries in
-`SCHEMAS` with zero residual violations.
+**Transform** (`_strictify_request`), applied only when exactly one tool is
+named `StructuredOutput` with an `input_schema`: sets `strict: true`; adds
+`additionalProperties: false` to every object node — including a bare
+`properties` with no declared `type` and a nullable `["object", "null"]`
+union, not just `{"type": "object"}` (a transform handling only the first
+shape 400s leerie's own nullable `implementer.clarification_question`);
+strips `minLength`/`maxLength`/`minimum`/`maximum`; clamps `minItems > 1` to
+`1`. `scripts/verify-strict-schemas.py` sends every schema in `SCHEMAS` to
+the **live API** (kept outside `pytest.ini`'s `testpaths` so the suite stays
+LLM-free) and exits 0 (all compile) / 1 (rejection) / 2 (control not
+rejected — the probe is untrustworthy) / 3 (inconclusive — throttled or
+timed out; not a pass). Re-run after editing `SCHEMAS` or `_strictify_schema`.
+Pinned by `test_every_object_shape_is_hardened` and
+`test_no_schema_has_an_unhardened_object_shape`.
 
-**"Object node" is three shapes, not one.** `{"type": "object"}`, a *union*
-type containing it (`["object", "null"]`), and a bare `properties` with no
-declared type. The API requires `additionalProperties: false` on all three —
-a transform that only handles the first shape 400s any schema with a nullable
-object field (leerie's own `implementer.clarification_question` is one).
+**All schemas in `SCHEMAS` compile**, but two needed restructuring beyond
+mechanical hardening: `planner` refused as "too complex" from many optional
+properties inside one `subtasks[]` array item — fixed by `_strictify_schema`'s
+all-required pass, which collapses the combinatorial explosion. `reconciler`
+refused as "grammar too large" even at zero optionals — fixed by lifting
+`requires` out of `added_subtasks` into a sibling `added_requires` keyed by
+`sid`, and collapsing four isomorphic `{sid, tag, reason}` arrays into one
+enum-discriminated `tag_ops`; `_expand_reconciler_output` fans that back into
+the nine arrays every consumer still expects. **Do not re-nest `requires` or
+re-split `tag_ops`** — both put the schema back over the ceiling; grammar
+size is driven by optional properties inside array items, not raw schema
+size, and cheaper reductions ($defs dedup, stripping descriptions, trimming
+property counts) were each tried and still refused.
 
-Verified against the **real API**, not just self-consistently against the
-transform's own constants: `scripts/verify-strict-schemas.py` sends every
-schema in `SCHEMAS` to the live API, deliberately outside `pytest.ini`'s
-`testpaths` so the pytest suite stays LLM-free. Re-run it after editing any
-entry in `SCHEMAS` or touching `_strictify_schema`. Pinned in the pytest
-suite by `test_every_object_shape_is_hardened` (the three shapes) and
-`test_no_schema_has_an_unhardened_object_shape` (the whole corpus, using an
-independently-spelled definition of "is an object").
+`output_config.format` compiles the original schema but is unusable — it
+returns the payload as a text block, so `structured_output` stays unpopulated
+and removing the injected tool makes the model refuse to answer, believing
+it's a prompt-injection attempt.
 
-**Running the probe.** `python3 scripts/verify-strict-schemas.py`. It sends one
-request per schema and exits **0** every schema compiles / **1** at least one
-was rejected / **2** the control was *not* rejected, so the probe cannot detect
-a rejection and a pass would be meaningless / **3** inconclusive — at least one
-schema was throttled or timed out. **3 is not a pass**: a schema with no verdict
-is unchecked, and the summary names which ones. Grammar compilation for a
-large schema is genuinely slow (tens of seconds), which is why a transport
-failure is reported as "no verdict" and never conflated with a rejection.
+**Fail-open on the response too.** A 400 to a hardened request is answered
+by re-sending the original, untouched. The proxy fingerprints the schema
+(sha256 of the canonical `input_schema`) into `_unhardenable` so the doomed
+attempt is paid once per run, not once per call, and logs the rejected
+worker type at every verbosity via a fingerprint→worker-type map built from
+`SCHEMAS`. Only 400s retry this way; 401/403/429/5xx are not schema
+problems. Grammar compilation is cached upstream — the first hardened call
+per schema is slow (tens of seconds), subsequent calls fast (~2s) — which is
+what makes the flag affordable.
 
-Two API facts worth knowing: a subscription OAuth token **requires the Claude
-Code system-prompt identity** (without it the API answers a bare
-`429 {"message":"Error"}` that reads exactly like quota exhaustion), and the
-20-strict-tool / 24-optional-parameter ceilings are per-**request** aggregates,
-so batching schemas into one request to save calls trips them and establishes
-nothing about any individual schema. leerie sends exactly one tool per
-request.
+**Two fatal collisions**, both `die()` rather than silently degrade, because
+the flag works by owning `ANTHROPIC_BASE_URL`: (1) an operator-set
+`ANTHROPIC_BASE_URL` — overriding it silently or silently dropping the
+guarantee are both wrong; (2) Bedrock (`AWS_BEARER_TOKEN_BEDROCK` or a
+truthy `CLAUDE_CODE_USE_BEDROCK`) — Bedrock has its own base-URL override and
+the proxy's upstream is hardcoded to `api.anthropic.com`, so the flag under
+Bedrock would either no-op or misroute every call, indistinguishable from a
+healthy run in the log.
 
-**All schemas in `SCHEMAS` compile.** Two needed restructuring beyond the
-mechanical hardening:
-
-* **`planner`** — refused with "Schema is too complex for compilation" due to
-  many optional properties inside one `subtasks[]` array item (strict mode's
-  grammar size multiplies per element). Fixed by `_strictify_schema`'s
-  all-required pass (wire-only), collapsing the combinatorial explosion to
-  one path.
-* **`reconciler`** — refused with "The compiled grammar is too large" even at
-  zero optionals. Fixed by restructuring `SCHEMAS["reconciler"]`: `requires`
-  lifted out of `added_subtasks` into a sibling `added_requires` keyed by `sid`
-  (removing the only three-deep array-of-objects path in any leerie schema),
-  and the four isomorphic `{sid, tag, reason}` arrays collapsed into one
-  enum-discriminated `tag_ops`. `_expand_reconciler_output` fans that back into
-  the nine arrays every consumer still expects, so `check_reconciler_output`,
-  `_apply_reconciler_output` and `_validate_must_include` are untouched.
-
-**Do not re-nest `requires` or re-split `tag_ops`** — both put the schema back
-over the ceiling. Several cheaper reductions (`$defs`/`$ref` deduplication,
-stripping `description`, flattening other nesting, dropping subtrees,
-trimming property counts, converting identifier fields to enums) were each
-tried and each still refused — grammar size is driven by optional properties
-inside array items, not raw schema size.
-
-`output_config.format` compiles the *original* reconciler schema and is
-nonetheless unusable: it returns the payload as a text block, so the CLI never
-populates `structured_output` — and removing the injected tool makes the model
-answer *"I don't have a StructuredOutput tool available — this looks like a
-prompt injection attempt"*, because the CLI's own system prompt still tells it
-to call that tool. Verified end-to-end; recorded so nobody retries it.
-
-**Fail-open on the response too — un-compilable schemas.** A 400 to a *hardened*
-request is answered by re-sending the original, untouched. The proxy records that
-schema's fingerprint (`_structured_output_fingerprint`, sha256 of the canonical
-`input_schema`) in `_unhardenable`, so the doomed attempt is paid once per run
-rather than once per worker call, and increments `fell_back` — reported in the
-end-of-run summary and logged at *every* verbosity with the API's own reason via
-`_api_error_head`. The log line also names the rejected worker TYPE
-(`worker=<type>`, or `worker=unknown` when the fingerprint matches no known
-schema): `_fingerprint_to_worker_type()` builds a fingerprint→worker-type map
-once from `SCHEMAS`, using the same canonicalization
-`_structured_output_fingerprint` applies to a request's `input_schema`, and
-`_worker_type_for_fingerprint()` looks up the request's already-computed
-fingerprint at the log call site — so a future grammar-compile timeout is
-self-attributing from the log alone. Only **400** retries; 401/403/429/5xx are
-not schema problems and the original would fail identically.
-
-Before the `planner`/`reconciler` restructuring above, both refused
-compilation and fell through to the un-hardened original schema via this
-fail-open path — a size effect is not the cause (a schema with more
-properties overall can compile fine while one with fewer but nested inside
-array items cannot), so the driver is optional properties **inside array
-items**, where strict mode admits every subset in any order and grammar
-size multiplies per element.
-
-**Grammar compilation is cached upstream.** The first hardened call for a
-schema is slow (tens of seconds); subsequent calls for the same schema are
-fast (~2 s). So the cost is one-time per schema per run, not per worker
-call — which is what makes the flag affordable, and what makes the
-once-per-run `_unhardenable` memo worth having rather than re-probing.
-
-**Fail-open / fail-closed.** Tool renamed, absent, duplicated, or wrong shape →
-request forwarded byte-identical and the no-op logged (a silent loss of the
-guarantee is the dangerous case). Listener cannot bind → `die()`, never a quiet
-downgrade to unconstrained.
-
-**Two fatal collisions, same contract.** The flag works by owning
-`ANTHROPIC_BASE_URL`, so leerie `die()`s rather than proceed when that ownership
-is contested:
-
-1. **An operator-set `ANTHROPIC_BASE_URL`.** Overriding a user's gateway
-   silently and silently skipping the requested guarantee are both wrong, so
-   leerie names both and lets the operator unset one or drop the flag.
-2. **Bedrock** (`AWS_BEARER_TOKEN_BEDROCK`, or a truthy `CLAUDE_CODE_USE_BEDROCK`
-   — the same spellings the launcher's `detect_bedrock_mode()` accepts).
-   `ANTHROPIC_BASE_URL` is the *first-party* endpoint override; Bedrock has its
-   own (`ANTHROPIC_BEDROCK_BASE_URL`) and the proxy's upstream is hardcoded to
-   `api.anthropic.com`. So the flag under Bedrock either does nothing — the CLI
-   never contacts the proxy and the operator is silently handed post-hoc
-   validation, the exact failure case 1 exists to prevent — or misroutes every
-   worker call. Neither is distinguishable from a healthy run in the log, so
-   this is a `die()`, not a warning.
-
-**Stripped numeric bounds are re-checked in Python.** Of the 21 stripped
-keywords, 16 are string-length bounds (15 `minLength`, 1 `maxLength`) whose
-consumers already test truthiness. The 5 numeric ones (3 `minimum`, 2 `maximum`)
-do not and fail permissively — `score = judge_result.get("score", 0.0)` then
-`if score >= threshold` would read an out-of-range score as well-fit — so
-`fit_judge.score` (0–1, `_recursive_decompose`),
-`adherence_judge.instruction_adherence` (0–10, `phase_adherence_gate`) and
-`provision.recipe[].timeout_s` (≥1, `_recipe_timeout_s`, used by both the
-prompt-rendering and the baseline-install call sites) go through
-`_bounded_or_conservative`.
-
-These guards run **unconditionally, not only under the flag**: a value outside
-its declared range was always a worker bug, and distrusting it is right whether
-or not strict mode is what removed the bound. `timeout_s` additionally has a
-pre-existing `or 1800` fallback that already absorbed `0`; the guard adds the
-negative case, which is truthy and would otherwise reach
-`wait_for(timeout=-5.0)` and fire instantly.
+**Stripped numeric bounds are re-checked in Python unconditionally**, not
+only under this flag, since an out-of-range worker value was always a bug:
+`fit_judge.score`, `adherence_judge.instruction_adherence`, and
+`provision.recipe[].timeout_s` go through `_bounded_or_conservative` (the
+consumers of the stripped string-length bounds already test truthiness and
+needed no separate guard).
 
 #### User prompt transport — stdin, not argv
 
-`build()` obtains its argv from `_contained_claude_argv` and appends the system-prompt flag with **no positional argument
-after `-p`** — the user prompt (task + subtask_views + any retry note)
-is fed to the child's stdin instead, via `_invoke()`'s `stdin_data`
-param. `_invoke()` writes that payload to a temp file **before** the
-spawn and hands the child that file as its stdin; the file reaches EOF
-on its own once read, which is the end-of-input the CLI needs to start
-processing. `stdin=DEVNULL` otherwise (callers with no prompt to feed,
-e.g. the preflight smoke test, are unaffected). The file is closed and
-unlinked from `_invoke`'s `finally`, so a timed-out or crashed worker
-cannot leak it, and it is created per call — so `claude_p`'s 2-attempt
-retry, which appends a retry note, stages a fresh file rather than
-replaying the first payload.
+`build()`'s argv carries no positional after `-p`; the user prompt (task +
+subtask_views + any retry note) is fed to the child's stdin instead via
+`_invoke()`'s `stdin_data` param, written to a temp file *before* spawn so
+the file's own EOF is the end-of-input signal the CLI needs — a positional
+prompt after `-p` would silently win over stdin with no error, so it must be
+absent, not merely supplemented. The file is created fresh per call (so a
+retry stages its own copy) and unlinked in `_invoke`'s `finally`.
 
 This exists because a single argv element cannot exceed Linux's
-`MAX_ARG_STRLEN` (131,071 bytes, `PAGE_SIZE * 32`, not raisable) —
-independent of the larger aggregate `ARG_MAX` — and reconciler/
-plan_overlap_judge payloads routinely exceed that on their own. A positional
-prompt after `-p` silently wins over stdin with no error, so it must be
-absent, not merely supplemented. Pinned by `tests/test_prompt_over_stdin.py`:
-the argv-length property (no `build()`-constructed argv element exceeds
-`MAX_ARG_STRLEN` for a 150KB+ prompt), the absent positional, the retry path
-routing `retry_note` through stdin too, `_invoke`'s file-vs-DEVNULL branch,
-the whole payload being readable *at spawn time* (asserted inside the spawn,
-since checking afterwards cannot distinguish "written before exec" from
-"written during the run"), the staged file being unlinked, and a real
-subprocess round trip for a 150,063-byte payload proving no deadlock with
-the stdout/stderr readers.
+`MAX_ARG_STRLEN` (131,071 bytes, not raisable), and reconciler /
+plan_overlap_judge payloads routinely exceed that on their own. Pinned by
+`tests/test_prompt_over_stdin.py`: the argv-length property, the absent
+positional, the retry path, the file-vs-DEVNULL branch, the payload being
+readable at spawn time, cleanup, and a real 150KB+ subprocess round trip.
 
-**The prompt must be readable at `exec`, not delivered afterwards.**
-`claude -p` waits a hard-coded **3 s** for its first stdin byte, then
-removes its own `data` listener and proceeds without it — a late write is
-**discarded**, not buffered, and the worker exits 1 with `Input must be
-provided either through stdin or as a prompt argument`. leerie previously
-made two synchronous broker round-trips (`_cgroup_create`, `_cgroup_enroll`)
-between the spawn and the first write, each bounded by a timeout larger
-than that 3 s deadline — an accepted stall the failure was permitted by
-construction. A first fix hoisted the write into a task scheduled
-immediately after spawn and moved the broker calls to `asyncio.to_thread`,
-which narrowed the window without closing it: delivery still depended on
-the event loop *scheduling* the feeder within 3 s, and under synchronous
-bursts on the parent loop a pipe+feeder transport lost the prompt
-reliably while a staged file lost none.
-
-The transport is therefore a **file**, which has no writer to schedule and
-so no deadline to lose. The broker calls stay on `asyncio.to_thread`
-regardless: stdin no longer depends on it, but every other coroutine still
-does. Pinned in `tests/test_stdin_feeder_ordering.py`, which asserts the
-property negatively — no writer task, no `proc.stdin.write`, stdin never a
-PIPE — because that is the form a regression takes, plus a behavioural pair
-showing a pipe losing and a file winning against a real child under a
-blocked loop.
+**The prompt must be readable at `exec`, not delivered afterwards** — `claude
+-p` waits a hard-coded 3s for its first stdin byte and then discards a late
+write, exiting 1. A pipe+feeder transport lost the prompt under synchronous
+event-loop bursts because delivery depended on the loop scheduling the
+feeder within that window; a staged file has no writer to schedule and so no
+deadline to lose. Pinned in `tests/test_stdin_feeder_ordering.py` (asserts
+no writer task, no `proc.stdin.write`, stdin never a PIPE), plus a
+behavioural pair showing a pipe losing and a file winning under a blocked
+loop.
 
 #### Appended system prompt transport — file, with a probe + inline fallback
 
-The appended system prompt (`system_prompt`, e.g. `reconciler.md` at
-~25KB) is the *second* large argv element, and on the overlap judge it
-compounds with the (now stdin-routed) user prompt toward the same
-`MAX_ARG_STRLEN` ceiling above. `claude_p()` writes `system_prompt` to a
-throwaway temp file once per call (not per retry attempt — the value is
-fixed for the whole call) and passes it via `--append-system-prompt-file
-<path>` instead of the inline `--append-system-prompt <text>`, removing
-it from argv the same way the user prompt was removed.
+The appended system prompt (`system_prompt`, e.g. `reconciler.md` at ~25KB)
+is the second large argv element and compounds toward the same
+`MAX_ARG_STRLEN` ceiling. `claude_p()` writes it to a throwaway temp file
+once per call and passes it via `--append-system-prompt-file <path>` instead
+of the inline flag.
 
-`--append-system-prompt-file` is **undocumented** — it has no entry of
-its own in `claude --help`, appearing only inside `--bare`'s help text
-("Explicitly provide context via: --system-prompt[-file],
---append-system-prompt[-file], ..."). Because an undocumented flag may
-be renamed or removed in a future CLI release without notice, its use
-is gated behind `_append_system_prompt_file_supported()` — a
-once-per-process probe memoized in the module-level
-`_APPEND_SYSTEM_PROMPT_FILE_SUPPORTED` global (same pattern as
-`_cgroup_probe()`'s `_CGROUP_PROBE_RESULT`) — with an unconditional
-fallback to the inline flag when the probe reports unsupported.
+That flag is **undocumented** (absent from `claude --help`, mentioned only
+inside `--bare`'s help text), so its use is gated behind
+`_append_system_prompt_file_supported()` — a once-per-process probe memoized
+in `_APPEND_SYSTEM_PROMPT_FILE_SUPPORTED` — with unconditional fallback to
+the inline flag when unsupported. The probe invokes `claude -p
+--append-system-prompt-file <throwaway file>` with stdin closed: an
+unrecognized flag fails immediately with `error: unknown option`, while a
+recognized one reaches the CLI's own "no prompt given" error — both exit
+non-zero, so the probe distinguishes them by stderr text, not exit code.
 
-The probe invokes `claude -p --append-system-prompt-file <throwaway
-file>` with stdin closed and no `--output-format`/model dispatch
-requested. Commander.js validates every flag before `-p` reaches "no
-prompt given": an unrecognized flag fails immediately with `error:
-unknown option '--append-system-prompt-file'`, while a recognized flag
-instead reaches the CLI's own "Input must be provided either through
-stdin or as a prompt argument" error. Both exit non-zero, cost nothing
-(no auth, no model call), and return in well under a second — the probe
-distinguishes them by the stderr text (`"unknown option"` means
-unsupported), not by exit code alone, since both paths exit non-zero.
-
-`claude_p()`'s temp file is created before `build()`'s first call, and
-`build()` through the end of the retry loop runs inside a `try/finally`
-that removes it once `claude_p()` returns — on both the success path and
-every exception path out of that block (the terminal-auth raise, either
-auth/quota-exhaustion raise, the final "worker failed schema-valid output
-twice" raise). The schema-key drift guard runs before the temp file is
-created at all, so it never needs cleanup. The retry loop (`_spawn`
-re-invoked with a `retry_note`) reuses the same file across both attempts
-rather than rewriting it, since `system_prompt` never changes between
-retries.
+The temp file is created before `build()`'s first call and removed in a
+`try/finally` covering every exit path (success, terminal-auth raise,
+auth/quota raise, schema-retry exhaustion); the retry loop reuses the same
+file across both attempts since `system_prompt` never changes between them.
 
 Pinned by `tests/test_append_system_prompt_file.py`: the probe's
-supported/unsupported/fail-closed-on-OSError-or-timeout branches, once-
-per-process memoization, its own throwaway-file cleanup,
-`build()`'s file-flag-vs-inline-flag branch and the temp file's
-contents matching `system_prompt`, the temp file being removed after
-`claude_p()` returns on both the success and exception paths, the retry
-path reusing rather than recreating the file, and a live (unmocked)
-sanity check against the installed `claude` CLI (skipped if absent).
+supported/unsupported/fail-closed branches, memoization, cleanup, the
+file-vs-inline branch, the retry path reusing the file, and a live
+(unmocked) sanity check against the installed `claude` CLI (skipped if
+absent).
 
 #### No result event
 
