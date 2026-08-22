@@ -6,50 +6,28 @@ labels: bug
 
 ## What happened
 
-<!-- One or two sentences. What did Leerie do that it shouldn't have? -->
+<!-- What did Leerie do that it shouldn't have? -->
 
 ## What you expected
 
-<!-- What should it have done instead? -->
-
 ## Reproduction
 
-- **Task you ran:**
-  ```
-  <the exact `leerie "..."` invocation, or the slash-command form>
-  ```
-- **Repo state:** branch, roughly how dirty, any non-default `leerie.toml`
-- **Other relevant flags:** `--source-of-truth`, `--model` / `--model-<worker>`, `--max-workers`, `--max-parallel`, `--clarify`, etc.
+- **Task you ran:** the exact `leerie "..."` invocation, or slash-command form
+- **Repo state:** branch, dirty/clean, any non-default `leerie.toml`
+- **Flags used:** `--source-of-truth`, `--model`, `--max-workers`, etc.
 
 ## Environment
 
-- OS: <e.g., macOS 14.5, Ubuntu 22.04>
-- Container runtime:
-  - macOS: `colima version` (one line)
-  - Linux: `nerdctl --version` and `containerd --version`
+- OS:
+- Container runtime: `colima version` (macOS) or `nerdctl --version` (Linux)
 - Image tag: `nerdctl images leerie --format '{{.Repository}}:{{.Tag}}'`
-- `claude --version` (on the host — `gh` and `~/.claude/` auth state live there):
-- Leerie commit: `git -C ~/.leerie rev-parse HEAD` (or wherever you cloned it)
+- `claude --version`
+- Leerie commit: `git -C ~/.leerie rev-parse HEAD`
 
 ## Relevant state
 
-Paste the relevant fields from `.leerie/state.json` (redact anything
-sensitive — task descriptions can contain repo-internal context). The full
-schema is in [`docs/IMPLEMENTATION.md`](../../docs/IMPLEMENTATION.md) §8 if
-you want to know what each field means.
+Paste relevant fields from `.leerie/state.json` (redact anything sensitive).
 
 ```json
 { }
 ```
-
-## Which layer is the defect in?
-
-Leerie separates theory (`docs/DESIGN.md`), mechanism
-(`docs/IMPLEMENTATION.md`), and code (`orchestrator/leerie.py`). Knowing
-which layer the bug lives in helps triage. (Quiet reinforcement of the
-three-layer rule — see [`CLAUDE.md`](../../CLAUDE.md).)
-
-- [ ] DESIGN (architecture is wrong or incomplete)
-- [ ] IMPLEMENTATION (code surface spec is wrong or incomplete)
-- [ ] code (code drifts from the spec)
-- [ ] unclear

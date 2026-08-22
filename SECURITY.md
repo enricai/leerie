@@ -2,50 +2,41 @@
 
 ## Supported versions
 
-Leerie is pre-1.0. Only the latest minor release line receives security
-fixes.
+Leerie is pre-1.0; only the latest minor release line receives fixes.
 
 | Version | Supported |
 |---------|-----------|
 | 0.2.x   | yes       |
 | < 0.2   | no        |
 
-Because Leerie is pre-1.0, the public surface (CLI flags, `.leerie/`
-layout, worker schemas, `leerie.toml` keys) may change between minor
-versions. Pin a commit if you need stability.
+The public surface (CLI flags, `.leerie/` layout, worker schemas,
+`leerie.toml` keys) may change between minor versions. Pin a commit if
+you need stability.
 
 ## Reporting a vulnerability
 
 Email **andres@enricai.com** with the subject prefix **`[leerie-security]`**.
-Please do not open a public GitHub issue or pull request for a suspected
-vulnerability.
+Do not open a public GitHub issue or pull request for a suspected
+vulnerability. Include a description of the issue and its impact, a
+minimal reproduction (task, repo state, invocation), the commit you
+reproduced on, and your contact info for follow-up.
 
-What to include:
-
-- A description of the issue and its impact
-- A minimal reproduction (task, repo state, invocation)
-- The Leerie commit you reproduced on
-- Your contact info for follow-up
-
-What to expect:
-
-- **Acknowledgment within 7 days** of receipt
-- A coordinated disclosure timeline negotiated with the reporter, typically
-  30–90 days depending on severity and the fix's complexity
-- Credit in the [GitHub Release](https://github.com/enricai/leerie/releases)
-  notes for the release containing the fix, unless you ask to remain anonymous
+What to expect: acknowledgment within 7 days, a coordinated disclosure
+timeline negotiated with you (typically 30–90 days depending on severity
+and fix complexity), and credit in the
+[GitHub Release](https://github.com/enricai/leerie/releases) notes unless
+you ask to remain anonymous.
 
 ## Threat model context
 
-Leerie's threat model is shaped by one load-bearing fact: **acting workers
-run `claude -p --dangerously-skip-permissions`**. That is intentional — it is
-what makes the run unattended. The mitigation is not removing the flag; it
-is the worktree isolation and staging-branch review documented in
-[`docs/DESIGN.md`](docs/DESIGN.md) §6, the container PID-namespace and
-cgroups boundary that contains every worker subprocess inside the per-run
-container (also DESIGN §6), and the deterministic enforcement boundary
-documented in [`docs/DESIGN.md`](docs/DESIGN.md) §12. See also
-the [README "Safety" section](README.md#safety).
+Acting workers run `claude -p --dangerously-skip-permissions` — intentional,
+since that's what makes a run unattended. The mitigation is not removing
+the flag; it is the worktree isolation and staging-branch review
+([`docs/DESIGN.md`](docs/DESIGN.md) §6), the container PID-namespace and
+cgroups boundary containing every worker subprocess (also DESIGN §6), and
+the deterministic enforcement boundary in
+[`docs/DESIGN.md`](docs/DESIGN.md) §12. See also the
+[README "Safety" section](README.md#safety).
 
 ### Vulnerabilities (please report)
 
@@ -54,34 +45,29 @@ Any defect that violates the documented isolation or enforcement boundary:
 - **Worktree escape** — a script in `scripts/*.sh` resolving `..` or a
   symlink into the main checkout, letting a worker write outside its
   worktree
-- **State-write vulnerabilities** — `validate_resume_state()` or the
-  `State.save()` write path being exploitable via a poisoned `.leerie/`
-  directory (e.g., an attacker writing `.leerie/state.json` so the next
-  `resume` does something unintended)
-- **Command injection** — unquoted or unsanitized expansion in
-  `scripts/*.sh` that lets a task description, repo name, or filename
-  inject shell commands
-- **Auto-merge bypass** — any defect causing a subtask branch to land
-  on the run branch (`leerie/runs/<id>`) without the documented
-  integrator gates, or causing the run-branch validation step to be
-  skipped. (Phase 6 does not merge into the working branch — it pushes
-  the run branch and opens a PR; the human review on that PR is the
-  user-facing safety boundary.)
-- **Schema bypass** — any path where a worker's output is consumed
-  without passing through its `SCHEMAS` entry (see CLAUDE.md "Mandatory
-  requirements")
+- **State-write vulnerabilities** — `validate_resume_state()` or
+  `State.save()` exploitable via a poisoned `.leerie/` directory (e.g.,
+  a poisoned `.leerie/state.json` making `resume` do something unintended)
+- **Command injection** — unsanitized expansion in `scripts/*.sh` that
+  lets a task description, repo name, or filename inject shell commands
+- **Auto-merge bypass** — a subtask branch landing on the run branch
+  (`leerie/runs/<id>`) without the documented integrator gates, or the
+  run-branch validation step being skipped. (Phase 6 pushes the run
+  branch and opens a PR — the human review on that PR is the
+  user-facing safety boundary, not the merge into staging.)
+- **Schema bypass** — a worker's output consumed without passing
+  through its `SCHEMAS` entry (see CLAUDE.md "Mandatory requirements")
 
 ### Not vulnerabilities
 
-These are accepted risks of running Leerie as designed; please do not
-report them as security issues:
+Accepted risks of running Leerie as designed; please don't report these:
 
 - **A worker doing something destructive inside its own worktree** —
-  that is the expected behavior under `--dangerously-skip-permissions`,
-  bounded by worktree isolation. Review staging before merging.
-- **A worker's commit being merged into staging by the integrator** —
-  the integrator does exactly that by design; the safety boundary is at
-  the user's review of the phase-6 PR, not at staging.
+  expected under `--dangerously-skip-permissions`, bounded by worktree
+  isolation. Review staging before merging.
+- **A worker's commit being merged into staging by the integrator** — by
+  design; the safety boundary is the user's review of the phase-6 PR, not
+  staging.
 - **Running on a repository whose `claude` CLI is misconfigured** —
   Leerie does not validate the user's `claude` credentials or
   permissions; this is upstream of the orchestrator.
