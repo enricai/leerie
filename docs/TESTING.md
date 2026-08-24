@@ -2131,7 +2131,34 @@ detects as `ec2`; a fly-machine.json-only run dir still detects as `fly`
 echoed; an explicit runtime short-circuits detection even when a sidecar
 for a different runtime is present; Fly wins when (never expected in
 practice) both sidecars co-exist; and the Fly-only wrapper returns
-nonzero for an EC2 run. The second half invokes the real launcher end to
+nonzero for an EC2 run.
+
+`finalize`'s **local** arm is covered by six further end-to-end cases in the
+same file. The discriminating one is
+`test_finalize_local_run_without_finished_at_reaches_host_finalize`: a run
+dir with no Fly/EC2 sidecar and deliberately **no `finished_at`** — the shape
+left by a Ctrl-C after the waves integrated but before `phase_finalize`.
+Before the local arm existed, `_auto_detect_run_runtime` left `_fin_runtime`
+empty, the `_already_synced` probe missed for want of `finished_at`, and the
+dispatch chain's bare `else` sent the run into the Fly path, where
+`require_flyctl` offered to *install flyctl* for a run that never touched
+Fly. The fixture sets `no_push` so `host_finalize` short-circuits at its own
+early gate (`scripts/host-finalize.sh:294`) — a return from *inside*
+`host_finalize`, which is what proves the launcher handed off, without the
+test needing a git remote or a rebaser worker. The remaining cases pin
+`--runtime local` as accepted (it used to `exit 1`), `--force` refused with
+the local message rather than the EC2 one, a missing run branch failing
+closed on the branch rather than deeper in `host_finalize`, a Fly sidecar
+still promoting to `fly` (the local default must not swallow a real Fly
+run), and the advertised usage enum reading `local|fly|ec2` — asserted
+through a real rejection, so it checks what a user is shown rather than a
+source substring. These fixtures point `USER_REPO` at a scratch git repo,
+which the finalize arm honors via `USER_REPO="${USER_REPO:-$PWD}"`. Note the
+local-shaped fixtures in `tests/test_launcher_finalize_no_work.py` cannot
+catch this regression: all of them exit early through `_already_synced` /
+`pushed_at` / argv validation and never reach the runtime dispatch.
+
+The second half invokes the real launcher end to
 end (mirroring
 `tests/test_accept_blocked.py`'s local-path pattern) across `stop`,
 `kill`, `accept-blocked`, and `finalize`: each accepts `ec2`

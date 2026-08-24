@@ -33,6 +33,9 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
+from tests.conftest import HAS_JQ
 from tests.ec2_stub import run_launcher as _run_launcher_shared
 
 REPO_ROOT_LAUNCHER = Path(__file__).resolve().parent.parent / "leerie"
@@ -426,3 +429,168 @@ def test_resume_fly_sidecar_still_promotes_to_fly_no_regression(tmp_path):
     assert r.returncode != 0
     assert "auto-detected Fly run" in r.stderr
     assert "LEERIE_FLY_APP is required" in r.stderr
+
+
+# --- finalize: the local arm ----------------------------------------------
+#
+# Before this arm existed, `_auto_detect_run_runtime` had no local case, so a
+# local run left `_fin_runtime` empty and fell through the dispatch chain's
+# bare `else` into the Fly path — which calls `require_flyctl` and offers to
+# INSTALL flyctl for a run that never touched Fly. The only thing that kept
+# an ordinary local run out of that branch was the `_already_synced` probe,
+# which requires `finished_at`; a run interrupted before `phase_finalize`
+# (Ctrl-C after the waves integrated) has none, so it hit flyctl.
+#
+# These drive the real launcher end to end. `USER_REPO` is honored by the
+# finalize arm (`USER_REPO="${USER_REPO:-$PWD}"`), which is what lets the
+# fixtures point it at a scratch repo instead of this one.
+
+
+def _git(repo: Path, *args: str) -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), *args],
+        check=True, capture_output=True, text=True,
+    )
+
+
+def _make_local_run(state_dir: Path, tmp_path: Path, run_id: str, *,
+                    create_branch: bool = True,
+                    finished: bool = False,
+                    no_push: bool = False) -> tuple[Path, Path]:
+    """A local run dir (no Fly/EC2 sidecar) plus a scratch USER_REPO.
+
+    Deliberately writes NO `finished_at` unless asked: that is the exact
+    shape of the incident this arm exists for, and it is what makes the
+    `_already_synced` probe miss so the dispatch has to classify the runtime.
+    """
+    repo = tmp_path / "user_repo"
+    repo.mkdir(parents=True, exist_ok=True)
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@example.com")
+    _git(repo, "config", "user.name", "t")
+    (repo / "f.txt").write_text("base\n")
+    _git(repo, "add", "f.txt")
+    _git(repo, "commit", "-q", "-m", "base")
+
+    branch = f"leerie/runs/{run_id}"
+    if create_branch:
+        _git(repo, "checkout", "-q", "-b", branch)
+        (repo / "f.txt").write_text("work\n")
+        _git(repo, "commit", "-q", "-am", "work")
+        _git(repo, "checkout", "-q", "main")
+
+    run_dir = state_dir / "runs" / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    run_json = {
+        "run_id": run_id,
+        "branch": branch,
+        "working_branch": "main",
+        "pr_base_branch": "main",
+    }
+    if finished:
+        run_json["finished_at"] = "2026-08-24T22:00:00+00:00"
+    if no_push:
+        run_json["no_push"] = True
+    (run_dir / "run.json").write_text(json.dumps(run_json))
+    (run_dir / "state.json").write_text(
+        json.dumps({"completed_waves": 1, "waves": [["s1"]]})
+    )
+    return run_dir, repo
+
+
+def _finalize(args, state_dir: Path, repo: Path):
+    env = _launcher_env(state_dir)
+    env["USER_REPO"] = str(repo)
+    return _run_launcher_shared(
+        args, env, launcher=REPO_ROOT_LAUNCHER, timeout=60
+    )
+
+
+@pytest.mark.skipif(not HAS_JQ, reason="host_finalize parses run.json with jq")
+def test_finalize_local_run_without_finished_at_reaches_host_finalize(tmp_path):
+    """THE reported bug: a local run interrupted before `finished_at` was
+    written must finalize locally, never ask for flyctl.
+
+    `no_push` is set so `host_finalize` short-circuits at its own early gate
+    (host-finalize.sh:294) — that return is *inside* host_finalize, so
+    observing it proves the launcher handed off, without this test needing a
+    git remote or a rebaser worker.
+
+    Note the existing local-shaped fixtures in
+    tests/test_launcher_finalize_no_work.py cannot catch this regression:
+    every one of them exits early via `_already_synced` / `pushed_at` / argv
+    validation and never reaches the runtime dispatch at all.
+    """
+    state_dir = tmp_path / "state"
+    run_dir, repo = _make_local_run(state_dir, tmp_path, "r1", no_push=True)
+    assert "finished_at" not in json.loads((run_dir / "run.json").read_text())
+
+    r = _finalize(["finalize", "r1"], state_dir, repo)
+
+    combined = r.stdout + r.stderr
+    assert "flyctl" not in combined.lower(), combined
+    assert "state and branch already on this host" in r.stderr, r.stderr
+    assert "no_push=true; skipping push + PR" in r.stderr, r.stderr
+    assert r.returncode == 0, combined
+
+
+@pytest.mark.skipif(not HAS_JQ, reason="host_finalize parses run.json with jq")
+def test_finalize_local_accepts_explicit_runtime_local(tmp_path):
+    """`--runtime local` used to be refused outright ("no local-runtime
+    equivalent yet"). It is now a supported selector for the same arm."""
+    state_dir = tmp_path / "state"
+    _, repo = _make_local_run(state_dir, tmp_path, "r1", no_push=True)
+    r = _finalize(["finalize", "r1", "--runtime", "local"], state_dir, repo)
+    assert "no local-runtime equivalent" not in r.stderr, r.stderr
+    assert "flyctl" not in (r.stdout + r.stderr).lower()
+    assert r.returncode == 0, r.stdout + r.stderr
+
+
+def test_finalize_local_refuses_force(tmp_path):
+    """--force exists to SIGTERM a detached remote orchestrator; a local
+    run's orchestrator exits with its container. Refused, not ignored — and
+    with the local message, not the EC2 one."""
+    state_dir = tmp_path / "state"
+    _, repo = _make_local_run(state_dir, tmp_path, "r1")
+    r = _finalize(["finalize", "r1", "--force"], state_dir, repo)
+    assert r.returncode != 0
+    assert "not supported for local runs" in r.stderr, r.stderr
+    assert "flyctl-transport only" not in r.stderr, r.stderr
+    assert "flyctl" not in (r.stdout + r.stderr).lower()
+
+
+def test_finalize_local_fails_closed_when_run_branch_absent(tmp_path):
+    """No branch and no `no_push` intent: fail with a message about the
+    missing branch, not a flyctl prompt and not a confusing run.json error
+    from deeper inside host_finalize."""
+    state_dir = tmp_path / "state"
+    _, repo = _make_local_run(state_dir, tmp_path, "r1", create_branch=False)
+    r = _finalize(["finalize", "r1"], state_dir, repo)
+    assert r.returncode != 0
+    assert "has no run branch" in r.stderr, r.stderr
+    assert "flyctl" not in (r.stdout + r.stderr).lower()
+
+
+def test_finalize_fly_sidecar_still_promotes_to_fly_no_regression(tmp_path):
+    """The local default must not swallow a genuine Fly run."""
+    state_dir = tmp_path / "state"
+    _, repo = _make_local_run(state_dir, tmp_path, "r1")
+    (state_dir / "runs" / "r1" / "fly-machine.json").write_text(
+        json.dumps({"fly_machine_id": "m1"})
+    )
+    r = _finalize(["finalize", "r1"], state_dir, repo)
+    assert "auto-detected Fly run; promoting --runtime to fly" in r.stderr
+    assert "state and branch already on this host" not in r.stderr
+    assert r.returncode != 0
+    assert "LEERIE_FLY_APP is required" in r.stderr, r.stderr
+
+
+def test_finalize_usage_strings_offer_local(tmp_path):
+    """Paired with the behavioural tests above: the advertised enum must
+    match what the arm now accepts. Driven through a real rejection so this
+    asserts what a user is actually shown, not a source substring."""
+    state_dir = tmp_path / "state"
+    _, repo = _make_local_run(state_dir, tmp_path, "r1")
+    r = _finalize(["finalize", "r1", "--foorce"], state_dir, repo)
+    assert r.returncode != 0
+    assert "--runtime local|fly|ec2" in r.stderr, r.stderr
