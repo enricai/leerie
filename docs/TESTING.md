@@ -3034,6 +3034,37 @@ same-named file with different contents still does. Falsification: replaying
 the pre-fix filter against the prose-only fixture matches 4 files where the
 test expects none.
 
+
+### `~` in task prose is approximation notation (2026-08-24)
+
+Two runs died in `phase 2: planning` with `RuntimeError: Could not determine
+home directory.`, raised by `Path("~17.9").expanduser()` from the task
+sentence *"max 17,923,286 B (~17.9 MB)"*. Not environmental: `expanduser`
+takes its `~user` branch for any `~` token whose first segment is non-empty,
+`pwd.getpwnam("17.9")` raises `KeyError`, the string comes back unexpanded,
+and pathlib converts that into `RuntimeError` — `HOME` is never read on that
+branch, so it reproduces on a host with `HOME` set. The check is advisory
+(one `log()` line, gates nothing), so the cost was a whole run for a warning.
+
+Measured 2026-08-24 over the 518 task strings then stored under
+`~/.leerie/*/runs/*/state.json` (a live corpus — re-running it later gives a
+larger denominator): **62 distinct `~`-prefixed path-shaped tokens, 32 of
+them prose, and all 32 raise**. Three of those 32 carry a
+separator (`~2.5/subtask`, `~9/10`, `~14GB/64GB`), which is why the token rule
+is home-*shape* (`~/…` or `~name/…`), not "contains a `/`" — a `/`-only rule
+still crashes on three real corpus shapes. Differential falsification against
+the same corpus: pre-fix **45 of 518** tasks raise, post-fix **0**, and the
+473 non-raising tasks return byte-identical results.
+
+The try/except is independently load-bearing: `~name/plan.md` for a name absent
+from the password database is home-shaped, still raises, and must be *reported*
+(it is genuinely unreadable), not propagated. Pinned by
+`test_unknown_user_home_reference_is_flagged_not_raised` and, for the wrapper,
+`test_advisory_never_gates_even_when_the_check_raises` — which executes
+`_log_unreachable_task_references` against a check that really raises rather
+than reading `phase_plan` for a `try` statement.
+
+
 ## EC2 read-mostly verbs (`accept-blocked`, `list`)
 
 `accept-blocked` (validated `--runtime` against only `fly`/`local`,

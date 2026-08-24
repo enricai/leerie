@@ -1797,7 +1797,11 @@ env (colon-separated) > `leerie.toml` `inspect_dirs =
 default `[]` (no extra directories).
 
 Paths are expanded (`~` → `$HOME`) and resolved to absolute form at
-startup. Duplicates are removed. The resolved list lives on
+startup. A `~name` prefix naming nobody in the password database is left
+unexpanded — `Path.expanduser()` raises `RuntimeError` on that shape, and
+the shell itself leaves such a token verbatim — so the typo reaches the use
+site for its clear error instead of aborting startup with a traceback.
+Duplicates are removed. The resolved list lives on
 `st.data["inspect_dirs"]` and is re-resolved fresh on every run,
 including `resume`, so the user can add or remove paths without
 editing state.
@@ -4402,7 +4406,8 @@ DESIGN.md §8 for the full rationale).
 | `_is_same_document(path, text_len, text)` | True when `path` holds exactly `text` modulo surrounding whitespace. Keeps a task file out of its own reference list, since the planner already has the task verbatim. A size pre-check (±8 bytes) means only a same-length candidate is ever opened. |
 | `_repo_rel(path, repo_root)` | Repo-relative string for a path, falling back to its basename when it resolves outside the repo. Pure path arithmetic. |
 | `_format_task_file_references(files, repo_root)` | Names the files the task references so the planner reads them itself. A list of paths and nothing else — it must not open them. `None` when the task names no files. |
-| `_unreachable_task_references(task, repo_root)` | Advisory sibling of `_glob_task_references`. Scans the same de-emphasized, path-shaped tokens and flags three shapes invisible to the planner for different mechanical reasons: tokens starting with `/` (absolute, dropped as candidates), `~` (home-relative — pathlib never expands `~`), and `../` (parent-relative — resolved against the required `repo_root` parameter; flagged when it escapes the root or resolves to nothing). Trailing sentence punctuation is `rstrip`ped (never `strip` — a leading dot or `./`/`../` is meaningful). `phase_plan` logs a single warning line when non-empty; the check never gates. |
+| `_unreachable_task_references(task, repo_root)` | Advisory sibling of `_glob_task_references`. Scans the same de-emphasized, path-shaped tokens and flags three shapes invisible to the planner for different mechanical reasons: tokens starting with `/` (absolute, dropped as candidates), `~` (home-relative — pathlib never expands `~`; the token must be home-**shaped**, i.e. `~/…` or `~name/…`, since a `~` in task prose is more often approximation notation (`~17.9 MB`, `~2.5/subtask`) whose `expanduser()` raises `RuntimeError` — a `/`-only test is insufficient), and `../` (parent-relative — resolved against the required `repo_root` parameter; flagged when it escapes the root or resolves to nothing). Trailing sentence punctuation is `rstrip`ped (never `strip` — a leading dot or `./`/`../` is meaningful). `_log_unreachable_task_references` (next row) owns the warning line and is `phase_plan`'s only entry point to this check; the check never gates. Both filesystem probes are exception-guarded (`OSError`/`RuntimeError`/`ValueError`), so the function has no raise path; a token that cannot be probed is reported, never propagated. |
+| `_log_unreachable_task_references(task, repo_root)` | The only caller of `_unreachable_task_references` (from `phase_plan`). Emits the operator warning and returns the list. Catches **every** exception from the check, logs `unreachable-reference advisory skipped: …`, and returns `[]` — the check gates nothing, so it must never be able to end a run. Added after two runs died in `phase 2: planning` on `RuntimeError: Could not determine home directory.` raised from a `~`-approximation token (2026-08-24). |
 
 **Freeze guard (2026-07-19 incident, root cause A) — resolved by deletion.**
 A single incidental dotted token (e.g. `CLAUDE.md` mentioned once in a

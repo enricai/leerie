@@ -138,6 +138,30 @@ def test_tilde_expansion(leerie, repo_root, monkeypatch, tmp_path):
     assert out == [str(home_dir.resolve())]
 
 
+def test_tilde_naming_no_user_is_left_unexpanded(leerie, repo_root, tmp_path,
+                                                 monkeypatch):
+    """`~name` for a name absent from the password database must resolve to
+    the token itself, exactly as the shell leaves it (`echo ~nosuchuser`
+    prints it verbatim) -- it must not raise.
+
+    `Path.expanduser()` raises `RuntimeError("Could not determine home
+    directory.")` on that shape regardless of $HOME, because it takes the
+    `~user` branch and `pwd.getpwnam` fails. The sibling call site in
+    `_unreachable_task_references` had the same hole and killed two runs at
+    phase 2 (2026-08-24); here it would abort startup before classify, with a
+    traceback instead of a message, on nothing worse than a typo.
+
+    Asserts the resolved VALUE, not merely that the call returned: a fix that
+    silently dropped the entry would also "not raise", and this resolver's
+    documented posture is to accept the path and let the use site produce the
+    clear error.
+    """
+    monkeypatch.chdir(tmp_path)
+    out = leerie.resolve_inspect_dirs(
+        repo_root, cli_values=["~nosuchuser-zzz"])
+    assert out == [str(tmp_path.resolve() / "~nosuchuser-zzz")]
+
+
 def test_blank_entries_skipped(leerie, repo_root, tmp_path, monkeypatch):
     """An env value of `a::b` (two colons in a row) shouldn't yield an
     empty-string entry that resolves to cwd. Same with trailing commas in
