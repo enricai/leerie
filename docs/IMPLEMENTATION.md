@@ -1797,7 +1797,11 @@ env (colon-separated) > `leerie.toml` `inspect_dirs =
 default `[]` (no extra directories).
 
 Paths are expanded (`~` → `$HOME`) and resolved to absolute form at
-startup. Duplicates are removed. The resolved list lives on
+startup. A `~name` prefix naming nobody in the password database is left
+unexpanded — `Path.expanduser()` raises `RuntimeError` on that shape, and
+the shell itself leaves such a token verbatim — so the typo reaches the use
+site for its clear error instead of aborting startup with a traceback.
+Duplicates are removed. The resolved list lives on
 `st.data["inspect_dirs"]` and is re-resolved fresh on every run,
 including `resume`, so the user can add or remove paths without
 editing state.

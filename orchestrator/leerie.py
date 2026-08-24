@@ -6208,7 +6208,18 @@ def resolve_inspect_dirs(repo_root: Path,
         p = raw.strip()
         if not p:
             return
-        abs_p = str(Path(p).expanduser().resolve())
+        try:
+            expanded = Path(p).expanduser()
+        except RuntimeError:
+            # `expanduser()` raises when a `~name` prefix names nobody in the
+            # password database. The shell leaves such a token alone
+            # (`echo ~nosuchuser` prints it verbatim), so do the same rather
+            # than abort: this resolver's documented posture is to accept the
+            # path and let the use site produce the clear error, and a typo
+            # here would otherwise kill the run before classify with a
+            # traceback instead of a message.
+            expanded = Path(p)
+        abs_p = str(expanded.resolve())
         if abs_p not in seen:
             seen.add(abs_p)
             out.append(abs_p)
