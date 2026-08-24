@@ -3194,7 +3194,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
         # silently dropped and the user thought they had passed --force.
         --*)
           remote_log "finalize: unknown flag: $_a"
-          echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
+          echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime local|fly|ec2]" >&2
           exit 1
           ;;
         *)
@@ -3203,7 +3203,7 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
           # — refuse to silently accept it.
           if [ "$_fin_seen_positional" = "true" ]; then
             remote_log "finalize: unexpected extra positional: $_a"
-            echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
+            echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime local|fly|ec2]" >&2
             exit 1
           fi
           _fin_seen_positional=true
@@ -3218,15 +3218,11 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
     # path — a surprise the operator would not have asked for.
     if [ -n "$_fin_prev" ]; then
       remote_log "finalize: $_fin_prev requires a value"
-      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
+      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime local|fly|ec2]" >&2
       exit 1
     fi
     if [ -n "$_fin_runtime" ] && [ "$_fin_runtime" != "fly" ] && [ "$_fin_runtime" != "local" ] && [ "$_fin_runtime" != "ec2" ]; then
       remote_log "finalize: --runtime must be 'local', 'fly', or 'ec2' (got '$_fin_runtime')"
-      exit 1
-    fi
-    if [ "$_fin_runtime" = "local" ]; then
-      remote_log "finalize --runtime local: no local-runtime equivalent yet (local runs finalize inline)."
       exit 1
     fi
     _fin_detected="$(_auto_detect_run_runtime "$_fin_run_id" "$_fin_runtime")" || _fin_detected=""
@@ -3237,9 +3233,24 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       remote_log "finalize: auto-detected EC2 run; promoting --runtime to ec2"
       _fin_runtime="ec2"
     fi
+    # Neither remote sidecar and no explicit --runtime: a local run.
+    # `_auto_detect_run_runtime` returning non-zero means exactly that (it
+    # probes only fly-machine.json then ec2-instance.json), and it is the
+    # only usable signal here. `_is_local_container` — which stop/kill use —
+    # cannot serve: it shells `nerdctl inspect <run-id>`, and a finalize by
+    # definition runs after the container has exited, so it reports "not
+    # local" for every run this arm exists to serve.
+    #
+    # Defaulting to local mirrors `resume`, which starts at RUNTIME=local and
+    # only *promotes* on sidecar detection. Before this, an empty runtime fell
+    # through to the Fly arm below and asked the operator to install flyctl
+    # for a run that never touched Fly.
+    if [ -z "$_fin_runtime" ]; then
+      _fin_runtime="local"
+    fi
     if [ -z "$_fin_run_id" ]; then
       remote_log "finalize requires a <run-id>"
-      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly|ec2]" >&2
+      echo "  Usage: leerie finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime local|fly|ec2]" >&2
       exit 1
     fi
     _fin_run_dir="$LEERIE_STATE_HOST_DIR/runs/$_fin_run_id"
@@ -3355,6 +3366,50 @@ except Exception:
       remote_log "finalize: run already synced to host; skipping fetch_branch"
       _fetched_run_id="$_fin_run_id"
       _fetched_run_dir="$_fin_run_dir"
+    elif [ "$_fin_runtime" = "local" ]; then
+      # Local run: branch and state are already on this host (the
+      # orchestrator writes straight to the bind-mounted state root), so
+      # there is nothing to fetch — fall through to host_finalize.
+      #
+      # This is the recovery path for a local run interrupted before its
+      # inline post-run finalize block could run. `finished_at` is unwritten
+      # in that case, so the `_already_synced` probe above cannot fire.
+      #
+      # `--force` is meaningless here: it exists to SIGTERM a *detached*
+      # remote orchestrator, and a local run's orchestrator dies with its
+      # container. Refuse it rather than silently ignoring it (mirrors the
+      # EC2 arm's refusal below).
+      if [ "$_FINALIZE_FORCE" = "true" ]; then
+        remote_log "finalize --force is not supported for local runs: there is no detached orchestrator to stop (a local run's orchestrator exits with its container)"
+        remote_log "  Retry without --force, or run \`leerie kill $_fin_run_id\` if a container is still up."
+        exit 1
+      fi
+      # Fail closed when there is no branch to push. host_finalize's own
+      # no_push gate covers the deliberate no-work case (DESIGN §8); this
+      # catches the other shape — a run whose branch was never created, or
+      # was deleted — where host_finalize would otherwise fail further in
+      # with a message about run.json rather than about the missing branch.
+      _fin_local_branch="$(_json_get "$_fin_run_dir/run.json" "branch")"
+      _fin_local_no_push="$(python3 -c '
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+    print("true" if d.get("no_push") is True else "")
+except Exception:
+    pass
+' "$_fin_run_dir/run.json")"
+      if [ "$_fin_local_no_push" != "true" ] && { [ -z "$_fin_local_branch" ] || \
+           ! git -C "$USER_REPO" rev-parse --verify \
+               "refs/heads/$_fin_local_branch" >/dev/null 2>&1; }; then
+        remote_log "finalize: local run $_fin_run_id has no run branch in $USER_REPO"
+        remote_log "  Expected branch: ${_fin_local_branch:-<none recorded in run.json>}"
+        remote_log "  Nothing to push. The per-subtask work (if any) is on the"
+        remote_log "  leerie/subtasks/$_fin_run_id/* branches."
+        exit 1
+      fi
+      remote_log "finalize: local run $_fin_run_id; state and branch already on this host, skipping fetch"
+      _fetched_run_id="$_fin_run_id"
+      _fetched_run_dir="$_fin_run_dir"
     elif [ "$_fin_runtime" = "ec2" ]; then
       # EC2 fetch: stream the completed run's branch + state back to the host,
       # then fall through to host_finalize exactly as the Fly path does.
@@ -3460,7 +3515,7 @@ except Exception:
       fi
       _fetched_run_id="$_fin_run_id"
       _fetched_run_dir="$_fin_run_dir"
-    else
+    elif [ "$_fin_runtime" = "fly" ]; then
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/provision.sh"
       # shellcheck disable=SC1091
@@ -3524,6 +3579,13 @@ except Exception:
         remote_log "error: fetch_branch succeeded but $_fetched_run_dir missing"
         exit 1
       fi
+    else
+      # Unreachable: the enum validator above accepts only local/fly/ec2 and
+      # the empty case is resolved to local. Kept so a future runtime added
+      # to the validator without an arm here fails loudly instead of
+      # silently taking whichever branch happens to be last.
+      remote_log "finalize: internal error - unhandled runtime: $_fin_runtime"
+      exit 1
     fi
     # Detect --no-verify and --no-push from $@ for consistency with the
     # normal post-run path. Seed from any inherited environment value first

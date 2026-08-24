@@ -1771,6 +1771,19 @@ Both paths share `scripts/host-finalize.sh`; the recovery command
 `leerie finalize <run-id>` also sources it — three call sites, one
 finalize implementation.
 
+That inline block is the *normal* local path, but it only runs when the
+launcher reaches the end of a run. A local run interrupted before then —
+Ctrl-C after the waves integrated but before `phase_finalize` — leaves a
+complete run branch on the host and no `finished_at` in `run.json`. So
+`leerie finalize <run-id>` is the recovery verb for local runs too, not
+only remote ones: it resolves the runtime to local (no Fly or EC2 sidecar
+present), skips the fetch — there is nothing to fetch, the state root is
+bind-mounted and the branch is already in the user's repo — and calls
+`host_finalize` directly. The completion gate there keys on
+`completed_waves`, deliberately not on `finished_at`, precisely so an
+interrupted-but-complete run is finalizable while a crashed-mid-wave one
+is not.
+
 **`no_push`: intent vs mechanism.** The orchestrator inside the Machine is
 *always* invoked with `--no-push` because the Fly Machine has no GitHub
 auth — a **mechanism flag**, not the user's preference. The user's actual

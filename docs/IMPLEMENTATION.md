@@ -7004,9 +7004,8 @@ auth fails. Any other `--runtime` value falls through unchanged.
 
 Verbs `kill`, `stop`, and `accept-blocked` accept an optional
 `--runtime <local|fly|ec2>` flag, validated against the same `RUNTIME_VALUES`
-enum that gates launching a new run. `finalize` remains narrower — it
-validates only `local`/`fly` (rejecting `ec2`) since `finalize --runtime ec2`
-has not shipped.
+enum that gates launching a new run. `finalize` accepts the same three
+values.
 
 The launcher's `RUNTIME=ec2` branch dispatches the full create → seed →
 launch → teardown cycle for launching a run; `stop --runtime ec2` routes to
@@ -7016,9 +7015,23 @@ stop`/`destroy`; EC2 to `aws ec2 stop-instances`/`terminate-instances`; local
 to `nerdctl stop`/`kill` via `_is_local_container` (`nerdctl inspect
 <run-id>`). `stop` uses SIGTERM-equivalents (graceful state save); `kill`
 uses immediate destroy (EC2 after the fetch-before-terminate sync).
-`finalize --runtime local` still errors — local finalization is inline.
-Without the flag, verbs infer runtime from the sidecar (Fly, then EC2, then
-`nerdctl inspect`, via `_auto_detect_run_runtime`). `resume` accepts
+A local run finalizes inline at the end of a normal run; `finalize
+--runtime local` is the *recovery* path for one interrupted before that
+block could run (Ctrl-C after the waves integrated, say), where `run.json`
+carries no `finished_at` and the already-synced probe cannot fire. It skips
+the fetch entirely — the branch and state are already on the host — and goes
+straight to `host_finalize`, whose completion gate keys on
+`completed_waves`, not `finished_at`. `finalize --force` is refused for a
+local run: it exists to SIGTERM a detached remote orchestrator, and a local
+run's orchestrator exits with its container.
+
+Without the flag, verbs infer runtime from the sidecar via
+`_auto_detect_run_runtime`: `fly-machine.json` → fly, else
+`ec2-instance.json` → ec2, else **local by absence**. `finalize` resolves the
+absent case to local rather than falling through to the Fly arm. It cannot
+use `_is_local_container` (`nerdctl inspect <run-id>`) the way `stop`/`kill`
+do — that probe only succeeds while the container is alive, and a finalize
+runs after it has exited. `resume` accepts
 `--runtime` directly (fly takes the smart-attach path, local the inline
 re-exec path).
 
