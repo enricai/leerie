@@ -304,3 +304,86 @@ def test_absolute_and_tilde_shapes_still_flagged_with_a_repo_root(leerie, tmp_pa
     refs = leerie._unreachable_task_references(
         "Read ~/.claude/plans/nope-xyz.md and /tmp/nope-xyz-abs.md first.", repo)
     assert refs == ["~/.claude/plans/nope-xyz.md", "/tmp/nope-xyz-abs.md"]
+
+
+# ---------------------------------------------------------------------------
+# A `~` in task prose is usually approximation notation, not a home path.
+#
+# Incident 2026-08-24: two runs died in `phase 2: planning` with
+# `RuntimeError: Could not determine home directory.` -- raised by
+# `Path("~17.9").expanduser()`, from the task sentence "max 17,923,286 B
+# (~17.9 MB)". `os.path.expanduser` takes the `~user` branch for any `~`
+# token whose first segment is not empty, looks up a user named `17.9`,
+# fails, and returns the string unexpanded; pathlib turns that into a
+# RuntimeError. `HOME` is never consulted on that branch, so the failure is
+# not environmental -- it reproduces on any host.
+#
+# Measured 2026-08-24 over the 518 task strings then stored under
+# `~/.leerie/*/runs/*/state.json`: 32 of the 62 distinct `~`-prefixed
+# path-shaped tokens are prose, and all 32 raised. Three of them carry a
+# separator, which is why the token rule cannot be "must contain a `/`".
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("prose", [
+    "max 17,923,286 B (~17.9 MB), avg ~3.98 MB",   # the incident's own line
+    "p95 latency ~4.6s after the change",
+    "error rate ~3.7% across the sample",
+    "throughput improved ~1.7×",
+    "roughly ~2.5/subtask on average",             # separator-bearing prose
+    "passes ~9/10 runs",                           # separator-bearing prose
+    "heap sat at ~14GB/64GB",                      # separator-bearing prose
+])
+def test_tilde_approximation_prose_is_not_a_reference(leerie, tmp_path, prose):
+    """Substance, not survival: the call must return NO references, not
+    merely avoid raising. Each shape is taken from the measured corpus, and
+    the last three carry a `/` so a `"/" in token` rule cannot pass this."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    assert leerie._unreachable_task_references(prose, repo) == [], prose
+
+
+def test_unknown_user_home_reference_is_flagged_not_raised(leerie, tmp_path):
+    """`~name/...` for a name absent from the password database is a real
+    reference the planner cannot read -- so it must be REPORTED, which is a
+    stronger claim than "did not raise". This is the case the try/except
+    owns; the token rule cannot help here."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    assert leerie._unreachable_task_references(
+        "Read ~nosuchuser-zzz/plan.md first.", repo) == [
+            "~nosuchuser-zzz/plan.md"]
+
+
+def test_advisory_never_gates_even_when_the_check_raises(leerie, tmp_path,
+                                                        monkeypatch,
+                                                        capsys):
+    """The wrapper phase_plan calls must absorb ANY failure of the check.
+    Driven by executing it against a check that really raises -- not by
+    reading phase_plan's source for a try statement."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+
+    def boom(task, repo_root):
+        raise RuntimeError("Could not determine home directory.")
+
+    monkeypatch.setattr(leerie, "_unreachable_task_references", boom)
+    assert leerie._log_unreachable_task_references("any task", repo) == []
+
+    # ...and it must SAY so. A silent `return []` passes the assertion
+    # above, and the skip line is the operator's only signal that a check
+    # they were told runs did not run. The exception type is part of it:
+    # an unnamed failure is the misdiagnosis shape the timeout-vs-
+    # WorkerError lesson already cost this repo once.
+    out = capsys.readouterr().out
+    assert "unreachable-reference advisory skipped" in out
+    assert "RuntimeError" in out
+
+
+def test_advisory_wrapper_passes_real_references_through(leerie, tmp_path):
+    """The wrapper is not a black hole either: a genuine unreachable
+    reference still reaches the caller."""
+    repo = tmp_path / "repo"
+    repo.mkdir(parents=True)
+    assert leerie._log_unreachable_task_references(
+        "Implement ~/.claude/plans/nope-abc.md", repo) == [
+            "~/.claude/plans/nope-abc.md"]

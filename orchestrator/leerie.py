@@ -9819,7 +9819,9 @@ def _unreachable_task_references(task: str, repo_root: Path) -> list[str]:
 
     Covers three shapes, all invisible to the planner for different
     mechanical reasons: absolute (`/…`, excluded as a candidate), `~`-
-    prefixed (never expanded), and **parent-relative (`../…`)**. The last
+    prefixed (never expanded — and only where the token is home-*shaped*,
+    `~/…` or `~name/…`, since a bare `~` before a digit is approximation
+    notation in prose, not a path), and **parent-relative (`../…`)**. The last
     one survives the token-level guard and is dropped later, by
     `_glob_task_references`'s `is_relative_to(root)` containment re-check —
     so it needs `repo_root` to be recognised here, and it is the shape most
@@ -9850,6 +9852,20 @@ def _unreachable_task_references(task: str, repo_root: Path) -> list[str]:
         has_sep = "/" in token
         if not (has_ext or has_sep):
             continue
+        if token.startswith("~") and not (
+                token.startswith("~/") or token[1:2].isalpha()
+                or token[1:2] == "_"):
+            # A `~` in task prose is far more often approximation notation
+            # than a home reference: `~17.9 MB`, `~2.5/subtask`, `~9/10`,
+            # `~14GB/64GB`. A real home reference is either `~/…` or
+            # `~name/…`, so a token whose second character is neither a
+            # separator nor the start of a username is prose. Measured over
+            # 518 real task strings: 32 of the 62 distinct `~`-prefixed
+            # path-shaped tokens were prose, and every one of them raised
+            # RuntimeError out of the expanduser() probe below. A
+            # separator-only test is NOT enough — three of those 32 carry
+            # a `/` (`~2.5/subtask`, `~9/10`, `~14GB/64GB`).
+            continue
         if (token.startswith("/") or token.startswith("~")
                 or token.startswith("../")):
             tokens.append(token)
@@ -9869,9 +9885,44 @@ def _unreachable_task_references(task: str, repo_root: Path) -> list[str]:
             except (OSError, ValueError):
                 pass
             unreachable.append(token)
-        elif not Path(token).expanduser().is_file():
+        else:
+            # Guarded like the `../` branch above, and for the same reason.
+            # `expanduser()` raises RuntimeError — not OSError — for
+            # `~name/…` when `name` is absent from the password database,
+            # and the token comes from user prose. Falling through to the
+            # append is the right outcome: such a reference really is one
+            # the planner cannot read; it simply must not abort the run.
+            try:
+                if Path(token).expanduser().is_file():
+                    continue
+            except (OSError, RuntimeError, ValueError):
+                pass
             unreachable.append(token)
     return unreachable
+
+
+def _log_unreachable_task_references(task: str, repo_root: Path) -> list[str]:
+    """Advisory-only wrapper around `_unreachable_task_references`.
+
+    The check gates nothing — it emits one operator warning — so a raise
+    out of it must never cost a run. It did twice: a `~`-approximation
+    token in task prose (`(~17.9 MB)`) reached `expanduser()` and killed
+    phase 2 after classify and the artifact registry had already been paid
+    for. `_unreachable_task_references` no longer has a raise path, and
+    this wrapper keeps that true for the caller regardless of what a later
+    edit does to it — the same posture `phase_artifact_registry` already
+    takes one phase earlier ("Best-effort — never die()s and returns []
+    on any failure")."""
+    try:
+        refs = _unreachable_task_references(task, repo_root)
+    except Exception as exc:  # advisory only — never gate on it
+        log(f"  unreachable-reference advisory skipped "
+            f"({type(exc).__name__}: {exc})")
+        return []
+    if refs:
+        log(f"  task references {len(refs)} path(s) outside the "
+            f"repo that leerie cannot read: {', '.join(refs)}")
+    return refs
 
 
 def _walk_calls(node: "object") -> list[str]:
@@ -20529,10 +20580,7 @@ async def phase_plan(task: str, st: State, caps: dict,
     if task_files:
         log(f"  task references {len(task_files)} file(s); "
             "planner will read them")
-    unreachable_refs = _unreachable_task_references(task, repo_root)
-    if unreachable_refs:
-        log(f"  task references {len(unreachable_refs)} path(s) outside the "
-            f"repo that leerie cannot read: {', '.join(unreachable_refs)}")
+    _log_unreachable_task_references(task, repo_root)
 
     # P6 repo-map injection (DESIGN §5½ (P6)). Build the ranked subgraph seeded
     # from the task-referenced files identified above, and inject it into the
