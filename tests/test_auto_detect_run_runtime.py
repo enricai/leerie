@@ -35,7 +35,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import HAS_JQ
+from tests.conftest import HAS_JQ, run_git_repo_first as _git
 from tests.ec2_stub import run_launcher as _run_launcher_shared
 
 REPO_ROOT_LAUNCHER = Path(__file__).resolve().parent.parent / "leerie"
@@ -441,22 +441,22 @@ def test_resume_fly_sidecar_still_promotes_to_fly_no_regression(tmp_path):
 # which requires `finished_at`; a run interrupted before `phase_finalize`
 # (Ctrl-C after the waves integrated) has none, so it hit flyctl.
 #
-# These drive the real launcher end to end. `USER_REPO` is honored by the
-# finalize arm (`USER_REPO="${USER_REPO:-$PWD}"`), which is what lets the
-# fixtures point it at a scratch repo instead of this one.
-
-
-def _git(repo: Path, *args: str) -> None:
-    subprocess.run(
-        ["git", "-C", str(repo), *args],
-        check=True, capture_output=True, text=True,
-    )
+# These drive the real launcher end to end against a scratch repo, and the
+# ONLY way to point it there is the child's working directory: `leerie:39`
+# assigns `USER_REPO="$(pwd -P)"` unconditionally, so the
+# `USER_REPO="${USER_REPO:-$PWD}"` at the top of the finalize arm can never
+# fire and exporting `USER_REPO` in the environment does nothing. Getting this
+# wrong is silent rather than loud — the launcher happily runs every
+# `git -C "$USER_REPO"` against the leerie checkout pytest was started from,
+# where the fixture's run branch does not exist, so the branch-dependent
+# assertions pass for the wrong reason.
 
 
 def _make_local_run(state_dir: Path, tmp_path: Path, run_id: str, *,
                     create_branch: bool = True,
                     finished: bool = False,
-                    no_push: bool = False) -> tuple[Path, Path]:
+                    no_push: bool = False,
+                    working_branch: str = "main") -> tuple[Path, Path]:
     """A local run dir (no Fly/EC2 sidecar) plus a scratch USER_REPO.
 
     Deliberately writes NO `finished_at` unless asked: that is the exact
@@ -465,12 +465,16 @@ def _make_local_run(state_dir: Path, tmp_path: Path, run_id: str, *,
     """
     repo = tmp_path / "user_repo"
     repo.mkdir(parents=True, exist_ok=True)
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    (repo / "f.txt").write_text("base\n")
-    _git(repo, "add", "f.txt")
-    _git(repo, "commit", "-q", "-m", "base")
+    # Idempotent: a test may build two runs against ONE scratch repo (that is
+    # how the cwd-scoping guard makes its two sources disagree), and a second
+    # `git commit` with an unchanged tree exits non-zero.
+    if not (repo / ".git").is_dir():
+        _git(repo, "init", "-q", "-b", "main")
+        _git(repo, "config", "user.email", "t@example.com")
+        _git(repo, "config", "user.name", "t")
+        (repo / "f.txt").write_text("base\n")
+        _git(repo, "add", "f.txt")
+        _git(repo, "commit", "-q", "-m", "base")
 
     branch = f"leerie/runs/{run_id}"
     if create_branch:
@@ -484,8 +488,8 @@ def _make_local_run(state_dir: Path, tmp_path: Path, run_id: str, *,
     run_json = {
         "run_id": run_id,
         "branch": branch,
-        "working_branch": "main",
-        "pr_base_branch": "main",
+        "working_branch": working_branch,
+        "pr_base_branch": working_branch,
     }
     if finished:
         run_json["finished_at"] = "2026-08-24T22:00:00+00:00"
@@ -499,10 +503,14 @@ def _make_local_run(state_dir: Path, tmp_path: Path, run_id: str, *,
 
 
 def _finalize(args, state_dir: Path, repo: Path):
-    env = _launcher_env(state_dir)
-    env["USER_REPO"] = str(repo)
+    # cwd, not env: see the note above — `USER_REPO` in the environment is
+    # overwritten by `leerie:39` before any verb runs.
+    return _launcher_in(args, _launcher_env(state_dir), repo)
+
+
+def _launcher_in(args, env, repo: Path):
     return _run_launcher_shared(
-        args, env, launcher=REPO_ROOT_LAUNCHER, timeout=60
+        args, env, launcher=REPO_ROOT_LAUNCHER, timeout=60, cwd=repo
     )
 
 
@@ -511,10 +519,15 @@ def test_finalize_local_run_without_finished_at_reaches_host_finalize(tmp_path):
     """THE reported bug: a local run interrupted before `finished_at` was
     written must finalize locally, never ask for flyctl.
 
-    `no_push` is set so `host_finalize` short-circuits at its own early gate
-    (host-finalize.sh:294) — that return is *inside* host_finalize, so
-    observing it proves the launcher handed off, without this test needing a
-    git remote or a rebaser worker.
+    `no_push` is set in run.json AND `--no-push` is passed, so `host_finalize`
+    short-circuits at its own early gate (host-finalize.sh:294) — a return from
+    *inside* host_finalize, which proves the launcher handed off, without this
+    test needing a git remote or a rebaser worker.
+
+    The CLI flag is load-bearing, not belt-and-braces: without it the launcher
+    reaches its mechanism-vs-intent block and STRIPS `no_push` from run.json
+    whenever the run branch exists locally, so the gate would never fire and
+    this test would run on into the rebase and push.
 
     Note the existing local-shaped fixtures in
     tests/test_launcher_finalize_no_work.py cannot catch this regression:
@@ -525,7 +538,7 @@ def test_finalize_local_run_without_finished_at_reaches_host_finalize(tmp_path):
     run_dir, repo = _make_local_run(state_dir, tmp_path, "r1", no_push=True)
     assert "finished_at" not in json.loads((run_dir / "run.json").read_text())
 
-    r = _finalize(["finalize", "r1"], state_dir, repo)
+    r = _finalize(["finalize", "r1", "--no-push"], state_dir, repo)
 
     combined = r.stdout + r.stderr
     assert "flyctl" not in combined.lower(), combined
@@ -540,7 +553,8 @@ def test_finalize_local_accepts_explicit_runtime_local(tmp_path):
     equivalent yet"). It is now a supported selector for the same arm."""
     state_dir = tmp_path / "state"
     _, repo = _make_local_run(state_dir, tmp_path, "r1", no_push=True)
-    r = _finalize(["finalize", "r1", "--runtime", "local"], state_dir, repo)
+    r = _finalize(["finalize", "r1", "--runtime", "local", "--no-push"],
+                  state_dir, repo)
     assert "no local-runtime equivalent" not in r.stderr, r.stderr
     assert "flyctl" not in (r.stdout + r.stderr).lower()
     assert r.returncode == 0, r.stdout + r.stderr
@@ -571,6 +585,57 @@ def test_finalize_local_fails_closed_when_run_branch_absent(tmp_path):
     assert "flyctl" not in (r.stdout + r.stderr).lower()
 
 
+def test_finalize_local_passes_the_branch_gate_when_the_branch_exists(tmp_path):
+    """The positive twin of the fail-closed case above: with the run branch
+    present the gate must PASS, not refuse unconditionally.
+
+    Without this, `test_..._fails_closed_when_run_branch_absent` alone cannot
+    tell a real check from a blanket refusal — the fixture's `create_branch`
+    parameter would be inert.
+
+    `working_branch`/`pr_base_branch` name a branch that does not exist, which
+    makes `host_finalize`'s rebase base unresolvable so it skips the rebase
+    block (scripts/host-finalize.sh:457-461) rather than spawning the real
+    `rebaser` worker. The push then fails for want of an `origin`, which is
+    fine — everything this test asserts happens before it.
+    """
+    state_dir = tmp_path / "state"
+    _, repo = _make_local_run(state_dir, tmp_path, "r1",
+                              create_branch=True,
+                              working_branch="no-such-base")
+
+    r = _finalize(["finalize", "r1"], state_dir, repo)
+
+    combined = r.stdout + r.stderr
+    assert "state and branch already on this host" in r.stderr, r.stderr
+    assert "has no run branch" not in r.stderr, r.stderr
+    assert "flyctl" not in combined.lower(), combined
+
+
+def test_finalize_local_branch_gate_is_scoped_to_the_launcher_cwd(tmp_path):
+    """`USER_REPO` comes from the launcher's working directory, never the
+    environment (`leerie:39` overwrites it), so the branch gate must read the
+    scratch repo.
+
+    Guards the plumbing itself: if `_finalize` regressed to exporting
+    `USER_REPO`, the gate would consult whatever repo pytest was started from
+    and this would flip. Two sources that disagree — a repo WITH the branch,
+    and a run id whose branch exists nowhere — so a bypass cannot pass.
+    """
+    state_dir = tmp_path / "state"
+    _, repo = _make_local_run(state_dir, tmp_path, "r1", create_branch=True,
+                              working_branch="no-such-base")
+    # Same scratch repo, a second run whose branch was never created.
+    _make_local_run(state_dir, tmp_path, "r2", create_branch=False,
+                    working_branch="no-such-base")
+
+    present = _finalize(["finalize", "r1"], state_dir, repo)
+    absent = _finalize(["finalize", "r2"], state_dir, repo)
+
+    assert "has no run branch" not in present.stderr, present.stderr
+    assert "has no run branch" in absent.stderr, absent.stderr
+
+
 def test_finalize_fly_sidecar_still_promotes_to_fly_no_regression(tmp_path):
     """The local default must not swallow a genuine Fly run."""
     state_dir = tmp_path / "state"
@@ -591,6 +656,16 @@ def test_finalize_usage_strings_offer_local(tmp_path):
     asserts what a user is actually shown, not a source substring."""
     state_dir = tmp_path / "state"
     _, repo = _make_local_run(state_dir, tmp_path, "r1")
-    r = _finalize(["finalize", "r1", "--foorce"], state_dir, repo)
-    assert r.returncode != 0
-    assert "--runtime local|fly|ec2" in r.stderr, r.stderr
+
+    # Each rejection path prints its own copy of the string; the change
+    # touched four, so assert on more than one of them.
+    unknown_flag = _finalize(["finalize", "r1", "--foorce"], state_dir, repo)
+    dangling = _finalize(["finalize", "r1", "--runtime"], state_dir, repo)
+    extra_pos = _finalize(["finalize", "r1", "r2"], state_dir, repo)
+
+    for label, r in (("unknown flag", unknown_flag),
+                     ("dangling --runtime", dangling),
+                     ("extra positional", extra_pos)):
+        assert r.returncode != 0, f"{label}: expected non-zero"
+        assert "--runtime local|fly|ec2" in r.stderr, f"{label}: {r.stderr}"
+        assert "--runtime fly|ec2]" not in r.stderr, f"{label}: {r.stderr}"

@@ -116,12 +116,22 @@ def test_run_launcher_matches_the_common_call_shape():
 
     sig = inspect.signature(ec2_stub.run_launcher)
     params = sig.parameters
-    assert list(params) == ["args", "env", "launcher", "timeout", "use_bash"]
-    assert params["launcher"].kind == inspect.Parameter.KEYWORD_ONLY
-    assert params["timeout"].kind == inspect.Parameter.KEYWORD_ONLY
-    assert params["use_bash"].kind == inspect.Parameter.KEYWORD_ONLY
+    # `cwd` joined the shape deliberately: `leerie:39` assigns
+    # `USER_REPO="$(pwd -P)"` unconditionally, so a test that needs the
+    # launcher to act on a scratch repo can only say so through the child's
+    # working directory — setting `USER_REPO` in `env` is silently ignored.
+    # It defaults to None so every existing caller is unaffected.
+    #
+    # NOTE: tests/test_no_duplicate_launcher_invoke_helper.py asserts this
+    # same shape. Both must move together; a change to one that misses the
+    # other lands red.
+    assert list(params) == [
+        "args", "env", "launcher", "timeout", "use_bash", "cwd"]
+    for name in ("launcher", "timeout", "use_bash", "cwd"):
+        assert params[name].kind == inspect.Parameter.KEYWORD_ONLY
     assert params["timeout"].default == 30
     assert params["use_bash"].default is False
+    assert params["cwd"].default is None
 
 
 def test_no_local_run_launcher_reimplementations_outside_the_allowlist():

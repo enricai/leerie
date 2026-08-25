@@ -76,6 +76,7 @@ def run_launcher(
     launcher: Path = DEFAULT_LAUNCHER,
     timeout: int = 30,
     use_bash: bool = False,
+    cwd: Path | None = None,
 ) -> subprocess.CompletedProcess:
     """Invoke the `leerie` launcher as a subprocess and return the result.
 
@@ -88,11 +89,18 @@ def run_launcher(
     be confused with tests/test_group_state_dir_guard.py's own
     `_run_launcher`, which has a materially different signature and
     purpose (stub-binary injection) and is left untouched.
+
+    `cwd` is load-bearing for any test that needs the launcher to act on a
+    scratch repo: `leerie:39` assigns `USER_REPO="$(pwd -P)"` unconditionally,
+    so setting `USER_REPO` in `env` has NO effect — the launcher overwrites it
+    before any verb runs. The working directory is the only lever. This is the
+    same idiom `tests/test_launcher_finalize_no_work.py` already uses.
     """
     argv = (["bash", str(launcher)] if use_bash else [str(launcher)]) + args
     return subprocess.run(
         argv,
         env=env,
+        cwd=None if cwd is None else str(cwd),
         capture_output=True,
         text=True,
         timeout=timeout,

@@ -2669,7 +2669,7 @@ a container.
 |------|-------------|
 | `stop <run-id> [--runtime local\|fly\|ec2]` | Pause a run — a remote Fly machine, an EC2 instance (`stop-instances`, preserving the root EBS volume), or a local container. Resumable via `resume` (EC2 `resume` calls `resume_instance()` and re-resolves the reassigned public IP). |
 | `kill <run-id> [--force]` | Destroy a remote machine permanently. `--force` skips confirmation. Also accepts `--machine-id <id> [--app <app>]` for orphan cleanup. |
-| `finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime fly]` | Post-detach finalization: collect un-integrated subtask branches on the machine, fetch the run branch, then push + open PR on the host. Without `--force`, requires the orchestrator to be dead. `--force` SIGTERMs a live orchestrator first, then collects and fetches. |
+| `finalize <run-id> [--force] [--no-verify] [--no-push] [--runtime local\|fly\|ec2]` | Finalization fast-path: get the run branch onto the host, then push + open PR. What "get it onto the host" means is runtime-dependent. **Fly/EC2:** collect un-integrated subtask branches on the machine and fetch the run branch; without `--force`, requires the orchestrator to be dead, and `--force` SIGTERMs a live one first (Fly only — the EC2 arm refuses it, since the force path is flyctl-transport). **Local:** there is nothing to fetch (the state root is bind-mounted and the branch is already in the user's repo), so it skips straight to `host_finalize`; `--force` is refused, because it exists to stop a *detached* orchestrator and a local run's exits with its container. Runtime is auto-detected from the run dir: `fly-machine.json` → fly, `ec2-instance.json` → ec2, **neither → local**. That last case is why a Fly/EC2 run whose sidecar has been deleted now reports "has no run branch in `$USER_REPO`" instead of reaching flyctl — pass `--runtime fly` explicitly to override. |
 | `re-seed <run-id> [--force]` | Mid-run host→machine re-rsync of dirty delta. `--force` bypasses the safety check that refuses to clobber machine-side uncommitted edits. |
 | `status <run-id\|chain-id\|group-id>` | Render run/chain/group state from `run.json`. |
 | `attach <run-id\|chain-id>` | Poll `run.json` files every 5s. |
@@ -7060,6 +7060,17 @@ address this together:
    `fetch_branch`, then the host-side finalize block (push + `gh pr
    create`). Idempotent — an already-pushed run short-circuits with
    "already finalized."
+
+   The `fetch_branch` half is **remote-only**. This section describes the
+   detached-orchestrator problem the verb was built for, but the verb also
+   serves local runs, where there is no machine to fetch from: the state root
+   is bind-mounted and the run branch is already in the user's repo, so the
+   local arm sets the fetched-run-dir to the run dir it already has and goes
+   straight to the host-side finalize block. A local run normally finalizes
+   inline at the end of `leerie "task"`; the verb matters when that inline
+   block never ran — a Ctrl-C after the waves integrated leaves no
+   `finished_at`, which is exactly the case the already-synced short-circuit
+   cannot detect.
 
 `leerie finalize` resolves `<run-id>` directly against
 `$LEERIE_STATE_HOST_DIR/runs/<run-id>/` (the run-id IS the machine id, DESIGN
