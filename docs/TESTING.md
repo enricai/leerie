@@ -2152,8 +2152,18 @@ closed on the branch rather than deeper in `host_finalize`, a Fly sidecar
 still promoting to `fly` (the local default must not swallow a real Fly
 run), and the advertised usage enum reading `local|fly|ec2` — asserted
 through a real rejection, so it checks what a user is shown rather than a
-source substring. These fixtures point `USER_REPO` at a scratch git repo,
-which the finalize arm honors via `USER_REPO="${USER_REPO:-$PWD}"`. Note the
+source substring. These fixtures point the launcher at a scratch git repo via
+its **working directory**, which is the only lever that works: `leerie:39`
+assigns `USER_REPO="$(pwd -P)"` unconditionally, so the
+`USER_REPO="${USER_REPO:-$PWD}"` at the top of the finalize arm can never fire
+and exporting `USER_REPO` has no effect. `tests/ec2_stub.py`'s shared
+`run_launcher` grew a `cwd` parameter for this (the idiom
+`test_launcher_finalize_no_work.py` already used). Getting it wrong fails
+silently rather than loudly — every `git -C "$USER_REPO"` would run against
+the leerie checkout pytest was started from, where the fixture's run branch
+does not exist, so the branch-dependent assertions would pass for the wrong
+reason. `test_finalize_local_branch_gate_is_scoped_to_the_launcher_cwd` pins
+the plumbing with two sources that disagree. Note the
 local-shaped fixtures in `tests/test_launcher_finalize_no_work.py` cannot
 catch this regression: all of them exit early through `_already_synced` /
 `pushed_at` / argv validation and never reach the runtime dispatch.
