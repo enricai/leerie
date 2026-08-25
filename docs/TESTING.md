@@ -2133,7 +2133,7 @@ for a different runtime is present; Fly wins when (never expected in
 practice) both sidecars co-exist; and the Fly-only wrapper returns
 nonzero for an EC2 run.
 
-`finalize`'s **local** arm is covered by six further end-to-end cases in the
+`finalize`'s **local** arm is covered by eight further end-to-end cases in the
 same file. The discriminating one is
 `test_finalize_local_run_without_finished_at_reaches_host_finalize`: a run
 dir with no Fly/EC2 sidecar and deliberately **no `finished_at`** — the shape
@@ -2142,17 +2142,24 @@ Before the local arm existed, `_auto_detect_run_runtime` left `_fin_runtime`
 empty, the `_already_synced` probe missed for want of `finished_at`, and the
 dispatch chain's bare `else` sent the run into the Fly path, where
 `require_flyctl` offered to *install flyctl* for a run that never touched
-Fly. The fixture sets `no_push` so `host_finalize` short-circuits at its own
-early gate (`scripts/host-finalize.sh:294`) — a return from *inside*
-`host_finalize`, which is what proves the launcher handed off, without the
-test needing a git remote or a rebaser worker. The remaining cases pin
+Fly. The fixture sets `no_push` in `run.json` **and** passes `--no-push`, so
+`host_finalize` short-circuits at its own early gate
+(`scripts/host-finalize.sh:294`) — a return from *inside* `host_finalize`,
+which is what proves the launcher handed off, without the test needing a git
+remote or a rebaser worker. The CLI flag is load-bearing rather than
+belt-and-braces: without it the launcher reaches its mechanism-vs-intent
+block and STRIPS `no_push` from `run.json` whenever the run branch exists
+locally, so the gate would never fire and the test would run on into the
+rebase and push. The remaining cases pin
 `--runtime local` as accepted (it used to `exit 1`), `--force` refused with
 the local message rather than the EC2 one, a missing run branch failing
-closed on the branch rather than deeper in `host_finalize`, a Fly sidecar
-still promoting to `fly` (the local default must not swallow a real Fly
-run), and the advertised usage enum reading `local|fly|ec2` — asserted
-through a real rejection, so it checks what a user is shown rather than a
-source substring. These fixtures point the launcher at a scratch git repo via
+closed on the branch rather than deeper in `host_finalize`, its positive
+twin proving the gate PASSES when the branch exists (without which
+`create_branch` is inert and nothing distinguishes a real check from a
+blanket refusal), a Fly sidecar still promoting to `fly` (the local default
+must not swallow a real Fly run), and the advertised usage enum reading
+`local|fly|ec2` — asserted through three different rejection paths, so it
+checks what a user is shown rather than a source substring. These fixtures point the launcher at a scratch git repo via
 its **working directory**, which is the only lever that works: `leerie:39`
 assigns `USER_REPO="$(pwd -P)"` unconditionally, so the
 `USER_REPO="${USER_REPO:-$PWD}"` at the top of the finalize arm can never fire
