@@ -147,6 +147,24 @@ The orchestrator gives you, in your prompt:
    prose. Leave `runs_commands` empty (or omit it) for subtasks that
    invoke no prescribed command — most subtasks do not.
 
+   **Set `change_shape` on every subtask.** Required — there is no default.
+   It declares how many places in the code this subtask actually edits:
+
+   - `point` — one site, or a couple of adjacent lines. A single wrong
+     condition, one missing guard, one bad default.
+   - `localized` — a handful of sites inside one function or one closely
+     related cluster.
+   - `sweep` — the same mechanical change repeated across many sites: a
+     rename, an API migration, a signature change threaded through a file.
+
+   Judge the *change*, not the file. A one-line fix inside a 9,000-line file is
+   `point`, not `sweep` — the file's size says nothing about how much of it you
+   are touching. This is not cosmetic bookkeeping: the orchestrator splits a
+   `sweep` subtask on a large file into parallel per-region children, and doing
+   that to a `point` change hands a dozen workers a mandate only one of them can
+   satisfy in scope. Declaring `sweep` because the file is big is the specific
+   mistake this field exists to prevent.
+
    **Set `fixes_reported_symptom: true`** only on a subtask whose job is to
    fix a failure the task text reports as *currently happening*. Leave it
    false or absent for everything else — new features, refactors, subtasks
@@ -436,6 +454,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "provides": ["capability-tag-produced"],
       "success_criteria_seed": "The concrete checkable condition; an automated test where possible.",
       "size": "small | medium",
+      "change_shape": "point | localized | sweep",
       "investigation_notes": "What you found that materially helps the implementer.",
       "migration_targets": [
         {"old_pattern": "<literal symbol grepped from this repo>",

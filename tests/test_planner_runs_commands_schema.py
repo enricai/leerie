@@ -48,6 +48,7 @@ def test_subtask_with_runs_commands_validates(leerie):
         "title": "Run recon:generate",
         "success_criteria_seed": "recon:generate is invoked and succeeds",
         "runs_commands": ["recon:browser", "recon:generate"],
+        "change_shape": "point",
     }
     _validate_subtask_item(leerie, instance)
 
@@ -57,6 +58,7 @@ def test_subtask_without_runs_commands_validates(leerie):
         "id": "feat-002",
         "title": "Add the /volumes endpoint",
         "success_criteria_seed": "POST /volumes returns 201",
+        "change_shape": "point",
     }
     _validate_subtask_item(leerie, instance)
 
@@ -67,6 +69,7 @@ def test_subtask_with_empty_runs_commands_validates(leerie):
         "title": "Refactor the auth middleware",
         "success_criteria_seed": "existing auth tests still pass",
         "runs_commands": [],
+        "change_shape": "point",
     }
     _validate_subtask_item(leerie, instance)
 
@@ -78,6 +81,7 @@ def test_runs_commands_rejects_non_string_items(leerie):
         "title": "Bad subtask",
         "success_criteria_seed": "n/a",
         "runs_commands": [123],
+        "change_shape": "point",
     }
     with pytest.raises(jsonschema.exceptions.ValidationError):
         jsonschema.validate(instance, _subtask_item_schema(leerie))
