@@ -1752,6 +1752,7 @@ def _subtask_item_schema(
     include_migration_targets: bool = False,
     include_runs_commands: bool = False,
     include_fixes_reported_symptom: bool = False,
+    include_change_shape: bool = False,
 ) -> dict:
     """Build the child-subtask item schema shared by planner.subtasks,
     reconciler.added_subtasks, and splitter.children.
@@ -1840,9 +1841,31 @@ def _subtask_item_schema(
         # absence means "no" — the check is advisory, so a silent check is
         # strictly better than one at a 100% false-positive rate.
         properties["fixes_reported_symptom"] = {"type": "boolean"}
+    required = ["id", "title", "success_criteria_seed"]
+    if include_change_shape:
+        # How many edit sites does this change need? `_subfile_split` gates on
+        # it: only a `sweep` is tiled into per-region children, because every
+        # region child inherits the parent's criteria and a tiled point fix
+        # hands N children a whole-file mandate exactly one can satisfy in
+        # scope (DESIGN §5½ (P1) *Sub-file* *Gating condition*).
+        #
+        # REQUIRED, not optional, on the same reasoning as
+        # `migration_targets.is_real_identifier`: a planner must not be able to
+        # skip an attestation a gate depends on simply by omitting the field.
+        #
+        # It cannot be a code-side inference. The number of sites a change
+        # needs is not a property of the file, and reading it out of
+        # `investigation_notes` would be regex-over-prose, which CLAUDE.md
+        # *Language-to-JSON* forbids — the owning worker surfaces the fact as
+        # JSON, and Python only compares strings.
+        properties["change_shape"] = {
+            "type": "string",
+            "enum": ["point", "localized", "sweep"],
+        }
+        required.append("change_shape")
     return {
         "type": "object",
-        "required": ["id", "title", "success_criteria_seed"],
+        "required": required,
         "properties": properties,
     }
 
@@ -1986,6 +2009,7 @@ SCHEMAS: dict[str, dict] = {
                     include_migration_targets=True,
                     include_runs_commands=True,
                     include_fixes_reported_symptom=True,
+                    include_change_shape=True,
                 ),
             },
         },
@@ -7973,8 +7997,59 @@ def _check_intra_file_surface(
     return issues
 
 
+# Sentinel introducing the new-file-ownership clause in a child's
+# `success_criteria_seed`. Load-bearing for RE-ENTRY: a child's criteria is built
+# by appending to its parent's, and a re-split child's parent criteria already
+# carries a clause. Without replacing it, a non-owner's child receives its
+# parent's "create no new files" AND its own "you are the owner" — directly
+# contradictory, and it breaks the one-owner invariant across the tree (measured:
+# run 719c2a26 re-entered three times, at r8/r12/r14, so it would have produced
+# four claimed owners instead of one).
+#
+# Splitting on this marker is string surgery on a string THIS MODULE generated,
+# which is what makes it legitimate: CLAUDE.md *Language-to-JSON* bars reading
+# meaning out of prose or a worker's response, not slicing our own mechanical
+# output at a delimiter we emit. The neighbouring `Scope:` clauses stack instead
+# of replacing, which is fine for them (each narrows the last) and exactly wrong
+# for this one (each would negate the last).
+_NEWFILE_CLAUSE_MARKER = "\nNEW-FILE OWNERSHIP: "
+
+
+def _apply_newfile_clause(criteria: str, *, is_owner: bool,
+                          owner_id: str) -> str:
+    """Return `criteria` with exactly one new-file-ownership clause, replacing
+    any clause inherited from a parent split (DESIGN §5½ (P1) *Sub-file*)."""
+    base = criteria.split(_NEWFILE_CLAUSE_MARKER)[0].rstrip()
+    if is_owner:
+        body = ("you are this split's designated new-file owner. If the "
+                "criteria above require a file that does not exist yet, create "
+                "it here. No sibling will.")
+    else:
+        body = (f"create no new files. If the criteria above require a file "
+                f"that does not exist yet, it belongs to {owner_id}; leave it "
+                f"to that subtask rather than creating your own copy.")
+    return f"{base}{_NEWFILE_CLAUSE_MARKER}{body}"
+
+
+def _newfile_designation(subtask: dict, first_child_id: str) -> tuple[str, bool]:
+    """Resolve (owner_id, parent_is_owner) for a split's children.
+
+    A non-owner's ENTIRE subtree must contain no owner: if a child that was told
+    "leave new files to X" is itself split, none of its own children may claim
+    ownership, and they must keep naming X rather than a fresh sibling. Only an
+    owner (or an undesignated top-level subtask) passes ownership down, to its
+    first child. That is what keeps exactly one leaf owner in the whole tree.
+
+    Read from a structural field rather than by re-reading the criteria text —
+    the same discipline as `_cofile_cluster`."""
+    if subtask.get("_newfile_owner") is False:
+        return subtask.get("_newfile_owner_id") or first_child_id, False
+    return first_child_id, True
+
+
 def _migration_child(subtask: dict, chunk: list[str], cid: str,
-                     title: str, criteria: str) -> dict:
+                     title: str, criteria: str,
+                     newfile_owner_id: str | None = None) -> dict:
     """Build one migration-chunk child subtask from its (code-fixed) file
     partition plus a title + success_criteria_seed. Inherits the parent's
     graph edges/intent; the files are the pre-computed chunk, never re-decided.
@@ -7998,6 +8073,28 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
     same pattern its parent did, and dropping the fields would silently
     make that fact unrecoverable for anything that reads a leaf in
     isolation later (a human reviewing the plan, or a future consumer)."""
+    # Same one-owner rule as `_subfile_child`, for the same reason: every child
+    # here also inherits the parent's `success_criteria_seed`, so a parent
+    # criterion demanding a file that does not exist yet ("A new runtime e2e
+    # test ...") is handed to all of them at once. Measured on run 719c2a26,
+    # `bugfix-001-f2` — a peel child, not a region child — carries the same
+    # criteria hash (8b372445) as all 12 region children, so the peel pair is
+    # the identical collision shape at 2-way instead of 14-way.
+    #
+    # UNLIKE the region children, there is NO mechanical backstop here: these
+    # children carry no `owned_region`, so `OWNED_REGION_FILE_ESCAPE` cannot
+    # see them and the criteria clause is the whole mechanism. Applied in
+    # `_migration_child` rather than in each label helper so it reaches the
+    # peel pair, the deterministic chunk-label fallback, AND the labels the
+    # label-only splitter writes — that last one composes its own criteria per
+    # chunk and would otherwise carry no clause at all.
+    #
+    # `None` means "no designation" and leaves `criteria` untouched, so a
+    # caller that has no sibling set to speak of keeps the previous behaviour.
+    is_owner = newfile_owner_id is not None and cid == newfile_owner_id
+    if newfile_owner_id is not None:
+        criteria = _apply_newfile_clause(
+            criteria, is_owner=is_owner, owner_id=newfile_owner_id)
     return {
         "id": cid,
         "title": title,
@@ -8013,6 +8110,19 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
         "migration_targets": copy.deepcopy(
             subtask.get("migration_targets", []) or []),
         "performs_replacement": subtask.get("performs_replacement", False),
+        # Carried forward for the same reason as migration_targets, plus one
+        # load-bearing one: `_peel_oversized_file` builds a migration child for
+        # the dense file, and that child re-enters `_subfile_split`, whose
+        # `change_shape` gate reads this field. Dropping it here routes the
+        # dominant dense-file shape (a file bundled with its test file)
+        # straight past the gate.
+        "change_shape": subtask.get("change_shape"),
+        # Structural record of the clause above, so a re-split of this child
+        # resolves ownership from a field instead of re-reading its criteria
+        # prose (`_newfile_designation`). A non-owner's whole subtree stays
+        # ownerless and keeps naming the original owner.
+        "_newfile_owner": is_owner if newfile_owner_id is not None else None,
+        "_newfile_owner_id": newfile_owner_id,
     }
 
 
@@ -8033,7 +8143,8 @@ def _deterministic_chunk_label(subtask: dict, chunk: list[str],
 
 def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
                    symbols: list[str], cid: str, cluster: str,
-                   idx: int, total: int) -> dict:
+                   idx: int, total: int, newfile_owner_id: str,
+                   is_owner: bool) -> dict:
     """Build one sub-file child owning a *region* (``(start, end)`` lines) of a
     single *file* (DESIGN §5½ (P1) *Sub-file*). The analog of ``_migration_child``
     for intra-file splitting.
@@ -8061,12 +8172,28 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
     parent_title = subtask.get("title", "file change")
     sym_txt = ", ".join(symbols) if symbols else "(no named symbols in range)"
     title = f"{parent_title} (region {idx + 1}/{total}: lines {lo}-{hi})"
-    criteria = (
-        f"{subtask.get('success_criteria_seed', '')}\n"
-        f"Scope: only lines {lo}-{hi} of {file} "
-        f"(symbols: {sym_txt}). Do not edit outside this range; a sibling "
-        f"subtask owns the rest of the file."
-    ).strip()
+    # New-file ownership is a SEPARATE constraint from the line range, not a
+    # corollary of it: the parent's criteria may demand a new file, and "do not
+    # edit outside lines X-Y" does not constrain creating one. In run 719c2a26
+    # every region child inherited a criterion opening "A new runtime e2e test
+    # ... reproduces ...", three near-synonymous files were invented for it, and
+    # two children independently chose the SAME new path — an add/add conflict
+    # on a path absent from the merge base, which has no resolution that keeps
+    # both sides. Exactly one child may create files; the rest are told which
+    # sibling owns that work, by id, so they can declare an edge instead of
+    # racing it. Which child is arbitrary; that there is exactly one is the
+    # point (DESIGN §5½ (P1) *Sub-file*).
+    # `is_owner` comes from the CALLER, not from `idx == 0`: on a re-split the
+    # parent may itself be a non-owner, and then no child of it may own new
+    # files however it is indexed (`_newfile_designation`).
+    criteria = _apply_newfile_clause(
+        (
+            f"{subtask.get('success_criteria_seed', '')}\n"
+            f"Scope: only lines {lo}-{hi} of {file} "
+            f"(symbols: {sym_txt}). Do not edit outside this range; a sibling "
+            f"subtask owns the rest of the file."
+        ).strip(),
+        is_owner=is_owner, owner_id=newfile_owner_id)
     # Region-scoped, not a verbatim parent copy (unlike _migration_child,
     # where verbatim inheritance is safe because chunks own disjoint files).
     # Region children co-own the SAME file, so an unscoped intent gives
@@ -8096,6 +8223,11 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
         "provides": list(subtask.get("provides", []) or []),
         "size": "medium",
         "investigation_notes": subtask.get("investigation_notes", ""),
+        "change_shape": subtask.get("change_shape"),
+        # See `_migration_child`'s copy of these two: a re-split resolves
+        # ownership from here, never by re-reading the criteria text.
+        "_newfile_owner": is_owner,
+        "_newfile_owner_id": newfile_owner_id,
     }
 
 
@@ -8132,8 +8264,10 @@ async def _label_migration_chunks(
         log(f"_recursive_decompose: decomposition budget exceeded before "
             f"label-only splitter for {base_id}; using deterministic "
             "chunk labels")
+        owner_id, _ = _newfile_designation(subtask, ids[0])
         return [
-            _migration_child(subtask, chunk, cid, *labels[cid])
+            _migration_child(subtask, chunk, cid, *labels[cid],
+                             newfile_owner_id=owner_id)
             for cid, chunk in zip(ids, chunks)
         ]
     sys_prompt = _load_prompt("splitter")
@@ -8175,10 +8309,19 @@ async def _label_migration_chunks(
         log(f"_recursive_decompose: label-only splitter failed for "
             f"{base_id}; using deterministic chunk labels")
 
+    owner_id, _ = _newfile_designation(subtask, ids[0])
     return [
-        _migration_child(subtask, chunk, cid, *labels[cid])
+        _migration_child(subtask, chunk, cid, *labels[cid],
+                         newfile_owner_id=owner_id)
         for cid, chunk in zip(ids, chunks)
     ]
+
+
+# Declared `change_shape` values that must NOT be tiled intra-file. The enum's
+# third member, "sweep", is the only shape the sub-file split exists for
+# (DESIGN §5½ (P1) *Sub-file*). Kept as a frozenset rather than inlined so the
+# gate and its test name the same object.
+_NON_SWEEP_CHANGE_SHAPES = frozenset({"point", "localized"})
 
 
 def _subfile_split(subtask: dict, repo_root: Path,
@@ -8224,6 +8367,27 @@ def _subfile_split(subtask: dict, repo_root: Path,
         symbols_per = [[] for _ in regions]
     else:
         # First entry: tier-1 function-boundary tiling of the whole file.
+        #
+        # Gate on the parent's declared change shape BEFORE looking at the
+        # file at all (DESIGN §5½ (P1) *Sub-file* *Gating condition*). Size
+        # alone is the wrong trigger: tiling is for an edit-DENSE sweep, and a
+        # point fix in a large file yields N children that each inherit a
+        # whole-file mandate only one of them can satisfy in region. Measured
+        # on run 719c2a26 — a one-expression fix in a 9,140-line file tiled
+        # into 14 regions — 11 of 12 children touched a file outside their
+        # region and 7 of 12 edited lines outside their range; exactly one
+        # complied.
+        #
+        # Absence is NOT treated as a refusal: `reconciler.added_subtasks` and
+        # `splitter.children` do not carry the field, and defaulting those to
+        # "don't split" would silently disable the mechanism for them. Only an
+        # explicit non-sweep declaration gates.
+        if subtask.get("change_shape") in _NON_SWEEP_CHANGE_SHAPES:
+            log(f"_recursive_decompose: {subtask.get('id', '?')} declares "
+                f"change_shape={subtask['change_shape']!r} — not tiling "
+                f"{file!r} intra-file (sub-file split is for sweeps; see "
+                f"DESIGN §5½ (P1) *Sub-file*)")
+            return []
         abs_path = repo_root / file
         try:
             total_lines = abs_path.read_text(errors="replace").count("\n") + 1
@@ -8252,9 +8416,14 @@ def _subfile_split(subtask: dict, repo_root: Path,
         return []  # nothing gained — leaf
 
     total = len(regions)
+    # Index 0's id, derived the same way its own cid is, so the designation is
+    # stable across a resume — but only when this subtask is entitled to hand
+    # ownership down at all. Re-entering a NON-owner must not mint a new owner.
+    owner_id, parent_owns = _newfile_designation(subtask, f"{base_id}-r1")
     return [
         _subfile_child(subtask, file, region, symbols_per[i],
-                       f"{base_id}-r{i + 1}", cluster, i, total)
+                       f"{base_id}-r{i + 1}", cluster, i, total,
+                       owner_id, parent_owns and i == 0)
         for i, region in enumerate(regions)
     ]
 
@@ -8302,16 +8471,24 @@ def _peel_oversized_file(subtask: dict, repo_root: Path,
     base_id = subtask.get("id", "split")
     parent_title = subtask.get("title", "file change")
     seed = subtask.get("success_criteria_seed", "")
+    # f1 owns new files rather than an arbitrary child: it holds the dense file
+    # the work is actually about, while f2 exists only to carry the leftovers.
+    # Unless this subtask is itself a non-owner, in which case the resolved id
+    # is an ancestor's and no child's cid can match it — so neither peel child
+    # claims ownership, and both keep naming the real owner.
+    newfile_owner, _ = _newfile_designation(subtask, f"{base_id}-f1")
     dense_child = _migration_child(
         subtask, [dense], f"{base_id}-f1",
         f"{parent_title} (dense file: {dense})",
         (f"{seed}\nScope: only {dense}. A sibling subtask owns the "
-         f"remaining file(s).").strip())
+         f"remaining file(s).").strip(),
+        newfile_owner_id=newfile_owner)
     rest_child = _migration_child(
         subtask, rest, f"{base_id}-f2",
         f"{parent_title} (remaining: {', '.join(rest)})",
         (f"{seed}\nScope: only these files — {', '.join(rest)}. A sibling "
-         f"subtask owns {dense}.").strip())
+         f"subtask owns {dense}.").strip(),
+        newfile_owner_id=newfile_owner)
     return [dense_child, rest_child]
 
 
@@ -9489,6 +9666,45 @@ def check_implementer_output(
                 f"NO_PLANNED_FILES_TOUCHED: none of the planned "
                 f"files were modified — planned: "
                 f"{sorted(planned)[:5]}")
+
+    # OWNED_REGION_FILE_ESCAPE — GATING, unlike NO_PLANNED_FILES_TOUCHED above.
+    # The distinction is the provenance of the expectation, not its shape:
+    # `files_likely_touched` is a planner GUESS, so re-driving on it asks a
+    # worker to match a prediction. `owned_region["file"]` is computed by
+    # `_subfile_split` from a tree-sitter tiling of one file the subtask was
+    # deliberately confined to — there is no false-positive surface, because a
+    # region child touching another path is by construction outside its
+    # mandate.
+    #
+    # Corrective, never fatal. The caller routes a gating issue through
+    # `_format_check_feedback` -> `note` -> `continuation=True`, bounded by
+    # `implementer_confidence_retries`, after which it degrades to advisory.
+    # It must NOT be moved into `check_diff_scope`'s fatal return, whose string
+    # reaches `fail("broken", ...)` and is non-retryable: replayed against run
+    # 719c2a26 a fatal rule kills 11 of 12 subtasks, converting a coverage gap
+    # into a total run kill — and those violations were children OBEYING an
+    # inherited criterion they could not satisfy in region (DESIGN §5½ (P1)
+    # *Sub-file*).
+    owned_region = subtask.get("owned_region") or {}
+    owned_file = owned_region.get("file")
+    if owned_file and actual_files:
+        escaped = sorted(f for f in actual_files if f != owned_file)
+        if escaped:
+            # The count is reported alongside the sample, not implied by it.
+            # `NO_PLANNED_FILES_TOUCHED` above truncates to 5 bare, which is
+            # fine for an ADVISORY nobody acts on; this string is fed back to
+            # the implementer as the list to revert, so a silent cap tells a
+            # worker that escaped into ten files to revert five and burn
+            # another retry on the rest.
+            sample = escaped[:5]
+            more = "" if len(escaped) == len(sample) else \
+                f" (showing {len(sample)} of {len(escaped)})"
+            issues.append(
+                f"OWNED_REGION_FILE_ESCAPE: this subtask owns only lines "
+                f"{owned_region.get('start', '?')}-{owned_region.get('end', '?')} "
+                f"of {owned_file}, but the commit touches "
+                f"{len(escaped)} other path(s){more}: {sample} — revert them; "
+                f"a sibling region subtask owns them")
 
     if result.get("status") == "complete":
         for cr in result.get("criteria_results", []) or []:
@@ -26354,7 +26570,13 @@ def _format_owned_region_section(leerie_dir: Path, sid: str) -> str | None:
         "risk an integration merge conflict the sibling would otherwise "
         "resolve cleanly. If the change genuinely requires touching a "
         "shared declaration outside your range (e.g. a type used by several "
-        "regions), make the minimal edit and note it in your summary."
+        "regions), make the minimal edit and note it in your summary.\n"
+        f"  You own no path other than {file}. Do not create or edit any "
+        "other file — not a new test, not a new helper — even if your "
+        "success criteria appear to ask for one; your criteria say which "
+        "sibling owns that. This is checked mechanically against your "
+        "commit (OWNED_REGION_FILE_ESCAPE) and you will be re-driven to "
+        "revert it."
     )
 
 

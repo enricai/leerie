@@ -137,7 +137,7 @@ def test_subfile_child_owns_region(leerie):
     parent = _base_parent()
     child = leerie._subfile_child(
         parent, "flow-runner.ts", (1, 700), ["runFrame", "FrameTarget"],
-        "feat-005-r1", "flow-runner.ts", 0, 3)
+        "feat-005-r1", "flow-runner.ts", 0, 3, "feat-005-r1", True)
 
     assert child["id"] == "feat-005-r1"
     assert child["files_likely_touched"] == ["flow-runner.ts"]
@@ -160,7 +160,7 @@ def test_subfile_child_deep_copies_requires_and_provides_no_aliasing(leerie):
     parent = _base_parent()
     child = leerie._subfile_child(
         parent, "flow-runner.ts", (1, 700), ["runFrame"],
-        "feat-005-r1", "flow-runner.ts", 0, 2)
+        "feat-005-r1", "flow-runner.ts", 0, 2, "feat-005-r1", True)
 
     assert child["depends_on"] == parent["depends_on"]
     assert child["depends_on"] is not parent["depends_on"]
@@ -191,7 +191,7 @@ def test_subfile_child_intent_is_region_scoped_not_verbatim(leerie):
     parent = _base_parent()
     child = leerie._subfile_child(
         parent, "flow-runner.ts", (701, 1400), ["otherFn"],
-        "feat-005-r2", "flow-runner.ts", 1, 3)
+        "feat-005-r2", "flow-runner.ts", 1, 3, "feat-005-r1", False)
 
     assert child["intent"] != parent["intent"]
     assert parent["intent"] in child["intent"]
@@ -203,7 +203,7 @@ def test_subfile_child_no_symbols_in_range(leerie):
     parent = _base_parent()
     child = leerie._subfile_child(
         parent, "flow-runner.ts", (1, 50), [], "feat-005-r1",
-        "flow-runner.ts", 0, 2)
+        "flow-runner.ts", 0, 2, "feat-005-r1", True)
 
     assert "(no named symbols in range)" in child["intent"]
     assert "(no named symbols in range)" in child["success_criteria_seed"]

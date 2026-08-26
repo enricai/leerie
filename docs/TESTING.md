@@ -607,8 +607,114 @@ ranking. No LLM calls; deterministic.
 
 ## P1 recursive decomposition
 
-The P1 recursive decomposition surface (DESIGN §5½ (P1)) is tested across
-four files.
+The P1 recursive decomposition surface (DESIGN §5½ (P1)) is tested across the
+files named below. (No count here on purpose: the previous one said "four"
+while the section already enumerated seven, and a bare number goes stale on
+every addition without anything failing.)
+
+### Sub-file split: the `change_shape` gate, new-file ownership, and `owned_region` enforcement
+
+`tests/test_subfile_split_change_shape_gate.py` pins the three defects behind
+run `719c2a26`, where a **one-expression** fix in a 9,140-line file was tiled
+into 14 region children.
+
+Replaying that run's actual subtask branches against the merge base is what
+turned the diagnosis from inference into measurement, and the numbers are the
+reason each pin exists: **11 of 12 region children touched a file outside their
+`owned_region`, 7 of 12 edited lines outside their range, and exactly one
+(`bugfix-001-f1-r7`) complied.** Four children owning regions thousands of lines
+apart all converged on the same ~70 lines — the actual bug site. Two children
+independently created the *same* new test file, an add/add conflict on a path
+absent from the merge base; verified in a throwaway repo that no strategy
+resolves it without discarding a side (`-X ours`/`-X theirs` each silently keep
+one). The integration judge caught it, post-merge, and killed the run.
+
+Three causes, three pins:
+
+1. **`_subfile_split` triggered on file *size* alone** (`subfile_split_max_span`,
+   700 — 9,140/700 → 14 regions) with no signal about how many sites the change
+   needed. Gated now on the planner-declared `change_shape`; only `sweep` tiles.
+   The gate is driven and its **return value** asserted, with an anti-vacuity
+   twin (same file, same cap, `sweep` → still tiles) so a `_subfile_split` that
+   returned `[]` unconditionally cannot pass. A third case pins that an *absent*
+   field preserves pre-gate behaviour — `reconciler.added_subtasks` and
+   `splitter.children` do not carry it, and defaulting those to "don't split"
+   would silently disable the mechanism for them.
+2. **`_subfile_child` cloned the parent's whole-file criteria verbatim** into
+   all 14 (measured: a single criteria hash, `8b372445`, across all 13 entries
+   carrying it in `plan_snapshot` — the 12 surviving region children plus
+   `bugfix-001-f2`), and that criterion
+   opened *"A new runtime e2e test … reproduces …"*. Exactly one child now owns
+   new files; the rest are told **which sibling's id** owns them. Asserted on the
+   clause's actual text and the owner's real id, not on presence.
+3. **`owned_region` was never checked** — written by `_subfile_split`, rendered
+   into the implementer prompt, read back only for re-splitting. Now
+   `OWNED_REGION_FILE_ESCAPE` in `check_implementer_output`, driven with r13's
+   real shape (one committed file, and not the one it owned).
+
+The **not-fatal** pin is load-bearing and is a retracted-on-measurement record:
+routing this through `check_diff_scope`'s return would reach
+`fail("broken", …)`, which `_retryable_failure` treats as non-retryable, and
+replayed against `719c2a26` that kills **11 of 12** subtasks — converting a
+coverage gap into a total run kill. Worse, those violations were children
+*obeying* an inherited criterion they could not satisfy in region. The test
+asserts the string is absent from `check_diff_scope`'s source and present in
+`check_implementer_output`'s, and re-asserts the premise (`"broken"` is still
+non-retryable) so the pin fails loudly rather than silently if that changes.
+
+`OWNED_REGION_FILE_ESCAPE` is **gating** where the neighbouring
+`NO_PLANNED_FILES_TOUCHED` is advisory, and the distinction is provenance, not
+shape: `files_likely_touched` is a planner *guess* (re-driving on it produced a
+measured pure-rename commit, POSTMORTEM-2026-08-14 F23), while
+`owned_region["file"]` is code-computed by `_subfile_split`. Two anti-vacuity
+pins keep it from firing where it shouldn't — `r7`'s compliant shape, and an
+ordinary subtask with no `owned_region` at all.
+
+The **peel and migration-chunk paths** carry the same one-owner rule and are
+pinned alongside, because gating the tiling alone would have narrowed the defect
+rather than fixed it: `bugfix-001-f2` is a *peel* child, not a region child, and
+carries the same criteria hash as all 12 region children — the identical
+collision at 2-way. Those children have no `owned_region`, so
+`OWNED_REGION_FILE_ESCAPE` cannot back them up and the criteria clause is the
+whole mechanism; one pin covers the peel pair, one covers N migration chunks,
+one pins that `newfile_owner_id=None` leaves criteria byte-identical, and one
+pins that the clause reaches **LLM-authored** chunk labels (the rule lives in
+`_migration_child`, not in `_deterministic_chunk_label`, precisely so the
+dominant Mode A path is not left uncovered). A fifth re-pins the pre-existing
+guarantee that deterministic chunk labels stay distinct per chunk — identical
+criteria across children is the shape this whole change exists to prevent.
+
+**Re-entry is pinned separately, and it is the gap that shipped a real bug.**
+The first version of this suite tested depth-1 splits only; because each helper
+appends its clause to the parent's criteria, a re-split non-owner received both
+its parent's "create no new files" and its own "you are the owner", and the
+one-owner invariant broke across the tree. Re-entry is not exotic — tier 2
+exists for it, and `719c2a26` re-entered three times (`r8`, `r12`, `r14`), so
+that run's own data would have produced four claimed owners. Pinned now: a
+re-split non-owner mints no owner and keeps naming the original; a re-split
+owner passes ownership to exactly one child (the anti-vacuity twin — "never
+designate on re-entry" would leave nothing owning new files); the peel of a
+non-owner chunk behaves the same; and a whole-tree walk asserts exactly one
+owner among the leaves with exactly one clause each. Five of these fail against
+the pre-fix behaviour, which is what makes them worth having.
+
+**Tier 1 is stubbed rather than left to the host.** `HAS_TREESITTER` is False on
+some dev machines but TRUE on CI (`requirements.txt` pins tree-sitter;
+`.github/workflows/test.yml` installs it), so a suite exercising only the tier-2
+line-window fallback locally would first meet tier-1 symbol tiling on CI — the
+green-locally/red-on-CI shape PR #211 already cost once. Two tests monkeypatch
+`_extract_symbol_ranges`, one with an over-cap symbol, which is the actual
+re-entry trigger (uniform line-windows can never produce one). The fixture is
+sized just over the cap rather than at the incident's 9,140 lines, so CI does
+not tree-sitter-parse a 9,000-line file five times for assertions that only
+need "more than one region".
+
+Two carry-forward traps are pinned separately: `_migration_child` must carry
+`change_shape` (the peel path builds a migration child that **re-enters**
+`_subfile_split`, so dropping it routes the dominant dense-file shape — a file
+bundled with its test file — straight past the gate), and the gate's
+`_NON_SWEEP_CHANGE_SHAPES` frozenset must equal the schema enum minus `sweep`,
+so a value added to one and not the other cannot silently become tileable.
 
 `tests/test_fit_judge_schema.py` covers `SCHEMAS["fit_judge"]` — required
 fields (`score`, `rationale`, `diffuse`, `confidence`), `score` bounds

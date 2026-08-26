@@ -1024,6 +1024,78 @@ split mechanism therefore separates by structural type:
     contiguous line-windows via the same tiling. This tier needs no range data and
     is also the whole-file fallback when tree-sitter yields no ranges.
 
+  **Gating condition — the split is for edit-*dense* work, not merely large
+  files.** The trigger is the parent's own declared `change_shape`, not the
+  file's line count. A `point` or `localized` change is left a leaf however
+  large its file is; only a `sweep` is tiled. Tiling a point fix is not merely
+  wasteful, it is actively harmful, and the failure is structural rather than
+  incidental: every region child inherits the parent's success criteria, so a
+  tiled point fix produces N children each holding a whole-file mandate that
+  exactly one of them can satisfy in scope. The other N-1 do not idle — they
+  pursue the mandate anyway, out of region. Measured on run `719c2a26`, where a
+  one-expression fix in a 9,140-line file was tiled into 14 regions: 11 of 12
+  region children touched a file outside their region, 7 of 12 edited lines
+  outside their range, and exactly one complied. Four children owning regions
+  thousands of lines apart all converged on the same ~70-line span — the actual
+  bug site. The line ranges partitioned nothing.
+
+  `change_shape` is a planner-declared JSON field, never inferred from prose
+  (§*Language-to-JSON*). The count of edit sites a change needs is a fact only
+  the planner holds; code cannot derive it from the file, and reading it out of
+  `investigation_notes` would be exactly the regex-over-prose this design
+  forbids.
+
+  **Region ownership constrains paths, not only lines.** A region child owns a
+  line range *and* owns no other path: the parent's criteria may demand a new
+  file, and "do not edit outside lines X-Y" does not constrain creating one. In
+  `719c2a26` three near-synonymous new test files were invented for one
+  inherited criterion, and two children independently chose the *same* new path
+  — an add/add conflict on a path absent from the merge base, which has no
+  resolution that keeps both sides (`-X ours`/`-X theirs` each silently discard
+  one). So exactly one region child is designated the new-file owner and the
+  rest are told, by id, which sibling to leave it to. One owner is what makes
+  the collision impossible; *which* one is arbitrary.
+
+  The invariant is **one owner per decomposition tree, not per split**, and that
+  distinction is where the obvious implementation goes wrong. A child's criteria
+  are built by appending to its parent's, so a child that is itself re-split
+  inherits a clause and would receive a second, contradictory one. Designation is
+  therefore inherited rather than recomputed: a non-owner's entire subtree stays
+  ownerless and keeps naming the original owner, and only an owner passes
+  ownership down — to one child. It is read from a structural field, never by
+  re-reading the criteria prose, and the clause is *replaced* rather than
+  stacked (unlike the neighbouring `Scope:` clauses, which stack harmlessly
+  because each narrows the last; these would each negate the last). Measured:
+  `719c2a26` re-entered three times — `r8`, `r12`, `r14` each produced `-r1`/
+  `-r2` children — so recomputing per split yields four claimed owners on that
+  run's own data, which is the multi-owner condition the rule exists to prevent.
+
+  **The same rule covers the file-level splits, without the same backstop.**
+  Region children are not the only children that inherit the parent's criteria
+  verbatim: the oversized-file peel and the migration-chunk labels do too, so a
+  parent criterion demanding a not-yet-existing file reaches every one of them
+  at once. Measured on `719c2a26`, the peel child `bugfix-001-f2` carries the
+  same criteria hash as all 12 region children — the identical collision shape
+  at 2-way instead of 14-way. One designated owner therefore applies to those
+  children as well (the dense-file child on the peel, chunk 0 on a migration
+  sweep), applied where the child is built so it also reaches the criteria the
+  label-only splitter writes for itself. Note what does *not* carry over: those
+  children have no `owned_region`, so the mechanical check below cannot see
+  them and the criteria clause is the whole mechanism there.
+
+  Both constraints are **enforced in code, not asked for in a prompt** (§12).
+  `owned_region` was prompt-only through `719c2a26` — rendered into the
+  implementer's context and never checked against what it committed — which is
+  why compliance was 1 in 12. The check now runs mechanically on the
+  implementer's actual diff. It is deliberately **corrective, not fatal**: a
+  violation feeds the offending paths back to the implementer and re-drives it
+  within the existing bounded retry budget, then degrades to advisory. Making it
+  fatal was considered and rejected on measurement — replayed against
+  `719c2a26` a fatal rule kills 11 of 12 subtasks, converting a coverage gap
+  into a total run kill, and the violations there were the children *obeying* an
+  inherited criterion they could not satisfy in region. Fix the criteria first;
+  enforcement is the backstop, not the remedy.
+
   Each child owns a region of the same file, so N children co-own it. This is
   already legitimate downstream: `_schedule()` derives waves only from
   `depends_on`/`requires` (never `files_likely_touched`), so co-owners run the
@@ -1031,7 +1103,9 @@ split mechanism therefore separates by structural type:
   artifact with incompatible APIs* and explicitly excludes "multiple primitive
   extractions in the same parent file"; and integration is a plain `git merge`
   whose 3-way merge clean-merges non-overlapping regions, escalating to the
-  integrator worker only on a true textual conflict. `check_planner_output`'s
+  integrator worker only on a true textual conflict. That merge argument is scoped to the *split file* and says nothing
+  about paths outside it, which is why path ownership above is a separate
+  constraint rather than a corollary. `check_planner_output`'s
   advisory `INTRA_DOMAIN_OVERLAP` warning is suppressed for children tagged with
   a co-ownership cluster marker, since the overlap is intentional — an
   accidental same-file overlap between unrelated subtasks still warns.

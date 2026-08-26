@@ -4222,7 +4222,7 @@ orthogonal and still applies to all callers regardless of
 | `_confidence_axes_clear(conf, axes, threshold)` | Pure predicate: True when every named axis is a number ≥ threshold. Used by the loop and `_settle_subtask`'s implementer confidence check. |
 | `_format_check_feedback(issues, rnd, max_rounds)` | Formats issues into the structured feedback block injected on re-invocation. |
 | `_confidence_schema(axes)` | DRY helper building the §8 confidence sub-schema. Used by 10 worker schemas (`classifier`, `planner`, `reconciler`, `implementer`, `integrator`, `rebaser`, `conformer`, `provision`, `plan_overlap_judge`, `fit_judge` — not `splitter`, whose output carries no confidence axis). Shape: `required: [*axes, "basis"]`; `falsifiers_tested`/`contradictions_reconciled` optional; no `gap_to_close` field, no `maxLength` caps (both removed as a decoder-corruption mitigation, `anthropics/claude-code#49747`; DESIGN §8). `confidence` is **not** in any of these schemas' top-level `required` — a worker omitting it still validates. Pinned by `tests/test_confidence_not_required.py`; `tests/test_confidence_length_caps.py` covers callers that do emit it. |
-| `_subtask_item_schema(*, include_requires, include_migration_targets, include_runs_commands, include_fixes_reported_symptom)` | DRY helper (same pattern as `_confidence_schema`) building the child-subtask item schema shared by `SCHEMAS["planner"]["subtasks"]`, `SCHEMAS["reconciler"]["added_subtasks"]`, `SCHEMAS["splitter"]["children"]` — previously three independently-written literals. Each call site passes its own `include_*` set (`reconciler.added_subtasks` narrowest — no `requires`/`migration_targets`/`runs_commands`/`fixes_reported_symptom`; `splitter.children` — `requires` only; `planner.subtasks` — all four) rather than converging on one shape, so a future field change is explicit about which sites it reaches. Pinned by `tests/test_shared_subtask_item_schema.py`, including an anti-vacuity check that narrower sites reject the wider ones' fields. |
+| `_subtask_item_schema(*, include_requires, include_migration_targets, include_runs_commands, include_fixes_reported_symptom, include_change_shape)` | DRY helper (same pattern as `_confidence_schema`) building the child-subtask item schema shared by `SCHEMAS["planner"]["subtasks"]`, `SCHEMAS["reconciler"]["added_subtasks"]`, `SCHEMAS["splitter"]["children"]` — previously three independently-written literals. Each call site passes its own `include_*` set (`reconciler.added_subtasks` narrowest — no `requires`/`migration_targets`/`runs_commands`/`fixes_reported_symptom`; `splitter.children` — `requires` only; `planner.subtasks` — all five, `change_shape` among them) rather than converging on one shape, so a future field change is explicit about which sites it reaches. Pinned by `tests/test_shared_subtask_item_schema.py`, including an anti-vacuity check that narrower sites reject the wider ones' fields. |
 
 ### Finding severity — gating vs advisory
 
@@ -4271,7 +4271,7 @@ is resolved from the issue code per the table above, not the function.
 | Overlap judge | `check_overlap_judge_output(output, plans, repo_root)` | `PHANTOM_ARTIFACT`, `NO_FILE_OVERLAP`, `DROP_BREAKS_GRAPH`, `DUPLICATE_PAIR` | `judgment_check_rounds` (3) |
 | Adherence gate | `check_prescribed_command_coverage(prescribed_procedure, subtasks)` (deterministic floor) + inline `LOW_ADHERENCE` check on the `adherence_judge` result | `PRESCRIBED_CMD_UNRUN`, `LOW_ADHERENCE` | `judgment_check_rounds` (3) |
 | Provision | `check_provision_output(result, repo_root)` | `WRONG_PM`, `MISSING_WORKDIR`, `EMPTY_RECIPE` | `judgment_check_rounds` (3) |
-| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED` (advisory — excluded from retry by `_gating_issues`), `UNMET_CRITERION`, plus `check_production_evidence`'s four (below) | `implementer_confidence_retries` (2) |
+| Implementer | `check_implementer_output(result, subtask, actual_files)` | `NO_PLANNED_FILES_TOUCHED` (advisory — excluded from retry by `_gating_issues`), `UNMET_CRITERION`, `OWNED_REGION_FILE_ESCAPE` (gating; sub-file region children only), plus `check_production_evidence`'s four (below) | `implementer_confidence_retries` (2) |
 | Integrator | `check_integrator_output(result)` | — | `judgment_check_rounds` (3) |
 | Conformer | (`_conformance_clean` on observable signals) | — | `conformance_rounds` (3) |
 
@@ -4433,6 +4433,18 @@ is code-enforced*)
 Fully shipped. `SCHEMAS["classifier"]` carries `prescribed_procedure`
 (`{is_prescribed, commands, forbid_manual, evidence}`, persisted to
 `st.data["prescribed_procedure"]` — see §3 "Worker output schemas"),
+`SCHEMAS["planner"]` carries the **required** per-subtask `change_shape`
+(`point` | `localized` | `sweep`) — the planner's declaration of how many edit
+sites its change needs. Required, not optional, for the same reason
+`migration_targets.is_real_identifier` is: a planner must not be able to skip an
+attestation a gate depends on by omitting the field. `_subfile_split()` reads it
+and refuses to tile anything but a `sweep` (DESIGN §5½ (P1) *Sub-file*
+*Gating condition*). It cannot be derived in code — the number of sites a change
+needs is not a property of the file — and it must never be read out of
+`investigation_notes`, which is planner prose (DESIGN §*Language-to-JSON*).
+Absent on `reconciler.added_subtasks` and `splitter.children`, where absence
+means "not declared" and the gate falls through to the pre-gate behaviour.
+
 `SCHEMAS["planner"]` carries the optional per-subtask `runs_commands`
 array, the `adherence_judge` worker is fully registered (schema, prompt,
 `WORKER_TYPES`, sonnet/`"medium"` model-effort defaults — see "The
@@ -4721,7 +4733,8 @@ accept the subtask as leaf); then splits via one of:
   falls back to a distinct deterministic label (`_deterministic_chunk_label()`).
 - **Coupled path** (≤ 8 files): `splitter` LLM worker — structural seam detection.
 - **Sub-file path** (exactly 1 file, low fit, file/region span >
-  `subfile_split_max_span`): checked **before** the file-count fork, since a
+  `subfile_split_max_span`, **and `change_shape == "sweep"`**): checked
+  **before** the file-count fork, since a
   single dense file falls into the coupled path today where the LLM splitter
   cannot break one file. Splits the file *intra*-file in two tiers (both
   deterministic): tier 1 tiles `[1, EOF]` on tree-sitter function-boundary
@@ -4733,7 +4746,62 @@ accept the subtask as leaf); then splits via one of:
   listing the same single file plus an `owned_region` field, a
   `_cofile_cluster` marker, and a **region-scoped `intent`** — mechanically
   derived from the parent's intent plus the region's line range and symbols,
-  not a byte-identical copy. `_check_intra_file_surface()` is the
+  not a byte-identical copy.
+
+  **`change_shape` gate (first entry only).** `_subfile_split()` returns `[]`
+  without tiling when the subtask declares `change_shape` of `point` or
+  `localized`; only `sweep` (or an absent field — the reconciler/splitter
+  schemas do not carry it, and absence preserves the pre-gate behaviour) is
+  tiled. Read from the parent subtask, so `_migration_child()` carries
+  `change_shape` forward for the same reason it carries `migration_targets`:
+  the peel path builds a migration child that then re-enters `_subfile_split()`,
+  and dropping the field there would route straight past this gate. The
+  re-entry (tier-2) branch is deliberately **not** gated — a child carrying
+  `owned_region` is already inside an approved sweep.
+
+  **New-file ownership.** Region child index 0 is the designated new-file
+  owner. Its criteria carry an explicit grant; every other child's criteria
+  name that sibling's id and forbid creating new files. Deterministic, so the
+  designation is stable across a resume. Which child is arbitrary; that there
+  is exactly one is the point (DESIGN §5½ *Sub-file*).
+
+  The same rule applies to the two file-level split paths, via
+  `_migration_child()`'s `newfile_owner_id` keyword (default `None` = no
+  designation, criteria untouched): `_peel_oversized_file()` designates the
+  **dense-file child** (`<base>-f1`), and `_label_migration_chunks()`
+  designates **chunk 0** (`ids[0]`) on both its budget-exceeded and normal
+  returns. Applied inside `_migration_child()` rather than in the label
+  helpers so it also reaches the `success_criteria_seed` the label-only
+  splitter composes per chunk, which `_deterministic_chunk_label()` never
+  sees. These children carry no `owned_region`, so
+  `OWNED_REGION_FILE_ESCAPE` does **not** back them up — the criteria clause
+  is the entire mechanism on those paths.
+
+  **Re-entry.** The clause is emitted after `_NEWFILE_CLAUSE_MARKER` and
+  `_apply_newfile_clause()` truncates at the last marker before appending, so a
+  re-split child carries exactly one — splitting our own generated delimiter,
+  not prose (*Language-to-JSON* bars the latter). `_newfile_designation()`
+  resolves `(owner_id, parent_may_designate)` from the child's structural
+  `_newfile_owner` / `_newfile_owner_id` fields (set by both `_subfile_child()`
+  and `_migration_child()`, alongside `_cofile_cluster`): a subtask with
+  `_newfile_owner is False` yields its inherited `_newfile_owner_id` and
+  `False`, so none of its children can match the owner id and the whole subtree
+  stays ownerless; anything else designates its own first child. Invariant:
+  exactly one leaf in the decomposition tree owns new files, at any depth.
+
+  **`OWNED_REGION_FILE_ESCAPE` (mechanical, corrective).** `owned_region` is
+  enforced by `check_implementer_output()`, which already receives the
+  implementer's actual touched paths: a subtask carrying `owned_region` that
+  commits any path other than `owned_region["file"]` yields a **gating** issue,
+  routed through the existing `_format_check_feedback()` → `note` →
+  `continuation=True` retry, bounded by `implementer_confidence_retries`, and
+  degrading to advisory once that budget is spent. Gating rather than advisory
+  (unlike `NO_PLANNED_FILES_TOUCHED`, whose subject `files_likely_touched` is a
+  planner *guess*) precisely because `owned_region["file"]` is code-computed by
+  `_subfile_split()`, so there is no false-positive surface. Never routed
+  through `check_diff_scope()`'s fatal return: that string reaches
+  `fail("broken", ...)`, which `_retryable_failure()` treats as non-retryable,
+  and replaying `719c2a26` shows a fatal rule there kills 11 of 12 subtasks. `_check_intra_file_surface()` is the
   zero-tolerance coverage/overlap backstop (union == `[1, EOF]`,
   pairwise-disjoint). Same-file co-ownership is legitimate downstream
   (schedule ignores `files_likely_touched`; `git merge` reconciles);
