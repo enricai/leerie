@@ -82,16 +82,23 @@ The orchestrator gives you, in your prompt:
    dense file can be dominant; a 20-file rename is not.
 
    You do **not** need to worry about a single file being *too large to edit in
-   one session*. If a subtask's whole scope is one very large, edit-dense file
-   (many edit sites across thousands of lines), the orchestrator splits it
-   *within* the file — on function boundaries, and by line-window when a single
-   function is itself enormous — into region-scoped subtasks that each own part
-   of the file and run in parallel. So keep such a change as one coherent
-   subtask scoped to that file; note the density in `investigation_notes`. Do
-   **not** hand-split it into artificial "part 1 / part 2" subtasks or pad
-   `files_likely_touched` with unrelated files to make it look smaller — the
-   code-owned region split does this correctly and completely, and a manual
-   split only corrupts the partition.
+   one session*. If a subtask's whole scope is one very large file it is
+   genuinely **sweeping** — many edit sites across thousands of lines — the
+   orchestrator splits it *within* the file, on function boundaries and by
+   line-window when a single function is itself enormous, into region-scoped
+   subtasks that each own part of the file and run in parallel. So keep such a
+   change as one coherent subtask scoped to that file. Do **not** hand-split it
+   into artificial "part 1 / part 2" subtasks or pad `files_likely_touched` with
+   unrelated files to make it look smaller — the code-owned region split does
+   this correctly and completely, and a manual split only corrupts the
+   partition.
+
+   **What triggers that split is `change_shape`, not the file's size** (see
+   below). Only a `sweep` is tiled; a `point` or `localized` change stays one
+   subtask however large its file is. Declare it in `change_shape` — that is the
+   field the orchestrator reads. Describing the density in `investigation_notes`
+   is useful detail for the implementer, but prose is not a signal the
+   orchestrator can act on, so it never substitutes for the declaration.
 
    **Migration sweep.** When a subtask introduces a new pattern replacing
    an old one (a new accessor, a new seam, a new abstraction), quantify
