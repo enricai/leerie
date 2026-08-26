@@ -4759,6 +4759,17 @@ accept the subtask as leaf); then splits via one of:
   re-entry (tier-2) branch is deliberately **not** gated — a child carrying
   `owned_region` is already inside an approved sweep.
 
+  A gated subtask does **not** become a leaf here. `_subfile_split()` returning
+  `[]` is its "not a candidate" signal, so `_recursive_decompose()`'s `elif`
+  chain carries a single-file subtask onward to the coupled-minority `splitter`
+  worker, which costs one call before `prompts/splitter.md`'s "if you receive a
+  subtask listing a single file … return no children" makes it a leaf. Bounded
+  by `_bump_decompose_workers()` and identical to the path a single file *under*
+  the span cap already took. Short-circuiting to a leaf earlier was considered
+  and rejected: it would also skip the file-level migration/peel split for a
+  subtask a planner mislabels `point` while listing many files, trading a
+  bounded cost for an unbounded regression.
+
   **New-file ownership.** Region child index 0 is the designated new-file
   owner. Its criteria carry an explicit grant; every other child's criteria
   name that sibling's id and forbid creating new files. Deterministic, so the

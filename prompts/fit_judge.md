@@ -34,9 +34,15 @@ A subtask is **well-fit** when ALL of the following hold:
    single session even though it lists one file — the mirror image of a
    many-file sweep. Score such a subtask **under-fit** (below 0.70). You do
    not need to devise the split yourself: the orchestrator region-splits an
-   over-scoped single file deterministically once you score it under the
-   threshold. Judge honestly — a large, dense single file is a split
-   candidate, not an automatic leaf.
+   over-scoped single file deterministically, without asking you how.
+
+   That region split follows your under-fit score only when the planner
+   declared the subtask a `sweep`; a `point` or `localized` change stays a leaf
+   however large its file is, because tiling a one-site fix hands every region
+   a whole-file mandate only one of them can satisfy. This does not change how
+   you score. Judge the fit honestly on its own terms — a large, dense single
+   file is a split candidate, not an automatic leaf — and let the orchestrator
+   decide what to do with the score.
 
 5. **No hidden broad surface.** The subtask's intent does not implicitly
    require touching broad surfaces (e.g., "update all callers of foo()")
