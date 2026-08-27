@@ -25,6 +25,17 @@ impossible to derive. Every loop is bounded, every decision is made from the
 codebase or research, and state is kept on disk so a run is observable and
 resumable.
 
+**On the term "graph engineering."** Leerie's task graph is literal, not
+metaphorical: nodes are subtasks, edges are `requires`/`provides`
+dependencies, and topology is topo-sorted into waves — see §5. "Graph
+engineering" (design the topology a multi-agent system runs in, as opposed
+to "loop engineering," the single-agent-loop layer below it) is recent
+industry framing, and some treat it as a rebrand of pre-existing
+DAG/dataflow orchestration rather than a new discipline; we take no
+position on that debate. Where Leerie departs from most systems using the
+term: the graph is authored and scheduled by ordinary Python before any
+worker runs, not negotiated by agents routing at runtime (§12).
+
 ---
 
 ## 2. The two constraints that produced this architecture
