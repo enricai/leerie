@@ -1,9 +1,9 @@
 # Leerie — Design Document
 
-> Deterministic, headless task orchestrator for Claude Code. Classifies an
-> engineering task, decomposes it into granular subtasks, schedules them into
-> dependency-ordered waves, and executes each in an isolated git worktree
-> under an evidence-gated implement/validate loop — with the fewest possible
+> Graph-engineered task driver for Claude Code. Classifies an engineering
+> task, decomposes it into a dependency graph of granular subtasks, topo-sorts
+> it into waves, and executes each node in an isolated git worktree under an
+> evidence-gated implement/validate loop — with the fewest possible
 > interruptions to the user.
 
 **Scope of this document.** This is the *theory*: the architecture, the
