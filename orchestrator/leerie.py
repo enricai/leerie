@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Leerie — deterministic task orchestrator for Claude Code.
+Leerie — graph-engineered task driver for Claude Code.
 
 Runs entirely on the Claude Code CLI / subscription. Every unit of LLM work is
 a `claude -p` headless invocation. This script owns ALL control flow — phase
