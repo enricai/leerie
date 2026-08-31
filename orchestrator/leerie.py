@@ -2,10 +2,12 @@
 """
 Leerie — graph-engineered task driver for Claude Code.
 
-Runs entirely on the Claude Code CLI / subscription. Every unit of LLM work is
-a `claude -p` headless invocation. This script owns ALL control flow — phase
-sequencing, wave scheduling, caps, retries, integration — in real Python, so
-the orchestration cannot drift the way an LLM-driven controller can.
+Runs entirely on the Claude Code CLI / subscription, every worker defaulting
+to Sonnet 5 (no opus tier) to keep subscription token usage down. Every unit
+of LLM work is a `claude -p` headless invocation. This script owns ALL control
+flow — phase sequencing, wave scheduling, caps, retries, integration — in real
+Python, so the orchestration cannot drift the way an LLM-driven controller
+can.
 
 Each worker is a separate `claude -p` process, so there is no subagent nesting
 anywhere. The script is the orchestrator; each `claude -p` call is a leaf.

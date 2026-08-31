@@ -4,7 +4,7 @@
 
 It classifies the task, decomposes it into subtasks wired into a dependency graph — nodes are subtasks, edges are `requires`/`provides` — then a deterministic Python scheduler topo-sorts that graph into waves, implements each wave in parallel isolated worktrees, validates the integrated result, and merges — beginning to end, unattended.
 
-It runs entirely on the **Claude Code CLI and your existing subscription** — no Anthropic API key, no per-call billing.
+It runs entirely on the **Claude Code CLI and your existing subscription** — no Anthropic API key, no per-call billing. Every worker, judgment and implementer alike, runs on **Sonnet 5**, so a run burns subscription usage rather than metered API tokens.
 
 **Why it finishes without you:** most AI "orchestrators" let the model pilot — decide what's next, declare when it's done, judge its own success. Leerie inverts that: **the model writes code, the program runs everything else.** The graph — its structure, its scheduling, its edges — is owned by ordinary Python, not by agents negotiating with each other; workers are headless, one-shot `claude -p` calls at each node, not a multi-agent conversation. Phases, scheduling, retries, caps, merge logic, and success-criteria enforcement are ordinary Python. Every worker output is JSON-schema-validated, and completion is gated by an independent adversarial verifier, not the implementer's self-report. See [`docs/DESIGN.md`](docs/DESIGN.md) for the full rationale.
 

@@ -23,7 +23,10 @@ Given one task description, Leerie drives it to a validated, integrated
 result without further human input except where input is genuinely
 impossible to derive. Every loop is bounded, every decision is made from the
 codebase or research, and state is kept on disk so a run is observable and
-resumable.
+resumable. Every worker — judgment and workhorse alike — runs on Sonnet 5 (§12
+*Opus-judgment, sonnet-workhorse (historical) — now sonnet for both*); a
+many-worker graph stays cheap against a subscription instead of accumulating
+per-call API charges the way a fleet of Opus-tier agents would.
 
 **On the term "graph engineering."** Leerie's task graph is literal, not
 metaphorical: nodes are subtasks, edges are `requires`/`provides`
