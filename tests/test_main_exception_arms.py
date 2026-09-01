@@ -233,6 +233,142 @@ class TestRateLimitedExit:
 
         assert exit_code == sentinel_rc
 
+    def test_wait_within_the_ceiling_still_sleeps(
+            self, leerie, monkeypatch, repo):
+        """A five-hour session limit is bounded and legitimately sleepable —
+        the ceiling must not turn every rate-limit into a pause."""
+        called = {}
+
+        def _fake_sleep_then_reexec(st, wait_seconds, reason):
+            called["wait"] = wait_seconds
+            return 130
+
+        monkeypatch.setattr(leerie, "_sleep_then_reexec",
+                            _fake_sleep_then_reexec)
+        soon = (leerie.datetime.now(leerie.timezone.utc)
+                + leerie.timedelta(hours=2))
+
+        async def _boom(*a, **kw):
+            raise leerie.RateLimitedExit(soon, "rate_limit_event",
+                                         limit_type="five_hour")
+
+        exit_code, _ = _run_main(
+            leerie, monkeypatch, repo, "main-rate-limited-short",
+            orchestrate_stub=_boom)
+
+        assert exit_code == 130
+        assert called["wait"] > 0
+
+    def test_wait_beyond_the_ceiling_pauses_instead_of_sleeping(
+            self, leerie, monkeypatch, repo):
+        """The weekly-limit case. Corpus run e6f7f8c3 computed a 43.7-HOUR
+        wait from a `seven_day` rejection and slept on it, holding the
+        run-directory flock; the user killed it. Asserts the DISPOSITION
+        (EXIT_LOCKED, `_sleep_then_reexec` never reached), not just that
+        some code path ran."""
+        def _must_not_sleep(st, wait_seconds, reason):
+            raise AssertionError(
+                f"slept {wait_seconds}s instead of pausing")
+
+        monkeypatch.setattr(leerie, "_sleep_then_reexec", _must_not_sleep)
+        far = (leerie.datetime.now(leerie.timezone.utc)
+               + leerie.timedelta(hours=43, minutes=42))
+
+        async def _boom(*a, **kw):
+            raise leerie.RateLimitedExit(far, "rate_limit_event",
+                                         limit_type="seven_day")
+
+        exit_code, run_dir = _run_main(
+            leerie, monkeypatch, repo, "main-rate-limited-weekly",
+            orchestrate_stub=_boom)
+
+        assert exit_code == leerie.EXIT_LOCKED
+        assert isinstance(_state_json(run_dir), dict)
+
+    def test_ceiling_is_keyed_on_the_wait_not_the_limit_type(
+            self, leerie, monkeypatch, repo):
+        """A renamed/unknown `rateLimitType` must not defeat the ceiling —
+        the failure shape CLAUDE.md records for `Agent` -> `Task`."""
+        def _must_not_sleep(st, wait_seconds, reason):
+            raise AssertionError("slept despite exceeding the ceiling")
+
+        monkeypatch.setattr(leerie, "_sleep_then_reexec", _must_not_sleep)
+        far = (leerie.datetime.now(leerie.timezone.utc)
+               + leerie.timedelta(days=3))
+
+        async def _boom(*a, **kw):
+            raise leerie.RateLimitedExit(far, "rate_limit_event",
+                                         limit_type=None)
+
+        exit_code, _ = _run_main(
+            leerie, monkeypatch, repo, "main-rate-limited-unknown-type",
+            orchestrate_stub=_boom)
+
+        assert exit_code == leerie.EXIT_LOCKED
+
+    def test_env_override_raises_the_ceiling_enough_to_sleep(
+            self, leerie, monkeypatch, repo):
+        """The ceiling is a resolved cap, not a frozen constant: a wait that
+        pauses at the default must sleep once the operator raises it. Makes
+        the two runs DISAGREE on the same input, so a test that ignored the
+        override could not pass by coincidence."""
+        far = (leerie.datetime.now(leerie.timezone.utc)
+               + leerie.timedelta(hours=10))
+
+        async def _boom(*a, **kw):
+            raise leerie.RateLimitedExit(far, "rate_limit_event",
+                                         limit_type="seven_day")
+
+        # Default ceiling is 6h, so a 10h wait pauses.
+        def _must_not_sleep(st, wait_seconds, reason):
+            raise AssertionError("slept at the default ceiling")
+
+        monkeypatch.setattr(leerie, "_sleep_then_reexec", _must_not_sleep)
+        assert _run_main(
+            leerie, monkeypatch, repo, "main-rl-default-ceiling",
+            orchestrate_stub=_boom)[0] == leerie.EXIT_LOCKED
+
+        # Same wait, ceiling raised past it → sleeps instead.
+        slept = {}
+
+        def _record(st, wait_seconds, reason):
+            slept["wait"] = wait_seconds
+            return 130
+
+        monkeypatch.setattr(leerie, "_sleep_then_reexec", _record)
+        monkeypatch.setenv(leerie.MAX_RATE_LIMIT_WAIT_ENV, str(20 * 3600))
+        assert _run_main(
+            leerie, monkeypatch, repo, "main-rl-raised-ceiling",
+            orchestrate_stub=_boom)[0] == 130
+        assert slept["wait"] > 0
+
+
+class TestRateLimitWaitCapResolution:
+    """CLI > env > leerie.toml > DEFAULT_CAPS, the same ladder
+    `resolve_worker_timeout_sec` uses."""
+
+    def test_default(self, leerie, tmp_path):
+        assert (leerie.resolve_max_rate_limit_wait_sec(tmp_path, None)
+                == leerie.DEFAULT_CAPS["max_rate_limit_wait_sec"])
+
+    def test_cli_beats_env_and_file(self, leerie, tmp_path, monkeypatch):
+        monkeypatch.setenv(leerie.MAX_RATE_LIMIT_WAIT_ENV, "1800")
+        (tmp_path / leerie.MAX_RATE_LIMIT_WAIT_FILE).write_text(
+            "max_rate_limit_wait_sec = 3600\n")
+        assert leerie.resolve_max_rate_limit_wait_sec(tmp_path, 999) == 999
+
+    def test_env_beats_file(self, leerie, tmp_path, monkeypatch):
+        (tmp_path / leerie.MAX_RATE_LIMIT_WAIT_FILE).write_text(
+            "max_rate_limit_wait_sec = 3600\n")
+        monkeypatch.setenv(leerie.MAX_RATE_LIMIT_WAIT_ENV, "1800")
+        assert leerie.resolve_max_rate_limit_wait_sec(tmp_path, None) == 1800
+
+    def test_file_beats_default(self, leerie, tmp_path, monkeypatch):
+        monkeypatch.delenv(leerie.MAX_RATE_LIMIT_WAIT_ENV, raising=False)
+        (tmp_path / leerie.MAX_RATE_LIMIT_WAIT_FILE).write_text(
+            "max_rate_limit_wait_sec = 3600\n")
+        assert leerie.resolve_max_rate_limit_wait_sec(tmp_path, None) == 3600
+
 
 class TestKeyboardInterrupt:
     def test_keyboard_interrupt_exits_130(self, leerie, monkeypatch, repo):

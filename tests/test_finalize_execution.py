@@ -354,6 +354,117 @@ def _finalize_ready_state(st):
     st.data["working_branch"] = "main"
 
 
+class TestEmptyRunBranchIsNoWorkNotAnError:
+    """Corpus runs `d1987e8b` ($9.68) and `05f65221` ($3.03) reached finalize
+    with every subtask `complete` and a run branch carrying no commits, and
+    died on `finalize.sh`'s "has no commits beyond <base> — nothing to push".
+    That is the cleared-but-empty terminal state, not a failure."""
+
+    @staticmethod
+    def _ahead(monkeypatch, leerie, count, script_calls=None):
+        async def _fake_run_proc(cmd, **kwargs):
+            if "rev-list" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, count, "")
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+
+        async def _fake_run_script(name, *args):
+            if script_calls is not None:
+                script_calls.append(name)
+            return subprocess.CompletedProcess(["bash", name], 0, "", "")
+
+        monkeypatch.setattr(leerie, "run_proc", _fake_run_proc)
+        monkeypatch.setattr(leerie, "_run_script", _fake_run_script)
+
+    def test_empty_branch_routes_to_the_no_work_terminal(
+            self, leerie, monkeypatch, st):
+        scripts = []
+        self._ahead(monkeypatch, leerie, "0", scripts)
+        _finalize_ready_state(st)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        # The disposition, not merely that something was written.
+        assert st.data["current_phase"] == "done: no work required"
+        assert st.data["no_work_required"] is True
+        assert "finalize.sh" not in scripts
+
+    def test_subtask_branches_and_worktrees_are_still_reaped(
+            self, leerie, monkeypatch, st):
+        """Asserting only that `finalize.sh` is SKIPPED would pass against a
+        version that also skips cleanup — and this run's waves did execute,
+        so `leerie/subtasks/<run-id>/*` branches and their worktrees exist.
+        Skipping cleanup would leak one of each per subtask, invisibly
+        (`.leerie/` is gitignored), and would be a regression against the
+        `die()` this path replaces, which at least reached
+        `_cleanup_on_abnormal_exit`."""
+        scripts = []
+        self._ahead(monkeypatch, leerie, "0", scripts)
+        _finalize_ready_state(st)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        assert "cleanup.sh" in scripts
+
+    def test_the_executed_plan_record_survives(self, leerie, monkeypatch, st):
+        """`reset_plan_state=False` is load-bearing here: the wave/subtask
+        record is the evidence of what was checked. Clearing it would make a
+        run that executed a plan indistinguishable from one that never
+        planned — which is exactly what the planning-time callers want and
+        this caller must not do."""
+        self._ahead(monkeypatch, leerie, "0")
+        _finalize_ready_state(st)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        assert st.data["waves"] == [["feat-001"]]
+        assert st.data["subtask_status"] == {"feat-001": "complete"}
+
+    def test_a_nonempty_branch_finalizes_normally(
+            self, leerie, monkeypatch, st):
+        """The guard must not swallow real runs."""
+        scripts = []
+        self._ahead(monkeypatch, leerie, "3", scripts)
+        _finalize_ready_state(st)
+
+        async def _fake_compose(*a, **k):
+            return None
+        monkeypatch.setattr(leerie, "_compose_pr_via_llm", _fake_compose)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        assert st.data["current_phase"] == "phase 6: finalize"
+        assert not st.data.get("no_work_required")
+        assert "finalize.sh" in scripts
+
+    def test_unknown_ahead_count_proceeds_to_finalize(
+            self, leerie, monkeypatch, st):
+        """A failed/empty `rev-list` must fall through to `finalize.sh`
+        rather than being read as zero — the safe direction, since
+        finalize.sh re-checks it authoritatively."""
+        scripts = []
+        self._ahead(monkeypatch, leerie, "", scripts)
+        _finalize_ready_state(st)
+
+        async def _fake_compose(*a, **k):
+            return None
+        monkeypatch.setattr(leerie, "_compose_pr_via_llm", _fake_compose)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        assert "finalize.sh" in scripts
+        assert not st.data.get("no_work_required")
+
+
 def test_phase_finalize_no_push_skips_pr_and_records_health(
         leerie, monkeypatch, st):
     _finalize_ready_state(st)

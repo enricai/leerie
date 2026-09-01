@@ -487,16 +487,82 @@ after it had already passed. §12's split applies here too: the judgment
 layer keeps the semantic call, and a mechanical floor beneath it catches
 the shape needing no judgment.
 
-The floor is pure set logic (*Language-to-JSON*): two subtasks declaring
-the **same `provides` tag** with intersecting **`files_likely_touched`**
-are doing the same work to the same file. One exclusion is load-bearing:
-subtasks sharing a `_cofile_cluster` are deliberate sub-file splits and
-must never be flagged — without it the rule matches 3571 pairs across the
-corpus; with it, 9, in exactly two runs, both destroyed by duplicate
-work. The other 50 corpus runs produce no flags. An "already ordered by
-`depends_on`" exemption looks obviously necessary and is not — zero
-flagged pairs were ordered across the corpus — so it stays unimplemented,
-evaluated even when the judgment layer crashes.
+The floor is pure set logic (*Language-to-JSON*), in **two tiers**:
+
+- `DUPLICATE_PROVIDER` — same **`provides` tag** *and* intersecting
+  **`files_likely_touched`**: two subtasks doing the same work to the same
+  file. This tier is auto-resolved (M11 DECISION below).
+- `DUPLICATE_PROVIDER_NO_OVERLAP` — same tag, **no** shared file. Advisory
+  only.
+
+The second tier exists because the first one's file requirement suppresses
+the most common real shape. When neither subtask has created the artifact
+yet, **each planner invents the path**, so two subtasks authoring one file
+essentially never share a `files_likely_touched` entry — which is why the
+residue is test- and changelog-shaped. In the 0.28.0 corpus, run
+`3e65e793` had three subtasks all declaring
+`captcha-inject-submit-primitive-tested` under three different invented
+test filenames; the overlap judge saw the shared tag, and its own recorded
+reasoning says it was *"withdrawing these per the NO_FILE_OVERLAP
+signal."* All three were implemented, and the next run deleted one as
+vacuous and folded another. So `NO_FILE_OVERLAP` (the judge-side check)
+now **exempts pairs that share a `provides` tag**: the tag is its own
+grounding.
+
+Path comparison is component-wise (`_paths_designate_same_file`), not
+literal string equality, so a repo-root prefix on one side does not read
+as disjoint. Run `bfba2c88` implemented the same five subtasks twice
+because one planner wrote `fema-demo/server/…` and the other `server/…`
+in a repo whose root *is* `fema-demo`; its judge recorded that the
+duplication was real but *"undetected by design of the input data."*
+
+**Three exclusions are load-bearing, each for the same reason** — a
+structure that makes same-tag true by construction rather than by defect:
+
+1. `_cofile_cluster` — deliberate **sub-file** region splits. Without it
+   the rule matches 3571 pairs across the corpus; with it, 9, in exactly
+   two runs, both destroyed by duplicate work.
+2. `_newfile_owner_id` — deliberate **multi-file** splits.
+   `_migration_child` copies the parent's `provides` to every chunk
+   verbatim while the chunks own disjoint files, and only `_cofile_child`
+   sets `_cofile_cluster`, so exclusion 1 does not cover this shape.
+   Without it the widened rule flags run `5fa2052b`'s
+   `config-002-{1,2,3}` — one deliberate three-way split — as three
+   duplicate pairs.
+3. **Ordering by `depends_on`** — *for the no-overlap tier only.* An
+   "already ordered" exemption was measured against the corpus for the
+   file-overlap tier and correctly rejected there (zero flagged pairs were
+   ordered), and it stays rejected for that tier. For the tag-only tier it
+   is required: an ordered chain whose links each declare a shared umbrella
+   tag is the dominant *legitimate* shape — this repo's own three-layer
+   rule generates it (corpus run `3a4abba3`: `docs/DESIGN.md` then
+   `docs/IMPLEMENTATION.md`, both providing `nl-regex-migration-spec`, the
+   second `depends_on` the first). Two subtasks an explicit edge already
+   sequences are not racing to author one artifact. The accepted cost: a
+   consumer that mis-declares a tag it merely uses is structurally
+   identical and goes unflagged — the cheaper error, since an ordered pair
+   produces no duplicate work.
+
+With all three, the widened rule produces **10 flags across 3 of the 66
+plans** in the 0.28.0 corpus — 7 in the overlap tier, 3 in the no-overlap
+tier, up from 1 before the change — all adjudicated as true positives,
+with no new flags on the pinned false-positive corpus.
+
+Only the file-overlap tier is auto-merged. A no-overlap pair is a real
+defect either way, but its *resolution* is ambiguous in a way the
+synthesizer cannot decide — folding is right for duplicate work and wrong
+for a mis-declared tag, where the fix keeps both subtasks. Auto-merging
+would delete a live subtask, so that tier stays advisory and the judge,
+which reads intent, owns the call.
+
+A related false positive lived next door in `DROP_BREAKS_GRAPH`, which
+flagged any drop removing a required tag **without subtracting tags a
+surviving subtask still provides** — firing hardest on the case it should
+permit, since a duplicate-provider's survivor provides the identical tag
+by definition. Measured over the two corpus runs carrying duplicate
+producers, 3 of 8 candidate drops were flagged purely this way, and
+`bfba2c88` recorded *"Reversed course"* after the check rejected the
+correct resolution. Genuine orphans still flag.
 
 **M11 DECISION — the floor's detections are resolved, not merely
 logged.** Each flagged pair is synthesized into a `merge` collision and
@@ -3238,6 +3304,29 @@ to a manual `resume` (exit 130); SIGTERM/SIGHUP likewise (143/129); an
 already run, so state and the run branch are intact for the manual
 `resume`.
 
+**A ceiling on the wait (`max_rate_limit_wait_sec`, default 6 h).** "Resets on a
+clock" does not mean "worth waiting for." Subscription limits come in two
+windows: the five-hour session limit, which is bounded and legitimately
+sleepable, and a **weekly** limit whose reset is a fixed instant assigned
+per account — days out, not hours. Leerie treated them identically. Across
+the 0.28.0 corpus, 17 runs hit a limit and asked to sleep **77 cumulative
+hours**, one of them **43.7 hours** on a `seven_day` rejection, holding the
+run-directory flock (and so blocking every other run on that repo) the
+whole time. Users killed 14 of them by hand.
+
+When the computed `wait_seconds` exceeds the ceiling, leerie takes the
+**out-of-credits disposition instead** — worktree-only cleanup, a `leerie
+resume <id>` hint, `EXIT_LOCKED` — rather than sleeping. Pausing strictly
+dominates: the state and run branch are preserved either way, but a pause
+returns the flock and the terminal to the user.
+
+The rule keys on the **computed wait**, not on `rateLimitType`. The wait is
+what actually harms the user; the rule then needs no table of window names
+to stay correct; and it cannot be silently disabled by the CLI renaming a
+limit type — the exact failure shape recorded for `Agent` → `Task` in
+`DISALLOWED_TOOLS`. `rateLimitType` is carried on `RateLimitedExit` and
+named in the pause message, where being wrong is cosmetic.
+
 - If `reset_at` parsed cleanly, `wait_seconds` is the time until that
   moment plus a small margin.
 - If the reset clause didn't parse, `wait_seconds` is a fixed
@@ -4782,6 +4871,32 @@ ready+empty, some ready+nonempty) proceeds normally, the empty domains simply
 contributing nothing. The all-blocked case still dies — a blocker is a gate
 failure the user must see.
 
+**Reaching it from finalize, after a plan has fully executed.** The two
+routes above both fire *before* any subtask runs. A third case arrives from
+the other end: every subtask reaches `complete`, yet the run branch carries
+no commits. That is legitimate and has two causes —
+`_settle_already_satisfied` settles a subtask whose deliverable a sibling
+landed or that was already on the base tree, and a `resume` whose subtasks
+all completed on an earlier attempt re-integrates nothing new.
+`finalize.sh` then refuses with *"has no commits beyond `<base>` — nothing
+to push"*, and treating that refusal as an error turned a correct no-op
+into a hard failure: corpus runs `d1987e8b` ($9.68, ~40 calls) and
+`05f65221` ($3.03) both died there where "done: no work required" was the
+truth.
+
+`phase_finalize` now checks the ahead-count itself before invoking
+`finalize.sh` and routes an empty branch to `_finish_no_work_run`. Two
+details are load-bearing. It reads the **ahead-count**, not `finalize.sh`'s
+message — the count is the actual fact, and matching on the script's prose
+would break the moment that string is reworded. And it passes
+`reset_plan_state=False`: the planning-time routes clear
+`waves`/`subtask_status` because there is no plan, but here the wave record
+*is* the evidence of what was checked, and clearing it would make a run
+that executed a five-subtask plan indistinguishable from one that never
+planned. (A state-only predicate — "every completed subtask is in
+`dropped_subtasks`" — was tried and rejected: it identifies neither run,
+because `05f65221` recorded no `dropped_subtasks` at all.)
+
 **Reaching the cleared-but-empty state from classification, before any
 planner runs.** An already-satisfied task can make the classification gate
 itself unable to converge on a category set: `check_classifier_output` and
@@ -5380,6 +5495,31 @@ Two further disciplines sit at the §12 axis:
   exists because those subtrees are the documented Claude Code
   customization locations; top-level files (`settings.json`,
   `settings.local.json`) stay protected as coordination state.
+- **Scope is checked in both directions.** The diff-scope check has always
+  warned when a subtask touched *radically more* than its
+  `files_likely_touched` predicted. The inverse — it committed real work,
+  but **none of it to any file it declared** — went unchecked, though
+  `touched` was already computed on the same line. Measured across the
+  0.28.0 corpus against exact per-run merge diffs: **5 of 131 completed
+  subtasks landed none of their declared files**, three of them
+  independently redone by a later run. Run `c1f45fd0`'s `feat-005` reported
+  `complete` and self-checked *"[x] Router mounted as
+  `app.use('/api/parcel', parcelRouter)` in server/index.ts"* while
+  `server/routes/parcel.ts` did not exist anywhere in the tree; a later run
+  created it from scratch, 74 lines.
+
+  **Advisory, deliberately.** `files_likely_touched` is a planner
+  *estimate*, not a contract: a subtask may satisfy its criteria in a file
+  nobody predicted, or legitimately no-op because a sibling landed the
+  deliverable first. Gating on it would resurrect the gameable per-criterion
+  bar §9 retired. What makes it worth checking anyway is that it reads **no
+  prose** — set logic over already-structured planner fields
+  (*Language-to-JSON*) — so it is not gameable the way criteria
+  satisfaction was: a worker cannot weaken a test to make a declared path
+  appear in a diff. Comparison is component-wise and absorbs a repo-root
+  prefix on either side, and a directory-shaped declaration covers files
+  beneath it (without which a tree-wide reformat reads as touching nothing
+  it declared — corpus run `5fa2052b`'s `config-005`).
 - **No clobbering the implementer's work.** The conformer's charter is
   *additive* — fix drift, add tests, repair rule violations — never to undo
   what the implementer built. But it runs with full Bash in the worktree,

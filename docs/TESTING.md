@@ -2612,9 +2612,12 @@ and this file fails with a message telling you the documented trade-off moved
 The **deterministic duplicate-provider floor** beneath `phase_overlap_judge`
 (DESIGN §5 *A deterministic floor underneath the judge*) is
 `check_duplicate_providers(plans) -> list[str]`, pinned in
-`tests/test_duplicate_providers.py`. It flags two subtasks that declare the
-same `provides` tag AND whose `files_likely_touched` intersect — pure set
-logic over structured planner fields, no prose read. It exists because the
+`tests/test_duplicate_providers.py`, with the 0.28.0 corpus regressions in
+`tests/test_duplicate_provider_corpus_regressions.py`. It flags two subtasks
+that declare the same `provides` tag, in **two tiers**: `DUPLICATE_PROVIDER`
+when `files_likely_touched` also intersect, and `DUPLICATE_PROVIDER_NO_OVERLAP`
+when only the tag is shared — pure set logic over structured planner fields,
+no prose read. It exists because the
 judge's 100% corpus recall is recall *when it runs*: it cheap-skips
 single-planner plans, is skippable by flag, and was bypassable by a downstream
 gate re-planning after it passed. The call therefore sits **above every skip**
@@ -2626,12 +2629,108 @@ runs, both destroyed by duplicate work (`392b5e7f` died at the wiring gate;
 `19a70d96` executed both duplicates and was refused at the integration gate
 after 4.7h/164 workers, having been scored CLEAN by the `wiring_judge`). The
 committed fixture makes that reproducible: stripping the marker floods
-`62a19deb` with 1752 false positives and `ad69057f` with 165. An
-"already ordered by `depends_on`" exemption is deliberately absent — measured
-zero such pairs. Paths are canonicalized with `_normalize_artifact_path` (not
+`62a19deb` with 1752 false positives and `ad69057f` with 165. Paths are canonicalized with `_normalize_artifact_path` (not
 `os.path.normpath`, which keeps a leading `/` and would miss `/src/x.ts` vs
-`src/x.ts`), matching the sibling `NO_FILE_OVERLAP` check. Shipped
-**advisory** — logged, never gating — pending confirmation across live runs.
+`src/x.ts`) and compared component-wise by `_paths_designate_same_file`, so a
+repo-root prefix on one side is not read as disjoint — run `bfba2c88`
+implemented the same five subtasks twice because one planner wrote
+`fema-demo/server/…` and the other `server/…`. Shipped **advisory** — logged,
+never gating — pending confirmation across live runs.
+
+**Two exclusions were added with the no-overlap tier, both load-bearing for
+the same reason as `_cofile_cluster`:** `_newfile_owner_id` (multi-file
+splitter chunks inherit the parent's `provides` verbatim, and only
+`_cofile_child` sets a cluster — without it run `5fa2052b`'s
+`config-002-{1,2,3}` reads as three duplicate pairs), and **ordering by
+`depends_on`/`requires`, scoped to the no-overlap tier only**. That last one
+reverses, for one tier, the "measured zero such pairs" finding this section
+previously recorded: zero *file-overlap* pairs were ordered and the exemption
+stays rejected there, but for the tag-only tier an ordered chain sharing an
+umbrella tag is the dominant legitimate shape — the pinned corpus run
+`3a4abba3` pairs `docs/DESIGN.md` with `docs/IMPLEMENTATION.md`, both
+providing `nl-regex-migration-spec`. `test_every_corpus_run_is_clean` catches
+its absence. The accepted cost is named in the code: a consumer that
+mis-declares a tag it merely uses is structurally identical and goes
+unflagged. The ordering lookup passes `quiet=True` to
+`_build_predecessor_graph` so this documented-pure floor emits no log line —
+and specifically not one labelled `_schedule:` during phase 2¾.
+
+Net over the 0.28.0 corpus: **10 flags across 3 of 66 plans** (7 overlap, 3
+no-overlap), up from 1, all adjudicated true positives, pinned false-positive
+corpus still clean.
+
+## Under-scope diff check (advisory)
+
+`check_diff_scope` has always warned on **over**-scope (a subtask touching far
+more than its `files_likely_touched` predicted). The inverse — it committed
+real work but touched **none** of the files it declared — went unchecked even
+though `touched` was already computed on the same line. Pinned in
+`tests/test_duplicate_provider_corpus_regressions.py::TestUnderScopeDecision`,
+which drives the predicate over the five 0.28.0 subtasks measured (against
+exact per-run merge diffs) as landing none of their declared files: the three
+true under-deliveries must warn, and the two detector artifacts must not.
+
+The motivating case is run `c1f45fd0`'s `feat-005`, which reported `complete`
+and self-checked *"[x] Router mounted as `app.use('/api/parcel',
+parcelRouter)` in server/index.ts"* while `server/routes/parcel.ts` did not
+exist anywhere in the tree; a later run created it from scratch. Base rate:
+**5 of 131 completed subtasks**, three of them independently redone by a later
+run.
+
+**Advisory on purpose, and it must stay that way.** `files_likely_touched` is
+a planner estimate, not a contract, so gating on it would resurrect the
+gameable per-criterion bar DESIGN §9 retired. What makes it worth checking is
+that it reads no prose: a worker cannot weaken a test to make a declared path
+appear in a diff. `_declared_path_covers` absorbs a repo-root prefix on either
+side and lets a directory-shaped declaration cover files beneath it — without
+which a tree-wide reformat (run `5fa2052b`'s `config-005`, declaring
+`['scripts', 'server']`) reads as touching nothing it declared.
+
+## Empty run branch is the no-work terminal, not an error
+
+`phase_finalize` checks the run branch's ahead-count before invoking
+`finalize.sh` and routes an empty branch to `_finish_no_work_run`. Pinned in
+`tests/test_finalize_execution.py::TestEmptyRunBranchIsNoWorkNotAnError`,
+which asserts the **disposition** (terminal phase value, `finalize.sh` never
+invoked) rather than that some branch ran.
+
+Every subtask can legitimately reach `complete` with no commit —
+`_settle_already_satisfied` settles one whose deliverable a sibling landed or
+that was already on the base tree, and a `resume` whose subtasks all completed
+earlier re-integrates nothing. Corpus runs `d1987e8b` ($9.68, ~40 calls) and
+`05f65221` ($3.03) both died on *"has no commits beyond `<base>` — nothing to
+push"* where "done: no work required" was the truth.
+
+Three details are pinned because each was a wrong answer first. The check
+reads the **ahead-count**, not `finalize.sh`'s message, so rewording the
+script cannot break it. It runs in **`st.repo_root`, not `leerie_dir`** — the
+state root is not a git repo under `LEERIE_STATE_DIR`, and using it made the
+guard fail open and silently never fire. And it passes
+`reset_plan_state=False`, so the executed wave/subtask record survives; a
+state-only predicate ("every completed subtask is in `dropped_subtasks`") was
+tried and rejected because it identifies **neither** run — `05f65221` recorded
+no `dropped_subtasks` at all.
+
+## Rate-limit wait ceiling
+
+`DEFAULT_CAPS["max_rate_limit_wait_sec"]` (6h, overridable via
+`--max-rate-limit-wait` / `LEERIE_MAX_RATE_LIMIT_WAIT` / leerie.toml) bounds
+how long `main()` will sleep before it
+stops auto-resuming and pauses resumably instead (the `out_of_credits`
+disposition: worktree cleanup, resume hint, `EXIT_LOCKED`). Pinned in
+`tests/test_main_exception_arms.py::TestRateLimitedExit`.
+
+Measured: 17 runs in the 0.28.0 corpus hit a limit and asked to sleep **77
+cumulative hours**, one for **43.7 hours** on a `seven_day` rejection, holding
+the run-directory flock the whole time; users killed 14 by hand. The
+five-hour session limit is bounded and legitimately sleepable; the weekly
+limit resets at a fixed per-account instant that can be days out.
+
+**The rule keys on the computed wait, never on `rateLimitType`** — a test
+pins that an unknown/`None` limit type still pauses, because keying on a type
+name is the failure shape CLAUDE.md records for `Agent` → `Task` in
+`DISALLOWED_TOOLS`. A companion test pins that a two-hour wait still *sleeps*,
+so the ceiling cannot quietly turn every rate-limit into a pause.
 
 ## Launcher stale-install warning
 
