@@ -2,9 +2,12 @@
 (DESIGN §5 *A deterministic floor underneath the judge*).
 
 `check_duplicate_providers` flags two subtasks that declare the SAME
-`provides` tag and whose `files_likely_touched` intersect — two subtasks
-doing the same work to the same file. Pure set logic over structured planner
-fields; no prose is read (CLAUDE.md *Language-to-JSON*).
+`provides` tag, in two tiers: `DUPLICATE_PROVIDER` when their
+`files_likely_touched` also intersect (the same work to the same file), and
+`DUPLICATE_PROVIDER_NO_OVERLAP` when only the tag is shared — the shape that
+appears when neither subtask has created the artifact yet and each planner
+invents its own path. Pure set logic over structured planner fields; no prose
+is read (CLAUDE.md *Language-to-JSON*).
 
 This file mirrors `tests/test_prescribed_cmd_coverage.py`: the floor in
 isolation, driven by synthetic plans plus the two real incident shapes, with
@@ -161,20 +164,100 @@ class TestCofileClusterExclusion:
             _plans(("feature-implementation", [a, b])))) == 1
 
 
+class TestNoOverlapTier:
+    """The tag-only tier (`DUPLICATE_PROVIDER_NO_OVERLAP`), added after the
+    0.28.0 corpus showed the file-overlap requirement suppressing real
+    duplicate work: when neither subtask has created the file yet, each
+    planner invents the path, so two subtasks authoring one artifact
+    essentially never share a `files_likely_touched` entry."""
+
+    def test_unordered_same_tag_disjoint_files_is_flagged(self, leerie):
+        """Run `3e65e793`'s shape, reduced: same tag, three invented test
+        filenames, no edges between them."""
+        plans = _plans(("feature-implementation", [
+            _sub("feat-007", provides=["primitive-tested"],
+                 files=["a.captcha-gated-submit-inject.test.ts"]),
+            _sub("bugfix-006", provides=["primitive-tested"],
+                 files=["a.captcha-inject-submit.test.ts"]),
+        ]))
+        issues = leerie.check_duplicate_providers(plans)
+        assert len(issues) == 1
+        assert issues[0].startswith("DUPLICATE_PROVIDER_NO_OVERLAP:")
+
+    def test_repo_root_prefix_variant_is_the_OVERLAP_tier(self, leerie):
+        """Run `bfba2c88`: one planner wrote `fema-demo/server/x.ts`, the
+        other `server/x.ts`, for the same file in a repo whose root IS
+        `fema-demo`. These are the SAME file, so this must resolve to the
+        stronger overlap tier — not the no-overlap tier — which is what
+        routes it into the auto-merge path."""
+        plans = _plans(("feature-implementation", [
+            _sub("feat-002", provides=["perplexity-source"],
+                 files=["fema-demo/server/sources/perplexity.ts"]),
+            _sub("bugfix-002", provides=["perplexity-source"],
+                 files=["server/sources/perplexity.ts"]),
+        ]))
+        issues = leerie.check_duplicate_providers(plans)
+        assert len(issues) == 1
+        assert issues[0].startswith("DUPLICATE_PROVIDER:")
+
+    def test_split_siblings_are_excluded(self, leerie):
+        """Run `5fa2052b`'s config-002-{1,2,3}: a deliberate MULTI-FILE
+        split. `_migration_child` copies the parent's `provides` to every
+        chunk verbatim while the chunks own disjoint files, so same-tag is
+        guaranteed by construction. Only `_cofile_child` sets
+        `_cofile_cluster`, so that exclusion does not cover this shape —
+        `_newfile_owner_id` does."""
+        subs = []
+        for n, f in ((1, "pages/A.tsx"), (2, "pages/B.tsx"), (3, "pages/C.tsx")):
+            s = _sub(f"config-002-{n}", provides=["boundary-fixed"], files=[f])
+            s["_newfile_owner_id"] = "config-002-1"
+            s["_newfile_owner"] = n == 1
+            subs.append(s)
+        assert leerie.check_duplicate_providers(
+            _plans(("configuration", subs))) == []
+
+    def test_no_overlap_pairs_do_not_reach_the_auto_merge_path(self, leerie):
+        """The weaker tier is advisory only. Auto-merging it would delete a
+        live subtask whenever the real defect was a mis-declared tag rather
+        than duplicate work — a resolution this synthesizer cannot tell
+        apart, so it must not choose."""
+        plans = _plans(("feature-implementation", [
+            _sub("feat-001", provides=["thing"], files=["a.ts"]),
+            _sub("feat-002", provides=["thing"], files=["b.ts"]),
+        ]))
+        assert leerie.check_duplicate_providers(plans)          # flagged
+        assert leerie._duplicate_provider_merge_collisions(plans) == []
+
+
 # --------------------------------------------------------------------- #
 # Silence — the property that makes it shippable
 # --------------------------------------------------------------------- #
 
 class TestStaysSilent:
 
-    def test_same_tag_but_disjoint_files(self, leerie):
-        """A shared capability tag with no file overlap is ordinary
-        cross-domain vocabulary, not duplicated work."""
+    def test_same_tag_disjoint_files_but_ORDERED_stays_silent(self, leerie):
+        """A shared capability tag across an ORDERED chain is ordinary
+        cross-domain vocabulary, not duplicated work.
+
+        This is the narrowed form of a broader claim this test used to make
+        ("a shared tag with no file overlap is never duplicated work"), which
+        the 0.28.0 corpus falsified: run `3e65e793` had three UNORDERED
+        subtasks all declaring `captcha-inject-submit-primitive-tested`, each
+        naming a different invented test filename, and all three were
+        implemented — the next run deleted one as vacuous and folded another.
+
+        What survives is the ordered case, which the pinned corpus still
+        requires to be silent (run 3a4abba3: docs/DESIGN.md then
+        docs/IMPLEMENTATION.md, both providing `nl-regex-migration-spec`,
+        the second depends_on the first). The edge is what distinguishes
+        "jointly delivering one capability in sequence" from "racing to
+        author the same artifact"."""
         plans = _plans(
             ("feature-implementation", [
                 _sub("feat-001", provides=["api-ready"], files=["a.ts"])]),
             ("testing", [
-                _sub("test-001", provides=["api-ready"], files=["b.ts"])]),
+                _sub("test-001", provides=["api-ready"], files=["b.ts"],
+                     depends_on=["feat-001"])]),
         )
         assert leerie.check_duplicate_providers(plans) == []
 
@@ -254,12 +337,20 @@ class TestInputHandling:
 
     def test_case_is_not_folded(self, leerie):
         """Container checkouts are case-sensitive — matching
-        `_normalize_artifact_path`'s documented behavior."""
+        `_normalize_artifact_path`'s documented behavior.
+
+        Asserts the TIER, not merely that something was emitted: `src/X.ts`
+        and `src/x.ts` are distinct files, so this pair must land in the
+        no-overlap tier. Seeing it as `DUPLICATE_PROVIDER` instead would mean
+        the paths had been folded into a false file match — the regression
+        this test exists to catch."""
         plans = _plans(("feature-implementation", [
             _sub("feat-001", provides=["hook"], files=["src/X.ts"]),
             _sub("feat-002", provides=["hook"], files=["src/x.ts"]),
         ]))
-        assert leerie.check_duplicate_providers(plans) == []
+        issues = leerie.check_duplicate_providers(plans)
+        assert len(issues) == 1
+        assert issues[0].startswith("DUPLICATE_PROVIDER_NO_OVERLAP:")
 
     def test_blank_and_non_string_entries_are_tolerated(self, leerie):
         a = _sub("feat-001", files=["  ", "", "x.ts"])

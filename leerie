@@ -4838,7 +4838,8 @@ _first_is_resume=false
 [ "${1:-}" = "resume" ] && _first_is_resume=true
 _value_flags=" --run-id --answers --pr-template --pr-base-branch --max-workers \
 --max-parallel --confidence-rounds --planner-samples --worker-memory-max \
---worker-pids-max --worker-timeout --source-of-truth --runtime \
+--worker-pids-max --worker-timeout --max-rate-limit-wait \
+--source-of-truth --runtime \
 --aws-region --aws-profile \
 --inspect-dir --model --effort \
 --judge-model --heal-model --pr-writer-model --heal-max-rounds \

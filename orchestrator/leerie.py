@@ -212,6 +212,13 @@ DEFAULT_CAPS = {
     "implementer_confidence_retries": 2,  # separate from subtask_continuations
     "planner_samples": 3,           # multi-sample; set to 1 to disable
     "worker_timeout_sec": 5400,     # 90 minutes per worker process
+    # Longest rate-limit reset `main()` will sleep through before it stops
+    # auto-resuming and pauses resumably instead (the `out_of_credits`
+    # disposition). Sized to the subscription's own windows: the five-hour
+    # session limit is bounded and worth waiting out, the weekly limit resets
+    # at a fixed per-account instant that can be days away. See DESIGN §6
+    # *A ceiling on the wait*.
+    "max_rate_limit_wait_sec": 6 * 3600,   # 6 hours
     # If a worker emits no stdout events for this many seconds, log a
     # warning naming the worker, its PID, the elapsed silence, and any
     # stderr tail. Observation-only — does not kill the worker. The
@@ -1025,6 +1032,7 @@ EXIT_LOCKED = 75
 # persisted `max_total_workers` budget so a stuck run never runs away.
 RATE_LIMIT_RETRY_BACKOFF_SEC = 300  # 5 minutes
 
+
 # N30: minimum fraction of the state-dir filesystem's total capacity that
 # must remain free. Below this, leerie refuses to start (preflight) or
 # pauses resumably (mid-run).
@@ -1137,6 +1145,12 @@ WORKER_PIDS_MAX_FILE = SOURCE_OF_TRUTH_FILE
 # carries CLI > env > TOML, and this one shipped with none.
 WORKER_TIMEOUT_ENV = "LEERIE_WORKER_TIMEOUT"
 WORKER_TIMEOUT_FILE = SOURCE_OF_TRUTH_FILE
+
+# Rate-limit wait ceiling (DESIGN §6 *A ceiling on the wait*). Resolution
+# order: --max-rate-limit-wait CLI flag → LEERIE_MAX_RATE_LIMIT_WAIT env →
+# max_rate_limit_wait_sec in leerie.toml → DEFAULT_CAPS.
+MAX_RATE_LIMIT_WAIT_ENV = "LEERIE_MAX_RATE_LIMIT_WAIT"
+MAX_RATE_LIMIT_WAIT_FILE = SOURCE_OF_TRUTH_FILE
 
 # --no-push preference (DESIGN §6 "Push + PR"): skip the push + open-PR
 # step at finalize. Resolution order: --no-push CLI flag → LEERIE_NO_PUSH
@@ -3284,11 +3298,18 @@ class RateLimitedExit(BaseException):
     See DESIGN §6 *Cleanup on abnormal exit* for the auto-resume
     contract."""
     def __init__(self, reset_at: datetime | None, raw_message: str,
-                 out_of_credits: bool = False):
+                 out_of_credits: bool = False,
+                 limit_type: str | None = None):
         super().__init__(raw_message)
         self.reset_at = reset_at
         self.raw_message = raw_message
         self.out_of_credits = out_of_credits
+        # Reporting only — `main()` decides between sleeping and pausing on
+        # the computed wait against the resolved
+        # `max_rate_limit_wait_sec` cap, never on this
+        # string. It names the window in the pause message so the user knows
+        # whether they are waiting on a five-hour session or a weekly reset.
+        self.limit_type = limit_type
 
 
 class ContextOverflow(BaseException):
@@ -6181,6 +6202,22 @@ def resolve_worker_timeout_sec(repo_root: Path,
         env_var=WORKER_TIMEOUT_ENV, file_key="worker_timeout_sec",
         file_name=WORKER_TIMEOUT_FILE,
         default=DEFAULT_CAPS["worker_timeout_sec"])
+
+
+def resolve_max_rate_limit_wait_sec(repo_root: Path,
+                                    cli_value: int | None = None) -> int:
+    """Resolve the rate-limit wait ceiling. Order: --max-rate-limit-wait CLI
+    flag → LEERIE_MAX_RATE_LIMIT_WAIT env → leerie.toml
+    `max_rate_limit_wait_sec` → DEFAULT_CAPS.
+
+    Configurable because the right answer is account-shaped: a five-hour
+    session window is worth sleeping out, a weekly one is not, and which
+    windows an account has depends on its plan."""
+    return _resolve_positive_int_pref(
+        repo_root, cli_value,
+        env_var=MAX_RATE_LIMIT_WAIT_ENV, file_key="max_rate_limit_wait_sec",
+        file_name=MAX_RATE_LIMIT_WAIT_FILE,
+        default=DEFAULT_CAPS["max_rate_limit_wait_sec"])
 
 
 def resolve_worker_timeout_explicit(repo_root: Path,
@@ -9302,6 +9339,63 @@ def _normalize_artifact_path(path: str) -> str:
     return normalized.lstrip("/")
 
 
+def _paths_designate_same_file(a: str, b: str) -> bool:
+    """True when two independently-authored repo-relative paths name the same
+    file even though one carries a repo-root prefix the other omits.
+
+    Both sides are authored without coordination — by two planners, or by a
+    planner and `git diff --name-only`. When the repo leerie is pointed at is
+    itself a subdirectory of the enclosing checkout, one side writes
+    `fema-demo/server/x.ts` and the other `server/x.ts`. Plain set
+    intersection reads those as disjoint. That is what let run `bfba2c88`
+    implement the same five subtasks twice: its overlap judge recorded that
+    the duplication was real but "undetected by design of the input data",
+    because no `files_likely_touched` entry literally matched its twin.
+
+    Compared on whole path components, never as a raw string suffix, so
+    `server/x.ts` matches `fema-demo/server/x.ts` but never
+    `other-server/x.ts` and `x.ts` never matches `prefix-x.ts`."""
+    pa = _normalize_artifact_path(a).split("/")
+    pb = _normalize_artifact_path(b).split("/")
+    if not pa[-1] or not pb[-1]:
+        return False
+    n = min(len(pa), len(pb))
+    return pa[-n:] == pb[-n:]
+
+
+def _declared_path_covers(declared: str, touched: str) -> bool:
+    """True when a planner's `files_likely_touched` entry designates a real
+    diff path — the same file (modulo a repo-root prefix, via
+    `_paths_designate_same_file`), or a DIRECTORY-shaped declaration
+    containing it.
+
+    The directory arm is not hypothetical: run `5fa2052b`'s `config-005`
+    ("run biome once across the whole tree") declared `['scripts', 'server']`,
+    and a file-only comparison reads a tree-wide reformat as touching nothing
+    it declared."""
+    if _paths_designate_same_file(declared, touched):
+        return True
+    d = [p for p in _normalize_artifact_path(declared).split("/") if p]
+    t = [p for p in _normalize_artifact_path(touched).split("/") if p]
+    if not d:
+        return False
+    # A repo-root prefix can sit on the DECLARATION (`fema-demo/src` vs a diff
+    # path of `src/pages/y.tsx`), on the diff path (`server` vs
+    # `fema-demo/server/routes/x.ts`), or on neither — so drop leading
+    # components from the declaration and look for what remains as a
+    # contiguous component run in the diff path. Matching loosely is the safe
+    # direction for an advisory: a missed match costs a warning nobody needed,
+    # a spurious one trains the operator to ignore the channel.
+    for start in range(len(d)):
+        tail = d[start:]
+        if len(tail) >= len(t):
+            continue
+        if any(t[i:i + len(tail)] == tail
+               for i in range(len(t) - len(tail) + 1)):
+            return True
+    return False
+
+
 def _coverage_citation_clears(defect: dict, repo_root: Path) -> str | None:
     """DESIGN §8 *Location is not coverage*. Returns the accepted citation as
     `"<file>: <assertion>"` when a `dropped_change` defect proves the dropped
@@ -9487,7 +9581,25 @@ def check_overlap_judge_output(
                    for f in (a.get("files_likely_touched", []) or [])}
         b_files = {_normalize_artifact_path(f)
                    for f in (b.get("files_likely_touched", []) or [])}
-        if a_files and b_files and not (a_files & b_files):
+        # A SHARED `provides` TAG IS ITS OWN GROUNDING, so this check must not
+        # reject a collision that has one. Two subtasks declaring the same tag
+        # are a defect whether or not their paths intersect (see
+        # `check_duplicate_providers`'s no-overlap tier) — and for a file
+        # neither subtask has created yet, each planner invents the path, so
+        # they essentially never intersect. Requiring intersection here
+        # actively suppressed correct findings: run `3e65e793`'s judge saw
+        # feat-007/bugfix-006/test-003 all declare
+        # `captcha-inject-submit-primitive-tested` and recorded that it was
+        # "withdrawing these per the NO_FILE_OVERLAP signal". Three workers
+        # then wrote three tests for one primitive, and the next run deleted
+        # one as vacuous and folded another.
+        shared_tags = ({t for t in (a.get("provides") or []) if t}
+                       & {t for t in (b.get("provides") or []) if t})
+        # Path comparison is component-wise so a repo-root prefix on one side
+        # does not read as disjoint (`_paths_designate_same_file`).
+        files_intersect = any(_paths_designate_same_file(fa, fb)
+                              for fa in a_files for fb in b_files)
+        if a_files and b_files and not files_intersect and not shared_tags:
             issues.append(
                 f"NO_FILE_OVERLAP: collision "
                 f"{c.get('a_sid', '?')} <-> {c.get('b_sid', '?')} "
@@ -9509,12 +9621,34 @@ def check_overlap_judge_output(
         if dropped_sid and dropped_sid in by_id:
             dropped_provides = set(
                 by_id[dropped_sid].get("provides", []) or [])
-            orphaned = dropped_provides & all_requires_tags
+            # A tag another SURVIVING subtask still provides is not orphaned
+            # by this drop. Without this subtraction the check fires hardest
+            # on the case it should permit: dropping one half of a
+            # duplicate-provider pair, where the survivor provides the
+            # identical tag BY DEFINITION. Measured over the two runs in the
+            # 0.28.0 corpus that carried duplicate producers, 3 of 8
+            # candidate drops were flagged purely this way — run `bfba2c88`
+            # withdrew its findings and shipped five subtasks implemented
+            # twice, recording "Reversed course" after the graph check
+            # rejected the correct resolution.
+            #
+            # The remaining flags are genuine and still fire: `3e65e793`'s
+            # bugfix-002 provides `submit-step-transition-poll-fixed`, which
+            # no other subtask provides, so dropping it really does orphan
+            # bugfix-007. That case needs a merge-and-rewire resolution, not
+            # a weaker check.
+            still_provided: set[str] = set()
+            for sid, s in by_id.items():
+                if sid == dropped_sid:
+                    continue
+                still_provided |= {t for t in (s.get("provides") or []) if t}
+            orphaned = (dropped_provides & all_requires_tags) - still_provided
             if orphaned:
                 issues.append(
                     f"DROP_BREAKS_GRAPH: dropping {dropped_sid!r} "
                     f"would remove provides tags {orphaned} that "
-                    "other subtasks require")
+                    "other subtasks require and no surviving subtask "
+                    "provides")
 
     # Code-enforced backstop for a real incident (DESIGN §5½ *Sub-file*):
     # two subtasks sharing the same non-null `_cofile_cluster` are, by
@@ -11033,11 +11167,26 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
     of `DUPLICATE_PROVIDER` messages ([] when clean). Pure function, no
     state, no LLM.
 
-    Two subtasks that declare the SAME `provides` tag and whose
-    `files_likely_touched` intersect are doing the same work to the same
-    file. That is a collision decidable by set logic over already-structured
-    planner fields — no prose is read (CLAUDE.md *Language-to-JSON*), which is
-    what makes it a floor rather than a second opinion.
+    TWO TIERS, both decidable by set logic over already-structured planner
+    fields — no prose is read (CLAUDE.md *Language-to-JSON*), which is what
+    makes this a floor rather than a second opinion:
+
+      - `DUPLICATE_PROVIDER` — same `provides` tag AND intersecting
+        `files_likely_touched`: the same work to the same file. Routed into
+        the M11 auto-merge by `_duplicate_provider_merge_collisions`.
+      - `DUPLICATE_PROVIDER_NO_OVERLAP` — same tag, no shared file. Advisory
+        only, never auto-merged: folding is right for duplicate work and
+        wrong for a mis-declared tag, and set logic cannot tell them apart.
+
+    The second tier exists because the first one's file requirement
+    suppresses the most common real shape. When neither subtask has created
+    the artifact yet each planner INVENTS the path, so two subtasks authoring
+    one file essentially never share a `files_likely_touched` entry — which is
+    why the residue this floor exists to stop is test- and changelog-shaped.
+    Run `3e65e793` had three subtasks all declaring
+    `captcha-inject-submit-primitive-tested` under three different invented
+    test filenames; all three were implemented, and the next run deleted one
+    as vacuous and folded another.
 
     Why a floor at all, when the `plan_overlap_judge` above it has 100% recall
     on the corpus: recall *when the judge runs* is not coverage of the class.
@@ -11048,48 +11197,112 @@ def check_duplicate_providers(plans: list[dict]) -> list[str]:
     applies as it does at every other gate: judgment keeps the semantic call,
     a mechanical check catches the shape that needs no judgment.
 
-    THE `_cofile_cluster` EXCLUSION IS LOAD-BEARING, NOT AN OPTIMIZATION. Two
-    subtasks sharing that marker are the deliberate sub-file region splits of
-    one file (DESIGN §5½ (P1) *Sub-file*) — same tag and same path by
-    construction. Without the exclusion this rule matches 3571 pairs across
-    the run corpus; with it, 9 — falling in exactly two runs, both of which
-    were destroyed by duplicate work (`392b5e7f` died at the phase-3 wiring
-    gate; `19a70d96` executed both duplicates and was refused at the
-    integration gate after 4.7 hours and 164 workers). The other 50 corpus
-    runs produce no flags.
+    THREE EXCLUSIONS, ALL LOAD-BEARING, NOT OPTIMIZATIONS. Each names a
+    structure that makes "same tag" true by CONSTRUCTION rather than by
+    defect (enforced in `_iter_duplicate_provider_pairs`):
 
-    An "already ordered by `depends_on`" exemption looks obviously necessary
-    and is deliberately absent: measured across the same corpus, ZERO flagged
-    pairs were ordered. Adding it would be untested speculation widening the
-    rule's escape hatches. `_build_predecessor_graph` is the function to reach
-    for if that ever changes.
+    1. `_cofile_cluster` — deliberate sub-file region splits of one file
+       (DESIGN §5½ (P1) *Sub-file*): same tag and same path by construction.
+       Without the exclusion this rule matches 3571 pairs across the run
+       corpus; with it, 9 — falling in exactly two runs, both of which were
+       destroyed by duplicate work (`392b5e7f` died at the phase-3 wiring
+       gate; `19a70d96` executed both duplicates and was refused at the
+       integration gate after 4.7 hours and 164 workers). The other 50 corpus
+       runs produce no flags.
+    2. `_newfile_owner_id` — deliberate MULTI-file splits. `_migration_child`
+       copies the parent's `provides` to every chunk verbatim while the chunks
+       own disjoint files, and only `_cofile_child` sets `_cofile_cluster`, so
+       exclusion 1 does not reach this shape. Without it the no-overlap tier
+       flags run `5fa2052b`'s `config-002-{1,2,3}` — one deliberate three-way
+       split — as three duplicate pairs.
+    3. Ordering by `depends_on`/`requires` — **NO-OVERLAP TIER ONLY.** For the
+       file-overlap tier this exemption was measured across the corpus and
+       correctly rejected (ZERO flagged pairs were ordered), and it stays
+       rejected there. For the tag-only tier it is required: an ordered chain
+       whose links each declare a shared umbrella tag is the dominant
+       LEGITIMATE shape, and this repo's own three-layer rule generates it —
+       corpus run `3a4abba3` pairs docs/DESIGN.md with docs/IMPLEMENTATION.md,
+       both providing `nl-regex-migration-spec`, the second depends_on the
+       first. Resolved through `_build_predecessor_graph(quiet=True)` so the
+       definition of "edge" cannot drift from the scheduler's.
+
+    With all three, the 0.28.0 corpus yields 10 flags across 3 of 66 plans,
+    all adjudicated true positives, and the pinned false-positive corpus
+    (`tests/fixtures/wiring_repair_corpus`) stays clean.
 
     Advisory as shipped — the caller logs these rather than gating on them,
     pending confirmation across live runs (DESIGN §5)."""
     issues: list[str] = []
-    for sid_a, sid_b, tag, shared in _iter_duplicate_provider_pairs(plans):
-        issues.append(
-            f"DUPLICATE_PROVIDER: {sid_a} and {sid_b} both "
-            f"provide {tag!r} and both touch "
-            f"{', '.join(sorted(shared))} — two subtasks doing the "
-            "same work to the same file. One should be dropped or "
-            "merged into the other, or they should be sequenced with "
-            "an explicit depends_on and given distinct surfaces "
-            "(DESIGN §5 *Cross-domain surface overlap*)")
+    for sid_a, sid_b, tag, shared, kind in _iter_duplicate_provider_pairs(
+            plans):
+        if kind == "overlap":
+            issues.append(
+                f"DUPLICATE_PROVIDER: {sid_a} and {sid_b} both "
+                f"provide {tag!r} and both touch "
+                f"{', '.join(sorted(shared))} — two subtasks doing the "
+                "same work to the same file. One should be dropped or "
+                "merged into the other, or they should be sequenced with "
+                "an explicit depends_on and given distinct surfaces "
+                "(DESIGN §5 *Cross-domain surface overlap*)")
+        else:
+            issues.append(
+                f"DUPLICATE_PROVIDER_NO_OVERLAP: {sid_a} and {sid_b} both "
+                f"provide {tag!r} but share no file. One tag with two "
+                "producers is a plan defect either way: either they are the "
+                "same work under two independently invented paths (the "
+                "usual shape for a new test or changelog file, where each "
+                "planner names the file itself), or one of them consumes "
+                "the tag and mis-declared it as `provides`. Fold them into "
+                "one subtask, or correct the mis-declared tag "
+                "(DESIGN §5 *A deterministic floor underneath the judge*)")
     return issues
 
 
+def _transitive_predecessors(
+        preds: dict[str, set[str]]) -> dict[str, set[str]]:
+    """Transitive closure of `_build_predecessor_graph`'s DIRECT-predecessor
+    map. Pure, and deliberately cycle-tolerant: the acyclicity gate is a
+    separate phase (2½), so this can be handed a graph that still has a
+    cycle and must terminate anyway rather than recursing forever. The
+    `seen` set does that — a cycle simply yields "everything reachable",
+    which is the right answer for an ordering question."""
+    out: dict[str, set[str]] = {}
+    for sid in preds:
+        seen: set[str] = set()
+        stack = list(preds.get(sid, ()))
+        while stack:
+            cur = stack.pop()
+            if cur in seen:
+                continue
+            seen.add(cur)
+            stack.extend(preds.get(cur, ()))
+        out[sid] = seen
+    return out
+
+
 def _iter_duplicate_provider_pairs(
-        plans: list[dict]) -> Iterator[tuple[str, str, str, set[str]]]:
+        plans: list[dict]) -> Iterator[tuple[str, str, str, set[str], str]]:
     """Shared detection loop behind `check_duplicate_providers` and
     `_duplicate_provider_merge_collisions`: builds the tag->providers map,
-    then yields `(sid_a, sid_b, tag, shared_files)` for every pair of
-    subtasks that declare the same `provides` tag and share a touched file —
-    skipping pairs that are a deliberate `_cofile_cluster` sub-file split of
-    one file (LOAD-BEARING, not an optimization — see
-    `check_duplicate_providers`'s docstring for the corpus measurement this
-    exclusion rests on). Callers differ only in what they do with a found
-    pair (an advisory issue string vs. a merge-collision dict)."""
+    then yields `(sid_a, sid_b, tag, shared_files, kind)` for every pair of
+    subtasks declaring the same `provides` tag, where `kind` is:
+
+      - `"overlap"`    — they also share a file (`shared_files` non-empty);
+      - `"no_overlap"` — only the tag is shared (`shared_files` empty).
+
+    File comparison is `_paths_designate_same_file` (component-wise), so a
+    repo-root prefix on one side does not read as disjoint.
+
+    Three exclusions, each naming a structure that makes "same tag" true by
+    construction rather than by defect — all LOAD-BEARING, not optimizations;
+    see `check_duplicate_providers`'s docstring for the corpus measurements
+    they rest on: `_cofile_cluster` (sub-file region splits),
+    `_newfile_owner_id` (multi-file splitter chunks), and — for the
+    `no_overlap` tier ONLY — an existing `depends_on`/`requires` ordering.
+
+    Callers differ only in what they do with a found pair (an advisory issue
+    string vs. a merge-collision dict), and only the `overlap` tier is
+    auto-merged."""
     subtasks: dict[str, dict] = {}
     for plan in plans:
         for s in plan.get("subtasks", []) or []:
@@ -11116,6 +11329,31 @@ def _iter_duplicate_provider_pairs(
             if isinstance(f, str) and f.strip()
         }
 
+    # Transitive predecessors, for the no-overlap tier's ordering exclusion
+    # below. `_build_predecessor_graph` is the one definition of "edge" every
+    # consumer of the subtask DAG shares (depends_on plus requires/provides
+    # tag matches), so this cannot drift from what the scheduler believes.
+    #
+    # It is handed a NULL-NORMALIZED view, not `subtasks` directly. This
+    # floor is documented total — it runs on every path, above every skip
+    # flag, on raw planner output that `_validate_plan` has not seen yet —
+    # and its own reads are all `or []`-guarded for exactly that reason.
+    # `_build_predecessor_graph`'s are not (`s.get("depends_on", [])` returns
+    # None for a present-but-null key), so calling it unguarded would make a
+    # `provides`/`depends_on`/`requires` of `null` raise TypeError out of a
+    # function that previously tolerated it, killing the run at phase 2¾.
+    # Normalizing here rather than inside the shared builder keeps eleven
+    # other DAG consumers untouched by a duplicate-detection change.
+    _ordering_view = {
+        sid: {**s,
+              "provides": s.get("provides") or [],
+              "depends_on": s.get("depends_on") or [],
+              "requires": s.get("requires") or []}
+        for sid, s in subtasks.items()
+    }
+    preds = _transitive_predecessors(
+        _build_predecessor_graph(_ordering_view, quiet=True)[0])
+
     for tag in sorted(providers):
         sids = sorted(providers[tag])
         for i in range(len(sids)):
@@ -11124,10 +11362,68 @@ def _iter_duplicate_provider_pairs(
                 cluster = a.get("_cofile_cluster")
                 if cluster and cluster == b.get("_cofile_cluster"):
                     continue  # deliberate sub-file split of one file
-                shared = _files(a) & _files(b)
-                if not shared:
+                # SECOND LOAD-BEARING EXCLUSION, and for the same reason as
+                # `_cofile_cluster` above: a MULTI-FILE splitter chunk
+                # (`_migration_child`) copies the parent's `provides` to every
+                # child verbatim, so same-tag is guaranteed by construction
+                # while the chunks own deliberately disjoint files. Only
+                # `_cofile_child` sets `_cofile_cluster`, so the sub-file
+                # exclusion does not cover this shape. Both child builders do
+                # set `_newfile_owner_id` to the one designated owner, which
+                # is what makes it a sound sibling marker. Measured: without
+                # this, widening the rule below flags run `5fa2052b`'s
+                # config-002-{1,2,3} — one deliberate three-way split — as
+                # three duplicate pairs; with it, the widened rule produces
+                # zero false positives across the 66-plan corpus.
+                owner = a.get("_newfile_owner_id")
+                if owner and owner == b.get("_newfile_owner_id"):
                     continue
-                yield sids[i], sids[j], tag, shared
+                # THIRD EXCLUSION, and it applies ONLY to the no-overlap tier
+                # below. `check_duplicate_providers`'s docstring records that
+                # an "already ordered by depends_on" exemption was measured
+                # against the corpus and deliberately left out — that finding
+                # is about the FILE-OVERLAP tier, where zero flagged pairs
+                # were ordered, and it still stands there.
+                #
+                # For the tag-only tier the same shape is the dominant
+                # LEGITIMATE one: an ordered chain whose links each also
+                # declare a shared umbrella tag for the capability they
+                # jointly deliver. This repo's own three-layer rule generates
+                # it constantly — corpus run 3a4abba3 has docs-001
+                # (docs/DESIGN.md) and docs-002 (docs/IMPLEMENTATION.md) both
+                # providing `nl-regex-migration-spec`, with docs-002
+                # depends_on docs-001. Two subtasks an explicit edge already
+                # sequences are not racing to author one artifact.
+                #
+                # The cost is honest and bounded: a consumer that mis-declares
+                # a tag it merely uses (run `c1f45fd0`'s feat-007 declares
+                # `agent-chat-client`, which feat-003 produces and it
+                # depends_on) is structurally identical to the legitimate
+                # shape and is no longer flagged. That is the cheaper error —
+                # a mis-declared tag on an already-ordered pair produces no
+                # duplicate work, which is what this floor exists to stop.
+                ordered = (sids[j] in preds.get(sids[i], set())
+                           or sids[i] in preds.get(sids[j], set()))
+                shared = {
+                    fa for fa in _files(a)
+                    if any(_paths_designate_same_file(fa, fb)
+                           for fb in _files(b))
+                }
+                # Two tiers. Sharing a file is the historical rule. Sharing
+                # only the TAG is the shape that let three subtasks in run
+                # `3e65e793` each write the same test under a different
+                # invented filename: the judge saw all three declare
+                # `provides=captcha-inject-submit-primitive-tested`, and
+                # withdrew the finding anyway because no path literally
+                # matched. One tag with two producers is a plan defect either
+                # way — genuine duplicate work, or a mis-declared tag (run
+                # `c1f45fd0`'s feat-007 declares the tag it CONSUMES) — so it
+                # is surfaced, with the kind carried so callers can treat the
+                # weaker signal more conservatively.
+                if not shared and ordered:
+                    continue
+                yield (sids[i], sids[j], tag, shared,
+                       "overlap" if shared else "no_overlap")
 
 
 def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
@@ -11136,12 +11432,17 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
     duplicate-provider floor's detections are routed into a merge resolution
     rather than left purely advisory).
 
-    Deliberately a standalone mirror of `check_duplicate_providers`'s
-    detection logic — same `_cofile_cluster` exclusion, same
-    `_normalize_artifact_path` file-overlap test, same tag/sid iteration
-    order — rather than a refactor of that function, per this subtask's
-    scope (`check_duplicate_providers` itself is unchanged and keeps
-    returning its own advisory `list[str]`).
+    Shares `_iter_duplicate_provider_pairs` with `check_duplicate_providers`
+    so the two cannot drift in what counts as a duplicate; they differ only in
+    what they do with a found pair (an advisory issue string vs. a
+    merge-collision dict).
+
+    ONLY THE FILE-OVERLAP TIER IS AUTO-MERGED. A `no_overlap` pair is a real
+    defect too, but its RESOLUTION is ambiguous in a way this synthesizer
+    cannot decide: folding is right when the pair is duplicate work, and wrong
+    when one side merely mis-declared a tag it consumes, where the fix keeps
+    both subtasks. Auto-merging that case would delete a live subtask, so it
+    stays advisory and the judge — which reads intent — owns the call.
 
     Every returned collision has `resolution: "merge"`, so the N-way case
     (three or more subtasks sharing one tag, pairwise) is not a separate
@@ -11155,7 +11456,18 @@ def _duplicate_provider_merge_collisions(plans: list[dict]) -> list[dict]:
     both to the same survivor) is recorded as `skipped_redundant` by that
     helper rather than double-applied."""
     collisions: list[dict] = []
-    for sid_a, sid_b, tag, shared in _iter_duplicate_provider_pairs(plans):
+    for sid_a, sid_b, tag, shared, kind in _iter_duplicate_provider_pairs(
+            plans):
+        # Only the file-overlap tier is auto-merged. A `no_overlap` pair is a
+        # real defect (see `check_duplicate_providers`) but its RESOLUTION is
+        # ambiguous in a way this synthesizer cannot decide: folding two
+        # subtasks is right when they are duplicate work, and wrong when one
+        # merely mis-declared a tag it consumes — where the fix is to correct
+        # the tag and keep both. Auto-merging that case would delete a live
+        # subtask. It stays advisory, and the judge (which reads intent) owns
+        # the call.
+        if kind != "overlap":
+            continue
         collisions.append({
             "a_sid": sid_a, "b_sid": sid_b,
             "resolution": "merge",
@@ -13589,6 +13901,39 @@ async def check_diff_scope(sid: str, worktree: str, subtask: dict,
         }
         st.save()
 
+    # non-fatal: the INVERSE direction. The over-scope warning above has
+    # always had `touched` in hand; only "committed real work, but none of it
+    # to any file it said it would touch" was missing. Measured across the
+    # 0.28.0 corpus: 5 of 131 completed subtasks landed none of their declared
+    # files, three of them independently redone by a later run. Run
+    # `c1f45fd0`'s `feat-005` reported `complete` and self-checked "[x] Router
+    # mounted as app.use('/api/parcel', parcelRouter) in server/index.ts"
+    # while `server/routes/parcel.ts` did not exist anywhere in the tree; a
+    # later run created it from scratch.
+    #
+    # ADVISORY, and that is deliberate. `files_likely_touched` is a planner
+    # ESTIMATE, not a contract: a subtask may satisfy its criteria in a file
+    # nobody predicted, or legitimately no-op because a sibling landed the
+    # deliverable first. Gating on it would resurrect exactly the bar DESIGN
+    # §9 retired. What makes it worth checking anyway is that it reads no
+    # prose — it is set logic over already-structured planner fields, so it
+    # is not gameable the way per-criterion satisfaction was: a worker cannot
+    # weaken a test to make a declared path appear in a diff.
+    # `or []`, matching every other reader of this field: `.get(k, [])`
+    # returns None when the key is present and null, which the over-scope
+    # check above survives only because `bool(None)` short-circuits it.
+    declared = [f for f in (expected or [])
+                if isinstance(f, str) and f.strip()]
+    if declared and not any(_declared_path_covers(d, t)
+                            for d in declared for t in touched):
+        reason = (f"touched {len(touched)} file(s), none of the "
+                  f"{len(declared)} declared in files_likely_touched")
+        log(f"  ⚠  under-scope warning {sid}: {reason}")
+        st.data.setdefault("under_scope_warnings", {})[sid] = {
+            "touched": touched, "declared": declared, "reason": reason,
+        }
+        st.save()
+
     return None
 
 
@@ -15399,7 +15744,12 @@ def _summarize_stream_event(sid: str, event: dict, verbosity: str) -> str | None
             raw = (f"rate_limit_event status={status} "
                    f"rateLimitType={rate_limit_type} "
                    f"resetsAt={resets_at_ts}")
-            raise RateLimitedExit(reset_at=reset_at, raw_message=raw)
+            raise RateLimitedExit(reset_at=reset_at, raw_message=raw,
+                                  limit_type=(
+                                      rate_limit_type
+                                      if isinstance(rate_limit_type, str)
+                                      and rate_limit_type != "?"
+                                      else None))
         # Surface threshold-crossings at stream; everything at debug.
         # The boolean-or-numeric `surpassedThreshold` field is a
         # threshold value (e.g. 0.9), not a boolean flag — truthy when
@@ -26039,9 +26389,17 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
 
 def _build_predecessor_graph(
     subtasks: dict[str, dict],
+    quiet: bool = False,
 ) -> tuple[dict[str, set[str]], dict[str, list[str]],
            dict[tuple[str, str], str]]:
     """Build the predecessor graph from a merged subtasks dict.
+
+    `quiet` suppresses the dangling-`depends_on` log below, for callers that
+    only need to ASK about ordering rather than act on the graph. The
+    duplicate-provider floor is one: it documents itself as a pure function,
+    and it runs at phase 2¾ where a line reading `_schedule: ...` names a
+    phase that is not running. The observation is still made by every caller
+    that builds the real schedule.
 
     Returns `(preds, providers, edge_sources)`:
     - `preds[sid]` is the set of subtask ids that must complete before `sid`.
@@ -26095,8 +26453,9 @@ def _build_predecessor_graph(
                 # and the canary if a new id-vanishing op forgets the
                 # rewrite. _validate_plan stays the single enforcement
                 # point — never die() here.
-                log(f"_schedule: {sid} depends_on unknown id {dep!r} "
-                    "— edge dropped")
+                if not quiet:
+                    log(f"_schedule: {sid} depends_on unknown id {dep!r} "
+                        "— edge dropped")
         for entry in s.get("requires", []):
             if not isinstance(entry, dict) or entry.get("extent") != "in_plan":
                 continue
@@ -26141,11 +26500,28 @@ def _detect_no_work(plans: list[dict]) -> dict[str, str] | None:
     return out
 
 
-def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
+def _finish_no_work_run(st: State, no_work_map: dict[str, str],
+                        headline: str | None = None,
+                        reset_plan_state: bool = True) -> None:
     """Terminal-state handler for the cleared-but-empty case
     (DESIGN §8 *The cleared-but-empty terminal state*). Records
     `no_work_required=true` in state.json, writes `finished_at` to
     state.json + run.json, logs the no-work summary, and returns.
+
+    Two shapes reach this, and they differ in what state is truthful to keep:
+
+    - The PLANNING-TIME shape (the default): planners returned zero subtasks,
+      so there is no plan to preserve and `reset_plan_state=True` clears
+      `waves`/`subtask_status` to match reality.
+    - The POST-EXECUTION shape: a plan ran to completion but every subtask
+      found its deliverable already present, so the run branch carries no
+      commits. Here the wave/subtask record is the evidence of what was
+      checked and MUST survive — `reset_plan_state=False`. Clearing it would
+      make a run that executed a 5-subtask plan indistinguishable from one
+      that never planned at all.
+
+    `headline` overrides the summary log line for callers that did not arrive
+    here from phase 3.
 
     `no_push=True` on the run.json write is load-bearing: the host
     launcher polls `finished_at` as the "ready to push" sentinel, and
@@ -26153,18 +26529,24 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str]) -> None:
     run_status` reads `finished_at` + the missing `pushed_at` / `pr_url`
     and renders the run as `done` in `leerie list`.
 
-    Does NOT invoke `finalize.sh` / `cleanup.sh` — `finalize.sh` would
-    fail its non-empty-branch check and `cleanup.sh` has no subtask
-    branches to drop."""
-    log("phase 3: nothing to _schedule — every planner returned "
-        "status=ready with zero subtasks")
+    Does NOT invoke `finalize.sh` / `cleanup.sh` itself — `finalize.sh`
+    would fail its non-empty-branch check, and for the PLANNING-time callers
+    `cleanup.sh` has no subtask branches to drop.
+
+    That second premise does NOT hold for the post-execution caller, whose
+    waves did run: `phase_finalize` therefore runs `cleanup.sh --run-id <id>
+    --subtask-branches` ITSELF before calling this, and a future caller that
+    reaches here after any worktree was created must do the same."""
+    log(headline or ("phase 3: nothing to _schedule — every planner returned "
+                     "status=ready with zero subtasks"))
     for domain, basis in no_work_map.items():
         log(f"  {domain}: no work (basis: {basis!r})")
     st.data["no_work_required"] = True
     st.data["no_work_reasons"] = dict(no_work_map)
     st.data["finished_at"] = now()
-    st.data["waves"] = []
-    st.data["subtask_status"] = {}
+    if reset_plan_state:
+        st.data["waves"] = []
+        st.data["subtask_status"] = {}
     st.data["current_phase"] = "done: no work required"
     st.save()
     # Reap the judgment worktree. This path reaches neither `cleanup.sh` (see
@@ -31935,6 +32317,63 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     if isinstance(waves, list) and completed < len(waves):
         die(f"refusing to finalize: only {completed} of {len(waves)} waves "
             f"complete. Resume to finish: leerie resume {st.run_id}")
+    # An empty run branch here is the cleared-but-empty terminal state, not an
+    # error. Every subtask can legitimately reach `complete` without adding a
+    # commit: `_settle_already_satisfied` settles one whose deliverable a
+    # sibling landed or that was already on the base tree, and a `resume`
+    # whose subtasks all completed in an earlier attempt re-integrates nothing
+    # new. `finalize.sh` then refuses with "has no commits beyond <base> —
+    # nothing to push" and this `die()` turned a correct no-op into a hard
+    # failure: run `d1987e8b` spent $9.68 and 40 calls, `05f65221` $3.03, both
+    # ending in an error where "done: no work required" was the truth.
+    #
+    # Checked here rather than by reading finalize.sh's message: the ahead-
+    # count is the actual fact, and matching on the script's prose would break
+    # the moment that string is reworded. A state-only predicate was tried and
+    # rejected — it identifies neither run, because `05f65221` recorded no
+    # `dropped_subtasks` at all (its subtasks completed on a prior attempt).
+    working_branch = st.data.get("working_branch")
+    if working_branch:
+        # `st.repo_root`, NOT `leerie_dir`: the latter is the STATE root,
+        # which under `LEERIE_STATE_DIR` (and the `$HOME/.leerie/<basename>/`
+        # default) is not a git repo at all. Running the count there fails,
+        # the `returncode == 0` guard below fails open, and the check silently
+        # never fires — except when the state root happens to sit inside the
+        # repo, which would make the behavior depend on where state lives.
+        # `_run_script` reaches the same repo via `os.getcwd()`.
+        ahead = await run_proc(
+            ["git", "rev-list", "--count",
+             f"{working_branch}..{_compute_run_branch(st.run_id)}"],
+            cwd=str(st.repo_root))
+        if ahead.returncode == 0 and ahead.stdout.strip() == "0":
+            # Clean up BEFORE recording the terminal state, exactly as the
+            # normal finalize path below does. `_finish_no_work_run`'s own
+            # docstring says it skips `cleanup.sh` because a no-work run has
+            # no subtask branches to drop — true of its PLANNING-time callers,
+            # false here: this run executed its waves, so
+            # `leerie/subtasks/<run-id>/*` branches and their worktrees all
+            # exist. Without this the run would leak one branch and one full
+            # checkout per subtask (18 of each in the largest corpus run),
+            # invisibly, since `.leerie/` is gitignored — and it would be a
+            # REGRESSION against the old behavior, where the `die()` this
+            # replaces at least reached `_cleanup_on_abnormal_exit`.
+            #
+            # `--subtask-branches` (not `--branches`) mirrors the successful
+            # path: the empty run branch is kept and reaped by `leerie prune`
+            # like any other, rather than inventing a second disposal rule.
+            await _run_script("cleanup.sh", "--run-id", st.run_id,
+                              "--subtask-branches")
+            _finish_no_work_run(
+                st,
+                {"<finalize>": (
+                    f"every subtask completed, but the run branch carries no "
+                    f"commits beyond {working_branch} — the deliverables were "
+                    "already present on the base tree or landed by an earlier "
+                    "attempt")},
+                headline=("phase 6: run branch is empty — nothing to push; "
+                          "recording the no-work terminal state"),
+                reset_plan_state=False)
+            return
     proc = await _run_script("finalize.sh", st.run_id)
     if proc.returncode != 0:
         die(f"finalize failed (run branch is intact): {proc.stderr.strip()}")
@@ -33210,6 +33649,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "/proc/meminfo when unset. Also "
                          f"{WORKER_MEMORY_MAX_ENV} env var or "
                          "worker_memory_max in leerie.toml")
+    ap.add_argument("--max-rate-limit-wait", type=_positive_int,
+                    metavar="SEC",
+                    help="longest rate-limit reset to sleep through before "
+                         "pausing resumably instead (positive integer; "
+                         f"default {DEFAULT_CAPS['max_rate_limit_wait_sec']}"
+                         "). A five-hour session limit is worth waiting out; "
+                         "a weekly limit resets at a fixed per-account "
+                         "instant that can be days away, and sleeping on it "
+                         "holds the run-directory flock. Also "
+                         f"{MAX_RATE_LIMIT_WAIT_ENV} env var or "
+                         "max_rate_limit_wait_sec in leerie.toml")
     ap.add_argument("--worker-timeout", type=_positive_int, metavar="SEC",
                     help="global per-worker wall-clock ceiling in seconds "
                          "(positive integer; default "
@@ -33560,6 +34010,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
         Path(os.getcwd()), args.worker_timeout)
     caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
         Path(os.getcwd()), args.worker_timeout)
+    # Read by main()'s `except RateLimitedExit` arm to decide between
+    # auto-resuming and pausing (DESIGN §6 *A ceiling on the wait*).
+    caps["max_rate_limit_wait_sec"] = resolve_max_rate_limit_wait_sec(
+        Path(os.getcwd()), args.max_rate_limit_wait)
     caps["strict_conformer"] = args.strict_conformer
 
     # Resolve verbosity. Explicit --verbosity wins; else -v/-q
@@ -34138,7 +34592,36 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             else:
                 wait_seconds = RATE_LIMIT_RETRY_BACKOFF_SEC
                 reason = "rate limited / no reset time"
-            rc = _sleep_then_reexec(st, wait_seconds, reason)
+            # `caps` is the resolved value (CLI > env > toml > DEFAULT_CAPS);
+            # the `.get` fallback covers the arms that build a bare
+            # `dict(DEFAULT_CAPS)` without going through main()'s resolution.
+            max_wait = caps.get("max_rate_limit_wait_sec",
+                                DEFAULT_CAPS["max_rate_limit_wait_sec"])
+            if wait_seconds > max_wait:
+                # Too far out to sleep through: take the out-of-credits
+                # disposition instead (worktree-only cleanup, resume hint,
+                # EXIT_LOCKED). Sleeping here is strictly worse than pausing —
+                # it holds the run-directory flock, blocks every other run on
+                # this repo, and gives the user no way to act except Ctrl-C,
+                # which is what 14 runs in the 0.28.0 corpus actually did.
+                window = f" ({e.limit_type} window)" if e.limit_type else ""
+                log(f"  {reason}{window}, which is "
+                    f"{wait_seconds // 3600}h{(wait_seconds % 3600) // 60:02d}m"
+                    f" away — longer than the "
+                    f"{max_wait // 3600}h auto-resume ceiling, "
+                    "so leerie is pausing instead of sleeping on it")
+                log(f"  resume when the limit clears: leerie resume {st.run_id}")
+                try:
+                    _cleanup_on_abnormal_exit(st, full_purge=False)
+                except BaseException as cleanup_err:
+                    log(f"cleanup failed (non-fatal): {cleanup_err}")
+                asyncio.run(_best_effort_capture_deps(
+                    repo_root, st, caps, models, efforts,
+                    "rate-limit pause (wait exceeds ceiling)"))
+                exit_code = EXIT_LOCKED
+                rc = None
+            else:
+                rc = _sleep_then_reexec(st, wait_seconds, reason)
             if rc is not None:
                 # Interrupted (SIGINT→130, SIGTERM/SIGHUP→128+signum) or execv
                 # failed (→75). Cleanup already ran; state preserved for resume.
