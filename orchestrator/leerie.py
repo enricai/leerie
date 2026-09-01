@@ -438,7 +438,7 @@ STATE_FIELDS = (
     # silent containment failure — this makes it visible in state.json.
     "cgroup_containment",
     "verbosity", "inspect_dirs",
-    "integrator_warnings", "scope_warnings",
+    "integrator_warnings", "scope_warnings", "under_scope_warnings",
     # Per-run memo of orchestrator-measured build/lint/test verdicts, keyed
     # by (axis, command, tree sha) — see `_measure_axes`. Deliberately placed
     # BEFORE `conformance` rather than between it and `unreviewed_subtasks`:
