@@ -3492,6 +3492,21 @@ rather than guarded — coverage is now `task_coverage_judge`'s job, so the
 freeze class cannot recur. `TestBothRootCausesComposeOnOnePayload` runs both
 halves against the same fixtures in one test.
 
+## Piped/decoupled-streaming exit path: wall-clock hang bound
+
+`tests/test_decoupled_streaming_hang_bound.py` covers a gap
+`test_log_file_persistence.py`/`test_log_file_wiring.py` leave open: both
+of those use a `nerdctl` stub that writes and returns synchronously, so
+neither ever exercises a background process that keeps the container's
+stdout stream open past the stub's own exit -- the SSH-mux / broker
+failure mode the file-based `_run_log` + launcher-owned `tail -f` design
+(leerie:8811-8826) exists to route around. This test's stub forks a
+detached grandchild that inherits stdout and sleeps well past the
+harness's own completion, then asserts the harness still returns well
+under a fixed wall-clock ceiling -- proving a lingering fd-holder can't
+block the harness because `_run_log` redirects to a plain file, not a
+pipe.
+
 ## Lessons worth keeping
 
 **A handler must survive its own exception, not merely catch it.** `main()`'s
