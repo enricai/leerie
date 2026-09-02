@@ -8295,6 +8295,30 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
     }
 
 
+async def _call_splitter(
+    system_prompt: str, user_prompt: str, sid: str, st: "State", caps: dict,
+    models: dict[str, str], efforts: dict[str, str | None],
+) -> dict:
+    """Shared claude_p() invocation shape for the two splitter call sites in
+    _label_migration_chunks and _recursive_decompose — identical kwargs apart
+    from the prompt content and sid. Each caller keeps its own try/except and
+    result-handling around this call."""
+    return await claude_p(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        schema_key="splitter",
+        cwd=_judgment_cwd(st),
+        allowed_tools=INSPECT_TOOLS,
+        max_turns=30,
+        autonomous=False,
+        caps=caps,
+        st=st,
+        model=models.get("splitter", MODEL_DEFAULT),
+        effort=efforts.get("splitter"),
+        sid=sid,
+    )
+
+
 async def _label_migration_chunks(
     subtask: dict, chunks: list[list[str]], base_id: str, depth: int,
     st: "State", caps: dict, models: dict[str, str],
@@ -8347,19 +8371,9 @@ async def _label_migration_chunks(
         f"{json.dumps(chunk_spec, indent=2)}"
     )
     try:
-        result = await claude_p(
-            system_prompt=sys_prompt,
-            user_prompt=user_prompt,
-            schema_key="splitter",
-            cwd=_judgment_cwd(st),
-            allowed_tools=INSPECT_TOOLS,
-            max_turns=30,
-            autonomous=False,
-            caps=caps,
-            st=st,
-            model=models.get("splitter", MODEL_DEFAULT),
-            effort=efforts.get("splitter"),
-            sid=f"splitter-label-{base_id}-d{depth}",
+        result = await _call_splitter(
+            sys_prompt, user_prompt, f"splitter-label-{base_id}-d{depth}",
+            st, caps, models, efforts,
         )
         for child in (result.get("children") or []):
             cid = child.get("id")
@@ -8811,19 +8825,10 @@ async def _recursive_decompose(
             "Split this subtask along real structural seams. Return child subtasks."
         )
         try:
-            split_result = await claude_p(
-                system_prompt=sys_prompt_s,
-                user_prompt=user_prompt_s,
-                schema_key="splitter",
-                cwd=_judgment_cwd(st),
-                allowed_tools=INSPECT_TOOLS,
-                max_turns=30,
-                autonomous=False,
-                caps=caps,
-                st=st,
-                model=models.get("splitter", MODEL_DEFAULT),
-                effort=efforts.get("splitter"),
-                sid=f"splitter-{subtask.get('id', 'x')}-d{depth}",
+            split_result = await _call_splitter(
+                sys_prompt_s, user_prompt_s,
+                f"splitter-{subtask.get('id', 'x')}-d{depth}",
+                st, caps, models, efforts,
             )
         except (WorkerError, subprocess.TimeoutExpired):
             # Worker crashed mid-split (auth failure, killed session, PID
