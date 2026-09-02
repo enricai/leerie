@@ -24292,6 +24292,22 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
         collisions[:] = coalesced
 
 
+def _rewrite_depends_on_refs(plans: list[dict], dropped_sid: str,
+                             surviving_sid: str) -> None:
+    """Replace `dropped_sid` with `surviving_sid` in every subtask's
+    `depends_on`, dedup, and never let a subtask depend on itself."""
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            deps = s.get("depends_on") or []
+            if dropped_sid in deps:
+                new_deps: list[str] = []
+                for dep in deps:
+                    dep = surviving_sid if dep == dropped_sid else dep
+                    if dep not in new_deps and dep != s.get("id"):
+                        new_deps.append(dep)
+                s["depends_on"] = new_deps
+
+
 def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
                         surviving_sid: str) -> None:
     """Remove `dropped_sid` from its plan, union its `provides` tags
@@ -24345,16 +24361,7 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
     if dropped is None or surviving is None:
         # Still rewrite depends_on references — they may point at the
         # dropped sid even if the subtask itself is already gone.
-        for plan in plans:
-            for s in plan.get("subtasks", []):
-                deps = s.get("depends_on") or []
-                if dropped_sid in deps:
-                    new_deps: list[str] = []
-                    for dep in deps:
-                        dep = surviving_sid if dep == dropped_sid else dep
-                        if dep not in new_deps and dep != s.get("id"):
-                            new_deps.append(dep)
-                    s["depends_on"] = new_deps
+        _rewrite_depends_on_refs(plans, dropped_sid, surviving_sid)
         # Still remove any stale subtask entry with the dropped id.
         for plan in plans:
             plan["subtasks"] = [
@@ -24389,16 +24396,7 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
 
     # Rewrite downstream depends_on references and drop the dropped sid
     # from anywhere it appears as a predecessor.
-    for plan in plans:
-        for s in plan.get("subtasks", []):
-            deps = s.get("depends_on") or []
-            if dropped_sid in deps:
-                new_deps: list[str] = []
-                for dep in deps:
-                    dep = surviving_sid if dep == dropped_sid else dep
-                    if dep not in new_deps and dep != s.get("id"):
-                        new_deps.append(dep)
-                s["depends_on"] = new_deps
+    _rewrite_depends_on_refs(plans, dropped_sid, surviving_sid)
 
 
 def _apply_multidrop(plans: list[dict], dropped_sid: str,
