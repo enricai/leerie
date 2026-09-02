@@ -5104,6 +5104,23 @@ def _list_runs(
     _render_run_table(rows)
 
 
+def _iter_ndjson_records(path: Path) -> Iterator[dict]:
+    """Yield each parsed JSON object from an NDJSON file, stripping
+    whitespace, skipping blank lines, and silently skipping lines that
+    fail to parse as JSON."""
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        yield rec
+
+
 def _aggregate_calls(calls_path: Path) -> dict[str, dict]:
     """Group a run's calls.ndjson by call_type, summing per-type counts,
     tokens, latency, and failures (by failure_kind). Malformed lines are
@@ -18881,15 +18898,7 @@ async def phase_judge(run_dir: Path, judge_out_dir: Path,
         return {"judged": 0, "index": []}
 
     records: list[dict] = []
-    for line in capture_path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            log(f"  phase_judge: skipping malformed NDJSON line: {line[:80]!r}")
-            continue
+    for rec in _iter_ndjson_records(capture_path):
         if judge_call_types and rec.get("call_type") not in judge_call_types:
             continue
         records.append(rec)
@@ -34329,15 +34338,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             capture_path = phase_run_dir / "calls.ndjson"
             all_captures: dict[str, dict] = {}
             if capture_path.exists():
-                for line in capture_path.read_text().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        all_captures[rec.get("call_id", "")] = rec
-                    except (ValueError, AttributeError):
-                        pass
+                for rec in _iter_ndjson_records(capture_path):
+                    all_captures[rec.get("call_id", "")] = rec
             for call_type, failing_ids in sorted(failing_by_type.items()):
                 failing_records = [all_captures[cid] for cid in failing_ids
                                    if cid in all_captures]
