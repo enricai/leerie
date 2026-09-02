@@ -488,7 +488,7 @@ class TestSnapshotSourceCoupling:
         splitter claude_p call inside _recursive_decompose (the non-migration
         path, ~70 lines after the fit_judge guard) must also be guarded."""
         src = inspect.getsource(leerie._recursive_decompose)
-        split_idx = src.find('schema_key="splitter"')
+        split_idx = src.find("_call_splitter(")
         assert split_idx != -1
         try_idx = src.rfind("try:", 0, split_idx)
         assert try_idx != -1, (
