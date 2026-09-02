@@ -5451,7 +5451,11 @@ branch, after the `_write_run_json(...)` block and before
    surfaces the failing tool+version to `die()`.
 5. **Version capture.** Runs `mise ls --current --json` (the
    subcommand `mise current --json` does not exist; verified
-   against mise.usage.kdl). Output is object-keyed-by-tool, each
+   against mise.usage.kdl) via `run_proc` bounded by
+   `MISE_LS_TIMEOUT` (30s) — a timeout or non-zero exit is logged and
+   skipped, the same fail-open disposition as any other capture
+   failure, since workers install their own tools via prompt
+   injection regardless. Output is object-keyed-by-tool, each
    value an array of `{version, install_path, source}` objects.
    Raw blob stored at `st.data["provision"]["mise_versions"]`;
    `tools[name][0].version` is the value rendered in `leerie list`
