@@ -17770,6 +17770,19 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
         await asyncio.sleep(interval_sec)
 
 
+def _write_memory_sample(st: "State") -> None:
+    """Write one `memory.ndjson` sample line. Best-effort: exceptions are
+    swallowed so a failed write (disk full, run_dir gone) never propagates
+    to the caller."""
+    try:
+        out = st.run_dir / "memory.ndjson"
+        sample = _collect_memory_sample(st)
+        with out.open("a", buffering=1) as f:
+            f.write(json.dumps(sample, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
 async def _memory_sampler(st: "State",
                           interval_sec: float = 30.0) -> None:
     """Periodic orchestrator-memory sample for leak detection.
@@ -17791,13 +17804,7 @@ async def _memory_sampler(st: "State",
     # Re-resolve `st.run_dir` every tick — defensive against any future
     # mutation of st.run_dir.
     while True:
-        try:
-            out = st.run_dir / "memory.ndjson"
-            sample = _collect_memory_sample(st)
-            with out.open("a", buffering=1) as f:
-                f.write(json.dumps(sample, separators=(",", ":")) + "\n")
-        except Exception:
-            pass
+        _write_memory_sample(st)
         try:
             await asyncio.sleep(interval_sec)
         except asyncio.CancelledError:
@@ -17805,13 +17812,7 @@ async def _memory_sampler(st: "State",
             # last-moment state. Best-effort: if the write fails (disk
             # full, run_dir gone), the existing samples on disk are
             # still useful; don't mask the CancelledError.
-            try:
-                out = st.run_dir / "memory.ndjson"
-                sample = _collect_memory_sample(st)
-                with out.open("a", buffering=1) as f:
-                    f.write(json.dumps(sample, separators=(",", ":")) + "\n")
-            except Exception:
-                pass
+            _write_memory_sample(st)
             raise
 
 
