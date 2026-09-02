@@ -559,8 +559,11 @@ ulimit -c 0
 # $CGROUP_ROOT/leerie.slice …
 # Launch the cgroup broker before the privilege drop (worker cgroup
 # enrollment/limit-setting can't be done by the dropped-privilege
-# orchestrator), telling it which root to operate under:
-LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py &
+# orchestrator), telling it which root to operate under. Stdio is
+# redirected away from PID 1's inherited fds so the broker can't hold
+# the container's output pipe open past PID 1's own exit:
+LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py \
+  </dev/null >>/tmp/cgroup-broker.log 2>&1 &
 cd /work
 # … /work ownership fix (Fly volume-attach path) …
 # … /tmp/.cache ownership fix (Fly rootfs preserves root-owned mise cache) …
