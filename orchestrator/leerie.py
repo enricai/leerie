@@ -21821,9 +21821,10 @@ def _merge_subtask_core_fields(
     """Mutate `into_s` in place with the union of `into_s`/`from_s`'s
     `provides`, `requires`, and `depends_on` — shared by
     `_apply_reconciler_output`'s `merged_subtasks` handling and
-    `_apply_overlap_merge`. `title`/`intent`/`success_criteria_seed`/
-    `files_likely_touched` merges are NOT identical between the two call
-    sites and stay local to each."""
+    `_apply_overlap_merge`. `title`/`intent`/`success_criteria_seed`
+    merges are NOT identical between the two call sites and stay local
+    to each; `files_likely_touched` is identical and lives in
+    `_merge_files_likely_touched` instead."""
     # provides: union, dedup, order-preserving.
     merged_provides = list(into_s.get("provides", []) or [])
     for tag in (from_s.get("provides") or []):
@@ -21861,6 +21862,18 @@ def _merge_subtask_core_fields(
         if dep not in merged_deps:
             merged_deps.append(dep)
     into_s["depends_on"] = merged_deps
+
+
+def _merge_files_likely_touched(into_s: dict, from_s: dict) -> None:
+    """Mutate `into_s` in place with the union of `into_s`/`from_s`'s
+    `files_likely_touched` — order-preserving dedup, shared by
+    `_apply_reconciler_output` and `_apply_overlap_merge`."""
+    merged_files: list[str] = []
+    for f in (list(into_s.get("files_likely_touched", []) or [])
+              + list(from_s.get("files_likely_touched", []) or [])):
+        if f not in merged_files:
+            merged_files.append(f)
+    into_s["files_likely_touched"] = merged_files
 
 
 def _apply_reconciler_output(
@@ -22154,14 +22167,7 @@ def _apply_reconciler_output(
         from_s = by_id[from_id]
 
         _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
-
-        # files_likely_touched: union, order-preserving dedup.
-        merged_files: list[str] = []
-        for f in (list(into_s.get("files_likely_touched", []) or [])
-                  + list(from_s.get("files_likely_touched", []) or [])):
-            if f not in merged_files:
-                merged_files.append(f)
-        into_s["files_likely_touched"] = merged_files
+        _merge_files_likely_touched(into_s, from_s)
 
         # success_criteria_seed: optional override; default to
         # concatenation so both halves' criteria survive into the
@@ -24595,14 +24601,7 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
         into_s["success_criteria_seed"] = from_scs
 
     _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
-
-    # files_likely_touched: union, order-preserving dedup.
-    merged_files: list[str] = []
-    for f in (list(into_s.get("files_likely_touched", []) or [])
-              + list(from_s.get("files_likely_touched", []) or [])):
-        if f not in merged_files:
-            merged_files.append(f)
-    into_s["files_likely_touched"] = merged_files
+    _merge_files_likely_touched(into_s, from_s)
 
     # _merged_from telemetry — append so a chain of merges is traceable.
     merged_from = into_s.setdefault("_merged_from", [])
