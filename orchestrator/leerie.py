@@ -19962,6 +19962,13 @@ def _repo_has_version_signal(repo_root: Path,
     return False
 
 
+# `mise ls --current --json` is a metadata read against the already-
+# installed toolchain (the slow part, `mise install`, already ran above
+# with its own timeout) — 30s is generous headroom over any observed
+# real-world runtime while still bounding the wait.
+MISE_LS_TIMEOUT = 30
+
+
 async def _run_mise_install(repo_root: Path, log_dir: Path,
                             st: "State",
                             override_file: Path | None = None) -> None:
@@ -20026,25 +20033,32 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
 
     # Capture resolved versions. `mise ls --current --json` is the
     # documented machine-readable view; `mise current --json` does NOT
-    # exist (verified against mise.usage.kdl).
-    proc = await asyncio.create_subprocess_exec(
-        "mise", "ls", "--current", "--json",
-        cwd=str(repo_root),
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        start_new_session=True,
-    )
-    stdout, stderr = await proc.communicate()
-    if proc.returncode != 0:
+    # exist (verified against mise.usage.kdl). Bounded via `run_proc` —
+    # an unbounded `communicate()` here would hang provisioning forever
+    # if the mise-managed shim ever blocked (the same unguarded-
+    # communicate() shape fixed for `mise install` above).
+    try:
+        result = await run_proc(
+            ["mise", "ls", "--current", "--json"],
+            cwd=str(repo_root),
+            env=env,
+            timeout=MISE_LS_TIMEOUT,
+        )
+    except subprocess.TimeoutExpired:
         # Not fatal — workers run their own install commands via prompt
         # injection (DESIGN §6½ "Worker-driven install"); they don't
         # need the resolved-versions blob to do so. Log and move on.
-        log(f"mise ls --current --json failed (exit {proc.returncode}); "
+        log("mise ls --current --json timed out; skipping version capture")
+        return
+    if result.returncode != 0:
+        # Not fatal — workers run their own install commands via prompt
+        # injection (DESIGN §6½ "Worker-driven install"); they don't
+        # need the resolved-versions blob to do so. Log and move on.
+        log(f"mise ls --current --json failed (exit {result.returncode}); "
             "skipping version capture")
         return
     try:
-        versions = json.loads(stdout.decode(errors="replace") if stdout else "{}")
+        versions = json.loads(result.stdout if result.stdout else "{}")
     except (ValueError, TypeError):
         versions = {}
     prov = st.data.setdefault("provision", {})
