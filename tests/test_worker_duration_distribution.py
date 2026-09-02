@@ -419,12 +419,18 @@ class TestOverrideReachesEveryConsumer:
         pins them (rebaser 1371s, dep_capture 600s) with no way up. All three
         already call resolve_models/resolve_efforts for the same reason."""
         import inspect
+        seam_src = inspect.getsource(leerie._resolve_host_seam_settings)
         for fn in (leerie.run_rebaser, leerie.run_recapture_deps,
                    leerie._replay_capture):
             src = inspect.getsource(fn)
-            assert "resolve_worker_timeout_sec(" in src, (
+            # run_rebaser/run_recapture_deps delegate the resolution to the
+            # shared _resolve_host_seam_settings helper rather than inlining
+            # it, so check whichever source actually contains the call.
+            combined = src if "_resolve_host_seam_settings(" not in src \
+                else src + seam_src
+            assert "resolve_worker_timeout_sec(" in combined, (
                 f"{fn.__name__} never resolves the global worker timeout, so "
                 "LEERIE_WORKER_TIMEOUT and leerie.toml are inert there")
-            assert "worker_timeout_explicit" in src, (
+            assert "worker_timeout_explicit" in combined, (
                 f"{fn.__name__} resolves the value but not its explicitness, "
                 "so an explicit default is a silent no-op there")
