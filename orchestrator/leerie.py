@@ -5104,10 +5104,15 @@ def _list_runs(
     _render_run_table(rows)
 
 
-def _iter_ndjson_records(path: Path) -> Iterator[dict]:
+def _iter_ndjson_records(
+    path: Path, on_malformed: Callable[[str], None] | None = None
+) -> Iterator[dict]:
     """Yield each parsed JSON object from an NDJSON file, stripping
-    whitespace, skipping blank lines, and silently skipping lines that
-    fail to parse as JSON."""
+    whitespace, skipping blank lines, and skipping lines that fail to
+    parse as JSON. `on_malformed`, if given, is called with the raw
+    (stripped) line for each line skipped due to a parse failure —
+    callers that want to log the skip pass a callback; callers that
+    want silent skipping (the previous heal-phase behavior) omit it."""
     for line in path.read_text().splitlines():
         line = line.strip()
         if not line:
@@ -5115,6 +5120,8 @@ def _iter_ndjson_records(path: Path) -> Iterator[dict]:
         try:
             rec = json.loads(line)
         except json.JSONDecodeError:
+            if on_malformed is not None:
+                on_malformed(line)
             continue
         if not isinstance(rec, dict):
             continue
@@ -18898,7 +18905,12 @@ async def phase_judge(run_dir: Path, judge_out_dir: Path,
         return {"judged": 0, "index": []}
 
     records: list[dict] = []
-    for rec in _iter_ndjson_records(capture_path):
+    for rec in _iter_ndjson_records(
+        capture_path,
+        on_malformed=lambda line: log(
+            f"  phase_judge: skipping malformed NDJSON line: {line[:80]!r}"
+        ),
+    ):
         if judge_call_types and rec.get("call_type") not in judge_call_types:
             continue
         records.append(rec)
