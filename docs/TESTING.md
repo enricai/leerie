@@ -3507,6 +3507,24 @@ under a fixed wall-clock ceiling -- proving a lingering fd-holder can't
 block the harness because `_run_log` redirects to a plain file, not a
 pipe.
 
+## Interactive (`-it`, `script`(1)-teed) exit path: wall-clock hang bound
+
+`tests/test_interactive_script_hang_bound.py` closes the same class of gap
+against the interactive branch (leerie:8877-8886, the non-Darwin
+`script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target"` block) that
+`tests/test_decoupled_streaming_hang_bound.py` closed for `_run_log`.
+DESIGN.md:2613-2614 asserts the interactive path "has a real pty and thus
+no hang," but `test_log_file_wiring.py`'s existing interactive coverage
+(`test_interactive_tty_path_is_teed_via_script` et al.) only proves the
+teed output is byte-correct with a `nerdctl` stub that writes and returns
+synchronously -- it never puts the `script`(1) pty allocation itself
+under the lingering-background-holder condition DESIGN.md's own hang
+writeup describes. This test's stub backgrounds a detached grandchild
+that inherits the `script`-allocated pty as its stdout and sleeps well
+past the stub's own exit, then asserts the harness still returns under a
+fixed wall-clock ceiling -- putting the pty's claimed hang-proofing under
+the same adversarial load, rather than merely asserting it by argument.
+
 ## Lessons worth keeping
 
 **A handler must survive its own exception, not merely catch it.** `main()`'s
