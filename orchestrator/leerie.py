@@ -8108,6 +8108,27 @@ def _newfile_designation(subtask: dict, first_child_id: str) -> tuple[str, bool]
     return first_child_id, True
 
 
+def _inherited_subtask_fields(subtask: dict) -> dict:
+    """Fields copied verbatim from a parent subtask into every child, shared
+    between `_migration_child` and `_subfile_child`. `requires` is deep-copied
+    (its entries are dicts); the list fields are shallow-copied. See
+    `_migration_child`'s docstring for why copying (not aliasing) matters."""
+    return {
+        "scope_note": subtask.get("scope_note", ""),
+        "depends_on": list(subtask.get("depends_on", []) or []),
+        "requires": copy.deepcopy(subtask.get("requires", []) or []),
+        "provides": list(subtask.get("provides", []) or []),
+        "size": "medium",
+        "investigation_notes": subtask.get("investigation_notes", ""),
+        # Load-bearing for the migration path: `_peel_oversized_file` builds a
+        # migration child for the dense file, and that child re-enters
+        # `_subfile_split`, whose `change_shape` gate reads this field.
+        # Dropping it here routes the dominant dense-file shape (a file
+        # bundled with its test file) straight past the gate.
+        "change_shape": subtask.get("change_shape"),
+    }
+
+
 def _migration_child(subtask: dict, chunk: list[str], cid: str,
                      title: str, criteria: str,
                      newfile_owner_id: str | None = None) -> dict:
@@ -8162,22 +8183,10 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
         "success_criteria_seed": criteria,
         "files_likely_touched": chunk,
         "intent": subtask.get("intent", ""),
-        "scope_note": subtask.get("scope_note", ""),
-        "depends_on": list(subtask.get("depends_on", []) or []),
-        "requires": copy.deepcopy(subtask.get("requires", []) or []),
-        "provides": list(subtask.get("provides", []) or []),
-        "size": "medium",
-        "investigation_notes": subtask.get("investigation_notes", ""),
+        **_inherited_subtask_fields(subtask),
         "migration_targets": copy.deepcopy(
             subtask.get("migration_targets", []) or []),
         "performs_replacement": subtask.get("performs_replacement", False),
-        # Carried forward for the same reason as migration_targets, plus one
-        # load-bearing one: `_peel_oversized_file` builds a migration child for
-        # the dense file, and that child re-enters `_subfile_split`, whose
-        # `change_shape` gate reads this field. Dropping it here routes the
-        # dominant dense-file shape (a file bundled with its test file)
-        # straight past the gate.
-        "change_shape": subtask.get("change_shape"),
         # Structural record of the clause above, so a re-split of this child
         # resolves ownership from a field instead of re-reading its criteria
         # prose (`_newfile_designation`). A non-owner's whole subtree stays
@@ -8278,13 +8287,7 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
                          "symbols": list(symbols)},
         "_cofile_cluster": cluster,
         "intent": intent,
-        "scope_note": subtask.get("scope_note", ""),
-        "depends_on": list(subtask.get("depends_on", []) or []),
-        "requires": copy.deepcopy(subtask.get("requires", []) or []),
-        "provides": list(subtask.get("provides", []) or []),
-        "size": "medium",
-        "investigation_notes": subtask.get("investigation_notes", ""),
-        "change_shape": subtask.get("change_shape"),
+        **_inherited_subtask_fields(subtask),
         # See `_migration_child`'s copy of these two: a re-split resolves
         # ownership from here, never by re-reading the criteria text.
         "_newfile_owner": is_owner,
