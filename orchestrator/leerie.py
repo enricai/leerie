@@ -4700,6 +4700,18 @@ def _discover_runs(leerie_root: Path) -> list[dict]:
 _AUTO_RESUMABLE_STATUSES = ("in-progress", "paused", "incomplete")
 
 
+def _read_run_json_sidecar(sidecar: Path) -> dict | None:
+    """Safe-read a run.json sidecar: None on missing file, non-dict JSON,
+    or (OSError, ValueError) — never raises."""
+    if not sidecar.is_file():
+        return None
+    try:
+        parsed = json.loads(sidecar.read_text())
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _run_status_for(run: dict, leerie_root: Path) -> str:
     """Derived status for a `_discover_runs` row.
 
@@ -4708,15 +4720,8 @@ def _run_status_for(run: dict, leerie_root: Path) -> str:
     discovery already parsed. Falls back to state.json alone when the
     sidecar is missing or unreadable — status is best-effort UX here, not
     a correctness boundary."""
-    run_json: dict | None = None
     sidecar = leerie_root / "runs" / run["run_id"] / "run.json"
-    if sidecar.is_file():
-        try:
-            parsed = json.loads(sidecar.read_text())
-            if isinstance(parsed, dict):
-                run_json = parsed
-        except (OSError, ValueError):
-            pass
+    run_json = _read_run_json_sidecar(sidecar)
     return _derive_run_status(run_json, run)
 
 
@@ -5018,15 +5023,8 @@ def _collect_run_rows(
     for state in runs:
         run_id = state["run_id"]
         run_dir = leerie_root / "runs" / run_id
-        run_json: dict | None = None
         sidecar = run_dir / "run.json"
-        if sidecar.is_file():
-            try:
-                parsed = json.loads(sidecar.read_text())
-                if isinstance(parsed, dict):
-                    run_json = parsed
-            except (OSError, ValueError):
-                run_json = None
+        run_json = _read_run_json_sidecar(sidecar)
         status = _derive_run_status(run_json, state)
         started_at = state.get("started_at") or "—"
         branch = (run_json or {}).get("branch") or _compute_run_branch(run_id)
@@ -5104,6 +5102,30 @@ def _list_runs(
         print(msg)
         return
     _render_run_table(rows)
+
+
+def _iter_ndjson_records(
+    path: Path, on_malformed: Callable[[str], None] | None = None
+) -> Iterator[dict]:
+    """Yield each parsed JSON object from an NDJSON file, stripping
+    whitespace, skipping blank lines, and skipping lines that fail to
+    parse as JSON. `on_malformed`, if given, is called with the raw
+    (stripped) line for each line skipped due to a parse failure —
+    callers that want to log the skip pass a callback; callers that
+    want silent skipping (the previous heal-phase behavior) omit it."""
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            if on_malformed is not None:
+                on_malformed(line)
+            continue
+        if not isinstance(rec, dict):
+            continue
+        yield rec
 
 
 def _aggregate_calls(calls_path: Path) -> dict[str, dict]:
@@ -6712,6 +6734,26 @@ def _verbosity_from_shortcuts(verbose: int, quiet: int) -> str | None:
     return None
 
 
+def _validated_env(name: str, values: tuple[str, ...]) -> str | None:
+    """Read env var `name`, die() if set but outside `values`."""
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return None
+    if v not in values:
+        die(f"{name}={v!r} is not one of {values}")
+    return v
+
+
+def _validated_toml(cfg: Path, key: str, values: tuple[str, ...]) -> str | None:
+    """Read toml `key` from `cfg`, die() if set but outside `values`."""
+    v = _read_toml_key(cfg, key)
+    if v is None:
+        return None
+    if v not in values:
+        die(f"{cfg}: {key}={v!r} is not one of {values}")
+    return v
+
+
 def resolve_models(repo_root: Path, args) -> dict[str, str]:
     """Resolve the model alias for each worker type. Per-worker
     precedence (highest first):
@@ -6729,20 +6771,10 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
     cfg = repo_root / MODEL_FILE
 
     def from_env(name: str) -> str | None:
-        v = os.environ.get(name, "").strip()
-        if not v:
-            return None
-        if v not in MODEL_VALUES:
-            die(f"{name}={v!r} is not one of {MODEL_VALUES}")
-        return v
+        return _validated_env(name, MODEL_VALUES)
 
     def from_file(key: str) -> str | None:
-        v = _read_toml_key(cfg, key)
-        if v is None:
-            return None
-        if v not in MODEL_VALUES:
-            die(f"{cfg}: {key}={v!r} is not one of {MODEL_VALUES}")
-        return v
+        return _validated_toml(cfg, key, MODEL_VALUES)
 
     global_cli = getattr(args, "model", None)
     global_env = from_env(MODEL_ENV)
@@ -6814,20 +6846,10 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
     cfg = repo_root / MODEL_FILE
 
     def from_env(name: str) -> str | None:
-        v = os.environ.get(name, "").strip()
-        if not v:
-            return None
-        if v not in EFFORT_VALUES:
-            die(f"{name}={v!r} is not one of {EFFORT_VALUES}")
-        return v
+        return _validated_env(name, EFFORT_VALUES)
 
     def from_file(key: str) -> str | None:
-        v = _read_toml_key(cfg, key)
-        if v is None:
-            return None
-        if v not in EFFORT_VALUES:
-            die(f"{cfg}: {key}={v!r} is not one of {EFFORT_VALUES}")
-        return v
+        return _validated_toml(cfg, key, EFFORT_VALUES)
 
     global_cli = getattr(args, "effort", None)
     global_env = from_env(EFFORT_ENV)
@@ -10986,6 +11008,19 @@ def _warn_cross_planner_file_overlap(plans: list[dict]) -> None:
         log(f"     {f}: {per}")
 
 
+def _flatten_plans_to_subtasks(plans: list[dict]) -> dict[str, dict]:
+    """Flatten a list of planner-output dicts into one dict of subtasks
+    keyed by id, last write wins on a duplicate id (matching every prior
+    inline occurrence of this loop). Skips any subtask missing an id."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+    return subtasks
+
+
 def _warn_provider_subset_subtasks(plans: list[dict]) -> list[str]:
     """Advisory plan-time warning (DESIGN §5): flag a subtask whose ENTIRE
     `files_likely_touched` surface is owned by an ordered predecessor it
@@ -11021,12 +11056,7 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> list[str]:
     flagged here — deliberately, to keep this advisory signal specific and
     low-noise; the mid-run satisfied rescue (DESIGN §8) still catches the
     transitive case at settle time regardless."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
+    subtasks = _flatten_plans_to_subtasks(plans)
     if not subtasks:
         return []
     preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
@@ -11303,12 +11333,7 @@ def _iter_duplicate_provider_pairs(
     Callers differ only in what they do with a found pair (an advisory issue
     string vs. a merge-collision dict), and only the `overlap` tier is
     auto-merged."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
+    subtasks = _flatten_plans_to_subtasks(plans)
 
     providers: dict[str, list[str]] = {}
     for sid, s in subtasks.items():
@@ -11524,12 +11549,7 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
 
     Advisory as shipped — logged, never gating, matching this repo's
     disposition for `check_duplicate_providers` (DESIGN §5)."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
+    subtasks = _flatten_plans_to_subtasks(plans)
 
     def _files(s: dict) -> set[str]:
         return {
@@ -12959,13 +12979,17 @@ async def _backstop_capture_prior_runs(
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
-def run_recapture_deps(
-        leerie_root: Path,
+def _resolve_host_seam_settings(
         repo_root: Path,
-        force: bool = False,
-        run_id: str | None = None,
-) -> None:
-    """Host-side recapture entrypoint (DESIGN §6½) — consolidates dep_capture across runs."""
+) -> tuple[dict, dict, dict]:
+    """Shared host-seam settings resolver for host-side, non-interactive
+    entrypoints (`run_recapture_deps`, `run_rebaser`) that have no argparse
+    Namespace of their own. Returns `(caps, models, efforts)` with
+    `worker_timeout_sec`/`worker_timeout_explicit` applied on `caps`, so env
+    vars and `leerie.toml` are still honoured even though there is no CLI —
+    without this the per-worker table pins these entrypoints at their
+    hardcoded timeouts (rebaser 1371s, dep_capture 600s) with no way to
+    raise it."""
     caps = dict(DEFAULT_CAPS)
 
     # Minimal args namespace so resolve_models/efforts can read env vars and
@@ -12978,13 +13002,20 @@ def run_recapture_deps(
     _args = _MinimalArgs()
     models = resolve_models(repo_root, _args)
     efforts = resolve_efforts(repo_root, _args)
-    # Same reason resolve_models/_efforts are called here: these
-    # entrypoints have no CLI, but env and leerie.toml must still
-    # be honoured. Without this the per-worker table pins them
-    # (rebaser 1371s, dep_capture 600s) with no way to raise it.
     caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
     caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
         repo_root)
+    return caps, models, efforts
+
+
+def run_recapture_deps(
+        leerie_root: Path,
+        repo_root: Path,
+        force: bool = False,
+        run_id: str | None = None,
+) -> None:
+    """Host-side recapture entrypoint (DESIGN §6½) — consolidates dep_capture across runs."""
+    caps, models, efforts = _resolve_host_seam_settings(repo_root)
 
     if run_id is not None:
         target_run_dir = leerie_root / "runs" / run_id
@@ -13131,23 +13162,7 @@ def run_rebaser(
     `{"status": "failed", ...}` result — so the caller's push path is never
     blocked by this being best-effort (DESIGN §6 hard requirement: never
     pause/block finalize over the rebase)."""
-    caps = dict(DEFAULT_CAPS)
-
-    class _MinimalArgs:
-        model = None
-        pr_writer_model = None
-        effort = None
-
-    _args = _MinimalArgs()
-    models = resolve_models(repo_root, _args)
-    efforts = resolve_efforts(repo_root, _args)
-    # Same reason resolve_models/_efforts are called here: this
-    # entrypoint has no CLI, but env and leerie.toml must still be
-    # honoured. Without it the per-worker table pins the rebaser at
-    # 1371s with no way to raise it.
-    caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
-    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
-        repo_root)
+    caps, models, efforts = _resolve_host_seam_settings(repo_root)
 
     try:
         st = State(leerie_root, run_id, repo_root=repo_root)
@@ -18890,15 +18905,12 @@ async def phase_judge(run_dir: Path, judge_out_dir: Path,
         return {"judged": 0, "index": []}
 
     records: list[dict] = []
-    for line in capture_path.read_text().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            rec = json.loads(line)
-        except json.JSONDecodeError:
-            log(f"  phase_judge: skipping malformed NDJSON line: {line[:80]!r}")
-            continue
+    for rec in _iter_ndjson_records(
+        capture_path,
+        on_malformed=lambda line: log(
+            f"  phase_judge: skipping malformed NDJSON line: {line[:80]!r}"
+        ),
+    ):
         if judge_call_types and rec.get("call_type") not in judge_call_types:
             continue
         records.append(rec)
@@ -22569,10 +22581,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         pre_plans_snapshot = copy.deepcopy(plans)
 
     # Build the post-mutation subtasks dict for the cycle gate.
-    post_subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []):
-            post_subtasks[s["id"]] = s
+    post_subtasks = _flatten_plans_to_subtasks(plans)
     preds, _provs, edge_sources = _build_predecessor_graph(post_subtasks)
     succ: dict[str, set[str]] = {sid: set() for sid in post_subtasks}
     for tgt, src_set in preds.items():
@@ -22632,10 +22641,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         _record_conditional_drops(output2)
 
         # Re-run the gate on attempt 2's output.
-        post2_subtasks: dict[str, dict] = {}
-        for plan in plans:
-            for s in plan.get("subtasks", []):
-                post2_subtasks[s["id"]] = s
+        post2_subtasks = _flatten_plans_to_subtasks(plans)
         preds2, _p2, edge_sources2 = _build_predecessor_graph(post2_subtasks)
         succ2: dict[str, set[str]] = {sid: set() for sid in post2_subtasks}
         for tgt, src_set in preds2.items():
@@ -22792,10 +22798,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         # Re-run the cycle gate on attempt-2's output — the revised
         # output could plausibly introduce a new cycle (e.g., a rename
         # that closes a loop with an existing edge).
-        post3_subtasks: dict[str, dict] = {}
-        for plan in plans:
-            for s in plan.get("subtasks", []):
-                post3_subtasks[s["id"]] = s
+        post3_subtasks = _flatten_plans_to_subtasks(plans)
         preds3, _p3, edge_sources3 = _build_predecessor_graph(post3_subtasks)
         succ3: dict[str, set[str]] = {sid: set() for sid in post3_subtasks}
         for tgt, src_set in preds3.items():
@@ -26327,10 +26330,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # disagreed, which is an orchestrator logic bug, not a user-recoverable
     # task-shape problem. Retained as defense-in-depth against future drift,
     # mirroring `_apply_overlap_merge`'s defensive missing-sid die().
-    post_merge_subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []):
-            post_merge_subtasks[s["id"]] = s
+    post_merge_subtasks = _flatten_plans_to_subtasks(plans)
     pm_preds, _pm_provs, pm_edge_sources = _build_predecessor_graph(
         post_merge_subtasks)
     pm_succ: dict[str, set[str]] = {sid: set() for sid in post_merge_subtasks}
@@ -26591,11 +26591,9 @@ def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
     """Phase 3 (pure Python): merge plans, resolve intra- and cross-domain
     dependencies, topologically sort into waves. Deterministic."""
     log("phase 3: scheduling")
-    subtasks: dict[str, dict] = {}
+    subtasks = _flatten_plans_to_subtasks(plans)
     blocked_domains: list[str] = []
     for plan in plans:
-        for s in plan.get("subtasks", []):
-            subtasks[s["id"]] = s
         if plan.get("status") == "blocked":
             blocked_domains.append(plan.get("domain", "<unknown>"))
     if not subtasks:
@@ -34352,15 +34350,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             capture_path = phase_run_dir / "calls.ndjson"
             all_captures: dict[str, dict] = {}
             if capture_path.exists():
-                for line in capture_path.read_text().splitlines():
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        rec = json.loads(line)
-                        all_captures[rec.get("call_id", "")] = rec
-                    except (ValueError, AttributeError):
-                        pass
+                for rec in _iter_ndjson_records(capture_path):
+                    all_captures[rec.get("call_id", "")] = rec
             for call_type, failing_ids in sorted(failing_by_type.items()):
                 failing_records = [all_captures[cid] for cid in failing_ids
                                    if cid in all_captures]
