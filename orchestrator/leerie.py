@@ -28614,6 +28614,25 @@ def _format_check_feedback(
     return header + body + footer
 
 
+def _compute_blt_feedback(
+    warnings: list[str], regressions: list[str], prefix: str,
+    c_round: int, caps: dict,
+) -> str | None:
+    """Filter this round's BLT warnings, concat with regressions, format.
+
+    Shared by _run_conformance_phase and _run_final_conformance, which
+    differ only in the round-label prefix used to select this round's
+    warnings out of the accumulated list."""
+    bg_retry_warnings = [
+        w for w in warnings
+        if w.startswith(prefix) and _is_blt_feedback_warning(w)]
+    feedback_items = bg_retry_warnings + regressions
+    return (
+        _format_check_feedback(feedback_items, c_round,
+                               caps["conformance_rounds"])
+        if feedback_items else None)
+
+
 # Findings that are ADVICE about a judgement call, not defects that make the
 # output unusable (DESIGN §"Findings carry a severity; only gating findings
 # re-invoke"). Surfaced once as warnings; they never cost a retry round and
@@ -29585,15 +29604,9 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         for r in regressions:
             warnings.append(f"conformer round {c_round}: {r}")
 
-        bg_retry_warnings = [
-            w for w in warnings
-            if w.startswith(f"conformer round {c_round}:")
-            and _is_blt_feedback_warning(w)]
-        feedback_items = bg_retry_warnings + regressions
-        blt_feedback = (
-            _format_check_feedback(feedback_items, c_round,
-                                   caps["conformance_rounds"])
-            if feedback_items else None)
+        blt_feedback = _compute_blt_feedback(
+            warnings, regressions, f"conformer round {c_round}:",
+            c_round, caps)
 
         # A regression this round introduced is the one build/lint/test
         # signal worth another round: unlike an absolute red axis it is
@@ -30383,15 +30396,9 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         for r in regressions:
             warnings.append(f"final conformer round {c_round}: {r}")
 
-        bg_retry_warnings = [
-            w for w in warnings
-            if w.startswith(f"final conformer round {c_round}:")
-            and _is_blt_feedback_warning(w)]
-        feedback_items = bg_retry_warnings + regressions
-        blt_feedback = (
-            _format_check_feedback(feedback_items, c_round,
-                                   caps["conformance_rounds"])
-            if feedback_items else None)
+        blt_feedback = _compute_blt_feedback(
+            warnings, regressions, f"final conformer round {c_round}:",
+            c_round, caps)
 
         if _conformance_clean(res, baseline) and not regressions:
             break
