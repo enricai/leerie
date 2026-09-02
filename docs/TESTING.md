@@ -414,6 +414,23 @@ calls `_mark_reapable` (the fix is inert without the wiring), and
 guards that `main()` calls `_become_subreaper()` and `_orchestrate()`
 spawns+cancels `_zombie_reaper`.
 
+`_orchestrate()`'s own `finally` block (leerie:32599-32660 — cancels
+`sampler_task`/`reaper_task` and, when `force_strict_output` is set, stops
+`_StrictOutputProxy`) is bounded end-to-end in
+`tests/test_orchestrate_cleanup_bound.py`: `_memory_sampler`/`_zombie_reaper`
+are replaced with a `while True: await asyncio.sleep(9999)` double so only
+prompt cancellation (not a short default `interval_sec`) lets
+`asyncio.run(_orchestrate(...))` return, across all 4 combinations of
+`_run_phases` returning normally vs. raising `WorkerError`, and plain vs.
+`force_strict_output=True` (which additionally asserts `_STRICT_PROXY` is
+cleared). The wall-clock ceiling is backstopped by a `SIGALRM`-based hard
+timeout rather than `asyncio.wait_for`, since `wait_for`'s own cancellation
+lands inside the same `contextlib.suppress(asyncio.CancelledError)` the
+regression class already defeats and would hang right along with it. An
+`entered` list asserts each double actually reached its sleep before being
+cancelled, so a double cancelled pre-schedule can't pass the test
+vacuously.
+
 ## PENDING_ISSUES.md follow-up surfaces
 
 Three further surfaces arrived with the `PENDING_ISSUES.md` work order,
