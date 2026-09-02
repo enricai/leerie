@@ -34,6 +34,11 @@ set -euo pipefail
 # masking the cleanup as a no-op and leaving worktrees behind.
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 
+# 240s calibration mirrors _cleanup_on_abnormal_exit (leerie.py:3896-3920).
+# Override is test-only, to exercise the timeout-fires path without a
+# real multi-minute wait.
+WORKTREE_REMOVE_TIMEOUT="${CLEANUP_SH_TEST_WORKTREE_REMOVE_TIMEOUT:-240}"
+
 # --- helpers -------------------------------------------------------------
 
 clean_one_run() {
@@ -56,7 +61,13 @@ clean_one_run() {
   if [ -d "${run_dir}/worktrees" ]; then
     for d in "${run_dir}/worktrees"/*/; do
       [ -d "$d" ] || continue
-      git worktree remove --force "$d" 2>/dev/null || true
+      # 240s timeout mirrors the calibrated bound on the abnormal-exit
+      # Python path (_cleanup_on_abnormal_exit, leerie.py:3896-3920): a
+      # 868MB/41k-file worktree takes ~45-90s uncontested and several-fold
+      # more under N-way concurrent wave cleanup, but a genuinely hung
+      # `git worktree remove` (stale mount, held index.lock, disk
+      # contention) must not block the whole orchestrator forever.
+      timeout "$WORKTREE_REMOVE_TIMEOUT" git worktree remove --force "$d" 2>/dev/null || true
       # Fall back to rm -rf when `git worktree remove` administratively
       # succeeded but left the directory behind (timeout mid-rmtree) or
       # when git no longer tracks the worktree (already pruned) and so
