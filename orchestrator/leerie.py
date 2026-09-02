@@ -4700,6 +4700,18 @@ def _discover_runs(leerie_root: Path) -> list[dict]:
 _AUTO_RESUMABLE_STATUSES = ("in-progress", "paused", "incomplete")
 
 
+def _read_run_json_sidecar(sidecar: Path) -> dict | None:
+    """Safe-read a run.json sidecar: None on missing file, non-dict JSON,
+    or (OSError, ValueError) — never raises."""
+    if not sidecar.is_file():
+        return None
+    try:
+        parsed = json.loads(sidecar.read_text())
+    except (OSError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _run_status_for(run: dict, leerie_root: Path) -> str:
     """Derived status for a `_discover_runs` row.
 
@@ -4708,15 +4720,8 @@ def _run_status_for(run: dict, leerie_root: Path) -> str:
     discovery already parsed. Falls back to state.json alone when the
     sidecar is missing or unreadable — status is best-effort UX here, not
     a correctness boundary."""
-    run_json: dict | None = None
     sidecar = leerie_root / "runs" / run["run_id"] / "run.json"
-    if sidecar.is_file():
-        try:
-            parsed = json.loads(sidecar.read_text())
-            if isinstance(parsed, dict):
-                run_json = parsed
-        except (OSError, ValueError):
-            pass
+    run_json = _read_run_json_sidecar(sidecar)
     return _derive_run_status(run_json, run)
 
 
@@ -5018,15 +5023,8 @@ def _collect_run_rows(
     for state in runs:
         run_id = state["run_id"]
         run_dir = leerie_root / "runs" / run_id
-        run_json: dict | None = None
         sidecar = run_dir / "run.json"
-        if sidecar.is_file():
-            try:
-                parsed = json.loads(sidecar.read_text())
-                if isinstance(parsed, dict):
-                    run_json = parsed
-            except (OSError, ValueError):
-                run_json = None
+        run_json = _read_run_json_sidecar(sidecar)
         status = _derive_run_status(run_json, state)
         started_at = state.get("started_at") or "—"
         branch = (run_json or {}).get("branch") or _compute_run_branch(run_id)
