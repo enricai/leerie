@@ -31901,6 +31901,11 @@ PR_WRITER_DIFF_SAMPLE_MAX_LINES = 500
 # an LLM-context budget alongside the other PR_WRITER_* caps above, not
 # an argv-size constraint.
 PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES = 8_000
+# Ceiling for each `_git` plumbing call inside `_compose_pr_via_llm`. Without
+# this, a stalled/lock-contended git process (the shared bind-mounted .git
+# across concurrent worktree operations, e.g.) blocks `proc.communicate()`
+# forever, hanging phase_finalize on every normal run that pushes a PR.
+PR_WRITER_GIT_TIMEOUT_SEC = 30
 
 
 def _cap_text(s: str, max_bytes: int, label: str) -> tuple[str, bool]:
@@ -32179,7 +32184,12 @@ async def _compose_pr_via_llm(st: "State",
                 stderr=asyncio.subprocess.PIPE,
                 start_new_session=True,
             )
-            out, _err = await proc.communicate()
+            try:
+                out, _err = await asyncio.wait_for(
+                    proc.communicate(), timeout=PR_WRITER_GIT_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                await _terminate_proc_tree(proc)
+                raise
             return out.decode("utf-8", errors="replace")
 
         commit_log_raw = await _git([
