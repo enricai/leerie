@@ -6734,6 +6734,26 @@ def _verbosity_from_shortcuts(verbose: int, quiet: int) -> str | None:
     return None
 
 
+def _validated_env(name: str, values: tuple[str, ...]) -> str | None:
+    """Read env var `name`, die() if set but outside `values`."""
+    v = os.environ.get(name, "").strip()
+    if not v:
+        return None
+    if v not in values:
+        die(f"{name}={v!r} is not one of {values}")
+    return v
+
+
+def _validated_toml(cfg: Path, key: str, values: tuple[str, ...]) -> str | None:
+    """Read toml `key` from `cfg`, die() if set but outside `values`."""
+    v = _read_toml_key(cfg, key)
+    if v is None:
+        return None
+    if v not in values:
+        die(f"{cfg}: {key}={v!r} is not one of {values}")
+    return v
+
+
 def resolve_models(repo_root: Path, args) -> dict[str, str]:
     """Resolve the model alias for each worker type. Per-worker
     precedence (highest first):
@@ -6751,20 +6771,10 @@ def resolve_models(repo_root: Path, args) -> dict[str, str]:
     cfg = repo_root / MODEL_FILE
 
     def from_env(name: str) -> str | None:
-        v = os.environ.get(name, "").strip()
-        if not v:
-            return None
-        if v not in MODEL_VALUES:
-            die(f"{name}={v!r} is not one of {MODEL_VALUES}")
-        return v
+        return _validated_env(name, MODEL_VALUES)
 
     def from_file(key: str) -> str | None:
-        v = _read_toml_key(cfg, key)
-        if v is None:
-            return None
-        if v not in MODEL_VALUES:
-            die(f"{cfg}: {key}={v!r} is not one of {MODEL_VALUES}")
-        return v
+        return _validated_toml(cfg, key, MODEL_VALUES)
 
     global_cli = getattr(args, "model", None)
     global_env = from_env(MODEL_ENV)
@@ -6836,20 +6846,10 @@ def resolve_efforts(repo_root: Path, args) -> dict[str, str | None]:
     cfg = repo_root / MODEL_FILE
 
     def from_env(name: str) -> str | None:
-        v = os.environ.get(name, "").strip()
-        if not v:
-            return None
-        if v not in EFFORT_VALUES:
-            die(f"{name}={v!r} is not one of {EFFORT_VALUES}")
-        return v
+        return _validated_env(name, EFFORT_VALUES)
 
     def from_file(key: str) -> str | None:
-        v = _read_toml_key(cfg, key)
-        if v is None:
-            return None
-        if v not in EFFORT_VALUES:
-            die(f"{cfg}: {key}={v!r} is not one of {EFFORT_VALUES}")
-        return v
+        return _validated_toml(cfg, key, EFFORT_VALUES)
 
     global_cli = getattr(args, "effort", None)
     global_env = from_env(EFFORT_ENV)
