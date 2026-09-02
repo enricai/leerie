@@ -10986,6 +10986,19 @@ def _warn_cross_planner_file_overlap(plans: list[dict]) -> None:
         log(f"     {f}: {per}")
 
 
+def _flatten_plans_to_subtasks(plans: list[dict]) -> dict[str, dict]:
+    """Flatten a list of planner-output dicts into one dict of subtasks
+    keyed by id, last write wins on a duplicate id (matching every prior
+    inline occurrence of this loop). Skips any subtask missing an id."""
+    subtasks: dict[str, dict] = {}
+    for plan in plans:
+        for s in plan.get("subtasks", []) or []:
+            sid = s.get("id")
+            if sid:
+                subtasks[sid] = s
+    return subtasks
+
+
 def _warn_provider_subset_subtasks(plans: list[dict]) -> list[str]:
     """Advisory plan-time warning (DESIGN §5): flag a subtask whose ENTIRE
     `files_likely_touched` surface is owned by an ordered predecessor it
@@ -11021,12 +11034,7 @@ def _warn_provider_subset_subtasks(plans: list[dict]) -> list[str]:
     flagged here — deliberately, to keep this advisory signal specific and
     low-noise; the mid-run satisfied rescue (DESIGN §8) still catches the
     transitive case at settle time regardless."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
+    subtasks = _flatten_plans_to_subtasks(plans)
     if not subtasks:
         return []
     preds, _providers, _edge_sources = _build_predecessor_graph(subtasks)
@@ -11303,12 +11311,7 @@ def _iter_duplicate_provider_pairs(
     Callers differ only in what they do with a found pair (an advisory issue
     string vs. a merge-collision dict), and only the `overlap` tier is
     auto-merged."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
+    subtasks = _flatten_plans_to_subtasks(plans)
 
     providers: dict[str, list[str]] = {}
     for sid, s in subtasks.items():
@@ -11524,12 +11527,7 @@ def check_test_ownership_overlap(plans: list[dict]) -> list[str]:
 
     Advisory as shipped — logged, never gating, matching this repo's
     disposition for `check_duplicate_providers` (DESIGN §5)."""
-    subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []) or []:
-            sid = s.get("id")
-            if sid:
-                subtasks[sid] = s
+    subtasks = _flatten_plans_to_subtasks(plans)
 
     def _files(s: dict) -> set[str]:
         return {
@@ -22569,10 +22567,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         pre_plans_snapshot = copy.deepcopy(plans)
 
     # Build the post-mutation subtasks dict for the cycle gate.
-    post_subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []):
-            post_subtasks[s["id"]] = s
+    post_subtasks = _flatten_plans_to_subtasks(plans)
     preds, _provs, edge_sources = _build_predecessor_graph(post_subtasks)
     succ: dict[str, set[str]] = {sid: set() for sid in post_subtasks}
     for tgt, src_set in preds.items():
@@ -22632,10 +22627,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         _record_conditional_drops(output2)
 
         # Re-run the gate on attempt 2's output.
-        post2_subtasks: dict[str, dict] = {}
-        for plan in plans:
-            for s in plan.get("subtasks", []):
-                post2_subtasks[s["id"]] = s
+        post2_subtasks = _flatten_plans_to_subtasks(plans)
         preds2, _p2, edge_sources2 = _build_predecessor_graph(post2_subtasks)
         succ2: dict[str, set[str]] = {sid: set() for sid in post2_subtasks}
         for tgt, src_set in preds2.items():
@@ -22792,10 +22784,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         # Re-run the cycle gate on attempt-2's output — the revised
         # output could plausibly introduce a new cycle (e.g., a rename
         # that closes a loop with an existing edge).
-        post3_subtasks: dict[str, dict] = {}
-        for plan in plans:
-            for s in plan.get("subtasks", []):
-                post3_subtasks[s["id"]] = s
+        post3_subtasks = _flatten_plans_to_subtasks(plans)
         preds3, _p3, edge_sources3 = _build_predecessor_graph(post3_subtasks)
         succ3: dict[str, set[str]] = {sid: set() for sid in post3_subtasks}
         for tgt, src_set in preds3.items():
@@ -26327,10 +26316,7 @@ async def phase_overlap_judge(plans: list[dict], task: str, st: State,
     # disagreed, which is an orchestrator logic bug, not a user-recoverable
     # task-shape problem. Retained as defense-in-depth against future drift,
     # mirroring `_apply_overlap_merge`'s defensive missing-sid die().
-    post_merge_subtasks: dict[str, dict] = {}
-    for plan in plans:
-        for s in plan.get("subtasks", []):
-            post_merge_subtasks[s["id"]] = s
+    post_merge_subtasks = _flatten_plans_to_subtasks(plans)
     pm_preds, _pm_provs, pm_edge_sources = _build_predecessor_graph(
         post_merge_subtasks)
     pm_succ: dict[str, set[str]] = {sid: set() for sid in post_merge_subtasks}
@@ -26591,11 +26577,9 @@ def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
     """Phase 3 (pure Python): merge plans, resolve intra- and cross-domain
     dependencies, topologically sort into waves. Deterministic."""
     log("phase 3: scheduling")
-    subtasks: dict[str, dict] = {}
+    subtasks = _flatten_plans_to_subtasks(plans)
     blocked_domains: list[str] = []
     for plan in plans:
-        for s in plan.get("subtasks", []):
-            subtasks[s["id"]] = s
         if plan.get("status") == "blocked":
             blocked_domains.append(plan.get("domain", "<unknown>"))
     if not subtasks:
