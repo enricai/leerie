@@ -76,4 +76,6 @@ def test_mise_ls_hang_does_not_block_forever(leerie, tmp_path, monkeypatch):
 
     assert elapsed < 5, f"provisioning blocked for {elapsed}s on a hung mise ls"
     assert any("skipping version capture" in m for m in logged)
-    assert st.data["provision"]["mise_versions"] == {}
+    # The skip-on-timeout path returns before setting `mise_versions` —
+    # same shape as the existing non-zero-exit skip a few lines below it.
+    assert "mise_versions" not in st.data.get("provision", {})
