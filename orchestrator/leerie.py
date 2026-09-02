@@ -26501,6 +26501,17 @@ def _detect_no_work(plans: list[dict]) -> dict[str, str] | None:
     return out
 
 
+def _log_run_weight(tel: dict | None, st: State) -> None:
+    """Log the 'run weight' cost summary line, shared by the no-work and
+    normal finalize paths so both report cost identically."""
+    if tel:
+        log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
+            f"${tel.get('cost_usd', 0.0):,.2f}, "
+            f"{tel.get('input_tokens', 0):,} in / "
+            f"{tel.get('output_tokens', 0):,} out tokens "
+            f"(see {_operator_path(st.path)})")
+
+
 def _finish_no_work_run(st: State, no_work_map: dict[str, str],
                         headline: str | None = None,
                         reset_plan_state: bool = True) -> None:
@@ -26579,13 +26590,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     # Surface what the run cost — the classifier + one planner per
     # category still ran. Same shape as phase_finalize's run-weight
     # line so the no-work and normal paths report cost identically.
-    tel = st.data.get("telemetry")
-    if tel:
-        log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
-            f"${tel.get('cost_usd', 0.0):,.2f}, "
-            f"{tel.get('input_tokens', 0):,} in / "
-            f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {_operator_path(st.path)})")
+    _log_run_weight(st.data.get("telemetry"), st)
 
 
 def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
@@ -32494,12 +32499,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             f"symptom could not reproduce it, "
             f"so the finding may already "
             f"have been fixed: {', '.join(_stale)}")
-    if tel:
-        log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
-            f"${tel.get('cost_usd', 0.0):,.2f}, "
-            f"{tel.get('input_tokens', 0):,} in / "
-            f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {_operator_path(st.path)})")
+    _log_run_weight(tel, st)
 
 
 # =========================================================================
