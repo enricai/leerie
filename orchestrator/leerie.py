@@ -8108,6 +8108,27 @@ def _newfile_designation(subtask: dict, first_child_id: str) -> tuple[str, bool]
     return first_child_id, True
 
 
+def _inherited_subtask_fields(subtask: dict) -> dict:
+    """Fields copied verbatim from a parent subtask into every child, shared
+    between `_migration_child` and `_subfile_child`. `requires` is deep-copied
+    (its entries are dicts); the list fields are shallow-copied. See
+    `_migration_child`'s docstring for why copying (not aliasing) matters."""
+    return {
+        "scope_note": subtask.get("scope_note", ""),
+        "depends_on": list(subtask.get("depends_on", []) or []),
+        "requires": copy.deepcopy(subtask.get("requires", []) or []),
+        "provides": list(subtask.get("provides", []) or []),
+        "size": "medium",
+        "investigation_notes": subtask.get("investigation_notes", ""),
+        # Load-bearing for the migration path: `_peel_oversized_file` builds a
+        # migration child for the dense file, and that child re-enters
+        # `_subfile_split`, whose `change_shape` gate reads this field.
+        # Dropping it here routes the dominant dense-file shape (a file
+        # bundled with its test file) straight past the gate.
+        "change_shape": subtask.get("change_shape"),
+    }
+
+
 def _migration_child(subtask: dict, chunk: list[str], cid: str,
                      title: str, criteria: str,
                      newfile_owner_id: str | None = None) -> dict:
@@ -8162,22 +8183,10 @@ def _migration_child(subtask: dict, chunk: list[str], cid: str,
         "success_criteria_seed": criteria,
         "files_likely_touched": chunk,
         "intent": subtask.get("intent", ""),
-        "scope_note": subtask.get("scope_note", ""),
-        "depends_on": list(subtask.get("depends_on", []) or []),
-        "requires": copy.deepcopy(subtask.get("requires", []) or []),
-        "provides": list(subtask.get("provides", []) or []),
-        "size": "medium",
-        "investigation_notes": subtask.get("investigation_notes", ""),
+        **_inherited_subtask_fields(subtask),
         "migration_targets": copy.deepcopy(
             subtask.get("migration_targets", []) or []),
         "performs_replacement": subtask.get("performs_replacement", False),
-        # Carried forward for the same reason as migration_targets, plus one
-        # load-bearing one: `_peel_oversized_file` builds a migration child for
-        # the dense file, and that child re-enters `_subfile_split`, whose
-        # `change_shape` gate reads this field. Dropping it here routes the
-        # dominant dense-file shape (a file bundled with its test file)
-        # straight past the gate.
-        "change_shape": subtask.get("change_shape"),
         # Structural record of the clause above, so a re-split of this child
         # resolves ownership from a field instead of re-reading its criteria
         # prose (`_newfile_designation`). A non-owner's whole subtree stays
@@ -8278,18 +8287,36 @@ def _subfile_child(subtask: dict, file: str, region: tuple[int, int],
                          "symbols": list(symbols)},
         "_cofile_cluster": cluster,
         "intent": intent,
-        "scope_note": subtask.get("scope_note", ""),
-        "depends_on": list(subtask.get("depends_on", []) or []),
-        "requires": copy.deepcopy(subtask.get("requires", []) or []),
-        "provides": list(subtask.get("provides", []) or []),
-        "size": "medium",
-        "investigation_notes": subtask.get("investigation_notes", ""),
-        "change_shape": subtask.get("change_shape"),
+        **_inherited_subtask_fields(subtask),
         # See `_migration_child`'s copy of these two: a re-split resolves
         # ownership from here, never by re-reading the criteria text.
         "_newfile_owner": is_owner,
         "_newfile_owner_id": newfile_owner_id,
     }
+
+
+async def _call_splitter(
+    system_prompt: str, user_prompt: str, sid: str, st: "State", caps: dict,
+    models: dict[str, str], efforts: dict[str, str | None],
+) -> dict:
+    """Shared claude_p() invocation shape for the two splitter call sites in
+    _label_migration_chunks and _recursive_decompose — identical kwargs apart
+    from the prompt content and sid. Each caller keeps its own try/except and
+    result-handling around this call."""
+    return await claude_p(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        schema_key="splitter",
+        cwd=_judgment_cwd(st),
+        allowed_tools=INSPECT_TOOLS,
+        max_turns=30,
+        autonomous=False,
+        caps=caps,
+        st=st,
+        model=models.get("splitter", MODEL_DEFAULT),
+        effort=efforts.get("splitter"),
+        sid=sid,
+    )
 
 
 async def _label_migration_chunks(
@@ -8344,19 +8371,9 @@ async def _label_migration_chunks(
         f"{json.dumps(chunk_spec, indent=2)}"
     )
     try:
-        result = await claude_p(
-            system_prompt=sys_prompt,
-            user_prompt=user_prompt,
-            schema_key="splitter",
-            cwd=_judgment_cwd(st),
-            allowed_tools=INSPECT_TOOLS,
-            max_turns=30,
-            autonomous=False,
-            caps=caps,
-            st=st,
-            model=models.get("splitter", MODEL_DEFAULT),
-            effort=efforts.get("splitter"),
-            sid=f"splitter-label-{base_id}-d{depth}",
+        result = await _call_splitter(
+            sys_prompt, user_prompt, f"splitter-label-{base_id}-d{depth}",
+            st, caps, models, efforts,
         )
         for child in (result.get("children") or []):
             cid = child.get("id")
@@ -8808,19 +8825,10 @@ async def _recursive_decompose(
             "Split this subtask along real structural seams. Return child subtasks."
         )
         try:
-            split_result = await claude_p(
-                system_prompt=sys_prompt_s,
-                user_prompt=user_prompt_s,
-                schema_key="splitter",
-                cwd=_judgment_cwd(st),
-                allowed_tools=INSPECT_TOOLS,
-                max_turns=30,
-                autonomous=False,
-                caps=caps,
-                st=st,
-                model=models.get("splitter", MODEL_DEFAULT),
-                effort=efforts.get("splitter"),
-                sid=f"splitter-{subtask.get('id', 'x')}-d{depth}",
+            split_result = await _call_splitter(
+                sys_prompt_s, user_prompt_s,
+                f"splitter-{subtask.get('id', 'x')}-d{depth}",
+                st, caps, models, efforts,
             )
         except (WorkerError, subprocess.TimeoutExpired):
             # Worker crashed mid-split (auth failure, killed session, PID
@@ -17762,6 +17770,19 @@ async def _zombie_reaper(interval_sec: float = 1.0) -> None:
         await asyncio.sleep(interval_sec)
 
 
+def _write_memory_sample(st: "State") -> None:
+    """Write one `memory.ndjson` sample line. Best-effort: exceptions are
+    swallowed so a failed write (disk full, run_dir gone) never propagates
+    to the caller."""
+    try:
+        out = st.run_dir / "memory.ndjson"
+        sample = _collect_memory_sample(st)
+        with out.open("a", buffering=1) as f:
+            f.write(json.dumps(sample, separators=(",", ":")) + "\n")
+    except Exception:
+        pass
+
+
 async def _memory_sampler(st: "State",
                           interval_sec: float = 30.0) -> None:
     """Periodic orchestrator-memory sample for leak detection.
@@ -17783,13 +17804,7 @@ async def _memory_sampler(st: "State",
     # Re-resolve `st.run_dir` every tick — defensive against any future
     # mutation of st.run_dir.
     while True:
-        try:
-            out = st.run_dir / "memory.ndjson"
-            sample = _collect_memory_sample(st)
-            with out.open("a", buffering=1) as f:
-                f.write(json.dumps(sample, separators=(",", ":")) + "\n")
-        except Exception:
-            pass
+        _write_memory_sample(st)
         try:
             await asyncio.sleep(interval_sec)
         except asyncio.CancelledError:
@@ -17797,13 +17812,7 @@ async def _memory_sampler(st: "State",
             # last-moment state. Best-effort: if the write fails (disk
             # full, run_dir gone), the existing samples on disk are
             # still useful; don't mask the CancelledError.
-            try:
-                out = st.run_dir / "memory.ndjson"
-                sample = _collect_memory_sample(st)
-                with out.open("a", buffering=1) as f:
-                    f.write(json.dumps(sample, separators=(",", ":")) + "\n")
-            except Exception:
-                pass
+            _write_memory_sample(st)
             raise
 
 
@@ -19001,6 +19010,37 @@ class HealState:
         return True
 
 
+async def _replay_and_judge_sample(record: dict, replay_idx: int,
+                                  verdicts_dir: Path, models: dict[str, str],
+                                  efforts: dict[str, str | None], caps: dict,
+                                  st: "State",
+                                  override_system_prompt: str | None = None) -> dict:
+    """Replay one capture, judge the result, and write the verdict file.
+
+    Shared by _heal_baseline and _heal_replay_patched's `_run_one` closures.
+    """
+    try:
+        if override_system_prompt is not None:
+            envelope, _ = await _replay_capture(
+                record, override_system_prompt=override_system_prompt
+            )
+        else:
+            envelope, _ = await _replay_capture(record)
+    except Exception:
+        envelope = {}
+    judge_record = dict(record)
+    judge_record["response_content"] = (
+        envelope.get("result") or record.get("response_content", "")
+    )
+    judge_record["parsed_ok"] = not envelope.get("is_error", True)
+    judge_record["success"] = not envelope.get("is_error", True)
+    verdict = await _judge_capture(judge_record, models, efforts, caps, st)
+    call_id = record["call_id"]
+    verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
+    verdict_path.write_text(json.dumps(verdict, indent=2))
+    return verdict
+
+
 async def _heal_baseline(call_type: str, failing_records: list[dict], n: int,
                         heal_dir: Path, caps: dict, st: "State",
                         models: dict[str, str],
@@ -19027,25 +19067,9 @@ async def _heal_baseline(call_type: str, failing_records: list[dict], n: int,
     async def _run_one(record: dict, replay_idx: int) -> dict:
         """Run one replay+judge pair; return verdict dict."""
         async with sem:
-            call_id = record["call_id"]
-            # Replay with original system prompt (no patch).
-            try:
-                envelope, _ = await _replay_capture(record)
-            except Exception:
-                envelope = {}
-            # Build a synthetic record for the judge using the replayed output.
-            judge_record = dict(record)
-            judge_record["response_content"] = (
-                envelope.get("result") or record.get("response_content", "")
+            return await _replay_and_judge_sample(
+                record, replay_idx, verdicts_dir, models, efforts, caps, st
             )
-            judge_record["parsed_ok"] = not envelope.get("is_error", True)
-            judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await _judge_capture(judge_record, models, efforts, caps, st)
-            # Write verdict file.
-            call_id = record["call_id"]
-            verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
-            verdict_path.write_text(json.dumps(verdict, indent=2))
-            return verdict
 
     # Gather all (record, replay_idx) pairs.
     tasks = []
@@ -19139,23 +19163,10 @@ async def _heal_replay_patched(call_type: str, iter_n: int, n: int,
     async def _run_one(record: dict, replay_idx: int,
                        patched_prompt: str) -> dict:
         async with sem:
-            try:
-                envelope, _ = await _replay_capture(
-                    record, override_system_prompt=patched_prompt
-                )
-            except Exception:
-                envelope = {}
-            judge_record = dict(record)
-            judge_record["response_content"] = (
-                envelope.get("result") or record.get("response_content", "")
+            return await _replay_and_judge_sample(
+                record, replay_idx, verdicts_dir, models, efforts, caps, st,
+                override_system_prompt=patched_prompt,
             )
-            judge_record["parsed_ok"] = not envelope.get("is_error", True)
-            judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await _judge_capture(judge_record, models, efforts, caps, st)
-            call_id = record["call_id"]
-            verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
-            verdict_path.write_text(json.dumps(verdict, indent=2))
-            return verdict
 
     # Build tasks: (record, patched_prompt, replay_idx).
     tasks: list[tuple[dict, str, int]] = []
@@ -21821,9 +21832,10 @@ def _merge_subtask_core_fields(
     """Mutate `into_s` in place with the union of `into_s`/`from_s`'s
     `provides`, `requires`, and `depends_on` — shared by
     `_apply_reconciler_output`'s `merged_subtasks` handling and
-    `_apply_overlap_merge`. `title`/`intent`/`success_criteria_seed`/
-    `files_likely_touched` merges are NOT identical between the two call
-    sites and stay local to each."""
+    `_apply_overlap_merge`. `title`/`intent`/`success_criteria_seed`
+    merges are NOT identical between the two call sites and stay local
+    to each; `files_likely_touched` is identical and lives in
+    `_merge_files_likely_touched` instead."""
     # provides: union, dedup, order-preserving.
     merged_provides = list(into_s.get("provides", []) or [])
     for tag in (from_s.get("provides") or []):
@@ -21861,6 +21873,18 @@ def _merge_subtask_core_fields(
         if dep not in merged_deps:
             merged_deps.append(dep)
     into_s["depends_on"] = merged_deps
+
+
+def _merge_files_likely_touched(into_s: dict, from_s: dict) -> None:
+    """Mutate `into_s` in place with the union of `into_s`/`from_s`'s
+    `files_likely_touched` — order-preserving dedup, shared by
+    `_apply_reconciler_output` and `_apply_overlap_merge`."""
+    merged_files: list[str] = []
+    for f in (list(into_s.get("files_likely_touched", []) or [])
+              + list(from_s.get("files_likely_touched", []) or [])):
+        if f not in merged_files:
+            merged_files.append(f)
+    into_s["files_likely_touched"] = merged_files
 
 
 def _apply_reconciler_output(
@@ -22154,14 +22178,7 @@ def _apply_reconciler_output(
         from_s = by_id[from_id]
 
         _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
-
-        # files_likely_touched: union, order-preserving dedup.
-        merged_files: list[str] = []
-        for f in (list(into_s.get("files_likely_touched", []) or [])
-                  + list(from_s.get("files_likely_touched", []) or [])):
-            if f not in merged_files:
-                merged_files.append(f)
-        into_s["files_likely_touched"] = merged_files
+        _merge_files_likely_touched(into_s, from_s)
 
         # success_criteria_seed: optional override; default to
         # concatenation so both halves' criteria survive into the
@@ -24281,6 +24298,22 @@ def _validate_overlap_judge_output(output: dict, subtasks_by_id: dict[str, dict]
         collisions[:] = coalesced
 
 
+def _rewrite_depends_on_refs(plans: list[dict], dropped_sid: str,
+                             surviving_sid: str) -> None:
+    """Replace `dropped_sid` with `surviving_sid` in every subtask's
+    `depends_on`, dedup, and never let a subtask depend on itself."""
+    for plan in plans:
+        for s in plan.get("subtasks", []):
+            deps = s.get("depends_on") or []
+            if dropped_sid in deps:
+                new_deps: list[str] = []
+                for dep in deps:
+                    dep = surviving_sid if dep == dropped_sid else dep
+                    if dep not in new_deps and dep != s.get("id"):
+                        new_deps.append(dep)
+                s["depends_on"] = new_deps
+
+
 def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
                         surviving_sid: str) -> None:
     """Remove `dropped_sid` from its plan, union its `provides` tags
@@ -24334,16 +24367,7 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
     if dropped is None or surviving is None:
         # Still rewrite depends_on references — they may point at the
         # dropped sid even if the subtask itself is already gone.
-        for plan in plans:
-            for s in plan.get("subtasks", []):
-                deps = s.get("depends_on") or []
-                if dropped_sid in deps:
-                    new_deps: list[str] = []
-                    for dep in deps:
-                        dep = surviving_sid if dep == dropped_sid else dep
-                        if dep not in new_deps and dep != s.get("id"):
-                            new_deps.append(dep)
-                    s["depends_on"] = new_deps
+        _rewrite_depends_on_refs(plans, dropped_sid, surviving_sid)
         # Still remove any stale subtask entry with the dropped id.
         for plan in plans:
             plan["subtasks"] = [
@@ -24378,16 +24402,7 @@ def _apply_overlap_drop(plans: list[dict], dropped_sid: str,
 
     # Rewrite downstream depends_on references and drop the dropped sid
     # from anywhere it appears as a predecessor.
-    for plan in plans:
-        for s in plan.get("subtasks", []):
-            deps = s.get("depends_on") or []
-            if dropped_sid in deps:
-                new_deps: list[str] = []
-                for dep in deps:
-                    dep = surviving_sid if dep == dropped_sid else dep
-                    if dep not in new_deps and dep != s.get("id"):
-                        new_deps.append(dep)
-                s["depends_on"] = new_deps
+    _rewrite_depends_on_refs(plans, dropped_sid, surviving_sid)
 
 
 def _apply_multidrop(plans: list[dict], dropped_sid: str,
@@ -24595,14 +24610,7 @@ def _apply_overlap_merge(plans: list[dict], a_sid: str, b_sid: str,
         into_s["success_criteria_seed"] = from_scs
 
     _merge_subtask_core_fields(into_s, from_s, into_id, from_id)
-
-    # files_likely_touched: union, order-preserving dedup.
-    merged_files: list[str] = []
-    for f in (list(into_s.get("files_likely_touched", []) or [])
-              + list(from_s.get("files_likely_touched", []) or [])):
-        if f not in merged_files:
-            merged_files.append(f)
-    into_s["files_likely_touched"] = merged_files
+    _merge_files_likely_touched(into_s, from_s)
 
     # _merged_from telemetry — append so a chain of merges is traceable.
     merged_from = into_s.setdefault("_merged_from", [])
@@ -26500,6 +26508,17 @@ def _detect_no_work(plans: list[dict]) -> dict[str, str] | None:
     return out
 
 
+def _log_run_weight(tel: dict | None, st: State) -> None:
+    """Log the 'run weight' cost summary line, shared by the no-work and
+    normal finalize paths so both report cost identically."""
+    if tel:
+        log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
+            f"${tel.get('cost_usd', 0.0):,.2f}, "
+            f"{tel.get('input_tokens', 0):,} in / "
+            f"{tel.get('output_tokens', 0):,} out tokens "
+            f"(see {_operator_path(st.path)})")
+
+
 def _finish_no_work_run(st: State, no_work_map: dict[str, str],
                         headline: str | None = None,
                         reset_plan_state: bool = True) -> None:
@@ -26578,13 +26597,7 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     # Surface what the run cost — the classifier + one planner per
     # category still ran. Same shape as phase_finalize's run-weight
     # line so the no-work and normal paths report cost identically.
-    tel = st.data.get("telemetry")
-    if tel:
-        log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
-            f"${tel.get('cost_usd', 0.0):,.2f}, "
-            f"{tel.get('input_tokens', 0):,} in / "
-            f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {_operator_path(st.path)})")
+    _log_run_weight(st.data.get("telemetry"), st)
 
 
 def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
@@ -28608,6 +28621,25 @@ def _format_check_feedback(
     return header + body + footer
 
 
+def _compute_blt_feedback(
+    warnings: list[str], regressions: list[str], prefix: str,
+    c_round: int, caps: dict,
+) -> str | None:
+    """Filter this round's BLT warnings, concat with regressions, format.
+
+    Shared by _run_conformance_phase and _run_final_conformance, which
+    differ only in the round-label prefix used to select this round's
+    warnings out of the accumulated list."""
+    bg_retry_warnings = [
+        w for w in warnings
+        if w.startswith(prefix) and _is_blt_feedback_warning(w)]
+    feedback_items = bg_retry_warnings + regressions
+    return (
+        _format_check_feedback(feedback_items, c_round,
+                               caps["conformance_rounds"])
+        if feedback_items else None)
+
+
 # Findings that are ADVICE about a judgement call, not defects that make the
 # output unusable (DESIGN §"Findings carry a severity; only gating findings
 # re-invoke"). Surfaced once as warnings; they never cost a retry round and
@@ -29579,15 +29611,9 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         for r in regressions:
             warnings.append(f"conformer round {c_round}: {r}")
 
-        bg_retry_warnings = [
-            w for w in warnings
-            if w.startswith(f"conformer round {c_round}:")
-            and _is_blt_feedback_warning(w)]
-        feedback_items = bg_retry_warnings + regressions
-        blt_feedback = (
-            _format_check_feedback(feedback_items, c_round,
-                                   caps["conformance_rounds"])
-            if feedback_items else None)
+        blt_feedback = _compute_blt_feedback(
+            warnings, regressions, f"conformer round {c_round}:",
+            c_round, caps)
 
         # A regression this round introduced is the one build/lint/test
         # signal worth another round: unlike an absolute red axis it is
@@ -30377,15 +30403,9 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         for r in regressions:
             warnings.append(f"final conformer round {c_round}: {r}")
 
-        bg_retry_warnings = [
-            w for w in warnings
-            if w.startswith(f"final conformer round {c_round}:")
-            and _is_blt_feedback_warning(w)]
-        feedback_items = bg_retry_warnings + regressions
-        blt_feedback = (
-            _format_check_feedback(feedback_items, c_round,
-                                   caps["conformance_rounds"])
-            if feedback_items else None)
+        blt_feedback = _compute_blt_feedback(
+            warnings, regressions, f"final conformer round {c_round}:",
+            c_round, caps)
 
         if _conformance_clean(res, baseline) and not regressions:
             break
@@ -32493,12 +32513,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             f"symptom could not reproduce it, "
             f"so the finding may already "
             f"have been fixed: {', '.join(_stale)}")
-    if tel:
-        log(f"run weight: {tel.get('calls', 0)} claude -p calls, "
-            f"${tel.get('cost_usd', 0.0):,.2f}, "
-            f"{tel.get('input_tokens', 0):,} in / "
-            f"{tel.get('output_tokens', 0):,} out tokens "
-            f"(see {_operator_path(st.path)})")
+    _log_run_weight(tel, st)
 
 
 # =========================================================================
