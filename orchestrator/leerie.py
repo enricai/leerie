@@ -19001,6 +19001,37 @@ class HealState:
         return True
 
 
+async def _replay_and_judge_sample(record: dict, replay_idx: int,
+                                  verdicts_dir: Path, models: dict[str, str],
+                                  efforts: dict[str, str | None], caps: dict,
+                                  st: "State",
+                                  override_system_prompt: str | None = None) -> dict:
+    """Replay one capture, judge the result, and write the verdict file.
+
+    Shared by _heal_baseline and _heal_replay_patched's `_run_one` closures.
+    """
+    try:
+        if override_system_prompt is not None:
+            envelope, _ = await _replay_capture(
+                record, override_system_prompt=override_system_prompt
+            )
+        else:
+            envelope, _ = await _replay_capture(record)
+    except Exception:
+        envelope = {}
+    judge_record = dict(record)
+    judge_record["response_content"] = (
+        envelope.get("result") or record.get("response_content", "")
+    )
+    judge_record["parsed_ok"] = not envelope.get("is_error", True)
+    judge_record["success"] = not envelope.get("is_error", True)
+    verdict = await _judge_capture(judge_record, models, efforts, caps, st)
+    call_id = record["call_id"]
+    verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
+    verdict_path.write_text(json.dumps(verdict, indent=2))
+    return verdict
+
+
 async def _heal_baseline(call_type: str, failing_records: list[dict], n: int,
                         heal_dir: Path, caps: dict, st: "State",
                         models: dict[str, str],
@@ -19027,25 +19058,9 @@ async def _heal_baseline(call_type: str, failing_records: list[dict], n: int,
     async def _run_one(record: dict, replay_idx: int) -> dict:
         """Run one replay+judge pair; return verdict dict."""
         async with sem:
-            call_id = record["call_id"]
-            # Replay with original system prompt (no patch).
-            try:
-                envelope, _ = await _replay_capture(record)
-            except Exception:
-                envelope = {}
-            # Build a synthetic record for the judge using the replayed output.
-            judge_record = dict(record)
-            judge_record["response_content"] = (
-                envelope.get("result") or record.get("response_content", "")
+            return await _replay_and_judge_sample(
+                record, replay_idx, verdicts_dir, models, efforts, caps, st
             )
-            judge_record["parsed_ok"] = not envelope.get("is_error", True)
-            judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await _judge_capture(judge_record, models, efforts, caps, st)
-            # Write verdict file.
-            call_id = record["call_id"]
-            verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
-            verdict_path.write_text(json.dumps(verdict, indent=2))
-            return verdict
 
     # Gather all (record, replay_idx) pairs.
     tasks = []
@@ -19139,23 +19154,10 @@ async def _heal_replay_patched(call_type: str, iter_n: int, n: int,
     async def _run_one(record: dict, replay_idx: int,
                        patched_prompt: str) -> dict:
         async with sem:
-            try:
-                envelope, _ = await _replay_capture(
-                    record, override_system_prompt=patched_prompt
-                )
-            except Exception:
-                envelope = {}
-            judge_record = dict(record)
-            judge_record["response_content"] = (
-                envelope.get("result") or record.get("response_content", "")
+            return await _replay_and_judge_sample(
+                record, replay_idx, verdicts_dir, models, efforts, caps, st,
+                override_system_prompt=patched_prompt,
             )
-            judge_record["parsed_ok"] = not envelope.get("is_error", True)
-            judge_record["success"] = not envelope.get("is_error", True)
-            verdict = await _judge_capture(judge_record, models, efforts, caps, st)
-            call_id = record["call_id"]
-            verdict_path = verdicts_dir / f"{call_id}-{replay_idx}.json"
-            verdict_path.write_text(json.dumps(verdict, indent=2))
-            return verdict
 
     # Build tasks: (record, patched_prompt, replay_idx).
     tasks: list[tuple[dict, str, int]] = []
