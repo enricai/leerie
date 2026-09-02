@@ -9,7 +9,7 @@
     {
       "name": "leerie",
       "source": ".",
-      "version": "0.28.0",
+      "version": "0.29.0",
       "description": "Graph-engineered task driver for Claude Code. Classifies a task, decomposes it into a dependency graph of granular subtasks, topo-sorts it into waves, and executes each node in an isolated git worktree under an evidence-gated implement/validate loop. Runs entirely on the Claude Code CLI/subscription via `claude -p` workers. Sonnet-only, saving subscription tokens over an Opus-heavy pipeline."
     }
   ]
