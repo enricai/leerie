@@ -1955,6 +1955,16 @@ Multi-byte UTF-8 safety: `_cap_text` slices at the byte boundary, then
 back-decodes with `errors="ignore"` so the trimmed prefix never ends
 mid-codepoint.
 
+`PR_WRITER_GIT_TIMEOUT_SEC` (30s, module constant) is a distinct kind of
+bound — a wall-clock ceiling, not a byte cap. It wraps the nested `_git`
+helper's `proc.communicate()` inside `_compose_pr_via_llm` in
+`asyncio.wait_for`, so a stalled/lock-contended `git` process (e.g. the
+shared bind-mounted `.git` across concurrent worktree operations) cannot
+hang `phase_finalize` forever. On timeout, `_terminate_proc_tree` reaps
+the stalled process before the exception propagates into
+`_compose_pr_via_llm`'s existing fail-open `except Exception` contract —
+no PR title/body written, launcher's bash fallback takes over.
+
 **`final_conformance` payload field** — when `_run_final_conformance`
 produced a result, `_compose_pr_via_llm` reads
 `st.data["conformance"]["_final"]` and adds a compact
@@ -5441,7 +5451,11 @@ branch, after the `_write_run_json(...)` block and before
    surfaces the failing tool+version to `die()`.
 5. **Version capture.** Runs `mise ls --current --json` (the
    subcommand `mise current --json` does not exist; verified
-   against mise.usage.kdl). Output is object-keyed-by-tool, each
+   against mise.usage.kdl) via `run_proc` bounded by
+   `MISE_LS_TIMEOUT` (30s) — a timeout or non-zero exit is logged and
+   skipped, the same fail-open disposition as any other capture
+   failure, since workers install their own tools via prompt
+   injection regardless. Output is object-keyed-by-tool, each
    value an array of `{version, install_path, source}` objects.
    Raw blob stored at `st.data["provision"]["mise_versions"]`;
    `tools[name][0].version` is the value rendered in `leerie list`

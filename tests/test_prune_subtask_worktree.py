@@ -118,6 +118,56 @@ def test_prune_falls_back_to_rmtree_when_git_leaves_dir_behind(
         "shutil.rmtree fallback")
 
 
+def test_prune_passes_a_bounded_timeout_to_run_proc(leerie, monkeypatch):
+    """`_prune_subtask_worktree` must pass an explicit, non-None timeout to
+    `run_proc` for its `git worktree remove` call -- this call site fires
+    unconditionally after every wave's integrate_wave, so an unbounded
+    `run_proc` (default: no timeout) can hang the orchestrator forever."""
+    captured = {}
+
+    async def fake_run_proc(cmd, **kwargs):
+        captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    async def fake_rmtree_fallback(*args, **kwargs):
+        return None
+    monkeypatch.setattr(leerie, "_rmtree_fallback_and_prune", fake_rmtree_fallback)
+
+    asyncio.run(leerie._prune_subtask_worktree("sid-x", Path("/tmp/does-not-matter")))
+
+    assert captured.get("timeout") is not None, (
+        "_prune_subtask_worktree must pass an explicit, non-None timeout "
+        "to run_proc for the git worktree remove call"
+    )
+    assert captured["timeout"] > 0
+
+
+def test_prune_survives_run_proc_timeout(leerie, tmp_path, monkeypatch):
+    """If `run_proc` raises `subprocess.TimeoutExpired` for the `git
+    worktree remove` call, `_prune_subtask_worktree` must catch it and fall
+    through to the existing rmtree fallback rather than letting the
+    exception propagate and take down the wave."""
+    repo = _make_repo(tmp_path / "repo")
+    monkeypatch.chdir(repo)
+    leerie_dir = repo / ".leerie" / "runs" / "run-id"
+    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir.mkdir(parents=True)
+    (wt_dir / "leftover.txt").write_text("stray\n")
+
+    async def fake_run_proc(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 0)
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    asyncio.run(leerie._prune_subtask_worktree("sid-x", leerie_dir))
+
+    assert not wt_dir.exists(), (
+        "a TimeoutExpired from the git worktree remove call must not "
+        "propagate -- it must be caught and fall through to the "
+        "shutil.rmtree fallback"
+    )
+
+
 def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
     """After a prune, a blocked/failed sibling sid's own worktree can still
     be reset via `_reset_subtask_worktree` independently — proves the two

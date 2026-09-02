@@ -103,6 +103,47 @@ def test_reset_falls_back_to_rmtree_when_git_leaves_dir_behind(
         "shutil.rmtree fallback")
 
 
+def test_reset_passes_a_bounded_timeout_to_run_proc_for_worktree_remove(
+        leerie, monkeypatch):
+    """`_reset_subtask_worktree`'s `git worktree remove` call previously
+    called `run_proc` with no `timeout` (defaults to None / unbounded at
+    leerie.py's run_proc), so a hung removal could block a wave forever —
+    same hang class 505007d fixed for cleanup.sh/_run_script. It must pass
+    an explicit bounded timeout for the `git worktree remove` call."""
+    captured = {}
+
+    async def fake_run_proc(cmd, **kwargs):
+        if cmd[:3] == ["git", "worktree", "remove"]:
+            captured.update(kwargs)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    asyncio.run(leerie._reset_subtask_worktree(
+        "sid-x", Path("/tmp/leerie-dir"), "run-id"))
+
+    assert captured.get("timeout") is not None, (
+        "_reset_subtask_worktree must pass an explicit, non-None timeout "
+        "to run_proc for the `git worktree remove` call"
+    )
+    assert captured["timeout"] > 0
+
+
+def test_reset_survives_a_worktree_remove_timeout(leerie, monkeypatch):
+    """Execution-level pin: if `git worktree remove` times out,
+    `_reset_subtask_worktree` must still complete instead of letting
+    `subprocess.TimeoutExpired` propagate uncaught — falling through to
+    the existing rmtree fallback rather than crashing the wave."""
+    async def fake_run_proc(cmd, **kwargs):
+        if cmd[:3] == ["git", "worktree", "remove"]:
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout") or 240)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+
+    # Should not raise.
+    asyncio.run(leerie._reset_subtask_worktree(
+        "sid-x", Path("/tmp/leerie-dir"), "run-id"))
+
+
 def test_resets_so_worktree_add_b_succeeds_on_retry(leerie, tmp_path, monkeypatch):
     """The end-to-end shape this helper exists to enable: after reset, a
     fresh `git worktree add -b <branch>` succeeds where it would otherwise
