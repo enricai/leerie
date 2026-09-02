@@ -343,6 +343,115 @@ class TestRateLimitedExit:
         assert slept["wait"] > 0
 
 
+class TestRateLimitEventWireFormatToPause:
+    """The wire-format -> exception -> handler chain, end to end.
+
+    Every other test in this file CONSTRUCTS `RateLimitedExit` by hand, so
+    the step that actually parses Claude Code's stream JSON has never been
+    exercised together with the handler that acts on it. A field renamed in
+    `_summarize_stream_event`'s parser (or a `limit_type` that silently
+    stops being populated) would leave all of those green while the real
+    pause path stopped working.
+
+    The payload shape below is not invented: `leerie.py`'s parser documents
+    it as verified from captured worker logs, and the 0.28.0 run corpus
+    contains real instances of exactly this triple, e.g.
+    `rate_limit_event status=rejected rateLimitType=five_hour resetsAt=...`.
+    """
+
+    @staticmethod
+    def _event(limit_type, offset_hours):
+        import time
+        return {"type": "rate_limit_event",
+                "rate_limit_info": {
+                    "status": "rejected",
+                    "rateLimitType": limit_type,
+                    "resetsAt": int(time.time()) + int(offset_hours * 3600)}}
+
+    def test_parser_raises_with_limit_type_and_reset_at(self, leerie):
+        """Parse, don't construct."""
+        with pytest.raises(leerie.RateLimitedExit) as ei:
+            leerie._summarize_stream_event(
+                "feat-001", self._event("seven_day", 48), "stream")
+        exc = ei.value
+        assert exc.limit_type == "seven_day"
+        assert exc.out_of_credits is False
+        assert exc.reset_at is not None
+        delta = (exc.reset_at
+                 - leerie.datetime.now(leerie.timezone.utc)).total_seconds()
+        assert 47 * 3600 < delta < 49 * 3600, (
+            f"resetsAt did not round-trip into reset_at: {exc.reset_at}")
+
+    @pytest.mark.parametrize("status", ["allowed", "allowed_warning"])
+    def test_allowed_statuses_do_not_raise(self, leerie, status):
+        """The negative direction: a normal utilization event must not be
+        mistaken for a rejection, or every run would pause at the first
+        threshold crossing."""
+        ev = self._event("five_hour", 3)
+        ev["rate_limit_info"]["status"] = status
+        leerie._summarize_stream_event("feat-001", ev, "stream")
+
+    def test_parsed_exception_drives_the_pause(self, leerie, monkeypatch,
+                                               repo):
+        """The whole chain: the parser's own exception object is what
+        reaches `main()`'s handler. A 48h reset exceeds the 6h default
+        ceiling, so the disposition must be the resumable pause."""
+        parsed = {}
+        try:
+            leerie._summarize_stream_event(
+                "feat-001", self._event("seven_day", 48), "stream")
+        except leerie.RateLimitedExit as e:
+            parsed["exc"] = e
+        assert "exc" in parsed, "parser did not raise — chain is broken"
+
+        def _must_not_sleep(st, wait_seconds, reason):
+            raise AssertionError(f"slept {wait_seconds}s instead of pausing")
+
+        monkeypatch.setattr(leerie, "_sleep_then_reexec", _must_not_sleep)
+
+        async def _boom(*a, **kw):
+            raise parsed["exc"]
+
+        exit_code, run_dir = _run_main(
+            leerie, monkeypatch, repo, "main-rl-wire-format",
+            orchestrate_stub=_boom)
+
+        assert exit_code == leerie.EXIT_LOCKED
+        assert isinstance(_state_json(run_dir), dict)
+
+    def test_parsed_five_hour_within_ceiling_still_sleeps(
+            self, leerie, monkeypatch, repo):
+        """Same chain, bounded window: a 2h five-hour reset is under the
+        default ceiling and must auto-resume, not pause. Makes the two
+        wire-format cases DISAGREE, so a handler ignoring `reset_at`
+        entirely cannot pass both."""
+        try:
+            leerie._summarize_stream_event(
+                "feat-001", self._event("five_hour", 2), "stream")
+            raise AssertionError("parser did not raise")
+        except leerie.RateLimitedExit as e:
+            parsed = e
+
+        slept = {}
+
+        def _record(st, wait_seconds, reason):
+            slept["wait"] = wait_seconds
+            return 130
+
+        monkeypatch.setattr(leerie, "_sleep_then_reexec", _record)
+
+        async def _boom(*a, **kw):
+            raise parsed
+
+        exit_code, _ = _run_main(
+            leerie, monkeypatch, repo, "main-rl-wire-five-hour",
+            orchestrate_stub=_boom)
+
+        assert exit_code == 130
+        assert slept["wait"] > 3600, (
+            f"expected a ~2h wait, got {slept.get('wait')}")
+
+
 class TestRateLimitWaitCapResolution:
     """CLI > env > leerie.toml > DEFAULT_CAPS, the same ladder
     `resolve_worker_timeout_sec` uses."""

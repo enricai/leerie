@@ -354,6 +354,130 @@ def _finalize_ready_state(st):
     st.data["working_branch"] = "main"
 
 
+@pytest.fixture(scope="session")
+def pristine_run_proc(leerie):
+    """leerie's genuine `run_proc`, captured before this module's autouse
+    stub can replace it.
+
+    Session-scoped on purpose: higher-scoped fixtures are instantiated
+    before the function-scoped autouse `_stub_finalize_subprocesses`, so
+    this sees the real attribute. A test that wants the real git call back
+    re-installs this over the stub.
+    """
+    return leerie.run_proc
+
+
+class TestEmptyRunBranchAgainstRealGit:
+    """The same disposition as `TestEmptyRunBranchIsNoWorkNotAnError`, but
+    with the REAL `git rev-list` running against a REAL repository.
+
+    That distinction is the whole point of this class. The sibling class
+    stubs `run_proc` wholesale, so the git command never executes — and the
+    command is precisely where the defect lived: the guard originally ran in
+    `leerie_dir` (the STATE root, not a git repo at all), which made it fail
+    open and never fire, except when the state root happened to sit inside
+    the repo. No stubbed test can catch that, because a stub answers
+    regardless of the directory it was asked from.
+    """
+
+    @staticmethod
+    def _make_run_branch(repo, ahead: int):
+        """Create `leerie/runs/r1` either equal to main or `ahead` commits
+        past it, using real git."""
+        _run(["git", "branch", "-f", "leerie/runs/r1", "main"], repo)
+        for i in range(ahead):
+            _run(["git", "checkout", "-q", "leerie/runs/r1"], repo)
+            (repo / f"landed{i}.txt").write_text(f"work {i}\n")
+            _run(["git", "add", "-A"], repo)
+            _run(["git", "commit", "-qm", f"work {i}"], repo)
+            _run(["git", "checkout", "-q", "main"], repo)
+
+    @staticmethod
+    def _install_real_git(monkeypatch, leerie, pristine_run_proc, scripts,
+                          repo):
+        """Real `run_proc`; only the shell scripts stay stubbed.
+
+        `chdir(repo)` mirrors production: leerie runs with the process cwd
+        set to the target repo, which is what `_run_script` relies on
+        (`cwd=os.getcwd()`) and what phase_finalize's post-cleanup
+        `git show-ref` — which passes no explicit cwd — resolves against.
+        Without it the real git calls would resolve against pytest's own
+        cwd and fail for reasons that have nothing to do with the guard.
+        """
+        monkeypatch.chdir(repo)
+
+        async def _fake_run_script(name, *args):
+            scripts.append(name)
+            return subprocess.CompletedProcess(["bash", name], 0, "", "")
+
+        async def _fake_compose(*a, **k):
+            return None
+
+        monkeypatch.setattr(leerie, "run_proc", pristine_run_proc)
+        monkeypatch.setattr(leerie, "_run_script", _fake_run_script)
+        monkeypatch.setattr(leerie, "_compose_pr_via_llm", _fake_compose)
+
+    def test_real_empty_branch_routes_to_no_work(
+            self, leerie, monkeypatch, st, repo, pristine_run_proc):
+        self._make_run_branch(repo, ahead=0)
+        scripts = []
+        self._install_real_git(monkeypatch, leerie, pristine_run_proc,
+                               scripts, repo)
+        _finalize_ready_state(st)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        assert st.data["current_phase"] == "done: no work required"
+        assert st.data["no_work_required"] is True
+        assert "finalize.sh" not in scripts
+        assert "cleanup.sh" in scripts
+
+    def test_real_nonempty_branch_finalizes_normally(
+            self, leerie, monkeypatch, st, repo, pristine_run_proc):
+        """The dangerous direction: a false positive here would discard a
+        completed run as 'no work required'."""
+        self._make_run_branch(repo, ahead=2)
+        scripts = []
+        self._install_real_git(monkeypatch, leerie, pristine_run_proc,
+                               scripts, repo)
+        _finalize_ready_state(st)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        assert st.data["current_phase"] == "phase 6: finalize"
+        assert not st.data.get("no_work_required")
+        assert "finalize.sh" in scripts
+
+    def test_guard_reads_the_repo_not_the_state_root(
+            self, leerie, monkeypatch, st, repo, pristine_run_proc):
+        """Pins the cwd fix directly. `st.leerie_root` is a plain directory
+        under tmp_path with no `.git`, so a guard that ran there would get a
+        non-zero returncode, fail open, and reach `finalize.sh` even though
+        the branch is genuinely empty. Asserting the no-work disposition on
+        an empty branch therefore proves the count was taken in the repo.
+        """
+        self._make_run_branch(repo, ahead=0)
+        assert not (st.leerie_root / ".git").exists(), (
+            "precondition: the state root must NOT be a git repo, or this "
+            "test cannot distinguish the two directories")
+        scripts = []
+        self._install_real_git(monkeypatch, leerie, pristine_run_proc,
+                               scripts, repo)
+        _finalize_ready_state(st)
+
+        asyncio.run(leerie.phase_finalize(
+            st.leerie_root, st, no_push=True, no_verify=False,
+            caps=_caps(leerie), models={}, efforts={}))
+
+        assert st.data["no_work_required"] is True, (
+            "guard did not see the empty branch — it likely ran outside "
+            "st.repo_root and failed open")
+
+
 class TestEmptyRunBranchIsNoWorkNotAnError:
     """Corpus runs `d1987e8b` ($9.68) and `05f65221` ($3.03) reached finalize
     with every subtask `complete` and a run branch carrying no commits, and
