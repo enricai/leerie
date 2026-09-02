@@ -223,6 +223,58 @@ def test_cleanup_rm_rf_fallback_after_timeout(leerie, tmp_path, monkeypatch):
     )
 
 
+def test_cleanup_worktree_removal_budget_is_shared_not_per_entry(
+        leerie, tmp_path, monkeypatch):
+    """The 240s worktree-removal ceiling must be a single budget shared
+    across the whole loop, not re-applied to every entry. Worktrees under
+    one run typically share the same underlying stall (they're all removed
+    from the same bind-mounted `.git`), so a fixed per-entry timeout lets a
+    real multi-subtask wave (15-20+ worktrees) spend up to
+    240s * worktree_count on one abnormal exit.
+
+    Simulates each `git worktree remove` call consuming 100s of simulated
+    wall-clock time via a monkeypatched `time.monotonic`. With a shared
+    240s budget, only the first 3 of 4 entries get a chance to call
+    subprocess.run before the deadline passes; the 4th must skip straight
+    to the rm -rf fallback. Every worktree must still end up removed."""
+    run_id = "feat-x-aaa111"
+    run_dir = tmp_path / "runs" / run_id
+    worktrees_dir = run_dir / "worktrees"
+    entries = []
+    for i in range(4):
+        wt = worktrees_dir / f"feat-{i:03d}"
+        wt.mkdir(parents=True)
+        (wt / "f.txt").write_text("x")
+        entries.append(wt)
+    st = _FakeState(run_id, run_dir)
+
+    fake_now = [0.0]
+    monkeypatch.setattr(leerie.time, "monotonic", lambda: fake_now[0])
+
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        if cmd[:3] == ["git", "worktree", "remove"]:
+            calls.append(kwargs.get("timeout"))
+            fake_now[0] += 100  # simulate a 100s stall consumed by this call
+            raise subprocess.TimeoutExpired(cmd, kwargs.get("timeout", 0))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+    monkeypatch.setattr(leerie.subprocess, "run", fake_run)
+
+    leerie._cleanup_on_abnormal_exit(st, full_purge=False)
+
+    assert len(calls) < len(entries), (
+        "every entry made a git worktree remove call — the shared 240s "
+        f"budget was not enforced against cumulative elapsed time; "
+        f"per-call timeouts were: {calls!r}"
+    )
+    for wt in entries:
+        assert not wt.exists(), (
+            f"{wt} must be removed via the rm -rf fallback even when its "
+            "git worktree remove call was skipped for budget exhaustion"
+        )
+
+
 def test_cleanup_rm_rf_skips_when_path_escapes_sandbox(leerie, tmp_path,
                                                       monkeypatch):
     """Belt-and-suspenders: the rm -rf fallback must verify the
