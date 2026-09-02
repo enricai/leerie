@@ -4114,7 +4114,10 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     administratively succeeded but left the directory behind."""
     worktree = leerie_dir / "worktrees" / sid
     branch = f"leerie/subtasks/{run_id}/{sid}"
-    await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
+    try:
+        await run_proc(["git", "worktree", "remove", "--force", str(worktree)], timeout=240)
+    except subprocess.TimeoutExpired:
+        log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
     await run_proc(["git", "branch", "-D", branch])
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
 
@@ -4132,7 +4135,10 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     expected idempotent case. Never raises — a failed prune is disk
     pressure deferred to run-end cleanup, not a reason to fail the wave."""
     worktree = leerie_dir / "worktrees" / sid
-    await run_proc(["git", "worktree", "remove", "--force", str(worktree)])
+    try:
+        await run_proc(["git", "worktree", "remove", "--force", str(worktree)], timeout=240)
+    except subprocess.TimeoutExpired:
+        log(f"[{sid}] git worktree remove timed out; falling back to rmtree")
     await _rmtree_fallback_and_prune(worktree, leerie_dir)
 
 
