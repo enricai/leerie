@@ -12957,13 +12957,17 @@ async def _backstop_capture_prior_runs(
             log(f"backstop: non-fatal error capturing {run_dir.name}: {exc}")
 
 
-def run_recapture_deps(
-        leerie_root: Path,
+def _resolve_host_seam_settings(
         repo_root: Path,
-        force: bool = False,
-        run_id: str | None = None,
-) -> None:
-    """Host-side recapture entrypoint (DESIGN §6½) — consolidates dep_capture across runs."""
+) -> tuple[dict, dict, dict]:
+    """Shared host-seam settings resolver for host-side, non-interactive
+    entrypoints (`run_recapture_deps`, `run_rebaser`) that have no argparse
+    Namespace of their own. Returns `(caps, models, efforts)` with
+    `worker_timeout_sec`/`worker_timeout_explicit` applied on `caps`, so env
+    vars and `leerie.toml` are still honoured even though there is no CLI —
+    without this the per-worker table pins these entrypoints at their
+    hardcoded timeouts (rebaser 1371s, dep_capture 600s) with no way to
+    raise it."""
     caps = dict(DEFAULT_CAPS)
 
     # Minimal args namespace so resolve_models/efforts can read env vars and
@@ -12976,13 +12980,20 @@ def run_recapture_deps(
     _args = _MinimalArgs()
     models = resolve_models(repo_root, _args)
     efforts = resolve_efforts(repo_root, _args)
-    # Same reason resolve_models/_efforts are called here: these
-    # entrypoints have no CLI, but env and leerie.toml must still
-    # be honoured. Without this the per-worker table pins them
-    # (rebaser 1371s, dep_capture 600s) with no way to raise it.
     caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
     caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
         repo_root)
+    return caps, models, efforts
+
+
+def run_recapture_deps(
+        leerie_root: Path,
+        repo_root: Path,
+        force: bool = False,
+        run_id: str | None = None,
+) -> None:
+    """Host-side recapture entrypoint (DESIGN §6½) — consolidates dep_capture across runs."""
+    caps, models, efforts = _resolve_host_seam_settings(repo_root)
 
     if run_id is not None:
         target_run_dir = leerie_root / "runs" / run_id
@@ -13129,23 +13140,7 @@ def run_rebaser(
     `{"status": "failed", ...}` result — so the caller's push path is never
     blocked by this being best-effort (DESIGN §6 hard requirement: never
     pause/block finalize over the rebase)."""
-    caps = dict(DEFAULT_CAPS)
-
-    class _MinimalArgs:
-        model = None
-        pr_writer_model = None
-        effort = None
-
-    _args = _MinimalArgs()
-    models = resolve_models(repo_root, _args)
-    efforts = resolve_efforts(repo_root, _args)
-    # Same reason resolve_models/_efforts are called here: this
-    # entrypoint has no CLI, but env and leerie.toml must still be
-    # honoured. Without it the per-worker table pins the rebaser at
-    # 1371s with no way to raise it.
-    caps["worker_timeout_sec"] = resolve_worker_timeout_sec(repo_root)
-    caps["worker_timeout_explicit"] = resolve_worker_timeout_explicit(
-        repo_root)
+    caps, models, efforts = _resolve_host_seam_settings(repo_root)
 
     try:
         st = State(leerie_root, run_id, repo_root=repo_root)
