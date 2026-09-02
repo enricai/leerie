@@ -151,7 +151,8 @@ fi
 # both runtimes; the idle-PID-1 Fly path below still needs it because the
 # orchestrator is launched out-of-band via ssh and connects to this socket.
 if command -v python3 >/dev/null 2>&1; then
-  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py &
+  LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py \
+    </dev/null >>/tmp/cgroup-broker.log 2>&1 &
 fi
 
 cd /work

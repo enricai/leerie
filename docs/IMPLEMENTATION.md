@@ -559,8 +559,11 @@ ulimit -c 0
 # $CGROUP_ROOT/leerie.slice …
 # Launch the cgroup broker before the privilege drop (worker cgroup
 # enrollment/limit-setting can't be done by the dropped-privilege
-# orchestrator), telling it which root to operate under:
-LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py &
+# orchestrator), telling it which root to operate under. Stdio is
+# redirected away from PID 1's inherited fds so the broker can't hold
+# the container's output pipe open past PID 1's own exit:
+LEERIE_CGROUP_V2_ROOT="$CGROUP_ROOT" python3 /opt/leerie-image/scripts/cgroup-broker.py \
+  </dev/null >>/tmp/cgroup-broker.log 2>&1 &
 cd /work
 # … /work ownership fix (Fly volume-attach path) …
 # … /tmp/.cache ownership fix (Fly rootfs preserves root-owned mise cache) …
@@ -2870,7 +2873,13 @@ Each worker is one `claude -p` headless process. Flags used:
 `_invoke()`, which spawns the worker via the `run_proc` helper
 (`asyncio.create_subprocess_exec` + `communicate()` with an optional timeout).
 Shell scripts in `scripts/*.sh` are invoked via `_run_script()`, a thin async
-wrapper that resolves the script path and forwards to `run_proc`.
+wrapper that resolves the script path and forwards to `run_proc` with an
+explicit `timeout=RUN_SCRIPT_TIMEOUT` (600s) — a backstop against a
+regressed script hanging the orchestrator forever, distinct from any
+timeout the script itself enforces internally. Both `phase_finalize`
+call sites that invoke `cleanup.sh` catch the resulting
+`subprocess.TimeoutExpired` and log-and-continue, the same best-effort
+disposition as `_record_run_health` in that function.
 
 The validated payload is read from `structured_output` on the envelope. On a
 missing or schema-invalid payload, `claude_p()` retries once with the violation
@@ -4115,11 +4124,19 @@ run branch, per-subtask branches, and implementer checkpoints all
 survive**; only worktrees are removed (and re-created idempotently on
 `resume` via `scripts/new-worktree.sh`).
 
-Per-worktree removal has a 240s timeout (a large worktree can be hundreds
-of MB / tens of thousands of files under N-way concurrent disk
-contention). Failures are non-fatal and counted; if any failed, cleanup
-logs a pointer to `scripts/cleanup.sh --run-id <id>` to finish manually —
-best-effort, a stale worktree is the worst case, not a corrupted run.
+Worktree removal has a 240s timeout **shared across the whole loop**, not
+re-granted per entry: a single deadline is computed once at loop entry
+(`time.monotonic() + 240`), and each `git worktree remove` call gets
+whatever budget remains until that deadline (a large worktree can be
+hundreds of MB / tens of thousands of files under N-way concurrent disk
+contention). Once the shared budget is exhausted, remaining entries skip
+the `git worktree remove` call and go straight to the `rm -rf` fallback —
+worktrees under one run typically share the same underlying stall (all
+removed from the same bind-mounted `.git`), so a fixed *per-entry* 240s
+would let one stall cost 240s times the worktree count. Failures are
+non-fatal and counted; if any failed, cleanup logs a pointer to
+`scripts/cleanup.sh --run-id <id>` to finish manually — best-effort, a
+stale worktree is the worst case, not a corrupted run.
 
 Per-worker `subprocess.TimeoutExpired` from `_invoke` (`worker_timeout_sec`,
 default 5400s/90min) is caught by both `_run_implementer` (returns an

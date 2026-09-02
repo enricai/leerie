@@ -258,6 +258,83 @@ def test_cleanup_finds_run_dir_under_state_dir(tmp_path):
     assert (run_dir / "state.json").exists()
 
 
+# --- bounded worktree removal (hang protection) ---------------------------
+
+def test_cleanup_wraps_worktree_remove_in_timeout():
+    """`git worktree remove` inside clean_one_run must be bounded by
+    `timeout 240` (mirrors the calibrated 240s bound on the abnormal-exit
+    Python path, leerie.py:3896-3920), so a stalled removal (stale mount,
+    held index.lock, disk contention) cannot hang the script forever."""
+    src = _src()
+    clean_one_run = src.split("clean_one_run() {")[1].split("\n}")[0]
+    assert 'timeout "$WORKTREE_REMOVE_TIMEOUT" git worktree remove --force' in clean_one_run
+    assert 'WORKTREE_REMOVE_TIMEOUT="${CLEANUP_SH_TEST_WORKTREE_REMOVE_TIMEOUT:-240}"' in src
+
+
+def test_cleanup_hanging_git_worktree_remove_still_completes_and_removes_dir(tmp_path):
+    """If `git worktree remove` hangs forever (stubbed via a fake `git` on
+    PATH that sleeps on that subcommand), cleanup.sh must still return
+    promptly (well under the old unbounded wait) and the worktree
+    directory must be gone afterward (rm -rf fallback fired)."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.email", "test@x"], cwd=repo, check=True)
+    subprocess.run(["git", "config", "user.name", "test"], cwd=repo, check=True)
+    (repo / "file").write_text("x")
+    subprocess.run(["git", "add", "."], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-q", "-m", "init"], cwd=repo, check=True)
+
+    run_id = "feat-hang-test"
+    run_dir = repo / ".leerie" / "runs" / run_id
+    worktree_dir = run_dir / "worktrees" / "some-subtask"
+    worktree_dir.mkdir(parents=True)
+    (worktree_dir / "marker").write_text("x")
+    (run_dir / "state.json").write_text('{"task": "test"}')
+
+    real_git_path = None
+    for p in os.environ.get("PATH", "").split(os.pathsep):
+        candidate = Path(p) / "git"
+        if candidate.is_file():
+            real_git_path = str(candidate)
+            break
+    assert real_git_path, "could not locate a real `git` on PATH"
+
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    fake_git = fake_bin / "git"
+    fake_git.write_text(
+        "#!/usr/bin/env bash\n"
+        "if [ \"$1\" = worktree ] && [ \"$2\" = remove ]; then\n"
+        "  sleep 999999\n"
+        "fi\n"
+        f'exec "{real_git_path}" "$@"\n'
+    )
+    fake_git.chmod(0o755)
+
+    env = {k: v for k, v in os.environ.items() if k != "LEERIE_STATE_DIR"}
+    env["PATH"] = f"{fake_bin}{os.pathsep}{env.get('PATH', '')}"
+    env["CLEANUP_SH_TEST_WORKTREE_REMOVE_TIMEOUT"] = "1"
+
+    import time
+    start = time.monotonic()
+    r = subprocess.run(
+        [str(CLEANUP_SH), "--run-id", run_id],
+        cwd=repo, env=env, capture_output=True, text=True, check=False,
+        timeout=60,
+    )
+    elapsed = time.monotonic() - start
+    assert r.returncode == 0, f"cleanup.sh failed: {r.stderr}"
+    assert elapsed < 30, (
+        f"cleanup.sh took {elapsed:.1f}s against a hanging `git worktree "
+        f"remove` — the timeout bound did not fire"
+    )
+    assert not worktree_dir.exists(), (
+        "cleanup.sh must rm -rf the worktree dir when `git worktree remove` "
+        "hangs past its timeout"
+    )
+
+
 def test_cleanup_state_dir_unset_falls_back_to_repo(tmp_path):
     """Without LEERIE_STATE_DIR, cleanup.sh resolves .leerie/runs/<id>/
     relative to CWD — the legacy/in-repo behavior."""

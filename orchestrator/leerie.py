@@ -3893,31 +3893,45 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     if full_purge or has_worktrees:
         log(f"cleanup: {'full purge' if full_purge else 'worktrees only'} "
             f"for run {st.run_id}")
-    # Remove worktrees. The 240s timeout is calibrated for realistic
-    # worker workloads: a 868 MB / 41k-file worktree (npm install +
-    # Next.js build) takes ~45-90s uncontested; under N-way concurrent
-    # cleanup (e.g. 6 worktrees from a multi-subtask wave), per-worktree
-    # time grows several-fold via disk contention. 240s covers the
-    # observed worst-case + room for a 2-3 GB monorepo. Still bounded
-    # so a genuinely hung git command (not just a slow rm-rf) doesn't
-    # block cleanup indefinitely. Per-worktree failures are non-fatal —
-    # the loop logs and continues — and a closing recovery-hint line
-    # tells the user how to finish manually.
+    # Remove worktrees. 240s is calibrated for realistic worker workloads:
+    # a 868 MB / 41k-file worktree (npm install + Next.js build) takes
+    # ~45-90s uncontested; under N-way concurrent cleanup (e.g. 6 worktrees
+    # from a multi-subtask wave), per-worktree time grows several-fold via
+    # disk contention. 240s covers the observed worst-case + room for a
+    # 2-3 GB monorepo for a SINGLE worktree — but all worktrees under one
+    # run typically share the same underlying stall (they're all removed
+    # from the same bind-mounted `.git`), so applying 240s to EACH entry
+    # let a stall cost 240s times the worktree count (15-20+ in a real
+    # multi-subtask wave, reaching ~1 hour). Instead, budget the 240s ONCE
+    # across the whole loop: each `git worktree remove` call gets whatever
+    # time remains until the shared deadline, and once the deadline has
+    # passed, remaining entries skip straight to the rm -rf fallback below
+    # (still executed for every entry) rather than making another
+    # subprocess call. Per-worktree failures are non-fatal — the loop logs
+    # and continues — and a closing recovery-hint line tells the user how
+    # to finish manually.
     worktree_remove_timeout = 240
+    cleanup_deadline = time.monotonic() + worktree_remove_timeout
     failed_removals = 0
     worktrees_dir_resolved = worktrees_dir.resolve() if worktrees_dir.is_dir() else None
     if worktrees_dir.is_dir():
         for entry in worktrees_dir.iterdir():
             if not entry.is_dir():
                 continue
-            try:
-                subprocess.run(
-                    ["git", "worktree", "remove", "--force", str(entry)],
-                    capture_output=True, check=False,
-                    timeout=worktree_remove_timeout,
-                )
-            except (OSError, subprocess.TimeoutExpired) as e:
-                log(f"  cleanup: git worktree remove failed for {entry}: {e}")
+            remaining = cleanup_deadline - time.monotonic()
+            if remaining > 0:
+                try:
+                    subprocess.run(
+                        ["git", "worktree", "remove", "--force", str(entry)],
+                        capture_output=True, check=False,
+                        timeout=remaining,
+                    )
+                except (OSError, subprocess.TimeoutExpired) as e:
+                    log(f"  cleanup: git worktree remove failed for {entry}: {e}")
+            else:
+                log(f"  cleanup: worktree-removal budget ({worktree_remove_timeout}s) "
+                    f"exhausted; skipping git worktree remove for {entry}, "
+                    "falling back to rm -rf")
             # Fall back to direct removal if the directory still exists.
             # Two real cases this catches:
             #   1) `git worktree remove` succeeded administratively
@@ -7153,9 +7167,19 @@ async def _gather_or_cancel(*aws):
         raise
 
 
+# Backstop for `_run_script` invocations of the bundled worktree scripts
+# (cleanup.sh, finalize.sh, etc). Unbounded (`timeout=None`) previously —
+# if the script itself ever hit an unbounded git/filesystem stall, the
+# orchestrator would block forever. Calibrated well above the 240s
+# worktree-removal ceiling used elsewhere in this file, since a script
+# invocation may itself remove many worktrees sequentially.
+RUN_SCRIPT_TIMEOUT = 600
+
+
 async def _run_script(name: str, *args: str) -> subprocess.CompletedProcess:
     """Run one of the bundled git worktree scripts in the target repo."""
-    return await run_proc(["bash", str(SCRIPTS / name), *args], cwd=os.getcwd())
+    return await run_proc(["bash", str(SCRIPTS / name), *args], cwd=os.getcwd(),
+                          timeout=RUN_SCRIPT_TIMEOUT)
 
 
 def _stage_worktree_extras(st: "State", worktree: str) -> None:
@@ -32379,8 +32403,15 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             # `--subtask-branches` (not `--branches`) mirrors the successful
             # path: the empty run branch is kept and reaped by `leerie prune`
             # like any other, rather than inventing a second disposal rule.
-            await _run_script("cleanup.sh", "--run-id", st.run_id,
-                              "--subtask-branches")
+            # Best-effort: a hung cleanup.sh must not block the no-work
+            # terminal state from being recorded (same swallow-and-continue
+            # pattern as `_record_run_health` below).
+            try:
+                await _run_script("cleanup.sh", "--run-id", st.run_id,
+                                  "--subtask-branches")
+            except subprocess.TimeoutExpired as _cleanup_exc:
+                log(f"cleanup: cleanup.sh timed out ({_cleanup_exc}); "
+                    "continuing")
             _finish_no_work_run(
                 st,
                 {"<finalize>": (
@@ -32409,7 +32440,13 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     # `resume` re-enters finalize to re-run finalize.sh's non-empty check.
     st.data["current_phase"] = "phase 6: finalize"
     st.save()
-    await _run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
+    # Best-effort: a hung cleanup.sh must not crash a finalize that already
+    # confirmed the run branch is non-empty and pushable (same
+    # swallow-and-continue pattern as `_record_run_health` below).
+    try:
+        await _run_script("cleanup.sh", "--run-id", st.run_id, "--subtask-branches")
+    except subprocess.TimeoutExpired as _cleanup_exc:
+        log(f"cleanup: cleanup.sh timed out ({_cleanup_exc}); continuing")
     # Post-cleanup verification: the run branch must survive cleanup.
     # finalize.sh verified it existed moments ago; if it's gone after
     # cleanup.sh, something deleted it (a concurrent process, a git

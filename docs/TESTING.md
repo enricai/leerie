@@ -414,6 +414,23 @@ calls `_mark_reapable` (the fix is inert without the wiring), and
 guards that `main()` calls `_become_subreaper()` and `_orchestrate()`
 spawns+cancels `_zombie_reaper`.
 
+`_orchestrate()`'s own `finally` block (leerie:32599-32660 — cancels
+`sampler_task`/`reaper_task` and, when `force_strict_output` is set, stops
+`_StrictOutputProxy`) is bounded end-to-end in
+`tests/test_orchestrate_cleanup_bound.py`: `_memory_sampler`/`_zombie_reaper`
+are replaced with a `while True: await asyncio.sleep(9999)` double so only
+prompt cancellation (not a short default `interval_sec`) lets
+`asyncio.run(_orchestrate(...))` return, across all 4 combinations of
+`_run_phases` returning normally vs. raising `WorkerError`, and plain vs.
+`force_strict_output=True` (which additionally asserts `_STRICT_PROXY` is
+cleared). The wall-clock ceiling is backstopped by a `SIGALRM`-based hard
+timeout rather than `asyncio.wait_for`, since `wait_for`'s own cancellation
+lands inside the same `contextlib.suppress(asyncio.CancelledError)` the
+regression class already defeats and would hang right along with it. An
+`entered` list asserts each double actually reached its sleep before being
+cancelled, so a double cancelled pre-schedule can't pass the test
+vacuously.
+
 ## PENDING_ISSUES.md follow-up surfaces
 
 Three further surfaces arrived with the `PENDING_ISSUES.md` work order,
@@ -3491,6 +3508,39 @@ it (`extract_task_file_structure`, `_is_uncoverable_convention_item`,
 rather than guarded — coverage is now `task_coverage_judge`'s job, so the
 freeze class cannot recur. `TestBothRootCausesComposeOnOnePayload` runs both
 halves against the same fixtures in one test.
+
+## Piped/decoupled-streaming exit path: wall-clock hang bound
+
+`tests/test_decoupled_streaming_hang_bound.py` covers a gap
+`test_log_file_persistence.py`/`test_log_file_wiring.py` leave open: both
+of those use a `nerdctl` stub that writes and returns synchronously, so
+neither ever exercises a background process that keeps the container's
+stdout stream open past the stub's own exit -- the SSH-mux / broker
+failure mode the file-based `_run_log` + launcher-owned `tail -f` design
+(leerie:8811-8826) exists to route around. This test's stub forks a
+detached grandchild that inherits stdout and sleeps well past the
+harness's own completion, then asserts the harness still returns well
+under a fixed wall-clock ceiling -- proving a lingering fd-holder can't
+block the harness because `_run_log` redirects to a plain file, not a
+pipe.
+
+## Interactive (`-it`, `script`(1)-teed) exit path: wall-clock hang bound
+
+`tests/test_interactive_script_hang_bound.py` closes the same class of gap
+against the interactive branch (leerie:8877-8886, the non-Darwin
+`script -qe -c "$_nerdctl_run_quoted" -a "$_log_tee_target"` block) that
+`tests/test_decoupled_streaming_hang_bound.py` closed for `_run_log`.
+DESIGN.md:2613-2614 asserts the interactive path "has a real pty and thus
+no hang," but `test_log_file_wiring.py`'s existing interactive coverage
+(`test_interactive_tty_path_is_teed_via_script` et al.) only proves the
+teed output is byte-correct with a `nerdctl` stub that writes and returns
+synchronously -- it never puts the `script`(1) pty allocation itself
+under the lingering-background-holder condition DESIGN.md's own hang
+writeup describes. This test's stub backgrounds a detached grandchild
+that inherits the `script`-allocated pty as its stdout and sleeps well
+past the stub's own exit, then asserts the harness still returns under a
+fixed wall-clock ceiling -- putting the pty's claimed hang-proofing under
+the same adversarial load, rather than merely asserting it by argument.
 
 ## Lessons worth keeping
 
