@@ -7753,6 +7753,100 @@ _VALID_EXTENTS = frozenset({"in_plan", "external"})
 # feedback on re-invocation.  See _run_checked_loop.
 
 
+# What counts as evidence that a category's subject matter lives in this repo,
+# used by `CATEGORY_NO_DIR`. Measured origin: across 468 recorded runs the
+# advisory fired 27 times, every one of them for `infrastructure` on a repo
+# that is a conventional CDK project — `cdk.json` at the root and stacks under
+# `src/infrastructure/`. The previous rule tested only for DIRECTORIES NAMED
+# infra/cdk/terraform/pulumi AT THE ROOT, which that layout satisfies neither
+# way, so the advisory was wrong 27 times out of 27. It never changed a
+# classification (the classifier held `infrastructure` in all 13 runs where it
+# could have folded), but it gates — `CATEGORY_NO_DIR` is absent from
+# `_ADVISORY_ISSUE_LABELS` — so each firing cost a re-classify round: within
+# that one repo, 4.36 mean classifier calls when it fired against 1.39 when it
+# did not.
+#
+# Three kinds of evidence, because a repo may carry any one of them:
+#   `dirs`   directory names, matched case-insensitively at the root AND one
+#            level down (`src/infrastructure/`);
+#   `files`  root file names, matched case-insensitively by stem, so `README`,
+#            `readme.md` and `Readme.rst` all count;
+#   `globs`  root patterns for ecosystems that use a file extension rather
+#            than a directory (`*.tf`).
+#
+# `fly.toml` and `Dockerfile` are deliberately absent: adding them would
+# satisfy `infrastructure` for this very repo, and leerie's own 3 firings are
+# correct — it has no infrastructure-as-code.
+CATEGORY_EVIDENCE: dict[str, dict[str, list[str]]] = {
+    "infrastructure": {
+        "dirs": ["infra", "infrastructure", "cdk", "terraform", "pulumi"],
+        "files": ["cdk.json", "pulumi.yaml", "serverless.yml",
+                  "template.yaml"],
+        "globs": ["*.tf", "*.bicep"],
+    },
+    "documentation": {
+        "dirs": ["docs", "doc"],
+        "files": ["readme", "changelog"],
+        "globs": [],
+    },
+}
+
+
+def _category_evidence_found(repo_root: Path, cat: str) -> bool:
+    """Whether `repo_root` carries any evidence for `cat` (CATEGORY_EVIDENCE).
+
+    Case-insensitive throughout: a rule keyed to `README` but not `readme`
+    flags a correct classification, and `judge_confirmed` is empty on the
+    initial `phase_classify`, so suppression cannot cover that — the signal
+    itself has to be right on the first call."""
+    spec = CATEGORY_EVIDENCE.get(cat)
+    if not spec:
+        return True
+    try:
+        entries = list(repo_root.iterdir())
+    except OSError:
+        # An unreadable or absent repo root is not evidence of absence.
+        return True
+    wanted_dirs = set(spec["dirs"])
+    for entry in entries:
+        name = entry.name.lower()
+        if entry.is_dir():
+            if name in wanted_dirs:
+                return True
+            # One level down, for `src/infrastructure/`-style layouts. Skipped
+            # for dot-dirs and vendored trees, where a coincidental match says
+            # nothing about what this repo authors.
+            if name.startswith(".") or name in ("node_modules", "vendor"):
+                continue
+            try:
+                if any(c.is_dir() and c.name.lower() in wanted_dirs
+                       for c in entry.iterdir()):
+                    return True
+            except OSError:
+                continue
+        elif any(name == f or name.startswith(f + ".")
+                 for f in spec["files"]):
+            return True
+    return any(any(repo_root.glob(pat)) for pat in spec["globs"])
+
+
+def _category_evidence_summary(cat: str) -> str:
+    """Human-readable list of what would satisfy `cat`, for the advisory text.
+
+    Derived from `CATEGORY_EVIDENCE` rather than written out, so the message
+    cannot drift from the rule it describes — the previous text named only the
+    directories and so misreported the remedy on every one of the 27 recorded
+    firings."""
+    spec = CATEGORY_EVIDENCE.get(cat, {})
+    parts = [f"{'/'.join(spec.get('dirs', []))} as a directory at the root or "
+             "one level down"]
+    if spec.get("files"):
+        parts.append(f"{'/'.join(spec['files'])} at the root")
+    if spec.get("globs"):
+        parts.append(f"{'/'.join(spec['globs'])} at the root")
+    return "; ".join(parts)
+
+
 def check_classifier_output(
         result: dict, repo_root: Path,
         judge_confirmed: frozenset[str] = frozenset()) -> list[str]:
@@ -7778,34 +7872,17 @@ def check_classifier_output(
     issues: list[str] = []
     cats = result.get("categories", [])
 
-    # Directories that evidence a category's subject matter exists here. A
-    # `documentation` deliverable need not live in `docs/`: DESIGN §4 makes
-    # the deciding question whether docs were *asked for*, and a repo whose
-    # documentation is a root README or CHANGELOG is the ordinary case. Those
-    # are matched as glob patterns rather than directories, so the advisory
-    # does not fire on a correct classification before the judge has even
-    # run — `judge_confirmed` is empty on the initial `phase_classify`, so
-    # suppression alone would not have covered it.
-    _DIR_SIGNALS: dict[str, list[str]] = {
-        "infrastructure": ["infra", "cdk", "terraform", "pulumi"],
-        "documentation": ["docs", "doc"],
-    }
-    _ROOT_FILE_SIGNALS: dict[str, list[str]] = {
-        "documentation": ["README*", "CHANGELOG*"],
-    }
-    for cat, dirs in _DIR_SIGNALS.items():
+    for cat in CATEGORY_EVIDENCE:
         # Yields to the independent judge for the same reason the two RISK
         # advisories below do: `phase_classification_gate` re-invokes this
         # whole function on every re-classify round, so an unconditional
         # advisory strips a category the judge just confirmed and the two
         # pull against each other until the budget runs out (DESIGN §8).
-        if cat in cats and cat not in judge_confirmed and not (
-                any((repo_root / d).exists() for d in dirs)
-                or any(any(repo_root.glob(pat))
-                       for pat in _ROOT_FILE_SIGNALS.get(cat, []))):
+        if (cat in cats and cat not in judge_confirmed
+                and not _category_evidence_found(repo_root, cat)):
             issues.append(
-                f"CATEGORY_NO_DIR: classified as {cat!r} but no "
-                f"{'/'.join(dirs)} directory found at repo root")
+                f"CATEGORY_NO_DIR: classified as {cat!r} but this repo "
+                f"carries none of: {_category_evidence_summary(cat)}")
 
     for q in result.get("questions", []):
         if not (q.get("why_underivable") or "").strip():

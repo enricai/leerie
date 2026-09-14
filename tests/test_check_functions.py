@@ -99,6 +99,79 @@ class TestCheckClassifierOutput:
             result, tmp_path, judge_confirmed=frozenset({"infrastructure"}))
         assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
 
+    # === CATEGORY_NO_DIR: evidence predicate =========================
+    # Measured origin: across 468 recorded runs the advisory fired 27 times,
+    # all for `infrastructure`, all on a repo that is a conventional CDK
+    # project (`cdk.json` at the root, stacks under `src/infrastructure/`) —
+    # a layout the old "directory named infra/cdk/... at the root" rule
+    # matched neither way. It gates, so each firing cost a re-classify round:
+    # 4.36 mean classifier calls when it fired against 1.39 when it did not,
+    # within that one repo.
+
+    def test_root_marker_file_satisfies_infrastructure(
+            self, leerie, tmp_path):
+        """The recorded false positive: a CDK repo carries `cdk.json` at the
+        root and no `cdk/` directory."""
+        (tmp_path / "cdk.json").write_text("{}\n")
+        result = {"categories": ["infrastructure"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_nested_dir_satisfies_infrastructure(self, leerie, tmp_path):
+        """The other half of that layout: `src/infrastructure/`, one level
+        down rather than at the root."""
+        (tmp_path / "src" / "infrastructure").mkdir(parents=True)
+        result = {"categories": ["infrastructure"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_terraform_glob_satisfies_infrastructure(self, leerie, tmp_path):
+        (tmp_path / "main.tf").write_text("\n")
+        result = {"categories": ["infrastructure"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_vendored_match_is_not_evidence(self, leerie, tmp_path):
+        """`node_modules/cdk` says nothing about what this repo authors. The
+        anti-vacuity counterpart to the nested-dir test: without the skip,
+        that test would pass for the wrong reason on any npm project."""
+        (tmp_path / "node_modules" / "cdk").mkdir(parents=True)
+        result = {"categories": ["infrastructure"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    @pytest.mark.parametrize("doc_file", ["README.md", "readme.md",
+                                          "Readme.rst", "CHANGELOG.md"])
+    def test_root_doc_file_satisfies_documentation(
+            self, leerie, tmp_path, doc_file):
+        """Case-folded by stem. The previous rule globbed `README*`, which is
+        case-sensitive on Linux, so `readme.md` still flagged a correct
+        classification — and `judge_confirmed` is empty on the initial
+        `phase_classify`, so suppression could never have covered it."""
+        (tmp_path / doc_file).write_text("# docs\n")
+        result = {"categories": ["documentation"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_evidence_is_per_category(self, leerie, tmp_path):
+        """A README is not evidence of infrastructure-as-code."""
+        (tmp_path / "README.md").write_text("# readme\n")
+        result = {"categories": ["infrastructure"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_message_names_every_form_of_evidence(self, leerie, tmp_path):
+        """The advisory gates, so its text is the remedy the classifier acts
+        on. The old wording named only the directories and so misreported the
+        remedy on all 27 recorded firings. Derived from `CATEGORY_EVIDENCE`,
+        asserted against that table rather than a hardcoded sentence."""
+        result = {"categories": ["infrastructure"], "questions": []}
+        msg = [i for i in leerie.check_classifier_output(result, tmp_path)
+               if "CATEGORY_NO_DIR" in i][0]
+        spec = leerie.CATEGORY_EVIDENCE["infrastructure"]
+        for token in spec["dirs"] + spec["files"] + spec["globs"]:
+            assert token in msg, (token, msg)
+
     def test_docs_with_dir(self, leerie, tmp_path):
         (tmp_path / "docs").mkdir()
         result = {"categories": ["documentation"], "questions": [],
