@@ -3542,6 +3542,98 @@ past the stub's own exit, then asserts the harness still returns under a
 fixed wall-clock ceiling -- putting the pty's claimed hang-proofing under
 the same adversarial load, rather than merely asserting it by argument.
 
+## Classification-gate non-convergence: the monotonic keep-list
+
+**Run `47ee1e9e` (v0.29.0) died at phase 1 without reaching a planner.**
+`judge_confirmed` in `phase_classification_gate` was monotonic: a category
+confirmed in an early round could never be dropped when a later round
+concretely objected to it. Round 0 reviewed `[bug-fixing, documentation]`
+clean and asked for `testing`; round 1 objected to `documentation` once
+`testing` had joined. The re-classify prompt then carried
+`MISCATEGORIZATION (spurious_category): documentation` and "keep every one of
+them in your category set: ['bug-fixing', 'documentation', 'testing']" in the
+same message — an instruction no classifier can satisfy. Three judge rounds,
+two re-classifies, dead before any provision or plan spend.
+
+**The fix must not depend on why the verdict changed, because the corpus
+cannot tell us.** Counting every case where a category the judge had confirmed
+(reviewed without objection, or itself requested) later drew an evidenced
+`spurious_category`: **16 instances across 7 of the 432 runs that invoked the
+judge (1.6%), and in none was the later verdict rendered against an identical
+category set.** That rules out a *proven* self-contradiction; it establishes
+nothing about whether the judge refined its view. In this run's own transcript
+it plainly did not: round 0 asserts the fix "will require updating
+docs/architecture.md and docs/playbook.md", rounds 1 and 2 assert no
+documentation deliverable is evidenced, and neither reversal mentions
+`testing` — they argue a round-independent fact about the task that would have
+applied equally in round 0.
+
+Retraction is right under either reading. If the judge refined, retraction
+lets it; if it resampled, retraction lets the latest evidenced verdict win and
+terminates the deadlock, with the oscillation guard bounding the churn. A set
+that cannot drop the current verdict makes the prompt unsatisfiable regardless.
+So the fix is retraction (`judge_confirmed.difference_update(spurious)`), not
+demoting the judge — 1.6% is far too low to strip terminal authority, though
+it is the number to re-measure if the rate climbs.
+
+**Tests, in `tests/test_phase_classification_gate.py`.** Three directional
+tests fix the rule from three sides. The retraction row is additionally
+covered by the recorded-transcript replay below, which reddens on the same
+ablation; the other two are singly covered, so deleting either leaves the
+rest green against a wrong rule:
+
+| test | pins | what breaks without it |
+|---|---|---|
+| `test_evidenced_spurious_retracts_an_earlier_confirmation` | an evidenced objection retracts | the original deadlock returns |
+| `test_narrower_later_round_does_not_retract` | OR-accumulation survives the fix | the 2026-07-31 regression returns — a round reviewing a narrower set says nothing about categories it did not look at |
+| `test_vague_spurious_does_not_retract` | the anti-gaming converse | a claim too vague to gate would still strip a category |
+
+`test_replays_the_recorded_non_converging_transcript` replays the run's own
+judge responses. It deliberately uses multi-sentence evidence prose rather
+than a toy string, so the drop-list formatting is exercised on a real payload
+shape. Ablation: removing the `difference_update` turns both it and the
+retraction test red.
+
+**Two traps this incident re-confirmed.**
+
+*The exhaustion message counted the wrong thing.* It printed
+`caps['judgment_check_rounds']` (3) regardless of what ran, while
+`_run_checked_loop` fires feedback only while `rnd < max_rounds - 1` — so a
+3-round budget re-classifies at most **twice**, and once when the oscillation
+guard aborts early. Both counts are pinned
+(`test_exhaustion_reports_the_real_reclassify_count`,
+`test_exhaustion_count_reflects_an_early_oscillation_abort`). The first draft
+of that test read the count off `SystemExit.args` and passed against the
+broken message: `die()` writes to **stderr**, so the assertion was checking an
+empty string. Read it with `capsys`.
+
+*A guard for a defect class lives where the repo put it, not where the change
+is.* `--skip-classification-check` was added in the same change and seeded
+only under `if args.resume:` — the `skip_coverage_check` defect verbatim
+(`## LEERIE_COMMIT state field` above, which also explains
+`test_no_resume_only_state_keys` and `_state_init_branch_keys`). The warning
+comment recording that earlier defect sits a few lines above where this one
+was omitted, inside the same dict literal — no line count here, because it
+moves with every edit to `_run_phases`. It was inert on every fresh run,
+which is exactly the case the gate's own exhaustion `die()` tells the operator
+to re-run with. `tests/test_state_fields.py::test_no_resume_only_state_keys`
+catches it generically and went red; the targeted test selection that
+"validated" the change never ran that file.
+`test_the_skip_flag_is_actually_seeded_on_a_fresh_run` is the named pin,
+importing `_state_init_branch_keys` rather than re-implementing the walk. The
+consumer-side test (`test_skip_flag_never_spawns_the_judge`) hand-sets
+`st.data`, so it was structurally blind to the producer — the
+structure-vs-substance rule again.
+
+`tests/test_resolve_skip_classification_check.py` locks the env-var name and
+the `leerie.toml` key. Precedence lives in the shared `_resolve_bool_pref`, so
+what this file adds is the wiring. Both `test_the_toml_key_is_not_a_sibling_key`
+and `test_the_env_var_is_not_a_sibling_var` make the sources *disagree* — a
+sibling set `true` while this one is explicitly `false` — because two agreeing
+sources cannot distinguish a correct read from a bypass, and leaving this one
+merely *unset* would test fall-through to the default rather than a
+disagreement.
+
 ## Lessons worth keeping
 
 **A handler must survive its own exception, not merely catch it.** `main()`'s

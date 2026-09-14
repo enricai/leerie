@@ -67,8 +67,9 @@ import pytest
 # `resume=False` is passed at each call site rather than defaulted here, so
 # the branch under test is stated where it is exercised. The keys this file's
 # path additionally reads (subtask_tests, skip_coverage_check,
-# skip_completeness_check, skip_integration_check) are all `getattr(...,
-# default)` reads and need no entry in the imported dict.
+# skip_completeness_check, skip_integration_check, skip_classification_check)
+# are all `getattr(..., default)` reads and need no entry in the imported
+# dict.
 from tests.test_resume_planning_reentry import _args, _caps
 
 

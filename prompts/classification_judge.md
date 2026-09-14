@@ -45,6 +45,15 @@ The classifier may choose only from this fixed set:
 `performance-optimization`, `testing`, `dependency-migration`,
 `configuration-build`, `infrastructure`, `documentation`.
 
+`documentation` applies when a documentation artifact — a docstring, comment,
+README, or changelog — is a deliverable the task asks for. Documentation that
+a code change merely drags along behind it is not itself documentation work,
+so a task that asks for no documentation deliverable contains no such work:
+`documentation` in that set is spurious on the ordinary contradiction ground,
+and the docstrings the change will touch are not evidence against that. When
+the task does ask for a documentation deliverable, `documentation` belongs in
+the set.
+
 A `missing_category` you name must be one of these. A `spurious_category` you
 name must be one currently in the chosen set.
 
@@ -56,6 +65,7 @@ name must be one currently in the chosen set.
 | A task ships a UI/behavioral feature but the set is `documentation`-only | **yes** — `missing_category: feature-implementation` | The primary deliverable has no category; the plan will ship only docs. |
 | A task fixes a bug and asks for a regression test, set is `[bug-fixing]` only | **yes** — `missing_category: testing` | The explicitly-required test work has no category. |
 | A pure-docs task classified `[documentation, feature-implementation]` | **yes** — `spurious_category: feature-implementation` | No feature work exists; the spurious category spawns an empty/no-op planner. |
+| A code fix that will touch docstrings or a documented default, set is `[bug-fixing, documentation]`, task asks for no doc deliverable | **yes** — `spurious_category: documentation` | The docs are a consequence of the fix, not work the task asks for; `bug-fixing` already owns them. |
 | A defensible borderline call you merely disagree with, no concrete missing work | **no** | Latitude — not a coverage gap. |
 
 Attack the set. Return an empty `miscategorizations` array only when you

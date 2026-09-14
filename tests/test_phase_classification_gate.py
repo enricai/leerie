@@ -624,3 +624,321 @@ def test_vague_spurious_category_does_not_block_implicit_confirmation(
         "objected to) must still be judge_confirmed alongside bug-fixing "
         "(implicit) and testing (explicit missing_category): got "
         f"{captured_confirmed['set']}")
+
+
+# === judge_confirmed retracts on an evidenced spurious finding =============
+# Root cause of a measured production failure (run 47ee1e9e, v0.29.0):
+# judge_confirmed was monotonic, so a category confirmed in an early round
+# could never be dropped when a later round concretely objected to it. The
+# re-classify prompt then carried "drop X" and "keep X" together — an order no
+# classifier can satisfy — and the gate burned every round and died at phase 1.
+# These tests deliberately assert nothing about WHY the judge's verdict
+# changed: the recorded rationales argue a round-independent fact about the
+# task, not the category that had joined, so refinement is not the
+# explanation. Retraction is correct either way — the latest evidenced verdict
+# is the one the gate must act on.
+
+def _judge_rounds(leerie, monkeypatch, responses):
+    """Drive the gate with canned judge responses; return the replan_task
+    strings the re-driven phase_classify actually received."""
+    seen: list[str] = []
+    calls = iter(responses)
+
+    async def fake_claude_p(**kwargs):
+        return next(calls)
+
+    async def fake_phase_classify(task, st, *a, **k):
+        seen.append(task)
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "phase_classify", fake_phase_classify)
+    return seen
+
+
+# The re-classify prompt's drop-list opener. Named once: three tests assert
+# against it, and a reword should not silently turn them vacuous.
+_DROP_MARKER = "The review found these categories spurious"
+
+
+def _miscat(kind, category, evidence="concrete: the task ships no such work"):
+    return {"kind": kind, "category": category,
+            "concrete_work_evidence": evidence}
+
+
+def test_evidenced_spurious_retracts_an_earlier_confirmation(
+        leerie, tmp_path, monkeypatch):
+    """The keep-list must not re-order a category the same feedback drops."""
+    st = _minimal_state(leerie, tmp_path)
+    seen = _judge_rounds(leerie, monkeypatch, [
+        # r0: reviews [bug-fixing, documentation] clean, asks for testing.
+        {"categories_reviewed": ["bug-fixing", "documentation"],
+         "miscategorizations": [_miscat("missing_category", "testing")],
+         "rationale": "needs tests"},
+        # r1: now objects to documentation — run 47ee1e9e's shape exactly.
+        {"categories_reviewed": ["bug-fixing", "testing", "documentation"],
+         "miscategorizations": [_miscat("spurious_category", "documentation")],
+         "rationale": "docs are incidental"},
+        {"categories_reviewed": ["bug-fixing", "testing"],
+         "miscategorizations": [], "rationale": "clean"},
+    ])
+
+    asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    # Assert the VALUE of the second re-classify prompt, not that a keep-list
+    # exists: the bug shipped a keep-list that was present and wrong.
+    assert len(seen) == 2, seen
+    second = seen[1]
+    keep_line = [ln for ln in second.splitlines() if "keep every one" in ln]
+    assert keep_line, second
+    assert "documentation" not in keep_line[0], keep_line[0]
+    assert "'testing'" in keep_line[0] and "'bug-fixing'" in keep_line[0]
+    # ...and it is named in the drop list instead.
+    assert _DROP_MARKER in second, second
+    assert "'documentation'" in second.split(_DROP_MARKER)[1]
+
+
+def test_vague_spurious_does_not_retract(leerie, tmp_path, monkeypatch):
+    """A spurious entry with no concrete evidence never gates, so it must not
+    strip the category either — the converse of the anti-gaming rule already
+    pinned by test_vague_spurious_category_does_not_block_implicit_confirmation.
+    """
+    st = _minimal_state(leerie, tmp_path)
+    seen = _judge_rounds(leerie, monkeypatch, [
+        {"categories_reviewed": ["bug-fixing", "documentation"],
+         "miscategorizations": [_miscat("missing_category", "testing")],
+         "rationale": "needs tests"},
+        {"categories_reviewed": ["bug-fixing", "testing", "documentation"],
+         "miscategorizations": [
+             _miscat("spurious_category", "documentation", ""),
+             _miscat("missing_category", "refactoring")],
+         "rationale": "hand-wave on docs"},
+        {"categories_reviewed": ["bug-fixing", "testing"],
+         "miscategorizations": [], "rationale": "clean"},
+    ])
+
+    asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    keep_line = [ln for ln in seen[1].splitlines() if "keep every one" in ln][0]
+    assert "documentation" in keep_line, keep_line
+    assert _DROP_MARKER not in seen[1]
+
+
+def test_narrower_later_round_does_not_retract(leerie, tmp_path, monkeypatch):
+    """OR-accumulation must survive the retraction fix: a round reviewing a
+    NARROWER set says nothing about the categories it did not look at. Pins
+    the 2026-07-31 regression (DESIGN §8) from the other direction."""
+    st = _minimal_state(leerie, tmp_path)
+    seen = _judge_rounds(leerie, monkeypatch, [
+        {"categories_reviewed": ["bug-fixing", "documentation"],
+         "miscategorizations": [_miscat("missing_category", "testing")],
+         "rationale": "needs tests"},
+        # Reviews only bug-fixing this round; documentation simply wasn't up
+        # for debate and must survive.
+        {"categories_reviewed": ["bug-fixing"],
+         "miscategorizations": [_miscat("missing_category", "refactoring")],
+         "rationale": "also refactoring"},
+        {"categories_reviewed": ["bug-fixing"],
+         "miscategorizations": [], "rationale": "clean"},
+    ])
+
+    asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    keep_line = [ln for ln in seen[1].splitlines() if "keep every one" in ln][0]
+    for cat in ("documentation", "testing", "bug-fixing", "refactoring"):
+        assert cat in keep_line, (cat, keep_line)
+
+
+def test_exhaustion_reports_the_real_reclassify_count(
+        leerie, tmp_path, monkeypatch, capsys):
+    """The message printed caps['judgment_check_rounds'] (3) regardless of
+    what ran. Feedback fires only while rnd < max_rounds - 1, so a 3-round
+    budget re-classifies at most TWICE. Asserts the number, not that a
+    number is present — die() writes to stderr, so reading the exception
+    args would silently assert against an empty string."""
+    st = _minimal_state(leerie, tmp_path)
+    # Mirrors the shape of the measured production failure: two DISTINCT
+    # rounds (each firing a re-classify) then a repeat that trips the
+    # oscillation guard. Three judge calls, two re-classifies, cap of 3.
+    seen = _judge_rounds(leerie, monkeypatch, [
+        {"categories_reviewed": ["bug-fixing"],
+         "miscategorizations": [_miscat("missing_category", "testing")],
+         "rationale": "r0"},
+        {"categories_reviewed": ["bug-fixing", "testing"],
+         "miscategorizations": [_miscat("missing_category", "refactoring")],
+         "rationale": "r1"},
+        {"categories_reviewed": ["bug-fixing", "testing"],
+         "miscategorizations": [_miscat("missing_category", "refactoring")],
+         "rationale": "r2 repeats r1"},
+    ])
+
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_classification_gate(
+            "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    err = capsys.readouterr().err
+    assert "exhausted after 2 re-classify rounds" in err, err
+    # The message's count must equal what actually ran, not the cap.
+    assert len(seen) == 2, seen
+    assert "3 re-classify" not in err, err
+    # The remediation now names the escape hatch.
+    assert "--skip-classification-check" in err, err
+
+
+def test_skip_flag_never_spawns_the_judge(leerie, tmp_path, monkeypatch):
+    """--skip-classification-check is a full bypass: no worker, categories
+    untouched, and it never claims the run has no work."""
+    st = _minimal_state(leerie, tmp_path)
+    st.data["skip_classification_check"] = True
+
+    async def fail_claude_p(**kwargs):
+        pytest.fail("classification_judge must not spawn when skipped")
+
+    monkeypatch.setattr(leerie, "claude_p", fail_claude_p)
+
+    routed = asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    assert routed is False
+    assert st.data["categories"] == ["documentation"]
+    # A bypass is not a clean-pass judgment: no verdict recorded, matching
+    # integrate_wave / phase_planning_coverage_gate / _filter_satisfied_subtasks.
+    assert "classification_coverage_gate" not in st.data
+
+
+def test_exhaustion_count_reflects_an_early_oscillation_abort(
+        leerie, tmp_path, monkeypatch, capsys):
+    """When every round repeats the same issue set the guard aborts after a
+    single re-classify. The old message still claimed 3."""
+    st = _minimal_state(leerie, tmp_path)
+    seen = _judge_rounds(leerie, monkeypatch, [
+        {"categories_reviewed": ["documentation"],
+         "miscategorizations": [_miscat("missing_category", "testing")],
+         "rationale": "r"} for _ in range(3)])
+
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_classification_gate(
+            "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    assert len(seen) == 1, seen
+    err = capsys.readouterr().err
+    assert "exhausted after 1 re-classify round " in err, err
+
+
+def test_replays_the_recorded_non_converging_transcript(
+        leerie, tmp_path, monkeypatch):
+    """Regression corpus: the judge responses recorded for run 47ee1e9e
+    (v0.29.0), which died at phase 1 without reaching the planner.
+
+    Round 0 reviewed [bug-fixing, documentation] clean and asked for testing;
+    round 1 objected to documentation once testing had joined the set. Under
+    the monotonic judge_confirmed those two rounds produced a re-classify
+    prompt ordering the classifier to keep and drop documentation at once,
+    and the gate exhausted. The evidence strings are the recorded shape —
+    multi-sentence prose with paths and punctuation — so the drop-list
+    formatting is exercised on a real payload, not a toy one."""
+    st = _minimal_state(leerie, tmp_path)
+    st.data["categories"] = ["bug-fixing", "documentation"]
+    st.save()
+
+    r0_ev = ("the module's existing unit tests exercise session/attach/resume "
+             "ordering, but none cover the same-origin child-frame realm race "
+             "described in the report — which is why this regression shipped "
+             "undetected.")
+    r1_ev = ("the task is a regression fix in the frame-init module plus the "
+             "associated registry-check logic — pure runtime behavior. The "
+             "input report is the bug filing itself, not a documentation "
+             "deliverable to produce or update.")
+
+    seen = _judge_rounds(leerie, monkeypatch, [
+        {"categories_reviewed": ["bug-fixing", "documentation"],
+         "miscategorizations": [
+             _miscat("missing_category", "testing", r0_ev)],
+         "rationale": "root-cause fix plus the tests that would have caught it"},
+        {"categories_reviewed": ["bug-fixing", "testing", "documentation"],
+         "miscategorizations": [
+             _miscat("spurious_category", "documentation", r1_ev)],
+         "rationale": "docs are incidental to the code change"},
+        # With the fix the third round finally reviews a set it accepts.
+        {"categories_reviewed": ["bug-fixing", "testing"],
+         "miscategorizations": [], "rationale": "covers the work"},
+    ])
+
+    # The whole point: this must NOT raise SystemExit.
+    routed = asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    assert routed is False
+    assert len(seen) == 2, seen
+    contradictory = [t for t in seen
+                     if _DROP_MARKER in t
+                     and "documentation" in t.split("keep every one")[-1]]
+    assert not contradictory, "gate re-sent the contradictory prompt"
+
+
+def test_the_skip_flag_is_actually_seeded_on_a_fresh_run(leerie):
+    """The producer half, which `test_skip_flag_never_spawns_the_judge` is
+    blind to.
+
+    That test hand-sets `st.data["skip_classification_check"]`, so it pins
+    the CONSUMER and passes no matter what `_run_phases` writes — the exact
+    shape that let `--skip-coverage-check` ship inert on every fresh run
+    (`test_phase_planning_coverage_gate.py`'s
+    `test_the_flag_is_actually_seeded_on_a_fresh_run`). This flag repeated
+    it: the key was first added under `if args.resume:` only, so `.get()`
+    returned None on every fresh run and the gate ran anyway — while the
+    gate's own exhaustion `die()` tells the operator to re-run with the very
+    flag a fresh re-run ignores.
+
+    The general rule is derived in `test_state_fields.py`; this is the named
+    pin in the file about this gate. The walk is imported, not
+    re-implemented (`tests/test_no_duplicate_state_walks.py`).
+    """
+    from tests.test_state_fields import _state_init_branch_keys
+
+    resume_keys, fresh_keys = _state_init_branch_keys(leerie)
+    assert "skip_classification_check" in resume_keys
+    assert "skip_classification_check" in fresh_keys, (
+        "--skip-classification-check is inert on every fresh run: the key is "
+        "never seeded, so the short-circuit reads None and the gate runs")
+
+
+def test_refuses_to_send_a_contradictory_reclassify_prompt(
+        leerie, tmp_path, monkeypatch, capsys):
+    """The keep/drop disjointness guard must actually fire when violated.
+
+    `_check`'s retraction makes the overlap unreachable through normal flow,
+    so without driving it directly this is a `die()` that exists in source
+    and is never called — the shape CLAUDE.md's structure-vs-substance table
+    names. Forcing `_gating_spurious_categories` to report a category the
+    gate has already confirmed reproduces the pre-fix state exactly.
+    """
+    st = _minimal_state(leerie, tmp_path)
+    # The helper is consulted twice per round: once by `_check` (where it
+    # drives the retraction) and once by the feedback builder (where it
+    # drives the drop list). Reporting nothing to the first and a confirmed
+    # category to the second simulates the retraction having silently
+    # stopped working — the precise pre-fix state, and the only way the
+    # keep-list and drop-list can intersect.
+    seen_calls = []
+
+    def _diverging(judge_result):
+        seen_calls.append(1)
+        return set() if len(seen_calls) == 1 else {"documentation"}
+
+    monkeypatch.setattr(leerie, "_gating_spurious_categories", _diverging)
+    _judge_rounds(leerie, monkeypatch, [
+        {"categories_reviewed": ["documentation"],
+         "miscategorizations": [_miscat("missing_category", "testing")],
+         "rationale": "r0"},
+    ])
+
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_classification_gate(
+            "task", st, _caps(leerie), False, MODELS, EFFORTS))
+
+    err = capsys.readouterr().err
+    assert "both keep and drop" in err, err
+    assert "documentation" in err, err

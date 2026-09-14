@@ -417,6 +417,7 @@ STATE_FIELDS = (
     "skip_coverage_check",
     "skip_completeness_check",
     "skip_integration_check",
+    "skip_classification_check",
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
@@ -1309,6 +1310,16 @@ SKIP_COMPLETENESS_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # skip_integration_check in leerie.toml → False.
 SKIP_INTEGRATION_CHECK_ENV = "LEERIE_SKIP_INTEGRATION_CHECK"
 SKIP_INTEGRATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
+
+# --skip-classification-check bypass (the classification_judge category-set
+# gate — DESIGN §8 *Independent adversarial verification*). That gate runs
+# before any provision/plan spend and die()s on exhaustion, so a gate that
+# will not converge takes the entire run with it; every sibling gate already
+# carried an escape hatch and this one did not. Resolution order:
+# --skip-classification-check CLI flag → LEERIE_SKIP_CLASSIFICATION_CHECK env
+# → skip_classification_check in leerie.toml → False.
+SKIP_CLASSIFICATION_CHECK_ENV = "LEERIE_SKIP_CLASSIFICATION_CHECK"
+SKIP_CLASSIFICATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
 # the mtime-keyed per-file parse results produced by _build_repo_map() so
@@ -6699,6 +6710,25 @@ def resolve_skip_integration_check(repo_root: Path, cli_value: bool) -> bool:
         file_name=SKIP_INTEGRATION_CHECK_FILE)
 
 
+def resolve_skip_classification_check(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --skip-classification-check preference. Order:
+    --skip-classification-check CLI flag (action='store_true') →
+    LEERIE_SKIP_CLASSIFICATION_CHECK env var →
+    skip_classification_check in leerie.toml → False.
+
+    When True, `phase_classification_gate` never invokes
+    `classification_judge` and the classifier's own category set is used
+    as-is. A miscategorized set produces the wrong planners — the same task
+    has classified to 0 subtasks one way and 10 another — so this is a
+    last-resort hatch for a gate that will not converge, not a routine
+    speedup. Off by default."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=SKIP_CLASSIFICATION_CHECK_ENV,
+        file_key="skip_classification_check",
+        file_name=SKIP_CLASSIFICATION_CHECK_FILE)
+
+
 def _positive_int(s: str) -> int:
     """argparse `type=` helper. Rejects non-positive integers with the
     standard argparse error message. Used by --confidence-rounds."""
@@ -7749,8 +7779,16 @@ def check_classifier_output(
         "documentation": ["docs", "doc"],
     }
     for cat, dirs in _DIR_SIGNALS.items():
-        if cat in cats and not any(
-                (repo_root / d).exists() for d in dirs):
+        # Yields to the independent judge for the same reason the two RISK
+        # advisories below do: `phase_classification_gate` re-invokes this
+        # whole function on every re-classify round, so an unconditional
+        # advisory strips a category the judge just confirmed and the two
+        # pull against each other until the budget runs out (DESIGN §8).
+        # The directory heuristic is also simply wrong for `documentation`
+        # on a repo whose deliverable is a root README or CHANGELOG — which
+        # DESIGN §4 explicitly licenses.
+        if (cat in cats and cat not in judge_confirmed and not any(
+                (repo_root / d).exists() for d in dirs)):
             issues.append(
                 f"CATEGORY_NO_DIR: classified as {cat!r} but no "
                 f"{'/'.join(dirs)} directory found at repo root")
@@ -20180,6 +20218,23 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     return result
 
 
+def _gating_spurious_categories(judge_result: dict) -> set[str]:
+    """Categories a `classification_judge` result concretely objects to.
+
+    Only an entry carrying non-empty `concrete_work_evidence` counts. A vague
+    spurious claim never gates, so it must not retract a confirmation or show
+    up in a re-classify prompt's drop list either — otherwise a category the
+    gate effectively ignored would still be stripped from the classifier's
+    set. Shared by `phase_classification_gate`'s `_check` and its feedback
+    builder so both read "objected to" the same way."""
+    return {
+        (m.get("category") or "").strip()
+        for m in (judge_result.get("miscategorizations") or [])
+        if isinstance(m, dict) and m.get("kind") == "spurious_category"
+        and (m.get("concrete_work_evidence") or "").strip()
+    } - {""}
+
+
 async def phase_classification_gate(task: str, st: State, caps: dict,
                                     clarify: bool, models: dict[str, str],
                                     efforts: dict[str, str | None]) -> bool:
@@ -20225,7 +20280,20 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     Mutates `st.data["categories"]` in place via the re-driven `phase_classify`.
     Returns True iff it routed to the no-work terminal state (caller must
     stop); False otherwise (the categories live on state, like
-    `phase_classify`'s own writes, and the caller proceeds normally)."""
+    `phase_classify`'s own writes, and the caller proceeds normally).
+
+    Skipped entirely when `st.data["skip_classification_check"]` is set: the
+    judge never spawns and the classifier's own category set stands. Returns
+    False (never routes to no-work) — the bypass says nothing about whether
+    the task has work. Nothing is written to the audit key, matching every
+    sibling skip path: a bypass is not a clean-pass judgment, and a sentinel
+    there would be read as one by anything doing
+    `.get("miscategorizations", [])`."""
+    if st.data.get("skip_classification_check"):
+        log("  classification gate skipped (--skip-classification-check "
+            f"/ {SKIP_CLASSIFICATION_CHECK_ENV} / "
+            "skip_classification_check=true)")
+        return False
     sys_prompt = _load_prompt("classification_judge")
 
     # Accumulated across every round of this gate call: every category the
@@ -20237,12 +20305,32 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     #     spurious_category (implicit confirmation via review-without-
     #     objection);
     #   - every category named in a missing_category entry (explicit
-    #     confirmation that it belongs, once added).
-    # OR-accumulated like likely_already_satisfied above: a later round
-    # reviewing a narrower set must not retract an earlier round's
-    # confirmation of a category that simply wasn't up for debate that
-    # round.
+    #     confirmation that it belongs).
+    # Monotone EXCEPT under an evidenced retraction. OR-accumulated like
+    # likely_already_satisfied above: a later round reviewing a narrower set
+    # must not retract an earlier round's confirmation of a category that
+    # simply wasn't up for debate that round. But an *evidenced*
+    # spurious_category finding IS the judge adjudicating that exact
+    # category, so it retracts.
+    #
+    # A purely monotonic set freezes the judge's FIRST opinion and fights
+    # every later one, producing a re-classify prompt carrying "drop X" and
+    # "keep X" together — an order no classifier can satisfy, which burns
+    # every remaining round and exhausts the gate. Measured on a real run:
+    # three judge rounds, two re-classifies, dead at phase 1.
+    #
+    # Deliberately NOT justified by a claim about why the verdict changed:
+    # whether the judge refined its view or simply resampled, the latest
+    # evidenced verdict is the one the gate must act on, and a set that
+    # cannot drop it is unsatisfiable. The corpus cannot distinguish the two
+    # (DESIGN §8); the oscillation guard bounds the resampling case.
     judge_confirmed: set[str] = set()
+
+    # The exhaustion message must report what actually ran, not the cap:
+    # _run_checked_loop fires feedback only while `rnd < max_rounds - 1`, so
+    # a 3-round budget re-classifies at most twice — fewer when the
+    # oscillation guard aborts early.
+    reclassify_rounds = [0]
 
     async def _invoke_judge() -> dict:
         st.bump_workers(caps)
@@ -20277,24 +20365,17 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
         last_judge[0] = judge_result
         issues: list[str] = []
         miscats = judge_result.get("miscategorizations") or []
-        # Same anti-gaming discipline as the issues loop below: a
-        # spurious_category entry with no concrete_work_evidence is a vague,
-        # ungated claim (never surfaces in `issues`), so it must not silently
-        # block that category from implicit confirmation either — otherwise
-        # a category the gate effectively ignored this round could still be
-        # excluded from judge_confirmed on a LATER round's accumulation.
-        spurious = {
-            (m.get("category") or "").strip()
-            for m in miscats
-            if isinstance(m, dict) and m.get("kind") == "spurious_category"
-            and (m.get("concrete_work_evidence") or "").strip()
-        }
+        spurious = _gating_spurious_categories(judge_result)
         # Implicit confirmation: every reviewed category the judge did NOT
         # object to via a spurious_category entry.
         for cat in judge_result.get("categories_reviewed") or []:
             cat = (cat or "").strip()
             if cat and cat not in spurious:
                 judge_confirmed.add(cat)
+        # Retraction: an evidenced objection outranks any earlier round's
+        # confirmation of the same category. Without this the keep-list and
+        # the feedback contradict each other and the gate cannot converge.
+        judge_confirmed.difference_update(spurious)
         for m in miscats:
             if not isinstance(m, dict):
                 continue
@@ -20305,10 +20386,12 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
             # dropped (mirrors the completeness gate's concrete_case rule).
             if not cat or not ev:
                 continue
-            if m.get("kind") == "missing_category":
+            if m.get("kind") == "missing_category" and cat not in spurious:
                 # Explicit confirmation: the judge itself asked for this
                 # category, so it must never be stripped by the classifier's
-                # own inner self-check on the next round.
+                # own inner self-check on the next round. Skipped when the
+                # same round also called it spurious — a round that
+                # contradicts itself confirms nothing.
                 judge_confirmed.add(cat)
             issues.append(
                 f"MISCATEGORIZATION ({m.get('kind', 'miscategorization')}): "
@@ -20318,6 +20401,24 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     async def _on_feedback(fb: str) -> dict:
         # Re-classify with the miscategorizations folded into the task, so the
         # fresh classifier call sees why its category set was rejected.
+        #
+        # `_check`'s retraction guarantees the keep-list and the drop-list are
+        # disjoint. The failure mode when they are not is not a wrong answer
+        # but an unsatisfiable instruction that silently burns the whole round
+        # budget, so verify it rather than assume it.
+        drop_now = sorted(_gating_spurious_categories(last_judge[0] or {}))
+        both = sorted(judge_confirmed & set(drop_now))
+        if both:
+            die("classification gate would tell the classifier to both keep "
+                f"and drop {both} — refusing to send a contradictory "
+                "re-classify prompt")
+        # Name the drop list outright instead of relying on the classifier to
+        # extract it from the MISCATEGORIZATION prose above.
+        drop_note = (
+            "\n\nThe review found these categories spurious; drop them: "
+            f"{drop_now}."
+            if drop_now else ""
+        )
         confirmed_note = (
             "\n\nThe following categories have already been independently "
             "confirmed as required by this review — keep every one of them "
@@ -20330,8 +20431,9 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
             f"found it miscategorized the work:\n{fb}\n"
             "Re-classify so the category set covers exactly the work this task "
             "requires — add every category the work needs, drop any the work "
-            "contradicts." + confirmed_note
+            "contradicts." + drop_note + confirmed_note
         )
+        reclassify_rounds[0] += 1
         await phase_classify(replan_task, st, caps, clarify, models, efforts,
                               judge_confirmed=frozenset(judge_confirmed))
         return {}
@@ -20372,16 +20474,19 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
             _finish_no_work_run(
                 st, {"<unresolved classification>": satisfied_evidence})
             return True
+        n = reclassify_rounds[0]
         die(
-            "classification gate exhausted "
-            f"{caps['judgment_check_rounds']} re-classify round(s) without "
+            "classification gate exhausted after "
+            f"{n} re-classify round{'' if n == 1 else 's'} without "
             "producing a category set that covers the task's actual work:\n" +
             "\n".join(f"  • {i}" for i in remaining) +
             "\nAn independent review found the category set still misses (or "
             "wrongly includes) a category the work requires. A wrong category "
             "set produces the wrong subtasks — the same task has classified to "
             "0 subtasks one way and 10 another. Refine the task description so "
-            "the required work is unambiguous."
+            "the required work is unambiguous, or re-run with "
+            "--skip-classification-check to proceed on the classifier's own "
+            "categories."
         )
 
     st.data["classification_coverage_gate"] = judge_result
@@ -32876,6 +32981,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             getattr(args, "skip_completeness_check", False))
         st.data["skip_integration_check"] = bool(
             getattr(args, "skip_integration_check", False))
+        st.data["skip_classification_check"] = bool(
+            getattr(args, "skip_classification_check", False))
         st.data["skip_satisfied_check"] = bool(
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
@@ -32970,6 +33077,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        getattr(args, "skip_completeness_check", False)),
                    "skip_integration_check": bool(
                        getattr(args, "skip_integration_check", False)),
+                   # Behavioural like skip_coverage_check above, and for the
+                   # same reason: phase_classification_gate reads this
+                   # straight off st.data, so omitting it here would leave
+                   # --skip-classification-check inert on every fresh run —
+                   # the exact case the gate's own exhaustion die() tells the
+                   # operator to re-run with.
+                   "skip_classification_check": bool(
+                       getattr(args, "skip_classification_check", False)),
                    "skip_satisfied_check": bool(
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
@@ -33810,6 +33925,17 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "the judge already produced. "
                          f"Also {SKIP_INTEGRATION_CHECK_ENV} env or "
                          "skip_integration_check in leerie.toml. Default: off.")
+    ap.add_argument("--skip-classification-check", action="store_true",
+                    help="skip the phase 1½ classification gate (DESIGN §8 "
+                         "Independent adversarial verification) entirely: the "
+                         "classification_judge worker never spawns and the "
+                         "classifier's own category set is used as-is. The "
+                         "escape hatch for a gate that will not converge; a "
+                         "miscategorized set produces the wrong planners, so "
+                         "prefer refining the task description first. "
+                         f"Also {SKIP_CLASSIFICATION_CHECK_ENV} env or "
+                         "skip_classification_check in leerie.toml. "
+                         "Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
                     help="skip the phase 3 per-subtask satisfied-probe that "
                          "drops subtasks already met on the base tree (DESIGN "
@@ -34267,6 +34393,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # `_run_integration_judge_gate` reads it from there on entry.
     args.skip_integration_check = resolve_skip_integration_check(
         repo_root, getattr(args, "skip_integration_check", False))
+
+    # Resolve --skip-classification-check (the classification_judge
+    # category-set gate, DESIGN §8). Same precedence shape; _orchestrate()
+    # folds it into state.json under "skip_classification_check";
+    # phase_classification_gate reads it from there on entry.
+    args.skip_classification_check = resolve_skip_classification_check(
+        repo_root, getattr(args, "skip_classification_check", False))
 
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.
