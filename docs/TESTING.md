@@ -3625,23 +3625,45 @@ consumer-side test (`test_skip_flag_never_spawns_the_judge`) hand-sets
 `st.data`, so it was structurally blind to the producer — the
 structure-vs-substance rule again.
 
-**Suppression does not fix a wrong signal (follow-up).** `CATEGORY_NO_DIR`
-was made to yield to `judge_confirmed` alongside the two RISK advisories, on
-the reasoning that its `docs/` heuristic is wrong for a repo whose
-documentation deliverable is a root README or CHANGELOG. It is — but yielding
-did not address it: `judge_confirmed` is empty on the initial
-`phase_classify`, so a correct `documentation` was still flagged inside that
-function's own retry loop, before the judge had run at all. The comment
-therefore described a fix that had not shipped. The signal now also accepts a
-repo-root `README*`/`CHANGELOG*`, and
-`test_root_doc_file_satisfies_the_signal_with_no_judge` pins it **with no
-`judge_confirmed` argument** — the only form that can catch this, since any
-test passing one exercises the suppression instead.
-`test_root_doc_file_does_not_rescue_infrastructure` keeps the new signal
-per-category, and `test_infrastructure_also_yields_to_the_judge` pins the half
-of the suppression that every comment, spec row and sibling test had described
-only in terms of `documentation`. General rule: when a check is wrong rather
-than merely ill-timed, suppressing it later leaves the first call still wrong.
+**Suppression does not fix a wrong signal, and an instance is not the class.**
+`CATEGORY_NO_DIR` was first made to yield to `judge_confirmed` alongside the
+two RISK advisories, on the reasoning that its `docs/` heuristic is wrong for
+a repo whose documentation deliverable is a root README. Yielding did not
+address that: `judge_confirmed` is empty on the initial `phase_classify`, so a
+correct classification was still flagged inside that function's own retry
+loop, before the judge had run at all. The next attempt added a `README*`
+glob — case-sensitive on Linux, so `readme.md` still flagged. Two fixes, both
+of which named the class in the commit message and shipped an instance.
+
+Measuring the check instead of reasoning about it inverted the priority.
+Across 468 recorded runs (766 classifier calls) `CATEGORY_NO_DIR` fired **27
+times in 19 runs, every one of them for `infrastructure` and none for
+`documentation`** — on a repo that is a conventional CDK project, `cdk.json`
+at the root with stacks under `src/infrastructure/`, a layout the rule matched
+neither way. It never changed a classification (the classifier held
+`infrastructure` in all 13 runs where it could have folded), but it **gates**
+— `CATEGORY_NO_DIR` is absent from `_ADVISORY_ISSUE_LABELS` — so each firing
+cost a round: within that one repo, **4.36** mean classifier calls when it
+fired against **1.39** when it did not. Controlling within the project matters;
+the cross-project figure is confounded, because every firing was in one repo.
+
+The rule is now an evidence predicate (`CATEGORY_EVIDENCE` +
+`_category_evidence_found`): directories case-insensitively at the root or one
+level down, root marker files by case-folded stem, and root globs. Validated
+against the real trees before it was written — `api` satisfied by `cdk.json`,
+`leerie` and `barnacle` still unsatisfied, so the 24 false firings go and the
+3 genuine ones stay. `test_vendored_match_is_not_evidence` is the anti-vacuity
+counterpart to the nested-directory pin: without the `node_modules` skip that
+pin would pass for the wrong reason on any npm project.
+`test_message_names_every_form_of_evidence` asserts the advisory text against
+`CATEGORY_EVIDENCE` rather than a hardcoded sentence — the text is the remedy
+a *gating* check hands the classifier, and the old wording named only the
+directories, misreporting it on all 27 firings.
+
+General rule: when a check is wrong rather than merely ill-timed, suppressing
+it later leaves the first call still wrong — and when a commit message claims
+a class, the test must pin the class, or the next round finds the instance you
+left.
 
 `tests/test_resolve_skip_classification_check.py` locks the env-var name and
 the `leerie.toml` key. Precedence lives in the shared `_resolve_bool_pref`, so
