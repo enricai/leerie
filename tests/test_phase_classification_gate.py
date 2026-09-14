@@ -41,6 +41,16 @@ class TestWiring:
         src = inspect.getsource(leerie.phase_classification_gate)
         assert 'schema_key="classification_judge"' in src
 
+    def test_drop_marker_matches_the_orchestrator(self, leerie):
+        """The tests below assert on `_DROP_MARKER`, a hand-written copy of
+        the drop-list opener. Two of those assertions are negative and would
+        pass against any reworded message, so without this coupling a reword
+        in `leerie.py` would quietly make them vacuous rather than red."""
+        src = inspect.getsource(leerie.phase_classification_gate)
+        assert _DROP_MARKER in src, (
+            f"the orchestrator no longer emits {_DROP_MARKER!r}; update the "
+            "constant and re-check the two negative assertions that use it")
+
     def test_uses_run_checked_loop(self, leerie):
         src = inspect.getsource(leerie.phase_classification_gate)
         assert "_run_checked_loop(" in src
@@ -655,8 +665,12 @@ def _judge_rounds(leerie, monkeypatch, responses):
     return seen
 
 
-# The re-classify prompt's drop-list opener. Named once: three tests assert
-# against it, and a reword should not silently turn them vacuous.
+# The re-classify prompt's drop-list opener, named once so three tests share
+# one spelling. The constant is a hand-written COPY of the orchestrator's
+# string, so on its own it cannot detect a reword: two of the three uses are
+# negative assertions that pass trivially against any other wording.
+# `TestWiring::test_drop_marker_matches_the_orchestrator` is what makes the
+# drift detectable.
 _DROP_MARKER = "The review found these categories spurious"
 
 

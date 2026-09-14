@@ -4971,10 +4971,25 @@ independent `classification_judge` had just confirmed required, since
 scratch with no memory of what the judge already vetted.
 `check_classifier_output` now accepts an accumulated `judge_confirmed` set
 (categories reviewed without a *concrete, evidenced* objection, or
-explicitly requested, across the gate call) and suppresses a
-same-work/test-ownership pair only when both categories are judge-confirmed
-— the classifier's self-check yields to the independent judge instead of
-re-litigating every round.
+explicitly requested, across the gate call) and three of its advisories
+yield to it, under two rules: the same-work and test-ownership advisories
+flag a *pair*, so they suppress only when both categories are
+judge-confirmed; the directory-signal advisory flags a *single* category, so
+it suppresses on that category alone. In each case the classifier's
+self-check yields to the independent judge instead of re-litigating every
+round. The single-category rule covers `infrastructure` as well as
+`documentation` — the judge is authoritative for both — and note that
+"judge-confirmed" includes *implicit* confirmation, so a round that objects
+to one category while reviewing others silently vouches for the rest of that
+set for the remainder of the gate call.
+
+Suppression alone is not sufficient where the heuristic itself is wrong.
+`judge_confirmed` is empty on the initial classify, so a signal that
+mis-describes a correct classification still fires before any judge has run —
+which is why the documentation signal accepts a repo-root README or
+CHANGELOG and not only a `docs/` tree. §4 makes the deciding question
+whether the docs were *asked for*; a directory's existence was never that
+question.
 
 **`judge_confirmed` is monotone except under an evidenced retraction.** The
 set is OR-accumulated across rounds so a later round reviewing a *narrower*

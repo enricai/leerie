@@ -3625,6 +3625,24 @@ consumer-side test (`test_skip_flag_never_spawns_the_judge`) hand-sets
 `st.data`, so it was structurally blind to the producer — the
 structure-vs-substance rule again.
 
+**Suppression does not fix a wrong signal (follow-up).** `CATEGORY_NO_DIR`
+was made to yield to `judge_confirmed` alongside the two RISK advisories, on
+the reasoning that its `docs/` heuristic is wrong for a repo whose
+documentation deliverable is a root README or CHANGELOG. It is — but yielding
+did not address it: `judge_confirmed` is empty on the initial
+`phase_classify`, so a correct `documentation` was still flagged inside that
+function's own retry loop, before the judge had run at all. The comment
+therefore described a fix that had not shipped. The signal now also accepts a
+repo-root `README*`/`CHANGELOG*`, and
+`test_root_doc_file_satisfies_the_signal_with_no_judge` pins it **with no
+`judge_confirmed` argument** — the only form that can catch this, since any
+test passing one exercises the suppression instead.
+`test_root_doc_file_does_not_rescue_infrastructure` keeps the new signal
+per-category, and `test_infrastructure_also_yields_to_the_judge` pins the half
+of the suppression that every comment, spec row and sibling test had described
+only in terms of `documentation`. General rule: when a check is wrong rather
+than merely ill-timed, suppressing it later leaves the first call still wrong.
+
 `tests/test_resolve_skip_classification_check.py` locks the env-var name and
 the `leerie.toml` key. Precedence lives in the shared `_resolve_bool_pref`, so
 what this file adds is the wiring. Both `test_the_toml_key_is_not_a_sibling_key`

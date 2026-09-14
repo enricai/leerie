@@ -57,16 +57,22 @@ create 2× the subtasks with no additional coverage.
 
 The test PASSES (keep both) when two categories produce genuinely
 different deliverables — different files, or different purposes on the
-same files. One exception, which outranks the file criterion:
-documentation a code change drags along behind it never earns
-`documentation` on the strength of landing in a different file — that is
-the rule above, and it wins here. `bug-fixing` fixes a handler + `testing` adds a test file →
+same files. `bug-fixing` fixes a handler + `testing` adds a test file →
 keep both. `bug-fixing` fixes a timeout + `feature-implementation` adds
 new retry logic → keep both (different purposes). The test FAILS (drop
 one) when both categories would update the same files for the same
 reason: "complete Spanish translations" as both `bug-fixing` and
 `feature-implementation` → both update translation files with the same
 translations → pick `bug-fixing`.
+
+One exception outranks the different-files criterion, in both directions.
+Documentation a code change drags along behind it never earns
+`documentation` by landing in a different file — a bug fix that rewrites a
+README paragraph is still `bug-fixing` alone. But when the task *asks* for
+the doc as a deliverable, `documentation` stays in the set even though the
+code category is there too: "fix the retry logic **and update the README**"
+is `bug-fixing` + `documentation`. Asked for, or dragged along — that is the
+question, not which file it lands in.
 
 Split principle for `configuration-build` vs `infrastructure`:
 `configuration-build` owns *wiring* (the app reads cloud outputs via
