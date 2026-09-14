@@ -7763,20 +7763,35 @@ def check_classifier_output(
     re-classify loop): categories the independent `classification_judge`
     has already vetted as required for this task, across every round of
     the current gate call (see `phase_classification_gate`'s
-    accumulation). The `SAME_WORK_RISK`/`TEST_OWNERSHIP_RISK` advisories
-    below are self-checks the classifier can act on alone; they must
-    yield when BOTH categories in a flagged pair are judge-confirmed,
-    since the independent judge is the authoritative signal (DESIGN §8)
-    and re-flagging a pair it already vetted would undo its finding on
-    the very next re-classify round — the tug-of-war that let a
+    accumulation), minus any the judge has since retracted with an
+    evidenced `spurious_category`. Three advisories yield to it, under two
+    different rules, because the independent judge is the authoritative
+    signal (DESIGN §8) and re-flagging what it has vetted undoes its
+    finding on the very next re-classify round — the tug-of-war that let a
     3-category task (bug-fixing + feature-implementation + testing)
-    oscillate indefinitely without ever holding all three at once."""
+    oscillate indefinitely without ever holding all three at once:
+
+    - `SAME_WORK_RISK` / `TEST_OWNERSHIP_RISK` flag a PAIR, so they yield
+      only when BOTH categories are judge-confirmed.
+    - `CATEGORY_NO_DIR` flags ONE category, so it yields on that category
+      alone."""
     issues: list[str] = []
     cats = result.get("categories", [])
 
+    # Directories that evidence a category's subject matter exists here. A
+    # `documentation` deliverable need not live in `docs/`: DESIGN §4 makes
+    # the deciding question whether docs were *asked for*, and a repo whose
+    # documentation is a root README or CHANGELOG is the ordinary case. Those
+    # are matched as glob patterns rather than directories, so the advisory
+    # does not fire on a correct classification before the judge has even
+    # run — `judge_confirmed` is empty on the initial `phase_classify`, so
+    # suppression alone would not have covered it.
     _DIR_SIGNALS: dict[str, list[str]] = {
         "infrastructure": ["infra", "cdk", "terraform", "pulumi"],
         "documentation": ["docs", "doc"],
+    }
+    _ROOT_FILE_SIGNALS: dict[str, list[str]] = {
+        "documentation": ["README*", "CHANGELOG*"],
     }
     for cat, dirs in _DIR_SIGNALS.items():
         # Yields to the independent judge for the same reason the two RISK
@@ -7784,11 +7799,10 @@ def check_classifier_output(
         # whole function on every re-classify round, so an unconditional
         # advisory strips a category the judge just confirmed and the two
         # pull against each other until the budget runs out (DESIGN §8).
-        # The directory heuristic is also simply wrong for `documentation`
-        # on a repo whose deliverable is a root README or CHANGELOG — which
-        # DESIGN §4 explicitly licenses.
-        if (cat in cats and cat not in judge_confirmed and not any(
-                (repo_root / d).exists() for d in dirs)):
+        if cat in cats and cat not in judge_confirmed and not (
+                any((repo_root / d).exists() for d in dirs)
+                or any(any(repo_root.glob(pat))
+                       for pat in _ROOT_FILE_SIGNALS.get(cat, []))):
             issues.append(
                 f"CATEGORY_NO_DIR: classified as {cat!r} but no "
                 f"{'/'.join(dirs)} directory found at repo root")
@@ -33926,7 +33940,7 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          f"Also {SKIP_INTEGRATION_CHECK_ENV} env or "
                          "skip_integration_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-classification-check", action="store_true",
-                    help="skip the phase 1½ classification gate (DESIGN §8 "
+                    help="skip the classification gate (DESIGN §8 "
                          "Independent adversarial verification) entirely: the "
                          "classification_judge worker never spawns and the "
                          "classifier's own category set is used as-is. The "

@@ -53,11 +53,51 @@ class TestCheckClassifierOutput:
             self, leerie, tmp_path):
         """Anti-vacuity control: a DIFFERENT category being confirmed must
         not suppress this one, or the test above would pass against a check
-        that had simply been deleted."""
+        that had simply been deleted. `testing` rather than the sibling
+        `infrastructure`, so the control cannot pass merely because the
+        confirmed name is absent from `cats`."""
         result = {"categories": ["documentation"], "questions": []}
         issues = leerie.check_classifier_output(
-            result, tmp_path, judge_confirmed=frozenset({"infrastructure"}))
+            result, tmp_path, judge_confirmed=frozenset({"testing"}))
         assert any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    # P1: the advisory must not fire on a CORRECT classification before the
+    # judge has run at all — `judge_confirmed` is empty on the initial
+    # `phase_classify`, so suppression alone never covered this case.
+    @pytest.mark.parametrize("doc_file", ["README.md", "CHANGELOG.md"])
+    def test_root_doc_file_satisfies_the_signal_with_no_judge(
+            self, leerie, tmp_path, doc_file):
+        """DESIGN §4: the deciding question is whether docs were asked for,
+        not whether a `docs/` tree exists. A repo whose documentation is a
+        root README or CHANGELOG is the ordinary case, and flagging it
+        pressured the classifier to drop a correct `documentation` inside
+        `phase_classify`'s own retry loop."""
+        (tmp_path / doc_file).write_text("# docs\n")
+        result = {"categories": ["documentation"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_root_doc_file_does_not_rescue_infrastructure(
+            self, leerie, tmp_path):
+        """The root-file signal is per-category, not a blanket escape: a
+        README says nothing about whether infra-as-code lives here."""
+        (tmp_path / "README.md").write_text("# readme\n")
+        result = {"categories": ["infrastructure"], "questions": []}
+        issues = leerie.check_classifier_output(result, tmp_path)
+        assert any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_infrastructure_also_yields_to_the_judge(self, leerie, tmp_path):
+        """The suppression lives in the `_DIR_SIGNALS` loop, so it covers
+        `infrastructure` too. Pinned because every justification written for
+        it — the comment, the spec row, the other tests — speaks only about
+        `documentation`, which is how an unstated behaviour change survives.
+        """
+        result = {"categories": ["infrastructure"], "questions": []}
+        assert any("CATEGORY_NO_DIR" in i
+                   for i in leerie.check_classifier_output(result, tmp_path))
+        issues = leerie.check_classifier_output(
+            result, tmp_path, judge_confirmed=frozenset({"infrastructure"}))
+        assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
 
     def test_docs_with_dir(self, leerie, tmp_path):
         (tmp_path / "docs").mkdir()
