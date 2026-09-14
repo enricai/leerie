@@ -491,6 +491,26 @@ on any recent merge.
   invocation; the five files the sentence names collect 44). Run the command
   whose scope is exactly the sentence's scope, and if the sentence names a
   set of files, name that same set on the command line.
+- **Confirm the branch at commit time; never inherit it from an earlier
+  checkout.** Merging a PR deletes the branch it came from, so a checkout that
+  succeeded minutes ago can leave you standing on `main` — which carries no
+  branch protection here (`gh api repos/<owner>/<repo>/branches/main/protection`
+  returns 404), so nothing rejects the push. That is how `124893a` landed
+  directly on `main`, reverted by `cdbcc75` and re-landed through #265: a
+  feature branch was checked out, the PR was merged during an interruption,
+  and the next `git commit` ran without re-checking. `git rev-parse
+  --abbrev-ref HEAD` immediately before committing is the whole guard.
+- **A process note put only in the PR body does not survive the squash** —
+  the same rule as the first bullet, and easy to miss because a disclosure
+  feels like description rather than content. #265 disclosed that direct push
+  in its PR body; the squash body on `main` mentions it nowhere, leaving a
+  title, its revert and a re-land in the history with no explanation. If it
+  matters enough to disclose, it belongs in the commit message.
+- **A cherry-pick carries a message written for the branch it left.** #265's
+  body opens "the predicate added by the previous commit on this branch"; that
+  branch held one commit and the predicate came from #264. True where it was
+  written, false where it merged — re-read a cherry-picked message against its
+  new parentage before pushing.
 
 ## Task completion checklist
 
