@@ -7802,32 +7802,53 @@ def _category_evidence_found(repo_root: Path, cat: str) -> bool:
     spec = CATEGORY_EVIDENCE.get(cat)
     if not spec:
         return True
+    # `.get` on every key, matching `_category_evidence_summary`. The two read
+    # the same table and must tolerate the same entries: a category added with
+    # only `dirs` used to raise KeyError here while the summary returned fine,
+    # so a maintainer sanity-checking the message saw it work. This runs
+    # inside a gating check, and KeyError is not WorkerError, so
+    # `_run_checked_loop` abandons rather than retrying — it takes the run
+    # down.
+    wanted_dirs = set(spec.get("dirs", []))
+    wanted_files = spec.get("files", [])
     try:
-        entries = list(repo_root.iterdir())
+        # `os.scandir` rather than `iterdir()` + `is_dir()`: it carries the
+        # entry type from the directory read, so it costs one syscall instead
+        # of one `stat` per child. Measured on a repo with a 40k-file
+        # directory one level down, 693 ms → 23 ms. No repo in the run corpus
+        # has that shape — the real trees cost 2-27 ms either way — so this is
+        # insurance against `data/`-style layouts, not a fix for an observed
+        # slowdown. Semantics are unchanged; the direct `(child / name)` probe
+        # is faster still but drops case-insensitivity one level down, which
+        # is the defect this predicate exists to remove.
+        with os.scandir(repo_root) as entries:
+            for entry in entries:
+                name = entry.name.lower()
+                if entry.is_dir():
+                    if name in wanted_dirs:
+                        return True
+                    # One level down, for `src/infrastructure/`-style
+                    # layouts. Skipped for dot-dirs and vendored trees, where
+                    # a coincidental match says nothing about what this repo
+                    # authors.
+                    if (name.startswith(".")
+                            or name in ("node_modules", "vendor")):
+                        continue
+                    try:
+                        with os.scandir(entry.path) as children:
+                            for child in children:
+                                if (child.is_dir()
+                                        and child.name.lower() in wanted_dirs):
+                                    return True
+                    except OSError:
+                        continue
+                elif any(name == f or name.startswith(f + ".")
+                         for f in wanted_files):
+                    return True
     except OSError:
         # An unreadable or absent repo root is not evidence of absence.
         return True
-    wanted_dirs = set(spec["dirs"])
-    for entry in entries:
-        name = entry.name.lower()
-        if entry.is_dir():
-            if name in wanted_dirs:
-                return True
-            # One level down, for `src/infrastructure/`-style layouts. Skipped
-            # for dot-dirs and vendored trees, where a coincidental match says
-            # nothing about what this repo authors.
-            if name.startswith(".") or name in ("node_modules", "vendor"):
-                continue
-            try:
-                if any(c.is_dir() and c.name.lower() in wanted_dirs
-                       for c in entry.iterdir()):
-                    return True
-            except OSError:
-                continue
-        elif any(name == f or name.startswith(f + ".")
-                 for f in spec["files"]):
-            return True
-    return any(any(repo_root.glob(pat)) for pat in spec["globs"])
+    return any(any(repo_root.glob(pat)) for pat in spec.get("globs", []))
 
 
 def _category_evidence_summary(cat: str) -> str:
