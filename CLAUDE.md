@@ -417,6 +417,21 @@ inventory itself.
   untested `resume=False` branch that killed every non-resume run. A
   key-presence AST walk passed against the broken code: presence of a dict
   key says nothing about whether its value expression evaluates.
+- **A targeted test selection is not evidence — a defect class's guard lives
+  where the repo put it, not next to your diff.** `--skip-classification-check`
+  shipped seeded only under `if args.resume:`, so it was inert on every fresh
+  run — the exact case the gate's own exhaustion `die()` tells the operator to
+  re-run with — while a hand-picked selection of the files whose names matched
+  the change ran green. The guard that catches that class,
+  `tests/test_state_fields.py::test_no_resume_only_state_keys`, is a *derived*
+  rule (`resume_keys - fresh_keys` over `_state_init_branch_keys`) naming
+  neither the flag nor the phase, so no filename heuristic reaches it; it was
+  red the whole time. Same defect as `skip_coverage_check` before it
+  (`docs/TESTING.md` *LEERIE_COMMIT state field*). **Run `pytest tests/`
+  before calling a change green** — scoping by relevance cannot find a guard
+  that is deliberately named after the rule rather than the surface. A
+  consumer-side test that hand-sets `st.data["<flag>"]` is structurally blind
+  to the producer and cannot substitute.
 - **A test asserting STRUCTURE must be paired with one asserting SUBSTANCE.**
   Four measured instances from one change (2026-08-17):
 

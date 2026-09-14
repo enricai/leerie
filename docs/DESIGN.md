@@ -147,7 +147,14 @@ Every task is classified into one or more of:
    `configuration-build` and `infrastructure` form a producer→consumer
    pair; infra provides `<stack>-stack-output-names`-style tags,
    config-build consumes them.
-9. **documentation** — docstrings, comments, READMEs, changelogs
+9. **documentation** — docstrings, comments, READMEs, changelogs, **when the
+   task asks for one as a deliverable**. Documentation a code change drags
+   along behind it belongs to the category causing that change, whatever file
+   it lands in; the deciding question is whether the docs were asked for, not
+   whether they will be touched. Left unstated, this boundary is read one way
+   by the classifier (any change invalidating a docstring is documentation
+   work) and the other by `classification_judge` (only a deliverable counts),
+   which the gate then spends rounds litigating.
 
 A task commonly spans several categories; one planner is assigned per
 matched category, since categories are domains of expertise, not mutually
@@ -4968,6 +4975,47 @@ explicitly requested, across the gate call) and suppresses a
 same-work/test-ownership pair only when both categories are judge-confirmed
 — the classifier's self-check yields to the independent judge instead of
 re-litigating every round.
+
+**`judge_confirmed` is monotone except under an evidenced retraction.** The
+set is OR-accumulated across rounds so a later round reviewing a *narrower*
+set cannot retract an earlier confirmation of a category that simply wasn't
+up for debate that round. The one thing that *does* retract is an
+**evidenced** `spurious_category` finding, because that finding is the judge
+adjudicating precisely that category. A purely monotonic set freezes the
+judge's first opinion and then fights every later one, producing a re-classify
+prompt that carries "drop X" and "keep X" together: an instruction no
+classifier can satisfy, which burns the remaining rounds and exhausts the gate
+before any planner runs.
+
+Retraction is correct **without needing to know why the verdict changed**, and
+that matters, because the run corpus cannot tell us. Measured: 7 of the 432
+runs that invoked the judge (1.6%) contain a category confirmed in one round
+and evidenced as spurious in a later one, and in none of them was the later
+verdict rendered against an identical category set — which rules out a *proven*
+self-contradiction but establishes nothing about refinement. In the canonical
+failure's own transcript the later rationales turn on a round-independent
+fact about the task ("no concrete documentation deliverable is evidenced"),
+not on the category that had joined, so refinement is not the explanation
+there. Either way the argument for retraction is the same: the latest
+evidenced verdict is the one the gate must act on, and a set that cannot drop
+it makes the prompt unsatisfiable. The oscillation guard bounds the case where
+the judge is merely resampling.
+
+A *vague* spurious entry — one the anti-gaming rule already
+drops so it never gates — must not retract either, or a category the gate
+effectively ignored would still be stripped. The orchestrator additionally
+refuses to emit a keep-list and drop-list that intersect, so the
+contradiction fails loudly rather than as silent non-convergence.
+
+The asymmetry here is deliberate and must not be "fixed" into symmetry.
+Confirmations accumulate because they exist to stop the *classifier's own
+self-check* stripping a category the judge vetted, and that need outlives the
+round. Rejections are the opposite: they are the current round's instruction,
+derived from the category set as it stands now, so they must expire with it.
+Accumulating a `judge_rejected` set would reintroduce the same freeze this
+section exists to prevent, merely pointed the other way — a category the
+judge legitimately re-requests on a later round, because the set changed
+again, would be fought by a rejection it can no longer revisit.
 
 **Already-satisfied subtask elimination (the per-subtask sibling).** The
 cleared-but-empty state above is *whole-run*. A planner does not know what a

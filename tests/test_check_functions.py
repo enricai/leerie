@@ -37,6 +37,28 @@ class TestCheckClassifierOutput:
         issues = leerie.check_classifier_output(result, tmp_path)
         assert any("CATEGORY_NO_DIR" in i for i in issues)
 
+    def test_docs_no_dir_suppressed_when_judge_confirmed(
+            self, leerie, tmp_path):
+        """The advisory yields to the independent judge, like the two RISK
+        checks. Without this, `phase_classification_gate` re-runs this
+        function every re-classify round and strips a category the judge
+        just confirmed — and the heuristic is wrong anyway for a repo whose
+        documentation deliverable is a root README or CHANGELOG."""
+        result = {"categories": ["documentation"], "questions": []}
+        issues = leerie.check_classifier_output(
+            result, tmp_path, judge_confirmed=frozenset({"documentation"}))
+        assert not any("CATEGORY_NO_DIR" in i for i in issues), issues
+
+    def test_docs_no_dir_still_fires_for_an_unconfirmed_category(
+            self, leerie, tmp_path):
+        """Anti-vacuity control: a DIFFERENT category being confirmed must
+        not suppress this one, or the test above would pass against a check
+        that had simply been deleted."""
+        result = {"categories": ["documentation"], "questions": []}
+        issues = leerie.check_classifier_output(
+            result, tmp_path, judge_confirmed=frozenset({"infrastructure"}))
+        assert any("CATEGORY_NO_DIR" in i for i in issues), issues
+
     def test_docs_with_dir(self, leerie, tmp_path):
         (tmp_path / "docs").mkdir()
         result = {"categories": ["documentation"], "questions": [],

@@ -38,7 +38,13 @@ Assign the task to one or more of these nine categories:
   `configuration-build` work consumes. When the task says "do what the
   inspect repos do" and an `--inspect-dir` references a repo with an
   `infra/` tree, this category applies.
-- `documentation` — docstrings, comments, READMEs, changelogs.
+- `documentation` — docstrings, comments, READMEs, changelogs, **when the
+  task asks for one as a deliverable**. Documentation a code change merely
+  drags along behind it belongs to the category causing that change, whatever
+  file it lands in: a bug fix that invalidates a function's docstring — or a
+  default documented in a README — is `bug-fixing`, not `bug-fixing` plus
+  `documentation`. Add `documentation` when the docs are asked for, not when
+  they are a consequence.
 
 A task commonly spans several. Include every category that genuinely applies;
 do not pad.
@@ -51,7 +57,10 @@ create 2× the subtasks with no additional coverage.
 
 The test PASSES (keep both) when two categories produce genuinely
 different deliverables — different files, or different purposes on the
-same files. `bug-fixing` fixes a handler + `testing` adds a test file →
+same files. One exception, which outranks the file criterion:
+documentation a code change drags along behind it never earns
+`documentation` on the strength of landing in a different file — that is
+the rule above, and it wins here. `bug-fixing` fixes a handler + `testing` adds a test file →
 keep both. `bug-fixing` fixes a timeout + `feature-implementation` adds
 new retry logic → keep both (different purposes). The test FAILS (drop
 one) when both categories would update the same files for the same
