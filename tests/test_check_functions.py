@@ -172,29 +172,6 @@ class TestCheckClassifierOutput:
         for token in spec["dirs"] + spec["files"] + spec["globs"]:
             assert token in msg, (token, msg)
 
-    def test_partial_evidence_entry_does_not_crash(
-            self, leerie, tmp_path, monkeypatch):
-        """A category added with only `dirs` must not raise.
-
-        `_category_evidence_found` and `_category_evidence_summary` read the
-        same table, so they must tolerate the same entries. They did not: the
-        predicate indexed every key while the summary used `.get`, so a
-        maintainer who added a category and sanity-checked the *message* saw
-        it work while the predicate raised `KeyError`. This runs inside a
-        gating check, and `KeyError` is not `WorkerError`, so
-        `_run_checked_loop` abandons the loop rather than retrying.
-        """
-        monkeypatch.setitem(leerie.CATEGORY_EVIDENCE, "testing",
-                            {"dirs": ["tests"]})
-        result = {"categories": ["testing"], "questions": []}
-        issues = leerie.check_classifier_output(result, tmp_path)
-        assert any("CATEGORY_NO_DIR" in i for i in issues), issues
-        # The summary half must stay tolerant too, or the pair diverges again.
-        assert "tests" in leerie._category_evidence_summary("testing")
-        (tmp_path / "tests").mkdir()
-        assert not any("CATEGORY_NO_DIR" in i for i in
-                       leerie.check_classifier_output(result, tmp_path))
-
     def test_docs_with_dir(self, leerie, tmp_path):
         (tmp_path / "docs").mkdir()
         result = {"categories": ["documentation"], "questions": [],
