@@ -267,6 +267,9 @@ def test_judgment_workers_pinned_set(leerie):
         # runs on the judgment tier at the same `medium` post-Opus-5 default.
         "classification_judge", "wiring_judge", "provision_judge",
         "task_coverage_judge", "integration_judge",
+        # Confirms the classifier's likely_already_satisfied claim on the
+        # converged-gate path (DESIGN §8 *The healthy-path consumer*).
+        "no_work_judge",
         # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
         # worker*) — a judgment worker (decides tag/path per artifact).
         "artifact_registry",

@@ -3609,6 +3609,22 @@ than a toy string, so the drop-list formatting is exercised on a real payload
 shape. Ablation: removing the `difference_update` turns both it and the
 retraction test red.
 
+**The converged-gate no-work consumer**, in `tests/test_no_work_judge.py`
+(DESIGN §8 *The healthy-path consumer* — measured 2026-09-22:
+`likely_already_satisfied` had exactly one reader, the exhaustion arm, so
+three consecutive re-runs of an already-merged task each cited the landed
+commits, converged, and shipped a PR anyway). Every behavioral test drives
+the real `phase_classification_gate` with a `claude_p` stub dispatching on
+`schema_key` (so the two judges' stubs cannot mask each other) and asserts
+terminal-state VALUES: confirm → routed True + `no_work_required` +
+`no_work_confirmation` carrying both evidences verbatim; dispute / crash /
+empty-evidence confirm → planning proceeds; flag-unset and
+`skip_satisfied_check` → per-schema call count of **zero** for
+`no_work_judge` (anti-vacuity — an unwired hook still "returns False");
+the judge's user_prompt carries the claim text and `required_items`
+(substance, not structure); and the exhaustion arm still routes on raw
+trust with no judge spawn (its documented boundary, unchanged).
+
 **Two traps this incident re-confirmed.**
 
 *The exhaustion message counted the wrong thing.* It printed

@@ -406,8 +406,14 @@ STATE_FIELDS = (
     # phase_classification_gate on retry-loop exhaustion to route to the
     # cleared-but-empty terminal state instead of dying, when the
     # classifier's own investigation already found the task's deliverable
-    # present on HEAD.
+    # present on HEAD — and, on the CONVERGED gate path, by
+    # _confirm_no_work_on_converged_gate through the independent
+    # no_work_judge (DESIGN §8 *The healthy-path consumer*).
     "likely_already_satisfied", "likely_already_satisfied_evidence",
+    # no_work_confirmation: audit record of a converged-gate no-work exit —
+    # both halves of the two-worker agreement (classifier claim + judge
+    # verification). Written only when the no_work_judge confirms.
+    "no_work_confirmation",
     "artifact_registry",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
@@ -1455,6 +1461,13 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "provision_judge": "medium",
     "task_coverage_judge": "medium",
     "integration_judge": "medium",
+    # Confirms (or disputes) the classifier's likely_already_satisfied claim
+    # on the converged-gate path (DESIGN §8 *The healthy-path consumer*).
+    # Same adversarial-verifier tier as its siblings above; absent from
+    # TIMEOUT_DEFAULT_PER_WORKER because that table is DERIVED from the
+    # measured duration corpus and a new worker has no measurements — it
+    # falls to the global worker_timeout_sec backstop until it does.
+    "no_work_judge": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -1587,7 +1600,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
-                "integration_judge", "rebaser")
+                "integration_judge", "no_work_judge", "rebaser")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1612,7 +1625,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "classifier", "classification_judge", "provision", "provision_judge",
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
-    "wiring_judge", "satisfied_probe", "integration_judge",
+    "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2869,6 +2882,38 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "rationale": {"type": "string"},
+        },
+    },
+    "no_work_judge": {
+        # Adversarially verifies the classifier's likely_already_satisfied
+        # claim on the CONVERGED classification-gate path (DESIGN §8 *The
+        # healthy-path consumer: a converged gate still checks the claim*).
+        # The claim was previously consumed only when the gate exhausted, so
+        # on every converging run it was written and never read — measured:
+        # three consecutive re-runs of an already-merged task each cited the
+        # landed commits, converged, and shipped a PR anyway. A
+        # `confirmed: true` with non-empty evidence routes the run to
+        # `_finish_no_work_run`; anything else — dispute, crash, timeout,
+        # empty evidence — falls through to planning unchanged (fail-open
+        # toward doing work). The judge runs read-only on the current
+        # checkout only (SATISFIED_PROBE_TOOLS — same base-tree discipline
+        # and for the same reason: a worktree shares the ref DB, and a
+        # history-spanning judge "finds" deliverables on unrelated branches).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["confirmed", "evidence"],
+        "properties": {
+            # True only when every deliverable the task requires is verified
+            # present on the current checkout. The prompt biases false on any
+            # doubt: a false confirm ends the run with real work undone,
+            # while a false dispute costs only the planning the run was
+            # about to do anyway.
+            "confirmed": {"type": "boolean"},
+            "evidence": {"type": "string"},
+            "checked": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
         },
     },
     "wiring_judge": {
@@ -20401,6 +20446,89 @@ def _gating_spurious_categories(judge_result: dict) -> set[str]:
     } - {""}
 
 
+async def _confirm_no_work_on_converged_gate(
+        task: str, st: State, caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None]) -> bool:
+    """Consult `likely_already_satisfied` on the CONVERGED gate path
+    (DESIGN §8 *The healthy-path consumer: a converged gate still checks
+    the claim*). Returns True iff the run was routed to
+    `_finish_no_work_run` (caller must stop); False on every other
+    outcome — flag unset, skip flag set, judge dispute, judge crash, or
+    empty judge evidence — so the run proceeds to planning unchanged.
+
+    The claim is never trusted raw here: on this path the run *can*
+    proceed normally, so the trust boundary DESIGN documents for the
+    exhaustion arm ("an investigation un-double-checked by a second
+    judge" is acceptable only when the alternative was dying) does not
+    extend to it. A `no_work_judge` — the `fit_judge` independent-
+    adversarial-verifier precedent — re-checks the cited commits, tests,
+    and required items against the tree it can see, and only its
+    confirmation routes to no-work. Fail-open in every failure mode:
+    a wrong dispute costs the planning the run was about to do anyway,
+    a wrong confirm ends the run with real work undone.
+
+    Honors `skip_satisfied_check`: one flag governs every
+    already-satisfied prune (this consumer and the phase-3 sweep)."""
+    if st.data.get("skip_satisfied_check"):
+        return False
+    evidence = (st.data.get("likely_already_satisfied_evidence") or "").strip()
+    if not (st.data.get("likely_already_satisfied") and evidence):
+        return False
+
+    required_items = st.data.get("required_items") or []
+    user_prompt = (
+        "TASK:\n" + task + "\n\n"
+        "CLASSIFIER CLAIM (to verify adversarially — the classifier's "
+        "investigation concluded this task's deliverable is already fully "
+        "present on the current checkout):\n" + evidence +
+        ("\n\nREQUIRED ITEMS (each must be verifiably met on the current "
+         "checkout for the claim to hold):\n" +
+         json.dumps(required_items, indent=2) if required_items else "") +
+        "\n\nVerify the claim against the CURRENT checkout only — never "
+        "other branches or history. Return only the JSON object per your "
+        "schema. Default confirmed=false on any doubt."
+    )
+    log("  classification gate converged with an already-satisfied claim; "
+        "spawning no_work_judge to verify it")
+    # bump_workers stays OUTSIDE the try: its WorkerError is the budget
+    # backstop and must propagate, not be read as a judge dispute.
+    st.bump_workers(caps)
+    try:
+        out = await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=_load_prompt("no_work_judge"),
+            schema_key="no_work_judge", cwd=_judgment_cwd(st),
+            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models.get("no_work_judge", MODEL_DEFAULT),
+            effort=efforts.get("no_work_judge"),
+            sid="no_work_judge",
+        )
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        log("  no_work_judge crashed "
+            f"({_brief_worker_exc(e)}); proceeding to planning "
+            "(fail-open — a crash never confirms)")
+        return False
+
+    judge_evidence = (out.get("evidence") or "").strip()
+    if out.get("confirmed") is True and judge_evidence:
+        log("  no_work_judge CONFIRMED the task is already satisfied on "
+            "the current checkout — routing to the cleared-but-empty "
+            f"terminal state (evidence: {judge_evidence!r})")
+        # Audit trail: both halves of the two-worker agreement.
+        st.data["no_work_confirmation"] = {
+            "classifier_evidence": evidence,
+            "judge_evidence": judge_evidence,
+            "checked": list(out.get("checked", []) or []),
+        }
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence})
+        return True
+    log("  no_work_judge did not confirm the claim "
+        f"(evidence: {judge_evidence[:200]!r}); proceeding to planning")
+    return False
+
+
 async def phase_classification_gate(task: str, st: State, caps: dict,
                                     clarify: bool, models: dict[str, str],
                                     efforts: dict[str, str | None]) -> bool:
@@ -20437,7 +20565,11 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     round is not guaranteed — only a genuinely fresh contradicting claim
     with its own evidence would ever override an earlier True. Routes
     to `_finish_no_work_run` and returns True in that case; the caller must
-    then stop the pipeline (mirroring the existing `_detect_no_work` call
+    then stop the pipeline. The CONVERGED path consults the same field too,
+    but through `_confirm_no_work_on_converged_gate`'s independent
+    `no_work_judge` (DESIGN §8 *The healthy-path consumer*) — raw trust in
+    the un-double-checked claim stays scoped to exhaustion, where the
+    alternative was dying, not planning (mirroring the existing `_detect_no_work` call
     site's `_finish_no_work_run(...); return` pattern). A
     `classification_judge` `WorkerError` (infrastructure crash) degrades: the
     classifier's own output is preserved (never discarded), consistent with
@@ -20658,6 +20790,15 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     st.data["classification_coverage_gate"] = judge_result
     st.save()
     log("phase 1: classification gate clean")
+    # Healthy-path consumer of likely_already_satisfied (DESIGN §8 *The
+    # healthy-path consumer*): before this, the exhaustion arm above was
+    # the field's ONLY reader, so a converging run wrote the claim and
+    # never consulted it — re-runs of already-merged tasks planned,
+    # executed, and shipped PRs anyway. Unlike the exhaustion arm, the
+    # claim here is gated behind an independent no_work_judge.
+    if await _confirm_no_work_on_converged_gate(task, st, caps, models,
+                                                efforts):
+        return True
     return False
 
 

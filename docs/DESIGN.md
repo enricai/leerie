@@ -4928,6 +4928,36 @@ instead of routing to no-work.) This extends the trust boundary
 second judge — to "classification could not otherwise converge anyway." A
 classifier that never sets the field sees zero behavior change.
 
+**The healthy-path consumer: a converged gate still checks the claim.**
+The exhaustion arm above turned out to be the field's *only* consumer, so
+on every run where classification converged — which is nearly every run —
+the claim was written to state and never read. Measured against one
+repo's corpus: three consecutive re-runs of an already-merged task each
+had the classifier correctly cite the exact landed commits ("this exact
+fix already landed in the immediately preceding commit… no further code
+changes are needed"), set the field, converge classification, and then
+plan, execute, and open a PR anyway — one of which introduced a
+regression the next run had to fix. The operators' workaround was manual:
+25 `accept-blocked` invocations on "no commits ahead of the run branch"
+across 22 runs, hand-performing the drop the signal already justified.
+
+So the converged path now consults the claim too — but through a second
+judge, preserving the trust boundary above rather than widening it. When
+the gate converges and `likely_already_satisfied` is `True` with
+evidence, `phase_classification_gate` spawns a **`no_work_judge`**: an
+independent, read-only, current-checkout-only adversarial verifier (the
+`fit_judge` precedent, §8 *Self-graded confidence is advisory; an
+independent verifier gates*) that re-checks the classifier's cited
+commits, tests, and required items against the tree it can see. Only a
+`confirmed: true` with evidence routes to `_finish_no_work_run`; a
+dispute, a crash, or a timeout falls through to planning unchanged
+(fail-open toward doing work — the same direction every other
+already-satisfied mechanism fails). The exhaustion arm is untouched: when
+classification cannot converge, the un-double-checked claim remains
+sufficient, because the alternative there was dying, not planning.
+`--skip-satisfied-check` suppresses this consumer along with the phase-3
+sweep — one flag governs every already-satisfied prune.
+
 Reaching this state from classification instead of post-plan meant a run
 could hit `_finish_no_work_run` earlier than `run.json`'s own run-identity
 fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`,
