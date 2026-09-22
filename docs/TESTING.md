@@ -1192,33 +1192,42 @@ filters, which vanish ids the same way: dropped-id inbound refs pruned,
 declared-command check (DESIGN §"A declared command must also have been
 executed" — measured barnacle 2026-09-22: a subtask declared the task's
 one empirical acceptance command in `runs_commands`, never issued it, and
-settled `complete` across ten runs). Pure-function cases make declared
-and executed disagree in the shapes that matter, in BOTH accepted
-directions: literal declared covered inside a pipeline / `cd … &&`
-prefix; paraphrase declared (the B4 shape) covered only when the
-executed segment equals a length-≥2 SUFFIX of the declared salient-token
-list — the adversarial rows that defeated the earlier bare-subset
-reverse rule are each pinned UNRUN ("pnpm run", "make test",
-"test suite", "run test", bare "pnpm", the parent sub-command
-`barnacle recon` for "barnacle recon browser --headless", and the
-flag-dropped `pnpm lint` for "pnpm lint --fix"); quoted-inside-`grep`
-and `--help`-probe invocations NOT counted; and the three cross-segment
-union gaming shapes (`pnpm install && ls test` etc.) NOT counted — the
-union rule they bypassed was removed. `DECLARED_CMD_UNRUN` is pinned
-gating (`_gating_issues` passthrough). `_executed_bash_commands` is
-pinned on a real JSONL fixture (order preserved; the same fixture
-appends a non-Bash tool_use and a malformed line, both ignored; missing
-log → `[]`). The settle wiring drives the real `_settle_subtask` via
-`test_oom_naming.py`'s `env` fixture: unexecuted → one corrective
-re-drive whose feedback note names the command, then `blocked` (never a
-silent `complete`) with the command in the blocker AND the N21
-`accept-blocked <run-id> <sid>` remedy in the log; an `empty_handoff`
-rescue with the command unrun settles COMPLETE with the warning
-persisted to `declared_unrun_warnings` (blocking would strand the
-rescued commits — the accept-blocked resume skip never integrates them);
-executed → completes with exactly one implementer spawn; undeclared →
-untouched (anti-vacuity control). The N21 guard itself
-(`tests/test_settle_subtask_completeness_gate.py`) asserts the
+settled `complete` across ten runs). Pure-function cases pin the settled
+matching rule in BOTH accepted directions: literal declared covered
+inside a pipeline / `cd … &&` prefix; paraphrase declared covered when
+the executed segment appears as a length-≥2 CONTIGUOUS ordered sublist
+of the declared salient-token list, WHEREVER the command sits (tail,
+mid-string, trailing-prose, and either half of a declared compound —
+the suffix-only rule's false-alarm rows, each of which looped into a
+false `blocked`); non-adjacent fragments reassembled from the paraphrase
+pinned UNRUN ("pnpm run", "make test", "run test", "sure green", bare
+"pnpm"); the DOCUMENTED near-miss residual class pinned as ACCEPTED, not
+an oversight (`test_near_miss_execution_is_accepted_residual`: parent
+sub-command, flag-dropped variant, `--help`-probed literal, adjacent
+prose pair — with the design rationale in the test comment); the
+glued-punctuation false-alarm residual pinned
+(`test_glued_punctuation_still_false_alarms`); quoted-inside-`grep` and
+differing-binary `--help` invocations NOT counted; and the three
+cross-segment union gaming shapes (`pnpm install && ls test` etc.) NOT
+counted — the union rule they bypassed was removed.
+`DECLARED_CMD_UNRUN` is pinned gating (`_gating_issues` passthrough).
+`_executed_bash_commands` is pinned on a real JSONL fixture (order
+preserved; the same fixture appends a non-Bash tool_use and a malformed
+line, both ignored; missing log → `[]`). The settle wiring drives the
+real `_settle_subtask` via `test_oom_naming.py`'s `env` fixture:
+unexecuted → one corrective re-drive whose feedback note names the
+command, then `blocked` (never a silent `complete`) with the command in
+the blocker AND the N21 `accept-blocked <run-id> <sid>` remedy in the
+log; an `empty_handoff` rescue with the command unrun settles COMPLETE
+with the warning persisted to `declared_unrun_warnings` (blocking would
+strand the rescued commits — the accept-blocked resume skip never
+integrates them); a clean later attempt POPS the stale warning
+(`test_clean_later_attempt_clears_the_stale_warning`); executed →
+completes with exactly one implementer spawn; undeclared → untouched
+(anti-vacuity control). `phase_finalize` surfaces the warnings as a
+`note —` line (`tests/test_finalize_execution.py::
+test_phase_finalize_surfaces_declared_unrun_warnings`). The N21 guard
+itself (`tests/test_settle_subtask_completeness_gate.py`) asserts the
 remedy shape at EVERY `[sid] = "blocked"` occurrence, not just the
 first.
 

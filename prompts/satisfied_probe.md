@@ -255,9 +255,11 @@ Return **only** a JSON object per your schema:
   `artifact_missing` / `behavior_gap` / `partially_met` / `cannot_verify`
   — see above.
 - `equivalent_coverage_exists` (set when `unsatisfied_reason` is
-  `artifact_missing`): whether the criterion's substance is already on
-  this tree under another name, with citing evidence.
+  `artifact_missing`; under forced-fields mode, set on every verdict
+  using the inert values above): whether the criterion's substance is
+  already on this tree under another name, with citing evidence.
 - `sibling_invalidation_risk` (set when `equivalent_coverage_exists` is
-  `true`): whether a surviving sibling's pending work would invalidate
-  that coverage once it lands. The drop requires an explicit `false`;
-  omitted or `true` keeps the subtask.
+  `true`; under forced-fields mode, set on every verdict using the inert
+  values above): whether a surviving sibling's pending work would
+  invalidate that coverage once it lands. The drop requires an explicit
+  `false`; omitted or `true` keeps the subtask.

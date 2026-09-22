@@ -49,47 +49,85 @@ def test_pipeline_and_cd_prefix_still_match(leerie):
         ["cd /work && NODE_ENV=test pnpm run build 2>&1 | tail -5"]) == []
 
 
-def test_paraphrase_declared_matches_as_suffix(leerie):
-    # The B4-validated planner shape: the declared entry WRAPS the
-    # command's tokens in extra words, with the command at the tail —
-    # the executed segment must equal a length-≥2 SUFFIX of the declared
-    # salient-token list.
+def test_paraphrase_declared_matches_wherever_the_command_sits(leerie):
+    # The paraphrase shape: the declared entry WRAPS the command's tokens
+    # in extra words — the executed segment must appear as a length-≥2
+    # CONTIGUOUS ordered sublist of the declared salient-token list,
+    # ANYWHERE in it. Mid-string and trailing-prose paraphrases were the
+    # suffix rule's false-alarm class: each looped the re-drive into a
+    # false `blocked`, whose accept-blocked remedy silently drops a
+    # correct subtask's commits.
+    for declared in (
+        "run the full test suite with pnpm test",              # tail
+        "run pnpm test to verify",                             # mid
+        "run the full test suite with pnpm test and make sure it is green",
+    ):
+        assert leerie.check_declared_commands_executed(
+            {"runs_commands": [declared]}, ["pnpm test"]) == [], declared
     assert leerie.check_declared_commands_executed(
-        {"runs_commands": ["run the full test suite with pnpm test"]},
-        ["pnpm test"]) == []
+        {"runs_commands": ["run barnacle recon browser and read the report"]},
+        ["barnacle recon browser"]) == []
     assert leerie.check_declared_commands_executed(
         {"runs_commands": ["barnacle recon browser"]},
         ["recon browser"]) == []
+    # A declared compound is satisfied by either of its halves — the
+    # separator token makes the forward direction unmatchable, so the
+    # contiguous rule carries this shape.
+    for executed in (["pnpm build"], ["pnpm test"]):
+        assert leerie.check_declared_commands_executed(
+            {"runs_commands": ["pnpm build && pnpm test"]},
+            executed) == [], executed
 
 
-def test_reverse_direction_rejects_fragments_and_subcommands(leerie):
-    # Adversarial rows that defeated the bare-subset reverse rule this
-    # suffix rule replaces: any ≥2-token fragment of a wordy paraphrase
-    # counted as executed. Each must now be UNRUN.
+def test_reverse_direction_rejects_nonadjacent_fragments(leerie):
+    # Adversarial rows that defeated the bare-subset reverse rule:
+    # NON-ADJACENT words of a paraphrase reassembled into a "command".
+    # Contiguity rejects each; a bare single token fails the ≥2 floor.
     long = ("run the full test suite with pnpm test and make sure it "
             "is green")
-    for executed in (["pnpm run"], ["make test"], ["test suite"],
-                     ["run test"], ["pnpm"]):
+    for executed in (["pnpm run"], ["make test"], ["run test"],
+                     ["sure green"], ["pnpm"]):
         issues = leerie.check_declared_commands_executed(
             {"runs_commands": [long]}, executed)
         assert len(issues) == 1, executed
         assert "DECLARED_CMD_UNRUN" in issues[0]
-    # A parent sub-command is not the declared command.
-    issues = leerie.check_declared_commands_executed(
-        {"runs_commands": ["barnacle recon browser --headless"]},
-        ["barnacle recon"])
-    assert len(issues) == 1 and "DECLARED_CMD_UNRUN" in issues[0]
 
 
-def test_literal_minus_flags_does_not_count(leerie):
-    # `pnpm lint` is not "pnpm lint --fix" minus prose — it is the
-    # command minus the flag that makes it do the work. The bare-subset
-    # reverse rule accepted this (and a prior test pinned the hole as
-    # correct behavior); the suffix rule rejects it.
-    issues = leerie.check_declared_commands_executed(
-        {"runs_commands": ["pnpm lint --fix"]},
-        ["pnpm lint"])
-    assert len(issues) == 1 and "DECLARED_CMD_UNRUN" in issues[0]
+def test_near_miss_execution_is_accepted_residual(leerie):
+    # The DOCUMENTED near-miss residual class (DESIGN §"A declared
+    # command must also have been executed"): the gate catches "never
+    # touched the declared command", not "ran a variant of it". Each row
+    # here is a deliberate design acceptance, not an oversight — a
+    # stricter rule (suffix-only) was shipped and withdrawn because its
+    # false alarms looped into a false `blocked` that silently drops
+    # correct commits, strictly worse than these near-miss passes; and
+    # the forward direction always passed the mirror shapes (e.g.
+    # `pnpm lint --fix --dry-run` for declared "pnpm lint --fix"), so
+    # rejecting only these was incoherent. Deliberate gaming is the same
+    # §9 concession that declines to gate on test content.
+    for declared, executed in (
+        ("barnacle recon browser --headless", "barnacle recon"),
+        ("pnpm lint --fix", "pnpm lint"),
+        ("pnpm test", "pnpm test --help"),
+        ("run the full test suite with pnpm test and make sure it is "
+         "green", "test suite"),
+    ):
+        assert leerie.check_declared_commands_executed(
+            {"runs_commands": [declared]}, [executed]) == [], (declared,
+                                                               executed)
+
+
+def test_glued_punctuation_still_false_alarms(leerie):
+    # The remaining documented FALSE-ALARM residual: a declared entry
+    # quoting the command keeps the quote characters glued to the
+    # tokens, so neither direction matches. Worst case is a re-drive
+    # naming the declared string, then the operator-adjudicated blocked
+    # terminal.
+    for declared in ("run `pnpm test`", "please run pnpm test."):
+        issues = leerie.check_declared_commands_executed(
+            {"runs_commands": [declared]}, ["pnpm test"])
+        assert len(issues) == 1, declared
+        assert "DECLARED_CMD_UNRUN" in issues[0]
 
 
 def test_no_cross_segment_union_gaming(leerie):
@@ -282,6 +320,41 @@ def test_empty_handoff_rescue_completes_with_persisted_warning(
     assert len(warnings) == 1 and "pnpm build" in warnings[0]
     out = capsys.readouterr().out
     assert "WARNING" in out and "pnpm build" in out
+
+
+def test_clean_later_attempt_clears_the_stale_warning(env, monkeypatch):  # noqa: F811
+    """Lifecycle: a persisted warning from an earlier rescued attempt is
+    POPPED when a later complete attempt of the same sid has no unrun
+    declared commands — a lingering warning would contradict the run
+    record, the same hazard the symptom_findings pop and the
+    blocked-dict clear guard against."""
+    leerie_mod = env["leerie"]
+    _declare(env, ["pnpm build"])
+    _write_worker_log(env["run_dir"] / "logs" / f"{env['sid']}.log",
+                      ["pnpm run build"])
+    # Stale warning from a (simulated) earlier rescued attempt.
+    env["st"].data["declared_unrun_warnings"] = {
+        env["sid"]: ["DECLARED_CMD_UNRUN: stale"]}
+    env["st"].save()
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        return {"subtask_id": sid_, "status": "complete",
+                **_COMPLETE_RES_EXTRA}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+
+    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
+                          label="post"):
+        return {"satisfied": True, "evidence": "on the run branch",
+                "checked": ["src.py"]}
+    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
+                        _stub_probe)
+
+    res = _settle(leerie_mod, env, failed_retries=0)
+
+    assert res["status"] == "complete"
+    assert env["sid"] not in env["st"].data.get(
+        "declared_unrun_warnings", {})
 
 
 def test_executed_declared_command_settles_complete_without_redrive(

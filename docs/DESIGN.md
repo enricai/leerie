@@ -4772,7 +4772,8 @@ refused; only the restructure worked.
 against the API across all 23 then-existing schemas (2026-08-04;
 re-swept 2026-09-22 across all 24 after `no_work_judge` and the
 `satisfied_probe` typed fields landed — all 24 compile), two were refused
-outright — the planner's and the reconciler's, both driven by optional
+outright before the restructure described above — the planner's and the
+reconciler's, both driven by optional
 properties inside array items (twelve each), not size (the conformer's
 larger schema compiles fine). The fix is not to make those fields required
 — that already failed once, for a different reason: requiring fields is
@@ -5470,33 +5471,47 @@ orchestrator already holds every Bash invocation the worker actually made
 as structured `tool_use` JSON in the per-worker log (`_iter_log_tool_use`
 — JSON→JSON, no prose is read), so `_settle_subtask` requires every
 `runs_commands` entry on a `complete` result to match some executed
-invocation under normalized token-set matching, per shell segment
+invocation under normalized token matching, per shell segment
 (segments split first, so a match inside a pipeline or a `cd … && …`
 prefix still counts — but never a cross-segment token union, which would
 credit `pnpm install && ls test` for a declared "pnpm test"). Matching
 accepts either direction, because `runs_commands` legitimately takes two
 shapes: a *literal* entry (declared token set ⊆ executed segment's) and
-the B4-validated *paraphrase* entry that wraps the command's tokens in
-extra words, with the command at the tail — for that shape the executed
-segment's salient token list must equal a length-≥2 **suffix** of the
-declared entry's salient token list. Suffix — ordered and contiguous —
-not subset: a bare-subset reverse rule was shipped and adversarially
-defeated the same day, because any ≥2-token *fragment* of a wordy
-paraphrase then counted as executed ("pnpm run", "test suite", a parent
-sub-command like `barnacle recon` for "barnacle recon browser", or the
-command minus the flag that does the work, `pnpm lint` for "pnpm lint
---fix") — a false-PASS class in exactly the direction this gate exists
-to close. Two residual classes are accepted and documented: a paraphrase
-whose real command is not its literal tail (flag-with-value drift, or a
-prose suffix like "…then inspect the report") **false-alarms** — the
-re-drive feedback names the declared string, so the worst case is one
-corrective round; and a worker that deliberately types a matching tail
-string is **not caught** — the check verifies invocation, not success or
-intent, because gating on the command's outcome is the same
-code-enforced "tests must pass" bar §9 rejects (it invites a stuck
-worker to weaken the command instead), and the command's *output*
-reaching the worker is what the re-drive prompt asks for, not what the
-gate can honestly measure. A miss first re-drives
+a *paraphrase* entry that wraps the command's tokens in extra words (the
+plan-level floor's one corpus sample, "barnacle recon browser" for
+`recon browser`, plus `prompts/planner.md`'s exact-commands instruction
+are the whole evidence base for that shape — a tail-position assumption
+was briefly shipped on no evidence and withdrawn). For the paraphrase
+shape the executed segment's salient token list must appear as a
+length-≥2 **contiguous ordered sublist** anywhere in the declared
+entry's salient token list. Contiguity is the settled endpoint of a
+measured three-round oscillation whose neighbors are both known-bad: a
+bare-SUBSET reverse rule let any ≥2-token fragment of a wordy paraphrase
+count as executed ("pnpm run", "make test" — non-adjacent words
+reassembled); a SUFFIX-only rule then false-alarmed on every paraphrase
+with words *after* the command ("run pnpm test to verify" vs an
+exactly-executed `pnpm test`), looping the re-drive deterministically
+into the blocked terminal — where `accept-blocked` silently drops a
+correct subtask's commits, strictly worse than any near-miss pass. No
+token rule can separate "ran the command mid-paraphrase" from "ran an
+adjacent fragment of the paraphrase"; contiguity resolves the
+undecidable remainder toward keeping work. The gate's honest contract is
+therefore: it catches **"never touched the declared command"**, not
+"ran a variant of it". Accepted near-miss residual class, in full: a
+parent sub-command (`barnacle recon` for "barnacle recon browser"), a
+flag-dropped variant (`pnpm lint` for "pnpm lint --fix" — its mirror,
+adding `--dry-run`, already passes the literal direction), `--help`-
+probing a declared literal, and a deliberately-typed adjacent word pair
+("test suite") — the same §9 concession that declines to gate on test
+content a stuck worker could weaken, because the check verifies
+invocation, not success or intent: gating on the command's outcome is
+the code-enforced "tests must pass" bar §9 rejects, and the command's
+*output* reaching the worker is what the re-drive prompt asks for, not
+what the gate can honestly measure. The false-alarm residual that
+remains is glued punctuation (a declared entry quoting the command,
+"run \`pnpm test\`") and genuinely non-contiguous paraphrases; the worst
+case there is the re-drive round then the blocked terminal, adjudicated
+by the operator via `accept-blocked`. A miss first re-drives
 the implementer through the existing mechanical-check feedback loop —
 forgetting to run a declared command is exactly the "retryable mistake"
 shape that loop exists for — and when the confidence-retry budget
@@ -5508,8 +5523,8 @@ site, credentials, an absent fixture) is precisely the
 external-precondition case `accept-blocked` exists to adjudicate, and the
 one thing the run must never do is what it measurably did — settle
 `complete` on a verification it *silently* skipped. One path deliberately
-does not block: a result rescued from `empty_handoff` (§ *A settle
-without an implementer…* context — the worker was reaped mid-turn with
+does not block: a result rescued from `empty_handoff` (§6 *Detecting
+memory OOM* — the worker was reaped mid-turn with
 committed work). Blocking there would strand the very commits the rescue
 exists to keep: `accept-blocked` marks the sid complete, resume then
 excludes it from the remaining set, and integration — which reads

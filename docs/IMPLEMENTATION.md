@@ -4577,10 +4577,13 @@ structured `tool_use` JSON, no prose). Matching is per shell segment
 cross-segment union, which would credit tokens scattered across
 unrelated commands), accepted in either direction: declared token set ⊆
 segment's (literal entry, wrapped execution), or the segment's salient
-token LIST equals a length-≥2 SUFFIX of the declared entry's salient
-token list (the B4 paraphrase shape — suffix, not subset, so fragments,
-parent sub-commands, and flag-dropped variants of the declared entry do
-not count). Invocation, not success, is what is verified (DESIGN §"A
+token LIST appears as a length-≥2 CONTIGUOUS ordered sublist of the
+declared entry's salient token list (the paraphrase shape — contiguity
+rejects non-adjacent fragments and scattered reassembly while accepting
+the command wherever it sits in the paraphrase; the accepted near-miss
+residual class — parent sub-commands, flag-dropped variants,
+`--help`-probed literals, deliberately-typed adjacent pairs — is
+documented in DESIGN). Invocation, not success, is what is verified (DESIGN §"A
 declared command must also have been executed"). Each miss yields a
 `DECLARED_CMD_UNRUN: …` issue: these join the mechanical-check re-drive
 (the `implementer_confidence_retries` budget, feedback naming the

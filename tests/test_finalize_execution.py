@@ -616,6 +616,32 @@ def test_phase_finalize_no_push_skips_pr_and_records_health(
     assert st.data["finished_at"]
 
 
+def test_phase_finalize_surfaces_declared_unrun_warnings(
+        leerie, monkeypatch, st, capsys):
+    """DESIGN §"A declared command must also have been executed": an
+    empty_handoff-rescued subtask that settled complete without executing
+    a declared command must reach the operator as a finalize `note —`
+    line (like unreviewed_subtasks / symptom_findings), not only as a
+    state.json field."""
+    _finalize_ready_state(st)
+    st.data["declared_unrun_warnings"] = {
+        "feat-001": ["DECLARED_CMD_UNRUN: declared it runs 'pnpm build'"]}
+    st.save()
+
+    async def _fake_compose(*a, **k):
+        pass
+    monkeypatch.setattr(leerie, "_compose_pr_via_llm", _fake_compose)
+
+    asyncio.run(leerie.phase_finalize(
+        st.leerie_root, st, no_push=True, no_verify=False,
+        caps=_caps(leerie), models={}, efforts={}))
+
+    out = capsys.readouterr().out
+    assert "note —" in out
+    assert "WITHOUT executing declared" in out
+    assert "feat-001" in out
+
+
 def test_phase_finalize_pushes_and_composes_pr(leerie, monkeypatch, st):
     _finalize_ready_state(st)
     st.data["unreviewed_subtasks"] = ["feat-002"]

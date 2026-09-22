@@ -7374,9 +7374,11 @@ async def _ensure_planning_worktree(st: "State") -> str:
     path for the audit trail and for `_judgment_cwd`, not for a skip check.
 
     Fails closed. A silent fallback to the real checkout would reinstate
-    exactly the exposure this exists to remove, and this runs after preflight
-    and before phase 1, so the run has spent essentially nothing — the
-    cheapest possible moment to refuse (DESIGN §13)."""
+    exactly the exposure this exists to remove — that holds at every call
+    site, which is why the later two (post-classification, pre-sweep)
+    still die() despite real spend already sunk by then; the "cheapest
+    possible moment to refuse" argument applies only to the first,
+    pre-phase-1 call (DESIGN §13)."""
     proc = await _run_script("planning-worktree.sh", st.run_id)
     if proc.returncode != 0:
         die("could not create the judgment-worker worktree "
@@ -9237,10 +9239,18 @@ _STOPWORDS = frozenset({
 _ADHERENCE_GATE_THRESHOLD = 5.0
 
 
+def _command_token_list(command: str) -> list[str]:
+    """Lowercased, stopword-filtered token LIST (order preserved) for a
+    single command string. The single owner of the normalization rule —
+    `_command_tokens` and both arms of the declared-command matcher derive
+    from it, so a stopword or punctuation change lands everywhere at once
+    (a duplicated rule drifts exactly the way a duplicated list does)."""
+    return [tok for tok in command.lower().split() if tok not in _STOPWORDS]
+
+
 def _command_tokens(command: str) -> frozenset[str]:
     """Lowercased, stopword-filtered token set for a single command string."""
-    return frozenset(
-        tok for tok in command.lower().split() if tok not in _STOPWORDS)
+    return frozenset(_command_token_list(command))
 
 
 def check_prescribed_command_coverage(
@@ -9329,32 +9339,42 @@ def check_declared_commands_executed(
       command itself, possibly executed wrapped — declared token SET ⊆
       segment token set, so `cd x && pnpm run build | tail` covers a
       declared "pnpm build";
-    - **paraphrase declared** (the B4-validated planner shape — the entry
-      WRAPS the command's tokens in extra words, e.g. "run the full test
-      suite with pnpm test" for `pnpm test`): the segment's salient token
-      LIST must equal a length-≥2 SUFFIX of the declared entry's salient
-      token list. Suffix, ordered, contiguous — not subset: a bare-subset
-      reverse rule was shipped and adversarially defeated — any ≥2-token
-      fragment of a wordy paraphrase counted as executed ("pnpm run",
-      "test suite", a parent sub-command like `barnacle recon` for
-      "barnacle recon browser"), a false-PASS class in the exact
-      direction the gate exists to close. The suffix rule accepts the
-      B4 shape (the wrapped command sits at the paraphrase's tail) and
-      rejects every demonstrated fragment/sub-command/flag-dropping row
-      (`pnpm lint` does NOT satisfy "pnpm lint --fix").
+    - **paraphrase declared** (the planner shape the plan-level floor's
+      one corpus sample shows — the entry WRAPS the command's tokens in
+      extra words, e.g. "run pnpm test to verify" for `pnpm test`): the
+      segment's salient token LIST must appear as a length-≥2 CONTIGUOUS
+      ordered sublist of the declared entry's salient token list.
 
-    Deliberately NO cross-segment token union: crediting tokens scattered
-    across different commands of one compound invocation would let
-    `pnpm install && ls test` cover a declared "pnpm test". Matching is
-    per-segment only. Two residual classes, both documented in DESIGN §"A
-    declared command must also have been executed": paraphrases whose real
-    command is not their literal tail (flag-with-value drift, or a prose
-    suffix like "…then inspect the report") false-ALARM — one re-drive
-    naming the declared string; and a worker that deliberately types a
-    matching string is not caught — invocation, not success or intent, is
-    what a mechanical gate can honestly measure (§9). Pure JSON→JSON
-    list/set logic, no NL parsing. Free (empty) when the subtask declares
-    nothing — the ~95% case."""
+    That contiguity rule is the settled endpoint of a measured
+    three-round oscillation, and both of its neighbors are known-bad:
+    a bare-SUBSET reverse rule let any ≥2-token fragment of a wordy
+    paraphrase count as executed ("pnpm run", "make test" — non-adjacent
+    words reassembled); a SUFFIX-only rule then false-alarmed on every
+    paraphrase with words AFTER the command ("run pnpm test to verify"
+    vs an exactly-executed `pnpm test`), which loops the re-drive
+    deterministically into the blocked terminal — where accept-blocked
+    silently drops a correct subtask's commits, strictly worse than any
+    near-miss pass. No token rule can separate "ran the command
+    mid-paraphrase" from "ran an adjacent fragment of the paraphrase";
+    contiguity resolves the undecidable remainder toward keeping work.
+
+    The gate's honest contract is therefore: it catches "never touched
+    the declared command", NOT "ran a variant of it". The accepted
+    near-miss residual class (documented in DESIGN §"A declared command
+    must also have been executed"): a parent sub-command
+    (`barnacle recon` for "barnacle recon browser"), a flag-dropped
+    variant (`pnpm lint` for "pnpm lint --fix" — its mirror, adding
+    `--dry-run`, already passed the forward arm), `--help`-probing a
+    declared literal, and a deliberately-typed adjacent word pair
+    ("test suite") — the same §9 concession that declines to gate on
+    test content a stuck worker could weaken. Still rejected: bare
+    single tokens, non-adjacent fragments, and tokens scattered across
+    different segments (NO cross-segment union — `pnpm install && ls
+    test` never covers "pnpm test"). Glued punctuation (a declared
+    entry quoting the command as `` `pnpm test` ``) still false-alarms;
+    worst case is the re-drive then the blocked terminal, adjudicated
+    by accept-blocked. Pure JSON→JSON list/set logic, no NL parsing.
+    Free (empty) when the subtask declares nothing — the ~95% case."""
     declared = [
         rc for rc in (subtask.get("runs_commands") or [])
         if isinstance(rc, str) and rc.strip()
@@ -9368,17 +9388,22 @@ def check_declared_commands_executed(
             seg = _BLT_SEG_LEAD_RE.sub("", raw.strip())
             if not seg:
                 continue
-            toks = [t for t in seg.lower().split() if t not in _STOPWORDS]
+            toks = _command_token_list(seg)
             if toks:
                 exec_sets.append(frozenset(toks))
                 exec_lists.append(toks)
+
+    def _contiguous_sublist(needle: list[str], hay: list[str]) -> bool:
+        n = len(needle)
+        return n >= 2 and any(
+            hay[i:i + n] == needle for i in range(len(hay) - n + 1))
+
     issues: list[str] = []
     for rc in declared:
         rc_tokens = _command_tokens(rc)
-        rc_list = [t for t in rc.lower().split() if t not in _STOPWORDS]
+        rc_list = _command_token_list(rc)
         covered = bool(rc_tokens) and any(
-            rc_tokens <= es
-            or (len(el) >= 2 and rc_list[-len(el):] == el)
+            rc_tokens <= es or _contiguous_sublist(el, rc_list)
             for es, el in zip(exec_sets, exec_lists))
         if not covered:
             issues.append(
@@ -31388,6 +31413,13 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             declared_unrun = check_declared_commands_executed(
                 subtask,
                 _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
+            if not declared_unrun:
+                # A clean later attempt clears a stale warning from an
+                # earlier rescued attempt of the same sid — same
+                # contradiction-avoidance as the symptom_findings pop and
+                # the blocked-dict clear below (persisted by the
+                # subtask_status save on every complete path).
+                st.data.get("declared_unrun_warnings", {}).pop(sid, None)
 
         # CRITIC-pattern MECHANICAL check on complete results. The implementer's
         # `root_cause` / `solution` self-score is NO LONGER a gating axis
@@ -31452,11 +31484,13 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             for _du in declared_unrun:
                 log(f"  {sid}: WARNING (empty_handoff rescue kept the "
                     f"committed diff): {_du}")
+            # State is the record (surfaced by phase_finalize's note
+            # line); a result-level copy was tried and dropped — the
+            # HEAD-reprobe settle path rebuilds the result dict, so a
+            # res-side key silently vanished on exactly that path.
             st.data.setdefault("declared_unrun_warnings", {})[sid] = list(
                 declared_unrun)
             st.save()
-            res.setdefault("declared_unrun_warnings", []).extend(
-                declared_unrun)
 
         # The declared-command check's terminal arm: the re-drive budget
         # is exhausted and a declared command is STILL unexecuted. The one
@@ -31465,9 +31499,14 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # command(s), so the run stops at the wave's blocked registry and
         # the operator adjudicates via accept-blocked (an
         # in-container-unrunnable command is exactly that escape hatch's
-        # case; the subtask's branch retains any commits, and
-        # accept-blocked's documented semantics — resume skips the sid —
-        # apply). Mirrors the completeness gate's N21 blocked-detection
+        # case). Be clear about what accept-blocked does here — the SAME
+        # chain the rescue arm above refuses to enter: it marks the sid
+        # complete, resume excludes it, and integration never merges
+        # whatever commits its branch carries. That is acceptable at THIS
+        # arm because the operator explicitly adjudicated a subtask whose
+        # verification never ran — and the branch survives for manual
+        # recovery — but it is a real trade, not a benign skip.
+        # Mirrors the completeness gate's N21 blocked-detection
         # shape below: the status write is immediately followed by the log
         # naming the exact remedy.
         if status == "complete" and declared_unrun and \
@@ -33221,6 +33260,17 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             f"symptom could not reproduce it, "
             f"so the finding may already "
             f"have been fixed: {', '.join(_stale)}")
+    # DESIGN §"A declared command must also have been executed": an
+    # empty_handoff-rescued subtask that never executed a declared command
+    # settled complete (blocking would strand its kept commits); this line
+    # is the promised operator visibility — same shape as the two notes
+    # above, so the skip is in the run summary, not only in state.json.
+    _unrun = st.data.get("declared_unrun_warnings") or {}
+    if _unrun:
+        log(f"note — {len(_unrun)} subtask(s) settled complete via the "
+            "empty_handoff rescue WITHOUT executing declared "
+            "runs_commands: " + ", ".join(
+                f"{sid} ({len(w)})" for sid, w in sorted(_unrun.items())))
     _log_run_weight(tel, st)
 
 
