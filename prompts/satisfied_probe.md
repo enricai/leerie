@@ -251,15 +251,21 @@ Return **only** a JSON object per your schema:
 - `evidence` (required): a short justification citing concrete on-tree
   facts. On `false`, say what is missing.
 - `checked` (optional): the paths / symbols you actually inspected.
-- `unsatisfied_reason` (required when `satisfied` is `false`): one of
+- `unsatisfied_reason` (required when `satisfied` is `false`; under
+  forced-fields mode also emitted on `satisfied: true`, as
+  `cannot_verify` — ignored there): one of
   `artifact_missing` / `behavior_gap` / `partially_met` / `cannot_verify`
   — see above.
 - `equivalent_coverage_exists` (set when `unsatisfied_reason` is
-  `artifact_missing`; under forced-fields mode, set on every verdict
-  using the inert values above): whether the criterion's substance is
-  already on this tree under another name, with citing evidence.
+  `artifact_missing`; under forced-fields mode, on any verdict where you
+  did NOT actually search, use the inert `false` — a verified finding of
+  equivalent coverage is still reported `true`): whether the criterion's
+  substance is already on this tree under another name, with citing
+  evidence.
 - `sibling_invalidation_risk` (set when `equivalent_coverage_exists` is
-  `true`; under forced-fields mode, set on every verdict using the inert
-  values above): whether a surviving sibling's pending work would
-  invalidate that coverage once it lands. The drop requires an explicit
-  `false`; omitted or `true` keeps the subtask.
+  `true`; under forced-fields mode, on any verdict where you did NOT
+  actually check the siblings, use the inert `true` — a verified
+  no-sibling-risk finding is still reported `false`): whether a
+  surviving sibling's pending work would invalidate that coverage once
+  it lands. The drop requires an explicit `false`; omitted or `true`
+  keeps the subtask.

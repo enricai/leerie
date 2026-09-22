@@ -5500,8 +5500,8 @@ therefore: it catches **"never touched the declared command"**, not
 "ran a variant of it". Accepted near-miss residual class, in full: a
 parent sub-command (`barnacle recon` for "barnacle recon browser"), a
 flag-dropped variant (`pnpm lint` for "pnpm lint --fix" — its mirror,
-adding `--dry-run`, already passes the literal direction), `--help`-
-probing a declared literal, and a deliberately-typed adjacent word pair
+adding `--dry-run`, already passes the literal direction), a `--help`
+probe of a declared literal, and a deliberately-typed adjacent word pair
 ("test suite") — the same §9 concession that declines to gate on test
 content a stuck worker could weaken, because the check verifies
 invocation, not success or intent: gating on the command's outcome is
@@ -5509,9 +5509,12 @@ the code-enforced "tests must pass" bar §9 rejects, and the command's
 *output* reaching the worker is what the re-drive prompt asks for, not
 what the gate can honestly measure. The false-alarm residual that
 remains is glued punctuation (a declared entry quoting the command,
-"run \`pnpm test\`") and genuinely non-contiguous paraphrases; the worst
-case there is the re-drive round then the blocked terminal, adjudicated
-by the operator via `accept-blocked`. A miss first re-drives
+"run \`pnpm test\`"), genuinely non-contiguous paraphrases, and a
+declared entry with fewer than one salient token (all-stopword or
+separator-only strings, e.g. "&&", are deterministically unsatisfiable
+— separators never survive segment splitting); the worst
+case for each is the re-drive round then the blocked terminal,
+adjudicated by the operator via `accept-blocked`. A miss first re-drives
 the implementer through the existing mechanical-check feedback loop —
 forgetting to run a declared command is exactly the "retryable mistake"
 shape that loop exists for — and when the confidence-retry budget

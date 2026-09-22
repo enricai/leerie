@@ -15,7 +15,10 @@ VALUES — the blocked blocker names the exact command, the re-drive
 feedback note carries it, and the executed/undeclared controls complete
 with exactly one implementer spawn. The pure-function cases make declared
 and executed DISAGREE in the shapes that matter: quoted-in-grep must not
-count, `--help` probing must not count, a pipeline/`cd &&` prefix must.
+count, a DIFFERING-BINARY `--help` probe must not count (a `--help` probe
+of the declared literal itself is a pinned accepted near-miss residual —
+see test_near_miss_execution_is_accepted_residual), a pipeline/`cd &&`
+prefix must count.
 """
 from __future__ import annotations
 

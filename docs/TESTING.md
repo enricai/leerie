@@ -1196,9 +1196,10 @@ settled `complete` across ten runs). Pure-function cases pin the settled
 matching rule in BOTH accepted directions: literal declared covered
 inside a pipeline / `cd … &&` prefix; paraphrase declared covered when
 the executed segment appears as a length-≥2 CONTIGUOUS ordered sublist
-of the declared salient-token list, WHEREVER the command sits (tail,
-mid-string, trailing-prose, and either half of a declared compound —
-the suffix-only rule's false-alarm rows, each of which looped into a
+of the declared salient-token list, WHEREVER the command sits (tail —
+which the suffix rule already passed — plus mid-string, trailing-prose,
+and either half of a declared compound: the suffix-only rule's
+false-alarm rows, each of which looped into a
 false `blocked`); non-adjacent fragments reassembled from the paraphrase
 pinned UNRUN ("pnpm run", "make test", "run test", "sure green", bare
 "pnpm"); the DOCUMENTED near-miss residual class pinned as ACCEPTED, not
