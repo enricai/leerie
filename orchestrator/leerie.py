@@ -31279,6 +31279,24 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
 
         status = res.get("status")
 
+        # Settle-time declared-command check (DESIGN §"A declared command
+        # must also have been executed"): a `complete` claim on a subtask
+        # that declared `runs_commands` must be backed by the worker
+        # actually running each declared command — read from the
+        # per-worker log's structured tool_use records, never trusted
+        # from the result. Computed OUTSIDE the mechanical-check block
+        # below because it has two consumers: its issues join that block's
+        # gating re-drive, and when the retry budget exhausts with a
+        # command still unexecuted, the result converts to `blocked`
+        # (never a silent `complete`) — see the arm after the block.
+        # Skipped for empty_handoff rescues for the same reason the block
+        # below skips them: the worker was reaped mid-turn.
+        declared_unrun: list[str] = []
+        if status == "complete" and not rescued_from_empty_handoff:
+            declared_unrun = check_declared_commands_executed(
+                subtask,
+                _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
+
         # CRITIC-pattern MECHANICAL check on complete results. The implementer's
         # `root_cause` / `solution` self-score is NO LONGER a gating axis
         # (DESIGN §8 *Independent adversarial verification*): a worker grading
@@ -31292,23 +31310,6 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # consume the handoff/clarification budget. Skipped for a result
         # rescued from `empty_handoff`: the worker was reaped mid-turn, so
         # re-spawning it would just repeat the doomed background step.
-        # Settle-time declared-command check (DESIGN §"A declared command
-        # must also have been executed"): a `complete` claim on a subtask
-        # that declared `runs_commands` must be backed by the worker
-        # actually running each declared command — read from the
-        # per-worker log's structured tool_use records, never trusted
-        # from the result. Computed OUTSIDE the confidence-retry guard
-        # below because it has a second consumer: when the retry budget
-        # exhausts with a command still unexecuted, the result converts
-        # to `blocked` (never a silent `complete`) — see the arm after
-        # the mechanical-check block. Skipped for empty_handoff rescues
-        # for the same reason the block below is.
-        declared_unrun: list[str] = []
-        if status == "complete" and not rescued_from_empty_handoff:
-            declared_unrun = check_declared_commands_executed(
-                subtask,
-                _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
-
         if status == "complete" and not rescued_from_empty_handoff and \
                 confidence_retries < caps.get("implementer_confidence_retries", 2):
             # Mechanical checks on the implementer's output.
