@@ -49,23 +49,46 @@ def test_pipeline_and_cd_prefix_still_match(leerie):
         ["cd /work && NODE_ENV=test pnpm run build 2>&1 | tail -5"]) == []
 
 
-def test_paraphrase_declared_matches_reverse_direction(leerie):
+def test_paraphrase_declared_matches_as_suffix(leerie):
     # The B4-validated planner shape: the declared entry WRAPS the
-    # command's tokens in extra words — executed segment ⊆ declared.
+    # command's tokens in extra words, with the command at the tail —
+    # the executed segment must equal a length-≥2 SUFFIX of the declared
+    # salient-token list.
     assert leerie.check_declared_commands_executed(
         {"runs_commands": ["run the full test suite with pnpm test"]},
         ["pnpm test"]) == []
     assert leerie.check_declared_commands_executed(
-        {"runs_commands": ["pnpm lint --fix"]},
-        ["pnpm lint"]) == []
+        {"runs_commands": ["barnacle recon browser"]},
+        ["recon browser"]) == []
 
 
-def test_reverse_direction_floor_rejects_single_token(leerie):
-    # A bare one-salient-token invocation must not satisfy every
-    # paraphrase that mentions it.
+def test_reverse_direction_rejects_fragments_and_subcommands(leerie):
+    # Adversarial rows that defeated the bare-subset reverse rule this
+    # suffix rule replaces: any ≥2-token fragment of a wordy paraphrase
+    # counted as executed. Each must now be UNRUN.
+    long = ("run the full test suite with pnpm test and make sure it "
+            "is green")
+    for executed in (["pnpm run"], ["make test"], ["test suite"],
+                     ["run test"], ["pnpm"]):
+        issues = leerie.check_declared_commands_executed(
+            {"runs_commands": [long]}, executed)
+        assert len(issues) == 1, executed
+        assert "DECLARED_CMD_UNRUN" in issues[0]
+    # A parent sub-command is not the declared command.
     issues = leerie.check_declared_commands_executed(
-        {"runs_commands": ["run the full test suite with pnpm test"]},
-        ["pnpm"])
+        {"runs_commands": ["barnacle recon browser --headless"]},
+        ["barnacle recon"])
+    assert len(issues) == 1 and "DECLARED_CMD_UNRUN" in issues[0]
+
+
+def test_literal_minus_flags_does_not_count(leerie):
+    # `pnpm lint` is not "pnpm lint --fix" minus prose — it is the
+    # command minus the flag that makes it do the work. The bare-subset
+    # reverse rule accepted this (and a prior test pinned the hole as
+    # correct behavior); the suffix rule rejects it.
+    issues = leerie.check_declared_commands_executed(
+        {"runs_commands": ["pnpm lint --fix"]},
+        ["pnpm lint"])
     assert len(issues) == 1 and "DECLARED_CMD_UNRUN" in issues[0]
 
 
@@ -210,12 +233,14 @@ def test_unexecuted_declared_command_blocks_after_redrive(
     assert f"accept-blocked {env['st'].run_id} {env['sid']}" in out
 
 
-def test_empty_handoff_rescue_still_blocks_unrun_declared_command(
+def test_empty_handoff_rescue_completes_with_persisted_warning(
         env, monkeypatch, capsys):  # noqa: F811
-    """F7 regression: the empty_handoff rescue skips the re-drive (a
-    reaped worker would just repeat the doomed step) but must NOT
-    launder an unrun declared command to `complete` — it blocks
-    immediately, with the remedy logged."""
+    """The empty_handoff rescue with an unrun declared command settles
+    COMPLETE — blocking would strand the very commits the rescue exists
+    to keep (blocked → accept-blocked marks complete → resume excludes
+    the sid → integrate_wave never merges the branch) — but NEVER
+    silently: the warning is logged and persisted to state, so the skip
+    is visible in the run record."""
     leerie_mod = env["leerie"]
     _declare(env, ["pnpm build"])
     calls: list = []
@@ -237,14 +262,26 @@ def test_empty_handoff_rescue_still_blocks_unrun_declared_command(
     monkeypatch.setattr(leerie_mod, "_branch_has_commits_ahead",
                         _has_commits)
 
-    res = _settle(leerie_mod, env, implementer_confidence_retries=2)
+    # The rescued result then flows the NORMAL complete path; settle it
+    # via the HEAD-reprobe rescue (the established harness shape from
+    # test_settle_subtask_branch_coverage.py) so no conformer spawns.
+    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
+                          label="post"):
+        return {"satisfied": True, "evidence": "on the run branch",
+                "checked": ["src.py"]}
+    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
+                        _stub_probe)
 
-    assert res["status"] == "blocked"
-    assert "pnpm build" in res["blocker"]
-    assert env["st"].data["subtask_status"][env["sid"]] == "blocked"
+    res = _settle(leerie_mod, env, implementer_confidence_retries=2,
+                  failed_retries=0)
+
+    assert res["status"] == "complete"
     assert len(calls) == 1  # no re-drive on the rescue path
-    assert f"accept-blocked {env['st'].run_id} {env['sid']}" in (
-        capsys.readouterr().out)
+    # The skip is persisted in state — value, not key presence.
+    warnings = env["st"].data["declared_unrun_warnings"][env["sid"]]
+    assert len(warnings) == 1 and "pnpm build" in warnings[0]
+    out = capsys.readouterr().out
+    assert "WARNING" in out and "pnpm build" in out
 
 
 def test_executed_declared_command_settles_complete_without_redrive(

@@ -414,6 +414,12 @@ STATE_FIELDS = (
     # both halves of the two-worker agreement (classifier claim + judge
     # verification). Written only when the no_work_judge confirms.
     "no_work_confirmation",
+    # declared_unrun_warnings: per-sid record of declared runs_commands an
+    # empty_handoff-rescued subtask never executed. The rescue settles
+    # complete (blocking would strand the kept commits — see the rescue
+    # arm in _settle_subtask), so this persisted warning is what keeps the
+    # skip visible in the run record instead of only in the log.
+    "declared_unrun_warnings",
     "artifact_registry",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
@@ -2673,9 +2679,11 @@ SCHEMAS: dict[str, dict] = {
         # not-satisfied verdicts rested solely on "the exact file the
         # planner named does not exist", so a re-run of a done task never
         # came up empty. Both optional (additive — an old-shaped verdict
-        # behaves exactly as before); the consumer drops only when BOTH
-        # agree (`artifact_missing` ∧ `equivalent_coverage_exists`), so
-        # absence of either field defaults to the safe direction, keep.
+        # behaves exactly as before); the consumer drops only on the
+        # three-field conjunction (`artifact_missing` ∧
+        # `equivalent_coverage_exists` ∧ an explicit
+        # `sibling_invalidation_risk: false`), so absence of any field
+        # defaults to the safe direction, keep.
         # Python compares the typed values only — never the evidence
         # prose (Language-to-JSON).
         "type": "object",
@@ -7356,7 +7364,9 @@ async def _ensure_planning_worktree(st: "State") -> str:
     """Create (or reset) this run's disposable judgment-worker worktree and
     return its absolute path, recording it in `st.data["planning_worktree"]`.
 
-    Called before `phase_classify` and again before the satisfied-probe
+    Called before `phase_classify`, again by
+    `_confirm_no_work_on_converged_gate` before the `no_work_judge`
+    spawns, and again before the satisfied-probe
     sweep. It is NOT guarded on the state key being absent: the worktree is a
     filesystem fact, not run state, so a resume must re-establish it (an
     abnormal exit removes it) and a second call must re-reset it (the probe
@@ -9311,29 +9321,40 @@ def check_declared_commands_executed(
     acceptance command, never issued it, and settled `complete` across
     ten runs.
 
-    Normalized token-set matching per shell segment (`_BLT_SEG_RE` split +
+    Normalized token matching per shell segment (`_BLT_SEG_RE` split +
     `_BLT_SEG_LEAD_RE` prefix strip), accepted in EITHER direction because
     `runs_commands` legitimately takes two shapes:
 
     - **literal declared** (the barnacle incident shape): the entry is the
-      command itself, possibly executed wrapped — declared ⊆ segment, so
-      `cd x && pnpm run build | tail` covers a declared "pnpm build";
+      command itself, possibly executed wrapped — declared token SET ⊆
+      segment token set, so `cd x && pnpm run build | tail` covers a
+      declared "pnpm build";
     - **paraphrase declared** (the B4-validated planner shape — the entry
-      WRAPS the command's tokens in extra words, e.g. "barnacle recon
-      browser" for `recon browser`): segment ⊆ declared, with a
-      ≥2-salient-token floor on the segment so a bare `pnpm` cannot
-      satisfy every pnpm-mentioning paraphrase.
+      WRAPS the command's tokens in extra words, e.g. "run the full test
+      suite with pnpm test" for `pnpm test`): the segment's salient token
+      LIST must equal a length-≥2 SUFFIX of the declared entry's salient
+      token list. Suffix, ordered, contiguous — not subset: a bare-subset
+      reverse rule was shipped and adversarially defeated — any ≥2-token
+      fragment of a wordy paraphrase counted as executed ("pnpm run",
+      "test suite", a parent sub-command like `barnacle recon` for
+      "barnacle recon browser"), a false-PASS class in the exact
+      direction the gate exists to close. The suffix rule accepts the
+      B4 shape (the wrapped command sits at the paraphrase's tail) and
+      rejects every demonstrated fragment/sub-command/flag-dropping row
+      (`pnpm lint` does NOT satisfy "pnpm lint --fix").
 
     Deliberately NO cross-segment token union: crediting tokens scattered
     across different commands of one compound invocation would let
     `pnpm install && ls test` cover a declared "pnpm test". Matching is
-    per-segment only. A residual false-positive class remains (a
-    paraphrase whose real invocation differs in flag-with-value tokens,
-    e.g. `--browser=chromium`) — the re-drive feedback names the declared
-    string, so the worst case is one corrective round (DESIGN §"A
-    declared command must also have been executed"). Pure JSON→JSON set
-    logic, no NL parsing. Free (empty) when the subtask declares nothing
-    — the ~95% case."""
+    per-segment only. Two residual classes, both documented in DESIGN §"A
+    declared command must also have been executed": paraphrases whose real
+    command is not their literal tail (flag-with-value drift, or a prose
+    suffix like "…then inspect the report") false-ALARM — one re-drive
+    naming the declared string; and a worker that deliberately types a
+    matching string is not caught — invocation, not success or intent, is
+    what a mechanical gate can honestly measure (§9). Pure JSON→JSON
+    list/set logic, no NL parsing. Free (empty) when the subtask declares
+    nothing — the ~95% case."""
     declared = [
         rc for rc in (subtask.get("runs_commands") or [])
         if isinstance(rc, str) and rc.strip()
@@ -9341,20 +9362,24 @@ def check_declared_commands_executed(
     if not declared:
         return []
     exec_sets: list[frozenset[str]] = []
+    exec_lists: list[list[str]] = []
     for cmd in executed:
         for raw in _BLT_SEG_RE.split(cmd):
             seg = _BLT_SEG_LEAD_RE.sub("", raw.strip())
             if not seg:
                 continue
-            toks = _command_tokens(seg)
+            toks = [t for t in seg.lower().split() if t not in _STOPWORDS]
             if toks:
-                exec_sets.append(toks)
+                exec_sets.append(frozenset(toks))
+                exec_lists.append(toks)
     issues: list[str] = []
     for rc in declared:
         rc_tokens = _command_tokens(rc)
+        rc_list = [t for t in rc.lower().split() if t not in _STOPWORDS]
         covered = bool(rc_tokens) and any(
-            rc_tokens <= es or (len(es) >= 2 and es <= rc_tokens)
-            for es in exec_sets)
+            rc_tokens <= es
+            or (len(el) >= 2 and rc_list[-len(el):] == el)
+            for es, el in zip(exec_sets, exec_lists))
         if not covered:
             issues.append(
                 f"DECLARED_CMD_UNRUN: this subtask declared it runs {rc!r} "
@@ -12130,8 +12155,9 @@ async def _filter_satisfied_subtasks(
     `st.data["dropped_subtasks"]` with `reason: "already_satisfied"` plus
     the probe's evidence — the same audit shape as
     `_filter_offtree_subtasks`. A not-satisfied verdict whose typed
-    fields agree (`unsatisfied_reason == "artifact_missing"` and
-    `equivalent_coverage_exists`) drops the same way with
+    fields agree (`unsatisfied_reason == "artifact_missing"`,
+    `equivalent_coverage_exists`, and an explicit
+    `sibling_invalidation_risk: false`) drops the same way with
     `reason: "equivalent_coverage"` — see `_probe_drop_reason` and
     DESIGN §8 *A "not satisfied" verdict carries a typed reason*.
 
@@ -15325,7 +15351,9 @@ def _strictify_schema(node: object) -> tuple[int, int]:
         # not-satisfied fields rely on "absent → keep" (_probe_drop_reason),
         # and forcing makes absence unrepresentable — the prompt therefore
         # instructs inert values for the forced case, and the drop needs a
-        # three-field conjunction, so grammar pressure alone cannot cause it
+        # three-field conjunction, which bounds what grammar pressure
+        # alone can cause (DESIGN's word — a probability reduction, not
+        # an impossibility; the last line of defense there is the prompt)
         # (see the §2½ disclosure and DESIGN §8 *A "not satisfied" verdict
         # carries a typed reason*).
         #
@@ -20572,12 +20600,19 @@ async def _confirm_no_work_on_converged_gate(
     extend to it. A `no_work_judge` — the `fit_judge` independent-
     adversarial-verifier precedent — re-checks the cited commits, tests,
     and required items against the tree it can see, and only its
-    confirmation routes to no-work. Fail-open in every failure mode:
+    confirmation routes to no-work. Fail-open on every JUDGE outcome:
     a wrong dispute costs the planning the run was about to do anyway,
-    a wrong confirm ends the run with real work undone.
+    a wrong confirm ends the run with real work undone. (Two failures
+    are deliberately NOT open: `bump_workers`' budget backstop
+    propagates, and `_ensure_planning_worktree`'s reset failure die()s —
+    infrastructure, same as at the satisfied-probe sweep's call site.)
 
-    Honors `skip_satisfied_check`: one flag governs every
-    already-satisfied prune (this consumer and the phase-3 sweep)."""
+    Honors `skip_satisfied_check`: one flag governs both
+    already-satisfied prunes (this consumer and the phase-3 pre-schedule
+    sweep; the post-execution HEAD-probe rescues are outside its scope —
+    they settle work, never delete it — and `skip_classification_check`
+    also suppresses this consumer as a side effect, since the gate it
+    hooks never runs)."""
     if st.data.get("skip_satisfied_check"):
         return False
     evidence = (st.data.get("likely_already_satisfied_evidence") or "").strip()
@@ -31402,21 +31437,43 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 st.save()
                 continue
 
-        # The declared-command check's terminal arm: no re-drive remains —
-        # the budget is exhausted, or the result was rescued from
-        # empty_handoff (no re-drive is offered there) — and a declared
-        # command is STILL unexecuted. The one thing this must never do is
-        # settle `complete` on a verification the worker silently skipped —
-        # convert to `blocked`, naming the command(s), so the run stops at
-        # the wave's blocked registry and the operator adjudicates via
-        # accept-blocked (an in-container-unrunnable command is exactly that
-        # escape hatch's case). Mirrors the completeness gate's N21
-        # blocked-detection shape below: the status write is immediately
-        # followed by the log naming the exact remedy.
-        if status == "complete" and declared_unrun and (
-                rescued_from_empty_handoff
-                or not (confidence_retries
-                        < caps.get("implementer_confidence_retries", 2))):
+        # The declared-command check on an empty_handoff RESCUE: never
+        # silent, never blocked. Blocking here would strand the very
+        # commits the rescue exists to keep — verified chain: blocked →
+        # wave die → accept-blocked marks the sid complete → resume
+        # excludes it from `remaining` → integrate_wave sees no result
+        # entry and never merges the branch (and the integration-integrity
+        # gate's `expected` excludes it too, so no shortfall fires). So a
+        # rescued result with an unrun declared command settles complete,
+        # with the warning logged loudly AND persisted to state — the
+        # operator sees it in the run record, not only in a 600 KB log.
+        if status == "complete" and declared_unrun and \
+                rescued_from_empty_handoff:
+            for _du in declared_unrun:
+                log(f"  {sid}: WARNING (empty_handoff rescue kept the "
+                    f"committed diff): {_du}")
+            st.data.setdefault("declared_unrun_warnings", {})[sid] = list(
+                declared_unrun)
+            st.save()
+            res.setdefault("declared_unrun_warnings", []).extend(
+                declared_unrun)
+
+        # The declared-command check's terminal arm: the re-drive budget
+        # is exhausted and a declared command is STILL unexecuted. The one
+        # thing this must never do is settle `complete` on a verification
+        # the worker silently skipped — convert to `blocked`, naming the
+        # command(s), so the run stops at the wave's blocked registry and
+        # the operator adjudicates via accept-blocked (an
+        # in-container-unrunnable command is exactly that escape hatch's
+        # case; the subtask's branch retains any commits, and
+        # accept-blocked's documented semantics — resume skips the sid —
+        # apply). Mirrors the completeness gate's N21 blocked-detection
+        # shape below: the status write is immediately followed by the log
+        # naming the exact remedy.
+        if status == "complete" and declared_unrun and \
+                not rescued_from_empty_handoff and not (
+                    confidence_retries
+                    < caps.get("implementer_confidence_retries", 2)):
             blocker = (
                 "declared runs_commands never executed after "
                 f"{confidence_retries} corrective retr"

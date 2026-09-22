@@ -3019,9 +3019,10 @@ typed not-satisfied fields (`unsatisfied_reason`,
 *keep* on absence, and under this flag absence is unrepresentable — the
 prompt instructs inert values for the forced case and the
 `equivalent_coverage` drop requires a three-field conjunction including an
-explicit `sibling_invalidation_risk: false`, so grammar pressure alone
-cannot produce a drop (DESIGN §8 *A "not satisfied" verdict carries a
-typed reason*). `reconciler`
+explicit `sibling_invalidation_risk: false`, which bounds — a probability
+reduction, not an impossibility; the prompt's inert-value rule is the
+remaining layer — what grammar pressure alone can produce (DESIGN §8 *A
+"not satisfied" verdict carries a typed reason*). `reconciler`
 refused as "grammar too large" even at zero optionals — fixed by lifting
 `requires` out of `added_subtasks` into a sibling `added_requires` keyed by
 `sid`, and collapsing four isomorphic `{sid, tag, reason}` arrays into one
@@ -4571,22 +4572,27 @@ executed)` on every `complete` result whose subtask populates
 `runs_commands`: `executed` is the list of Bash commands the worker
 actually invoked, extracted from its per-worker JSONL log by
 `_executed_bash_commands(log_path)` (over `_iter_log_tool_use` —
-structured `tool_use` JSON, no prose). Matching reuses `_command_tokens`
-normalization, applied per shell segment (`_BLT_SEG_RE` split +
-`_BLT_SEG_LEAD_RE` prefix strip — **no** cross-segment union, which
-would credit tokens scattered across unrelated commands), accepted in
-either direction: declared ⊆ segment (literal entry, wrapped execution)
-or segment ⊆ declared with a ≥2-salient-token floor (the B4 paraphrase
-shape). Invocation, not success, is what is verified (DESIGN §"A
+structured `tool_use` JSON, no prose). Matching is per shell segment
+(`_BLT_SEG_RE` split + `_BLT_SEG_LEAD_RE` prefix strip — **no**
+cross-segment union, which would credit tokens scattered across
+unrelated commands), accepted in either direction: declared token set ⊆
+segment's (literal entry, wrapped execution), or the segment's salient
+token LIST equals a length-≥2 SUFFIX of the declared entry's salient
+token list (the B4 paraphrase shape — suffix, not subset, so fragments,
+parent sub-commands, and flag-dropped variants of the declared entry do
+not count). Invocation, not success, is what is verified (DESIGN §"A
 declared command must also have been executed"). Each miss yields a
 `DECLARED_CMD_UNRUN: …` issue: these join the mechanical-check re-drive
 (the `implementer_confidence_retries` budget, feedback naming the
-unexecuted command); when no re-drive remains — budget exhausted, or the
-result arrived via the `empty_handoff` rescue (which skips the re-drive,
-never the check) — the subtask settles `status: "blocked"` with the
+unexecuted command); when the budget exhausts with a command still
+unexecuted, the subtask settles `status: "blocked"` with the
 blocker naming the command(s) and the N21 remedy log naming
-`leerie accept-blocked <run-id> <sid>` — never `complete` — feeding the
-existing blocked registry / `accept-blocked` path. Skipped for
+`leerie accept-blocked <run-id> <sid>` — never a silent `complete` —
+feeding the existing blocked registry / `accept-blocked` path. A result
+rescued from `empty_handoff` instead settles complete with the warning
+persisted to `state.data["declared_unrun_warnings"][sid]` (blocking
+would strand the rescued commits — see DESIGN; the rescue still skips
+the re-drive, never the check). Skipped for
 empty/absent `runs_commands` (the ~95% case, free).
 
 ### P6 repo-map — `_build_repo_map` + `_rank_repo_map`
@@ -7493,6 +7499,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `likely_already_satisfied` | bool | classifier's additive signal that the task's deliverable already appears present on HEAD (DESIGN §8). Written on every `phase_classify` invocation, default `False`. |
 | `likely_already_satisfied_evidence` | str | required non-empty whenever `likely_already_satisfied` is `True` (`EMPTY_EVIDENCE` check); default `""` |
 | `no_work_confirmation` | dict | audit record of a converged-gate no-work exit (DESIGN §8 *The healthy-path consumer*): `{classifier_evidence, judge_evidence, checked[]}` — both halves of the classifier + `no_work_judge` agreement. Written only when the judge confirms. |
+| `declared_unrun_warnings` | dict | per-sid list of `DECLARED_CMD_UNRUN` issues on an `empty_handoff`-rescued subtask that settled `complete` (DESIGN §"A declared command must also have been executed"): the rescue must not route into the blocked terminal (that would strand the kept commits — accept-blocked's resume skip never integrates them), so this persisted record is what keeps the skipped verification visible in the run record. |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
 | `artifact_registry` | list[dict] | shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*). |
 | `needs_source_of_truth` | bool | whether classifier asked for source-of-truth disambiguation. |

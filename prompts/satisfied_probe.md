@@ -99,7 +99,13 @@ subtasks in this plan (with their declared `provides` and
 them as work that is *about to land*: this is a snapshot taken before the
 plan runs, so it lists every sibling, and you do not know which of them
 may themselves turn out to be already-done — that is fine, because you
-only ever use this list to *keep* a subtask, never to drop one. Judge the
+only ever use this list to *keep* a subtask, never as evidence *for* a
+drop. (The typed-reason section below asks you to certify the opposite
+finding — `sibling_invalidation_risk: false` — as an additional
+*precondition* the orchestrator requires before an equivalent-coverage
+drop; that is the one place a conclusion drawn from this list
+participates in a drop, and only by ruling the risk out, never by
+supplying the drop's evidence.) Judge the
 tree as usual, but before returning
 `satisfied: true`, ask one more question: **would any sibling's
 work, once it lands, break this criterion?**
@@ -119,7 +125,8 @@ safe direction as every other uncertainty — a false `false` costs one
 implementer round; a false `true` here silently drops the only thing
 keeping the suite green. Do **not** use `surviving_siblings` to judge the
 tree itself or to look past the current checkout — it is only a reason to
-*decline* a drop, never a reason to grant one.
+*decline* a drop, never the evidence that grants one (see the
+typed-reason section for the one certification it feeds).
 
 Note that a file *existing* is not the same as the criterion being *met*.
 If a subtask asks for translation keys and the file `messages/en.json`
@@ -179,7 +186,8 @@ these fields. Set `unsatisfied_reason` to exactly one of:
 - `cannot_verify` — you could not check (tooling failed, the criterion is
   not checkable read-only, or you ran out of turns).
 
-When — and only when — the reason is `artifact_missing`, also set
+When the reason is `artifact_missing` (and, apart from the forced-fields
+case at the end of this section, only then), also set
 `equivalent_coverage_exists`: after applying the convention-search
 discipline above, does the criterion's **substance** already exist on this
 tree under a different artifact name? `true` means you found and can cite
@@ -219,7 +227,11 @@ constrain decoding so no field can be omitted): on `satisfied: true`,
 set `unsatisfied_reason` to `cannot_verify`,
 `equivalent_coverage_exists` to `false`, and
 `sibling_invalidation_risk` to `true` — all three are ignored on a
-satisfied verdict, and those values are the inert ones. Never let a
+satisfied verdict, and those values are the inert ones. On a forced
+`satisfied: false` where you did NOT actually search for equivalent
+coverage (any reason, including `artifact_missing`), the inert values
+are the same: `equivalent_coverage_exists: false` and
+`sibling_invalidation_risk: true` — the keep direction. Never let a
 forced field pressure you into `equivalent_coverage_exists: true` or
 `sibling_invalidation_risk: false` you did not actually verify.
 

@@ -4769,7 +4769,9 @@ identifiers-to-enums) were tried against the live API first and all
 refused; only the restructure worked.
 
 **A schema that still cannot be constrained is survivable.** Measured
-against the API across all 23 schemas (2026-08-04), two are refused
+against the API across all 23 then-existing schemas (2026-08-04;
+re-swept 2026-09-22 across all 24 after `no_work_judge` and the
+`satisfied_probe` typed fields landed — all 24 compile), two were refused
 outright — the planner's and the reconciler's, both driven by optional
 properties inside array items (twelve each), not size (the conformer's
 larger schema compiles fine). The fix is not to make those fields required
@@ -5473,32 +5475,48 @@ invocation under normalized token-set matching, per shell segment
 prefix still counts — but never a cross-segment token union, which would
 credit `pnpm install && ls test` for a declared "pnpm test"). Matching
 accepts either direction, because `runs_commands` legitimately takes two
-shapes: a *literal* entry (declared ⊆ executed segment) and the
-B4-validated *paraphrase* entry that wraps the command's tokens in extra
-words (executed segment ⊆ declared, with a ≥2-salient-token floor so a
-trivial one-word invocation cannot satisfy a paraphrase). A residual
-false-positive class remains — a paraphrase whose real invocation
-differs in flag-with-value tokens — and is accepted: the re-drive
-feedback names the declared string, so the worst case is one corrective
-round. The check verifies **invocation, not success** — deliberately: a
-failing invocation still counts as executed, because gating on the
-command's outcome is the same code-enforced "tests must pass" bar §9
-rejects (it invites a stuck worker to weaken the command instead), and
-the command's *output* reaching the worker is what the re-drive prompt
-asks for, not what the gate can honestly measure. A miss first re-drives
+shapes: a *literal* entry (declared token set ⊆ executed segment's) and
+the B4-validated *paraphrase* entry that wraps the command's tokens in
+extra words, with the command at the tail — for that shape the executed
+segment's salient token list must equal a length-≥2 **suffix** of the
+declared entry's salient token list. Suffix — ordered and contiguous —
+not subset: a bare-subset reverse rule was shipped and adversarially
+defeated the same day, because any ≥2-token *fragment* of a wordy
+paraphrase then counted as executed ("pnpm run", "test suite", a parent
+sub-command like `barnacle recon` for "barnacle recon browser", or the
+command minus the flag that does the work, `pnpm lint` for "pnpm lint
+--fix") — a false-PASS class in exactly the direction this gate exists
+to close. Two residual classes are accepted and documented: a paraphrase
+whose real command is not its literal tail (flag-with-value drift, or a
+prose suffix like "…then inspect the report") **false-alarms** — the
+re-drive feedback names the declared string, so the worst case is one
+corrective round; and a worker that deliberately types a matching tail
+string is **not caught** — the check verifies invocation, not success or
+intent, because gating on the command's outcome is the same
+code-enforced "tests must pass" bar §9 rejects (it invites a stuck
+worker to weaken the command instead), and the command's *output*
+reaching the worker is what the re-drive prompt asks for, not what the
+gate can honestly measure. A miss first re-drives
 the implementer through the existing mechanical-check feedback loop —
 forgetting to run a declared command is exactly the "retryable mistake"
-shape that loop exists for — and when no re-drive remains (the
-confidence-retry budget exhausts, or the result arrived via the
-`empty_handoff` rescue, which skips the re-drive because re-spawning
-would repeat the doomed step but must not skip the check itself) the
+shape that loop exists for — and when the confidence-retry budget
+exhausts with the command still unexecuted the
 subtask settles **`blocked`**, naming the command, feeding the existing
 `accept-blocked` escape hatch. That
 terminal is deliberate: a command that cannot run in-container (a live
 site, credentials, an absent fixture) is precisely the
 external-precondition case `accept-blocked` exists to adjudicate, and the
 one thing the run must never do is what it measurably did — settle
-`complete` on a verification it silently skipped. The check binds only
+`complete` on a verification it *silently* skipped. One path deliberately
+does not block: a result rescued from `empty_handoff` (§ *A settle
+without an implementer…* context — the worker was reaped mid-turn with
+committed work). Blocking there would strand the very commits the rescue
+exists to keep: `accept-blocked` marks the sid complete, resume then
+excludes it from the remaining set, and integration — which reads
+results, not branches — never merges it. So the rescue settles complete
+with the unrun-command warning logged loudly and persisted to state
+(`declared_unrun_warnings`), which is what keeps the skip visible in the
+run record: not silent, and not stranded. The check binds only
 where the field is populated (under 5% of subtasks), but
 `_repair_prescribed_commands` above makes prescribed commands
 always-declared, so the two halves together close the loop: plan-level
