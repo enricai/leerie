@@ -6,14 +6,18 @@ satisfied-probe verdicts across the barnacle corpus (433/753 on
 v0.29/v0.30) rested solely on "the exact file the planner named does not
 exist" — the planner invents a fresh artifact path each run, so a re-run
 of an already-satisfied task structurally never comes up empty. The fix
-types the verdict: `unsatisfied_reason` + `equivalent_coverage_exists`,
-with `_probe_drop_reason` as the single pure consumer.
+types the verdict: `unsatisfied_reason` + `equivalent_coverage_exists` +
+`sibling_invalidation_risk`, with `_probe_drop_reason` as the single pure
+consumer.
 
 Covers:
   - `_probe_drop_reason` truth table: only `satisfied: true` (→
     "already_satisfied") and `artifact_missing` ∧
-    `equivalent_coverage_exists` (→ "equivalent_coverage") drop; every
-    other reason × coverage combination, and absent fields, keep
+    `equivalent_coverage_exists` ∧ an explicit
+    `sibling_invalidation_risk: false` (→ "equivalent_coverage") drop;
+    every other combination — including risk true, risk absent, and risk
+    falsy-but-not-False — keeps, so the sibling-invalidation channel
+    stays keep-only by construction
   - executing `_filter_satisfied_subtasks` (not reading its source): an
     equivalent-coverage verdict removes the subtask from `plans` and
     records reason "equivalent_coverage" + evidence; disagreeing
@@ -127,27 +131,48 @@ def test_artifact_missing_with_coverage_maps_to_equivalent_coverage(leerie):
         "satisfied": False, "evidence": "named file absent, covered",
         "unsatisfied_reason": "artifact_missing",
         "equivalent_coverage_exists": True,
+        # The drop additionally requires an EXPLICIT false here — the
+        # sibling-invalidation channel stays keep-only by construction.
+        "sibling_invalidation_risk": False,
     }) == "equivalent_coverage"
 
 
 @pytest.mark.parametrize("verdict", [
     # right reason, wrong/absent coverage flag
     {"satisfied": False, "unsatisfied_reason": "artifact_missing",
-     "equivalent_coverage_exists": False},
-    {"satisfied": False, "unsatisfied_reason": "artifact_missing"},
+     "equivalent_coverage_exists": False,
+     "sibling_invalidation_risk": False},
+    {"satisfied": False, "unsatisfied_reason": "artifact_missing",
+     "sibling_invalidation_risk": False},
     # coverage flag set, wrong reason — a consumer reading only
     # equivalent_coverage_exists would wrongly drop these
     {"satisfied": False, "unsatisfied_reason": "behavior_gap",
-     "equivalent_coverage_exists": True},
+     "equivalent_coverage_exists": True,
+     "sibling_invalidation_risk": False},
     {"satisfied": False, "unsatisfied_reason": "partially_met",
-     "equivalent_coverage_exists": True},
+     "equivalent_coverage_exists": True,
+     "sibling_invalidation_risk": False},
     {"satisfied": False, "unsatisfied_reason": "cannot_verify",
-     "equivalent_coverage_exists": True},
+     "equivalent_coverage_exists": True,
+     "sibling_invalidation_risk": False},
     # old-shaped verdict: no typed fields at all
     {"satisfied": False, "evidence": "missing"},
     # coverage flag truthy-but-not-True must not drop (typed comparison)
     {"satisfied": False, "unsatisfied_reason": "artifact_missing",
-     "equivalent_coverage_exists": "yes"},
+     "equivalent_coverage_exists": "yes",
+     "sibling_invalidation_risk": False},
+    # sibling-invalidation channel is keep-only: risk true, or risk
+    # merely ABSENT, must keep even when the other two fields agree —
+    # a two-field consumer (the pre-fix rule) fails both of these.
+    {"satisfied": False, "unsatisfied_reason": "artifact_missing",
+     "equivalent_coverage_exists": True,
+     "sibling_invalidation_risk": True},
+    {"satisfied": False, "unsatisfied_reason": "artifact_missing",
+     "equivalent_coverage_exists": True},
+    # risk falsy-but-not-False must not drop (typed comparison)
+    {"satisfied": False, "unsatisfied_reason": "artifact_missing",
+     "equivalent_coverage_exists": True,
+     "sibling_invalidation_risk": None},
 ])
 def test_every_other_combination_keeps(leerie, verdict):
     assert leerie._probe_drop_reason(verdict) is None
@@ -169,7 +194,8 @@ def test_equivalent_coverage_verdict_drops_and_records(
         "test-001": {"satisfied": False,
                      "evidence": "named spec absent; equivalent suite cited",
                      "unsatisfied_reason": "artifact_missing",
-                     "equivalent_coverage_exists": True},
+                     "equivalent_coverage_exists": True,
+                     "sibling_invalidation_risk": False},
         "feat-001": {"satisfied": False, "evidence": "missing",
                      "unsatisfied_reason": "behavior_gap"},
     })
@@ -217,7 +243,8 @@ def test_all_equivalent_coverage_routes_no_work(
     _patch_probe(leerie, monkeypatch, {
         "test-001": {"satisfied": False, "evidence": "covered elsewhere",
                      "unsatisfied_reason": "artifact_missing",
-                     "equivalent_coverage_exists": True},
+                     "equivalent_coverage_exists": True,
+                     "sibling_invalidation_risk": False},
     })
     res = _run(leerie._filter_satisfied_subtasks(
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
@@ -238,7 +265,8 @@ def test_typed_fields_cached_and_replayed_without_reprobe(
     calls = _patch_probe(leerie, monkeypatch, {
         "test-001": {"satisfied": False, "evidence": "covered elsewhere",
                      "unsatisfied_reason": "artifact_missing",
-                     "equivalent_coverage_exists": True},
+                     "equivalent_coverage_exists": True,
+                     "sibling_invalidation_risk": False},
         "feat-001": {"satisfied": False, "evidence": "missing"},
     })
     _run(leerie._filter_satisfied_subtasks(
@@ -246,6 +274,7 @@ def test_typed_fields_cached_and_replayed_without_reprobe(
     cached = st.data["satisfied_probe_cache"]["test-001"]
     assert cached["unsatisfied_reason"] == "artifact_missing"
     assert cached["equivalent_coverage_exists"] is True
+    assert cached["sibling_invalidation_risk"] is False
     assert cached["base_sha"] == sha
 
     # Second sweep (resume shape): same base_sha → cached verdict must
@@ -270,7 +299,8 @@ def test_schema_accepts_typed_fields(leerie):
     schema = leerie.SCHEMAS["satisfied_probe"]
     good = {"satisfied": False, "evidence": "e",
             "unsatisfied_reason": "artifact_missing",
-            "equivalent_coverage_exists": True}
+            "equivalent_coverage_exists": True,
+            "sibling_invalidation_risk": False}
     assert validate_or_fallback_required(schema, good)
 
 

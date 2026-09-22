@@ -201,6 +201,28 @@ own wording demands the artifact by name) but the substance is present —
 the orchestrator treats that agreement as a drop, so hold it to
 `satisfied: true`'s standard of evidence.
 
+Because that agreement can drop the subtask, it must also answer the
+sibling question from the section above: set
+`sibling_invalidation_risk` to `true` whenever any entry in
+`surviving_siblings` could, once its work lands, invalidate the
+equivalent coverage you found (the classic guard-test case — the
+coverage passes *today*, a surviving feature sibling is about to change
+what it guards). Set it to `false` only when you checked the surviving
+siblings and none would. The orchestrator drops on
+`equivalent_coverage_exists: true` **only with an explicit
+`sibling_invalidation_risk: false`** — an omitted or `true` value keeps
+the subtask, the same keep-only direction the sibling rule has
+everywhere else.
+
+When your output schema forces you to emit every field (some runs
+constrain decoding so no field can be omitted): on `satisfied: true`,
+set `unsatisfied_reason` to `cannot_verify`,
+`equivalent_coverage_exists` to `false`, and
+`sibling_invalidation_risk` to `true` — all three are ignored on a
+satisfied verdict, and those values are the inert ones. Never let a
+forced field pressure you into `equivalent_coverage_exists: true` or
+`sibling_invalidation_risk: false` you did not actually verify.
+
 ## Output
 
 Return **only** a JSON object per your schema:
@@ -223,3 +245,7 @@ Return **only** a JSON object per your schema:
 - `equivalent_coverage_exists` (set when `unsatisfied_reason` is
   `artifact_missing`): whether the criterion's substance is already on
   this tree under another name, with citing evidence.
+- `sibling_invalidation_risk` (set when `equivalent_coverage_exists` is
+  `true`): whether a surviving sibling's pending work would invalidate
+  that coverage once it lands. The drop requires an explicit `false`;
+  omitted or `true` keeps the subtask.

@@ -2696,6 +2696,14 @@ SCHEMAS: dict[str, dict] = {
                 ],
             },
             "equivalent_coverage_exists": {"type": "boolean"},
+            # Keeps the sibling-invalidation channel keep-only BY
+            # CONSTRUCTION even for typed drops: the equivalent-coverage
+            # drop additionally requires an explicit `false` here, so a
+            # probe that judged a surviving sibling would break these
+            # criteria (or that omitted the field) can never be dropped
+            # by the typed path — mirroring the prose rule that
+            # `surviving_siblings` context only ever drives keeps.
+            "sibling_invalidation_risk": {"type": "boolean"},
         },
     },
     "artifact_registry": {
@@ -9303,13 +9311,29 @@ def check_declared_commands_executed(
     acceptance command, never issued it, and settled `complete` across
     ten runs.
 
-    Same normalized token-subset matching as the plan-level floor (the
-    declared entry is a paraphrase, never byte-identical), applied per
-    shell segment — `_BLT_SEG_RE` split + `_BLT_SEG_LEAD_RE` prefix strip,
-    plus the segments' union — so `cd x && pnpm run build | tail` still
-    matches a declared "pnpm build". Pure JSON→JSON set logic, no NL
-    parsing. Free (empty) when the subtask declares nothing — the ~95%
-    case."""
+    Normalized token-set matching per shell segment (`_BLT_SEG_RE` split +
+    `_BLT_SEG_LEAD_RE` prefix strip), accepted in EITHER direction because
+    `runs_commands` legitimately takes two shapes:
+
+    - **literal declared** (the barnacle incident shape): the entry is the
+      command itself, possibly executed wrapped — declared ⊆ segment, so
+      `cd x && pnpm run build | tail` covers a declared "pnpm build";
+    - **paraphrase declared** (the B4-validated planner shape — the entry
+      WRAPS the command's tokens in extra words, e.g. "barnacle recon
+      browser" for `recon browser`): segment ⊆ declared, with a
+      ≥2-salient-token floor on the segment so a bare `pnpm` cannot
+      satisfy every pnpm-mentioning paraphrase.
+
+    Deliberately NO cross-segment token union: crediting tokens scattered
+    across different commands of one compound invocation would let
+    `pnpm install && ls test` cover a declared "pnpm test". Matching is
+    per-segment only. A residual false-positive class remains (a
+    paraphrase whose real invocation differs in flag-with-value tokens,
+    e.g. `--browser=chromium`) — the re-drive feedback names the declared
+    string, so the worst case is one corrective round (DESIGN §"A
+    declared command must also have been executed"). Pure JSON→JSON set
+    logic, no NL parsing. Free (empty) when the subtask declares nothing
+    — the ~95% case."""
     declared = [
         rc for rc in (subtask.get("runs_commands") or [])
         if isinstance(rc, str) and rc.strip()
@@ -9318,20 +9342,19 @@ def check_declared_commands_executed(
         return []
     exec_sets: list[frozenset[str]] = []
     for cmd in executed:
-        seg_sets = [
-            _command_tokens(seg)
-            for seg in (_BLT_SEG_LEAD_RE.sub("", raw.strip())
-                        for raw in _BLT_SEG_RE.split(cmd))
-            if seg
-        ]
-        exec_sets.extend(s for s in seg_sets if s)
-        if len(seg_sets) > 1:
-            exec_sets.append(frozenset().union(*seg_sets))
+        for raw in _BLT_SEG_RE.split(cmd):
+            seg = _BLT_SEG_LEAD_RE.sub("", raw.strip())
+            if not seg:
+                continue
+            toks = _command_tokens(seg)
+            if toks:
+                exec_sets.append(toks)
     issues: list[str] = []
     for rc in declared:
         rc_tokens = _command_tokens(rc)
         covered = bool(rc_tokens) and any(
-            rc_tokens <= es for es in exec_sets)
+            rc_tokens <= es or (len(es) >= 2 and es <= rc_tokens)
+            for es in exec_sets)
         if not covered:
             issues.append(
                 f"DECLARED_CMD_UNRUN: this subtask declared it runs {rc!r} "
@@ -12073,18 +12096,23 @@ def _probe_drop_reason(verdict: dict) -> str | None:
 
     Pure typed-field logic (Language-to-JSON): `satisfied: true` drops as
     `"already_satisfied"`; a not-satisfied verdict drops as
-    `"equivalent_coverage"` only when BOTH typed fields agree —
+    `"equivalent_coverage"` only when ALL THREE typed fields agree —
     `unsatisfied_reason == "artifact_missing"` (the planner-named artifact
-    is absent) and `equivalent_coverage_exists is True` (the criteria's
-    substance is already met on the tree under another artifact name). Any
-    other combination, or either field absent, keeps the subtask — absence
-    defaults to the safe direction (DESIGN §8 *A "not satisfied" verdict
-    carries a typed reason*).
+    is absent), `equivalent_coverage_exists is True` (the criteria's
+    substance is already met on the tree under another artifact name), and
+    `sibling_invalidation_risk is False` (an EXPLICIT false — the probe
+    affirmed no surviving sibling's pending work would break the
+    criteria). Any other combination, or any field absent, keeps the
+    subtask — absence defaults to the safe direction, and the explicit-
+    false requirement keeps the sibling-invalidation channel keep-only by
+    construction rather than by prompt (DESIGN §8 *A "not satisfied"
+    verdict carries a typed reason*).
     """
     if verdict.get("satisfied") is True:
         return "already_satisfied"
     if (verdict.get("unsatisfied_reason") == "artifact_missing"
-            and verdict.get("equivalent_coverage_exists") is True):
+            and verdict.get("equivalent_coverage_exists") is True
+            and verdict.get("sibling_invalidation_risk") is False):
         return "equivalent_coverage"
     return None
 
@@ -12291,6 +12319,8 @@ async def _filter_satisfied_subtasks(
             "unsatisfied_reason": out.get("unsatisfied_reason"),
             "equivalent_coverage_exists": out.get(
                 "equivalent_coverage_exists"),
+            "sibling_invalidation_risk": out.get(
+                "sibling_invalidation_risk"),
             "base_sha": base_sha,
         }
         st.save()
@@ -12319,9 +12349,9 @@ async def _filter_satisfied_subtasks(
         ]
 
     log(f"phase 3: satisfied-probe dropped {len(dropped)}/{total} "
-        "already-satisfied subtask(s):")
+        "subtask(s) (already satisfied, or equivalent coverage exists):")
     for sid, info in sorted(dropped.items()):
-        log(f"     {sid}: {info['evidence'][:160]}")
+        log(f"     {sid} [{info['reason']}]: {info['evidence'][:160]}")
     _apply_subtask_drop_propagation(plans, dropped, st)
 
     # If every ready plan is now empty, this is the per-subtask analogue
@@ -12336,12 +12366,20 @@ async def _filter_satisfied_subtasks(
             return None
         if plan.get("subtasks"):
             return None
+    # The basis names both drop reasons when both occurred — this string
+    # reaches run.json/no_work_reasons, and "already satisfied" alone
+    # would misdescribe an equivalent-coverage exit to the operator.
+    reasons_seen = sorted({i["reason"] for i in dropped.values()})
+    basis = (
+        "all subtasks already satisfied on HEAD, or their substance "
+        "covered under another artifact name "
+        if "equivalent_coverage" in reasons_seen else
+        "all subtasks already satisfied on HEAD "
+    ) + "(satisfied-probe, DESIGN §8)"
     no_work_map: dict[str, str] = {}
     for plan in plans:
         domain = plan.get("domain") or "<unknown>"
-        no_work_map[domain] = (
-            "all subtasks already satisfied on HEAD "
-            "(satisfied-probe, DESIGN §8)")
+        no_work_map[domain] = basis
     return no_work_map
 
 
@@ -15279,10 +15317,17 @@ def _strictify_schema(node: object) -> tuple[int, int]:
         # Safe because only the *wire* schema changes. The CLI still validates
         # the worker's output against leerie's ORIGINAL schema, where these
         # fields remain optional — and a field that is merely *present*
-        # satisfies an optional field's type check. Audited across all 23
-        # schemas: 89 optional fields, none of which becomes illegal when
-        # forced (arrays admit `[]`, and no forced field carries a `minLength`
-        # its trivial value would violate).
+        # satisfies an optional field's type check. Audited across all 24
+        # schemas (re-derived 2026-09-22): 131 optional fields, none of which
+        # becomes illegal when forced (arrays admit `[]`, and no forced field
+        # carries a `minLength` its trivial value would violate). One
+        # BEHAVIORAL caveat, not a legality one: satisfied_probe's typed
+        # not-satisfied fields rely on "absent → keep" (_probe_drop_reason),
+        # and forcing makes absence unrepresentable — the prompt therefore
+        # instructs inert values for the forced case, and the drop needs a
+        # three-field conjunction, so grammar pressure alone cannot cause it
+        # (see the §2½ disclosure and DESIGN §8 *A "not satisfied" verdict
+        # carries a typed reason*).
         #
         # NOT the mistake PR #153 undid. That regression was models *omitting*
         # required fields and so producing nothing schema-valid; here the
@@ -20554,6 +20599,16 @@ async def _confirm_no_work_on_converged_gate(
     )
     log("  classification gate converged with an already-satisfied claim; "
         "spawning no_work_judge to verify it")
+    # Re-reset the judgment worktree before the judge sees it — same
+    # discipline, same reason as the reset before the satisfied-probe
+    # sweep: the judge is handed no diff and no file contents, so its cwd
+    # is the ONLY thing determining which tree it verifies, and the
+    # classifier plus up to N classification_judge rounds have lived in
+    # this worktree first. A stray write there would make the judge
+    # confirm against a tree that is not the user's — and a false confirm
+    # ends the whole run with real work undone, a strictly worse cost
+    # than the probe's false drop of one subtask.
+    await _ensure_planning_worktree(st)
     # bump_workers stays OUTSIDE the try: its WorkerError is the budget
     # backstop and must propagate, not be read as a judge dispute.
     st.bump_workers(caps)
@@ -31286,13 +31341,15 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # per-worker log's structured tool_use records, never trusted
         # from the result. Computed OUTSIDE the mechanical-check block
         # below because it has two consumers: its issues join that block's
-        # gating re-drive, and when the retry budget exhausts with a
-        # command still unexecuted, the result converts to `blocked`
-        # (never a silent `complete`) — see the arm after the block.
-        # Skipped for empty_handoff rescues for the same reason the block
-        # below skips them: the worker was reaped mid-turn.
+        # gating re-drive, and when no re-drive remains — budget
+        # exhausted, or an empty_handoff rescue (re-spawning would repeat
+        # the doomed step, so a rescue skips the re-drive but must NOT
+        # skip this: rescuing an unrun declared command straight to
+        # `complete` is exactly the silent skip the check exists to
+        # prevent) — the result converts to `blocked`; see the arm after
+        # the block.
         declared_unrun: list[str] = []
-        if status == "complete" and not rescued_from_empty_handoff:
+        if status == "complete":
             declared_unrun = check_declared_commands_executed(
                 subtask,
                 _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
@@ -31345,27 +31402,35 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 st.save()
                 continue
 
-        # The declared-command check's terminal arm: the re-drive budget is
-        # exhausted (or the block above was skipped by it) and a declared
+        # The declared-command check's terminal arm: no re-drive remains —
+        # the budget is exhausted, or the result was rescued from
+        # empty_handoff (no re-drive is offered there) — and a declared
         # command is STILL unexecuted. The one thing this must never do is
         # settle `complete` on a verification the worker silently skipped —
         # convert to `blocked`, naming the command(s), so the run stops at
         # the wave's blocked registry and the operator adjudicates via
         # accept-blocked (an in-container-unrunnable command is exactly that
-        # escape hatch's case).
-        if status == "complete" and declared_unrun and not (
-                confidence_retries
-                < caps.get("implementer_confidence_retries", 2)):
+        # escape hatch's case). Mirrors the completeness gate's N21
+        # blocked-detection shape below: the status write is immediately
+        # followed by the log naming the exact remedy.
+        if status == "complete" and declared_unrun and (
+                rescued_from_empty_handoff
+                or not (confidence_retries
+                        < caps.get("implementer_confidence_retries", 2))):
             blocker = (
                 "declared runs_commands never executed after "
                 f"{confidence_retries} corrective retr"
                 f"{'y' if confidence_retries == 1 else 'ies'}: "
                 + "; ".join(declared_unrun))
             log(f"  {sid}: {blocker}")
-            res = {"subtask_id": sid, "status": "blocked",
-                   "blocker": blocker,
-                   "summary": "declared command(s) never executed"}
-            status = "blocked"
+            st.data.setdefault("subtask_status", {})[sid] = "blocked"
+            log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
+                f"{st.run_id} {sid}` once addressed, then `leerie "
+                "resume` to continue without re-running it")
+            st.save()
+            return {"subtask_id": sid, "status": "blocked",
+                    "blocker": blocker,
+                    "summary": "declared command(s) never executed"}
 
         # DESIGN §9 *A stale finding is not a bug*. Advisory: surfaced on the
         # result and in the log, never routed into `check_implementer_output`

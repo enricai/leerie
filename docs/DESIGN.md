@@ -1536,7 +1536,11 @@ sweep (§8 *Already-satisfied subtask elimination*): that sweep fans out
 one probe per subtask and can itself run for minutes, so a pause
 mid-sweep would otherwise re-probe every subtask from scratch on resume,
 including the ones already judged. The fix persists each subtask's
-verdict — `satisfied`, `evidence`, and the fact that it was `checked` —
+verdict — `satisfied`, `evidence`, the fact that it was `checked`, and
+the typed not-satisfied fields (`unsatisfied_reason`,
+`equivalent_coverage_exists`, `sibling_invalidation_risk` — load-bearing
+on resume, since the cached-verdict fast path re-derives the drop reason
+from them; §8 *A "not satisfied" verdict carries a typed reason*) —
 into a `satisfied_probe_cache` keyed by subtask id as soon as that
 subtask's probe returns, rather than only in the aggregate after the
 whole sweep's `gather` completes. On resume, a subtask with a cached
@@ -4956,7 +4960,13 @@ already-satisfied mechanism fails). The exhaustion arm is untouched: when
 classification cannot converge, the un-double-checked claim remains
 sufficient, because the alternative there was dying, not planning.
 `--skip-satisfied-check` suppresses this consumer along with the phase-3
-sweep — one flag governs every already-satisfied prune.
+pre-schedule sweep — one flag governs both already-satisfied *prunes*.
+Two adjacent mechanisms are deliberately outside that flag's scope: the
+post-execution HEAD-probe *rescues* (which settle work, never delete it,
+so skipping them would only re-create the retry-cap failure they exist
+to prevent), and `--skip-classification-check`, which suppresses this
+consumer as a side effect — the gate it hooks never runs — as does a
+`classification_judge` that crashes every round.
 
 Reaching this state from classification instead of post-plan meant a run
 could hit `_finish_no_work_run` earlier than `run.json`'s own run-identity
@@ -5101,14 +5111,32 @@ so the probe surfaces the distinction as structured fields:
 `behavior_gap` — the behavior itself is wrong or missing; `partially_met`;
 `cannot_verify`) and, for `artifact_missing` only,
 `equivalent_coverage_exists` — whether the criteria's *substance* is already
-met on the tree under a different artifact name. The consumer drops the
-subtask only when **both** fields agree (`artifact_missing` ∧
-`equivalent_coverage_exists`), the same recorded soft-drop as
-`satisfied: true`; every other combination keeps it. The conservative bias
-is preserved: judging whether equivalent coverage exists is the same
+met on the tree under a different artifact name — plus
+`sibling_invalidation_risk`, the typed form of the sibling question below:
+would a surviving sibling's pending work invalidate that coverage once it
+lands. The consumer drops the subtask only when **all three** fields agree
+(`artifact_missing` ∧ `equivalent_coverage_exists` ∧ an **explicit**
+`sibling_invalidation_risk: false`), the same recorded soft-drop as
+`satisfied: true`; every other combination keeps it. The explicit-false
+requirement exists because a `satisfied: false` verdict is also the
+sibling-invalidation section's *keep* mechanism — without it, the typed
+drop would silently override a sibling-motivated keep, and the
+"sibling context only ever drives keeps" invariant would rest on prose
+alone. With it, the invariant holds by construction: an omitted or `true`
+risk field keeps, unconditionally. The conservative bias is otherwise
+preserved: judging whether equivalent coverage exists is the same
 "criteria semantically met on this tree" judgment the probe already owns,
-the default on absence of either field is *keep*, and the no-commits
-backstop remains the mechanical guarantee underneath.
+the default on absence of any field is *keep*, and the no-commits
+backstop remains the mechanical guarantee underneath. (One caveat:
+`--dangerously-force-strict-output` makes every schema property
+grammar-required, so "absence" cannot occur in that mode — the prompt
+instructs inert values for the forced case, and the three-field
+conjunction bounds what grammar pressure alone can cause; the flag's own
+§2½ disclosure lists this.) The post-execution twin
+(`_probe_criteria_satisfied_on_head`) deliberately reads `satisfied`
+alone: the typed drop is a pre-schedule concept, and a rescue that
+honored `equivalent_coverage` would settle a no-commit subtask complete
+on coverage a sibling may still invalidate mid-run.
 
 **The mid-run sibling case.** The pre-schedule probe judges the base tree as
 it stood at run start, so it is *structurally blind* to a subtask that
@@ -5440,14 +5468,32 @@ orchestrator already holds every Bash invocation the worker actually made
 as structured `tool_use` JSON in the per-worker log (`_iter_log_tool_use`
 — JSON→JSON, no prose is read), so `_settle_subtask` requires every
 `runs_commands` entry on a `complete` result to match some executed
-invocation under the same normalized token-subset rule the plan-level
-floor uses (segments split first, so a match inside a pipeline or a
-`cd … && …` prefix still counts). A miss first re-drives the implementer
-through the existing mechanical-check feedback loop — forgetting to run a
-declared command is exactly the "retryable mistake" shape that loop
-exists for — and only when the confidence-retry budget exhausts with the
-command still unexecuted does the subtask settle **`blocked`**, naming
-the command, feeding the existing `accept-blocked` escape hatch. That
+invocation under normalized token-set matching, per shell segment
+(segments split first, so a match inside a pipeline or a `cd … && …`
+prefix still counts — but never a cross-segment token union, which would
+credit `pnpm install && ls test` for a declared "pnpm test"). Matching
+accepts either direction, because `runs_commands` legitimately takes two
+shapes: a *literal* entry (declared ⊆ executed segment) and the
+B4-validated *paraphrase* entry that wraps the command's tokens in extra
+words (executed segment ⊆ declared, with a ≥2-salient-token floor so a
+trivial one-word invocation cannot satisfy a paraphrase). A residual
+false-positive class remains — a paraphrase whose real invocation
+differs in flag-with-value tokens — and is accepted: the re-drive
+feedback names the declared string, so the worst case is one corrective
+round. The check verifies **invocation, not success** — deliberately: a
+failing invocation still counts as executed, because gating on the
+command's outcome is the same code-enforced "tests must pass" bar §9
+rejects (it invites a stuck worker to weaken the command instead), and
+the command's *output* reaching the worker is what the re-drive prompt
+asks for, not what the gate can honestly measure. A miss first re-drives
+the implementer through the existing mechanical-check feedback loop —
+forgetting to run a declared command is exactly the "retryable mistake"
+shape that loop exists for — and when no re-drive remains (the
+confidence-retry budget exhausts, or the result arrived via the
+`empty_handoff` rescue, which skips the re-drive because re-spawning
+would repeat the doomed step but must not skip the check itself) the
+subtask settles **`blocked`**, naming the command, feeding the existing
+`accept-blocked` escape hatch. That
 terminal is deliberate: a command that cannot run in-container (a live
 site, credentials, an absent fixture) is precisely the
 external-precondition case `accept-blocked` exists to adjudicate, and the
@@ -6675,15 +6721,19 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the sixteen worker types in
+Every main-loop LLM call in Leerie passes through one of the twenty worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
-`wiring_judge`, `provision_judge`, or `artifact_registry` (`fit_judge`/`splitter` are the P1
+`wiring_judge`, `provision_judge`, `task_coverage_judge`,
+`artifact_registry`, `integration_judge`, `no_work_judge`, or `rebaser`
+(`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
-`wiring_judge`, and `provision_judge` are the independent adversarial verifiers
-— see §8; `artifact_registry` is the pre-planning shared-vocabulary worker —
-see §5). Each worker type is a distinct **call type** — a
+`wiring_judge`, `provision_judge`, `task_coverage_judge`,
+`integration_judge`, and `no_work_judge` are the independent adversarial
+verifiers — see §8; `artifact_registry` is the pre-planning
+shared-vocabulary worker — see §5; `rebaser` is the finalize-time rebase
+worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap. Post-run skill workers — `judge`,

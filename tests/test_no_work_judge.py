@@ -99,6 +99,18 @@ class TestWiring:
         assert 'schema_key="no_work_judge"' in src
         assert "SATISFIED_PROBE_TOOLS" in src
 
+    def test_consumer_resets_the_judgment_worktree_first(self, leerie):
+        """The judge is handed no diff — its cwd is the only thing
+        determining which tree it verifies, and the classifier plus N
+        classification_judge rounds lived there first. Same reset
+        discipline as the satisfied-probe sweep, whose comment records
+        the 12/12 false-positive calibration; a false confirm here ends
+        the whole run."""
+        src = inspect.getsource(leerie._confirm_no_work_on_converged_gate)
+        i_reset = src.index("_ensure_planning_worktree(")
+        i_spawn = src.index("claude_p(")
+        assert i_reset < i_spawn
+
     def test_worker_registered(self, leerie):
         assert "no_work_judge" in leerie.WORKER_TYPES
         assert "no_work_judge" in leerie.PLANNING_WORKER_TYPES
@@ -184,11 +196,33 @@ def test_no_claim_means_judge_never_spawns(leerie, tmp_path, monkeypatch):
     assert "no_work_judge" not in calls
 
 
+def test_skip_classification_check_also_suppresses_the_consult(
+        leerie, tmp_path, monkeypatch):
+    """Documented side effect (DESIGN §8 *The healthy-path consumer*):
+    --skip-classification-check returns from the gate before the
+    consumer's hook point, so the judge never spawns even on a True
+    claim with evidence — the run proceeds on the classifier's own
+    categories."""
+    st = _minimal_state(leerie, tmp_path)
+    _seed_claim(st)
+    st.data["skip_classification_check"] = True
+    st.save()
+    calls, _ = _patch_workers(leerie, monkeypatch, {
+        "confirmed": True, "evidence": "should never be consulted"})
+    routed = asyncio.run(leerie.phase_classification_gate(
+        "task", st, _caps(leerie), False, MODELS, EFFORTS))
+    assert routed is False
+    assert calls == {}  # neither judge spawns — the gate itself is skipped
+    assert "no_work_required" not in st.data
+
+
 def test_skip_satisfied_check_suppresses_the_consult(
         leerie, tmp_path, monkeypatch):
-    """One flag governs every already-satisfied prune: with
-    skip_satisfied_check set, the judge never spawns even on a True
-    claim with evidence."""
+    """One flag governs both already-satisfied PRUNES (this consumer and
+    the phase-3 pre-schedule sweep; the post-execution HEAD-probe
+    rescues are deliberately outside its scope — they settle work,
+    never delete it): with skip_satisfied_check set, the judge never
+    spawns even on a True claim with evidence."""
     st = _minimal_state(leerie, tmp_path)
     _seed_claim(st)
     st.data["skip_satisfied_check"] = True

@@ -680,11 +680,13 @@ def test_verdicts_persisted_for_both_outcomes(leerie, tmp_path, monkeypatch):
         "satisfied": True, "evidence": "done",
         "checked": ["a.py"], "base_sha": sha,
         "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
     assert cache["feat-002"] == {
         "satisfied": False, "evidence": "not yet",
         "checked": [], "base_sha": sha,
         "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
 
 

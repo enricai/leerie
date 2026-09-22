@@ -1193,27 +1193,41 @@ declared-command check (DESIGN §"A declared command must also have been
 executed" — measured barnacle 2026-09-22: a subtask declared the task's
 one empirical acceptance command in `runs_commands`, never issued it, and
 settled `complete` across ten runs). Pure-function cases make declared
-and executed disagree in the shapes that matter: quoted-inside-`grep`
-and `--help`-probe invocations must NOT count as executed, while a
-pipeline / `cd … &&` prefix / cross-segment token union must;
-`DECLARED_CMD_UNRUN` is pinned gating (`_gating_issues` passthrough).
-`_executed_bash_commands` is pinned on a real JSONL fixture (order,
-non-Bash and malformed lines ignored, missing log → `[]`). The settle
-wiring drives the real `_settle_subtask` via `test_oom_naming.py`'s
+and executed disagree in the shapes that matter, in BOTH accepted
+directions: literal declared covered inside a pipeline / `cd … &&`
+prefix; paraphrase declared (the B4 shape) covered by its wrapped
+command's execution, with the ≥2-salient-token floor rejecting a bare
+one-word invocation; quoted-inside-`grep` and `--help`-probe invocations
+NOT counted; and the three cross-segment union gaming shapes
+(`pnpm install && ls test` etc.) NOT counted — the union rule they
+bypassed was removed. `DECLARED_CMD_UNRUN` is pinned gating
+(`_gating_issues` passthrough). `_executed_bash_commands` is pinned on a
+real JSONL fixture (order preserved; the same fixture appends a non-Bash
+tool_use and a malformed line, both ignored; missing log → `[]`). The
+settle wiring drives the real `_settle_subtask` via `test_oom_naming.py`'s
 `env` fixture: unexecuted → one corrective re-drive whose feedback note
 names the command, then `blocked` (never `complete`) with the command in
-the blocker; executed → completes with exactly one implementer spawn;
-undeclared → untouched (anti-vacuity control).
+the blocker AND the N21 `accept-blocked <run-id> <sid>` remedy in the
+log; an `empty_handoff` rescue with the command unrun blocks immediately
+(no re-drive) instead of laundering to `complete`; executed → completes
+with exactly one implementer spawn; undeclared → untouched (anti-vacuity
+control). The N21 guard itself
+(`tests/test_settle_subtask_completeness_gate.py`) now asserts the
+remedy shape at EVERY `[sid] = "blocked"` occurrence, not just the
+first.
 
 `tests/test_probe_typed_reason.py` covers the typed not-satisfied probe
 verdict (DESIGN §8 *A "not satisfied" verdict carries a typed reason* —
 measured 2026-09-22: 58% of all not-satisfied verdicts corpus-wide rested
 solely on a planner-invented file path not existing yet, so a re-run of a
 done task never came up empty): the `_probe_drop_reason` truth table
-(only `satisfied: true` and `artifact_missing` ∧
-`equivalent_coverage_exists` drop; the parametrized keep cases make the
-two fields *disagree* so a one-field consumer fails), the executed
-consumer (`_filter_satisfied_subtasks` drops with
+(only `satisfied: true` and the three-field conjunction
+`artifact_missing` ∧ `equivalent_coverage_exists` ∧ an explicit
+`sibling_invalidation_risk: false` drop; the parametrized keep cases
+make the fields *disagree* — including risk `true`, risk absent, and
+risk falsy-but-not-`False` — so a one- or two-field consumer fails, and
+the sibling-invalidation channel is pinned keep-only by construction),
+the executed consumer (`_filter_satisfied_subtasks` drops with
 `reason: "equivalent_coverage"`, survives on disagreement, routes no-work
 when the drop empties the plan), the cache round-trip (typed fields
 persist and replay the drop with zero re-probes), schema enum
@@ -3635,12 +3649,16 @@ the real `phase_classification_gate` with a `claude_p` stub dispatching on
 `schema_key` (so the two judges' stubs cannot mask each other) and asserts
 terminal-state VALUES: confirm → routed True + `no_work_required` +
 `no_work_confirmation` carrying both evidences verbatim; dispute / crash /
-empty-evidence confirm → planning proceeds; flag-unset and
-`skip_satisfied_check` → per-schema call count of **zero** for
-`no_work_judge` (anti-vacuity — an unwired hook still "returns False");
-the judge's user_prompt carries the claim text and `required_items`
-(substance, not structure); and the exhaustion arm still routes on raw
-trust with no judge spawn (its documented boundary, unchanged).
+empty-evidence confirm → planning proceeds; flag-unset,
+`skip_satisfied_check`, and `skip_classification_check` (the gate never
+runs, so the consumer never fires — a documented side effect) → call
+count of **zero** for `no_work_judge` (anti-vacuity — an unwired hook
+still "returns False"); the judge's user_prompt carries the claim text
+and `required_items` (substance, not structure); the consumer resets the
+judgment worktree before the spawn (same discipline as the
+satisfied-probe sweep, pinned by ordering on the source); and the
+exhaustion arm still routes on raw trust with no judge spawn (its
+documented boundary, unchanged).
 
 **Two traps this incident re-confirmed.**
 

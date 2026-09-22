@@ -196,11 +196,13 @@ def test_uncached_sid_probed_once_and_verdict_persisted_both_outcomes(
         "satisfied": True, "evidence": "done",
         "checked": ["a.py"], "base_sha": sha,
         "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
     assert cache["feat-unsat"] == {
         "satisfied": False, "evidence": "not yet",
         "checked": [], "base_sha": sha,
         "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
 
 
@@ -302,6 +304,7 @@ def test_verdict_reaches_disk_before_the_sweep_completes(
         "satisfied": False, "evidence": "still needed",
         "checked": ["a.py"], "base_sha": sha,
         "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
 
 

@@ -49,12 +49,42 @@ def test_pipeline_and_cd_prefix_still_match(leerie):
         ["cd /work && NODE_ENV=test pnpm run build 2>&1 | tail -5"]) == []
 
 
-def test_tokens_split_across_segments_match_via_union(leerie):
-    # Declared tokens spread over a compound command's segments are
-    # covered by the segments' union set.
+def test_paraphrase_declared_matches_reverse_direction(leerie):
+    # The B4-validated planner shape: the declared entry WRAPS the
+    # command's tokens in extra words — executed segment ⊆ declared.
     assert leerie.check_declared_commands_executed(
-        {"runs_commands": ["build widgets"]},
-        ["prep widgets --stage 1 && build --now"]) == []
+        {"runs_commands": ["run the full test suite with pnpm test"]},
+        ["pnpm test"]) == []
+    assert leerie.check_declared_commands_executed(
+        {"runs_commands": ["pnpm lint --fix"]},
+        ["pnpm lint"]) == []
+
+
+def test_reverse_direction_floor_rejects_single_token(leerie):
+    # A bare one-salient-token invocation must not satisfy every
+    # paraphrase that mentions it.
+    issues = leerie.check_declared_commands_executed(
+        {"runs_commands": ["run the full test suite with pnpm test"]},
+        ["pnpm"])
+    assert len(issues) == 1 and "DECLARED_CMD_UNRUN" in issues[0]
+
+
+def test_no_cross_segment_union_gaming(leerie):
+    # Tokens scattered across DIFFERENT commands of one compound
+    # invocation must not be credited — each shape was a working bypass
+    # of the union rule this replaces.
+    for executed in (
+        ["pnpm install && ls test"],
+        ["echo pnpm; ls test"],
+    ):
+        issues = leerie.check_declared_commands_executed(
+            {"runs_commands": ["pnpm test"]}, executed)
+        assert len(issues) == 1, executed
+        assert "DECLARED_CMD_UNRUN" in issues[0]
+    issues = leerie.check_declared_commands_executed(
+        {"runs_commands": ["barnacle recon browser"]},
+        ["echo barnacle; ls recon; which browser"])
+    assert len(issues) == 1 and "DECLARED_CMD_UNRUN" in issues[0]
 
 
 def test_quoted_in_grep_does_not_count(leerie):
@@ -150,10 +180,12 @@ def _settle(leerie_mod, env, **caps_overrides):  # noqa: F811
         env["models"], env["efforts"]))
 
 
-def test_unexecuted_declared_command_blocks_after_redrive(env, monkeypatch):  # noqa: F811
+def test_unexecuted_declared_command_blocks_after_redrive(
+        env, monkeypatch, capsys):  # noqa: F811
     """The full escalation: re-drive with feedback naming the command,
     then convert to `blocked` (never `complete`) when the budget
-    exhausts with the command still unexecuted."""
+    exhausts with the command still unexecuted — with the N21
+    accept-blocked remedy logged at the moment of the status write."""
     leerie_mod = env["leerie"]
     _declare(env, ["pnpm build"])
     calls: list = []
@@ -174,6 +206,45 @@ def test_unexecuted_declared_command_blocks_after_redrive(env, monkeypatch):  # 
     # 1 attempt + 1 corrective re-drive, whose note names the command.
     assert len(calls) == 2
     assert "DECLARED_CMD_UNRUN" in calls[1] and "pnpm build" in calls[1]
+    out = capsys.readouterr().out
+    assert f"accept-blocked {env['st'].run_id} {env['sid']}" in out
+
+
+def test_empty_handoff_rescue_still_blocks_unrun_declared_command(
+        env, monkeypatch, capsys):  # noqa: F811
+    """F7 regression: the empty_handoff rescue skips the re-drive (a
+    reaped worker would just repeat the doomed step) but must NOT
+    launder an unrun declared command to `complete` — it blocks
+    immediately, with the remedy logged."""
+    leerie_mod = env["leerie"]
+    _declare(env, ["pnpm build"])
+    calls: list = []
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        calls.append(note)
+        return {"subtask_id": sid_, "status": "complete",
+                **_COMPLETE_RES_EXTRA}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+    # Drive the REAL rescue branch: the result invariant tags
+    # empty_handoff and the worktree provably has committed work.
+    monkeypatch.setattr(
+        leerie_mod, "_validate_result",
+        lambda res: ("empty_handoff", "no checkpoint"))
+
+    async def _has_commits(worktree, run_branch):
+        return True
+    monkeypatch.setattr(leerie_mod, "_branch_has_commits_ahead",
+                        _has_commits)
+
+    res = _settle(leerie_mod, env, implementer_confidence_retries=2)
+
+    assert res["status"] == "blocked"
+    assert "pnpm build" in res["blocker"]
+    assert env["st"].data["subtask_status"][env["sid"]] == "blocked"
+    assert len(calls) == 1  # no re-drive on the rescue path
+    assert f"accept-blocked {env['st'].run_id} {env['sid']}" in (
+        capsys.readouterr().out)
 
 
 def test_executed_declared_command_settles_complete_without_redrive(
