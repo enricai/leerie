@@ -1188,6 +1188,21 @@ filters, which vanish ids the same way: dropped-id inbound refs pruned,
 `_validate_plan` survives end-to-end, and a no-drop run leaves
 `depends_on` byte-identical.
 
+`tests/test_probe_typed_reason.py` covers the typed not-satisfied probe
+verdict (DESIGN §8 *A "not satisfied" verdict carries a typed reason* —
+measured 2026-09-22: 58% of all not-satisfied verdicts corpus-wide rested
+solely on a planner-invented file path not existing yet, so a re-run of a
+done task never came up empty): the `_probe_drop_reason` truth table
+(only `satisfied: true` and `artifact_missing` ∧
+`equivalent_coverage_exists` drop; the parametrized keep cases make the
+two fields *disagree* so a one-field consumer fails), the executed
+consumer (`_filter_satisfied_subtasks` drops with
+`reason: "equivalent_coverage"`, survives on disagreement, routes no-work
+when the drop empties the plan), the cache round-trip (typed fields
+persist and replay the drop with zero re-probes), schema enum
+enforcement, and `_filter_provably_false_wiring_defects` predicate 2
+treating an `equivalent_coverage` drop's tags as satisfied-on-base.
+
 ### Planning checkpoints: snapshot, decompose-crash barrier, schedule determinism
 
 `tests/test_plan_snapshot_wiring.py` pins `plan_snapshot` by source

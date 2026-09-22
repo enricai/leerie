@@ -2654,6 +2654,17 @@ SCHEMAS: dict[str, dict] = {
         # round the mechanical no-commits backstop already tolerates).
         # No confidence block: this is an advisory prune subordinate to
         # `check_branch_has_commits` (§12), not a run-gating judgment.
+        # `unsatisfied_reason` / `equivalent_coverage_exists` type the
+        # not-satisfied verdict (DESIGN §8 *A "not satisfied" verdict
+        # carries a typed reason*): measured corpus-wide, 58% of
+        # not-satisfied verdicts rested solely on "the exact file the
+        # planner named does not exist", so a re-run of a done task never
+        # came up empty. Both optional (additive — an old-shaped verdict
+        # behaves exactly as before); the consumer drops only when BOTH
+        # agree (`artifact_missing` ∧ `equivalent_coverage_exists`), so
+        # absence of either field defaults to the safe direction, keep.
+        # Python compares the typed values only — never the evidence
+        # prose (Language-to-JSON).
         "type": "object",
         "additionalProperties": False,
         "required": ["satisfied", "evidence"],
@@ -2664,6 +2675,14 @@ SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "items": {"type": "string"},
             },
+            "unsatisfied_reason": {
+                "type": "string",
+                "enum": [
+                    "artifact_missing", "behavior_gap",
+                    "partially_met", "cannot_verify",
+                ],
+            },
+            "equivalent_coverage_exists": {"type": "boolean"},
         },
     },
     "artifact_registry": {
@@ -11940,6 +11959,27 @@ def _filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     _apply_subtask_drop_propagation(plans, dropped, st)
 
 
+def _probe_drop_reason(verdict: dict) -> str | None:
+    """Map a satisfied_probe verdict to a soft-drop reason, or None to keep.
+
+    Pure typed-field logic (Language-to-JSON): `satisfied: true` drops as
+    `"already_satisfied"`; a not-satisfied verdict drops as
+    `"equivalent_coverage"` only when BOTH typed fields agree —
+    `unsatisfied_reason == "artifact_missing"` (the planner-named artifact
+    is absent) and `equivalent_coverage_exists is True` (the criteria's
+    substance is already met on the tree under another artifact name). Any
+    other combination, or either field absent, keeps the subtask — absence
+    defaults to the safe direction (DESIGN §8 *A "not satisfied" verdict
+    carries a typed reason*).
+    """
+    if verdict.get("satisfied") is True:
+        return "already_satisfied"
+    if (verdict.get("unsatisfied_reason") == "artifact_missing"
+            and verdict.get("equivalent_coverage_exists") is True):
+        return "equivalent_coverage"
+    return None
+
+
 async def _filter_satisfied_subtasks(
     plans: list[dict], repo_root: Path, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
@@ -11952,7 +11992,11 @@ async def _filter_satisfied_subtasks(
     soft-drops the ones the probe marks `satisfied`. Recorded in
     `st.data["dropped_subtasks"]` with `reason: "already_satisfied"` plus
     the probe's evidence — the same audit shape as
-    `_filter_offtree_subtasks`.
+    `_filter_offtree_subtasks`. A not-satisfied verdict whose typed
+    fields agree (`unsatisfied_reason == "artifact_missing"` and
+    `equivalent_coverage_exists`) drops the same way with
+    `reason: "equivalent_coverage"` — see `_probe_drop_reason` and
+    DESIGN §8 *A "not satisfied" verdict carries a typed reason*.
 
     Returns a `no_work_map` (`domain → basis`) IFF the drop empties every
     `status == "ready"` plan (so the caller routes to
@@ -12055,9 +12099,10 @@ async def _filter_satisfied_subtasks(
             # the SAME base tree — skip the semaphore and claude_p
             # entirely (DESIGN §6 "The satisfied-probe sweep needs
             # finer-than-phase granularity").
-            if cached.get("satisfied") is True:
+            cached_reason = _probe_drop_reason(cached)
+            if cached_reason is not None:
                 dropped[sid] = {
-                    "reason": "already_satisfied",
+                    "reason": cached_reason,
                     "evidence": cached.get("evidence", ""),
                     "checked": list(cached.get("checked", []) or []),
                     "provides": list(s.get("provides") or []),
@@ -12129,12 +12174,21 @@ async def _filter_satisfied_subtasks(
             "satisfied": bool(out.get("satisfied") is True),
             "evidence": out.get("evidence", ""),
             "checked": list(out.get("checked", []) or []),
+            # Typed not-satisfied fields (DESIGN §8 *A "not satisfied"
+            # verdict carries a typed reason*) — cached so a resume
+            # replays the same equivalent-coverage decision without
+            # re-probing. Absent on old-shaped verdicts; None is the
+            # keep direction in _probe_drop_reason.
+            "unsatisfied_reason": out.get("unsatisfied_reason"),
+            "equivalent_coverage_exists": out.get(
+                "equivalent_coverage_exists"),
             "base_sha": base_sha,
         }
         st.save()
-        if out.get("satisfied") is True:
+        fresh_reason = _probe_drop_reason(out)
+        if fresh_reason is not None:
             dropped[sid] = {
-                "reason": "already_satisfied",
+                "reason": fresh_reason,
                 "evidence": out.get("evidence", ""),
                 "checked": list(out.get("checked", []) or []),
                 # Capture provides now, before the survivor-filter below drops
@@ -25089,7 +25143,9 @@ def _filter_provably_false_wiring_defects(
     1. a `broken_by_*` whose capability is still in the provides union: the
        finding's own premise ("a merge/drop severed this") is false.
     2. any defect whose capability was provided by an `already_satisfied`
-       drop: satisfied on the base tree.
+       or `equivalent_coverage` drop: satisfied on the base tree (the
+       latter under a different artifact name — same base-tree premise,
+       DESIGN §8 *A "not satisfied" verdict carries a typed reason*).
 
     **Predicate 1 covers `broken_by_*` and `missing_provides`, and must never
     cover `missing_requires`.** The distinction is which side of the edge the
@@ -25124,7 +25180,8 @@ def _filter_provably_false_wiring_defects(
     for sid, rec in (dropped or {}).items():
         tags = set((rec or {}).get("provides") or []) if isinstance(rec, dict) else set()
         dropped_tags |= tags
-        if isinstance(rec, dict) and rec.get("reason") == "already_satisfied":
+        if isinstance(rec, dict) and rec.get("reason") in (
+                "already_satisfied", "equivalent_coverage"):
             satisfied_tags |= tags
             satisfied_tags.add(sid)
 

@@ -163,6 +163,44 @@ discipline from above still governs it exactly:
   assertion anywhere on the tree, return `false`; do not credit a
   near-miss.
 
+## When you return `false`, type the reason
+
+A `satisfied: false` verdict must also say **what kind of gap** you found,
+as structured data — the orchestrator's Python never reads your prose, only
+these fields. Set `unsatisfied_reason` to exactly one of:
+
+- `artifact_missing` — the criterion names a specific artifact (a test
+  file, a config, a doc) and that named artifact is absent from this tree.
+  Use this only when the absence of the named artifact is the whole gap.
+- `behavior_gap` — the described behavior itself is wrong, missing, or
+  only partially present in the code, regardless of any named artifact.
+- `partially_met` — some criteria are concretely met on this tree and
+  others are not.
+- `cannot_verify` — you could not check (tooling failed, the criterion is
+  not checkable read-only, or you ran out of turns).
+
+When — and only when — the reason is `artifact_missing`, also set
+`equivalent_coverage_exists`: after applying the convention-search
+discipline above, does the criterion's **substance** already exist on this
+tree under a different artifact name? `true` means you found and can cite
+the equivalent artifact (e.g. the named test file
+`example-widget.spec.ts` is absent, but the same assertions already live
+in an existing suite file you inspected); `false` means you searched and
+the substance is genuinely absent too. The same evidence rule governs a
+`true` here as governs `satisfied: true`: cite the specific file and the
+specific content that carries the equivalence — never a plausibly-named
+file you did not read. If you did not actually search, or are unsure, set
+`false`.
+
+Note the relationship to the convention rule above: when equivalent
+coverage is real and complete, the criterion is simply **met** — return
+`satisfied: true`. `artifact_missing` + `equivalent_coverage_exists: true`
+is for the narrower case where you judge the named artifact's absence
+still leaves the criterion formally unmet (for instance, the criterion's
+own wording demands the artifact by name) but the substance is present —
+the orchestrator treats that agreement as a drop, so hold it to
+`satisfied: true`'s standard of evidence.
+
 ## Output
 
 Return **only** a JSON object per your schema:
@@ -179,3 +217,9 @@ Return **only** a JSON object per your schema:
 - `evidence` (required): a short justification citing concrete on-tree
   facts. On `false`, say what is missing.
 - `checked` (optional): the paths / symbols you actually inspected.
+- `unsatisfied_reason` (required when `satisfied` is `false`): one of
+  `artifact_missing` / `behavior_gap` / `partially_met` / `cannot_verify`
+  — see above.
+- `equivalent_coverage_exists` (set when `unsatisfied_reason` is
+  `artifact_missing`): whether the criterion's substance is already on
+  this tree under another name, with citing evidence.

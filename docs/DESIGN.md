@@ -5058,6 +5058,28 @@ the probe defaults to *not satisfied* on any uncertainty, since a false
 "already done" silently deletes real work, strictly worse than a false
 "still needed."
 
+**A "not satisfied" verdict carries a typed reason.** Measured across one
+repo's full run corpus, 58% of all not-satisfied probe verdicts (433/753 on
+the two most recent versions) rested solely on "the exact file the planner
+named does not exist yet" — the planner invents a fresh test path each run,
+the probe truthfully observes its absence, and a re-run of an
+already-satisfied task can therefore never come up empty even when
+equivalent coverage already landed under a different name. Prose evidence
+cannot be consulted by Python (the language-to-JSON rule, §"Language-to-JSON"),
+so the probe surfaces the distinction as structured fields:
+`unsatisfied_reason` (`artifact_missing` — the named artifact is absent;
+`behavior_gap` — the behavior itself is wrong or missing; `partially_met`;
+`cannot_verify`) and, for `artifact_missing` only,
+`equivalent_coverage_exists` — whether the criteria's *substance* is already
+met on the tree under a different artifact name. The consumer drops the
+subtask only when **both** fields agree (`artifact_missing` ∧
+`equivalent_coverage_exists`), the same recorded soft-drop as
+`satisfied: true`; every other combination keeps it. The conservative bias
+is preserved: judging whether equivalent coverage exists is the same
+"criteria semantically met on this tree" judgment the probe already owns,
+the default on absence of either field is *keep*, and the no-commits
+backstop remains the mechanical guarantee underneath.
+
 **The mid-run sibling case.** The pre-schedule probe judges the base tree as
 it stood at run start, so it is *structurally blind* to a subtask that
 becomes satisfied **during this run** by an earlier-wave sibling. Concretely:
