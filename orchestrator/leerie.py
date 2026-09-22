@@ -9279,6 +9279,70 @@ def check_prescribed_command_coverage(
     return issues
 
 
+def _executed_bash_commands(log_path: Path) -> list[str]:
+    """Every Bash command a worker actually invoked, in order, from its
+    per-worker JSONL log (via `_iter_log_tool_use` — structured `tool_use`
+    JSON, never prose). Empty when the log is missing or holds no Bash
+    invocations."""
+    return [
+        (inp.get("command") or "")
+        for kind, inp, _result in _iter_log_tool_use(log_path)
+        if kind == "Bash" and (inp.get("command") or "").strip()
+    ]
+
+
+def check_declared_commands_executed(
+    subtask: dict, executed: list[str],
+) -> list[str]:
+    """Settle-time half of the declared-command contract (DESIGN §"A
+    declared command must also have been executed"): every `runs_commands`
+    entry on a subtask claiming `complete` must match some Bash command
+    its worker actually ran. `check_prescribed_command_coverage` above
+    only proves a subtask *declares* each prescribed command; measured
+    (barnacle 2026-09-22), a subtask declared the task's one empirical
+    acceptance command, never issued it, and settled `complete` across
+    ten runs.
+
+    Same normalized token-subset matching as the plan-level floor (the
+    declared entry is a paraphrase, never byte-identical), applied per
+    shell segment — `_BLT_SEG_RE` split + `_BLT_SEG_LEAD_RE` prefix strip,
+    plus the segments' union — so `cd x && pnpm run build | tail` still
+    matches a declared "pnpm build". Pure JSON→JSON set logic, no NL
+    parsing. Free (empty) when the subtask declares nothing — the ~95%
+    case."""
+    declared = [
+        rc for rc in (subtask.get("runs_commands") or [])
+        if isinstance(rc, str) and rc.strip()
+    ]
+    if not declared:
+        return []
+    exec_sets: list[frozenset[str]] = []
+    for cmd in executed:
+        seg_sets = [
+            _command_tokens(seg)
+            for seg in (_BLT_SEG_LEAD_RE.sub("", raw.strip())
+                        for raw in _BLT_SEG_RE.split(cmd))
+            if seg
+        ]
+        exec_sets.extend(s for s in seg_sets if s)
+        if len(seg_sets) > 1:
+            exec_sets.append(frozenset().union(*seg_sets))
+    issues: list[str] = []
+    for rc in declared:
+        rc_tokens = _command_tokens(rc)
+        covered = bool(rc_tokens) and any(
+            rc_tokens <= es for es in exec_sets)
+        if not covered:
+            issues.append(
+                f"DECLARED_CMD_UNRUN: this subtask declared it runs {rc!r} "
+                "(runs_commands), but no Bash command its worker actually "
+                "executed matches it. Run the command and act on its real "
+                "output; if it cannot run in this environment, return "
+                "status 'blocked' naming what it needs instead of "
+                "'complete'.")
+    return issues
+
+
 def check_planner_output(
     result: dict, repo_root: Path, domain: str,
 ) -> list[str]:
@@ -31228,6 +31292,23 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # consume the handoff/clarification budget. Skipped for a result
         # rescued from `empty_handoff`: the worker was reaped mid-turn, so
         # re-spawning it would just repeat the doomed background step.
+        # Settle-time declared-command check (DESIGN §"A declared command
+        # must also have been executed"): a `complete` claim on a subtask
+        # that declared `runs_commands` must be backed by the worker
+        # actually running each declared command — read from the
+        # per-worker log's structured tool_use records, never trusted
+        # from the result. Computed OUTSIDE the confidence-retry guard
+        # below because it has a second consumer: when the retry budget
+        # exhausts with a command still unexecuted, the result converts
+        # to `blocked` (never a silent `complete`) — see the arm after
+        # the mechanical-check block. Skipped for empty_handoff rescues
+        # for the same reason the block below is.
+        declared_unrun: list[str] = []
+        if status == "complete" and not rescued_from_empty_handoff:
+            declared_unrun = check_declared_commands_executed(
+                subtask,
+                _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
+
         if status == "complete" and not rescued_from_empty_handoff and \
                 confidence_retries < caps.get("implementer_confidence_retries", 2):
             # Mechanical checks on the implementer's output.
@@ -31238,7 +31319,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             actual_files = set(diff_proc.stdout.strip().splitlines()
                                ) if diff_proc.returncode == 0 else set()
             impl_issues = check_implementer_output(
-                res, subtask, actual_files)
+                res, subtask, actual_files) + declared_unrun
             # Advisories are surfaced but never re-drive (see _ADVISORY_ISSUES).
             _gating = _gating_issues(impl_issues)
             for _adv in impl_issues:
@@ -31262,6 +31343,28 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 st.data.setdefault("subtask_status", {})[sid] = "in_progress"
                 st.save()
                 continue
+
+        # The declared-command check's terminal arm: the re-drive budget is
+        # exhausted (or the block above was skipped by it) and a declared
+        # command is STILL unexecuted. The one thing this must never do is
+        # settle `complete` on a verification the worker silently skipped —
+        # convert to `blocked`, naming the command(s), so the run stops at
+        # the wave's blocked registry and the operator adjudicates via
+        # accept-blocked (an in-container-unrunnable command is exactly that
+        # escape hatch's case).
+        if status == "complete" and declared_unrun and not (
+                confidence_retries
+                < caps.get("implementer_confidence_retries", 2)):
+            blocker = (
+                "declared runs_commands never executed after "
+                f"{confidence_retries} corrective retr"
+                f"{'y' if confidence_retries == 1 else 'ies'}: "
+                + "; ".join(declared_unrun))
+            log(f"  {sid}: {blocker}")
+            res = {"subtask_id": sid, "status": "blocked",
+                   "blocker": blocker,
+                   "summary": "declared command(s) never executed"}
+            status = "blocked"
 
         # DESIGN §9 *A stale finding is not a bug*. Advisory: surfaced on the
         # result and in the log, never routed into `check_implementer_output`

@@ -1188,6 +1188,23 @@ filters, which vanish ids the same way: dropped-id inbound refs pruned,
 `_validate_plan` survives end-to-end, and a no-drop run leaves
 `depends_on` byte-identical.
 
+`tests/test_declared_commands_executed.py` covers the settle-time
+declared-command check (DESIGN §"A declared command must also have been
+executed" — measured barnacle 2026-09-22: a subtask declared the task's
+one empirical acceptance command in `runs_commands`, never issued it, and
+settled `complete` across ten runs). Pure-function cases make declared
+and executed disagree in the shapes that matter: quoted-inside-`grep`
+and `--help`-probe invocations must NOT count as executed, while a
+pipeline / `cd … &&` prefix / cross-segment token union must;
+`DECLARED_CMD_UNRUN` is pinned gating (`_gating_issues` passthrough).
+`_executed_bash_commands` is pinned on a real JSONL fixture (order,
+non-Bash and malformed lines ignored, missing log → `[]`). The settle
+wiring drives the real `_settle_subtask` via `test_oom_naming.py`'s
+`env` fixture: unexecuted → one corrective re-drive whose feedback note
+names the command, then `blocked` (never `complete`) with the command in
+the blocker; executed → completes with exactly one implementer spawn;
+undeclared → untouched (anti-vacuity control).
+
 `tests/test_probe_typed_reason.py` covers the typed not-satisfied probe
 verdict (DESIGN §8 *A "not satisfied" verdict carries a typed reason* —
 measured 2026-09-22: 58% of all not-satisfied verdicts corpus-wide rested

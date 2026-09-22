@@ -4555,6 +4555,27 @@ runs in isolation):
 On success the gate persists `st.data["adherence_gate"] = {"judge":
 <adherence_judge output>, "floor_issues": []}` for audit.
 
+**Settle-time execution check (DESIGN §"A declared command must also have
+been executed").** The floor above proves declaration only. At settle
+time, `_settle_subtask` runs `check_declared_commands_executed(subtask,
+executed)` on every `complete` result whose subtask populates
+`runs_commands`: `executed` is the list of Bash commands the worker
+actually invoked, extracted from its per-worker JSONL log by
+`_executed_bash_commands(log_path)` (over `_iter_log_tool_use` —
+structured `tool_use` JSON, no prose). Matching reuses `_command_tokens`
+token-subset normalization, applied per shell segment (`_BLT_SEG_RE`
+split + `_BLT_SEG_LEAD_RE` prefix strip, plus the segments' union) so a
+declared command matches inside a pipeline or behind a `cd … &&` prefix.
+Each miss yields a `DECLARED_CMD_UNRUN: …` issue: these join the
+mechanical-check re-drive (the `implementer_confidence_retries` budget,
+feedback naming the unexecuted command); when the budget exhausts with a
+command still unexecuted, the result is converted to
+`status: "blocked"` with the blocker naming the command(s) — never
+settled `complete` — feeding the existing blocked registry /
+`accept-blocked` path. Skipped for empty/absent `runs_commands` (the
+~95% case, free) and for results rescued from `empty_handoff` (the
+worker was reaped mid-turn; blocking it would punish the reap).
+
 ### P6 repo-map — `_build_repo_map` + `_rank_repo_map`
 
 Implements DESIGN §5½ (P6) *Codebase structural map*. Both functions are

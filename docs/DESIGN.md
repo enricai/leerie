@@ -5427,6 +5427,37 @@ prescribed commands cannot be wrong about intent, depends on the plan's
 current sinks (acyclic by construction), and schedules alone in the final
 wave.
 
+**A declared command must also have been executed — the settle-time half.**
+The floor above only proves some subtask *declares* each prescribed
+command; nothing verified the declaring subtask ever *ran* it. Measured
+(barnacle, 2026-09-22): a subtask declared `runs_commands` naming the
+task's one empirical acceptance command, its worker never issued it (the
+input the command needed was unreachable from the sandbox), and the
+subtask settled `complete` on tests the same wave had authored — across
+ten runs of that task, the declared command was executed zero times while
+every run finalized green. The settle-time half closes this: the
+orchestrator already holds every Bash invocation the worker actually made
+as structured `tool_use` JSON in the per-worker log (`_iter_log_tool_use`
+— JSON→JSON, no prose is read), so `_settle_subtask` requires every
+`runs_commands` entry on a `complete` result to match some executed
+invocation under the same normalized token-subset rule the plan-level
+floor uses (segments split first, so a match inside a pipeline or a
+`cd … && …` prefix still counts). A miss first re-drives the implementer
+through the existing mechanical-check feedback loop — forgetting to run a
+declared command is exactly the "retryable mistake" shape that loop
+exists for — and only when the confidence-retry budget exhausts with the
+command still unexecuted does the subtask settle **`blocked`**, naming
+the command, feeding the existing `accept-blocked` escape hatch. That
+terminal is deliberate: a command that cannot run in-container (a live
+site, credentials, an absent fixture) is precisely the
+external-precondition case `accept-blocked` exists to adjudicate, and the
+one thing the run must never do is what it measurably did — settle
+`complete` on a verification it silently skipped. The check binds only
+where the field is populated (under 5% of subtasks), but
+`_repair_prescribed_commands` above makes prescribed commands
+always-declared, so the two halves together close the loop: plan-level
+"someone declares it," settle-level "the declarer ran it."
+
 ### Task-referenced file extraction
 
 When the task string references files (detectable by globbing), the
