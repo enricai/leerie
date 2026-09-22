@@ -34,7 +34,8 @@ the plan's declared edges do not encode. Concretely:
 - **`broken_by_merge`** — two subtasks were merged (see `dropped_subtasks`), and
   the merge dropped a real dependency one of them had — the merged subtask no
   longer expresses an edge its work still needs.
-- **`broken_by_drop`** — a subtask was dropped (already-satisfied / off-tree),
+- **`broken_by_drop`** — a subtask was dropped (already-satisfied /
+  equivalent-coverage / off-tree),
   and a surviving subtask's work genuinely depended on it in a way the tags
   never captured (so `_prune_orphaned_requires` did not catch it — that only
   prunes tags whose provider vanished, not real dependencies the tags never

@@ -1188,6 +1188,68 @@ filters, which vanish ids the same way: dropped-id inbound refs pruned,
 `_validate_plan` survives end-to-end, and a no-drop run leaves
 `depends_on` byte-identical.
 
+`tests/test_declared_commands_executed.py` covers the settle-time
+declared-command check (DESIGN §"A declared command must also have been
+executed" — measured barnacle 2026-09-22: a subtask declared the task's
+one empirical acceptance command in `runs_commands`, never issued it, and
+settled `complete` across ten runs). Pure-function cases pin the settled
+matching rule in BOTH accepted directions: literal declared covered
+inside a pipeline / `cd … &&` prefix; paraphrase declared covered when
+the executed segment appears as a length-≥2 CONTIGUOUS ordered sublist
+of the declared salient-token list, WHEREVER the command sits (tail —
+which the suffix rule already passed — plus mid-string, trailing-prose,
+and either half of a declared compound: the suffix-only rule's
+false-alarm rows, each of which looped into a
+false `blocked`); non-adjacent fragments reassembled from the paraphrase
+pinned UNRUN ("pnpm run", "make test", "run test", "sure green", bare
+"pnpm"); the DOCUMENTED near-miss residual class pinned as ACCEPTED, not
+an oversight (`test_near_miss_execution_is_accepted_residual`: parent
+sub-command, flag-dropped variant, `--help`-probed literal, adjacent
+prose pair — with the design rationale in the test comment); the
+glued-punctuation false-alarm residual pinned
+(`test_glued_punctuation_still_false_alarms`); quoted-inside-`grep` and
+differing-binary `--help` invocations NOT counted; and the three
+cross-segment union gaming shapes (`pnpm install && ls test` etc.) NOT
+counted — the union rule they bypassed was removed.
+`DECLARED_CMD_UNRUN` is pinned gating (`_gating_issues` passthrough).
+`_executed_bash_commands` is pinned on a real JSONL fixture (order
+preserved; the same fixture appends a non-Bash tool_use and a malformed
+line, both ignored; missing log → `[]`). The settle wiring drives the
+real `_settle_subtask` via `test_oom_naming.py`'s `env` fixture:
+unexecuted → one corrective re-drive whose feedback note names the
+command, then `blocked` (never a silent `complete`) with the command in
+the blocker AND the N21 `accept-blocked <run-id> <sid>` remedy in the
+log; an `empty_handoff` rescue with the command unrun settles COMPLETE
+with the warning persisted to `declared_unrun_warnings` (blocking would
+strand the rescued commits — the accept-blocked resume skip never
+integrates them); a clean later attempt POPS the stale warning
+(`test_clean_later_attempt_clears_the_stale_warning`); executed →
+completes with exactly one implementer spawn; undeclared → untouched
+(anti-vacuity control). `phase_finalize` surfaces the warnings as a
+`note —` line (`tests/test_finalize_execution.py::
+test_phase_finalize_surfaces_declared_unrun_warnings`). The N21 guard
+itself (`tests/test_settle_subtask_completeness_gate.py`) asserts the
+remedy shape at EVERY `[sid] = "blocked"` occurrence, not just the
+first.
+
+`tests/test_probe_typed_reason.py` covers the typed not-satisfied probe
+verdict (DESIGN §8 *A "not satisfied" verdict carries a typed reason* —
+measured 2026-09-22: 58% of all not-satisfied verdicts corpus-wide rested
+solely on a planner-invented file path not existing yet, so a re-run of a
+done task never came up empty): the `_probe_drop_reason` truth table
+(only `satisfied: true` and the three-field conjunction
+`artifact_missing` ∧ `equivalent_coverage_exists` ∧ an explicit
+`sibling_invalidation_risk: false` drop; the parametrized keep cases
+make the fields *disagree* — including risk `true`, risk absent, and
+risk falsy-but-not-`False` — so a one- or two-field consumer fails, and
+the sibling-invalidation channel is pinned keep-only by construction),
+the executed consumer (`_filter_satisfied_subtasks` drops with
+`reason: "equivalent_coverage"`, survives on disagreement, routes no-work
+when the drop empties the plan), the cache round-trip (typed fields
+persist and replay the drop with zero re-probes), schema enum
+enforcement, and `_filter_provably_false_wiring_defects` predicate 2
+treating an `equivalent_coverage` drop's tags as satisfied-on-base.
+
 ### Planning checkpoints: snapshot, decompose-crash barrier, schedule determinism
 
 `tests/test_plan_snapshot_wiring.py` pins `plan_snapshot` by source
@@ -3593,6 +3655,26 @@ judge responses. It deliberately uses multi-sentence evidence prose rather
 than a toy string, so the drop-list formatting is exercised on a real payload
 shape. Ablation: removing the `difference_update` turns both it and the
 retraction test red.
+
+**The converged-gate no-work consumer**, in `tests/test_no_work_judge.py`
+(DESIGN §8 *The healthy-path consumer* — measured 2026-09-22:
+`likely_already_satisfied` had exactly one reader, the exhaustion arm, so
+three consecutive re-runs of an already-merged task each cited the landed
+commits, converged, and shipped a PR anyway). Every behavioral test drives
+the real `phase_classification_gate` with a `claude_p` stub dispatching on
+`schema_key` (so the two judges' stubs cannot mask each other) and asserts
+terminal-state VALUES: confirm → routed True + `no_work_required` +
+`no_work_confirmation` carrying both evidences verbatim; dispute / crash /
+empty-evidence confirm → planning proceeds; flag-unset,
+`skip_satisfied_check`, and `skip_classification_check` (the gate never
+runs, so the consumer never fires — a documented side effect) → call
+count of **zero** for `no_work_judge` (anti-vacuity — an unwired hook
+still "returns False"); the judge's user_prompt carries the claim text
+and `required_items` (substance, not structure); the consumer resets the
+judgment worktree before the spawn (same discipline as the
+satisfied-probe sweep, pinned by ordering on the source); and the
+exhaustion arm still routes on raw trust with no judge spawn (its
+documented boundary, unchanged).
 
 **Two traps this incident re-confirmed.**
 

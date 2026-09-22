@@ -1536,7 +1536,11 @@ sweep (§8 *Already-satisfied subtask elimination*): that sweep fans out
 one probe per subtask and can itself run for minutes, so a pause
 mid-sweep would otherwise re-probe every subtask from scratch on resume,
 including the ones already judged. The fix persists each subtask's
-verdict — `satisfied`, `evidence`, and the fact that it was `checked` —
+verdict — `satisfied`, `evidence`, the fact that it was `checked`, and
+the typed not-satisfied fields (`unsatisfied_reason`,
+`equivalent_coverage_exists`, `sibling_invalidation_risk` — load-bearing
+on resume, since the cached-verdict fast path re-derives the drop reason
+from them; §8 *A "not satisfied" verdict carries a typed reason*) —
 into a `satisfied_probe_cache` keyed by subtask id as soon as that
 subtask's probe returns, rather than only in the aggregate after the
 whole sweep's `gather` completes. On resume, a subtask with a cached
@@ -4765,8 +4769,11 @@ identifiers-to-enums) were tried against the live API first and all
 refused; only the restructure worked.
 
 **A schema that still cannot be constrained is survivable.** Measured
-against the API across all 23 schemas (2026-08-04), two are refused
-outright — the planner's and the reconciler's, both driven by optional
+against the API across all 23 then-existing schemas (2026-08-04;
+re-swept 2026-09-22 across all 24 after `no_work_judge` and the
+`satisfied_probe` typed fields landed — all 24 compile), two were refused
+outright before the restructure described above — the planner's and the
+reconciler's, both driven by optional
 properties inside array items (twelve each), not size (the conformer's
 larger schema compiles fine). The fix is not to make those fields required
 — that already failed once, for a different reason: requiring fields is
@@ -4928,6 +4935,42 @@ instead of routing to no-work.) This extends the trust boundary
 second judge — to "classification could not otherwise converge anyway." A
 classifier that never sets the field sees zero behavior change.
 
+**The healthy-path consumer: a converged gate still checks the claim.**
+The exhaustion arm above turned out to be the field's *only* consumer, so
+on every run where classification converged — which is nearly every run —
+the claim was written to state and never read. Measured against one
+repo's corpus: three consecutive re-runs of an already-merged task each
+had the classifier correctly cite the exact landed commits ("this exact
+fix already landed in the immediately preceding commit… no further code
+changes are needed"), set the field, converge classification, and then
+plan, execute, and open a PR anyway — one of which introduced a
+regression the next run had to fix. The operators' workaround was manual:
+25 `accept-blocked` invocations on "no commits ahead of the run branch"
+across 22 runs, hand-performing the drop the signal already justified.
+
+So the converged path now consults the claim too — but through a second
+judge, preserving the trust boundary above rather than widening it. When
+the gate converges and `likely_already_satisfied` is `True` with
+evidence, `phase_classification_gate` spawns a **`no_work_judge`**: an
+independent, read-only, current-checkout-only adversarial verifier (the
+`fit_judge` precedent, §8 *Self-graded confidence is advisory; an
+independent verifier gates*) that re-checks the classifier's cited
+commits, tests, and required items against the tree it can see. Only a
+`confirmed: true` with evidence routes to `_finish_no_work_run`; a
+dispute, a crash, or a timeout falls through to planning unchanged
+(fail-open toward doing work — the same direction every other
+already-satisfied mechanism fails). The exhaustion arm is untouched: when
+classification cannot converge, the un-double-checked claim remains
+sufficient, because the alternative there was dying, not planning.
+`--skip-satisfied-check` suppresses this consumer along with the phase-3
+pre-schedule sweep — one flag governs both already-satisfied *prunes*.
+Two adjacent mechanisms are deliberately outside that flag's scope: the
+post-execution HEAD-probe *rescues* (which settle work, never delete it,
+so skipping them would only re-create the retry-cap failure they exist
+to prevent), and `--skip-classification-check`, which suppresses this
+consumer as a side effect — the gate it hooks never runs — as does a
+`classification_judge` that crashes every round.
+
 Reaching this state from classification instead of post-plan meant a run
 could hit `_finish_no_work_run` earlier than `run.json`'s own run-identity
 fields (`run_id`, `branch`, `working_branch`, `pr_base_branch`, `started_at`,
@@ -5057,6 +5100,46 @@ history-spanning probe "finds" the deliverable on an unrelated branch; (2)
 the probe defaults to *not satisfied* on any uncertainty, since a false
 "already done" silently deletes real work, strictly worse than a false
 "still needed."
+
+**A "not satisfied" verdict carries a typed reason.** Measured across one
+repo's full run corpus, 58% of all not-satisfied probe verdicts (433/753 on
+the two most recent versions) rested solely on "the exact file the planner
+named does not exist yet" — the planner invents a fresh test path each run,
+the probe truthfully observes its absence, and a re-run of an
+already-satisfied task can therefore never come up empty even when
+equivalent coverage already landed under a different name. Prose evidence
+cannot be consulted by Python (the language-to-JSON rule, §"Language-to-JSON"),
+so the probe surfaces the distinction as structured fields:
+`unsatisfied_reason` (`artifact_missing` — the named artifact is absent;
+`behavior_gap` — the behavior itself is wrong or missing; `partially_met`;
+`cannot_verify`) and, for `artifact_missing` only,
+`equivalent_coverage_exists` — whether the criteria's *substance* is already
+met on the tree under a different artifact name — plus
+`sibling_invalidation_risk`, the typed form of the sibling question below:
+would a surviving sibling's pending work invalidate that coverage once it
+lands. The consumer drops the subtask only when **all three** fields agree
+(`artifact_missing` ∧ `equivalent_coverage_exists` ∧ an **explicit**
+`sibling_invalidation_risk: false`), the same recorded soft-drop as
+`satisfied: true`; every other combination keeps it. The explicit-false
+requirement exists because a `satisfied: false` verdict is also the
+sibling-invalidation section's *keep* mechanism — without it, the typed
+drop would silently override a sibling-motivated keep, and the
+"sibling context only ever drives keeps" invariant would rest on prose
+alone. With it, the invariant holds by construction: an omitted or `true`
+risk field keeps, unconditionally. The conservative bias is otherwise
+preserved: judging whether equivalent coverage exists is the same
+"criteria semantically met on this tree" judgment the probe already owns,
+the default on absence of any field is *keep*, and the no-commits
+backstop remains the mechanical guarantee underneath. (One caveat:
+`--dangerously-force-strict-output` makes every schema property
+grammar-required, so "absence" cannot occur in that mode — the prompt
+instructs inert values for the forced case, and the three-field
+conjunction bounds what grammar pressure alone can cause; the flag's own
+§2½ disclosure lists this.) The post-execution twin
+(`_probe_criteria_satisfied_on_head`) deliberately reads `satisfied`
+alone: the typed drop is a pre-schedule concept, and a rescue that
+honored `equivalent_coverage` would settle a no-commit subtask complete
+on coverage a sibling may still invalidate mid-run.
 
 **The mid-run sibling case.** The pre-schedule probe judges the base tree as
 it stood at run start, so it is *structurally blind* to a subtask that
@@ -5374,6 +5457,88 @@ arbitrarily. A dedicated subtask whose entire content is running the
 prescribed commands cannot be wrong about intent, depends on the plan's
 current sinks (acyclic by construction), and schedules alone in the final
 wave.
+
+**A declared command must also have been executed — the settle-time half.**
+The floor above only proves some subtask *declares* each prescribed
+command; nothing verified the declaring subtask ever *ran* it. Measured
+(barnacle, 2026-09-22): a subtask declared `runs_commands` naming the
+task's one empirical acceptance command, its worker never issued it (the
+input the command needed was unreachable from the sandbox), and the
+subtask settled `complete` on tests the same wave had authored — across
+ten runs of that task, the declared command was executed zero times while
+every run finalized green. The settle-time half closes this: the
+orchestrator already holds every Bash invocation the worker actually made
+as structured `tool_use` JSON in the per-worker log (`_iter_log_tool_use`
+— JSON→JSON, no prose is read), so `_settle_subtask` requires every
+`runs_commands` entry on a `complete` result to match some executed
+invocation under normalized token matching, per shell segment
+(segments split first, so a match inside a pipeline or a `cd … && …`
+prefix still counts — but never a cross-segment token union, which would
+credit `pnpm install && ls test` for a declared "pnpm test"). Matching
+accepts either direction, because `runs_commands` legitimately takes two
+shapes: a *literal* entry (declared token set ⊆ executed segment's) and
+a *paraphrase* entry that wraps the command's tokens in extra words (the
+plan-level floor's one corpus sample, "barnacle recon browser" for
+`recon browser`, plus `prompts/planner.md`'s exact-commands instruction
+are the whole evidence base for that shape — a tail-position assumption
+was briefly shipped on no evidence and withdrawn). For the paraphrase
+shape the executed segment's salient token list must appear as a
+length-≥2 **contiguous ordered sublist** anywhere in the declared
+entry's salient token list. Contiguity is the settled endpoint of a
+measured three-round oscillation whose neighbors are both known-bad: a
+bare-SUBSET reverse rule let any ≥2-token fragment of a wordy paraphrase
+count as executed ("pnpm run", "make test" — non-adjacent words
+reassembled); a SUFFIX-only rule then false-alarmed on every paraphrase
+with words *after* the command ("run pnpm test to verify" vs an
+exactly-executed `pnpm test`), looping the re-drive deterministically
+into the blocked terminal — where `accept-blocked` silently drops a
+correct subtask's commits, strictly worse than any near-miss pass. No
+token rule can separate "ran the command mid-paraphrase" from "ran an
+adjacent fragment of the paraphrase"; contiguity resolves the
+undecidable remainder toward keeping work. The gate's honest contract is
+therefore: it catches **"never touched the declared command"**, not
+"ran a variant of it". Accepted near-miss residual class, in full: a
+parent sub-command (`barnacle recon` for "barnacle recon browser"), a
+flag-dropped variant (`pnpm lint` for "pnpm lint --fix" — its mirror,
+adding `--dry-run`, already passes the literal direction), a `--help`
+probe of a declared literal, and a deliberately-typed adjacent word pair
+("test suite") — the same §9 concession that declines to gate on test
+content a stuck worker could weaken, because the check verifies
+invocation, not success or intent: gating on the command's outcome is
+the code-enforced "tests must pass" bar §9 rejects, and the command's
+*output* reaching the worker is what the re-drive prompt asks for, not
+what the gate can honestly measure. The false-alarm residual that
+remains is glued punctuation (a declared entry quoting the command,
+"run \`pnpm test\`"), genuinely non-contiguous paraphrases, and a
+declared entry with fewer than one salient token (all-stopword or
+separator-only strings, e.g. "&&", are deterministically unsatisfiable
+— separators never survive segment splitting); the worst
+case for each is the re-drive round then the blocked terminal,
+adjudicated by the operator via `accept-blocked`. A miss first re-drives
+the implementer through the existing mechanical-check feedback loop —
+forgetting to run a declared command is exactly the "retryable mistake"
+shape that loop exists for — and when the confidence-retry budget
+exhausts with the command still unexecuted the
+subtask settles **`blocked`**, naming the command, feeding the existing
+`accept-blocked` escape hatch. That
+terminal is deliberate: a command that cannot run in-container (a live
+site, credentials, an absent fixture) is precisely the
+external-precondition case `accept-blocked` exists to adjudicate, and the
+one thing the run must never do is what it measurably did — settle
+`complete` on a verification it *silently* skipped. One path deliberately
+does not block: a result rescued from `empty_handoff` (§6 *Detecting
+memory OOM* — the worker was reaped mid-turn with
+committed work). Blocking there would strand the very commits the rescue
+exists to keep: `accept-blocked` marks the sid complete, resume then
+excludes it from the remaining set, and integration — which reads
+results, not branches — never merges it. So the rescue settles complete
+with the unrun-command warning logged loudly and persisted to state
+(`declared_unrun_warnings`), which is what keeps the skip visible in the
+run record: not silent, and not stranded. The check binds only
+where the field is populated (under 5% of subtasks), but
+`_repair_prescribed_commands` above makes prescribed commands
+always-declared, so the two halves together close the loop: plan-level
+"someone declares it," settle-level "the declarer ran it."
 
 ### Task-referenced file extraction
 
@@ -6592,15 +6757,19 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the sixteen worker types in
+Every main-loop LLM call in Leerie passes through one of the twenty worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
-`wiring_judge`, `provision_judge`, or `artifact_registry` (`fit_judge`/`splitter` are the P1
+`wiring_judge`, `provision_judge`, `task_coverage_judge`,
+`artifact_registry`, `integration_judge`, `no_work_judge`, or `rebaser`
+(`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
-`wiring_judge`, and `provision_judge` are the independent adversarial verifiers
-— see §8; `artifact_registry` is the pre-planning shared-vocabulary worker —
-see §5). Each worker type is a distinct **call type** — a
+`wiring_judge`, `provision_judge`, `task_coverage_judge`,
+`integration_judge`, and `no_work_judge` are the independent adversarial
+verifiers — see §8; `artifact_registry` is the pre-planning
+shared-vocabulary worker — see §5; `rebaser` is the finalize-time rebase
+worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap. Post-run skill workers — `judge`,

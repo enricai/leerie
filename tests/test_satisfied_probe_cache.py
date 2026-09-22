@@ -189,13 +189,20 @@ def test_uncached_sid_probed_once_and_verdict_persisted_both_outcomes(
     assert calls == {"feat-sat": 1, "feat-unsat": 1}
 
     cache = st.data["satisfied_probe_cache"]
+    # The typed not-satisfied fields (DESIGN §8 *A "not satisfied" verdict
+    # carries a typed reason*) are cached as None when the verdict omits
+    # them — None is the keep direction in _probe_drop_reason.
     assert cache["feat-sat"] == {
         "satisfied": True, "evidence": "done",
         "checked": ["a.py"], "base_sha": sha,
+        "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
     assert cache["feat-unsat"] == {
         "satisfied": False, "evidence": "not yet",
         "checked": [], "base_sha": sha,
+        "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
 
 
@@ -296,6 +303,8 @@ def test_verdict_reaches_disk_before_the_sweep_completes(
     assert seen_on_disk.get("feat-fast") == {
         "satisfied": False, "evidence": "still needed",
         "checked": ["a.py"], "base_sha": sha,
+        "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
 
 

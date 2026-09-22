@@ -406,8 +406,20 @@ STATE_FIELDS = (
     # phase_classification_gate on retry-loop exhaustion to route to the
     # cleared-but-empty terminal state instead of dying, when the
     # classifier's own investigation already found the task's deliverable
-    # present on HEAD.
+    # present on HEAD — and, on the CONVERGED gate path, by
+    # _confirm_no_work_on_converged_gate through the independent
+    # no_work_judge (DESIGN §8 *The healthy-path consumer*).
     "likely_already_satisfied", "likely_already_satisfied_evidence",
+    # no_work_confirmation: audit record of a converged-gate no-work exit —
+    # both halves of the two-worker agreement (classifier claim + judge
+    # verification). Written only when the no_work_judge confirms.
+    "no_work_confirmation",
+    # declared_unrun_warnings: per-sid record of declared runs_commands an
+    # empty_handoff-rescued subtask never executed. The rescue settles
+    # complete (blocking would strand the kept commits — see the rescue
+    # arm in _settle_subtask), so this persisted warning is what keeps the
+    # skip visible in the run record instead of only in the log.
+    "declared_unrun_warnings",
     "artifact_registry",
     "needs_source_of_truth", "source_of_truth_pref", "clarify",
     "dangerously_skip_permissions",
@@ -1455,6 +1467,13 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     "provision_judge": "medium",
     "task_coverage_judge": "medium",
     "integration_judge": "medium",
+    # Confirms (or disputes) the classifier's likely_already_satisfied claim
+    # on the converged-gate path (DESIGN §8 *The healthy-path consumer*).
+    # Same adversarial-verifier tier as its siblings above; absent from
+    # TIMEOUT_DEFAULT_PER_WORKER because that table is DERIVED from the
+    # measured duration corpus and a new worker has no measurements — it
+    # falls to the global worker_timeout_sec backstop until it does.
+    "no_work_judge": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -1587,7 +1606,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
-                "integration_judge", "rebaser")
+                "integration_judge", "no_work_judge", "rebaser")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1612,7 +1631,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "classifier", "classification_judge", "provision", "provision_judge",
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
-    "wiring_judge", "satisfied_probe", "integration_judge",
+    "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2654,6 +2673,19 @@ SCHEMAS: dict[str, dict] = {
         # round the mechanical no-commits backstop already tolerates).
         # No confidence block: this is an advisory prune subordinate to
         # `check_branch_has_commits` (§12), not a run-gating judgment.
+        # `unsatisfied_reason` / `equivalent_coverage_exists` type the
+        # not-satisfied verdict (DESIGN §8 *A "not satisfied" verdict
+        # carries a typed reason*): measured corpus-wide, 58% of
+        # not-satisfied verdicts rested solely on "the exact file the
+        # planner named does not exist", so a re-run of a done task never
+        # came up empty. Both optional (additive — an old-shaped verdict
+        # behaves exactly as before); the consumer drops only on the
+        # three-field conjunction (`artifact_missing` ∧
+        # `equivalent_coverage_exists` ∧ an explicit
+        # `sibling_invalidation_risk: false`), so absence of any field
+        # defaults to the safe direction, keep.
+        # Python compares the typed values only — never the evidence
+        # prose (Language-to-JSON).
         "type": "object",
         "additionalProperties": False,
         "required": ["satisfied", "evidence"],
@@ -2664,6 +2696,22 @@ SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "items": {"type": "string"},
             },
+            "unsatisfied_reason": {
+                "type": "string",
+                "enum": [
+                    "artifact_missing", "behavior_gap",
+                    "partially_met", "cannot_verify",
+                ],
+            },
+            "equivalent_coverage_exists": {"type": "boolean"},
+            # Keeps the sibling-invalidation channel keep-only BY
+            # CONSTRUCTION even for typed drops: the equivalent-coverage
+            # drop additionally requires an explicit `false` here, so a
+            # probe that judged a surviving sibling would break these
+            # criteria (or that omitted the field) can never be dropped
+            # by the typed path — mirroring the prose rule that
+            # `surviving_siblings` context only ever drives keeps.
+            "sibling_invalidation_risk": {"type": "boolean"},
         },
     },
     "artifact_registry": {
@@ -2850,6 +2898,38 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "rationale": {"type": "string"},
+        },
+    },
+    "no_work_judge": {
+        # Adversarially verifies the classifier's likely_already_satisfied
+        # claim on the CONVERGED classification-gate path (DESIGN §8 *The
+        # healthy-path consumer: a converged gate still checks the claim*).
+        # The claim was previously consumed only when the gate exhausted, so
+        # on every converging run it was written and never read — measured:
+        # three consecutive re-runs of an already-merged task each cited the
+        # landed commits, converged, and shipped a PR anyway. A
+        # `confirmed: true` with non-empty evidence routes the run to
+        # `_finish_no_work_run`; anything else — dispute, crash, timeout,
+        # empty evidence — falls through to planning unchanged (fail-open
+        # toward doing work). The judge runs read-only on the current
+        # checkout only (SATISFIED_PROBE_TOOLS — same base-tree discipline
+        # and for the same reason: a worktree shares the ref DB, and a
+        # history-spanning judge "finds" deliverables on unrelated branches).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["confirmed", "evidence"],
+        "properties": {
+            # True only when every deliverable the task requires is verified
+            # present on the current checkout. The prompt biases false on any
+            # doubt: a false confirm ends the run with real work undone,
+            # while a false dispute costs only the planning the run was
+            # about to do anyway.
+            "confirmed": {"type": "boolean"},
+            "evidence": {"type": "string"},
+            "checked": {
+                "type": "array",
+                "items": {"type": "string"},
+            },
         },
     },
     "wiring_judge": {
@@ -7284,7 +7364,9 @@ async def _ensure_planning_worktree(st: "State") -> str:
     """Create (or reset) this run's disposable judgment-worker worktree and
     return its absolute path, recording it in `st.data["planning_worktree"]`.
 
-    Called before `phase_classify` and again before the satisfied-probe
+    Called before `phase_classify`, again by
+    `_confirm_no_work_on_converged_gate` before the `no_work_judge`
+    spawns, and again before the satisfied-probe
     sweep. It is NOT guarded on the state key being absent: the worktree is a
     filesystem fact, not run state, so a resume must re-establish it (an
     abnormal exit removes it) and a second call must re-reset it (the probe
@@ -7292,9 +7374,11 @@ async def _ensure_planning_worktree(st: "State") -> str:
     path for the audit trail and for `_judgment_cwd`, not for a skip check.
 
     Fails closed. A silent fallback to the real checkout would reinstate
-    exactly the exposure this exists to remove, and this runs after preflight
-    and before phase 1, so the run has spent essentially nothing — the
-    cheapest possible moment to refuse (DESIGN §13)."""
+    exactly the exposure this exists to remove — that holds at every call
+    site, which is why the later two (post-classification, pre-sweep)
+    still die() despite real spend already sunk by then; the "cheapest
+    possible moment to refuse" argument applies only to the first,
+    pre-phase-1 call (DESIGN §13)."""
     proc = await _run_script("planning-worktree.sh", st.run_id)
     if proc.returncode != 0:
         die("could not create the judgment-worker worktree "
@@ -9155,10 +9239,18 @@ _STOPWORDS = frozenset({
 _ADHERENCE_GATE_THRESHOLD = 5.0
 
 
+def _command_token_list(command: str) -> list[str]:
+    """Lowercased, stopword-filtered token LIST (order preserved) for a
+    single command string. The single owner of the normalization rule —
+    `_command_tokens` and both arms of the declared-command matcher derive
+    from it, so a stopword or punctuation change lands everywhere at once
+    (a duplicated rule drifts exactly the way a duplicated list does)."""
+    return [tok for tok in command.lower().split() if tok not in _STOPWORDS]
+
+
 def _command_tokens(command: str) -> frozenset[str]:
     """Lowercased, stopword-filtered token set for a single command string."""
-    return frozenset(
-        tok for tok in command.lower().split() if tok not in _STOPWORDS)
+    return frozenset(_command_token_list(command))
 
 
 def check_prescribed_command_coverage(
@@ -9212,6 +9304,115 @@ def check_prescribed_command_coverage(
             issues.append(
                 f"PRESCRIBED_CMD_UNRUN: prescribed command {cmd!r} is not "
                 "covered by any subtask's runs_commands")
+    return issues
+
+
+def _executed_bash_commands(log_path: Path) -> list[str]:
+    """Every Bash command a worker actually invoked, in order, from its
+    per-worker JSONL log (via `_iter_log_tool_use` — structured `tool_use`
+    JSON, never prose). Empty when the log is missing or holds no Bash
+    invocations."""
+    return [
+        (inp.get("command") or "")
+        for kind, inp, _result in _iter_log_tool_use(log_path)
+        if kind == "Bash" and (inp.get("command") or "").strip()
+    ]
+
+
+def check_declared_commands_executed(
+    subtask: dict, executed: list[str],
+) -> list[str]:
+    """Settle-time half of the declared-command contract (DESIGN §"A
+    declared command must also have been executed"): every `runs_commands`
+    entry on a subtask claiming `complete` must match some Bash command
+    its worker actually ran. `check_prescribed_command_coverage` above
+    only proves a subtask *declares* each prescribed command; measured
+    (barnacle 2026-09-22), a subtask declared the task's one empirical
+    acceptance command, never issued it, and settled `complete` across
+    ten runs.
+
+    Normalized token matching per shell segment (`_BLT_SEG_RE` split +
+    `_BLT_SEG_LEAD_RE` prefix strip), accepted in EITHER direction because
+    `runs_commands` legitimately takes two shapes:
+
+    - **literal declared** (the barnacle incident shape): the entry is the
+      command itself, possibly executed wrapped — declared token SET ⊆
+      segment token set, so `cd x && pnpm run build | tail` covers a
+      declared "pnpm build";
+    - **paraphrase declared** (the planner shape the plan-level floor's
+      one corpus sample shows — the entry WRAPS the command's tokens in
+      extra words, e.g. "run pnpm test to verify" for `pnpm test`): the
+      segment's salient token LIST must appear as a length-≥2 CONTIGUOUS
+      ordered sublist of the declared entry's salient token list.
+
+    That contiguity rule is the settled endpoint of a measured
+    three-round oscillation, and both of its neighbors are known-bad:
+    a bare-SUBSET reverse rule let any ≥2-token fragment of a wordy
+    paraphrase count as executed ("pnpm run", "make test" — non-adjacent
+    words reassembled); a SUFFIX-only rule then false-alarmed on every
+    paraphrase with words AFTER the command ("run pnpm test to verify"
+    vs an exactly-executed `pnpm test`), which loops the re-drive
+    deterministically into the blocked terminal — where accept-blocked
+    silently drops a correct subtask's commits, strictly worse than any
+    near-miss pass. No token rule can separate "ran the command
+    mid-paraphrase" from "ran an adjacent fragment of the paraphrase";
+    contiguity resolves the undecidable remainder toward keeping work.
+
+    The gate's honest contract is therefore: it catches "never touched
+    the declared command", NOT "ran a variant of it". The accepted
+    near-miss residual class (documented in DESIGN §"A declared command
+    must also have been executed"): a parent sub-command
+    (`barnacle recon` for "barnacle recon browser"), a flag-dropped
+    variant (`pnpm lint` for "pnpm lint --fix" — its mirror, adding
+    `--dry-run`, already passed the forward arm), `--help`-probing a
+    declared literal, and a deliberately-typed adjacent word pair
+    ("test suite") — the same §9 concession that declines to gate on
+    test content a stuck worker could weaken. Still rejected: bare
+    single tokens, non-adjacent fragments, and tokens scattered across
+    different segments (NO cross-segment union — `pnpm install && ls
+    test` never covers "pnpm test"). Glued punctuation (a declared
+    entry quoting the command as `` `pnpm test` ``) still false-alarms;
+    worst case is the re-drive then the blocked terminal, adjudicated
+    by accept-blocked. Pure JSON→JSON list/set logic, no NL parsing.
+    Free (empty) when the subtask declares nothing — the ~95% case."""
+    declared = [
+        rc for rc in (subtask.get("runs_commands") or [])
+        if isinstance(rc, str) and rc.strip()
+    ]
+    if not declared:
+        return []
+    exec_sets: list[frozenset[str]] = []
+    exec_lists: list[list[str]] = []
+    for cmd in executed:
+        for raw in _BLT_SEG_RE.split(cmd):
+            seg = _BLT_SEG_LEAD_RE.sub("", raw.strip())
+            if not seg:
+                continue
+            toks = _command_token_list(seg)
+            if toks:
+                exec_sets.append(frozenset(toks))
+                exec_lists.append(toks)
+
+    def _contiguous_sublist(needle: list[str], hay: list[str]) -> bool:
+        n = len(needle)
+        return n >= 2 and any(
+            hay[i:i + n] == needle for i in range(len(hay) - n + 1))
+
+    issues: list[str] = []
+    for rc in declared:
+        rc_tokens = _command_tokens(rc)
+        rc_list = _command_token_list(rc)
+        covered = bool(rc_tokens) and any(
+            rc_tokens <= es or _contiguous_sublist(el, rc_list)
+            for es, el in zip(exec_sets, exec_lists))
+        if not covered:
+            issues.append(
+                f"DECLARED_CMD_UNRUN: this subtask declared it runs {rc!r} "
+                "(runs_commands), but no Bash command its worker actually "
+                "executed matches it. Run the command and act on its real "
+                "output; if it cannot run in this environment, return "
+                "status 'blocked' naming what it needs instead of "
+                "'complete'.")
     return issues
 
 
@@ -11940,6 +12141,32 @@ def _filter_offtree_subtasks(plans: list[dict], repo_root: Path,
     _apply_subtask_drop_propagation(plans, dropped, st)
 
 
+def _probe_drop_reason(verdict: dict) -> str | None:
+    """Map a satisfied_probe verdict to a soft-drop reason, or None to keep.
+
+    Pure typed-field logic (Language-to-JSON): `satisfied: true` drops as
+    `"already_satisfied"`; a not-satisfied verdict drops as
+    `"equivalent_coverage"` only when ALL THREE typed fields agree —
+    `unsatisfied_reason == "artifact_missing"` (the planner-named artifact
+    is absent), `equivalent_coverage_exists is True` (the criteria's
+    substance is already met on the tree under another artifact name), and
+    `sibling_invalidation_risk is False` (an EXPLICIT false — the probe
+    affirmed no surviving sibling's pending work would break the
+    criteria). Any other combination, or any field absent, keeps the
+    subtask — absence defaults to the safe direction, and the explicit-
+    false requirement keeps the sibling-invalidation channel keep-only by
+    construction rather than by prompt (DESIGN §8 *A "not satisfied"
+    verdict carries a typed reason*).
+    """
+    if verdict.get("satisfied") is True:
+        return "already_satisfied"
+    if (verdict.get("unsatisfied_reason") == "artifact_missing"
+            and verdict.get("equivalent_coverage_exists") is True
+            and verdict.get("sibling_invalidation_risk") is False):
+        return "equivalent_coverage"
+    return None
+
+
 async def _filter_satisfied_subtasks(
     plans: list[dict], repo_root: Path, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
@@ -11952,7 +12179,12 @@ async def _filter_satisfied_subtasks(
     soft-drops the ones the probe marks `satisfied`. Recorded in
     `st.data["dropped_subtasks"]` with `reason: "already_satisfied"` plus
     the probe's evidence — the same audit shape as
-    `_filter_offtree_subtasks`.
+    `_filter_offtree_subtasks`. A not-satisfied verdict whose typed
+    fields agree (`unsatisfied_reason == "artifact_missing"`,
+    `equivalent_coverage_exists`, and an explicit
+    `sibling_invalidation_risk: false`) drops the same way with
+    `reason: "equivalent_coverage"` — see `_probe_drop_reason` and
+    DESIGN §8 *A "not satisfied" verdict carries a typed reason*.
 
     Returns a `no_work_map` (`domain → basis`) IFF the drop empties every
     `status == "ready"` plan (so the caller routes to
@@ -12055,9 +12287,10 @@ async def _filter_satisfied_subtasks(
             # the SAME base tree — skip the semaphore and claude_p
             # entirely (DESIGN §6 "The satisfied-probe sweep needs
             # finer-than-phase granularity").
-            if cached.get("satisfied") is True:
+            cached_reason = _probe_drop_reason(cached)
+            if cached_reason is not None:
                 dropped[sid] = {
-                    "reason": "already_satisfied",
+                    "reason": cached_reason,
                     "evidence": cached.get("evidence", ""),
                     "checked": list(cached.get("checked", []) or []),
                     "provides": list(s.get("provides") or []),
@@ -12129,12 +12362,23 @@ async def _filter_satisfied_subtasks(
             "satisfied": bool(out.get("satisfied") is True),
             "evidence": out.get("evidence", ""),
             "checked": list(out.get("checked", []) or []),
+            # Typed not-satisfied fields (DESIGN §8 *A "not satisfied"
+            # verdict carries a typed reason*) — cached so a resume
+            # replays the same equivalent-coverage decision without
+            # re-probing. Absent on old-shaped verdicts; None is the
+            # keep direction in _probe_drop_reason.
+            "unsatisfied_reason": out.get("unsatisfied_reason"),
+            "equivalent_coverage_exists": out.get(
+                "equivalent_coverage_exists"),
+            "sibling_invalidation_risk": out.get(
+                "sibling_invalidation_risk"),
             "base_sha": base_sha,
         }
         st.save()
-        if out.get("satisfied") is True:
+        fresh_reason = _probe_drop_reason(out)
+        if fresh_reason is not None:
             dropped[sid] = {
-                "reason": "already_satisfied",
+                "reason": fresh_reason,
                 "evidence": out.get("evidence", ""),
                 "checked": list(out.get("checked", []) or []),
                 # Capture provides now, before the survivor-filter below drops
@@ -12156,9 +12400,9 @@ async def _filter_satisfied_subtasks(
         ]
 
     log(f"phase 3: satisfied-probe dropped {len(dropped)}/{total} "
-        "already-satisfied subtask(s):")
+        "subtask(s) (already satisfied, or equivalent coverage exists):")
     for sid, info in sorted(dropped.items()):
-        log(f"     {sid}: {info['evidence'][:160]}")
+        log(f"     {sid} [{info['reason']}]: {info['evidence'][:160]}")
     _apply_subtask_drop_propagation(plans, dropped, st)
 
     # If every ready plan is now empty, this is the per-subtask analogue
@@ -12173,12 +12417,20 @@ async def _filter_satisfied_subtasks(
             return None
         if plan.get("subtasks"):
             return None
+    # The basis names both drop reasons when both occurred — this string
+    # reaches run.json/no_work_reasons, and "already satisfied" alone
+    # would misdescribe an equivalent-coverage exit to the operator.
+    reasons_seen = sorted({i["reason"] for i in dropped.values()})
+    basis = (
+        "all subtasks already satisfied on HEAD, or their substance "
+        "covered under another artifact name "
+        if "equivalent_coverage" in reasons_seen else
+        "all subtasks already satisfied on HEAD "
+    ) + "(satisfied-probe, DESIGN §8)"
     no_work_map: dict[str, str] = {}
     for plan in plans:
         domain = plan.get("domain") or "<unknown>"
-        no_work_map[domain] = (
-            "all subtasks already satisfied on HEAD "
-            "(satisfied-probe, DESIGN §8)")
+        no_work_map[domain] = basis
     return no_work_map
 
 
@@ -15116,10 +15368,19 @@ def _strictify_schema(node: object) -> tuple[int, int]:
         # Safe because only the *wire* schema changes. The CLI still validates
         # the worker's output against leerie's ORIGINAL schema, where these
         # fields remain optional — and a field that is merely *present*
-        # satisfies an optional field's type check. Audited across all 23
-        # schemas: 89 optional fields, none of which becomes illegal when
-        # forced (arrays admit `[]`, and no forced field carries a `minLength`
-        # its trivial value would violate).
+        # satisfies an optional field's type check. Audited across all 24
+        # schemas (re-derived 2026-09-22): 131 optional fields, none of which
+        # becomes illegal when forced (arrays admit `[]`, and no forced field
+        # carries a `minLength` its trivial value would violate). One
+        # BEHAVIORAL caveat, not a legality one: satisfied_probe's typed
+        # not-satisfied fields rely on "absent → keep" (_probe_drop_reason),
+        # and forcing makes absence unrepresentable — the prompt therefore
+        # instructs inert values for the forced case, and the drop needs a
+        # three-field conjunction, which bounds what grammar pressure
+        # alone can cause (DESIGN's word — a probability reduction, not
+        # an impossibility; the last line of defense there is the prompt)
+        # (see the §2½ disclosure and DESIGN §8 *A "not satisfied" verdict
+        # carries a typed reason*).
         #
         # NOT the mistake PR #153 undid. That regression was models *omitting*
         # required fields and so producing nothing schema-valid; here the
@@ -20347,6 +20608,106 @@ def _gating_spurious_categories(judge_result: dict) -> set[str]:
     } - {""}
 
 
+async def _confirm_no_work_on_converged_gate(
+        task: str, st: State, caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None]) -> bool:
+    """Consult `likely_already_satisfied` on the CONVERGED gate path
+    (DESIGN §8 *The healthy-path consumer: a converged gate still checks
+    the claim*). Returns True iff the run was routed to
+    `_finish_no_work_run` (caller must stop); False on every other
+    outcome — flag unset, skip flag set, judge dispute, judge crash, or
+    empty judge evidence — so the run proceeds to planning unchanged.
+
+    The claim is never trusted raw here: on this path the run *can*
+    proceed normally, so the trust boundary DESIGN documents for the
+    exhaustion arm ("an investigation un-double-checked by a second
+    judge" is acceptable only when the alternative was dying) does not
+    extend to it. A `no_work_judge` — the `fit_judge` independent-
+    adversarial-verifier precedent — re-checks the cited commits, tests,
+    and required items against the tree it can see, and only its
+    confirmation routes to no-work. Fail-open on every JUDGE outcome:
+    a wrong dispute costs the planning the run was about to do anyway,
+    a wrong confirm ends the run with real work undone. (Two failures
+    are deliberately NOT open: `bump_workers`' budget backstop
+    propagates, and `_ensure_planning_worktree`'s reset failure die()s —
+    infrastructure, same as at the satisfied-probe sweep's call site.)
+
+    Honors `skip_satisfied_check`: one flag governs both
+    already-satisfied prunes (this consumer and the phase-3 pre-schedule
+    sweep; the post-execution HEAD-probe rescues are outside its scope —
+    they settle work, never delete it — and `skip_classification_check`
+    also suppresses this consumer as a side effect, since the gate it
+    hooks never runs)."""
+    if st.data.get("skip_satisfied_check"):
+        return False
+    evidence = (st.data.get("likely_already_satisfied_evidence") or "").strip()
+    if not (st.data.get("likely_already_satisfied") and evidence):
+        return False
+
+    required_items = st.data.get("required_items") or []
+    user_prompt = (
+        "TASK:\n" + task + "\n\n"
+        "CLASSIFIER CLAIM (to verify adversarially — the classifier's "
+        "investigation concluded this task's deliverable is already fully "
+        "present on the current checkout):\n" + evidence +
+        ("\n\nREQUIRED ITEMS (each must be verifiably met on the current "
+         "checkout for the claim to hold):\n" +
+         json.dumps(required_items, indent=2) if required_items else "") +
+        "\n\nVerify the claim against the CURRENT checkout only — never "
+        "other branches or history. Return only the JSON object per your "
+        "schema. Default confirmed=false on any doubt."
+    )
+    log("  classification gate converged with an already-satisfied claim; "
+        "spawning no_work_judge to verify it")
+    # Re-reset the judgment worktree before the judge sees it — same
+    # discipline, same reason as the reset before the satisfied-probe
+    # sweep: the judge is handed no diff and no file contents, so its cwd
+    # is the ONLY thing determining which tree it verifies, and the
+    # classifier plus up to N classification_judge rounds have lived in
+    # this worktree first. A stray write there would make the judge
+    # confirm against a tree that is not the user's — and a false confirm
+    # ends the whole run with real work undone, a strictly worse cost
+    # than the probe's false drop of one subtask.
+    await _ensure_planning_worktree(st)
+    # bump_workers stays OUTSIDE the try: its WorkerError is the budget
+    # backstop and must propagate, not be read as a judge dispute.
+    st.bump_workers(caps)
+    try:
+        out = await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=_load_prompt("no_work_judge"),
+            schema_key="no_work_judge", cwd=_judgment_cwd(st),
+            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models.get("no_work_judge", MODEL_DEFAULT),
+            effort=efforts.get("no_work_judge"),
+            sid="no_work_judge",
+        )
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        log("  no_work_judge crashed "
+            f"({_brief_worker_exc(e)}); proceeding to planning "
+            "(fail-open — a crash never confirms)")
+        return False
+
+    judge_evidence = (out.get("evidence") or "").strip()
+    if out.get("confirmed") is True and judge_evidence:
+        log("  no_work_judge CONFIRMED the task is already satisfied on "
+            "the current checkout — routing to the cleared-but-empty "
+            f"terminal state (evidence: {judge_evidence!r})")
+        # Audit trail: both halves of the two-worker agreement.
+        st.data["no_work_confirmation"] = {
+            "classifier_evidence": evidence,
+            "judge_evidence": judge_evidence,
+            "checked": list(out.get("checked", []) or []),
+        }
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence})
+        return True
+    log("  no_work_judge did not confirm the claim "
+        f"(evidence: {judge_evidence[:200]!r}); proceeding to planning")
+    return False
+
+
 async def phase_classification_gate(task: str, st: State, caps: dict,
                                     clarify: bool, models: dict[str, str],
                                     efforts: dict[str, str | None]) -> bool:
@@ -20383,7 +20744,11 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     round is not guaranteed — only a genuinely fresh contradicting claim
     with its own evidence would ever override an earlier True. Routes
     to `_finish_no_work_run` and returns True in that case; the caller must
-    then stop the pipeline (mirroring the existing `_detect_no_work` call
+    then stop the pipeline. The CONVERGED path consults the same field too,
+    but through `_confirm_no_work_on_converged_gate`'s independent
+    `no_work_judge` (DESIGN §8 *The healthy-path consumer*) — raw trust in
+    the un-double-checked claim stays scoped to exhaustion, where the
+    alternative was dying, not planning (mirroring the existing `_detect_no_work` call
     site's `_finish_no_work_run(...); return` pattern). A
     `classification_judge` `WorkerError` (infrastructure crash) degrades: the
     classifier's own output is preserved (never discarded), consistent with
@@ -20604,6 +20969,15 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
     st.data["classification_coverage_gate"] = judge_result
     st.save()
     log("phase 1: classification gate clean")
+    # Healthy-path consumer of likely_already_satisfied (DESIGN §8 *The
+    # healthy-path consumer*): before this, the exhaustion arm above was
+    # the field's ONLY reader, so a converging run wrote the claim and
+    # never consulted it — re-runs of already-merged tasks planned,
+    # executed, and shipped PRs anyway. Unlike the exhaustion arm, the
+    # claim here is gated behind an independent no_work_judge.
+    if await _confirm_no_work_on_converged_gate(task, st, caps, models,
+                                                efforts):
+        return True
     return False
 
 
@@ -25089,7 +25463,9 @@ def _filter_provably_false_wiring_defects(
     1. a `broken_by_*` whose capability is still in the provides union: the
        finding's own premise ("a merge/drop severed this") is false.
     2. any defect whose capability was provided by an `already_satisfied`
-       drop: satisfied on the base tree.
+       or `equivalent_coverage` drop: satisfied on the base tree (the
+       latter under a different artifact name — same base-tree premise,
+       DESIGN §8 *A "not satisfied" verdict carries a typed reason*).
 
     **Predicate 1 covers `broken_by_*` and `missing_provides`, and must never
     cover `missing_requires`.** The distinction is which side of the edge the
@@ -25124,7 +25500,8 @@ def _filter_provably_false_wiring_defects(
     for sid, rec in (dropped or {}).items():
         tags = set((rec or {}).get("provides") or []) if isinstance(rec, dict) else set()
         dropped_tags |= tags
-        if isinstance(rec, dict) and rec.get("reason") == "already_satisfied":
+        if isinstance(rec, dict) and rec.get("reason") in (
+                "already_satisfied", "equivalent_coverage"):
             satisfied_tags |= tags
             satisfied_tags.add(sid)
 
@@ -31017,6 +31394,33 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
 
         status = res.get("status")
 
+        # Settle-time declared-command check (DESIGN §"A declared command
+        # must also have been executed"): a `complete` claim on a subtask
+        # that declared `runs_commands` must be backed by the worker
+        # actually running each declared command — read from the
+        # per-worker log's structured tool_use records, never trusted
+        # from the result. Computed OUTSIDE the mechanical-check block
+        # below because it has two consumers: its issues join that block's
+        # gating re-drive, and when no re-drive remains — budget
+        # exhausted, or an empty_handoff rescue (re-spawning would repeat
+        # the doomed step, so a rescue skips the re-drive but must NOT
+        # skip this: rescuing an unrun declared command straight to
+        # `complete` is exactly the silent skip the check exists to
+        # prevent) — the result converts to `blocked`; see the arm after
+        # the block.
+        declared_unrun: list[str] = []
+        if status == "complete":
+            declared_unrun = check_declared_commands_executed(
+                subtask,
+                _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
+            if not declared_unrun:
+                # A clean later attempt clears a stale warning from an
+                # earlier rescued attempt of the same sid — same
+                # contradiction-avoidance as the symptom_findings pop and
+                # the blocked-dict clear below (persisted by the
+                # subtask_status save on every complete path).
+                st.data.get("declared_unrun_warnings", {}).pop(sid, None)
+
         # CRITIC-pattern MECHANICAL check on complete results. The implementer's
         # `root_cause` / `solution` self-score is NO LONGER a gating axis
         # (DESIGN §8 *Independent adversarial verification*): a worker grading
@@ -31040,7 +31444,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             actual_files = set(diff_proc.stdout.strip().splitlines()
                                ) if diff_proc.returncode == 0 else set()
             impl_issues = check_implementer_output(
-                res, subtask, actual_files)
+                res, subtask, actual_files) + declared_unrun
             # Advisories are surfaced but never re-drive (see _ADVISORY_ISSUES).
             _gating = _gating_issues(impl_issues)
             for _adv in impl_issues:
@@ -31064,6 +31468,65 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 st.data.setdefault("subtask_status", {})[sid] = "in_progress"
                 st.save()
                 continue
+
+        # The declared-command check on an empty_handoff RESCUE: never
+        # silent, never blocked. Blocking here would strand the very
+        # commits the rescue exists to keep — verified chain: blocked →
+        # wave die → accept-blocked marks the sid complete → resume
+        # excludes it from `remaining` → integrate_wave sees no result
+        # entry and never merges the branch (and the integration-integrity
+        # gate's `expected` excludes it too, so no shortfall fires). So a
+        # rescued result with an unrun declared command settles complete,
+        # with the warning logged loudly AND persisted to state — the
+        # operator sees it in the run record, not only in a 600 KB log.
+        if status == "complete" and declared_unrun and \
+                rescued_from_empty_handoff:
+            for _du in declared_unrun:
+                log(f"  {sid}: WARNING (empty_handoff rescue kept the "
+                    f"committed diff): {_du}")
+            # State is the record (surfaced by phase_finalize's note
+            # line); a result-level copy was tried and dropped — the
+            # HEAD-reprobe settle path rebuilds the result dict, so a
+            # res-side key silently vanished on exactly that path.
+            st.data.setdefault("declared_unrun_warnings", {})[sid] = list(
+                declared_unrun)
+            st.save()
+
+        # The declared-command check's terminal arm: the re-drive budget
+        # is exhausted and a declared command is STILL unexecuted. The one
+        # thing this must never do is settle `complete` on a verification
+        # the worker silently skipped — convert to `blocked`, naming the
+        # command(s), so the run stops at the wave's blocked registry and
+        # the operator adjudicates via accept-blocked (an
+        # in-container-unrunnable command is exactly that escape hatch's
+        # case). Be clear about what accept-blocked does here — the SAME
+        # chain the rescue arm above refuses to enter: it marks the sid
+        # complete, resume excludes it, and integration never merges
+        # whatever commits its branch carries. That is acceptable at THIS
+        # arm because the operator explicitly adjudicated a subtask whose
+        # verification never ran — and the branch survives for manual
+        # recovery — but it is a real trade, not a benign skip.
+        # Mirrors the completeness gate's N21 blocked-detection
+        # shape below: the status write is immediately followed by the log
+        # naming the exact remedy.
+        if status == "complete" and declared_unrun and \
+                not rescued_from_empty_handoff and not (
+                    confidence_retries
+                    < caps.get("implementer_confidence_retries", 2)):
+            blocker = (
+                "declared runs_commands never executed after "
+                f"{confidence_retries} corrective retr"
+                f"{'y' if confidence_retries == 1 else 'ies'}: "
+                + "; ".join(declared_unrun))
+            log(f"  {sid}: {blocker}")
+            st.data.setdefault("subtask_status", {})[sid] = "blocked"
+            log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
+                f"{st.run_id} {sid}` once addressed, then `leerie "
+                "resume` to continue without re-running it")
+            st.save()
+            return {"subtask_id": sid, "status": "blocked",
+                    "blocker": blocker,
+                    "summary": "declared command(s) never executed"}
 
         # DESIGN §9 *A stale finding is not a bug*. Advisory: surfaced on the
         # result and in the log, never routed into `check_implementer_output`
@@ -32797,6 +33260,17 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
             f"symptom could not reproduce it, "
             f"so the finding may already "
             f"have been fixed: {', '.join(_stale)}")
+    # DESIGN §"A declared command must also have been executed": an
+    # empty_handoff-rescued subtask that never executed a declared command
+    # settled complete (blocking would strand its kept commits); this line
+    # is the promised operator visibility — same shape as the two notes
+    # above, so the skip is in the run summary, not only in state.json.
+    _unrun = st.data.get("declared_unrun_warnings") or {}
+    if _unrun:
+        log(f"note — {len(_unrun)} subtask(s) settled complete via the "
+            "empty_handoff rescue WITHOUT executing declared "
+            "runs_commands: " + ", ".join(
+                f"{sid} ({len(w)})" for sid, w in sorted(_unrun.items())))
     _log_run_weight(tel, st)
 
 

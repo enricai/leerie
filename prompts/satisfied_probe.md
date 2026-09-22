@@ -99,7 +99,13 @@ subtasks in this plan (with their declared `provides` and
 them as work that is *about to land*: this is a snapshot taken before the
 plan runs, so it lists every sibling, and you do not know which of them
 may themselves turn out to be already-done — that is fine, because you
-only ever use this list to *keep* a subtask, never to drop one. Judge the
+only ever use this list to *keep* a subtask, never as evidence *for* a
+drop. (The typed-reason section below asks you to certify the opposite
+finding — `sibling_invalidation_risk: false` — as an additional
+*precondition* the orchestrator requires before an equivalent-coverage
+drop; that is the one place a conclusion drawn from this list
+participates in a drop, and only by ruling the risk out, never by
+supplying the drop's evidence.) Judge the
 tree as usual, but before returning
 `satisfied: true`, ask one more question: **would any sibling's
 work, once it lands, break this criterion?**
@@ -119,7 +125,8 @@ safe direction as every other uncertainty — a false `false` costs one
 implementer round; a false `true` here silently drops the only thing
 keeping the suite green. Do **not** use `surviving_siblings` to judge the
 tree itself or to look past the current checkout — it is only a reason to
-*decline* a drop, never a reason to grant one.
+*decline* a drop, never the evidence that grants one (see the
+typed-reason section for the one certification it feeds).
 
 Note that a file *existing* is not the same as the criterion being *met*.
 If a subtask asks for translation keys and the file `messages/en.json`
@@ -163,6 +170,71 @@ discipline from above still governs it exactly:
   assertion anywhere on the tree, return `false`; do not credit a
   near-miss.
 
+## When you return `false`, type the reason
+
+A `satisfied: false` verdict must also say **what kind of gap** you found,
+as structured data — the orchestrator's Python never reads your prose, only
+these fields. Set `unsatisfied_reason` to exactly one of:
+
+- `artifact_missing` — the criterion names a specific artifact (a test
+  file, a config, a doc) and that named artifact is absent from this tree.
+  Use this only when the absence of the named artifact is the whole gap.
+- `behavior_gap` — the described behavior itself is wrong, missing, or
+  only partially present in the code, regardless of any named artifact.
+- `partially_met` — some criteria are concretely met on this tree and
+  others are not.
+- `cannot_verify` — you could not check (tooling failed, the criterion is
+  not checkable read-only, or you ran out of turns).
+
+When the reason is `artifact_missing` (and, apart from the forced-fields
+case at the end of this section, only then), also set
+`equivalent_coverage_exists`: after applying the convention-search
+discipline above, does the criterion's **substance** already exist on this
+tree under a different artifact name? `true` means you found and can cite
+the equivalent artifact (e.g. the named test file
+`example-widget.spec.ts` is absent, but the same assertions already live
+in an existing suite file you inspected); `false` means you searched and
+the substance is genuinely absent too. The same evidence rule governs a
+`true` here as governs `satisfied: true`: cite the specific file and the
+specific content that carries the equivalence — never a plausibly-named
+file you did not read. If you did not actually search, or are unsure, set
+`false`.
+
+Note the relationship to the convention rule above: when equivalent
+coverage is real and complete, the criterion is simply **met** — return
+`satisfied: true`. `artifact_missing` + `equivalent_coverage_exists: true`
+is for the narrower case where you judge the named artifact's absence
+still leaves the criterion formally unmet (for instance, the criterion's
+own wording demands the artifact by name) but the substance is present —
+the orchestrator treats that agreement as a drop, so hold it to
+`satisfied: true`'s standard of evidence.
+
+Because that agreement can drop the subtask, it must also answer the
+sibling question from the section above: set
+`sibling_invalidation_risk` to `true` whenever any entry in
+`surviving_siblings` could, once its work lands, invalidate the
+equivalent coverage you found (the classic guard-test case — the
+coverage passes *today*, a surviving feature sibling is about to change
+what it guards). Set it to `false` only when you checked the surviving
+siblings and none would. The orchestrator drops on
+`equivalent_coverage_exists: true` **only with an explicit
+`sibling_invalidation_risk: false`** — an omitted or `true` value keeps
+the subtask, the same keep-only direction the sibling rule has
+everywhere else.
+
+When your output schema forces you to emit every field (some runs
+constrain decoding so no field can be omitted): on `satisfied: true`,
+set `unsatisfied_reason` to `cannot_verify`,
+`equivalent_coverage_exists` to `false`, and
+`sibling_invalidation_risk` to `true` — all three are ignored on a
+satisfied verdict, and those values are the inert ones. On a forced
+`satisfied: false` where you did NOT actually search for equivalent
+coverage (any reason, including `artifact_missing`), the inert values
+are the same: `equivalent_coverage_exists: false` and
+`sibling_invalidation_risk: true` — the keep direction. Never let a
+forced field pressure you into `equivalent_coverage_exists: true` or
+`sibling_invalidation_risk: false` you did not actually verify.
+
 ## Output
 
 Return **only** a JSON object per your schema:
@@ -179,3 +251,21 @@ Return **only** a JSON object per your schema:
 - `evidence` (required): a short justification citing concrete on-tree
   facts. On `false`, say what is missing.
 - `checked` (optional): the paths / symbols you actually inspected.
+- `unsatisfied_reason` (required when `satisfied` is `false`; under
+  forced-fields mode also emitted on `satisfied: true`, as
+  `cannot_verify` — ignored there): one of
+  `artifact_missing` / `behavior_gap` / `partially_met` / `cannot_verify`
+  — see above.
+- `equivalent_coverage_exists` (set when `unsatisfied_reason` is
+  `artifact_missing`; under forced-fields mode, on any verdict where you
+  did NOT actually search, use the inert `false` — a verified finding of
+  equivalent coverage is still reported `true`): whether the criterion's
+  substance is already on this tree under another name, with citing
+  evidence.
+- `sibling_invalidation_risk` (set when `equivalent_coverage_exists` is
+  `true`; under forced-fields mode, on any verdict where you did NOT
+  actually check the siblings, use the inert `true` — a verified
+  no-sibling-risk finding is still reported `false`): whether a
+  surviving sibling's pending work would invalidate that coverage once
+  it lands. The drop requires an explicit `false`; omitted or `true`
+  keeps the subtask.

@@ -68,21 +68,28 @@ class TestSettleSubtaskWiring:
         """N21: the moment `subtask_status[sid]` is set to 'blocked', a
         log() call fires immediately naming the sid and the exact
         `leerie accept-blocked <run-id> <sid>` remedy — not only surfaced
-        later at wave close."""
+        later at wave close. Checked at EVERY occurrence of the literal
+        write, not just the first — the declared-command terminal arm
+        added a second site, and an index()-of-first check would have
+        gone silently vacuous for whichever site came later."""
         src = inspect.getsource(leerie._settle_subtask)
-        i_assign = src.index('[sid] = "blocked"')
-        # The very next statement after the assignment must be a log()
-        # call carrying the sid and the remedy command (before st.save()).
-        after = src[i_assign:i_assign + 400]
-        i_log = after.index("log(")
-        i_save = after.index("st.save()")
-        assert i_log < i_save, (
-            "log() must fire immediately at blocked-detection, not after "
-            "the state write is saved and the loop moves on")
-        log_call = after[i_log:i_save]
-        assert "{sid}" in log_call
-        assert "accept-blocked" in log_call
-        assert "{st.run_id}" in log_call or "st.run_id" in log_call
+        occurrences = [i for i in range(len(src))
+                       if src.startswith('[sid] = "blocked"', i)]
+        assert occurrences, "no direct blocked-status write found"
+        for i_assign in occurrences:
+            # The very next statements after the assignment must include
+            # a log() carrying the sid and the remedy command, before
+            # st.save().
+            after = src[i_assign:i_assign + 400]
+            i_log = after.index("log(")
+            i_save = after.index("st.save()")
+            assert i_log < i_save, (
+                "log() must fire immediately at blocked-detection, not "
+                "after the state write is saved and the loop moves on")
+            log_call = after[i_log:i_save]
+            assert "{sid}" in log_call
+            assert "accept-blocked" in log_call
+            assert "{st.run_id}" in log_call or "st.run_id" in log_call
 
 
 class TestFinalConformanceWiring:

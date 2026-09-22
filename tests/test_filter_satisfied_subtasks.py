@@ -674,13 +674,19 @@ def test_verdicts_persisted_for_both_outcomes(leerie, tmp_path, monkeypatch):
         plans, repo, st, _CAPS, _MODELS, _EFFORTS))
 
     cache = st.data["satisfied_probe_cache"]
+    # Typed not-satisfied fields cache as None when the verdict omits
+    # them (DESIGN §8 *A "not satisfied" verdict carries a typed reason*).
     assert cache["feat-001"] == {
         "satisfied": True, "evidence": "done",
         "checked": ["a.py"], "base_sha": sha,
+        "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
     assert cache["feat-002"] == {
         "satisfied": False, "evidence": "not yet",
         "checked": [], "base_sha": sha,
+        "unsatisfied_reason": None, "equivalent_coverage_exists": None,
+        "sibling_invalidation_risk": None,
     }
 
 
