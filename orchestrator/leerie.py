@@ -420,6 +420,14 @@ STATE_FIELDS = (
     # targets the disputed residual instead of re-deriving the task
     # (DESIGN §8 *A dispute's evidence is planning input, not log noise*).
     "no_work_dispute",
+    # delivery_gate: audit record of the finalize-side required-items
+    # verification on the integrated staging tree (DESIGN §8 *The
+    # delivery gate*): {unmet_before[], unmet_after[], samples_before,
+    # samples_after}. unmet_after == [] means every confirmed-unmet item
+    # was remedied by the final-conformer round it was routed into;
+    # non-empty unmet_after is the persisted residual the operator (and
+    # the next run's planner, via the classifier) can see.
+    "delivery_gate",
     # declared_unrun_warnings: per-sid record of declared runs_commands an
     # empty_handoff-rescued subtask never executed. The rescue settles
     # complete (blocking would strand the kept commits — see the rescue
@@ -1480,6 +1488,11 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # measured duration corpus and a new worker has no measurements — it
     # falls to the global worker_timeout_sec backstop until it does.
     "no_work_judge": "medium",
+    # Verifies the integrated staging tree against required_items before
+    # finalize (DESIGN §8 *The delivery gate*). Same adversarial-verifier
+    # tier; same TIMEOUT_DEFAULT_PER_WORKER absence rationale as
+    # no_work_judge (no measured duration corpus yet).
+    "delivery_judge": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -1612,7 +1625,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "conformer", "fit_judge", "splitter", "adherence_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
-                "integration_judge", "no_work_judge", "rebaser")
+                "integration_judge", "no_work_judge", "delivery_judge",
+                "rebaser")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1638,6 +1652,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
+    "delivery_judge",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2936,6 +2951,46 @@ SCHEMAS: dict[str, dict] = {
                 "type": "array",
                 "items": {"type": "string"},
             },
+        },
+    },
+    "delivery_judge": {
+        # Verifies the INTEGRATED staging tree against the run's
+        # required_items just before finalize (DESIGN §8 *The delivery
+        # gate*). The measured gap it closes: a standing deliverable
+        # constraint carried in required_items was enforced by the NEXT
+        # run's no_work_judge (which vetoed no-work over it) but by
+        # nothing in the run that shipped the violation — enforcement
+        # asymmetry that guarantees at least one extra run per violation.
+        # Verdicts align to the payload's numbered items by `item_index`
+        # (mechanical integer alignment — never prose matching), and the
+        # consumer applies a majority vote across samples before calling
+        # any item unmet (single-trial LLM judging is measurably noisy;
+        # most recoverable reliability arrives by 3 votes).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["verdicts"],
+        "properties": {
+            "verdicts": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_index", "met", "evidence"],
+                    "properties": {
+                        # Index into the numbered REQUIRED ITEMS list the
+                        # judge was handed. Integer, not the item text —
+                        # the consumer tallies votes per index.
+                        "item_index": {"type": "integer"},
+                        # met=true only with cited on-tree evidence; on
+                        # cannot-verify the prompt biases met=false (a
+                        # false unmet costs one fix round; a false met
+                        # ships the violation).
+                        "met": {"type": "boolean"},
+                        "evidence": {"type": "string"},
+                    },
+                },
+            },
+            "rationale": {"type": "string"},
         },
     },
     "wiring_judge": {
@@ -30848,9 +30903,220 @@ async def _capture_conformance_baseline(
                                                "red_axes": []}})
 
 
-async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
+def _format_unmet_required_items_section(unmet: list[dict]) -> str:
+    """The final-conformer prompt section that routes confirmed-unmet
+    required items into the existing fix loop (DESIGN §8 *The delivery
+    gate*). Pure, so the exact text the conformer receives is testable —
+    the value delivered, not just a key present."""
+    lines = [
+        "UNMET REQUIRED ITEMS (delivery gate): an independent read-only "
+        "judge verified this integrated tree against the task's explicit "
+        "required items and found the following NOT met, with evidence. "
+        "Remedy each one in this worktree and commit the fixes alongside "
+        "your conformance work — these are task requirements, not style "
+        "rules, and a post-pass recheck verifies them again:",
+    ]
+    for u in unmet:
+        lines.append(f"  - [{u.get('item_index')}] {u.get('item', '')}")
+        ev = (u.get("evidence") or "").strip()
+        if ev:
+            lines.append(f"    evidence: {ev}")
+    return "\n".join(lines)
+
+
+def _delivery_unmet_majority(samples: list[dict], n_items: int) -> list[int]:
+    """Item indices unmet by strict majority across judge samples.
+
+    Mechanical tally only (Language-to-JSON): votes align by the
+    schema's integer `item_index`, never by matching item prose. Within
+    one sample the LAST verdict for an index wins (defensive against a
+    duplicated entry); an index a sample never mentions is a MET vote —
+    only an affirmative unmet counts, so a truncated verdict list fails
+    open toward shipping, the same direction as every other
+    already-satisfied mechanism. Threshold is a strict majority of ALL
+    samples taken (1 of 1, 2 of 3), per the measured reliability curve
+    for single-trial LLM judging (DESIGN §8 *The delivery gate*)."""
+    threshold = len(samples) // 2 + 1
+    votes = [0] * n_items
+    for s in samples:
+        seen: dict[int, bool] = {}
+        for v in (s.get("verdicts") or []):
+            idx = v.get("item_index")
+            if (isinstance(idx, int) and 0 <= idx < n_items
+                    and isinstance(v.get("met"), bool)):
+                seen[idx] = v["met"]
+        for idx, met in seen.items():
+            if not met:
+                votes[idx] += 1
+    return [i for i in range(n_items) if votes[i] >= threshold]
+
+
+async def _delivery_judge_unmet(
+        task: str, items: list[dict], staging: Path, st: "State",
+        caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None],
+        phase_label: str) -> tuple[list[dict], int]:
+    """Run the delivery_judge over the staging tree; return
+    (confirmed_unmet, samples_used).
+
+    Confirm-on-first-pass: one sample, and only when it flags something
+    do two more run, with an item confirmed unmet only on a 2-of-3
+    majority — single-trial LLM judging is measurably noisy, majority
+    over 3 samples recovers most of the reliability, and voting on
+    DISPUTES only keeps the clean-pass common case at one spawn.
+    Exceptions (WorkerError / timeout) propagate; the callers treat the
+    whole gate as advisory."""
+    numbered = [{"item_index": i, **item} for i, item in enumerate(items)]
+    user_prompt = (
+        "TASK:\n" + task + "\n\n"
+        "REQUIRED ITEMS (verify each against the CURRENT tree — your cwd "
+        "is the integrated staging worktree, the exact tree this run is "
+        "about to ship):\n"
+        + json.dumps(numbered, indent=2) +
+        "\n\nReturn one verdict per item_index per your schema. met=true "
+        "only with cited on-tree evidence; when you cannot verify, "
+        "met=false with evidence saying what you could not verify."
+    )
+
+    async def _sample(k: int) -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt=user_prompt,
+            system_prompt=_load_prompt("delivery_judge"),
+            schema_key="delivery_judge", cwd=str(staging),
+            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=30,
+            autonomous=False, caps=caps, st=st,
+            model=models.get("delivery_judge", MODEL_DEFAULT),
+            effort=efforts.get("delivery_judge"),
+            sid=f"delivery_judge-{phase_label}-s{k}",
+        )
+
+    samples = [await _sample(0)]
+    if not _delivery_unmet_majority(samples, len(items)):
+        return [], 1
+    for k in (1, 2):
+        samples.append(await _sample(k))
+    unmet_idx = _delivery_unmet_majority(samples, len(items))
+    confirmed: list[dict] = []
+    for i in unmet_idx:
+        evidence = ""
+        for s in reversed(samples):
+            for v in (s.get("verdicts") or []):
+                if v.get("item_index") == i and v.get("met") is False:
+                    evidence = (v.get("evidence") or "").strip()
+                    break
+            if evidence:
+                break
+        confirmed.append({"item_index": i,
+                          "item": items[i].get("item", ""),
+                          "evidence": evidence})
+    return confirmed, len(samples)
+
+
+async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
+                                 models: dict[str, str],
+                                 efforts: dict[str, str | None],
+                                 ) -> list[dict]:
+    """First half of the delivery gate (DESIGN §8 *The delivery gate*):
+    verify the integrated staging tree against `required_items` BEFORE
+    the final-conformer pass, so confirmed-unmet items route into that
+    existing fix loop instead of needing one of their own.
+
+    Returns the confirmed-unmet list (possibly empty) and persists the
+    `before` half of `st.data["delivery_gate"]`. Advisory throughout:
+    no required items, the shared `skip_coverage_check` flag (one flag
+    governs required-items checking, plan-side and finalize-side),
+    a missing staging worktree, or a judge crash all return [] — the
+    gate must never become a new way to stop a run."""
+    if st.data.get("skip_coverage_check"):
+        return []
+    items = st.data.get("required_items") or []
+    if not items:
+        return []
+    existing = st.data.get("delivery_gate") or {}
+    if "unmet_after" in existing:
+        log("phase 5: delivery gate already complete — skipping (resume)")
+        return []
+    if "unmet_before" in existing:
+        # Resumed between the two halves: reuse the recorded verdict so
+        # the recheck still runs without re-spending the pre-judge.
+        return list(existing.get("unmet_before") or [])
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        log("phase 5: delivery gate skipped — staging worktree absent")
+        return []
+    log(f"phase 5: delivery gate — verifying {len(items)} required "
+        "item(s) against the integrated tree (DESIGN §8)")
+    st.data["current_phase"] = "phase 5: delivery gate"
+    st.save()
+    try:
+        unmet, n = await _delivery_judge_unmet(
+            st.data.get("task", ""), items, staging, st, caps, models,
+            efforts, phase_label="pre")
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        log(f"  delivery_judge crashed ({_brief_worker_exc(e)}); "
+            "gate skipped (advisory)")
+        return []
+    st.data["delivery_gate"] = {"unmet_before": unmet,
+                                "samples_before": n}
+    st.save()
+    if unmet:
+        log(f"  delivery gate: {len(unmet)} required item(s) confirmed "
+            f"unmet by majority over {n} sample(s); routing into the "
+            "final-conformer pass")
+    else:
+        log("  delivery gate: every required item verified met on the "
+            "integrated tree")
+    return unmet
+
+
+async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
                                 models: dict[str, str],
                                 efforts: dict[str, str | None]) -> None:
+    """Second half of the delivery gate: after the final-conformer pass
+    was handed the confirmed-unmet items, mechanically re-verify — never
+    trust the fixer's self-report (the same discipline as
+    `check_rebaser_worktree_state`). Records `unmet_after` either way;
+    a non-empty residual ships anyway (fail-open toward shipping) but
+    loudly, and the record is what the operator and the next run's
+    classifier can see."""
+    gate = st.data.get("delivery_gate") or {}
+    unmet_before = gate.get("unmet_before") or []
+    if not unmet_before or "unmet_after" in gate:
+        return
+    items = st.data.get("required_items") or []
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not items or not staging.is_dir():
+        log("  delivery gate recheck skipped — items or staging absent")
+        return
+    try:
+        unmet, n = await _delivery_judge_unmet(
+            st.data.get("task", ""), items, staging, st, caps, models,
+            efforts, phase_label="recheck")
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
+            "residual unrecorded (advisory)")
+        return
+    gate["unmet_after"] = unmet
+    gate["samples_after"] = n
+    st.data["delivery_gate"] = gate
+    st.save()
+    if unmet:
+        log(f"  delivery gate residual: {len(unmet)} required item(s) "
+            "still unmet after the final-conformer pass — finalize "
+            "proceeds (fail-open), residual recorded in state.json "
+            "delivery_gate.unmet_after: "
+            + "; ".join((i.get("item") or "")[:80] for i in unmet))
+    else:
+        log("  delivery gate: all previously-unmet required items "
+            "verified remedied")
+
+
+async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
+                                models: dict[str, str],
+                                efforts: dict[str, str | None],
+                                unmet_required_items:
+                                list[dict] | None = None) -> None:
     """Whole-tree conformance pass on the integrated staging worktree
     (DESIGN §6 *Worktree and integration model*, final-tree pass).
 
@@ -30966,6 +31232,13 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             f"DIFF_BASE: {working_branch} (compare with "
             f"`git diff {working_branch}..HEAD`)",
         ]
+        # Delivery-gate routing (DESIGN §8 *The delivery gate*): the
+        # confirmed-unmet required items ride the existing fix loop
+        # rather than getting one of their own; the gate's recheck is
+        # the mechanical verification that they were actually remedied.
+        if unmet_required_items:
+            up.append(_format_unmet_required_items_section(
+                unmet_required_items))
         _append_conformer_context_sections(up, pre, "full", st)
         if blt_feedback is not None:
             up.append(blt_feedback)
@@ -34266,12 +34539,24 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         _write_plan(leerie_dir, task, st, subtasks, waves)
 
     await phase_execute(leerie_dir, st, caps, models, efforts)
+    # Delivery gate, first half (DESIGN §8 *The delivery gate*): verify
+    # the integrated tree against required_items and hand any
+    # confirmed-unmet items to the final-conformer pass below. Advisory
+    # at this call site for the same reason as the conformance pass.
+    unmet_delivery: list[dict] = []
+    try:
+        unmet_delivery = await _run_delivery_prejudge(
+            leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"delivery gate (pre) raised {type(e).__name__}: {e} — "
+            "surfaced as advisory, continuing")
     # Final-tree conformance pass on the integrated staging worktree
     # (DESIGN §6 *Worktree and integration model*, final-tree pass).
     # Advisory — never raises; failure modes surface in
     # st.data["conformance"]["_final"].
     try:
-        await _run_final_conformance(leerie_dir, st, caps, models, efforts)
+        await _run_final_conformance(leerie_dir, st, caps, models, efforts,
+                                     unmet_required_items=unmet_delivery)
     except Exception as e:
         # Defense-in-depth: _run_final_conformance is documented to
         # never raise, but a bug in its glue (e.g. a future state
@@ -34284,6 +34569,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         )["warnings"].append(
             f"orchestrator-side exception: {type(e).__name__}: {e}")
         st.save()
+    # Delivery gate, second half: mechanically re-verify the items the
+    # conformer was handed — never trust a fixer's self-report. Only
+    # spawned when the first half confirmed something unmet.
+    if unmet_delivery:
+        try:
+            await _run_delivery_recheck(leerie_dir, st, caps, models,
+                                        efforts)
+        except Exception as e:
+            log(f"delivery gate (recheck) raised {type(e).__name__}: {e} "
+                "— surfaced as advisory, finalize proceeds")
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),

@@ -5031,6 +5031,54 @@ completed. The identity write is therefore hoisted to run start, before
 `phase_classify`, so every early-exit path sees a correctly-identified
 `run.json`.
 
+**The delivery gate: required items are verified on the tree that
+ships.** The no-work judge above enforces `required_items` against the
+tree — but only at the START of the run AFTER the one that shipped.
+Measured cost of that asymmetry: a run shipped deliverables violating a
+standing constraint carried in its own required items (an explicit
+"never reference X in the code" instruction), every in-run gate passed
+them, and the next run's no-work judge — correctly — refused to declare
+the task done over exactly that violation. Fail-open sent it to
+planning, and the cycle was structurally able to repeat: whatever the
+terminal gate checks that the shipping gates don't is a guaranteed
+extra run per violation.
+
+So the same standard runs at finalize, in the run that ships. After the
+last wave integrates and before the final-conformer pass, a
+**`delivery_judge`** (read-only, SATISFIED_PROBE_TOOLS, cwd = the
+integrated staging worktree — the exact tree the PR will carry)
+verifies each required item and returns one typed verdict per item,
+aligned by integer `item_index` — mechanical alignment, never prose
+matching (Language-to-JSON). Two reliability rules shape the consumer:
+
+- **Majority vote on disputes only.** Single-trial LLM judging is
+  measurably noisy (the demoted `task_coverage_judge` returned a
+  different finding set 85% of the time on identical input), and the
+  published reliability curves show most recoverable agreement arriving
+  by 3–5 votes. A clean first pass confirms at one spawn; only when the
+  first sample flags something do two more run, and an item is
+  confirmed unmet only at 2-of-3. Voting cannot fix an error the judge
+  makes consistently — that residual is accepted and covered by the
+  fail-open below.
+- **Route into the existing fix loop; re-check mechanically.**
+  Confirmed-unmet items ride the final-conformer pass as a prompt
+  section (`_format_unmet_required_items_section`) rather than getting
+  a fix loop of their own — the conformer already edits, commits, and
+  is bounded, clobber-checked, and rollback-protected on staging. After
+  that pass, the judge runs again (same vote rules): the fixer's
+  self-report is never trusted, same discipline as
+  `check_rebaser_worktree_state`.
+
+A residual after the recheck ships anyway — fail-open toward shipping,
+recorded loudly in `state.data["delivery_gate"].unmet_after` — because
+a blocking gate with a noisy judge gets switched off, and the cross-run
+backstop now exists (*A dispute's evidence is planning input*: the next
+run's no-work judge vetoes and its evidence steers the next plan at the
+residual). One flag governs required-items checking on both sides:
+`--skip-coverage-check` suppresses the plan-side advisory coverage
+judge and this gate alike. A run whose classifier extracted no
+`required_items` pays nothing.
+
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
 classification-gate, reconciler, provision, overlap-judge, and integrator
