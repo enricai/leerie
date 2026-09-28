@@ -383,6 +383,19 @@ The orchestrator gives you, in your prompt:
    `files_likely_touched`: the orchestrator mechanically warns when an
    audited site's file appears in no subtask.
 
+   **Carry `defect_shape` into every covering subtask's
+   `success_criteria_seed`, as the acceptance bar** — the full contract
+   wording, not a paraphrase scoped to one variant. A subtask that
+   claims an audited site but states a narrower shape in its own intent
+   produces a faithful fix for the narrower shape (measured, on a run
+   where no shape was carried: a subtask's own intent read "score
+   generic action-button controls above zero" — a sub-shape of the
+   reported contract, which covered ANY submit-shaped element
+   regardless of tag or role; the faithful sub-shape fix shipped, the
+   residual survived, and the next run died on it). The
+   shape in the criteria is what makes a too-narrow fix fail its own
+   acceptance instead of shipping.
+
    If your CONTEXT includes `no_work_dispute` (absent on most runs), an
    independent read-only judge already examined the current tree this run
    and disputed the claim that the task is complete. Its `judge_evidence`

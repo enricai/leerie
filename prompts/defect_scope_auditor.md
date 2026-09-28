@@ -54,14 +54,39 @@ Cite real files and symbols you actually read. An enumerated site you
 did not read is worse than an omitted one: the planner will scope work
 to what you list.
 
+## Unconfirmed-cause reports ARE applicable
+
+A report that describes one live symptom, says the cause is
+unconfirmed, and names (or implies) several candidate mechanisms is
+NOT a reason to decline — it is the case where your enumeration helps
+most, because a planner without it will pick one candidate and ship a
+fix scoped to that candidate alone (measured: an "open investigation"
+report was declined twice; the report named three candidate
+mechanisms that no plan carried, the shipped fix covered a sub-shape
+of the reported contract, and the residual killed the next run in
+planning). For such
+a report:
+
+- `defect_shape` is the **violated behavioral contract** the report
+  describes — what should happen and does not (e.g. "a submit-shaped
+  target element must be resolvable and clickable regardless of its
+  tag or explicit role") — not a diagnosed code idiom.
+- `sites` are the **candidate mechanisms**: every place that could
+  produce the symptom — the report's own hypotheses AND the ones your
+  reading finds — each with the usual role. A candidate you examined
+  and ruled out with evidence may be omitted, but say so in
+  `rationale`; a candidate you could not rule out goes on the list.
+
 ## When to say "not applicable"
 
-`applicable: false` is the correct output when the task is not a
-defect-shape fix: a feature, a documentation change, an infrastructure
-task, or a defect with a single obvious location and no repeated idiom
-(one off-by-one in one function needs no audit). Do not force an
-enumeration where there is nothing to enumerate — a fabricated site
-list sends the planner to files that do not need changing. The
+`applicable: false` is reserved for tasks that are not defect fixes at
+all — a feature, a documentation change, an infrastructure task — or
+a defect with a single obvious location and no repeated idiom and no
+competing candidate mechanisms (one off-by-one in one function needs
+no audit). Do not force an enumeration where there is genuinely
+nothing to enumerate — a fabricated site list sends the planner to
+files that do not need changing. But "the cause is not yet diagnosed"
+is the opposite of that case, not an instance of it. The
 not-applicable output is exactly this (`sites` is required by your
 schema even when empty):
 

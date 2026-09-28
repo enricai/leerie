@@ -292,6 +292,39 @@ subtask it tests). Three mechanisms reconcile that coupling:
   `files_likely_touched` union and warns loudly on any audited file no
   subtask claims. A task that is not a defect fix pays nothing.
 
+  **The applicability trigger includes unconfirmed-cause reports.**
+  Measured on the audit's first two live runs (one task, 2026-09-28):
+  the auditor declined both ("the report is an open investigation, not
+  a diagnosed defect with a repeated wrong idiom") — while the report
+  named three candidate mechanisms, each run's plan carried exactly
+  one hypothesis, and the shipped fix covered a sub-shape (an intent
+  of "generic action-button controls" against a reported contract
+  covering any submit-shaped element regardless of tag or role); the
+  next run's plan re-targeted the residual and died at the wiring
+  gate. A symptom
+  report with an unconfirmed cause and multiple candidate mechanisms is
+  where enumeration helps MOST, not least: the shape is then the
+  *violated behavioral contract* the report describes (what should
+  happen and does not), and the sites are the candidate mechanisms —
+  both the report's own hypotheses and the ones the auditor finds.
+  Not-applicable is reserved for tasks that are not defect fixes at
+  all, and for defects with a single obvious location and no repeated
+  or multi-candidate structure.
+
+  **The audited shape is the acceptance bar, not commentary.** The
+  second measured failure mode is a covering subtask quietly narrowing
+  the shape: a plan can claim the audited site while its intent names a
+  sub-shape of the contract, and a faithful implementer then ships the
+  sub-shape (measured on a run where no shape had been carried —
+  "score generic action-button controls above zero" at a site whose
+  gate excludes every non-button-like element).
+  The planner is therefore instructed to carry the audit's
+  `defect_shape` wording into each covering subtask's success
+  criteria, so a fix for a narrower shape fails its own criteria
+  instead of shipping. Prompt-level (§12: the floor stays mechanical
+  and file-scoped; shape coverage is semantic and cannot be
+  regex-checked without violating Language-to-JSON).
+
   **Test subtasks must wire to their producers.** An edge only forms when
   the consumer *declares* it. Recurring shape: a `testing`-domain subtask
   exercises what another subtask creates but declares neither a
