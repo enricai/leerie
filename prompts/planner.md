@@ -376,9 +376,11 @@ The orchestrator gives you, in your prompt:
    when one exists, the `chokepoint` where a single fix covers all of
    them. Your cut must account for EVERY listed site. For a diagnosed
    shape, "account for" means fix or deliberately defer; for candidate
-   mechanisms it means rule out with recorded evidence or fix — a
-   candidate is a hypothesis, and blind fixes at possibly-innocent
-   sites are not coverage. When the `chokepoint` entry says it exists,
+   mechanisms it means rule out (with the evidence recorded at plan
+   time in a subtask's `scope_note`, per the leave-out rule below) or
+   fix — a candidate is a
+   hypothesis, and blind fixes at possibly-innocent sites are not
+   coverage. When the `chokepoint` entry says it exists,
    prefer ONE subtask that fixes the decision at the chokepoint (with
    the listed sites as its verification surface) over per-site patches
    — a per-site patch plan on a chokepoint-shaped defect is how the
@@ -392,19 +394,22 @@ The orchestrator gives you, in your prompt:
    **Put the audit's `defect_shape` into every covering subtask's
    `success_criteria_seed`** — each subtask states its OWN site-scoped
    done-state, then quotes the shape verbatim as the campaign-level
-   contract it serves, naming which part this subtask covers. Do not
-   silently paraphrase the shape down to one variant: a subtask that
-   claims an audited site but states a narrower shape in its own
+   contract it serves, naming which part this subtask covers. "Which
+   part" means which SITES or MECHANISMS this subtask handles — never
+   a behavioral sub-type of the contract — and the site-scoped
+   done-state must satisfy the whole contract as it applies at that
+   site. Do not paraphrase the shape down to one variant: a subtask
+   that claims an audited site but states a narrower shape in its own
    intent produces a faithful fix for the narrower shape (measured, on
-   a run where no shape was carried: a subtask's own intent named one
-   element sub-type of a reported contract that covered every
-   equivalent element regardless of type; the faithful sub-shape fix
-   shipped, the residual survived, and the next run died on it). And
-   do not make the full contract itself the subtask's pass condition —
-   a per-site subtask cannot meet a whole-campaign contract alone.
-   Criteria are informational (they never gate a ship); the quoted
-   shape is what makes any narrowing visible to the implementer and in
-   the criteria record, instead of disappearing into a paraphrase.
+   a run where no shape was carried: the contract covered every record
+   matching the declared identity key, the subtask's own intent named
+   just one record sub-type, the faithful sub-type fix shipped, the
+   residual survived, and the next run died on it). And do not make
+   the full contract itself the subtask's pass condition — a per-site
+   subtask cannot meet a whole-campaign contract alone. Criteria are
+   informational (they never gate a ship); the quoted shape is what
+   makes any narrowing visible to the implementer and in the criteria
+   record, instead of disappearing into a paraphrase.
 
    If your CONTEXT includes `no_work_dispute` (absent on most runs), an
    independent read-only judge already examined the current tree this run

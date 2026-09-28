@@ -3884,6 +3884,7 @@ the next run's `state.data["defect_scope"]`: `applicable: true` with
 sites confirms; two more declines falsify the calibration. Guard
 rails that do run in pytest: the foreign-identifier scan over both
 edited prompts (`tests/test_prompts_have_no_foreign_identifiers.py`)
-and the existing `tests/test_defect_scope_audit.py` arms — prompt-
-agnostic except `test_planner_prompt_documents_the_key`, which pins
-the `defect_scope`/`chokepoint` mentions in the planner prompt.
+and the existing `tests/test_defect_scope_audit.py` arms —
+prompt-agnostic except `test_planner_prompt_documents_the_key`,
+which pins the `defect_scope`/`chokepoint` mentions in the planner
+prompt.

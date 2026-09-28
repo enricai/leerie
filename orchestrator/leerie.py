@@ -21888,9 +21888,9 @@ async def phase_defect_scope_audit(
     contract, for an unconfirmed-cause report), enumerates every site
     on the base tree implementing it (decision sites, producers,
     consumers, and bypasses — or the candidate mechanisms), and says
-    whether a chokepoint exists where one fix covers all of them. `phase_plan` injects the result into every
-    planner's ctx; `_warn_defect_sites_uncovered` is the mechanical
-    floor. Best-effort and non-fatal on the artifact-registry model:
+    whether a chokepoint exists where one fix covers all of them.
+    `phase_plan` injects the result into every planner's ctx;
+    `_warn_defect_sites_uncovered` is the mechanical floor. Best-effort and non-fatal on the artifact-registry model:
     any failure returns `{"applicable": False}` and the run proceeds as
     it did before the audit existed. Never die()s."""
     if "bug-fixing" not in (st.data.get("categories") or []):
@@ -21933,7 +21933,7 @@ async def phase_defect_scope_audit(
             "(planners run without the site enumeration) — non-fatal")
         return {"applicable": False}
     if not result.get("applicable"):
-        log("  defect-scope audit: task not defect-shaped — no enumeration")
+        log("  defect-scope audit: not applicable — no enumeration")
         return {"applicable": False}
     sites = [s for s in (result.get("sites") or [])
              if isinstance(s, dict) and s.get("file") and s.get("symbol")]
