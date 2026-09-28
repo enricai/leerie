@@ -2155,8 +2155,9 @@ host's credentials — the container has none): a best-effort
 ancestry comparison. It refuses to start — with the pull command and
 the env escape hatch (`LEERIE_SKIP_FRESHNESS_CHECK=1`) in the message —
 on exactly the measured signature: HEAD a strict ancestor of its
-upstream. Ahead and diverged pass silently (local commits mean the
-operator is doing something deliberate; "behind" is the signature).
+upstream. Equal, ahead, and diverged pass silently (local commits
+mean the operator is doing something deliberate; "behind" is the
+signature).
 Beyond the trivially clean cases above (equal, ahead, diverged), the
 degrade-to-permissive set is exactly: a local (same-repo) upstream, no
 origin remote, detached HEAD, no upstream when origin has no

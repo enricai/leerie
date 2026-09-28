@@ -299,8 +299,9 @@ $out"
 # doing something deliberate, and "behind" is not the signature), the
 # upstream is LOCAL (branch.<name>.remote = "." — being behind a local
 # base is not the merge→re-run race signature, slashed branch names
-# included), the branch has no upstream and origin has no same-named
-# branch, the repo has no origin, or HEAD is detached. Returns 1 — the
+# included), the branch has no upstream (or an unresolvable one — the
+# configured-but-gone case) and origin has no same-named branch, the
+# repo has no origin, or HEAD is detached. Returns 1 — the
 # launcher dies — only on the one measured signature: HEAD is a strict
 # ancestor of its REMOTE upstream (or, on the no-upstream fallback, of
 # the same-named origin branch). DESIGN §6 *A fresh run refuses a stale
