@@ -54,6 +54,12 @@ FOREIGN_PROJECT_MARKERS = (
     "emptystate", "empty-state",
     "getactivetenantid",
     "dashboard.tsx", "statcard", "sparkline",
+    # Site vocabulary from one target repo's bug-report fixtures (2026-09-28
+    # sweep): these leaked from reports into that repo's own tests via
+    # automated runs, so they are exactly the fixture-resident class rule 1
+    # cannot catch on its own.
+    "partymix", "sailmonth", "privateisland",
+    "royalcaribbean", "disneycruise", "disney-wish",
 )
 
 # Identifiers that legitimately appear in a prompt without existing in this
