@@ -368,33 +368,43 @@ The orchestrator gives you, in your prompt:
    required item but describes it in unrelated words reads as uncovered.
 
    If your CONTEXT includes `defect_scope` (present only on defect-fix
-   tasks where an upstream audit found the defective decision implemented
-   at multiple sites), it lists every site sharing the defect shape —
-   including `bypass` sites that skip the shared logic entirely — and,
+   tasks where an upstream audit found the defect implicating multiple
+   sites), it lists the audited sites — either every site sharing a
+   diagnosed defect shape, including `bypass` sites that skip the
+   shared logic entirely, or (when the report's cause was unconfirmed)
+   the CANDIDATE mechanisms that could each produce the symptom — and,
    when one exists, the `chokepoint` where a single fix covers all of
-   them. Your cut must account for EVERY listed site. When the
-   `chokepoint` entry says it exists, prefer ONE subtask that fixes the
-   decision at the chokepoint (with the listed sites as its verification
-   surface) over per-site patches — a per-site patch plan on a
-   chokepoint-shaped defect is how the same bug ships "fixed" at one
-   site per run while the symptom survives. Any site you deliberately
-   leave out must be named in a subtask's `scope_note` with the reason.
+   them. Your cut must account for EVERY listed site. For a diagnosed
+   shape, "account for" means fix or deliberately defer; for candidate
+   mechanisms it means rule out with recorded evidence or fix — a
+   candidate is a hypothesis, and blind fixes at possibly-innocent
+   sites are not coverage. When the `chokepoint` entry says it exists,
+   prefer ONE subtask that fixes the decision at the chokepoint (with
+   the listed sites as its verification surface) over per-site patches
+   — a per-site patch plan on a chokepoint-shaped defect is how the
+   same bug ships "fixed" at one site per run while the symptom
+   survives. Any site you deliberately leave out must be named in a
+   subtask's `scope_note` with the reason.
    List each covered site's file in that subtask's
    `files_likely_touched`: the orchestrator mechanically warns when an
    audited site's file appears in no subtask.
 
-   **Carry `defect_shape` into every covering subtask's
-   `success_criteria_seed`, as the acceptance bar** — the full contract
-   wording, not a paraphrase scoped to one variant. A subtask that
-   claims an audited site but states a narrower shape in its own intent
-   produces a faithful fix for the narrower shape (measured, on a run
-   where no shape was carried: a subtask's own intent read "score
-   generic action-button controls above zero" — a sub-shape of the
-   reported contract, which covered ANY submit-shaped element
-   regardless of tag or role; the faithful sub-shape fix shipped, the
-   residual survived, and the next run died on it). The
-   shape in the criteria is what makes a too-narrow fix fail its own
-   acceptance instead of shipping.
+   **Put the audit's `defect_shape` into every covering subtask's
+   `success_criteria_seed`** — each subtask states its OWN site-scoped
+   done-state, then quotes the shape verbatim as the campaign-level
+   contract it serves, naming which part this subtask covers. Do not
+   silently paraphrase the shape down to one variant: a subtask that
+   claims an audited site but states a narrower shape in its own
+   intent produces a faithful fix for the narrower shape (measured, on
+   a run where no shape was carried: a subtask's own intent named one
+   element sub-type of a reported contract that covered every
+   equivalent element regardless of type; the faithful sub-shape fix
+   shipped, the residual survived, and the next run died on it). And
+   do not make the full contract itself the subtask's pass condition —
+   a per-site subtask cannot meet a whole-campaign contract alone.
+   Criteria are informational (they never gate a ship); the quoted
+   shape is what makes any narrowing visible to the implementer and in
+   the criteria record, instead of disappearing into a paraphrase.
 
    If your CONTEXT includes `no_work_dispute` (absent on most runs), an
    independent read-only judge already examined the current tree this run

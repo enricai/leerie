@@ -294,34 +294,49 @@ subtask it tests). Three mechanisms reconcile that coupling:
 
   **The applicability trigger includes unconfirmed-cause reports.**
   Measured on the audit's first two live runs (one task, 2026-09-28):
-  the auditor declined both ("the report is an open investigation, not
-  a diagnosed defect with a repeated wrong idiom") — while the report
-  named three candidate mechanisms, each run's plan carried exactly
-  one hypothesis, and the shipped fix covered a sub-shape (an intent
-  of "generic action-button controls" against a reported contract
-  covering any submit-shaped element regardless of tag or role); the
-  next run's plan re-targeted the residual and died at the wiring
-  gate. A symptom
+  the auditor declined both, each reasoning inside the carve-out's
+  framing (the second decline's rationale: "the report is an open
+  investigation, not a diagnosed defect with a repeated wrong idiom";
+  the first: "explicitly non-diagnostic", "not yet a defect-shape
+  fix") — while the report named multiple candidate mechanisms and
+  each run's plan carried at most one of them: the first run's fix
+  covered a sub-shape (an intent of "generic action-button controls"
+  against a reported contract covering any submit-shaped element
+  regardless of tag or role), and the next run's plan re-targeted the
+  residual and died at the wiring gate. A symptom
   report with an unconfirmed cause and multiple candidate mechanisms is
   where enumeration helps MOST, not least: the shape is then the
   *violated behavioral contract* the report describes (what should
   happen and does not), and the sites are the candidate mechanisms —
-  both the report's own hypotheses and the ones the auditor finds.
+  the report's own hypotheses and the ones the auditor finds, limited
+  to locations the auditor actually read (a hypothesis with no
+  locatable code site belongs in `rationale` as an open question,
+  never as an invented file/symbol).
   Not-applicable is reserved for tasks that are not defect fixes at
   all, and for defects with a single obvious location and no repeated
   or multi-candidate structure.
 
-  **The audited shape is the acceptance bar, not commentary.** The
-  second measured failure mode is a covering subtask quietly narrowing
-  the shape: a plan can claim the audited site while its intent names a
-  sub-shape of the contract, and a faithful implementer then ships the
-  sub-shape (measured on a run where no shape had been carried —
-  "score generic action-button controls above zero" at a site whose
-  gate excludes every non-button-like element).
-  The planner is therefore instructed to carry the audit's
-  `defect_shape` wording into each covering subtask's success
-  criteria, so a fix for a narrower shape fails its own criteria
-  instead of shipping. Prompt-level (§12: the floor stays mechanical
+  **The audited shape rides in the criteria, as visibility — not a
+  gate.** The second measured failure mode is a covering subtask
+  quietly narrowing the shape: a plan can claim the audited site while
+  its intent names a sub-shape of the contract, and a faithful
+  implementer then ships the sub-shape (measured on a run where no
+  shape had been carried — "score generic action-button controls above
+  zero" at a site whose gate excludes every non-button-like element).
+  The planner is therefore instructed to state, in each covering
+  subtask's success criteria, that subtask's own site-scoped
+  done-state AND the audit's `defect_shape` wording as the
+  campaign-level contract the subtask serves, naming which part it
+  covers. Per-subtask criteria stay individually satisfiable (a
+  full-contract criterion on a per-site subtask would be formally
+  unmeetable, would read as bundling to the fit judge, and would let
+  the satisfied-probe drop remaining candidate subtasks once one
+  sibling's fix makes the contract look met — that probe interaction
+  is the accepted residual of this design). Criteria remain
+  informational per §9 — the shape in the criteria makes narrowing
+  *visible* (the implementer states the contract it serves; the
+  criteria record shows what was and wasn't covered), it does not
+  block a ship. Prompt-level (§12: the floor stays mechanical
   and file-scoped; shape coverage is semantic and cannot be
   regex-checked without violating Language-to-JSON).
 

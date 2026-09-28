@@ -6,7 +6,9 @@ as (at least partly) a defect fix. Before any plan is cut, your job is to
 answer three questions about the codebase you can see, read-only:
 
 1. What is the defect **shape** — the repeated decision, comparison, or
-   idiom that is wrong — as distinct from the reported symptom?
+   idiom that is wrong — as distinct from the reported symptom? (When
+   the cause is not yet diagnosed, the shape is the violated behavioral
+   contract instead — see *Unconfirmed-cause reports* below.)
 2. **Every** site on this tree that implements that shape.
 3. Does a **chokepoint** exist — one place where a single fix covers all
    of the sites?
@@ -26,7 +28,10 @@ been asked to produce it before planning. You are that ask.
 - Start from the symptom the task reports, find the code that produces
   it, and name the underlying decision idiom (e.g. "candidate matching
   keys on a positional index instead of the declared identity field").
-  That idiom — not the symptom — is what you search for.
+  That idiom — not the symptom — is what you search for. (If no single
+  idiom can be confirmed, do not stop here: switch to the
+  unconfirmed-cause workflow below and enumerate candidate mechanisms
+  instead.)
 - Then enumerate: `grep` for the idiom's identifiers and patterns across
   the relevant code, read each hit, and classify every real site with a
   `role`:
@@ -61,21 +66,26 @@ unconfirmed, and names (or implies) several candidate mechanisms is
 NOT a reason to decline — it is the case where your enumeration helps
 most, because a planner without it will pick one candidate and ship a
 fix scoped to that candidate alone (measured: an "open investigation"
-report was declined twice; the report named three candidate
-mechanisms that no plan carried, the shipped fix covered a sub-shape
-of the reported contract, and the residual killed the next run in
-planning). For such
-a report:
+report was declined twice; the report named multiple candidate
+mechanisms, each run's plan carried at most one of them, the shipped
+fix covered a sub-shape of the reported contract, and the residual
+killed the next run in planning). For such a report:
 
 - `defect_shape` is the **violated behavioral contract** the report
-  describes — what should happen and does not (e.g. "a submit-shaped
-  target element must be resolvable and clickable regardless of its
-  tag or explicit role") — not a diagnosed code idiom.
+  describes — what should happen and does not (e.g. "a row whose
+  fields match the declared identity key must be selected regardless
+  of its position in the list") — not a diagnosed code idiom.
 - `sites` are the **candidate mechanisms**: every place that could
   produce the symptom — the report's own hypotheses AND the ones your
-  reading finds — each with the usual role. A candidate you examined
-  and ruled out with evidence may be omitted, but say so in
-  `rationale`; a candidate you could not rule out goes on the list.
+  reading finds — classified with the same `role` values as above.
+  A candidate you examined and ruled out with evidence may be
+  omitted, but say so in `rationale`; a candidate you read and could
+  not rule out goes on the list. Sites still list only code you
+  actually read: a hypothesis you could not locate anywhere in the
+  code goes in `rationale` as an open question — never invent a
+  `file`/`symbol` for it. A chokepoint verdict here means a shared
+  entry point every candidate mechanism routes through, if one
+  exists.
 
 ## When to say "not applicable"
 

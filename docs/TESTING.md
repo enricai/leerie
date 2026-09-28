@@ -3863,23 +3863,27 @@ mechanical floor's file-set normalization (dot-prefix) and
 silent-when-inapplicable arms.
 
 **Defect-scope trigger calibration (unconfirmed-cause reports)**: the
-evidence base is a live A/B, not a pytest file — the prompt change is
-advisory surface with no new code path to pin. On the audit's first two
-live runs (one task, 2026-09-28) the auditor declined with reasoned,
-11-turn rationales quoting the stock prompt's not-applicable carve-out.
-A six-arm host elimination ladder (same tree, same report, verbatim
+evidence base is live telemetry plus a host bench, not a pytest file —
+the prompt change is advisory surface with no new code path to pin. On
+the audit's first two live runs (one task, 2026-09-28) the auditor
+declined with reasoned multi-turn rationales (8 and 11 turns), each
+reasoning inside the stock prompt's not-applicable carve-out. A
+six-arm host elimination ladder (same tree, same report, verbatim
 live `user_content`) accepted on all 13 control replicates across
 every component of the live worker path — free-form (3),
 `--json-schema` (2), exact live framing (2), `sonnet[1m]` (2), the
 real `_StrictOutputProxy` driven standalone (2), and a
 container-equivalent arm (image CLI version, credentials-only config,
 full worker argv) (2) — so no single component drives the decline
-(common-distribution likelihood ≈0.3%); the calibrated prompt
-forecloses the quoted decision path by name and enumerated the
-candidate-mechanism sites on the same input. The live confirmation
-lever is the next run's `state.data["defect_scope"]`: `applicable:
-true` with sites confirms; two more declines falsify the calibration.
-Guard rails that do run in pytest: the foreign-identifier scan over
-both edited prompts (`tests/test_prompts_have_no_foreign_identifiers.py`)
-and the existing `tests/test_defect_scope_audit.py` arms, which are
-prompt-agnostic.
+(common-distribution likelihood ≈0.3%). The calibrated prompt
+forecloses the carve-out reasoning by name; its one host replicate
+enumerated candidate-mechanism sites on the same input, but is
+NON-discriminating (the stock control also accepts on the host), so
+the calibration's real test is live. That live confirmation lever is
+the next run's `state.data["defect_scope"]`: `applicable: true` with
+sites confirms; two more declines falsify the calibration. Guard
+rails that do run in pytest: the foreign-identifier scan over both
+edited prompts (`tests/test_prompts_have_no_foreign_identifiers.py`)
+and the existing `tests/test_defect_scope_audit.py` arms — prompt-
+agnostic except `test_planner_prompt_documents_the_key`, which pins
+the `defect_scope`/`chokepoint` mentions in the planner prompt.
