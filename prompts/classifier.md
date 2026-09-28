@@ -133,6 +133,21 @@ downstream mechanical check cannot resolve. When in doubt, omit the item
 rather than invent one. Most tasks have no `required_items` at all — leave
 the array empty or omit the field.
 
+One class is NEVER omitted, doubt or no doubt: a **standing deliverable
+constraint** — an explicit instruction in the task text that constrains
+what the delivered code or tests may contain or must never contain
+("never reference X anywhere in the code or examples," "always use
+synthetic fixtures, not real data," "no fallback or band-aid handling").
+Such an instruction is enumerable by construction — it is its own
+checklist item — and it binds every subtask rather than any one, which is
+exactly why dropping it is costly: downstream verification enforces only
+the items you extract, so a run whose classifier silently drops the
+constraint ships deliverables that a later gate rejects for violating it
+(measured: the same task text had its constraint extracted on one run and
+dropped on the re-run, and the re-run's deliverables violated it).
+Extract it verbatim or near-verbatim, with `source_ref` naming where in
+the task it appears.
+
 If the task includes feature work, set `source_of_truth_question` to `true`.
 The orchestrator resolves the value from a preference (`--source-of-truth`
 CLI flag → `LEERIE_SOURCE_OF_TRUTH` env var → per-repo `leerie.toml`
