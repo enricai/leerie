@@ -303,8 +303,8 @@ $out"
 # configured-but-gone case) and origin has no same-named branch, the
 # repo has no origin, or HEAD is detached. Returns 1 — the
 # launcher dies — only on the one measured signature: HEAD is a strict
-# ancestor of its REMOTE upstream (or, on the no-upstream fallback, of
-# the same-named origin branch). DESIGN §6 *A fresh run refuses a stale
+# ancestor of its REMOTE upstream (or, when the upstream is absent or
+# unresolvable, of the same-named origin branch). DESIGN §6 *A fresh run refuses a stale
 # base* is the canonical statement of both sets.
 #
 # The fetch is best-effort: offline or credential-less must never block

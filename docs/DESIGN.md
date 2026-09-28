@@ -2155,16 +2155,19 @@ host's credentials — the container has none): a best-effort
 ancestry comparison. It refuses to start — with the pull command and
 the env escape hatch (`LEERIE_SKIP_FRESHNESS_CHECK=1`) in the message —
 on exactly the measured signature: HEAD a strict ancestor of its
-upstream. Equal, ahead, and diverged pass silently (local commits
-mean the operator is doing something deliberate; "behind" is the
+upstream. Equal, ahead, and diverged pass silently (equal has
+nothing to be behind; ahead/diverged mean local commits exist and
+the operator is doing something deliberate — "behind" is the
 signature).
 Beyond the trivially clean cases above (equal, ahead, diverged), the
 degrade-to-permissive set is exactly: a local (same-repo) upstream, no
-origin remote, detached HEAD, no upstream when origin has no
-same-named branch, and a failed fetch when the last-fetched state
+origin remote, detached HEAD, no upstream (or an unresolvable,
+configured-but-gone one) when origin has no same-named branch, and a
+failed fetch when the last-fetched state
 shows nothing behind — because a guard that blocks offline work gets
 switched off. Two cases that look permissive are deliberately NOT:
-a branch with no upstream configured still refuses when a
+a branch with no usable upstream (none configured, or a
+configured-but-gone one) still refuses when a
 **same-named origin branch** exists and is ahead (the merge→re-run
 race does not care whether tracking was configured), and a failed
 fetch still refuses when the **last-fetched** tracking ref already
