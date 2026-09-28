@@ -414,6 +414,12 @@ STATE_FIELDS = (
     # both halves of the two-worker agreement (classifier claim + judge
     # verification). Written only when the no_work_judge confirms.
     "no_work_confirmation",
+    # no_work_dispute: the disagreement record when the no_work_judge does
+    # NOT confirm the claim — written only on a dispute with non-empty
+    # judge evidence, consumed by phase_plan's planner ctx so the plan
+    # targets the disputed residual instead of re-deriving the task
+    # (DESIGN §8 *A dispute's evidence is planning input, not log noise*).
+    "no_work_dispute",
     # declared_unrun_warnings: per-sid record of declared runs_commands an
     # empty_handoff-rescued subtask never executed. The rescue settles
     # complete (blocking would strand the kept commits — see the rescue
@@ -20703,6 +20709,19 @@ async def _confirm_no_work_on_converged_gate(
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence})
         return True
+    if judge_evidence:
+        # The dispute names exactly which claimed deliverables the judge
+        # verified and why completion still fails — the densest planning
+        # signal the run has produced. Persist it for phase_plan's ctx;
+        # dropping it here reproduced a measured cross-run loop (the next
+        # plan carried zero subtasks addressing the dispute's reason, so
+        # the following run's judge disputed identically).
+        st.data["no_work_dispute"] = {
+            "classifier_evidence": evidence,
+            "judge_evidence": judge_evidence,
+            "checked": list(out.get("checked", []) or []),
+        }
+        st.save()
     log("  no_work_judge did not confirm the claim "
         f"(evidence: {judge_evidence[:200]!r}); proceeding to planning")
     return False
@@ -21853,6 +21872,17 @@ async def phase_plan(task: str, st: State, caps: dict,
     required_items = st.data.get("required_items") or []
     if required_items:
         ctx_dict["required_items"] = required_items
+    # Converged-gate dispute residual (DESIGN §8 *A dispute's evidence is
+    # planning input, not log noise*): when the no_work_judge disputed an
+    # already-satisfied claim, its evidence names exactly what is already
+    # present and exactly why completion still fails. Handing it to every
+    # planner is what lets the plan target that residual instead of
+    # re-deriving the task from scratch — a prompt cannot act on a signal
+    # the orchestrator never delivered. Omitted when no dispute occurred,
+    # so the common case carries no false framing.
+    no_work_dispute = st.data.get("no_work_dispute") or {}
+    if no_work_dispute.get("judge_evidence"):
+        ctx_dict["no_work_dispute"] = no_work_dispute
     # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
     # A pre-planning canonical {description, tag, path} list, injected into
     # EVERY planner's ctx (built once, shared across all plan_one calls) so

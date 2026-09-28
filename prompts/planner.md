@@ -367,6 +367,19 @@ The orchestrator gives you, in your prompt:
    `title`/`success_criteria_seed` text, so a subtask that covers a
    required item but describes it in unrelated words reads as uncovered.
 
+   If your CONTEXT includes `no_work_dispute` (absent on most runs), an
+   independent read-only judge already examined the current tree this run
+   and disputed the claim that the task is complete. Its `judge_evidence`
+   is your primary planning input: it states exactly which deliverables
+   the judge verified as already present and exactly why completion still
+   fails. Plan the residual the dispute names — turn each concrete unmet
+   point in `judge_evidence` into a subtask — and do NOT create subtasks
+   that re-implement work the same evidence confirms as already on the
+   tree (one lightweight final verification subtask over the confirmed
+   work is acceptable; re-implementation is not). If the tree you see
+   contradicts the dispute (the evidence has gone stale), trust the tree
+   and say so in your `confidence.basis`.
+
 5. **Evidence gate.** Before you emit the plan, self-gate on two axes. The
    gate, the score floor, and the three disciplines below are the planning
    analogue of the implementer's evidence gate. Each of the four fields

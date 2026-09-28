@@ -4959,7 +4959,29 @@ commits, tests, and required items against the tree it can see. Only a
 `confirmed: true` with evidence routes to `_finish_no_work_run`; a
 dispute, a crash, or a timeout falls through to planning unchanged
 (fail-open toward doing work — the same direction every other
-already-satisfied mechanism fails). The exhaustion arm is untouched: when
+already-satisfied mechanism fails).
+
+**A dispute's evidence is planning input, not log noise.** The judge's
+dispute is the single most information-dense artifact the run has
+produced by that point: it names exactly which claimed deliverables it
+verified as present and exactly why completion still fails. Discarding
+it and replanning from the raw task reproduces the loop this consumer
+exists to close, from the other side — measured on one repo's corpus: a
+run whose judge confirmed every functional deliverable on HEAD and
+disputed solely over an unmet standing instruction (a constraint on the
+deliverable stated in the task text) then produced a plan with **zero**
+subtasks addressing the dispute's stated reason, re-verifying the
+already-confirmed work instead, guaranteeing the next run's judge would
+dispute identically. So a dispute with non-empty evidence persists both
+halves of the disagreement to `state.data["no_work_dispute"]`
+(classifier claim, judge evidence, `checked[]`), and `phase_plan`
+injects it into every planner's context the same way `required_items`
+travels: the planner is told to plan the residual the dispute names and
+not to re-plan work the dispute's own evidence confirms as present.
+Advisory at the prompt layer (the planner can still judge the evidence
+stale against the tree it sees), but the *delivery* of the evidence is
+mechanical and unconditional — a prompt cannot act on a signal the
+orchestrator never handed it. The exhaustion arm is untouched: when
 classification cannot converge, the un-double-checked claim remains
 sufficient, because the alternative there was dying, not planning.
 `--skip-satisfied-check` suppresses this consumer along with the phase-3

@@ -145,19 +145,38 @@ def test_confirmed_claim_routes_to_no_work(leerie, tmp_path, monkeypatch):
     assert conf["checked"] == ["src/example_module.py"]
     # The gate still persisted its own audit key before the consult.
     assert st.data["classification_coverage_gate"] is not None
+    # A confirm is not a dispute — the two records are mutually exclusive.
+    assert "no_work_dispute" not in st.data
 
 
 def test_disputed_claim_proceeds_to_planning(leerie, tmp_path, monkeypatch):
     st = _minimal_state(leerie, tmp_path)
     _seed_claim(st)
     calls, _ = _patch_workers(leerie, monkeypatch, {
-        "confirmed": False, "evidence": "required test file absent"})
+        "confirmed": False, "evidence": "required test file absent",
+        "checked": ["src/example_module.py"]})
     routed = asyncio.run(leerie.phase_classification_gate(
         "task", st, _caps(leerie), False, MODELS, EFFORTS))
     assert routed is False
     assert "no_work_required" not in st.data
     assert "no_work_confirmation" not in st.data
     assert calls["no_work_judge"] == 1
+    # The disagreement is persisted for phase_plan's ctx (DESIGN §8 *A
+    # dispute's evidence is planning input, not log noise*) — VALUES,
+    # verbatim, both halves.
+    dispute = st.data["no_work_dispute"]
+    assert dispute["judge_evidence"] == "required test file absent"
+    assert dispute["classifier_evidence"] == (
+        "deliverable already on HEAD at commit abc1234")
+    assert dispute["checked"] == ["src/example_module.py"]
+    # And it reached disk (st.save(), not just the in-memory dict) — a
+    # signal that never persisted would vanish on a resume before
+    # phase_plan runs. Read the file directly: a second State() here
+    # would trip the single-owner flock.
+    import json
+    on_disk = json.loads(st.path.read_text())
+    assert on_disk["no_work_dispute"]["judge_evidence"] == (
+        "required test file absent")
 
 
 def test_judge_crash_fails_open(leerie, tmp_path, monkeypatch):
@@ -169,6 +188,9 @@ def test_judge_crash_fails_open(leerie, tmp_path, monkeypatch):
     assert routed is False
     assert "no_work_required" not in st.data
     assert calls["no_work_judge"] == 1
+    # A crash carries no evidence — nothing to plan against, nothing
+    # persisted.
+    assert "no_work_dispute" not in st.data
 
 
 def test_confirm_with_empty_evidence_is_discarded(
@@ -184,6 +206,9 @@ def test_confirm_with_empty_evidence_is_discarded(
         "task", st, _caps(leerie), False, MODELS, EFFORTS))
     assert routed is False
     assert "no_work_required" not in st.data
+    # Whitespace evidence strips to empty — no residual named, no
+    # dispute record either.
+    assert "no_work_dispute" not in st.data
 
 
 def test_no_claim_means_judge_never_spawns(leerie, tmp_path, monkeypatch):
