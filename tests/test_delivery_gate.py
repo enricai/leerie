@@ -233,6 +233,53 @@ def test_plain_string_items_are_coerced_not_fatal(
     assert st.data["delivery_gate"]["unmet_before"] == []
 
 
+def test_no_item_key_serialization_excludes_stray_item_index(
+        leerie, tmp_path, monkeypatch):
+    """Review round 6: the no-item-key serialization must EXCLUDE a
+    stray item_index from the text — the positional index is
+    authoritative, and echoing a contradicting number into the judge
+    payload invites misaligned verdicts. Discriminating: without the
+    filter the text is '{"item_index": 99, "requirement": ...}'."""
+    st, run_dir = _state(leerie, tmp_path, required_items=[
+        {"requirement": "keyless with stray index", "item_index": 99}])
+    calls = _patch_judge(leerie, monkeypatch, [
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+    ])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    text = unmet[0]["item"]
+    assert "keyless with stray index" in text
+    assert "item_index" not in text
+    assert "99" not in text
+    # The payload's authoritative index is still positional.
+    assert '"item_index": 0' in calls[0]["user_prompt"]
+
+
+def test_nested_item_value_serializes_with_sorted_keys(
+        leerie, tmp_path, monkeypatch):
+    """Review round 6: both json.dumps coercion branches sort keys, so
+    the same requirement always produces the same judge-payload text
+    across samples (vote alignment is by index, but identical text
+    keeps the three samples judging the same rendering).
+    Discriminating: an unsorted dump of this fixture starts with
+    'zebra'."""
+    st, run_dir = _state(leerie, tmp_path, required_items=[
+        {"item": {"zebra": 1, "alpha": 2}}])
+    calls = _patch_judge(leerie, monkeypatch, [
+        {"verdicts": [{"item_index": 0, "met": True, "evidence": "ok"}]}])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert unmet == []
+    prompt = calls[0]["user_prompt"]
+    assert "alpha" in prompt and "zebra" in prompt
+    assert prompt.index("alpha") < prompt.index("zebra"), (
+        "the nested value must serialize with sorted keys — alpha "
+        "before zebra in the payload text; an unsorted dump of this "
+        "fixture starts with zebra")
+
+
 def test_missing_working_branch_skips(leerie, tmp_path, monkeypatch):
     """Review round 1: with working_branch absent the final-conformer
     pass skips, so the gate must not spend judge samples on a routing
