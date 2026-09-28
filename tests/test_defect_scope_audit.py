@@ -31,7 +31,7 @@ AUDIT = {
     "sites": [
         {"file": "src/example_module.py", "symbol": "merge_candidates",
          "line_hint": 120, "role": "decision_site"},
-        {"file": "src/example_module.py", "symbol": "collect_chain_values",
+        {"file": "src/example_module.py", "symbol": "collect_pending_rows",
          "line_hint": 480, "role": "bypass"},
     ],
     "chokepoint": {"exists": True, "file": "src/example_module.py",
@@ -88,7 +88,7 @@ def test_bug_fixing_task_gets_the_enumeration(leerie, tmp_path, monkeypatch):
     assert len(calls) == 1
     assert scope["applicable"] is True
     assert [s["symbol"] for s in scope["sites"]] == [
-        "merge_candidates", "collect_chain_values"]
+        "merge_candidates", "collect_pending_rows"]
     assert scope["chokepoint"]["symbol"] == "resolve_identity_key"
     # Judgment-worker scope pins.
     assert calls[0]["autonomous"] is False
@@ -160,7 +160,7 @@ def test_scope_reaches_the_planner_prompt(leerie, tmp_path, monkeypatch):
     st = _state(leerie, tmp_path, defect_scope=dict(AUDIT))
     calls = _drive_phase_plan(leerie, monkeypatch, st)
     prompt = calls[0].get("user_prompt") or ""
-    assert "collect_chain_values" in prompt, (
+    assert "collect_pending_rows" in prompt, (
         "the bypass site — historically the missed one — must reach "
         "the planner")
     assert "resolve_identity_key" in prompt
@@ -195,7 +195,7 @@ def test_uncovered_site_warns_with_file_and_symbol(leerie, monkeypatch):
         _plans_touching("src/other.py"), AUDIT)
     joined = "\n".join(lines)
     assert "src/example_module.py" in joined
-    assert "collect_chain_values" in joined
+    assert "collect_pending_rows" in joined
     assert "bypass" in joined
 
 

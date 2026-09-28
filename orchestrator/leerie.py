@@ -21948,13 +21948,21 @@ def _warn_defect_sites_uncovered(plans: list[dict],
     sites = defect_scope.get("sites") or []
     if not sites:
         return
+    def _norm(path: str) -> str:
+        # removeprefix, not lstrip: lstrip("./") strips a CHARACTER SET,
+        # so "/abs/x.py" and "abs/x.py" would conflate (review round 1 —
+        # suppressed a warning). Peel only literal "./" prefixes.
+        while path.startswith("./"):
+            path = path[2:]
+        return path
+
     claimed: set[str] = set()
     for p in plans:
         for s in (p.get("subtasks") or []):
             for f in (s.get("files_likely_touched") or []):
-                claimed.add(str(f).lstrip("./"))
+                claimed.add(_norm(str(f)))
     uncovered = [s for s in sites
-                 if str(s.get("file", "")).lstrip("./") not in claimed]
+                 if _norm(str(s.get("file", ""))) not in claimed]
     if not uncovered:
         return
     log("  WARNING: defect-scope audit sites not claimed by any subtask's "
@@ -31118,7 +31126,12 @@ def _delivery_unmet_majority(samples: list[dict], n_items: int) -> list[int]:
         seen: dict[int, bool] = {}
         for v in (s.get("verdicts") or []):
             idx = v.get("item_index")
-            if (isinstance(idx, int) and 0 <= idx < n_items
+            # `not isinstance(idx, bool)`: bool subclasses int, so a
+            # schema-escaping `true` would otherwise tally as index 1
+            # (review round 1 — defense in depth; the schema types the
+            # field integer, but the tally must not rest on that).
+            if (isinstance(idx, int) and not isinstance(idx, bool)
+                    and 0 <= idx < n_items
                     and isinstance(v.get("met"), bool)):
                 seen[idx] = v["met"]
         for idx, met in seen.items():
@@ -31142,7 +31155,18 @@ async def _delivery_judge_unmet(
     DISPUTES only keeps the clean-pass common case at one spawn.
     Exceptions (WorkerError / timeout) propagate; the callers treat the
     whole gate as advisory."""
-    numbered = [{"item_index": i, **item} for i, item in enumerate(items)]
+    # Normalize BEFORE numbering (review round 1): required_items can
+    # reach state as plain strings (an existing test seeds that shape,
+    # and pre-gate consumers all tolerate it), and a dict item could
+    # carry its own item_index — the classifier schema does not set
+    # additionalProperties, so that key is schema-legal and, spread
+    # after the literal, would override the positional index and make
+    # the item unvotable (every vote for it lands out of range). The
+    # literal goes LAST so the positional index always wins.
+    normalized = [item if isinstance(item, dict) else {"item": str(item)}
+                  for item in items]
+    numbered = [{**item, "item_index": i}
+                for i, item in enumerate(normalized)]
     user_prompt = (
         "TASK:\n" + task + "\n\n"
         "REQUIRED ITEMS (verify each against the CURRENT tree — your cwd "
@@ -31184,7 +31208,7 @@ async def _delivery_judge_unmet(
             if evidence:
                 break
         confirmed.append({"item_index": i,
-                          "item": items[i].get("item", ""),
+                          "item": normalized[i].get("item", ""),
                           "evidence": evidence})
     return confirmed, len(samples)
 
@@ -31220,6 +31244,15 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not staging.is_dir():
         log("phase 5: delivery gate skipped — staging worktree absent")
+        return []
+    # Mirror _run_final_conformance's own guard (review round 1): with
+    # working_branch missing the conformer pass will skip, so spending
+    # judge samples here buys a recheck that then reports "still unmet
+    # after the final-conformer pass" for a pass that never ran.
+    if not st.data.get("working_branch"):
+        log("phase 5: delivery gate skipped — working_branch not in "
+            "state (the final-conformer pass it routes into would skip "
+            "for the same reason)")
         return []
     log(f"phase 5: delivery gate — verifying {len(items)} required "
         "item(s) against the integrated tree (DESIGN §8)")

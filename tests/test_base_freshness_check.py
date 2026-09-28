@@ -161,6 +161,29 @@ def test_no_upstream_falls_back_to_origin_branch(repos):
     assert "BEHIND" in r.stderr
 
 
+def test_local_upstream_passes_silently(repos):
+    """Review round 1: `git branch --set-upstream-to=<local>` sets
+    branch.<name>.remote = "." and @{u} becomes a BARE branch name. The
+    remote/branch split then treated a branch name as a remote — a
+    failed fetch with a misleading offline warning, and an ancestry
+    refusal against a LOCAL base, which is not the merge→re-run race
+    signature. A local upstream is out of the guard's remit: silent
+    pass, even when strictly behind it."""
+    work = repos["work"]
+    run_git_repo_first(work, "checkout", "-q", "-b", "feature")
+    run_git_repo_first(work, "branch", "--set-upstream-to=main", "feature")
+    # Put feature strictly BEHIND its local upstream.
+    run_git_repo_first(work, "checkout", "-q", "main")
+    (work / "ahead.txt").write_text("x\n")
+    run_git_repo_first(work, "add", "ahead.txt")
+    run_git_repo_first(work, "commit", "-qm", "main moves ahead")
+    run_git_repo_first(work, "checkout", "-q", "feature")
+    r = _check(work)
+    assert r.returncode == 0
+    assert "could not refresh" not in r.stderr
+    assert "BEHIND" not in r.stderr
+
+
 def test_unreachable_origin_warns_and_passes(repos):
     """Offline must never block run start: the fetch fails, a warning
     says the comparison used the last-fetched state, and an up-to-date

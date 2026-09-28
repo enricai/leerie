@@ -75,7 +75,7 @@ Return **only** a JSON object per your schema:
     {"file": "src/example_module.py", "symbol": "merge_candidates",
      "line_hint": 120, "role": "decision_site",
      "note": "three branches share the idiom"},
-    {"file": "src/example_module.py", "symbol": "collect_chain_values",
+    {"file": "src/example_module.py", "symbol": "collect_pending_rows",
      "line_hint": 480, "role": "bypass",
      "note": "builds its own plan list; never consults the shared resolver"}
   ],

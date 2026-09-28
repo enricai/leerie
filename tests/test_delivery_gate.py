@@ -47,6 +47,10 @@ def _state(leerie, tmp_path, **overrides):
     (run_dir / "worktrees" / "staging").mkdir(parents=True)
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "test task", "worker_count": 0,
+               # The gate mirrors _run_final_conformance's own guard: no
+               # working_branch → the conformer pass it routes into
+               # would skip, so the gate skips too.
+               "working_branch": "main",
                "required_items": [dict(i) for i in ITEMS]}
     st.data.update(overrides)
     st.save()
@@ -110,6 +114,13 @@ class TestMajority:
             {"item_index": -1, "met": False, "evidence": "e"}]}]
         assert leerie._delivery_unmet_majority(s, 2) == []
 
+    def test_bool_index_is_ignored(self, leerie):
+        """bool subclasses int — a schema-escaping `true` must not tally
+        as index 1 (review round 1, defense in depth)."""
+        s = [{"verdicts": [
+            {"item_index": True, "met": False, "evidence": "e"}]}]
+        assert leerie._delivery_unmet_majority(s, 3) == []
+
 
 # === prejudge, executed ====================================================
 
@@ -172,6 +183,65 @@ def test_outvoted_first_sample_confirms_nothing(
 def test_gate_is_free_when_inapplicable(leerie, tmp_path, monkeypatch,
                                         overrides):
     st, run_dir = _state(leerie, tmp_path, **overrides)
+    calls = _patch_judge(leerie, monkeypatch, [])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert unmet == [] and calls == []
+    assert "delivery_gate" not in st.data
+
+
+def test_item_supplied_index_cannot_override_position(
+        leerie, tmp_path, monkeypatch):
+    """Review round 1: the classifier schema has no additionalProperties,
+    so an item carrying its own item_index is schema-legal — spread
+    after the literal it overrode the positional index, making the item
+    unvotable and the gate report a false clean pass. The positional
+    index must always win."""
+    poisoned = [{"item": "poisoned requirement", "item_index": 99}]
+    st, run_dir = _state(leerie, tmp_path, required_items=poisoned)
+    calls = _patch_judge(leerie, monkeypatch, [
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e0"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e1"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e2"}]},
+    ])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    # The judge payload numbers the item positionally, not as 99.
+    assert '"item_index": 0' in calls[0]["user_prompt"]
+    assert '"item_index": 99' not in calls[0]["user_prompt"]
+    # And the votes for index 0 confirm it unmet.
+    assert [u["item_index"] for u in unmet] == [0]
+    assert unmet[0]["item"] == "poisoned requirement"
+
+
+def test_plain_string_items_are_coerced_not_fatal(
+        leerie, tmp_path, monkeypatch):
+    """Review round 1: required_items can reach state as plain strings
+    (tests/test_no_work_judge.py seeds that shape, and every pre-gate
+    consumer tolerates it). The gate must run on them, not TypeError
+    into a silent advisory no-op."""
+    st, run_dir = _state(leerie, tmp_path,
+                         required_items=["a plain string requirement"])
+    calls = _patch_judge(leerie, monkeypatch, [
+        {"verdicts": [{"item_index": 0, "met": True, "evidence": "ok"}]}])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert unmet == []
+    assert len(calls) == 1
+    # The coerced text reached the judge.
+    assert "a plain string requirement" in calls[0]["user_prompt"]
+    assert st.data["delivery_gate"]["unmet_before"] == []
+
+
+def test_missing_working_branch_skips(leerie, tmp_path, monkeypatch):
+    """Review round 1: with working_branch absent the final-conformer
+    pass skips, so the gate must not spend judge samples on a routing
+    target that will not run (and a recheck that would then report
+    'still unmet after the final-conformer pass' for a pass that never
+    ran)."""
+    st, run_dir = _state(leerie, tmp_path)
+    del st.data["working_branch"]
+    st.save()
     calls = _patch_judge(leerie, monkeypatch, [])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))

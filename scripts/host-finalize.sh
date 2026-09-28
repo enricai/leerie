@@ -5,7 +5,8 @@
 # `leerie finalize <run-id>` fast-path. Both code paths share the same
 # push/PR mechanics — the discovery of *which* run to finalize differs.
 #
-# Exports: host_finalize <run-dir>
+# Exports: host_finalize <run-dir>, host_prepush_preflight <repo> <branch>,
+#          host_base_freshness_check <repo>
 #
 # Inputs (env or args):
 #   $1                — absolute path to .leerie/runs/<run-id>/
@@ -327,6 +328,16 @@ host_base_freshness_check() {
       return 0
     fi
   fi
+  # A LOCAL upstream (branch.<name>.remote = ".", e.g. `git switch -c x
+  # --track main`) makes @{u} a bare branch name with no remote prefix
+  # — the remote/branch split below would then "fetch" a branch name as
+  # a remote (misleading offline warning) and compare against a local
+  # ref this guard has no business refusing over (review round 1).
+  # Being behind a local base is not the merge→re-run race signature.
+  case "$upstream" in
+    */*) : ;;
+    *) return 0 ;;
+  esac
   local remote_name="${upstream%%/*}"
   local remote_branch="${upstream#*/}"
   local _fetch_rc=0

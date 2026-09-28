@@ -2157,7 +2157,8 @@ the env escape hatch (`LEERIE_SKIP_FRESHNESS_CHECK=1`) in the message —
 on exactly the measured signature: HEAD a strict ancestor of its
 upstream. Ahead and diverged pass silently (local commits mean the
 operator is doing something deliberate; "behind" is the signature).
-No upstream, no origin, detached HEAD, and a failed fetch all degrade
+No upstream, a local (same-repo) upstream, no origin, detached HEAD,
+and a failed fetch all degrade
 to permissive, because a guard that blocks offline work gets switched
 off. Fresh runs only — a resume deliberately continues its recorded
 baseline.
