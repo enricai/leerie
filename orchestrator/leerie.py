@@ -31177,11 +31177,15 @@ async def _delivery_judge_unmet(
             # empty string here handed the conformer a blank
             # requirement, unchanged from pre-normalization behavior
             # (round 4: that made the no-item-key test
-            # non-discriminating).
-            return {**item, "item": json.dumps(item, sort_keys=True)}
+            # non-discriminating). A stray item_index key is excluded
+            # from the text: the positional index is authoritative, and
+            # echoing a contradicting number into the judge payload
+            # invites misaligned verdicts (round 5).
+            body = {k: v for k, v in item.items() if k != "item_index"}
+            return {**item, "item": json.dumps(body, sort_keys=True)}
         text = item["item"]
         if not isinstance(text, str):
-            text = "" if text is None else json.dumps(text)
+            text = "" if text is None else json.dumps(text, sort_keys=True)
         return {**item, "item": text}
 
     normalized = [_norm_item(item) for item in items]
@@ -34494,10 +34498,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # {"applicable": False} is a valid completed state. The extra
         # plans_after_plan gate covers a resume of a run whose state
         # PREDATES this key: with planning already checkpointed, the
-        # audit's only consumer has run, so spawning the auditor there
-        # would spend a worker (and bump worker_count on a re-entry
-        # that must be free — CI caught exactly that) for a result
-        # nothing reads.
+        # audit's PLANNER-side consumer (phase_plan's ctx injection)
+        # has run, so spawning the auditor there would spend a worker
+        # (and bump worker_count on a re-entry that must be free — CI
+        # caught exactly that) to steer a plan already cut. The
+        # DOWNSTREAM consumer, _warn_defect_sites_uncovered, then reads
+        # {} and degrades to a no-op on that resume shape — an accepted
+        # trade: an advisory warning against a worker spawn, on a
+        # window only pre-feature states can enter (round 5).
         if ("defect_scope" not in st.data
                 and "plans_after_plan" not in st.data):
             st.data["defect_scope"] = await phase_defect_scope_audit(
