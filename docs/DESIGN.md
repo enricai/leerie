@@ -255,6 +255,43 @@ subtask it tests). Three mechanisms reconcile that coupling:
   only raises the *rate* at which two blind planners land on the same
   string; a planner must still *declare* the edge.
 
+  **Defect-scope audit (advisory, upstream of the planner).** The
+  companion enumeration for defect-fix tasks. Measured pathology (one
+  repo's corpus, eleven production commits over four days): a defect
+  whose decision idiom was implemented at multiple sites in one dense
+  file was re-planned run after run as "the one remaining gap" — each
+  run's planner scoped a single call site, each implementer faithfully
+  delivered that narrow intent, seven of the eleven commits re-edited
+  the same ~120-line region, and the live symptom survived every one of
+  them. The enumeration that would have prevented it was mechanical to
+  produce on day one: two greps over the file surfaced all eight
+  same-idiom comparison sites plus the two upstream causes, and the
+  eventually-correct fix was a single-point refactor two of the runs
+  each performed *partially*. The failure was never that the sites were
+  unfindable — it was that no one was asked to find them before the
+  plan was cut.
+
+  So when classification includes a defect-fix category, a read-only
+  `defect_scope_auditor` runs once before planning: given the task and
+  the base tree, it states the defect *shape* (the repeated
+  decision/idiom, not the symptom), enumerates every site implementing
+  that shape — decision sites, producers, consumers, and **bypasses**
+  (the path that skips the shared logic entirely is historically the
+  site the campaign never looks at) — and says whether a chokepoint
+  exists where one fix covers all of them. The result is injected into
+  every planner's context: the planner must cover every listed site or
+  scope it out by name, and when a chokepoint exists it is told to
+  prefer the single-point fix over per-site patches — which is also
+  what operator prompts asking to "fix the root cause at its source"
+  have been requesting all along. Advisory throughout, on the
+  artifact-registry model: the audit can be wrong (it is judgment, and
+  a hallucinated site must not be able to block a run), so nothing
+  gates on it — but a mechanical floor,
+  `_warn_defect_sites_uncovered`, compares the audited sites' *files*
+  (set comparison on paths — never prose) against the plan's
+  `files_likely_touched` union and warns loudly on any audited file no
+  subtask claims. A task that is not a defect fix pays nothing.
+
   **Test subtasks must wire to their producers.** An edge only forms when
   the consumer *declares* it. Recurring shape: a `testing`-domain subtask
   exercises what another subtask creates but declares neither a

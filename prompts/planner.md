@@ -367,6 +367,22 @@ The orchestrator gives you, in your prompt:
    `title`/`success_criteria_seed` text, so a subtask that covers a
    required item but describes it in unrelated words reads as uncovered.
 
+   If your CONTEXT includes `defect_scope` (present only on defect-fix
+   tasks where an upstream audit found the defective decision implemented
+   at multiple sites), it lists every site sharing the defect shape —
+   including `bypass` sites that skip the shared logic entirely — and,
+   when one exists, the `chokepoint` where a single fix covers all of
+   them. Your cut must account for EVERY listed site. When the
+   `chokepoint` entry says it exists, prefer ONE subtask that fixes the
+   decision at the chokepoint (with the listed sites as its verification
+   surface) over per-site patches — a per-site patch plan on a
+   chokepoint-shaped defect is how the same bug ships "fixed" at one
+   site per run while the symptom survives. Any site you deliberately
+   leave out must be named in a subtask's `scope_note` with the reason.
+   List each covered site's file in that subtask's
+   `files_likely_touched`: the orchestrator mechanically warns when an
+   audited site's file appears in no subtask.
+
    If your CONTEXT includes `no_work_dispute` (absent on most runs), an
    independent read-only judge already examined the current tree this run
    and disputed the claim that the task is complete. Its `judge_evidence`

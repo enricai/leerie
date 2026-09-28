@@ -420,6 +420,12 @@ STATE_FIELDS = (
     # targets the disputed residual instead of re-deriving the task
     # (DESIGN §8 *A dispute's evidence is planning input, not log noise*).
     "no_work_dispute",
+    # defect_scope: the defect-scope audit's result on a defect-fix task
+    # (DESIGN §5 *Defect-scope audit*): sites sharing the defective
+    # decision idiom + chokepoint verdict. Presence-keyed resume
+    # checkpoint mirroring artifact_registry; injected into planner ctx
+    # when applicable with non-empty sites.
+    "defect_scope",
     # delivery_gate: audit record of the finalize-side required-items
     # verification on the integrated staging tree (DESIGN §8 *The
     # delivery gate*): {unmet_before[], unmet_after[], samples_before,
@@ -1493,6 +1499,10 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # tier; same TIMEOUT_DEFAULT_PER_WORKER absence rationale as
     # no_work_judge (no measured duration corpus yet).
     "delivery_judge": "medium",
+    # Pre-planning defect-shape site enumeration on defect-fix tasks
+    # (DESIGN §5 *Defect-scope audit*). Judgment tier; same
+    # TIMEOUT_DEFAULT_PER_WORKER absence rationale as its siblings.
+    "defect_scope_auditor": "medium",
     # Pre-planning canonical-vocabulary worker (DESIGN §5 *Artifact-registry
     # worker*). A judgment worker (decides the canonical tag/path per artifact),
     # so sonnet via MODEL_DEFAULT fallback (absent from MODEL_DEFAULT_PER_WORKER)
@@ -1626,7 +1636,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "no_work_judge", "delivery_judge",
-                "rebaser")
+                "defect_scope_auditor", "rebaser")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1652,7 +1662,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
-    "delivery_judge",
+    "delivery_judge", "defect_scope_auditor",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2988,6 +2998,58 @@ SCHEMAS: dict[str, dict] = {
                         "met": {"type": "boolean"},
                         "evidence": {"type": "string"},
                     },
+                },
+            },
+            "rationale": {"type": "string"},
+        },
+    },
+    "defect_scope_auditor": {
+        # Pre-planning defect-shape enumeration (DESIGN §5 *Defect-scope
+        # audit*). Measured pathology it closes: a multi-site defect
+        # re-planned as "the one remaining gap" run after run — 7 of 11
+        # commits re-editing the same ~120-line region — because no one
+        # was asked to enumerate the sites before the plan was cut,
+        # though two greps would have surfaced all of them on day one.
+        # Sites carry a typed `role`; `bypass` exists because the path
+        # that skips the shared logic entirely is historically the site
+        # a fix campaign never looks at.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["applicable", "sites"],
+        "properties": {
+            # False when the task is not a defect-shape fix (a feature,
+            # a doc change, a symptom with a single obvious location) —
+            # the common case; everything else is then ignored.
+            "applicable": {"type": "boolean"},
+            # One sentence naming the repeated decision/idiom — the
+            # SHAPE, not the symptom.
+            "defect_shape": {"type": "string"},
+            "sites": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["file", "symbol", "role"],
+                    "properties": {
+                        "file": {"type": "string"},
+                        "symbol": {"type": "string"},
+                        "line_hint": {"type": "integer"},
+                        "role": {"type": "string",
+                                 "enum": ["decision_site", "producer",
+                                          "consumer", "bypass"]},
+                        "note": {"type": "string"},
+                    },
+                },
+            },
+            "chokepoint": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["exists"],
+                "properties": {
+                    "exists": {"type": "boolean"},
+                    "file": {"type": "string"},
+                    "symbol": {"type": "string"},
+                    "rationale": {"type": "string"},
                 },
             },
             "rationale": {"type": "string"},
@@ -21800,6 +21862,111 @@ async def phase_artifact_registry(
     return artifacts
 
 
+async def phase_defect_scope_audit(
+        task: str, st: State, caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None]) -> dict:
+    """Pre-planning defect-shape enumeration (DESIGN §5 *Defect-scope
+    audit*). Runs ONCE after the artifact registry, before any planner,
+    and only when classification includes `bug-fixing` — every other
+    task pays nothing.
+
+    A single read-only `defect_scope_auditor` states the task's defect
+    SHAPE (the repeated decision/idiom), enumerates every site on the
+    base tree implementing it (decision sites, producers, consumers,
+    and bypasses), and says whether a chokepoint exists where one fix
+    covers all of them. `phase_plan` injects the result into every
+    planner's ctx; `_warn_defect_sites_uncovered` is the mechanical
+    floor. Best-effort and non-fatal on the artifact-registry model:
+    any failure returns `{"applicable": False}` and the run proceeds as
+    it did before the audit existed. Never die()s."""
+    if "bug-fixing" not in (st.data.get("categories") or []):
+        return {"applicable": False}
+    st.data["current_phase"] = "phase 2: defect-scope audit"
+    st.save()
+    sys_prompt = _load_prompt("defect_scope_auditor")
+
+    async def _invoke() -> dict:
+        st.bump_workers(caps)
+        user_prompt = (
+            "TASK:\n" + task +
+            "\n\nAudit the defect scope per your instructions: name the "
+            "defect shape, enumerate every site on this tree that "
+            "implements it (including bypasses), and give the chokepoint "
+            "verdict. `applicable: false` is the correct answer when the "
+            "task is not a defect-shape fix."
+        )
+        return await claude_p(
+            user_prompt=user_prompt, system_prompt=sys_prompt,
+            schema_key="defect_scope_auditor", cwd=_judgment_cwd(st),
+            allowed_tools=INSPECT_TOOLS, max_turns=40, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("defect_scope_auditor", MODEL_DEFAULT),
+            effort=efforts.get("defect_scope_auditor"),
+            sid="defect_scope_auditor",
+            add_dirs=st.data.get("inspect_dirs") or None,
+        )
+
+    result, _warnings = await _run_checked_loop(
+        invoke=_invoke, check=lambda _r: [], name="defect_scope_auditor",
+        max_rounds=caps["judgment_check_rounds"],
+    )
+    if result is None:
+        log("  defect-scope audit: worker crashed every round; degrading "
+            "(planners run without the site enumeration) — non-fatal")
+        return {"applicable": False}
+    if not result.get("applicable"):
+        log("  defect-scope audit: task not defect-shaped — no enumeration")
+        return {"applicable": False}
+    sites = [s for s in (result.get("sites") or [])
+             if isinstance(s, dict) and s.get("file") and s.get("symbol")]
+    scope = {
+        "applicable": True,
+        "defect_shape": result.get("defect_shape") or "",
+        "sites": sites,
+        "chokepoint": result.get("chokepoint") or {"exists": False},
+    }
+    chokepoint = scope["chokepoint"]
+    log(f"phase 2: defect-scope audit — {len(sites)} site(s) share the "
+        "defect shape"
+        + (f"; chokepoint: {chokepoint.get('symbol') or chokepoint.get('file')}"
+           if chokepoint.get("exists") else "; no single chokepoint"))
+    return scope
+
+
+def _warn_defect_sites_uncovered(plans: list[dict],
+                                 defect_scope: dict) -> None:
+    """Mechanical floor for the defect-scope audit (DESIGN §5
+    *Defect-scope audit*): warn on every audited site whose FILE appears
+    in no subtask's `files_likely_touched`. Pure set comparison on paths
+    — never on prose (a scope_note naming a deliberate exclusion still
+    warns; that noise is accepted, since parsing the note would be
+    exactly the Language-to-JSON violation the repo forbids). Advisory
+    only: the audit is judgment, and a hallucinated site must not be
+    able to block a run."""
+    if not defect_scope.get("applicable"):
+        return
+    sites = defect_scope.get("sites") or []
+    if not sites:
+        return
+    claimed: set[str] = set()
+    for p in plans:
+        for s in (p.get("subtasks") or []):
+            for f in (s.get("files_likely_touched") or []):
+                claimed.add(str(f).lstrip("./"))
+    uncovered = [s for s in sites
+                 if str(s.get("file", "")).lstrip("./") not in claimed]
+    if not uncovered:
+        return
+    log("  WARNING: defect-scope audit sites not claimed by any subtask's "
+        "files_likely_touched — a plan that leaves a same-shape site "
+        "unfixed is how the same defect ships partially fixed run after "
+        "run (advisory; scope a subtask to each, or name the exclusion "
+        "in a scope_note):")
+    for s in uncovered:
+        log(f"    • {s.get('file')} :: {s.get('symbol')} "
+            f"({s.get('role', '?')})")
+
+
 def _replan_domain_closure(plans: list[dict], targets: set[str]) -> set[str]:
     """Domains that must be re-planned together with `targets`.
 
@@ -21970,6 +22137,15 @@ async def phase_plan(task: str, st: State, caps: dict,
     no_work_dispute = st.data.get("no_work_dispute") or {}
     if no_work_dispute.get("judge_evidence"):
         ctx_dict["no_work_dispute"] = no_work_dispute
+    # Defect-scope audit result (DESIGN §5 *Defect-scope audit*): the
+    # enumerated sites sharing the defect shape plus the chokepoint
+    # verdict. The planner must cover every site or scope it out by
+    # name; a chokepoint-shaped defect should get a single-point fix,
+    # not per-site patches. Omitted when inapplicable or empty, so the
+    # common case carries no false framing.
+    defect_scope = st.data.get("defect_scope") or {}
+    if defect_scope.get("applicable") and defect_scope.get("sites"):
+        ctx_dict["defect_scope"] = defect_scope
     # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
     # A pre-planning canonical {description, tag, path} list, injected into
     # EVERY planner's ctx (built once, shared across all plan_one calls) so
@@ -34249,6 +34425,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 task, st, caps, models, efforts)
             st.save()
 
+        # Defect-scope audit (DESIGN §5 *Defect-scope audit*): same
+        # presence-keyed checkpoint pattern as the registry above —
+        # computed once, persisted, skipped on resume; best-effort, and
+        # {"applicable": False} is a valid completed state.
+        if "defect_scope" not in st.data:
+            st.data["defect_scope"] = await phase_defect_scope_audit(
+                task, st, caps, models, efforts)
+            st.save()
+
         if "plans_after_plan" not in st.data:
             plans = await phase_plan(task, st, caps, models, efforts)
             # Resumable-planning checkpoint: post-recursive-decompose
@@ -34384,6 +34569,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # empty condition cannot see. The wiring gate's constrained repair
             # is what closes that class (DESIGN §5).
             _warn_test_subtask_missing_producer_edge(plans)
+            # Mechanical floor for the defect-scope audit (DESIGN §5
+            # *Defect-scope audit*): file-set comparison of the audited
+            # sites against the plans' files_likely_touched union.
+            _warn_defect_sites_uncovered(
+                plans, st.data.get("defect_scope") or {})
             # Drop subtasks whose files_likely_touched leak into
             # inspect-dir mounts (read-only) or other off-tree paths. Soft
             # drop so the surviving subtasks proceed; the drop is

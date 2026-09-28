@@ -3804,3 +3804,49 @@ cases, and four were unreachable false-positive surface behind the
 misclassifications. `_host_finalize_ssh_transport_failure` was **provably
 dead**: its condition was a line the first arm already matched, which ran
 first.
+
+## The repeat-run loop closure (2026-09-28)
+
+Five features from one diagnosis (the barnacle repeat-run loop; measured
+root causes in DESIGN §5 *Defect-scope audit*, §6 *A fresh run refuses a
+stale base*, §8 *A dispute's evidence is planning input* / *The delivery
+gate*, §12 L4):
+
+**Dispute threading**, in `tests/test_no_work_judge.py` (extended) +
+`tests/test_no_work_dispute_ctx.py`: the dispute arm persists both halves
+to disk (value-asserted via a direct `state.json` read — a second
+`State()` would trip the single-owner flock), and the ctx tests drive the
+REAL `phase_plan`, asserting the judge's evidence text lands in the
+planner prompt verbatim; falsified live — deleting the injection fails the
+delivery test. Crash / confirm / empty-evidence persist nothing.
+
+**Base freshness**, in `tests/test_base_freshness_check.py`: real repos,
+real bare origin, real second writer. The load-bearing case is the
+measured incident shape — origin advanced, local tracking ref stale and
+EQUAL to HEAD, so only the function's own fetch can discover the
+staleness; a fetch-less comparison passes it. Plus
+fetched-but-not-pulled-then-offline (the stale ref alone must refuse),
+ahead/diverged/no-origin/detached silent, and launcher wiring pins
+(`IS_RESUME` gate, env hatch, shared truthy vocabulary).
+
+**Operator-overlap tripwire framing**, in
+`tests/test_tripwire_operator_signature.py`: predicate truth table
+(all-untracked true; tracked / mixed / HEAD / ref / empty false) paired
+with behavioral message tests through the real `_assert_repo_unchanged` —
+including that a worker adding a file ON TOP of a tracked edit is never
+softened.
+
+**Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
+the observable (1 on a clean first pass, 3 when flagged — a gate that
+always or never votes fails the count assertions); majority truth table
+(omitted index = met vote, last duplicate wins, garbage indices);
+executed recheck for both remedied and residual; both resume sentinels;
+the conformer section text (the routed VALUE); `_run_phases` ordering
+pins. Falsified live: flattening the majority threshold fails 3 tests.
+
+**Defect-scope audit**, in `tests/test_defect_scope_audit.py`: the phase
+executed for the bug-fixing / not-applicable / crash / malformed-site
+arms; ctx delivery through the real `phase_plan` asserting the BYPASS
+site's symbol reaches the planner (the historically-missed role); the
+mechanical floor's file-set normalization (dot-prefix) and
+silent-when-inapplicable arms.
