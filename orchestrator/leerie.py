@@ -21890,8 +21890,9 @@ async def phase_defect_scope_audit(
     consumers, and bypasses — or the candidate mechanisms), and says
     whether a chokepoint exists where one fix covers all of them.
     `phase_plan` injects the result into every planner's ctx;
-    `_warn_defect_sites_uncovered` is the mechanical floor. Best-effort and non-fatal on the artifact-registry model:
-    any failure returns `{"applicable": False}` and the run proceeds as
+    `_warn_defect_sites_uncovered` is the mechanical floor.
+    Best-effort and non-fatal on the artifact-registry model: any
+    failure returns `{"applicable": False}` and the run proceeds as
     it did before the audit existed. Never die()s."""
     if "bug-fixing" not in (st.data.get("categories") or []):
         return {"applicable": False}

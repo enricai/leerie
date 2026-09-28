@@ -326,17 +326,17 @@ subtask it tests). Three mechanisms reconcile that coupling:
   The planner is therefore instructed to state, in each covering
   subtask's success criteria, that subtask's own site-scoped
   done-state AND the audit's `defect_shape` wording as the
-  campaign-level contract the subtask serves, naming which part it
-  covers. Per-subtask criteria stay individually satisfiable (a
+  campaign-level contract the subtask serves, naming which part —
+  which sites or mechanisms, never a behavioral sub-type — it
+  covers. Per-subtask criteria stay individually satisfiable: a
   full-contract criterion on a per-site subtask would be formally
-  unmeetable, would read as bundling to the fit judge, and would
-  expose sibling subtasks to the satisfied-probe's settle paths —
-  the probe judges a subtask's criteria against HEAD when a no-op
-  completion or a provider-subset check invokes it, so a shared
-  full-contract criterion could read as met once one sibling's fix
-  lands; carrying the quoted contract alongside a site-scoped
-  criterion keeps that exposure, and it is the accepted residual of
-  this design). Criteria remain
+  unmeetable, would read as bundling to the fit judge, and could be
+  settled as already-met by the satisfied-probe once a sibling's fix
+  lands (the probe judges a subtask's criteria against HEAD on its
+  settle paths — a no-op completion or a provider-subset check).
+  The quoted contract riding alongside a site-scoped criterion still
+  puts the contract's text in front of that probe; that smaller
+  exposure is the accepted residual of this design. Criteria remain
   informational per §9 — the shape in the criteria makes narrowing
   *visible* (the implementer states the contract it serves; the
   criteria record shows what was and wasn't covered), it does not

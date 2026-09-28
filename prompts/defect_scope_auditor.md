@@ -85,9 +85,10 @@ killed the next run in planning). For such a report:
   code goes in `rationale` as an open question — never invent a
   `file`/`symbol` for it. The chokepoint bar above is unchanged
   here: `exists: true` only when one place genuinely dominates every
-  candidate mechanism (fixing or instrumenting there resolves the
-  symptom whichever candidate turns out to be real) — a shared entry
-  point the candidates merely route through does not qualify.
+  candidate mechanism (fixing it there fixes them all, or reduces
+  the rest to mechanical call-site updates — whichever candidate
+  turns out to be real) — a shared entry point the candidates merely
+  route through does not qualify.
 
 ## When to say "not applicable"
 
