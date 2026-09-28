@@ -184,6 +184,31 @@ def test_local_upstream_passes_silently(repos):
     assert "BEHIND" not in r.stderr
 
 
+def test_slashed_local_upstream_passes_silently(repos):
+    """Review round 2: the round-1 fix guarded the ABBREVIATED upstream
+    name against slashlessness, but the defect predicate is 'the
+    upstream is local'. A local upstream NAMED with a slash
+    (`team/base`) sailed through `*/*`, fetched `team` as a remote
+    (misleading offline warning), and refused run start against a local
+    base. The discriminator must be the full @{u} ref (refs/heads/* vs
+    refs/remotes/*), not the name's shape."""
+    work = repos["work"]
+    run_git_repo_first(work, "checkout", "-q", "-b", "team/base")
+    run_git_repo_first(work, "checkout", "-q", "-b", "feature")
+    run_git_repo_first(work, "branch", "--set-upstream-to=team/base",
+                       "feature")
+    # Put feature strictly BEHIND its slashed local upstream.
+    run_git_repo_first(work, "checkout", "-q", "team/base")
+    (work / "ahead.txt").write_text("x\n")
+    run_git_repo_first(work, "add", "ahead.txt")
+    run_git_repo_first(work, "commit", "-qm", "local base moves ahead")
+    run_git_repo_first(work, "checkout", "-q", "feature")
+    r = _check(work)
+    assert r.returncode == 0
+    assert "could not refresh" not in r.stderr
+    assert "BEHIND" not in r.stderr
+
+
 def test_unreachable_origin_warns_and_passes(repos):
     """Offline must never block run start: the fetch fails, a warning
     says the comparison used the last-fetched state, and an up-to-date

@@ -31155,16 +31155,28 @@ async def _delivery_judge_unmet(
     DISPUTES only keeps the clean-pass common case at one spawn.
     Exceptions (WorkerError / timeout) propagate; the callers treat the
     whole gate as advisory."""
-    # Normalize BEFORE numbering (review round 1): required_items can
-    # reach state as plain strings (an existing test seeds that shape,
-    # and pre-gate consumers all tolerate it), and a dict item could
-    # carry its own item_index — the classifier schema does not set
-    # additionalProperties, so that key is schema-legal and, spread
+    # Normalize BEFORE numbering (review rounds 1–2): required_items
+    # can reach state as plain strings (an existing test seeds that
+    # shape, and pre-gate consumers all tolerate it), and a dict item
+    # could carry its own item_index — the classifier schema does not
+    # set additionalProperties, so that key is schema-legal and, spread
     # after the literal, would override the positional index and make
     # the item unvotable (every vote for it lands out of range). The
-    # literal goes LAST so the positional index always wins.
-    normalized = [item if isinstance(item, dict) else {"item": str(item)}
-                  for item in items]
+    # literal goes LAST so the positional index always wins. Every
+    # normalized entry also carries a guaranteed-STR "item": the
+    # conformer section and the persisted delivery_gate record need
+    # printable text, and the recheck's residual log slices it — a
+    # nested non-string value there raised TypeError into the advisory
+    # wrapper, losing the residual line (round 2).
+    def _norm_item(item: object) -> dict:
+        if not isinstance(item, dict):
+            return {"item": str(item)}
+        text = item.get("item")
+        if not isinstance(text, str):
+            text = "" if text is None else json.dumps(text)
+        return {**item, "item": text}
+
+    normalized = [_norm_item(item) for item in items]
     numbered = [{**item, "item_index": i}
                 for i, item in enumerate(normalized)]
     user_prompt = (
@@ -31233,6 +31245,18 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
     items = st.data.get("required_items") or []
     if not items:
         return []
+    # Mirror _run_final_conformance's own guard (review rounds 1–2):
+    # with working_branch missing the conformer pass will skip, so
+    # spending judge samples buys a recheck that then reports "still
+    # unmet after the final-conformer pass" for a pass that never ran.
+    # Sits ABOVE the resume early-returns — a resume that recorded
+    # unmet_before and then lost working_branch must not hand the
+    # caller a truthy list that triggers the recheck (round 2).
+    if not st.data.get("working_branch"):
+        log("phase 5: delivery gate skipped — working_branch not in "
+            "state (the final-conformer pass it routes into would skip "
+            "for the same reason)")
+        return []
     existing = st.data.get("delivery_gate") or {}
     if "unmet_after" in existing:
         log("phase 5: delivery gate already complete — skipping (resume)")
@@ -31244,15 +31268,6 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not staging.is_dir():
         log("phase 5: delivery gate skipped — staging worktree absent")
-        return []
-    # Mirror _run_final_conformance's own guard (review round 1): with
-    # working_branch missing the conformer pass will skip, so spending
-    # judge samples here buys a recheck that then reports "still unmet
-    # after the final-conformer pass" for a pass that never ran.
-    if not st.data.get("working_branch"):
-        log("phase 5: delivery gate skipped — working_branch not in "
-            "state (the final-conformer pass it routes into would skip "
-            "for the same reason)")
         return []
     log(f"phase 5: delivery gate — verifying {len(items)} required "
         "item(s) against the integrated tree (DESIGN §8)")
@@ -31292,6 +31307,13 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     gate = st.data.get("delivery_gate") or {}
     unmet_before = gate.get("unmet_before") or []
     if not unmet_before or "unmet_after" in gate:
+        return
+    # Own copy of the working_branch guard (round 2): this function
+    # consults gate state directly, so it must not rely on the prejudge
+    # having filtered the resume path in the same invocation.
+    if not st.data.get("working_branch"):
+        log("  delivery gate recheck skipped — working_branch not in "
+            "state (no final-conformer pass ran to re-verify against)")
         return
     items = st.data.get("required_items") or []
     staging = (leerie_dir / "worktrees" / "staging").resolve()

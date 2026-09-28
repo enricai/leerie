@@ -317,26 +317,34 @@ host_base_freshness_check() {
   if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
     return 0
   fi
-  local upstream
-  upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name \
-              "@{u}" 2>/dev/null || true)"
-  if [ -z "$upstream" ]; then
-    if git -C "$repo" show-ref --verify --quiet \
-        "refs/remotes/origin/$branch"; then
-      upstream="origin/$branch"
-    else
-      return 0
-    fi
-  fi
-  # A LOCAL upstream (branch.<name>.remote = ".", e.g. `git switch -c x
-  # --track main`) makes @{u} a bare branch name with no remote prefix
-  # — the remote/branch split below would then "fetch" a branch name as
-  # a remote (misleading offline warning) and compare against a local
-  # ref this guard has no business refusing over (review round 1).
-  # Being behind a local base is not the merge→re-run race signature.
-  case "$upstream" in
-    */*) : ;;
-    *) return 0 ;;
+  # Resolve the upstream as a FULL ref, never an abbreviated name: only
+  # refs/remotes/<remote>/<branch> is a remote upstream. A LOCAL
+  # upstream (branch.<name>.remote = ".", e.g. `git branch
+  # --set-upstream-to=<local-branch>`) resolves under refs/heads/ —
+  # slashed or not — and is out of this guard's remit: being behind a
+  # local base is not the merge→re-run race signature. The predicate
+  # must be "local vs remote", not "has a slash": the round-1 fix
+  # guarded the abbreviated name against slashlessness, and a local
+  # upstream NAMED with a slash (`team/base` — this repo's own branch
+  # convention) sailed through it, "fetching" a branch name as a remote
+  # and refusing run start against a local base (round-2 review).
+  local upstream_ref upstream
+  upstream_ref="$(git -C "$repo" rev-parse --symbolic-full-name \
+                  "@{u}" 2>/dev/null || true)"
+  case "$upstream_ref" in
+    refs/remotes/*/*)
+      upstream="${upstream_ref#refs/remotes/}" ;;
+    "")
+      # No upstream configured: fall back to a same-named origin branch.
+      if git -C "$repo" show-ref --verify --quiet \
+          "refs/remotes/origin/$branch"; then
+        upstream="origin/$branch"
+      else
+        return 0
+      fi ;;
+    *)
+      # refs/heads/* — a local upstream.
+      return 0 ;;
   esac
   local remote_name="${upstream%%/*}"
   local remote_branch="${upstream#*/}"

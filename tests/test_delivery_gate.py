@@ -249,6 +249,83 @@ def test_missing_working_branch_skips(leerie, tmp_path, monkeypatch):
     assert "delivery_gate" not in st.data
 
 
+def test_dict_item_without_item_key_is_survivable(
+        leerie, tmp_path, monkeypatch):
+    """Review round 2: a dict item lacking an 'item' key (state-
+    reachable, not model-reachable — the classifier schema requires
+    'item') must still run the gate: the judge payload keeps the
+    original keys, and the confirmed record carries a guaranteed STRING
+    item (empty here) rather than crashing downstream consumers."""
+    st, run_dir = _state(leerie, tmp_path, required_items=[
+        {"requirement": "no item key here", "source_ref": "x"}])
+    calls = _patch_judge(leerie, monkeypatch, [
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+    ])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert "no item key here" in calls[0]["user_prompt"]
+    assert unmet[0]["item"] == ""
+    assert isinstance(unmet[0]["item"], str)
+    # The conformer section renders without crashing on the empty text.
+    section = leerie._format_unmet_required_items_section(unmet)
+    assert "[0]" in section
+
+
+def test_non_string_item_value_survives_the_recheck_residual_log(
+        leerie, tmp_path, monkeypatch):
+    """Review round 2: a nested non-string 'item' value reached the
+    recheck's summary slice ([:80]) and raised TypeError into the
+    advisory wrapper, losing the residual log line. The normalization
+    must coerce it to a string end-to-end."""
+    st, run_dir = _state(leerie, tmp_path,
+                         required_items=[{"item": {"nested": "text"}}],
+                         delivery_gate={
+                             "unmet_before": [{"item_index": 0,
+                                               "item": "recorded",
+                                               "evidence": "e"}],
+                             "samples_before": 3})
+    _patch_judge(leerie, monkeypatch, [
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+    ])
+    lines: list[str] = []
+    monkeypatch.setattr(leerie, "log", lines.append)
+    asyncio.run(leerie._run_delivery_recheck(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    residual = st.data["delivery_gate"]["unmet_after"]
+    assert isinstance(residual[0]["item"], str)
+    assert "nested" in residual[0]["item"]
+    # The residual log line executed — that is the substance the
+    # TypeError was eating.
+    assert any("delivery gate residual" in ln for ln in lines)
+
+
+def test_recheck_skips_without_working_branch(
+        leerie, tmp_path, monkeypatch):
+    """Review round 2: the prejudge's working_branch guard sat below its
+    resume early-return, so a resume carrying unmet_before with
+    working_branch since lost spent 3 samples and logged a residual for
+    a conformer pass that skipped. Both halves must refuse
+    independently."""
+    st, run_dir = _state(leerie, tmp_path, delivery_gate={
+        "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
+        "samples_before": 3})
+    del st.data["working_branch"]
+    st.save()
+    calls = _patch_judge(leerie, monkeypatch, [])
+    # The prejudge resume path must not hand back a truthy list either.
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert unmet == []
+    asyncio.run(leerie._run_delivery_recheck(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert calls == []
+    assert "unmet_after" not in st.data["delivery_gate"]
+
+
 def test_missing_staging_skips(leerie, tmp_path, monkeypatch):
     st, run_dir = _state(leerie, tmp_path)
     import shutil
