@@ -297,10 +297,14 @@ $out"
 # Returns 0 (silently) when: HEAD equals its upstream, HEAD is ahead,
 # HEAD and upstream have diverged (local commits exist — the operator is
 # doing something deliberate, and "behind" is not the signature), the
-# branch has no upstream and origin has no same-named branch, the repo
-# has no origin, or HEAD is detached. Returns 1 — the launcher dies —
-# only on the one measured signature: HEAD is a strict ancestor of the
-# upstream.
+# upstream is LOCAL (branch.<name>.remote = "." — being behind a local
+# base is not the merge→re-run race signature, slashed branch names
+# included), the branch has no upstream and origin has no same-named
+# branch, the repo has no origin, or HEAD is detached. Returns 1 — the
+# launcher dies — only on the one measured signature: HEAD is a strict
+# ancestor of its REMOTE upstream (or, on the no-upstream fallback, of
+# the same-named origin branch). DESIGN §6 *A fresh run refuses a stale
+# base* is the canonical statement of both sets.
 #
 # The fetch is best-effort: offline or credential-less must never block
 # run start (GIT_TERMINAL_PROMPT=0 keeps HTTPS from prompting; a warning

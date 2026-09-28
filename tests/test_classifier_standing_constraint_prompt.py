@@ -31,9 +31,15 @@ def test_classifier_prompt_carries_the_standing_constraint_rule(leerie):
     # The class definition, by its name and by its shape.
     assert "standing deliverable" in text
     assert "must never contain" in text
-    # The extraction instruction the downstream consumers depend on.
+    # The extraction instruction the downstream consumers depend on —
+    # asserted INSIDE the carve-out's own text, not anywhere in the
+    # prompt: `source_ref` also appears in the section's field
+    # definitions above, so a whole-prompt substring check would
+    # survive deleting the carve-out entirely (round 9).
     assert "verbatim or near-verbatim" in text
-    assert "`source_ref`" in text
+    carve_out = text[text.index("NEVER omitted"):
+                     text.index("## Already satisfied on HEAD")]
+    assert "`source_ref`" in carve_out
 
 
 def test_rule_lives_inside_the_required_items_section(leerie):

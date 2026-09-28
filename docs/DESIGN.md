@@ -2157,7 +2157,8 @@ the env escape hatch (`LEERIE_SKIP_FRESHNESS_CHECK=1`) in the message —
 on exactly the measured signature: HEAD a strict ancestor of its
 upstream. Ahead and diverged pass silently (local commits mean the
 operator is doing something deliberate; "behind" is the signature).
-The permissive set is exactly: a local (same-repo) upstream, no
+Beyond the trivially clean cases above (equal, ahead, diverged), the
+degrade-to-permissive set is exactly: a local (same-repo) upstream, no
 origin remote, detached HEAD, no upstream when origin has no
 same-named branch, and a failed fetch when the last-fetched state
 shows nothing behind — because a guard that blocks offline work gets
