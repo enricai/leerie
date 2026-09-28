@@ -61,7 +61,13 @@ defect-shape fix: a feature, a documentation change, an infrastructure
 task, or a defect with a single obvious location and no repeated idiom
 (one off-by-one in one function needs no audit). Do not force an
 enumeration where there is nothing to enumerate — a fabricated site
-list sends the planner to files that do not need changing.
+list sends the planner to files that do not need changing. The
+not-applicable output is exactly this (`sites` is required by your
+schema even when empty):
+
+```json
+{"applicable": false, "sites": []}
+```
 
 ## Output
 

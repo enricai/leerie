@@ -5623,9 +5623,12 @@ unset _skip_prepush_preflight
 #    PR's just-merged fix. Fresh runs only: a resume deliberately continues
 #    its recorded baseline. Env-only escape hatch, mirroring
 #    LEERIE_SKIP_PREPUSH_PREFLIGHT (an argv flag would leak into the
-#    orchestrator's argparse passthrough). Fatal on the one measured
-#    signature (strictly behind); silent on ahead/diverged/no-upstream, and
-#    the fetch inside is best-effort so offline never blocks run start.
+#    orchestrator's argparse passthrough). Fatal on the measured signature
+#    (strictly behind — including a no-upstream branch behind a same-named
+#    origin branch, and an offline check whose last-fetched ref already
+#    shows behind); silent on ahead/diverged/local-upstream/no-origin and
+#    on a failed fetch that has no on-disk evidence of staleness — see
+#    DESIGN §6 *A fresh run refuses a stale base* for the exact sets.
 case "${LEERIE_SKIP_FRESHNESS_CHECK:-}" in
   1|true|TRUE|yes|YES) _skip_freshness_check=true ;;
   *) _skip_freshness_check=false ;;

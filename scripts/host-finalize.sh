@@ -387,7 +387,11 @@ host_base_freshness_check() {
     echo "  older solution OVER the newer one (measured: a re-run started one minute" >&2
     echo "  after its predecessor's PR merged, before the local pull, and regressed" >&2
     echo "  that PR's fix). Pull first:" >&2
-    echo "    git -C $repo pull --ff-only" >&2
+    # Name remote and branch explicitly: on the no-upstream fallback arm
+    # a bare `git pull --ff-only` fails with "There is no tracking
+    # information for the current branch" — a refusal whose only printed
+    # working exit would otherwise be the skip env var (round 8).
+    echo "    git -C $repo pull --ff-only $remote_name $remote_branch" >&2
     echo "  Or, to deliberately run on this older base:" >&2
     echo "    LEERIE_SKIP_FRESHNESS_CHECK=1 ./leerie ..." >&2
     return 1

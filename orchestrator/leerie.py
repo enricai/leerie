@@ -1312,7 +1312,11 @@ SKIP_ADHERENCE_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # rejected again until the round budget ran out. The `deferred` field on
 # `required_items` fixes that specific cause; this flag exists because a
 # judgment worker will always be able to produce a false positive the
-# operator needs to push past. Resolution order:
+# operator needs to push past. Since the phase-5 delivery gate landed,
+# ONE FLAG GOVERNS BOTH SIDES of required-items checking: this flag also
+# suppresses the finalize-side delivery_judge verification
+# (_run_delivery_prejudge/_run_delivery_recheck — DESIGN §8 *The
+# delivery gate*). Resolution order:
 # --skip-coverage-check CLI flag → LEERIE_SKIP_COVERAGE_CHECK env →
 # skip_coverage_check in leerie.toml → False.
 SKIP_COVERAGE_CHECK_ENV = "LEERIE_SKIP_COVERAGE_CHECK"
@@ -6863,10 +6867,14 @@ def resolve_skip_coverage_check(repo_root: Path, cli_value: bool) -> bool:
     LEERIE_SKIP_COVERAGE_CHECK env var →
     skip_coverage_check in leerie.toml → False.
 
-    When True, `phase_planning_coverage_gate` is not run — neither the
-    advisory `task_coverage_judge` review — so a plan that omits a required item is
-    not caught before `phase_execute` spends. Off by default; use when the
-    gate is demanding work the task does not actually want built."""
+    When True, required-items checking is suppressed on BOTH sides:
+    `phase_planning_coverage_gate` (the advisory `task_coverage_judge`
+    review) does not run, so a plan that omits a required item is not
+    caught before `phase_execute` spends — and the phase-5 delivery gate
+    (`_run_delivery_prejudge`/`_run_delivery_recheck`, DESIGN §8 *The
+    delivery gate*) does not verify the integrated tree either. Off by
+    default; use when the judges are demanding work the task does not
+    actually want built."""
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=SKIP_COVERAGE_CHECK_ENV,
@@ -35109,12 +35117,13 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          f"Also {SKIP_ADHERENCE_CHECK_ENV} env or "
                          "skip_adherence_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-coverage-check", action="store_true",
-                    help="skip the phase 2⅞½ task-coverage gate: the "
-                         "advisory task_coverage_judge review. The gate no "
-                         "longer gates (its floor passed 0 of 102 items and "
-                         "was deleted; its judge's findings do not reproduce "
-                         "across re-samples), so this only suppresses the "
-                         "review and its worker call. "
+                    help="skip required-items checking on BOTH sides: the "
+                         "phase 2⅞½ advisory task_coverage_judge review "
+                         "(which no longer gates — its floor passed 0 of "
+                         "102 items and was deleted; its judge's findings "
+                         "do not reproduce across re-samples) AND the "
+                         "phase-5 delivery gate that verifies required "
+                         "items on the integrated tree before finalize. "
                          f"Also {SKIP_COVERAGE_CHECK_ENV} env or "
                          "skip_coverage_check in leerie.toml. Default: off.")
     ap.add_argument("--skip-completeness-check", action="store_true",

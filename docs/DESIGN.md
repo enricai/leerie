@@ -2157,11 +2157,18 @@ the env escape hatch (`LEERIE_SKIP_FRESHNESS_CHECK=1`) in the message —
 on exactly the measured signature: HEAD a strict ancestor of its
 upstream. Ahead and diverged pass silently (local commits mean the
 operator is doing something deliberate; "behind" is the signature).
-No upstream, a local (same-repo) upstream, no origin, detached HEAD,
-and a failed fetch all degrade
-to permissive, because a guard that blocks offline work gets switched
-off. Fresh runs only — a resume deliberately continues its recorded
-baseline.
+The permissive set is exactly: a local (same-repo) upstream, no
+origin remote, detached HEAD, no upstream when origin has no
+same-named branch, and a failed fetch when the last-fetched state
+shows nothing behind — because a guard that blocks offline work gets
+switched off. Two cases that look permissive are deliberately NOT:
+a branch with no upstream configured still refuses when a
+**same-named origin branch** exists and is ahead (the merge→re-run
+race does not care whether tracking was configured), and a failed
+fetch still refuses when the **last-fetched** tracking ref already
+shows the checkout behind (the staleness is proven by information
+already on disk; going offline must not erase it). Fresh runs only —
+a resume deliberately continues its recorded baseline.
 
 **Push and PR are honest about failure.** A push or PR step that fails does
 not pretend the run failed: the local work is intact on the run branch. The
@@ -6904,18 +6911,21 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the twenty worker types in
+Every main-loop LLM call in Leerie passes through one of the twenty-two worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
-`artifact_registry`, `integration_judge`, `no_work_judge`, or `rebaser`
+`artifact_registry`, `integration_judge`, `no_work_judge`,
+`delivery_judge`, `defect_scope_auditor`, or `rebaser`
 (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
-`integration_judge`, and `no_work_judge` are the independent adversarial
+`integration_judge`, `no_work_judge`, and `delivery_judge` are the
+independent adversarial
 verifiers — see §8; `artifact_registry` is the pre-planning
-shared-vocabulary worker — see §5; `rebaser` is the finalize-time rebase
+shared-vocabulary worker and `defect_scope_auditor` the pre-planning
+defect-shape enumerator — see §5; `rebaser` is the finalize-time rebase
 worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per

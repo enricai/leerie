@@ -3807,10 +3807,21 @@ first.
 
 ## The repeat-run loop closure (2026-09-28)
 
-Five features from one diagnosis (the barnacle repeat-run loop; measured
+Six features from one diagnosis (the barnacle repeat-run loop; measured
 root causes in DESIGN §5 *Defect-scope audit*, §6 *A fresh run refuses a
 stale base*, §8 *A dispute's evidence is planning input* / *The delivery
-gate*, §12 L4):
+gate*, §12 L4; this section originally said five — the classifier rule
+below shipped without a pin or an inventory entry, caught in review
+round 8):
+
+**Classifier standing-constraint extraction**, in
+`tests/test_classifier_standing_constraint_prompt.py`: prompt-content
+pins on the never-omitted carve-out's load-bearing clauses (the force,
+the class definition, the verbatim-extraction instruction) plus a
+section-ordering pin that the rule sits inside the Required-items
+instructions. A prompt rule with no pin is exactly the
+"present one run, absent the next" regression class the rule itself
+closes.
 
 **Dispute threading**, in `tests/test_no_work_judge.py` (extended) +
 `tests/test_no_work_dispute_ctx.py`: the dispute arm persists both halves

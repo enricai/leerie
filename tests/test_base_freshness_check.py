@@ -160,6 +160,10 @@ def test_no_upstream_falls_back_to_origin_branch(repos):
     r = _check(work)
     assert r.returncode == 1
     assert "BEHIND" in r.stderr
+    # The printed remedy must WORK on this arm: a bare `git pull
+    # --ff-only` fails here ("no tracking information"), so the hint
+    # names remote and branch explicitly (round 8).
+    assert "pull --ff-only origin main" in r.stderr
 
 
 def test_local_upstream_passes_silently(repos):
