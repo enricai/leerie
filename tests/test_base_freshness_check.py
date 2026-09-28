@@ -37,7 +37,8 @@ def repos(tmp_path: Path) -> dict:
     the forge-side merge in the measured incident)."""
     origin = tmp_path / "origin.git"
     work = tmp_path / "work"
-    subprocess.run(["git", "init", "-q", "--bare", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)],
+                   check=True)
     subprocess.run(["git", "init", "-q", "-b", "main", str(work)],
                    check=True)
     run_git_repo_first(work, "config", "user.email", "t@example.com")
@@ -207,6 +208,25 @@ def test_slashed_local_upstream_passes_silently(repos):
     assert r.returncode == 0
     assert "could not refresh" not in r.stderr
     assert "BEHIND" not in r.stderr
+
+
+def test_gone_upstream_falls_back_to_origin_branch(repos):
+    """Review round 4: a configured-but-GONE tracking ref makes
+    `git rev-parse --symbolic-full-name @{u}` echo the literal `@{u}`
+    on stdout at rc 128 — a non-empty string that is neither
+    refs/remotes/* nor refs/heads/*. The fallback arm must catch it
+    (matching on 'empty' missed it) so a same-named origin branch is
+    still checked: here the checkout is strictly behind origin/main
+    and must be refused."""
+    work = repos["work"]
+    _advance_origin(repos)
+    assert run_git_repo_first(work, "fetch", "-q", "origin",
+                              "main").returncode == 0
+    run_git_repo_first(work, "config", "branch.main.merge",
+                       "refs/heads/gone")
+    r = _check(work)
+    assert r.returncode == 1
+    assert "BEHIND" in r.stderr
 
 
 def test_unreachable_origin_warns_and_passes(repos):

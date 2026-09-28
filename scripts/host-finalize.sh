@@ -328,23 +328,31 @@ host_base_freshness_check() {
   # upstream NAMED with a slash (`team/base` — this repo's own branch
   # convention) sailed through it, "fetching" a branch name as a remote
   # and refusing run start against a local base (round-2 review).
+  # Known residual (fail-open, exotic): a REMOTE whose own name contains
+  # a slash (`git remote add a/b <url>` is legal) makes the
+  # remote/branch split below wrong — the fetch fails and the check
+  # degrades to the last-fetched state with a spurious offline warning.
   local upstream_ref upstream
   upstream_ref="$(git -C "$repo" rev-parse --symbolic-full-name \
                   "@{u}" 2>/dev/null || true)"
   case "$upstream_ref" in
     refs/remotes/*/*)
       upstream="${upstream_ref#refs/remotes/}" ;;
-    "")
-      # No upstream configured: fall back to a same-named origin branch.
+    refs/heads/*)
+      # A local upstream (branch.<name>.remote = "."), slashed or not:
+      # being behind a local base is not the race signature.
+      return 0 ;;
+    *)
+      # No upstream, or an unresolvable one — a configured-but-gone
+      # tracking ref makes rev-parse echo the literal `@{u}` on stdout
+      # at rc 128 (round 4), so this arm must not require an empty
+      # string. Fall back to a same-named origin branch.
       if git -C "$repo" show-ref --verify --quiet \
           "refs/remotes/origin/$branch"; then
         upstream="origin/$branch"
       else
         return 0
       fi ;;
-    *)
-      # refs/heads/* — a local upstream.
-      return 0 ;;
   esac
   local remote_name="${upstream%%/*}"
   local remote_branch="${upstream#*/}"

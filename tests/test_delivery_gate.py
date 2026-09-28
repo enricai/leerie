@@ -249,13 +249,16 @@ def test_missing_working_branch_skips(leerie, tmp_path, monkeypatch):
     assert "delivery_gate" not in st.data
 
 
-def test_dict_item_without_item_key_is_survivable(
+def test_dict_item_without_item_key_gets_serialized_text(
         leerie, tmp_path, monkeypatch):
-    """Review round 2: a dict item lacking an 'item' key (state-
+    """Review rounds 2+4: a dict item lacking an 'item' key (state-
     reachable, not model-reachable — the classifier schema requires
-    'item') must still run the gate: the judge payload keeps the
-    original keys, and the confirmed record carries a guaranteed STRING
-    item (empty here) rather than crashing downstream consumers."""
+    'item') must hand every downstream consumer USABLE text. The first
+    fix mapped it to "" — indistinguishable from pre-fix behavior, so
+    the original form of this test passed unfixed code (round 4:
+    non-discriminating). Now the whole entry is serialized as the item
+    text, and the assertions demand the CONTENT, which the pre-fix ""
+    cannot satisfy."""
     st, run_dir = _state(leerie, tmp_path, required_items=[
         {"requirement": "no item key here", "source_ref": "x"}])
     calls = _patch_judge(leerie, monkeypatch, [
@@ -266,11 +269,12 @@ def test_dict_item_without_item_key_is_survivable(
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
     assert "no item key here" in calls[0]["user_prompt"]
-    assert unmet[0]["item"] == ""
     assert isinstance(unmet[0]["item"], str)
-    # The conformer section renders without crashing on the empty text.
+    assert "no item key here" in unmet[0]["item"]
+    # The conformer section carries the requirement's content, not a
+    # blank line.
     section = leerie._format_unmet_required_items_section(unmet)
-    assert "[0]" in section
+    assert "no item key here" in section
 
 
 def test_non_string_item_value_survives_the_recheck_residual_log(

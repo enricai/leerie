@@ -223,7 +223,13 @@ def test_inapplicable_scope_never_warns(leerie, monkeypatch, scope):
 class TestWiring:
     def test_run_phases_checkpoints_the_audit(self, leerie):
         src = inspect.getsource(leerie._run_phases)
-        assert 'if "defect_scope" not in st.data:' in src
+        assert ('if ("defect_scope" not in st.data\n'
+                '                and "plans_after_plan" not in st.data):'
+                ) in src, (
+            "the audit must be gated on BOTH its own checkpoint and "
+            "planning not being checkpointed — a resume of a "
+            "pre-feature state past planning must not spawn the "
+            "auditor (CI: worker_count changed on a free re-entry)")
         assert "phase_defect_scope_audit(" in src
         # After the registry, before planning.
         assert (src.index("phase_artifact_registry(")

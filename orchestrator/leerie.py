@@ -31171,7 +31171,15 @@ async def _delivery_judge_unmet(
     def _norm_item(item: object) -> dict:
         if not isinstance(item, dict):
             return {"item": str(item)}
-        text = item.get("item")
+        if "item" not in item:
+            # No text field at all: the whole entry is the only
+            # description this requirement has, so serialize it — an
+            # empty string here handed the conformer a blank
+            # requirement, unchanged from pre-normalization behavior
+            # (round 4: that made the no-item-key test
+            # non-discriminating).
+            return {**item, "item": json.dumps(item, sort_keys=True)}
+        text = item["item"]
         if not isinstance(text, str):
             text = "" if text is None else json.dumps(text)
         return {**item, "item": text}
@@ -34483,8 +34491,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # Defect-scope audit (DESIGN §5 *Defect-scope audit*): same
         # presence-keyed checkpoint pattern as the registry above —
         # computed once, persisted, skipped on resume; best-effort, and
-        # {"applicable": False} is a valid completed state.
-        if "defect_scope" not in st.data:
+        # {"applicable": False} is a valid completed state. The extra
+        # plans_after_plan gate covers a resume of a run whose state
+        # PREDATES this key: with planning already checkpointed, the
+        # audit's only consumer has run, so spawning the auditor there
+        # would spend a worker (and bump worker_count on a re-entry
+        # that must be free — CI caught exactly that) for a result
+        # nothing reads.
+        if ("defect_scope" not in st.data
+                and "plans_after_plan" not in st.data):
             st.data["defect_scope"] = await phase_defect_scope_audit(
                 task, st, caps, models, efforts)
             st.save()
