@@ -5615,6 +5615,28 @@ if [ "$NO_PUSH" = "false" ] \
 fi
 unset _skip_prepush_preflight
 
+# 5. base freshness (DESIGN §6 *A fresh run refuses a stale base*). A fresh
+#    run whose HEAD is strictly behind its upstream re-solves work that
+#    already merged, and its finalize rebase can land the older solution
+#    over the newer one — measured on a re-run started one minute after its
+#    predecessor's PR merged, before the local pull, which regressed that
+#    PR's just-merged fix. Fresh runs only: a resume deliberately continues
+#    its recorded baseline. Env-only escape hatch, mirroring
+#    LEERIE_SKIP_PREPUSH_PREFLIGHT (an argv flag would leak into the
+#    orchestrator's argparse passthrough). Fatal on the one measured
+#    signature (strictly behind); silent on ahead/diverged/no-upstream, and
+#    the fetch inside is best-effort so offline never blocks run start.
+case "${LEERIE_SKIP_FRESHNESS_CHECK:-}" in
+  1|true|TRUE|yes|YES) _skip_freshness_check=true ;;
+  *) _skip_freshness_check=false ;;
+esac
+if [ "$IS_RESUME" = "false" ] && [ "$_skip_freshness_check" = "false" ]; then
+  # shellcheck source=scripts/host-finalize.sh
+  . "$LEERIE_REPO/scripts/host-finalize.sh"
+  host_base_freshness_check "$USER_REPO" || exit 1
+fi
+unset _skip_freshness_check
+
 # --- build image if not present (one-time, ~60-120s) --------------------
 if ! nerdctl image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
   remote_log "building container image (one-time; ~60-120s)..."

@@ -2097,6 +2097,34 @@ compute one answer N times concurrently); a group probes per member, since
 its members are separate repositories. Same "fail fast at the cheapest
 moment" reasoning as §13's budget feasibility.
 
+**A fresh run refuses a stale base.** The complementary t=0 hazard is the
+checkout being *behind* its upstream. The operator loop that leerie's
+convergence story assumes — run, merge the PR on the forge, re-run — has
+a race in it: the merge lands on the remote, and nothing guarantees the
+local checkout saw it before the re-run starts. Measured on one repo's
+corpus: a re-run started one minute after its predecessor's PR merged,
+planned against the pre-merge tree (`repo_state_before_planning.head`
+identical across the two runs), re-solved the same findings from
+scratch, and its finalize rebase-onto-base landed the older, weaker
+solution OVER the just-merged fix — a regression the following run had
+to re-fix. Three runs' spend for negative progress, invisible to every
+in-run gate because each run was self-consistent against the tree it
+saw.
+
+So host preflight ends with a freshness check
+(`host_base_freshness_check`, host-side because the fetch needs the
+host's credentials — the container has none): a best-effort
+`git fetch` of the current branch's upstream, then a mechanical
+ancestry comparison. It refuses to start — with the pull command and
+the env escape hatch (`LEERIE_SKIP_FRESHNESS_CHECK=1`) in the message —
+on exactly the measured signature: HEAD a strict ancestor of its
+upstream. Ahead and diverged pass silently (local commits mean the
+operator is doing something deliberate; "behind" is the signature).
+No upstream, no origin, detached HEAD, and a failed fetch all degrade
+to permissive, because a guard that blocks offline work gets switched
+off. Fresh runs only — a resume deliberately continues its recorded
+baseline.
+
 **Push and PR are honest about failure.** A push or PR step that fails does
 not pretend the run failed: the local work is intact on the run branch. The
 orchestrator records what was attempted and what failed in a per-run

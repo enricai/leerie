@@ -276,6 +276,98 @@ $out"
   return 1
 }
 
+# host_base_freshness_check <repo> — refuse to start a fresh run on a
+# checkout that is strictly BEHIND its upstream.
+#
+# A run-START check, not a finalize step — it lives here because this file
+# is the launcher's home for host-side git helpers (the host has the ssh /
+# gh credentials a `git fetch` needs; the container does not — DESIGN §6
+# *Finalization*).
+#
+# Why it exists (measured, 2026-09-26): an operator merged a run's PR on
+# the forge and re-ran the same task ONE MINUTE later, before the merge
+# reached the local checkout. The new run planned against the pre-merge
+# tree, re-solved the same findings from scratch, and its finalize rebase
+# landed a WEAKER variant over the just-merged fix — a regression the
+# following run had to re-fix. `repo_state_before_planning.head` for the
+# two runs was identical; the whole wasted cycle hinged on HEAD being
+# behind origin at t=0, which this probe detects mechanically.
+#
+# Returns 0 (silently) when: HEAD equals its upstream, HEAD is ahead,
+# HEAD and upstream have diverged (local commits exist — the operator is
+# doing something deliberate, and "behind" is not the signature), the
+# branch has no upstream and origin has no same-named branch, the repo
+# has no origin, or HEAD is detached. Returns 1 — the launcher dies —
+# only on the one measured signature: HEAD is a strict ancestor of the
+# upstream.
+#
+# The fetch is best-effort: offline or credential-less must never block
+# run start (GIT_TERMINAL_PROMPT=0 keeps HTTPS from prompting; a warning
+# notes the comparison then runs against the last-fetched state, which
+# still catches fetched-but-not-pulled). `timeout 30` bounds a hung
+# network when GNU timeout exists (absent on stock macOS — the prompt
+# suppression covers the common hang there).
+host_base_freshness_check() {
+  local repo="$1"
+  [ -n "$repo" ] || return 0
+  git -C "$repo" remote get-url origin >/dev/null 2>&1 || return 0
+  local branch
+  branch="$(git -C "$repo" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+  if [ -z "$branch" ] || [ "$branch" = "HEAD" ]; then
+    return 0
+  fi
+  local upstream
+  upstream="$(git -C "$repo" rev-parse --abbrev-ref --symbolic-full-name \
+              "@{u}" 2>/dev/null || true)"
+  if [ -z "$upstream" ]; then
+    if git -C "$repo" show-ref --verify --quiet \
+        "refs/remotes/origin/$branch"; then
+      upstream="origin/$branch"
+    else
+      return 0
+    fi
+  fi
+  local remote_name="${upstream%%/*}"
+  local remote_branch="${upstream#*/}"
+  local _fetch_rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    GIT_TERMINAL_PROMPT=0 timeout 30 git -C "$repo" fetch --quiet \
+        "$remote_name" "$remote_branch" >/dev/null 2>&1 || _fetch_rc=$?
+  else
+    GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet \
+        "$remote_name" "$remote_branch" >/dev/null 2>&1 || _fetch_rc=$?
+  fi
+  if [ "$_fetch_rc" -ne 0 ]; then
+    echo "leerie: warning: could not refresh $upstream (offline, or no" >&2
+    echo "  credentials for a non-interactive fetch); the freshness check" >&2
+    echo "  runs against the last-fetched state." >&2
+  fi
+  local head_sha up_sha
+  head_sha="$(git -C "$repo" rev-parse HEAD 2>/dev/null || true)"
+  up_sha="$(git -C "$repo" rev-parse "$upstream" 2>/dev/null || true)"
+  if [ -z "$head_sha" ] || [ -z "$up_sha" ] \
+     || [ "$head_sha" = "$up_sha" ]; then
+    return 0
+  fi
+  if git -C "$repo" merge-base --is-ancestor "$head_sha" "$up_sha" \
+      2>/dev/null; then
+    local behind
+    behind="$(git -C "$repo" rev-list --count \
+              "${head_sha}..${up_sha}" 2>/dev/null || echo '?')"
+    echo "leerie: error: your checkout ($branch) is $behind commit(s) BEHIND $upstream." >&2
+    echo "  A fresh run plans against the tree it sees. Started on a stale base, it" >&2
+    echo "  re-solves work that already merged — and its finalize rebase can land the" >&2
+    echo "  older solution OVER the newer one (measured: a re-run started one minute" >&2
+    echo "  after its predecessor's PR merged, before the local pull, and regressed" >&2
+    echo "  that PR's fix). Pull first:" >&2
+    echo "    git -C $repo pull --ff-only" >&2
+    echo "  Or, to deliberately run on this older base:" >&2
+    echo "    LEERIE_SKIP_FRESHNESS_CHECK=1 ./leerie ..." >&2
+    return 1
+  fi
+  return 0
+}
+
 host_finalize() {
   local run_dir="$1"
   if [ -z "$run_dir" ] || [ ! -d "$run_dir" ]; then
