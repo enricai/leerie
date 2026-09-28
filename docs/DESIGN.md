@@ -6404,7 +6404,18 @@ on any delta — same discipline as `check_rebaser_worktree_state` (trust the
 worker, then mechanically re-check the claim), run per-phase so it fires
 within one worker of the damage. Untracked files are compared deliberately,
 since a worker *creating* files is exactly what a clean-tree `??`-filtered
-gate cannot see.
+gate cannot see. The die message classifies the delta signature
+mechanically: when every delta is a newly-appeared untracked file, the
+likely cause is the *operator* dropping task/report files into the
+checkout for another run while this one executes (measured: a run died
+mid-phase-5 over exactly one untracked report `.md` the operator had just
+created for the next run, and the operator then re-ran from scratch —
+a full replan — because the message blamed a worker escape and framed
+resume behind a restore step). The run still stops either way — its
+baseline moved — but the operator-signature message leads with
+`resume` and says no restore is needed if the files are the operator's
+own; any tracked-file, HEAD, or ref delta keeps the full worker-escape
+framing.
 
 This does **not** achieve kernel-level confinement: `/work` is a read-write
 bind mount in the same container for the whole run, and nothing short of a

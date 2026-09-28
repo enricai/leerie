@@ -7490,6 +7490,20 @@ def _diff_repo_state(before: dict, after: dict, *,
     return out
 
 
+def _tripwire_operator_overlap(deltas: list[str]) -> bool:
+    """True when EVERY delta is a newly-appeared untracked file (porcelain
+    `??`) — the measured signature of the operator dropping task/report
+    files into the checkout for another run while this one executes, not
+    of a worker escape (the measured overlap incident added exactly one
+    untracked report `.md`; escapes show tracked-file modifications).
+    Mechanical string comparison on `_diff_repo_state`'s fixed delta
+    prefixes and git porcelain codes only — never on prose. Deliberately
+    narrow: any tracked-file delta, HEAD move, or ref delta returns False
+    and keeps the full worker-escape framing (DESIGN §12 L4)."""
+    return bool(deltas) and all(
+        d.startswith("working tree changed: ?? ") for d in deltas)
+
+
 async def _assert_repo_unchanged(st: "State", phase: str, *,
                                  porcelain_only: bool = False) -> None:
     """The §12 guarantee: verify no worker has touched the user's checkout.
@@ -7529,6 +7543,24 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
     deltas = _diff_repo_state(before, after, porcelain_only=porcelain_only)
     if not deltas:
         return
+    if _tripwire_operator_overlap(deltas):
+        # Same stop, different framing: the measured cost of blaming a
+        # worker escape here was a from-scratch re-run (full replan)
+        # because the message put resume behind a restore step the
+        # operator's own files never needed (DESIGN §12 L4).
+        die("your real checkout changed during " + phase + ".\n  "
+            + "\n  ".join(deltas)
+            + "\n\nEvery delta above is a newly-added untracked file — the "
+              "signature of operator activity in this checkout (dropping a "
+              "task or report file for another run) rather than a worker "
+              "escape, which shows up as tracked-file modifications. The "
+              "run still stops, because its planning baseline moved. If "
+              "those files are yours, no restore is needed — resume "
+              "directly:\n"
+              f"  ./leerie resume {st.run_id}\n"
+            "If they are NOT yours, treat this as an escape:\n"
+            f"  git -C {st.repo_root} status\n"
+            f"  git -C {st.repo_root} clean -i")
     die("a worker modified your real checkout during " + phase + ".\n  "
         + "\n  ".join(deltas)
         + "\n\nleerie runs judgment workers in a disposable worktree "
