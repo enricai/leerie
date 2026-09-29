@@ -532,9 +532,9 @@ def test_judge_turn_budget_scales_with_item_count(
     """min(30 + 6*items, 90), asserted on the value claude_p RECEIVES by
     executing the real prejudge — not by reading source. A fixed
     max_turns=30 was measured crashing all four live judge attempts at
-    turns=31 on a 9-item list (2026-09-29, both v0.32.1 runs), skipping
-    the gate in exactly the runs where a bench replay of the same
-    payload flags an item unmet."""
+    turns=31 (2026-09-29, both v0.32.1 runs, 9- and 6-item lists),
+    skipping the gate in a run where a bench replay of the same payload
+    flags an item unmet."""
     items = [{"item": f"required item {i}", "source_ref": "task"}
              for i in range(n_items)]
     st, run_dir = _state(leerie, tmp_path, required_items=items)

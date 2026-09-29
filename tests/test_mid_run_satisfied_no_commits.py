@@ -105,10 +105,11 @@ def test_satisfied_on_head_returns_drop_record(leerie, tmp_path, monkeypatch):
     assert seen["cwd"] == str(tmp_path / "wt")
     assert seen["sid"] == "satisfied_probe-head-test-003"
     # The HEAD-probe's own larger budget, not the pre-schedule probe's 20:
-    # this site audits a whole integrated tree, and the shared cap of 20
-    # was measured killing a run (both rescue attempts died at turns=21 on
-    # a genuine no-op, 2026-09-29 — DESIGN §8). Asserted on the value
-    # claude_p RECEIVES, executing the real helper.
+    # this site audits a whole integrated tree, and the previously
+    # identical cap of 20 was measured killing a run (all six HEAD-probe
+    # attempts for a genuine no-op — two pre-spawn, four rescue — died at
+    # turns=21, 2026-09-29 — DESIGN §8). Asserted on the value claude_p
+    # RECEIVES, executing the real helper.
     assert seen["max_turns"] == 40
 
 
