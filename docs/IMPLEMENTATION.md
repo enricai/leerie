@@ -5255,14 +5255,14 @@ splitter 30, adherence_judge 30, classification_judge 30, wiring_judge 30,
 provision_judge 30, task_coverage_judge 30, integration_judge 30,
 no_work_judge 30 —
 matching every other read-only judgment verifier — with three
-exceptions whose verification surface is not one question:
-delivery_judge derives `min(30 + 6*len(items), 90)` (the workload
-scales with the required-items count — DESIGN §8 *The judge's turn
-budget scales with the item count*); the HEAD-probe helper
-`_probe_criteria_satisfied_on_head` carries 40 (a cap-out there had
-no recovery below the run level; the pre-schedule base-tree
-satisfied_probe keeps 20 — its cap-out is retried and at worst
-fail-safe-keeps the subtask); and defect_scope_auditor 40: its whole job is a wider
+exceptions: delivery_judge derives `min(30 + 6*len(items), 90)`
+(its workload scales with the required-items count — DESIGN §8
+*The judge's turn budget scales with the item count*); the
+HEAD-probe helper `_probe_criteria_satisfied_on_head` carries 40
+(consequence-justified: a cap-out there had no recovery below the
+run level; the pre-schedule base-tree satisfied_probe keeps 20 —
+its cap-out is retried and at worst fail-safe-keeps the subtask);
+and defect_scope_auditor 40: its whole job is a wider
 enumeration pass over potentially very large files. For
 the implementer, 120 turns and 90 minutes both apply — whichever trips
 first. The conformer cap is lower than the implementer's because its

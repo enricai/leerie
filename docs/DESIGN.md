@@ -5211,10 +5211,11 @@ balloons the cost, at either site, is a criterion that is met or
 audit-shaped on the judged tree, because a probe cannot say
 "satisfied" without verifying every part. Measured in one run: the
 pre-schedule sweep's confirming probes ran 14–21 turns, two of
-twelve first attempts died at the cap and were recovered by
-`claude_p`'s retry — while every HEAD-probe attempt for one genuine
-no-op subtask (two pre-spawn and four rescue attempts, six in all)
-died one turn over the same cap, and no rescue means
+twelve first attempts died at `error_max_turns` one turn over the
+cap and were recovered by `claude_p`'s retry — while every
+HEAD-probe attempt for one genuine no-op subtask (two pre-spawn and
+four rescue attempts, six in all) died the same way, and no rescue
+means
 retryable-failure, so the retry cap turned a correct no-op into
 `wave has unresolved subtasks`. The asymmetric caps are therefore
 justified by CONSEQUENCE, not workload shape: a HEAD-probe cap-out
