@@ -1251,8 +1251,9 @@ enforcement, and `_filter_provably_false_wiring_defects` predicate 2
 treating an `equivalent_coverage` drop's tags as satisfied-on-base.
 The same file pins the pre-schedule probe's `max_turns=20` on the
 executed filter — the converse of the HEAD-probe's 40 pinned in
-`tests/test_mid_run_satisfied_no_commits.py` (DESIGN §8: the two
-sites verify different-sized things), so the deliberate asymmetry
+`tests/test_mid_run_satisfied_no_commits.py` (DESIGN §8: the
+asymmetric caps are consequence-justified — a HEAD-probe cap-out
+had no recovery below the run level), so the deliberate asymmetry
 cannot silently collapse in either direction.
 
 ### Planning checkpoints: snapshot, decompose-crash barrier, schedule determinism

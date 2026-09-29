@@ -5202,19 +5202,27 @@ trade: the further past ten items a list runs, the further the
 budget falls behind the measured pace, so a long list (roughly a
 dozen items and beyond) can again exhaust the cap and skip the gate
 — an accepted, bounded residual, preferred over an uncapped budget.
-The same rule holds for the post-execution
-HEAD-probe rescue (§ *satisfied-probe* below): its workload is the
-whole integrated diff it audits, not the single criterion the
-pre-schedule probe checks, and the same fixed-cap failure killed a run
-outright (every HEAD-probe attempt for one genuine no-op subtask —
-two pre-spawn and four rescue attempts, six in all — died one turn
-over the cap; its audit surface was the run's full diff; no rescue
-means retryable-failure, and the retry cap turned a correct no-op
-into `wave has unresolved subtasks`). The HEAD-probe helper (serving
-the rescue and the provider-subset pre-spawn check — both judge real
-integrated trees) carries its own larger fixed cap; the pre-schedule
-base-tree probe keeps the small one — the sites verify
-different-sized things, and sizing them identically was the defect.
+The same failure hit the satisfied-probe
+(§ *satisfied-probe* below). Both of its call sites judge the same
+single criterion (the HEAD-probe helper — serving the no-commit
+rescue and the provider-subset pre-spawn check — sends the same one
+`success_criteria_seed` payload the pre-schedule probe sends); what
+balloons the cost, at either site, is a criterion that is met or
+audit-shaped on the judged tree, because a probe cannot say
+"satisfied" without verifying every part. Measured in one run: the
+pre-schedule sweep's confirming probes ran 14–21 turns, two of
+twelve first attempts died at the cap and were recovered by
+`claude_p`'s retry — while every HEAD-probe attempt for one genuine
+no-op subtask (two pre-spawn and four rescue attempts, six in all)
+died one turn over the same cap, and no rescue means
+retryable-failure, so the retry cap turned a correct no-op into
+`wave has unresolved subtasks`. The asymmetric caps are therefore
+justified by CONSEQUENCE, not workload shape: a HEAD-probe cap-out
+had no recovery below the run level, so that helper carries the
+larger cap; a pre-schedule cap-out is retried, and a double cap-out
+merely fail-safe-keeps the subtask — one wasted implementer round
+whose resulting no-op then lands on the larger-capped rescue — so
+the small cap stays acceptable there.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,

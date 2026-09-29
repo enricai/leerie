@@ -339,8 +339,9 @@ def test_pre_schedule_probe_keeps_the_small_turn_cap(
         leerie, tmp_path, monkeypatch):
     """The pre-schedule base-tree probe keeps max_turns=20 while the
     HEAD-probe helper carries 40 (pinned in
-    test_mid_run_satisfied_no_commits.py): the sites verify
-    different-sized things, and sizing them identically was a measured
+    test_mid_run_satisfied_no_commits.py): the asymmetric caps are
+    consequence-justified — a HEAD-probe cap-out had no recovery below
+    the run level, and sizing them identically was a measured
     run-killer (2026-09-29 — DESIGN §8). Asserted on the value claude_p
     RECEIVES by executing the real filter; the converse pin exists so
     the asymmetry cannot silently collapse in either direction."""

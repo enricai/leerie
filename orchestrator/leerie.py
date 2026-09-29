@@ -12669,17 +12669,21 @@ async def _probe_criteria_satisfied_on_head(
             user_prompt=user_prompt,
             system_prompt=_load_prompt("satisfied_probe"),
             schema_key="satisfied_probe", cwd=worktree,
-            # 40, not the pre-schedule probe's 20: this site's audit
-            # surface is the whole integrated diff plus whatever repo
-            # sweep the criteria demand, not one seed on the base tree.
-            # Sizing the two sites identically was a measured run-killer:
-            # every HEAD-probe attempt for a genuine no-op (an
-            # audit-shaped subtask whose implementer correctly committed
-            # nothing) — two pre-spawn and four rescue attempts — died at
-            # error_max_turns turns=21, the fail-safe declined to rescue,
-            # and the retry cap turned a correct no-op into "wave has
-            # unresolved subtasks" (DESIGN §8 *The judge's turn budget
-            # scales with the item count*).
+            # 40, not the pre-schedule probe's 20 — justified by
+            # consequence, not workload shape: both sites judge the same
+            # single criterion, and either can exhaust its cap when the
+            # criterion is met or audit-shaped on the judged tree
+            # (confirming costs a verify-every-part pass). A cap-out HERE
+            # had no recovery below the run level: every HEAD-probe
+            # attempt for a genuine no-op (an audit-shaped subtask whose
+            # implementer correctly committed nothing) — two pre-spawn
+            # and four rescue attempts — died at error_max_turns
+            # turns=21, the fail-safe declined to rescue, and the retry
+            # cap turned a correct no-op into "wave has unresolved
+            # subtasks". A pre-schedule cap-out, by contrast, is retried
+            # and at worst fail-safe-keeps the subtask, whose no-op then
+            # lands back on this larger-capped site (DESIGN §8 *The
+            # judge's turn budget scales with the item count*).
             allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=40,
             autonomous=False, caps=caps, st=st,
             model=models["satisfied_probe"],
