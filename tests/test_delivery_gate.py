@@ -515,3 +515,33 @@ class TestWiring:
         assert leerie.EFFORT_DEFAULT_PER_WORKER["delivery_judge"] == "medium"
         assert "delivery_judge" not in leerie.TIMEOUT_DEFAULT_PER_WORKER
         assert "delivery_judge" in leerie.SCHEMAS
+
+
+# === turn budget scales with item count (measured incident) ================
+
+@pytest.mark.parametrize("n_items,expected_turns", [
+    # Disagreeing values on purpose: a bypass that hardcodes any one
+    # number fails the other two params (CLAUDE.md: parametrized value
+    # tests make inputs disagree).
+    (1, 36),    # floor region: base 30 + 6
+    (9, 84),    # the measured live incident's item count
+    (20, 90),   # ceiling: 30 + 120 clamps to 90
+])
+def test_judge_turn_budget_scales_with_item_count(
+        leerie, tmp_path, monkeypatch, n_items, expected_turns):
+    """min(30 + 6*items, 90), asserted on the value claude_p RECEIVES by
+    executing the real prejudge — not by reading source. A fixed
+    max_turns=30 was measured crashing all four live judge attempts at
+    turns=31 on a 9-item list (2026-09-29, both v0.32.1 runs), skipping
+    the gate in exactly the runs where a bench replay of the same
+    payload flags an item unmet."""
+    items = [{"item": f"required item {i}", "source_ref": "task"}
+             for i in range(n_items)]
+    st, run_dir = _state(leerie, tmp_path, required_items=items)
+    calls = _patch_judge(
+        leerie, monkeypatch, [_verdicts(*([True] * n_items))])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert unmet == []
+    assert len(calls) == 1
+    assert calls[0]["max_turns"] == expected_turns

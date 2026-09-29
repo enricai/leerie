@@ -5184,6 +5184,31 @@ residual). One flag governs required-items checking on both sides:
 judge and this gate alike. A run whose classifier extracted no
 `required_items` pays nothing.
 
+**The judge's turn budget scales with the item count.** A verifier's
+workload is proportional to what it verifies, and a fixed cap converts
+a thorough judge into a crashed one: measured on the gate's first two
+outings against a 9-item list (one task, 2026-09-29), all four judge
+attempts across both runs died at `error_max_turns` one turn over the
+fixed cap, mid-list, while verifying conscientiously — so the gate
+whose whole purpose is catching an unmet item was skipped (advisory)
+in exactly the runs where a bench replay of the same payload flags an
+item unmet. The budget is therefore derived per call — a base for
+setup plus a measured per-item allowance (the live traces show ~5–6
+turns per item in the thorough style; an efficient batched style
+finishes far under the base) — bounded above so a pathological item
+list cannot run away. The same rule holds for the post-execution
+HEAD-probe rescue (§ *satisfied-probe* below): its workload is the
+whole integrated diff it audits, not the single criterion the
+pre-schedule probe checks, and the same fixed-cap failure killed a run
+outright (both rescue attempts died one turn over the cap on a
+genuine no-op whose audit surface was the run's full diff; no rescue
+means retryable-failure, and the retry cap turned a correct no-op
+into `wave has unresolved subtasks`). The HEAD-probe helper (serving
+the rescue and the provider-subset pre-spawn check — both judge real
+integrated trees) carries its own larger fixed cap; the pre-schedule
+base-tree probe keeps the small one — the sites verify
+different-sized things, and sizing them identically was the defect.
+
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
 classification-gate, reconciler, provision, overlap-judge, and integrator

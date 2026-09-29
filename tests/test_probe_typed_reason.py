@@ -329,3 +329,33 @@ def test_wiring_falsifier_treats_equivalent_coverage_as_satisfied(leerie):
         plans, defects, dropped)
     assert surviving == []
     assert notes  # the discard is explained, not silent
+
+
+# ---------------------------------------------------------------------------
+# asymmetric turn caps (DESIGN §8) — pre-schedule stays 20, HEAD-probe is 40
+# ---------------------------------------------------------------------------
+
+def test_pre_schedule_probe_keeps_the_small_turn_cap(
+        leerie, tmp_path, monkeypatch):
+    """The pre-schedule base-tree probe keeps max_turns=20 while the
+    HEAD-probe helper carries 40 (pinned in
+    test_mid_run_satisfied_no_commits.py): the sites verify
+    different-sized things, and sizing them identically was a measured
+    run-killer (2026-09-29 — DESIGN §8). Asserted on the value claude_p
+    RECEIVES by executing the real filter; the converse pin exists so
+    the asymmetry cannot silently collapse in either direction."""
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "d", "status": "ready",
+              "subtasks": [_sub("feat-001")]}]
+    seen: dict = {}
+
+    async def fake_claude_p(*, user_prompt, sid, **_kw):
+        seen["max_turns"] = _kw.get("max_turns")
+        return {"satisfied": False, "evidence": "missing"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    _run(leerie._filter_satisfied_subtasks(
+        plans, repo, st, _CAPS, _MODELS, _EFFORTS))
+    assert seen["max_turns"] == 20
