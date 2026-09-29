@@ -1578,11 +1578,14 @@ _TIMEOUT_RETRY_MAX = 1
 TIMEOUT_DEFAULT_PER_WORKER: dict[str, int] = {
     "fit_judge": 1875,             # p99 624.8
     # satisfied_probe's corpus predates the HEAD-probe's 40-turn cap
-    # (every measured call ran under the shared 20): linearly scaled to
-    # 40 turns, p99 ≈ 1236 still fits, but the corpus-max pace (~52.6
-    # s/turn) would hit this wall clock near turn 35 — failing safe (a
-    # timeout declines a rescue exactly like a turn-cap death). Re-derive
-    # this entry once a 40-turn HEAD-probe corpus exists.
+    # (every measured call ran capped at 20; per-call turn counts were
+    # not recorded). The corpus max implies AT LEAST ~52.6 s/turn
+    # (1051.0 / the 20-turn cap — a call that used fewer turns ran
+    # slower per turn), so at that pace or worse the wall clock bites by
+    # turn ~35 or earlier, and the linearly scaled p99 (~1236 s) fits
+    # only under the same all-20-turns assumption. Either way it fails
+    # safe (a timeout declines a rescue exactly like a turn-cap death).
+    # Re-derive this entry once a 40-turn HEAD-probe corpus exists.
     "satisfied_probe": 1854,       # p99 617.9
     "classifier": 1236,            # p99 411.7
     "splitter": 1992,              # p99 663.7
@@ -31248,11 +31251,12 @@ async def _delivery_judge_unmet(
     # with the item count*). 30 is the setup base — the gate never runs
     # on an empty list, so the smallest real budget is 36 at one item,
     # above the old fixed 30; 6/item is the measured thorough-style
-    # allowance (~5-6 turns/item in the live traces). The 90 ceiling is
-    # reached at 10 items; past that the per-item allowance shrinks
-    # (~4.5 turns/item at 20 items, below the measured rate around ~14),
-    # so a very long list can again exhaust the cap and skip the gate —
-    # an accepted, bounded residual, preferred over an uncapped budget.
+    # allowance (~5-6 total turns per item in the live traces). The 90
+    # ceiling is reached at 10 items; past that the whole budget shrinks
+    # per item on the same total-turns basis (90/15 = 6.0, 90/20 = 4.5 —
+    # below the measured 5-6 band from about fifteen items), so a very
+    # long list can again exhaust the cap and skip the gate — an
+    # accepted, bounded residual, preferred over an uncapped budget.
     judge_max_turns = min(30 + 6 * len(numbered), 90)
 
     async def _sample(k: int) -> dict:
