@@ -1577,6 +1577,12 @@ _TIMEOUT_RETRY_MAX = 1
 
 TIMEOUT_DEFAULT_PER_WORKER: dict[str, int] = {
     "fit_judge": 1875,             # p99 624.8
+    # satisfied_probe's corpus predates the HEAD-probe's 40-turn cap
+    # (every measured call ran under the shared 20): linearly scaled to
+    # 40 turns, p99 ≈ 1236 still fits, but the corpus-max pace (~52.6
+    # s/turn) would hit this wall clock near turn 35 — failing safe (a
+    # timeout declines a rescue exactly like a turn-cap death). Re-derive
+    # this entry once a 40-turn HEAD-probe corpus exists.
     "satisfied_probe": 1854,       # p99 617.9
     "classifier": 1236,            # p99 411.7
     "splitter": 1992,              # p99 663.7
@@ -31239,10 +31245,14 @@ async def _delivery_judge_unmet(
     # 6-item lists) died at error_max_turns (turns=31) mid-list, and the
     # gate was skipped in a run where a bench replay of the same payload
     # flags an item unmet (DESIGN §8 *The judge's turn budget scales
-    # with the item count*). Base 30 keeps small lists at the prior
-    # budget; 6/item is the measured thorough-style allowance (~5-6
-    # turns/item in the live traces); the ceiling bounds a pathological
-    # item list.
+    # with the item count*). 30 is the setup base — the gate never runs
+    # on an empty list, so the smallest real budget is 36 at one item,
+    # above the old fixed 30; 6/item is the measured thorough-style
+    # allowance (~5-6 turns/item in the live traces). The 90 ceiling is
+    # reached at 10 items; past that the per-item allowance shrinks
+    # (~4.5 turns/item at 20 items, below the measured rate around ~14),
+    # so a very long list can again exhaust the cap and skip the gate —
+    # an accepted, bounded residual, preferred over an uncapped budget.
     judge_max_turns = min(30 + 6 * len(numbered), 90)
 
     async def _sample(k: int) -> dict:

@@ -521,11 +521,12 @@ class TestWiring:
 
 @pytest.mark.parametrize("n_items,expected_turns", [
     # Disagreeing values on purpose: a bypass that hardcodes any one
-    # number fails the other two params (CLAUDE.md: parametrized value
+    # number fails the other params (CLAUDE.md: parametrized value
     # tests make inputs disagree).
-    (1, 36),    # floor region: base 30 + 6
-    (9, 84),    # the measured live incident's item count
-    (20, 90),   # ceiling: 30 + 120 clamps to 90
+    (1, 36),    # floor region: base 30 + 6 (smallest real list)
+    (9, 84),    # the measured live incident's larger item count
+    (11, 90),   # first clamped count: 30 + 66 = 96 clamps to 90
+    (20, 90),   # deep in the clamp: 30 + 120 clamps to 90
 ])
 def test_judge_turn_budget_scales_with_item_count(
         leerie, tmp_path, monkeypatch, n_items, expected_turns):

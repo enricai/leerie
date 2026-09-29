@@ -1249,6 +1249,11 @@ when the drop empties the plan), the cache round-trip (typed fields
 persist and replay the drop with zero re-probes), schema enum
 enforcement, and `_filter_provably_false_wiring_defects` predicate 2
 treating an `equivalent_coverage` drop's tags as satisfied-on-base.
+The same file pins the pre-schedule probe's `max_turns=20` on the
+executed filter — the converse of the HEAD-probe's 40 pinned in
+`tests/test_mid_run_satisfied_no_commits.py` (DESIGN §8: the two
+sites verify different-sized things), so the deliberate asymmetry
+cannot silently collapse in either direction.
 
 ### Planning checkpoints: snapshot, decompose-crash barrier, schedule determinism
 
@@ -3854,6 +3859,16 @@ always or never votes fails the count assertions); majority truth table
 executed recheck for both remedied and residual; both resume sentinels;
 the conformer section text (the routed VALUE); `_run_phases` ordering
 pins. Falsified live: flattening the majority threshold fails 3 tests.
+The judge's item-scaled turn budget (`min(30 + 6*items, 90)`,
+DESIGN §8 *The judge's turn budget scales with the item count*) is
+pinned by a parametrized consumer-executing test asserting the
+`max_turns` value `claude_p` RECEIVES for disagreeing item counts —
+1→36, 9→84 (the measured incident's larger list), 11→90 (the first
+clamped count), 20→90 — so a hardcoded bypass fails multiple params.
+The HEAD-probe/pre-schedule cap asymmetry is pinned from both sides:
+40 on the executed helper in
+`tests/test_mid_run_satisfied_no_commits.py`, 20 on the executed
+filter in `tests/test_probe_typed_reason.py`.
 
 **Defect-scope audit**, in `tests/test_defect_scope_audit.py`: the phase
 executed for the bug-fixing / not-applicable / crash / malformed-site

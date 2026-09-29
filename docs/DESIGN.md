@@ -5195,8 +5195,13 @@ in a run where a bench replay of the same payload flags an item
 unmet. The budget is therefore derived per call — a base for
 setup plus a measured per-item allowance (the live traces show ~5–6
 turns per item in the thorough style; an efficient batched style
-finishes far under the base) — bounded above so a pathological item
-list cannot run away. The same rule holds for the post-execution
+finishes far under the base) — with a ceiling, reached at ten items,
+so a runaway list cannot buy unbounded turns. The ceiling is an
+honest trade: past it the per-item allowance shrinks below the
+measured rate (around fourteen items and beyond), so a very long
+required-items list can again exhaust the cap and skip the gate —
+an accepted, bounded residual, preferred over an uncapped budget.
+The same rule holds for the post-execution
 HEAD-probe rescue (§ *satisfied-probe* below): its workload is the
 whole integrated diff it audits, not the single criterion the
 pre-schedule probe checks, and the same fixed-cap failure killed a run
