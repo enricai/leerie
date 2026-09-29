@@ -422,7 +422,8 @@ STATE_FIELDS = (
     "no_work_dispute",
     # defect_scope: the defect-scope audit's result on a defect-fix task
     # (DESIGN §5 *Defect-scope audit*): sites sharing the defective
-    # decision idiom + chokepoint verdict. Presence-keyed resume
+    # decision idiom — or, for an unconfirmed-cause report, the
+    # candidate mechanisms — + chokepoint verdict. Presence-keyed resume
     # checkpoint mirroring artifact_registry; injected into planner ctx
     # when applicable with non-empty sites.
     "defect_scope",

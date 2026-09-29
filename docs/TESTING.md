@@ -3875,7 +3875,10 @@ every component of the live worker path — free-form (3),
 real `_StrictOutputProxy` driven standalone (2), and a
 container-equivalent arm (image CLI version, credentials-only config,
 full worker argv) (2) — so no single component drives the decline
-(common-distribution likelihood ≈0.3%). The calibrated prompt
+(the best-fit shared rate makes the observed split's joint likelihood
+≈0.3%; an exact placement test — both declines landing in the 2 live
+slots of 15 trials, 1/C(15,2) — gives ≈1%; either way the split is
+not sampling noise). The calibrated prompt
 forecloses the carve-out reasoning by name; its one host replicate
 enumerated candidate-mechanism sites on the same input, but is
 NON-discriminating (the stock control also accepts on the host), so

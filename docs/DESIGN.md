@@ -274,7 +274,10 @@ subtask it tests). Three mechanisms reconcile that coupling:
   So when classification includes a defect-fix category, a read-only
   `defect_scope_auditor` runs once before planning: given the task and
   the base tree, it states the defect *shape* (the repeated
-  decision/idiom, not the symptom), enumerates every site implementing
+  decision/idiom, not the symptom — or, when the cause is not yet
+  diagnosed, the violated behavioral contract; see *The applicability
+  trigger includes unconfirmed-cause reports* below), enumerates every
+  site implementing
   that shape — decision sites, producers, consumers, and **bypasses**
   (the path that skips the shared logic entirely is historically the
   site the campaign never looks at) — and says whether a chokepoint
