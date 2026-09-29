@@ -5215,9 +5215,8 @@ twelve first attempts died at `error_max_turns` one turn over the
 cap and were recovered by `claude_p`'s retry — while every
 HEAD-probe attempt for one genuine no-op subtask (two pre-spawn and
 four rescue attempts, six in all) died the same way, and no rescue
-means
-retryable-failure, so the retry cap turned a correct no-op into
-`wave has unresolved subtasks`. The asymmetric caps are therefore
+means retryable-failure, so the retry cap turned a correct no-op
+into `wave has unresolved subtasks`. The asymmetric caps are therefore
 justified by CONSEQUENCE, not workload shape: a HEAD-probe cap-out
 had no recovery below the run level, so that helper carries the
 larger cap; a pre-schedule cap-out is retried, and a double cap-out
