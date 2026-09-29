@@ -31238,10 +31238,11 @@ async def _delivery_judge_unmet(
     # four live attempts across the gate's first two outings (9- and
     # 6-item lists) died at error_max_turns (turns=31) mid-list, and the
     # gate was skipped in a run where a bench replay of the same payload
-    # flags an item unmet (DESIGN §8 *The judge's turn budget scales with
-    # the item count*). Base 30 keeps small lists at the prior budget; 6/item is
-    # the measured thorough-style allowance (~5-6 turns/item in the live
-    # traces); the ceiling bounds a pathological item list.
+    # flags an item unmet (DESIGN §8 *The judge's turn budget scales
+    # with the item count*). Base 30 keeps small lists at the prior
+    # budget; 6/item is the measured thorough-style allowance (~5-6
+    # turns/item in the live traces); the ceiling bounds a pathological
+    # item list.
     judge_max_turns = min(30 + 6 * len(numbered), 90)
 
     async def _sample(k: int) -> dict:

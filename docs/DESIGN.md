@@ -5191,8 +5191,8 @@ outings (one task, 2026-09-29, 9- and 6-item lists), all four judge
 attempts across both runs died at `error_max_turns` one turn over the
 fixed cap, mid-list, while verifying conscientiously — so the gate
 whose whole purpose is catching an unmet item was skipped (advisory)
-in exactly the runs where a bench replay of the same payload flags an
-item unmet. The budget is therefore derived per call — a base for
+in a run where a bench replay of the same payload flags an item
+unmet. The budget is therefore derived per call — a base for
 setup plus a measured per-item allowance (the live traces show ~5–6
 turns per item in the thorough style; an efficient batched style
 finishes far under the base) — bounded above so a pathological item
