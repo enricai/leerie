@@ -5187,7 +5187,7 @@ judge and this gate alike. A run whose classifier extracted no
 **The judge's turn budget scales with the item count.** A verifier's
 workload is proportional to what it verifies, and a fixed cap converts
 a thorough judge into a crashed one: measured on the gate's first two
-outings against a 9-item list (one task, 2026-09-29), all four judge
+outings (one task, 2026-09-29, 9- and 6-item lists), all four judge
 attempts across both runs died at `error_max_turns` one turn over the
 fixed cap, mid-list, while verifying conscientiously — so the gate
 whose whole purpose is catching an unmet item was skipped (advisory)
@@ -5200,8 +5200,9 @@ list cannot run away. The same rule holds for the post-execution
 HEAD-probe rescue (§ *satisfied-probe* below): its workload is the
 whole integrated diff it audits, not the single criterion the
 pre-schedule probe checks, and the same fixed-cap failure killed a run
-outright (both rescue attempts died one turn over the cap on a
-genuine no-op whose audit surface was the run's full diff; no rescue
+outright (every HEAD-probe attempt for one genuine no-op subtask —
+two pre-spawn and four rescue attempts, six in all — died one turn
+over the cap; its audit surface was the run's full diff; no rescue
 means retryable-failure, and the retry cap turned a correct no-op
 into `wave has unresolved subtasks`). The HEAD-probe helper (serving
 the rescue and the provider-subset pre-spawn check — both judge real

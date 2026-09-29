@@ -12664,12 +12664,13 @@ async def _probe_criteria_satisfied_on_head(
             # surface is the whole integrated diff plus whatever repo
             # sweep the criteria demand, not one seed on the base tree.
             # Sizing the two sites identically was a measured run-killer:
-            # both rescue attempts for a genuine no-op (an audit-shaped
-            # subtask whose implementer correctly committed nothing) died
-            # at error_max_turns turns=21, the fail-safe declined to
-            # rescue, and the retry cap turned a correct no-op into
-            # "wave has unresolved subtasks" (DESIGN §8 *The judge's turn
-            # budget scales with the item count*).
+            # every HEAD-probe attempt for a genuine no-op (an
+            # audit-shaped subtask whose implementer correctly committed
+            # nothing) — two pre-spawn and four rescue attempts — died at
+            # error_max_turns turns=21, the fail-safe declined to rescue,
+            # and the retry cap turned a correct no-op into "wave has
+            # unresolved subtasks" (DESIGN §8 *The judge's turn budget
+            # scales with the item count*).
             allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=40,
             autonomous=False, caps=caps, st=st,
             model=models["satisfied_probe"],
@@ -31234,11 +31235,11 @@ async def _delivery_judge_unmet(
 
     # The verifier's workload scales with the item count, so a fixed cap
     # converts a thorough judge into a crashed one: with max_turns=30, all
-    # four live attempts across the gate's first two 9-item outings died
-    # at error_max_turns (turns=31) mid-list, and the gate was skipped in
-    # exactly the runs where a bench replay of the same payload flags an
-    # item unmet (DESIGN §8 *The judge's turn budget scales with the item
-    # count*). Base 30 keeps small lists at the prior budget; 6/item is
+    # four live attempts across the gate's first two outings (9- and
+    # 6-item lists) died at error_max_turns (turns=31) mid-list, and the
+    # gate was skipped in a run where a bench replay of the same payload
+    # flags an item unmet (DESIGN §8 *The judge's turn budget scales with
+    # the item count*). Base 30 keeps small lists at the prior budget; 6/item is
     # the measured thorough-style allowance (~5-6 turns/item in the live
     # traces); the ceiling bounds a pathological item list.
     judge_max_turns = min(30 + 6 * len(numbered), 90)
