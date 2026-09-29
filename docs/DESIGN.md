@@ -5192,15 +5192,16 @@ attempts across both runs died at `error_max_turns` one turn over the
 fixed cap, mid-list, while verifying conscientiously — so the gate
 whose whole purpose is catching an unmet item was skipped (advisory)
 in a run where a bench replay of the same payload flags an item
-unmet. The budget is therefore derived per call — a base for
-setup plus a measured per-item allowance (the live traces show ~5–6
-turns per item in the thorough style; an efficient batched style
-finishes far under the base) — with a ceiling, reached at ten items,
-so a runaway list cannot buy unbounded turns. The ceiling is an
-honest trade: past it the total budget per item shrinks below the
-measured per-item rate (from about fifteen items), so a very long
-required-items list can again exhaust the cap and skip the gate —
-an accepted, bounded residual, preferred over an uncapped budget.
+unmet. The budget is therefore derived per call — a setup base plus
+a per-item allowance approximating the measured thorough pace (the
+live traces show ~5–6 turns per item, measured as total turns over
+items covered at death; an efficient batched style finishes far
+under the base) — with a ceiling, which binds from ten items, so a
+runaway list cannot buy unbounded turns. The ceiling is an honest
+trade: the further past ten items a list runs, the further the
+budget falls behind the measured pace, so a long list (roughly a
+dozen items and beyond) can again exhaust the cap and skip the gate
+— an accepted, bounded residual, preferred over an uncapped budget.
 The same rule holds for the post-execution
 HEAD-probe rescue (§ *satisfied-probe* below): its workload is the
 whole integrated diff it audits, not the single criterion the

@@ -31250,13 +31250,15 @@ async def _delivery_judge_unmet(
     # flags an item unmet (DESIGN §8 *The judge's turn budget scales
     # with the item count*). 30 is the setup base — the gate never runs
     # on an empty list, so the smallest real budget is 36 at one item,
-    # above the old fixed 30; 6/item is the measured thorough-style
-    # allowance (~5-6 total turns per item in the live traces). The 90
-    # ceiling is reached at 10 items; past that the whole budget shrinks
-    # per item on the same total-turns basis (90/15 = 6.0, 90/20 = 4.5 —
-    # below the measured 5-6 band from about fifteen items), so a very
-    # long list can again exhaust the cap and skip the gate — an
-    # accepted, bounded residual, preferred over an uncapped budget.
+    # above the old fixed 30. 6/item approximates the measured thorough
+    # pace: the live traces show ~5-6 turns per item, measured as total
+    # turns over items covered at death (setup included), so treating it
+    # as a pure per-item allowance above the base errs generous at small
+    # counts. The 90 ceiling binds from 10 items; the further past that
+    # a list runs, the further the budget falls behind the measured
+    # pace, so a long list (roughly a dozen items and beyond) can again
+    # exhaust the cap and skip the gate — an accepted, bounded residual,
+    # preferred over an uncapped budget.
     judge_max_turns = min(30 + 6 * len(numbered), 90)
 
     async def _sample(k: int) -> dict:
