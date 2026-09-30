@@ -3881,7 +3881,14 @@ siblings/empty task), and the cross-run `prior_delivery_residual`
 planner-ctx injection driven through the REAL `phase_plan`
 (evidence text reaches the planner prompt verbatim; the common
 no-residual case carries no key), plus the planner-prompt
-documentation pin. The paid-but-empty audit's log line is pinned in
+documentation pin. Review-round arms in the same files: the
+crashed-newer-run SKIP (a rerun-after-crash must not hide the last
+finished residual), a recheck met-verdict superseding a pre-pass
+conflict, the `timeout`/env-prefixed digest arms (a dropped prefix
+turned a real execution into a confident false unmet), and the
+recheck call-site pin (`test_recheck_spawns_on_either_flagged_half`
+— the contract-only case's recheck was dead when the call site
+gated on the items list alone). The paid-but-empty audit's log line is pinned in
 `tests/test_defect_scope_audit.py` (executed phase, capsys).
 The judge's item-scaled turn budget (`min(30 + 6*items, 90)`,
 DESIGN §8 *The judge's turn budget scales with the item count*) is
