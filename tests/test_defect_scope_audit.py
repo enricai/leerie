@@ -253,3 +253,20 @@ class TestWiring:
                 == "medium")
         assert "defect_scope_auditor" not in leerie.TIMEOUT_DEFAULT_PER_WORKER
         assert "defect_scope_auditor" in leerie.SCHEMAS
+
+
+def test_applicable_with_zero_sites_names_itself(
+        leerie, tmp_path, monkeypatch, capsys):
+    """A paid-but-empty audit (applicable:true, zero enumerable sites)
+    was silent — measured live 2026-09-29 — while planners flew without
+    enumeration. Behavior is unchanged (nothing injectable); the
+    outcome must now log its own line."""
+    st = _state(leerie, tmp_path)
+    _patch_auditor(leerie, monkeypatch,
+                   {"applicable": True, "defect_shape": "the contract",
+                    "sites": []})
+    scope = asyncio.run(leerie.phase_defect_scope_audit(
+        "fix the bug", st, _caps(leerie), MODELS, EFFORTS))
+    assert scope["applicable"] is True and scope["sites"] == []
+    out = capsys.readouterr().out
+    assert "applicable but zero enumerable" in out

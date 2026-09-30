@@ -1,0 +1,244 @@
+"""Tests for the finding-level delivery gate's non-judge halves
+(DESIGN §8 *The gate judges the finding, not only the items* and
+*Execution-shaped items are judged from the run's own records*):
+`_executed_commands_digest`, `_prior_delivery_residual`, and the
+cross-run `prior_delivery_residual` planner-ctx injection.
+
+The judge-side contract flow (schema, escalation, majority, routing,
+recheck) lives in tests/test_delivery_gate.py with that file's
+existing harness. Coverage discipline as everywhere: execute the real
+consumer, assert the VALUE delivered.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+
+MODELS = {"planner": "sonnet", "fit_judge": "sonnet", "splitter": "sonnet"}
+EFFORTS = {"planner": "medium", "fit_judge": "medium", "splitter": "medium"}
+
+TASK = "fix the reported defect exactly as the report demands"
+
+
+# --- synthetic per-worker JSONL logs (the SDK shape _iter_log_tool_use
+# --- parses: message.content blocks, tool_result keyed by tool_use_id)
+
+def _log_line_use(uid, cmd):
+    return json.dumps({"message": {"content": [
+        {"type": "tool_use", "id": uid, "name": "Bash",
+         "input": {"command": cmd}}]}})
+
+
+def _log_line_result(uid, text):
+    return json.dumps({"message": {"content": [
+        {"type": "tool_result", "tool_use_id": uid, "content": text}]}})
+
+
+def _write_log(logs_dir, sid, pairs):
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    lines = []
+    for i, (cmd, result) in enumerate(pairs):
+        uid = f"{sid}-u{i}"
+        lines.append(_log_line_use(uid, cmd))
+        if result is not None:
+            lines.append(_log_line_result(uid, result))
+    (logs_dir / f"{sid}.log").write_text("\n".join(lines) + "\n")
+
+
+# === _executed_commands_digest =============================================
+
+def test_digest_extracts_blt_commands_with_result_tails(
+        leerie, tmp_path, monkeypatch):
+    """Substance: the digest carries the BLT command AND its verbatim
+    result tail; a non-BLT command is excluded."""
+    monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
+    _write_log(tmp_path / "logs", "bugfix-001", [
+        ("pnpm test src/x.test.ts", "Test Files  1 passed (1)"),
+        ("git status --short", "M src/x.ts"),
+    ])
+    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    assert "[bugfix-001] $ pnpm test src/x.test.ts" in d
+    assert "Test Files  1 passed (1)" in d
+    assert "git status" not in d
+
+
+def test_digest_no_result_and_missing_logs(leerie, tmp_path, monkeypatch):
+    monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
+    _write_log(tmp_path / "logs", "s1", [("pnpm typecheck", None)])
+    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    assert "(no result recorded)" in d
+    assert leerie._executed_commands_digest(
+        tmp_path / "absent", tmp_path) == ""
+
+
+def test_digest_empty_without_blt_verbs(leerie, tmp_path, monkeypatch):
+    """No declared BLT commands → no digest (the filter is the verbs;
+    without them everything or nothing would be arbitrary)."""
+    monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: [])
+    _write_log(tmp_path / "logs", "s1", [("pnpm test", "ok")])
+    assert leerie._executed_commands_digest(tmp_path, tmp_path) == ""
+
+
+def test_digest_entry_cap(leerie, tmp_path, monkeypatch):
+    monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
+    _write_log(tmp_path / "logs", "s1", [
+        (f"pnpm test f{i}.ts", "ok") for i in range(5)])
+    d = leerie._executed_commands_digest(tmp_path, tmp_path,
+                                         max_entries=2)
+    assert d.count("$ pnpm test") == 2
+
+
+# === _prior_delivery_residual ==============================================
+
+def _run_state(leerie, runs_root, run_id, task, gate=None,
+               mtime=None):
+    d = runs_root / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    data = {"task": task}
+    if gate is not None:
+        data["delivery_gate"] = gate
+    (d / "state.json").write_text(json.dumps(data))
+    if mtime is not None:
+        import os
+        os.utime(d, (mtime, mtime))
+    return d
+
+
+def _current(leerie, tmp_path, task=TASK):
+    leerie_root = tmp_path / ".leerie"
+    (leerie_root / "runs" / "current-run").mkdir(parents=True)
+    st = leerie.State(leerie_root, "current-run")
+    st.data = {"task": task}
+    return st
+
+
+RESIDUAL_GATE = {
+    "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
+    "samples_before": 3,
+    "unmet_after": [{"item_index": 0,
+                     "item": "the contract's second variant",
+                     "evidence": "site Y still fails the shape"}],
+    "samples_after": 3,
+}
+
+
+def test_prior_residual_found_from_newest_same_task_run(
+        leerie, tmp_path):
+    st = _current(leerie, tmp_path)
+    runs = st.run_dir.parent
+    _run_state(leerie, runs, "older-run", TASK, RESIDUAL_GATE,
+               mtime=1_000_000)
+    _run_state(leerie, runs, "other-task-run", "different task",
+               RESIDUAL_GATE, mtime=2_000_000)
+    r = leerie._prior_delivery_residual(st)
+    assert r is not None
+    assert r["run_id"].startswith("older-run")
+    assert r["unmet_after"][0]["evidence"] == \
+        "site Y still fails the shape"
+
+
+def test_prior_residual_newest_clean_run_stops_the_lookback(
+        leerie, tmp_path):
+    """A later run with a clean gate means the residual was resolved —
+    looking further back would resurrect stale steering."""
+    st = _current(leerie, tmp_path)
+    runs = st.run_dir.parent
+    _run_state(leerie, runs, "older-run", TASK, RESIDUAL_GATE,
+               mtime=1_000_000)
+    _run_state(leerie, runs, "newest-clean", TASK,
+               {"unmet_before": [], "samples_before": 1},
+               mtime=2_000_000)
+    assert leerie._prior_delivery_residual(st) is None
+
+
+def test_prior_residual_contract_unmet_and_conflict(leerie, tmp_path):
+    st = _current(leerie, tmp_path)
+    runs = st.run_dir.parent
+    _run_state(leerie, runs, "r1", TASK, {
+        "unmet_before": [], "samples_before": 3,
+        "contract_before": {"verdict": "unmet", "evidence": "gap"},
+        "unmet_after": [], "samples_after": 3,
+        "contract_after": {"verdict": "unmet",
+                           "evidence": "variant B still reproducible"},
+    }, mtime=1_000_000)
+    r = leerie._prior_delivery_residual(st)
+    assert r["contract_unmet"]["evidence"] == \
+        "variant B still reproducible"
+    # conflict is carried from contract_before (a conflict is never
+    # rechecked, so contract_after does not exist for it)
+    _run_state(leerie, runs, "r2", TASK, {
+        "unmet_before": [], "samples_before": 3,
+        "contract_before": {
+            "verdict": "conflict", "evidence": "both pinned",
+            "conflicting_contracts": ["contract A", "contract B"]},
+        "unmet_after": [], "samples_after": 1,
+    }, mtime=2_000_000)
+    r2 = leerie._prior_delivery_residual(st)
+    assert r2["contract_conflict"]["conflicting_contracts"] == \
+        ["contract A", "contract B"]
+
+
+def test_prior_residual_none_without_siblings_or_task(leerie, tmp_path):
+    st = _current(leerie, tmp_path)
+    assert leerie._prior_delivery_residual(st) is None
+    st.data["task"] = ""
+    assert leerie._prior_delivery_residual(st) is None
+
+
+# === planner ctx injection (executed through the real phase_plan) ==========
+
+def _drive_phase_plan(leerie, monkeypatch, st):
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return {"domain": "testing", "status": "ready", "subtasks": [],
+                "confidence": {"task_understanding": 9.0,
+                               "decomposition_quality": 9.0,
+                               "basis": "stub"}}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    asyncio.run(leerie.phase_plan(
+        "t", st, dict(leerie.DEFAULT_CAPS), MODELS, EFFORTS))
+    assert calls, "phase_plan never reached claude_p"
+    return calls
+
+
+def _plan_state(leerie, tmp_path, **overrides):
+    leerie_root = tmp_path / ".leerie"
+    (leerie_root / "runs" / "ctx-run").mkdir(parents=True)
+    st = leerie.State(leerie_root, "ctx-run")
+    st.data = {
+        "task": TASK,
+        "categories": ["testing"],
+        "classifier_questions": [],
+        "needs_source_of_truth": False,
+        "source_of_truth_pref": "both",
+        "skip_repo_map": True,
+    }
+    st.data.update(overrides)
+    return st
+
+
+def test_prior_residual_text_reaches_the_planner_prompt(
+        leerie, tmp_path, monkeypatch):
+    st = _plan_state(leerie, tmp_path)
+    _run_state(leerie, st.run_dir.parent, "prev-run", TASK,
+               RESIDUAL_GATE, mtime=1_000_000)
+    calls = _drive_phase_plan(leerie, monkeypatch, st)
+    prompt = calls[0].get("user_prompt") or ""
+    assert '"prior_delivery_residual"' in prompt
+    assert "site Y still fails the shape" in prompt
+
+
+def test_no_prior_residual_means_no_key(leerie, tmp_path, monkeypatch):
+    st = _plan_state(leerie, tmp_path)
+    calls = _drive_phase_plan(leerie, monkeypatch, st)
+    assert "prior_delivery_residual" not in (
+        calls[0].get("user_prompt") or "")
+
+
+def test_planner_prompt_documents_the_key(leerie):
+    text = leerie._load_prompt("planner")
+    assert "prior_delivery_residual" in text
+    assert "contract_conflict" in text or "conflict" in text

@@ -3860,6 +3860,29 @@ always or never votes fails the count assertions); majority truth table
 executed recheck for both remedied and residual; both resume sentinels;
 the conformer section text (the routed VALUE); `_run_phases` ordering
 pins. Falsified live: flattening the majority threshold fails 3 tests.
+The finding-level contract verdict (DESIGN §8 *The gate judges the
+finding, not only the items*) is covered by executed-gate arms in the
+same file: a flagged contract buys the 3-sample vote (count
+assertion) and the +12 budget allowance (54 at two items — a value
+the item-only params never produce); persistence of
+`contract_before`/`contract_after` with the winning sample's evidence
+VALUE; the 1-1-1 split failing open to met; conflict persisting both
+contracts and skipping the recheck; contract-only-unmet triggering
+the recheck; the formatter's DEFECT CONTRACT block carrying the
+evidence value; and the EXECUTED COMMANDS RECORD section reaching the
+judge's actual payload from a synthetic worker log.
+`tests/test_finding_level_gate.py` covers the non-judge halves:
+`_executed_commands_digest` (BLT-verb filter, verbatim result tails,
+no-result and missing-log arms, entry cap),
+`_prior_delivery_residual` (newest same-task run wins; a newer CLEAN
+same-task run stops the lookback rather than resurrecting a resolved
+residual; contract-unmet and contract-conflict record shapes; no
+siblings/empty task), and the cross-run `prior_delivery_residual`
+planner-ctx injection driven through the REAL `phase_plan`
+(evidence text reaches the planner prompt verbatim; the common
+no-residual case carries no key), plus the planner-prompt
+documentation pin. The paid-but-empty audit's log line is pinned in
+`tests/test_defect_scope_audit.py` (executed phase, capsys).
 The judge's item-scaled turn budget (`min(30 + 6*items, 90)`,
 DESIGN §8 *The judge's turn budget scales with the item count*) is
 pinned by a parametrized consumer-executing test asserting the

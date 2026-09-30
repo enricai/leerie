@@ -500,7 +500,10 @@ class TestWiring:
     def test_final_conformance_injects_the_section(self, leerie):
         src = inspect.getsource(leerie._run_final_conformance)
         assert "_format_unmet_required_items_section(" in src
-        assert "if unmet_required_items:" in src
+        # Routed on EITHER half: unmet items or an unmet contract
+        # (DESIGN §8 *The gate judges the finding, not only the items*).
+        assert ("if unmet_required_items or _contract_unmet is not None:"
+                in src)
 
     def test_unmet_list_is_actually_passed_through(self, leerie):
         """The prejudge result must reach _run_final_conformance — a
@@ -546,3 +549,157 @@ def test_judge_turn_budget_scales_with_item_count(
     assert unmet == []
     assert len(calls) == 1
     assert calls[0]["max_turns"] == expected_turns
+
+
+# === finding-level contract verdict (DESIGN §8 *The gate judges the
+# === finding, not only the items*) — executed through the real gate
+
+DEFECT_SCOPE = {
+    "applicable": True,
+    "defect_shape": "every matching record must be selected regardless "
+                    "of its position",
+    "sites": [{"file": "src/example_module.py",
+               "symbol": "merge_candidates", "role": "decision_site"}],
+}
+
+
+def _contract(verdict, evidence="residual at site", conflicts=None):
+    c = {"verdict": verdict, "evidence": evidence}
+    if conflicts is not None:
+        c["conflicting_contracts"] = conflicts
+    return c
+
+
+def test_contract_unmet_escalates_persists_and_budgets(
+        leerie, tmp_path, monkeypatch):
+    """Items all met but contract unmet on sample 0 → escalate to 3
+    samples; 2-of-3 unmet persists contract_before with the evidence
+    VALUE; the budget carries the +12 contract allowance
+    (2 items → 30+12+12 = 54, a value the item-only params never
+    produce)."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("unmet", "gap A")},
+        {**_verdicts(True, True), "contract": _contract("unmet", "gap B")},
+        {**_verdicts(True, True), "contract": _contract("met")},
+    ])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert unmet == []
+    assert len(calls) == 3, "a flagged contract must buy the vote"
+    assert calls[0]["max_turns"] == 54
+    gate = st.data["delivery_gate"]
+    assert gate["contract_before"]["verdict"] == "unmet"
+    # evidence comes from the LAST sample voting the winning verdict
+    assert gate["contract_before"]["evidence"] == "gap B"
+    assert "DEFECT CONTRACT" in calls[0]["user_prompt"]
+    assert DEFECT_SCOPE["defect_shape"] in calls[0]["user_prompt"]
+
+
+def test_contract_met_on_clean_first_pass_costs_one_sample(
+        leerie, tmp_path, monkeypatch):
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("met", "holds")}])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 1
+    assert st.data["delivery_gate"]["contract_before"]["verdict"] == "met"
+
+
+def test_no_defect_scope_means_no_contract_section_or_allowance(
+        leerie, tmp_path, monkeypatch):
+    st, run_dir = _state(leerie, tmp_path)
+    calls = _patch_judge(leerie, monkeypatch, [_verdicts(True, True)])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert "DEFECT CONTRACT" not in calls[0]["user_prompt"]
+    assert calls[0]["max_turns"] == 42  # 30 + 6*2, no +12
+    assert "contract_before" not in st.data["delivery_gate"]
+
+
+def test_contract_split_vote_fails_open_to_met(
+        leerie, tmp_path, monkeypatch):
+    """1-1-1 over {unmet, conflict, met} reaches no 2-of-3 → met,
+    mirroring the items' fail-open direction."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("unmet")},
+        {**_verdicts(True, True), "contract": _contract("conflict")},
+        {**_verdicts(True, True), "contract": _contract("met")},
+    ])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert st.data["delivery_gate"]["contract_before"]["verdict"] == "met"
+
+
+def test_contract_conflict_persists_both_contracts_and_skips_recheck(
+        leerie, tmp_path, monkeypatch):
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True),
+         "contract": _contract("conflict", "both pinned",
+                               ["contract A", "contract B"])},
+        {**_verdicts(True, True),
+         "contract": _contract("conflict", "both pinned",
+                               ["contract A", "contract B"])},
+        {**_verdicts(True, True), "contract": _contract("met")},
+    ])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    cb = st.data["delivery_gate"]["contract_before"]
+    assert cb["verdict"] == "conflict"
+    assert cb["conflicting_contracts"] == ["contract A", "contract B"]
+    # a conflict routes to the record, not the fix loop: the recheck
+    # must not spend judge samples on it
+    n_before = len(calls)
+    asyncio.run(leerie._run_delivery_recheck(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == n_before
+    assert "contract_after" not in st.data["delivery_gate"]
+
+
+def test_contract_only_unmet_triggers_recheck_and_records_after(
+        leerie, tmp_path, monkeypatch):
+    """No unmet ITEMS, but an unmet contract, must still buy the
+    post-conformer recheck; the remedied verdict lands in
+    contract_after."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    st.data["delivery_gate"] = {
+        "unmet_before": [], "samples_before": 3,
+        "contract_before": _contract("unmet", "gap")}
+    st.save()
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("met", "fixed")}])
+    asyncio.run(leerie._run_delivery_recheck(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 1
+    assert st.data["delivery_gate"]["contract_after"]["verdict"] == "met"
+
+
+def test_formatter_contract_block_carries_the_evidence_value(leerie):
+    text = leerie._format_unmet_required_items_section(
+        [], {"verdict": "unmet",
+             "evidence": "variant B of the contract still reproducible"})
+    assert "DEFECT CONTRACT" in text
+    assert "variant B of the contract still reproducible" in text
+
+
+def test_exec_digest_section_reaches_the_judge(
+        leerie, tmp_path, monkeypatch):
+    """The executed-commands record must be IN the payload the judge
+    receives, with the command text — value, not key."""
+    st, run_dir = _state(leerie, tmp_path)
+    monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
+    logs = run_dir / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "conformer-x.log").write_text(json.dumps({
+        "message": {"content": [
+            {"type": "tool_use", "id": "u1", "name": "Bash",
+             "input": {"command": "pnpm test src/a.test.ts"}}]}}) + "\n")
+    calls = _patch_judge(leerie, monkeypatch, [_verdicts(True, True)])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    up = calls[0]["user_prompt"]
+    assert "EXECUTED COMMANDS RECORD" in up
+    assert "pnpm test src/a.test.ts" in up

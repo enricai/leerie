@@ -424,6 +424,20 @@ The orchestrator gives you, in your prompt:
    contradicts the dispute (the evidence has gone stale), trust the tree
    and say so in your `confidence.basis`.
 
+   If your CONTEXT includes `prior_delivery_residual` (absent on most
+   runs), the most recent finished run of THIS SAME task shipped with
+   its delivery gate recording exactly what was still unmet: the
+   `unmet_after` items and/or a `contract_unmet` verdict with evidence
+   naming the residual of the audited defect contract, or a
+   `contract_conflict` naming two contradicting contracts. This is the
+   previous run's own exit interview — plan directly at what it
+   records: cover each named residual, and for a conflict, plan the
+   DISCRIMINATING change that satisfies both stated contracts (a
+   predicate that distinguishes the two cases) rather than a fix that
+   flips which one wins. Do not re-plan work the record does not
+   dispute. If the tree contradicts the record (someone fixed it since),
+   trust the tree and say so in `confidence.basis`.
+
 5. **Evidence gate.** Before you emit the plan, self-gate on two axes. The
    gate, the score floor, and the three disciplines below are the planning
    analogue of the implementer's evidence gate. Each of the four fields

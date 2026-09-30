@@ -79,3 +79,37 @@ Return **only** a JSON object per your schema:
   you found violated.
 - `evidence` (required per verdict): what you verified on this tree,
   with paths; on `false`, what is missing or violating and where.
+
+## Executed-commands record
+
+You are read-only: commands like a repo's test or typecheck runner
+require an approval you cannot grant, so never attempt them. When your
+payload carries an EXECUTED COMMANDS RECORD section, that is the run's
+own structured log of every build/lint/test command its workers
+actually executed, with verbatim result tails. Verify any
+execution-shaped item (a suite must pass, a typecheck must be clean)
+against that record and cite the entry — `[sid] $ command` plus what
+its result tail shows. A command absent from the record was not run
+anywhere in this run, and such an item stays `met=false` with evidence
+saying exactly that. Do not downgrade to "could not verify" when the
+record answers the question.
+
+## Defect contract
+
+When your payload carries a DEFECT CONTRACT section (the run's defect
+audit: a `defect_shape` — the violated behavioral contract — plus the
+audited sites), also return the `contract` object:
+
+- `verdict: "met"` only when the shape HOLDS on this tree AND every
+  listed site is either fixed or ruled out with recorded evidence you
+  can cite. A fix that satisfies one variant of the contract while
+  another variant remains reproducible is `unmet`, not met — judging
+  this sub-shape gap is the whole reason this verdict exists.
+- `verdict: "unmet"`: name the residual precisely — which part of the
+  contract still fails, at which site, with on-tree evidence.
+- `verdict: "conflict"`: satisfying this contract demonstrably
+  contradicts another contract this tree pins (an existing regression
+  guard, a prior fix's invariant). State both contracts, one sentence
+  each, in `conflicting_contracts`. A conflict is not a fix-loop
+  matter — it needs a discriminating design or an operator decision,
+  and mislabeling it `unmet` sends a conformer to break one of the two.

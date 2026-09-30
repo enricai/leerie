@@ -3014,6 +3014,29 @@ SCHEMAS: dict[str, dict] = {
                     },
                 },
             },
+            # Finding-level contract verdict (DESIGN §8 *The gate judges
+            # the finding, not only the items*). Present only when the
+            # payload carried a DEFECT CONTRACT section (the run had an
+            # applicable defect audit); the consumer treats an absent
+            # object on an asked call as a no-vote, never as met.
+            # "conflict" is the measured two-pinned-contracts shape —
+            # it routes to the operator record, not the fix loop.
+            "contract": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["verdict", "evidence"],
+                "properties": {
+                    "verdict": {"type": "string",
+                                "enum": ["met", "unmet", "conflict"]},
+                    "evidence": {"type": "string"},
+                    # For "conflict": the two contradicting contracts,
+                    # each stated in one sentence.
+                    "conflicting_contracts": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+            },
             "rationale": {"type": "string"},
         },
     },
@@ -21963,6 +21986,16 @@ async def phase_defect_scope_audit(
         return {"applicable": False}
     sites = [s for s in (result.get("sites") or [])
              if isinstance(s, dict) and s.get("file") and s.get("symbol")]
+    if not sites:
+        # applicable:true with nothing enumerable was silent (measured
+        # live, 2026-09-29: a run paid the audit, got zero sites, and
+        # planners flew without enumeration with no visible trace).
+        # Behavior unchanged — injection and the delivery gate's
+        # contract verdict both require non-empty sites — but the
+        # paid-but-empty outcome now names itself.
+        log("  defect-scope audit: applicable but zero enumerable "
+            "site(s) — planners run without enumeration, and the "
+            "delivery gate's contract verdict will not be asked")
     scope = {
         "applicable": True,
         "defect_shape": result.get("defect_shape") or "",
@@ -22167,6 +22200,13 @@ async def phase_plan(task: str, st: State, caps: dict,
     prescribed_procedure = st.data.get("prescribed_procedure") or {}
     if prescribed_procedure.get("is_prescribed"):
         ctx_dict["prescribed_procedure"] = prescribed_procedure
+    # Cross-run half of the finding-level delivery gate (DESIGN §8 *The
+    # gate judges the finding, not only the items*): the most recent
+    # finished same-task run's recorded residual steers this plan at
+    # the recorded gap. Omitted when there is none.
+    prior_residual = _prior_delivery_residual(st)
+    if prior_residual:
+        ctx_dict["prior_delivery_residual"] = prior_residual
     # PRIMARY floor for the task-coverage gate (DESIGN §8 sibling to the
     # instruction-adherence gate above): feed the classifier's
     # required_items checklist into the planner context so it can echo
@@ -31131,7 +31171,8 @@ async def _capture_conformance_baseline(
                                                "red_axes": []}})
 
 
-def _format_unmet_required_items_section(unmet: list[dict]) -> str:
+def _format_unmet_required_items_section(
+        unmet: list[dict], contract_unmet: dict | None = None) -> str:
     """The final-conformer prompt section that routes confirmed-unmet
     required items into the existing fix loop (DESIGN §8 *The delivery
     gate*). Pure, so the exact text the conformer receives is testable —
@@ -31149,6 +31190,15 @@ def _format_unmet_required_items_section(unmet: list[dict]) -> str:
         ev = (u.get("evidence") or "").strip()
         if ev:
             lines.append(f"    evidence: {ev}")
+    if contract_unmet is not None:
+        lines.append(
+            "  - [DEFECT CONTRACT] the run's audited defect contract is "
+            "confirmed unmet on this tree (DESIGN §8 *The gate judges "
+            "the finding, not only the items*) — remedy the residual it "
+            "names, at its site, alongside the items above:")
+        cev = (contract_unmet.get("evidence") or "").strip()
+        if cev:
+            lines.append(f"    evidence: {cev}")
     return "\n".join(lines)
 
 
@@ -31184,13 +31234,140 @@ def _delivery_unmet_majority(samples: list[dict], n_items: int) -> list[int]:
     return [i for i in range(n_items) if votes[i] >= threshold]
 
 
+def _prior_delivery_residual(st: "State") -> dict | None:
+    """The most recent OTHER run's recorded delivery-gate residual for
+    the SAME task, or None (DESIGN §8 *The gate judges the finding, not
+    only the items* — the cross-run half: a fresh run's planners plan
+    at the recorded gap instead of rediscovering it one sub-shape at a
+    time). Task match is exact string equality on the stored task text
+    (mechanical — Language-to-JSON forbids fuzzier matching here, and
+    the live loop shape is the operator re-running an unchanged task
+    file). Read-only over sibling run dirs, newest mtime first;
+    unreadable state files are skipped. Only FINISHED gate records
+    count: a residual means unmet_after non-empty or contract_after
+    unmet — an in-flight or crashed run's partial record must not
+    steer a fresh plan."""
+    task = (st.data.get("task") or "").strip()
+    if not task:
+        return None
+    runs_dir = st.run_dir.parent
+    candidates = []
+    try:
+        candidates = sorted(
+            (d for d in runs_dir.iterdir()
+             if d.is_dir() and d.name != st.run_dir.name),
+            key=lambda d: d.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for d in candidates:
+        try:
+            data = json.loads((d / "state.json").read_text())
+        except (OSError, ValueError):
+            continue
+        if (data.get("task") or "").strip() != task:
+            continue
+        gate = data.get("delivery_gate") or {}
+        unmet_after = gate.get("unmet_after") or []
+        contract_after = gate.get("contract_after") or {}
+        contract_conflict = (gate.get("contract_before") or {})
+        residual: dict = {}
+        if unmet_after:
+            residual["unmet_after"] = [
+                {"item": (u.get("item") or "")[:200],
+                 "evidence": (u.get("evidence") or "")[:400]}
+                for u in unmet_after[:3]]
+        if contract_after.get("verdict") == "unmet":
+            residual["contract_unmet"] = {
+                "evidence": (contract_after.get("evidence") or "")[:400]}
+        elif contract_conflict.get("verdict") == "conflict":
+            residual["contract_conflict"] = {
+                "conflicting_contracts": [
+                    str(x)[:200] for x in
+                    (contract_conflict.get("conflicting_contracts")
+                     or [])][:2],
+                "evidence": (contract_conflict.get("evidence")
+                             or "")[:400]}
+        if residual:
+            residual["run_id"] = d.name[:16]
+            return residual
+        # The newest same-task run had a gate with no residual (or no
+        # gate): nothing to steer with — and looking FURTHER back would
+        # resurrect a residual a later run already resolved.
+        return None
+    return None
+
+
+def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
+                              max_entries: int = 40,
+                              tail_chars: int = 300) -> str:
+    """The run's build/lint/test executions, extracted from per-worker
+    logs for the delivery judge (DESIGN §8 *Execution-shaped items are
+    judged from the run's own records*). Mechanical extraction only
+    (Language-to-JSON): a command is included when its first token per
+    shell segment matches a BLT verb (`_blt_verbs` — command strings
+    are mechanical), and the paired tool_result's TAIL is included
+    verbatim for the JUDGE to interpret — Python never reads pass/fail
+    out of the prose. Empty string when nothing matched; caps bound a
+    log-heavy run (newest workers first, so the final-conformer's and
+    late conformers' runs — the ones that verify the shipping tree —
+    survive truncation)."""
+    verbs = set(_blt_verbs(repo_root))
+    if not verbs:
+        return ""
+    logs_dir = leerie_dir / "logs"
+    if not logs_dir.is_dir():
+        return ""
+    entries: list[str] = []
+    log_files = sorted(logs_dir.glob("*.log"),
+                       key=lambda f: f.stat().st_mtime, reverse=True)
+    for lf in log_files:
+        sid = lf.stem
+        for kind, inp, result in _iter_log_tool_use(lf):
+            if kind != "Bash":
+                continue
+            cmd = (inp.get("command") or "").strip()
+            if not cmd:
+                continue
+            hit = False
+            for seg in _BLT_SEG_RE.split(cmd):
+                toks = seg.strip().split()
+                if toks and _BLT_SEG_LEAD_RE.sub("", toks[0]) in verbs:
+                    hit = True
+                    break
+            if not hit:
+                continue
+            tail = (result or "").strip()[-tail_chars:]
+            entries.append(
+                f"[{sid}] $ {cmd[:200]}\n    result tail: "
+                + (tail.replace(chr(10), " | ") if tail
+                   else "(no result recorded)"))
+            if len(entries) >= max_entries:
+                break
+        if len(entries) >= max_entries:
+            break
+    return "\n".join(entries)
+
+
 async def _delivery_judge_unmet(
         task: str, items: list[dict], staging: Path, st: "State",
         caps: dict, models: dict[str, str],
         efforts: dict[str, str | None],
-        phase_label: str) -> tuple[list[dict], int]:
+        phase_label: str,
+        contract_ctx: dict | None = None,
+        exec_digest: str = "") -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
-    (confirmed_unmet, samples_used).
+    (confirmed_unmet, samples_used, contract_result).
+
+    `contract_ctx` (the run's applicable defect audit: defect_shape +
+    sites) adds the finding-level DEFECT CONTRACT section to the
+    payload and a `contract` verdict to the expected output (DESIGN §8
+    *The gate judges the finding, not only the items*);
+    `contract_result` is None when not asked, else the
+    majority-resolved {verdict, evidence, conflicting_contracts?} —
+    with an absent-object sample counting as a NO-vote (never met) and
+    no-majority resolving to met (fail-open). `exec_digest` is the
+    executed-commands record the judge is directed to verify
+    execution-shaped items against.
 
     Confirm-on-first-pass: one sample, and only when it flags something
     do two more run, with an item confirmed unmet only on a 2-of-3
@@ -31235,16 +31412,42 @@ async def _delivery_judge_unmet(
     normalized = [_norm_item(item) for item in items]
     numbered = [{**item, "item_index": i}
                 for i, item in enumerate(normalized)]
-    user_prompt = (
-        "TASK:\n" + task + "\n\n"
+    sections = [
+        "TASK:\n" + task,
         "REQUIRED ITEMS (verify each against the CURRENT tree — your cwd "
         "is the integrated staging worktree, the exact tree this run is "
         "about to ship):\n"
-        + json.dumps(numbered, indent=2) +
-        "\n\nReturn one verdict per item_index per your schema. met=true "
+        + json.dumps(numbered, indent=2),
+    ]
+    if exec_digest:
+        sections.append(
+            "EXECUTED COMMANDS RECORD (every build/lint/test command "
+            "this run's workers actually ran, with verbatim result "
+            "tails, extracted from their structured logs): for any item "
+            "that requires a command to have been EXECUTED (a test "
+            "suite, a typecheck), verify it against THIS record and "
+            "cite the entry — you are read-only and cannot run suites "
+            "yourself; a command absent from this record was not run, "
+            "and such an item stays unmet.\n" + exec_digest)
+    if contract_ctx is not None:
+        sections.append(
+            "DEFECT CONTRACT (the run's defect audit — DESIGN §8 *The "
+            "gate judges the finding, not only the items*): also return "
+            "the `contract` object per your schema. verdict=met only if "
+            "the audited defect_shape below HOLDS on this tree AND every "
+            "listed site is either fixed or ruled out with recorded "
+            "evidence; verdict=unmet with evidence naming the residual "
+            "otherwise; verdict=conflict — with both contracts stated in "
+            "conflicting_contracts — when satisfying this contract "
+            "demonstrably contradicts another contract this tree pins "
+            "(e.g. an existing regression guard), which needs a "
+            "discriminating design, not a fix loop.\n"
+            + json.dumps(contract_ctx, indent=2))
+    sections.append(
+        "Return one verdict per item_index per your schema. met=true "
         "only with cited on-tree evidence; when you cannot verify, "
-        "met=false with evidence saying what you could not verify."
-    )
+        "met=false with evidence saying what you could not verify.")
+    user_prompt = "\n\n".join(sections)
 
     # The verifier's workload scales with the item count, so a fixed cap
     # converts a thorough judge into a crashed one: with max_turns=30, all
@@ -31263,7 +31466,12 @@ async def _delivery_judge_unmet(
     # pace, so a long list (roughly a dozen items and beyond) can again
     # exhaust the cap and skip the gate — an accepted, bounded residual,
     # preferred over an uncapped budget.
-    judge_max_turns = min(30 + 6 * len(numbered), 90)
+    # +12 when the finding-level contract verdict is asked for: shape
+    # + per-site disposition is measured at roughly two items' worth of
+    # verification (DESIGN §8). Ceiling unchanged.
+    judge_max_turns = min(
+        30 + 6 * len(numbered) + (12 if contract_ctx is not None else 0),
+        90)
 
     async def _sample(k: int) -> dict:
         st.bump_workers(caps)
@@ -31278,9 +31486,23 @@ async def _delivery_judge_unmet(
             sid=f"delivery_judge-{phase_label}-s{k}",
         )
 
+    def _contract_flagged(sample: dict) -> bool:
+        # On an asked call an absent/malformed contract object is a
+        # flag, never a met — the fail-open direction for ESCALATION is
+        # to spend two more samples, not to skip them (the final
+        # resolution below still fails open to met on no-majority).
+        if contract_ctx is None:
+            return False
+        c = sample.get("contract")
+        return not (isinstance(c, dict) and c.get("verdict") == "met")
+
     samples = [await _sample(0)]
-    if not _delivery_unmet_majority(samples, len(items)):
-        return [], 1
+    if (not _delivery_unmet_majority(samples, len(items))
+            and not _contract_flagged(samples[0])):
+        return [], 1, ({"verdict": "met", "evidence":
+                        (samples[0].get("contract") or {}).get(
+                            "evidence", "")}
+                       if contract_ctx is not None else None)
     for k in (1, 2):
         samples.append(await _sample(k))
     unmet_idx = _delivery_unmet_majority(samples, len(items))
@@ -31297,7 +31519,33 @@ async def _delivery_judge_unmet(
         confirmed.append({"item_index": i,
                           "item": normalized[i].get("item", ""),
                           "evidence": evidence})
-    return confirmed, len(samples)
+    contract_result: dict | None = None
+    if contract_ctx is not None:
+        # Majority over the three samples' typed verdicts; an absent or
+        # malformed object is a no-vote. No verdict reaching 2 (e.g. a
+        # 1-1-1 split) resolves to met — fail-open, mirroring the
+        # items' direction. Two distinct verdicts cannot both reach 2
+        # of 3, so the first match is the only match.
+        tally: dict[str, int] = {}
+        for smp in samples:
+            c = smp.get("contract")
+            v = c.get("verdict") if isinstance(c, dict) else None
+            if v in ("met", "unmet", "conflict"):
+                tally[v] = tally.get(v, 0) + 1
+        winner = next((v for v in ("unmet", "conflict")
+                       if tally.get(v, 0) >= 2), "met")
+        contract_result = {"verdict": winner, "evidence": ""}
+        for smp in reversed(samples):
+            c = smp.get("contract")
+            if isinstance(c, dict) and c.get("verdict") == winner:
+                contract_result["evidence"] = (
+                    c.get("evidence") or "").strip()
+                if winner == "conflict":
+                    contract_result["conflicting_contracts"] = [
+                        str(x) for x in
+                        (c.get("conflicting_contracts") or [])][:2]
+                break
+    return confirmed, len(samples), contract_result
 
 
 async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
@@ -31348,16 +31596,26 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
         "item(s) against the integrated tree (DESIGN §8)")
     st.data["current_phase"] = "phase 5: delivery gate"
     st.save()
+    ds = st.data.get("defect_scope") or {}
+    contract_ctx = None
+    if ds.get("applicable") and (ds.get("sites") or []):
+        contract_ctx = {"defect_shape": ds.get("defect_shape") or "",
+                        "sites": ds.get("sites") or []}
+    exec_digest = _executed_commands_digest(
+        leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
     try:
-        unmet, n = await _delivery_judge_unmet(
+        unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
-            efforts, phase_label="pre")
+            efforts, phase_label="pre", contract_ctx=contract_ctx,
+            exec_digest=exec_digest)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge crashed ({_brief_worker_exc(e)}); "
             "gate skipped (advisory)")
         return []
-    st.data["delivery_gate"] = {"unmet_before": unmet,
-                                "samples_before": n}
+    gate: dict = {"unmet_before": unmet, "samples_before": n}
+    if contract is not None:
+        gate["contract_before"] = contract
+    st.data["delivery_gate"] = gate
     st.save()
     if unmet:
         log(f"  delivery gate: {len(unmet)} required item(s) confirmed "
@@ -31366,6 +31624,19 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
     else:
         log("  delivery gate: every required item verified met on the "
             "integrated tree")
+    if contract is not None and contract.get("verdict") == "unmet":
+        log("  delivery gate: the audited DEFECT CONTRACT is confirmed "
+            "unmet on the integrated tree — routing into the "
+            "final-conformer pass alongside any unmet items: "
+            + (contract.get("evidence") or "")[:200])
+    elif contract is not None and contract.get("verdict") == "conflict":
+        log("  delivery gate: CONTRACT CONFLICT — satisfying this "
+            "task's audited contract contradicts a contract this tree "
+            "already pins; this needs a discriminating design or an "
+            "operator decision, not a fix loop. Both contracts recorded "
+            "in state.json delivery_gate.contract_before: "
+            + " || ".join(contract.get("conflicting_contracts")
+                          or [(contract.get("evidence") or "")[:160]]))
     return unmet
 
 
@@ -31381,7 +31652,13 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     classifier can see."""
     gate = st.data.get("delivery_gate") or {}
     unmet_before = gate.get("unmet_before") or []
-    if not unmet_before or "unmet_after" in gate:
+    contract_before = gate.get("contract_before") or {}
+    # The recheck runs when EITHER half flagged: unmet items, or an
+    # unmet contract (a conflict is not re-checked — it routes to the
+    # record, not the fix loop, DESIGN §8).
+    if ((not unmet_before
+         and contract_before.get("verdict") != "unmet")
+            or "unmet_after" in gate):
         return
     # Own copy of the working_branch guard (round 2): this function
     # consults gate state directly, so it must not rely on the prejudge
@@ -31395,18 +31672,35 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     if not items or not staging.is_dir():
         log("  delivery gate recheck skipped — items or staging absent")
         return
+    ds = st.data.get("defect_scope") or {}
+    contract_ctx = None
+    if ds.get("applicable") and (ds.get("sites") or []):
+        contract_ctx = {"defect_shape": ds.get("defect_shape") or "",
+                        "sites": ds.get("sites") or []}
+    exec_digest = _executed_commands_digest(
+        leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
     try:
-        unmet, n = await _delivery_judge_unmet(
+        unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
-            efforts, phase_label="recheck")
+            efforts, phase_label="recheck", contract_ctx=contract_ctx,
+            exec_digest=exec_digest)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
             "residual unrecorded (advisory)")
         return
     gate["unmet_after"] = unmet
     gate["samples_after"] = n
+    if contract is not None:
+        gate["contract_after"] = contract
     st.data["delivery_gate"] = gate
     st.save()
+    if contract is not None and contract.get("verdict") == "unmet":
+        log("  delivery gate residual: the audited DEFECT CONTRACT is "
+            "still unmet after the final-conformer pass — finalize "
+            "proceeds (fail-open); recorded in "
+            "delivery_gate.contract_after and handed to the next "
+            "same-task run's planners as prior_delivery_residual: "
+            + (contract.get("evidence") or "")[:200])
     if unmet:
         log(f"  delivery gate residual: {len(unmet)} required item(s) "
             "still unmet after the final-conformer pass — finalize "
@@ -31542,9 +31836,14 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # confirmed-unmet required items ride the existing fix loop
         # rather than getting one of their own; the gate's recheck is
         # the mechanical verification that they were actually remedied.
-        if unmet_required_items:
+        _gate_contract = (st.data.get("delivery_gate")
+                          or {}).get("contract_before") or {}
+        _contract_unmet = (_gate_contract
+                           if _gate_contract.get("verdict") == "unmet"
+                           else None)
+        if unmet_required_items or _contract_unmet is not None:
             up.append(_format_unmet_required_items_section(
-                unmet_required_items))
+                unmet_required_items, _contract_unmet))
         _append_conformer_context_sections(up, pre, "full", st)
         if blt_feedback is not None:
             up.append(blt_feedback)
