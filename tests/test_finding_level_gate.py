@@ -171,8 +171,9 @@ def test_prior_residual_contract_unmet_and_conflict(leerie, tmp_path):
         "variant B still reproducible"
     # conflict carried from contract_before — a conflict ALONE never
     # buys a recheck, so contract_after has no verdict here (one
-    # forced by unmet items CAN re-judge and record contract_after;
-    # that arm lives in test_delivery_gate.py)
+    # forced by unmet items CAN re-judge and record contract_after —
+    # test_pre_pass_conflict_with_unmet_items_rechecks_the_contract
+    # in test_delivery_gate.py)
     _run_state(leerie, runs, "r2", TASK, {
         "unmet_before": [], "samples_before": 3,
         "contract_before": {

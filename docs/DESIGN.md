@@ -5228,14 +5228,15 @@ whose resulting no-op then lands on the larger-capped rescue — so
 the small cap stays acceptable there.
 
 **The gate judges the finding, not only the items.** Measured across
-the v0.32.x telemetry (17 runs over four reports, 2026-09-28..30):
-every run's narrowed fix
-satisfied the extracted `required_items` — standing constraints and
-"fix the issues" phrasings that any internally-consistent sub-fix
-meets — while the *reported finding* stayed open, costing one full
-run per sub-shape (the create-account tag/role campaign, then a
-classification predicate re-fixed across four PRs at sites the second
-run's audit had already enumerated). Items are necessary but not
+three reports' repeat-run loops (14 of the 17 v0.32.x runs,
+2026-09-28..30): every run that shipped a fix shipped an
+internally-consistent narrowed one — each satisfying, or shipping
+fail-open past, the items-level gate, since standing constraints
+and "fix the issues" phrasings are met by any internally-consistent
+sub-fix — while the *reported finding* stayed open, costing one
+full run per sub-shape (the create-account tag/role campaign, then
+a classification predicate re-fixed across four PRs, the last two
+at sites an earlier run's audit had already enumerated). Items are necessary but not
 sufficient: they verify what the classifier extracted, not what the
 report demanded. So when the run carries an applicable defect audit
 (§5: `defect_scope.applicable` with non-empty `sites`), the same

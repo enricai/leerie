@@ -3865,8 +3865,8 @@ finding, not only the items*) is covered by executed-gate arms in the
 same file: a flagged contract buys the 3-sample vote (count
 assertion) and the +12 budget allowance (54 at the harness's two
 items, where item-only arithmetic gives 42 — the pinned pair
-discriminates; item-only alone reaches 54 at four items);
-persistence of
+discriminates; item-only alone reaches 54 at four
+items); persistence of
 `contract_before`/`contract_after` with the winning sample's evidence
 VALUE; the 1-1-1 split failing open to met; conflict persisting both
 contracts and skipping the recheck; contract-only-unmet triggering

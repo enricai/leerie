@@ -746,3 +746,26 @@ def test_conflict_discovered_at_recheck_is_recorded(
     ca = st.data["delivery_gate"]["contract_after"]
     assert ca["verdict"] == "conflict"
     assert ca["conflicting_contracts"] == ["contract A", "contract B"]
+
+
+def test_pre_pass_conflict_with_unmet_items_rechecks_the_contract(
+        leerie, tmp_path, monkeypatch):
+    """A pre-pass CONFLICT alone never buys a recheck — but one forced
+    by unmet ITEMS re-judges the contract, and a met verdict there
+    supersedes the pre-pass conflict in contract_after (review round
+    5: a comment claimed this arm existed; now it does)."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    st.data["delivery_gate"] = {
+        "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
+        "samples_before": 3,
+        "contract_before": _contract("conflict", "both pinned",
+                                     ["contract A", "contract B"])}
+    st.save()
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("met", "resolved")}])
+    asyncio.run(leerie._run_delivery_recheck(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 1
+    gate = st.data["delivery_gate"]
+    assert gate["unmet_after"] == []
+    assert gate["contract_after"]["verdict"] == "met"
