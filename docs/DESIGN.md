@@ -5233,15 +5233,16 @@ three reports' repeat-run loops (14 of the 17 v0.32.x runs,
 internally-consistent narrowed one — each satisfying the
 items-level gate, shipping fail-open past it with its residual
 recorded, or (three runs) shipping after a judge crash skipped the
-gate entirely; where the gate judged, standing constraints and
-"fix the issues" phrasings were met by the sub-fix — while the
-*reported finding* stayed open, costing one full run per sub-shape
-(the create-account tag/role campaign, then a classification
-predicate re-fixed across four PRs, the last two at sites an
-earlier run's audit had already enumerated). Items are necessary
-but not sufficient: they verify what the classifier extracted, not what the
-report demanded. So when the run carries an applicable defect audit
-(§5: `defect_scope.applicable` with non-empty `sites`), the same
+gate entirely; where the gate judged, the only residuals it ever
+held were standing constraints, recorded fail-open — never the
+narrowed finding itself — while the *reported finding* stayed
+open, costing one full run per sub-shape (the create-account
+tag/role campaign, then a classification predicate re-fixed across
+four PRs, the last two at sites an earlier run's audit had already
+enumerated). Items are necessary but not sufficient: they verify
+what the classifier extracted, not what the report demanded. So
+when the run carries an applicable defect audit (§5:
+`defect_scope.applicable` with non-empty `sites`), the same
 delivery-judge call also returns a typed **contract verdict** —
 `met`, `unmet`, or `conflict` — judging whether the audited
 `defect_shape` (the violated behavioral contract) holds on the

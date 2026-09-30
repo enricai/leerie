@@ -3873,7 +3873,8 @@ persisting both contracts and skipping the recheck, while a
 conflict alongside unmet items DOES buy the recheck and a met
 verdict there lands in contract_after
 (test_pre_pass_conflict_with_unmet_items_rechecks_the_contract);
-contract-only-unmet triggering the recheck; the formatter's DEFECT CONTRACT block carrying the
+contract-only-unmet triggering the recheck; the formatter's
+DEFECT CONTRACT block carrying the
 evidence value; and the EXECUTED COMMANDS RECORD section reaching the
 judge's actual payload from a synthetic worker log.
 `tests/test_finding_level_gate.py` covers the non-judge halves:
