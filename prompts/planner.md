@@ -425,7 +425,7 @@ The orchestrator gives you, in your prompt:
    and say so in your `confidence.basis`.
 
    If your CONTEXT includes `prior_delivery_residual` (absent on most
-   runs), the most recent finished run of THIS SAME task shipped with
+   runs), the most recent completed run of THIS SAME task shipped with
    its delivery gate recording exactly what was still unmet: the
    `unmet_after` items and/or a `contract_unmet` verdict with evidence
    naming the residual of the audited defect contract, or a

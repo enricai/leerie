@@ -169,8 +169,10 @@ def test_prior_residual_contract_unmet_and_conflict(leerie, tmp_path):
     r = leerie._prior_delivery_residual(st)
     assert r["contract_unmet"]["evidence"] == \
         "variant B still reproducible"
-    # conflict is carried from contract_before (a conflict is never
-    # rechecked, so contract_after does not exist for it)
+    # conflict carried from contract_before — a conflict ALONE never
+    # buys a recheck, so contract_after has no verdict here (one
+    # forced by unmet items CAN re-judge and record contract_after;
+    # that arm lives in test_delivery_gate.py)
     _run_state(leerie, runs, "r2", TASK, {
         "unmet_before": [], "samples_before": 3,
         "contract_before": {
@@ -258,7 +260,7 @@ def test_prior_residual_skips_crashed_newer_run(leerie, tmp_path):
     is how the round-1 fix was falsified against live telemetry."""
     st = _current(leerie, tmp_path)
     runs = st.run_dir.parent
-    _run_state(leerie, runs, "finished-residual", TASK, RESIDUAL_GATE,
+    _run_state(leerie, runs, "completed-residual", TASK, RESIDUAL_GATE,
                mtime=1_000_000)
     # die()-shaped crash: state carries finished_at, exit code is "1"
     _run_state(leerie, runs, "died-newer", TASK, None,
@@ -268,7 +270,7 @@ def test_prior_residual_skips_crashed_newer_run(leerie, tmp_path):
                mtime=3_000_000, exit_code=None)
     r = leerie._prior_delivery_residual(st)
     # run_id is truncated to 16 chars in the record
-    assert r is not None and r["run_id"] == "finished-residual"[:16]
+    assert r is not None and r["run_id"] == "completed-residual"[:16]
 
 
 def test_prior_residual_recheck_met_supersedes_pre_pass_conflict(

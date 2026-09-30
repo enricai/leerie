@@ -3863,8 +3863,10 @@ pins. Falsified live: flattening the majority threshold fails 3 tests.
 The finding-level contract verdict (DESIGN §8 *The gate judges the
 finding, not only the items*) is covered by executed-gate arms in the
 same file: a flagged contract buys the 3-sample vote (count
-assertion) and the +12 budget allowance (54 at two items — a value
-the item-only params never produce); persistence of
+assertion) and the +12 budget allowance (54 at the harness's two
+items, where item-only arithmetic gives 42 — the pinned pair
+discriminates; item-only alone reaches 54 at four items);
+persistence of
 `contract_before`/`contract_after` with the winning sample's evidence
 VALUE; the 1-1-1 split failing open to met; conflict persisting both
 contracts and skipping the recheck; contract-only-unmet triggering
@@ -3881,24 +3883,25 @@ siblings/empty task), and the cross-run `prior_delivery_residual`
 planner-ctx injection driven through the REAL `phase_plan`
 (evidence text reaches the planner prompt verbatim; the common
 no-residual case carries no key), plus the planner-prompt
-documentation pin. Review-round arms in the same files: the
-crashed-newer-run SKIP keyed on orchestrator.exit_code — the
-decisive arm is the die() shape, which WRITES finished_at (a
-discovery sentinel, not completion) plus a nonzero exit code, so a
-finished_at-keyed filter was falsified against live telemetry
-(review round 2); a rerun-after-crash must not hide the last
-completed residual. Further round-2 arms: digest failure degrades
-to items-only judging (the real prejudge runs, the record section
-is absent, and without the degrade guard the raised error would
-escape — the crash-or-not outcome is the discriminator); the
-contract-only formatter header claims no unmet items while the
-with-items header still does; and a conflict DISCOVERED at the
-recheck lands in contract_after with both contracts, a recheck met-verdict superseding a pre-pass
-conflict, the `timeout`/env-prefixed digest arms (a dropped prefix
-turned a real execution into a confident false unmet), and the
+documentation pin. Round-1 review arms in the same files: the
 recheck call-site pin (`test_recheck_spawns_on_either_flagged_half`
 — the contract-only case's recheck was dead when the call site
-gated on the items list alone). The paid-but-empty audit's log line is pinned in
+gated on the items list alone); the `timeout`/env-prefixed digest
+arms (a dropped prefix turned a real execution into a confident
+false unmet); and a recheck met-verdict superseding a pre-pass
+conflict. Round-2 arms: the crashed-newer-run SKIP keyed on
+orchestrator.exit_code — the decisive shape is the die() crash,
+which WRITES finished_at (a discovery sentinel, not completion)
+plus a nonzero exit code, so a finished_at-keyed filter was
+falsified against live telemetry, and a rerun-after-crash must not
+hide the last completed residual; digest failure degrading to
+items-only judging (the real prejudge runs, the record section is
+absent, and without the degrade guard the raised error would
+escape — the crash-or-not outcome is the discriminator); the
+contract-only formatter header claiming no unmet items while the
+with-items header still does; and a conflict DISCOVERED at the
+recheck landing in contract_after with both contracts. The
+paid-but-empty audit's log line is pinned in
 `tests/test_defect_scope_audit.py` (executed phase, capsys).
 The judge's item-scaled turn budget (`min(30 + 6*items, 90)`,
 DESIGN §8 *The judge's turn budget scales with the item count*) is

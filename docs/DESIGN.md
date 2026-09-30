@@ -5228,7 +5228,8 @@ whose resulting no-op then lands on the larger-capped rescue — so
 the small cap stays acceptable there.
 
 **The gate judges the finding, not only the items.** Measured across
-three tasks (eleven runs, 2026-09-28..30): every run's narrowed fix
+the v0.32.x telemetry (17 runs over four reports, 2026-09-28..30):
+every run's narrowed fix
 satisfied the extracted `required_items` — standing constraints and
 "fix the issues" phrasings that any internally-consistent sub-fix
 meets — while the *reported finding* stayed open, costing one full
@@ -5257,17 +5258,17 @@ named, because it needs an operator or a discriminating-predicate
 design, not another fix loop. Fail-open stands unchanged: a residual
 ships, recorded in `delivery_gate.contract_after`; what closes the
 cross-run loop is that a fresh run's planners receive the most
-recent COMPLETED same-task run's residual as ctx (completion means
-the orchestrator's own exit code 0 — `finished_at` is a discovery
-sentinel the die() path also writes and does not qualify)
-(`prior_delivery_residual`, the *dispute's evidence is planning
-input* discipline extended across runs), so run N+1 plans at the
-recorded gap instead of rediscovering it.
+recent COMPLETED same-task run's residual as ctx
+(`prior_delivery_residual` — completion means the orchestrator's
+own exit code 0; `finished_at` is a discovery sentinel the die()
+path also writes and does not qualify — the *dispute's evidence is
+planning input* discipline extended across runs), so run N+1 plans
+at the recorded gap instead of rediscovering it.
 
 **Execution-shaped items are judged from the run's own records.**
-Measured on four of the gate's first six completed outings: the
-dominant unmet item was "no regressions", with evidence reading
-"pnpm test requires approval" — the judge is deliberately read-only
+Measured on three of the gate's completed outings: the dominant
+unmet item was "no regressions", with evidence citing the sandbox's
+command-approval gate — the judge is deliberately read-only
 (SATISFIED_PROBE_TOOLS), so an item demanding an executed suite is
 unverifiable *by construction* from inside the gate, and every such
 run paid the 3-sample dispute vote plus conformer routing for a
