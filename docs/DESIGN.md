@@ -283,10 +283,11 @@ subtask it tests). Three mechanisms reconcile that coupling:
   site the campaign never looks at) — and says whether a chokepoint
   exists where one fix covers all of them. The result is injected into
   every planner's context: the planner must cover every listed site or
-  scope it out by name — and at finalize the delivery gate re-verifies
-  the audited contract against the integrated tree (§8 *The gate judges
-  the finding, not only the items*), and when a chokepoint exists it is told to
-  prefer the single-point fix over per-site patches — which is also
+  scope it out by name, and when a chokepoint exists the planner is
+  told to prefer the single-point fix over per-site patches; at
+  finalize the delivery gate re-verifies the audited contract against
+  the integrated tree (§8 *The gate judges the finding, not only the
+  items*) — which is also
   what operator prompts asking to "fix the root cause at its source"
   have been requesting all along. Advisory throughout, on the
   artifact-registry model: the audit can be wrong (it is judgment, and
@@ -5241,7 +5242,13 @@ delivery-judge call also returns a typed **contract verdict** —
 `met`, `unmet`, or `conflict` — judging whether the audited
 `defect_shape` (the violated behavioral contract) holds on the
 integrated tree and whether every audited site is either fixed or
-ruled out with recorded evidence. `unmet` rides the final-conformer
+ruled out with recorded evidence. A flagged contract buys the same
+3-sample dispute vote as a flagged item (an absent contract object on
+an asked call escalates as a flag but tallies as a no-vote; no
+verdict reaching 2 of 3 resolves to met, the items' own fail-open
+direction), and the asked call carries a +12-turn allowance under
+the unchanged 90 ceiling — which the combined budget then reaches
+from eight items instead of ten. `unmet` rides the final-conformer
 pass and its recheck exactly like unmet items; `conflict` — two
 pinned contracts contradicting at one decision site, the measured
 shape where one subtask's fix was reverted by another protecting a
@@ -5270,8 +5277,11 @@ invocations with verbatim result tails, extracted mechanically by
 BLT-verb token match — command strings are mechanical, and the
 JUDGE interprets the result prose, never Python), and the judge is
 directed to verify execution-shaped items against that record,
-citing it. An item whose commands were never run anywhere in the
-run remains honestly unmet.
+citing it. The record contains only what the run actually ran —
+conformers execute targeted falsifiers, not necessarily a full
+suite — so an item whose commands appear nowhere remains honestly
+unmet, and its remediation is the routed conformer RUNNING them,
+which the recheck's fresh record then shows.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,

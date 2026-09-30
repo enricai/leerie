@@ -511,6 +511,20 @@ class TestWiring:
         src = inspect.getsource(leerie._run_phases)
         assert "unmet_required_items=unmet_delivery" in src
 
+    def test_recheck_spawns_on_either_flagged_half(self, leerie):
+        """The recheck call site must fire on unmet ITEMS or an unmet
+        CONTRACT — gating on the items list alone left the
+        contract-only case (every item met, finding open) with a
+        recheck that never ran (review round 1; the behavioral half
+        is test_contract_only_unmet_triggers_recheck_and_records_after,
+        which drives the recheck body — this pin covers the call
+        site that decides whether it is reached at all)."""
+        src = inspect.getsource(leerie._run_phases)
+        assert "if unmet_delivery or _delivery_recheck_due(st):" in src
+        # and the predicate itself is the state-reading one
+        psrc = inspect.getsource(leerie._delivery_recheck_due)
+        assert '"contract_before"' in psrc and '"unmet"' in psrc
+
     def test_worker_registered(self, leerie):
         assert "delivery_judge" in leerie.WORKER_TYPES
         assert "delivery_judge" in leerie.PLANNING_WORKER_TYPES
@@ -574,9 +588,10 @@ def test_contract_unmet_escalates_persists_and_budgets(
         leerie, tmp_path, monkeypatch):
     """Items all met but contract unmet on sample 0 → escalate to 3
     samples; 2-of-3 unmet persists contract_before with the evidence
-    VALUE; the budget carries the +12 contract allowance
-    (2 items → 30+12+12 = 54, a value the item-only params never
-    produce)."""
+    VALUE; the budget carries the +12 contract allowance: 54 at the
+    harness's two items, where item-only arithmetic gives 42 (the
+    no-defect-scope test pins that 42, so the pair discriminates —
+    54 alone would not, since item-only reaches it at four items)."""
     st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
     calls = _patch_judge(leerie, monkeypatch, [
         {**_verdicts(True, True), "contract": _contract("unmet", "gap A")},

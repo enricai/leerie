@@ -429,7 +429,8 @@ The orchestrator gives you, in your prompt:
    its delivery gate recording exactly what was still unmet: the
    `unmet_after` items and/or a `contract_unmet` verdict with evidence
    naming the residual of the audited defect contract, or a
-   `contract_conflict` naming two contradicting contracts. This is the
+   `contract_conflict` naming two contradicting contracts (plus the
+   `run_id` of the run that recorded it). This is the
    previous run's own exit interview — plan directly at what it
    records: cover each named residual, and for a conflict, plan the
    DISCRIMINATING change that satisfies both stated contracts (a

@@ -91,10 +91,12 @@ def test_digest_entry_cap(leerie, tmp_path, monkeypatch):
 # === _prior_delivery_residual ==============================================
 
 def _run_state(leerie, runs_root, run_id, task, gate=None,
-               mtime=None):
+               mtime=None, finished=True):
     d = runs_root / run_id
     d.mkdir(parents=True, exist_ok=True)
     data = {"task": task}
+    if finished:
+        data["finished_at"] = "2026-09-30T00:00:00+00:00"
     if gate is not None:
         data["delivery_gate"] = gate
     (d / "state.json").write_text(json.dumps(data))
@@ -242,3 +244,53 @@ def test_planner_prompt_documents_the_key(leerie):
     text = leerie._load_prompt("planner")
     assert "prior_delivery_residual" in text
     assert "contract_conflict" in text or "conflict" in text
+
+
+def test_prior_residual_skips_crashed_newer_run(leerie, tmp_path):
+    """A newer same-task run that never reached finalize resolved
+    nothing: it is SKIPPED, not a lookback stop — the operator's
+    normal loop is to re-run after a crash, and stopping there would
+    throw away the last finished run's residual (review round 1)."""
+    st = _current(leerie, tmp_path)
+    runs = st.run_dir.parent
+    _run_state(leerie, runs, "finished-residual", TASK, RESIDUAL_GATE,
+               mtime=1_000_000)
+    _run_state(leerie, runs, "crashed-newer", TASK, None,
+               mtime=2_000_000, finished=False)
+    r = leerie._prior_delivery_residual(st)
+    # run_id is truncated to 16 chars in the record
+    assert r is not None and r["run_id"] == "finished-residual"[:16]
+
+
+def test_prior_residual_recheck_met_supersedes_pre_pass_conflict(
+        leerie, tmp_path):
+    """An after-verdict of met (the recheck saw the remediated tree)
+    supersedes a pre-pass conflict — a resolved conflict must not
+    steer the next run (review round 1)."""
+    st = _current(leerie, tmp_path)
+    _run_state(leerie, st.run_dir.parent, "r-resolved", TASK, {
+        "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
+        "samples_before": 3,
+        "contract_before": {"verdict": "conflict", "evidence": "was",
+                            "conflicting_contracts": ["A", "B"]},
+        "unmet_after": [], "samples_after": 1,
+        "contract_after": {"verdict": "met", "evidence": "resolved"},
+    }, mtime=1_000_000)
+    assert leerie._prior_delivery_residual(st) is None
+
+
+def test_digest_strips_timeout_and_env_prefixes(
+        leerie, tmp_path, monkeypatch):
+    """`timeout 600 pnpm test` and `NODE_ENV=test pnpm test` must be IN
+    the record — the judge is told an absent command was never run, so
+    a dropped prefix turns a real execution into a confident false
+    unmet (review round 1: the lead-strip regex must apply to the
+    segment, never to an already-split token)."""
+    monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
+    _write_log(tmp_path / "logs", "s1", [
+        ("timeout 600 pnpm test src/a.test.ts", "1 passed"),
+        ("NODE_ENV=test pnpm test src/b.test.ts", "2 passed"),
+    ])
+    d = leerie._executed_commands_digest(tmp_path, tmp_path)
+    assert "timeout 600 pnpm test src/a.test.ts" in d
+    assert "NODE_ENV=test pnpm test src/b.test.ts" in d

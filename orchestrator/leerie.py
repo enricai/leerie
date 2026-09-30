@@ -31177,14 +31177,20 @@ def _format_unmet_required_items_section(
     required items into the existing fix loop (DESIGN §8 *The delivery
     gate*). Pure, so the exact text the conformer receives is testable —
     the value delivered, not just a key present."""
-    lines = [
+    header = (
         "UNMET REQUIRED ITEMS (delivery gate): an independent read-only "
         "judge verified this integrated tree against the task's explicit "
         "required items and found the following NOT met, with evidence. "
         "Remedy each one in this worktree and commit the fixes alongside "
         "your conformance work — these are task requirements, not style "
-        "rules, and a post-pass recheck verifies them again:",
-    ]
+        "rules, and a post-pass recheck verifies them again:"
+        if unmet else
+        "DELIVERY GATE (no unmet required items, but see below): an "
+        "independent read-only judge verified this integrated tree and "
+        "found the finding-level contract NOT met, with evidence. Remedy "
+        "it in this worktree and commit the fix alongside your "
+        "conformance work — a post-pass recheck verifies it again:")
+    lines = [header]
     for u in unmet:
         lines.append(f"  - [{u.get('item_index')}] {u.get('item', '')}")
         ev = (u.get("evidence") or "").strip()
@@ -31195,7 +31201,7 @@ def _format_unmet_required_items_section(
             "  - [DEFECT CONTRACT] the run's audited defect contract is "
             "confirmed unmet on this tree (DESIGN §8 *The gate judges "
             "the finding, not only the items*) — remedy the residual it "
-            "names, at its site, alongside the items above:")
+            "names, at its site:")
         cev = (contract_unmet.get("evidence") or "").strip()
         if cev:
             lines.append(f"    evidence: {cev}")
@@ -31234,6 +31240,15 @@ def _delivery_unmet_majority(samples: list[dict], n_items: int) -> list[int]:
     return [i for i in range(n_items) if votes[i] >= threshold]
 
 
+def _delivery_recheck_due(st: "State") -> bool:
+    """True when the delivery gate's first half flagged the CONTRACT as
+    unmet — the recheck trigger the items list cannot carry, since the
+    prejudge returns only items (DESIGN §8 *The gate judges the
+    finding, not only the items*)."""
+    gate = st.data.get("delivery_gate") or {}
+    return (gate.get("contract_before") or {}).get("verdict") == "unmet"
+
+
 def _prior_delivery_residual(st: "State") -> dict | None:
     """The most recent OTHER run's recorded delivery-gate residual for
     the SAME task, or None (DESIGN §8 *The gate judges the finding, not
@@ -31266,33 +31281,46 @@ def _prior_delivery_residual(st: "State") -> dict | None:
             continue
         if (data.get("task") or "").strip() != task:
             continue
+        # A run that never reached finalize resolved nothing: skip it
+        # rather than stopping — the operator's normal loop is to
+        # re-run after a crash, and stopping here would throw away the
+        # last FINISHED run's residual behind every crashed retry
+        # (review round 1; finished_at is the finalize-side marker).
+        if not data.get("finished_at"):
+            continue
         gate = data.get("delivery_gate") or {}
         unmet_after = gate.get("unmet_after") or []
         contract_after = gate.get("contract_after") or {}
-        contract_conflict = (gate.get("contract_before") or {})
+        contract_before = gate.get("contract_before") or {}
         residual: dict = {}
         if unmet_after:
             residual["unmet_after"] = [
                 {"item": (u.get("item") or "")[:200],
                  "evidence": (u.get("evidence") or "")[:400]}
                 for u in unmet_after[:3]]
+        # The recheck's verdict outranks the pre-pass one wherever it
+        # exists (it saw the remediated tree): an after-verdict of met
+        # supersedes a pre-pass conflict, and the recheck can DISCOVER
+        # a conflict the pre-pass called unmet. Only when no recheck
+        # verdict exists (a pre-pass conflict is never rechecked) does
+        # the pre-pass one steer.
         if contract_after.get("verdict") == "unmet":
             residual["contract_unmet"] = {
                 "evidence": (contract_after.get("evidence") or "")[:400]}
-        elif contract_conflict.get("verdict") == "conflict":
+        c = (contract_after if contract_after.get("verdict")
+             else contract_before)
+        if c.get("verdict") == "conflict":
             residual["contract_conflict"] = {
                 "conflicting_contracts": [
                     str(x)[:200] for x in
-                    (contract_conflict.get("conflicting_contracts")
-                     or [])][:2],
-                "evidence": (contract_conflict.get("evidence")
-                             or "")[:400]}
+                    (c.get("conflicting_contracts") or [])][:2],
+                "evidence": (c.get("evidence") or "")[:400]}
         if residual:
             residual["run_id"] = d.name[:16]
             return residual
-        # The newest same-task run had a gate with no residual (or no
-        # gate): nothing to steer with — and looking FURTHER back would
-        # resurrect a residual a later run already resolved.
+        # The newest FINISHED same-task run had no residual: nothing to
+        # steer with — and looking further back would resurrect a
+        # residual this run already resolved.
         return None
     return None
 
@@ -31330,8 +31358,18 @@ def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
                 continue
             hit = False
             for seg in _BLT_SEG_RE.split(cmd):
-                toks = seg.strip().split()
-                if toks and _BLT_SEG_LEAD_RE.sub("", toks[0]) in verbs:
+                # Strip the non-invoking lead on the SEGMENT before
+                # splitting, `_blt_verbs`' own idiom — the lead regex's
+                # alternatives all require trailing whitespace, so
+                # applying it to an already-split single token can
+                # never match, and `timeout 600 pnpm test` or
+                # `NODE_ENV=test pnpm test` would silently vanish from
+                # the record the judge is told is exhaustive (review
+                # round 1: a dropped command becomes a confident false
+                # unmet).
+                seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
+                toks = seg.split()
+                if toks and toks[0] in verbs:
                     hit = True
                     break
             if not hit:
@@ -31339,7 +31377,7 @@ def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
             tail = (result or "").strip()[-tail_chars:]
             entries.append(
                 f"[{sid}] $ {cmd[:200]}\n    result tail: "
-                + (tail.replace(chr(10), " | ") if tail
+                + (tail.replace("\n", " | ") if tail
                    else "(no result recorded)"))
             if len(entries) >= max_entries:
                 break
@@ -31500,8 +31538,8 @@ async def _delivery_judge_unmet(
     if (not _delivery_unmet_majority(samples, len(items))
             and not _contract_flagged(samples[0])):
         return [], 1, ({"verdict": "met", "evidence":
-                        (samples[0].get("contract") or {}).get(
-                            "evidence", "")}
+                        ((samples[0].get("contract") or {}).get(
+                            "evidence") or "").strip()}
                        if contract_ctx is not None else None)
     for k in (1, 2):
         samples.append(await _sample(k))
@@ -31537,13 +31575,16 @@ async def _delivery_judge_unmet(
         contract_result = {"verdict": winner, "evidence": ""}
         for smp in reversed(samples):
             c = smp.get("contract")
-            if isinstance(c, dict) and c.get("verdict") == winner:
-                contract_result["evidence"] = (
-                    c.get("evidence") or "").strip()
-                if winner == "conflict":
-                    contract_result["conflicting_contracts"] = [
-                        str(x) for x in
-                        (c.get("conflicting_contracts") or [])][:2]
+            if not (isinstance(c, dict) and c.get("verdict") == winner):
+                continue
+            ev = (c.get("evidence") or "").strip()
+            if winner == "conflict" and not contract_result.get(
+                    "conflicting_contracts"):
+                contract_result["conflicting_contracts"] = [
+                    str(x) for x in
+                    (c.get("conflicting_contracts") or [])][:2]
+            if ev:
+                contract_result["evidence"] = ev
                 break
     return confirmed, len(samples), contract_result
 
@@ -31601,8 +31642,16 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
     if ds.get("applicable") and (ds.get("sites") or []):
         contract_ctx = {"defect_shape": ds.get("defect_shape") or "",
                         "sites": ds.get("sites") or []}
-    exec_digest = _executed_commands_digest(
-        leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+    try:
+        exec_digest = _executed_commands_digest(
+            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+    except Exception as e:
+        # The record is an optional add-on: a torn log or stat race
+        # must degrade to items-only judging, never take the whole
+        # gate down (review round 1).
+        log(f"  delivery gate: executed-commands digest failed "
+            f"({type(e).__name__}) — judging without the record")
+        exec_digest = ""
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -31677,8 +31726,13 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     if ds.get("applicable") and (ds.get("sites") or []):
         contract_ctx = {"defect_shape": ds.get("defect_shape") or "",
                         "sites": ds.get("sites") or []}
-    exec_digest = _executed_commands_digest(
-        leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+    try:
+        exec_digest = _executed_commands_digest(
+            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+    except Exception as e:
+        log(f"  delivery gate recheck: executed-commands digest failed "
+            f"({type(e).__name__}) — judging without the record")
+        exec_digest = ""
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
@@ -31701,6 +31755,12 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
             "delivery_gate.contract_after and handed to the next "
             "same-task run's planners as prior_delivery_residual: "
             + (contract.get("evidence") or "")[:200])
+    elif contract is not None and contract.get("verdict") == "conflict":
+        log("  delivery gate recheck: CONTRACT CONFLICT discovered on "
+            "the remediated tree — recorded in "
+            "delivery_gate.contract_after for the next same-task run: "
+            + " || ".join(contract.get("conflicting_contracts")
+                          or [(contract.get("evidence") or "")[:160]]))
     if unmet:
         log(f"  delivery gate residual: {len(unmet)} required item(s) "
             "still unmet after the final-conformer pass — finalize "
@@ -35199,10 +35259,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         )["warnings"].append(
             f"orchestrator-side exception: {type(e).__name__}: {e}")
         st.save()
-    # Delivery gate, second half: mechanically re-verify the items the
-    # conformer was handed — never trust a fixer's self-report. Only
-    # spawned when the first half confirmed something unmet.
-    if unmet_delivery:
+    # Delivery gate, second half: mechanically re-verify what the
+    # conformer was handed — never trust a fixer's self-report. Spawned
+    # when EITHER half of the first pass confirmed something unmet:
+    # items, or the finding-level contract (review round 1: gating this
+    # on the items list alone left the contract-only case — every item
+    # met, finding open, the exact loop shape this gate exists for —
+    # with a recheck that never ran, no contract_after, and therefore
+    # no cross-run steering).
+    if unmet_delivery or _delivery_recheck_due(st):
         try:
             await _run_delivery_recheck(leerie_dir, st, caps, models,
                                         efforts)
