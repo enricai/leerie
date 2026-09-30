@@ -5233,9 +5233,9 @@ three reports' repeat-run loops (14 of the 17 v0.32.x runs,
 internally-consistent narrowed one — each satisfying the
 items-level gate, shipping fail-open past it with its residual
 recorded, or (three runs) shipping after a judge crash skipped the
-gate entirely; where the gate judged, the only residuals it ever
-held were standing constraints, recorded fail-open — never the
-narrowed finding itself — while the *reported finding* stayed
+gate entirely; where the gate judged, every residual it shipped
+past the recheck was a standing no-regressions constraint,
+recorded fail-open — while the *reported finding* stayed
 open, costing one full run per sub-shape (the create-account
 tag/role campaign, then a classification predicate re-fixed across
 four PRs, the last two at sites an earlier run's audit had already
