@@ -5257,7 +5257,9 @@ named, because it needs an operator or a discriminating-predicate
 design, not another fix loop. Fail-open stands unchanged: a residual
 ships, recorded in `delivery_gate.contract_after`; what closes the
 cross-run loop is that a fresh run's planners receive the most
-recent finalized same-task run's residual as ctx
+recent COMPLETED same-task run's residual as ctx (completion means
+the orchestrator's own exit code 0 — `finished_at` is a discovery
+sentinel the die() path also writes and does not qualify)
 (`prior_delivery_residual`, the *dispute's evidence is planning
 input* discipline extended across runs), so run N+1 plans at the
 recorded gap instead of rediscovering it.

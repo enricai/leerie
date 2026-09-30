@@ -3887,7 +3887,13 @@ decisive arm is the die() shape, which WRITES finished_at (a
 discovery sentinel, not completion) plus a nonzero exit code, so a
 finished_at-keyed filter was falsified against live telemetry
 (review round 2); a rerun-after-crash must not hide the last
-completed residual, a recheck met-verdict superseding a pre-pass
+completed residual. Further round-2 arms: digest failure degrades
+to items-only judging (the real prejudge runs, the record section
+is absent, and without the degrade guard the raised error would
+escape — the crash-or-not outcome is the discriminator); the
+contract-only formatter header claims no unmet items while the
+with-items header still does; and a conflict DISCOVERED at the
+recheck lands in contract_after with both contracts, a recheck met-verdict superseding a pre-pass
 conflict, the `timeout`/env-prefixed digest arms (a dropped prefix
 turned a real execution into a confident false unmet), and the
 recheck call-site pin (`test_recheck_spawns_on_either_flagged_half`

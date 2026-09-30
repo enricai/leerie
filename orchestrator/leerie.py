@@ -22202,8 +22202,9 @@ async def phase_plan(task: str, st: State, caps: dict,
         ctx_dict["prescribed_procedure"] = prescribed_procedure
     # Cross-run half of the finding-level delivery gate (DESIGN §8 *The
     # gate judges the finding, not only the items*): the most recent
-    # finished same-task run's recorded residual steers this plan at
-    # the recorded gap. Omitted when there is none.
+    # COMPLETED same-task run's recorded residual (exit code 0 — not
+    # finished_at, which the die() path also writes) steers this plan
+    # at the recorded gap. Omitted when there is none.
     prior_residual = _prior_delivery_residual(st)
     if prior_residual:
         ctx_dict["prior_delivery_residual"] = prior_residual
@@ -31331,8 +31332,8 @@ def _prior_delivery_residual(st: "State") -> dict | None:
         if residual:
             residual["run_id"] = d.name[:16]
             return residual
-        # The newest FINISHED same-task run had no residual: nothing to
-        # steer with — and looking further back would resurrect a
+        # The newest COMPLETED same-task run had no residual: nothing
+        # to steer with — and looking further back would resurrect a
         # residual this run already resolved.
         return None
     return None
