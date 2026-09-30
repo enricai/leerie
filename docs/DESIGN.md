@@ -5235,9 +5235,11 @@ items-level gate, shipping fail-open past it with its residual
 recorded, or (three runs) shipping after a judge crash skipped the
 gate entirely; where the gate judged, every residual it shipped
 past the recheck was a standing no-regressions constraint,
-recorded fail-open — while the *reported finding* stayed
-open, costing one full run per sub-shape (the create-account
-tag/role campaign, then a classification predicate re-fixed across
+recorded fail-open (in one run that residual was a concrete
+reopened regression, not a mere cannot-verify) — while the
+*reported finding* stayed open, costing one full run per
+sub-shape (the create-account tag/role campaign, then a
+classification predicate re-fixed across
 four PRs, the last two at sites an earlier run's audit had already
 enumerated). Items are necessary but not sufficient: they verify
 what the classifier extracted, not what the report demanded. So
