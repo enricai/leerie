@@ -31258,10 +31258,12 @@ def _prior_delivery_residual(st: "State") -> dict | None:
     (mechanical — Language-to-JSON forbids fuzzier matching here, and
     the live loop shape is the operator re-running an unchanged task
     file). Read-only over sibling run dirs, newest mtime first;
-    unreadable state files are skipped. Only FINISHED gate records
-    count: a residual means unmet_after non-empty or contract_after
-    unmet — an in-flight or crashed run's partial record must not
-    steer a fresh plan."""
+    unreadable state files are skipped. Only COMPLETED runs count
+    (orchestrator.exit_code present and "0" — finished_at is a
+    discovery sentinel the die() path also writes and must not be
+    used here): an in-flight or crashed run's partial record must
+    not steer a fresh plan, and must not stop the lookback at the
+    last completed run's residual either."""
     task = (st.data.get("task") or "").strip()
     if not task:
         return None
@@ -31281,12 +31283,22 @@ def _prior_delivery_residual(st: "State") -> dict | None:
             continue
         if (data.get("task") or "").strip() != task:
             continue
-        # A run that never reached finalize resolved nothing: skip it
-        # rather than stopping — the operator's normal loop is to
-        # re-run after a crash, and stopping here would throw away the
-        # last FINISHED run's residual behind every crashed retry
-        # (review round 1; finished_at is the finalize-side marker).
-        if not data.get("finished_at"):
+        # A run that never COMPLETED resolved nothing: skip it rather
+        # than stopping — the operator's normal loop is to re-run
+        # after a crash, and stopping here would throw away the last
+        # completed run's residual behind every crashed retry (review
+        # round 1). finished_at is NOT the marker: it is a discovery
+        # sentinel the die() path also writes (DESIGN §6), so a
+        # planning-phase death carries it (review round 2, verified
+        # against a live crashed run). The completion marker is the
+        # run's own exit status: orchestrator.exit_code exists and is
+        # "0" only when the orchestrator exited cleanly through
+        # finalize (or the no-work path); a die() exit writes a
+        # nonzero code and a kill leaves no file.
+        try:
+            if (d / "orchestrator.exit_code").read_text().strip() != "0":
+                continue
+        except OSError:
             continue
         gate = data.get("delivery_gate") or {}
         unmet_after = gate.get("unmet_after") or []
@@ -31302,8 +31314,9 @@ def _prior_delivery_residual(st: "State") -> dict | None:
         # exists (it saw the remediated tree): an after-verdict of met
         # supersedes a pre-pass conflict, and the recheck can DISCOVER
         # a conflict the pre-pass called unmet. Only when no recheck
-        # verdict exists (a pre-pass conflict is never rechecked) does
-        # the pre-pass one steer.
+        # verdict exists does the pre-pass one steer — a conflict
+        # ALONE never buys a recheck, though one can still run (and
+        # re-judge the contract) when unmet ITEMS forced it.
         if contract_after.get("verdict") == "unmet":
             residual["contract_unmet"] = {
                 "evidence": (contract_after.get("evidence") or "")[:400]}

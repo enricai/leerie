@@ -91,15 +91,18 @@ def test_digest_entry_cap(leerie, tmp_path, monkeypatch):
 # === _prior_delivery_residual ==============================================
 
 def _run_state(leerie, runs_root, run_id, task, gate=None,
-               mtime=None, finished=True):
+               mtime=None, exit_code="0"):
+    """exit_code: "0" = completed; "1" = died through die() (which
+    ALSO writes finished_at — the discovery sentinel that must not be
+    mistaken for completion); None = in-flight/killed (no file)."""
     d = runs_root / run_id
     d.mkdir(parents=True, exist_ok=True)
-    data = {"task": task}
-    if finished:
-        data["finished_at"] = "2026-09-30T00:00:00+00:00"
+    data = {"task": task, "finished_at": "2026-09-30T00:00:00+00:00"}
     if gate is not None:
         data["delivery_gate"] = gate
     (d / "state.json").write_text(json.dumps(data))
+    if exit_code is not None:
+        (d / "orchestrator.exit_code").write_text(exit_code)
     if mtime is not None:
         import os
         os.utime(d, (mtime, mtime))
@@ -247,16 +250,22 @@ def test_planner_prompt_documents_the_key(leerie):
 
 
 def test_prior_residual_skips_crashed_newer_run(leerie, tmp_path):
-    """A newer same-task run that never reached finalize resolved
-    nothing: it is SKIPPED, not a lookback stop — the operator's
-    normal loop is to re-run after a crash, and stopping there would
-    throw away the last finished run's residual (review round 1)."""
+    """A newer same-task run that never COMPLETED resolved nothing:
+    it is SKIPPED, not a lookback stop. The die() crash shape is the
+    decisive arm (review round 2): die() WRITES finished_at (the
+    discovery sentinel) and a nonzero exit code — a filter keyed on
+    finished_at lets exactly this run hide the older residual, which
+    is how the round-1 fix was falsified against live telemetry."""
     st = _current(leerie, tmp_path)
     runs = st.run_dir.parent
     _run_state(leerie, runs, "finished-residual", TASK, RESIDUAL_GATE,
                mtime=1_000_000)
-    _run_state(leerie, runs, "crashed-newer", TASK, None,
-               mtime=2_000_000, finished=False)
+    # die()-shaped crash: state carries finished_at, exit code is "1"
+    _run_state(leerie, runs, "died-newer", TASK, None,
+               mtime=2_000_000, exit_code="1")
+    # killed/in-flight shape: no exit-code file at all
+    _run_state(leerie, runs, "inflight-newest", TASK, None,
+               mtime=3_000_000, exit_code=None)
     r = leerie._prior_delivery_residual(st)
     # run_id is truncated to 16 chars in the record
     assert r is not None and r["run_id"] == "finished-residual"[:16]
@@ -294,3 +303,51 @@ def test_digest_strips_timeout_and_env_prefixes(
     d = leerie._executed_commands_digest(tmp_path, tmp_path)
     assert "timeout 600 pnpm test src/a.test.ts" in d
     assert "NODE_ENV=test pnpm test src/b.test.ts" in d
+
+
+def test_digest_failure_degrades_to_items_only_judging(
+        leerie, tmp_path, monkeypatch):
+    """A digest crash must cost the RECORD, not the gate (review
+    round 2: the arm existed only as code)."""
+    import asyncio as _a
+
+    def boom(*_a2, **_k):
+        raise UnicodeDecodeError("utf-8", b"", 0, 1, "torn log")
+
+    monkeypatch.setattr(leerie, "_executed_commands_digest", boom)
+    leerie_root = tmp_path / ".leerie"
+    run_id = "digest-degrade"
+    run_dir = leerie_root / "runs" / run_id
+    (run_dir / "worktrees" / "staging").mkdir(parents=True)
+    st = leerie.State(leerie_root, run_id)
+    st.data = {"task": "t", "worker_count": 0, "working_branch": "main",
+               "required_items": [{"item": "a required thing",
+                                   "source_ref": "task"}]}
+    st.save()
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return {"verdicts": [{"item_index": 0, "met": True,
+                              "evidence": "ok"}]}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    unmet = _a.run(leerie._run_delivery_prejudge(
+        run_dir, st, dict(leerie.DEFAULT_CAPS),
+        {"delivery_judge": "sonnet"}, {"delivery_judge": "medium"}))
+    assert unmet == [] and len(calls) == 1
+    assert "EXECUTED COMMANDS RECORD" not in calls[0]["user_prompt"]
+
+
+def test_formatter_contract_only_header_claims_no_unmet_items(leerie):
+    """With zero unmet items the section must not claim 'the
+    following NOT met' items (review round 2: the two headers were
+    indistinguishable to the existing formatter test)."""
+    only_contract = leerie._format_unmet_required_items_section(
+        [], {"verdict": "unmet", "evidence": "E"})
+    assert "no unmet required items" in only_contract
+    assert "found the following NOT met" not in only_contract
+    with_items = leerie._format_unmet_required_items_section(
+        [{"item_index": 0, "item": "x", "evidence": "e"}],
+        {"verdict": "unmet", "evidence": "E"})
+    assert "found the following NOT met" in with_items

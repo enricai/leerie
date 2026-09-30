@@ -718,3 +718,31 @@ def test_exec_digest_section_reaches_the_judge(
     up = calls[0]["user_prompt"]
     assert "EXECUTED COMMANDS RECORD" in up
     assert "pnpm test src/a.test.ts" in up
+
+
+def test_conflict_discovered_at_recheck_is_recorded(
+        leerie, tmp_path, monkeypatch):
+    """The recheck can DISCOVER a conflict the pre-pass called unmet
+    (review round 2: the arm existed only as code); it lands in
+    contract_after for the next run's steering."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    st.data["delivery_gate"] = {
+        "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
+        "samples_before": 3,
+        "contract_before": _contract("unmet", "gap")}
+    st.save()
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True),
+         "contract": _contract("conflict", "both pinned",
+                               ["contract A", "contract B"])},
+        {**_verdicts(True, True),
+         "contract": _contract("conflict", "both pinned",
+                               ["contract A", "contract B"])},
+        {**_verdicts(True, True), "contract": _contract("met")},
+    ])
+    asyncio.run(leerie._run_delivery_recheck(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 3
+    ca = st.data["delivery_gate"]["contract_after"]
+    assert ca["verdict"] == "conflict"
+    assert ca["conflicting_contracts"] == ["contract A", "contract B"]
