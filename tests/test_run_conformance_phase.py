@@ -1431,12 +1431,48 @@ def test_noncanonical_cited_path_is_still_caught(env):
     def _leave_uncommitted(wt: Path):
         (wt / "test_dot.py").write_text("def test_d(): pass\n")
 
-    dotted = "./test_dot.py"
+    for claimed in ("./test_dot.py",
+                    str(env["worktree"] / "test_dot.py"),
+                    "test_dot.py ",      # trailing space: the validator
+                    "\ttest_dot.py"):    # strips, so canon must too
+        result = _clean_result()
+        result["tests_updates"] = [{"path": claimed, "reason": "covers d"}]
+        result["file_updates"] = [{"kind": "tests", "path": claimed,
+                                   "reason": "covers d"}]
+        _stub_run_conformer(c, [result], commits={0: _leave_uncommitted})
+        _stub_measure_axes(c, {})
+        res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+            env["sid"], env["run_dir"], str(env["worktree"]),
+            env["subtask"], env["caps"], env["st"], env["models"],
+            env["efforts"]))
+        assert res.get("conformer_repair_rolled_back") is True, \
+            (claimed, res, warnings)
+
+
+def test_worktree_rename_origin_desync_does_not_swallow_records(env):
+    """The discriminating shape for the two-sided R/C parse (the one-
+    sided `_rec[0]` form passes every other test): a WORKTREE-side
+    rename (` R new\\0old\\0`) whose origin itself starts with `R`,
+    followed by the claimed untracked path. One-sided parsing misreads
+    the origin as a record and swallows the next record as its bogus
+    origin — the claimed path never enters `unclean` and the phantom
+    repair counts (executed under the mutant)."""
+    import shutil
+    c = env["leerie"]
+
+    def _setup(wt: Path):
+        (wt / "R_orig.py").write_text("x = 1\n")
+        _run(["git", "add", "R_orig.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: orig"], cwd=wt)
+        shutil.move(str(wt / "R_orig.py"), str(wt / "a_new.py"))
+        _run(["git", "add", "-N", "a_new.py"], cwd=wt)
+        (wt / "test_x.py").write_text("def test_x(): pass\n")
+
     result = _clean_result()
-    result["tests_updates"] = [{"path": dotted, "reason": "covers d"}]
-    result["file_updates"] = [{"kind": "tests", "path": dotted,
-                               "reason": "covers d"}]
-    _stub_run_conformer(c, [result], commits={0: _leave_uncommitted})
+    result["tests_updates"] = [{"path": "test_x.py", "reason": "covers x"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_x.py",
+                               "reason": "covers x"}]
+    _stub_run_conformer(c, [result], commits={0: _setup})
     _stub_measure_axes(c, {})
     res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],

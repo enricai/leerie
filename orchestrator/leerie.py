@@ -31173,7 +31173,13 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
 
             def _canon_rel(p: object) -> str | None:
                 try:
-                    rp = Path(str(p))
+                    # .strip() mirrors _validate_conformance_result: the
+                    # validator strips a cited path before resolving, so
+                    # a padded spelling ("x.py ") passes validation —
+                    # without the same strip here it never matched
+                    # porcelain and the phantom repair counted (executed,
+                    # 4/4 padding variants).
+                    rp = Path(str(p).strip())
                     if not rp.is_absolute():
                         rp = _wt_resolved / rp
                     return str(rp.resolve().relative_to(_wt_resolved))

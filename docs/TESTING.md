@@ -4095,8 +4095,13 @@ section to the accepted body BEFORE the run.json write, appends nothing
 on an empty register, and owns the `_strip_worker_risk_sections`
 guarantees: a worker-emitted section stripped even with an empty
 register, a mid-body copy removed span-limited with trailing sections
-surviving, a fence-quoted heading left alone, and the U+FE0F
-variation-selector heading still matched), and
+surviving, a fence-quoted heading left alone — with fence state
+tracked per fence line, so an inline ``` in prose does not flip it and
+`~~~` fences are honored
+(`test_strip_fence_detection_survives_inline_backticks_and_tildes`) —
+the section END equally fence-aware so a fenced `## ` line inside the
+section is not a boundary (`test_strip_section_end_is_fence_aware`),
+and the U+FE0F variation-selector heading still matched), and
 `tests/test_host_finalize_sh.py` (the bash fallback's jq renderer
 byte-matches `_format_risk_register_section` on the same state —
 including the blocked-sid and `accepted_blocked` filters — with the
