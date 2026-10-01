@@ -348,6 +348,33 @@ subtask it tests). Three mechanisms reconcile that coupling:
   post-hoc telemetry investigation, ten runs in, after the host copy
   of the archive had also been lost.
 
+  **Resolution is the auditor's judgment; existence is the
+  orchestrator's check.** A report names its inputs in the
+  operator's coordinate system (host paths); the run sees them, if
+  at all, where the container mounted them (an `--inspect-dir`
+  lands read-only at `/inspect/<basename>`, and an operator may
+  stage a *copy* of a named file inside a mount). Whether a mounted
+  location IS the report's named input is semantic identity — not
+  derivable from path strings, and any Python heuristic for it
+  (basename matching, suffix guessing) would be prose-inference by
+  another name, rejected for the same reason the Language-to-JSON
+  rule exists. Measured on the first run that had the data mounted:
+  the verbatim-path check marked both inputs ABSENT while six
+  workers were actively reading the mounted archive, so the gate's
+  payload told the judge no worker could read data the tree's own
+  evidence was visibly informed by, and the downgrade below fired
+  on a false premise (its logic was correct; its input was not). So
+  each `ground_truth` input also carries `resolved_path` — the
+  in-container location where the AUDITOR verified the named input
+  is reachable (the verbatim path itself when it exists; a mounted
+  location it confirmed; null when unfound) — under the same
+  no-fabrication bar as sites: a resolution the auditor did not
+  verify by reading is never invented. Python then stays purely
+  mechanical: existence is checked at the resolved path first,
+  falling back to the verbatim path, at audit time and again at the
+  gate's refresh, and the gate's payload names the resolved
+  location ("PRESENT at …") instead of asserting absence.
+
   **An applicable audit with zero sites is re-asked once.**
   `applicable: true` with an empty `sites` list disarms both
   consumers of the audit — planner injection and the gate's contract
@@ -5343,7 +5370,31 @@ evidence instead, because asserting a data-absence narrative the
 run's own audit does not support would put an unverified claim on
 exactly the channel this verdict exists to keep truthful. The
 operator learns the gap on run one, not from a post-hoc telemetry
-investigation ten runs in. Fail-open stands unchanged: a residual
+investigation ten runs in. The present case is the converse duty,
+and it closes a measured gap: on the first run with the data
+mounted, workers read the archive extensively — host
+distributions, capture ordering, the real declarations — and still
+verified every fix against run-authored synthetic fixtures; zero
+end-to-end executions of the report's repro appear in its records,
+because the acceptance test was nobody's assigned work (the only
+worker that evaluates the finding is read-only, and nothing tasked
+an acting worker with running it). So, in the §12 shape — prompts
+assign, records verify, the gate enforces: planners, whose
+`defect_scope` ctx already carries the audit's `ground_truth`, are
+directed that resolved-present inputs plus a repro command mean
+the plan CARRIES a subtask that executes the repro against them
+and records its outcome — the campaign's acceptance check, owned
+like any other subtask; that execution lands in the per-worker
+logs and therefore in the executed-commands digest; and the judge
+is directed that with inputs PRESENT the record's repro evidence
+decides the contract — a met resting only on synthetic fixtures
+while the repro was never run must state why in-tree evidence
+suffices, else return an ACTIONABLE unmet naming exactly that
+(bench-measured on the live run's verbatim recheck payload: 2/2
+replicates return unmet leading with the unexecuted repro), which
+rides the ordinary final-conformer route — an acting worker with
+execution rights, whose repro run then shows in the recheck's
+fresh digest. Fail-open stands unchanged: a residual
 ships, recorded in `delivery_gate.contract_after`; what closes the
 cross-run loop is that a fresh run's planners receive the most
 recent COMPLETED same-task run's residual as ctx

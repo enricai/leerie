@@ -3945,7 +3945,27 @@ the second arm's payload still lists the absent input factually). In
 residual carrying exactly the sibling audit's absent paths in
 `missing_inputs` (the present one excluded), and a recheck met
 superseding a pre-pass unverifiable (same after-outranks-before
-rule as conflict). In `tests/test_defect_scope_audit.py`, executed
+rule as conflict).
+
+**Ground-truth resolution and the repro-decides duty (S-5, DESIGN
+§5 *Resolution is the auditor's judgment* / §8's present-inputs
+paragraph).** In `tests/test_delivery_gate.py`, executed through
+the real prejudge: the load-bearing resolution arm reproduces the
+live incident's exact shape — verbatim path absent,
+auditor-resolved mount EXISTS → presence comes from the
+resolution, the downgrade does NOT fire, and the payload names
+"PRESENT at <resolved>"; all-present WITH a repro emits the
+converse-duty section naming the executable repro (met stands);
+all-present WITHOUT a repro stays silent. In
+`tests/test_defect_scope_audit.py`: the four-way resolution truth
+table against the real filesystem (container view; host view with
+the winning probe recorded; dangling resolution kept on the record
+for the gate's re-probe; null), the phase persisting
+`resolved_path`/`repro_command`, and three documentation pins
+(auditor: resolution is a verified claim, never a guess; planner:
+the acceptance-subtask directive; judge: the repro-decides rule).
+
+In `tests/test_defect_scope_audit.py`, executed
 through the real phase: the one-shot empty-enumeration re-ask
 (recovered sites become the scope, exactly two calls, the
 corrective prompt carries the previous answer; a re-ask crash

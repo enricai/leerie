@@ -105,7 +105,17 @@ files.
 Never list source files of the code under test, and never invent a
 path — every entry must appear in the report. Copy the report's own
 repro command verbatim into `repro_command` when it gives one, else
-null. The orchestrator mechanically checks each path's existence in
+null. For each input, also RESOLVE it against this environment and
+record the result in `resolved_path`: the verbatim path itself when
+it exists here; otherwise the in-container location where you
+VERIFIED the same input is reachable — mounted data typically lives
+read-only under /inspect/, and an operator may have staged a copy of
+a named file inside a mount, so look there and confirm by reading
+(a directory listing that matches, a file whose content carries the
+declarations the report attributes to it). `resolved_path` is a
+claim you verified, never a guess: when you cannot find the input,
+set it to null — a wrong resolution misdirects every later
+verification at once. The orchestrator mechanically checks each path's existence in
 this environment and tells both the operator and the delivery judge
 which inputs are absent — this is how a run learns its verification
 can only be hypothesis-shaped BEFORE it ships a fix, instead of
@@ -152,9 +162,11 @@ Return **only** a JSON object per your schema:
     "data_dependent": true,
     "inputs": [
       {"path": "/tmp/example-input-dataset/", "kind": "directory",
-       "role": "the dataset the report says triggers the failure"},
+       "role": "the dataset the report says triggers the failure",
+       "resolved_path": "/inspect/example-input-dataset"},
       {"path": "~/.config/example-tool-config.json", "kind": "file",
-       "role": "the configuration the report's repro loads"}
+       "role": "the configuration the report's repro loads",
+       "resolved_path": null}
     ],
     "repro_command": "python3 scripts/example_repro.py --dataset /tmp/example-input-dataset/"
   },

@@ -3135,6 +3135,19 @@ SCHEMAS: dict[str, dict] = {
                                 "kind": {"type": "string",
                                          "enum": ["file", "directory"]},
                                 "role": {"type": "string"},
+                                # The in-container location the auditor
+                                # VERIFIED this input reachable at (the
+                                # verbatim path when it exists; a
+                                # mounted /inspect location it read;
+                                # null when unfound). Identity between
+                                # a host path and a mounted copy is
+                                # semantic judgment — the auditor's,
+                                # never a Python path heuristic
+                                # (DESIGN §5 *Resolution is the
+                                # auditor's judgment*). Never invented:
+                                # the sites' no-fabrication bar.
+                                "resolved_path": {
+                                    "type": ["string", "null"]},
                             },
                         },
                     },
@@ -31386,11 +31399,26 @@ def _check_ground_truth_inputs(ground_truth: object,
         if not (isinstance(i, dict) and i.get("path")):
             continue
         path = str(i["path"])
-        present = os.path.exists(os.path.expanduser(path))
+        # resolved_path is the AUDITOR's verified in-container
+        # location (DESIGN §5 *Resolution is the auditor's
+        # judgment*): Python probes it first and falls back to the
+        # verbatim path, but never derives a resolution itself —
+        # measured incident: the verbatim-only check marked both
+        # inputs ABSENT while six workers were reading the data at
+        # its /inspect mount, and the §8 downgrade then fired on a
+        # false premise. A dangling resolution is kept on the
+        # record (the gate's refresh re-probes it), never trusted
+        # as presence.
+        rp = i.get("resolved_path")
+        rp = str(rp) if rp else None
+        present_at = next(
+            (c for c in (rp, path)
+             if c and os.path.exists(os.path.expanduser(c))), None)
         inputs.append({"path": path,
                        "kind": i.get("kind") or "file",
                        "role": str(i.get("role") or ""),
-                       "present": present})
+                       "present": present_at is not None,
+                       "resolved_path": present_at or rp})
     gt = {"data_dependent": bool(ground_truth.get("data_dependent")),
           "inputs": inputs,
           "repro_command": ground_truth.get("repro_command") or None}
@@ -31412,12 +31440,19 @@ def _check_ground_truth_inputs(ground_truth: object,
 
 def _format_ground_truth_availability(ground_truth: dict | None) -> str:
     """The judge payload's GROUND-TRUTH AVAILABILITY section, or ""
-    when there is nothing to say (no ground_truth, or every input
-    present — an all-present basis needs no caveat; the judge probes
-    the inputs itself under its own tool scope)."""
+    when there is nothing to say: no ground_truth, or every input
+    present WITHOUT a repro command (an all-present basis with
+    nothing to execute needs no caveat; the judge probes the inputs
+    itself under its own tool scope). All-present WITH a repro is
+    the §8 converse duty — the section then tells the judge the
+    repro was executable here and the record's repro evidence
+    decides (bench-measured 2/2 on the live recheck payload: the
+    verdict flips to an actionable unmet naming the unexecuted
+    repro)."""
     gt = ground_truth or {}
     inputs = gt.get("inputs") or []
-    if not inputs or all(i.get("present") for i in inputs):
+    all_present = bool(inputs) and all(i.get("present") for i in inputs)
+    if not inputs or (all_present and not gt.get("repro_command")):
         return ""
     lines = ["GROUND-TRUTH AVAILABILITY (mechanically checked by the "
              "orchestrator before this call): the report names these "
@@ -31425,14 +31460,25 @@ def _format_ground_truth_availability(ground_truth: dict | None) -> str:
              + (" and states the defect is data-triggered by them"
                 if gt.get("data_dependent") else "") + ":"]
     for i in inputs:
+        loc = ""
+        if i.get("present") and i.get("resolved_path") \
+                and i.get("resolved_path") != i.get("path"):
+            loc = f" at {i.get('resolved_path')}"
         lines.append(f"- {i.get('kind')}: {i.get('path')} -- "
-                     + ("PRESENT" if i.get("present") else "ABSENT")
+                     + (f"PRESENT{loc}" if i.get("present") else "ABSENT")
                      + (f" ({i.get('role')})" if i.get("role") else ""))
-    lines.append(
-        "An ABSENT input could not be read by any worker in this run, "
-        "so no fixture or test archive on this tree derives from it; "
-        "evidence resting only on run-authored fixtures cannot decide "
-        "what an ABSENT input contains.")
+    if all_present:
+        lines.append(
+            "Every report-named input is PRESENT at the location shown, "
+            "and the report's own repro command is executable against "
+            "them in this environment: "
+            + str(gt.get("repro_command")))
+    else:
+        lines.append(
+            "An ABSENT input could not be read by any worker in this "
+            "run, so no fixture or test archive on this tree derives "
+            "from it; evidence resting only on run-authored fixtures "
+            "cannot decide what an ABSENT input contains.")
     return "\n".join(lines)
 
 

@@ -134,3 +134,15 @@ failure verdict and not a hedge to avoid: it is the honest record
 that keeps the gap visible to the operator and the next run, where a
 `met` would silently ship an unproven hypothesis. Inputs listed
 PRESENT you probe like any on-tree evidence, within your tool scope.
+
+When the section lists EVERY input as PRESENT and names the report's
+repro command, the repro — run against those inputs — is the
+decisive evidence for the defect contract. Verify the contract
+against the EXECUTED COMMANDS RECORD's repro evidence first. If the
+record shows the repro was never executed against the present
+inputs, a `met` resting only on synthetic fixtures must state why
+in-tree evidence decides the contract without the repro; absent
+such a reason, return `verdict: "unmet"` with evidence naming
+exactly that: the report's repro was not executed against the
+present inputs. This unmet is actionable — the remediation is
+running the repro and judging the contract on its output.

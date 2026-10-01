@@ -816,11 +816,14 @@ def test_ungrounded_met_is_downgraded_to_unverifiable(
     assert f"{absent} -- ABSENT" in prompt
 
 
-def test_grounded_met_stands_when_every_input_is_present(
+def test_grounded_met_stands_and_present_repro_section_appears(
         leerie, tmp_path, monkeypatch):
     """Converse of the downgrade arm (inputs disagree with the stale
-    flags in the OTHER direction): all inputs exist → met stands and
-    the payload carries no availability caveat."""
+    flags in the OTHER direction): all inputs exist → met stands —
+    and because the fixture carries a repro_command, the §8 converse
+    duty emits the PRESENT section naming the executable repro
+    (S-5: all-present WITH a repro is the repro-decides case, no
+    longer silent)."""
     present = tmp_path / "real-archive"
     present.mkdir()
     st, run_dir = _state(
@@ -833,10 +836,61 @@ def test_grounded_met_stands_when_every_input_is_present(
     cb = st.data["delivery_gate"]["contract_before"]
     assert cb["verdict"] == "met"
     assert "judge_claimed" not in cb
-    # The DEFECT CONTRACT instruction legitimately NAMES the section;
-    # what must be absent is the section itself (its per-input lines).
-    assert "-- ABSENT" not in calls[0]["user_prompt"]
-    assert "-- PRESENT" not in calls[0]["user_prompt"]
+    prompt = calls[0]["user_prompt"]
+    assert f"{present} -- PRESENT" in prompt
+    assert "-- ABSENT" not in prompt
+    assert "repro command is executable against them" in prompt
+    assert "run the generator against the archive" in prompt
+
+
+def test_all_present_without_repro_stays_silent(
+        leerie, tmp_path, monkeypatch):
+    """All inputs present and NO repro command: nothing to execute,
+    nothing to say — no availability section (the pre-S-5 silence,
+    now scoped to the no-repro case)."""
+    present = tmp_path / "real-archive"
+    present.mkdir()
+    scope = _scope_with_ground_truth((present, False))
+    scope["ground_truth"]["repro_command"] = None
+    st, run_dir = _state(leerie, tmp_path, defect_scope=scope)
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("met", "holds")}])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert st.data["delivery_gate"]["contract_before"]["verdict"] == "met"
+    prompt = calls[0]["user_prompt"]
+    assert "-- PRESENT" not in prompt
+    assert "-- ABSENT" not in prompt
+
+
+def test_resolved_path_grounds_presence_and_is_named_in_payload(
+        leerie, tmp_path, monkeypatch):
+    """The S-5 load-bearing arm, the live incident's exact shape: the
+    report's verbatim path is absent in this environment, but the
+    auditor resolved the input to a mounted location that EXISTS.
+    Presence must come from the resolved path (so the downgrade does
+    NOT fire on the false absent premise), and the payload must name
+    the resolved location."""
+    verbatim = tmp_path / "host-only-archive"       # never created
+    mounted = tmp_path / "inspect" / "host-only-archive"
+    mounted.mkdir(parents=True)
+    scope = {**DEFECT_SCOPE, "ground_truth": {
+        "data_dependent": True,
+        "inputs": [{"path": str(verbatim), "kind": "directory",
+                    "role": "archive", "present": False,
+                    "resolved_path": str(mounted)}],
+        "repro_command": "run the generator against the archive"}}
+    st, run_dir = _state(leerie, tmp_path, defect_scope=scope)
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("met", "holds")}])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    cb = st.data["delivery_gate"]["contract_before"]
+    assert cb["verdict"] == "met", \
+        "a resolved-present input must not trigger the absent downgrade"
+    assert "judge_claimed" not in cb
+    prompt = calls[0]["user_prompt"]
+    assert f"{verbatim} -- PRESENT at {mounted}" in prompt
 
 
 def test_partially_present_inputs_caveat_but_no_downgrade(

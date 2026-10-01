@@ -408,3 +408,75 @@ def test_audit_persists_ground_truth_and_logs_remediation(
     assert "NOT available in this environment" in out
     assert "--inspect-dir" in out
     assert str(absent) in out
+
+
+# === resolved_path: resolution is the auditor's judgment, existence the
+# === orchestrator's check (S-5, DESIGN §5 *Resolution is the auditor's
+# === judgment*)
+
+def test_check_ground_truth_resolution_arms(leerie, tmp_path):
+    """Four arms whose answers all differ, against the real
+    filesystem: (a) container view — verbatim absent, resolved
+    exists → present at the resolution; (b) host view — resolved
+    dangling, verbatim exists → present at the verbatim path (the
+    winning probe is recorded); (c) both absent with a dangling
+    resolution → absent, the auditor's claim KEPT on the record for
+    the gate's re-probe; (d) no resolution, absent → absent, null."""
+    mounted = tmp_path / "inspect" / "dataset"
+    mounted.mkdir(parents=True)
+    hostfile = tmp_path / "host.json"
+    hostfile.write_text("{}")
+
+    def one(path, rp):
+        gt = leerie._check_ground_truth_inputs(
+            {"data_dependent": True,
+             "inputs": [{"path": str(path), "kind": "directory",
+                         "role": "r", "resolved_path": rp}],
+             "repro_command": None}, log_missing=False)
+        i = gt["inputs"][0]
+        return i["present"], i["resolved_path"]
+
+    assert one(tmp_path / "gone", str(mounted)) == (True, str(mounted))
+    assert one(hostfile, str(tmp_path / "dangling")) == \
+        (True, str(hostfile))
+    assert one(tmp_path / "gone", str(tmp_path / "dangling")) == \
+        (False, str(tmp_path / "dangling"))
+    assert one(tmp_path / "gone", None) == (False, None)
+
+
+def test_audit_persists_resolved_path(leerie, tmp_path, monkeypatch):
+    """The phase carries the auditor's resolution through to state,
+    normalized by the mechanical check (the resolved location exists,
+    so present flips true even though the verbatim path is absent —
+    a container-view audit)."""
+    st = _state(leerie, tmp_path)
+    mounted = tmp_path / "inspect" / "archive"
+    mounted.mkdir(parents=True)
+    _patch_auditor(leerie, monkeypatch, {
+        **AUDIT,
+        "ground_truth": {"data_dependent": True, "inputs": [
+            {"path": "/host-only/archive", "kind": "directory",
+             "role": "archive", "resolved_path": str(mounted)}],
+            "repro_command": "python3 scripts/example_repro.py"}})
+    scope = asyncio.run(leerie.phase_defect_scope_audit(
+        "fix the bug", st, _caps(leerie), MODELS, EFFORTS))
+    i = scope["ground_truth"]["inputs"][0]
+    assert i["present"] is True
+    assert i["resolved_path"] == str(mounted)
+    assert scope["ground_truth"]["repro_command"] == \
+        "python3 scripts/example_repro.py"
+
+
+def test_prompts_document_resolution_and_acceptance(leerie):
+    """Documentation pins: the auditor prompt defines resolved_path
+    as a VERIFIED claim (never a guess); the planner prompt carries
+    the acceptance-subtask directive for resolved-present inputs;
+    the judge prompt carries the repro-decides converse rule."""
+    auditor = leerie._load_prompt("defect_scope_auditor")
+    assert "resolved_path" in auditor
+    assert "claim you verified, never a guess" in auditor
+    planner = leerie._load_prompt("planner")
+    assert "EXECUTES that repro" in planner
+    assert "resolved_path" in planner
+    judge = leerie._load_prompt("delivery_judge")
+    assert "repro was not executed against the" in judge

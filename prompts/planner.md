@@ -391,6 +391,25 @@ The orchestrator gives you, in your prompt:
    `files_likely_touched`: the orchestrator mechanically warns when an
    audited site's file appears in no subtask.
 
+   When the `ground_truth` object inside your `defect_scope` ctx
+   lists the report's named inputs with every one PRESENT (each
+   carrying the `resolved_path` where it is reachable in this
+   environment) and a `repro_command`, the plan
+   MUST carry a subtask that EXECUTES that repro against the resolved
+   inputs and records its outcome — the campaign's acceptance check,
+   owned like any other subtask, ordered after the fixing subtasks it
+   accepts. Synthetic fixtures verify your hypotheses about the data;
+   only the repro against the real inputs verifies the report, and
+   the delivery gate judges the finding from the run's executed-
+   commands record — a campaign that never ran its repro cannot show
+   the contract met. (Measured: a run with the data mounted read it
+   extensively, verified every fix against run-authored fixtures,
+   executed the repro zero times, and the finding stayed open into
+   the next run.) When inputs are ABSENT, do not fabricate a
+   stand-in for this check — state the limitation in the relevant
+   subtask's `scope_note` and keep verification honest about resting
+   on fixtures.
+
    **Put the audit's `defect_shape` into every covering subtask's
    `success_criteria_seed`** — each subtask states its OWN site-scoped
    done-state, then quotes the shape verbatim as the campaign-level
