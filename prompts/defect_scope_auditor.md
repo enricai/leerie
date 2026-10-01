@@ -115,7 +115,8 @@ a named file inside a mount, so look there and confirm by reading
 declarations the report attributes to it). `resolved_path` is a
 claim you verified, never a guess: when you cannot find the input,
 set it to null — a wrong resolution misdirects every later
-verification at once. The orchestrator mechanically checks each path's existence in
+verification at once. The orchestrator mechanically checks each
+path's existence in
 this environment and tells both the operator and the delivery judge
 which inputs are absent — this is how a run learns its verification
 can only be hypothesis-shaped BEFORE it ships a fix, instead of

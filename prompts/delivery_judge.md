@@ -86,7 +86,9 @@ You are read-only: commands like a repo's test or typecheck runner
 require an approval you cannot grant, so never attempt them. When your
 payload carries an EXECUTED COMMANDS RECORD section, that is the run's
 own structured log of every build/lint/test command its workers
-actually executed, with verbatim result tails. Verify any
+actually executed — and, when the defect audit names a repro command,
+every command led by that repro's own verbs — with verbatim result
+tails. Verify any
 execution-shaped item (a suite must pass, a typecheck must be clean)
 against that record and cite the entry — `[sid] $ command` plus what
 its result tail shows. A command absent from the record was not run
