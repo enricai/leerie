@@ -423,14 +423,19 @@ STATE_FIELDS = (
     # defect_scope: the defect-scope audit's result on a defect-fix task
     # (DESIGN §5 *Defect-scope audit*): sites sharing the defective
     # decision idiom — or, for an unconfirmed-cause report, the
-    # candidate mechanisms — + chokepoint verdict. Presence-keyed resume
-    # checkpoint mirroring artifact_registry; injected into planner ctx
-    # when applicable with non-empty sites.
+    # candidate mechanisms — + chokepoint verdict, + the report's
+    # ground_truth evidence basis with per-input audit-time `present`
+    # flags (DESIGN §5 *Report-named ground truth*). Presence-keyed
+    # resume checkpoint mirroring artifact_registry; injected into
+    # planner ctx when applicable with non-empty sites.
     "defect_scope",
     # delivery_gate: audit record of the finalize-side required-items
     # verification on the integrated staging tree (DESIGN §8 *The
     # delivery gate*): {unmet_before[], unmet_after[], samples_before,
-    # samples_after}. unmet_after == [] means every confirmed-unmet item
+    # samples_after, contract_before?, contract_after?} — the contract
+    # halves carry the finding-level verdict (DESIGN §8 *The gate
+    # judges the finding, not only the items*). unmet_after == [] means
+    # every confirmed-unmet item
     # was remedied by the final-conformer round it was routed into;
     # non-empty unmet_after is the persisted residual the operator (and
     # the next run's planner, via the classifier) can see.
