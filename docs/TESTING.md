@@ -3955,7 +3955,8 @@ live incident's exact shape — verbatim path absent,
 auditor-resolved mount EXISTS → presence comes from the
 resolution, the downgrade does NOT fire, and the payload names
 "PRESENT at <resolved>"; all-present WITH a repro emits the
-converse-duty section naming the executable repro (met stands);
+converse-duty section naming the repro — presence at the shown
+locations only, never executability (met stands);
 all-present WITHOUT a repro stays silent. In
 `tests/test_defect_scope_audit.py`: the four-way resolution truth
 table against the real filesystem (container view; host view with
@@ -3969,10 +3970,11 @@ repro-verb widening on the measured failure shape (a node-led
 repro on a pnpm-verbed repo is EXCLUDED without `repro_command`
 and included with it — the two calls disagree, so a widening that
 ignores the parameter fails) and `_repro_verbs`' lead-strip/
-multi-segment/garbage truth table; and the availability sentence
-pin asserting the ABSENCE of the retired "executable against
-them" claim (the orchestrator states presence, never unverified
-executability).
+multi-segment/garbage truth table. The availability-sentence pin
+asserting the ABSENCE of the retired "executable against them"
+claim (the orchestrator states presence, never unverified
+executability) lives in `tests/test_delivery_gate.py`, inside the
+all-present-with-repro arm.
 
 In `tests/test_defect_scope_audit.py`, executed
 through the real phase: the one-shot empty-enumeration re-ask

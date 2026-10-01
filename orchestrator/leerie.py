@@ -31444,11 +31444,12 @@ def _format_ground_truth_availability(ground_truth: dict | None) -> str:
     present WITHOUT a repro command (an all-present basis with
     nothing to execute needs no caveat; the judge probes the inputs
     itself under its own tool scope). All-present WITH a repro is
-    the §8 converse duty — the section then tells the judge the
-    repro was executable here and the record's repro evidence
-    decides (bench-measured 2/2 on the live recheck payload: the
-    verdict flips to an actionable unmet naming the unexecuted
-    repro)."""
+    the §8 converse duty — the section then names the repro, states
+    presence at the shown locations (never executability, which the
+    orchestrator does not check — see the comment at the sentence),
+    and the record's repro evidence decides (bench-measured 2/2 on
+    the live recheck payload: the verdict flips to an actionable
+    unmet naming the unexecuted repro)."""
     gt = ground_truth or {}
     inputs = gt.get("inputs") or []
     all_present = bool(inputs) and all(i.get("present") for i in inputs)
@@ -31831,7 +31832,9 @@ async def _delivery_judge_unmet(
     if exec_digest:
         sections.append(
             "EXECUTED COMMANDS RECORD (every build/lint/test command "
-            "this run's workers actually ran, with verbatim result "
+            "this run's workers actually ran — and, when the defect "
+            "audit names a repro command, every command led by that "
+            "repro's own verbs — with verbatim result "
             "tails, extracted from their structured logs): for any item "
             "that requires a command to have been EXECUTED (a test "
             "suite, a typecheck), verify it against THIS record and "

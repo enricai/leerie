@@ -821,9 +821,9 @@ def test_grounded_met_stands_and_present_repro_section_appears(
     """Converse of the downgrade arm (inputs disagree with the stale
     flags in the OTHER direction): all inputs exist → met stands —
     and because the fixture carries a repro_command, the §8 converse
-    duty emits the PRESENT section naming the executable repro
-    (S-5: all-present WITH a repro is the repro-decides case, no
-    longer silent)."""
+    duty emits the PRESENT section naming the repro (presence only,
+    never executability — S-5: all-present WITH a repro is the
+    repro-decides case, no longer silent)."""
     present = tmp_path / "real-archive"
     present.mkdir()
     st, run_dir = _state(
