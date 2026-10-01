@@ -839,8 +839,14 @@ def test_grounded_met_stands_and_present_repro_section_appears(
     prompt = calls[0]["user_prompt"]
     assert f"{present} -- PRESENT" in prompt
     assert "-- ABSENT" not in prompt
-    assert "repro command is executable against them" in prompt
+    # The sentence states only what was CHECKED (presence at the
+    # shown locations) — never unverified executability of the
+    # verbatim command (round-1 defect: its paths may be the
+    # report's originals, needing mapping to the resolved
+    # locations).
+    assert "The report's own repro command is:" in prompt
     assert "run the generator against the archive" in prompt
+    assert "executable against them" not in prompt
 
 
 def test_all_present_without_repro_stays_silent(

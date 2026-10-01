@@ -31468,11 +31468,20 @@ def _format_ground_truth_availability(ground_truth: dict | None) -> str:
                      + (f"PRESENT{loc}" if i.get("present") else "ABSENT")
                      + (f" ({i.get('role')})" if i.get("role") else ""))
     if all_present:
+        # State only what the orchestrator checked: presence at the
+        # shown locations. Executability of the VERBATIM command is
+        # not checked — when presence came via a resolution, the
+        # command's embedded paths are the report's originals and a
+        # runner must map them to the locations shown (round-1
+        # review: asserting unverified executability on this channel
+        # is the same class as the unverified data-absence narrative
+        # the logger was stripped of).
         lines.append(
-            "Every report-named input is PRESENT at the location shown, "
-            "and the report's own repro command is executable against "
-            "them in this environment: "
-            + str(gt.get("repro_command")))
+            "Every report-named input is PRESENT at the location "
+            "shown. The report's own repro command is: "
+            + str(gt.get("repro_command"))
+            + " — where its input paths differ from the locations "
+            "shown, a run of it must map them to those locations.")
     else:
         lines.append(
             "An ABSENT input could not be read by any worker in this "
@@ -31656,21 +31665,44 @@ def _prior_delivery_residual(st: "State") -> dict | None:
     return None
 
 
+def _repro_verbs(repro_command: str | None) -> set[str]:
+    """Lead verbs of the audit's repro command, segment by segment —
+    the same lead-strip/first-token idiom as `_blt_verbs` (command
+    strings are mechanical). Widens the digest's verb set so the
+    acceptance run is admissible to the record the repro-decides rule
+    reads: measured on the motivating repository, the report's repro
+    was node-led while every BLT verb was pnpm-led, so the digest the
+    judge is told is exhaustive could never contain the repro, and the
+    actionable unmet would have been unclearable by the very conformer
+    re-run meant to clear it."""
+    if not repro_command or not isinstance(repro_command, str):
+        return set()
+    verbs: set[str] = set()
+    for seg in _BLT_SEG_RE.split(repro_command):
+        seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
+        toks = seg.split()
+        if toks:
+            verbs.add(toks[0])
+    return verbs
+
+
 def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
                               max_entries: int = 40,
-                              tail_chars: int = 300) -> str:
+                              tail_chars: int = 300,
+                              repro_command: str | None = None) -> str:
     """The run's build/lint/test executions, extracted from per-worker
     logs for the delivery judge (DESIGN §8 *Execution-shaped items are
     judged from the run's own records*). Mechanical extraction only
     (Language-to-JSON): a command is included when its first token per
     shell segment matches a BLT verb (`_blt_verbs` — command strings
-    are mechanical), and the paired tool_result's TAIL is included
+    are mechanical) or a lead verb of the audit's `repro_command`
+    (`_repro_verbs`), and the paired tool_result's TAIL is included
     verbatim for the JUDGE to interpret — Python never reads pass/fail
     out of the prose. Empty string when nothing matched; caps bound a
     log-heavy run (newest workers first, so the final-conformer's and
     late conformers' runs — the ones that verify the shipping tree —
     survive truncation)."""
-    verbs = set(_blt_verbs(repo_root))
+    verbs = set(_blt_verbs(repo_root)) | _repro_verbs(repro_command)
     if not verbs:
         return ""
     logs_dir = leerie_dir / "logs"
@@ -32005,7 +32037,8 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
             ds.get("ground_truth"), log_missing=False)
     try:
         exec_digest = _executed_commands_digest(
-            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
+            repro_command=(ground_truth or {}).get("repro_command"))
     except Exception as e:
         # The record is an optional add-on: a torn log or stat race
         # must degrade to items-only judging, never take the whole
@@ -32095,7 +32128,8 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
             ds.get("ground_truth"), log_missing=False)
     try:
         exec_digest = _executed_commands_digest(
-            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
+            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
+            repro_command=(ground_truth or {}).get("repro_command"))
     except Exception as e:
         log(f"  delivery gate recheck: executed-commands digest failed "
             f"({type(e).__name__}) — judging without the record")

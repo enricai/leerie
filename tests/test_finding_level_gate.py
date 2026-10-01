@@ -403,3 +403,47 @@ def test_formatter_contract_only_header_claims_no_unmet_items(leerie):
         [{"item_index": 0, "item": "x", "evidence": "e"}],
         {"verdict": "unmet", "evidence": "E"})
     assert "found the following NOT met" in with_items
+
+
+# === repro-verb widening (S-5 round 1, HIGH): the acceptance run must
+# === be admissible to the record the repro-decides rule reads
+
+def test_digest_admits_repro_led_commands_only_with_repro(
+        leerie, tmp_path, monkeypatch):
+    """The measured failure shape: a node-led repro on a pnpm-verbed
+    repo. Without repro_command the execution is EXCLUDED from the
+    digest (the round-1 defect — the judge would see 'never run'
+    forever); with it, included with its verbatim tail. The two calls
+    disagree, so a widening that ignores the parameter fails."""
+    monkeypatch.setattr(leerie, "_blt_verbs", lambda _root: ["pnpm"])
+    _write_log(tmp_path / "logs", "accept-001", [
+        ("EXAMPLE_RUN_ID=example-run node scripts/example_repro.py "
+         "--force", "classification: REST; output compiles"),
+        ("pnpm test src/x.test.ts", "1 passed"),
+    ])
+    without = leerie._executed_commands_digest(tmp_path, tmp_path)
+    assert "example_repro" not in without
+    assert "pnpm test src/x.test.ts" in without
+    with_repro = leerie._executed_commands_digest(
+        tmp_path, tmp_path,
+        repro_command="EXAMPLE_RUN_ID=example-run node "
+                      "scripts/example_repro.py --force")
+    assert "[accept-001] $ EXAMPLE_RUN_ID=example-run node " \
+           "scripts/example_repro.py --force" in with_repro
+    assert "classification: REST; output compiles" in with_repro
+    assert "pnpm test src/x.test.ts" in with_repro
+
+
+def test_repro_verbs_lead_strip_and_garbage(leerie):
+    """_repro_verbs mirrors the digest's own segment idiom: env
+    prefixes and timeout wrappers are stripped to the real verb;
+    multi-segment commands contribute each segment's verb; garbage
+    shapes yield the empty set (digest then behaves exactly as
+    before)."""
+    assert leerie._repro_verbs(
+        "EXAMPLE_VAR=x timeout 600 node scripts/gen.js --force") == {"node"}
+    assert leerie._repro_verbs(
+        "node a.js && python3 b.py") == {"node", "python3"}
+    assert leerie._repro_verbs(None) == set()
+    assert leerie._repro_verbs("") == set()
+    assert leerie._repro_verbs(123) == set()

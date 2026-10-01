@@ -3964,6 +3964,15 @@ for the gate's re-probe; null), the phase persisting
 `resolved_path`/`repro_command`, and three documentation pins
 (auditor: resolution is a verified claim, never a guess; planner:
 the acceptance-subtask directive; judge: the repro-decides rule).
+Round-1 arms in `tests/test_finding_level_gate.py`: the digest's
+repro-verb widening on the measured failure shape (a node-led
+repro on a pnpm-verbed repo is EXCLUDED without `repro_command`
+and included with it — the two calls disagree, so a widening that
+ignores the parameter fails) and `_repro_verbs`' lead-strip/
+multi-segment/garbage truth table; and the availability sentence
+pin asserting the ABSENCE of the retired "executable against
+them" claim (the orchestrator states presence, never unverified
+executability).
 
 In `tests/test_defect_scope_audit.py`, executed
 through the real phase: the one-shot empty-enumeration re-ask

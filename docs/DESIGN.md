@@ -5417,7 +5417,14 @@ each command it actually ran, with results. The gate's payload now
 includes an executed-commands digest (the run's build/lint/test
 invocations with verbatim result tails, extracted mechanically by
 BLT-verb token match — command strings are mechanical, and the
-JUDGE interprets the result prose, never Python), and the judge is
+JUDGE interprets the result prose, never Python — with the verb set
+widened by the lead verbs of the audit's own `repro_command` when
+one exists: measured on the motivating repository, the report's
+repro was node-led while the repo's BLT verbs were all pnpm-led, so
+a record the judge is told is exhaustive would never have contained
+the acceptance run it is directed to look for, and the
+repro-decides rule would have produced a false, unclearable unmet
+that the conformer's own re-run could not clear), and the judge is
 directed to verify execution-shaped items against that record,
 citing it. The record contains only what the run actually ran —
 conformers execute targeted falsifiers, not necessarily a full
