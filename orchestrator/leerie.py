@@ -31424,9 +31424,10 @@ def _format_ground_truth_availability(ground_truth: dict | None) -> str:
                      + ("PRESENT" if i.get("present") else "ABSENT")
                      + (f" ({i.get('role')})" if i.get("role") else ""))
     lines.append(
-        "An ABSENT input could not be read by any worker in this run; "
-        "every archive or fixture referenced by this tree's tests was "
-        "authored during the run, not taken from the report's data.")
+        "An ABSENT input could not be read by any worker in this run, "
+        "so no fixture or test archive on this tree derives from it; "
+        "evidence resting only on run-authored fixtures cannot decide "
+        "what an ABSENT input contains.")
     return "\n".join(lines)
 
 
@@ -31439,6 +31440,19 @@ def _log_contract_unverifiable(contract: dict, ground_truth: dict | None,
     runs later."""
     missing = [i for i in ((ground_truth or {}).get("inputs") or [])
                if not i.get("present")]
+    if not missing:
+        # A VOTED unverifiable with nothing absent (or no ground_truth
+        # at all — the schema permits both): the data-absence narrative
+        # and its --inspect-dir remediation were not established by the
+        # orchestrator's own check, so asserting them here would put an
+        # unverified claim on exactly the channel this feature exists
+        # to keep truthful (review round 1). State the judge's own
+        # evidence instead.
+        log("  delivery gate: the audited DEFECT CONTRACT is "
+            "UNVERIFIABLE per the judge — recorded in state.json "
+            + record_key + ": "
+            + (contract.get("evidence") or "")[:200])
+        return
     log("  delivery gate: the audited DEFECT CONTRACT is UNVERIFIABLE "
         "in this environment — the report pins it to external data no "
         "worker in this run could read, so the shipped fix is "

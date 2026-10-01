@@ -94,13 +94,14 @@ killed the next run in planning). For such a report:
 
 Also return `ground_truth`: the report's evidence basis. Set
 `data_dependent: true` when the report pins the failure to specific
-named external data (a captured dataset, an input archive, a
-configuration or flow file) rather than to repository content alone —
+named external data (an input dataset, a data archive, a
+configuration file) rather than to repository content alone —
 the telltale is a report that says the same code succeeds on other
 data, or that the failure reproduces only against one named input.
 List in `inputs` ONLY the concrete filesystem paths the report names
 as required to reproduce or verify the defect, verbatim: external
-data like archives, capture directories, and declared-spec files.
+data such as input archives, captured datasets, and configuration
+files.
 Never list source files of the code under test, and never invent a
 path — every entry must appear in the report. Copy the report's own
 repro command verbatim into `repro_command` when it gives one, else
@@ -150,12 +151,12 @@ Return **only** a JSON object per your schema:
   "ground_truth": {
     "data_dependent": true,
     "inputs": [
-      {"path": "/tmp/captures/example-run-20260101/", "kind": "directory",
-       "role": "the captured dataset the report says triggers the failure"},
-      {"path": "~/.config/example-declared-spec.json", "kind": "file",
-       "role": "the declared spec whose resolution the report says fails"}
+      {"path": "/tmp/example-input-dataset/", "kind": "directory",
+       "role": "the dataset the report says triggers the failure"},
+      {"path": "~/.config/example-tool-config.json", "kind": "file",
+       "role": "the configuration the report's repro loads"}
     ],
-    "repro_command": "EXAMPLE_RUN_ID=example-run-20260101 node scripts/generate.js --force"
+    "repro_command": "python3 scripts/example_repro.py --dataset /tmp/example-input-dataset/"
   },
   "rationale": "how you searched and what you read"
 }

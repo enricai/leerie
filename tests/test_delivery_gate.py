@@ -902,3 +902,54 @@ def test_unverifiable_does_not_trigger_the_recheck(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
     assert calls == []
     assert "contract_after" not in st.data["delivery_gate"]
+
+
+def test_voted_path_downgrade_fires_at_three_samples(
+        leerie, tmp_path, monkeypatch):
+    """Round-1 falsification gap: deleting the VOTED-path downgrade
+    call left the whole suite green, because every availability
+    fixture exited through the 1-sample early return. This arm forces
+    the vote (sample 0 flags an item at 1-of-3 — not confirmed) while
+    all three samples claim contract met over an all-absent ground
+    truth: the recorded verdict must still be the downgrade's."""
+    absent = tmp_path / "never-there"
+    st, run_dir = _state(
+        leerie, tmp_path,
+        defect_scope=_scope_with_ground_truth((absent, True)))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, False), "contract": _contract("met", "m0")},
+        {**_verdicts(True, True), "contract": _contract("met", "m1")},
+        {**_verdicts(True, True), "contract": _contract("met", "m2")},
+    ])
+    unmet = asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 3
+    assert unmet == []  # 1-of-3 never confirms the item
+    cb = st.data["delivery_gate"]["contract_before"]
+    assert cb["verdict"] == "unverifiable"
+    assert cb["judge_claimed"] == "met"
+    assert str(absent) in cb["evidence"]
+
+
+def test_voted_unverifiable_log_claims_no_data_absence(
+        leerie, tmp_path, monkeypatch, capsys):
+    """A VOTED unverifiable with no ground_truth must not tell the
+    operator the data-absence narrative or prescribe --inspect-dir —
+    the orchestrator never established either (round-1 defect: the
+    logger asserted both with zero absent-input bullets). It states
+    the judge's evidence instead."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True),
+         "contract": _contract("unverifiable", "judge's own reason")},
+        {**_verdicts(True, True),
+         "contract": _contract("unverifiable", "judge's own reason")},
+        {**_verdicts(True, True), "contract": _contract("met")},
+    ])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    out = capsys.readouterr().out
+    assert "UNVERIFIABLE per the judge" in out
+    assert "judge's own reason" in out
+    assert "--inspect-dir" not in out
+    assert "external data no" not in out

@@ -119,7 +119,7 @@ audited sites), also return the `contract` object:
 
 When your payload carries a GROUND-TRUTH AVAILABILITY section, the
 orchestrator has mechanically checked the inputs the report names as
-its evidence basis — a data archive, a capture directory, a
+its evidence basis — a data archive, an input dataset, a
 configuration file — and listed each as PRESENT or ABSENT in this
 environment. When the defect is data-triggered by inputs listed
 ABSENT, `met` requires evidence that decides the contract without

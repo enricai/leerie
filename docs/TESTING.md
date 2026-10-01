@@ -3924,12 +3924,22 @@ every named input is absent persists as `unverifiable` with
 the exact silent shape two consecutive live v0.33.0 gates
 shipped); its converse (all inputs present → met stands, no
 availability section); the partial case (per-input PRESENT/ABSENT
-lines in the payload, no downgrade — every fixture's audit-time
-`present` flags deliberately DISAGREE with the filesystem, so a
-gate trusting the stale record instead of re-checking fails);
+lines in the payload, no downgrade — each of the three availability
+fixtures' audit-time `present` flags deliberately DISAGREES with
+the filesystem, so a gate trusting the stale record instead of
+re-checking fails);
 `unverifiable` as a first-class 2-of-3 tally verdict with the last
-winning sample's evidence; and `unverifiable` never buying the
-recheck (`_delivery_recheck_due` False, zero samples spent). In
+winning sample's evidence; `unverifiable` never buying the
+recheck (`_delivery_recheck_due` False, zero samples spent); the
+VOTED-path downgrade (round-1 falsification gap: deleting that
+call left the suite green because every availability fixture
+exited through the 1-sample early return — the arm forces the vote
+with a 1-of-3 item flag while all three samples claim met over an
+all-absent ground truth, and asserts the downgrade's verdict at
+three calls); and the voted-unverifiable log arm (no ground_truth
+→ the operator line states the judge's evidence and asserts the
+ABSENCE of the --inspect-dir remediation and the data-absence
+narrative, which the orchestrator never established). In
 `tests/test_finding_level_gate.py`: the `contract_unverifiable`
 residual carrying exactly the sibling audit's absent paths in
 `missing_inputs` (the present one excluded), and a recheck met

@@ -340,11 +340,13 @@ subtask it tests). Three mechanisms reconcile that coupling:
   gate judges the finding, not only the items*). Measured incident
   (one task, ten runs across three leerie versions, 2026-09-28..10-01):
   the report named a host archive and flow file the container never
-  mounted; the v0.33.0 runs' workers probed the named path, found
-  nothing, and pivoted to authoring synthetic fixtures, with no
-  record anywhere that the report's own repro was impossible — the
-  operator learned it from a post-hoc telemetry investigation, ten
-  runs in, after the host copy of the archive had also been lost.
+  mounted; workers in two of the three v0.33.0 runs probed the named
+  path and found nothing, the remaining run's workers never looked —
+  and its gate still verdicted met — and all three runs pivoted to
+  authoring synthetic fixtures, with no record anywhere that the
+  report's own repro was impossible. The operator learned it from a post-hoc
+  telemetry investigation, ten runs in, after the host copy of the
+  archive had also been lost.
 
   **An applicable audit with zero sites is re-asked once.**
   `applicable: true` with an empty `sites` list disarms both
@@ -5286,7 +5288,7 @@ what the classifier extracted, not what the report demanded. So
 when the run carries an applicable defect audit (§5:
 `defect_scope.applicable` with non-empty `sites`), the same
 delivery-judge call also returns a typed **contract verdict** —
-`met`, `unmet`, or `conflict` — judging whether the audited
+`met`, `unmet`, `conflict`, or `unverifiable` — judging whether the audited
 `defect_shape` (the violated behavioral contract) holds on the
 integrated tree and whether every audited site is either fixed or
 ruled out with recorded evidence. A flagged contract buys the same
@@ -5327,10 +5329,14 @@ is recorded as `unverifiable`, the judge's raw claim preserved
 beside it. `unverifiable` does not ride the conformer pass — there
 is nothing on the tree for a conformer to fix; it persists like any
 contract residual, steers the next run through
-`prior_delivery_residual`, and is stated in the run's final output
-with the exact `--inspect-dir` remediation, so the operator learns
-the gap on run one, not from a post-hoc telemetry investigation ten
-runs in. Fail-open stands unchanged: a residual
+`prior_delivery_residual`, and is stated loudly in the run's output
+at gate time — immediately before finalize — with the exact
+`--inspect-dir` remediation when absent inputs drove it (a voted
+unverifiable with nothing absent states the judge's evidence
+instead: the data-absence narrative and its remediation are only
+asserted when the orchestrator's own check established them), so
+the operator learns the gap on run one, not from a post-hoc
+telemetry investigation ten runs in. Fail-open stands unchanged: a residual
 ships, recorded in `delivery_gate.contract_after`; what closes the
 cross-run loop is that a fresh run's planners receive the most
 recent COMPLETED same-task run's residual as ctx
