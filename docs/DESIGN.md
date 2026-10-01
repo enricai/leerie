@@ -5333,9 +5333,10 @@ contract residual, steers the next run through
 `prior_delivery_residual`, and is stated loudly in the run's
 output at whichever gate half records it — the delivery pre-pass
 (where the final-tree conformance pass still follows), or the
-recheck directly before finalize when unmet items forced one and
-its contract verdict lands unverifiable — with the
-exact `--inspect-dir` remediation when the audit's own record
+recheck directly before finalize, when the pre-pass confirmed
+unmet items or an unmet contract and the recheck's own contract
+verdict then lands unverifiable — with the exact `--inspect-dir`
+remediation when the audit's own record
 established the data-absence case (data-dependent, with named
 inputs absent); any other voted unverifiable states the judge's
 evidence instead, because asserting a data-absence narrative the
