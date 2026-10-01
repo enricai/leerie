@@ -953,3 +953,36 @@ def test_voted_unverifiable_log_claims_no_data_absence(
     assert "judge's own reason" in out
     assert "--inspect-dir" not in out
     assert "external data no" not in out
+
+
+def test_absent_inputs_without_data_dependence_claims_nothing(
+        leerie, tmp_path, monkeypatch, capsys):
+    """Round-2 defect: the logger's data-absence branch keyed on
+    `missing` alone, so a voted unverifiable over an audit that
+    recorded data_dependent: FALSE asserted "the report pins it to
+    external data" — a claim the run's own audit contradicts. The
+    discriminator mirrors _check_ground_truth_inputs' warning gate
+    (missing AND data_dependent). A met verdict here must also stand
+    (the downgrade already required data_dependent)."""
+    absent = tmp_path / "gone-config.json"
+    scope = {**DEFECT_SCOPE, "ground_truth": {
+        "data_dependent": False,
+        "inputs": [{"path": str(absent), "kind": "file",
+                    "role": "config", "present": True}],
+        "repro_command": None}}
+    st, run_dir = _state(leerie, tmp_path, defect_scope=scope)
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True),
+         "contract": _contract("unverifiable", "cannot decide")},
+        {**_verdicts(True, True),
+         "contract": _contract("unverifiable", "cannot decide")},
+        {**_verdicts(True, True), "contract": _contract("met")},
+    ])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    # the availability section still lists the absent input factually
+    assert f"{absent} -- ABSENT" in calls[0]["user_prompt"]
+    out = capsys.readouterr().out
+    assert "UNVERIFIABLE per the judge" in out
+    assert "external data no" not in out
+    assert "--inspect-dir" not in out

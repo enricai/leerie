@@ -100,7 +100,7 @@ the telltale is a report that says the same code succeeds on other
 data, or that the failure reproduces only against one named input.
 List in `inputs` ONLY the concrete filesystem paths the report names
 as required to reproduce or verify the defect, verbatim: external
-data such as input archives, captured datasets, and configuration
+data such as input archives, stored datasets, and configuration
 files.
 Never list source files of the code under test, and never invent a
 path — every entry must appear in the report. Copy the report's own

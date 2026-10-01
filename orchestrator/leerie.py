@@ -31438,16 +31438,20 @@ def _log_contract_unverifiable(contract: dict, ground_truth: dict | None,
     recorded, and the exact remediation — so the operator learns the
     gap from this run's output, not from a telemetry investigation
     runs later."""
-    missing = [i for i in ((ground_truth or {}).get("inputs") or [])
+    gt = ground_truth or {}
+    missing = [i for i in (gt.get("inputs") or [])
                if not i.get("present")]
-    if not missing:
-        # A VOTED unverifiable with nothing absent (or no ground_truth
-        # at all — the schema permits both): the data-absence narrative
-        # and its --inspect-dir remediation were not established by the
-        # orchestrator's own check, so asserting them here would put an
-        # unverified claim on exactly the channel this feature exists
-        # to keep truthful (review round 1). State the judge's own
-        # evidence instead.
+    if not (missing and gt.get("data_dependent")):
+        # A VOTED unverifiable the audit's own record does not back:
+        # nothing absent, no ground_truth at all, or absent inputs on
+        # a report the audit recorded as NOT data-dependent (all
+        # schema-legal; the discriminator mirrors
+        # _check_ground_truth_inputs' warning gate). The data-absence
+        # narrative and its --inspect-dir remediation were not
+        # established by the orchestrator's own check, so asserting
+        # them here would put an unverified claim on exactly the
+        # channel this feature exists to keep truthful (review rounds
+        # 1-2). State the judge's own evidence instead.
         log("  delivery gate: the audited DEFECT CONTRACT is "
             "UNVERIFIABLE per the judge — recorded in state.json "
             + record_key + ": "
