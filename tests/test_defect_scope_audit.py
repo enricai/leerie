@@ -410,9 +410,9 @@ def test_audit_persists_ground_truth_and_logs_remediation(
     assert str(absent) in out
 
 
-# === resolved_path: resolution is the auditor's judgment, existence the
-# === orchestrator's check (S-5, DESIGN §5 *Resolution is the auditor's
-# === judgment*)
+# === resolved_path: resolution is the auditor's judgment; existence is
+# === the orchestrator's check (S-5, DESIGN §5 *Resolution is the
+# === auditor's judgment*)
 
 def test_check_ground_truth_resolution_arms(leerie, tmp_path):
     """Four arms whose answers all differ, against the real
