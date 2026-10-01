@@ -5331,8 +5331,10 @@ beside it. `unverifiable` does not ride the conformer pass — there
 is nothing on the tree for a conformer to fix; it persists like any
 contract residual, steers the next run through
 `prior_delivery_residual`, and is stated loudly in the run's
-output at gate time (the delivery pre-pass; the final-tree
-conformance pass still runs between it and finalize) — with the
+output at whichever gate half records it — the delivery pre-pass
+(where the final-tree conformance pass still follows), or the
+recheck directly before finalize when unmet items forced one and
+its contract verdict lands unverifiable — with the
 exact `--inspect-dir` remediation when the audit's own record
 established the data-absence case (data-dependent, with named
 inputs absent); any other voted unverifiable states the judge's
