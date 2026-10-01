@@ -369,7 +369,13 @@ subtask it tests). Three mechanisms reconcile that coupling:
   is reachable (the verbatim path itself when it exists; a mounted
   location it confirmed; null when unfound) — under the same
   no-fabrication bar as sites: a resolution the auditor did not
-  verify by reading is never invented. Python then stays purely
+  verify by reading is never invented. The field is
+  schema-REQUIRED, as is `repro_command` beside the inputs: both
+  are attestations the gate's presence check and repro-decides rule
+  depend on, and an attestation a gate depends on must not be
+  skippable by omission (the `change_shape` precedent) — null is
+  the honest answer for unfound and for a report that gives no
+  repro, so requiring the field costs the auditor nothing. Python then stays purely
   mechanical: existence is checked at the resolved path first,
   falling back to the verbatim path, at audit time and again at the
   gate's refresh, and the gate's payload names the resolved

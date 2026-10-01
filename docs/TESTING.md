@@ -3974,7 +3974,12 @@ multi-segment/garbage truth table. The availability-sentence pin
 asserting the ABSENCE of the retired "executable against them"
 claim (the orchestrator states presence, never unverified
 executability) lives in `tests/test_delivery_gate.py`, inside the
-all-present-with-repro arm.
+all-present-with-repro arm. Round 4's hardening pin
+(`tests/test_defect_scope_audit.py`): the `ground_truth` REQUIRED
+lists are value-asserted — `resolved_path` and `repro_command` are
+attestations the gate depends on and must not be skippable by
+omission (the `change_shape` precedent; null stays the honest
+unfound/no-repro answer).
 
 In `tests/test_defect_scope_audit.py`, executed
 through the real phase: the one-shot empty-enumeration re-ask

@@ -425,7 +425,9 @@ STATE_FIELDS = (
     # decision idiom — or, for an unconfirmed-cause report, the
     # candidate mechanisms — + chokepoint verdict, + the report's
     # ground_truth evidence basis with per-input audit-time `present`
-    # flags (DESIGN §5 *Report-named ground truth*). Presence-keyed
+    # flags and `resolved_path` (the auditor's verified in-container
+    # location, or the winning probe — DESIGN §5 *Report-named ground
+    # truth* / *Resolution is the auditor's judgment*). Presence-keyed
     # resume checkpoint mirroring artifact_registry; injected into
     # planner ctx when applicable with non-empty sites.
     "defect_scope",
@@ -3121,7 +3123,12 @@ SCHEMAS: dict[str, dict] = {
             "ground_truth": {
                 "type": "object",
                 "additionalProperties": False,
-                "required": ["data_dependent", "inputs"],
+                # repro_command required for the same reason as
+                # resolved_path below: this branch made it load-bearing
+                # for the repro-decides loop (null = the report gives
+                # none).
+                "required": ["data_dependent", "inputs",
+                             "repro_command"],
                 "properties": {
                     "data_dependent": {"type": "boolean"},
                     "inputs": {
@@ -3129,7 +3136,17 @@ SCHEMAS: dict[str, dict] = {
                         "items": {
                             "type": "object",
                             "additionalProperties": False,
-                            "required": ["path", "kind", "role"],
+                            # resolved_path is REQUIRED (null = the
+                            # honest unfound answer): it is an
+                            # attestation the gate's presence check
+                            # depends on, and an attestation a gate
+                            # depends on must not be skippable by
+                            # omission — the change_shape precedent.
+                            # An omitting audit would silently degrade
+                            # to the verbatim-only probe and resurrect
+                            # the measured false-absent downgrade.
+                            "required": ["path", "kind", "role",
+                                         "resolved_path"],
                             "properties": {
                                 "path": {"type": "string"},
                                 "kind": {"type": "string",
@@ -31407,7 +31424,8 @@ def _check_ground_truth_inputs(ground_truth: object,
         # inputs ABSENT while six workers were reading the data at
         # its /inspect mount, and the §8 downgrade then fired on a
         # false premise. A dangling resolution is kept on the
-        # record (the gate's refresh re-probes it), never trusted
+        # record when nothing is present (the gate's refresh
+        # re-probes it; a winning probe replaces it), never trusted
         # as presence.
         rp = i.get("resolved_path")
         rp = str(rp) if rp else None

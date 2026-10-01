@@ -480,3 +480,23 @@ def test_prompts_document_resolution_and_acceptance(leerie):
     assert "resolved_path" in planner
     judge = leerie._load_prompt("delivery_judge")
     assert "repro was not executed against the" in judge
+
+
+def test_ground_truth_attestations_are_schema_required(leerie):
+    """Round-4 hardening (the change_shape precedent): resolved_path
+    and repro_command are attestations the gate's presence check and
+    repro-decides rule depend on — a schema-valid audit must not be
+    able to skip them by omission (null is the honest answer for
+    unfound / no-repro). Value assertions on the REQUIRED lists, not
+    key presence."""
+    gt = leerie.SCHEMAS["defect_scope_auditor"]["properties"][
+        "ground_truth"]
+    assert sorted(gt["required"]) == [
+        "data_dependent", "inputs", "repro_command"]
+    item = gt["properties"]["inputs"]["items"]
+    assert sorted(item["required"]) == [
+        "kind", "path", "resolved_path", "role"]
+    assert item["properties"]["resolved_path"]["type"] == \
+        ["string", "null"]
+    assert gt["properties"]["repro_command"]["type"] == \
+        ["string", "null"]
