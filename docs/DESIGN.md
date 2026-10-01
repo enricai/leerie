@@ -375,7 +375,8 @@ subtask it tests). Three mechanisms reconcile that coupling:
   depend on, and an attestation a gate depends on must not be
   skippable by omission (the `change_shape` precedent) — null is
   the honest answer for unfound and for a report that gives no
-  repro, so requiring the field costs the auditor nothing. Python then stays purely
+  repro, so requiring the field costs the auditor nothing. Python
+  then stays purely
   mechanical: existence is checked at the resolved path first,
   falling back to the verbatim path, at audit time and again at the
   gate's refresh, and the gate's payload names the resolved
