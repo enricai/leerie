@@ -500,6 +500,15 @@ STATE_FIELDS = (
     # know about a subtask that reports itself complete?" — see DESIGN §9
     # *A stale finding is not a bug*.
     "symptom_findings",
+    # sid -> _collect_subtask_risks entries: every worker self-reported
+    # risk (typed `self_reported_risks` plus the production_evidence
+    # exercised:false tier); entries the conformer's dispositions cleared
+    # through a verifiable act carry addressed:true, the rest stay
+    # unaddressed. Kept beside the two rows above for the same reason;
+    # rendered verbatim (addressed entries annotated) into the PR body's
+    # residual-risks section by code on every composition path — see
+    # DESIGN §9 *Self-reported risk is routed, not read*.
+    "risk_register",
     "provision",
     # external_preconditions: planner-declared `extent: external` requires
     # entries collected during phase_reconcile (DESIGN §5
@@ -2009,6 +2018,81 @@ def _production_evidence_schema() -> dict:
     }
 
 
+_SOLUTION_DEFECT_KINDS = [
+    "unhandled_input", "unhandled_path", "missing_guard",
+    "sibling_site_unedited", "wrong_selector", "decoy_or_shortcut",
+    # The last two attack BEYOND the planner's criteria (DESIGN §9 *The
+    # success criteria are not the ceiling of this attack*): a criterion
+    # can itself embed the defect, measured on the message-regex incident.
+    "external_contract_assumption", "unrevalidated_precondition",
+]
+
+
+def _risk_dispositions_schema() -> dict:
+    """DESIGN §9 *Self-reported risk is routed, not read*: the conformer's
+    positional answers to the SELF_REPORTED_RISKS challenge block — bare
+    strings, entry i answering risk i. A short or absent array, or an
+    unrecognised value, fails SAFE: the item counts as unanswered and the
+    risk stays on the `risk_register` (`_collect_subtask_risks` owns the
+    value set and the verifiable-act co-occurrence checks). Deliberately
+    no item object and no enum — both shapes exceed the conformer
+    schema's grammar-size budget (N29,
+    `tests/test_conformer_schema_size.py`); the three values are
+    documented in conformer.md, and code enforces. A helper (not inline)
+    so the SCHEMAS literal stays under the N29 source-byte line
+    (`tests/test_conformer_schema_shrink.py`), the same split
+    `_production_evidence_schema` uses.
+
+    `maxItems` is 9, not 8: the challenge block holds up to 8 tier-2
+    risks PLUS the tier-1 `exercised: false` entry, and an 8-item cap
+    made the ninth answer structurally unsendable while the prompt
+    commands answering every item (the whole payload then costs
+    re-prompts). Costs nothing on the hardened form — `maxItems` is in
+    `_STRICT_UNSUPPORTED_KEYWORDS` and stripped."""
+    return {"type": "array", "maxItems": 9, "items": {"type": "string"}}
+
+
+def _self_reported_risks_schema() -> dict:
+    """DESIGN §9 *Self-reported risk is routed, not read*.
+
+    The typed channel for a caveat the worker would otherwise bury in
+    `confidence.basis` prose, where no code reads it. Measured incident: an
+    implementer disclosed in its basis string that success hinged on an
+    external API's exact message wording, flagged its path unexercised —
+    and the defect shipped, because the prose reached nobody. Per the
+    Language-to-JSON rule the remedy is a typed field Python can route
+    (`_collect_subtask_risks` → `risk_register` → PR body), never parsing
+    the prose.
+
+    Kept small and flat (`_production_evidence_schema`'s decoder-safety
+    argument): `where` optional, `maxItems` bounds the array in place of
+    any new cap (there is no loop to cap — risks never gate or retry).
+    Optional at the top level; an absent field simply contributes nothing
+    to the register, because the `exercised: false` tier already covers
+    the undisclosed case mechanically. Deliberately NO maxLength on
+    `detail`: a length bound on the wire makes an honest 301-char
+    disclosure cost the whole payload a validation retry — honesty must
+    not cost a retry — so `_typed_risks` normalizes and trims at
+    ingestion (`_RISK_DETAIL_MAX`) instead.
+    """
+    return {
+        "type": "array",
+        "maxItems": 8,
+        "items": {
+            "type": "object",
+            "required": ["kind", "detail"],
+            "properties": {
+                "kind": {"type": "string",
+                         "enum": ["unexercised_behavior",
+                                  "external_contract_assumption",
+                                  "untested_change"]},
+                "detail": {"type": "string", "minLength": 1},
+                "where": {"type": "string"},
+            },
+        },
+    }
+
+
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
@@ -2267,6 +2351,11 @@ SCHEMAS: dict[str, dict] = {
             # cheapest: it has the repo mounted and has just written the
             # path. Optional here; check_production_evidence gates.
             "production_evidence": _production_evidence_schema(),
+            # DESIGN §9 *Self-reported risk is routed, not read*. Optional
+            # and advisory: entries are routed into the risk_register and
+            # the conformer's challenge context by _collect_subtask_risks,
+            # never gated on — honesty must not cost a retry.
+            "self_reported_risks": _self_reported_risks_schema(),
             # DESIGN §9 *A stale finding is not a bug*. Asked for only when
             # the subtask declares `fixes_reported_symptom: true`; the id
             # prefix is not the signal. Same flat, single-required-bool
@@ -2486,17 +2575,15 @@ SCHEMAS: dict[str, dict] = {
                         # tests/test_conformer_fixed_defects.py.
                         "fixed": {"type": "boolean"},
                         "kind": {"type": "string",
-                                 "enum": ["unhandled_input", "unhandled_path",
-                                          "missing_guard",
-                                          "sibling_site_unedited",
-                                          "wrong_selector",
-                                          "decoy_or_shortcut"]},
+                                 "enum": _SOLUTION_DEFECT_KINDS},
                         "concrete_case": {"type": "string", "minLength": 1},
                         "where": {"type": "string", "minLength": 1},
                         "why_ships_a_defect": {"type": "string", "minLength": 1},
                     },
                 },
             },
+            # DESIGN §9 *Self-reported risk is routed, not read*.
+            "risk_dispositions": _risk_dispositions_schema(),
             # Advisory; gating axis is solution_defects above (DESIGN §8/§9).
             "confidence": _confidence_schema(["conformance"]),
             "production_evidence": _production_evidence_schema(),
@@ -4791,6 +4878,147 @@ def _format_run_duration(started_at: str | None, finished_at: str | None) -> str
         return None
 
 
+_RISK_SECTION_HEADING = "## ⚠ Residual risks"
+
+
+def _strip_worker_risk_sections(body: str) -> tuple[str, bool]:
+    """Remove worker-emitted residual-risks sections from a pr_writer
+    body, preserving everything else (DESIGN §6: the section is
+    code-owned; §12: the prompt asks, this enforces).
+
+    Line-anchored and span-limited, deliberately: a naive
+    `body[:body.find(heading)]` truncated every LEGITIMATE section after
+    a mid-body (or merely quoted) heading — measured, a `## Deploy
+    order` section silently lost — and matched the substring inside a
+    `### `-prefixed line, leaving a dangling `#`. This removes only
+    from a heading at a line start to the next `\\n## ` top-level
+    heading (or end of body), and loops in case the worker emitted the
+    section more than once. A heading quoted inside a code fence is
+    skipped — stripping it left the fence unclosed and rendered
+    everything after as a literal code block, measured. Fence state is
+    tracked per fence LINE (a line opening with ``` or ~~~, closed by
+    its own marker), not by substring count: an inline ``` in prose
+    flipped a count-based parity and let a real section ship doubled,
+    and ~~~ fences reproduced the broken-fence incident through the
+    other syntax markdown allows. The U+FE0F variation selector is
+    normalized away first: `⚠️` and `⚠` are glyph-identical, so a
+    worker echoing the heading from its prompt plausibly emits either.
+    """
+    def _inside_fence(text: str, pos: int) -> bool:
+        open_marker = ""
+        for line in text[:pos].splitlines():
+            ls = line.lstrip()
+            if not open_marker:
+                if ls.startswith("```") or ls.startswith("~~~"):
+                    open_marker = ls[:3]
+            elif ls.startswith(open_marker):
+                open_marker = ""
+        return bool(open_marker)
+
+    body = body.replace("⚠️", "⚠")
+    stripped = False
+    search_from = 0
+    while True:
+        if search_from == 0 and body.startswith(_RISK_SECTION_HEADING):
+            start = 0
+        else:
+            marker = body.find("\n" + _RISK_SECTION_HEADING, search_from)
+            if marker == -1:
+                break
+            start = marker + 1
+        if _inside_fence(body, start):
+            # Inside an open code fence: a quote, not a section. Advance
+            # past it (loop progress is the termination guarantee).
+            search_from = start + len(_RISK_SECTION_HEADING)
+            continue
+        # The section END must be fence-aware too: a `## ` line inside a
+        # code fence WITHIN the worker's section is not a boundary —
+        # stopping there kept worker-fabricated content and left the
+        # fence's opener unclosed (the measured broken-fence incident,
+        # from the other side).
+        pos = start
+        nxt = -1
+        while True:
+            nxt = body.find("\n## ", pos + 1)
+            if nxt == -1 or not _inside_fence(body, nxt + 1):
+                break
+            pos = nxt
+        end = len(body) if nxt == -1 else nxt + 1
+        body = (body[:start].rstrip("\r\n") + "\n\n"
+                + body[end:].lstrip("\n")).strip("\n") \
+            if body[end:].strip() else body[:start].rstrip("\r\n")
+        search_from = 0
+        stripped = True
+    return body, stripped
+
+
+def _format_risk_register_section(state: dict) -> str:
+    """Render `state.json.risk_register` as the PR body's residual-risks
+    section, or "" when the register is empty (DESIGN §9 *Self-reported
+    risk is routed, not read*; DESIGN §6 *The residual-risk section is
+    appended by code on every composition path*).
+
+    Appended by code on both live composition paths — after the pr_writer
+    worker's accepted body in `_compose_pr_via_llm`, and in
+    `scripts/host-finalize.sh`'s LLM-less fallback by a format-identical
+    `jq` renderer (keep that mirror in sync, like the cost line) that
+    mirrors `compose_pr_body`, the never-invoked canonical fallback
+    reference, which also carries the section. Never owned by the
+    pr_writer worker: an LLM composer can summarize a caveat away; an
+    append cannot. Entries render verbatim — the worker's own words are
+    the content (one line each: `_typed_risks` normalized them at
+    ingestion, so no entry can open a new markdown heading here)."""
+    register = state.get("risk_register")
+    if not isinstance(register, dict):
+        # A malformed register must degrade to "no section": this runs
+        # inside _compose_pr_via_llm AFTER the worker's body is accepted,
+        # and an exception there is swallowed fail-open — discarding the
+        # whole accepted body over a garbage register entry.
+        return ""
+    # Render only sids whose work the PR actually contains. A sid still
+    # `blocked` at finalize was excluded from wave integration; an
+    # accept-blocked'ed sid is rewritten to `complete` by the launcher
+    # mutator but its branch is STILL never merged (the verified chain at
+    # the completeness gate: resume excludes it from `remaining`, so
+    # integrate_wave sees no result entry) — so both are skipped via
+    # `subtask_status` plus the `accepted_blocked` registry. Keep the jq
+    # mirror's filter identical. isinstance guards, not `or {}`: a
+    # malformed value must degrade to "no filter"/"no section", never
+    # raise — a raise here is swallowed by _compose_pr_via_llm's
+    # fail-open, which then discards the whole accepted pr_writer body.
+    statuses = state.get("subtask_status")
+    if not isinstance(statuses, dict):
+        statuses = {}
+    accepted = state.get("accepted_blocked")
+    if not isinstance(accepted, dict):
+        accepted = {}
+    lines: list[str] = []
+    for sid, entries in register.items():
+        if statuses.get(sid) == "blocked" or sid in accepted:
+            continue
+        if not isinstance(entries, list):
+            continue
+        for e in entries:
+            if not isinstance(e, dict):
+                continue
+            where = f" ({e['where']})" if e.get("where") else ""
+            if e.get("addressed") is True:
+                status = f"addressed ({e.get('disposition') or ''})"
+            elif e.get("disposition"):
+                status = f"{e['disposition']}, not cleared"
+            else:
+                status = "unaddressed"
+            lines.append(f"- **{sid}** [{e.get('kind') or 'risk'}] "
+                         f"{e.get('detail') or ''}{where} — {status}")
+    if not lines:
+        return ""
+    return ("\n## ⚠ Residual risks\n\n"
+            "Self-reported by workers; entries cleared by a verifiable "
+            "act during conformance are annotated addressed. Full entries "
+            "in state.json `risk_register`.\n\n"
+            + "\n".join(lines))
+
+
 def compose_pr_body(state: dict, run_id: str) -> str:
     """Generate the deterministic fallback PR body from run state +
     run_id. No I/O.
@@ -4880,6 +5108,7 @@ def compose_pr_body(state: dict, run_id: str) -> str:
                 body += f"- **{tag}** — {combined}\n"
             else:
                 body += f"- **{tag}**\n"
+    body += _format_risk_register_section(state)
     return body
 
 
@@ -10703,6 +10932,179 @@ def check_production_evidence(result: dict) -> list[str]:
         f"MALFORMED_PRODUCTION_EVIDENCE: `exercised` must be a boolean, "
         f"got {type(exercised).__name__}")
     return issues
+
+
+_RISK_KINDS = frozenset({"unexercised_behavior", "external_contract_assumption",
+                         "untested_change"})
+_RISK_DISPOSITIONS = frozenset({"confirmed_defect", "mitigated", "accepted"})
+# Ingestion caps for worker-authored risk text. Enforced here rather than
+# by schema maxLength: a length bound on the wire makes an honest 301-char
+# disclosure cost the WHOLE payload a validation retry, the exact outcome
+# `_production_evidence_schema`'s decoder-safety doctrine exists to avoid —
+# honesty must not cost a retry, so the schema accepts and Python trims.
+_RISK_DETAIL_MAX = 300
+_RISK_WHERE_MAX = 120
+
+
+def _normalize_risk_text(value: object, cap: int) -> str:
+    """One line, bounded. Collapses all whitespace runs (including
+    newlines) so a disclosure can never inject markdown structure — a
+    `\\n## ` heading — into the PR body's risk section, on any of the
+    renderers at once; tier-1's `unexercisable_reason` has no schema
+    bound at all, so this is the only bound it gets."""
+    return " ".join(str(value or "").split())[:cap]
+
+
+def _typed_risks(result: dict | None, source: str) -> list[dict]:
+    """One result's risk entries, both tiers, as normalized dicts.
+
+    Tier 1 is the already-typed `production_evidence.exercised == false`
+    signal — measured across 2,627 implementer calls on three repos it
+    fires on 3.2% of results, and on the motivating run (a separate
+    corpus) it flagged exactly the defect-bearing subtasks. Tier 2 is the
+    explicit `self_reported_risks` array. Pure JSON→dict set logic, no
+    prose interpreted (CLAUDE.md Language-to-JSON); malformed entries are
+    dropped rather than guessed.
+    """
+    if not isinstance(result, dict):
+        return []
+    out: list[dict] = []
+    ev = result.get("production_evidence")
+    if isinstance(ev, dict) and ev.get("exercised") is False:
+        out.append({
+            "kind": "unexercised_behavior",
+            "detail": _normalize_risk_text(
+                ev.get("unexercisable_reason"), _RISK_DETAIL_MAX)
+            or "path not exercised against real repo state",
+            "source": source,
+        })
+    for item in result.get("self_reported_risks") or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get("kind")
+        detail = _normalize_risk_text(item.get("detail"), _RISK_DETAIL_MAX)
+        if kind not in _RISK_KINDS or not detail:
+            continue
+        entry = {"kind": kind, "detail": detail, "source": source}
+        where = _normalize_risk_text(item.get("where"), _RISK_WHERE_MAX)
+        if where:
+            entry["where"] = where
+        out.append(entry)
+    return out
+
+
+def _collect_subtask_risks(impl_res: dict | None,
+                           conf_res: dict | None) -> list[dict]:
+    """DESIGN §9 *Self-reported risk is routed, not read*: the pure routing
+    helper that turns worker-disclosed risk into `risk_register` entries.
+
+    The conformer's positional `risk_dispositions` answers the
+    implementer-side entries in order (entry i answers risk i — the same
+    order `_format_self_reported_risks` presented them in). The ONE
+    disposition that can mark an entry `addressed` is "mitigated", and
+    only with the repair recorded in a structured field: a `fixed: true`
+    `solution_defects` entry or a `kind: "tests"` `file_updates` entry
+    (the two records a conformer repair can leave; a docs update is not
+    a mitigation; a record neutralized via `conformer_repair_rolled_back`
+    — rollback arms, uncommitted tests path, or a result the honesty
+    validator rejected — does not count). "confirmed_defect"
+    NEVER sets `addressed`, by design, not oversight: its act is the
+    filed defect, owned by the completeness gate, and an entry that then
+    SURVIVES to a finalized PR is a case where that channel did not fix
+    it — `--skip-completeness-check` demoted it, or the conformer
+    confirmed while filing no actionable entry (advisory-warned at
+    settle); rendering it "addressed" there would be anti-correlated
+    with reality. (Gate exhaustion blocks the subtask instead, and an
+    `accept-blocked`ed sid's entries never render — the PR section skips
+    work the PR does not contain.) "accepted", an unanswered
+    tail, a non-string or unrecognised item, or a mitigation with no
+    recorded repair all stay unaddressed — the fail-safe union: ignoring
+    a risk cannot clear it (A/B-measured: handing a reviewer the
+    disclosure with no typed way to answer it suppressed defect-reporting
+    to 0/3, against 2/3 with no disclosure at all — disclosure anchors
+    unless the answer is a recorded act). The mitigation act is
+    co-occurrence, not per-risk linkage — DESIGN §9 names the residual
+    class that leaves and why linkage was rejected (grammar budget;
+    Language-to-JSON).
+
+    Addressed entries are kept (annotated), not dropped: the PR section
+    shows the reviewer the full picture. Risks never gate — the gating
+    robustness kinds live on `solution_defects` and ride the existing
+    completeness channel.
+    """
+    impl_risks = _typed_risks(impl_res, "implementer")
+    dispositions = (conf_res or {}).get("risk_dispositions") \
+        if isinstance(conf_res, dict) else None
+    if not isinstance(dispositions, list):
+        dispositions = []
+    defects = (conf_res.get("solution_defects") or []) \
+        if isinstance(conf_res, dict) else []
+    file_updates = (conf_res.get("file_updates") or []) \
+        if isinstance(conf_res, dict) else []
+    # `conformer_repair_rolled_back` is orchestrator-set, not worker
+    # output: _run_conformance_phase marks the result when its own
+    # rollback arms reverted the round's commits, a tests file_update
+    # points at an uncommitted path, or the result failed the honesty
+    # validator — so repair records that no longer exist on the branch,
+    # or come from a rejected result, can never count as the act.
+    repair_lost = bool(isinstance(conf_res, dict)
+                       and conf_res.get("conformer_repair_rolled_back"))
+    has_mitigation_act = not repair_lost and bool(
+        any(isinstance(d, dict) and d.get("fixed") is True for d in defects)
+        or any(isinstance(u, dict) and u.get("kind") == "tests"
+               for u in file_updates))
+    out: list[dict] = []
+    for i, risk in enumerate(impl_risks):
+        entry = dict(risk)
+        disp = dispositions[i] if i < len(dispositions) else None
+        # isinstance guard is load-bearing, not defensive decoration: a
+        # dict/list item would raise TypeError on the frozenset membership
+        # test, and this runs on _settle_subtask's success path OUTSIDE
+        # the advisory conformance try/except — a malformed disposition
+        # must degrade to "unanswered", never kill the settle.
+        if isinstance(disp, str) and disp in _RISK_DISPOSITIONS:
+            entry["disposition"] = disp
+        entry["addressed"] = bool(
+            entry.get("disposition") == "mitigated" and has_mitigation_act)
+        out.append(entry)
+    # The conformer's own schema carries no self_reported_risks (grammar
+    # budget — see SCHEMAS["conformer"]), so normally only its
+    # production_evidence tier lands here; if a worker emits the field
+    # anyway (extra keys pass non-strict validation), the entries ride
+    # fail-safe to the register too. Never challenged, so never addressed.
+    for risk in _typed_risks(conf_res, "conformer"):
+        entry = dict(risk)
+        entry["addressed"] = False
+        out.append(entry)
+    return out
+
+
+def _format_self_reported_risks(impl_res: dict | None) -> str | None:
+    """The conformer-facing challenge block for an implementer's disclosed
+    risks, in the exact order `_collect_subtask_risks` will read the
+    positional `risk_dispositions` back. None when there is nothing to
+    challenge (the common case — no block beats an empty block)."""
+    risks = _typed_risks(impl_res, "implementer")
+    if not risks:
+        return None
+    lines = [
+        "SELF_REPORTED_RISKS — the implementer disclosed these risks about "
+        "its own diff. Answer EACH, in order, via `risk_dispositions` "
+        "(entry i answers risk i): \"confirmed_defect\" (the risk is a real "
+        "outstanding defect — also file it as an actionable "
+        "`solution_defects` entry so it gates; the register entry stays "
+        "visible either way), \"mitigated\" (you resolved it in this pass, "
+        "recorded as a `fixed: true` `solution_defects` entry or a "
+        "`kind: \"tests\"` `file_updates` entry — the only answer that "
+        "marks the risk addressed), or \"accepted\" (tolerable; it stays "
+        "on the run's risk register for the reviewer). An entry you leave "
+        "unanswered stays on the register — silence does not clear it, "
+        "and neither does \"mitigated\" without its recorded repair:",
+    ]
+    for i, r in enumerate(risks):
+        where = f" ({r['where']})" if r.get("where") else ""
+        lines.append(f"  {i}. [{r['kind']}]{where} {r['detail']}")
+    return "\n".join(lines)
 
 
 # ---- Task-referenced file extraction (CRITIC correlated-error breaker) - #
@@ -29685,7 +30087,8 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
                         blt_results: dict[str, dict],
                         blt_scope: str,
                         diff_base: str,
-                        extra_feedback: str | None = None) -> dict | None:
+                        extra_feedback: str | None = None,
+                        risk_challenge: str | None = None) -> dict | None:
     """Spawn one conformer for one subtask in its existing worktree.
     Returns the worker's structured output, or None on WorkerError (which
     is recorded as a warning by the caller — DESIGN §9: the phase is
@@ -29707,6 +30110,10 @@ async def _run_conformer(sid: str, leerie_dir: Path, worktree: str,
           f"RULES_FILES: {rules_paths_str}",
           f"DIFF_BASE: {diff_base} (compare with `git diff {diff_base}..HEAD`)"]
     _append_conformer_context_sections(up, blt_results, blt_scope, st)
+    # DESIGN §9 *Self-reported risk is routed, not read*: the implementer's
+    # disclosed risks, answered positionally via `risk_dispositions`.
+    if risk_challenge is not None:
+        up.append(risk_challenge)
     if extra_feedback is not None:
         up.append(extra_feedback)
 
@@ -30578,7 +30985,8 @@ def _emit_bash_axis_warnings(log_path: Path, round_label: str,
 async def _run_conformance_phase(sid: str, leerie_dir: Path,
                                  worktree: str, subtask: dict, caps: dict,
                                  st: State, models: dict[str, str],
-                                 efforts: dict[str, str | None]
+                                 efforts: dict[str, str | None],
+                                 impl_res: dict | None = None
                                  ) -> tuple[dict | None, list[str], str | None]:
     """Drive the orchestrator-level conformer loop for one subtask.
     Returns `(last_conformer_result, warnings, blocked_reason)`. Never
@@ -30588,8 +30996,11 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
     `caps["strict_conformer"]` is True and residuals remain after the
     loop, `blocked_reason` is a non-None summary string; the caller
     uses it to block the subtask instead of completing with advisory
-    warnings."""
+    warnings. `impl_res` is the implementer's structured result; its
+    disclosed risks become the conformer's SELF_REPORTED_RISKS challenge
+    block (DESIGN §9 *Self-reported risk is routed, not read*)."""
     warnings: list[str] = []
+    risk_challenge = _format_self_reported_risks(impl_res)
     repo_root = st.repo_root
     rules_files = _discover_rules_files(repo_root)
     blt = resolve_blt(repo_root)
@@ -30648,7 +31059,8 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                 sid, leerie_dir, worktree, caps, st, models, efforts,
                 rules_files=rules_files, blt_results=pre,
                 blt_scope=blt_scope,
-                diff_base=run_branch, extra_feedback=blt_feedback)
+                diff_base=run_branch, extra_feedback=blt_feedback,
+                risk_challenge=risk_challenge)
         except PidExhaustedError as e:
             # N22: the build/lint/test the conformer ran spawned enough
             # worker threads/processes to hit the cgroup's pids.max — a
@@ -30692,6 +31104,13 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
         err = _validate_conformance_result(last_res, worktree)
         if err:
             warnings.append(f"conformer round {c_round}: malformed result: {err}")
+            # A result that failed the honesty validator has no
+            # trustworthy repair records — without this, a fabricated
+            # tests path the validator itself just named as nonexistent
+            # still counted as the mitigation act at settle (measured:
+            # the validator catches the lie, the risk pipeline then
+            # rewarded the same lie).
+            last_res["conformer_repair_rolled_back"] = True
             break
 
         # Re-apply the implementer gates against any new conformer commits.
@@ -30713,6 +31132,16 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             await _rollback_conformer_commits(worktree, before_sha)
             warnings.append(f"conformer round {c_round}: protected-path "
                             f"violation reverted ({scope_err})")
+            # The rollback just reverted every commit this round made, so
+            # any repair records in the result (fixed:true defects, tests
+            # file_updates) describe work that no longer exists on the
+            # branch. Mark the result so _collect_subtask_risks never
+            # counts them as a mitigation act — measured: without this,
+            # a "mitigated" answer whose repair was rolled back rendered
+            # "addressed (mitigated)" in the PR for a repair the PR does
+            # not contain (DESIGN §9: the repair must be a COMMITTED
+            # record).
+            last_res["conformer_repair_rolled_back"] = True
             break
 
         # Dirty-worktree check: the conformer should commit, not leave
@@ -30722,6 +31151,76 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             warnings.append(f"conformer round {c_round}: left "
                             f"{len(dirty)} uncommitted change(s) — not "
                             "rolled back, but surfaced as advisory")
+        # Phantom-repair hazard, same class as the rollback arms above: a
+        # `kind: "tests"` file_updates entry whose path is not committed
+        # records a repair integration will lose. Checked against the
+        # FULL porcelain output, not `_uncommitted_paths` — that helper
+        # deliberately excludes untracked (`??`) files, and a test the
+        # conformer wrote but never `git add`ed is exactly this case.
+        # Neutralizes the mitigation act only; the files stay (advisory
+        # arm, nothing reverted).
+        tests_paths = {u.get("path") for u in
+                       (last_res.get("file_updates") or [])
+                       if isinstance(u, dict) and u.get("kind") == "tests"}
+        if tests_paths:
+            # Canonicalize the cited paths to worktree-relative before
+            # intersecting: porcelain prints canonical relative paths,
+            # while the validator RESOLVES a cited path — so `./x.py`
+            # and the absolute worktree spelling both pass validation
+            # yet never string-match porcelain (two executed evasions,
+            # the most common LLM path spellings).
+            _wt_resolved = Path(worktree).resolve()
+
+            def _canon_rel(p: object) -> str | None:
+                try:
+                    rp = Path(str(p))
+                    if not rp.is_absolute():
+                        rp = _wt_resolved / rp
+                    return str(rp.resolve().relative_to(_wt_resolved))
+                except (OSError, ValueError):
+                    return None
+            tests_paths = {c for c in (_canon_rel(p) for p in tests_paths)
+                           if c}
+        if tests_paths:
+            # `-z -uall`, parsed as NUL records, not `line[3:]` over the
+            # line form: the line form never prints the verbatim path
+            # for an untracked file under a new directory (`?? dir/`,
+            # collapsed), a path with spaces (quoted), a rename
+            # (`R old -> new`), or non-ASCII under core.quotepath
+            # (octal-escaped) — four executed evasions, each of which
+            # let a genuinely-uncommitted tests path count as a repair.
+            unclean: set[str] = set()
+            try:
+                _porc = await run_proc(
+                    ["git", "status", "--porcelain", "-z", "-uall"],
+                    cwd=worktree)
+            except OSError:
+                _porc = None
+            if _porc is not None and _porc.returncode == 0:
+                _fields = _porc.stdout.split("\0")
+                _i = 0
+                while _i < len(_fields):
+                    _rec = _fields[_i]
+                    _i += 1
+                    if len(_rec) < 4:
+                        continue
+                    unclean.add(_rec[3:])
+                    # Rename/copy records carry the ORIGIN path as the
+                    # following NUL field — on EITHER status side: X=R is
+                    # a staged rename, Y=R (`' R'`) a worktree-side one
+                    # (intent-to-add), and missing the latter desyncs the
+                    # record walk so a later record's path is swallowed
+                    # as a bogus origin (measured).
+                    if ("R" in _rec[:2] or "C" in _rec[:2]) \
+                            and _i < len(_fields):
+                        unclean.add(_fields[_i])
+                        _i += 1
+            if tests_paths & unclean:
+                warnings.append(
+                    f"conformer round {c_round}: tests file_updates "
+                    "entry references an uncommitted path — not counted "
+                    "as a mitigation repair")
+                last_res["conformer_repair_rolled_back"] = True
 
         # Clobber-survival check (DESIGN §9 *No clobbering the
         # implementer's work*): did the conformer revert-to-base or delete
@@ -30748,6 +31247,9 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                     f"conformer round {c_round}: strict mode — rolled "
                     "conformer commits back to implementer HEAD to restore "
                     "clobbered work")
+                # Same reasoning as the protected-path arm above: the
+                # result's repair records no longer exist on the branch.
+                last_res["conformer_repair_rolled_back"] = True
                 break
 
         # Commit-prefix observability: surface (but don't roll back) any
@@ -33092,7 +33594,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 conf_res, conf_warnings, blocked_reason = \
                     await _run_conformance_phase(
                         sid, leerie_dir, worktree, subtask, caps, st,
-                        models, efforts)
+                        models, efforts, impl_res=res)
             except Exception as e:
                 conf_warnings.append(
                     f"conformance phase raised {type(e).__name__}: {e} — "
@@ -33143,6 +33645,40 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     unreviewed.append(sid)
             elif sid in unreviewed:
                 unreviewed.remove(sid)
+            # DESIGN §9 *Self-reported risk is routed, not read*: fold both
+            # workers' typed risk into the register, net of the conformer's
+            # verifiable-act dispositions. Set / pop-on-clean mirrors
+            # `symptom_findings` above — a later clean attempt for the same
+            # sid must not keep reporting risks a re-drive resolved.
+            # Advisory (§12: the prompt rule gets a code check): a
+            # "confirmed_defect" answer whose result filed NO actionable
+            # defect confirmed a risk into a gating channel it never
+            # entered — the third way a confirmed entry survives to the
+            # PR, beside skip-flag demotion and gate exhaustion. Warn,
+            # never gate: risks are advisory end to end.
+            # isinstance(list) is load-bearing here for the same reason
+            # as _collect_subtask_risks' guard three lines down: a
+            # non-list value raises (int) or substring-matches (str) on
+            # `in`, and this sits on the settle success path outside the
+            # advisory try/except. The _typed_risks term keeps the
+            # warning from firing when no risk was ever disclosed (a
+            # schema-valid but pointless disposition answers nothing).
+            _disps = conf_res.get("risk_dispositions") \
+                if isinstance(conf_res, dict) else None
+            if isinstance(_disps, list) and "confirmed_defect" in _disps \
+                    and _typed_risks(res, "implementer") \
+                    and not _actionable_solution_defects(conf_res):
+                _cd_msg = ("conformer answered confirmed_defect but filed "
+                           "no actionable solution_defects entry — the "
+                           "confirmation never reaches the completeness "
+                           "gate; the risk stays on the register")
+                log(f"  {sid}: conformance: {_cd_msg}")
+                res.setdefault("conformance_warnings", []).append(_cd_msg)
+            _risks = _collect_subtask_risks(res, conf_res)
+            if _risks:
+                st.data.setdefault("risk_register", {})[sid] = _risks
+            else:
+                st.data.get("risk_register", {}).pop(sid, None)
             st.save()
 
             # DESIGN §9 *The one gating axis: solution completeness*. The
@@ -34428,6 +34964,23 @@ async def _compose_pr_via_llm(st: "State",
             log("pr_writer: worker returned empty title or body; "
                 "launcher will use deterministic fallback")
             return
+        # DESIGN §6 *The residual-risk section is appended by code on every
+        # composition path*: the worker never owns this section (its prompt
+        # says so, but the append is the guarantee — §12, the same
+        # discipline as _strip_leerie_prefix above: a worker-emitted
+        # section would otherwise render twice, or — with an empty
+        # register — ship worker-fabricated risks unbacked by any state).
+        # Strip UNCONDITIONALLY, append only when the register has
+        # content; both before the run.json write so the handed-off
+        # pr_body is already complete and the launcher needs no risk
+        # logic on this path.
+        body, stripped = _strip_worker_risk_sections(body)
+        if stripped:
+            log("pr_writer: stripped a worker-emitted residual-risks "
+                "section; the orchestrator owns that section")
+        risk_section = _format_risk_register_section(st.data)
+        if risk_section:
+            body = body + "\n" + risk_section
         used = result.get("used_template")
         _write_run_json(
             st.run_dir,

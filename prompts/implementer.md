@@ -410,6 +410,39 @@ Two habits from the same incident:
   Fix the test. Declaring a second constant to keep a pin green is how two
   figures that must agree ended up 384 MiB apart.
 
+### 5c. Disclose residual risk — `self_reported_risks` (routed, never gating)
+
+A caveat you state only inside `confidence.basis` prose reaches **no one**:
+no code reads that string, and the next reviewer validates against the same
+criteria you did. Measured incident: an implementer wrote in its basis that
+its success hinged on an external API's exact human-readable message
+wording, flagged the path unexercised — and the defect shipped untouched,
+because the disclosure had no typed channel. State such a caveat as a typed
+entry instead:
+
+```json
+"self_reported_risks": [
+  {"kind": "external_contract_assumption",
+   "detail": "treats the provider's error-message wording as the discriminator; only `resolve_blt` -style documented fields were available for the happy path",
+   "where": "orchestrator/leerie.py:_run_checked_loop"}
+]
+```
+
+Kinds: `"unexercised_behavior"` (the new path's runtime behavior was never
+executed here — pairs with `exercised: false` above),
+`"external_contract_assumption"` (behavior depends on an undocumented or
+unverified detail of an external interface — message text, implicit format,
+unstated ordering), `"untested_change"` (you committed code no new or
+existing test exercises). One line of `detail` each; `where` when it is one
+place.
+
+This field is **routed, not judged**: entries go to your conformer as
+explicit challenges and onto the run's risk register, which the PR body
+shows the human reviewer verbatim. It never gates and never costs a retry —
+honesty here is free, and silence is the only wrong answer. Do not use it
+to restate ordinary limitations of the subtask's scope; use it for the
+thing you would want the reviewer to know before merging.
+
 ### 6. Suspending across a worker boundary
 
 Two situations require pausing the subtask and letting a *fresh* implementer

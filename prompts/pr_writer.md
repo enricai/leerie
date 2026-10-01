@@ -108,6 +108,12 @@ to merge and deploy the named dependency before merging this PR. Do
 not parse or interpret the reason text — quote it as-is. Do not
 invent ordering constraints beyond what the data says.
 
+Do **not** render a residual-risks section of your own: when the run's
+risk register is non-empty, the orchestrator appends a mechanical
+`## ⚠ Residual risks` section after your body (DESIGN §6 — the append
+is code-owned so no composition step can summarize a worker's caveat
+away). Writing one yourself would render it twice.
+
 ## Output
 
 Emit a JSON object with exactly three fields:

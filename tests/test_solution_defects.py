@@ -120,3 +120,39 @@ class TestValidateConformanceSolutionDefects:
     def test_empty_array_passes(self, leerie):
         with tempfile.TemporaryDirectory() as wt:
             assert leerie._validate_conformance_result(self._base(), wt) is None
+
+
+class TestRobustnessKinds:
+    """DESIGN §9 *The success criteria are not the ceiling of this attack*:
+    the two beyond-criteria kinds ride the existing gating channel
+    unchanged — same anti-gaming filter, same retry formatting — and the
+    schema's enum actually admits them (substance, not key presence)."""
+
+    def test_new_kinds_are_actionable_through_the_filter(self, leerie):
+        for kind in ("external_contract_assumption",
+                     "unrevalidated_precondition"):
+            res = {"solution_defects": [_defect(kind=kind)]}
+            out = leerie._actionable_solution_defects(res)
+            assert len(out) == 1 and out[0]["kind"] == kind
+
+    def test_new_kinds_render_in_retry_feedback(self, leerie):
+        text = leerie._format_solution_defects(
+            [_defect(kind="unrevalidated_precondition",
+                     case="a row inserted between the guard and the commit",
+                     where="svc.py:call")])
+        assert "unrevalidated_precondition" in text
+        assert "a row inserted between the guard and the commit" in text
+
+    def test_schema_enum_admits_new_and_rejects_unknown(self, leerie):
+        import pytest as _pytest
+        jsonschema = _pytest.importorskip("jsonschema")
+        kinds = (leerie.SCHEMAS["conformer"]["properties"]["solution_defects"]
+                 ["items"]["properties"]["kind"]["enum"])
+        assert "external_contract_assumption" in kinds
+        assert "unrevalidated_precondition" in kinds
+        item_schema = (leerie.SCHEMAS["conformer"]["properties"]
+                       ["solution_defects"]["items"])
+        jsonschema.validate(_defect(kind="unrevalidated_precondition"),
+                            item_schema)
+        with _pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(_defect(kind="spooky_vibes"), item_schema)

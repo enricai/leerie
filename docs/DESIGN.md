@@ -2163,8 +2163,29 @@ the same container→host handoff channel used for
 `gh pr create` via `jq`. This is **fail-open**: any failure (worker
 error, schema mismatch, timeout, budget exhaustion, oversized payload) is
 logged and swallowed, falling back to a deterministic body composed from
-`state.json` (`compose_pr_body`). Generating a richer body must never
-block finalize success.
+`state.json` (the launcher's inline bash composition, mirroring
+`compose_pr_body`, the canonical reference for that shape). Generating a
+richer body must never block finalize success.
+
+**The residual-risk section is appended by code on every composition
+path.** When the run's `risk_register` (§9 *Self-reported risk is routed,
+not read*) is non-empty, a `## ⚠ Residual risks` section rendering each
+entry verbatim is appended to the PR body mechanically, on both live
+composition paths: by Python after the `pr_writer` worker's body is
+accepted, and in the launcher's LLM-less bash fallback by a `jq` renderer
+format-identical to `compose_pr_body` — the never-invoked canonical
+fallback reference the bash mirrors, which carries the same section —
+the same append-regardless-of-path discipline as the rebaser's diagnosis
+note. The `pr_writer` prompt tells the worker not to render its own risks
+section, but the guarantee is the append, not the prompt (§12): a
+worker-emitted section is stripped unconditionally — span-limited to the
+section, so surrounding legitimate content survives — whether or not the
+register has anything to append in its place. The section renders only
+subtasks whose work the PR actually contains: a sid still `blocked` at
+finalize was excluded from wave integration, and an `accept-blocked`ed
+sid's branch is likewise never merged (resume excludes it, so
+integration sees no result entry) — both are skipped, via
+`subtask_status` and the `accepted_blocked` registry.
 
 When the target repo has multiple templates inside
 `PULL_REQUEST_TEMPLATE/`, the alphabetically first `.md` wins by
@@ -6106,7 +6127,9 @@ Two further disciplines sit at the §12 axis:
   lower, but an adversarial attack on an artifact the conformer did not
   write (§8 *Independent adversarial verification*). It enumerates concrete
   behavioral gaps — an unhandled input, a missing guard, a decoy shortcut, a
-  sibling call site left unedited. A non-empty set of concretely-named
+  sibling call site left unedited, a behavior keyed on an undocumented
+  external-interface detail, a check-then-act sequence whose precondition
+  is never revalidated at the act. A non-empty set of concretely-named
   defects gates the subtask: the found gaps become mandatory additional
   criteria and the subtask retries the implementer with them folded in
   (bounded by `completeness_retry_rounds`; on exhaustion the subtask blocks
@@ -6115,6 +6138,22 @@ Two further disciplines sit at the §12 axis:
   reintroduce the gameable bar because there is no bar to lower — a defect
   without a concrete case is dropped as non-actionable. When the diff is
   empty or unreadable the axis fails open.
+
+  **The success criteria are not the ceiling of this attack.** The criteria
+  are planner-authored, and a criterion can itself embed the defect: on one
+  run a planner's criterion quoted a third-party API's human-readable error
+  message as the success discriminator, the implementer matched that message
+  with a regex, and the conformer — validating against the same criterion —
+  reported no defects and wrote tests cementing the regex. Measured on that
+  incident's inputs: the identical model flags the defect 3/3 when told the
+  criteria are not the ceiling and asked for the two kinds above
+  (`external_contract_assumption`, `unrevalidated_precondition`), and 0/3
+  false-positives on a clean control diff. The same measurement grounded
+  the sibling planner rule (a `success_criteria_seed` must state success in
+  documented discriminators, never in an external interface's message
+  wording): re-running the incident's implementer with the criterion
+  rephrased flipped the output from the message regex to a code-only check
+  in 3 of 3 samples, against 2 of 2 regexes under the original wording.
 - **Evidence must be production-grounded: a fix that never fires is not a
   fix.** Every gate above asks whether the code matches its specification.
   None asks whether the specification matches reality, and a wrong
@@ -6154,6 +6193,87 @@ Two further disciplines sit at the §12 axis:
   feeding the fix — also fails: instrumented, the defective branch executed
   under the defective fixture too, so the gate passes while the defect
   stands.
+- **Self-reported risk is routed, not read.** The evidence contract above
+  makes a worker *record* "I could not make this fire here" — but a recorded
+  caveat that nothing consumes is still silence one hop downstream. Measured
+  on a live run: an implementer disclosed, in its own structured output,
+  both that its new path was never exercised (`exercised: false`, with a
+  legitimate reason) and that its success hinged on an external API's exact
+  message wording — and the run shipped the defect anyway, because the only
+  consumer of `production_evidence` is a presence/shape check and the prose
+  caveat lived in a `confidence.basis` string no code reads. Per the
+  Language-to-JSON rule, the remedy is never to parse the prose: risk is
+  surfaced as typed JSON and routed by code.
+
+  Three mechanical consumers close the loop:
+
+  1. **A `risk_register` in run state.** `_collect_subtask_risks` folds the
+     already-typed tier (`production_evidence.exercised == false`, from the
+     implementer and the conformer) together with an explicit typed
+     `self_reported_risks` field on the implementer result (kind enum +
+     one-line detail), keyed by subtask, set and cleared on the same
+     settle path as `symptom_findings`. (Measured across 2,627 implementer
+     calls on three repos: the `exercised: false` tier fires on 3.2% of
+     results; on the motivating run — a fourth, separate corpus — it
+     flagged exactly the defect-bearing subtasks. A low-noise,
+     high-recall signal.)
+  2. **A Python-appended PR section.** The register renders into the PR
+     body as a `## ⚠ Residual risks` section appended by code on every
+     composition path — LLM-written, deterministic fallback, and the
+     launcher's bash fallback alike — so the reviewer sees the worker's own
+     caveats verbatim. The `pr_writer` worker never owns this section: an
+     LLM composer can summarize a caveat away; an append cannot.
+  3. **Conformer challenge items, answered through a typed disposition.**
+     The implementer's disclosed risks are injected into its conformer's
+     context, and the conformer must answer each through a positional
+     `risk_dispositions` field (`confirmed_defect` — the risk is real and
+     outstanding, escalated by also filing an actionable
+     `solution_defects` entry into the gating completeness channel;
+     `mitigated` — the conformer resolved it in this pass, recorded as a
+     `fixed: true` defect entry or a committed tests update in
+     `file_updates`; `accepted` — judged tolerable, stays visible). The
+     disposition channel is load-bearing, not decoration: A/B-measured on
+     the incident inputs, handing a reviewer the disclosure *without* a
+     typed way to answer it suppressed defect-reporting entirely (0/3
+     flagged, against 2/3 for the same reviewer with no disclosure at
+     all) — disclosure anchors a reviewer into "known limitation,
+     acceptable" unless the answer is itself a recorded, typed act.
+     Enforcement is the fail-safe union, in code, and **only a recorded
+     repair clears**: an entry is annotated `addressed` solely for
+     `mitigated` with the repair recorded in a structured field — and a
+     repair record is neutralized in code
+     (`conformer_repair_rolled_back`) and never counts when the PR will
+     not contain it or it cannot be trusted: the conformance phase's
+     own rollback arms reverted the round's commits (protected-path,
+     strict-clobber), the tests entry points at an uncommitted path, or
+     the whole result failed the honesty validator (a result whose
+     cited paths the validator itself rejected has no trustworthy
+     repair records — measured, the validator caught a fabricated
+     tests path and the risk pipeline then rewarded the same lie). A risk left unanswered, marked `accepted`,
+     confirmed, or mitigated without a surviving recorded repair
+     **stays on the register** and reaches the PR. `confirmed_defect`
+     never reads as addressed, by design rather than omission: its
+     defect entry belongs to the completeness gate, and a confirmed
+     entry that still *appears* in a finalized PR is a case where that
+     channel did not fix it — the defect was demoted by
+     `--skip-completeness-check`, or the conformer confirmed while
+     filing no actionable entry at all (the §12 code check behind the
+     prompt rule: that shape draws an advisory warning at settle). A
+     gate-exhausted subtask blocks instead, and settling it by
+     `accept-blocked` leaves its branch unmerged — its entries never
+     render, because the section skips work the PR does not contain.
+     Clearing a risk costs a verifiable repair recorded in a structured
+     field; ignoring it costs nothing and changes nothing. The repair check is deliberately a
+     co-occurrence check on the result's own structured fields, not
+     per-risk linkage: a linkage field was rejected for the conformer
+     schema's grammar budget, and matching dispositions to risks through
+     free text would violate the Language-to-JSON rule — so it proves
+     the conformer repaired something *in this pass*, not which risk the
+     repair targeted. The residual class this leaves open — a conformer
+     whose unrelated fix in the same pass co-occurs with a `mitigated`
+     answer to a different risk — is bounded by the PR section rendering
+     every entry, addressed or not, with its disposition visible.
+
 - **A stale finding is not a bug.** The evidence contract above asks whether
   a fix fires; this asks whether the failure it fixes still happens. On one
   run a subtask "fixed" a cgroup leak an earlier PR had already fixed before
@@ -6751,6 +6871,15 @@ recurs everywhere in the design:
   detection in Python and handing the model structured feedback plays to
   model strengths.
 
+- The orchestrator does not trust a prose caveat to reach anyone; risk is
+  typed JSON (`self_reported_risks`, `production_evidence.exercised`)
+  routed by code into the `risk_register`, and the register reaches the PR
+  body through a Python-appended section that no LLM composes (§9
+  *Self-reported risk is routed, not read*). A conformer clears a
+  challenged risk only through a repair recorded in a structured field —
+  a `fixed: true` defect record or a committed tests update — never
+  through silence, acceptance, or a confirmation (a confirmation files
+  the defect into the gating channel; it does not clear the risk).
 - The orchestrator does not trust a worker's confidence score at face
   value; it runs deterministic structural checks (file existence, graph
   cycles, lockfile consistency) on the output **and** gates on the

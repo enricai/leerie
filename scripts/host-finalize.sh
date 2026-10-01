@@ -1050,6 +1050,43 @@ EOF
     if [ -n "$deploy_note" ]; then
       pr_body="$pr_body$deploy_note"
     fi
+
+    # Residual-risk section (DESIGN §9 *Self-reported risk is routed, not
+    # read*; DESIGN §6 *The residual-risk section is appended by code on
+    # every composition path*). Mirror of _format_risk_register_section
+    # (orchestrator/leerie.py) — keep format-identical, like the cost line.
+    # Lives INSIDE the fallback branch only: on the pr_writer path the
+    # orchestrator already appended the section to run.json's pr_body, so
+    # appending here too would render it twice. jq emits nothing when the
+    # register is absent/empty; `2>/dev/null || true` keeps a missing or
+    # unreadable state.json from aborting finalize under `set -euo
+    # pipefail`.
+    local risk_note
+    risk_note="$(jq -r '
+      (.subtask_status // {} | if type == "object" then . else {} end) as $statuses
+      | (.accepted_blocked // {} | if type == "object" then . else {} end) as $accepted
+      | (.risk_register // {} | if type == "object" then . else {} end)
+      | [to_entries[] | .key as $sid
+         | select(($statuses[$sid] // "") != "blocked"
+                  and ($accepted | has($sid) | not))
+         | (.value | if type == "array" then . else [] end)[]
+         | select(type == "object")
+         | "- **" + $sid + "** [" + ((.kind // "risk") | tostring) + "] "
+           + ((.detail // "") | tostring)
+           + (if ((.where // "") | tostring) != ""
+              then " (" + ((.where // "") | tostring) + ")" else "" end)
+           + " — " + (if .addressed == true
+                      then "addressed (" + ((.disposition // "") | tostring) + ")"
+                      elif ((.disposition // "") | tostring) != ""
+                      then ((.disposition) | tostring) + ", not cleared"
+                      else "unaddressed" end)]
+      | select(length > 0)
+      | "\n## ⚠ Residual risks\n\nSelf-reported by workers; entries cleared by a verifiable act during conformance are annotated addressed. Full entries in state.json `risk_register`.\n\n"
+        + join("\n")
+    ' "$state_json" 2>/dev/null || true)"
+    if [ -n "$risk_note" ]; then
+      pr_body="$pr_body$risk_note"
+    fi
   fi
 
   # Fold in the rebaser's diagnosis (if the best-effort rebase above was

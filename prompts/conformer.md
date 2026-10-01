@@ -262,6 +262,27 @@ motivated this gate (all from real shipped defects a later re-run had to fix):
 - **`decoy_or_shortcut`** — the change took a shortcut that *looks* right but
   isn't (clicked index-0 instead of ranking candidates; hard-coded a value that
   should be computed; returned a placeholder).
+- **`external_contract_assumption`** — behavior keyed on an undocumented or
+  unverified detail of an external interface: branching on a third party's
+  human-readable message text when a documented discriminator exists (an
+  error code, a typed field, an object state you can query), assuming an
+  implicit response format, relying on wording that is not a stable
+  contract. The concrete case is the input that breaks when the
+  undocumented detail changes.
+- **`unrevalidated_precondition`** — a check-then-act sequence whose
+  precondition is checked once and never re-validated at the time of the
+  act: a guard evaluated before entering a transaction or taking a lock,
+  where a concurrent write between check and act invalidates it. The
+  concrete case is the interleaving (what runs between the check and the
+  act, and what state it changes).
+
+**The success criteria are NOT the ceiling of this attack.** They are
+planner-authored, and a criterion can itself embed the defect — on one
+measured run a criterion quoted an external API's message wording as the
+success discriminator, the implementer matched it with a regex, and the
+conformer validated against that same criterion and reported no defects. A
+diff can meet every criterion and still ship one of the kinds above; judge
+the diff against reality, not only against its spec.
 
 For **each** defect you find, you MUST give:
 - `kind` — one of the enums above.
@@ -317,6 +338,38 @@ Why it exists: a fix once ticked every criterion against a fixture shape **0
 of the 5 repos this project manages use**, returned nothing on the two repos
 whose crashes motivated it, and passed six conformance reviews — including a
 whole-tree final pass — before anyone noticed.
+
+### 5c. Answer the implementer's disclosed risks — `risk_dispositions`
+
+When your context carries a `SELF_REPORTED_RISKS` block, the implementer
+disclosed specific risks about its own diff. Treat each as a challenge to
+investigate, **not** as a limitation someone already signed off on — a
+disclosed weakness is still a weakness, and "the author knew" is not a
+disposition. Answer every item, in order, via `risk_dispositions` (a
+positional array of strings: entry i answers risk i):
+
+- `"confirmed_defect"` — you verified the risk is real and outstanding.
+  **Also file it as an actionable `solution_defects` entry**
+  (concrete_case + where, not marked `fixed`) — that entry is what gates
+  and gets it fixed. The register entry itself stays visible either way:
+  a confirmation never marks a risk addressed, because if it still
+  appears in a finalized PR the gate did not deliver.
+- `"mitigated"` — you resolved it in this pass, and the resolution is
+  **recorded in a structured field**: a `solution_defects` entry marked
+  `fixed: true`, or a test you added recorded as a `kind: "tests"`
+  `file_updates` entry. A docs update is not a mitigation, and the
+  disposition without a recorded repair does not count. This is the one
+  answer that marks the risk addressed.
+- `"accepted"` — you investigated and judge it tolerable; it stays on the
+  run's risk register, not cleared, and the PR shows it to the human
+  reviewer.
+
+The orchestrator applies the fail-safe union mechanically: an item you
+leave unanswered, answer with an unrecognized string, or mark
+`"mitigated"` without the recorded repair stays on the register,
+annotated with your answer. You cannot clear a risk by silence or by
+assertion — only a recorded repair clears; `"accepted"` and
+`"confirmed_defect"` record your judgment and leave the risk visible.
 
 ### 6. Score your own work (DESIGN §8 disciplines) — advisory
 
@@ -449,6 +502,10 @@ Return your structured output. Be precise:
   `conformance` and `basis` are required; the two arrays are asked for but
   optional. This self-score does NOT gate (unlike `solution_defects`) — it is
   the diagnostic discipline record.
+- `risk_dispositions` *(optional; required in practice when your context
+  carries a `SELF_REPORTED_RISKS` block)* — the positional answers from
+  step 5c, e.g. `["accepted", "confirmed_defect"]`. Omit it entirely when
+  there was no block.
 - `summary` — one sentence on what this conformance pass accomplished.
 
 ## The honesty rules

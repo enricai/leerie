@@ -1942,6 +1942,19 @@ detail past the cut-off.
 | `PR_WRITER_DIFF_SAMPLE_MAX_LINES`| 500    | sampled `git diff` hunks (line-capped because individual diff lines can be long and breaking one mid-line would render the surrounding hunk unreadable) |
 | `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES` | 8,000 | serialized JSON length of the `final_conformance` payload field. Enforced inside `_final_conformance_payload` by trimming `warnings` (then `residuals`) from the tail; at least one of each is preserved and a `truncated: true` marker is added when trimming fired |
 
+When `state.json.risk_register` is non-empty, `_compose_pr_via_llm` appends
+`_format_risk_register_section(st.data)` to the worker's accepted body
+before writing `pr_body` to `run.json` — so the handed-off body is already
+complete — and the same section is rendered in the launcher's LLM-less
+bash fallback by a `jq` block format-identical to `compose_pr_body`, the
+canonical fallback reference it mirrors (DESIGN §6 *Finalization*, *The
+residual-risk section is appended by code on every composition path*).
+The `pr_writer` prompt tells the worker not to render its own risks
+section; the append is the guarantee, and a worker-emitted copy of the
+section is removed unconditionally (span-limited, via
+`_strip_worker_risk_sections`) even when the register is empty and
+nothing is appended in its place.
+
 These are **module constants, not `DEFAULT_CAPS` entries**, by design:
 `DEFAULT_CAPS` is the surface for user-tunable run-wide operational caps
 (`max_total_workers`, `worker_timeout_sec`, `max_rate_limit_wait_sec`,
@@ -4403,6 +4416,63 @@ strings stay optional, since many required params mixed with verbose strings
 triggers anthropics/claude-code#49747's decoder corruption.
 `tests/test_production_evidence.py` pins both.
 
+`_collect_subtask_risks(impl_res, conf_res) -> list[dict]`
+(DESIGN §9 *Self-reported risk is routed, not read*) is the pure routing
+helper beside the two checks above. It folds two typed tiers into risk
+entries `{kind, detail, where?, source, disposition?, addressed}`: tier 1 is
+`production_evidence.exercised == false` on either result (kind
+`unexercised_behavior`, detail = the `unexercisable_reason`); tier 2 is the
+implementer's optional `self_reported_risks` array
+(`_self_reported_risks_schema()`: `{kind:
+unexercised_behavior|external_contract_assumption|untested_change, detail,
+where?}`, max 8). Every detail/where is normalized on ingestion by
+`_normalize_risk_text` (whitespace runs — including newlines — collapsed;
+length-capped at `_RISK_DETAIL_MAX` = 300 / `_RISK_WHERE_MAX` = 120
+characters) so a disclosure can never inject markdown structure into the
+PR section or bloat it. The conformer's positional `risk_dispositions`
+(bare strings, read from `conf_res`) answers the implementer-side entries
+in order (index i answers risk i): an entry is marked `addressed: true`
+ONLY for `"mitigated"` with the repair recorded in a structured field — a
+`fixed: true` `solution_defects` entry or a `kind: "tests"`
+`file_updates` entry, and only while the record survives and is
+trustworthy: `_run_conformance_phase` sets
+`conformer_repair_rolled_back` on the result when its rollback arms
+reverted the round's commits, a tests entry points at an uncommitted
+path (checked against full `-z -uall` porcelain, cited paths
+canonicalized worktree-relative first), or the result failed
+`_validate_conformance_result` — each neutralizes the act — while
+`"accepted"`, `"confirmed_defect"`, an unanswered tail, a non-string or
+unrecognised item, or a mitigation with no surviving repair record all
+stay unaddressed (the fail-safe union; no prose is ever interpreted,
+only set/string comparison on structured fields). `"confirmed_defect"`
+never reads as addressed by design: its act is the filed defect, which
+the completeness gate owns; a confirmation filed with NO actionable
+entry draws an advisory warning at settle (the §12 code check behind
+the prompt rule) — see DESIGN §9, which also names the
+unrelated-repair residual class and why per-risk linkage was rejected.
+`_settle_subtask`'s success path persists the result to
+`state.json.risk_register[sid]` with the same set / pop-on-clean shape as
+`symptom_findings`, and threads the implementer-side entries into
+`_run_conformance_phase` → `_run_conformer`, which renders them as a
+`SELF_REPORTED_RISKS` context block the conformer must answer. The register
+reaches the PR body through `_format_risk_register_section(state)` —
+which skips any sid still `blocked` at finalize AND any sid in the
+`accepted_blocked` registry (an accepted sid's status is rewritten to
+`complete` but its branch is never merged), since neither's work is in
+the PR — appended by code on both live composition paths
+(`_compose_pr_via_llm` after the worker's body is accepted — any
+worker-emitted copy of the section removed unconditionally by
+`_strip_worker_risk_sections`, span-limited so surrounding content
+survives — and a format-identical `jq` renderer in
+`scripts/host-finalize.sh`'s LLM-less fallback, mirroring
+`compose_pr_body`, the canonical fallback reference, which carries the
+same section — the `rebase_diagnosis_note` append discipline). Advisory
+end to end: risks never gate, re-drive, or block; the two *gating*
+robustness kinds live on `solution_defects`
+(`external_contract_assumption`, `unrevalidated_precondition`) and ride
+the existing completeness channel unchanged. Pinned by
+`tests/test_risk_register.py`.
+
 `PHANTOM_ARTIFACT` resolves a collision's `artifact` against the union of
 every subtask's `files_likely_touched` **as well as** the working tree, not
 the tree alone — the judge's charter is subtasks that both *create or
@@ -5896,10 +5966,12 @@ The launcher's finalize block in `leerie` (bash) does, in order:
    `pr_writer` entry). Fallback path (pr_writer skipped or crashed): a
    bash heredoc reads `state.json` fields with `jq` and emits the
    deterministic body shape `compose_pr_body` produces (task, category,
-   source-of-truth, run timestamps, wave + subtask + worker counts, and
-   — when `external_preconditions` is non-empty — a `⚠ Deploy-ordering`
-   section rendered via `jq`, byte-identical to the Python renderer;
-   see "Deploy-ordering notes"). The launcher branches on whether
+   source-of-truth, run timestamps, wave + subtask + worker counts,
+   when `external_preconditions` is non-empty a `⚠ Deploy-ordering`
+   section, and when `risk_register` is non-empty a `⚠ Residual risks`
+   section — each rendered via `jq`, byte-identical to the Python
+   renderer; see "Deploy-ordering notes" and the §5½ risk-routing
+   paragraph). The launcher branches on whether
    `pr_title_llm` / `pr_body_llm` are non-empty.
 5. **Open PR.** Before calling `gh pr create`, validate that
    `working_branch` still exists on origin via `git ls-remote
@@ -7434,7 +7506,7 @@ discovery without parsing the full `state.json`):
 | `volume_id` | str \| null | Fly volume ID when the machine was provisioned with one (default on `--runtime fly`). Mounted at `/work`; destroyed with the machine. Requires `fly_machine_id` non-null. |
 | `image_tag` | str \| null | Full Fly registry image tag recorded at provision time; `resume_machine()` updates the machine's image on resume if `$FLY_IMAGE_TAG` has drifted from the stored value. |
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix; the launcher prepends it). Null when the worker errored or was skipped (no-push); `host_finalize` falls back to a deterministic title. |
-| `pr_body` | str \| null | LLM-written PR body (markdown) from the `pr_writer` worker. Null on the same conditions as `pr_title`. |
+| `pr_body` | str \| null | PR body (markdown): the `pr_writer` worker's accepted body, with any worker-emitted residual-risks section stripped and the code-appended `## ⚠ Residual risks` section attached when `risk_register` is non-empty (`_compose_pr_via_llm` — that section is deliberately never LLM-written). Null on the same conditions as `pr_title`. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
 | `rebase_disposition_status` | str \| null | set to `"unusable"` by the rebase fallback arm when the rebaser seam returns rc=0 but its JSON is empty, unparseable, or lacks `status`. |
 | `rebase_disposition_jq_rc` | str \| null | the `jq -e` exit code from parsing `$_rebaser_json` in that fallback arm — non-zero means the payload was unparseable JSON, not merely missing `.status`. Null under the same conditions as `rebase_disposition_status`. |
@@ -7549,6 +7621,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). |
 | `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. |
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
+| `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries (`{kind, detail, where?, source, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks` plus the `production_evidence.exercised == false` tier); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`; rendered verbatim — addressed entries annotated — into the PR body's `## ⚠ Residual risks` section by code on every composition path. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. |
@@ -7668,7 +7741,12 @@ Required fields, current shape:
   not gate), `checkpoint_path`, `blocker`, `summary`, `clarification_question`
   (DESIGN §11: `{id, question, why_underivable}`, all required together with
   `checkpoint_path`), `artifacts` (DESIGN §5: `{name, kind: "markdown"|"json"|"text",
-  content, summary?}[]` — deliverables for downstream subtasks).
+  content, summary?}[]` — deliverables for downstream subtasks),
+  `self_reported_risks` (DESIGN §9 *Self-reported risk is routed, not read*:
+  `{kind: unexercised_behavior|external_contract_assumption|untested_change,
+  detail, where?}[]`, max 8 — routed by `_collect_subtask_risks` into the
+  `risk_register` and the conformer's challenge context, never parsed from
+  prose).
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
   `design-conflict` / `failed`). `confidence`: `_confidence_schema(["resolution"])`.
   Optional: `resolution_summary`, `diagnosis` (fallback on non-`resolved`).
@@ -7685,12 +7763,23 @@ Required fields, current shape:
   reason}[]`), `build`/`lint`/`tests` (each `{ran, passed, command, summary?}`
   — `ran: false` when not applicable), `summary`, and `solution_defects`
   (`{kind: unhandled_input|unhandled_path|missing_guard|sibling_site_unedited|
-  wrong_selector|decoy_or_shortcut, concrete_case, where, why_ships_a_defect}[]`,
+  wrong_selector|decoy_or_shortcut|external_contract_assumption|
+  unrevalidated_precondition, concrete_case, where, why_ships_a_defect}[]`,
   all three fields non-empty). `solution_defects` is the **gating** axis
   (DESIGN §9 *The one gating axis: solution completeness*) — the conformer's
   independent adversarial attack on the diff; non-empty retries the
   implementer with the defects as mandatory criteria (bounded by
-  `completeness_retry_rounds`), or blocks on exhaustion.
+  `completeness_retry_rounds`), or blocks on exhaustion. The last two kinds
+  extend the attack beyond the planner-authored criteria (DESIGN §9 *The
+  success criteria are not the ceiling of this attack*). Optional:
+  `risk_dispositions` — a positional array of BARE STRINGS
+  (`"confirmed_defect"` / `"mitigated"` / `"accepted"`; no enum on the
+  wire, no item object, no rationale field — both were rejected for the
+  grammar budget, see `_risk_dispositions_schema`), where entry i answers
+  the i-th `SELF_REPORTED_RISKS` challenge item; a short or absent array
+  leaves the tail unanswered, which `_collect_subtask_risks` keeps on the
+  `risk_register` — the fail-safe union, DESIGN §9 *Self-reported risk is
+  routed, not read*.
 
   `rule_violations`/`file_updates` are wire-flattened discriminated arrays
   (mirroring `SCHEMAS["reconciler"]`'s `tag_ops` technique) to keep the

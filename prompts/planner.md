@@ -358,6 +358,22 @@ The orchestrator gives you, in your prompt:
 4. **Seed success criteria.** For each subtask, write a concrete, checkable
    `success_criteria_seed` — describe an automated test wherever possible.
 
+   **Never pin a criterion to an external interface's human-readable
+   message wording.** State success in terms of documented discriminators —
+   an error code, a typed field, an object state the code can query — not
+   the text of a message a third party may reword at any time. A criterion
+   that quotes message wording teaches the implementer to match that
+   wording: measured on one incident, a criterion phrased as "error whose
+   message says already gone counts as success" produced a message-matching
+   regex in 2 of 2 samples, while the same criterion rephrased onto the
+   documented error code produced a code-only check in 3 of 3 — the
+   criterion's wording *is* the implementation. When the external interface
+   genuinely documents no discriminator for a case, say exactly that in the
+   subtask's `investigation_notes` and direct the implementer to a
+   structural check (query the object's state, e.g. the way
+   `check_rebaser_worktree_state` re-reads git state instead of parsing a
+   worker's prose) rather than silently falling back to message text.
+
    If your CONTEXT includes `required_items` (the task's explicit,
    enumerable requirements, extracted upstream — absent when the task has
    none), and one of them is something a subtask satisfies, echo that

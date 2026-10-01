@@ -90,19 +90,25 @@ def test_status_is_optional(leerie):
 def test_it_is_a_bool_because_the_schema_has_a_hard_size_bound(leerie):
     """Deliberately NOT a `status` enum mirroring rule_violations.
 
-    This schema has a 2550-byte dumped bound, because the strict-output grammar
-    compiler has actually rejected it when larger (DESIGN §7, N29). The enum
-    encoding costs 59 bytes of field text and the bool 28 — +61 and +30 once
-    `json.dumps`' `", "` separator is counted, which is what the bound actually
-    measures. Only the bool fits. The
-    consistency with rule_violations is worth less than worker output that
-    validates at all.
+    This schema has a hard dumped-size bound, because the strict-output
+    grammar compiler has actually rejected it when larger (DESIGN §7, N29).
+    The enum encoding costs 59 bytes of field text and the bool 28 — +61 and
+    +30 once `json.dumps`' `", "` separator is counted, which is what the
+    bound actually measures. Only the bool fits. The consistency with
+    rule_violations is worth less than worker output that validates at all.
+
+    The bound is imported from `tests/test_conformer_schema_size.py`, the
+    file that OWNS the wire metric and re-measures it on every schema
+    change — a second hard-coded copy here is how this test went red on
+    the 2026-10-01 risk-register fields while measuring nothing new.
     """
     import json
+
+    from tests.test_conformer_schema_size import _MAX_DUMPED_BYTES
     props = (leerie.SCHEMAS["conformer"]["properties"]["solution_defects"]
              ["items"]["properties"])
     assert props["fixed"] == {"type": "boolean"}
-    assert len(json.dumps(leerie.SCHEMAS["conformer"])) < 2550
+    assert len(json.dumps(leerie.SCHEMAS["conformer"])) < _MAX_DUMPED_BYTES
 
 
 def test_no_path_overlap_inference(leerie):

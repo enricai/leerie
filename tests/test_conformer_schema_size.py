@@ -33,18 +33,32 @@ import json
 
 import pytest
 
-# Bound for the WIRE metric, sitting between the current shape (2,450) and
-# the pre-flatten shape (2,653 as reconstructed by `_unflattened_conformer`
-# below; 2,722 as measured against the real 7721a6e~1 literal, which also
-# carried descriptions this reconstruction drops). Reverting the flatten
-# therefore crosses it. Deliberately NOT plan_overlap_judge's 894 — the
-# conformer legitimately carries more fields, and the work order's ~4.8K
-# bracket was a source-byte figure that belongs to the sibling file.
-_MAX_DUMPED_BYTES = 2550
+# Bound for the WIRE metric, sitting between the current shape and the
+# pre-flatten reconstruction so reverting the flatten crosses it.
+# Re-measured 2026-10-01 when the risk-register change added two
+# `solution_defects` kinds and `risk_dispositions` (DESIGN §9
+# *Self-reported risk is routed, not read*): current 2,690, reconstruction
+# 2,829 (displacing 2,544 / 2,683 measured at the pre-change HEAD with
+# this file's own metrics; the real 7721a6e~1 pre-flatten literal dumps
+# to 2,722, carrying descriptions the reconstruction drops). Deliberately
+# NOT plan_overlap_judge's 894 — the conformer legitimately carries more
+# fields, and the work order's ~4.8K bracket was a source-byte figure that
+# belongs to the sibling file.
+_MAX_DUMPED_BYTES = 2750
 
-# Same discipline for the hardened form the grammar compiler actually sees:
-# current 2,880, pre-flatten 3,178 (both measured).
-_MAX_HARDENED_BYTES = 3000
+# Same discipline for the hardened form the grammar compiler actually
+# sees — except this bound IS the measured failure point, not a margin
+# between shapes: the pre-N29 schema hardened to 3,178 bytes and the
+# compiler rejected it ("The compiled grammar is too large"), so reaching
+# this number is the measured regression itself. Current, re-measured
+# 2026-10-01 with the risk-register fields: 3,143, displacing 2,991 /
+# 3,217 (current / reconstruction at the pre-change HEAD, this file's
+# own metrics) — every byte added to SCHEMAS["conformer"] now spends
+# from a ~35-byte margin, and sizes inside (3,143, 3,178) are UNTESTED
+# against the compiler: the bound only proves reaching 3,178 fails, not
+# that 3,170 compiles. See _risk_dispositions_schema's docstring for
+# the shapes rejected as unaffordable.
+_MAX_HARDENED_BYTES = 3178
 
 
 def _unflattened_conformer(schema: dict) -> dict:
@@ -175,9 +189,10 @@ def test_payload_missing_a_required_gating_field_is_rejected(leerie, missing_fie
 def test_hardened_wire_form_also_stays_small(leerie):
     """The strict-output proxy's `strict:true` rewrite is what actually
     reaches the grammar compiler, so it gets its own bound — measured on
-    the same two shapes (current 2,880 vs pre-flatten 3,178) rather than
-    against the old 6,219 source-byte figure, which every hardened form
-    trivially cleared."""
+    real shapes (current 3,143; this file's reconstruction hardens to
+    3,369; the real 7721a6e~1 pre-flatten literal to exactly 3,178, the
+    bound) rather than against the old 6,219 source-byte figure, which
+    every hardened form trivially cleared."""
     node = copy.deepcopy(leerie.SCHEMAS["conformer"])
     leerie._strictify_schema(node)
     hardened_size = len(json.dumps(node))

@@ -4032,3 +4032,88 @@ and the existing `tests/test_defect_scope_audit.py` arms —
 prompt-agnostic except `test_planner_prompt_documents_the_key`,
 which pins the `defect_scope`/`chokepoint` mentions in the planner
 prompt.
+
+## Self-reported risk routing (2026-10-01)
+
+One diagnosis (the phoenix GDPR-deletion run, leerie v0.32.2: a planner
+criterion quoting an external API's message wording propagated through an
+honest-but-unconsumed implementer disclosure into shipped brittle code;
+DESIGN §9 *Self-reported risk is routed, not read* and *The success
+criteria are not the ceiling of this attack*), five surfaces:
+
+**The routing helpers**, in `tests/test_risk_register.py`: the incident
+pin (an `exercised: false` + valid `unexercisable_reason` result — the
+exact shape `check_production_evidence` passes silently — must land in
+`_collect_subtask_risks` with the reason text asserted by VALUE); the
+two-tier union and malformed-entry drops; the fail-safe disposition
+union (conformer silence, `accepted`, `confirmed_defect` — never
+addressed by design, its act gates instead — an unrecognised or
+non-string item, and a `mitigated` with neither a `fixed: true` defect
+entry nor a `kind: "tests"` `file_updates` entry each leave the risk
+unaddressed — inputs disagree per case); positional mapping pinned
+against `_format_self_reported_risks`'s own item order; schema
+substance (the implementer enum really rejects an unknown kind); the
+rollback neutralization (`conformer_repair_rolled_back` present with
+both repair records → not addressed); the renderer's
+work-not-in-the-PR filters (a `blocked` sid skipped; an
+`accepted_blocked` sid skipped despite its rewritten `complete`
+status; malformed status/registry values degrade instead of raising);
+and the EXECUTED settle path (`test_settle_success_path_populates_and_pops_the_register`
+drives the real `_settle_subtask` — mutation-
+probed: dropping the `impl_res` threading, the register write, or the
+pop each kills it — plus the confirmed-without-filing advisory
+warning).
+
+**Conformer threading**, in `tests/test_run_conformance_phase.py`:
+behavioral probes that execute both consumers — `_run_conformance_phase`
+threads the challenge text (detail values, not a key) into the
+`_run_conformer` call, a risk-free result threads `None`, and the real
+`_run_conformer` renders a given block into the worker's user prompt.
+The same file carries the producer-side survival pins for
+`conformer_repair_rolled_back`, one per flag-setting arm plus the
+evasion shapes: protected-path rollback
+(`test_protected_path_rollback_neutralizes_repair_records`),
+strict-clobber rollback
+(`test_strict_clobber_rollback_neutralizes_repair_records`), the
+honesty-validator rejection
+(`test_malformed_result_neutralizes_repair_records`), and the
+uncommitted-tests-path check via the full `-z -uall` porcelain parse
+(`test_uncommitted_tests_entry_neutralizes_repair`,
+`test_uncommitted_tests_file_in_new_directory_is_caught`, the
+parametrized `test_porcelain_evasion_shapes_are_caught` over
+space/non-ASCII/staged-rename paths, and
+`test_noncanonical_cited_path_is_still_caught` for `./`-prefixed and
+absolute citations, which the validator resolves but exact-string
+matching missed).
+
+**The PR composition renderers** (two live paths plus `compose_pr_body`,
+the never-invoked canonical reference the bash fallback mirrors):
+`tests/test_compose_pr_body.py` (reference renders details verbatim;
+empty register renders no heading),
+`tests/test_pr_writer_git_helper_bounded.py` (the LLM path appends the
+section to the accepted body BEFORE the run.json write, appends nothing
+on an empty register, and owns the `_strip_worker_risk_sections`
+guarantees: a worker-emitted section stripped even with an empty
+register, a mid-body copy removed span-limited with trailing sections
+surviving, a fence-quoted heading left alone, and the U+FE0F
+variation-selector heading still matched), and
+`tests/test_host_finalize_sh.py` (the bash fallback's jq renderer
+byte-matches `_format_risk_register_section` on the same state —
+including the blocked-sid and `accepted_blocked` filters — with the
+expectation computed from the Python renderer, so the two cannot drift
+independently of the test).
+
+**The gating robustness kinds**, in `tests/test_solution_defects.py`:
+`external_contract_assumption` / `unrevalidated_precondition` pass the
+anti-gaming filter, render in the retry feedback, and the schema enum
+admits them while rejecting an invented kind.
+
+**The conformer schema's size budget**, re-pinned in
+`tests/test_conformer_schema_size.py`: bounds re-measured 2026-10-01
+(dumped 2,690/2,750; hardened 3,143 against `_MAX_HARDENED_BYTES` now set
+to 3,178 — the MEASURED pre-N29 grammar-compiler failure point, so
+reaching the bound is the regression itself, not a margin). The shapes
+rejected as unaffordable (an item object, an enum on the disposition
+strings) are recorded in `_risk_dispositions_schema`'s docstring; the
+value set is enforced in Python instead, which is also why
+`risk_dispositions` carries no enum for the parity sweep to require.

@@ -60,6 +60,14 @@ FOREIGN_PROJECT_MARKERS = (
     # cannot catch on its own.
     "partymix", "sailmonth", "privateisland",
     "royalcaribbean", "disneycruise", "disney-wish",
+    # Distinctive identifiers from the 2026-10-01 risk-routing incident's
+    # target repo (a Rails billing app). The motivating code and its run
+    # telemetry carry these names; the shipped prompts and fixtures were
+    # genericized, and this seeding pins the leak path the same way the
+    # 2026-09-28 sweep did for its incident.
+    "already_detached", "detach_payment_method",
+    "stripe_payment_method_service", "deletion_blockers",
+    "account_deletion_service", "scrub_for_account_deletion",
 )
 
 # Identifiers that legitimately appear in a prompt without existing in this

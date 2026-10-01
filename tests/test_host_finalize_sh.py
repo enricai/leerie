@@ -1131,3 +1131,92 @@ def test_rebase_fallback_arm_persists_null_raw_json_when_payload_empty(tmp_path)
     after = json.loads((run_dir / "run.json").read_text())
     assert after.get("rebase_disposition_status") == "unusable"
     assert after.get("rebase_disposition_raw_json") is None
+
+
+# --- residual-risk note in the LLM-less fallback (DESIGN §9 *Self- --------
+# reported risk is routed, not read*; §6 *appended by code on every --------
+# composition path*) --------------------------------------------------------
+
+_RISK_REGISTER = {
+    "feat-001": [
+        {"kind": "external_contract_assumption",
+         "detail": "matches the provider's error-message wording",
+         "where": "app/services/x.rb", "source": "implementer",
+         "disposition": "accepted", "addressed": False},
+        {"kind": "unexercised_behavior", "detail": "needs a live API",
+         "source": "implementer", "disposition": "mitigated",
+         "addressed": True},
+        {"kind": "untested_change", "detail": "escalated to the gate",
+         "source": "implementer", "disposition": "confirmed_defect",
+         "addressed": False},
+    ],
+    "feat-002": [
+        {"kind": "untested_change", "detail": "no test covers the branch",
+         "source": "conformer", "addressed": False},
+    ],
+    # Still blocked at finalize: excluded from integration, so BOTH
+    # renderers must skip it (the subtask_status filter).
+    "feat-003": [
+        {"kind": "untested_change", "detail": "orphan risk on blocked work",
+         "source": "implementer", "addressed": False},
+    ],
+    # Accept-blocked'ed: status rewritten to `complete` by the launcher
+    # mutator, but the branch is never merged — the accepted_blocked
+    # registry is the discriminator both renderers must honor.
+    "feat-004": [
+        {"kind": "untested_change", "detail": "orphan risk on accepted work",
+         "source": "implementer", "addressed": False},
+    ],
+}
+
+_RISK_STATUSES = {"feat-001": "complete", "feat-002": "complete",
+                  "feat-003": "blocked", "feat-004": "complete"}
+
+_RISK_ACCEPTED = {"feat-004": {"accepted_at": "2026-10-01T00:00:00Z"}}
+
+
+def test_fallback_renders_risk_note_from_state(tmp_path):
+    run_dir = _finalizable_run(
+        tmp_path, "risk-note-aaaa",
+        extra_state={"risk_register": _RISK_REGISTER,
+                     "subtask_status": _RISK_STATUSES,
+                     "accepted_blocked": _RISK_ACCEPTED})
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+    assert "⚠ Residual risks" in body, body
+    assert "matches the provider's error-message wording" in body, body
+    assert "no test covers the branch" in body, body
+    # The still-blocked sid's entry must NOT render (work not integrated).
+    assert "orphan risk on blocked work" not in body, body
+    assert "orphan risk on accepted work" not in body, body
+
+
+def test_fallback_risk_note_byte_matches_python_renderer(tmp_path, leerie):
+    """The bash (jq) residual-risks section must be byte-identical to
+    `_format_risk_register_section` on the same state — true
+    cross-implementation parity, computed from the Python renderer itself
+    rather than a hand-written expectation (so the two cannot drift
+    independently of this test). The state includes a blocked sid and an
+    accept-blocked'ed sid so both renderer filters are part of the
+    parity contract."""
+    state = {"risk_register": _RISK_REGISTER,
+             "subtask_status": _RISK_STATUSES,
+             "accepted_blocked": _RISK_ACCEPTED}
+    run_dir = _finalizable_run(
+        tmp_path, "risk-parity-aa", extra_state=state)
+    proc, body = _run_host_finalize_capturing_body(tmp_path, run_dir)
+    assert proc.returncode == 0, proc.stderr
+    expected = leerie._format_risk_register_section(state)
+    assert expected, "Python renderer returned nothing for a populated register"
+    assert expected in body, (
+        f"section not byte-identical.\n---got---\n{body!r}"
+        f"\n---want---\n{expected!r}")
+
+
+def test_fallback_no_risk_note_when_register_absent_or_empty(tmp_path):
+    for rid, extra in (("risk-none-aaaa", {}),
+                       ("risk-empty-aaa", {"risk_register": {}})):
+        run_dir = _finalizable_run(tmp_path / rid, rid, extra_state=extra)
+        proc, body = _run_host_finalize_capturing_body(tmp_path / rid, run_dir)
+        assert proc.returncode == 0, proc.stderr
+        assert "Residual risks" not in body, body
