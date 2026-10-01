@@ -3913,6 +3913,37 @@ pinned by a parametrized consumer-executing test asserting the
 `max_turns` value `claude_p` RECEIVES for disagreeing item counts —
 1→36, 9→84 (the measured incident's larger list), 11→90 (the first
 clamped count), 20→90 — so a hardcoded bypass fails multiple params.
+
+**Ground-truth availability and the `unverifiable` verdict (S-4,
+DESIGN §5 *Report-named ground truth* / §8's unverifiable rule).**
+In `tests/test_delivery_gate.py`, executed through the real
+prejudge against the real filesystem: the load-bearing downgrade
+arm (a judge claiming met while the audit is data-dependent and
+every named input is absent persists as `unverifiable` with
+`judge_claimed: "met"` and both evidence halves, at one sample —
+the exact silent shape two consecutive live v0.33.0 gates
+shipped); its converse (all inputs present → met stands, no
+availability section); the partial case (per-input PRESENT/ABSENT
+lines in the payload, no downgrade — every fixture's audit-time
+`present` flags deliberately DISAGREE with the filesystem, so a
+gate trusting the stale record instead of re-checking fails);
+`unverifiable` as a first-class 2-of-3 tally verdict with the last
+winning sample's evidence; and `unverifiable` never buying the
+recheck (`_delivery_recheck_due` False, zero samples spent). In
+`tests/test_finding_level_gate.py`: the `contract_unverifiable`
+residual carrying exactly the sibling audit's absent paths in
+`missing_inputs` (the present one excluded), and a recheck met
+superseding a pre-pass unverifiable (same after-outranks-before
+rule as conflict). In `tests/test_defect_scope_audit.py`, executed
+through the real phase: the one-shot empty-enumeration re-ask
+(recovered sites become the scope, exactly two calls, the
+corrective prompt carries the previous answer; a re-ask crash
+keeps the empty answer at two calls; a flip to not-applicable is
+honored; non-empty sites never re-ask), `_check_ground_truth_inputs`
+(per-input filesystem truth with `~` expansion — the two inputs'
+answers disagree, so a hardcoded bypass fails; malformed shapes
+tolerated), and the persisted `ground_truth` plus the loud
+`--inspect-dir` remediation log (capsys, path value asserted).
 The HEAD-probe/pre-schedule cap asymmetry is pinned from both sides:
 40 on the executed helper in
 `tests/test_mid_run_satisfied_no_commits.py`, 20 on the executed

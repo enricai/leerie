@@ -91,15 +91,19 @@ def test_digest_entry_cap(leerie, tmp_path, monkeypatch):
 # === _prior_delivery_residual ==============================================
 
 def _run_state(leerie, runs_root, run_id, task, gate=None,
-               mtime=None, exit_code="0"):
+               mtime=None, exit_code="0", extra=None):
     """exit_code: "0" = completed; "1" = died through die() (which
     ALSO writes finished_at — the discovery sentinel that must not be
-    mistaken for completion); None = in-flight/killed (no file)."""
+    mistaken for completion); None = in-flight/killed (no file).
+    `extra` merges additional top-level state keys (e.g. the
+    defect_scope the unverifiable-residual arm reads paths from)."""
     d = runs_root / run_id
     d.mkdir(parents=True, exist_ok=True)
     data = {"task": task, "finished_at": "2026-09-30T00:00:00+00:00"}
     if gate is not None:
         data["delivery_gate"] = gate
+    if extra:
+        data.update(extra)
     (d / "state.json").write_text(json.dumps(data))
     if exit_code is not None:
         (d / "orchestrator.exit_code").write_text(exit_code)
@@ -190,6 +194,51 @@ def test_prior_residual_none_without_siblings_or_task(leerie, tmp_path):
     st = _current(leerie, tmp_path)
     assert leerie._prior_delivery_residual(st) is None
     st.data["task"] = ""
+    assert leerie._prior_delivery_residual(st) is None
+
+
+def test_prior_residual_contract_unverifiable_names_missing_inputs(
+        leerie, tmp_path):
+    """An unverifiable residual steers with WHAT was absent, not just
+    that something was: missing_inputs lists exactly the sibling
+    audit's absent paths (the present one is excluded), alongside the
+    recorded evidence (S-4)."""
+    st = _current(leerie, tmp_path)
+    runs = st.run_dir.parent
+    _run_state(leerie, runs, "r-unv", TASK, {
+        "unmet_before": [], "samples_before": 1,
+        "contract_before": {"verdict": "unverifiable",
+                            "judge_claimed": "met",
+                            "evidence": "archive absent; fixtures only"},
+    }, mtime=1_000_000, extra={"defect_scope": {
+        "applicable": True,
+        "ground_truth": {"data_dependent": True, "inputs": [
+            {"path": "/data/archive-dir", "kind": "directory",
+             "role": "archive", "present": False},
+            {"path": "/data/spec.json", "kind": "file",
+             "role": "spec", "present": True},
+        ], "repro_command": None}}})
+    r = leerie._prior_delivery_residual(st)
+    assert r is not None
+    cu = r["contract_unverifiable"]
+    assert cu["evidence"] == "archive absent; fixtures only"
+    assert cu["missing_inputs"] == ["/data/archive-dir"]
+
+
+def test_prior_residual_recheck_met_supersedes_unverifiable_before(
+        leerie, tmp_path):
+    """Same after-supersedes-before rule as conflict: a recheck that
+    reached met (forced by unmet items) outranks a pre-pass
+    unverifiable, leaving nothing to steer with."""
+    st = _current(leerie, tmp_path)
+    runs = st.run_dir.parent
+    _run_state(leerie, runs, "r-sup", TASK, {
+        "unmet_before": [{"item_index": 0, "item": "x", "evidence": "e"}],
+        "samples_before": 3,
+        "contract_before": {"verdict": "unverifiable", "evidence": "pre"},
+        "unmet_after": [], "samples_after": 1,
+        "contract_after": {"verdict": "met", "evidence": "grounded now"},
+    }, mtime=1_000_000)
     assert leerie._prior_delivery_residual(st) is None
 
 

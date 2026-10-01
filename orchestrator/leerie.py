@@ -3021,13 +3021,20 @@ SCHEMAS: dict[str, dict] = {
             # object on an asked call as a no-vote, never as met.
             # "conflict" is the measured two-pinned-contracts shape —
             # it routes to the operator record, not the fix loop.
+            # "unverifiable" is the honesty verdict for a data-triggered
+            # contract whose report-named ground-truth inputs are absent
+            # in this environment (the payload says which): met on
+            # synthetic-fixture evidence alone shipped silently twice
+            # before this verdict existed, and _downgrade_ungrounded_met
+            # enforces it mechanically when the judge still claims met.
             "contract": {
                 "type": "object",
                 "additionalProperties": False,
                 "required": ["verdict", "evidence"],
                 "properties": {
                     "verdict": {"type": "string",
-                                "enum": ["met", "unmet", "conflict"]},
+                                "enum": ["met", "unmet", "conflict",
+                                         "unverifiable"]},
                     "evidence": {"type": "string"},
                     # For "conflict": the two contradicting contracts,
                     # each stated in one sentence.
@@ -3092,6 +3099,41 @@ SCHEMAS: dict[str, dict] = {
                     "file": {"type": "string"},
                     "symbol": {"type": "string"},
                     "rationale": {"type": "string"},
+                },
+            },
+            # The report's evidence basis (DESIGN §5 *Report-named
+            # ground truth is extracted and mechanically checked*).
+            # `inputs` paths are verbatim from the report — external
+            # data the repro needs (archives, flow/config files), never
+            # source files of the code under test, never invented. The
+            # orchestrator existence-checks each path mechanically
+            # (_check_ground_truth_inputs) and the delivery gate's
+            # payload states which are absent; measured incident: a
+            # data-triggered report's archive was host-only and never
+            # mounted, every run verified against synthetic fixtures,
+            # and nothing recorded that the report's own repro was
+            # impossible in-container.
+            "ground_truth": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["data_dependent", "inputs"],
+                "properties": {
+                    "data_dependent": {"type": "boolean"},
+                    "inputs": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["path", "kind", "role"],
+                            "properties": {
+                                "path": {"type": "string"},
+                                "kind": {"type": "string",
+                                         "enum": ["file", "directory"]},
+                                "role": {"type": "string"},
+                            },
+                        },
+                    },
+                    "repro_command": {"type": ["string", "null"]},
                 },
             },
             "rationale": {"type": "string"},
@@ -21923,6 +21965,23 @@ async def phase_artifact_registry(
     return artifacts
 
 
+# Corrective message for the one-shot empty-enumeration re-ask (DESIGN
+# §5 *An applicable audit with zero sites is re-asked once*). Bench-
+# measured 2/2 full recovery on the live misfiled answer it was written
+# against. Wording stays generic — it ships to the auditor on whatever
+# repository leerie is pointed at.
+_REASK_EMPTY_SITES_MSG = (
+    "CORRECTION REQUIRED: your previous response set \"applicable\": "
+    "true but returned an empty \"sites\" array. Enumeration inside "
+    "prose is invisible to the orchestrator: the ONLY channel it reads "
+    "is the \"sites\" field, and site entries embedded as text inside "
+    "\"defect_shape\" or \"rationale\" are lost. Re-emit your full "
+    "result now with every enumerable site as an entry in \"sites\" "
+    "(file, symbol, line_hint, role, note). A hypothesis with no "
+    "locatable code site goes in \"rationale\" as an open question — "
+    "never as an invented file/symbol, and never only inside prose.")
+
+
 async def phase_defect_scope_audit(
         task: str, st: State, caps: dict, models: dict[str, str],
         efforts: dict[str, str | None]) -> dict:
@@ -21984,8 +22043,54 @@ async def phase_defect_scope_audit(
     if not result.get("applicable"):
         log("  defect-scope audit: not applicable — no enumeration")
         return {"applicable": False}
-    sites = [s for s in (result.get("sites") or [])
-             if isinstance(s, dict) and s.get("file") and s.get("symbol")]
+
+    def _valid_sites(r: dict) -> list[dict]:
+        return [s for s in (r.get("sites") or [])
+                if isinstance(s, dict) and s.get("file") and s.get("symbol")]
+
+    sites = _valid_sites(result)
+    if not sites:
+        # One corrective re-ask (DESIGN §5 *An applicable audit with
+        # zero sites is re-asked once*): measured live, an auditor
+        # returned its full 8-site enumeration embedded as JSON text
+        # inside `defect_shape` with sites=[] — schema-valid, so only
+        # a re-ask can recover it (parsing the prose would be the
+        # Language-to-JSON violation). Second answer honored either
+        # way; still fail-open.
+        log("  defect-scope audit: applicable with zero sites — "
+            "re-asking once (the enumeration may be misfiled in prose)")
+        try:
+            st.bump_workers(caps)
+            retry = await claude_p(
+                user_prompt=(
+                    "TASK:\n" + task
+                    + "\n\nYOUR PREVIOUS RESPONSE (returned to you for "
+                    "correction):\n" + json.dumps(result, indent=2)
+                    + "\n\n" + _REASK_EMPTY_SITES_MSG),
+                system_prompt=sys_prompt,
+                schema_key="defect_scope_auditor", cwd=_judgment_cwd(st),
+                allowed_tools=INSPECT_TOOLS, max_turns=40,
+                autonomous=False, caps=caps, st=st,
+                model=models.get("defect_scope_auditor", MODEL_DEFAULT),
+                effort=efforts.get("defect_scope_auditor"),
+                sid="defect_scope_auditor-reask",
+                add_dirs=st.data.get("inspect_dirs") or None,
+            )
+        except (WorkerError, subprocess.TimeoutExpired) as e:
+            # Timeout classified with WorkerError, never interpolated
+            # raw — infra, not a leerie bug.
+            log(f"  defect-scope audit re-ask crashed "
+                f"({_brief_worker_exc(e)}); keeping the empty answer")
+            retry = None
+        if retry is not None:
+            if not retry.get("applicable"):
+                # Honored either way: the corrective look can also
+                # conclude the first answer's applicable was wrong.
+                log("  defect-scope audit: re-ask returned not "
+                    "applicable — no enumeration")
+                return {"applicable": False}
+            result = retry
+            sites = _valid_sites(retry)
     if not sites:
         # applicable:true with nothing enumerable was silent (measured
         # live, 2026-09-29: a run paid the audit, got zero sites, and
@@ -22002,6 +22107,9 @@ async def phase_defect_scope_audit(
         "sites": sites,
         "chokepoint": result.get("chokepoint") or {"exists": False},
     }
+    ground_truth = _check_ground_truth_inputs(result.get("ground_truth"))
+    if ground_truth is not None:
+        scope["ground_truth"] = ground_truth
     chokepoint = scope["chokepoint"]
     log(f"phase 2: defect-scope audit — {len(sites)} site(s) share the "
         "defect shape"
@@ -31245,9 +31353,137 @@ def _delivery_recheck_due(st: "State") -> bool:
     """True when the delivery gate's first half flagged the CONTRACT as
     unmet — the recheck trigger the items list cannot carry, since the
     prejudge returns only items (DESIGN §8 *The gate judges the
-    finding, not only the items*)."""
+    finding, not only the items*). `unverifiable` deliberately does
+    NOT qualify: there is nothing on the tree for a conformer to fix,
+    so a recheck would re-reach the same verdict at full sample cost."""
     gate = st.data.get("delivery_gate") or {}
     return (gate.get("contract_before") or {}).get("verdict") == "unmet"
+
+
+def _check_ground_truth_inputs(ground_truth: object,
+                               log_missing: bool = True) -> dict | None:
+    """Mechanically existence-check the audit's report-named
+    ground-truth inputs (DESIGN §5 *Report-named ground truth is
+    extracted and mechanically checked*). The LLM did the extraction;
+    Python only touches the filesystem — paths are mechanical strings,
+    never interpreted prose (Language-to-JSON). Returns the normalized
+    object with a `present` flag per input, or None when the audit
+    carried none. `log_missing` logs the loud operator remediation —
+    the measured alternative was ten runs verifying against synthetic
+    fixtures with the gap recorded nowhere; the gate re-calls with
+    log_missing=False to refresh presence at judge time (an
+    implementer may have staged an input mid-run, e.g. copied from an
+    /inspect mount)."""
+    if not isinstance(ground_truth, dict):
+        return None
+    inputs: list[dict] = []
+    for i in (ground_truth.get("inputs") or []):
+        if not (isinstance(i, dict) and i.get("path")):
+            continue
+        path = str(i["path"])
+        present = os.path.exists(os.path.expanduser(path))
+        inputs.append({"path": path,
+                       "kind": i.get("kind") or "file",
+                       "role": str(i.get("role") or ""),
+                       "present": present})
+    gt = {"data_dependent": bool(ground_truth.get("data_dependent")),
+          "inputs": inputs,
+          "repro_command": ground_truth.get("repro_command") or None}
+    missing = [i for i in inputs if not i["present"]]
+    if log_missing and missing and gt["data_dependent"]:
+        log("  WARNING: the report pins its defect to external data "
+            "that is NOT available in this environment — every in-run "
+            "verification will rest on synthetic fixtures, and the "
+            "delivery gate's contract verdict can be at best "
+            "'unverifiable':")
+        for i in missing:
+            log(f"    • {i['kind']}: {i['path']}"
+                + (f" ({i['role']})" if i["role"] else ""))
+        log("    remediation: re-run with --inspect-dir <host-path> "
+            "for each (mounted read-only at /inspect/<basename> "
+            "inside the container)")
+    return gt
+
+
+def _format_ground_truth_availability(ground_truth: dict | None) -> str:
+    """The judge payload's GROUND-TRUTH AVAILABILITY section, or ""
+    when there is nothing to say (no ground_truth, or every input
+    present — an all-present basis needs no caveat; the judge probes
+    the inputs itself under its own tool scope)."""
+    gt = ground_truth or {}
+    inputs = gt.get("inputs") or []
+    if not inputs or all(i.get("present") for i in inputs):
+        return ""
+    lines = ["GROUND-TRUTH AVAILABILITY (mechanically checked by the "
+             "orchestrator before this call): the report names these "
+             "inputs as its evidence basis"
+             + (" and states the defect is data-triggered by them"
+                if gt.get("data_dependent") else "") + ":"]
+    for i in inputs:
+        lines.append(f"- {i.get('kind')}: {i.get('path')} -- "
+                     + ("PRESENT" if i.get("present") else "ABSENT")
+                     + (f" ({i.get('role')})" if i.get("role") else ""))
+    lines.append(
+        "An ABSENT input could not be read by any worker in this run; "
+        "every archive or fixture referenced by this tree's tests was "
+        "authored during the run, not taken from the report's data.")
+    return "\n".join(lines)
+
+
+def _log_contract_unverifiable(contract: dict, ground_truth: dict | None,
+                               record_key: str) -> None:
+    """The operator-facing statement DESIGN §8 promises for an
+    unverifiable contract verdict: what it means, where it is
+    recorded, and the exact remediation — so the operator learns the
+    gap from this run's output, not from a telemetry investigation
+    runs later."""
+    missing = [i for i in ((ground_truth or {}).get("inputs") or [])
+               if not i.get("present")]
+    log("  delivery gate: the audited DEFECT CONTRACT is UNVERIFIABLE "
+        "in this environment — the report pins it to external data no "
+        "worker in this run could read, so the shipped fix is "
+        "hypothesis-shaped and the loop cannot terminate on evidence "
+        "until that data is provided. Recorded in state.json "
+        + record_key
+        + (" (the judge claimed met; downgraded mechanically)"
+           if contract.get("judge_claimed") else "") + ":")
+    for i in missing:
+        log(f"    • absent {i.get('kind')}: {i.get('path')}")
+    log("    remediation: re-run with --inspect-dir <host-path> for "
+        "each absent input (mounted read-only at /inspect/<basename> "
+        "inside the container); the next same-task run's planners "
+        "also receive this residual as prior_delivery_residual")
+
+
+def _downgrade_ungrounded_met(contract: dict | None,
+                              ground_truth: dict | None) -> dict | None:
+    """Enforce DESIGN §8's unverifiable rule mechanically (§12: the
+    prompt advises the judge to return `unverifiable`; this check is
+    the guarantee): a `met` reached while the audit says the defect is
+    data-dependent and EVERY report-named input is absent is recorded
+    as `unverifiable`, the judge's raw claim preserved in
+    `judge_claimed`. Set/boolean comparison on structured fields only.
+    Measured: two consecutive live gates verdicted met on synthetic-
+    fixture evidence for a data-triggered contract whose archive no
+    worker could read; bench replay reproduced the met, and 2/2
+    replicates flipped to unverifiable once the availability fact was
+    in the payload — this downgrade covers the judge that does not."""
+    if not contract or contract.get("verdict") != "met":
+        return contract
+    gt = ground_truth or {}
+    inputs = gt.get("inputs") or []
+    if not (gt.get("data_dependent") and inputs
+            and all(not i.get("present") for i in inputs)):
+        return contract
+    missing = ", ".join(str(i.get("path") or "") for i in inputs)
+    note = ("[orchestrator] recorded as unverifiable: the report's "
+            "defect is data-dependent and every named ground-truth "
+            f"input is absent in this environment ({missing}); "
+            "in-tree evidence cannot decide the contract.")
+    evidence = (contract.get("evidence") or "").strip()
+    return {**contract, "verdict": "unverifiable",
+            "judge_claimed": "met",
+            "evidence": (evidence + "\n" + note).strip()}
 
 
 def _prior_delivery_residual(st: "State") -> dict | None:
@@ -31329,6 +31565,18 @@ def _prior_delivery_residual(st: "State") -> dict | None:
                     str(x)[:200] for x in
                     (c.get("conflicting_contracts") or [])][:2],
                 "evidence": (c.get("evidence") or "")[:400]}
+        if c.get("verdict") == "unverifiable":
+            # Same after-supersedes-before rule as conflict. The
+            # missing-input paths come from that run's own audit
+            # record, so the fresh run's planners see WHAT was absent,
+            # not just that something was.
+            gt = (data.get("defect_scope") or {}).get("ground_truth") or {}
+            residual["contract_unverifiable"] = {
+                "evidence": (c.get("evidence") or "")[:400],
+                "missing_inputs": [
+                    str(i.get("path") or "")[:200]
+                    for i in (gt.get("inputs") or [])
+                    if not i.get("present")][:4]}
         if residual:
             residual["run_id"] = d.name[:16]
             return residual
@@ -31406,7 +31654,9 @@ async def _delivery_judge_unmet(
         efforts: dict[str, str | None],
         phase_label: str,
         contract_ctx: dict | None = None,
-        exec_digest: str = "") -> tuple[list[dict], int, dict | None]:
+        exec_digest: str = "",
+        ground_truth: dict | None = None,
+        ) -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
     (confirmed_unmet, samples_used, contract_result).
 
@@ -31419,7 +31669,13 @@ async def _delivery_judge_unmet(
     with an absent-object sample counting as a NO-vote (never met) and
     no-majority resolving to met (fail-open). `exec_digest` is the
     executed-commands record the judge is directed to verify
-    execution-shaped items against.
+    execution-shaped items against. `ground_truth` (the audit's
+    report-named evidence basis with gate-time `present` flags) adds
+    the GROUND-TRUTH AVAILABILITY section when any input is absent,
+    and arms `_downgrade_ungrounded_met` on both return paths — a met
+    reached while the report's defect is data-dependent and every
+    named input is absent is recorded as `unverifiable` (DESIGN §8;
+    prompts advise, this code enforces).
 
     Confirm-on-first-pass: one sample, and only when it flags something
     do two more run, with an item confirmed unmet only on a 2-of-3
@@ -31493,8 +31749,18 @@ async def _delivery_judge_unmet(
             "conflicting_contracts — when satisfying this contract "
             "demonstrably contradicts another contract this tree pins "
             "(e.g. an existing regression guard), which needs a "
-            "discriminating design, not a fix loop.\n"
+            "discriminating design, not a fix loop; verdict=unverifiable "
+            "— with evidence naming exactly which missing input blocks "
+            "which part of the contract — when a GROUND-TRUTH "
+            "AVAILABILITY section below lists the report's named inputs "
+            "as ABSENT and the contract cannot be decided from evidence "
+            "that exists in this environment (synthetic fixtures "
+            "authored during this run do not qualify: they encode the "
+            "run's own hypothesis about what the real data contains).\n"
             + json.dumps(contract_ctx, indent=2))
+        avail = _format_ground_truth_availability(ground_truth)
+        if avail:
+            sections.append(avail)
     sections.append(
         "Return one verdict per item_index per your schema. met=true "
         "only with cited on-tree evidence; when you cannot verify, "
@@ -31551,9 +31817,11 @@ async def _delivery_judge_unmet(
     samples = [await _sample(0)]
     if (not _delivery_unmet_majority(samples, len(items))
             and not _contract_flagged(samples[0])):
-        return [], 1, ({"verdict": "met", "evidence":
-                        ((samples[0].get("contract") or {}).get(
-                            "evidence") or "").strip()}
+        return [], 1, (_downgrade_ungrounded_met(
+                           {"verdict": "met", "evidence":
+                            ((samples[0].get("contract") or {}).get(
+                                "evidence") or "").strip()},
+                           ground_truth)
                        if contract_ctx is not None else None)
     for k in (1, 2):
         samples.append(await _sample(k))
@@ -31577,14 +31845,16 @@ async def _delivery_judge_unmet(
         # malformed object is a no-vote. No verdict reaching 2 (e.g. a
         # 1-1-1 split) resolves to met — fail-open, mirroring the
         # items' direction. Two distinct verdicts cannot both reach 2
-        # of 3, so the first match is the only match.
+        # of 3, so the first match is the only match; the candidate
+        # order only expresses that the actionable verdicts come
+        # before the honesty one, it never breaks a tie.
         tally: dict[str, int] = {}
         for smp in samples:
             c = smp.get("contract")
             v = c.get("verdict") if isinstance(c, dict) else None
-            if v in ("met", "unmet", "conflict"):
+            if v in ("met", "unmet", "conflict", "unverifiable"):
                 tally[v] = tally.get(v, 0) + 1
-        winner = next((v for v in ("unmet", "conflict")
+        winner = next((v for v in ("unmet", "conflict", "unverifiable")
                        if tally.get(v, 0) >= 2), "met")
         contract_result = {"verdict": winner, "evidence": ""}
         for smp in reversed(samples):
@@ -31600,6 +31870,8 @@ async def _delivery_judge_unmet(
             if ev:
                 contract_result["evidence"] = ev
                 break
+        contract_result = _downgrade_ungrounded_met(
+            contract_result, ground_truth)
     return confirmed, len(samples), contract_result
 
 
@@ -31653,9 +31925,15 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
     st.save()
     ds = st.data.get("defect_scope") or {}
     contract_ctx = None
+    ground_truth = None
     if ds.get("applicable") and (ds.get("sites") or []):
         contract_ctx = {"defect_shape": ds.get("defect_shape") or "",
                         "sites": ds.get("sites") or []}
+        # Presence refreshed at judge time (log_missing=False — the
+        # audit already logged the remediation once): an implementer
+        # may have staged an input mid-run.
+        ground_truth = _check_ground_truth_inputs(
+            ds.get("ground_truth"), log_missing=False)
     try:
         exec_digest = _executed_commands_digest(
             leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
@@ -31670,7 +31948,7 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="pre", contract_ctx=contract_ctx,
-            exec_digest=exec_digest)
+            exec_digest=exec_digest, ground_truth=ground_truth)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge crashed ({_brief_worker_exc(e)}); "
             "gate skipped (advisory)")
@@ -31700,6 +31978,9 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
             "in state.json delivery_gate.contract_before: "
             + " || ".join(contract.get("conflicting_contracts")
                           or [(contract.get("evidence") or "")[:160]]))
+    elif contract is not None and contract.get("verdict") == "unverifiable":
+        _log_contract_unverifiable(contract, ground_truth,
+                                   "delivery_gate.contract_before")
     return unmet
 
 
@@ -31737,9 +32018,12 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
         return
     ds = st.data.get("defect_scope") or {}
     contract_ctx = None
+    ground_truth = None
     if ds.get("applicable") and (ds.get("sites") or []):
         contract_ctx = {"defect_shape": ds.get("defect_shape") or "",
                         "sites": ds.get("sites") or []}
+        ground_truth = _check_ground_truth_inputs(
+            ds.get("ground_truth"), log_missing=False)
     try:
         exec_digest = _executed_commands_digest(
             leerie_dir, Path(getattr(st, "repo_root", os.getcwd())))
@@ -31751,7 +32035,7 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="recheck", contract_ctx=contract_ctx,
-            exec_digest=exec_digest)
+            exec_digest=exec_digest, ground_truth=ground_truth)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
             "residual unrecorded (advisory)")
@@ -31775,6 +32059,9 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
             "delivery_gate.contract_after for the next same-task run: "
             + " || ".join(contract.get("conflicting_contracts")
                           or [(contract.get("evidence") or "")[:160]]))
+    elif contract is not None and contract.get("verdict") == "unverifiable":
+        _log_contract_unverifiable(contract, ground_truth,
+                                   "delivery_gate.contract_after")
     if unmet:
         log(f"  delivery gate residual: {len(unmet)} required item(s) "
             "still unmet after the final-conformer pass — finalize "

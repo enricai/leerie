@@ -90,6 +90,27 @@ killed the next run in planning). For such a report:
   turns out to be real) — a shared entry point the candidates merely
   route through does not qualify.
 
+## Report-named ground truth
+
+Also return `ground_truth`: the report's evidence basis. Set
+`data_dependent: true` when the report pins the failure to specific
+named external data (a captured dataset, an input archive, a
+configuration or flow file) rather than to repository content alone —
+the telltale is a report that says the same code succeeds on other
+data, or that the failure reproduces only against one named input.
+List in `inputs` ONLY the concrete filesystem paths the report names
+as required to reproduce or verify the defect, verbatim: external
+data like archives, capture directories, and declared-spec files.
+Never list source files of the code under test, and never invent a
+path — every entry must appear in the report. Copy the report's own
+repro command verbatim into `repro_command` when it gives one, else
+null. The orchestrator mechanically checks each path's existence in
+this environment and tells both the operator and the delivery judge
+which inputs are absent — this is how a run learns its verification
+can only be hypothesis-shaped BEFORE it ships a fix, instead of
+after. A report with no named external inputs returns
+`{"data_dependent": false, "inputs": [], "repro_command": null}`.
+
 ## When to say "not applicable"
 
 `applicable: false` is reserved for tasks that are not defect fixes at
@@ -126,6 +147,16 @@ Return **only** a JSON object per your schema:
   "chokepoint": {"exists": true, "file": "src/example_module.py",
                  "symbol": "resolve_identity_key",
                  "rationale": "sole producer of the comparison key; every decision site consumes it"},
+  "ground_truth": {
+    "data_dependent": true,
+    "inputs": [
+      {"path": "/tmp/captures/example-run-20260101/", "kind": "directory",
+       "role": "the captured dataset the report says triggers the failure"},
+      {"path": "~/.config/example-declared-spec.json", "kind": "file",
+       "role": "the declared spec whose resolution the report says fails"}
+    ],
+    "repro_command": "EXAMPLE_RUN_ID=example-run-20260101 node scripts/generate.js --force"
+  },
   "rationale": "how you searched and what you read"
 }
 ```

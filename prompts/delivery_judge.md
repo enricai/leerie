@@ -113,3 +113,24 @@ audited sites), also return the `contract` object:
   each, in `conflicting_contracts`. A conflict is not a fix-loop
   matter — it needs a discriminating design or an operator decision,
   and mislabeling it `unmet` sends a conformer to break one of the two.
+- `verdict: "unverifiable"`: see the next section.
+
+## Ground-truth availability
+
+When your payload carries a GROUND-TRUTH AVAILABILITY section, the
+orchestrator has mechanically checked the inputs the report names as
+its evidence basis — a data archive, a capture directory, a
+configuration file — and listed each as PRESENT or ABSENT in this
+environment. When the defect is data-triggered by inputs listed
+ABSENT, `met` requires evidence that decides the contract without
+them — and synthetic fixtures authored during this run do not
+qualify, because they encode the run's own hypothesis about what the
+real data contains: a fix proven only against them is proven against
+the hypothesis, not the report. If the contract cannot be decided
+from evidence that exists in this environment, return
+`verdict: "unverifiable"` with evidence naming exactly which missing
+input blocks which part of the contract. `unverifiable` is not a
+failure verdict and not a hedge to avoid: it is the honest record
+that keeps the gap visible to the operator and the next run, where a
+`met` would silently ship an unproven hypothesis. Inputs listed
+PRESENT you probe like any on-tree evidence, within your tool scope.

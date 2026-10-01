@@ -270,3 +270,141 @@ def test_applicable_with_zero_sites_names_itself(
     assert scope["applicable"] is True and scope["sites"] == []
     out = capsys.readouterr().out
     assert "applicable but zero enumerable" in out
+
+
+# === one-shot empty-enumeration re-ask + report-named ground truth (S-4,
+# === DESIGN §5 *An applicable audit with zero sites is re-asked once* /
+# === *Report-named ground truth is extracted and mechanically checked*)
+
+def _patch_auditor_seq(leerie, monkeypatch, results):
+    """Sequence-dispatching auditor stub: one queued result per call,
+    so the re-ask's extra spawn (and ONLY one) is observable."""
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        assert kwargs.get("schema_key") == "defect_scope_auditor"
+        calls.append(kwargs)
+        assert results, "auditor spawned more calls than the test queued"
+        r = results.pop(0)
+        if r == "CRASH":
+            raise leerie.WorkerError("auditor boom")
+        return dict(r)
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    return calls
+
+
+MISFILED = {"applicable": True, "sites": [],
+            "defect_shape": 'contract prose with the enumeration embedded '
+                            'as text: [{"file": "src/example_module.py"}]'}
+
+
+def test_empty_sites_reask_recovers_the_enumeration(
+        leerie, tmp_path, monkeypatch):
+    """The measured misfiling shape: applicable with sites=[] while the
+    enumeration sits in defect_shape prose. Exactly one corrective
+    re-ask runs — carrying the previous answer and the correction —
+    and its recovered sites are the scope's sites."""
+    st = _state(leerie, tmp_path)
+    calls = _patch_auditor_seq(leerie, monkeypatch, [dict(MISFILED),
+                                                     dict(AUDIT)])
+    scope = asyncio.run(leerie.phase_defect_scope_audit(
+        "fix the bug", st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 2
+    assert [s["symbol"] for s in scope["sites"]] == [
+        "merge_candidates", "collect_pending_rows"]
+    reask = calls[1]
+    assert reask["sid"] == "defect_scope_auditor-reask"
+    assert "CORRECTION REQUIRED" in reask["user_prompt"]
+    # the previous answer rides along, so the worker corrects rather
+    # than re-derives
+    assert "enumeration embedded" in reask["user_prompt"]
+
+
+def test_empty_sites_reask_crash_keeps_the_empty_answer(
+        leerie, tmp_path, monkeypatch, capsys):
+    st = _state(leerie, tmp_path)
+    calls = _patch_auditor_seq(leerie, monkeypatch, [dict(MISFILED),
+                                                     "CRASH"])
+    scope = asyncio.run(leerie.phase_defect_scope_audit(
+        "fix the bug", st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 2, "the re-ask is one-shot: a crash never retries"
+    assert scope["applicable"] is True and scope["sites"] == []
+    out = capsys.readouterr().out
+    assert "re-ask crashed" in out
+    assert "applicable but zero enumerable" in out
+
+
+def test_empty_sites_reask_not_applicable_is_honored(
+        leerie, tmp_path, monkeypatch):
+    """The second answer is honored either way — including a flip to
+    not-applicable (the corrective look can conclude the first
+    answer's applicable was wrong)."""
+    st = _state(leerie, tmp_path)
+    _patch_auditor_seq(leerie, monkeypatch, [
+        dict(MISFILED), {"applicable": False, "sites": []}])
+    scope = asyncio.run(leerie.phase_defect_scope_audit(
+        "fix the bug", st, _caps(leerie), MODELS, EFFORTS))
+    assert scope == {"applicable": False}
+
+
+def test_nonempty_sites_never_reask(leerie, tmp_path, monkeypatch):
+    """The re-ask exists for the empty-enumeration shape only."""
+    st = _state(leerie, tmp_path)
+    calls = _patch_auditor_seq(leerie, monkeypatch, [dict(AUDIT)])
+    asyncio.run(leerie.phase_defect_scope_audit(
+        "fix the bug", st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 1
+
+
+def test_check_ground_truth_inputs_flags_presence(leerie, tmp_path,
+                                                  monkeypatch):
+    """present is a REAL filesystem answer per input, with ~ expanded
+    (the flags disagree across the two inputs, so a bypass that
+    hardcodes either value fails)."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    (tmp_path / "flow.json").write_text("{}")
+    gt = leerie._check_ground_truth_inputs({
+        "data_dependent": True,
+        "inputs": [
+            {"path": "~/flow.json", "kind": "file", "role": "spec"},
+            {"path": str(tmp_path / "gone-dir"), "kind": "directory",
+             "role": "archive"},
+        ],
+        "repro_command": "node generate.js"})
+    assert gt["data_dependent"] is True
+    assert gt["repro_command"] == "node generate.js"
+    assert [(i["path"], i["present"]) for i in gt["inputs"]] == [
+        ("~/flow.json", True),
+        (str(tmp_path / "gone-dir"), False)]
+
+
+def test_check_ground_truth_inputs_tolerates_malformed(leerie):
+    assert leerie._check_ground_truth_inputs(None) is None
+    assert leerie._check_ground_truth_inputs("prose") is None
+    gt = leerie._check_ground_truth_inputs(
+        {"data_dependent": True,
+         "inputs": [{"kind": "file"}, "junk", None]})
+    assert gt["inputs"] == []
+
+
+def test_audit_persists_ground_truth_and_logs_remediation(
+        leerie, tmp_path, monkeypatch, capsys):
+    """The phase carries the checked ground_truth into the scope, and
+    a data-dependent report with an absent input logs the loud
+    operator remediation naming --inspect-dir — the measured
+    alternative was learning the gap from telemetry ten runs in."""
+    st = _state(leerie, tmp_path)
+    absent = tmp_path / "missing-archive"
+    _patch_auditor(leerie, monkeypatch, {
+        **AUDIT,
+        "ground_truth": {"data_dependent": True, "inputs": [
+            {"path": str(absent), "kind": "directory", "role": "archive"}],
+            "repro_command": None}})
+    scope = asyncio.run(leerie.phase_defect_scope_audit(
+        "fix the bug", st, _caps(leerie), MODELS, EFFORTS))
+    assert scope["ground_truth"]["inputs"][0]["present"] is False
+    out = capsys.readouterr().out
+    assert "NOT available in this environment" in out
+    assert "--inspect-dir" in out
+    assert str(absent) in out

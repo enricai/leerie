@@ -322,6 +322,46 @@ subtask it tests). Three mechanisms reconcile that coupling:
   all, and for defects with a single obvious location and no repeated
   or multi-candidate structure.
 
+  **Report-named ground truth is extracted and mechanically
+  checked.** A data-triggered report pins its defect to evidence
+  outside the repository — a capture archive, a configuration file, a
+  verbatim repro command — and no amount of in-repo verification can
+  decide its contract without that evidence. The auditor therefore
+  also returns the report's evidence basis as structured fields
+  (`ground_truth`): whether the defect is data-dependent, every
+  external input path the report names as required to reproduce or
+  verify it (verbatim paths only — never source files of the code
+  under test, never invented), and the report's own repro command
+  when it gives one. Python checks each named path's existence
+  in-container (a mechanical filesystem check, never prose
+  interpretation) and on any absence logs loudly at audit time with
+  the exact remediation — the existing `--inspect-dir` mount — and
+  persists the availability result for the delivery gate (§8 *The
+  gate judges the finding, not only the items*). Measured incident
+  (one task, ten runs across three leerie versions, 2026-09-28..10-01):
+  the report named a host archive and flow file the container never
+  mounted; the v0.33.0 runs' workers probed the named path, found
+  nothing, and pivoted to authoring synthetic fixtures, with no
+  record anywhere that the report's own repro was impossible — the
+  operator learned it from a post-hoc telemetry investigation, ten
+  runs in, after the host copy of the archive had also been lost.
+
+  **An applicable audit with zero sites is re-asked once.**
+  `applicable: true` with an empty `sites` list disarms both
+  consumers of the audit — planner injection and the gate's contract
+  verdict — while paying the full audit cost. Measured twice
+  (2026-09-29 and 2026-09-30), the second time with the enumeration
+  demonstrably present but misfiled: eight complete
+  file/symbol/role site objects embedded as JSON text inside the
+  `defect_shape` string, invisible to the orchestrator, which reads
+  only the `sites` field (and per the Language-to-JSON rule must not
+  parse prose). One corrective re-prompt naming the misfiling
+  recovers it (bench-measured on that run's verbatim answer: 2/2
+  full recovery of all eight sites); the second answer is honored
+  either way and the phase stays fail-open — a schema-level minimum
+  item count would instead recreate the fabrication pressure the
+  applicability paragraph above forecloses.
+
   **The audited shape rides in the criteria, as visibility — not a
   gate.** The second measured failure mode is a covering subtask
   quietly narrowing the shape: a plan can claim the audited site while
@@ -5261,7 +5301,36 @@ pinned contracts contradicting at one decision site, the measured
 shape where one subtask's fix was reverted by another protecting a
 prior bug's guards — is persisted and logged with both contracts
 named, because it needs an operator or a discriminating-predicate
-design, not another fix loop. Fail-open stands unchanged: a residual
+design, not another fix loop. The fourth verdict, `unverifiable`,
+exists because `met` must not be reachable on hypothesis-shaped
+evidence: measured on one task's ten runs across three leerie
+versions (2026-09-28..10-01), the report pinned its defect to named
+external data no worker could ever read (§5 *Report-named ground
+truth*), every proof then rested on synthetic fixtures authored by
+the run itself — each encoding the run's own hypothesis about what
+the real data contains — and both completed v0.33.0 gates verdicted
+`met` that way, silently; the cross-run residual channel (below)
+then correctly stayed empty, so each next run re-derived the same
+contract cold. So the gate's payload states which of the audit's
+extracted ground-truth inputs are absent in this environment, and
+the judge is directed to return `unverifiable` — naming exactly
+which missing input blocks which part of the contract — when the
+contract is data-triggered by absent inputs and in-tree evidence
+cannot decide it (bench-measured on the live run's verbatim payload
+and tree: the control replay reproduces `met`; with the availability
+fact and the fourth verdict available, 2/2 replicates flip to
+`unverifiable` and discount the synthetic fixtures unprompted).
+Because this guarantee matters and is mechanically checkable (§12),
+the code enforces what the prompt advises: a `met` majority reached
+while the audit says data-dependent and every named input is absent
+is recorded as `unverifiable`, the judge's raw claim preserved
+beside it. `unverifiable` does not ride the conformer pass — there
+is nothing on the tree for a conformer to fix; it persists like any
+contract residual, steers the next run through
+`prior_delivery_residual`, and is stated in the run's final output
+with the exact `--inspect-dir` remediation, so the operator learns
+the gap on run one, not from a post-hoc telemetry investigation ten
+runs in. Fail-open stands unchanged: a residual
 ships, recorded in `delivery_gate.contract_after`; what closes the
 cross-run loop is that a fresh run's planners receive the most
 recent COMPLETED same-task run's residual as ctx

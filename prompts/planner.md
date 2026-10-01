@@ -429,13 +429,23 @@ The orchestrator gives you, in your prompt:
    its delivery gate recording exactly what was still unmet: the
    `unmet_after` items and/or a `contract_unmet` verdict with evidence
    naming the residual of the audited defect contract, or a
-   `contract_conflict` naming two contradicting contracts (plus the
-   `run_id` of the run that recorded it). This is the
-   previous run's own exit interview — plan directly at what it
+   `contract_conflict` naming two contradicting contracts, or a
+   `contract_unverifiable` with the `missing_inputs` the report names
+   as its evidence basis but which were absent in that run's
+   environment (plus the `run_id` of the run that recorded it). This
+   is the previous run's own exit interview — plan directly at what it
    records: cover each named residual, and for a conflict, plan the
    DISCRIMINATING change that satisfies both stated contracts (a
    predicate that distinguishes the two cases) rather than a fix that
-   flips which one wins. Do not re-plan work the record does not
+   flips which one wins. For `contract_unverifiable`, check whether
+   the missing inputs are available NOW (the operator may have
+   provided them since — look under /inspect/ and at the recorded
+   paths): if they are, plan verification against the real data FIRST
+   — run the report's own repro before and after any change — rather
+   than another hypothesis-scoped fix; if they are still absent, say
+   so in `confidence.basis` and keep the plan minimal — stacking more
+   unverifiable fixes on an unverifiable pile is how the same task
+   loops. Do not re-plan work the record does not
    dispute. If the tree contradicts the record (someone fixed it since),
    trust the tree and say so in `confidence.basis`.
 

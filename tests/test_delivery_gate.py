@@ -769,3 +769,136 @@ def test_pre_pass_conflict_with_unmet_items_rechecks_the_contract(
     gate = st.data["delivery_gate"]
     assert gate["unmet_after"] == []
     assert gate["contract_after"]["verdict"] == "met"
+
+
+# === ground-truth availability + the unverifiable verdict (DESIGN §8;
+# === S-4) — executed through the real gate against the real filesystem
+
+def _scope_with_ground_truth(*inputs):
+    """DEFECT_SCOPE plus a data-dependent ground_truth whose input
+    paths the gate re-checks against the REAL filesystem at judge
+    time (the audit-time `present` flags are deliberately wrong in
+    these fixtures, so a gate that trusts them instead of re-checking
+    fails the assertions)."""
+    return {**DEFECT_SCOPE, "ground_truth": {
+        "data_dependent": True,
+        "inputs": [{"path": str(p), "kind": "directory", "role": "archive",
+                    "present": stale}
+                   for p, stale in inputs],
+        "repro_command": "run the generator against the archive"}}
+
+
+def test_ungrounded_met_is_downgraded_to_unverifiable(
+        leerie, tmp_path, monkeypatch):
+    """The load-bearing S-4 arm: a judge that says met while the
+    report's defect is data-dependent and EVERY named input is absent
+    is recorded as unverifiable with the claim preserved — the exact
+    shape two consecutive live v0.33.0 gates shipped silently. The
+    stale present=True flag proves the gate re-checks the filesystem
+    rather than trusting the audit-time record."""
+    absent = tmp_path / "no-such-archive"
+    st, run_dir = _state(
+        leerie, tmp_path,
+        defect_scope=_scope_with_ground_truth((absent, True)))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True),
+         "contract": _contract("met", "synthetic fixtures pass")}])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 1, "downgrade must not buy extra samples"
+    cb = st.data["delivery_gate"]["contract_before"]
+    assert cb["verdict"] == "unverifiable"
+    assert cb["judge_claimed"] == "met"
+    assert "synthetic fixtures pass" in cb["evidence"]
+    assert str(absent) in cb["evidence"]
+    prompt = calls[0]["user_prompt"]
+    assert "GROUND-TRUTH AVAILABILITY" in prompt
+    assert f"{absent} -- ABSENT" in prompt
+
+
+def test_grounded_met_stands_when_every_input_is_present(
+        leerie, tmp_path, monkeypatch):
+    """Converse of the downgrade arm (inputs disagree with the stale
+    flags in the OTHER direction): all inputs exist → met stands and
+    the payload carries no availability caveat."""
+    present = tmp_path / "real-archive"
+    present.mkdir()
+    st, run_dir = _state(
+        leerie, tmp_path,
+        defect_scope=_scope_with_ground_truth((present, False)))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("met", "holds")}])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    cb = st.data["delivery_gate"]["contract_before"]
+    assert cb["verdict"] == "met"
+    assert "judge_claimed" not in cb
+    # The DEFECT CONTRACT instruction legitimately NAMES the section;
+    # what must be absent is the section itself (its per-input lines).
+    assert "-- ABSENT" not in calls[0]["user_prompt"]
+    assert "-- PRESENT" not in calls[0]["user_prompt"]
+
+
+def test_partially_present_inputs_caveat_but_no_downgrade(
+        leerie, tmp_path, monkeypatch):
+    """One of two inputs absent: the availability section lists each
+    with its own flag (the judge weighs the gap), but the mechanical
+    downgrade requires EVERY input absent — a partially grounded met
+    is the judge's call, not the orchestrator's."""
+    present = tmp_path / "real-archive"
+    present.mkdir()
+    absent = tmp_path / "gone-flow.json"
+    st, run_dir = _state(
+        leerie, tmp_path,
+        defect_scope=_scope_with_ground_truth((present, False),
+                                              (absent, True)))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True), "contract": _contract("met", "holds")}])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert st.data["delivery_gate"]["contract_before"]["verdict"] == "met"
+    prompt = calls[0]["user_prompt"]
+    assert f"{present} -- PRESENT" in prompt
+    assert f"{absent} -- ABSENT" in prompt
+
+
+def test_unverifiable_majority_wins_the_vote(
+        leerie, tmp_path, monkeypatch):
+    """unverifiable is a first-class tally verdict (no ground_truth in
+    state here, so this is the vote path, not the downgrade): sample 0
+    flags → escalate; 2-of-3 unverifiable persists, evidence from the
+    last sample voting it."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    calls = _patch_judge(leerie, monkeypatch, [
+        {**_verdicts(True, True),
+         "contract": _contract("unverifiable", "cannot decide A")},
+        {**_verdicts(True, True),
+         "contract": _contract("unverifiable", "cannot decide B")},
+        {**_verdicts(True, True), "contract": _contract("met")},
+    ])
+    asyncio.run(leerie._run_delivery_prejudge(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert len(calls) == 3
+    cb = st.data["delivery_gate"]["contract_before"]
+    assert cb["verdict"] == "unverifiable"
+    assert cb["evidence"] == "cannot decide B"
+
+
+def test_unverifiable_does_not_trigger_the_recheck(
+        leerie, tmp_path, monkeypatch):
+    """There is nothing on the tree for a conformer to fix, so an
+    unverifiable contract (items all met) must not buy a recheck —
+    _delivery_recheck_due stays False and the recheck spends no
+    samples."""
+    st, run_dir = _state(leerie, tmp_path, defect_scope=dict(DEFECT_SCOPE))
+    st.data["delivery_gate"] = {
+        "unmet_before": [], "samples_before": 3,
+        "contract_before": {"verdict": "unverifiable",
+                            "judge_claimed": "met", "evidence": "e"}}
+    st.save()
+    assert leerie._delivery_recheck_due(st) is False
+    calls = _patch_judge(leerie, monkeypatch, [])
+    asyncio.run(leerie._run_delivery_recheck(
+        run_dir, st, _caps(leerie), MODELS, EFFORTS))
+    assert calls == []
+    assert "contract_after" not in st.data["delivery_gate"]
