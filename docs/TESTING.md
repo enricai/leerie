@@ -1155,33 +1155,52 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
-The first review round broke the "re-emitting is harmless" claim seven
-ways by execution. Each break now has a test that fails on the build
-it broke (`test_apply_layered_*` and `test_unresolved_retry_*` with a
-"round 1" docstring tag):
+Two review rounds, both executing code, broke the "re-emitting an
+applied op is harmless" claim. Each break has a test that fails on the
+build it broke.
 
+Round one, against the first layered build:
 - a re-emitted edge naming an id attempt 1 merged away;
+- a binding to a merged-away connector, lost silently;
 - a restated connector attempt 1 merged away, which came back as a
   duplicate producer;
-- a restatement discarding a subtask attempt 1 merged into the connector;
+- a restatement discarding a subtask attempt 1 merged into the
+  connector;
 - a restatement re-adding a require attempt 1 dropped;
-- a connector satisfying its own require;
-- a binding to a merged-away connector, lost silently;
-- a natural answer naming a consumer's pre-rename tag, read off the
-  prompt's pre-attempt-1 input.
+- a connector satisfying its own require.
+
+Round two, against round one's fixes:
+- a restated connector's `depends_on` naming a merged-away id;
+- a restated merge chain;
+- a fold that made its survivor depend on itself;
+- a drop recorded against the absorbed id, not the survivor;
+- redirects resolved through an earlier phase's `_merged_from` stamp.
+  `_survivor_map` now follows only the reconcile's applied merges.
+
+Separately, the layered build first rejected a natural answer naming a
+consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),
+which the reverting retry had accepted. Its fix, translation, then
+mistranslated a tag the consumer still held. Both cases are pinned
+(`test_unresolved_retry_accepts_answer_naming_pre_rename_tag`,
+`test_unresolved_retry_rename_that_never_applied_is_not_translated`).
 
 `test_unresolved_retry_after_size_and_cycle_retries_sees_both` drives
 size → cycle → unresolved retries through real `phase_reconcile`: the
-"applied" set must include both retries' outputs. The `_merged_from`
-union and the never-existed-merge die are mutant guards. Each passes on
-the build it was added against, and fails on the mutant that removes
-it.
+"applied" set must include both retries' outputs. Four tests are
+mutant guards, which pass on the build they were added against and
+fail on the mutant that removes the behaviour:
+- the `_merged_from` union;
+- the never-existed-merge die;
+- the binding skip for a dropped or self-provided require;
+- the die on a genuine `from == to` edge while a redirect is active.
 
 Every reconciler test stubs the worker, so the live behaviour was
 measured separately. Real `claude -p` ran as attempt 2 on fc56, from the
 recorded attempt 1. The old retry died 5/5, and its worker restated 0 of
 15 attempt-1 renames. The layered retry converged 5/5, and 3/3 on
 0cfb46a0. Those trials ran before the wire-vocabulary rendering below.
+Re-run live on b98aece's code, which renders through it, fc56 and
+0cfb46a0 converged 3/3 each.
 A replay of every locally recorded run with pre-reconcile plans gave
 plans identical to the old code in all runs where both finished. Most of
 those never reach the retry this changes: they made no reconciler call,

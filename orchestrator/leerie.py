@@ -23510,7 +23510,7 @@ def _merge_files_likely_touched(into_s: dict, from_s: dict) -> None:
 
 
 def _union_connector_edges(
-    first: dict, second: dict, dropped_tags: set[str],
+    first: dict, second: dict, dropped_tags: set[str], self_ids: set[str],
 ) -> dict:
     """The edge-bearing fields of two versions of one connector, unioned
     with `first`'s entries first. Returns only those fields; callers
@@ -23521,7 +23521,9 @@ def _union_connector_edges(
     restatement must not silently reopen it (it could re-close a cycle
     attempt 1 broke). In-plan requires the merged `provides` now cover
     are dropped, as `_merge_subtask_core_fields` does: a self-edge is
-    not a producer."""
+    not a producer. A `depends_on` entry naming `self_ids` (the
+    connector's own id, or the id folded into it) would be a self-loop
+    and is dropped."""
     out: dict = {}
     for key in ("provides", "depends_on", "files_likely_touched",
                 "_merged_from"):
@@ -23529,7 +23531,9 @@ def _union_connector_edges(
         for v in second.get(key) or []:
             if v not in merged:
                 merged.append(v)
-        if merged:
+        if key == "depends_on":
+            merged = [d for d in merged if d not in self_ids]
+        if merged or key == "depends_on":
             out[key] = merged
     provides = set(out.get("provides") or [])
     reqs: list[dict] = []
@@ -23562,21 +23566,75 @@ def _merge_restated_connector(
     when attempt 1 merged other subtasks into this connector: its text
     then carries the absorbed subtasks' criteria, which the retry never
     saw in that form, so the earlier text is kept."""
-    restated.update(_union_connector_edges(earlier, restated, dropped_tags))
+    restated.update(_union_connector_edges(
+        earlier, restated, dropped_tags, {restated["id"]}))
     if earlier.get("_merged_from"):
         for key in ("title", "intent", "success_criteria_seed"):
             if earlier.get(key):
                 restated[key] = earlier[key]
 
 
-def _survivor_map(by_id: dict[str, dict]) -> dict[str, str]:
-    """Absorbed id → surviving id, from every live subtask's
-    `_merged_from` stamp. The layered unresolved-tags retry may name a
-    subtask attempt 1 already merged away; this redirects it to the
-    subtask that now carries its work instead of resurrecting it or
-    dying on a missing id."""
-    return {gone: sid for sid, sub in by_id.items()
-            for gone in (sub.get("_merged_from") or [])}
+def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict]
+                  ) -> dict[str, str]:
+    """Absorbed id → surviving id, derived from the `merged_subtasks` ops
+    this reconcile has applied, following chains (A→B then B→C maps A
+    and B to C). Only survivors still live in `by_id` are kept.
+
+    Built from the applied ops rather than from `_merged_from` stamps:
+    stamps also record earlier phases' merges (an overlap merge, an
+    earlier reconcile), whose absorbed ids are out of this retry's scope
+    and may even be reused by a later connector — two stamps naming one
+    id would make the redirect ambiguous."""
+    step = {m["from"]: m["into"] for m in applied_merges
+            if m.get("from") and m.get("into")}
+    out: dict[str, str] = {}
+    for gone in step:
+        target, seen = step[gone], {gone}
+        while target in step and target not in seen:
+            seen.add(target)
+            target = step[target]
+        if target in by_id:
+            out[gone] = target
+    return out
+
+
+def _redirect_absorbed_ids(output: dict, survivor: dict[str, str]) -> dict:
+    """The layered retry's `output` with every reference to an id the
+    applied merges absorbed rewritten to its survivor, so a worker naming
+    a subtask attempt 1 merged away neither resurrects it nor dies on a
+    missing id. Covers the sid of `renames` / `added_provides` /
+    `dropped_requires` / `_bind_requires`, `dependency_edges` and
+    `merged_subtasks` endpoints, and `added_subtasks[].depends_on`.
+
+    Two shapes collapse and are removed rather than rewritten: an edge
+    whose redirected endpoints coincide (it ordered two subtasks that
+    are now one), and a merge whose redirected endpoints coincide (it
+    already happened). A from == to the worker wrote itself is left for
+    the apply step's die. `conditional_drops` is NOT redirected: dropping
+    the survivor would remove work the worker never named. A restated
+    connector id is left as-is; the apply step folds it into its
+    survivor."""
+    def r(sid: str) -> str:
+        return survivor.get(sid, sid)
+
+    out = dict(output)
+    for key in ("renames", "added_provides", "dropped_requires",
+                "_bind_requires"):
+        out[key] = [{**row, "sid": r(row["sid"])}
+                    for row in output.get(key) or []]
+    out["dependency_edges"] = [
+        {**e, "from": r(e["from"]), "to": r(e["to"])}
+        for e in output.get("dependency_edges") or []
+        if not (e["from"] != e["to"] and r(e["from"]) == r(e["to"]))]
+    out["merged_subtasks"] = [
+        {**m, "into": r(m["into"]), "from": r(m["from"])}
+        for m in output.get("merged_subtasks") or []
+        if not (m["into"] != m["from"] and r(m["into"]) == r(m["from"]))]
+    out["added_subtasks"] = [
+        {**s, "depends_on": [d for d in dict.fromkeys(
+            r(d) for d in s.get("depends_on") or []) if d != r(s["id"])]}
+        for s in output.get("added_subtasks") or []]
+    return out
 
 
 def _apply_reconciler_output(
@@ -23585,6 +23643,7 @@ def _apply_reconciler_output(
     attempt_1_renames: list[dict] | None = None,
     restatable: set[str] | None = None,
     restated_drops: set[tuple[str, str]] | None = None,
+    applied_merges: list[dict] | None = None,
 ) -> list[dict]:
     """Mutate `plans` per the reconciler's output. On success, returns
     the same `plans` list (with in-place edits on existing subtasks
@@ -23608,28 +23667,29 @@ def _apply_reconciler_output(
     (no revert in scope, strict match is correct).
 
     `restatable` (not None) marks the layered unresolved-tags retry:
-    `output` is applied ON TOP of attempt 1's already-applied mutations
-    instead of after a revert (DESIGN §5 *The unresolved-tags retry is
-    layered*). It holds the ids attempt 1 of THIS reconcile added —
+    `output` is applied ON TOP of the outputs this reconcile has already
+    applied, instead of after a revert (DESIGN §5 *The unresolved-tags
+    retry is layered*). It holds the ids those applied outputs added —
     never an earlier reconcile's connectors, which a re-plan reconcile
     still guards with the fail-loud collision check. The worker may
-    restate an attempt-1 op, so the ops that are not naturally
+    restate an applied op, so the ops that are not naturally
     idempotent become so:
 
     * an `added_subtasks` entry whose id is in `restatable` is merged
       into the earlier version (`_merge_restated_connector`), so nothing
       attempt 1 established is lost to an omission;
-    * an id attempt 1 merged away is redirected to its survivor
-      (`_survivor_map`) wherever the retry names it — a restated
-      connector, an `added_requires` binding, a `dependency_edges`
-      endpoint — instead of being resurrected or dying as missing;
+    * an id the applied merges absorbed (`applied_merges`) is redirected
+      to its survivor (`_survivor_map`, `_redirect_absorbed_ids`) wherever
+      the retry names it, except in `conditional_drops`; a restated
+      connector with such an id folds into its survivor;
     * an `added_requires` naming a `restatable` connector without
       restating it (`output["_bind_requires"]`) is bound to it;
     * a `merged_subtasks` entry whose `from` is already in `into`'s
       `_merged_from` is skipped.
 
-    `restated_drops` holds the `(sid, tag)` pairs attempt 1 removed with
-    `drop_require`; a restatement or binding does not re-add them.
+    `restated_drops` holds the `(sid, tag)` pairs the applied outputs
+    removed with `drop_require`; a restatement, fold or binding does not
+    re-add them, whichever of the two ids the pair names.
 
     Seven action arrays consumed here, in order:
 
@@ -23692,6 +23752,11 @@ def _apply_reconciler_output(
         for s in plan.get("subtasks", []):
             by_id[s["id"]] = s
 
+    survivor = (_survivor_map(applied_merges or [], by_id)
+                if restatable is not None else {})
+    if survivor:
+        output = _redirect_absorbed_ids(output, survivor)
+
     for r in output.get("renames", []):
         s = by_id.get(r["sid"])
         if s is None:
@@ -23737,16 +23802,16 @@ def _apply_reconciler_output(
         # check so only an id outside `restatable` can still collide.
         if restatable:
             drops = restated_drops or set()
-            survivor = _survivor_map(by_id)
-            # A restated connector attempt 1 merged away folds its edges
-            # into the survivor (whose text already composes both) and
-            # is not re-added — re-adding would duplicate its work.
+            # A restated connector an applied merge absorbed folds its
+            # edges into the survivor (whose text already composes both)
+            # and is not re-added — re-adding would duplicate its work.
             folded = [s for s in added if s["id"] in restatable
                       and s["id"] not in by_id and s["id"] in survivor]
             for s in folded:
                 target = by_id[survivor[s["id"]]]
+                ids = {target["id"], s["id"]}
                 target.update(_union_connector_edges(
-                    target, s, {t for sid, t in drops if sid == target["id"]}))
+                    target, s, {t for sid, t in drops if sid in ids}, ids))
             added = [s for s in added if s not in folded]
             restated = {s["id"] for s in added
                         if s["id"] in restatable and s["id"] in by_id}
@@ -23814,17 +23879,24 @@ def _apply_reconciler_output(
             by_id[s["id"]] = s
 
     if restatable is not None:
-        survivor = _survivor_map(by_id)
+        # The pre-pass already redirected an absorbed sid to its
+        # survivor; `named` keeps the sid the worker wrote, so a drop
+        # recorded against either id still holds.
+        named: dict[str, set[str]] = {}
+        for k in restatable:
+            named.setdefault(survivor.get(k, k), set()).add(k)
         for req in output.get("_bind_requires", []):
             sid = req["sid"]
-            target = by_id.get(sid) or by_id.get(survivor.get(sid, ""))
+            target = by_id.get(sid)
             item = {k: v for k, v in req.items() if k != "sid"}
-            if target is None or sid not in restatable:
+            if target is None or sid not in named:
                 log(f"  reconciler: dropped added_requires {sid!r}:"
                     f"{item.get('tag')!r} — names no live subtask")
                 continue
+            ids = {sid} | named[sid]
             if item.get("extent") == "in_plan" and (
-                    (target["id"], item.get("tag")) in (restated_drops or set())
+                    any((i, item.get("tag")) in (restated_drops or set())
+                        for i in ids)
                     or item.get("tag") in (target.get("provides") or [])):
                 continue
             reqs = target.setdefault("requires", [])
@@ -23911,18 +23983,8 @@ def _apply_reconciler_output(
                     and entry.get("tag") in candidate_tags)
         ]
 
-    survivor = _survivor_map(by_id) if restatable is not None else {}
     for de in output.get("dependency_edges", []):
         frm, to = de["from"], de["to"]
-        # Layered retry: an endpoint attempt 1 merged away now lives in
-        # its survivor; an edge that collapses onto one subtask is the
-        # merge's own internal ordering and needs no edge.
-        if frm not in by_id and frm in survivor:
-            frm = survivor[frm]
-        if to not in by_id and to in survivor:
-            to = survivor[to]
-        if survivor and frm == to and de["from"] != de["to"]:
-            continue
         if frm == to:
             die(
                 "reconciler proposed dependency_edges with from == to "
@@ -23949,10 +24011,6 @@ def _apply_reconciler_output(
                 "reconciler proposed merged_subtasks with into == from "
                 f"({into_id!r}); merge endpoints must differ."
             )
-        if (restatable is not None and from_id not in by_id
-                and into_id in by_id
-                and from_id in (by_id[into_id].get("_merged_from") or [])):
-            continue  # attempt 1 already performed this merge
         if into_id not in by_id or from_id not in by_id:
             missing = [x for x in (into_id, from_id) if x not in by_id]
             die(
@@ -24586,7 +24644,12 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         # worker may name a consumer's tag as it was before attempt 1
         # renamed it. Rewrite those sid-keyed references to the current
         # tag before validating — otherwise they would no-op at apply.
-        _translate_pre_rename_tags(output3, prior.get("renames") or [])
+        _translate_pre_rename_tags(
+            output3, prior.get("renames") or [],
+            {s["id"]: {e.get("tag") for e in s.get("requires") or []
+                       if isinstance(e, dict)
+                       and e.get("extent") == "in_plan"}
+             for plan in plans for s in plan.get("subtasks", [])})
 
         # Must-include validation: did the revised output address every
         # named unresolved entry? Same fail-loud discipline as the
@@ -24614,7 +24677,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         _apply_reconciler_output(
             plans, output3, restatable=set(attempt_1_added),
             restated_drops={(d["sid"], d["tag"]) for d in
-                            prior.get("dropped_requires") or []})
+                            prior.get("dropped_requires") or []},
+            applied_merges=prior.get("merged_subtasks") or [])
         applied = applied + [output3]
         _record_conditional_drops(applied)
 
@@ -25531,14 +25595,19 @@ def _concat_reconciler_outputs(outputs: list[dict]) -> dict:
     return merged
 
 
-def _translate_pre_rename_tags(output: dict, applied_renames: list[dict]
-                               ) -> None:
+def _translate_pre_rename_tags(output: dict, applied_renames: list[dict],
+                               held: dict[str, set[str]]) -> None:
     """Rewrite, in place, sid-keyed tag references in a layered-retry
     output that name a consumer's tag as it was BEFORE an applied rename
     (`renames[].from`, `dropped_requires[].tag`) to the tag that consumer
     holds now. Chains follow (a→b then b→c maps a to c). The retry
     prompt's ORIGINAL INPUT is the pre-attempt-1 payload, so the old
-    form is a natural answer; applied as-is it would silently no-op."""
+    form is a natural answer; applied as-is it would silently no-op.
+
+    `held` is each subtask's CURRENT in-plan require tags. A reference
+    to a tag the subtask still holds is left alone: the applied rename
+    did not take (e.g. it named a connector's require before the
+    connector existed), or a later rename re-introduced the tag."""
     current: dict[tuple[str, str], str] = {}
     for r in applied_renames:
         sid, frm, to = r.get("sid"), r.get("from"), r.get("to")
@@ -25548,10 +25617,15 @@ def _translate_pre_rename_tags(output: dict, applied_renames: list[dict]
             if key[0] == sid and val == frm:
                 current[key] = to
         current[(sid, frm)] = to
+    def _now(sid: str, tag: str) -> str:
+        if tag in held.get(sid, set()):
+            return tag
+        return current.get((sid, tag), tag)
+
     for r in output.get("renames") or []:
-        r["from"] = current.get((r.get("sid"), r.get("from")), r.get("from"))
+        r["from"] = _now(r.get("sid"), r.get("from"))
     for d in output.get("dropped_requires") or []:
-        d["tag"] = current.get((d.get("sid"), d.get("tag")), d.get("tag"))
+        d["tag"] = _now(d.get("sid"), d.get("tag"))
 
 
 def _build_unresolved_retry_prompt(
@@ -25574,7 +25648,9 @@ def _build_unresolved_retry_prompt(
       - The bounded must-include set.
 
     `recommendations` maps (sid, tag) → recommendation-dict-or-None.
-    `output` is attempt 1's reconciler output. It stays applied: the
+    `output` is every reconciler output this reconcile has applied,
+    concatenated (`_concat_reconciler_outputs`) — attempt 1, or a size
+    retry's and a cycle retry's outputs. It stays applied: the
     retry is layered on top of it (DESIGN §5 *The unresolved-tags retry
     is layered*), so the prompt renders it as settled and asks only for
     new operations. Every example uses the unresolved tag as-is, because

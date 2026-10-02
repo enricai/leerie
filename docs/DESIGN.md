@@ -488,8 +488,12 @@ subtask it tests). Three mechanisms reconcile that coupling:
     unless attempt 1 merged other subtasks into that connector, whose
     criteria the composed text carries. A require attempt 1 removed with
     `drop_require` is not re-added;
-  - an id attempt 1 merged away is read as its survivor wherever the
-    retry names it, rather than resurrected or rejected as missing.
+  - an id that one of this reconcile's applied merges absorbed is read as
+    its survivor wherever the retry names it (rather than resurrected or
+    rejected as missing), except in a `conditional_drop`: dropping the
+    survivor would remove work the worker never named. The scope is
+    this reconcile's merges, not an earlier phase's, so an earlier
+    merge's absorbed id cannot make the redirect ambiguous.
 
   Only connectors added by *this* reconcile's applied attempts are
   restatable; a re-plan reconcile's earlier connectors keep the
@@ -500,7 +504,9 @@ subtask it tests). Three mechanisms reconcile that coupling:
   The retry prompt still carries the pre-attempt-1 input, so a worker may
   name a consumer's tag as it was before an applied rename. That
   reference is translated mechanically to the current tag rather than
-  rejected; it was the natural answer under the revert design.
+  rejected; it was the natural answer under the revert design. A tag the
+  consumer still holds is never translated: the rename that would have
+  replaced it did not take.
 
 ### `requires.extent` — in-graph vs. external prerequisites
 

@@ -3770,10 +3770,12 @@ cleaner graph.
 
 **Retry composition (snapshot refresh).** When multiple retries fire on
 the same run (e.g., size retry succeeds and then the cycle gate fires),
-each successful retry refreshes `pre_plans_snapshot` to the post-retry
-state, so the next retry's revert restores the most recent good state
-rather than undoing an already-successful split. The unresolved retry
-doesn't revert at all (see below), so it needs no snapshot.
+a successful size retry refreshes `pre_plans_snapshot` (and the
+`applied` list beside it) to the post-retry state. The cycle retry's
+revert therefore restores the most recent good state rather than
+undoing an already-successful split. The cycle retry does not refresh,
+because the only later retry, for unresolved tags, never reverts (see
+below).
 
 **Cycle-resolution retry loop.** When the acyclicity gate fires on the first
 reconciler attempt, `phase_reconcile` deep-copies the pre-mutation plans,
@@ -3822,7 +3824,8 @@ extent-aware guard (`in_plan` only). Cases (first match wins):
 3. Else → no recommendation; model picks unaided (the common case).
 
 The retry's output is applied on top of the plans' current state with
-`_apply_reconciler_output(plans, output, restatable=…, restated_drops=…)`.
+`_apply_reconciler_output(plans, output, restatable=…, restated_drops=…,
+applied_merges=…)`.
 "Applied" is tracked as the list of outputs `plans` currently holds
 (`applied`, restored alongside `pre_plans_snapshot` by the reverting
 retries). After a size retry and then a cycle retry it holds both;
@@ -3835,7 +3838,8 @@ retries). After a size retry and then a cycle retry it holds both;
   the pre-attempt-1 payload. A worker that names a consumer's
   pre-rename tag in a sid-keyed op (`renames[].from`,
   `dropped_requires[].tag`) has it rewritten to the current tag by
-  `_translate_pre_rename_tags` before validation.
+  `_translate_pre_rename_tags` before validation, unless the consumer
+  still holds that tag (the applied rename did not take).
 - **Rendering.** The retry prompt shows the applied operations as
   ALREADY APPLIED and asks for new operations only. It renders them
   through `_compact_reconciler_output` (the inverse of
@@ -3864,22 +3868,33 @@ applied operation harmless:
     composed text is kept.
   - Any other collision, including a connector from an earlier (re-plan)
     reconcile or a planner-authored id, still `die()`s.
-- An id that an applied merge absorbed is redirected to its survivor
-  (`_survivor_map`, built from `_merged_from` stamps):
-  - a restated connector folds its edges into the survivor and is not
-    re-added;
-  - a `dependency_edges` endpoint is rewritten, and an edge that
-    collapses onto the survivor itself is skipped;
-  - an `added_requires` binding is redirected.
+- An id that one of this reconcile's applied merges absorbed is
+  redirected to its survivor. `_survivor_map(applied_merges, by_id)`
+  follows the applied `merged_subtasks` chains, not `_merged_from`
+  stamps, which also record earlier phases' merges.
+  `_redirect_absorbed_ids` rewrites the retry's output before any op
+  applies:
+  - the sid of `renames`, `added_provides`, `dropped_requires` and
+    `_bind_requires`;
+  - `dependency_edges` and `merged_subtasks` endpoints, and
+    `added_subtasks[].depends_on` (a self-reference is removed).
+
+  An edge or merge whose endpoints collapse onto one survivor through
+  the redirect is removed: the merge already happened. A `from == to`
+  the worker wrote itself still dies. `conditional_drops` are not
+  redirected. A restated connector whose id was absorbed folds its edges
+  into the survivor (`_union_connector_edges`, with no self-loop) and is
+  not re-added.
 - An `added_requires` naming a `restatable` connector that the retry did
   not restate is bound to it (deduped; skipped if `restated_drops` or
   its own `provides` covers it; logged as dropped if no live subtask
-  matches). `_expand_reconciler_output` reports danglers structured as
+  matches). A drop recorded against either the connector's id or the
+  id the worker named (before the redirect) holds.
+  `_expand_reconciler_output` reports danglers structured as
   `_dangling_requires_raw`, and `_spawn_reconciler(bindable=…)` routes
   the ones naming applied connectors to `_bind_requires`.
-- A `merged_subtasks` entry whose `from` is already in `into`'s
-  `_merged_from` is skipped. One naming an id that never existed still
-  `die()`s.
+- A repeated merge collapses through the redirect above and is removed,
+  chains included. One naming an id that never existed still `die()`s.
 
 Added subtasks from every applied output share the single `_reconciler`
 pseudo-plan. `state.data["conditional_drops"]` is recomputed from
