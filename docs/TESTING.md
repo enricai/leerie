@@ -4106,9 +4106,10 @@ passes it). Every porcelain pin asserts the porcelain arm's OWN warning
 committed-by-this-pass arm also flags any wholly-uncommitted citation,
 and with flag-only assertions 5 of 7 porcelain mutants (ancestor
 clause, canonicalization, `.strip()`, one-sided rename parse, `-uall`)
-survived every test after it landed — measured post-merge. With the
-arm-specific assertion all 7 are killed, each by the pin named for its
-clause.
+survived every test in `test_run_conformance_phase.py` and
+`test_risk_register.py` after it landed — measured post-merge, at that
+two-file scope. With the arm-specific assertion all 7 are killed, each
+by the pin named for its clause.
 
 **The PR composition renderers** (two live paths plus `compose_pr_body`,
 the never-invoked canonical reference the bash fallback mirrors):

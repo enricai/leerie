@@ -1269,7 +1269,7 @@ def test_protected_path_rollback_neutralizes_repair_records(env):
 
 
 # Every porcelain-arm pin below asserts the porcelain arm's OWN warning,
-# not just the flag: 2841b3d's committed-by-this-pass arm also sets the
+# not just the flag: the committed-by-this-pass arm also sets the
 # flag for any wholly-uncommitted citation, so a flag-only assertion
 # passes even with the porcelain arm broken (measured post-merge: 5 of 7
 # porcelain mutants survived flag-only pins). The round-8 arm is skipped
@@ -1592,7 +1592,6 @@ def test_committed_cited_repair_is_not_neutralized(env):
     assert risks[0]["addressed"] is True
 
 
-
 def test_partially_committed_directory_citation_is_caught(env):
     """The one input where the porcelain arm is the SOLE catcher: the
     pass commits one file under the cited directory (so the
@@ -1619,3 +1618,4 @@ def test_partially_committed_directory_citation_is_caught(env):
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    _assert_porcelain_arm_fired(warnings)
