@@ -295,29 +295,25 @@ def test_conformer_schema_accepts_positional_dispositions(leerie):
 
 import asyncio
 import json as _json
-import subprocess as _subprocess
 
 
-def _git(cmd, cwd):
-    r = _subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
-    assert r.returncode == 0, f"{cmd} failed in {cwd}: {r.stderr}"
-    return r
+from tests.conftest import run_git_cwd_kw
 
 
 @pytest.fixture
 def settle_env(leerie, tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
-    _git(["git", "init", "-q", "-b", "main"], repo)
-    _git(["git", "config", "user.email", "t@t"], repo)
-    _git(["git", "config", "user.name", "t"], repo)
+    run_git_cwd_kw("init", "-q", "-b", "main", cwd=repo)
+    run_git_cwd_kw("config", "user.email", "t@t", cwd=repo)
+    run_git_cwd_kw("config", "user.name", "t", cwd=repo)
     (repo / "README.md").write_text("# repo\n")
-    _git(["git", "add", "-A"], repo)
-    _git(["git", "commit", "-q", "-m", "initial"], repo)
+    run_git_cwd_kw("add", "-A", cwd=repo)
+    run_git_cwd_kw("commit", "-q", "-m", "initial", cwd=repo)
 
     run_id = "risk-001-abcdef"
     run_branch = f"leerie/runs/{run_id}"
-    _git(["git", "checkout", "-q", "-b", run_branch], repo)
+    run_git_cwd_kw("checkout", "-q", "-b", run_branch, cwd=repo)
 
     sid = "t1"
     leerie_root = repo / ".leerie"
@@ -325,12 +321,12 @@ def settle_env(leerie, tmp_path):
     for d in ("subtasks", "criteria", "logs", "worktrees"):
         (run_dir / d).mkdir(parents=True, exist_ok=True)
     worktree = run_dir / "worktrees" / sid
-    _git(["git", "worktree", "add", "-q", "-b",
-          f"leerie/subtasks/{run_id}/{sid}", str(worktree), run_branch], repo)
+    run_git_cwd_kw("worktree", "add", "-q", "-b",
+          f"leerie/subtasks/{run_id}/{sid}", str(worktree), run_branch, cwd=repo)
     # The implementer's committed work, so check_branch_has_commits passes.
     (worktree / "src.py").write_text("def f():\n    return 1\n")
-    _git(["git", "add", "-A"], worktree)
-    _git(["git", "commit", "-q", "-m", "implementer: add f()"], worktree)
+    run_git_cwd_kw("add", "-A", cwd=worktree)
+    run_git_cwd_kw("commit", "-q", "-m", "implementer: add f()", cwd=worktree)
 
     (run_dir / "criteria" / f"{sid}.md").write_text("# Criteria\n- f()\n")
     subtask = {"id": sid, "files_likely_touched": ["src.py"]}
