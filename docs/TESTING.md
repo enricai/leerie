@@ -1134,10 +1134,14 @@ correct code, since the unparser emits single quotes.
 retry is layered*. The regression, `test_unresolved_retry_keeps_attempt_1_resolutions`,
 is barnacle run fc56e9e5's shape. Attempt 1 renames one consumer onto
 its producer and leaves a second tag with none. Attempt 2 answers only
-the residue. Against the old reverting retry it fails with the run's
-exact abort message. `test_unresolved_retry_restated_connector_replays_0cfb46a0`
+the residue. Against the old reverting retry it fails with the same
+still-unresolved-after-retry abort the run hit (one consumer here, two
+in the run). `test_unresolved_retry_restated_connector_replays_0cfb46a0`
 replays the corpus's other unresolved retry, where attempt 2 restated
-attempt 1's connector under the same id.
+attempt 1's connector under the same id. It passes against the old
+reverting retry too, and it pins the restate path rather than the
+layering. A layered apply without `restatable` dies on that live
+shape.
 
 Restatement is pinned on three axes:
 
@@ -1151,22 +1155,53 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
+The first review round broke the "re-emitting is harmless" claim seven
+ways by execution. Each break now has a test that fails on the build
+it broke (`test_apply_layered_*` and `test_unresolved_retry_*` with a
+"round 1" docstring tag):
+
+- a re-emitted edge naming an id attempt 1 merged away;
+- a restated connector attempt 1 merged away, which came back as a
+  duplicate producer;
+- a restatement discarding a subtask attempt 1 merged into the connector;
+- a restatement re-adding a require attempt 1 dropped;
+- a connector satisfying its own require;
+- a binding to a merged-away connector, lost silently;
+- a natural answer naming a consumer's pre-rename tag, read off the
+  prompt's pre-attempt-1 input.
+
+`test_unresolved_retry_after_size_and_cycle_retries_sees_both` drives
+size → cycle → unresolved retries through real `phase_reconcile`: the
+"applied" set must include both retries' outputs. The `_merged_from`
+union and the never-existed-merge die are mutant guards. Each passes on
+the build it was added against, and fails on the mutant that removes
+it.
+
 Every reconciler test stubs the worker, so the live behaviour was
 measured separately. Real `claude -p` ran as attempt 2 on fc56, from the
 recorded attempt 1. The old retry died 5/5, and its worker restated 0 of
 15 attempt-1 renames. The layered retry converged 5/5, and 3/3 on
-0cfb46a0. A replay of every locally recorded run with pre-reconcile
-plans gave plans identical to the old code in all 505 runs where both
-finished.
+0cfb46a0. Those trials ran before the wire-vocabulary rendering below.
+A replay of every locally recorded run with pre-reconcile plans gave
+plans identical to the old code in all runs where both finished. Most of
+those never reach the retry this changes: they made no reconciler call,
+or one call with no unresolved-tags retry. Only two runs in the corpus ever logged that
+retry, which is why the edge cases above are pinned by constructed
+tests rather than corpus replay.
 
 `tests/test_strict_output_proxy.py::test_retry_prompts_only_name_ops_the_schema_accepts`
 covers the prompt's ALREADY APPLIED block, which renders attempt 1's
-ops back to the worker. Its fixture now carries every op kind. With
-the renames-only fixture it had before, the first layered build passed
-the guard while rendering the retired `added_provides` /
-`dropped_requires` / `conditional_drops` keys. The rendering now goes
-through `_compact_reconciler_output`, pinned by a compact→expand
-round-trip test.
+ops back to the worker. Its fixture used to hold renames only, and
+renames render the same in either shape, so the first layered build
+passed it. That build rendered the retired `added_provides` /
+`dropped_requires` / `conditional_drops` keys for any attempt 1 that
+held those ops. The fixture now carries every op kind and fails on that
+build.
+
+The guard's `retired` set does not cover nested `requires` or the
+`_added_by_reconciler` stamp. The compact→expand round-trip test pins
+those on `_compact_reconciler_output`, which the rendering now goes
+through.
 
 ### Planner extent fencing and the fence-probe sandbox harness
 

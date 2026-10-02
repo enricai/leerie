@@ -478,15 +478,29 @@ subtask it tests). Three mechanisms reconcile that coupling:
   and the final unresolved check then aborts on tags attempt 1 had
   already resolved (barnacle, 2026-10-02: two consumers renamed onto
   their producer in attempt 1, reverted, never re-emitted, run died).
-  Re-emitting an attempt-1 op must be harmless, so the apply step treats
-  it as idempotent: a repeated rename or drop no-ops, a repeated merge is
-  skipped, and a re-emitted connector is *merged* into the version
-  attempt 1 added — restated text wins, edges are unioned — because a
-  worker restating a connector routinely omits requires it considers
-  settled, and an omission must not undo attempt-1 work (a removal is
-  `drop_require`'s job). Only connectors attempt 1 of *this* reconcile
-  added are restatable; a re-plan reconcile's earlier connectors keep the
-  fail-loud id-collision guard.
+  Re-emitting an attempt-1 op must be harmless, and an omission must not
+  undo attempt-1 work, so the apply step treats the retry as idempotent
+  over what is already applied:
+  - a repeated rename or drop no-ops, and a repeated merge is skipped;
+  - a re-emitted connector is *merged* into the version attempt 1 added:
+    its edges are unioned, because a worker restating a connector
+    routinely omits requires it considers settled. Restated text wins
+    unless attempt 1 merged other subtasks into that connector, whose
+    criteria the composed text carries. A require attempt 1 removed with
+    `drop_require` is not re-added;
+  - an id attempt 1 merged away is read as its survivor wherever the
+    retry names it, rather than resurrected or rejected as missing.
+
+  Only connectors added by *this* reconcile's applied attempts are
+  restatable; a re-plan reconcile's earlier connectors keep the
+  fail-loud id-collision guard. "Applied" means every output the plans
+  currently hold: after a size retry and then a cycle retry, both
+  outputs.
+
+  The retry prompt still carries the pre-attempt-1 input, so a worker may
+  name a consumer's tag as it was before an applied rename. That
+  reference is translated mechanically to the current tag rather than
+  rejected; it was the natural answer under the revert design.
 
 ### `requires.extent` — in-graph vs. external prerequisites
 

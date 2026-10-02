@@ -3821,39 +3821,71 @@ extent-aware guard (`in_plan` only). Cases (first match wins):
 2. Top match, Jaccard ≥ 0.7 (even if not unique) → same.
 3. Else → no recommendation; model picks unaided (the common case).
 
-The retry's output is applied on top of attempt 1 with
-`_apply_reconciler_output(plans, output, restatable=<ids attempt 1 added>)`. Every tag the
-retry addresses is the consumer's *current* (post-attempt-1) tag. The
-recommendation, the must-include validator, and the prompt's examples
-all use that tag, strictly; there is no pre-revert form. The retry prompt
-renders attempt 1's operations as already applied, and asks for new
-operations only. The rendering goes through `_compact_reconciler_output`
-(the inverse of `_expand_reconciler_output`, projected through
-`SCHEMAS["reconciler"]`), so the worker sees only wire vocabulary, never
-the internal `added_provides` / `dropped_requires` / `conditional_drops`
-arrays or the `_added_by_reconciler` stamp. The `layered=True` apply step makes re-emitting an
-attempt-1 operation harmless:
+The retry's output is applied on top of the plans' current state with
+`_apply_reconciler_output(plans, output, restatable=…, restated_drops=…)`.
+"Applied" is tracked as the list of outputs `plans` currently holds
+(`applied`, restored alongside `pre_plans_snapshot` by the reverting
+retries). After a size retry and then a cycle retry it holds both;
+`_concat_reconciler_outputs(applied)` is the retry's view of attempt 1.
 
-- `renames`, `added_provides`, `dependency_edges`, `dropped_requires`
-  and `conditional_drops` already no-op or dedup on repeat.
-- An `added_subtasks` id in `restatable` is merged into attempt 1's
-  version by `_merge_restated_connector`: restated scalar fields win;
-  `provides`, `requires` (by tag+extent), `depends_on` and
-  `_merged_from` are unioned, earlier entries first. Any other
-  collision, including a connector from an earlier (re-plan) reconcile
-  or a planner-authored id, still `die()`s.
-- An `added_requires` naming a `restatable` connector that the retry
-  did not restate is bound to it (deduped) instead of being dropped.
-  `_expand_reconciler_output` reports danglers structured as
-  `_dangling_requires_raw`; `_spawn_reconciler(bindable=…)` routes the
-  ones naming attempt-1 connectors to `_bind_requires`.
+- **Tags.** Every tag the retry addresses is the consumer's *current*
+  tag. The recommendation, the must-include validator and the prompt's
+  examples all use it, strictly; there is no pre-revert form. The
+  prompt's trailing `--- ORIGINAL INPUT … ---` block is labelled as
+  the pre-attempt-1 payload. A worker that names a consumer's
+  pre-rename tag in a sid-keyed op (`renames[].from`,
+  `dropped_requires[].tag`) has it rewritten to the current tag by
+  `_translate_pre_rename_tags` before validation.
+- **Rendering.** The retry prompt shows the applied operations as
+  ALREADY APPLIED and asks for new operations only. It renders them
+  through `_compact_reconciler_output` (the inverse of
+  `_expand_reconciler_output`, projected through
+  `SCHEMAS["reconciler"]`), so the worker sees only wire vocabulary:
+  never the internal `added_provides` / `dropped_requires` /
+  `conditional_drops` arrays, nested `requires`, or the
+  `_added_by_reconciler` stamp.
+
+The layered apply step (`restatable` not None) makes re-emitting an
+applied operation harmless:
+
+- `renames`, `added_provides`, `dropped_requires` and
+  `conditional_drops` no-op or dedup on repeat.
+- An `added_subtasks` id in `restatable` (ids added by the applied
+  outputs) is merged into the existing version by
+  `_merge_restated_connector`.
+  - `provides`, `requires` (by tag+extent), `depends_on`,
+    `files_likely_touched` and `_merged_from` are unioned, earlier first,
+    via `_union_connector_edges`.
+  - In-plan requires the merged `provides` cover are dropped, as are
+    `(sid, tag)` pairs in `restated_drops` (the applied
+    `dropped_requires`).
+  - Restated `title` / `intent` / `success_criteria_seed` win, unless
+    the existing version carries `_merged_from`, in which case its
+    composed text is kept.
+  - Any other collision, including a connector from an earlier (re-plan)
+    reconcile or a planner-authored id, still `die()`s.
+- An id that an applied merge absorbed is redirected to its survivor
+  (`_survivor_map`, built from `_merged_from` stamps):
+  - a restated connector folds its edges into the survivor and is not
+    re-added;
+  - a `dependency_edges` endpoint is rewritten, and an edge that
+    collapses onto the survivor itself is skipped;
+  - an `added_requires` binding is redirected.
+- An `added_requires` naming a `restatable` connector that the retry did
+  not restate is bound to it (deduped; skipped if `restated_drops` or
+  its own `provides` covers it; logged as dropped if no live subtask
+  matches). `_expand_reconciler_output` reports danglers structured as
+  `_dangling_requires_raw`, and `_spawn_reconciler(bindable=…)` routes
+  the ones naming applied connectors to `_bind_requires`.
 - A `merged_subtasks` entry whose `from` is already in `into`'s
-  `_merged_from` is skipped.
+  `_merged_from` is skipped. One naming an id that never existed still
+  `die()`s.
 
-Added subtasks from both attempts share the single `_reconciler`
-pseudo-plan. `state.data["conditional_drops"]` merges across the two
-attempts rather than being replaced, because attempt 1's drops are
-still applied.
+Added subtasks from every applied output share the single `_reconciler`
+pseudo-plan. `state.data["conditional_drops"]` is recomputed from
+`applied` after each apply, so a reverting retry's reverted drops leave
+the audit while the layered retry's attempt-1 drops stay. The closing
+"reconciled (…)" summary counts distinct operations across `applied`.
 
 `unresolvable` IS valid for this retry (unlike the cycle retry's strict
 forbid) — if no real producer exists, surfacing that cleanly is right.
