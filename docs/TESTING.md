@@ -1155,7 +1155,7 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
-Four review rounds, each executing code, broke the "re-emitting an
+Five review rounds, each executing code, broke the "re-emitting an
 applied op is harmless" claim. Each break has a test that fails on the
 build it broke, with one exception noted under round two.
 
@@ -1200,6 +1200,15 @@ Round four, against round three's fixes:
 - an absorbed id the retry itself reused for a new subtask had its
   edges rewired to the old survivor.
 
+Round five, against round four's fixes: round four's answer to the
+reuse case (leave a reused id unredirected) let a restated merge
+silently swallow the reused subtask. Reuse of an absorbed id for a new
+subtask is ambiguous by construction, so it now dies like any id
+collision (`test_apply_layered_new_subtask_reusing_absorbed_id_dies`
+and its `phase_reconcile` twin). A worker-written self-edge is now left
+exactly as written, as the docs already claimed
+(`test_redirect_leaves_worker_written_self_references_as_written`).
+
 Separately, the layered build first rejected a natural answer naming a
 consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),
 which the reverting retry had accepted. Its fix, translation, then
@@ -1211,9 +1220,11 @@ mistranslated a tag the consumer still held. Both cases are pinned
 size → cycle → unresolved retries through real `phase_reconcile`: the
 "applied" set must include both retries' outputs. Twelve tests are
 mutant guards, which fail on the mutant that removes the behaviour.
-Each passes on the build it was added against, except the self-edge
-guard: it trips on the `applied_merges` keyword there, and passes once
-that later argument is adapted away.
+Each passes on the build it was added against, with two qualifications.
+The self-edge guard trips on the `applied_merges` keyword there, and
+passes once that later argument is adapted away. The survivor-scoping
+guard passes on the build its fixture was reordered against, not the
+one it was first added against (see round two).
 - the `_merged_from` union;
 - the never-existed-merge die;
 - the binding skip for a dropped or self-provided require;

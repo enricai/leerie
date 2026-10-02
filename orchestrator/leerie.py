@@ -23578,8 +23578,8 @@ def _merge_restated_connector(
                 restated[key] = earlier[key]
 
 
-def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict],
-                  reused: set[str]) -> dict[str, str]:
+def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict]
+                  ) -> dict[str, str]:
     """Absorbed id → surviving id, derived from the `merged_subtasks` ops
     this reconcile has applied, following chains (A→B then B→C maps A
     and B to C). Only survivors still live in `by_id` are kept.
@@ -23588,12 +23588,8 @@ def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict],
     stamps also record earlier phases' merges (an overlap merge, an
     earlier reconcile), whose absorbed ids are out of this retry's scope
     and may even be reused by a later connector — two stamps naming one
-    id would make the redirect ambiguous.
-
-    `reused` holds ids the retry itself adds as NEW subtasks (not
-    restatements). An absorbed id the retry reuses names the new subtask
-    from then on, so it is not redirected — same as an id a later
-    applied output reused, which is already live in `by_id`."""
+    id would make the redirect ambiguous. (The retry itself may not
+    reuse an absorbed id for a new subtask: `_die_on_absorbed_id_reuse`.)"""
     step = {m["from"]: m["into"] for m in applied_merges
             if m.get("from") and m.get("into")}
     out: dict[str, str] = {}
@@ -23604,9 +23600,29 @@ def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict],
             target = step[target]
         # `gone in by_id`: a later applied output reused the id for a new
         # subtask, which is live and must keep its own references.
-        if target in by_id and gone not in by_id and gone not in reused:
+        if target in by_id and gone not in by_id:
             out[gone] = target
     return out
+
+
+def _die_on_absorbed_id_reuse(output: dict, survivor: dict[str, str],
+                              restatable: set[str]) -> None:
+    """die() if the layered retry adds a NEW subtask under an id an
+    applied merge absorbed. A restatement of an absorbed connector
+    (`restatable`) folds into its survivor; a new subtask under that id
+    would make every reference to it ambiguous — the old, merged work or
+    the new — and both readings have silently corrupted the plan (a
+    restated merge swallowing the new subtask; edges rewired to the old
+    survivor). Treated like any other id collision: fail loud."""
+    clashes = sorted(s["id"] for s in output.get("added_subtasks") or []
+                     if s["id"] in survivor and s["id"] not in restatable)
+    if clashes:
+        die(
+            "reconciler proposed added_subtasks reusing id(s) an applied "
+            f"merge already absorbed: {', '.join(clashes)}. The id now "
+            "names merged work; a new subtask under it would make every "
+            "reference ambiguous. Refine the task or re-run."
+        )
 
 
 def _redirect_absorbed_ids(output: dict, survivor: dict[str, str]) -> dict:
@@ -23641,7 +23657,8 @@ def _redirect_absorbed_ids(output: dict, survivor: dict[str, str]) -> dict:
         out[key] = [{**row, "sid": r(row["sid"])}
                     for row in output.get(key) or []]
     out["dependency_edges"] = [
-        {**e, "from": r(e["from"]), "to": r(e["to"])}
+        e if e["from"] == e["to"]
+        else {**e, "from": r(e["from"]), "to": r(e["to"])}
         for e in output.get("dependency_edges") or []
         if not (e["from"] != e["to"] and r(e["from"]) == r(e["to"]))]
     out["merged_subtasks"] = [
@@ -23775,12 +23792,10 @@ def _apply_reconciler_output(
         for s in plan.get("subtasks", []):
             by_id[s["id"]] = s
 
-    survivor = (_survivor_map(
-        applied_merges or [], by_id,
-        {s["id"] for s in output.get("added_subtasks") or []
-         if s["id"] not in restatable})
-        if restatable is not None else {})
+    survivor = (_survivor_map(applied_merges or [], by_id)
+                if restatable is not None else {})
     if survivor:
+        _die_on_absorbed_id_reuse(output, survivor, restatable or set())
         output = _redirect_absorbed_ids(output, survivor)
 
     for r in output.get("renames", []):
@@ -24675,9 +24690,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         # held-tag check reads an absorbed sid's survivor.
         survivor = _survivor_map(
             prior.get("merged_subtasks") or [],
-            {s["id"]: s for plan in plans for s in plan.get("subtasks", [])},
-            {s["id"] for s in output3.get("added_subtasks") or []
-             if s["id"] not in attempt_1_added})
+            {s["id"]: s for plan in plans for s in plan.get("subtasks", [])})
         held = {s["id"]: {e.get("tag") for e in s.get("requires") or []
                           if isinstance(e, dict)
                           and e.get("extent") == "in_plan"}

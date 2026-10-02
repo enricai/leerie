@@ -494,11 +494,12 @@ subtask it tests). Three mechanisms reconcile that coupling:
     survivor holds more work than the worker named: a `conditional_drop`
     (it would drop the survivor), and a new merge's `from` (it would
     merge the whole survivor away). The latter still dies as missing.
-    The scope is this reconcile's merges, not an earlier phase's. It
-    excludes an id that a later output, or the retry itself, reused for
-    a new subtask: that id names the new subtask from then on. A
-    self-merge the worker wrote stays exactly as written, so it still
-    dies. The must-include check judges the
+    The scope is this reconcile's merges, not an earlier phase's, and
+    excludes an id a later applied output reused for a live subtask. The
+    retry itself may not add a NEW subtask under an absorbed id: every
+    reference to it would be ambiguous (the merged work, or the new), so
+    it dies like any id collision. A self-edge or self-merge the worker
+    wrote stays exactly as written, so it still dies naming that id. The must-include check judges the
     redirected answer, i.e. what the apply step will do.
 
   Only connectors added by *this* reconcile's applied attempts are

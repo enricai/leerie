@@ -2801,7 +2801,7 @@ def test_survivor_map_ignores_earlier_phase_merges(leerie):
     by_id = {"feat-008": {"id": "feat-008", "_merged_from": ["feat-900"]},
              "feat-007": {"id": "feat-007", "_merged_from": ["feat-900"]}}
     assert leerie._survivor_map(
-        [{"into": "feat-008", "from": "feat-900"}], by_id, set()) == {
+        [{"into": "feat-008", "from": "feat-900"}], by_id) == {
             "feat-900": "feat-008"}
 
 
@@ -2858,7 +2858,7 @@ def test_survivor_map_skips_an_id_live_again(leerie):
     not redirected — its references are its own."""
     by_id = {"feat-001": {"id": "feat-001"}, "feat-002": {"id": "feat-002"}}
     assert leerie._survivor_map(
-        [{"into": "feat-002", "from": "feat-001"}], by_id, set()) == {}
+        [{"into": "feat-002", "from": "feat-001"}], by_id) == {}
 
 
 def test_apply_layered_redirects_sid_of_rename_provide_and_drop(leerie):
@@ -3011,21 +3011,57 @@ def test_unresolved_retry_worker_written_self_merge_still_dies(
         _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
 
 
-def test_apply_layered_retry_reusing_absorbed_id_is_not_redirected(leerie):
-    """A retry that adds a NEW subtask under an id an applied merge
-    absorbed owns that id from then on: its edges and dependencies are
-    not rewired to the old survivor."""
+def test_apply_layered_new_subtask_reusing_absorbed_id_dies(leerie):
+    """A NEW subtask under an id an applied merge absorbed is ambiguous —
+    references could mean the merged work or the new — so it dies like
+    any id collision."""
     plans = [{"domain": "feat", "subtasks": [
         _r1_sub("feat-001"), _r1_sub("feat-002"), _r1_sub("feat-003")]}]
     merge = [{"into": "feat-002", "from": "feat-001"}]
     leerie._apply_reconciler_output(plans, {"merged_subtasks": merge})
-    leerie._apply_reconciler_output(plans, {
-        "added_subtasks": [{**_r1_sub("feat-001", provides=["x"]),
-                            "depends_on": ["feat-002"]}],
-        "dependency_edges": [{"from": "feat-001", "to": "feat-003"}],
-    }, restatable=set(), applied_merges=merge)
-    assert _conn(plans, "feat-003")["depends_on"] == ["feat-001"]
-    assert _conn(plans, "feat-001")["depends_on"] == ["feat-002"]
+    with pytest.raises(SystemExit):
+        leerie._apply_reconciler_output(plans, {
+            "added_subtasks": [{**_r1_sub("feat-001", provides=["x"]),
+                                "depends_on": ["feat-002"]}],
+            "dependency_edges": [{"from": "feat-001", "to": "feat-003"}],
+        }, restatable=set(), applied_merges=merge)
+
+
+def test_unresolved_retry_reusing_absorbed_id_dies(
+    leerie, monkeypatch, tmp_path, capsys
+):
+    """Through phase_reconcile the reuse dies with the reuse message, even
+    when the same answer restates the merge that absorbed the id — which
+    used to swallow the new subtask silently. (The redirect never changes
+    an added subtask's id, so the apply step's check sees the reuse
+    before any mutation.)"""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"], files=["shared.py"]),
+        _r1_sub("feat-003", provides=["c"], requires=["x"])]}]
+    merge = {"into": "feat-002", "from": "feat-001", "reason": "overlap"}
+    a1 = {**_r4_base(), "merged_subtasks": [merge]}
+    new_001 = {k: v for k, v in _r1_sub("feat-001", provides=["x"]).items()
+               if k != "requires"}
+    a2 = {**_r4_base(), "added_subtasks": [new_001],
+          "merged_subtasks": [merge]}
+    with pytest.raises(SystemExit):
+        _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+    assert "reusing id(s) an applied merge already absorbed: feat-001" in (
+        capsys.readouterr().err)
+
+
+def test_redirect_leaves_worker_written_self_references_as_written(leerie):
+    """A worker-written self-edge and self-merge on an absorbed id are
+    left exactly as written, so the apply step's die names the id the
+    worker wrote and a second pass changes nothing."""
+    out = {"dependency_edges": [{"from": "feat-001", "to": "feat-001"}],
+           "merged_subtasks": [{"into": "feat-001", "from": "feat-001"}]}
+    once = leerie._redirect_absorbed_ids(out, {"feat-001": "feat-002"})
+    assert once["dependency_edges"] == out["dependency_edges"]
+    assert once["merged_subtasks"] == out["merged_subtasks"]
+    assert leerie._redirect_absorbed_ids(
+        once, {"feat-001": "feat-002"}) == once
 
 
 def test_unresolved_retry_held_check_reads_the_survivor(

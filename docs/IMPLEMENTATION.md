@@ -3876,8 +3876,11 @@ applied operation harmless:
   redirected to its survivor. `_survivor_map(applied_merges, by_id)`
   follows the applied `merged_subtasks` chains, not `_merged_from`
   stamps, which also record earlier phases' merges. An id that is live
-  again (a later output reused it) is not redirected. Neither is an id
-  the retry itself adds as a new subtask (the `reused` argument).
+  again (a later applied output reused it) is not redirected. A retry
+  that adds a NEW subtask under an absorbed id (not a restatement)
+  `die()`s via `_die_on_absorbed_id_reuse`, called by the apply step
+  before its redirect. The redirect never changes an added subtask's
+  id, so `phase_reconcile`'s earlier pass cannot hide the reuse.
   `_redirect_absorbed_ids` rewrites the retry's output before any op
   applies:
   - the sid of `renames`, `added_provides`, `dropped_requires` and
@@ -3887,9 +3890,9 @@ applied operation harmless:
 
   An edge or merge whose endpoints collapse onto one survivor through
   the redirect is removed: the merge already happened. A `from == to`
-  (or merge `into == from`) the worker wrote itself is left exactly as
-  written and still dies. That also keeps the second pass (the apply
-  step's) idempotent. Two references are not redirected,
+  edge or `into == from` merge the worker wrote itself is left exactly
+  as written, so it still dies naming the id the worker wrote. That
+  also keeps the second pass (the apply step's) idempotent. Two references are not redirected,
   because the survivor holds more work than the worker named: a
   `conditional_drops` sid, and a non-collapsing merge's `from`. The
   latter dies as missing. A restated connector whose id was absorbed folds its edges
