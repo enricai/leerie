@@ -3827,7 +3827,11 @@ retry addresses is the consumer's *current* (post-attempt-1) tag. The
 recommendation, the must-include validator, and the prompt's examples
 all use that tag, strictly; there is no pre-revert form. The retry prompt
 renders attempt 1's operations as already applied, and asks for new
-operations only. The `layered=True` apply step makes re-emitting an
+operations only. The rendering goes through `_compact_reconciler_output`
+(the inverse of `_expand_reconciler_output`, projected through
+`SCHEMAS["reconciler"]`), so the worker sees only wire vocabulary, never
+the internal `added_provides` / `dropped_requires` / `conditional_drops`
+arrays or the `_added_by_reconciler` stamp. The `layered=True` apply step makes re-emitting an
 attempt-1 operation harmless:
 
 - `renames`, `added_provides`, `dependency_edges`, `dropped_requires`

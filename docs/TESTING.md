@@ -1128,6 +1128,46 @@ prompt fails it. Payload keys are read **structurally** off the
 `ast.unparse` output for `"scope_note": s.get(` and failed against
 correct code, since the unparser emits single quotes.
 
+### Layered unresolved-tags retry
+
+`tests/test_reconciler_cycle_gate.py` pins DESIGN §5 *The unresolved-tags
+retry is layered*. The regression, `test_unresolved_retry_keeps_attempt_1_resolutions`,
+is barnacle run fc56e9e5's shape. Attempt 1 renames one consumer onto
+its producer and leaves a second tag with none. Attempt 2 answers only
+the residue. Against the old reverting retry it fails with the run's
+exact abort message. `test_unresolved_retry_restated_connector_replays_0cfb46a0`
+replays the corpus's other unresolved retry, where attempt 2 restated
+attempt 1's connector under the same id.
+
+Restatement is pinned on three axes:
+
+- **Merge, not replace.** `test_apply_layered_merges_restated_connector`
+  fails against a replace implementation, which silently dropped attempt
+  1's `requires` and inbound `depends_on`.
+- **Scope.** `test_apply_layered_dies_on_connector_from_an_earlier_reconcile`
+  covers a re-plan reconcile reusing an earlier connector's id. That case
+  must still die.
+- **Binding.** `test_apply_layered_binds_requires_to_attempt_1_connector`
+  plus its `phase_reconcile`-level twin cover an `added_requires` that
+  names an attempt-1 connector without restating it.
+
+Every reconciler test stubs the worker, so the live behaviour was
+measured separately. Real `claude -p` ran as attempt 2 on fc56, from the
+recorded attempt 1. The old retry died 5/5, and its worker restated 0 of
+15 attempt-1 renames. The layered retry converged 5/5, and 3/3 on
+0cfb46a0. A replay of every locally recorded run with pre-reconcile
+plans gave plans identical to the old code in all 505 runs where both
+finished.
+
+`tests/test_strict_output_proxy.py::test_retry_prompts_only_name_ops_the_schema_accepts`
+covers the prompt's ALREADY APPLIED block, which renders attempt 1's
+ops back to the worker. Its fixture now carries every op kind. With
+the renames-only fixture it had before, the first layered build passed
+the guard while rendering the retired `added_provides` /
+`dropped_requires` / `conditional_drops` keys. The rendering now goes
+through `_compact_reconciler_output`, pinned by a compact→expand
+round-trip test.
+
 ### Planner extent fencing and the fence-probe sandbox harness
 
 `tests/test_planner_extent_out_of_scope.py` gained the third

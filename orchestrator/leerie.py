@@ -10136,6 +10136,55 @@ def _expand_reconciler_output(out: dict) -> dict:
     return expanded
 
 
+def _compact_reconciler_output(expanded: dict) -> dict:
+    """Inverse of `_expand_reconciler_output`: render leerie's nine-array
+    shape back into the wire vocabulary `SCHEMAS["reconciler"]` accepts.
+
+    Needed wherever leerie SHOWS the worker its own earlier output — the
+    unresolved-tags retry renders attempt 1's applied ops. Showing the
+    internal shape (`added_provides`, nested `requires`, the
+    `_added_by_reconciler` stamp) teaches keys the schema no longer has,
+    which strict output cannot even represent (see
+    `test_retry_prompts_only_name_ops_the_schema_accepts`). Field lists
+    are projected through the live schema, so a schema change cannot
+    leave this renderer emitting a retired field.
+    """
+    props = SCHEMAS["reconciler"]["properties"]
+
+    def _project(rows: list, key: str) -> list[dict]:
+        allowed = props[key]["items"]["properties"]
+        return [{k: v for k, v in row.items() if k in allowed}
+                for row in rows or [] if isinstance(row, dict)]
+
+    op_for = {target: op for op, target in _TAG_OP_TARGET.items()}
+    tag_ops: list[dict] = []
+    for target, op in op_for.items():
+        for row in expanded.get(target) or []:
+            entry = {"op": op, "sid": row.get("sid", ""),
+                     "reason": row.get("reason", "")}
+            if row.get("tag"):
+                entry["tag"] = row["tag"]
+            tag_ops.append(entry)
+    added_requires = [
+        {"sid": sub.get("id", ""), **{k: v for k, v in req.items()
+                                      if k in ("tag", "extent", "reason")}}
+        for sub in expanded.get("added_subtasks") or []
+        if isinstance(sub, dict)
+        for req in sub.get("requires") or [] if isinstance(req, dict)
+    ]
+    return {
+        "added_subtasks": _project(expanded.get("added_subtasks"),
+                                   "added_subtasks"),
+        "added_requires": added_requires,
+        "tag_ops": tag_ops,
+        "renames": _project(expanded.get("renames"), "renames"),
+        "dependency_edges": _project(expanded.get("dependency_edges"),
+                                     "dependency_edges"),
+        "merged_subtasks": _project(expanded.get("merged_subtasks"),
+                                    "merged_subtasks"),
+    }
+
+
 # The three build/lint/test axis names, in the spelling the conformer's
 # structured output and the base-health baseline both use ("tests", plural).
 # `resolve_blt` keys the test axis "test" (singular); `_AXIS_CMD_KEY` bridges
@@ -25391,10 +25440,10 @@ def _build_unresolved_retry_prompt(
     that is what the consumer's requires entry holds at apply time.
     """
     parts: list[str] = []
-    applied = {k: output.get(k) for k in (
-        "renames", "added_provides", "added_subtasks", "conditional_drops",
-        "dropped_requires", "dependency_edges", "merged_subtasks")
-        if output.get(k)}
+    # Wire vocabulary only: the worker must see attempt 1 in the shape it
+    # can emit (`_compact_reconciler_output`), never leerie's internal one.
+    applied = {k: v for k, v in _compact_reconciler_output(output).items()
+               if v}
     applied_note = (
         "Your attempt-1 operations below are ALREADY APPLIED and stay "
         "applied — every `requires` entry they resolved is settled. "
