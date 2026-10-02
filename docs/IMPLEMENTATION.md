@@ -3841,8 +3841,16 @@ retries). After a size retry and then a cycle retry it holds both;
   `_translate_pre_rename_tags` before validation, unless the consumer
   still holds that tag (the applied rename did not take). For an
   absorbed sid it checks the survivor's tags. In `phase_reconcile` the
-  order is translate, then redirect (below), then validate, so the
-  validator judges what the apply step will do.
+  order is: drop exact repeats (below), translate, redirect (below),
+  validate. The validator therefore judges what the apply step will do.
+- **Exact repeats.** `_drop_reemitted_tag_ops(output, applied)` removes
+  every rename and drop_require that exactly repeats one an applied
+  output performed. These two are not idempotent on the layered plans:
+  a later merge can give the subtask, or the survivor a redirect would
+  send the op to, its own entry for the same tag, and repeating the op
+  would hit that entry instead. A rename naming a connector its own
+  output added never took effect (step 1 runs before step 3) and is
+  not treated as performed. A drop_require (step 5) always took effect.
 - **Rendering.** The retry prompt shows the applied operations as
   ALREADY APPLIED and asks for new operations only. It renders them
   through `_compact_reconciler_output` (the inverse of
@@ -3866,7 +3874,9 @@ applied operation harmless:
   - In-plan requires the merged `provides` cover are dropped. So is an
     incoming require matching a `(sid, tag)` pair in `restated_drops`
     (the applied `dropped_requires`); one the existing version already
-    holds is kept.
+    holds is kept. A `depends_on` entry naming no live subtask (not in
+    the plan or this output) is dropped, so a restatement cannot revive
+    a dependency an applied `conditional_drop` pruned.
   - Restated `title` / `intent` / `success_criteria_seed` win, unless
     the existing version carries `_merged_from`, in which case its
     composed text is kept.
@@ -3892,12 +3902,15 @@ applied operation harmless:
   the redirect is removed: the merge already happened. A `from == to`
   edge or `into == from` merge the worker wrote itself is left exactly
   as written, so it still dies naming the id the worker wrote. That
-  also keeps the second pass (the apply step's) idempotent. Two references are not redirected,
-  because the survivor holds more work than the worker named: a
-  `conditional_drops` sid, and a non-collapsing merge's `from`. The
-  latter dies as missing. A restated connector whose id was absorbed folds its edges
-  into the survivor (`_union_connector_edges`, with no self-loop) and is
-  not re-added.
+  also keeps the second pass (the apply step's) idempotent. Two
+  references are not redirected, because the survivor holds more work
+  than the worker named: a `conditional_drops` sid, and a
+  non-collapsing merge's `from`. The latter dies as missing. A restated
+  connector whose id was absorbed folds its edges into the survivor
+  (`_union_connector_edges`, with no self-loop) and is not re-added.
+  Duplicate ids within the retry's `added_subtasks` are checked before
+  any fold, so two restatements of one absorbed connector die as a
+  duplicate rather than folding twice.
 - An `added_requires` naming a `restatable` connector that the retry did
   not restate is bound to it (deduped; skipped if `restated_drops` or
   its own `provides` covers it; logged as dropped if no live subtask

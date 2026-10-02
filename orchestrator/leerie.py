@@ -23511,6 +23511,7 @@ def _merge_files_likely_touched(into_s: dict, from_s: dict) -> None:
 
 def _union_connector_edges(
     first: dict, second: dict, dropped_tags: set[str], self_ids: set[str],
+    live_ids: set[str],
 ) -> dict:
     """The edge-bearing fields of two versions of one connector, unioned
     with `first`'s entries first. Returns only those fields; callers
@@ -23523,7 +23524,10 @@ def _union_connector_edges(
     are dropped, as `_merge_subtask_core_fields` does: a self-edge is
     not a producer. A `depends_on` entry naming `self_ids` (the
     connector's own id, or the id folded into it) would be a self-loop
-    and is dropped."""
+    and is dropped, and so is one naming no live subtask (`live_ids`): a
+    restatement may carry a dependency an applied `conditional_drop`
+    already pruned, and unioning it back would leave a dangling edge that
+    only fails later, at plan validation."""
     out: dict = {}
     for key in ("provides", "depends_on", "files_likely_touched",
                 "_merged_from"):
@@ -23532,7 +23536,8 @@ def _union_connector_edges(
             if v not in merged:
                 merged.append(v)
         if key == "depends_on":
-            merged = [d for d in merged if d not in self_ids]
+            merged = [d for d in merged
+                      if d not in self_ids and d in live_ids]
         if merged or key == "depends_on":
             out[key] = merged
     provides = set(out.get("provides") or [])
@@ -23557,6 +23562,7 @@ def _union_connector_edges(
 
 def _merge_restated_connector(
     earlier: dict, restated: dict, dropped_tags: set[str],
+    live_ids: set[str],
 ) -> None:
     """Fold `earlier` (a connector attempt 1 added and applied) into
     `restated` (the same id re-emitted by the layered unresolved-tags
@@ -23571,7 +23577,7 @@ def _merge_restated_connector(
     then carries the absorbed subtasks' criteria, which the retry never
     saw in that form, so the earlier text is kept."""
     restated.update(_union_connector_edges(
-        earlier, restated, dropped_tags, {restated["id"]}))
+        earlier, restated, dropped_tags, {restated["id"]}, live_ids))
     if earlier.get("_merged_from"):
         for key in ("title", "intent", "success_criteria_seed"):
             if earlier.get(key):
@@ -23718,9 +23724,11 @@ def _apply_reconciler_output(
       the applied outputs established is lost to an omission;
     * an id the applied merges absorbed (`applied_merges`) is redirected
       to its survivor (`_survivor_map`, `_redirect_absorbed_ids`) wherever
-      the retry names it, except a `conditional_drops` sid and a
-      non-collapsing merge's `from`; a restated connector with such an
-      id folds into its survivor;
+      the retry names it, except a `conditional_drops` sid, a
+      non-collapsing merge's `from`, and a worker-written self-edge or
+      self-merge (left as written, to die naming that id); a restated
+      connector with such an id folds into its survivor, while a NEW
+      subtask reusing it dies (`_die_on_absorbed_id_reuse`);
     * an `added_requires` naming a `restatable` connector without
       restating it (`output["_bind_requires"]`) is bound to it;
     * a repeated merge — one whose endpoints collapse onto one survivor
@@ -23841,8 +23849,19 @@ def _apply_reconciler_output(
         # Layered retry: a restated attempt-1 connector is merged into its
         # earlier version, which is then removed before the collision
         # check so only an id outside `restatable` can still collide.
-        if restatable:
+        # Checked on the output as emitted, before a layered fold can
+        # remove one of two copies of an id and hide the duplicate.
+        seen: set[str] = set()
+        self_collisions: list[str] = []
+        for s in added:
+            sid = s["id"]
+            if sid in seen and sid not in self_collisions:
+                self_collisions.append(sid)
+            seen.add(sid)
+        if restatable and not self_collisions:
             drops = restated_drops or set()
+            # A dependency may name a subtask this same output adds.
+            live = set(by_id) | {s["id"] for s in added}
             # A restated connector an applied merge absorbed folds its
             # edges into the survivor (whose text already composes both)
             # and is not re-added — re-adding would duplicate its work.
@@ -23852,7 +23871,8 @@ def _apply_reconciler_output(
                 target = by_id[survivor[s["id"]]]
                 ids = {target["id"], s["id"]}
                 target.update(_union_connector_edges(
-                    target, s, {t for sid, t in drops if sid in ids}, ids))
+                    target, s, {t for sid, t in drops if sid in ids}, ids,
+                    live))
             added = [s for s in added if s not in folded]
             restated = {s["id"] for s in added
                         if s["id"] in restatable and s["id"] in by_id}
@@ -23860,7 +23880,7 @@ def _apply_reconciler_output(
                 if s["id"] in restated:
                     _merge_restated_connector(
                         by_id[s["id"]], s,
-                        {t for sid, t in drops if sid == s["id"]})
+                        {t for sid, t in drops if sid == s["id"]}, live)
             for plan in plans:
                 plan["subtasks"] = [
                     t for t in plan.get("subtasks", [])
@@ -23870,13 +23890,6 @@ def _apply_reconciler_output(
                 del by_id[sid]
         existing_ids = {s["id"] for s in by_id.values()}
         ext_collisions = sorted({s["id"] for s in added if s["id"] in existing_ids})
-        seen: set[str] = set()
-        self_collisions: list[str] = []
-        for s in added:
-            sid = s["id"]
-            if sid in seen and sid not in self_collisions:
-                self_collisions.append(sid)
-            seen.add(sid)
         if ext_collisions or self_collisions:
             parts = []
             if ext_collisions:
@@ -24697,6 +24710,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 for plan in plans for s in plan.get("subtasks", [])}
         for gone, surv in survivor.items():
             held[gone] = held.get(surv, set())
+        _drop_reemitted_tag_ops(output3, applied)
         _translate_pre_rename_tags(output3, prior.get("renames") or [], held)
         if survivor:
             output3 = _redirect_absorbed_ids(output3, survivor)
@@ -25643,6 +25657,38 @@ def _concat_reconciler_outputs(outputs: list[dict]) -> dict:
             if isinstance(val, list):
                 merged.setdefault(key, []).extend(val)
     return merged
+
+
+def _drop_reemitted_tag_ops(output: dict, applied: list[dict]) -> None:
+    """Remove, in place, every rename and drop_require in a layered
+    retry's `output` that exactly repeats one an applied output already
+    performed. Unlike the other ops these are not idempotent on the
+    layered plans: a merge applied after the original op can have given
+    the subtask (or the survivor a redirect would send it to) its own
+    entry for the same tag, and repeating the op would rename or drop
+    THAT entry — work the worker never named.
+
+    "Performed" excludes a RENAME naming a connector its own output
+    added: renames apply before that output's `added_subtasks`
+    (`_apply_reconciler_output` step 1 vs step 3), so it never took
+    effect and a repetition is the worker's first real attempt at it —
+    kept. A drop_require applies after `added_subtasks` (step 5), so it
+    always took effect on its own output's connectors."""
+    renames: set[tuple] = set()
+    drops: set[tuple] = set()
+    for out in applied:
+        own = {s.get("id") for s in out.get("added_subtasks") or []}
+        renames |= {(r.get("sid"), r.get("from"), r.get("to"))
+                    for r in out.get("renames") or []
+                    if r.get("sid") not in own}
+        drops |= {(d.get("sid"), d.get("tag"))
+                  for d in out.get("dropped_requires") or []}
+    output["renames"] = [
+        r for r in output.get("renames") or []
+        if (r.get("sid"), r.get("from"), r.get("to")) not in renames]
+    output["dropped_requires"] = [
+        d for d in output.get("dropped_requires") or []
+        if (d.get("sid"), d.get("tag")) not in drops]
 
 
 def _translate_pre_rename_tags(output: dict, applied_renames: list[dict],

@@ -1155,7 +1155,7 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
-Five review rounds, each executing code, broke the "re-emitting an
+Six review rounds, each executing code, broke the "re-emitting an
 applied op is harmless" claim. Each break has a test that fails on the
 build it broke, with one exception noted under round two.
 
@@ -1208,6 +1208,28 @@ collision (`test_apply_layered_new_subtask_reusing_absorbed_id_dies`
 and its `phase_reconcile` twin). A worker-written self-edge is now left
 exactly as written, as the docs already claimed
 (`test_redirect_leaves_worker_written_self_references_as_written`).
+
+Round six, a property fuzz over real `phase_reconcile`. It generated
+random attempt-1 outputs, then retries that re-emit a random subset of
+the applied ops plus a fix. Re-emission changed the final plan in 144
+of 3,000 seeds, all in three classes:
+- a repeated drop or rename on an absorbed id redirected onto the
+  survivor's own entry;
+- a repeated drop undoing a tag an applied merge brought back;
+- a restated connector reviving a dependency on a conditionally
+  dropped subtask.
+
+A fourth finding was a double fold of one absorbed connector restated
+twice. Each now has a test that fails on the round-five build
+(`test_unresolved_retry_reemitted_*`,
+`test_unresolved_retry_restatement_does_not_revive_dropped_dependency`,
+`test_apply_layered_duplicate_restated_absorbed_connector_dies`). The
+same fuzz re-run on the fixed build gives 0 changed plans in 3,000
+seeds.
+
+Its companion compared full restatements, which the old reverting retry
+expected, against origin/main. Before the fix, 32 of 530 runs accepted
+by both differed. After the fix, 0 of 530 do.
 
 Separately, the layered build first rejected a natural answer naming a
 consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),

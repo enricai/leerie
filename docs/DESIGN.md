@@ -478,28 +478,39 @@ subtask it tests). Three mechanisms reconcile that coupling:
   and the final unresolved check then aborts on tags attempt 1 had
   already resolved (barnacle, 2026-10-02: two consumers renamed onto
   their producer in attempt 1, reverted, never re-emitted, run died).
-  Re-emitting an attempt-1 op must be harmless, and an omission must not
-  undo attempt-1 work, so the apply step treats the retry as idempotent
+  Re-emitting an applied op must be harmless, and an omission must not
+  undo applied work, so the apply step treats the retry as idempotent
   over what is already applied:
-  - a repeated rename or drop no-ops, and a repeated merge is skipped;
-  - a re-emitted connector is *merged* into the version attempt 1 added:
-    its edges are unioned, because a worker restating a connector
+  - a repeated rename or `drop_require` that an applied output already
+    performed is removed before anything else reads the answer. These
+    two are not naturally idempotent on the layered plans: a later merge
+    can give the same subtask, or the survivor a redirect would send the
+    op to, its own entry for that tag, and repeating the op would hit
+    that entry instead. A rename naming a connector its own output added
+    never took effect (renames apply before that output's added
+    subtasks), so repeating it counts as a first attempt and is kept;
+  - a repeated merge collapses through the redirect below and is removed;
+  - a re-emitted connector is *merged* into the version already applied.
+    Its edges are unioned, because a worker restating a connector
     routinely omits requires it considers settled. Restated text wins
-    unless attempt 1 merged other subtasks into that connector, whose
-    criteria the composed text carries. A require an applied output
-    removed with `drop_require` is not re-added;
-  - an id that one of this reconcile's applied merges absorbed is read as
-    its survivor wherever the retry names it (rather than resurrected or
-    rejected as missing). There are two exceptions, both because the
+    unless an applied merge folded other subtasks into that connector,
+    whose criteria the composed text carries. A require an applied
+    output removed with `drop_require` is not re-added, and a dependency
+    on a subtask no longer in the plan (e.g. one an applied
+    `conditional_drop` removed) is not revived;
+  - an id that one of this reconcile's applied merges absorbed is read
+    as its survivor wherever the retry names it, rather than resurrected
+    or rejected as missing. There are two exceptions, both because the
     survivor holds more work than the worker named: a `conditional_drop`
     (it would drop the survivor), and a new merge's `from` (it would
     merge the whole survivor away). The latter still dies as missing.
-    The scope is this reconcile's merges, not an earlier phase's, and
-    excludes an id a later applied output reused for a live subtask. The
-    retry itself may not add a NEW subtask under an absorbed id: every
-    reference to it would be ambiguous (the merged work, or the new), so
-    it dies like any id collision. A self-edge or self-merge the worker
-    wrote stays exactly as written, so it still dies naming that id. The must-include check judges the
+    The scope is this reconcile's merges into a still-live survivor, not
+    an earlier phase's, and excludes an id a later applied output reused
+    for a live subtask. The retry itself may not add a NEW subtask under
+    an id in that scope: every reference to it would be ambiguous (the
+    merged work, or the new), so it dies like any id collision. A
+    self-edge or self-merge the worker wrote stays exactly as written,
+    so it still dies naming that id. The must-include check judges the
     redirected answer, i.e. what the apply step will do.
 
   Only connectors added by *this* reconcile's applied attempts are

@@ -3110,6 +3110,118 @@ def test_unresolved_retry_translates_before_redirecting(
         "real"]
 
 
+def test_unresolved_retry_reemitted_drop_on_absorbed_id_spares_survivor(
+    leerie, monkeypatch, tmp_path
+):
+    """Attempt 1 drops feat-001's `x`, then merges feat-001 into
+    feat-002, which requires `x` itself. Re-emitting that drop must not
+    be redirected onto the survivor's own `x` — it is already done."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["x"],
+                files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"], requires=["x"],
+                files=["shared.py"]),
+        _r1_sub("feat-003", provides=["x", "y"]),
+        _r1_sub("feat-004", provides=["d"], requires=["q"]),
+        _r1_sub("feat-005", provides=["e"])]}]
+    drop = {"op": "drop_require", "sid": "feat-001", "tag": "x",
+            "reason": "r"}
+    a1 = {**_r4_base(), "tag_ops": [drop], "merged_subtasks": [
+        {"into": "feat-002", "from": "feat-001", "reason": "overlap"}]}
+    a2 = {**_r4_base(), "tag_ops": [
+        drop, {"op": "add_provide", "sid": "feat-005", "tag": "q",
+               "reason": "r"}]}
+    result = _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+    assert {"tag": "x", "extent": "in_plan"} in _conn(
+        result, "feat-002")["requires"]
+
+
+def test_unresolved_retry_reemitted_rename_on_absorbed_id_spares_survivor(
+    leerie, monkeypatch, tmp_path
+):
+    """Same shape with a rename: re-emitting attempt 1's rename of the
+    absorbed feat-001 must not rename the survivor's own `x`."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["x"],
+                files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"], requires=["x"],
+                files=["shared.py"]),
+        _r1_sub("feat-003", provides=["x", "y"]),
+        _r1_sub("feat-004", provides=["d"], requires=["q"]),
+        _r1_sub("feat-005", provides=["e"])]}]
+    rename = {"sid": "feat-001", "from": "x", "to": "y"}
+    a1 = {**_r4_base(), "renames": [rename], "merged_subtasks": [
+        {"into": "feat-002", "from": "feat-001", "reason": "overlap"}]}
+    a2 = {**_r4_base(), "renames": [rename], "tag_ops": [
+        {"op": "add_provide", "sid": "feat-005", "tag": "q", "reason": "r"}]}
+    result = _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+    assert sorted(r["tag"] for r in _conn(result, "feat-002")["requires"]) \
+        == ["x", "y"]
+
+
+def test_unresolved_retry_reemitted_drop_spares_tag_a_merge_brought_back(
+    leerie, monkeypatch, tmp_path
+):
+    """Attempt 1 drops feat-003's `b`, then merges feat-001 (requiring
+    `b`) into feat-003, bringing `b` back. Re-emitting the drop must not
+    undo what the merge brought."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["b"],
+                files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"]),
+        _r1_sub("feat-003", provides=["c"], requires=["b"],
+                files=["shared.py"]),
+        _r1_sub("feat-009", provides=["d"], requires=["q"]),
+        _r1_sub("feat-010", provides=["e"])]}]
+    drop = {"op": "drop_require", "sid": "feat-003", "tag": "b",
+            "reason": "r"}
+    a1 = {**_r4_base(), "tag_ops": [drop], "merged_subtasks": [
+        {"into": "feat-003", "from": "feat-001", "reason": "overlap"}]}
+    a2 = {**_r4_base(), "tag_ops": [
+        drop, {"op": "add_provide", "sid": "feat-010", "tag": "q",
+               "reason": "r"}]}
+    result = _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+    assert {"tag": "b", "extent": "in_plan"} in _conn(
+        result, "feat-003")["requires"]
+
+
+def test_unresolved_retry_restatement_does_not_revive_dropped_dependency(
+    leerie, monkeypatch, tmp_path
+):
+    """Attempt 1 conditionally drops feat-001 (pruning connector
+    feat-900's dependency on it). A verbatim restatement of feat-900 must
+    not union that dependency back as a dangling edge."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["never"],
+                scs="no-op if never is absent"),
+        _r1_sub("feat-002", provides=["b"], requires=["x"]),
+        _r1_sub("feat-004", provides=["d"], requires=["q"]),
+        _r1_sub("feat-005", provides=["e"])]}]
+    connector = {**{k: v for k, v in _r1_sub("feat-900", provides=["x"])
+                    .items() if k != "requires"},
+                 "depends_on": ["feat-001"]}
+    a1 = {**_r4_base(), "added_subtasks": [connector], "tag_ops": [
+        {"op": "conditional_drop", "sid": "feat-001", "reason": "r"}]}
+    a2 = {**_r4_base(), "added_subtasks": [connector], "tag_ops": [
+        {"op": "add_provide", "sid": "feat-005", "tag": "q", "reason": "r"}]}
+    result = _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+    assert _conn(result, "feat-900")["depends_on"] == []
+
+
+def test_apply_layered_duplicate_restated_absorbed_connector_dies(leerie):
+    """The same absorbed connector restated twice in one output is a
+    duplicate id, as it is for any other id — not two silent folds."""
+    plans = [{"domain": "feat", "subtasks": [_r1_sub("feat-002")]},
+             {"domain": "_reconciler", "subtasks": [_r1_recon("feat-900")]}]
+    merge = [{"into": "feat-002", "from": "feat-900"}]
+    leerie._apply_reconciler_output(plans, {"merged_subtasks": merge})
+    with pytest.raises(SystemExit):
+        leerie._apply_reconciler_output(plans, {"added_subtasks": [
+            _r1_sub("feat-900", provides=["x"]),
+            _r1_sub("feat-900", provides=["y"])]},
+            restatable={"feat-900"}, applied_merges=merge)
+
+
 def test_unresolved_retry_keeps_attempt_1_resolutions(
     leerie, monkeypatch, tmp_path
 ):
