@@ -3773,7 +3773,7 @@ the same run (e.g., size retry succeeds and then the cycle gate fires),
 each successful retry refreshes `pre_plans_snapshot` to the post-retry
 state, so the next retry's revert restores the most recent good state
 rather than undoing an already-successful split. The unresolved retry
-doesn't refresh — it's the last gate before `phase_reconcile` returns.
+doesn't revert at all (see below), so it needs no snapshot.
 
 **Cycle-resolution retry loop.** When the acyclicity gate fires on the first
 reconciler attempt, `phase_reconcile` deep-copies the pre-mutation plans,
@@ -3806,8 +3806,9 @@ guarantee; the recommendation primes the model toward it.
 
 **Unresolved-requires retry loop.** Symmetric architecture, fired by a
 different gate: when post-mutation `_compute_unresolved_requires` is
-non-empty (cycle gate already clear), `phase_reconcile` deep-copies the
-pre-mutation plans, computes a string-similarity recommendation per
+non-empty (cycle gate already clear), `phase_reconcile` keeps attempt
+1's applied plans (DESIGN §5 *The unresolved-tags retry is layered*),
+computes a string-similarity recommendation per
 unresolved entry (`_recommend_unresolved_resolution`), builds a retry
 prompt (`_build_unresolved_retry_prompt`) naming the unresolved `(sid,
 tag)` pairs, top-3 candidate `provides` ranked by Jaccard, the
@@ -3819,6 +3820,36 @@ extent-aware guard (`in_plan` only). Cases (first match wins):
 1. Unique top match, Jaccard ≥ 0.5 → `rename(sid, from=tag, to=top.tag)`.
 2. Top match, Jaccard ≥ 0.7 (even if not unique) → same.
 3. Else → no recommendation; model picks unaided (the common case).
+
+The retry's output is applied on top of attempt 1 with
+`_apply_reconciler_output(plans, output, restatable=<ids attempt 1 added>)`. Every tag the
+retry addresses is the consumer's *current* (post-attempt-1) tag. The
+recommendation, the must-include validator, and the prompt's examples
+all use that tag, strictly; there is no pre-revert form. The retry prompt
+renders attempt 1's operations as already applied, and asks for new
+operations only. The `layered=True` apply step makes re-emitting an
+attempt-1 operation harmless:
+
+- `renames`, `added_provides`, `dependency_edges`, `dropped_requires`
+  and `conditional_drops` already no-op or dedup on repeat.
+- An `added_subtasks` id in `restatable` is merged into attempt 1's
+  version by `_merge_restated_connector`: restated scalar fields win;
+  `provides`, `requires` (by tag+extent), `depends_on` and
+  `_merged_from` are unioned, earlier entries first. Any other
+  collision, including a connector from an earlier (re-plan) reconcile
+  or a planner-authored id, still `die()`s.
+- An `added_requires` naming a `restatable` connector that the retry
+  did not restate is bound to it (deduped) instead of being dropped.
+  `_expand_reconciler_output` reports danglers structured as
+  `_dangling_requires_raw`; `_spawn_reconciler(bindable=…)` routes the
+  ones naming attempt-1 connectors to `_bind_requires`.
+- A `merged_subtasks` entry whose `from` is already in `into`'s
+  `_merged_from` is skipped.
+
+Added subtasks from both attempts share the single `_reconciler`
+pseudo-plan. `state.data["conditional_drops"]` merges across the two
+attempts rather than being replaced, because attempt 1's drops are
+still applied.
 
 `unresolvable` IS valid for this retry (unlike the cycle retry's strict
 forbid) — if no real producer exists, surfacing that cleanly is right.

@@ -1179,7 +1179,7 @@ def test_recommend_unresolved_resolution_075210_case(leerie):
         "node-engine-bumped": ["deps-007"],
     }
     rec = leerie._recommend_unresolved_resolution(
-        "deps-008", "cdk-stacks-authored", providers, {})
+        "deps-008", "cdk-stacks-authored", providers)
     assert rec is not None
     assert rec["op"] == "rename"
     assert rec["sid"] == "deps-008"
@@ -1199,7 +1199,7 @@ def test_recommend_unresolved_resolution_self_loop_guard(leerie):
         "node-engine-bumped": ["deps-007"],
     }
     rec = leerie._recommend_unresolved_resolution(
-        "deps-011", "supabase-client-imports-removed", providers, {})
+        "deps-011", "supabase-client-imports-removed", providers)
     # Self-match skipped; nothing else has j >= 0.5; abstain.
     assert rec is None
 
@@ -1213,7 +1213,7 @@ def test_recommend_unresolved_resolution_no_match(leerie):
         "another-unrelated": ["sub-b"],
     }
     rec = leerie._recommend_unresolved_resolution(
-        "consumer", "something-completely-different", providers, {})
+        "consumer", "something-completely-different", providers)
     assert rec is None
 
 
@@ -1228,7 +1228,7 @@ def test_recommend_unresolved_resolution_multi_strong_abstains(leerie):
         "unrelated": ["sub-z"],
     }
     rec = leerie._recommend_unresolved_resolution(
-        "consumer", "cdk-aws-stacks-authored", providers, {})
+        "consumer", "cdk-aws-stacks-authored", providers)
     # Neither hits the j>=0.7 very-high threshold; case-1 needs unique
     # top match so it also doesn't fire. Abstain.
     assert rec is None
@@ -1245,7 +1245,7 @@ def test_validate_unresolved_must_include_accepts_rename(leerie):
         "dependency_edges": [],
         "merged_subtasks": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
 def test_validate_unresolved_must_include_accepts_added_provides(leerie):
@@ -1258,7 +1258,7 @@ def test_validate_unresolved_must_include_accepts_added_provides(leerie):
                                             "tag": "cdk-stacks-authored"}],
         "added_subtasks": [],         "dependency_edges": [], "merged_subtasks": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
 def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(leerie):
@@ -1273,7 +1273,7 @@ def test_validate_unresolved_must_include_accepts_added_subtask_with_provides(le
         "dependency_edges": [],
         "merged_subtasks": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
 def test_validate_unresolved_must_include_accepts_unresolvable(leerie):
@@ -1288,7 +1288,7 @@ def test_validate_unresolved_must_include_accepts_unresolvable(leerie):
         "unresolvable": [{"sid": "deps-008", "tag": "cdk-stacks-authored",
                           "reason": "no real producer in this plan"}],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
 def test_validate_unresolved_must_include_accepts_dropped_requires(leerie):
@@ -1306,56 +1306,41 @@ def test_validate_unresolved_must_include_accepts_dropped_requires(leerie):
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
-def test_validate_unresolved_must_include_dropped_requires_pre_revert_tag(leerie):
-    """When attempt 1 renamed the consumer's tag, attempt 2's
-    dropped_requires may target the PRE-revert tag (what the consumer's
-    requires entry actually holds after the unresolved-retry's revert).
-    The validator must accept the pre-revert form via dual-tag matching,
-    mirroring how renames/added_provides/added_subtasks already work."""
-    # Attempt 1 renamed (config-006, foo-finalized → foo-keys-finalized).
-    attempt_1_output = {
-        "renames": [{"sid": "config-006", "from": "foo-finalized",
-                     "to": "foo-keys-finalized"}],
-    }
-    # The unresolved set contains the POST-mutation tag.
+def test_validate_unresolved_must_include_dropped_requires_rejects_pre_rename_tag(leerie):
+    """The unresolved-tags retry is layered on attempt 1's applied plans,
+    so after attempt 1 renamed config-006's `foo-finalized` to
+    `foo-keys-finalized`, the consumer's requires entry holds the
+    renamed tag. A dropped_requires naming the old tag would no-op at
+    apply time, so the validator must not count it as addressing the
+    entry."""
     unresolved = [{"domain": "configuration-build", "sid": "config-006",
                    "tag": "foo-keys-finalized"}]
-    # Attempt 2 emits dropped_requires targeting the PRE-revert tag
-    # (which is what the consumer's requires actually holds after revert).
     output = {
         "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
-                "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
+        "dropped_requires": [{"sid": "config-006", "tag": "foo-finalized",
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [],
     }
-    assert leerie._validate_unresolved_must_include(
-        output, unresolved, attempt_1_output) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == [
+        "configuration-build/config-006 requires 'foo-keys-finalized'"]
 
 
-def test_validate_unresolved_must_include_dropped_requires_post_mutation_tag(leerie):
-    """Symmetric to the pre-revert case: attempt 2 may also target the
-    POST-mutation tag (a literal-minded model reading the unresolved
-    header verbatim). The validator must accept that form too — without
-    it, leerie would reject its own model's reasonable output."""
-    attempt_1_output = {
-        "renames": [{"sid": "config-006", "from": "foo-finalized",
-                     "to": "foo-keys-finalized"}],
-    }
+def test_validate_unresolved_must_include_dropped_requires_current_tag(leerie):
+    """A dropped_requires on the consumer's current tag addresses the
+    entry."""
     unresolved = [{"domain": "configuration-build", "sid": "config-006",
                    "tag": "foo-keys-finalized"}]
-    # Attempt 2 emits dropped_requires with the POST-mutation tag.
     output = {
         "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
-                "dropped_requires": [{"sid": "config-006",
+        "dropped_requires": [{"sid": "config-006",
                               "tag": "foo-keys-finalized",
                               "reason": "self-reference over-specified"}],
         "dependency_edges": [], "merged_subtasks": [],
     }
-    assert leerie._validate_unresolved_must_include(
-        output, unresolved, attempt_1_output) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
 def test_apply_reconciler_output_dropped_requires_strict_match_attempt_1(leerie):
@@ -1381,9 +1366,10 @@ def test_apply_reconciler_output_dropped_requires_strict_match_attempt_1(leerie)
 
 
 def test_apply_reconciler_output_dropped_requires_dual_tag_in_retry(leerie):
-    """In retry mode, the apply step accepts EITHER the post-mutation
-    tag or the pre-revert tag — symmetric to the validator's dual-tag
-    acceptance. The scenario: attempt 1 renamed the consumer's
+    """In a reverting retry (size, cycle), the apply step accepts EITHER
+    the post-mutation tag or the pre-revert tag. The layered
+    unresolved-tags retry never passes `attempt_1_renames`, so it stays
+    strict. The scenario: attempt 1 renamed the consumer's
     requires tag; the retry reverts the plan; attempt 2 emits
     dropped_requires targeting the post-mutation form (the unresolved
     set's tag). Without the dual-tag fallback this would silently
@@ -1522,7 +1508,7 @@ def test_validate_unresolved_must_include_rejects_unrelated_op(leerie):
         "dependency_edges": [],
         "merged_subtasks": [],
     }
-    unaddressed = leerie._validate_unresolved_must_include(output, unresolved, None)
+    unaddressed = leerie._validate_unresolved_must_include(output, unresolved)
     assert unaddressed == ["deps/deps-008 requires 'cdk-stacks-authored'"]
 
 
@@ -1537,7 +1523,7 @@ def test_build_unresolved_retry_prompt_contains_required_sections(leerie):
         "prisma-deps-present": ["deps-001"],
     }
     rec = leerie._recommend_unresolved_resolution(
-        "deps-008", "cdk-stacks-authored", providers, {})
+        "deps-008", "cdk-stacks-authored", providers)
     recs = {("deps-008", "cdk-stacks-authored"): rec}
     prompt = leerie._build_unresolved_retry_prompt(
         unresolved, providers, recs, {}, "ORIGINAL USER PROMPT")
@@ -1569,51 +1555,40 @@ def test_build_unresolved_retry_prompt_contains_required_sections(leerie):
     assert "rename(sid='deps-008', from='cdk-stacks-authored', " in prompt
 
 
-def test_build_unresolved_retry_prompt_uses_pre_revert_tag_in_example(leerie):
-    """When attempt 1 renamed the consumer's tag to the now-unresolved
-    target, the must-include `renames:` example must use the original
-    pre-revert tag as `from` — not the post-mutation tag. After the
-    retry's revert restores the pre-mutation plans, the consumer's
-    requires entry holds the pre-revert tag; a rename emitted with
-    `from=<post-mutation-tag>` would silently no-op.
-
-    Symmetric to the pre-revert tag handling in
-    `_recommend_unresolved_resolution` + `_validate_unresolved_must_include`;
-    this is the third site (the prompt builder's inline must-include
-    example)."""
-    # Attempt 1 emitted a rename: consumer's original `foo-original`
-    # → `bar`. Post-mutation, the consumer requires `bar`, but
-    # nothing in the plan provides `bar` → unresolved.
+def test_build_unresolved_retry_prompt_uses_current_tag_in_examples(leerie):
+    """When attempt 1 renamed the consumer's tag (`foo-original` → `bar`)
+    and `bar` has no producer, the retry is layered on attempt 1's applied
+    plans: the consumer holds `bar`. Every must-include example must name
+    `bar`. An example naming `foo-original` would no-op at apply time,
+    which is the trap the old revert-based retry needed a NOTE for."""
     output = {
         "renames": [{"sid": "consumer", "from": "foo-original",
                      "to": "bar", "reason": "..."}],
         "tag_ops": [], "added_requires": [],
         "added_subtasks": [],
-                "dependency_edges": [],
+        "dependency_edges": [],
         "merged_subtasks": [],
-            }
+    }
     unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
     providers = {"barely-related-tag": ["producer"]}
     recs = {("consumer", "bar"): None}  # exercises the no-recommendation path
     prompt = leerie._build_unresolved_retry_prompt(
         unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
 
-    # The must-include example MUST use the pre-revert tag
-    # (`foo-original`) as `from`, not the post-mutation `bar`.
-    assert "from='foo-original'" in prompt, (
-        "must-include example must use the pre-revert tag as `from` so "
-        "a model copying it verbatim hits the consumer's actual entry "
-        "after the retry's revert")
-    assert "from='bar'" not in prompt, (
-        "must-include example must NOT use the post-mutation tag as "
-        "`from` — that's the silent-no-op trap")
+    assert "from='bar'" in prompt
+    assert "actually produces 'bar'" in prompt
+    assert "provides includes 'bar'" in prompt
+    assert "from='foo-original'" not in prompt
+    assert "actually produces 'foo-original'" not in prompt
+    assert "provides includes 'foo-original'" not in prompt
+    assert "reverts your attempt-1" not in prompt
 
 
 # ===========================================================================
 # Test 49: end-to-end integration test of the unresolved-retry loop.
 # Drives phase_reconcile with a stubbed claude_p so a regression in the
 # retry-loop wiring (e.g., refactor breaks attempt-2's prompt construction,
-# or the revert step doesn't fully restore the snapshot) is caught by
+# or the layered apply drops attempt 1's work) is caught by
 # pytest, not only by live PR-review runs.
 # ===========================================================================
 
@@ -2166,257 +2141,423 @@ def test_cycle_retry_dies_after_attempt_2(
 
 
 # ===========================================================================
-# Test 53 — unresolved-retry recommendation uses pre-revert tag as `from`
+# Test 53 — the unresolved-tags retry is layered on attempt 1
 #
-# The unresolved-retry's `rename` recommendation has the same post-mutation-
-# tag trap as the cycle-retry's `dropped_requires` recommendation. If
-# attempt-1 rewrote the consumer's tag (rename to a non-existent provider),
-# the unresolved entry surfaces with the POST-rename tag, but after the
-# retry's revert the consumer's requires entry holds the ORIGINAL pre-rename
-# tag. The recommendation must emit `from=original-tag` so the model copying
-# it verbatim produces a rename the apply step actually executes.
+# DESIGN §5 *The unresolved-tags retry is layered*. The retry used to revert
+# `plans` to the pre-attempt-1 snapshot, which silently discarded every
+# attempt-1 resolution for consumers the retry prompt never named
+# (barnacle, 2026-10-02). These pin the layered contract at each seam:
+# recommendation, validator, prompt, apply step, and phase_reconcile.
 # ===========================================================================
 
-def test_recommend_unresolved_resolution_with_attempt_1_rename(leerie):
-    """Attempt 1 renamed the consumer's tag (foo → bar) but `bar` has
-    no producer, so the unresolved entry is (consumer, bar). Post-
-    revert, consumer's requires entry has `foo`. The recommendation
-    must emit `rename(sid=consumer, from=foo, to=...)` — not `from=bar`
-    — so the model copying it produces a rename the apply step actually
-    executes against the pre-revert state."""
-    providers = {
-        # A candidate producer of a tag similar to `bar` so the
-        # similarity heuristic fires.
-        "bar-canonical": ["other-subtask"],
-    }
-    # Attempt-1 output: model renamed consumer's `foo-original` to `bar`.
-    attempt_1_output = {
-        "renames": [
-            {"sid": "consumer", "from": "foo-original", "to": "bar"},
-        ],
-        "added_provides": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
-    }
+def test_recommend_unresolved_resolution_uses_current_tag(leerie):
+    """The recommendation's `from` is the unresolved tag as-is: it is
+    the consumer's current tag on the layered plans."""
+    providers = {"bar-canonical": ["other-subtask"]}
     rec = leerie._recommend_unresolved_resolution(
-        "consumer", "bar", providers, attempt_1_output)
-    # Recommendation must use the pre-revert tag (`foo-original`), not
-    # the post-rename tag (`bar`). Without this, model copying verbatim
-    # would emit rename(from='bar', to='bar-canonical'), which finds no
-    # matching entry post-revert and silently no-ops.
-    assert rec is not None, (
-        "heuristic should fire — `bar` shares the 'bar' token with "
-        "`bar-canonical` (Jaccard 0.5, unique top)")
-    assert rec["op"] == "rename"
-    assert rec["sid"] == "consumer"
-    assert rec["from"] == "foo-original", (
-        f"recommendation's `from` must be the PRE-REVERT tag "
-        f"(`foo-original`), not the post-rename tag (`bar`); got "
-        f"{rec['from']!r}. Without this, the model copying verbatim "
-        "would emit a no-op rename after the retry's revert.")
+        "consumer", "bar", providers)
+    assert rec is not None
+    assert rec["from"] == "bar"
     assert rec["to"] == "bar-canonical"
 
 
-def test_recommend_unresolved_resolution_no_rename_in_attempt_1(leerie):
-    """If attempt-1's renames don't touch the consumer's tag (the
-    common case — captured 075210 fixture), the recommendation falls
-    through to using the unresolved tag as-is for `from`. Pin that
-    the existing behavior is preserved."""
-    providers = {"bar-canonical": ["other-subtask"]}
-    # Empty attempt-1 output (no renames touched the consumer).
-    attempt_1_output = {
-        "renames": [], "tag_ops": [], "added_requires": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
-    }
-    rec = leerie._recommend_unresolved_resolution(
-        "consumer", "bar", providers, attempt_1_output)
-    assert rec is not None
-    assert rec["from"] == "bar", (
-        f"with no attempt-1 rename touching the consumer, the "
-        f"recommendation's `from` is the unresolved tag as-is; got "
-        f"{rec['from']!r}")
+def test_validate_unresolved_must_include_rejects_pre_rename_tag_ops(leerie):
+    """rename / added_provides / added_subtasks naming the tag the
+    consumer held before attempt 1's rename no longer count: on the
+    layered plans they would not resolve anything. Each op is checked
+    alone, and the converse (the current tag) is accepted."""
+    unresolved = [{"domain": "feat", "sid": "consumer", "tag": "bar"}]
+    empty = {"renames": [], "added_provides": [], "added_subtasks": [],
+             "dependency_edges": [], "merged_subtasks": []}
+    stale_ops = [
+        {"renames": [{"sid": "consumer", "from": "foo-original",
+                      "to": "bar-canonical"}]},
+        {"added_provides": [{"sid": "producer", "tag": "foo-original"}]},
+        {"added_subtasks": [{"id": "connector-001",
+                             "provides": ["foo-original"]}]},
+    ]
+    current_ops = [
+        {"renames": [{"sid": "consumer", "from": "bar",
+                      "to": "bar-canonical"}]},
+        {"added_provides": [{"sid": "producer", "tag": "bar"}]},
+        {"added_subtasks": [{"id": "connector-001", "provides": ["bar"]}]},
+    ]
+    for op in stale_ops:
+        assert leerie._validate_unresolved_must_include(
+            {**empty, **op}, unresolved) == ["feat/consumer requires 'bar'"], op
+    for op in current_ops:
+        assert leerie._validate_unresolved_must_include(
+            {**empty, **op}, unresolved) == [], op
 
 
-def test_validate_unresolved_must_include_accepts_pre_revert_tag_rename(leerie):
-    """The validator must accept a rename whose `from` is the
-    consumer's pre-revert tag (looked up via attempt-1's output) — not
-    just the post-mutation tag. This matches what leerie's own
-    recommendation produces.
-
-    Without this, leerie would reject its own recommendation as not
-    addressing the unresolved entry."""
-    unresolved = [{"domain": "feat", "sid": "consumer",
-                   "tag": "bar"}]  # post-mutation tag (unresolved set)
-    # Attempt-1 had renamed consumer's `foo-original` to `bar`.
-    attempt_1_output = {
-        "renames": [
-            {"sid": "consumer", "from": "foo-original", "to": "bar"},
-        ],
+def test_build_unresolved_retry_prompt_renders_attempt_1_ops_as_applied(leerie):
+    """The retry asks only for new operations, so the prompt must show
+    attempt 1's operations as already applied — including ops on
+    consumers that are NOT in the unresolved list, which the worker
+    would otherwise have no reason to believe still stand."""
+    output = {
+        "renames": [{"sid": "test-006", "from": "widget-fixed",
+                     "to": "widget-resolved"}],
         "added_provides": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
+        "dependency_edges": [], "merged_subtasks": [],
     }
-    # Attempt-2 emits the leerie-recommended rename: from the PRE-revert
-    # tag (foo-original), not the post-mutation tag (bar).
-    attempt_2_output = {
-        "renames": [
-            {"sid": "consumer", "from": "foo-original",
-             "to": "bar-canonical"},
-        ],
-        "added_provides": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
-    }
-    unaddressed = leerie._validate_unresolved_must_include(
-        attempt_2_output, unresolved, attempt_1_output)
-    assert unaddressed == [], (
-        "validator must accept a rename whose `from` matches the "
-        "consumer's pre-revert tag (looked up via attempt-1's renames); "
-        f"got {unaddressed}")
+    unresolved = [{"domain": "testing", "sid": "test-001",
+                   "tag": "gate-widened"}]
+    prompt = leerie._build_unresolved_retry_prompt(
+        unresolved, {"gate-consolidated": ["bugfix-003"]},
+        {("test-001", "gate-widened"): None}, output, "ORIGINAL")
+    assert "ALREADY APPLIED" in prompt
+    assert "do not re-emit attempt-1 operations" in prompt
+    # The settled rename is rendered, so the worker sees it stands.
+    assert '"widget-resolved"' in prompt
+    assert prompt.index("ALREADY APPLIED") < prompt.index("UNRESOLVED 1:")
 
 
-def test_validate_unresolved_must_include_accepts_added_provides_pre_revert_tag(leerie):
-    """The validator must accept an added_provides covering the
-    consumer's PRE-revert tag, not just the post-mutation tag.
-
-    Without this, a model that addresses the unresolved entry via
-    added_provides(producer, tag=<pre-revert-tag>) — the only form
-    that actually resolves the entry after the retry's revert
-    restores consumer.requires=[pre-revert-tag] — would be rejected
-    by the validator."""
-    unresolved = [{"domain": "feat", "sid": "consumer",
-                   "tag": "bar"}]  # post-mutation tag
-    attempt_1_output = {
-        "renames": [
-            {"sid": "consumer", "from": "foo-original", "to": "bar"},
-        ],
-        "added_provides": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
-    }
-    # Attempt-2 declares producer provides the PRE-revert tag.
-    attempt_2_output = {
-        "renames": [],
-        "added_provides": [{"sid": "producer", "tag": "foo-original"}],
-        "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
-    }
-    unaddressed = leerie._validate_unresolved_must_include(
-        attempt_2_output, unresolved, attempt_1_output)
-    assert unaddressed == [], (
-        "validator must accept added_provides covering the pre-revert "
-        f"tag; got {unaddressed}")
+def _layered_plans():
+    return [
+        {"domain": "feat", "status": "ready", "subtasks": [
+            {"id": "feat-001", "provides": ["a"], "requires": [],
+             "depends_on": []},
+            {"id": "feat-002", "provides": ["b"], "requires": [],
+             "depends_on": []},
+        ]},
+        {"domain": "_reconciler", "status": "ready", "subtasks": [
+            {"id": "conn-001", "title": "old title", "provides": ["c-old"],
+             "requires": [{"tag": "a", "extent": "in_plan"}],
+             "depends_on": ["feat-002"], "_added_by_reconciler": True},
+        ]},
+    ]
 
 
-def test_validate_unresolved_must_include_accepts_added_subtask_pre_revert_tag(leerie):
-    """The validator must accept an added_subtask whose `provides`
-    includes the consumer's PRE-revert tag."""
-    unresolved = [{"domain": "feat", "sid": "consumer",
-                   "tag": "bar"}]  # post-mutation tag
-    attempt_1_output = {
-        "renames": [
-            {"sid": "consumer", "from": "foo-original", "to": "bar"},
-        ],
-        "added_provides": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
+def _conn(plans, sid):
+    return next(s for p in plans for s in p["subtasks"] if s["id"] == sid)
+
+
+def test_apply_layered_merges_restated_connector(leerie):
+    """A restated attempt-1 connector is merged, not replaced: one copy,
+    still in the single `_reconciler` pseudo-plan, restated scalars win,
+    and attempt 1's requires and inbound depends_on edge survive a
+    restatement that omits them (the shape `0cfb46a0`'s live retry
+    produced: same id, `provides` filled in, nothing else carried)."""
+    plans = _layered_plans()
+    leerie._apply_reconciler_output(plans, {"added_subtasks": [
+        {"id": "conn-001", "title": "new title", "provides": ["c-new"],
+         "requires": [], "depends_on": []},
+        {"id": "conn-002", "provides": ["d"], "requires": [],
+         "depends_on": []},
+    ]}, restatable={"conn-001"})
+    recon = [p for p in plans if p["domain"] == "_reconciler"]
+    assert len(recon) == 1
+    assert [s["id"] for s in recon[0]["subtasks"]] == ["conn-001", "conn-002"]
+    conn = _conn(plans, "conn-001")
+    assert conn["title"] == "new title"
+    assert conn["provides"] == ["c-old", "c-new"]
+    assert conn["requires"] == [{"tag": "a", "extent": "in_plan"}]
+    assert conn["depends_on"] == ["feat-002"]
+    assert conn["_added_by_reconciler"] is True
+
+
+def test_apply_without_restatable_still_dies_on_reconciler_id_collision(leerie):
+    """Restatement is scoped to the layered retry; any other apply keeps
+    the fail-loud collision guard."""
+    plans = _layered_plans()
+    with pytest.raises(SystemExit):
+        leerie._apply_reconciler_output(plans, {"added_subtasks": [
+            {"id": "conn-001", "provides": ["c-new"]}]})
+
+
+def test_apply_layered_dies_on_connector_from_an_earlier_reconcile(leerie):
+    """A re-plan reconcile runs over plans that already hold an EARLIER
+    reconcile's connectors. Only ids attempt 1 of THIS reconcile added
+    are restatable; reusing an earlier connector's id still dies."""
+    plans = _layered_plans()
+    with pytest.raises(SystemExit):
+        leerie._apply_reconciler_output(plans, {"added_subtasks": [
+            {"id": "conn-001", "provides": ["c-new"]}]},
+            restatable={"conn-999"})
+
+
+def test_apply_layered_still_dies_on_planner_id_collision(leerie):
+    """Reusing a planner-authored id dies even in layered mode."""
+    plans = _layered_plans()
+    with pytest.raises(SystemExit):
+        leerie._apply_reconciler_output(plans, {"added_subtasks": [
+            {"id": "feat-001", "provides": ["x"]}]}, restatable={"conn-001"})
+
+
+def test_apply_layered_binds_requires_to_attempt_1_connector(leerie):
+    """An added_requires naming an attempt-1 connector without
+    restating it is bound (deduped); one naming any other sid is not."""
+    plans = _layered_plans()
+    leerie._apply_reconciler_output(plans, {"_bind_requires": [
+        {"sid": "conn-001", "tag": "b", "extent": "in_plan"},
+        {"sid": "conn-001", "tag": "a", "extent": "in_plan"},  # dup
+        {"sid": "feat-001", "tag": "b", "extent": "in_plan"},  # not restatable
+    ]}, restatable={"conn-001"})
+    assert _conn(plans, "conn-001")["requires"] == [
+        {"tag": "a", "extent": "in_plan"}, {"tag": "b", "extent": "in_plan"}]
+    assert _conn(plans, "feat-001")["requires"] == []
+
+
+def test_spawn_routes_dangling_requires_by_bindable(leerie):
+    """`_expand_reconciler_output` keeps danglers structured so the
+    layered retry can bind the ones naming attempt-1 connectors."""
+    out = leerie._expand_reconciler_output({
+        "added_subtasks": [], "tag_ops": [], "renames": [],
+        "dependency_edges": [], "merged_subtasks": [], "confidence": {},
+        "added_requires": [
+            {"sid": "conn-001", "tag": "b", "extent": "IN_PLAN",
+             "reason": "r"}],
+    })
+    assert out["_dangling_requires_raw"] == [
+        {"sid": "conn-001", "tag": "b", "extent": "in_plan", "reason": "r"}]
+    assert len(out["_dangling_requires"]) == 1
+
+
+def test_apply_layered_skips_restated_merge(leerie):
+    """A merge attempt 1 already performed is skipped on restatement
+    instead of dying on the absorbed id; outside layered it still dies."""
+    plans = _layered_plans()
+    merge = {"merged_subtasks": [{"into": "feat-001", "from": "feat-002"}]}
+    leerie._apply_reconciler_output(plans, merge)
+    leerie._apply_reconciler_output(plans, merge, restatable=set())
+    feat = plans[0]["subtasks"]
+    assert [s["id"] for s in feat] == ["feat-001"]
+    assert feat[0]["_merged_from"] == ["feat-002"]
+    with pytest.raises(SystemExit):
+        leerie._apply_reconciler_output(plans, merge)
+
+
+def test_unresolved_retry_restated_connector_replays_0cfb46a0(
+    leerie, monkeypatch, tmp_path
+):
+    """Replay of barnacle run 0cfb46a0 (2026-08-23), the other historical
+    unresolved-tags retry. Attempt 1 added connector `bugfix-004` with an
+    empty `provides`; attempt 2 RESTATED it under the same id with the
+    missing provides. Layered apply must merge it (not die on the id
+    collision) and converge, with one bugfix-004 in the plan."""
+    plans = [
+        {"domain": "bug-fixing", "status": "ready", "subtasks": [
+            {"id": "bugfix-001", "title": "t", "intent": "i",
+             "provides": ["array-path-fixed"], "requires": [],
+             "depends_on": [], "files_likely_touched": ["src/a.ts"],
+             "success_criteria_seed": "s", "size": "small"}]},
+        {"domain": "testing", "status": "ready", "subtasks": [
+            {"id": "test-003", "title": "t", "intent": "i",
+             "provides": ["join-coverage"],
+             "requires": [{"tag": "join-field-type-coerced-fold-match",
+                           "extent": "in_plan"}],
+             "depends_on": [], "files_likely_touched": ["src/a.test.ts"],
+             "success_criteria_seed": "s", "size": "small"}]},
+    ]
+    conf = {"reconciliation": 9.0, "basis": "test", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+    connector = {"id": "bugfix-004", "title": "Coerce join-field match",
+                 "intent": "compare by coerced value", "scope_note": "n",
+                 "files_likely_touched": [], "depends_on": [],
+                 "success_criteria_seed": "s", "size": "small",
+                 "investigation_notes": ""}
+    attempt_1 = {"added_subtasks": [{**connector, "provides": []}],
+                 "added_requires": [], "tag_ops": [], "renames": [],
+                 "dependency_edges": [], "merged_subtasks": [],
+                 "confidence": conf}
+    attempt_2 = {"added_subtasks": [{
+                     **connector,
+                     "provides": ["join-field-type-coerced-fold-match"]}],
+                 "added_requires": [], "tag_ops": [],
+                 "renames": [{"sid": "test-003",
+                              "from": "join-field-type-coerced-fold-match",
+                              "to": "join-field-type-coerced-fold-match"}],
+                 "dependency_edges": [], "merged_subtasks": [],
+                 "confidence": conf}
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return attempt_1 if len(calls) == 1 else attempt_2
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
+        {"reconciler": "sonnet"}, {"reconciler": "medium"}))
+    assert len(calls) == 2
+    assert leerie._compute_unresolved_requires(result) == []
+    ids = [s["id"] for p in result for s in p["subtasks"]]
+    assert ids.count("bugfix-004") == 1
+    assert _conn(result, "bugfix-004")["provides"] == [
+        "join-field-type-coerced-fold-match"]
+
+
+def test_unresolved_retry_binds_requires_on_attempt_1_connector(
+    leerie, monkeypatch, tmp_path
+):
+    """Attempt 1 adds connector feat-901 whose own requires names a tag
+    nothing provides. The retry fixes it with an added_requires-only
+    answer (no restatement) plus a new producer. The requires must bind
+    to feat-901 rather than being logged as dropped."""
+    def _sub(sid, provides, requires):
+        return {"id": sid, "title": "t", "intent": "i",
+                "provides": provides,
+                "requires": [{"tag": t, "extent": "in_plan"}
+                             for t in requires],
+                "depends_on": [], "files_likely_touched": [f"{sid}.py"],
+                "success_criteria_seed": "s", "size": "small"}
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _sub("feat-001", ["a"], ["conn-cap"])]}]
+    conf = {"reconciliation": 9.0, "basis": "test", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+    base = {"tag_ops": [], "renames": [], "dependency_edges": [],
+            "merged_subtasks": [], "confidence": conf}
+    attempt_1 = {**base,
+                 "added_subtasks": [{**_sub("feat-901", ["conn-cap"], []),
+                                     "requires": []}],
+                 "added_requires": [{"sid": "feat-901", "tag": "missing",
+                                     "extent": "in_plan"}]}
+    attempt_2 = {**base,
+                 "added_subtasks": [{**_sub("feat-902", ["base-cap"], []),
+                                     "requires": []}],
+                 "added_requires": [{"sid": "feat-901", "tag": "base-cap",
+                                     "extent": "in_plan"}],
+                 "tag_ops": [{"op": "drop_require", "sid": "feat-901",
+                              "tag": "missing", "reason": "over-specified"}]}
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return (attempt_2 if "ALREADY APPLIED" in kwargs["user_prompt"]
+                else attempt_1)
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
+        {"reconciler": "sonnet"}, {"reconciler": "medium"}))
+    assert len(calls) == 2
+    assert leerie._compute_unresolved_requires(result) == []
+    assert [r["tag"] for r in _conn(result, "feat-901")["requires"]] == [
+        "base-cap"]
+
+
+def test_unresolved_retry_keeps_attempt_1_resolutions(
+    leerie, monkeypatch, tmp_path
+):
+    """Regression for barnacle run fc56e9e5 (2026-10-02). Attempt 1
+    resolves one mismatch (renames test-006's `widget-fixed` onto
+    bugfix-006's `widget-resolved`) and leaves another (test-001's
+    `gate-widened`, which nothing produces). Attempt 2 is shown only the
+    residue and addresses only it, exactly as the live worker did. The
+    run must converge with attempt 1's rename still applied — before
+    the fix the retry reverted it and died on `widget-fixed`."""
+    plans = [
+        {"domain": "bug-fixing", "status": "ready", "subtasks": [
+            {"id": "bugfix-003", "title": "t", "intent": "i",
+             "provides": ["gate-consolidated"], "requires": [],
+             "depends_on": [], "files_likely_touched": ["src/a.ts"],
+             "success_criteria_seed": "s", "size": "small"},
+            {"id": "bugfix-006", "title": "t", "intent": "i",
+             "provides": ["widget-resolved"], "requires": [],
+             "depends_on": [], "files_likely_touched": ["src/b.ts"],
+             "success_criteria_seed": "s", "size": "small"},
+        ]},
+        {"domain": "testing", "status": "ready", "subtasks": [
+            {"id": "test-006", "title": "t", "intent": "i",
+             "provides": ["widget-coverage"],
+             "requires": [{"tag": "widget-fixed", "extent": "in_plan"}],
+             "depends_on": [], "files_likely_touched": ["src/b.test.ts"],
+             "success_criteria_seed": "s", "size": "small"},
+            {"id": "test-001", "title": "t", "intent": "i",
+             "provides": ["gate-coverage"],
+             "requires": [{"tag": "gate-widened", "extent": "in_plan"}],
+             "depends_on": [], "files_likely_touched": ["src/a.test.ts"],
+             "success_criteria_seed": "s", "size": "small"},
+        ]},
+    ]
+    conf = {"reconciliation": 9.0, "basis": "test", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+    attempt_1 = {
+        "renames": [{"sid": "test-006", "from": "widget-fixed",
+                     "to": "widget-resolved"}],
+        "tag_ops": [], "added_requires": [], "added_subtasks": [],
+        "dependency_edges": [], "merged_subtasks": [], "confidence": conf,
     }
-    attempt_2_output = {
+    attempt_2 = {
         "renames": [], "tag_ops": [], "added_requires": [],
-        "added_subtasks": [{"id": "connector-001",
-                             "provides": ["foo-original"]}],
-        "dependency_edges": [],
-        "merged_subtasks": [],
+        "added_subtasks": [{
+            "id": "bugfix-007", "title": "Widen the gate",
+            "intent": "widen", "success_criteria_seed": "s",
+            "provides": ["gate-widened"], "requires": [],
+            "depends_on": ["bugfix-003"], "files_likely_touched": ["src/a.ts"],
+            "size": "small"}],
+        "dependency_edges": [], "merged_subtasks": [], "confidence": conf,
     }
-    unaddressed = leerie._validate_unresolved_must_include(
-        attempt_2_output, unresolved, attempt_1_output)
-    assert unaddressed == [], (
-        "validator must accept added_subtasks whose provides covers "
-        f"the pre-revert tag; got {unaddressed}")
+    calls: list[dict] = []
+
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return attempt_1 if len(calls) == 1 else attempt_2
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
+        {"reconciler": "sonnet"}, {"reconciler": "medium"}))
+
+    assert len(calls) == 2
+    retry_prompt = calls[1]["user_prompt"]
+    assert "UNRESOLVED 1: testing/test-001 requires 'gate-widened'" in retry_prompt
+    # Only the residue is named; test-006 was settled by attempt 1.
+    assert "UNRESOLVED 2:" not in retry_prompt
+    assert leerie._compute_unresolved_requires(result) == []
+    by_id = {s["id"]: s for p in result for s in p.get("subtasks", [])}
+    assert [r["tag"] for r in by_id["test-006"]["requires"]] == [
+        "widget-resolved"]
+    assert [r["tag"] for r in by_id["test-001"]["requires"]] == [
+        "gate-widened"]
+    assert "bugfix-007" in by_id
 
 
-def test_build_unresolved_retry_prompt_added_ops_examples_use_pre_revert_tag(leerie):
-    """The must-include `added_provides:` and `added_subtasks:`
-    examples must reference the PRE-revert tag, not the post-mutation
-    tag. A model copying the example verbatim with the post-mutation
-    tag would silently no-op after the retry's revert restores
-    consumer.requires=[pre-revert-tag]."""
-    output = {
-        "renames": [{"sid": "consumer", "from": "foo-original",
-                     "to": "bar", "reason": "..."}],
-        "tag_ops": [], "added_requires": [],
-        "added_subtasks": [],
-                "dependency_edges": [],
-        "merged_subtasks": [],
-            }
-    unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
-    providers = {"barely-related-tag": ["producer"]}
-    recs = {("consumer", "bar"): None}
-    prompt = leerie._build_unresolved_retry_prompt(
-        unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
+def test_unresolved_retry_merges_conditional_drop_audit(
+    leerie, monkeypatch, tmp_path
+):
+    """Attempt 1's conditional_drop stays applied under the layered
+    retry, so the audit must keep it alongside the retry's own drop
+    (the reverting retries still wholesale-replace)."""
+    def _sub(sid, req, intent="i"):
+        return {"id": sid, "title": "t", "intent": intent,
+                "provides": [f"{sid}-out"],
+                "requires": [{"tag": req, "extent": "in_plan"}],
+                "depends_on": [], "files_likely_touched": [f"{sid}.py"],
+                "success_criteria_seed": "s", "size": "small"}
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _sub("feat-001", "never-made", "no-op if never-made is absent"),
+        _sub("feat-002", "also-never-made",
+             "no-op if also-never-made is absent"),
+    ]}]
+    conf = {"reconciliation": 9.0, "basis": "test", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+    base = {"renames": [], "added_requires": [], "added_subtasks": [],
+            "dependency_edges": [], "merged_subtasks": [], "confidence": conf}
+    attempt_1 = {**base, "tag_ops": [
+        {"op": "conditional_drop", "sid": "feat-001", "reason": "r1"}]}
+    attempt_2 = {**base, "tag_ops": [
+        {"op": "conditional_drop", "sid": "feat-002", "reason": "r2"}]}
+    calls: list[dict] = []
 
-    # added_provides example uses pre-revert tag (foo-original), not
-    # post-mutation tag (bar).
-    assert "actually produces 'foo-original'" in prompt, (
-        "added_provides example must reference the pre-revert tag")
-    assert "actually produces 'bar'" not in prompt, (
-        "added_provides example must NOT reference the post-mutation tag")
-    # added_subtasks example uses pre-revert tag (foo-original).
-    assert "provides includes 'foo-original'" in prompt, (
-        "added_subtasks example must reference the pre-revert tag")
-    assert "provides includes 'bar'" not in prompt, (
-        "added_subtasks example must NOT reference the post-mutation tag")
+    async def fake_claude_p(**kwargs):
+        calls.append(kwargs)
+        return attempt_1 if len(calls) == 1 else attempt_2
 
-
-def test_build_unresolved_retry_prompt_includes_revert_note_when_tags_differ(leerie):
-    """When attempt 1 renamed the consumer's tag, the per-entry NOTE
-    must explain the revert semantic so a literal-minded model doesn't
-    override the must-include examples with the post-mutation form."""
-    output = {
-        "renames": [{"sid": "consumer", "from": "foo-original",
-                     "to": "bar", "reason": "..."}],
-        "added_provides": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
-    }
-    unresolved = [{"domain": "d1", "sid": "consumer", "tag": "bar"}]
-    providers = {"barely-related-tag": ["producer"]}
-    recs = {("consumer", "bar"): None}
-    prompt = leerie._build_unresolved_retry_prompt(
-        unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
-
-    assert "NOTE:" in prompt, "revert note must be present when tags differ"
-    assert "renamed 'foo-original' → 'bar'" in prompt, (
-        "note must name the attempt-1 rename so the model can correlate")
-    assert "ORIGINAL 'foo-original'" in prompt, (
-        "note must tell the model which tag to address")
-    assert "don't emit 'bar'" in prompt, (
-        "note must explicitly warn against the post-mutation form")
-
-
-def test_build_unresolved_retry_prompt_omits_revert_note_when_tags_match(leerie):
-    """When no attempt-1 rename touched the consumer (pre_revert_tag
-    == tag), the revert note is irrelevant noise and must be omitted."""
-    output = {
-        "renames": [],  # no rename touched the consumer
-        "added_provides": [], "added_subtasks": [],
-        "dependency_edges": [],
-        "merged_subtasks": [],
-    }
-    unresolved = [{"domain": "deps", "sid": "deps-008",
-                   "tag": "cdk-stacks-authored"}]
-    providers = {"infra-stacks-authored": ["config-011"]}
-    rec = leerie._recommend_unresolved_resolution(
-        "deps-008", "cdk-stacks-authored", providers, output)
-    recs = {("deps-008", "cdk-stacks-authored"): rec}
-    prompt = leerie._build_unresolved_retry_prompt(
-        unresolved, providers, recs, output, "ORIGINAL USER PROMPT")
-
-    assert "NOTE:" not in prompt, (
-        "revert note must be omitted when pre_revert_tag equals "
-        "the unresolved tag (no attempt-1 rename touched this consumer)")
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    try:
+        asyncio.run(leerie.phase_reconcile(
+            plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
+            {"reconciler": "sonnet"}, {"reconciler": "medium"}))
+    except SystemExit:
+        pass  # both domain subtasks dropped → no-work exit is fine here
+    assert len(calls) == 2
+    assert set(st.data["conditional_drops"]) == {"feat-001", "feat-002"}
 
 
 # ===========================================================================
@@ -2552,7 +2693,7 @@ def test_validate_unresolved_must_include_accepts_conditional_drop(leerie):
         "dependency_edges": [],
         "merged_subtasks": [],
     }
-    assert leerie._validate_unresolved_must_include(output, unresolved, None) == []
+    assert leerie._validate_unresolved_must_include(output, unresolved) == []
 
 
 def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(leerie):
@@ -2568,7 +2709,7 @@ def test_validate_unresolved_must_include_rejects_conditional_drop_on_wrong_sid(
         "dependency_edges": [],
         "merged_subtasks": [],
     }
-    unaddressed = leerie._validate_unresolved_must_include(output, unresolved, None)
+    unaddressed = leerie._validate_unresolved_must_include(output, unresolved)
     assert len(unaddressed) == 1
     assert "deps-004" in unaddressed[0]
     assert "email-provider-is-ses" in unaddressed[0]

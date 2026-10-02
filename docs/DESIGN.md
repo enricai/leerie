@@ -467,6 +467,27 @@ subtask it tests). Three mechanisms reconcile that coupling:
   the post-mutation `provides` namespace and respawns once; still
   unresolved, the run aborts with the structured report.
 
+  **The unresolved-tags retry is layered, not a replacement.** The size
+  and cycle retries revert attempt 1 because its graph was structurally
+  rejected. An unresolved-tags retry fires on a graph that already
+  *passed* both gates; its only defect is the residue. So the retry
+  applies on top of attempt 1's accepted mutations, and the worker is
+  asked only for the residue. Reverting would make every resolution
+  attempt 1 got right depend on the worker restating it. A worker shown
+  only the residue reasonably treats its earlier resolutions as settled,
+  and the final unresolved check then aborts on tags attempt 1 had
+  already resolved (barnacle, 2026-10-02: two consumers renamed onto
+  their producer in attempt 1, reverted, never re-emitted, run died).
+  Re-emitting an attempt-1 op must be harmless, so the apply step treats
+  it as idempotent: a repeated rename or drop no-ops, a repeated merge is
+  skipped, and a re-emitted connector is *merged* into the version
+  attempt 1 added — restated text wins, edges are unioned — because a
+  worker restating a connector routinely omits requires it considers
+  settled, and an omission must not undo attempt-1 work (a removal is
+  `drop_require`'s job). Only connectors attempt 1 of *this* reconcile
+  added are restatable; a re-plan reconcile's earlier connectors keep the
+  fail-loud id-collision guard.
+
 ### `requires.extent` — in-graph vs. external prerequisites
 
 Not every prerequisite a planner identifies is satisfiable by another

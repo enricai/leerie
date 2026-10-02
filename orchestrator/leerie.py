@@ -10114,19 +10114,25 @@ def _expand_reconciler_output(out: dict) -> dict:
         expanded["added_subtasks"].append(copy_of)
 
     dangling: list[str] = []
+    dangling_raw: list[dict] = []
     for req in out.get("added_requires") or []:
         if not isinstance(req, dict):
-            continue
-        sub = by_sid.get(str(req.get("sid", "")))
-        if sub is None:
-            dangling.append(f"{req.get('sid')!r}:{req.get('tag')!r}")
             continue
         item = {"tag": req.get("tag", ""),
                 "extent": str(req.get("extent", "")).strip().lower()}
         if req.get("reason"):
             item["reason"] = req["reason"]
+        sub = by_sid.get(str(req.get("sid", "")))
+        if sub is None:
+            dangling.append(f"{req.get('sid')!r}:{req.get('tag')!r}")
+            # Kept structured as well: a layered unresolved-tags retry may
+            # legitimately name a connector its attempt 1 added, which is
+            # absent from THIS output but present in the plan.
+            dangling_raw.append({"sid": str(req.get("sid", "")), **item})
+            continue
         sub["requires"].append(item)
     expanded["_dangling_requires"] = dangling
+    expanded["_dangling_requires_raw"] = dangling_raw
     return expanded
 
 
@@ -23454,10 +23460,39 @@ def _merge_files_likely_touched(into_s: dict, from_s: dict) -> None:
     into_s["files_likely_touched"] = merged_files
 
 
+def _merge_restated_connector(earlier: dict, restated: dict) -> None:
+    """Fold `earlier` (a connector attempt 1 added and applied) into
+    `restated` (the same id re-emitted by the layered unresolved-tags
+    retry), in place on `restated`.
+
+    Restated scalar fields win — the retry may legitimately sharpen a
+    title, intent or criteria. The edge-bearing lists are unioned,
+    earlier entries first: a `dependency_edges` op stores an inbound edge
+    on the connector's own `depends_on`, and a worker restating a
+    connector routinely omits requires it considers settled, so plain
+    replacement would silently undo attempt-1 work. Removing an entry is
+    `drop_require`'s job, not an omission's."""
+    for key in ("provides", "depends_on", "_merged_from"):
+        merged = list(earlier.get(key) or [])
+        for v in restated.get(key) or []:
+            if v not in merged:
+                merged.append(v)
+        if merged:
+            restated[key] = merged
+    reqs = [e for e in (earlier.get("requires") or [])]
+    for e in restated.get("requires") or []:
+        if not any(isinstance(x, dict) and isinstance(e, dict)
+                   and x.get("tag") == e.get("tag")
+                   and x.get("extent") == e.get("extent") for x in reqs):
+            reqs.append(e)
+    restated["requires"] = reqs
+
+
 def _apply_reconciler_output(
     plans: list[dict],
     output: dict,
     attempt_1_renames: list[dict] | None = None,
+    restatable: set[str] | None = None,
 ) -> list[dict]:
     """Mutate `plans` per the reconciler's output. On success, returns
     the same `plans` list (with in-place edits on existing subtasks
@@ -23475,11 +23510,28 @@ def _apply_reconciler_output(
     either form of an unresolved tag — the post-mutation tag that
     attempt 1's rename produced, or the pre-revert tag the consumer's
     `requires` actually holds after the retry's revert restored the
-    pre-mutation plans. Mirrors the dual-tag acceptance in
-    `_validate_unresolved_must_include` so the validator and the apply
-    step cannot disagree — the same symmetry repair commit cd244cf
-    applied to renames/added_provides/added_subtasks. `None` on
-    attempt 1 (no revert in scope, strict match is correct).
+    pre-mutation plans. Only the reverting retries (size, cycle) pass
+    it. `None` on attempt 1 and on the layered unresolved-tags retry
+    (no revert in scope, strict match is correct).
+
+    `restatable` (not None) marks the layered unresolved-tags retry:
+    `output` is applied ON TOP of attempt 1's already-applied mutations
+    instead of after a revert (DESIGN §5 *The unresolved-tags retry is
+    layered*). It holds the ids attempt 1 of THIS reconcile added —
+    never an earlier reconcile's connectors, which a re-plan reconcile
+    still guards with the fail-loud collision check. The worker may
+    restate an attempt-1 op, so the ops that are not naturally
+    idempotent become so:
+
+    * an `added_subtasks` entry whose id is in `restatable` is merged
+      into the earlier version (`_merge_restated_connector`): restated
+      scalars win, `provides`/`requires`/`depends_on`/`_merged_from`
+      are unioned, so nothing attempt 1 established is lost to an
+      omission;
+    * an `added_requires` naming a `restatable` connector without
+      restating it (`output["_bind_requires"]`) is bound to it;
+    * a `merged_subtasks` entry whose `from` is already in `into`'s
+      `_merged_from` is skipped.
 
     Seven action arrays consumed here, in order:
 
@@ -23580,6 +23632,22 @@ def _apply_reconciler_output(
         #   2. added-vs-added: the reconciler emitted the same id twice
         #      within added_subtasks itself. Both halves get silently
         #      collapsed by _schedule()'s dict-flatten if not caught here.
+        # Layered retry: a restated attempt-1 connector is merged into its
+        # earlier version, which is then removed before the collision
+        # check so only an id outside `restatable` can still collide.
+        if restatable:
+            restated = {s["id"] for s in added
+                        if s["id"] in restatable and s["id"] in by_id}
+            for s in added:
+                if s["id"] in restated:
+                    _merge_restated_connector(by_id[s["id"]], s)
+            for plan in plans:
+                plan["subtasks"] = [
+                    t for t in plan.get("subtasks", [])
+                    if t.get("id") not in restated
+                ]
+            for sid in restated:
+                del by_id[sid]
         existing_ids = {s["id"] for s in by_id.values()}
         ext_collisions = sorted({s["id"] for s in added if s["id"] in existing_ids})
         seen: set[str] = set()
@@ -23612,17 +23680,35 @@ def _apply_reconciler_output(
         # model cannot bypass by emitting `false`.
         for s in added:
             s["_added_by_reconciler"] = True
-        plans.append({
-            "domain": "_reconciler",
-            "status": "ready",
-            "subtasks": added,
-        })
+        # One `_reconciler` pseudo-plan per run: a layered retry's
+        # additions join attempt 1's rather than starting a second one.
+        recon_plan = next(
+            (p for p in plans if p.get("domain") == "_reconciler"), None)
+        if recon_plan is None:
+            plans.append({
+                "domain": "_reconciler",
+                "status": "ready",
+                "subtasks": list(added),
+            })
+        else:
+            recon_plan.setdefault("subtasks", []).extend(added)
         # Re-index so the conditional_drops + cycle-breaking ops below
         # can find added_subtasks by id (e.g. a dependency_edges entry
         # could legitimately reference an added_subtask). conditional_drops
         # also reads `by_id` to enforce its `_added_by_reconciler` guard.
         for s in added:
             by_id[s["id"]] = s
+
+    if restatable:
+        for req in output.get("_bind_requires", []):
+            target = by_id.get(req["sid"])
+            if target is None or req["sid"] not in restatable:
+                continue
+            item = {k: v for k, v in req.items() if k != "sid"}
+            reqs = target.setdefault("requires", [])
+            if not any(isinstance(e, dict) and e.get("tag") == item["tag"]
+                       and e.get("extent") == item["extent"] for e in reqs):
+                reqs.append(item)
 
     # --- Resolution op #4: conditional_drops (DESIGN §5) ---
     # Runs after added_subtasks (so the `_added_by_reconciler` guard
@@ -23691,8 +23777,6 @@ def _apply_reconciler_output(
         # retry's revert, the consumer's `requires` holds the
         # pre-revert form; if the model emits dropped_requires keyed
         # on the post-mutation form, fall back to the pre-revert tag.
-        # Mirror of the validator's dual-tag acceptance — keeps the
-        # apply step and the must-include validator from disagreeing.
         candidate_tags = {dr["tag"]}
         pre_tag = pre_revert_tag_by_sid_tag.get((dr["sid"], dr["tag"]))
         if pre_tag is not None:
@@ -23733,6 +23817,10 @@ def _apply_reconciler_output(
                 "reconciler proposed merged_subtasks with into == from "
                 f"({into_id!r}); merge endpoints must differ."
             )
+        if (restatable is not None and from_id not in by_id
+                and into_id in by_id
+                and from_id in (by_id[into_id].get("_merged_from") or [])):
+            continue  # attempt 1 already performed this merge
         if into_id not in by_id or from_id not in by_id:
             missing = [x for x in (into_id, from_id) if x not in by_id]
             die(
@@ -23959,7 +24047,9 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         for cap in s.get("provides", []) or []:
             pre_providers.setdefault(cap, []).append(sid)
 
-    async def _spawn_reconciler(up: str) -> dict:
+    async def _spawn_reconciler(
+        up: str, bindable: frozenset[str] = frozenset(),
+    ) -> dict:
         st.bump_workers(caps)
         raw = await claude_p(
             user_prompt=up, system_prompt=sys_prompt,
@@ -23974,7 +24064,14 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         # consumer below expects the nine-array shape. This is the only seam
         # that knows both (see `_expand_reconciler_output`).
         out = _expand_reconciler_output(raw)
-        for dangler in out.pop("_dangling_requires", []):
+        # `bindable` is the layered retry's attempt-1 connectors: an
+        # added_requires naming one is bound at apply time, not dropped.
+        out["_bind_requires"] = []
+        for dangler, raw_req in zip(out.pop("_dangling_requires", []),
+                                    out.pop("_dangling_requires_raw", [])):
+            if raw_req["sid"] in bindable:
+                out["_bind_requires"].append(raw_req)
+                continue
             log(f"  reconciler: dropped added_requires {dangler} — names a "
                 "subtask absent from added_subtasks")
         return out
@@ -23990,7 +24087,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         die(_unresolvable_die_message(
             unresolvable, sid_domain, _effective_source_of_truth(st)))
 
-    def _record_conditional_drops(out: dict) -> None:
+    def _record_conditional_drops(out: dict, merge: bool = False) -> None:
         """Persist each conditional_drops entry to
         st.data["conditional_drops"] (keyed by sid → reason + the tag
         whose resolution motivated the drop). Called after each
@@ -24015,19 +24112,24 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         docstring on that helper). Per-sid overwrite would leak stale
         attempt-1 entries when a retry chain (size, cycle, unresolved)
         reverts `plans` but the audit field isn't reverted. An empty
-        drops list correctly clears any prior attempt's entries."""
+        drops list correctly clears any prior attempt's entries.
+
+        `merge=True` is the layered unresolved-tags retry, which does
+        NOT revert: attempt 1's drops are still applied to `plans`, so
+        the audit keeps them and adds the retry's."""
         drops = out.get("conditional_drops") or []
         sid_first_tag = {}
         for u in unresolved:
             sid_first_tag.setdefault(u["sid"], u["tag"])
-        st.data["conditional_drops"] = {
+        prior = (st.data.get("conditional_drops") or {}) if merge else {}
+        st.data["conditional_drops"] = {**prior, **{
             cd["sid"]: {
                 "reason": cd.get("reason", ""),
                 "from_unresolved_tag": sid_first_tag.get(cd["sid"], ""),
             }
             for cd in drops
             if cd.get("sid")
-        }
+        }}
         st.save()
 
     # === Attempt 1: spawn (with CRITIC-pattern check loop), apply,
@@ -24319,7 +24421,7 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         for u in still_unresolved:
             recommendations[(u["sid"], u["tag"])] = (
                 _recommend_unresolved_resolution(
-                    u["sid"], u["tag"], post_providers, output))
+                    u["sid"], u["tag"], post_providers))
         n_recommended = sum(1 for r in recommendations.values()
                             if r is not None)
         log(f"  computed {n_recommended} string-similarity hint(s) "
@@ -24330,25 +24432,26 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             still_unresolved, post_providers, recommendations, output,
             user_prompt)
 
-        # Revert: deep-copy snapshot back into `plans` (same pattern
-        # as the cycle retry). `pre_plans_snapshot` is still in scope
-        # from the cycle-gate block above.
-        plans.clear()
-        plans.extend(copy.deepcopy(pre_plans_snapshot))
-
+        # No revert: attempt 1's graph already passed the size and cycle
+        # gates, so its resolutions stand and the retry is layered on
+        # top (DESIGN §5 *The unresolved-tags retry is layered*).
+        # Reverting here once discarded attempt 1's correct renames for
+        # consumers the retry prompt never named, and the final check
+        # below aborted on them.
         log("phase 2½: respawning reconciler with unresolved-tags "
             "retry prompt")
-        output3 = await _spawn_reconciler(retry_prompt)
+        attempt_1_added = frozenset(
+            s["id"] for s in output.get("added_subtasks", []) or [])
+        output3 = await _spawn_reconciler(
+            retry_prompt, bindable=attempt_1_added)
         _check_unresolvable(output3)
 
         # Must-include validation: did the revised output address every
         # named unresolved entry? Same fail-loud discipline as the
-        # cycle-gate's must-include check. Pass `output` (attempt-1's
-        # output) so the validator can accept renames whose `from` is
-        # the consumer's pre-revert tag — matches what leerie's own
-        # recommendation produces.
+        # cycle-gate's must-include check. Strict on the consumer's
+        # current tag — the layered apply sees exactly that tag.
         unaddressed = _validate_unresolved_must_include(
-            output3, still_unresolved, output)
+            output3, still_unresolved)
         if unaddressed:
             bullets = "\n".join(f"  • {u}" for u in unaddressed)
             die(
@@ -24367,8 +24470,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         for w in check_reconciler_output(output3, plans):
             log(f"  reconciler unresolved-retry: {w}")
         _apply_reconciler_output(
-            plans, output3, attempt_1_renames=output.get("renames"))
-        _record_conditional_drops(output3)
+            plans, output3, restatable=set(attempt_1_added))
+        _record_conditional_drops(output3, merge=True)
 
         # Re-run the external-extent passes against attempt-2's plans
         # (mirror of the post-cycle-retry re-run; attempt-2's
@@ -24417,8 +24520,10 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 "tag and didn't emit `unresolvable`. Refine the task "
                 "description and re-run."
             )
-        # Attempt-2 succeeded — adopt its output for downstream logging.
-        output = output3
+        # Attempt-2 succeeded. Both attempts' ops are applied, so the
+        # summary counts both.
+        output = {k: (output.get(k) or []) + (output3.get(k) or [])
+                  for k in ("renames", "added_provides", "added_subtasks")}
 
     log(f"phase 2½: reconciled "
         f"({len(output.get('renames', []))} rename(s), "
@@ -25180,7 +25285,6 @@ def _recommend_unresolved_resolution(
     consumer_sid: str,
     unresolved_tag: str,
     providers: dict[str, list[str]],
-    output: dict,
 ) -> dict | None:
     """Deterministic recommendation for resolving one unresolved
     `(consumer_sid, unresolved_tag)` requires entry. Mirror of
@@ -25190,15 +25294,9 @@ def _recommend_unresolved_resolution(
     or `None` if no candidate is confident enough to recommend
     (model picks unaided).
 
-    The recommendation's `from` field is the consumer's PRE-REVERT
-    requires-entry tag. If `output["renames"]` contains a rename
-    matching `(sid=consumer_sid, to=unresolved_tag)`, attempt-1 had
-    rewritten the consumer's tag to `unresolved_tag`; after the
-    retry's revert, the consumer's entry holds `r["from"]` (the
-    original pre-rename tag). Else `unresolved_tag` was never touched
-    by a rename and IS the consumer's pre-revert tag. Analogous to
-    `_original_tag_for_rename_edge`'s role for the cycle-retry's
-    `dropped_requires` recommendations.
+    The recommendation's `from` field is `unresolved_tag` itself: the
+    retry is layered on attempt 1's applied plans, so the consumer's
+    requires entry holds exactly that tag at apply time.
 
     Self-loop guard: skips candidates whose `providers[candidate]`
     includes `consumer_sid` — a rename TO a tag the consumer itself
@@ -25219,16 +25317,6 @@ def _recommend_unresolved_resolution(
     calibrated for synonym-asymmetric cases (like captured run
     075210), not general renames.
     """
-    # Determine the consumer's pre-revert tag (what attempt-2's apply
-    # will see). If attempt-1 renamed the consumer's tag to
-    # `unresolved_tag`, the pre-revert tag is `r["from"]`. Else it's
-    # `unresolved_tag` (no rename touched it).
-    pre_revert_tag = unresolved_tag
-    for r in output.get("renames", []):
-        if r.get("sid") == consumer_sid and r.get("to") == unresolved_tag:
-            pre_revert_tag = r["from"]
-            break
-
     # Score candidates, applying the self-loop guard.
     scored: list[tuple[float, str]] = []
     for candidate_tag, candidate_providers in providers.items():
@@ -25248,7 +25336,7 @@ def _recommend_unresolved_resolution(
         return {
             "op": "rename",
             "sid": consumer_sid,
-            "from": pre_revert_tag,
+            "from": unresolved_tag,
             "to": strong[0][1],
             "reason": (
                 f"Top string-similarity match (Jaccard {strong[0][0]:.3f}, "
@@ -25263,7 +25351,7 @@ def _recommend_unresolved_resolution(
         return {
             "op": "rename",
             "sid": consumer_sid,
-            "from": pre_revert_tag,
+            "from": unresolved_tag,
             "to": very_strong[0][1],
             "reason": (
                 f"Very high string-similarity match (Jaccard "
@@ -25296,17 +25384,26 @@ def _build_unresolved_retry_prompt(
       - The bounded must-include set.
 
     `recommendations` maps (sid, tag) → recommendation-dict-or-None.
-    `output` is attempt 1's reconciler output — used to look up the
-    pre-revert tag for any unresolved entry that attempt 1 renamed.
-    All must-include examples (renames `from`, added_provides tag,
-    added_subtasks provides) use the pre-revert tag so a model copying
-    them verbatim hits the consumer's actual requires entry after the
-    retry's revert restores the pre-mutation plans. When `pre_revert_tag
-    != tag`, a NOTE is also rendered explaining the revert semantic so
-    a literal-minded model doesn't override the examples with the
-    post-mutation tag (which silently no-ops at apply time).
+    `output` is attempt 1's reconciler output. It stays applied: the
+    retry is layered on top of it (DESIGN §5 *The unresolved-tags retry
+    is layered*), so the prompt renders it as settled and asks only for
+    new operations. Every example uses the unresolved tag as-is, because
+    that is what the consumer's requires entry holds at apply time.
     """
     parts: list[str] = []
+    applied = {k: output.get(k) for k in (
+        "renames", "added_provides", "added_subtasks", "conditional_drops",
+        "dropped_requires", "dependency_edges", "merged_subtasks")
+        if output.get(k)}
+    applied_note = (
+        "Your attempt-1 operations below are ALREADY APPLIED and stay "
+        "applied — every `requires` entry they resolved is settled. "
+        "Emit only the NEW operations that address the unresolved "
+        "entries listed after them; do not re-emit attempt-1 operations. "
+        "Each unresolved tag below is the consumer's CURRENT tag, after "
+        "your attempt-1 renames.\n"
+        "ATTEMPT-1 OPERATIONS (applied):\n"
+        + (json.dumps(applied, indent=2) if applied else "(none)") + "\n")
     parts.append(
         "Your previous reconciler output left "
         f"{len(unresolved)} cross-domain `requires` tag(s) still "
@@ -25323,6 +25420,7 @@ def _build_unresolved_retry_prompt(
         "cross-subtask dependency), drop the requires entry — the "
         "consumer stays, only the bad edge goes.\n"
     )
+    parts.append(applied_note)
 
     for i, u in enumerate(unresolved, 1):
         sid = u["sid"]
@@ -25361,30 +25459,6 @@ def _build_unresolved_retry_prompt(
                 "\n  No high-confidence hint computed — pick from the "
                 "bounded set below using your judgment.")
 
-        # Must-include set. The rename example must use the
-        # pre-revert tag as `from`: attempt 2 applies against the
-        # reverted (pre-mutation) plans, so the consumer's requires
-        # entry holds the pre-revert tag, not the post-mutation one.
-        pre_revert_tag = tag
-        for r in output.get("renames", []):
-            if r.get("sid") == sid and r.get("to") == tag:
-                pre_revert_tag = r["from"]
-                break
-        # When attempt 1 renamed the consumer's tag, the unresolved
-        # header shows the POST-mutation tag but the must-include
-        # examples reference the PRE-revert tag. Explain the revert
-        # so a literal-minded model doesn't override the examples
-        # with the post-mutation form (which silently no-ops after
-        # apply).
-        if pre_revert_tag != tag:
-            parts.append(
-                f"\n  NOTE: Your attempt 1 renamed '{pre_revert_tag}' → "
-                f"'{tag}' on this consumer. Leerie reverts your attempt-1 "
-                f"output before re-applying attempt 2 against the "
-                f"pre-mutation plans — so the consumer's requires entry "
-                f"holds the ORIGINAL '{pre_revert_tag}' at apply time. "
-                f"Address '{pre_revert_tag}' (the examples below use it "
-                f"correctly); don't emit '{tag}' as the tag/from field.")
         parts.append(
             "\n  Your output for this unresolved entry MUST include "
             "at least one of:")
@@ -25392,15 +25466,15 @@ def _build_unresolved_retry_prompt(
             top = scored[0][1]
             parts.append(
                 f"    - renames: rewrite this entry to a real producer "
-                f"(e.g. rename(sid={sid!r}, from={pre_revert_tag!r}, "
+                f"(e.g. rename(sid={sid!r}, from={tag!r}, "
                 f"to={top!r}))")
         parts.append(
             f"    - tag_ops op='add_provide': declare an existing subtask "
-            f"actually produces '{pre_revert_tag}' (add it to that "
+            f"actually produces '{tag}' (add it to that "
             f"subtask's provides)")
         parts.append(
             f"    - added_subtasks: add a new connector subtask whose "
-            f"provides includes '{pre_revert_tag}'")
+            f"provides includes '{tag}'")
         parts.append(
             f"    - tag_ops op='conditional_drop': drop the consumer subtask "
             f"({sid!r}) wholesale — ONLY if its own `intent` declares "
@@ -25411,7 +25485,7 @@ def _build_unresolved_retry_prompt(
             f"    - tag_ops op='drop_require': drop just this `requires` entry "
             f"from {sid!r} (the consumer stays in the plan) — ONLY if "
             f"the consumer's own `provides` already covers the work "
-            f"'{pre_revert_tag}' names, at a different granularity. "
+            f"'{tag}' names, at a different granularity. "
             "I.e. the requires entry is an aggregate, a coarser synonym, "
             "or an authoring-time decision the same subtask itself "
             "records, rather than a code artifact another subtask "
@@ -25423,7 +25497,8 @@ def _build_unresolved_retry_prompt(
             "one-sentence reason (aborts the run cleanly).")
 
     parts.append(
-        "\nEmit the same eight-array output as before. Leerie will "
+        "\nEmit the same eight-array output shape as before, holding "
+        "only the new operations. Leerie will "
         "re-check unresolved-requires AND re-run the cycle gate on "
         "your revised output; an attempt that still has unresolved "
         "tags will abort the run with the structured report.\n\n"
@@ -25435,7 +25510,6 @@ def _build_unresolved_retry_prompt(
 def _validate_unresolved_must_include(
     output: dict,
     unresolved: list[dict],
-    attempt_1_output: dict | None,
 ) -> list[str]:
     """For each unresolved (sid, tag), check the reconciler's revised
     output addresses it via one of: rename on that sid+tag, added_provides
@@ -25451,39 +25525,15 @@ def _validate_unresolved_must_include(
     requires 'tag'") — empty list means every unresolved entry was
     addressed. Mirror of `_validate_must_include` for the cycle gate.
 
-    For rename / added_provides / added_subtasks ops, accept a match
-    if the op covers EITHER the unresolved (post-mutation) tag OR the
-    consumer's pre-revert tag (looked up via `attempt_1_output`'s
-    renames). This matches what leerie's own recommendation + must-include
-    examples produce: the pre-revert tag is what the consumer's
-    requires entry holds at apply time after the retry's revert
-    restores the pre-mutation state. Without this dual-tag
-    acceptance leerie would reject its own recommendations as not
-    addressing the unresolved entry; without ALSO accepting the
-    post-mutation form a model that legitimately re-emits the rename
-    + addresses the resulting post-mutation entry would be rejected.
+    Matching is strict on the unresolved tag: the retry is layered on
+    attempt 1's applied plans, so that tag is exactly what the
+    consumer's requires entry holds at apply time. An op naming an
+    older form of the tag would no-op at apply, so it must not count.
 
     Called from the unresolved-retry loop after attempt 2 emits, before
     the apply-step runs. A non-empty result means the model defied the
     structural constraint and the run aborts cleanly.
-
-    `attempt_1_output` is the failing first-attempt reconciler output
-    (in scope as `output` at the call site). Pass `None` when no
-    attempt-1 output is available (no pre-revert tag lookup occurs).
     """
-    # Build a (consumer_sid → pre_revert_tag) lookup from attempt-1's
-    # renames so we can accept the pre-revert tag alongside the
-    # unresolved (post-mutation) tag in validation (all three branches:
-    # rename, added_provides, added_subtasks).
-    pre_revert_tag_by_sid_tag: dict[tuple[str, str], str] = {}
-    if attempt_1_output:
-        for r in attempt_1_output.get("renames", []):
-            sid = r.get("sid")
-            to_tag = r.get("to")
-            from_tag = r.get("from")
-            if sid and to_tag and from_tag:
-                pre_revert_tag_by_sid_tag[(sid, to_tag)] = from_tag
-
     # Index the revised output's operations for fast lookup.
     rename_sid_tags = {
         (r["sid"], r["from"]) for r in output.get("renames", [])
@@ -25520,45 +25570,12 @@ def _validate_unresolved_must_include(
     unaddressed: list[str] = []
     for u in unresolved:
         sid, tag = u["sid"], u["tag"]
-        # Accept rename on either the post-mutation tag or the pre-revert tag.
-        pre_revert_tag = pre_revert_tag_by_sid_tag.get((sid, tag))
-        rename_addressed = (
-            (sid, tag) in rename_sid_tags
-            or (pre_revert_tag is not None
-                and (sid, pre_revert_tag) in rename_sid_tags)
-        )
-        # added_provides/added_subtasks must accept BOTH the post-mutation
-        # tag (legal when attempt 2 re-emits the rename so apply produces
-        # consumer.requires=[post-mutation-tag]) AND the pre-revert tag
-        # (legal when attempt 2 omits the rename and the producer covers
-        # the consumer's pre-revert entry directly). Symmetric to the
-        # dual-tag acceptance for the rename branch above.
-        added_provides_addressed = (
-            tag in added_provides_tags
-            or (pre_revert_tag is not None
-                and pre_revert_tag in added_provides_tags)
-        )
-        added_subtask_addressed = (
-            tag in added_subtask_provides
-            or (pre_revert_tag is not None
-                and pre_revert_tag in added_subtask_provides)
-        )
-        # dropped_requires: same dual-tag acceptance as the other ops.
-        # If attempt 2 re-emits the rename, the apply step sees
-        # consumer.requires=[post-mutation-tag]; if attempt 2 omits
-        # the rename, the requires entry holds the pre-revert tag.
-        # Either form should count as addressing this unresolved entry.
-        dropped_requires_addressed = (
-            (sid, tag) in dropped_requires_sid_tags
-            or (pre_revert_tag is not None
-                and (sid, pre_revert_tag) in dropped_requires_sid_tags)
-        )
         addressed = (
-            rename_addressed
-            or added_provides_addressed
-            or added_subtask_addressed
+            (sid, tag) in rename_sid_tags
+            or tag in added_provides_tags
+            or tag in added_subtask_provides
             or sid in conditional_drop_sids
-            or dropped_requires_addressed
+            or (sid, tag) in dropped_requires_sid_tags
             or (sid, tag) in unresolvable_sid_tags
         )
         if not addressed:
