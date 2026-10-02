@@ -4439,8 +4439,12 @@ trustworthy: `_run_conformance_phase` sets
 `conformer_repair_rolled_back` on the result when its rollback arms
 reverted the round's commits, a tests entry points at an uncommitted
 path (checked against full `-z -uall` porcelain, cited paths
-canonicalized worktree-relative first), or the result failed
-`_validate_conformance_result` — each neutralizes the act — while
+canonicalized worktree-relative first), the cited tests path is absent
+from the phase's own diff (`impl_head_sha..HEAD`, ancestor-prefix — a
+zero-commit pass citing a pre-existing file records no repair; a
+`fixed: true` claim with zero phase commits falls to the same rule),
+or the result failed `_validate_conformance_result` — each
+neutralizes the act — while
 `"accepted"`, `"confirmed_defect"`, an unanswered tail, a non-string or
 unrecognised item, or a mitigation with no surviving repair record all
 stay unaddressed (the fail-safe union; no prose is ever interpreted,

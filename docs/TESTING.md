@@ -4084,7 +4084,7 @@ parametrized `test_porcelain_evasion_shapes_are_caught` over
 space/non-ASCII/staged-rename paths,
 `test_worktree_rename_origin_desync_does_not_swallow_records` — the
 two-sided ` R` record walk whose one-sided mutant survived every other
-test — `test_noncanonical_cited_path_is_still_caught` over
+test in the targeted battery — `test_noncanonical_cited_path_is_still_caught` over
 `./`-prefixed, absolute, trailing-space and tab-prefixed citations
 (the validator strips and resolves; exact-string matching missed
 each), and `test_directory_citation_does_not_mask_uncommitted_tests`

@@ -1504,3 +1504,69 @@ def test_directory_citation_does_not_mask_uncommitted_tests(env, claimed):
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+def test_zero_commit_pass_citing_committed_path_is_neutralized(env):
+    """The repair must be committed BY THIS PASS: a conformer that
+    commits nothing and cites the implementer's own pre-existing
+    committed file passes the validator (exists, in-tree) and is
+    invisible to porcelain (clean tree) — yet records no repair
+    (executed: rendered 'addressed (mitigated)')."""
+    c = env["leerie"]
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "src.py", "reason": "claims it"}]
+    result["file_updates"] = [{"kind": "tests", "path": "src.py",
+                               "reason": "claims it"}]
+    _stub_run_conformer(c, [result])  # no commits action
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    assert any("does not appear in this phase's own commits" in w
+               for w in warnings), warnings
+
+
+def test_zero_commit_fixed_claim_is_neutralized(env):
+    """The twin hole: a fixed:true solution_defects entry has no path to
+    check, so a pass that committed NOTHING cannot have fixed anything."""
+    c = env["leerie"]
+    result = _clean_result()
+    result["solution_defects"] = [
+        {"kind": "missing_guard", "concrete_case": "c", "where": "w",
+         "why_ships_a_defect": "y", "fixed": True}]
+    _stub_run_conformer(c, [result])
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+def test_committed_cited_repair_is_not_neutralized(env):
+    """POSITIVE CONTROL for the whole neutralization stack: a pass that
+    really commits the cited tests file must keep its act — no flag,
+    and the mitigation clears at the collector."""
+    c = env["leerie"]
+
+    def _commit_tests(wt: Path):
+        (wt / "test_real.py").write_text("def test_r(): pass\n")
+        _run(["git", "add", "test_real.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: add test_real"],
+             cwd=wt)
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_real.py", "reason": "r"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_real.py",
+                               "reason": "r"}]
+    _stub_run_conformer(c, [result], commits={0: _commit_tests})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
+    risks = c._collect_subtask_risks(
+        {"production_evidence": {"exercised": False,
+                                 "unexercisable_reason": "r"}},
+        dict(res, risk_dispositions=["mitigated"]))
+    assert risks[0]["addressed"] is True

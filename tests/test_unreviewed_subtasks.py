@@ -202,7 +202,7 @@ def _stub_conformance_sequence(leerie_mod, monkeypatch, outcomes):
     calls = {"n": 0}
 
     async def _stub(sid_, leerie_dir, worktree, subtask, caps, st,
-                    models, efforts):
+                    models, efforts, impl_res=None):
         i = min(calls["n"], len(outcomes) - 1)
         calls["n"] += 1
         if outcomes[i] == "crash":

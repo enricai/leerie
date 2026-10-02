@@ -6245,11 +6245,17 @@ Two further disciplines sit at the §12 axis:
      (`conformer_repair_rolled_back`) and never counts when the PR will
      not contain it or it cannot be trusted: the conformance phase's
      own rollback arms reverted the round's commits (protected-path,
-     strict-clobber), the tests entry points at an uncommitted path, or
-     the whole result failed the honesty validator (a result whose
-     cited paths the validator itself rejected has no trustworthy
-     repair records — measured, the validator caught a fabricated
-     tests path and the risk pipeline then rewarded the same lie). A risk left unanswered, marked `accepted`,
+     strict-clobber), the tests entry points at an uncommitted path, the
+     cited tests path does not appear in the phase's own commits (a
+     zero-commit pass citing a pre-existing committed file — or an
+     always-existing directory — passed every other check and rendered
+     "addressed" for a pass containing no repair, measured; a
+     `fixed: true` claim from a pass that committed nothing falls to
+     the same rule), or the whole result failed the honesty validator
+     (a result whose cited paths the validator itself rejected has no
+     trustworthy repair records — measured, the validator caught a
+     fabricated tests path and the risk pipeline then rewarded the
+     same lie). A risk left unanswered, marked `accepted`,
      confirmed, or mitigated without a surviving recorded repair
      **stays on the register** and reaches the PR. `confirmed_defect`
      never reads as addressed, by design rather than omission: its

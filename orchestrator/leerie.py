@@ -11006,8 +11006,9 @@ def _collect_subtask_risks(impl_res: dict | None,
     `solution_defects` entry or a `kind: "tests"` `file_updates` entry
     (the two records a conformer repair can leave; a docs update is not
     a mitigation; a record neutralized via `conformer_repair_rolled_back`
-    — rollback arms, uncommitted tests path, or a result the honesty
-    validator rejected — does not count). "confirmed_defect"
+    — rollback arms, uncommitted tests path, a cited path absent from
+    the phase's own commits, or a result the honesty validator
+    rejected — does not count). "confirmed_defect"
     NEVER sets `addressed`, by design, not oversight: its act is the
     filed defect, owned by the completeness gate, and an entry that then
     SURVIVES to a finalized PR is a case where that channel did not fix
@@ -31228,15 +31229,62 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
             # files beneath it, so "tests_new" / "." as the cited path
             # intersected nothing and the phantom counted (executed,
             # three spellings).
-            _phantom = any(
-                u == c or c == "." or u.startswith(c + "/")
-                for c in tests_paths for u in unclean if u)
+            _phantom = next(
+                ((c, u) for c in tests_paths for u in unclean
+                 if u and (u == c or c == "." or u.startswith(c + "/"))),
+                None)
             if _phantom:
                 warnings.append(
                     f"conformer round {c_round}: tests file_updates "
-                    "entry references an uncommitted path — not counted "
-                    "as a mitigation repair")
+                    f"entry {_phantom[0]!r} references the uncommitted "
+                    f"path {_phantom[1]!r} — not counted as a mitigation "
+                    "repair")
                 last_res["conformer_repair_rolled_back"] = True
+
+        # DESIGN §9: the repair must be a COMMITTED tests update — i.e.
+        # committed by THIS phase. A citation of a pre-existing,
+        # untouched committed path (or of an always-existing directory)
+        # passes the validator and is invisible to porcelain, yet records
+        # no repair (executed: a zero-commit pass citing the
+        # implementer's own file rendered "addressed (mitigated)"). The
+        # cited path must ancestor-match the phase's own diff
+        # (impl_head_sha..HEAD, spanning every round's commits); and a
+        # `fixed: true` defect claimed by a pass that committed NOTHING
+        # is neutralized by the same rule, since it has no path to check.
+        if not last_res.get("conformer_repair_rolled_back"):
+            _fixed_claims = any(
+                isinstance(d, dict) and d.get("fixed") is True
+                for d in last_res.get("solution_defects") or [])
+            if tests_paths or _fixed_claims:
+                phase_files: set[str] = set()
+                try:
+                    _pd = await run_proc(
+                        ["git", "diff", "--name-only", "-z",
+                         f"{impl_head_sha}..HEAD"], cwd=worktree)
+                    if _pd.returncode == 0:
+                        phase_files = {f for f in _pd.stdout.split("\0")
+                                       if f}
+                except OSError:
+                    pass
+                _uncovered = next(
+                    (c for c in tests_paths
+                     if not any(u == c or c == "." or u.startswith(c + "/")
+                                for u in phase_files)),
+                    None)
+                if tests_paths and _uncovered is not None:
+                    warnings.append(
+                        f"conformer round {c_round}: tests file_updates "
+                        f"entry {_uncovered!r} does not appear in this "
+                        "phase's own commits — not counted as a "
+                        "mitigation repair")
+                    last_res["conformer_repair_rolled_back"] = True
+                elif _fixed_claims and not tests_paths and not phase_files:
+                    warnings.append(
+                        f"conformer round {c_round}: result claims a "
+                        "fixed solution_defects entry but this phase "
+                        "committed nothing — not counted as a mitigation "
+                        "repair")
+                    last_res["conformer_repair_rolled_back"] = True
 
         # Clobber-survival check (DESIGN §9 *No clobbering the
         # implementer's work*): did the conformer revert-to-base or delete
