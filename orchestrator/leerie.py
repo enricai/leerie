@@ -23584,6 +23584,20 @@ def _merge_restated_connector(
                 restated[key] = earlier[key]
 
 
+def _apply_own_renames(requires: list, owner: str,
+                       own_renames: dict[tuple[str, str], str]) -> list:
+    """`requires` with this output's renames on `owner` applied to their
+    in-plan tags. The layered retry's renames run against the version of
+    a connector already in the plan; a restatement or `added_requires`
+    of that connector arrives afterwards still carrying the old tag, and
+    unioning it in would silently undo the rename."""
+    return [
+        {**e, "tag": own_renames[(owner, e.get("tag"))]}
+        if isinstance(e, dict) and e.get("extent") == "in_plan"
+        and (owner, e.get("tag")) in own_renames else e
+        for e in requires]
+
+
 def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict]
                   ) -> dict[str, str]:
     """Absorbed id → surviving id, derived from the `merged_subtasks` ops
@@ -23716,8 +23730,11 @@ def _apply_reconciler_output(
     retry is layered*). It holds the ids those applied outputs added —
     never an earlier reconcile's connectors, which a re-plan reconcile
     still guards with the fail-loud collision check. The worker may
-    restate an applied op, so the ops that are not naturally
-    idempotent become so:
+    restate an applied op. Exact repeats of renames, drop_requires,
+    add_provides and dependency_edges are filtered BEFORE this step, in
+    `phase_reconcile` (`_drop_reemitted_ops` / `_restore_needed_repeats`),
+    so a direct caller passing `restatable` does not get that. The ops
+    handled here become idempotent:
 
     * an `added_subtasks` entry whose id is in `restatable` is merged
       into the earlier version (`_merge_restated_connector`), so nothing
@@ -23805,6 +23822,8 @@ def _apply_reconciler_output(
     if survivor:
         _die_on_absorbed_id_reuse(output, survivor, restatable or set())
         output = _redirect_absorbed_ids(output, survivor)
+    own_renames = {(r["sid"], r["from"]): r["to"]
+                   for r in output.get("renames", [])}
 
     for r in output.get("renames", []):
         s = by_id.get(r["sid"])
@@ -23862,6 +23881,15 @@ def _apply_reconciler_output(
             drops = restated_drops or set()
             # A dependency may name a subtask this same output adds.
             live = set(by_id) | {s["id"] for s in added}
+            # This output's renames ran (step 1) against the version
+            # already in the plan; a restatement carrying the old tag
+            # would union it straight back. Apply them to what it brings.
+            added = [
+                {**s, "requires": _apply_own_renames(
+                    s.get("requires") or [],
+                    survivor.get(s["id"], s["id"]), own_renames)}
+                if s["id"] in restatable else s
+                for s in added]
             # A restated connector an applied merge absorbed folds its
             # edges into the survivor (whose text already composes both)
             # and is not re-added — re-adding would duplicate its work.
@@ -23942,7 +23970,9 @@ def _apply_reconciler_output(
         for req in output.get("_bind_requires", []):
             sid = req["sid"]
             target = by_id.get(sid)
-            item = {k: v for k, v in req.items() if k != "sid"}
+            item = _apply_own_renames(
+                [{k: v for k, v in req.items() if k != "sid"}],
+                sid, own_renames)[0]
             if target is None or sid not in named:
                 log(f"  reconciler: dropped added_requires {sid!r}:"
                     f"{item.get('tag')!r} — names no live subtask")
@@ -24710,10 +24740,11 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                 for plan in plans for s in plan.get("subtasks", [])}
         for gone, surv in survivor.items():
             held[gone] = held.get(surv, set())
-        _drop_reemitted_tag_ops(output3, applied)
+        repeats = _drop_reemitted_ops(output3, applied)
         _translate_pre_rename_tags(output3, prior.get("renames") or [], held)
         if survivor:
             output3 = _redirect_absorbed_ids(output3, survivor)
+        _restore_needed_repeats(output3, repeats, still_unresolved, survivor)
 
         # Must-include validation: did the revised output address every
         # named unresolved entry? Same fail-loud discipline as the
@@ -25659,36 +25690,84 @@ def _concat_reconciler_outputs(outputs: list[dict]) -> dict:
     return merged
 
 
-def _drop_reemitted_tag_ops(output: dict, applied: list[dict]) -> None:
-    """Remove, in place, every rename and drop_require in a layered
-    retry's `output` that exactly repeats one an applied output already
-    performed. Unlike the other ops these are not idempotent on the
-    layered plans: a merge applied after the original op can have given
-    the subtask (or the survivor a redirect would send it to) its own
-    entry for the same tag, and repeating the op would rename or drop
-    THAT entry — work the worker never named.
+def _drop_reemitted_ops(output: dict, applied: list[dict]) -> dict:
+    """Remove, in place, every op in a layered retry's `output` that
+    exactly repeats one of the `applied` outputs' renames,
+    drop_requires, add_provides or dependency_edges, and return the
+    removed renames, drop_requires and add_provides
+    (`{"renames": [...], "dropped_requires": [...],
+    "added_provides": [...]}`).
 
-    "Performed" excludes a RENAME naming a connector its own output
-    added: renames apply before that output's `added_subtasks`
-    (`_apply_reconciler_output` step 1 vs step 3), so it never took
-    effect and a repetition is the worker's first real attempt at it —
-    kept. A drop_require applies after `added_subtasks` (step 5), so it
-    always took effect on its own output's connectors."""
-    renames: set[tuple] = set()
-    drops: set[tuple] = set()
-    for out in applied:
-        own = {s.get("id") for s in out.get("added_subtasks") or []}
-        renames |= {(r.get("sid"), r.get("from"), r.get("to"))
-                    for r in out.get("renames") or []
-                    if r.get("sid") not in own}
-        drops |= {(d.get("sid"), d.get("tag"))
-                  for d in out.get("dropped_requires") or []}
-    output["renames"] = [
-        r for r in output.get("renames") or []
-        if (r.get("sid"), r.get("from"), r.get("to")) not in renames]
-    output["dropped_requires"] = [
-        d for d in output.get("dropped_requires") or []
-        if (d.get("sid"), d.get("tag")) not in drops]
+    These three are not idempotent on the layered plans. A repeated
+    rename or drop can hit an entry the original never touched — one a
+    later merge gave the subtask, or the survivor's own entry through
+    the redirect. A repeated edge can name an endpoint a later applied
+    output removed. An applied edge always took effect, so a repeat is
+    simply dropped. A rename or drop may not have: it was a no-op if the
+    subtask did not hold the tag yet. An add_provide naming a connector
+    its own output added never took effect either (step 2 runs before
+    step 3), so repeating it would add a provide the applied plan does
+    not have. So the caller restores a removed
+    one if, and only if, nothing else in the answer addresses the entry
+    it targets (`_restore_needed_repeats`) — then it is the worker's real
+    answer to the residue, not a repetition."""
+    renames = {(r.get("sid"), r.get("from"), r.get("to"))
+               for out in applied for r in out.get("renames") or []}
+    drops = {(d.get("sid"), d.get("tag"))
+             for out in applied for d in out.get("dropped_requires") or []}
+    edges = {(e.get("from"), e.get("to"))
+             for out in applied for e in out.get("dependency_edges") or []}
+    provides = {(a.get("sid"), a.get("tag"))
+                for out in applied for a in out.get("added_provides") or []}
+    removed: dict[str, list[dict]] = {
+        "renames": [], "dropped_requires": [], "added_provides": []}
+    kept_r: list[dict] = []
+    for r in output.get("renames") or []:
+        if (r.get("sid"), r.get("from"), r.get("to")) in renames:
+            removed["renames"].append(r)
+        else:
+            kept_r.append(r)
+    kept_d: list[dict] = []
+    for d in output.get("dropped_requires") or []:
+        if (d.get("sid"), d.get("tag")) in drops:
+            removed["dropped_requires"].append(d)
+        else:
+            kept_d.append(d)
+    kept_p: list[dict] = []
+    for a in output.get("added_provides") or []:
+        if (a.get("sid"), a.get("tag")) in provides:
+            removed["added_provides"].append(a)
+        else:
+            kept_p.append(a)
+    output["renames"] = kept_r
+    output["dropped_requires"] = kept_d
+    output["added_provides"] = kept_p
+    output["dependency_edges"] = [
+        e for e in output.get("dependency_edges") or []
+        if (e.get("from"), e.get("to")) not in edges]
+    return removed
+
+
+def _restore_needed_repeats(output: dict, removed: dict,
+                            unresolved: list[dict],
+                            survivor: dict[str, str]) -> None:
+    """Put back, in place, each repeat `_drop_reemitted_ops` removed that
+    is needed: a rename or drop whose target entry — `(survivor of sid,
+    tag)` — is an unresolved entry the rest of `output` leaves
+    unaddressed, or an add_provide whose tag is one. `output` is already
+    redirected, so a restored op's sid is redirected the same way."""
+    left = {(u["sid"], u["tag"]) for u in unresolved
+            if _validate_unresolved_must_include(output, [u])}
+    left_tags = {tag for _, tag in left}
+    for key, tag_field in (("renames", "from"), ("dropped_requires", "tag")):
+        for op in removed[key]:
+            sid = survivor.get(op["sid"], op["sid"])
+            if (sid, op[tag_field]) in left:
+                output.setdefault(key, []).append({**op, "sid": sid})
+    for op in removed["added_provides"]:
+        if op["tag"] in left_tags:
+            output.setdefault("added_provides", []).append(
+                {**op, "sid": survivor.get(op["sid"], op["sid"])})
 
 
 def _translate_pre_rename_tags(output: dict, applied_renames: list[dict],

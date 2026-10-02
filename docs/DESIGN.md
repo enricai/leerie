@@ -481,14 +481,20 @@ subtask it tests). Three mechanisms reconcile that coupling:
   Re-emitting an applied op must be harmless, and an omission must not
   undo applied work, so the apply step treats the retry as idempotent
   over what is already applied:
-  - a repeated rename or `drop_require` that an applied output already
-    performed is removed before anything else reads the answer. These
-    two are not naturally idempotent on the layered plans: a later merge
-    can give the same subtask, or the survivor a redirect would send the
-    op to, its own entry for that tag, and repeating the op would hit
-    that entry instead. A rename naming a connector its own output added
-    never took effect (renames apply before that output's added
-    subtasks), so repeating it counts as a first attempt and is kept;
+  - an exact repeat of an applied rename, `drop_require`, `add_provide`
+    or `dependency_edges` entry is removed before anything else reads
+    the answer. Then a removed rename, drop or provide is put back only
+    if it is *needed*: nothing else in the answer addresses the
+    unresolved entry it targets (through the survivor redirect below).
+    These ops are not naturally idempotent on the layered plans, and
+    whether the original took effect cannot be read off the op. It was a
+    no-op if the subtask did not hold the tag yet (a later merge brought
+    it), or if it named a connector its own output added before that
+    connector existed. A needed repeat is the worker's real answer to
+    the residue. An unneeded one could only hit an entry the original
+    never touched (one a later merge gave the subtask, or the
+    survivor's own), or add a provide the applied plan does not have.
+    An applied edge always took effect, so its repeat is never needed;
   - a repeated merge collapses through the redirect below and is removed;
   - a re-emitted connector is *merged* into the version already applied.
     Its edges are unioned, because a worker restating a connector
@@ -497,7 +503,9 @@ subtask it tests). Three mechanisms reconcile that coupling:
     whose criteria the composed text carries. A require an applied
     output removed with `drop_require` is not re-added, and a dependency
     on a subtask no longer in the plan (e.g. one an applied
-    `conditional_drop` removed) is not revived;
+    `conditional_drop` removed) is not revived. The retry's own renames
+    on that connector apply to what the restatement (or a re-emitted
+    `added_requires`) brings in, so it cannot undo them;
   - an id that one of this reconcile's applied merges absorbed is read
     as its survivor wherever the retry names it, rather than resurrected
     or rejected as missing. There are two exceptions, both because the

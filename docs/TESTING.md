@@ -1155,7 +1155,7 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
-Six review rounds, each executing code, broke the "re-emitting an
+Seven review rounds, each executing code, broke the "re-emitting an
 applied op is harmless" claim. Each break has a test that fails on the
 build it broke, with one exception noted under round two.
 
@@ -1212,7 +1212,8 @@ exactly as written, as the docs already claimed
 Round six, a property fuzz over real `phase_reconcile`. It generated
 random attempt-1 outputs, then retries that re-emit a random subset of
 the applied ops plus a fix. Re-emission changed the final plan in 144
-of 3,000 seeds, all in three classes:
+of 3,136 retry trials (51 of the 784 seeds that reached a comparison,
+out of 3,000 generated), all in three classes:
 - a repeated drop or rename on an absorbed id redirected onto the
   survivor's own entry;
 - a repeated drop undoing a tag an applied merge brought back;
@@ -1224,12 +1225,50 @@ twice. Each now has a test that fails on the round-five build
 (`test_unresolved_retry_reemitted_*`,
 `test_unresolved_retry_restatement_does_not_revive_dropped_dependency`,
 `test_apply_layered_duplicate_restated_absorbed_connector_dies`). The
-same fuzz re-run on the fixed build gives 0 changed plans in 3,000
-seeds.
+same fuzz re-run on the fixed build gives 0 changed plans in 3,136
+trials.
 
 Its companion compared full restatements, which the old reverting retry
-expected, against origin/main. Before the fix, 32 of 530 runs accepted
-by both differed. After the fix, 0 of 530 do.
+expected, against origin/main, over 2,000 seeds. Before the fix, 32 of
+530 runs accepted by both differed. After the fix, 0 of 530 do.
+
+Round seven extended that fuzz to size → cycle → unresolved
+compositions, connectors with requires, folds, binds, chained merges,
+and fixes that name pre-rename tags or absorbed sids. It found three
+defects:
+- Round six's exact-repeat filter treated an op attempt 1 *wrote* as
+  one it *performed*. A drop or rename that was a no-op when applied,
+  and that a later merge made necessary, was deleted as a repeat, and
+  the run died (`test_unresolved_retry_repeated_noop_*`).
+
+  A first fix — keep a repeat whose target entry is unresolved — was
+  itself broken by the extended fuzz. Through an absorbed alias, such a
+  repeat removed the survivor's unresolved entry even when the
+  worker's fix had already addressed it
+  (`test_unresolved_retry_repeat_via_alias_spares_entry_fix_addresses`).
+
+  The rule is now remove-then-restore: every exact repeat is removed,
+  and one is put back only if nothing else in the answer addresses its
+  target (`test_drop_reemitted_ops_removes_exact_repeats`,
+  `test_restore_needed_repeats_only_for_unaddressed_targets`).
+  Repeated `add_provide`s on a connector their own output added follow
+  the same rule.
+- A restated connector, or a re-emitted `added_requires` row, unioned
+  back a tag the same retry's rename had just fixed. Renames now apply
+  to what such a restatement brings in
+  (`test_unresolved_retry_*_keeps_this_retrys_rename`).
+- A re-emitted edge whose endpoint a later applied output removed
+  died. Exact repeats of applied edges are removed.
+
+On the final build, over 1,600 seeds, the extended fuzz gives:
+- Property A (re-emission changes nothing): 85 of 2,304 compared
+  trials differ, and every one is a restated connector deduplicating a
+  duplicate requires entry. Same set, same graph.
+- Property B (full restatement vs origin/main): 1,152 compared trials.
+  origin/main never accepts what this build rejects. Of the 15 that
+  both accept with different plans, 8 are that dedup. The other 7 are
+  origin/main's revert ordering turning a fix op into a no-op; this
+  build's full-restatement plan equals its fix-only plan in all 7.
 
 Separately, the layered build first rejected a natural answer naming a
 consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),
@@ -1240,7 +1279,7 @@ mistranslated a tag the consumer still held. Both cases are pinned
 
 `test_unresolved_retry_after_size_and_cycle_retries_sees_both` drives
 size → cycle → unresolved retries through real `phase_reconcile`: the
-"applied" set must include both retries' outputs. Twelve tests are
+"applied" set must include both retries' outputs. Fourteen tests are
 mutant guards, which fail on the mutant that removes the behaviour.
 Each passes on the build it was added against, with two qualifications.
 The self-edge guard trips on the `applied_merges` keyword there, and
@@ -1259,7 +1298,10 @@ one it was first added against (see round two).
 - `self_ids` in `_merge_restated_connector`;
 - the pre-pass self-strip of `depends_on`;
 - the held-tag check reading an absorbed sid's survivor;
-- translating before redirecting.
+- translating before redirecting;
+- restoring a needed repeated rename
+  (`test_unresolved_retry_rename_that_never_applied_is_not_translated`);
+- `live_ids` keeping a dependency on a subtask the same output adds.
 
 Every reconciler test stubs the worker, so the live behaviour was
 measured separately. Real `claude -p` ran as attempt 2 on fc56, from the

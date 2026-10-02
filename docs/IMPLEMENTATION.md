@@ -3841,16 +3841,25 @@ retries). After a size retry and then a cycle retry it holds both;
   `_translate_pre_rename_tags` before validation, unless the consumer
   still holds that tag (the applied rename did not take). For an
   absorbed sid it checks the survivor's tags. In `phase_reconcile` the
-  order is: drop exact repeats (below), translate, redirect (below),
-  validate. The validator therefore judges what the apply step will do.
-- **Exact repeats.** `_drop_reemitted_tag_ops(output, applied)` removes
-  every rename and drop_require that exactly repeats one an applied
-  output performed. These two are not idempotent on the layered plans:
-  a later merge can give the subtask, or the survivor a redirect would
-  send the op to, its own entry for the same tag, and repeating the op
-  would hit that entry instead. A rename naming a connector its own
-  output added never took effect (step 1 runs before step 3) and is
-  not treated as performed. A drop_require (step 5) always took effect.
+  order is: remove exact repeats (below), translate, redirect (below),
+  restore needed repeats, validate. The validator therefore judges what the apply step will do.
+- **Exact repeats.** `_drop_reemitted_ops(output, applied)` runs first
+  and removes every exact repeat of an applied rename, drop_require,
+  add_provide or `dependency_edges` entry, returning the removed
+  renames, drops and provides. After translate and redirect,
+  `_restore_needed_repeats(output, removed, unresolved, survivor)` puts
+  back the needed ones:
+  - a rename or drop whose target entry `(survivor of sid, tag)` is
+    unresolved and left unaddressed by the rest of the answer (per
+    `_validate_unresolved_must_include`);
+  - a provide whose tag is such an entry's tag.
+
+  The original's effect cannot be read off the op: it was a no-op if
+  the subtask did not hold the tag yet, or if it named a connector its
+  own output added (steps 1–2 run before step 3). An unneeded repeat
+  could only touch an entry a later merge supplied, or add a provide
+  the applied plan lacks. An applied edge always took effect, so its
+  repeat is never restored.
 - **Rendering.** The retry prompt shows the applied operations as
   ALREADY APPLIED and asks for new operations only. It renders them
   through `_compact_reconciler_output` (the inverse of
@@ -3863,8 +3872,11 @@ retries). After a size retry and then a cycle retry it holds both;
 The layered apply step (`restatable` not None) makes re-emitting an
 applied operation harmless:
 
-- `renames`, `added_provides`, `dropped_requires` and
-  `conditional_drops` no-op or dedup on repeat.
+- `conditional_drops` no-op on repeat. Repeated `renames`,
+  `dropped_requires`, `added_provides` and `dependency_edges` are not
+  idempotent on the layered plans; `phase_reconcile` filters them first
+  (*Exact repeats*, above), so a direct caller passing `restatable`
+  does not get that protection.
 - An `added_subtasks` id in `restatable` (ids added by the applied
   outputs) is merged into the existing version by
   `_merge_restated_connector`.
@@ -3877,6 +3889,11 @@ applied operation harmless:
     holds is kept. A `depends_on` entry naming no live subtask (not in
     the plan or this output) is dropped, so a restatement cannot revive
     a dependency an applied `conditional_drop` pruned.
+  - This output's own renames on the connector (`_apply_own_renames`)
+    are applied to the requires the restatement, fold or a re-emitted
+    `added_requires` binding brings in: renames run at step 1, against
+    the version already in the plan, so the incoming copy still
+    carries the old tag.
   - Restated `title` / `intent` / `success_criteria_seed` win, unless
     the existing version carries `_merged_from`, in which case its
     composed text is kept.
