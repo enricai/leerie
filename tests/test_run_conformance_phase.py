@@ -1268,6 +1268,21 @@ def test_protected_path_rollback_neutralizes_repair_records(env):
     assert risks[0]["addressed"] is False
 
 
+# Every porcelain-arm pin below asserts the porcelain arm's OWN warning,
+# not just the flag: 2841b3d's committed-by-this-pass arm also sets the
+# flag for any wholly-uncommitted citation, so a flag-only assertion
+# passes even with the porcelain arm broken (measured post-merge: 5 of 7
+# porcelain mutants survived flag-only pins). The round-8 arm is skipped
+# once the flag is set, so its different warning appears only when the
+# porcelain arm failed to fire.
+_PORCELAIN_ARM_WARNING = "references the uncommitted path"
+
+
+def _assert_porcelain_arm_fired(warnings):
+    assert any(_PORCELAIN_ARM_WARNING in w for w in warnings), (
+        "flag set by a different arm, not the porcelain check", warnings)
+
+
 def test_uncommitted_tests_entry_neutralizes_repair(env):
     """The dirty-worktree sibling: a `kind:"tests"` file_updates entry
     whose path was left UNCOMMITTED records a repair integration will
@@ -1317,6 +1332,7 @@ def test_uncommitted_tests_file_in_new_directory_is_caught(env):
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    _assert_porcelain_arm_fired(warnings)
 
 
 def test_malformed_result_neutralizes_repair_records(env):
@@ -1419,6 +1435,7 @@ def test_porcelain_evasion_shapes_are_caught(env, setup, claimed):
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    _assert_porcelain_arm_fired(warnings)
 
 
 def test_noncanonical_cited_path_is_still_caught(env):
@@ -1447,6 +1464,7 @@ def test_noncanonical_cited_path_is_still_caught(env):
             env["efforts"]))
         assert res.get("conformer_repair_rolled_back") is True, \
             (claimed, res, warnings)
+        _assert_porcelain_arm_fired(warnings)
 
 
 def test_worktree_rename_origin_desync_does_not_swallow_records(env):
@@ -1478,6 +1496,7 @@ def test_worktree_rename_origin_desync_does_not_swallow_records(env):
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    _assert_porcelain_arm_fired(warnings)
 
 
 @_pytest.mark.parametrize("claimed", ["tests_new", "tests_new/", "."],
@@ -1504,6 +1523,7 @@ def test_directory_citation_does_not_mask_uncommitted_tests(env, claimed):
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+    _assert_porcelain_arm_fired(warnings)
 
 
 def test_zero_commit_pass_citing_committed_path_is_neutralized(env):
@@ -1570,3 +1590,32 @@ def test_committed_cited_repair_is_not_neutralized(env):
                                  "unexercisable_reason": "r"}},
         dict(res, risk_dispositions=["mitigated"]))
     assert risks[0]["addressed"] is True
+
+
+
+def test_partially_committed_directory_citation_is_caught(env):
+    """The one input where the porcelain arm is the SOLE catcher: the
+    pass commits one file under the cited directory (so the
+    committed-by-this-pass arm sees the directory in the phase diff and
+    passes it) but leaves a second file there uncommitted. Only the
+    porcelain arm's ancestor-prefix match flags it — measured, reverting
+    that clause to bare equality left this unflagged."""
+    c = env["leerie"]
+
+    def _partial(wt: Path):
+        (wt / "tests_new").mkdir()
+        (wt / "tests_new" / "test_a.py").write_text("def test_a(): pass\n")
+        _run(["git", "add", "tests_new/test_a.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: a"], cwd=wt)
+        (wt / "tests_new" / "test_b.py").write_text("def test_b(): pass\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "tests_new", "reason": "covers a, b"}]
+    result["file_updates"] = [{"kind": "tests", "path": "tests_new",
+                               "reason": "covers a, b"}]
+    _stub_run_conformer(c, [result], commits={0: _partial})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)

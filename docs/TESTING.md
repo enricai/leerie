@@ -4094,9 +4094,21 @@ two-sided ` R` record walk whose one-sided mutant survived every other
 test in the targeted battery — `test_noncanonical_cited_path_is_still_caught` over
 `./`-prefixed, absolute, trailing-space and tab-prefixed citations
 (the validator strips and resolves; exact-string matching missed
-each), and `test_directory_citation_does_not_mask_uncommitted_tests`
+each), `test_directory_citation_does_not_mask_uncommitted_tests`
 over dir / dir-slash / `.` citations — ancestor-prefix matching,
-because the validator checks existence, never file-ness).
+because the validator checks existence, never file-ness — and
+`test_partially_committed_directory_citation_is_caught`, the one input
+where the porcelain arm is the SOLE catcher: one file under the cited
+directory committed, a second left uncommitted, so the
+committed-by-this-pass arm sees the directory in the phase diff and
+passes it). Every porcelain pin asserts the porcelain arm's OWN warning
+(`_assert_porcelain_arm_fired`), not just the flag: the
+committed-by-this-pass arm also flags any wholly-uncommitted citation,
+and with flag-only assertions 5 of 7 porcelain mutants (ancestor
+clause, canonicalization, `.strip()`, one-sided rename parse, `-uall`)
+survived every test after it landed — measured post-merge. With the
+arm-specific assertion all 7 are killed, each by the pin named for its
+clause.
 
 **The PR composition renderers** (two live paths plus `compose_pr_body`,
 the never-invoked canonical reference the bash fallback mirrors):
