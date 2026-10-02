@@ -4101,15 +4101,29 @@ because the validator checks existence, never file-ness — and
 where the porcelain arm is the SOLE catcher: one file under the cited
 directory committed, a second left uncommitted, so the
 committed-by-this-pass arm sees the directory in the phase diff and
-passes it). Every porcelain pin asserts the porcelain arm's OWN warning
-(`_assert_porcelain_arm_fired`), not just the flag: the
-committed-by-this-pass arm also flags any wholly-uncommitted citation,
-and with flag-only assertions 5 of 7 porcelain mutants (ancestor
-clause, canonicalization, `.strip()`, one-sided rename parse, `-uall`)
-survived every test in `test_run_conformance_phase.py` and
-`test_risk_register.py` after it landed — measured post-merge, at that
-two-file scope. With the arm-specific assertion all 7 are killed, each
-by the pin named for its clause.
+passes it), `test_staged_rename_origin_under_cited_directory_is_caught`
+(a staged `git mv` out of the cited directory: the rename ORIGIN is the
+only evidence, which no destination-matching pin exercises), the
+`one-char` evasion case (a 1-character path, the record walk's minimum
+length) and a `..` citation spelling (only `.resolve()` folds it). Every
+porcelain pin asserts the porcelain arm's OWN warning
+(`_assert_porcelain_arm_fired`, or the equivalent inline check in
+`test_uncommitted_tests_entry_neutralizes_repair`), not just the flag:
+the committed-by-this-pass arm also flags any wholly-uncommitted
+citation, and with flag-only assertions 5 of 7 porcelain mutants
+(ancestor clause, canonicalization, `.strip()`, one-sided rename parse,
+`-uall`) survived every test in `test_run_conformance_phase.py` and
+`test_risk_register.py` after S-6 (#274) merged, at that two-file
+scope. The porcelain arm's one NEGATIVE pin with a dirty worktree,
+`test_sibling_prefix_path_not_flagged`, guards the other direction: a
+string-prefix sibling (`tests_new_scratch.txt` beside a cited
+`tests_new`) must not neutralize a real repair. Against a combined set
+of 20 porcelain mutants (the 7 above plus 13 built independently by a
+reviewer), 18 are killed, each by the pin named for its clause, at the
+same two-file scope. The 2 survivors are equivalent mutants that no pin
+can catch: not advancing past a rename's origin field only re-reads it
+as an extra junk record, and stripping the porcelain record path is
+cancelled out because the cited path is stripped too.
 
 **The PR composition renderers** (two live paths plus `compose_pr_body`,
 the never-invoked canonical reference the bash fallback mirrors):
