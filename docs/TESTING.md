@@ -4114,16 +4114,22 @@ citation, and with flag-only assertions 5 of 7 porcelain mutants
 (ancestor clause, canonicalization, `.strip()`, one-sided rename parse,
 `-uall`) survived every test in `test_run_conformance_phase.py` and
 `test_risk_register.py` after S-6 (#274) merged, at that two-file
-scope. The porcelain arm's one NEGATIVE pin with a dirty worktree,
-`test_sibling_prefix_path_not_flagged`, guards the other direction: a
-string-prefix sibling (`tests_new_scratch.txt` beside a cited
-`tests_new`) must not neutralize a real repair. Against a combined set
-of 20 porcelain mutants (the 7 above plus 13 built independently by a
-reviewer), 18 are killed, each by the pin named for its clause, at the
-same two-file scope. The 2 survivors are equivalent mutants that no pin
-can catch: not advancing past a rename's origin field only re-reads it
-as an extra junk record, and stripping the porcelain record path is
-cancelled out because the cited path is stripped too.
+scope. Three NEGATIVE pins with a dirty worktree guard the other
+direction, where a loosened check discards a real repair:
+`test_sibling_prefix_path_not_flagged` (a string-prefix sibling,
+`tests_new_scratch.txt` beside a cited `tests_new`),
+`test_rename_origin_is_not_reread_as_a_record` (a staged rename's
+origin field must be consumed; re-reading `xx_tests/test.py` as a
+record yields the junk path `tests/test.py`, which matches a cited
+`tests`), and `test_trailing_space_sibling_not_flagged` (record paths
+are compared verbatim; `test_x.py ` is not the cited `test_x.py`).
+Against a combined set of 20 porcelain mutants (the 7 above plus 13
+built independently by a reviewer), all 20 are killed at the same
+two-file scope. The clause-specific mutants are each killed by the pin
+named for their clause. The four that change the record walk's
+structure (record offset, walk start, early break, and a warning
+emitted without setting the flag) are killed by several pins, none
+named for them.
 
 **The PR composition renderers** (two live paths plus `compose_pr_body`,
 the never-invoked canonical reference the bash fallback mirrors):

@@ -1693,3 +1693,64 @@ def test_staged_rename_origin_under_cited_directory_is_caught(env):
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
     _assert_porcelain_arm_fired(warnings)
+
+
+def test_rename_origin_is_not_reread_as_a_record(env):
+    """NEGATIVE: a staged rename's origin field must be consumed, not
+    re-read as a record of its own. If the walk fails to advance past
+    `xx_tests/test.py`, slicing it as a record yields the junk path
+    `tests/test.py`, which then falsely matches a cited `tests` holding a
+    real committed repair (measured: that mutant neutralized this
+    repair)."""
+    c = env["leerie"]
+
+    def _repair_plus_unrelated_rename(wt: Path):
+        (wt / "tests").mkdir()
+        (wt / "tests" / "test_real.py").write_text("def test_r(): pass\n")
+        (wt / "xx_tests").mkdir()
+        (wt / "xx_tests" / "test.py").write_text("x = 1\n")
+        _run(["git", "add", "tests", "xx_tests"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: repair + other"],
+             cwd=wt)
+        _run(["git", "mv", "xx_tests/test.py", "moved.py"], cwd=wt)
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "tests", "reason": "covers r"}]
+    result["file_updates"] = [{"kind": "tests", "path": "tests",
+                               "reason": "covers r"}]
+    _stub_run_conformer(c, [result],
+                        commits={0: _repair_plus_unrelated_rename})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
+    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
+
+
+def test_trailing_space_sibling_not_flagged(env):
+    """NEGATIVE: porcelain record paths are compared verbatim. An
+    uncommitted file named `test_x.py ` (trailing space) is a different
+    file from the cited, committed `test_x.py`, so stripping the record
+    path would falsely match it and discard the real repair (measured:
+    that mutant did)."""
+    c = env["leerie"]
+
+    def _repair_plus_space_named_file(wt: Path):
+        (wt / "test_x.py").write_text("def test_x(): pass\n")
+        _run(["git", "add", "test_x.py"], cwd=wt)
+        _run(["git", "commit", "-q", "-m", "conformer: x"], cwd=wt)
+        (wt / "test_x.py ").write_text("unrelated\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": "test_x.py", "reason": "covers x"}]
+    result["file_updates"] = [{"kind": "tests", "path": "test_x.py",
+                               "reason": "covers x"}]
+    _stub_run_conformer(c, [result],
+                        commits={0: _repair_plus_space_named_file})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is None, (res, warnings)
+    assert not any(_PORCELAIN_ARM_WARNING in w for w in warnings), warnings
