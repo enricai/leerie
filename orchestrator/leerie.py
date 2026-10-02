@@ -23516,8 +23516,8 @@ def _union_connector_edges(
     with `first`'s entries first. Returns only those fields; callers
     decide which version's text survives.
 
-    In-plan requires attempt 1 removed with `drop_require`
-    (`dropped_tags`) stay removed — removal is that op's job, and a
+    In-plan requires an applied `drop_require` removed (`dropped_tags`)
+    are not re-added by `second` — removal is that op's job, and a
     restatement must not silently reopen it (it could re-close a cycle
     attempt 1 broke). In-plan requires the merged `provides` now cover
     are dropped, as `_merge_subtask_core_fields` does: a self-edge is
@@ -23537,12 +23537,16 @@ def _union_connector_edges(
             out[key] = merged
     provides = set(out.get("provides") or [])
     reqs: list[dict] = []
-    for e in (list(first.get("requires") or [])
-              + list(second.get("requires") or [])):
+    # `dropped_tags` filters only what `second` brings: an entry `first`
+    # already holds is there for its own reasons (a fold's survivor may
+    # require the same tag the absorbed connector had dropped).
+    for e, incoming in ([(e, False) for e in first.get("requires") or []]
+                        + [(e, True) for e in second.get("requires") or []]):
         if not isinstance(e, dict):
             continue
         if e.get("extent") == "in_plan" and (
-                e.get("tag") in provides or e.get("tag") in dropped_tags):
+                e.get("tag") in provides
+                or (incoming and e.get("tag") in dropped_tags)):
             continue
         if not any(x.get("tag") == e.get("tag")
                    and x.get("extent") == e.get("extent") for x in reqs):
@@ -23593,7 +23597,9 @@ def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict]
         while target in step and target not in seen:
             seen.add(target)
             target = step[target]
-        if target in by_id:
+        # `gone in by_id`: a later applied output reused the id for a new
+        # subtask, which is live and must keep its own references.
+        if target in by_id and gone not in by_id:
             out[gone] = target
     return out
 
@@ -23601,19 +23607,24 @@ def _survivor_map(applied_merges: list[dict], by_id: dict[str, dict]
 def _redirect_absorbed_ids(output: dict, survivor: dict[str, str]) -> dict:
     """The layered retry's `output` with every reference to an id the
     applied merges absorbed rewritten to its survivor, so a worker naming
-    a subtask attempt 1 merged away neither resurrects it nor dies on a
-    missing id. Covers the sid of `renames` / `added_provides` /
-    `dropped_requires` / `_bind_requires`, `dependency_edges` and
-    `merged_subtasks` endpoints, and `added_subtasks[].depends_on`.
+    a subtask an applied output merged away neither resurrects it nor
+    dies on a missing id. Covers the sid of `renames` / `added_provides` /
+    `dropped_requires` / `_bind_requires`, `dependency_edges` endpoints,
+    a `merged_subtasks` `into`, and `added_subtasks[].depends_on`.
+    Idempotent: a survivor is never itself absorbed.
 
     Two shapes collapse and are removed rather than rewritten: an edge
     whose redirected endpoints coincide (it ordered two subtasks that
     are now one), and a merge whose redirected endpoints coincide (it
     already happened). A from == to the worker wrote itself is left for
-    the apply step's die. `conditional_drops` is NOT redirected: dropping
-    the survivor would remove work the worker never named. A restated
-    connector id is left as-is; the apply step folds it into its
-    survivor."""
+    the apply step's die.
+
+    Not redirected, because the survivor holds more work than the worker
+    named: a `conditional_drops` sid (it would drop the survivor), and
+    a non-collapsing merge's `from` (it would merge the whole survivor
+    away). The apply step's missing-id die reports the latter. A
+    restated connector id is left as-is; the apply step folds it into
+    its survivor."""
     def r(sid: str) -> str:
         return survivor.get(sid, sid)
 
@@ -23627,7 +23638,7 @@ def _redirect_absorbed_ids(output: dict, survivor: dict[str, str]) -> dict:
         for e in output.get("dependency_edges") or []
         if not (e["from"] != e["to"] and r(e["from"]) == r(e["to"]))]
     out["merged_subtasks"] = [
-        {**m, "into": r(m["into"]), "from": r(m["from"])}
+        {**m, "into": r(m["into"])}
         for m in output.get("merged_subtasks") or []
         if not (m["into"] != m["from"] and r(m["into"]) == r(m["from"]))]
     out["added_subtasks"] = [
@@ -23677,15 +23688,17 @@ def _apply_reconciler_output(
 
     * an `added_subtasks` entry whose id is in `restatable` is merged
       into the earlier version (`_merge_restated_connector`), so nothing
-      attempt 1 established is lost to an omission;
+      the applied outputs established is lost to an omission;
     * an id the applied merges absorbed (`applied_merges`) is redirected
       to its survivor (`_survivor_map`, `_redirect_absorbed_ids`) wherever
-      the retry names it, except in `conditional_drops`; a restated
-      connector with such an id folds into its survivor;
+      the retry names it, except a `conditional_drops` sid and a
+      non-collapsing merge's `from`; a restated connector with such an
+      id folds into its survivor;
     * an `added_requires` naming a `restatable` connector without
       restating it (`output["_bind_requires"]`) is bound to it;
-    * a `merged_subtasks` entry whose `from` is already in `into`'s
-      `_merged_from` is skipped.
+    * a repeated merge — one whose endpoints collapse onto one survivor
+      through `applied_merges` — is removed by the redirect. A merge
+      naming an id an EARLIER phase absorbed still dies as missing.
 
     `restated_drops` holds the `(sid, tag)` pairs the applied outputs
     removed with `drop_require`; a restatement, fold or binding does not
@@ -24641,15 +24654,24 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
             retry_prompt, bindable=attempt_1_added)
         _check_unresolvable(output3)
         # The prompt's ORIGINAL INPUT is the pre-attempt-1 payload, so a
-        # worker may name a consumer's tag as it was before attempt 1
-        # renamed it. Rewrite those sid-keyed references to the current
-        # tag before validating — otherwise they would no-op at apply.
-        _translate_pre_rename_tags(
-            output3, prior.get("renames") or [],
-            {s["id"]: {e.get("tag") for e in s.get("requires") or []
-                       if isinstance(e, dict)
-                       and e.get("extent") == "in_plan"}
-             for plan in plans for s in plan.get("subtasks", [])})
+        # worker may name a consumer's tag as it was before an applied
+        # rename, or a subtask an applied merge absorbed. Normalise both
+        # BEFORE validating, so the validator judges what the apply step
+        # will actually do. Translation first, while sids are still as
+        # the worker wrote them (applied renames are keyed that way); its
+        # held-tag check reads an absorbed sid's survivor.
+        survivor = _survivor_map(
+            prior.get("merged_subtasks") or [],
+            {s["id"]: s for plan in plans for s in plan.get("subtasks", [])})
+        held = {s["id"]: {e.get("tag") for e in s.get("requires") or []
+                          if isinstance(e, dict)
+                          and e.get("extent") == "in_plan"}
+                for plan in plans for s in plan.get("subtasks", [])}
+        for gone, surv in survivor.items():
+            held[gone] = held.get(surv, set())
+        _translate_pre_rename_tags(output3, prior.get("renames") or [], held)
+        if survivor:
+            output3 = _redirect_absorbed_ids(output3, survivor)
 
         # Must-include validation: did the revised output address every
         # named unresolved entry? Same fail-loud discipline as the
@@ -25617,6 +25639,7 @@ def _translate_pre_rename_tags(output: dict, applied_renames: list[dict],
             if key[0] == sid and val == frm:
                 current[key] = to
         current[(sid, frm)] = to
+
     def _now(sid: str, tag: str) -> str:
         if tag in held.get(sid, set()):
             return tag

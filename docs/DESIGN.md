@@ -490,10 +490,14 @@ subtask it tests). Three mechanisms reconcile that coupling:
     `drop_require` is not re-added;
   - an id that one of this reconcile's applied merges absorbed is read as
     its survivor wherever the retry names it (rather than resurrected or
-    rejected as missing), except in a `conditional_drop`: dropping the
-    survivor would remove work the worker never named. The scope is
-    this reconcile's merges, not an earlier phase's, so an earlier
-    merge's absorbed id cannot make the redirect ambiguous.
+    rejected as missing). There are two exceptions, both because the
+    survivor holds more work than the worker named: a `conditional_drop`
+    (it would drop the survivor), and a new merge's `from` (it would
+    merge the whole survivor away). The latter still dies as missing.
+    The scope is this reconcile's merges, not an earlier phase's, and
+    excludes an id a later output reused for a live subtask, so the
+    redirect is never ambiguous. The must-include check judges the
+    redirected answer, i.e. what the apply step will do.
 
   Only connectors added by *this* reconcile's applied attempts are
   restatable; a re-plan reconcile's earlier connectors keep the

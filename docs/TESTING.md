@@ -1155,9 +1155,9 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
-Two review rounds, both executing code, broke the "re-emitting an
+Three review rounds, each executing code, broke the "re-emitting an
 applied op is harmless" claim. Each break has a test that fails on the
-build it broke.
+build it broke, with one exception noted under round two.
 
 Round one, against the first layered build:
 - a re-emitted edge naming an id attempt 1 merged away;
@@ -1176,6 +1176,21 @@ Round two, against round one's fixes:
 - a drop recorded against the absorbed id, not the survivor;
 - redirects resolved through an earlier phase's `_merged_from` stamp.
   `_survivor_map` now follows only the reconcile's applied merges.
+  This one is the exception. Its test
+  (`test_survivor_map_ignores_earlier_phase_merges`) first failed on the
+  round-one build only through a signature change; as written then, it
+  passed on stamp-based semantics by dict order. It was reordered in
+  round three so a stamp-based map gives a different answer.
+
+Round three, against round two's fixes:
+- a fold's drop filter stripping the survivor's own require for the
+  same tag;
+- an id a later output reused, redirected away from the live subtask;
+- the must-include check judging the answer before the redirect, so it
+  rejected an answer naming an absorbed sid that the apply step would
+  have handled;
+- a new merge naming an absorbed id, which merged the whole survivor
+  away.
 
 Separately, the layered build first rejected a natural answer naming a
 consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),
@@ -1186,13 +1201,20 @@ mistranslated a tag the consumer still held. Both cases are pinned
 
 `test_unresolved_retry_after_size_and_cycle_retries_sees_both` drives
 size → cycle → unresolved retries through real `phase_reconcile`: the
-"applied" set must include both retries' outputs. Four tests are
+"applied" set must include both retries' outputs. Ten tests are
 mutant guards, which pass on the build they were added against and
 fail on the mutant that removes the behaviour:
 - the `_merged_from` union;
 - the never-existed-merge die;
 - the binding skip for a dropped or self-provided require;
-- the die on a genuine `from == to` edge while a redirect is active.
+- the die on a genuine `from == to` edge while a redirect is active;
+- survivor scoping, with the reordered fixture;
+- removing a collapsed edge;
+- the sid redirect of renames, add_provides and drop_requires (one
+  test, which kills each of the three per-op mutants);
+- the conditional-drop exemption;
+- `self_ids` in `_merge_restated_connector`;
+- the pre-pass self-strip of `depends_on`.
 
 Every reconciler test stubs the worker, so the live behaviour was
 measured separately. Real `claude -p` ran as attempt 2 on fc56, from the

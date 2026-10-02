@@ -2476,8 +2476,7 @@ def test_apply_layered_redirects_edge_endpoint_merged_away(leerie):
 
 def test_apply_layered_folds_restated_merged_away_connector(leerie):
     """A restated connector attempt 1 merged into another subtask folds
-    into the survivor instead of coming back as a duplicate producer
-   ."""
+    into the survivor instead of coming back as a duplicate producer."""
     plans = [{"domain": "feat", "subtasks": [_r1_sub("feat-001")]},
              {"domain": "_reconciler", "subtasks": [
                  _r1_recon("feat-900", provides=["x"])]}]
@@ -2522,8 +2521,7 @@ def test_apply_layered_restate_does_not_readd_dropped_require(leerie):
 
 def test_apply_layered_restate_prunes_self_require(leerie):
     """A restated connector cannot satisfy its own require: in-plan
-    requires its merged provides cover are dropped, as a merge does
-   ."""
+    requires its merged provides cover are dropped, as a merge does."""
     plans = [{"domain": "_reconciler", "subtasks": [
         _r1_recon("feat-900", provides=["x"])]}]
     leerie._apply_reconciler_output(plans, {"added_subtasks": [
@@ -2537,8 +2535,7 @@ def test_apply_layered_restate_prunes_self_require(leerie):
 def test_apply_layered_binds_to_survivor_and_logs_unbindable(
         leerie, capsys):
     """A binding naming a merged-away attempt-1 connector lands on its
-    survivor; one naming no live subtask is logged, not lost silently
-   ."""
+    survivor; one naming no live subtask is logged, not lost silently."""
     plans = [{"domain": "feat", "subtasks": [_r1_sub("feat-001")]},
              {"domain": "_reconciler", "subtasks": [
                  _r1_recon("feat-900", provides=["x"])]}]
@@ -2593,8 +2590,7 @@ def test_unresolved_retry_accepts_answer_naming_pre_rename_tag(
     """Attempt 1 renames feat-001's `auth` to `auth-token`, which nothing
     provides. The prompt's ORIGINAL INPUT still shows `auth`, so the
     worker answers rename(from=auth) — the answer the old reverting
-    retry accepted. It must be translated and applied, not rejected
-   ."""
+    retry accepted. It must be translated and applied, not rejected."""
     plans = [{"domain": "feat", "status": "ready", "subtasks": [
         _r1_sub("feat-001", provides=["fe"], requires=["auth"]),
         _r1_sub("feat-002", provides=["session-auth"])]}]
@@ -2800,9 +2796,10 @@ def test_apply_layered_drop_keyed_by_absorbed_id_holds(leerie):
 def test_survivor_map_ignores_earlier_phase_merges(leerie):
     """A `_merged_from` stamp from an earlier phase naming the same id
     does not compete: the map follows only this reconcile's applied
-    merges."""
-    by_id = {"feat-007": {"id": "feat-007", "_merged_from": ["feat-900"]},
-             "feat-008": {"id": "feat-008", "_merged_from": ["feat-900"]}}
+    merges. The earlier-phase stamp comes LAST, so a stamp-based map
+    (last wins) would answer feat-007 — the inputs disagree."""
+    by_id = {"feat-008": {"id": "feat-008", "_merged_from": ["feat-900"]},
+             "feat-007": {"id": "feat-007", "_merged_from": ["feat-900"]}}
     assert leerie._survivor_map(
         [{"into": "feat-008", "from": "feat-900"}], by_id) == {
             "feat-900": "feat-008"}
@@ -2835,6 +2832,142 @@ def test_apply_layered_genuine_self_edge_still_dies(leerie):
         leerie._apply_reconciler_output(plans, {"dependency_edges": [
             {"from": "feat-001", "to": "feat-001"}]},
             restatable=set(), applied_merges=merge)
+
+
+def test_apply_layered_fold_keeps_survivors_own_require(leerie):
+    """A drop recorded against the absorbed connector blocks only the
+    restatement re-adding that require — never the survivor's own entry
+    for the same tag."""
+    plans = [{"domain": "feat", "subtasks": [
+        _r1_sub("feat-002", requires=["t"]),
+        _r1_sub("feat-003", provides=["t"])]},
+        {"domain": "_reconciler", "subtasks": [
+            _r1_recon("feat-900", provides=["x"])]}]
+    merge = [{"into": "feat-002", "from": "feat-900"}]
+    leerie._apply_reconciler_output(plans, {"merged_subtasks": merge})
+    leerie._apply_reconciler_output(plans, {"added_subtasks": [
+        _r1_sub("feat-900", provides=["x"], requires=["t"])]},
+        restatable={"feat-900"}, restated_drops={("feat-900", "t")},
+        applied_merges=merge)
+    assert _conn(plans, "feat-002")["requires"] == [
+        {"tag": "t", "extent": "in_plan"}]
+
+
+def test_survivor_map_skips_an_id_live_again(leerie):
+    """An id a later applied output reused for a new, live subtask is
+    not redirected — its references are its own."""
+    by_id = {"feat-001": {"id": "feat-001"}, "feat-002": {"id": "feat-002"}}
+    assert leerie._survivor_map(
+        [{"into": "feat-002", "from": "feat-001"}], by_id) == {}
+
+
+def test_apply_layered_redirects_sid_of_rename_provide_and_drop(leerie):
+    """renames / added_provides / dropped_requires naming an absorbed sid
+    act on its survivor."""
+    plans = [{"domain": "feat", "subtasks": [
+        _r1_sub("feat-001", requires=["a", "d"]), _r1_sub("feat-002")]}]
+    merge = [{"into": "feat-002", "from": "feat-001"}]
+    leerie._apply_reconciler_output(plans, {"merged_subtasks": merge})
+    leerie._apply_reconciler_output(plans, {
+        "renames": [{"sid": "feat-001", "from": "a", "to": "b"}],
+        "added_provides": [{"sid": "feat-001", "tag": "p"}],
+        "dropped_requires": [{"sid": "feat-001", "tag": "d"}],
+    }, restatable=set(), applied_merges=merge)
+    surv = _conn(plans, "feat-002")
+    assert [r["tag"] for r in surv["requires"]] == ["b"]
+    assert "p" in surv["provides"]
+
+
+def test_apply_layered_does_not_redirect_conditional_drop(leerie):
+    """A conditional_drop naming an absorbed sid is not redirected:
+    dropping the survivor would remove work the worker never named."""
+    plans = [{"domain": "feat", "subtasks": [
+        _r1_sub("feat-001"), _r1_sub("feat-002")]}]
+    merge = [{"into": "feat-002", "from": "feat-001"}]
+    leerie._apply_reconciler_output(plans, {"merged_subtasks": merge})
+    leerie._apply_reconciler_output(plans, {"conditional_drops": [
+        {"sid": "feat-001", "reason": "r"}]},
+        restatable=set(), applied_merges=merge)
+    assert [s["id"] for s in plans[0]["subtasks"]] == ["feat-002"]
+
+
+def test_apply_layered_removes_edge_collapsing_onto_one_survivor(leerie):
+    """An edge between two ids now merged into one survivor is removed,
+    not turned into a self-edge die."""
+    plans = [{"domain": "feat", "subtasks": [
+        _r1_sub("feat-001"), _r1_sub("feat-002"), _r1_sub("feat-003")]}]
+    merges = [{"into": "feat-003", "from": "feat-001"},
+              {"into": "feat-003", "from": "feat-002"}]
+    leerie._apply_reconciler_output(plans, {"merged_subtasks": merges})
+    leerie._apply_reconciler_output(plans, {"dependency_edges": [
+        {"from": "feat-001", "to": "feat-002"}]},
+        restatable=set(), applied_merges=merges)
+    assert _conn(plans, "feat-003")["depends_on"] == []
+
+
+def test_apply_layered_new_merge_from_absorbed_id_dies(leerie):
+    """A NEW merge whose `from` an applied merge absorbed is not
+    redirected — it would merge the whole survivor away — so it dies as
+    missing."""
+    plans = [{"domain": "feat", "subtasks": [
+        _r1_sub("feat-001"), _r1_sub("feat-002"), _r1_sub("feat-003")]}]
+    merge = [{"into": "feat-002", "from": "feat-001"}]
+    leerie._apply_reconciler_output(plans, {"merged_subtasks": merge})
+    with pytest.raises(SystemExit):
+        leerie._apply_reconciler_output(plans, {"merged_subtasks": [
+            {"into": "feat-003", "from": "feat-001"}]},
+            restatable=set(), applied_merges=merge)
+
+
+def test_merge_restated_connector_drops_self_dependency(leerie):
+    """With no redirect in play, a restated connector naming itself in
+    `depends_on` loses that entry via `self_ids`."""
+    plans = [{"domain": "_reconciler", "subtasks": [_r1_recon("feat-900")]}]
+    leerie._apply_reconciler_output(plans, {"added_subtasks": [
+        {**_r1_sub("feat-900"), "depends_on": ["feat-900"]}]},
+        restatable={"feat-900"})
+    assert plans[0]["subtasks"][0]["depends_on"] == []
+
+
+def test_redirect_strips_new_connectors_self_dependency(leerie):
+    """The redirect pre-pass removes an added subtask's dependency that
+    resolves to itself."""
+    out = leerie._redirect_absorbed_ids({"added_subtasks": [
+        {"id": "feat-002", "depends_on": ["feat-001", "feat-003"]}]},
+        {"feat-001": "feat-002"})
+    assert out["added_subtasks"][0]["depends_on"] == ["feat-003"]
+
+
+def test_unresolved_retry_answer_naming_absorbed_sid_is_validated(
+    leerie, monkeypatch, tmp_path
+):
+    """Attempt 1 merges feat-001 (requiring `x`) into feat-002, so the
+    unresolved entry names feat-002. The worker, reading the pre-attempt-1
+    input, answers drop_require(feat-001, x). The validator must see it
+    redirected, as the apply step will — not reject it."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["x"],
+                files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"], files=["shared.py"])]}]
+    conf = {"reconciliation": 9.0, "basis": "t", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+    base = {"added_subtasks": [], "added_requires": [], "tag_ops": [],
+            "renames": [], "dependency_edges": [], "merged_subtasks": [],
+            "confidence": conf}
+    a1 = {**base, "merged_subtasks": [
+        {"into": "feat-002", "from": "feat-001", "reason": "overlap"}]}
+    a2 = {**base, "tag_ops": [{"op": "drop_require", "sid": "feat-001",
+                               "tag": "x", "reason": "over-specified"}]}
+
+    async def fake_claude_p(**kw):
+        return a2 if "ALREADY APPLIED" in kw["user_prompt"] else a1
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    result = asyncio.run(leerie.phase_reconcile(
+        plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
+        {"reconciler": "sonnet"}, {"reconciler": "medium"}))
+    assert _conn(result, "feat-002")["requires"] == []
 
 
 def test_unresolved_retry_keeps_attempt_1_resolutions(
