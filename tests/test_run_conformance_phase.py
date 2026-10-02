@@ -1478,3 +1478,29 @@ def test_worktree_rename_origin_desync_does_not_swallow_records(env):
         env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
         env["caps"], env["st"], env["models"], env["efforts"]))
     assert res.get("conformer_repair_rolled_back") is True, (res, warnings)
+
+
+@_pytest.mark.parametrize("claimed", ["tests_new", "tests_new/", "."],
+                          ids=["dir", "dir-slash", "dot"])
+def test_directory_citation_does_not_mask_uncommitted_tests(env, claimed):
+    """The validator accepts a DIRECTORY citation (exists(), never
+    is_file()), while `-uall` porcelain prints only the files beneath
+    it — a bare intersection matched nothing and the phantom counted
+    (executed, all three spellings). Ancestor-prefix matching closes
+    it."""
+    c = env["leerie"]
+
+    def _new_dir_uncommitted(wt: Path):
+        (wt / "tests_new").mkdir(exist_ok=True)
+        (wt / "tests_new" / "test_d.py").write_text("def test_d(): pass\n")
+
+    result = _clean_result()
+    result["tests_updates"] = [{"path": claimed, "reason": "covers d"}]
+    result["file_updates"] = [{"kind": "tests", "path": claimed,
+                               "reason": "covers d"}]
+    _stub_run_conformer(c, [result], commits={0: _new_dir_uncommitted})
+    _stub_measure_axes(c, {})
+    res, warnings, _blocked = asyncio.run(c._run_conformance_phase(
+        env["sid"], env["run_dir"], str(env["worktree"]), env["subtask"],
+        env["caps"], env["st"], env["models"], env["efforts"]))
+    assert res.get("conformer_repair_rolled_back") is True, (res, warnings)

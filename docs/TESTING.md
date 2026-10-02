@@ -4081,10 +4081,15 @@ uncommitted-tests-path check via the full `-z -uall` porcelain parse
 (`test_uncommitted_tests_entry_neutralizes_repair`,
 `test_uncommitted_tests_file_in_new_directory_is_caught`, the
 parametrized `test_porcelain_evasion_shapes_are_caught` over
-space/non-ASCII/staged-rename paths, and
-`test_noncanonical_cited_path_is_still_caught` for `./`-prefixed and
-absolute citations, which the validator resolves but exact-string
-matching missed).
+space/non-ASCII/staged-rename paths,
+`test_worktree_rename_origin_desync_does_not_swallow_records` — the
+two-sided ` R` record walk whose one-sided mutant survived every other
+test — `test_noncanonical_cited_path_is_still_caught` over
+`./`-prefixed, absolute, trailing-space and tab-prefixed citations
+(the validator strips and resolves; exact-string matching missed
+each), and `test_directory_citation_does_not_mask_uncommitted_tests`
+over dir / dir-slash / `.` citations — ancestor-prefix matching,
+because the validator checks existence, never file-ness).
 
 **The PR composition renderers** (two live paths plus `compose_pr_body`,
 the never-invoked canonical reference the bash fallback mirrors):

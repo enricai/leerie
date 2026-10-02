@@ -31221,7 +31221,17 @@ async def _run_conformance_phase(sid: str, leerie_dir: Path,
                             and _i < len(_fields):
                         unclean.add(_fields[_i])
                         _i += 1
-            if tests_paths & unclean:
+            # Ancestor-prefix match, not bare intersection: the validator
+            # accepts a DIRECTORY citation (it checks exists(), never
+            # is_file() — a pre-existing laxness this feature makes
+            # load-bearing), while `-uall` porcelain prints only the
+            # files beneath it, so "tests_new" / "." as the cited path
+            # intersected nothing and the phantom counted (executed,
+            # three spellings).
+            _phantom = any(
+                u == c or c == "." or u.startswith(c + "/")
+                for c in tests_paths for u in unclean if u)
+            if _phantom:
                 warnings.append(
                     f"conformer round {c_round}: tests file_updates "
                     "entry references an uncommitted path — not counted "
