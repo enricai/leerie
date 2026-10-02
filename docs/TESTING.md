@@ -4070,13 +4070,20 @@ threads the challenge text (detail values, not a key) into the
 `_run_conformer` call, a risk-free result threads `None`, and the real
 `_run_conformer` renders a given block into the worker's user prompt.
 The same file carries the producer-side survival pins for
-`conformer_repair_rolled_back`, one per flag-setting arm plus the
-evasion shapes: protected-path rollback
+`conformer_repair_rolled_back`, one per flag-setting arm (six
+assignment sites) plus the evasion shapes: protected-path rollback
 (`test_protected_path_rollback_neutralizes_repair_records`),
 strict-clobber rollback
 (`test_strict_clobber_rollback_neutralizes_repair_records`), the
 honesty-validator rejection
-(`test_malformed_result_neutralizes_repair_records`), and the
+(`test_malformed_result_neutralizes_repair_records`), the
+committed-by-this-pass rule
+(`test_zero_commit_pass_citing_committed_path_is_neutralized` — a
+cited path absent from the phase's own diff;
+`test_zero_commit_fixed_claim_is_neutralized` — fixed:true with zero
+phase commits; and the positive control
+`test_committed_cited_repair_is_not_neutralized`, proving a real
+committed repair still clears), and the
 uncommitted-tests-path check via the full `-z -uall` porcelain parse
 (`test_uncommitted_tests_entry_neutralizes_repair`,
 `test_uncommitted_tests_file_in_new_directory_is_caught`, the
