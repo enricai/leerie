@@ -1155,7 +1155,7 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
-Three review rounds, each executing code, broke the "re-emitting an
+Four review rounds, each executing code, broke the "re-emitting an
 applied op is harmless" claim. Each break has a test that fails on the
 build it broke, with one exception noted under round two.
 
@@ -1192,6 +1192,14 @@ Round three, against round two's fixes:
 - a new merge naming an absorbed id, which merged the whole survivor
   away.
 
+Round four, against round three's fixes:
+- the answer is now redirected twice (in `phase_reconcile`, then in
+  the apply step). A worker-written self-merge on an absorbed id was
+  rewritten by the first pass into a collapsing merge, which the second
+  pass silently removed instead of dying on;
+- an absorbed id the retry itself reused for a new subtask had its
+  edges rewired to the old survivor.
+
 Separately, the layered build first rejected a natural answer naming a
 consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),
 which the reverting retry had accepted. Its fix, translation, then
@@ -1201,9 +1209,11 @@ mistranslated a tag the consumer still held. Both cases are pinned
 
 `test_unresolved_retry_after_size_and_cycle_retries_sees_both` drives
 size → cycle → unresolved retries through real `phase_reconcile`: the
-"applied" set must include both retries' outputs. Ten tests are
-mutant guards, which pass on the build they were added against and
-fail on the mutant that removes the behaviour:
+"applied" set must include both retries' outputs. Twelve tests are
+mutant guards, which fail on the mutant that removes the behaviour.
+Each passes on the build it was added against, except the self-edge
+guard: it trips on the `applied_merges` keyword there, and passes once
+that later argument is adapted away.
 - the `_merged_from` union;
 - the never-existed-merge die;
 - the binding skip for a dropped or self-provided require;
@@ -1214,7 +1224,9 @@ fail on the mutant that removes the behaviour:
   test, which kills each of the three per-op mutants);
 - the conditional-drop exemption;
 - `self_ids` in `_merge_restated_connector`;
-- the pre-pass self-strip of `depends_on`.
+- the pre-pass self-strip of `depends_on`;
+- the held-tag check reading an absorbed sid's survivor;
+- translating before redirecting.
 
 Every reconciler test stubs the worker, so the live behaviour was
 measured separately. Real `claude -p` ran as attempt 2 on fc56, from the

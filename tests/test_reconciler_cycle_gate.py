@@ -2560,9 +2560,9 @@ def test_apply_layered_restate_unions_merged_from(leerie):
 
 
 def test_apply_layered_still_dies_on_merge_from_never_existing_id(leerie):
-    """The repeated-merge skip applies only to a `from` the survivor's
-    `_merged_from` records; a merge naming an id that never existed
-    still dies."""
+    """A repeated merge is removed only when its endpoints collapse onto
+    one survivor through the applied merges; a merge naming an id that
+    never existed still dies."""
     plans = [{"domain": "feat", "subtasks": [_r1_sub("feat-001")]}]
     with pytest.raises(SystemExit):
         leerie._apply_reconciler_output(plans, {"merged_subtasks": [
@@ -2801,7 +2801,7 @@ def test_survivor_map_ignores_earlier_phase_merges(leerie):
     by_id = {"feat-008": {"id": "feat-008", "_merged_from": ["feat-900"]},
              "feat-007": {"id": "feat-007", "_merged_from": ["feat-900"]}}
     assert leerie._survivor_map(
-        [{"into": "feat-008", "from": "feat-900"}], by_id) == {
+        [{"into": "feat-008", "from": "feat-900"}], by_id, set()) == {
             "feat-900": "feat-008"}
 
 
@@ -2858,7 +2858,7 @@ def test_survivor_map_skips_an_id_live_again(leerie):
     not redirected — its references are its own."""
     by_id = {"feat-001": {"id": "feat-001"}, "feat-002": {"id": "feat-002"}}
     assert leerie._survivor_map(
-        [{"into": "feat-002", "from": "feat-001"}], by_id) == {}
+        [{"into": "feat-002", "from": "feat-001"}], by_id, set()) == {}
 
 
 def test_apply_layered_redirects_sid_of_rename_provide_and_drop(leerie):
@@ -2968,6 +2968,110 @@ def test_unresolved_retry_answer_naming_absorbed_sid_is_validated(
         plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
         {"reconciler": "sonnet"}, {"reconciler": "medium"}))
     assert _conn(result, "feat-002")["requires"] == []
+
+
+def _r4_base():
+    conf = {"reconciliation": 9.0, "basis": "t", "falsifiers_tested": [],
+            "contradictions_reconciled": [], "gap_to_close": {}}
+    return {"added_subtasks": [], "added_requires": [], "tag_ops": [],
+            "renames": [], "dependency_edges": [], "merged_subtasks": [],
+            "confidence": conf}
+
+
+def _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2):
+    async def fake_claude_p(**kw):
+        return a2 if "ALREADY APPLIED" in kw["user_prompt"] else a1
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    return asyncio.run(leerie.phase_reconcile(
+        plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
+        {"reconciler": "sonnet"}, {"reconciler": "medium"}))
+
+
+def test_unresolved_retry_worker_written_self_merge_still_dies(
+    leerie, monkeypatch, tmp_path
+):
+    """The retry's answer is redirected twice (phase_reconcile, then the
+    apply step). A self-merge {into: X, from: X} on an id an applied merge
+    absorbed must survive both passes as worker-written and die — not be
+    rewritten by the first pass into a collapsing merge the second pass
+    silently removes."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["x"],
+                files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"], files=["shared.py"])]}]
+    a1 = {**_r4_base(), "merged_subtasks": [
+        {"into": "feat-002", "from": "feat-001", "reason": "overlap"}]}
+    a2 = {**_r4_base(),
+          "tag_ops": [{"op": "drop_require", "sid": "feat-002", "tag": "x",
+                       "reason": "r"}],
+          "merged_subtasks": [{"into": "feat-001", "from": "feat-001",
+                               "reason": "r"}]}
+    with pytest.raises(SystemExit):
+        _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+
+
+def test_apply_layered_retry_reusing_absorbed_id_is_not_redirected(leerie):
+    """A retry that adds a NEW subtask under an id an applied merge
+    absorbed owns that id from then on: its edges and dependencies are
+    not rewired to the old survivor."""
+    plans = [{"domain": "feat", "subtasks": [
+        _r1_sub("feat-001"), _r1_sub("feat-002"), _r1_sub("feat-003")]}]
+    merge = [{"into": "feat-002", "from": "feat-001"}]
+    leerie._apply_reconciler_output(plans, {"merged_subtasks": merge})
+    leerie._apply_reconciler_output(plans, {
+        "added_subtasks": [{**_r1_sub("feat-001", provides=["x"]),
+                            "depends_on": ["feat-002"]}],
+        "dependency_edges": [{"from": "feat-001", "to": "feat-003"}],
+    }, restatable=set(), applied_merges=merge)
+    assert _conn(plans, "feat-003")["depends_on"] == ["feat-001"]
+    assert _conn(plans, "feat-001")["depends_on"] == ["feat-002"]
+
+
+def test_unresolved_retry_held_check_reads_the_survivor(
+    leerie, monkeypatch, tmp_path
+):
+    """Attempt 1 renames feat-001's `old` to `new`, then merges feat-001
+    into feat-002, which holds `old` itself. A retry rename keyed by the
+    absorbed sid with from=`old` names a tag the SURVIVOR still holds, so
+    it must not be translated to `new` (the held set is aliased to the
+    survivor)."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["old"],
+                files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"], requires=["old"],
+                files=["shared.py"]),
+        _r1_sub("feat-003", provides=["new", "real"])]}]
+    a1 = {**_r4_base(),
+          "renames": [{"sid": "feat-001", "from": "old", "to": "new"}],
+          "merged_subtasks": [{"into": "feat-002", "from": "feat-001",
+                               "reason": "overlap"}]}
+    a2 = {**_r4_base(),
+          "renames": [{"sid": "feat-001", "from": "old", "to": "real"}]}
+    result = _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+    assert leerie._compute_unresolved_requires(result) == []
+
+
+def test_unresolved_retry_translates_before_redirecting(
+    leerie, monkeypatch, tmp_path
+):
+    """Applied renames are keyed by the sid the worker named, so a
+    pre-rename tag on an absorbed sid must be translated BEFORE that sid
+    is redirected to its survivor."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["old"],
+                files=["shared.py"]),
+        _r1_sub("feat-002", provides=["b"], files=["shared.py"]),
+        _r1_sub("feat-003", provides=["real"])]}]
+    a1 = {**_r4_base(),
+          "renames": [{"sid": "feat-001", "from": "old", "to": "new"}],
+          "merged_subtasks": [{"into": "feat-002", "from": "feat-001",
+                               "reason": "overlap"}]}
+    a2 = {**_r4_base(),
+          "renames": [{"sid": "feat-001", "from": "old", "to": "real"}]}
+    result = _r4_run(leerie, monkeypatch, tmp_path, plans, a1, a2)
+    assert [r["tag"] for r in _conn(result, "feat-002")["requires"]] == [
+        "real"]
 
 
 def test_unresolved_retry_keeps_attempt_1_resolutions(
