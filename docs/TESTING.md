@@ -1131,268 +1131,69 @@ correct code, since the unparser emits single quotes.
 ### Layered unresolved-tags retry
 
 `tests/test_reconciler_cycle_gate.py` pins DESIGN §5 *The unresolved-tags
-retry is layered*. The regression, `test_unresolved_retry_keeps_attempt_1_resolutions`,
-is barnacle run fc56e9e5's shape. Attempt 1 renames one consumer onto
-its producer and leaves a second tag with none. Attempt 2 answers only
-the residue. Against the old reverting retry it fails with the same
-still-unresolved-after-retry abort the run hit (one consumer here, two
-in the run). `test_unresolved_retry_restated_connector_replays_0cfb46a0`
-replays the corpus's other unresolved retry, where attempt 2 restated
-attempt 1's connector under the same id. It passes against the old
-reverting retry too, and it pins the restate path rather than the
-layering. A layered apply without `restatable` dies on that live
-shape.
+retry is layered* and *The retry worker sees the current plan*.
 
-Restatement is pinned on three axes:
+- **The regression.** `test_unresolved_retry_keeps_attempt_1_resolutions`
+  is barnacle run fc56e9e5's shape. Attempt 1 renames one consumer onto
+  its producer and leaves a second tag with none; the retry answers only
+  the residue. Against origin/main's reverting retry it fails with the
+  same still-unresolved-after-retry abort the run hit (one consumer here,
+  two in the run).
+- **The input.** `test_unresolved_retry_prompt_shows_the_current_plan`
+  parses the retry prompt's payload and asserts it is the plan after
+  attempt 1: the renamed tag, the connector attempt 1 added, only the
+  residue as `unresolved_requires`, and no pre-attempt tag, ALREADY
+  APPLIED list or ORIGINAL INPUT.
+  `test_unresolved_retry_stale_pre_rename_reference_fails_loudly` pins
+  the other half: an answer naming a pre-rename tag is not interpreted,
+  and the run dies at must-include, asserted by its message. Both fail
+  on origin/main and on the guessing build they replaced (`1c9ffa7`). The
+  fake worker routes on "still unresolved", which every version's retry
+  prompt contains, so the comparison is fair.
+- **Re-declared connectors.** A connector the applied outputs added may
+  be re-declared:
+  - `test_apply_layered_merges_restated_connector`,
+    `…_restate_keeps_absorbed_subtask_content`, `…_restate_prunes_self_require`,
+    `…_restate_unions_merged_from`, `test_merge_restated_connector_drops_self_dependency`
+    and `…_restated_dependency_on_same_output_subtask_kept` pin the merge;
+  - `…_duplicate_restated_connector_dies`,
+    `test_apply_without_restatable_still_dies_on_reconciler_id_collision` and
+    `…_still_dies_on_planner_id_collision` pin its limits;
+  - `test_unresolved_retry_restated_connector_replays_0cfb46a0` replays the
+    corpus's other unresolved retry, where attempt 2 re-declared attempt
+    1's connector. It passes on origin/main too; it pins that layering
+    keeps that answer working.
+- **Bindings and own renames.** `…_binds_requires_to_attempt_1_connector`,
+  `…_bind_skips_self_provided_require`, the two `…_keeps_this_retrys_rename`
+  tests, `test_apply_own_renames_replays_a_chain_in_order` and
+  `…_rename_that_matched_nothing_not_applied_to_bind`.
+- **Composition and audit.** `test_unresolved_retry_after_size_and_cycle_retries_sees_both`
+  drives size → cycle → unresolved through real `phase_reconcile`;
+  `…_merges_conditional_drop_audit` pins the audit across the two
+  attempts.
 
-- **Merge, not replace.** `test_apply_layered_merges_restated_connector`
-  fails against a replace implementation, which silently dropped attempt
-  1's `requires` and inbound `depends_on`.
-- **Scope.** `test_apply_layered_dies_on_connector_from_an_earlier_reconcile`
-  covers a re-plan reconcile reusing an earlier connector's id. That case
-  must still die.
-- **Binding.** `test_apply_layered_binds_requires_to_attempt_1_connector`
-  plus its `phase_reconcile`-level twin cover an `added_requires` that
-  names an attempt-1 connector without restating it.
+**How the design got here.** An earlier version showed the retry worker
+the pre-attempt-1 input plus a list of attempt 1's operations. It then
+had to guess what stale references and re-emitted operations meant:
+translating pre-rename tags, redirecting merged-away ids, removing and
+restoring repeats. Ten rounds of independent review, including property
+fuzzing, kept finding new corners in that guessing layer. Each fix
+opened another (`git log` on this file's history and the branch's
+commit messages carry the detail). Replacing the input with the current
+plan removed the layer and its tests.
 
-Nine review rounds, each executing code, broke the "re-emitting an
-applied op is harmless" claim. Each break has a test that fails on the
-build it broke, with one exception noted under round two.
+**Live and corpus evidence.** Every test above stubs the worker, so the
+live behaviour was measured separately. Real `claude -p` ran as attempt 2
+on fc56, from the recorded attempt 1:
+- the old reverting retry died 5/5, and its worker restated 0 of 15
+  attempt-1 renames;
+- on this design's prompt, fc56 and 0cfb46a0 converged 3/3 each, and no
+  answer restated an earlier op.
 
-Round one, against the first layered build:
-- a re-emitted edge naming an id attempt 1 merged away;
-- a binding to a merged-away connector, lost silently;
-- a restated connector attempt 1 merged away, which came back as a
-  duplicate producer;
-- a restatement discarding a subtask attempt 1 merged into the
-  connector;
-- a restatement re-adding a require attempt 1 dropped;
-- a connector satisfying its own require.
-
-Round two, against round one's fixes:
-- a restated connector's `depends_on` naming a merged-away id;
-- a restated merge chain;
-- a fold that made its survivor depend on itself;
-- a drop recorded against the absorbed id, not the survivor;
-- redirects resolved through an earlier phase's `_merged_from` stamp.
-  `_survivor_map` now follows only the reconcile's applied merges.
-  This one is the exception. Its test
-  (`test_survivor_map_ignores_earlier_phase_merges`) first failed on the
-  round-one build only through a signature change; as written then, it
-  passed on stamp-based semantics by dict order. It was reordered in
-  round three so a stamp-based map gives a different answer.
-
-Round three, against round two's fixes:
-- a fold's drop filter stripping the survivor's own require for the
-  same tag;
-- an id a later output reused, redirected away from the live subtask;
-- the must-include check judging the answer before the redirect, so it
-  rejected an answer naming an absorbed sid that the apply step would
-  have handled;
-- a new merge naming an absorbed id, which merged the whole survivor
-  away.
-
-Round four, against round three's fixes:
-- the answer is now redirected twice (in `phase_reconcile`, then in
-  the apply step). A worker-written self-merge on an absorbed id was
-  rewritten by the first pass into a collapsing merge, which the second
-  pass silently removed instead of dying on;
-- an absorbed id the retry itself reused for a new subtask had its
-  edges rewired to the old survivor.
-
-Round five, against round four's fixes: round four's answer to the
-reuse case (leave a reused id unredirected) let a restated merge
-silently swallow the reused subtask. Reuse of an absorbed id for a new
-subtask is ambiguous by construction, so it now dies like any id
-collision (`test_apply_layered_new_subtask_reusing_absorbed_id_dies`
-and its `phase_reconcile` twin). A worker-written self-edge is now left
-exactly as written, as the docs already claimed
-(`test_redirect_leaves_worker_written_self_references_as_written`).
-
-Round six, a property fuzz over real `phase_reconcile`. It generated
-random attempt-1 outputs, then retries that re-emit a random subset of
-the applied ops plus a fix. Re-emission changed the final plan in 144
-of 3,136 retry trials (51 of the 784 seeds that reached a comparison,
-out of 3,000 generated), all in three classes:
-- a repeated drop or rename on an absorbed id redirected onto the
-  survivor's own entry;
-- a repeated drop undoing a tag an applied merge brought back;
-- a restated connector reviving a dependency on a conditionally
-  dropped subtask.
-
-A fourth finding was a double fold of one absorbed connector restated
-twice. Each now has a test that fails on the round-five build
-(`test_unresolved_retry_reemitted_*`,
-`test_unresolved_retry_restatement_does_not_revive_dropped_dependency`,
-`test_apply_layered_duplicate_restated_absorbed_connector_dies`). The
-same fuzz re-run on the fixed build gives 0 changed plans in 3,136
-trials.
-
-Its companion compared full restatements, which the old reverting retry
-expected, against origin/main, over 2,000 seeds. Before the fix, 32 of
-530 runs accepted by both differed. After the fix, 0 of 530 do.
-
-Round seven extended that fuzz to size → cycle → unresolved
-compositions, connectors with requires, folds, binds, chained merges,
-and fixes that name pre-rename tags or absorbed sids. It found three
-defects:
-- Round six's exact-repeat filter treated an op attempt 1 *wrote* as
-  one it *performed*. A drop or rename that was a no-op when applied,
-  and that a later merge made necessary, was deleted as a repeat, and
-  the run died (`test_unresolved_retry_repeated_noop_*`).
-
-  A first fix — keep a repeat whose target entry is unresolved — was
-  itself broken by the extended fuzz. Through an absorbed alias, such a
-  repeat removed the survivor's unresolved entry even when the
-  worker's fix had already addressed it
-  (`test_unresolved_retry_repeat_via_alias_spares_entry_fix_addresses`).
-
-  The rule is now remove-then-restore: every exact repeat is removed,
-  and one is put back only if nothing else in the answer addresses its
-  target (`test_drop_reemitted_ops_removes_exact_repeats`,
-  `test_restore_needed_repeats_only_for_unaddressed_targets`).
-  Repeated `add_provide`s follow the same rule; one on a connector its
-  own output added never took effect.
-- A restated connector, or a re-emitted `added_requires` row, unioned
-  back a tag the same retry's rename had just fixed. Renames now apply
-  to what such a restatement brings in
-  (`test_unresolved_retry_*_keeps_this_retrys_rename`).
-- A re-emitted edge whose endpoint a later applied output removed
-  died. Exact repeats of applied edges are removed.
-
-On the final build, over 1,600 seeds, the extended fuzz gives:
-- Property A (re-emission changes nothing): 85 of 2,304 compared
-  trials differ, and every one is a restated connector deduplicating a
-  duplicate requires entry. Same set, same graph.
-- Property B (full restatement vs origin/main): 1,152 compared trials.
-  origin/main never accepts what this build rejects. Of the 15 that
-  both accept with different plans, 8 are that dedup. The other 7 are
-  origin/main's revert ordering turning a fix op into a no-op; this
-  build's full-restatement plan equals its fix-only plan in all 7.
-
-Round eight's fuzz reached size → cycle → unresolved compositions far
-more often than round seven's (the earlier generator hit that path in 8
-of 1,152 property-B trials). It found two more defects:
-- A restatement, or a re-emitted `added_requires` row, of a connector
-  put back a tag an EARLIER applied output had renamed. Only the
-  retry's own renames were applied to incoming requires. Translation
-  now covers them
-  (`test_unresolved_retry_restatement_carries_earlier_outputs_rename`).
-- A connector merged into a subtask that a later output conditionally
-  dropped was resurrected when restated, and a re-emitted merge naming
-  it died. Restatement now skips it, and exact repeats of applied
-  merges are removed
-  (`test_unresolved_retry_connector_merged_into_dropped_subtask_stays_gone`).
-
-Own renames now replay a chain in emission order
-(`test_apply_own_renames_replays_a_chain_in_order`).
-
-Re-running round eight's fuzz against those fixes found three more
-classes. Each minimized to one re-emitted op, and each now has a test
-that fails on the pre-fix build:
-- translation following a rename that never took effect
-  (`test_unresolved_retry_rebound_require_ignores_rename_that_never_took`);
-- translation carrying a dropped tag past the drop filter through a
-  later no-op rename
-  (`test_unresolved_retry_rebound_require_stays_dropped_despite_later_rename`);
-- two repeats restored for one entry
-  (`test_unresolved_retry_restores_one_repeat_per_entry`).
-
-On the final build, over 1,600 seeds:
-- Round eight's property A: 90 of 2,372 compared trials differ. 82 are
-  the requires dedup. In the other 8 the fix alone dies at must-include
-  and the re-emitted op is the worker's real answer, which is the
-  generator's fix being insufficient, not re-emission changing a
-  working plan.
-- Round eight's property B, 1,186 compared trials: origin/main never
-  accepts what this build rejects. Of the 5 that both accept with
-  different plans, 3 are the dedup; in the other 2 this build's
-  full-restatement plan equals its fix-only plan.
-- Round seven's and round six's fuzzers give the same results as
-  before.
-
-Round nine found five more, by construction rather than fuzz:
-- `_effective_renames` kept a rename naming a subtask an earlier output
-  had merged away, so a stray drop was translated onto the survivor's
-  own resolved require
-  (`test_unresolved_retry_stray_drop_ignores_rename_on_merged_away_subtask`).
-- A restated or re-bound connector folded into its survivor did not see
-  a later output's rename keyed by the survivor
-  (`test_unresolved_retry_folded_connector_sees_later_rename_on_survivor`).
-- A retry rename that rewrote nothing was still replayed on a
-  re-emitted requires row
-  (`test_unresolved_retry_rename_that_matched_nothing_not_applied_to_bind`).
-- Rename chains inside one answer were broken in two ways: a restored
-  link was appended after the next one, and the next link's `from` was
-  translated as if stale (`test_unresolved_retry_restored_rename_keeps_its_place_in_a_chain`,
-  `test_unresolved_retry_chain_link_is_not_translated`).
-
-Separately, the layered build first rejected a natural answer naming a
-consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),
-which the reverting retry had accepted. Its fix, translation, then
-mistranslated a tag the consumer still held. Both cases are pinned
-(`test_unresolved_retry_accepts_answer_naming_pre_rename_tag`,
-`test_unresolved_retry_rename_that_never_applied_is_not_translated`).
-
-`test_unresolved_retry_after_size_and_cycle_retries_sees_both` drives
-size → cycle → unresolved retries through real `phase_reconcile`: the
-"applied" set must include both retries' outputs. Seventeen tests are
-mutant guards, which fail on the mutant that removes the behaviour.
-Each passes on the build it was added against, with two qualifications.
-The self-edge guard trips on the `applied_merges` keyword there, and
-passes once that later argument is adapted away. The survivor-scoping
-guard passes on the build its fixture was reordered against, not the
-one it was first added against (see round two).
-- the `_merged_from` union;
-- the never-existed-merge die;
-- the binding skip for a dropped or self-provided require;
-- the die on a genuine `from == to` edge while a redirect is active;
-- survivor scoping, with the reordered fixture;
-- removing a collapsed edge;
-- the sid redirect of renames, add_provides and drop_requires (one
-  test, which kills each of the three per-op mutants);
-- the conditional-drop exemption;
-- `self_ids` in `_merge_restated_connector`;
-- the pre-pass self-strip of `depends_on`;
-- the held-tag check reading an absorbed sid's survivor;
-- translating before redirecting;
-- restoring a needed repeated rename
-  (`test_unresolved_retry_rename_that_never_applied_is_not_translated`);
-- `live_ids` keeping a dependency on a subtask the same output adds;
-- filtering a repeated `add_provide`
-  (`test_unresolved_retry_repeated_add_provide_on_own_connector_not_added`);
-- keying a retry's own renames by the survivor when an absorbed
-  connector is restated
-  (`test_unresolved_retry_folded_restatement_keeps_this_retrys_rename`);
-- one restored provide per tag (`test_restore_needed_repeats_one_provide_per_tag`).
-
-Every reconciler test stubs the worker, so the live behaviour was
-measured separately. Real `claude -p` ran as attempt 2 on fc56, from the
-recorded attempt 1. The old retry died 5/5, and its worker restated 0 of
-15 attempt-1 renames. The layered retry converged 5/5, and 3/3 on
-0cfb46a0. Those trials ran before the wire-vocabulary rendering below.
-Re-run live on b98aece's code, which renders through it, fc56 and
-0cfb46a0 converged 3/3 each.
 A replay of every locally recorded run with pre-reconcile plans gave
-plans identical to the old code in all runs where both finished. Most of
-those never reach the retry this changes: they made no reconciler call,
-or one call with no unresolved-tags retry. Only two runs in the corpus ever logged that
-retry, which is why the edge cases above are pinned by constructed
-tests rather than corpus replay.
-
-`tests/test_strict_output_proxy.py::test_retry_prompts_only_name_ops_the_schema_accepts`
-covers the prompt's ALREADY APPLIED block, which renders attempt 1's
-ops back to the worker. Its fixture used to hold renames only, and
-renames render the same in either shape, so the first layered build
-passed it. That build rendered the retired `added_provides` /
-`dropped_requires` / `conditional_drops` keys for any attempt 1 that
-held those ops. The fixture now carries every op kind and fails on that
-build.
-
-The guard's `retired` set does not cover nested `requires` or the
-`_added_by_reconciler` stamp. The compact→expand round-trip test pins
-those on `_compact_reconciler_output`, which the rendering now goes
-through.
+plans identical to origin/main in all runs where both finished; fc56
+goes from die to ok. Most of those runs never reach the retry this
+changes: only two in the corpus ever logged it.
 
 ### Planner extent fencing and the fence-probe sandbox harness
 

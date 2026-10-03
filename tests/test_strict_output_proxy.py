@@ -1729,56 +1729,6 @@ def _reconciler_vocabulary(leerie) -> set[str]:
     return vocab
 
 
-def _expanded_with_every_op() -> dict:
-    """An internal-shape (post-`_expand_reconciler_output`) reconciler
-    output exercising every array, as phase_reconcile holds it after
-    apply — including the stamp the apply step adds."""
-    return {
-        "renames": [{"sid": "config-001", "from": "a", "to": "b"}],
-        "added_provides": [{"sid": "feat-001", "tag": "p", "reason": "r"}],
-        "dropped_requires": [{"sid": "feat-001", "tag": "q", "reason": "r"}],
-        "unresolvable": [{"sid": "feat-002", "tag": "u", "reason": "r"}],
-        "conditional_drops": [{"sid": "feat-003", "reason": "r"}],
-        "added_subtasks": [{
-            "id": "config-009", "title": "t", "success_criteria_seed": "c",
-            "provides": ["x"], "_added_by_reconciler": True,
-            "requires": [{"tag": "y", "extent": "in_plan", "reason": "r"}]}],
-        "dependency_edges": [{"from": "feat-001", "to": "config-001",
-                              "reason": "r"}],
-        "merged_subtasks": [{"into": "feat-001", "from": "feat-004",
-                             "reason": "r"}],
-        "confidence": {},
-    }
-
-
-def test_compact_reconciler_output_round_trips_and_uses_wire_names(leerie):
-    """`_compact_reconciler_output` is the inverse of the expand adapter:
-    every op survives a compact→expand round trip, and the compact form
-    carries only property names and op values the schema accepts."""
-    import json
-    expanded = _expanded_with_every_op()
-    compact = leerie._compact_reconciler_output(expanded)
-    schema = leerie.SCHEMAS["reconciler"]
-    assert set(compact) <= set(schema["properties"])
-    for key, rows in compact.items():
-        allowed = set(schema["properties"][key]["items"]["properties"])
-        for row in rows:
-            assert set(row) <= allowed, (key, row)
-    assert {o["op"] for o in compact["tag_ops"]} == set(
-        schema["properties"]["tag_ops"]["items"]["properties"]["op"]["enum"])
-    assert "_added_by_reconciler" not in json.dumps(compact)
-
-    back = leerie._expand_reconciler_output(compact)
-    for key in ("renames", "added_provides", "dropped_requires",
-                "unresolvable", "conditional_drops", "dependency_edges",
-                "merged_subtasks"):
-        assert back[key] == expanded[key], key
-    sub = dict(expanded["added_subtasks"][0])
-    sub.pop("_added_by_reconciler")
-    assert back["added_subtasks"] == [sub]
-    assert back["_dangling_requires"] == []
-
-
 def test_retry_prompts_only_name_ops_the_schema_accepts(leerie):
     """Checks the RENDERED prompt text, not the source.
 
@@ -1807,15 +1757,11 @@ def test_retry_prompts_only_name_ops_the_schema_accepts(leerie):
     rendered["_format_must_include"] = "\n".join(
         leerie._format_must_include(["feat-001", "config-001"], edges, attempt1))
 
-    # The unresolved retry renders attempt 1's APPLIED ops back to the
-    # worker, so its fixture carries every op kind — a renames-only
-    # attempt 1 let the internal-shape rendering pass this guard.
     rendered["_build_unresolved_retry_prompt"] = (
         leerie._build_unresolved_retry_prompt(
             [{"sid": "config-001", "tag": "some-cap", "domain": "config"}],
             {"other-cap": ["feat-001"]},
             {("config-001", "some-cap"): None},
-            _expanded_with_every_op(),
             "orig",
         ))
 

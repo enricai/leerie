@@ -471,85 +471,53 @@ subtask it tests). Three mechanisms reconcile that coupling:
   and cycle retries revert attempt 1 because its graph was structurally
   rejected. An unresolved-tags retry fires on a graph that already
   *passed* both gates; its only defect is the residue. So the retry
-  applies on top of attempt 1's accepted mutations, and the worker is
-  asked only for the residue. Reverting would make every resolution
-  attempt 1 got right depend on the worker restating it. A worker shown
-  only the residue reasonably treats its earlier resolutions as settled,
-  and the final unresolved check then aborts on tags attempt 1 had
-  already resolved (barnacle, 2026-10-02: two consumers renamed onto
-  their producer in attempt 1, reverted, never re-emitted, run died).
-  Re-emitting an applied op must be harmless, and an omission must not
-  undo applied work, so the apply step treats the retry as idempotent
-  over what is already applied:
-  - an exact repeat of an applied rename, `drop_require`, `add_provide`,
-    `dependency_edges` or `merged_subtasks` entry is removed before
-    anything else reads the answer. Then a removed rename, drop or provide is put back only
-    if it is *needed*: nothing else in the answer addresses the
-    unresolved entry it targets (through the survivor redirect below).
-    These ops are not naturally idempotent on the layered plans, and
-    whether the original took effect cannot be read off the op. It was a
-    no-op if the subtask did not hold the tag yet (a later merge brought
-    it), or if it named a connector its own output added before that
-    connector existed. A needed repeat is the worker's real answer to
-    the residue. An unneeded one could only hit an entry the original
-    never touched (one a later merge gave the subtask, or the
-    survivor's own), or add a provide the applied plan does not have.
-    At most one repeat is restored per entry, by a fixed priority across
-    op kinds (renames, drops, provides); within one kind the first in
-    the answer wins. A restored rename or drop goes back to its place in
-    the answer, so a chain of renames keeps its order.
-    An applied edge or merge always took effect, so its repeat is never
-    needed;
-  - a repeated merge collapses through the redirect below and is removed;
-  - a re-emitted connector is *merged* into the version already applied.
-    Its edges are unioned, because a worker restating a connector
-    routinely omits requires it considers settled. Restated text wins
-    unless an applied merge folded other subtasks into that connector,
-    whose criteria the composed text carries. A require an applied
-    output removed with `drop_require` is not re-added, and a dependency
-    on a subtask no longer in the plan (e.g. one an applied
-    `conditional_drop` removed) is not revived. Every applied rename on
-    that connector, from an earlier output or from the retry itself,
-    applies to what the restatement (or a re-emitted `added_requires`)
-    brings in, so it cannot undo them; only renames that actually
-    rewrote an entry count. A connector whose merge survivor
-    a later applied output dropped is not resurrected by restating it;
-  - an id that one of this reconcile's applied merges absorbed is read
-    as its survivor wherever the retry names it, rather than resurrected
-    or rejected as missing. There are two exceptions, both because the
-    survivor holds more work than the worker named: a `conditional_drop`
-    (it would drop the survivor), and a new merge's `from` (it would
-    merge the whole survivor away). The latter still dies as missing.
-    The scope is this reconcile's merges into a still-live survivor, not
-    an earlier phase's, and excludes an id a later applied output reused
-    for a live subtask. The retry itself may not add a NEW subtask under
-    an id in that scope: every reference to it would be ambiguous (the
-    merged work, or the new), so it dies like any id collision. A
-    self-edge or self-merge the worker wrote stays exactly as written,
-    so it still dies naming that id. The must-include check judges the
-    redirected answer, i.e. what the apply step will do.
+  applies on top of the accepted mutations, and the worker is asked only
+  for the residue. Reverting would make every resolution attempt 1 got
+  right depend on the worker restating it. A worker shown only the
+  residue reasonably treats its earlier resolutions as settled, and the
+  final unresolved check then aborts on tags attempt 1 had already
+  resolved (barnacle, 2026-10-02: two consumers renamed onto their
+  producer in attempt 1, reverted, never re-emitted, run died).
+  "Applied" means every output the plans currently hold: after a size
+  retry and then a cycle retry, both outputs.
 
-  Only connectors added by *this* reconcile's applied attempts are
-  restatable; a re-plan reconcile's earlier connectors keep the
-  fail-loud id-collision guard. "Applied" means every output the plans
-  currently hold: after a size retry and then a cycle retry, both
-  outputs.
+  **The retry worker sees the current plan, not the history.** The retry
+  is a fresh worker process; it knows the earlier attempt only through
+  its prompt. That prompt carries the reconciler input rebuilt from the
+  plans as they stand after the applied outputs — current tags, current
+  ids, connectors already added — and the residue, and nothing else: no
+  pre-attempt input and no list of the earlier operations. A worker
+  given those reasonably names stale tags and ids or repeats earlier
+  operations, and every such reference would have to be guessed back
+  into the current plan. Each guess has its own corner cases (a rename
+  that never took effect, an id a merge absorbed, a repeat aimed at an
+  entry a later merge revived); ten review rounds of an earlier version
+  of this design kept finding new ones. Showing the current plan removes
+  the source instead. The worker is told its earlier operations are
+  applied and asked for new ones, by name as the current plan shows
+  them. A reference that does not match the current plan is not
+  interpreted: the must-include check judges the answer against the
+  current tags, so a stale reference fails loudly rather than being
+  applied to something the worker did not name.
 
-  The retry prompt still carries the pre-attempt-1 input, so a worker may
-  name a consumer's tag as it was before an applied rename. That
-  reference is translated mechanically to the current tag rather than
-  rejected; it was the natural answer under the revert design. Only
-  renames that could have taken effect are followed: one naming a
-  subtask its own output (or a later one) added ran before that subtask
-  existed, and one naming a subtask an earlier output merged away or
-  dropped ran after it was gone. A rename keyed by an absorbed
-  subtask's survivor applies to it too, and a rename whose `from` an
-  earlier rename in the same answer produced is a chain link, not a
-  stale tag. A tag the consumer still holds is never translated (the
-  rename that would have replaced it did not take), and neither is one
-  an applied `drop_require` removed from it (a later rename of that tag
-  was a no-op). The same translation applies to the requires a
-  restatement or a re-emitted `added_requires` row brings in.
+  Two tolerances remain, because the current plan does invite them:
+  - a connector the applied outputs added may be *re-declared* (the
+    worker sees it and keeps or extends it). It is merged into the
+    version already applied rather than dying as an id collision: its
+    edges are unioned, because a worker re-declaring a connector
+    routinely omits requires it considers settled and an omission must
+    not undo applied work. Re-declared text wins unless an applied merge
+    folded other subtasks into that connector, whose criteria the
+    composed text carries. Self-references and dependencies on subtasks
+    no longer in the plan are dropped;
+  - an `added_requires` naming such a connector, without re-declaring
+    it, binds to it.
+
+  The retry's own renames on that connector apply to what a
+  re-declaration or binding brings in, so it cannot undo them; only
+  renames that actually rewrote an entry count. Only connectors added by
+  this reconcile's applied outputs qualify; a re-plan reconcile's
+  earlier connectors keep the fail-loud id-collision guard.
 
 ### `requires.extent` — in-graph vs. external prerequisites
 
