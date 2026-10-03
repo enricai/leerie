@@ -1597,7 +1597,7 @@ def test_unresolved_retry_prompt_shows_the_current_plan(
 
     async def fake_claude_p(**kw):
         seen.append(kw["user_prompt"])
-        return a2 if "CURRENT INPUT" in kw["user_prompt"] else a1
+        return a2 if "still unresolved" in kw["user_prompt"] else a1
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     st = _minimal_state_for_retry(leerie, tmp_path)
@@ -2882,6 +2882,81 @@ def test_unresolved_retry_rename_chain_reuses_a_tag_renamed_earlier(
         == ["k", "z"]
 
 
+def test_apply_layered_redeclaration_keeps_fields_the_input_did_not_show(
+        leerie):
+    """A re-declared connector's `size` was written without the worker
+    seeing the applied value (the input does not show it), so the
+    applied value stays — no gate re-checks size after the retry. Shown
+    fields (`title`, and a connector's `success_criteria_seed` and
+    `investigation_notes`) take the re-declared value."""
+    plans = [{"domain": "_reconciler", "subtasks": [
+        {**_r1_recon("feat-900", provides=["x"],
+                     scs="X endpoint returns 200 with the token payload"),
+         "size": "small", "investigation_notes": "applied notes"}]}]
+    leerie._apply_reconciler_output(plans, {"added_subtasks": [
+        {**_r1_sub("feat-900", provides=["x", "q"],
+                   scs="X returns 200 with the token payload, and q"),
+         "title": "sharper title", "size": "large",
+         "investigation_notes": "sharper notes"}]}, restatable={"feat-900"})
+    conn = plans[0]["subtasks"][0]
+    assert conn["size"] == "small"
+    assert conn["investigation_notes"] == "sharper notes"
+    assert conn["title"] == "sharper title"
+    assert conn["success_criteria_seed"] == (
+        "X returns 200 with the token payload, and q")
+    assert conn["provides"] == ["x", "q"]
+
+
+def test_reconciler_view_fields_match_the_payload_the_worker_gets(
+    leerie, monkeypatch, tmp_path
+):
+    """`_RECONCILER_VIEW_FIELDS` / `_RECONCILER_CONNECTOR_VIEW_FIELDS`
+    decide which re-declared fields may change; each must equal the
+    per-subtask keys the worker's input actually carries — for a planner
+    subtask and for a reconciler-added connector — or a field could be
+    taken from a worker that never saw it."""
+    plans = [{"domain": "feat", "status": "ready", "subtasks": [
+        _r1_sub("feat-001", provides=["a"], requires=["x"]),
+        _r1_sub("feat-002", provides=["b"], requires=["q"])]}]
+    conn = {k: v for k, v in _r1_sub("feat-900", provides=["x"]).items()
+            if k != "requires"}
+    a1 = {**_r4_base(), "added_subtasks": [conn]}
+    a2 = {**_r4_base(), "tag_ops": [
+        {"op": "unresolvable", "sid": "feat-002", "tag": "q",
+         "reason": "r"}]}
+    seen: list[str] = []
+
+    async def fake_claude_p(**kw):
+        seen.append(kw["user_prompt"])
+        return a2 if "still unresolved" in kw["user_prompt"] else a1
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    st = _minimal_state_for_retry(leerie, tmp_path)
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_reconcile(
+            plans, "fix it", st, dict(leerie.DEFAULT_CAPS),
+            {"reconciler": "sonnet"}, {"reconciler": "medium"}))
+    payload = json.loads(seen[-1].split("RECONCILER INPUT:\n", 1)[1])
+    views = {v["id"]: v for v in payload["subtasks"]}
+    assert set(views["feat-001"]) == set(leerie._RECONCILER_VIEW_FIELDS)
+    assert set(views["feat-900"]) == set(
+        leerie._RECONCILER_CONNECTOR_VIEW_FIELDS)
+
+
+def test_apply_layered_rename_that_matched_nothing_is_not_replayed(leerie):
+    """A rename on a connector that does not hold its `from` tag rewrites
+    nothing in step 1, so it is not replayed on a binding that brings
+    that tag in: the bound `a` stays `a`."""
+    plans = [{"domain": "_reconciler", "subtasks": [
+        _r1_recon("feat-900", provides=["x"])]}]
+    leerie._apply_reconciler_output(plans, {
+        "renames": [{"sid": "feat-900", "from": "a", "to": "b"}],
+        "_bind_requires": [{"sid": "feat-900", "tag": "a",
+                            "extent": "in_plan"}]}, restatable={"feat-900"})
+    assert plans[0]["subtasks"][0]["requires"] == [
+        {"tag": "a", "extent": "in_plan"}]
+
+
 def test_unresolved_retry_keeps_attempt_1_resolutions(
     leerie, monkeypatch, tmp_path
 ):
@@ -3199,11 +3274,16 @@ def test_record_conditional_drops_wholesale_replaces_across_attempts(leerie):
     replace `st.data["conditional_drops"]` on every call (not
     per-sid overwrite), mirroring how `external_preconditions` is
     replaced across the same retry sites. Otherwise an attempt-1
-    drop would leak into the audit when a retry (cycle/size/
-    unresolved) picks a different resolution for the same gap in
-    attempt 2: `plans` is reverted to the snapshot but `st.data` is
-    not, so the audit would carry a stale entry that no longer
-    reflects the final plan.
+    drop would leak into the audit when a reverting retry (size or
+    cycle) picks a different resolution for the same gap in attempt 2:
+    `plans` is reverted to the snapshot but `st.data` is not, so the
+    audit would carry a stale entry that no longer reflects the final
+    plan. (Production now recomputes the audit from `applied`, the
+    outputs the plans hold, and the layered unresolved retry appends to
+    that list rather than reverting; the inline mirror below keeps the
+    one-output shape and pins only wholesale replacement — see
+    `test_unresolved_retry_merges_conditional_drop_audit` for the real
+    closure.)
 
     Verified by synthesizing the same closure-bound helper inline
     (mirrors test_unresolvable_is_reported_even_when_conditional_drops_also_emitted

@@ -506,18 +506,27 @@ subtask it tests). Three mechanisms reconcile that coupling:
     version already applied rather than dying as an id collision: its
     edges are unioned, because a worker re-declaring a connector
     routinely omits requires it considers settled and an omission must
-    not undo applied work. Re-declared text wins unless an applied merge
-    folded other subtasks into that connector, whose criteria the
-    composed text carries. Self-references and dependencies on subtasks
-    no longer in the plan are dropped;
+    not undo applied work. Only what the input showed may change. The
+    input shows a connector's title, intent, scope note, success
+    criteria and investigation notes, and those take the re-declared
+    value (the worker read them
+    and may sharpen them), unless an applied merge folded other subtasks
+    into that connector, whose content the composed text carries. A
+    field it never showed, such as the size, keeps its applied value,
+    because the worker wrote it blind. Self-references and dependencies
+    on subtasks no longer in the plan are dropped;
   - an `added_requires` naming such a connector, without re-declaring
     it, binds to it.
 
   The retry's own renames on that connector apply to what a
   re-declaration or binding brings in, so it cannot undo them; only
   renames that actually rewrote an entry count. Only connectors added by
-  this reconcile's applied outputs qualify; a re-plan reconcile's
-  earlier connectors keep the fail-loud id-collision guard.
+  this reconcile's applied outputs qualify: re-declaring a re-plan
+  reconcile's earlier connector still dies as an id collision, and an
+  `added_requires` naming one is dropped with a log line, as on any
+  attempt. An id an applied merge absorbed is no longer in the input;
+  a new subtask the worker adds under it is accepted as new (the
+  absorbed id survives only as `_merged_from` telemetry).
 
 ### `requires.extent` — in-graph vs. external prerequisites
 

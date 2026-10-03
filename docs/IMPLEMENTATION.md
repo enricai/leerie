@@ -3833,7 +3833,7 @@ a size retry and then a cycle retry it holds both.
 - **Input.** The retry prompt ends with `--- CURRENT INPUT (the plan as
   it stands now) ---` and the reconciler payload rebuilt from the
   current plans and the still-unresolved set. Attempt 1 and the retry
-  share one builder, `_reconciler_payload(current_plans, unresolved)`,
+  share one builder, `_reconciler_payload(current_plans, unresolved_now)`,
   nested in `phase_reconcile`. The prompt says the earlier operations
   are applied and asks for new operations, naming tags and ids as the
   current input shows them. It does not include the pre-attempt payload
@@ -3856,9 +3856,17 @@ what the current input invites:
   - In-plan requires the merged `provides` cover are dropped, and so is
     a `depends_on` entry naming the connector itself or no subtask in
     the plan or this output.
-  - Re-declared `title` / `intent` / `success_criteria_seed` win, unless
-    the existing version carries `_merged_from`, in which case its
-    composed text is kept.
+  - A field the input does not show (anything outside
+    `_RECONCILER_CONNECTOR_VIEW_FIELDS`; in practice `size`, which no
+    gate re-checks after this retry) keeps the applied value. Shown text
+    (`title`, `intent`, `scope_note`, `success_criteria_seed`,
+    `investigation_notes`) takes the re-declared value,
+    unless the existing version carries `_merged_from`, in which case
+    its composed text is kept. The payload's view of a
+    reconciler-added connector carries `success_criteria_seed` and
+    `investigation_notes` on top of the planner-subtask view
+    (`_RECONCILER_VIEW_FIELDS`), so the worker sees what it may change. A test pins both sets to
+    the keys the worker actually receives.
   - Duplicate ids within the output die before the merge. Any other
     collision, including a connector from an earlier (re-plan) reconcile
     or a planner-authored id, still `die()`s.

@@ -10071,9 +10071,12 @@ def _expand_reconciler_output(out: dict) -> dict:
       resolution action would mutate the plan in a way the operator never sees.
     * **`added_requires` is no longer nested inside its subtask.** The binding
       is by `sid` now, so an entry naming a subtask that does not exist in this
-      output has nothing to attach to. Those are dropped and counted; the
-      caller logs the count, because a dangling requires means the worker
-      believed in a subtask it did not emit.
+      output has nothing to attach to here. Those are reported twice: as
+      strings in `_dangling_requires`, and structured in
+      `_dangling_requires_raw`. The caller (`_spawn_reconciler`) logs each
+      one as dropped — a dangling requires means the worker believed in a
+      subtask it did not emit — unless it names a connector an applied
+      output added, which the layered unresolved-tags retry binds to it.
 
     Returns a NEW dict; the input is not mutated (the raw worker output is
     persisted as telemetry and must stay as-emitted).
@@ -23498,6 +23501,19 @@ def _union_connector_edges(
     return out
 
 
+# The per-subtask fields the reconciler's input shows the worker
+# (`phase_reconcile`'s `subtask_views`), and the larger set it shows for a
+# reconciler-added connector. A re-declared connector may only change what
+# the worker could see; tests/test_reconciler_cycle_gate.py pins both sets
+# against the payload the worker actually receives.
+_RECONCILER_VIEW_FIELDS: frozenset[str] = frozenset({
+    "id", "title", "intent", "scope_note", "depends_on",
+    "files_likely_touched", "provides", "requires",
+})
+_RECONCILER_CONNECTOR_VIEW_FIELDS: frozenset[str] = (
+    _RECONCILER_VIEW_FIELDS | {"success_criteria_seed", "investigation_notes"})
+
+
 def _merge_restated_connector(
     earlier: dict, restated: dict, live_ids: set[str],
 ) -> None:
@@ -23509,16 +23525,26 @@ def _merge_restated_connector(
     worker may re-declare one it means to keep or extend. It routinely
     omits what it considers settled, so an omission must not undo
     applied work (DESIGN §5 *The unresolved-tags retry is layered*): the
-    edge-bearing fields are unioned (`_union_connector_edges`). Restated
-    `title`/`intent`/`success_criteria_seed` win — the retry may sharpen
-    them — EXCEPT when an applied merge folded other subtasks into this
-    connector: its text then carries the absorbed subtasks' criteria,
-    which the retry never saw in that form, so the earlier text is
+    edge-bearing fields are unioned (`_union_connector_edges`).
+
+    A field the input did not show (outside
+    `_RECONCILER_CONNECTOR_VIEW_FIELDS` — in practice `size`) keeps its
+    applied value: the worker wrote it blind, and `size` is checked by
+    no gate after this retry. Shown text (`title`, `intent`,
+    `scope_note`, `success_criteria_seed`, `investigation_notes`) takes
+    the re-declared value, since the worker read it and may sharpen it —
+    EXCEPT when an applied merge folded other subtasks into this
+    connector: its text then composes the absorbed subtasks' content,
+    which the view shows only as merged prose, so the applied text is
     kept."""
     restated.update(_union_connector_edges(
         earlier, restated, {restated["id"]}, live_ids))
+    for key, val in earlier.items():
+        if key not in _RECONCILER_CONNECTOR_VIEW_FIELDS and key not in (
+                "_merged_from",):
+            restated[key] = val
     if earlier.get("_merged_from"):
-        for key in ("title", "intent", "success_criteria_seed"):
+        for key in ("title", "intent", "scope_note", "success_criteria_seed"):
             if earlier.get(key):
                 restated[key] = earlier[key]
 
@@ -24095,6 +24121,16 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
                     "provides": list(s.get("provides", []) or []),
                     "requires": in_plan_tags,
                 })
+                # A connector's criteria and notes are shown too: the
+                # layered retry may re-declare it, and only what the worker
+                # saw may change (`_merge_restated_connector`). Planner
+                # subtasks' views — attempt 1's whole input on a normal
+                # run — are unchanged.
+                if s.get("_added_by_reconciler"):
+                    subtask_views[-1]["success_criteria_seed"] = s.get(
+                        "success_criteria_seed", "")
+                    subtask_views[-1]["investigation_notes"] = s.get(
+                        "investigation_notes", "")
         return {
             "task": task,
             "categories": categories,

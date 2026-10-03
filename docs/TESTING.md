@@ -1152,6 +1152,10 @@ retry is layered* and *The retry worker sees the current plan*.
   prompt contains, so the comparison is fair.
 - **Re-declared connectors.** A connector the applied outputs added may
   be re-declared:
+  - `…_redeclaration_keeps_fields_the_input_did_not_show` pins that
+    only shown fields may change, and
+    `test_reconciler_view_fields_match_the_payload_the_worker_gets` pins
+    `_RECONCILER_VIEW_FIELDS` to the payload the worker receives;
   - `test_apply_layered_merges_restated_connector`,
     `…_restate_keeps_absorbed_subtask_content`, `…_restate_prunes_self_require`,
     `…_restate_unions_merged_from`, `test_merge_restated_connector_drops_self_dependency`
@@ -1165,8 +1169,9 @@ retry is layered* and *The retry worker sees the current plan*.
     keeps that answer working.
 - **Bindings and own renames.** `…_binds_requires_to_attempt_1_connector`,
   `…_bind_skips_self_provided_require`, the two `…_keeps_this_retrys_rename`
-  tests, `test_apply_own_renames_replays_a_chain_in_order` and
-  `…_rename_that_matched_nothing_not_applied_to_bind`.
+  tests, `test_apply_own_renames_replays_a_chain_in_order`,
+  `…_rename_that_matched_nothing_not_applied_to_bind` and
+  `test_apply_layered_rename_that_matched_nothing_is_not_replayed`.
 - **Composition and audit.** `test_unresolved_retry_after_size_and_cycle_retries_sees_both`
   drives size → cycle → unresolved through real `phase_reconcile`;
   `…_merges_conditional_drop_audit` pins the audit across the two
@@ -1188,7 +1193,10 @@ on fc56, from the recorded attempt 1:
 - the old reverting retry died 5/5, and its worker restated 0 of 15
   attempt-1 renames;
 - on this design's prompt, fc56 and 0cfb46a0 converged 3/3 each, and no
-  answer restated an earlier op.
+  answer restated an earlier op. 0cfb46a0 was re-run 3/3 after the
+  connector view gained `success_criteria_seed` and
+  `investigation_notes`; fc56's attempt 1 adds no connector, so its
+  retry input did not change.
 
 A replay of every locally recorded run with pre-reconcile plans gave
 plans identical to origin/main in all runs where both finished; fc56
