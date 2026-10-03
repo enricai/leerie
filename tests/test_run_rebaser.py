@@ -106,17 +106,25 @@ def test_run_rebaser_downgrades_to_failed_when_claim_mismatches_state(leerie, tm
     downgrades the result to 'failed' rather than trusting the self-report
     (the whole point of check_rebaser_worktree_state)."""
     repo = init_git_repo(tmp_path / "repo")
-    (repo / "a.txt").write_text("<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")
-    run_git_repo_first(repo, "add", ".")
-    run_git_repo_first(repo, "commit", "-q", "-m", "leaves markers")
     leerie_root = tmp_path / "leerie_root"
-    _patch_invoke(leerie, monkeypatch, _rebaser_envelope({
+    envelope = _rebaser_envelope({
         "status": "rebased",
         "final_branch_state": "claims clean but isn't",
         "resolution_summary": "",
         "diagnosis": "",
         "confidence": _full_confidence(9.5),
-    }))
+    })
+
+    # the markers must come from the worker: ones already present at the
+    # pre-rebase tip are not the rebase's doing
+    async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
+                          progress=None, **_kw):
+        (repo / "a.txt").write_text(
+            "<<<<<<< HEAD\nx\n=======\ny\n>>>>>>> b\n")
+        run_git_repo_first(repo, "commit", "-q", "-am", "leaves markers")
+        return envelope
+
+    monkeypatch.setattr(leerie, "_invoke", fake_invoke)
 
     result = leerie.run_rebaser(
         leerie_root, repo, "run-003", repo,
