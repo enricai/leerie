@@ -15132,6 +15132,20 @@ async def check_integrator_commit(staging: Path) -> str | None:
     return None
 
 
+async def _rebase_state_dirs(worktree: Path) -> list[str]:
+    """Names of git's in-progress-rebase dirs present for `worktree`.
+    Resolved via `git rev-parse --git-path` because in a `git worktree add`
+    checkout `.git` is a file and the rebase state lives under
+    `<common-dir>/worktrees/<name>/`, not `<worktree>/.git/`."""
+    present = []
+    for name in ("rebase-merge", "rebase-apply"):
+        r = await run_proc(["git", "rev-parse", "--git-path", name],
+                           cwd=str(worktree))
+        if r.returncode == 0 and (worktree / r.stdout.strip()).exists():
+            present.append(name)
+    return present
+
+
 async def check_rebaser_worktree_state(
         worktree: Path, status: str, pre_rebase_sha: str) -> str | None:
     """Mechanically verify the `rebaser` worker's claimed outcome (DESIGN §6
@@ -15148,31 +15162,35 @@ async def check_rebaser_worktree_state(
     git-level outcome is real, mirroring `check_integrator_commit`'s
     state-not-content discipline above."""
     if status == "rebased":
-        marker_scan = await run_proc(
-            ["git", "diff", "--check"], cwd=str(worktree))
-        # `git diff --check` on a clean working tree also flags trailing
-        # whitespace, so a nonzero rc alone is not proof of conflict markers.
-        # Grep the actual tracked content for the marker patterns instead.
-        grep = await run_proc(
-            ["git", "grep", "-l", "-E",
-             r"^(<{7}|={7}|>{7})", "--", "."],
+        # Only markers the rebase introduced count, by git's own marker
+        # definition — a `=====…` divider row already on base is content,
+        # not a conflict. Diffing the working tree against the pre-rebase
+        # tip catches uncommitted leftovers too; `--check`'s rc also covers
+        # whitespace errors, so the marker lines are read from its output.
+        check = await run_proc(
+            ["git", "-c", "core.quotePath=off", "diff", "--no-color",
+             "--check", pre_rebase_sha, "--"],
             cwd=str(worktree))
-        if grep.returncode == 0 and grep.stdout.strip():
+        marked = sorted({
+            m.group(1) for m in re.finditer(
+                r"^(.+):\d+: leftover conflict marker$",
+                check.stdout, re.MULTILINE)})
+        if marked:
             return (f"rebaser claimed 'rebased' but conflict markers remain "
-                    f"in: {grep.stdout.strip().splitlines()}")
-        for mid_rebase_dir in (".git/rebase-merge", ".git/rebase-apply"):
-            if (worktree / mid_rebase_dir).exists():
-                return (f"rebaser claimed 'rebased' but worktree is still "
-                        f"mid-rebase ({mid_rebase_dir} present)")
+                    f"in: {marked}")
+        in_progress = await _rebase_state_dirs(worktree)
+        if in_progress:
+            return (f"rebaser claimed 'rebased' but worktree is still "
+                    f"mid-rebase ({in_progress[0]} present)")
         return None
 
     # irreconcilable / failed: the worktree must be back to its pre-rebase
     # tip — nothing left mid-rebase, nothing partially applied.
-    for mid_rebase_dir in (".git/rebase-merge", ".git/rebase-apply"):
-        if (worktree / mid_rebase_dir).exists():
-            return (f"rebaser claimed {status!r} but worktree is still "
-                    f"mid-rebase ({mid_rebase_dir} present) — abort did not "
-                    f"complete")
+    in_progress = await _rebase_state_dirs(worktree)
+    if in_progress:
+        return (f"rebaser claimed {status!r} but worktree is still "
+                f"mid-rebase ({in_progress[0]} present) — abort did not "
+                f"complete")
     r = await run_proc(["git", "rev-parse", "HEAD"], cwd=str(worktree))
     if r.returncode != 0:
         return f"could not verify worktree HEAD after rebaser claimed {status!r}"
