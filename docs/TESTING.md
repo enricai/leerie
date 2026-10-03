@@ -1155,7 +1155,7 @@ Restatement is pinned on three axes:
   plus its `phase_reconcile`-level twin cover an `added_requires` that
   names an attempt-1 connector without restating it.
 
-Eight review rounds, each executing code, broke the "re-emitting an
+Nine review rounds, each executing code, broke the "re-emitting an
 applied op is harmless" claim. Each break has a test that fails on the
 build it broke, with one exception noted under round two.
 
@@ -1271,8 +1271,8 @@ On the final build, over 1,600 seeds, the extended fuzz gives:
   build's full-restatement plan equals its fix-only plan in all 7.
 
 Round eight's fuzz reached size → cycle → unresolved compositions far
-more often than round seven's (the earlier generator hit that path in 6
-of 1,152 trials). It found two more defects:
+more often than round seven's (the earlier generator hit that path in 8
+of 1,152 property-B trials). It found two more defects:
 - A restatement, or a re-emitted `added_requires` row, of a connector
   put back a tag an EARLIER applied output had renamed. Only the
   retry's own renames were applied to incoming requires. Translation
@@ -1311,6 +1311,22 @@ On the final build, over 1,600 seeds:
 - Round seven's and round six's fuzzers give the same results as
   before.
 
+Round nine found five more, by construction rather than fuzz:
+- `_effective_renames` kept a rename naming a subtask an earlier output
+  had merged away, so a stray drop was translated onto the survivor's
+  own resolved require
+  (`test_unresolved_retry_stray_drop_ignores_rename_on_merged_away_subtask`).
+- A restated or re-bound connector folded into its survivor did not see
+  a later output's rename keyed by the survivor
+  (`test_unresolved_retry_folded_connector_sees_later_rename_on_survivor`).
+- A retry rename that rewrote nothing was still replayed on a
+  re-emitted requires row
+  (`test_unresolved_retry_rename_that_matched_nothing_not_applied_to_bind`).
+- Rename chains inside one answer were broken in two ways: a restored
+  link was appended after the next one, and the next link's `from` was
+  translated as if stale (`test_unresolved_retry_restored_rename_keeps_its_place_in_a_chain`,
+  `test_unresolved_retry_chain_link_is_not_translated`).
+
 Separately, the layered build first rejected a natural answer naming a
 consumer's pre-rename tag (read off the prompt's pre-attempt-1 input),
 which the reverting retry had accepted. Its fix, translation, then
@@ -1320,7 +1336,7 @@ mistranslated a tag the consumer still held. Both cases are pinned
 
 `test_unresolved_retry_after_size_and_cycle_retries_sees_both` drives
 size → cycle → unresolved retries through real `phase_reconcile`: the
-"applied" set must include both retries' outputs. Sixteen tests are
+"applied" set must include both retries' outputs. Seventeen tests are
 mutant guards, which fail on the mutant that removes the behaviour.
 Each passes on the build it was added against, with two qualifications.
 The self-edge guard trips on the `applied_merges` keyword there, and
@@ -1347,7 +1363,8 @@ one it was first added against (see round two).
   (`test_unresolved_retry_repeated_add_provide_on_own_connector_not_added`);
 - keying a retry's own renames by the survivor when an absorbed
   connector is restated
-  (`test_unresolved_retry_folded_restatement_keeps_this_retrys_rename`).
+  (`test_unresolved_retry_folded_restatement_keeps_this_retrys_rename`);
+- one restored provide per tag (`test_restore_needed_repeats_one_provide_per_tag`).
 
 Every reconciler test stubs the worker, so the live behaviour was
 measured separately. Real `claude -p` ran as attempt 2 on fc56, from the

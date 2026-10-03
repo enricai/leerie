@@ -23757,14 +23757,17 @@ def _apply_reconciler_output(
     never an earlier reconcile's connectors, which a re-plan reconcile
     still guards with the fail-loud collision check. The worker may
     restate an applied op. Exact repeats of renames, drop_requires,
-    add_provides and dependency_edges are filtered BEFORE this step, in
+    add_provides, dependency_edges and merged_subtasks are filtered
+    BEFORE this step, in
     `phase_reconcile` (`_drop_reemitted_ops` / `_restore_needed_repeats`),
     so a direct caller passing `restatable` does not get that. The ops
     handled here become idempotent:
 
     * an `added_subtasks` entry whose id is in `restatable` is merged
       into the earlier version (`_merge_restated_connector`), so nothing
-      the applied outputs established is lost to an omission;
+      the applied outputs established is lost to an omission — unless an
+      applied merge absorbed it into a subtask since dropped
+      (`_absorbed_into_dropped`), in which case it is skipped;
     * an id the applied merges absorbed (`applied_merges`) is redirected
       to its survivor (`_survivor_map`, `_redirect_absorbed_ids`) wherever
       the retry names it, except a `conditional_drops` sid, a
@@ -23848,8 +23851,9 @@ def _apply_reconciler_output(
     if survivor:
         _die_on_absorbed_id_reuse(output, survivor, restatable or set())
         output = _redirect_absorbed_ids(output, survivor)
-    own_renames = [(r["sid"], r["from"], r["to"])
-                   for r in output.get("renames", [])]
+    # Renames of this output that actually rewrote an entry in step 1,
+    # in order — the only ones a restated copy can be behind.
+    own_renames: list[tuple[str, str, str]] = []
 
     for r in output.get("renames", []):
         s = by_id.get(r["sid"])
@@ -23868,6 +23872,7 @@ def _apply_reconciler_output(
                     and entry.get("extent") == "in_plan"
                     and entry.get("tag") == r["from"]):
                 entry["tag"] = r["to"]
+                own_renames.append((r["sid"], r["from"], r["to"]))
 
     for ap in output.get("added_provides", []):
         s = by_id.get(ap["sid"])
@@ -24780,7 +24785,8 @@ async def phase_reconcile(plans: list[dict], task: str, st: State,
         _translate_pre_rename_tags(
             output3, _effective_renames(applied, set(pre_subtasks_snapshot)),
             held, set(attempt_1_added),
-            {(d["sid"], d["tag"]) for d in prior.get("dropped_requires") or []})
+            {(d["sid"], d["tag"]) for d in prior.get("dropped_requires") or []},
+            survivor)
         if survivor:
             output3 = _redirect_absorbed_ids(output3, survivor)
         _restore_needed_repeats(output3, repeats, still_unresolved, survivor)
@@ -25761,6 +25767,12 @@ def _drop_reemitted_ops(output: dict, applied: list[dict]) -> dict:
                 for out in applied for a in out.get("added_provides") or []}
     removed: dict[str, list[dict]] = {
         "renames": [], "dropped_requires": [], "added_provides": []}
+    # Position in the answer, so `_restore_needed_repeats` can put a
+    # restored rename or drop back where it was: renames compose in
+    # order (a→b then b→c), and an appended link would break the chain.
+    for key in ("renames", "dropped_requires"):
+        output[key] = [{**op, "_pos": i}
+                       for i, op in enumerate(output.get(key) or [])]
     kept_r: list[dict] = []
     for r in output.get("renames") or []:
         if (r.get("sid"), r.get("from"), r.get("to")) in renames:
@@ -25804,9 +25816,11 @@ def _restore_needed_repeats(output: dict, removed: dict,
 
     An entry is marked addressed as soon as one repeat is restored for
     it, so two repeats aimed at the same entry (say the worker's real
-    drop and a stray re-emitted provide) do not both come back. Which
-    one wins is fixed — renames, then drops, then provides — so the
-    result does not depend on how the answer happens to be ordered."""
+    drop and a stray re-emitted provide) do not both come back. Across
+    op kinds the winner is fixed — renames, then drops, then provides —
+    so it does not depend on how the answer is ordered; within one kind
+    the first in the answer wins. Restored renames and drops go back to
+    their position in the answer (`_pos`), so a chain keeps its order."""
     left = {(u["sid"], u["tag"]) for u in unresolved
             if _validate_unresolved_must_include(output, [u])}
     for key, tag_field in (("renames", "from"), ("dropped_requires", "tag")):
@@ -25815,6 +25829,10 @@ def _restore_needed_repeats(output: dict, removed: dict,
             if (sid, op[tag_field]) in left:
                 output.setdefault(key, []).append({**op, "sid": sid})
                 left.discard((sid, op[tag_field]))
+        output[key] = [
+            {k: v for k, v in op.items() if k != "_pos"}
+            for op in sorted(output.get(key) or [],
+                             key=lambda op: op.get("_pos", float("inf")))]
     for op in removed["added_provides"]:
         if any(tag == op["tag"] for _, tag in left):
             output.setdefault("added_provides", []).append(
@@ -25830,20 +25848,27 @@ def _effective_renames(applied: list[dict], original_ids: set[str]
     that same output or a later one — was a no-op. Translating through
     it would rewrite a tag the subtask in fact still carries; the held
     check alone cannot tell, because the tag may have left the subtask
-    for another reason (pruned as a self-reference after a merge)."""
+    for another reason (pruned as a self-reference after a merge). The
+    same holds for a subtask an earlier output merged away or
+    conditionally dropped: it no longer existed when the rename ran.
+    Within one output renames run first, so that output's own drops and
+    merges only affect the outputs after it."""
     existing = set(original_ids)
     out: list[dict] = []
     for o in applied:
         out.extend(r for r in o.get("renames") or []
                    if r.get("sid") in existing)
         existing |= {s.get("id") for s in o.get("added_subtasks") or []}
+        existing -= {m.get("from") for m in o.get("merged_subtasks") or []}
+        existing -= {c.get("sid") for c in o.get("conditional_drops") or []}
     return out
 
 
 def _translate_pre_rename_tags(output: dict, applied_renames: list[dict],
                                held: dict[str, set[str]],
                                restatable: set[str],
-                               dropped: set[tuple[str, str]]) -> None:
+                               dropped: set[tuple[str, str]],
+                               survivor: dict[str, str]) -> None:
     """Rewrite, in place, sid-keyed tag references in a layered-retry
     output that name a consumer's tag as it was BEFORE an applied rename
     (`renames[].from`, `dropped_requires[].tag`) to the tag that consumer
@@ -25864,7 +25889,14 @@ def _translate_pre_rename_tags(output: dict, applied_renames: list[dict],
     a `(sid, tag)` an applied drop_require removed (`dropped`): a later
     rename of that tag was then a no-op, and translating through it
     would carry the dropped require past the apply step's drop filter,
-    which is keyed by the original tag."""
+    which is keyed by the original tag.
+
+    A rename keyed by the survivor of an absorbed sid applies to that sid
+    too (`survivor`): a connector folded into its survivor carries its
+    requires there, and a later output's rename of the survivor's tag is
+    the one that changed them. A rename in this answer whose `from` an
+    earlier rename in the same answer produced is a chain link, not a
+    stale tag, and is left alone."""
     current: dict[tuple[str, str], str] = {}
     for r in applied_renames:
         sid, frm, to = r.get("sid"), r.get("from"), r.get("to")
@@ -25878,10 +25910,16 @@ def _translate_pre_rename_tags(output: dict, applied_renames: list[dict],
     def _now(sid: str, tag: str) -> str:
         if tag in held.get(sid, set()) or (sid, tag) in dropped:
             return tag
-        return current.get((sid, tag), tag)
+        if (sid, tag) in current:
+            return current[(sid, tag)]
+        return current.get((survivor.get(sid, sid), tag), tag)
 
+    produced: set[tuple[str, str]] = set()
     for r in output.get("renames") or []:
-        r["from"] = _now(r.get("sid"), r.get("from"))
+        sid = r.get("sid")
+        if (survivor.get(sid, sid), r.get("from")) not in produced:
+            r["from"] = _now(sid, r.get("from"))
+        produced.add((survivor.get(sid, sid), r.get("to")))
     for d in output.get("dropped_requires") or []:
         d["tag"] = _now(d.get("sid"), d.get("tag"))
     for sub in output.get("added_subtasks") or []:

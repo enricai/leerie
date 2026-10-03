@@ -494,9 +494,10 @@ subtask it tests). Three mechanisms reconcile that coupling:
     the residue. An unneeded one could only hit an entry the original
     never touched (one a later merge gave the subtask, or the
     survivor's own), or add a provide the applied plan does not have.
-    At most one repeat is restored per entry, by a fixed priority
-    (renames, drops, provides), so the result does not depend on how
-    the answer is ordered.
+    At most one repeat is restored per entry, by a fixed priority across
+    op kinds (renames, drops, provides); within one kind the first in
+    the answer wins. A restored rename or drop goes back to its place in
+    the answer, so a chain of renames keeps its order.
     An applied edge or merge always took effect, so its repeat is never
     needed;
   - a repeated merge collapses through the redirect below and is removed;
@@ -510,7 +511,8 @@ subtask it tests). Three mechanisms reconcile that coupling:
     `conditional_drop` removed) is not revived. Every applied rename on
     that connector, from an earlier output or from the retry itself,
     applies to what the restatement (or a re-emitted `added_requires`)
-    brings in, so it cannot undo them. A connector whose merge survivor
+    brings in, so it cannot undo them; only renames that actually
+    rewrote an entry count. A connector whose merge survivor
     a later applied output dropped is not resurrected by restating it;
   - an id that one of this reconcile's applied merges absorbed is read
     as its survivor wherever the retry names it, rather than resurrected
@@ -539,7 +541,11 @@ subtask it tests). Three mechanisms reconcile that coupling:
   rejected; it was the natural answer under the revert design. Only
   renames that could have taken effect are followed: one naming a
   subtask its own output (or a later one) added ran before that subtask
-  existed. A tag the consumer still holds is never translated (the
+  existed, and one naming a subtask an earlier output merged away or
+  dropped ran after it was gone. A rename keyed by an absorbed
+  subtask's survivor applies to it too, and a rename whose `from` an
+  earlier rename in the same answer produced is a chain link, not a
+  stale tag. A tag the consumer still holds is never translated (the
   rename that would have replaced it did not take), and neither is one
   an applied `drop_require` removed from it (a later rename of that tag
   was a no-op). The same translation applies to the requires a

@@ -3840,7 +3840,11 @@ retries). After a size retry and then a cycle retry it holds both;
   `dropped_requires[].tag`) has it rewritten to the current tag by
   `_translate_pre_rename_tags` before validation. Only renames that
   could have taken effect are followed (`_effective_renames`: a rename
-  whose subtask existed before its own output was applied). A tag the
+  whose subtask existed when its own output's step 1 ran — present in
+  the original plan or added by an earlier applied output, and not
+  merged away or conditionally dropped by one). Lookups also try the
+  survivor of an absorbed sid, and a rename whose `from` an earlier
+  rename in the same answer produced is left alone (a chain link). A tag the
   consumer still holds, or one an applied drop_require removed from it
   (`dropped`), is left alone. For an
   absorbed sid it checks the survivor's tags. In `phase_reconcile` the
@@ -3869,7 +3873,9 @@ retries). After a size retry and then a cycle retry it holds both;
   the applied plan lacks. An applied edge or merge always took effect,
   so its repeat is never restored. At most one repeat is restored per
   entry: the entry is marked addressed as soon as one comes back, in
-  the fixed order renames, drops, provides.
+  the fixed order renames, drops, provides (within one kind, the first
+  in the answer). Restored renames and drops return to their position
+  in the answer (`_pos`), so a chain keeps its order.
 - **Rendering.** The retry prompt shows the applied operations as
   ALREADY APPLIED and asks for new operations only. It renders them
   through `_compact_reconciler_output` (the inverse of
@@ -3883,7 +3889,8 @@ The layered apply step (`restatable` not None) makes re-emitting an
 applied operation harmless:
 
 - `conditional_drops` no-op on repeat. Repeated `renames`,
-  `dropped_requires`, `added_provides` and `dependency_edges` are not
+  `dropped_requires`, `added_provides`, `dependency_edges` and
+  `merged_subtasks` are not
   idempotent on the layered plans; `phase_reconcile` filters them first
   (*Exact repeats*, above), so a direct caller passing `restatable`
   does not get that protection.
@@ -3900,8 +3907,8 @@ applied operation harmless:
     the plan or this output) is dropped, so a restatement cannot revive
     a dependency an applied `conditional_drop` pruned.
   - This output's own renames on the connector (`_apply_own_renames`,
-    replayed in emission order, so chains compose as step 1 composes
-    them) are applied to the requires the restatement, fold or a
+    only those that rewrote an entry in step 1, replayed in emission
+    order so chains compose as step 1 composes them) are applied to the requires the restatement, fold or a
     re-emitted `added_requires` binding brings in. Renames run at step
     1, against the version already in the plan, so the incoming copy
     still carries the old tag. Earlier applied outputs' renames reach
