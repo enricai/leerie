@@ -231,6 +231,9 @@ DEFAULT_CAPS = {
     # acceptance tests*). Five so the last two can stay unseen by the
     # repair rounds while three are shown (by case name only).
     "acceptance_sets": 5,
+    # Repair rounds when a majority of held-out sets fail on the integrated
+    # tree; the residual then ships and feeds the next run.
+    "acceptance_repair_rounds": 2,
     # Longest rate-limit reset `main()` will sleep through before it stops
     # auto-resuming and pauses resumably instead (the `out_of_credits`
     # disposition). Sized to the subscription's own windows: the five-hour
@@ -15061,10 +15064,11 @@ _PROTOCOL_MARKUP_TOKENS = (
     "antml:", '<parameter name="', "</parameter>", '<invoke name="',
     "</invoke>",
 )
-# Backtick-quoted spans are code the worker is quoting (a repo that is
-# itself about this protocol), not leaked syntax — the one legitimate hit
-# in a 120-sample corpus audit was exactly that shape.
-_BACKTICK_SPAN_RE = re.compile(r"`[^`\n]*`")
+# Quoted code — fenced blocks and inline backtick spans — is something the
+# worker is quoting (a repo that is itself about this protocol, an HTML
+# snippet in a PR body), not leaked syntax; the one legitimate hit in a
+# 120-sample corpus audit was exactly that shape.
+_BACKTICK_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
 
 
 def _schema_property_names(schema: object) -> frozenset[str]:
@@ -15083,6 +15087,26 @@ def _schema_property_names(schema: object) -> frozenset[str]:
     return frozenset(names)
 
 
+def _closing_tag_leak(text: str, prop_names: frozenset[str]) -> bool:
+    """A closing tag named after one of the worker's own schema properties
+    counts only where leaked tool-call syntax sits: at the end of the value,
+    or directly before another parameter/invoke tag or another of the
+    schema's own tags. A schema property that is also an ordinary markup
+    name (`summary`, `title`, `name`) inside running text is not a leak —
+    measured 2026-10-04, it dropped none of 2,394 corpus hits."""
+    for p in prop_names:
+        start = 0
+        tag = f"</{p}>"
+        while (i := text.find(tag, start)) != -1:
+            rest = text[i + len(tag):].lstrip()
+            if (not rest or rest.startswith(("<parameter", "<invoke"))
+                    or any(rest.startswith((f"</{q}>", f"<{q}"))
+                           for q in prop_names)):
+                return True
+            start = i + len(tag)
+    return False
+
+
 def _find_protocol_markup(value: object,
                           prop_names: frozenset[str] = frozenset()
                           ) -> str | None:
@@ -15095,7 +15119,7 @@ def _find_protocol_markup(value: object,
         bare = _BACKTICK_SPAN_RE.sub("", value)
         if any(t in bare for t in _PROTOCOL_MARKUP_TOKENS):
             return value
-        if "</" in bare and any(f"</{p}>" in bare for p in prop_names):
+        if "</" in bare and _closing_tag_leak(bare, prop_names):
             return value
         return None
     if isinstance(value, dict):
@@ -32848,6 +32872,9 @@ def _acceptance_validity_base(st: "State") -> str | None:
             continue
         head = (data.get("repo_state_before_planning") or {}).get("head")
         started = str(data.get("started_at") or "")
+        if not started:
+            # Unknown start time: cannot be ranked earliest.
+            continue
         if head and (best is None or started < best[0]):
             best = (started, head)
     if best is not None:
@@ -32906,6 +32933,9 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     wt = leerie_dir / "worktrees" / f"acceptance-{k}"
     log_path = leerie_dir / "logs" / f"acceptance-{k}.log"
     out = {"index": k, "valid": False}
+    # Outside every try: budget exhaustion must propagate, not read as an
+    # invalid set (the same discipline as the no_work_judge call).
+    st.bump_workers(caps)
     subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     shutil.rmtree(wt, ignore_errors=True)
@@ -32944,7 +32974,6 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             "UNFIXED tree. Write the held-out tests per your rules, run them "
             "here, and return the JSON object per your schema.",
         ])
-        st.bump_workers(caps)
         res = await claude_p(
             user_prompt=user,
             system_prompt=_load_prompt("acceptance_writer"),
@@ -32959,9 +32988,20 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             rel = str(f.get("path") or "")
             while rel.startswith("./"):
                 rel = rel[2:]
+            # Relative, inside the worktree, a real file, not the report.
+            if (not rel or os.path.isabs(rel) or ".." in Path(rel).parts
+                    or rel in refs):
+                continue
             p_ = (wt / rel).resolve()
-            if not rel or not str(p_).startswith(str(wt.resolve()) + os.sep) \
-                    or not p_.is_file() or rel in refs:
+            if not str(p_).startswith(str(wt.resolve()) + os.sep) \
+                    or not p_.is_file():
+                continue
+            # New files only (code, not the prompt, enforces it): an edited
+            # existing test would collide with the target tree's own copy at
+            # evaluation and could never be run there.
+            if subprocess.run(["git", "-C", str(wt), "cat-file", "-e",
+                               f"{base}:{rel}"], capture_output=True,
+                              check=False).returncode == 0:
                 continue
             verdict = await _run_acceptance_file(
                 st, caps, str(wt), rel, log_path, f"acceptance-{k}-base")
@@ -32995,6 +33035,10 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     except (WorkerError, subprocess.TimeoutExpired) as e:
         out["reason"] = _brief_worker_exc(e)
         return out
+    except Exception as e:
+        # One writer's failure must not lose the other sets.
+        out["reason"] = f"{type(e).__name__}: {e}"[:200]
+        return out
     finally:
         subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
                         "--force", str(wt)], capture_output=True, check=False)
@@ -33021,9 +33065,13 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
     n = int(caps.get("acceptance_sets", DEFAULT_CAPS["acceptance_sets"]))
     log(f"phase 2: writing {n} held-out acceptance set(s) against "
         f"{base[:12]} (DESIGN §8)")
-    results = await asyncio.gather(*[
-        _write_acceptance_set(k, task, st, caps, models, efforts, base)
-        for k in range(1, n + 1)])
+    sem = asyncio.Semaphore(max(1, int(caps.get("max_parallel", 1))))
+
+    async def _one(k: int) -> dict:
+        async with sem:
+            return await _write_acceptance_set(k, task, st, caps, models,
+                                               efforts, base)
+    results = await asyncio.gather(*[_one(k) for k in range(1, n + 1)])
     sets = [r for r in results if r.get("valid")]
     for r in results:
         if not r.get("valid"):
@@ -33040,47 +33088,90 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
     A set fails when any of its files fails. Files that already exist in
     the tree are never overwritten."""
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+
+    def _untracked() -> set[str]:
+        # --others without --exclude-standard: ignored residue (bytecode,
+        # caches) counts too.
+        out = subprocess.run(["git", "-C", tree, "ls-files", "--others"],
+                             capture_output=True, text=True, check=False)
+        return set(out.stdout.splitlines()) if out.returncode == 0 else set()
+
+    untracked_before = _untracked()
     results = []
     for s_ in sets:
-        failing, copied, ran = [], [], []
+        failing, copied, ran, created_dirs = [], [], [], []
+        unmeasured = False
         try:
             for rel in s_["defect_files"] + s_["control_files"]:
                 dst = Path(tree) / rel
                 if dst.exists():
                     # Never overwrite (or run in its place) a file the run
-                    # itself put at that path.
+                    # itself put at that path — and never count the set as
+                    # passing on a file it could not run.
+                    unmeasured = True
                     continue
+                d = dst.parent
+                while not d.exists():
+                    created_dirs.append(d)
+                    d = d.parent
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(Path(s_["dir"]) / rel, dst)
                 copied.append(dst)
                 ran.append(rel)
             for rel in ran:
-                if await _run_acceptance_file(
-                        st, caps, tree, rel, log_path,
-                        f"acceptance-{label}") is False:
+                verdict = await _run_acceptance_file(
+                    st, caps, tree, rel, log_path, f"acceptance-{label}")
+                if verdict is None:
+                    unmeasured = True
+                elif verdict is False:
                     failing.append(rel)
         finally:
             for dst in copied:
                 with contextlib.suppress(OSError):
                     dst.unlink()
-        results.append({"index": s_["index"], "passed": not failing,
+            # Directories this call created (and any bytecode the runner
+            # left in them) go too: nothing of a hidden set may linger in
+            # the tree a fixer works in.
+            for d in sorted(created_dirs, key=lambda x: len(x.parts)):
+                shutil.rmtree(d, ignore_errors=True)
+        results.append({"index": s_["index"],
+                        "passed": not failing and not unmeasured,
+                        "unmeasured": unmeasured and not failing,
                         "failing_files": failing})
+    # Anything else the runs left in the tree (a runner's caches beside a
+    # pre-existing directory) goes too: nothing of a hidden set may linger
+    # where a fixer works, and nothing may reach a commit.
+    for rel in sorted(_untracked() - untracked_before):
+        with contextlib.suppress(OSError):
+            (Path(tree) / rel).unlink()
     return results
 
 
+def _acceptance_measured(results: list[dict]) -> list[dict]:
+    """Sets that produced a verdict: one whose files could not all be run
+    is no evidence either way (DESIGN §8 *Held-out acceptance tests*)."""
+    return [r for r in results if not r.get("unmeasured")]
+
+
 def _acceptance_majority_fails(results: list[dict]) -> bool:
-    return bool(results) and sum(1 for r in results if not r["passed"]) * 2 \
-        > len(results)
+    """True unless a strict majority of MEASURED sets passed — a tie is not
+    a passing majority. False when nothing was measured: the caller treats
+    that as no evidence, never as a pass."""
+    measured = _acceptance_measured(results)
+    return bool(measured) and sum(1 for r in measured if r["passed"]) * 2 \
+        <= len(measured)
 
 
 def _format_acceptance_failures_section(results: list[dict],
                                         sets: list[dict], shown: set[int],
-                                        rnd: int, defect_shape: str) -> str:
+                                        rnd: int, defect_shape: str,
+                                        rounds: int = 2) -> str:
     """Names, never output or source (DESIGN §8: a conformer shown the
     runner output special-cased it)."""
     by_index = {s_["index"]: s_ for s_ in sets}
     lines = [
-        f"ACCEPTANCE FAILURES (held-out acceptance gate, round {rnd} of 2): "
+        f"ACCEPTANCE FAILURES (held-out acceptance gate, round {rnd} of "
+        f"{rounds}): "
         "independent tests written from the defect report alone, by workers "
         "that never saw this run's code, FAIL on this integrated tree. You "
         "cannot see the tests or their output; the failing cases are named "
@@ -33113,19 +33204,35 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         return
     st.data["current_phase"] = "phase 5: acceptance gate"
     st.save()
-    gate: dict = {"rounds": []}
+    await _ensure_worktree_deps(
+        str(staging), st, caps,
+        log_path=leerie_dir / "logs" / "acceptance-gate.log",
+        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+        label_prefix="acceptance-gate", log_prefix="acceptance")
+    gate: dict = dict(acc.get("gate") or {})
+    gate.setdefault("rounds", [])
     initial = await _evaluate_acceptance_sets(st, caps, str(staging), sets,
                                               "gate-initial")
     gate["initial"] = initial
     final = initial
-    if _acceptance_majority_fails(initial):
+    if not _acceptance_measured(initial):
+        log("phase 5: acceptance gate — no held-out set could be run on the "
+            "integrated tree; no evidence either way")
+    elif _acceptance_majority_fails(initial):
         log(f"phase 5: acceptance gate — "
             f"{sum(1 for r in initial if not r['passed'])} of {len(initial)} "
             "held-out set(s) fail on the integrated tree; repairing")
         ordered = sorted(s_["index"] for s_ in sets)
         hidden = set(ordered[-2:]) if len(ordered) >= 4 else set()
         shown = set(ordered) - hidden
-        before_sha = await _branch_head_sha(str(staging))
+        # Persisted so a resume mid-repair still rolls back to the tree the
+        # repair started from, not to a later repair commit.
+        if not gate.get("before_sha"):
+            gate["before_sha"] = await _branch_head_sha(str(staging))
+            acc["gate"] = gate
+            st.data["acceptance"] = acc
+            st.save()
+        before_sha = gate["before_sha"]
         blt = resolve_blt(st.repo_root)
         test_cmd = (blt.get(_AXIS_CMD_KEY["tests"]) or "").strip()
         pre_tests = None
@@ -33137,7 +33244,9 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                 label_prefix="acceptance-pre",
                 log_prefix="acceptance")).get("tests")
         shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
-        for rnd in (1, 2):
+        rounds = int(caps.get("acceptance_repair_rounds",
+                              DEFAULT_CAPS["acceptance_repair_rounds"]))
+        for rnd in range(1, rounds + 1):
             up = [
                 "Run the acceptance repair pass on the merged run branch.",
                 f"LEERIE_DIR is {leerie_dir} (absolute).",
@@ -33147,10 +33256,10 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                 f"DIFF_BASE: {st.data.get('working_branch')} (compare with "
                 f"`git diff {st.data.get('working_branch')}..HEAD`)",
                 _format_acceptance_failures_section(
-                    final, sets, shown, rnd, shape),
+                    final, sets, shown, rnd, shape, rounds),
             ]
+            st.bump_workers(caps)
             try:
-                st.bump_workers(caps)
                 await claude_p(
                     user_prompt="\n".join(up),
                     system_prompt=_load_prompt("conformer"),
@@ -33187,7 +33296,7 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     "commits were reset away; residual recorded")
                 final = initial
     gate["final"] = final
-    if _acceptance_majority_fails(final):
+    if _acceptance_measured(final) and _acceptance_majority_fails(final):
         by_index = {s_["index"]: s_ for s_ in sets}
         names = [c for r in final if not r["passed"]
                  for rel in r["failing_files"]
@@ -33198,7 +33307,7 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         log(f"  WARNING: held-out acceptance residual — "
             f"{gate['residual']['failing_sets']} of {len(final)} set(s) still "
             "fail; shipping anyway (non-blocking), recorded for the next run")
-    else:
+    elif _acceptance_measured(final):
         log("phase 5: acceptance gate — held-out sets pass on the "
             "integrated tree")
     acc["gate"] = gate
@@ -33232,7 +33341,8 @@ async def _acceptance_results_on_head(st: "State", caps: dict
 
 async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
     res = await _acceptance_results_on_head(st, caps)
-    return res is not None and not _acceptance_majority_fails(res)
+    return (res is not None and bool(_acceptance_measured(res))
+            and not _acceptance_majority_fails(res))
 
 
 def _prior_acceptance_dispute(st: "State") -> bool:
@@ -33261,6 +33371,35 @@ def _prior_acceptance_dispute(st: "State") -> bool:
     return False
 
 
+async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
+                                              fix_ids_before: set[str],
+                                              plans: list[dict]) -> bool:
+    """DESIGN §8 *A plan whose fixes are all already on HEAD ends as no
+    work*: every subtask flagged `fixes_reported_symptom` before the
+    satisfied-probe sweep was dropped by it, and the held-out sets pass on
+    HEAD. Ends the run and returns True; otherwise the plan proceeds. Typed
+    fields and exit codes only. Fail-open: an error proceeds with the plan."""
+    fix_ids_after = {s_["id"] for p_ in plans
+                     for s_ in (p_.get("subtasks") or [])
+                     if s_.get("fixes_reported_symptom")}
+    if not fix_ids_before or fix_ids_after:
+        return False
+    try:
+        passes = await _acceptance_passes_on_head(st, caps)
+    except Exception as e:
+        log(f"acceptance: the already-fixed check raised "
+            f"{type(e).__name__}: {e} — proceeding with the plan")
+        return False
+    if not passes:
+        return False
+    _finish_no_work_run(st, {
+        "<every fix already on HEAD>": (
+            "every subtask fixing the reported symptom was dropped as "
+            "already satisfied, and the held-out acceptance sets pass on "
+            "HEAD")})
+    return True
+
+
 async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     """Decide a held no-work confirmation on executed evidence (DESIGN §8
     *No work is declared on executed evidence, and disputed at most
@@ -33268,8 +33407,11 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     conf = st.data.get("no_work_confirmation") or {}
     judge_evidence = conf.get("judge_evidence") or ""
     res = await _acceptance_results_on_head(st, caps)
-    if res is None:
-        st.data["no_work_acceptance"] = {"verdict": "no valid sets"}
+    if res is None or not _acceptance_measured(res):
+        # No valid sets, or none could be run on HEAD: no evidence either
+        # way, so the judge's confirmation stands (as before this check).
+        st.data["no_work_acceptance"] = {
+            "verdict": "no valid sets" if res is None else "not measurable"}
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence})
         return True
@@ -33286,6 +33428,12 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     if _prior_acceptance_dispute(st):
         st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
                                          "results": res, "cases": cases}
+        # Carry the marker forward: the dispute-once rule reads only the
+        # newest completed same-task run, so without this the run after an
+        # accepted one would dispute again — every other re-run.
+        st.data["acceptance_dispute"] = {
+            "failing_sets": sum(1 for r in res if not r["passed"]),
+            "total_sets": len(res), "cases": cases, "accepted": True}
         log("  WARNING: held-out acceptance sets still fail on HEAD, but the "
             "previous run of this task already disputed on them — accepting "
             "no work (disputed at most once). Failing cases: "
@@ -36806,9 +36954,24 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                 st.data["acceptance"] = {"skipped": f"error: {type(e).__name__}"}
             st.save()
         if (st.data.get("no_work_pending")
-                and "no_work_acceptance" not in st.data
-                and await _settle_pending_no_work(st, caps)):
-            return
+                and "no_work_acceptance" not in st.data):
+            try:
+                settled = await _settle_pending_no_work(st, caps)
+            except Exception as e:
+                # Fail open toward the judge's confirmation, as with no
+                # valid sets: the acceptance check is evidence, not a gate
+                # that may crash the run.
+                log(f"acceptance: settling the held no-work confirmation "
+                    f"raised {type(e).__name__}: {e} — the judge's "
+                    "confirmation stands")
+                st.data["no_work_acceptance"] = {
+                    "verdict": f"error: {type(e).__name__}"}
+                _finish_no_work_run(st, {"<confirmed already-satisfied>": (
+                    (st.data.get("no_work_confirmation") or {})
+                    .get("judge_evidence") or "")})
+                settled = True
+            if settled:
+                return
 
         if "plans_after_plan" not in st.data:
             plans = await phase_plan(task, st, caps, models, efforts)
@@ -36991,19 +37154,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             if satisfied_no_work is not None:
                 _finish_no_work_run(st, satisfied_no_work)
                 return
-            # DESIGN §8 *A plan whose fixes are all already on HEAD ends as
-            # no work*: only test/verification survivors left, and the
-            # held-out sets agree.
-            fix_ids_after = {s_["id"] for p_ in plans
-                             for s_ in (p_.get("subtasks") or [])
-                             if s_.get("fixes_reported_symptom")}
-            if (fix_ids_before and not fix_ids_after
-                    and await _acceptance_passes_on_head(st, caps)):
-                _finish_no_work_run(st, {
-                    "<every fix already on HEAD>": (
-                        "every subtask fixing the reported symptom was "
-                        "dropped as already satisfied, and the held-out "
-                        "acceptance sets pass on HEAD")})
+            if await _finish_if_every_fix_already_on_head(
+                    st, caps, fix_ids_before, plans):
                 return
             # Resumable-planning checkpoint: the filtered `plans`
             # immediately before _schedule() — the last plans_after_*

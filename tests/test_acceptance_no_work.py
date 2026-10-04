@@ -145,9 +145,34 @@ def test_a_second_failing_run_accepts_no_work(leerie, tmp_path, monkeypatch,
     _sibling(st, "run-prev", dispute={"failing_sets": 2, "cases": ["x"]})
     assert _settle(leerie, monkeypatch, st, _results([False, False, False])) is True
     assert st.data["no_work_acceptance"]["verdict"] == "accepted after dispute"
-    assert "acceptance_dispute" not in st.data      # no second dispute record
+    # The marker is carried forward (round-1 M4): otherwise the run after an
+    # accepted one would dispute again, every other re-run.
+    assert st.data["acceptance_dispute"]["accepted"] is True
     assert "WARNING" in capsys.readouterr().out
     assert len(finished) == 1
+
+
+def test_a_third_run_still_does_not_dispute(leerie, tmp_path, monkeypatch,
+                                           finished):
+    """Round-1 M4, end to end over three runs' state: dispute, accept,
+    accept — never dispute, accept, dispute."""
+    st = _st(leerie, tmp_path)
+    _sibling(st, "run-1", dispute={"failing_sets": 2, "cases": ["x"]})
+    import os, time
+    d2 = _sibling(st, "run-2", dispute={"failing_sets": 2, "cases": ["x"],
+                                        "accepted": True})
+    t = time.time() + 10
+    os.utime(d2, (t, t))
+    assert leerie._prior_acceptance_dispute(st) is True
+    assert _settle(leerie, monkeypatch, st, _results([False, False, False])) is True
+
+
+def test_unmeasurable_sets_keep_the_judges_confirmation(leerie, tmp_path,
+                                                       monkeypatch, finished):
+    st = _st(leerie, tmp_path)
+    res = [dict(r, unmeasured=True) for r in _results([False, False, False])]
+    assert _settle(leerie, monkeypatch, st, res) is True
+    assert st.data["no_work_acceptance"]["verdict"] == "not measurable"
 
 
 def test_no_valid_sets_keeps_the_judges_confirmation(leerie, tmp_path,
@@ -181,6 +206,44 @@ def test_passes_on_head_helper(leerie, tmp_path, monkeypatch):
             st, dict(leerie.DEFAULT_CAPS))) is want
 
 
+def _plans(*flags):
+    return [{"domain": "bug-fixing", "subtasks": [
+        {"id": f"s{i}", "fixes_reported_symptom": f}
+        for i, f in enumerate(flags)]}]
+
+
+@pytest.mark.parametrize("before,after,passes,ends", [
+    ({"s0"}, _plans(False), True, True),     # every fix dropped, sets pass
+    ({"s0"}, _plans(False), False, False),   # sets fail → keep the plan
+    ({"s0"}, _plans(True), True, False),     # a fix subtask survived
+    (set(), _plans(False), True, False),     # the plan had no fix subtasks
+])
+def test_every_fix_already_on_head_routing(leerie, tmp_path, monkeypatch,
+                                           finished, before, after, passes,
+                                           ends):
+    """Behavioural A4 (round-1 review: structure alone is not substance)."""
+    st = _st(leerie, tmp_path)
+
+    async def fake(st_, caps):
+        return passes
+    monkeypatch.setattr(leerie, "_acceptance_passes_on_head", fake)
+    got = asyncio.run(leerie._finish_if_every_fix_already_on_head(
+        st, dict(leerie.DEFAULT_CAPS), before, after))
+    assert got is ends and len(finished) == (1 if ends else 0)
+
+
+def test_already_fixed_check_errors_proceed_with_the_plan(
+        leerie, tmp_path, monkeypatch, finished):
+    st = _st(leerie, tmp_path)
+
+    async def boom(st_, caps):
+        raise OSError("set dir pruned")
+    monkeypatch.setattr(leerie, "_acceptance_passes_on_head", boom)
+    assert asyncio.run(leerie._finish_if_every_fix_already_on_head(
+        st, dict(leerie.DEFAULT_CAPS), {"s0"}, _plans(False))) is False
+    assert finished == []
+
+
 def test_run_phases_wiring(leerie):
     src = inspect.getsource(leerie._run_phases)
     # Settled after the acceptance sets exist, before planning.
@@ -192,6 +255,5 @@ def test_run_phases_wiring(leerie):
     # gated on the held-out sets passing on HEAD.
     i_before = src.index("fix_ids_before = ")
     i_sweep = src.index("await _filter_satisfied_subtasks(")
-    i_after = src.index("fix_ids_after = ")
-    i_pass = src.index("await _acceptance_passes_on_head(st, caps)")
-    assert i_before < i_sweep < i_after < i_pass
+    i_a4 = src.index("await _finish_if_every_fix_already_on_head(")
+    assert i_before < i_sweep < i_a4

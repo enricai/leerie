@@ -71,6 +71,25 @@ def test_backtick_quoted_protocol_text_is_not_a_hit(leerie):
     assert leerie._find_protocol_markup(s, _auditor_props(leerie)) is None
 
 
+def test_ordinary_markup_named_like_a_schema_field_is_not_a_hit(leerie):
+    """Round-1 M5: `summary`, `title`, `name` are schema properties AND
+    ordinary markup. A closing tag counts only where leaked syntax sits — at
+    the end of the value or before another tool/schema tag — and fenced code
+    is ignored. Measured 2026-10-04, that dropped none of 2,394 corpus hits."""
+    pr = leerie._schema_property_names(leerie.SCHEMAS["pr_writer"])
+    impl = leerie._schema_property_names(leerie.SCHEMAS["implementer"])
+    body = "Adds a page:\n```html\n<title>Orders</title>\n```\nand tests."
+    assert leerie._find_protocol_markup({"title": "t", "body": body}, pr) is None
+    assert leerie._find_protocol_markup(
+        "see <details><summary>Log</summary> for more", impl) is None
+    assert leerie._find_protocol_markup(
+        "fenced:\n```\n<parameter name=\"x\">y</parameter>\n```", impl) is None
+    # The leaked shapes still hit.
+    assert leerie._find_protocol_markup("done</summary>\n", impl)
+    assert leerie._find_protocol_markup(
+        'done</summary>\n<parameter name="files">', impl)
+
+
 def test_detection_recurses_into_nested_structures(leerie):
     props = _auditor_props(leerie)
     out = {"applicable": True, "sites": [{"note": "fine"},

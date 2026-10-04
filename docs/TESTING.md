@@ -4321,3 +4321,35 @@ evidence, and disputed at most once*).
   pending settle runs after the acceptance write and before planning. (The A4
   routing is pinned structurally; driving the real filters block end to end is
   left to the live run.)
+
+### Review round 1 fixes (2026-10-04)
+
+The first adversarial review round found the held-out machinery could read
+"no evidence" as "pass", could be gamed or sunk by one writer's output, and
+that the protocol-markup check flagged ordinary markup. Each fix is pinned and
+was falsified by reverting it (each reversion turns exactly one test red):
+
+- **Unrunnable ≠ passing** (`test_unrunnable_files_never_count_as_passing`,
+  `test_unmeasurable_sets_keep_the_judges_confirmation`): a file the runner
+  cannot run, or a path the target tree already uses, marks the set
+  `unmeasured`; unmeasured sets are left out of the vote, and nothing measured
+  is "no evidence" (the judge's confirmation stands), never a pass.
+- **New files only, in code** (`test_writer_editing_an_existing_file_is_not_kept`).
+- **One writer cannot sink the rest**
+  (`test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest`):
+  absolute and `..` paths are rejected, and any per-writer exception only
+  discards that set.
+- **Disputed at most once, really** (`test_a_second_failing_run_accepts_no_work`
+  asserts the carried-forward marker; `test_a_third_run_still_does_not_dispute`).
+- **Ties are not a passing majority** (`test_majority_rule`).
+- **No residue** (`test_evaluation_leaves_the_tree_clean_and_never_overwrites`):
+  every untracked path an evaluation introduced, bytecode included, is removed.
+- **Markup check precision** (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`):
+  fenced code is stripped, and a schema-named closing tag counts only where
+  leaked syntax sits; the leaked shapes still hit.
+- **A4, behaviourally** (`test_every_fix_already_on_head_routing`, four cases,
+  and `test_already_fixed_check_errors_proceed_with_the_plan`), now through
+  `_finish_if_every_fix_already_on_head` rather than a source-order pin alone.
+
+`tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
+(CLI → env → leerie.toml → off), mirroring its sibling resolvers.

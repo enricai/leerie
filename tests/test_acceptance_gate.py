@@ -245,16 +245,89 @@ def test_evaluation_leaves_the_tree_clean_and_never_overwrites(leerie, tmp_path)
     (staging / "acc" / "test_defect_1.py").write_text("# the run's own file\n")
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 2), str(staging), sets, "t"))
-    assert [r["passed"] for r in res] == [True, False]  # set 1's defect skipped
+    # Set 1 collides with the run's own file: it could not run that file, so
+    # it is unmeasured — never a pass (round-1 review M1/M2).
+    assert [(r["passed"], r["unmeasured"]) for r in res] == [
+        (False, True), (False, False)]
     assert (staging / "acc" / "test_defect_1.py").read_text() == "# the run's own file\n"
     assert not (staging / "acc" / "test_defect_2.py").exists()
+    # Nothing the call created is left behind — not even bytecode.
+    assert subprocess.run(
+        ["git", "-C", str(staging), "ls-files", "--others"],
+        capture_output=True, text=True).stdout.split() == ["acc/test_defect_1.py"]
 
 
 def test_majority_rule(leerie):
     f = leerie._acceptance_majority_fails
     assert f([{"passed": False}, {"passed": False}, {"passed": True}])
-    assert not f([{"passed": False}, {"passed": True}])
+    assert not f([{"passed": True}, {"passed": True}, {"passed": False}])
+    # A tie is not a passing majority.
+    assert f([{"passed": False}, {"passed": True}])
+    # Unmeasured sets are not evidence: excluded from the vote, and nothing
+    # measured is "no evidence", never a failing (or passing) majority.
+    assert not f([{"passed": True}, {"passed": False, "unmeasured": True}])
+    assert not f([{"passed": False, "unmeasured": True}])
     assert not f([])
+
+
+def test_unrunnable_files_never_count_as_passing(leerie, tmp_path):
+    """Round-1 M1: a runner that cannot run the file must not read as a
+    pass — that would end a run as "no work" on tests that never ran."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_scoped = "no-such-runner-xyz {test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 3), str(staging), _make_sets(leerie, st, 3), "t"))
+    assert all(r["unmeasured"] and not r["passed"] for r in res)
+    assert leerie._acceptance_measured(res) == []
+
+
+def test_writer_editing_an_existing_file_is_not_kept(leerie, tmp_path,
+                                                    monkeypatch):
+    """Round-1 M2: "new files only" is enforced in code, not left to the
+    prompt."""
+    repo, head = _repo(tmp_path)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_calc.py").write_text(CONTROL_TEST)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "existing test")
+    head = _git(repo, "rev-parse", "HEAD")
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {1: {
+        "tests/test_calc.py": ("defect", DEFECT_TEST, ["edits existing"])}})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    assert acc["sets"] == []
+
+
+def test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest(
+        leerie, tmp_path, monkeypatch):
+    """Round-1 M3: an absolute declared path (models often report them)
+    used to raise SameFileError out of asyncio.gather and lose every set."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    calls = []
+
+    async def fake_claude_p(**kw):
+        k = int(kw["sid"].split("-")[-1])
+        calls.append(k)
+        p = Path(kw["cwd"]) / "acc" / f"test_defect_{k}.py"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(DEFECT_TEST)
+        if k == 1:
+            return {"files": [{"path": str(p), "kind": "defect", "cases": ["a"]}]}
+        if k == 2:
+            raise OSError("writer 2 blew up")
+        return {"files": [{"path": f"acc/test_defect_{k}.py", "kind": "defect",
+                           "cases": ["c"]}]}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 3), MODELS, EFFORTS))
+    assert [s["index"] for s in acc["sets"]] == [3]
+    assert sorted(calls) == [1, 2, 3]
 
 
 def test_failures_section_is_names_only_and_hides_the_holdout(leerie, tmp_path):

@@ -423,8 +423,8 @@ subtask it tests). Three mechanisms reconcile that coupling:
   chokepoint fix alone changes that site's output on the report's
   inputs, or dispose it `fix`. Measured on the post-0.33 repeat pairs
   (replayed against run N's base tree): the later-fixed symbol came back
-  disposed `fix` 8/8 (`deriveBaseUrl`), 3/3, 7/8 and 5/8, with no growth
-  in mean site count (12.0 vs 12.8). One blind spot stayed (a helper
+  disposed `fix` 8/8, 3/3, 7/8 and 5/8, and the mean site count did not
+  grow (12.0 with dispositions, 12.8 without). One blind spot stayed (a helper
   1/8), which is why the planner's coverage warning remains advisory.
   The planner must cover every `fix` site; `ruled_out` sites travel with
   their evidence (in `note`) for the record. A per-site judge on the integrated tree
@@ -5318,12 +5318,13 @@ completed. The identity write is therefore hoisted to run start, before
 **No work is declared on executed evidence, and disputed at most once.**
 A confirmed claim used to end the run on the judge's reading alone, and the
 judge can neither run tests nor, as measured, see the report's contract:
-43% of no-work confirmations since v0.31.0 carried no contract item, and one
+6 of the 14 no-work confirmations recorded from v0.31.0 through 2026-10-03
+carried no contract item, and one
 of them (generate-1.12.74) declared done a defect that report-shaped tests
 still reproduce on barnacle's HEAD. So on a defect-fix task with held-out
 acceptance available, the judge's confirmation is held as *pending*; the
 run continues through provisioning, the defect-scope audit and the
-acceptance sets (§ *Held-out acceptance tests* — they need the installed
+acceptance sets (§8 *Held-out acceptance tests* — they need the installed
 dependencies, which is why the decision moves after provisioning), and the
 sets are run on HEAD. A majority passing ends the run as no work. A
 majority failing is a dispute: the failing case names become the
@@ -6016,9 +6017,17 @@ told which declared cases failed and the defect contract — never the
 runner output or the test source, because a conformer shown the failing
 output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes
-at the root against 1/4). The last two valid sets are never shown at
-all; every round is re-judged on all sets, so a fix fitted to the shown
-names still fails the hidden ones. Repair rounds run the conformer at
+at the root against 1/4). When four or more sets are valid, the two
+highest-indexed are never shown at all; every round is re-judged on all
+sets, so a fix fitted to the shown names still fails the hidden ones. With
+fewer valid sets every failing set is shown and nothing is held back — a
+weaker check, logged as such. A set whose files could not all be run (a
+missing runner, a path the target tree already uses) is no evidence either
+way: it is left out of the vote rather than counted as passing, and when
+no set can be run the gate records no evidence instead of a pass. A tie is
+not a passing majority. Repair rounds run at `high` effort regardless of
+the operator's `--effort`/`--effort-conformer` settings: the rounds exist
+only on failing runs, and the effort is the measured lever below. Repair rounds run the conformer at
 **high effort**: on the multi-mechanism generate report the low-effort
 pinned conformer fixed the contract from HEAD 1/2 times, medium 2/3,
 high every time it finished (6/6) — effort, not turn budget, was the
@@ -7363,7 +7372,15 @@ one of the worker's own schema properties) are mechanical in this sense:
 they are the CLI's wire syntax, never a worker's way of saying something,
 so `claude_p`'s check for them (§7 *Forcing constrained decoding*) is
 inside the rule. It answers "is this payload corrupted?", not "what does
-this text mean?".
+this text mean?". The check first removes markdown code spans (fenced
+blocks and inline backtick spans) — again by their mechanical delimiters,
+not by reading what they say — because a worker quoting code is quoting,
+not leaking; and a closing tag named after a schema property counts only
+where leaked syntax sits (at the end of the value, or before another tool
+or schema tag), since names like `summary` or `title` are also ordinary
+markup. Measured on 2026-10-04, these two restrictions dropped none of the
+2,394 hits in the recorded corpus and removed the false positives a review
+found in PR bodies and summaries quoting HTML.
 
 An earlier audit found several orchestrator sites that violated this by
 regexing natural-language prose (task text, planner intent,

@@ -14,7 +14,7 @@ from tests.test_defect_scope_audit import (AUDIT, EFFORTS, MODELS, _caps,
                                            _patch_auditor, _state)
 
 
-def test_schema_requires_disposition_and_evidence(leerie):
+def test_schema_requires_disposition_without_extra_fields(leerie):
     sch = leerie.SCHEMAS["defect_scope_auditor"]
     site = sch["properties"]["sites"]["items"]
     assert sorted(site["required"]) == [

@@ -439,9 +439,10 @@ The orchestrator gives you, in your prompt:
    itself; the implementer reads your spec, not the report. A test whose
    inputs drop a trigger feature does not prove the fix, even if it
    passes. (Measured: a first run's fix failed on the report's own quoted
-   instruction because its test paraphrased "…sign-in form, click
-   'Create Account'" into "Click the Create Profile button", dropping
-   the words that trigger the defect.)
+   instruction because its test paraphrased it — the shape is "Below the
+   summary panel, click the 'Export' button" becoming "Click the
+   download button", which drops the "summary panel" mention that
+   triggers the defect.)
 
    **Put the audit's `defect_shape` into every covering subtask's
    `success_criteria_seed`** — each subtask states its OWN site-scoped
