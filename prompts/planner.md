@@ -426,6 +426,20 @@ The orchestrator gives you, in your prompt:
    subtask's `scope_note` and keep verification honest about resting
    on fixtures.
 
+   When `ground_truth.inline_examples` lists the report's own example
+   inputs, the plan MUST include a test whose `success_criteria_seed`
+   feeds the decision site each example — VERBATIM when
+   `site_identifying` is false; when true, through a site-neutral
+   substitute that preserves EVERY trigger feature (name the preserved
+   features, and never write any of its `site_tokens`). Put the literal
+   (or the substitute and its preserved features) in the criterion
+   itself; the implementer reads your spec, not the report. A test whose
+   inputs drop a trigger feature does not prove the fix, even if it
+   passes. (Measured: a first run's fix failed on the report's own quoted
+   instruction because its test paraphrased "…sign-in form, click
+   'Create Account'" into "Click the Create Profile button", dropping
+   the words that trigger the defect.)
+
    **Put the audit's `defect_shape` into every covering subtask's
    `success_criteria_seed`** — each subtask states its OWN site-scoped
    done-state, then quotes the shape verbatim as the campaign-level

@@ -4197,3 +4197,33 @@ v0.36.0 `defect_scope_auditor` call: 4/4 leaks with the proxy, 0/4 without,
 
 `tests/test_retryable_failure.py` follows the rename
 (`_find_antml_markup` → `_find_protocol_markup`).
+
+## The report's own example inputs (2026-10-04)
+
+Both repeat runs on v0.36.0 traced to a first run whose fix failed on the
+report's own quoted input (executed against run 1's shipped code): the tests
+paraphrased the input and dropped the triggering feature (DESIGN §5 *The
+report's own example inputs are captured too*).
+
+`tests/test_inline_examples.py`:
+
+- **Passthrough.** The executed audit phase carries
+  `ground_truth.inline_examples` (literal, `site_identifying`,
+  `trigger_tokens`, `site_tokens`) into the scope by value; malformed entries
+  (prose, missing literal, empty tokens) are dropped. Falsified: emptying the
+  passthrough turns three tests red.
+- **Planner.** Driving the real `phase_plan`, the example literal reaches the
+  planner's user prompt, and the planner system prompt carries the
+  verbatim-test directive.
+- **Advisory site-token check** (`_warn_site_token_leaks`), against a real git
+  repo: a token the run's diff adds is reported with its file and recorded in
+  `site_token_warnings`; a token already in the base tree is skipped (the
+  measured false-positive source — falsified by removing the skip); a partial
+  word is not a hit; no examples means no check. Word boundaries are `\w`,
+  so `AcmeShop-style` is a hit, as `git grep -w` would also see it.
+- **Order.** In `_run_phases` the check runs after `phase_execute` and before
+  `_run_delivery_prejudge`, inside an `except Exception` (advisory). Falsified
+  by removing the call.
+
+`tests/test_defect_scope_audit.py::test_ground_truth_attestations_are_schema_required`
+now pins `inline_examples` (and its item's four fields) as required.

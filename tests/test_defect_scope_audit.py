@@ -492,7 +492,10 @@ def test_ground_truth_attestations_are_schema_required(leerie):
     gt = leerie.SCHEMAS["defect_scope_auditor"]["properties"][
         "ground_truth"]
     assert sorted(gt["required"]) == [
-        "data_dependent", "inputs", "repro_command"]
+        "data_dependent", "inline_examples", "inputs", "repro_command"]
+    ex = gt["properties"]["inline_examples"]["items"]
+    assert sorted(ex["required"]) == [
+        "literal", "site_identifying", "site_tokens", "trigger_tokens"]
     item = gt["properties"]["inputs"]["items"]
     assert sorted(item["required"]) == [
         "kind", "path", "resolved_path", "role"]

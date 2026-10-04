@@ -382,6 +382,34 @@ subtask it tests). Three mechanisms reconcile that coupling:
   gate's refresh, and the gate's payload names the resolved
   location ("PRESENT at …") instead of asserting absence.
 
+  **The report's own example inputs are captured too.** Most reports
+  carry no archive at all — their evidence is the example the report
+  quotes inline: a step instruction, a URL sequence, a hash fragment,
+  a request-body fragment. Those literals are the inputs a fix must be
+  proven against, and they were being lost: both repeat runs on v0.36.0
+  traced to a first run whose fix failed on the report's own quoted
+  input (executed against run 1's shipped code), because the tests
+  paraphrased the input and the paraphrase dropped the feature that
+  triggers the defect — "Below the newly-revealed … sign-in form, click
+  'Create Account'" became "Click the Create Profile button", and a
+  comma-accumulating hash sequence became a single `/`-segmented one.
+  So `ground_truth` also carries `inline_examples`, each the verbatim
+  `literal`, whether it is `site_identifying` (it names the real site
+  or brand, so it cannot be committed to a site-agnostic repo
+  verbatim), the `trigger_tokens` that carry the triggering feature
+  (short verbatim substrings any faithful substitute must keep) and the
+  `site_tokens` that identify the site. Measured: extraction caught the
+  decisive trigger in 12/12 trials across both reports; given the
+  examples, planners required a verbatim or feature-preserving test in
+  9/9 plans (0/12 recorded plans did without them), and the resulting
+  verbatim test failed on a broken fix 4/4 times. The field is
+  schema-required (possibly empty) for the same reason as
+  `resolved_path`. The planner prompt turns the examples into test
+  requirements; the `site_tokens` back an advisory, never gating,
+  diff check after integration — measured precision 100% but recall
+  only 1 of 3 leaking commits across 36 shipped commits, because a
+  leak already present in the base tree hides later ones.
+
   **An applicable audit with zero sites is re-asked once.**
   `applicable: true` with an empty `sites` list disarms both
   consumers of the audit — planner injection and the gate's contract

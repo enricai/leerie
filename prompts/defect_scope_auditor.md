@@ -121,7 +121,37 @@ this environment and tells both the operator and the delivery judge
 which inputs are absent — this is how a run learns its verification
 can only be hypothesis-shaped BEFORE it ships a fix, instead of
 after. A report with no named external inputs returns
-`{"data_dependent": false, "inputs": [], "repro_command": null}`.
+`{"data_dependent": false, "inputs": [], "repro_command": null, "inline_examples": []}`.
+
+## The report's own example inputs
+
+Also return `ground_truth.inline_examples`: the concrete values the
+report quotes on which the defect manifests — a step instruction
+string, a URL or URL sequence, a hash fragment, a request-body
+fragment, a configuration entry. These are the inputs the fix must be
+proven against; a test that paraphrases them can drop the very feature
+that triggers the defect and pass against a broken fix. For each:
+
+- `literal`: the value copied verbatim from the report — no
+  paraphrase, no trimming of words; join a value the report wraps
+  across lines with single spaces. When the defect needs a SEQUENCE
+  of related inputs to fire, give the whole sequence in one literal,
+  one value per line.
+- `site_identifying`: true when the literal names a real site, brand,
+  company, product or customer, so it cannot be committed verbatim to
+  a repository that must stay site-agnostic; false otherwise.
+- `trigger_tokens`: the SHORT verbatim substrings of the literal (a few
+  words each) that carry the triggering feature and that any faithful
+  substitute must keep word-for-word. Empty when the trigger is purely
+  structural (a shape of a sequence) rather than lexical.
+- `site_tokens`: the words in the literal that identify the real site,
+  brand, company, product or customer — lowercase, one word each.
+  Empty when `site_identifying` is false.
+
+Do not list values that are only outputs or symptoms (log lines, the
+generated code the report shows as wrong) unless they are also
+inputs, and never invent an example the report does not contain.
+`[]` only when the report quotes no concrete input at all.
 
 ## When to say "not applicable"
 
@@ -169,7 +199,13 @@ Return **only** a JSON object per your schema:
        "role": "the configuration the report's repro loads",
        "resolved_path": null}
     ],
-    "repro_command": "python3 scripts/example_repro.py --dataset /tmp/example-input-dataset/"
+    "repro_command": "python3 scripts/example_repro.py --dataset /tmp/example-input-dataset/",
+    "inline_examples": [
+      {"literal": "Below the summary panel, click the 'Export' button to download the report",
+       "site_identifying": false,
+       "trigger_tokens": ["summary panel", "click the 'Export' button"],
+       "site_tokens": []}
+    ]
   },
   "rationale": "how you searched and what you read"
 }

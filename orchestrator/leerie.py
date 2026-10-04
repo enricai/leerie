@@ -440,6 +440,12 @@ STATE_FIELDS = (
     # resume checkpoint mirroring artifact_registry; injected into
     # planner ctx when applicable with non-empty sites.
     "defect_scope",
+    # site_token_warnings: advisory [{token, file}] from
+    # _warn_site_token_leaks after integration — a report's site-identifying
+    # token found in the run's added lines and absent from the base tree
+    # (DESIGN §5 *The report's own example inputs are captured too*).
+    # Never gates.
+    "site_token_warnings",
     # delivery_gate: audit record of the finalize-side required-items
     # verification on the integrated staging tree (DESIGN §8 *The
     # delivery gate*): {unmet_before[], unmet_after[], samples_before,
@@ -3224,7 +3230,7 @@ SCHEMAS: dict[str, dict] = {
                 # for the repro-decides loop (null = the report gives
                 # none).
                 "required": ["data_dependent", "inputs",
-                             "repro_command"],
+                             "repro_command", "inline_examples"],
                 "properties": {
                     "data_dependent": {"type": "boolean"},
                     "inputs": {
@@ -3265,6 +3271,31 @@ SCHEMAS: dict[str, dict] = {
                         },
                     },
                     "repro_command": {"type": ["string", "null"]},
+                    # The example inputs the report quotes inline (DESIGN
+                    # §5 *The report's own example inputs are captured
+                    # too*): the literals a fix must be proven against.
+                    # Required (possibly empty) for the resolved_path
+                    # reason above — the planner's test requirements and
+                    # the site-token warning both read it.
+                    "inline_examples": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "required": ["literal", "site_identifying",
+                                         "trigger_tokens", "site_tokens"],
+                            "properties": {
+                                "literal": {"type": "string"},
+                                "site_identifying": {"type": "boolean"},
+                                "trigger_tokens": {
+                                    "type": "array",
+                                    "items": {"type": "string"}},
+                                "site_tokens": {
+                                    "type": "array",
+                                    "items": {"type": "string"}},
+                            },
+                        },
+                    },
                 },
             },
             "rationale": {"type": "string"},
@@ -32092,9 +32123,21 @@ def _check_ground_truth_inputs(ground_truth: object,
                        "role": str(i.get("role") or ""),
                        "present": present_at is not None,
                        "resolved_path": present_at or rp})
+    examples: list[dict] = []
+    for e in (ground_truth.get("inline_examples") or []):
+        if not (isinstance(e, dict) and e.get("literal")):
+            continue
+        examples.append({
+            "literal": str(e["literal"]),
+            "site_identifying": bool(e.get("site_identifying")),
+            "trigger_tokens": [str(t) for t in (e.get("trigger_tokens") or [])
+                               if t],
+            "site_tokens": [str(t) for t in (e.get("site_tokens") or []) if t],
+        })
     gt = {"data_dependent": bool(ground_truth.get("data_dependent")),
           "inputs": inputs,
-          "repro_command": ground_truth.get("repro_command") or None}
+          "repro_command": ground_truth.get("repro_command") or None,
+          "inline_examples": examples}
     missing = [i for i in inputs if not i["present"]]
     if log_missing and missing and gt["data_dependent"]:
         log("  WARNING: the report pins its defect to external data "
@@ -32650,6 +32693,69 @@ async def _delivery_judge_unmet(
         contract_result = _downgrade_ungrounded_met(
             contract_result, ground_truth)
     return confirmed, len(samples), contract_result
+
+
+def _site_tokens_from_scope(defect_scope: object) -> list[str]:
+    """Lower-cased, de-duplicated site tokens across every inline example
+    the audit recorded."""
+    if not isinstance(defect_scope, dict):
+        return []
+    gt = defect_scope.get("ground_truth") or {}
+    seen: dict[str, None] = {}
+    for e in (gt.get("inline_examples") or []):
+        for t in (e.get("site_tokens") or []):
+            t = str(t).strip().lower()
+            if t:
+                seen.setdefault(t, None)
+    return list(seen)
+
+
+def _warn_site_token_leaks(st: "State", leerie_dir: Path) -> list[dict]:
+    """Advisory: report any site-identifying token from the report's inline
+    examples that this run's diff adds and the base tree does not already
+    contain (DESIGN §5 *The report's own example inputs are captured
+    too*). Tokens are matched as whole words, case-insensitively, against
+    `git diff` added lines — mechanical string containment on an
+    LLM-extracted typed field, never prose interpretation. A token already
+    in the base tree is skipped: measured, that exclusion is what keeps
+    generic words ("go", "cruise") from flagging nearly every commit. It
+    also hides a leak that is already merged, which is why this never
+    gates. Returns the recorded hits."""
+    tokens = _site_tokens_from_scope(st.data.get("defect_scope"))
+    base = st.data.get("working_branch")
+    staging = leerie_dir / "worktrees" / "staging"
+    if not tokens or not base or not staging.is_dir():
+        return []
+    diff = subprocess.run(
+        ["git", "-C", str(staging), "diff", "--unified=0", f"{base}..HEAD"],
+        capture_output=True, text=True, check=False).stdout
+    added: list[tuple[str, str]] = []
+    current = ""
+    for line in diff.splitlines():
+        if line.startswith("+++ b/"):
+            current = line[6:]
+        elif line.startswith("+") and not line.startswith("+++"):
+            added.append((current, line[1:]))
+    hits: list[dict] = []
+    for tok in tokens:
+        in_base = subprocess.run(
+            ["git", "-C", str(staging), "grep", "-q", "-w", "-i", "-F",
+             "-e", tok, base, "--"],
+            capture_output=True, check=False).returncode == 0
+        if in_base:
+            continue
+        pat = re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", re.IGNORECASE)
+        files = sorted({f for f, text in added if pat.search(text)})
+        hits.extend({"token": tok, "file": f} for f in files)
+    if hits:
+        log("  WARNING: this run's diff adds site-identifying name(s) from "
+            "the report's examples (the task may require a site-agnostic "
+            "repo; advisory only):")
+        for h in hits:
+            log(f"    • {h['token']!r} in {h['file']}")
+    st.data["site_token_warnings"] = hits
+    st.save()
+    return hits
 
 
 async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
@@ -36360,6 +36466,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         _write_plan(leerie_dir, task, st, subtasks, waves)
 
     await phase_execute(leerie_dir, st, caps, models, efforts)
+    try:
+        _warn_site_token_leaks(st, leerie_dir)
+    except Exception as e:
+        # Advisory output must never abort a run.
+        log(f"site-token check errored ({type(e).__name__}: {e}); continuing")
     # Delivery gate, first half (DESIGN §8 *The delivery gate*): verify
     # the integrated tree against required_items and hand any
     # confirmed-unmet items to the final-conformer pass below. Advisory
