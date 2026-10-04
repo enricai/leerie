@@ -4318,16 +4318,19 @@ evidence, and disputed at most once*).
 - **A4.** `_acceptance_passes_on_head` over no sets, a passing and a failing
   majority; in `_run_phases` the fix-subtask set is taken before the
   satisfied-probe sweep and re-checked after it, gated on that helper, and the
-  pending settle runs after the acceptance write and before planning. (The A4
-  routing is pinned structurally; driving the real filters block end to end is
-  left to the live run.)
+  pending settle runs after the acceptance write and before planning. The A4
+  routing itself is pinned behaviourally (round-1 fixes below); only its
+  placement in `_run_phases` is a source-order pin.
 
 ### Review round 1 fixes (2026-10-04)
 
 The first adversarial review round found the held-out machinery could read
 "no evidence" as "pass", could be gamed or sunk by one writer's output, and
-that the protocol-markup check flagged ordinary markup. Each fix is pinned and
-was falsified by reverting it (each reversion turns exactly one test red):
+that the protocol-markup check flagged ordinary markup. Each fix is pinned
+below. (The round-1 commit claimed every reversion turned exactly one test red;
+round 2 measured that as false — reverting the absolute-path rejection turned
+none red, and several smaller fixes had no test. Round 2 added the missing
+tests; see below.)
 
 - **Unrunnable ≠ passing** (`test_unrunnable_files_never_count_as_passing`,
   `test_unmeasurable_sets_keep_the_judges_confirmation`): a file the runner
@@ -4350,6 +4353,48 @@ was falsified by reverting it (each reversion turns exactly one test red):
 - **A4, behaviourally** (`test_every_fix_already_on_head_routing`, four cases,
   and `test_already_fixed_check_errors_proceed_with_the_plan`), now through
   `_finish_if_every_fix_already_on_head` rather than a source-order pin alone.
+
+### Review round 2 fixes (2026-10-04)
+
+Each pin below was falsified by reverting its fix and running the test named
+(18 reversions, 17 caught). The one survivor is equivalent, not unpinned:
+removing the explicit save after `pre_tests_passed` changes nothing observable,
+because `bump_workers` saves state before the round's worker starts with
+nothing awaited in between. The explicit save stays so persistence does not
+rest on that coincidence.
+
+- **Undeclared helpers travel with the set**
+  (`test_undeclared_helper_travels_with_the_set`): a non-test file the writer
+  created but did not declare becomes a `support_files` entry; without it a
+  correct fix failed the set at evaluation.
+- **A writer may not edit tracked files**
+  (`test_writer_editing_a_tracked_file_discards_the_set`), read from
+  `git status --porcelain -z`.
+- **Absolute paths, really** (`test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest`
+  now has set 1 declare an absolute AND a relative file: rejected, the set
+  survives on the relative one; unrejected, the self-copy discards it).
+- **Resume mid-repair** (`test_resume_mid_repair_still_rolls_back_a_red_repair`,
+  `test_pre_repair_state_is_persisted_before_the_first_round`): `before_sha` and
+  `pre_tests_passed` are on disk before round 1, and spent rounds count.
+- **Budget exhaustion mid-repair still rolls back**
+  (`test_budget_exhaustion_mid_repair_still_rolls_back`); in the writer it
+  still propagates (`test_writer_budget_exhaustion_propagates`).
+- **Cap, concurrency, deps** (`test_repair_rounds_follow_the_cap`,
+  `test_writers_respect_max_parallel`, `test_gate_installs_deps_in_staging`).
+- **Cleanup** (`test_evaluation_removes_the_directories_it_created`: `git
+  ls-files --others` never lists an empty directory, so this is the only pin).
+- **Validity base** skips an undated sibling
+  (`test_validity_base_prefers_the_earliest_same_task_sibling`).
+- **No claim of hidden tests that do not exist**
+  (`test_no_hidden_sets_means_no_claim_of_hidden_tests`).
+- **Counts over measured sets only** (`test_residual_counts_only_measured_sets`,
+  `test_dispute_counts_only_measured_sets`); `_acceptance_passes_on_head`
+  reads nothing-measured as not passing (`test_passes_on_head_helper`).
+- **Settle fails open** (`test_settle_errors_fail_open_to_the_judges_confirmation`,
+  through the extracted `_settle_pending_no_work_failing_open`).
+- **Fenced code in the markup check** is matched line-anchored, so a stray
+  inline triple backtick cannot swallow a leak
+  (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

@@ -182,6 +182,35 @@ def test_no_valid_sets_keeps_the_judges_confirmation(leerie, tmp_path,
     assert st.data["no_work_acceptance"]["verdict"] == "no valid sets"
 
 
+def test_dispute_counts_only_measured_sets(leerie, tmp_path, monkeypatch,
+                                          finished):
+    """An unrunnable set is no evidence: it is neither a failing set in the
+    recorded count nor a source of failing case names."""
+    st = _st(leerie, tmp_path)
+    res = _results([False, False, True])
+    res[2] = {"index": 3, "passed": False, "unmeasured": True,
+              "failing_files": []}
+    res.append({"index": 4, "passed": False, "unmeasured": True,
+                "failing_files": []})
+    assert _settle(leerie, monkeypatch, st, res) is False
+    assert st.data["acceptance_dispute"]["failing_sets"] == 2
+    assert st.data["acceptance_dispute"]["total_sets"] == 2
+
+
+def test_settle_errors_fail_open_to_the_judges_confirmation(
+        leerie, tmp_path, monkeypatch, finished):
+    st = _st(leerie, tmp_path, no_work_pending=True,
+             no_work_confirmation={"judge_evidence": "verified on HEAD"})
+
+    async def boom(st_, caps):
+        raise OSError("planning worktree vanished")
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", boom)
+    assert asyncio.run(leerie._settle_pending_no_work_failing_open(
+        st, dict(leerie.DEFAULT_CAPS))) is True
+    assert st.data["no_work_acceptance"] == {"verdict": "error: OSError"}
+    assert finished == [{"<confirmed already-satisfied>": "verified on HEAD"}]
+
+
 def test_prior_dispute_reads_only_the_newest_completed_same_task_run(
         leerie, tmp_path):
     st = _st(leerie, tmp_path)
@@ -197,8 +226,12 @@ def test_prior_dispute_reads_only_the_newest_completed_same_task_run(
 
 def test_passes_on_head_helper(leerie, tmp_path, monkeypatch):
     st = _st(leerie, tmp_path)
+    unmeasured = [dict(r, unmeasured=True) for r in _results([False] * 3)]
     for res, want in ((None, False), (_results([True, True, False]), True),
-                      (_results([False, False, True]), False)):
+                      (_results([False, False, True]), False),
+                      # Nothing measured is no evidence, never "already
+                      # fixed" (round-2 review).
+                      (unmeasured, False)):
         async def fake(st_, caps, r=res):
             return r
         monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
@@ -248,7 +281,7 @@ def test_run_phases_wiring(leerie):
     src = inspect.getsource(leerie._run_phases)
     # Settled after the acceptance sets exist, before planning.
     i_write = src.index("await phase_acceptance_write(")
-    i_settle = src.index("await _settle_pending_no_work(st, caps)")
+    i_settle = src.index("await _settle_pending_no_work_failing_open(st, caps)")
     i_plan = src.index("plans = await phase_plan(")
     assert i_write < i_settle < i_plan
     # A4: the fix-subtask set is taken BEFORE the sweep and re-checked after,

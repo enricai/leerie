@@ -6021,14 +6021,15 @@ at the root against 1/4). When four or more sets are valid, the two
 highest-indexed are never shown at all; every round is re-judged on all
 sets, so a fix fitted to the shown names still fails the hidden ones. With
 fewer valid sets every failing set is shown and nothing is held back — a
-weaker check, logged as such. A set whose files could not all be run (a
+weaker check, logged as such, and the repair is not told of hidden tests
+that do not exist. A set whose files could not all be run (a
 missing runner, a path the target tree already uses) is no evidence either
 way: it is left out of the vote rather than counted as passing, and when
 no set can be run the gate records no evidence instead of a pass. A tie is
-not a passing majority. Repair rounds run at `high` effort regardless of
-the operator's `--effort`/`--effort-conformer` settings: the rounds exist
-only on failing runs, and the effort is the measured lever below. Repair rounds run the conformer at
-**high effort**: on the multi-mechanism generate report the low-effort
+not a passing majority. Repair rounds run the conformer at **high
+effort**, regardless of the operator's `--effort`/`--effort-conformer`
+settings — the rounds exist only on failing runs, and effort is the
+measured lever: on the multi-mechanism generate report the low-effort
 pinned conformer fixed the contract from HEAD 1/2 times, medium 2/3,
 high every time it finished (6/6) — effort, not turn budget, was the
 lever, and only failing runs pay for it.
@@ -7378,9 +7379,10 @@ not by reading what they say — because a worker quoting code is quoting,
 not leaking; and a closing tag named after a schema property counts only
 where leaked syntax sits (at the end of the value, or before another tool
 or schema tag), since names like `summary` or `title` are also ordinary
-markup. Measured on 2026-10-04, these two restrictions dropped none of the
-2,394 hits in the recorded corpus and removed the false positives a review
-found in PR bodies and summaries quoting HTML.
+markup (such a tag that happens to end the value is still a hit).
+Measured on 2026-10-04, these two restrictions dropped none of the 2,395
+hits in the 26,663 recorded responses and removed the false positives a
+review found in PR bodies and summaries quoting HTML.
 
 An earlier audit found several orchestrator sites that violated this by
 regexing natural-language prose (task text, planner intent,
@@ -7567,13 +7569,13 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the twenty-two worker types in
+Every main-loop LLM call in Leerie passes through one of the twenty-three worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
 `artifact_registry`, `integration_judge`, `no_work_judge`,
-`delivery_judge`, `defect_scope_auditor`, or `rebaser`
+`delivery_judge`, `defect_scope_auditor`, `acceptance_writer`, or `rebaser`
 (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,

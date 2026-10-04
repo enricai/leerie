@@ -15068,7 +15068,8 @@ _PROTOCOL_MARKUP_TOKENS = (
 # worker is quoting (a repo that is itself about this protocol, an HTML
 # snippet in a PR body), not leaked syntax; the one legitimate hit in a
 # 120-sample corpus audit was exactly that shape.
-_BACKTICK_SPAN_RE = re.compile(r"```.*?```|`[^`\n]*`", re.S)
+_BACKTICK_SPAN_RE = re.compile(r"^```[^\n]*\n.*?^```|`[^`\n]*`",
+                               re.S | re.M)
 
 
 def _schema_property_names(schema: object) -> frozenset[str]:
@@ -15092,8 +15093,9 @@ def _closing_tag_leak(text: str, prop_names: frozenset[str]) -> bool:
     counts only where leaked tool-call syntax sits: at the end of the value,
     or directly before another parameter/invoke tag or another of the
     schema's own tags. A schema property that is also an ordinary markup
-    name (`summary`, `title`, `name`) inside running text is not a leak —
-    measured 2026-10-04, it dropped none of 2,394 corpus hits."""
+    name (`summary`, `title`, `name`) inside running text is not a leak
+    (one that ends the value still is) — measured 2026-10-04, it dropped
+    none of the 2,395 hits in 26,663 recorded responses."""
     for p in prop_names:
         start = 0
         tag = f"</{p}>"
@@ -32983,6 +32985,30 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             model=models.get("acceptance_writer", MODEL_DEFAULT),
             effort=efforts.get("acceptance_writer"),
             sid=f"acceptance-{k}")
+        # What the writer actually left in the tree (git porcelain —
+        # mechanical CLI output). Validation runs on THIS tree, so the set
+        # must carry exactly it: an edited tracked file invalidates the set,
+        # and every undeclared new file (a fixture module, a helper) becomes
+        # a support file copied with the set — without it a correct fix
+        # fails the set elsewhere.
+        porcelain = subprocess.run(
+            ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
+             "--untracked-files=all"],
+            capture_output=True, text=True, check=False)
+        if porcelain.returncode != 0:
+            out["reason"] = "could not read the writer's worktree status"
+            return out
+        new_files: list[str] = []
+        for entry in porcelain.stdout.split("\0"):
+            if len(entry) < 4:
+                continue
+            code, path = entry[:2], entry[3:]
+            if code == "??":
+                if path not in refs and not path.startswith("node_modules"):
+                    new_files.append(path)
+            else:
+                out["reason"] = f"writer modified a tracked file: {path}"
+                return out
         defect, control, cases = [], [], {}
         for f in (res.get("files") or []):
             rel = str(f.get("path") or "")
@@ -33024,13 +33050,17 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         if not defect:
             out["reason"] = "no defect file fails on the validity base"
             return out
+        declared = set(defect) | set(control)
+        support = sorted(f for f in new_files if f not in declared
+                         and not _is_test_file(
+                             f, resolve_test_file_globs(st.repo_root)))
         dest = leerie_dir / "acceptance" / f"set-{k}"
         shutil.rmtree(dest, ignore_errors=True)
-        for rel in defect + control:
+        for rel in defect + control + support:
             (dest / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(wt / rel, dest / rel)
         out.update(valid=True, dir=str(dest), defect_files=defect,
-                   control_files=control, cases=cases)
+                   control_files=control, support_files=support, cases=cases)
         return out
     except (WorkerError, subprocess.TimeoutExpired) as e:
         out["reason"] = _brief_worker_exc(e)
@@ -33071,7 +33101,7 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
         async with sem:
             return await _write_acceptance_set(k, task, st, caps, models,
                                                efforts, base)
-    results = await asyncio.gather(*[_one(k) for k in range(1, n + 1)])
+    results = await _gather_or_cancel(*[_one(k) for k in range(1, n + 1)])
     sets = [r for r in results if r.get("valid")]
     for r in results:
         if not r.get("valid"):
@@ -33089,19 +33119,36 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
     the tree are never overwritten."""
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
 
-    def _untracked() -> set[str]:
+    def _untracked() -> set[str] | None:
         # --others without --exclude-standard: ignored residue (bytecode,
-        # caches) counts too.
-        out = subprocess.run(["git", "-C", tree, "ls-files", "--others"],
+        # caches) counts too. -z: no quoting of unusual names. None on
+        # failure — then nothing is cleaned rather than everything.
+        out = subprocess.run(["git", "-C", tree, "ls-files", "--others", "-z"],
                              capture_output=True, text=True, check=False)
-        return set(out.stdout.splitlines()) if out.returncode == 0 else set()
+        if out.returncode != 0:
+            return None
+        return {p for p in out.stdout.split("\0") if p}
 
     untracked_before = _untracked()
+    touched_dirs: set[str] = set()
     results = []
     for s_ in sets:
         failing, copied, ran, created_dirs = [], [], [], []
         unmeasured = False
         try:
+            for rel in (s_.get("support_files") or []):
+                dst = Path(tree) / rel
+                if dst.exists():
+                    unmeasured = True
+                    continue
+                d = dst.parent
+                while not d.exists():
+                    created_dirs.append(d)
+                    d = d.parent
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(Path(s_["dir"]) / rel, dst)
+                copied.append(dst)
+                touched_dirs.add(str(Path(rel).parent))
             for rel in s_["defect_files"] + s_["control_files"]:
                 dst = Path(tree) / rel
                 if dst.exists():
@@ -33118,6 +33165,7 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
                 shutil.copy2(Path(s_["dir"]) / rel, dst)
                 copied.append(dst)
                 ran.append(rel)
+                touched_dirs.add(str(Path(rel).parent))
             for rel in ran:
                 verdict = await _run_acceptance_file(
                     st, caps, tree, rel, log_path, f"acceptance-{label}")
@@ -33141,9 +33189,18 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
     # Anything else the runs left in the tree (a runner's caches beside a
     # pre-existing directory) goes too: nothing of a hidden set may linger
     # where a fixer works, and nothing may reach a commit.
-    for rel in sorted(_untracked() - untracked_before):
-        with contextlib.suppress(OSError):
-            (Path(tree) / rel).unlink()
+    # Only beneath directories a held-out file was placed in: a runner that
+    # provisions elsewhere on first call (a virtualenv, a build dir) keeps
+    # what it made.
+    after = _untracked()
+    if untracked_before is not None and after is not None:
+        def _under(rel: str) -> bool:
+            return any(d in (".", "") or rel == d or rel.startswith(d + "/")
+                       for d in touched_dirs)
+        for rel in sorted(after - untracked_before):
+            if _under(rel):
+                with contextlib.suppress(OSError):
+                    (Path(tree) / rel).unlink()
     return results
 
 
@@ -33165,7 +33222,8 @@ def _acceptance_majority_fails(results: list[dict]) -> bool:
 def _format_acceptance_failures_section(results: list[dict],
                                         sets: list[dict], shown: set[int],
                                         rnd: int, defect_shape: str,
-                                        rounds: int = 2) -> str:
+                                        rounds: int = 2,
+                                        held_back: bool = True) -> str:
     """Names, never output or source (DESIGN §8: a conformer shown the
     runner output special-cased it)."""
     by_index = {s_["index"]: s_ for s_ in sets}
@@ -33176,9 +33234,11 @@ def _format_acceptance_failures_section(results: list[dict],
         "that never saw this run's code, FAIL on this integrated tree. You "
         "cannot see the tests or their output; the failing cases are named "
         "below. They encode the REPORT'S contract — fix the defect at its "
-        "root so the contract holds in general. Fitting these names will "
-        "fail the recheck, which also runs further tests you are not shown. "
-        "Re-derive the cause from the report itself (the task names it).",
+        "root so the contract holds in general. "
+        + ("Fitting these names will fail the recheck, which also runs "
+           "further tests you are not shown. " if held_back else
+           "Fitting these names alone does not fix the defect. ")
+        + "Re-derive the cause from the report itself (the task names it).",
     ]
     for r in results:
         if r["passed"] or r["index"] not in shown:
@@ -33219,12 +33279,17 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         log("phase 5: acceptance gate — no held-out set could be run on the "
             "integrated tree; no evidence either way")
     elif _acceptance_majority_fails(initial):
+        measured = _acceptance_measured(initial)
         log(f"phase 5: acceptance gate — "
-            f"{sum(1 for r in initial if not r['passed'])} of {len(initial)} "
-            "held-out set(s) fail on the integrated tree; repairing")
+            f"{sum(1 for r in measured if not r['passed'])} of "
+            f"{len(measured)} measured held-out set(s) fail on the integrated "
+            "tree; repairing")
         ordered = sorted(s_["index"] for s_ in sets)
         hidden = set(ordered[-2:]) if len(ordered) >= 4 else set()
         shown = set(ordered) - hidden
+        if not hidden:
+            log(f"  only {len(ordered)} valid set(s): every failing set is "
+                "shown to the repair and none is held back — a weaker check")
         # Persisted so a resume mid-repair still rolls back to the tree the
         # repair started from, not to a later repair commit.
         if not gate.get("before_sha"):
@@ -33235,18 +33300,27 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         before_sha = gate["before_sha"]
         blt = resolve_blt(st.repo_root)
         test_cmd = (blt.get(_AXIS_CMD_KEY["tests"]) or "").strip()
-        pre_tests = None
-        if test_cmd:
-            pre_tests = (await _measure_axes(
+        # The pre-repair verdict is persisted beside before_sha: re-measured
+        # on resume it would read the already-repaired tree, and a red
+        # repair would then escape the rollback.
+        if test_cmd and "pre_tests_passed" not in gate:
+            pre = (await _measure_axes(
                 str(staging), {"tests": test_cmd}, st, caps,
                 log_path=leerie_dir / "logs" / "acceptance-repair.log",
                 verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
                 label_prefix="acceptance-pre",
-                log_prefix="acceptance")).get("tests")
+                log_prefix="acceptance")).get("tests") or {}
+            gate["pre_tests_passed"] = bool(
+                pre.get("passed") and pre.get("measured", True))
+            acc["gate"] = gate
+            st.data["acceptance"] = acc
+            st.save()
+        pre_tests = {"passed": gate.get("pre_tests_passed", False)}
         shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
         rounds = int(caps.get("acceptance_repair_rounds",
                               DEFAULT_CAPS["acceptance_repair_rounds"]))
-        for rnd in range(1, rounds + 1):
+        # Rounds already spent before a resume count against the cap.
+        for rnd in range(len(gate["rounds"]) + 1, rounds + 1):
             up = [
                 "Run the acceptance repair pass on the merged run branch.",
                 f"LEERIE_DIR is {leerie_dir} (absolute).",
@@ -33256,10 +33330,14 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                 f"DIFF_BASE: {st.data.get('working_branch')} (compare with "
                 f"`git diff {st.data.get('working_branch')}..HEAD`)",
                 _format_acceptance_failures_section(
-                    final, sets, shown, rnd, shape, rounds),
+                    final, sets, shown, rnd, shape, rounds,
+                    held_back=bool(hidden)),
             ]
-            st.bump_workers(caps)
             try:
+                # Inside the try: an exhausted worker budget ends the
+                # repair like any worker failure, and the rollback check
+                # below still runs on the rounds already committed.
+                st.bump_workers(caps)
                 await claude_p(
                     user_prompt="\n".join(up),
                     system_prompt=_load_prompt("conformer"),
@@ -33276,6 +33354,9 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             final = await _evaluate_acceptance_sets(
                 st, caps, str(staging), sets, f"gate-r{rnd}")
             gate["rounds"].append({"round": rnd, "results": final})
+            acc["gate"] = gate
+            st.data["acceptance"] = acc
+            st.save()
             if not _acceptance_majority_fails(final):
                 break
         after_sha = await _branch_head_sha(str(staging))
@@ -33298,14 +33379,16 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
     gate["final"] = final
     if _acceptance_measured(final) and _acceptance_majority_fails(final):
         by_index = {s_["index"]: s_ for s_ in sets}
-        names = [c for r in final if not r["passed"]
+        measured = _acceptance_measured(final)
+        names = [c for r in measured if not r["passed"]
                  for rel in r["failing_files"]
                  for c in by_index[r["index"]]["cases"].get(rel, [])]
         gate["residual"] = {
-            "failing_sets": sum(1 for r in final if not r["passed"]),
-            "total_sets": len(final), "cases": names[:20]}
+            "failing_sets": sum(1 for r in measured if not r["passed"]),
+            "total_sets": len(measured), "cases": names[:20]}
         log(f"  WARNING: held-out acceptance residual — "
-            f"{gate['residual']['failing_sets']} of {len(final)} set(s) still "
+            f"{gate['residual']['failing_sets']} of "
+            f"{gate['residual']['total_sets']} measured set(s) still "
             "fail; shipping anyway (non-blocking), recorded for the next run")
     elif _acceptance_measured(final):
         log("phase 5: acceptance gate — held-out sets pass on the "
@@ -33423,7 +33506,11 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
         return True
     sets = {s_["index"]: s_ for s_ in
             (st.data.get("acceptance") or {}).get("sets") or []}
-    cases = [c for r in res if not r["passed"] for rel in r["failing_files"]
+    # Counts are over measured sets only: an unrunnable set is no evidence.
+    measured = _acceptance_measured(res)
+    failing_sets = sum(1 for r in measured if not r["passed"])
+    cases = [c for r in measured if not r["passed"]
+             for rel in r["failing_files"]
              for c in sets[r["index"]]["cases"].get(rel, [])][:20]
     if _prior_acceptance_dispute(st):
         st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
@@ -33432,8 +33519,8 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
         # newest completed same-task run, so without this the run after an
         # accepted one would dispute again — every other re-run.
         st.data["acceptance_dispute"] = {
-            "failing_sets": sum(1 for r in res if not r["passed"]),
-            "total_sets": len(res), "cases": cases, "accepted": True}
+            "failing_sets": failing_sets, "total_sets": len(measured),
+            "cases": cases, "accepted": True}
         log("  WARNING: held-out acceptance sets still fail on HEAD, but the "
             "previous run of this task already disputed on them — accepting "
             "no work (disputed at most once). Failing cases: "
@@ -33445,8 +33532,8 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     st.data["no_work_acceptance"] = {"verdict": "dispute", "results": res,
                                      "cases": cases}
     st.data["acceptance_dispute"] = {
-        "failing_sets": sum(1 for r in res if not r["passed"]),
-        "total_sets": len(res), "cases": cases}
+        "failing_sets": failing_sets, "total_sets": len(measured),
+        "cases": cases}
     st.data["no_work_dispute"] = {
         "classifier_evidence": conf.get("classifier_evidence", ""),
         "judge_evidence": ("Held-out acceptance tests written from the "
@@ -33455,9 +33542,27 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     st.data.pop("no_work_pending", None)
     st.save()
     log("  no-work confirmation DISPUTED by the held-out acceptance sets on "
-        f"HEAD ({st.data['acceptance_dispute']['failing_sets']} of {len(res)} "
+        f"HEAD ({failing_sets} of {len(measured)} measured set(s) "
         "fail) — planning the work")
     return False
+
+
+async def _settle_pending_no_work_failing_open(st: "State",
+                                              caps: dict) -> bool:
+    """`_settle_pending_no_work`, failing open toward the judge's
+    confirmation on any error, as with no valid sets: the acceptance check
+    is evidence, not a gate that may crash the run."""
+    try:
+        return await _settle_pending_no_work(st, caps)
+    except Exception as e:
+        log(f"acceptance: settling the held no-work confirmation raised "
+            f"{type(e).__name__}: {e} — the judge's confirmation stands")
+        st.data["no_work_acceptance"] = {
+            "verdict": f"error: {type(e).__name__}"}
+        _finish_no_work_run(st, {"<confirmed already-satisfied>": (
+            (st.data.get("no_work_confirmation") or {})
+            .get("judge_evidence") or "")})
+        return True
 
 
 def _site_tokens_from_scope(defect_scope: object) -> list[str]:
@@ -36948,6 +37053,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             try:
                 st.data["acceptance"] = await phase_acceptance_write(
                     task, st, caps, models, efforts)
+            except WorkerError:
+                # Budget exhaustion (bump_workers) must stop the run, as it
+                # does everywhere else; writer failures never reach here.
+                raise
             except Exception as e:
                 log(f"acceptance: writing sets raised {type(e).__name__}: "
                     f"{e} — gate disabled for this run")
@@ -36955,22 +37064,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             st.save()
         if (st.data.get("no_work_pending")
                 and "no_work_acceptance" not in st.data):
-            try:
-                settled = await _settle_pending_no_work(st, caps)
-            except Exception as e:
-                # Fail open toward the judge's confirmation, as with no
-                # valid sets: the acceptance check is evidence, not a gate
-                # that may crash the run.
-                log(f"acceptance: settling the held no-work confirmation "
-                    f"raised {type(e).__name__}: {e} — the judge's "
-                    "confirmation stands")
-                st.data["no_work_acceptance"] = {
-                    "verdict": f"error: {type(e).__name__}"}
-                _finish_no_work_run(st, {"<confirmed already-satisfied>": (
-                    (st.data.get("no_work_confirmation") or {})
-                    .get("judge_evidence") or "")})
-                settled = True
-            if settled:
+            if await _settle_pending_no_work_failing_open(st, caps):
                 return
 
         if "plans_after_plan" not in st.data:

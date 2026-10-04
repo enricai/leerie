@@ -75,7 +75,8 @@ def test_ordinary_markup_named_like_a_schema_field_is_not_a_hit(leerie):
     """Round-1 M5: `summary`, `title`, `name` are schema properties AND
     ordinary markup. A closing tag counts only where leaked syntax sits — at
     the end of the value or before another tool/schema tag — and fenced code
-    is ignored. Measured 2026-10-04, that dropped none of 2,394 corpus hits."""
+    is ignored. Measured 2026-10-04, that dropped none of the 2,395 hits in
+    26,663 recorded responses."""
     pr = leerie._schema_property_names(leerie.SCHEMAS["pr_writer"])
     impl = leerie._schema_property_names(leerie.SCHEMAS["implementer"])
     body = "Adds a page:\n```html\n<title>Orders</title>\n```\nand tests."
@@ -84,6 +85,11 @@ def test_ordinary_markup_named_like_a_schema_field_is_not_a_hit(leerie):
         "see <details><summary>Log</summary> for more", impl) is None
     assert leerie._find_protocol_markup(
         "fenced:\n```\n<parameter name=\"x\">y</parameter>\n```", impl) is None
+    # A fence must start a line: an unpaired backtick or a mid-line ```
+    # cannot swallow a leak (round-2 review).
+    assert leerie._find_protocol_markup(
+        'x ``` leaked</summary>\n<parameter name="files">[{"note": "see ```y```"}]',
+        impl)
     # The leaked shapes still hit.
     assert leerie._find_protocol_markup("done</summary>\n", impl)
     assert leerie._find_protocol_markup(

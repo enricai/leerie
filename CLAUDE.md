@@ -157,7 +157,9 @@ for whenever the CLI renames a tool.
   `TestRegexPathAbsent` — dep-capture's migration off a regex path onto
   LLM-structured output, see below — is prior art for this same
   principle; see DESIGN.md §"Language-to-JSON: natural-language
-  interpretation is never regex" for the architectural statement.)
+  interpretation is never regex" (§12) for the architectural statement,
+  including why tool-call wire syntax in a worker's output — checked by
+  `_find_protocol_markup` — counts as a mechanical string.)
 - **Every worker — judgment and acting/workhorse alike — defaults to
   `sonnet`.** This was previously split: judgment workers (classify,
   plan, reconcile, judge, verify, gate) defaulted to opus, because

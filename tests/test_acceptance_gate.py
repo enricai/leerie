@@ -208,6 +208,13 @@ def test_validity_base_prefers_the_earliest_same_task_sibling(leerie, tmp_path):
             "task": st.data["task"], "started_at": started,
             "repo_state_before_planning": {"head": h}}))
     assert leerie._acceptance_validity_base(st) == head
+    # A sibling with no recorded start time cannot be ranked earliest ("" would
+    # sort first): it is skipped, not chosen.
+    d = st.run_dir.parent / "run-undated"
+    d.mkdir()
+    (d / "state.json").write_text(json.dumps({
+        "task": st.data["task"], "repo_state_before_planning": {"head": later}}))
+    assert leerie._acceptance_validity_base(st) == head
     # A different task is ignored.
     st.data["task"] = "another task"
     assert leerie._acceptance_validity_base(st) == later
@@ -252,9 +259,29 @@ def test_evaluation_leaves_the_tree_clean_and_never_overwrites(leerie, tmp_path)
     assert (staging / "acc" / "test_defect_1.py").read_text() == "# the run's own file\n"
     assert not (staging / "acc" / "test_defect_2.py").exists()
     # Nothing the call created is left behind — not even bytecode.
-    assert subprocess.run(
-        ["git", "-C", str(staging), "ls-files", "--others"],
-        capture_output=True, text=True).stdout.split() == ["acc/test_defect_1.py"]
+    left = subprocess.run(["git", "-C", str(staging), "ls-files", "--others"],
+                          capture_output=True, text=True).stdout.split()
+    # Nothing of the hidden sets lingers where they were placed (the run's
+    # own file stays); residue elsewhere — the repo's own bytecode at the
+    # root — is the runner's, not a hidden set's, and is left alone.
+    assert [p for p in left if p.startswith("acc/")] == ["acc/test_defect_1.py"]
+
+
+def test_evaluation_removes_the_directories_it_created(leerie, tmp_path):
+    """`git ls-files --others` never lists an empty directory, so only the
+    created-directory cleanup keeps a hidden set's directory name out of
+    the tree a fixer works in."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 1)
+    d = Path(sets[0]["dir"])
+    (d / "acc" / "deep").mkdir()
+    (d / "acc" / "test_defect_1.py").rename(d / "acc" / "deep" / "test_defect_1.py")
+    sets[0]["defect_files"] = ["acc/deep/test_defect_1.py"]
+    asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), sets, "t"))
+    assert not (staging / "acc").exists()
 
 
 def test_majority_rule(leerie):
@@ -284,6 +311,60 @@ def test_unrunnable_files_never_count_as_passing(leerie, tmp_path):
     assert leerie._acceptance_measured(res) == []
 
 
+def test_undeclared_helper_travels_with_the_set(leerie, tmp_path,
+                                               monkeypatch):
+    """Round-2 M1: a fixture module the writer created but did not declare
+    was present at validation and absent at evaluation, so a CORRECT fix
+    failed the set. It is now a support file copied with the set."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    helper_test = ("from acc.helper_vals import EXPECTED\nfrom calc import add\n\n"
+                   "def test_add_sums():\n    assert add(2, 3) == EXPECTED\n")
+
+    async def fake_claude_p(**kw):
+        wt = Path(kw["cwd"])
+        (wt / "acc").mkdir()
+        (wt / "acc" / "__init__.py").write_text("")
+        (wt / "acc" / "helper_vals.py").write_text("EXPECTED = 5\n")
+        (wt / "acc" / "test_defect_h.py").write_text(helper_test)
+        return {"files": [{"path": "acc/test_defect_h.py", "kind": "defect",
+                           "cases": ["sums via helper"]}]}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["support_files"] == ["acc/__init__.py", "acc/helper_vals.py"]
+    staging = _staging(st, repo)
+    _commit_fix(staging)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    assert res == [{"index": 1, "passed": True, "unmeasured": False,
+                    "failing_files": []}]
+
+
+def test_writer_editing_a_tracked_file_discards_the_set(leerie, tmp_path,
+                                                       monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+
+    async def fake_claude_p(**kw):
+        wt = Path(kw["cwd"])
+        # An edit to a tracked file that does not change the verdicts: only
+        # the tracked-file check can reject this set.
+        (wt / "conftest.py").write_text(
+            (wt / "conftest.py").read_text() + "# tweaked by the writer\n")
+        (wt / "acc").mkdir()
+        (wt / "acc" / "test_defect_x.py").write_text(DEFECT_TEST)
+        return {"files": [{"path": "acc/test_defect_x.py", "kind": "defect",
+                           "cases": ["x"]}]}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    assert acc["sets"] == []
+
+
 def test_writer_editing_an_existing_file_is_not_kept(leerie, tmp_path,
                                                     monkeypatch):
     """Round-1 M2: "new files only" is enforced in code, not left to the
@@ -305,7 +386,10 @@ def test_writer_editing_an_existing_file_is_not_kept(leerie, tmp_path,
 def test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest(
         leerie, tmp_path, monkeypatch):
     """Round-1 M3: an absolute declared path (models often report them)
-    used to raise SameFileError out of asyncio.gather and lose every set."""
+    used to raise SameFileError out of asyncio.gather and lose every set.
+    Set 1 also declares a valid relative file: with the absolute entry
+    rejected the set survives on it; without the rejection, copying the
+    absolute entry onto itself discards the whole set."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     calls = []
@@ -317,7 +401,12 @@ def test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest(
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(DEFECT_TEST)
         if k == 1:
-            return {"files": [{"path": str(p), "kind": "defect", "cases": ["a"]}]}
+            q = Path(kw["cwd"]) / "acc" / "test_defect_1b.py"
+            q.write_text(DEFECT_TEST)
+            return {"files": [
+                {"path": str(p), "kind": "defect", "cases": ["a"]},
+                {"path": "acc/test_defect_1b.py", "kind": "defect",
+                 "cases": ["b"]}]}
         if k == 2:
             raise OSError("writer 2 blew up")
         return {"files": [{"path": f"acc/test_defect_{k}.py", "kind": "defect",
@@ -326,8 +415,42 @@ def test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest(
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
         st.data["task"], st, _caps(leerie, 3), MODELS, EFFORTS))
-    assert [s["index"] for s in acc["sets"]] == [3]
+    assert [s["index"] for s in acc["sets"]] == [1, 3]
+    assert acc["sets"][0]["defect_files"] == ["acc/test_defect_1b.py"]
     assert sorted(calls) == [1, 2, 3]
+
+
+def test_writer_budget_exhaustion_propagates(leerie, tmp_path, monkeypatch):
+    """`bump_workers` sits outside the writer's try: an exhausted budget
+    stops the run instead of reading as an invalid set."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {})
+    caps = _caps(leerie, 2)
+    caps["max_total_workers"] = 0
+    with pytest.raises(leerie.WorkerError, match="budget exhausted"):
+        asyncio.run(leerie.phase_acceptance_write(
+            st.data["task"], st, caps, MODELS, EFFORTS))
+
+
+def test_writers_respect_max_parallel(leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    live, peak = [0], [0]
+
+    async def fake_claude_p(**kw):
+        live[0] += 1
+        peak[0] = max(peak[0], live[0])
+        await asyncio.sleep(0.05)
+        live[0] -= 1
+        return {"files": []}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    caps = _caps(leerie, 3)
+    caps["max_parallel"] = 1
+    asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, caps, MODELS, EFFORTS))
+    assert peak[0] == 1
 
 
 def test_failures_section_is_names_only_and_hides_the_holdout(leerie, tmp_path):
@@ -411,6 +534,185 @@ def test_repair_that_turns_the_test_axis_red_is_rolled_back(
     assert gate["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
     assert gate["residual"]["failing_sets"] == 5
+
+
+def test_resume_mid_repair_still_rolls_back_a_red_repair(
+        leerie, tmp_path, monkeypatch):
+    """Round-2 M2: the pre-repair verdict is persisted, so a resume after a
+    red repair round still rolls back, and spent rounds count against the
+    cap."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    sets = _make_sets(leerie, st, 5)
+    # State as an interrupted round 1 left it: baseline green, one round
+    # spent, its (bad) commit on staging, no final verdict.
+    (staging / "calc.py").write_text("def add(a, b):\n    raise SystemExit(3)\n")
+    _git(staging, "commit", "-qam", "conformer: r1")
+    st.data["acceptance"] = {"sets": sets, "gate": {
+        "before_sha": before, "pre_tests_passed": True,
+        "rounds": [{"round": 1, "results": []}]}}
+    calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
+                      measured=[{"passed": False, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert len(calls) == 1                      # only round 2 left
+    assert gate["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == before
+
+
+def test_repair_rounds_follow_the_cap(leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    calls = []
+
+    async def fake_claude_p(**kw):
+        calls.append(kw)
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    caps = _caps(leerie, 5)
+    caps["acceptance_repair_rounds"] = 1
+    asyncio.run(leerie._run_acceptance_gate(st.run_dir, st, caps, MODELS,
+                                            EFFORTS))
+    assert len(calls) == 1
+    assert "round 1 of 1" in calls[0]["user_prompt"]
+
+
+def test_pre_repair_state_is_persisted_before_the_first_round(
+        leerie, tmp_path, monkeypatch):
+    """A resume reads before_sha and pre_tests_passed from disk, so both
+    must be saved before any repair can commit. before_sha is checked as
+    the pre-repair test run starts — before anything else saves state."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    on_disk = []
+
+    def _disk_gate():
+        return (json.loads((st.run_dir / "state.json").read_text())
+                ["acceptance"].get("gate") or {})
+
+    def fixer(p):
+        on_disk.append(_disk_gate())
+        _commit_fix(p)
+    seq = [{"passed": True, "measured": True},
+           {"passed": True, "measured": True}]
+    at_pre = []
+
+    async def fake_axes(tree, axes, st_, caps, **kw):
+        if not at_pre:
+            at_pre.append(_disk_gate())
+        return {"tests": seq.pop(0)}
+
+    async def fake_claude_p(**kw):
+        fixer(Path(kw["cwd"]))
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    assert at_pre[0].get("before_sha") == before
+    assert on_disk[0]["before_sha"] == before
+    assert on_disk[0]["pre_tests_passed"] is True
+
+
+def test_gate_installs_deps_in_staging(leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 1)}
+    events = []
+    real_run_file = leerie._run_acceptance_file
+
+    async def fake_deps(tree, *a, **k):
+        events.append(("deps", tree))
+
+    async def spy_run_file(st_, caps, tree, *a, **k):
+        events.append(("run", tree))
+        return await real_run_file(st_, caps, tree, *a, **k)
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", fake_deps)
+    monkeypatch.setattr(leerie, "_run_acceptance_file", spy_run_file)
+    _run_gate(leerie, monkeypatch, st, _commit_fix)
+    # Deps are in place before the first held-out file runs on staging.
+    assert events[0] == ("deps", str(staging.resolve()))
+    assert events[1][0] == "run"
+
+
+def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
+                                                      monkeypatch):
+    """Round 1 commits a repair that turns the test axis red; round 2's
+    `bump_workers` exhausts the budget. The rollback check must still run
+    (the budget error used to escape the gate before it)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    calls = []
+
+    async def fake_claude_p(**kw):
+        calls.append(kw)
+        (Path(kw["cwd"]) / "calc.py").write_text(
+            "def add(a, b):\n    return a * b\n")
+        _git(kw["cwd"], "commit", "-qam", "conformer: r1")
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    seq = [{"passed": True, "measured": True},
+           {"passed": False, "measured": True}]
+
+    async def fake_axes(tree, axes, st_, caps, **kw):
+        return {"tests": seq.pop(0)}
+    monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+    caps = _caps(leerie, 5)
+    caps["max_total_workers"] = 1
+    asyncio.run(leerie._run_acceptance_gate(st.run_dir, st, caps, MODELS,
+                                            EFFORTS))
+    gate = st.data["acceptance"]["gate"]
+    assert len(calls) == 1
+    assert "budget exhausted" in gate["rounds"][-1]["error"]
+    assert gate["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == before
+    assert gate["final"] is not None
+
+
+def test_no_hidden_sets_means_no_claim_of_hidden_tests(leerie, tmp_path,
+                                                      monkeypatch, capsys):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 3)}
+    calls = _run_gate(leerie, monkeypatch, st, _commit_fix)
+    up = calls[0]["user_prompt"]
+    assert "not shown" not in up
+    assert "case from set 3" in up                  # every set is shown
+    assert "none is held back" in capsys.readouterr().out
+    sets = [{"index": k, "cases": {f"acc/test_defect_{k}.py": [f"c{k}"]}}
+            for k in range(1, 6)]
+    res = [{"index": k, "passed": False,
+            "failing_files": [f"acc/test_defect_{k}.py"]} for k in range(1, 6)]
+    held = leerie._format_acceptance_failures_section(
+        res, sets, {1, 2, 3}, 1, "x", held_back=True)
+    assert "further tests you are not shown" in held
+
+
+def test_residual_counts_only_measured_sets(leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 5)
+    # Set 5 cannot run: the run's own tree already holds its file.
+    (staging / "acc").mkdir()
+    (staging / "acc" / "test_defect_5.py").write_text("# the run's own\n")
+    _git(staging, "add", "-A")
+    _git(staging, "commit", "-qm", "run's own test")
+    st.data["acceptance"] = {"sets": sets}
+    _run_gate(leerie, monkeypatch, st, lambda _p: None)
+    res = st.data["acceptance"]["gate"]["residual"]
+    assert (res["failing_sets"], res["total_sets"]) == (4, 4)
 
 
 def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):
