@@ -4356,17 +4356,19 @@ tests; see below.)
 
 ### Review round 2 fixes (2026-10-04)
 
-Each pin below was falsified by reverting its fix and running the test named
-(18 reversions, 17 caught). The one survivor is equivalent, not unpinned:
-removing the explicit save after `pre_tests_passed` changes nothing observable,
-because `bump_workers` saves state before the round's worker starts with
-nothing awaited in between. The explicit save stays so persistence does not
-rest on that coincidence.
+The round-2 commit claimed 18 reversions of its fixes, 17 caught. Round 3
+measured five more of that commit's fixes with no catching test (the
+call-site `WorkerError` re-raise, `_gather_or_cancel`, the scoped cleanup, a
+failed snapshot cleaning nothing, the per-round save); round 3 added them (see
+below). The removed explicit save after `pre_tests_passed` remains an
+equivalent mutant: `bump_workers` saves state before the round's worker
+starts, with nothing awaited in between; the save stays so persistence does
+not rest on that coincidence.
 
 - **Undeclared helpers travel with the set**
-  (`test_undeclared_helper_travels_with_the_set`): a non-test file the writer
-  created but did not declare becomes a `support_files` entry; without it a
-  correct fix failed the set at evaluation.
+  (`test_undeclared_helper_travels_with_the_set`): a file the writer created
+  but did not declare becomes a `support_files` entry; without it a correct fix
+  failed the set at evaluation. (Round 3 widened this to test-shaped paths.)
 - **A writer may not edit tracked files**
   (`test_writer_editing_a_tracked_file_discards_the_set`), read from
   `git status --porcelain -z`.
@@ -4381,8 +4383,9 @@ rest on that coincidence.
   still propagates (`test_writer_budget_exhaustion_propagates`).
 - **Cap, concurrency, deps** (`test_repair_rounds_follow_the_cap`,
   `test_writers_respect_max_parallel`, `test_gate_installs_deps_in_staging`).
-- **Cleanup** (`test_evaluation_removes_the_directories_it_created`: `git
-  ls-files --others` never lists an empty directory, so this is the only pin).
+- **Created directories** (`test_evaluation_removes_the_directories_it_created`)
+  — a round-1 behaviour first pinned in round 2: `git ls-files --others` never
+  lists an empty directory, so this is the only pin.
 - **Validity base** skips an undated sibling
   (`test_validity_base_prefers_the_earliest_same_task_sibling`).
 - **No claim of hidden tests that do not exist**
@@ -4395,6 +4398,34 @@ rest on that coincidence.
 - **Fenced code in the markup check** is matched line-anchored, so a stray
   inline triple backtick cannot swallow a leak
   (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`).
+
+### Review round 3 fixes (2026-10-04)
+
+Each pin was falsified by reverting its fix and running the named test: 19
+reversions (14 round-3 fixes, the 5 previously unpinned round-2 fixes), 19
+caught.
+
+- **Resume never skips the rollback check**
+  (`test_resume_after_a_passing_but_red_round_still_rolls_back`, with and
+  without a persisted `initial`): the pre-repair verdict is persisted and
+  reused, and a recorded `before_sha` resumes the repair branch; the shipped
+  pre-repair tree keeps its own verdict and residual.
+  `test_resume_after_a_passing_round_runs_no_further_round`,
+  `test_every_round_is_on_disk_before_the_rollback_check`,
+  `test_the_pre_repair_verdict_is_on_disk_before_round_one`.
+- **Helpers beside the tests travel; caches and the install's output do not**
+  (`test_helper_beside_the_tests_travels_with_the_set`,
+  `test_cache_and_provision_paths`).
+- **Fixers cannot Read the writers' transcripts, evaluation logs or
+  `calls.ndjson`** (`test_fixers_cannot_read_the_sets`).
+- **No hidden test id survives in staging**
+  (`test_existing_pytest_cache_is_restored_and_a_new_one_removed`).
+- **Cleanup is scoped** (`test_runner_provisioning_outside_the_set_survives_cleanup`,
+  for a set beneath `acc/` and at the root; `test_a_failed_snapshot_cleans_nothing`).
+- **Budget exhaustion stops the run and the other writers**
+  (`test_write_or_skip_lets_budget_exhaustion_stop_the_run`,
+  `test_budget_exhaustion_cancels_the_other_writers`).
+- **Indented fences are quoting** (`test_indented_fenced_code_is_quoting_not_a_leak`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

@@ -18,7 +18,9 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -284,6 +286,147 @@ def test_evaluation_removes_the_directories_it_created(leerie, tmp_path):
     assert not (staging / "acc").exists()
 
 
+def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
+                                                     monkeypatch):
+    """Round-3 H2: a helper under a test-shaped directory (`tests/`) was
+    dropped as "a test file", so a correct fix failed the set. Every
+    undeclared new file travels; caches and bytecode never do, and nothing
+    that existed before the writer ran (the dependency install's output)
+    is the writer's."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    helper_test = ("from tests.acc_helpers import EXPECTED\n"
+                   "from calc import add\n\n"
+                   "def test_add_sums():\n    assert add(2, 3) == EXPECTED\n")
+
+    async def fake_deps(tree, *a, **k):
+        (Path(tree) / "provisioned.txt").write_text("from the install\n")
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", fake_deps)
+
+    async def fake_claude_p(**kw):
+        wt = Path(kw["cwd"])
+        (wt / "tests").mkdir()
+        (wt / "tests" / "__init__.py").write_text("")
+        (wt / "tests" / "acc_helpers.py").write_text("EXPECTED = 5\n")
+        (wt / "tests" / "test_defect_h.py").write_text(helper_test)
+        # What running the test leaves behind.
+        subprocess.run([sys.executable, "-m", "pytest", "-q",
+                        "tests/test_defect_h.py"], cwd=wt, capture_output=True)
+        return {"files": [{"path": "tests/test_defect_h.py", "kind": "defect",
+                           "cases": ["sums via helper"]}]}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["support_files"] == ["tests/__init__.py", "tests/acc_helpers.py"]
+    staging = _staging(st, repo)
+    _commit_fix(staging)
+    # The run's own tests already ran in staging, leaving bytecode there.
+    subprocess.run([sys.executable, "-c", "import calc"], cwd=staging,
+                   env={**os.environ, "PYTHONPATH": str(staging)})
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    assert res == [{"index": 1, "passed": True, "unmeasured": False,
+                    "failing_files": []}]
+
+
+def test_cache_and_provision_paths(leerie):
+    byp, cache = (leerie._acceptance_is_byproduct_path,
+                  leerie._acceptance_is_cache_path)
+    assert byp("__pycache__/calc.cpython-314.pyc")
+    assert byp(".pytest_cache/v/cache/lastfailed")
+    assert byp("tests/x.pyc")
+    assert not byp(".venv/lib/__pycache__/site.cpython-314.pyc")
+    assert not byp("tests/acc_helpers.py")
+    assert cache(".venv/lib/site.py") and cache("web/node_modules/a/b.js")
+    assert not cache("tests/conftest.py")
+
+
+def test_existing_pytest_cache_is_restored_and_a_new_one_removed(
+        leerie, tmp_path):
+    """Round-3 M5: pytest's cache recorded the hidden tests' ids in the
+    tree a fixer works in."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_scoped = "python3 -m pytest -q {test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 2)
+    asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 2), str(staging), sets, "t"))
+    assert not (staging / ".pytest_cache").exists()
+    own = staging / ".pytest_cache" / "v" / "cache" / "lastfailed"
+    own.parent.mkdir(parents=True)
+    own.write_text('{"test_own.py::test_x": true}')
+    asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 2), str(staging), sets, "t"))
+    assert own.read_text() == '{"test_own.py::test_x": true}'
+    left = subprocess.run(["git", "-C", str(staging), "ls-files", "--others"],
+                          capture_output=True, text=True).stdout
+    assert "test_defect_" not in left
+
+
+def _provisioning_runner(repo: Path):
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_scoped = "mkdir -p .venv/lib build acc/node_modules '
+        '&& touch .venv/lib/site.py build/out.txt acc/node_modules/m.js '
+        'prov.lock && python3 -m pytest -q -p no:cacheprovider '
+        '{test_files}"\n')
+
+
+@pytest.mark.parametrize("where", ["acc", "."])
+def test_runner_provisioning_outside_the_set_survives_cleanup(
+        leerie, tmp_path, where):
+    """The cleanup is scoped to where held-out files were placed (round-3
+    L6: a root-level set used to match every path in the tree)."""
+    repo, head = _repo(tmp_path)
+    _provisioning_runner(repo)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 1)
+    # acc/ already exists (a directory the evaluation creates goes whole).
+    (staging / "acc").mkdir()
+    (staging / "acc" / "keep.txt").write_text("the run's own\n")
+    if where == ".":
+        d = Path(sets[0]["dir"])
+        for rel in ("test_defect_1.py", "test_control_1.py"):
+            (d / "acc" / rel).rename(d / rel)
+        sets[0]["defect_files"] = ["test_defect_1.py"]
+        sets[0]["control_files"] = ["test_control_1.py"]
+    asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), sets, "t"))
+    assert (staging / ".venv" / "lib" / "site.py").exists()
+    assert (staging / "build" / "out.txt").exists()
+    # A provisioned environment beneath the set's own directory stays too.
+    assert (staging / "acc" / "node_modules" / "m.js").exists()
+    # A root-level by-product of a root-level set is the set's to clean;
+    # beneath acc/ it is not.
+    assert (staging / "prov.lock").exists() is (where == "acc")
+
+
+def test_a_failed_snapshot_cleans_nothing(leerie, tmp_path, monkeypatch):
+    """When the before-snapshot fails, nothing can be told apart from the
+    run's own untracked files, so nothing is deleted."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    (staging / "acc").mkdir()
+    (staging / "acc" / "run_own_notes.txt").write_text("the run's own\n")
+    real_run = subprocess.run
+    failed = []
+
+    def flaky(argv, *a, **k):
+        if "ls-files" in argv and not failed:
+            failed.append(1)
+            return subprocess.CompletedProcess(argv, 128, "", "boom")
+        return real_run(argv, *a, **k)
+    monkeypatch.setattr(leerie.subprocess, "run", flaky)
+    asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), _make_sets(leerie, st, 1), "t"))
+    assert (staging / "acc" / "run_own_notes.txt").exists()
+
+
 def test_majority_rule(leerie):
     f = leerie._acceptance_majority_fails
     assert f([{"passed": False}, {"passed": False}, {"passed": True}])
@@ -431,6 +574,52 @@ def test_writer_budget_exhaustion_propagates(leerie, tmp_path, monkeypatch):
     with pytest.raises(leerie.WorkerError, match="budget exhausted"):
         asyncio.run(leerie.phase_acceptance_write(
             st.data["task"], st, caps, MODELS, EFFORTS))
+
+
+def test_write_or_skip_lets_budget_exhaustion_stop_the_run(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+
+    async def budget(*a, **k):
+        raise leerie.WorkerError("worker budget exhausted (3)")
+
+    async def other(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(leerie, "phase_acceptance_write", budget)
+    with pytest.raises(leerie.WorkerError):
+        asyncio.run(leerie._acceptance_write_or_skip(
+            "t", st, _caps(leerie, 1), MODELS, EFFORTS))
+    monkeypatch.setattr(leerie, "phase_acceptance_write", other)
+    assert asyncio.run(leerie._acceptance_write_or_skip(
+        "t", st, _caps(leerie, 1), MODELS, EFFORTS)) == {
+            "skipped": "error: OSError"}
+
+
+def test_budget_exhaustion_cancels_the_other_writers(leerie, tmp_path,
+                                                    monkeypatch):
+    """`_gather_or_cancel`, not `asyncio.gather`: once one writer stops the
+    run, the others must not keep spending workers in the background."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    finished = []
+
+    async def slow_claude_p(**kw):
+        await asyncio.sleep(0.5)
+        finished.append(kw["sid"])
+        return {"files": []}
+    monkeypatch.setattr(leerie, "claude_p", slow_claude_p)
+    caps = _caps(leerie, 2)
+    caps["max_parallel"] = 2
+    caps["max_total_workers"] = 1
+
+    async def drive():
+        with pytest.raises(leerie.WorkerError):
+            await leerie.phase_acceptance_write(st.data["task"], st, caps,
+                                                MODELS, EFFORTS)
+        await asyncio.sleep(1.0)
+    asyncio.run(drive())
+    assert finished == []
 
 
 def test_writers_respect_max_parallel(leerie, tmp_path, monkeypatch):
@@ -715,6 +904,116 @@ def test_residual_counts_only_measured_sets(leerie, tmp_path, monkeypatch):
     assert (res["failing_sets"], res["total_sets"]) == (4, 4)
 
 
+def _passing(n):
+    return [{"index": k, "passed": True, "unmeasured": False,
+             "failing_files": []} for k in range(1, n + 1)]
+
+
+def _failing(n):
+    return [{"index": k, "passed": False, "unmeasured": False,
+             "failing_files": [f"acc/test_defect_{k}.py"]}
+            for k in range(1, n + 1)]
+
+
+@pytest.mark.parametrize("with_initial", [True, False])
+def test_resume_after_a_passing_but_red_round_still_rolls_back(
+        leerie, tmp_path, monkeypatch, with_initial):
+    """Round-3 H1: round 1 made the sets pass but turned the test axis red,
+    then the process died before the rollback check. Re-measured on resume,
+    `initial` read the repaired tree as passing and skipped the check. Now
+    `initial` is persisted, and a recorded before_sha alone resumes the
+    repair (the `with_initial=False` case)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    _commit_fix(staging)
+    gate = {"before_sha": before, "pre_tests_passed": True,
+            "rounds": [{"round": 1, "results": _passing(5)}]}
+    if with_initial:
+        gate["initial"] = _failing(5)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5), "gate": gate}
+    calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
+                      measured=[{"passed": False, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert calls == []                  # the round already passed
+    assert gate["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == before
+    if with_initial:
+        # What ships is the pre-repair tree, so its persisted verdict — not
+        # one re-measured on the repaired tree — is the record.
+        assert gate["final"] == _failing(5)
+        assert gate["residual"]["failing_sets"] == 5
+
+
+def test_the_pre_repair_verdict_is_on_disk_before_round_one(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+
+    async def dies(**kw):
+        raise RuntimeError("killed during round 1")
+
+    async def axes(tree, axes_, st_, caps, **kw):
+        return {"tests": {"passed": True, "measured": True}}
+    monkeypatch.setattr(leerie, "claude_p", dies)
+    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    monkeypatch.setattr(leerie.State, "bump_workers", lambda self, caps: None)
+    with pytest.raises(RuntimeError):
+        asyncio.run(leerie._run_acceptance_gate(
+            st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    disk = json.loads((st.run_dir / "state.json").read_text())
+    assert disk["acceptance"]["gate"]["initial"] == _failing(5)
+
+
+def test_resume_after_a_passing_round_runs_no_further_round(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    _commit_fix(staging)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5), "gate": {
+        "before_sha": before, "pre_tests_passed": True,
+        "initial": _failing(5),
+        "rounds": [{"round": 1, "results": _passing(5)}]}}
+    calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
+                      measured=[{"passed": True, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert calls == [] and "rolled_back" not in gate
+    assert "residual" not in gate
+
+
+def test_every_round_is_on_disk_before_the_rollback_check(
+        leerie, tmp_path, monkeypatch):
+    """A crash between the last round and the rollback check must not lose
+    the round, or a resume would run it again past the cap."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    seq = [{"passed": True, "measured": True}]
+
+    async def axes(tree, axes_, st_, caps, **kw):
+        if seq:
+            return {"tests": seq.pop(0)}
+        raise RuntimeError("killed before the post-repair measurement")
+
+    async def fixer_claude_p(**kw):
+        _commit_fix(Path(kw["cwd"]))
+        return {}
+    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    monkeypatch.setattr(leerie, "claude_p", fixer_claude_p)
+    with pytest.raises(RuntimeError):
+        asyncio.run(leerie._run_acceptance_gate(
+            st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    disk = json.loads((st.run_dir / "state.json").read_text())
+    assert [r["round"] for r in disk["acceptance"]["gate"]["rounds"]] == [1]
+    assert disk["acceptance"]["gate"]["initial"] == _failing(5)
+
+
 def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
@@ -745,8 +1044,13 @@ def test_residual_reaches_the_next_runs_planner_ctx(leerie, tmp_path):
 def test_fixers_cannot_read_the_sets(leerie, tmp_path):
     run_dir = tmp_path / "runs" / "r"
     for w in ("implementer", "conformer"):
-        assert leerie._acceptance_read_denials(w, run_dir) == \
-            f"Read(/{run_dir}/acceptance/**)"
+        # Round-3 M4: the writers' stream transcripts (logs/acceptance-<k>.log)
+        # carry the test source, evaluation logs the runner output, and
+        # calls.ndjson the writers' responses.
+        assert leerie._acceptance_read_denials(w, run_dir).split(",") == [
+            f"Read(/{run_dir}/acceptance/**)",
+            f"Read(/{run_dir}/logs/acceptance-*)",
+            f"Read(/{run_dir}/calls.ndjson)"]
     for w in ("planner", "acceptance_writer", "delivery_judge"):
         assert leerie._acceptance_read_denials(w, run_dir) == ""
     src = inspect.getsource(leerie.claude_p)
@@ -756,7 +1060,7 @@ def test_fixers_cannot_read_the_sets(leerie, tmp_path):
 def test_wiring_order_in_run_phases(leerie):
     src = inspect.getsource(leerie._run_phases)
     i_audit = src.index("await phase_defect_scope_audit(")
-    i_write = src.index("await phase_acceptance_write(")
+    i_write = src.index("await _acceptance_write_or_skip(")
     i_plan = src.index("plans = await phase_plan(")
     assert i_audit < i_write < i_plan
     i_recheck = src.index("await _run_delivery_recheck(")

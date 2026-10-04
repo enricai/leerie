@@ -71,12 +71,21 @@ def test_backtick_quoted_protocol_text_is_not_a_hit(leerie):
     assert leerie._find_protocol_markup(s, _auditor_props(leerie)) is None
 
 
+def test_indented_fenced_code_is_quoting_not_a_leak(leerie):
+    """Round-3 L7: a fence inside a list item is indented."""
+    quoted = ("Steps:\n  1. Call it like this:\n     ```xml\n"
+              '     <invoke name="Bash">\n     ```\n  2. Done.')
+    assert leerie._find_protocol_markup({"s": quoted}) is None
+    assert leerie._find_protocol_markup(
+        {"s": quoted + '\n<invoke name="Bash">'}) is not None
+
+
 def test_ordinary_markup_named_like_a_schema_field_is_not_a_hit(leerie):
     """Round-1 M5: `summary`, `title`, `name` are schema properties AND
     ordinary markup. A closing tag counts only where leaked syntax sits — at
     the end of the value or before another tool/schema tag — and fenced code
     is ignored. Measured 2026-10-04, that dropped none of the 2,395 hits in
-    26,663 recorded responses."""
+    26,673 recorded responses."""
     pr = leerie._schema_property_names(leerie.SCHEMAS["pr_writer"])
     impl = leerie._schema_property_names(leerie.SCHEMAS["implementer"])
     body = "Adds a page:\n```html\n<title>Orders</title>\n```\nand tests."

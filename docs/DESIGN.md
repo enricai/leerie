@@ -6002,7 +6002,11 @@ validates each set mechanically, by exit code only (no runner-output
 parsing, so the mechanism is language-agnostic): a defect file that
 passes on the validity base cannot discriminate and is dropped; a set
 needs at least one discriminating defect file and every control passing.
-Measured: on the page-advance report, five sets written this way
+A set carries exactly the tree its validation ran on: a writer that
+edited an existing file loses the set, and every other new file it left
+(a helper or fixture beside the tests) travels with the set — minus the
+runner's caches and bytecode, which would only collide with the target
+tree's own. Without its helper, a correct fix fails the set. Measured: on the page-advance report, five sets written this way
 classified all 8 trees correctly (40/40: run 1's broken fix, two other
 example-shaped or test-skipping fixes, four correct ones); on the
 generate report all sets failed every broken tree including barnacle's
@@ -6043,16 +6047,26 @@ run's planner (`prior_delivery_residual`), where a full plan-and-
 implement cycle settled the generate residual 2/3 times. And a repair
 round must not trade the report for a regression: if the repo's test
 axis goes from passing to failing across the repair rounds, their
-commits are reset away and the residual is recorded instead. Measured
+commits are reset away and the residual is recorded instead. The
+pre-repair verdict and HEAD are persisted before the first round and
+every round after it runs, so a resumed gate always reaches this check:
+re-measured on resume, the verdict would read the already-repaired tree
+and skip it. Measured
 on the finished task with wrong held-out tests: the repair conformer
 changed code in 3/3 trials, but 0 of the task's 247 regression tests
 and 0 attributable scraper tests (of 1,605) regressed.
 
 **Hidden from the fixers.** The sets live under the run's state root,
-and implementers and conformers carry a `Read` deny on that directory —
-the same deny mechanism that keeps acting workers out of the user's
-checkout. A shell `cat` is not covered by a `Read` deny; hiding is a
-best-effort reduction of the special-casing incentive, not a guarantee.
+and implementers and conformers carry `Read` denies on that directory
+and on everything else that records them — the writers' transcripts and
+the evaluation logs (test source, runner output) and the captured-call
+log — the same deny mechanism that keeps acting workers out of the
+user's checkout. Nothing of a set may linger in staging either: the
+evaluation removes what it copied, the directories it created and the
+runner by-products it left, and restores a runner cache that existed
+before it (pytest's records the ids of the tests it ran). A shell `cat`
+is not covered by a `Read` deny; hiding is a best-effort reduction of
+the special-casing incentive, not a guarantee.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 
@@ -7381,7 +7395,7 @@ where leaked syntax sits (at the end of the value, or before another tool
 or schema tag), since names like `summary` or `title` are also ordinary
 markup (such a tag that happens to end the value is still a hit).
 Measured on 2026-10-04, these two restrictions dropped none of the 2,395
-hits in the 26,663 recorded responses and removed the false positives a
+hits in the 26,673 recorded responses and removed the false positives a
 review found in PR bodies and summaries quoting HTML.
 
 An earlier audit found several orchestrator sites that violated this by
@@ -7583,7 +7597,8 @@ recursive-decomposition workers — see §5½; `classification_judge`,
 independent adversarial
 verifiers — see §8; `artifact_registry` is the pre-planning
 shared-vocabulary worker and `defect_scope_auditor` the pre-planning
-defect-shape enumerator — see §5; `rebaser` is the finalize-time rebase
+defect-shape enumerator — see §5; `acceptance_writer` writes the held-out
+acceptance tests — see §8; `rebaser` is the finalize-time rebase
 worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per

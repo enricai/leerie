@@ -133,7 +133,9 @@ class TestReachesTheArgv:
         # (DESIGN §8) now follows it for implementer/conformer.
         assert ",Edit(//work/**)" in _deny_value(argv)
         if schema_key == "implementer":
-            assert _deny_value(argv).endswith("/acceptance/**)")
+            deny = _deny_value(argv)
+            assert "/acceptance/**)," in deny
+            assert deny.endswith("/calls.ndjson)")
 
     def test_the_acting_worker_really_does_carry_the_bypass_flag(
             self, leerie, monkeypatch):
