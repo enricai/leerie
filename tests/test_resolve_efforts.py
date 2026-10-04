@@ -283,6 +283,9 @@ def test_judgment_workers_pinned_set(leerie):
         # "Rebase-onto-base before push") — judgment-adjacent (decides
         # abort-vs-resolve per conflict), mirrors integrator's medium tier.
         "rebaser",
+        # Held-out acceptance test writer (DESIGN §8 *Held-out acceptance
+        # tests*) — measured at medium (40/40 page verdicts correct).
+        "acceptance_writer",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

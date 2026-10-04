@@ -4250,3 +4250,46 @@ chose the shape: dispositions alone came back non-empty 6/6, the prior schema
 10/10, while every variant that also carried a top-level
 `already_resolved_on_tree` boolean returned `sites: []` in 5 of 18 calls —
 so that flag was dropped.
+
+## Held-out acceptance tests (2026-10-04)
+
+Every verification layer before this graded a fix against tests the fixing run
+wrote itself (DESIGN §8 *Held-out acceptance tests*).
+`tests/test_acceptance_gate.py` runs the REAL write/validate/gate code against
+a real git repo with a real pytest `test_scoped` command; only `claude_p` is
+stubbed, and the stubs write files the way the workers would.
+
+- **Validity by exit code.** A file the test command cannot run (not test-shaped,
+  runner missing) discards the set with an honest "could not run" reason. A
+  defect file that passes on the validity base is
+  dropped (it cannot discriminate); a failing control discards the set; a set
+  with no discriminating defect file is discarded; kept files land under
+  `<run_dir>/acceptance/set-<k>/`, the disposable worktree is removed and the
+  user's checkout stays clean. The writer is shown the defect contract, the
+  inline examples and the referenced report, at `medium` effort, as an acting
+  worker.
+- **Skips** (audit not applicable, `--skip-acceptance-check`) are recorded with
+  their reason.
+- **Validity base**: the earliest same-task sibling's starting HEAD; a
+  different task is ignored.
+- **Evaluation** never overwrites, or runs in place of, a file the run itself
+  put at the same path, and removes what it copied.
+- **Repair**: one fixing round at `EFFORT_ACCEPTANCE_REPAIR == "high"`, its
+  prompt naming shown sets' cases and never the hidden two; an unfixed tree
+  gets exactly two rounds and ships with a residual; a repair that turns the
+  test axis red is `git reset --hard` away (`rolled_back`); the gate is
+  resume-idempotent on `gate.final`.
+- **Cross-run**: the residual reaches `_prior_delivery_residual` as
+  `acceptance_unmet`, and the planner prompt carries guidance for it.
+- **Hiding**: `_acceptance_read_denials` adds the `Read` deny for implementer
+  and conformer only, and `claude_p` wires it.
+- **Order**: in `_run_phases`, audit → acceptance write → plan, and
+  delivery recheck → acceptance gate → finalize.
+
+Falsified five ways, each turning at least one test red: repair at the
+conformer's own effort; no hidden sets; no rollback; keeping
+non-discriminating defect files; no Read deny.
+`tests/test_repo_write_denial.py` now asserts the write deny's presence rather
+than its position (the acceptance Read deny follows it for implementer and
+conformer), and the registry tests (`test_resolve_models`,
+`test_resolve_efforts`) list the new worker.

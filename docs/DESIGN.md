@@ -5941,6 +5941,79 @@ worker never anticipated. A verdict is a list of concrete found defects, not
 a score crossing a threshold — the invariant every new verifier must
 preserve.
 
+### Held-out acceptance tests
+
+Every verification layer above grades the fix against tests the fixing
+run wrote itself. On both v0.36.0 repeat runs the first run's fix failed
+on the report's own quoted input, and none of the 44 review calls across
+those two runs (fit judges, conformers, delivery judges) flagged it: the
+tests had been written around the implementation, not the report. The
+automated-program-repair literature names this *overfitting*: a patch
+that passes the tests its author saw and fails the behaviour those tests
+stood for (Smith et al., FSE 2015; on SWE-bench, 29.6% of "plausible"
+patches disagree with the reference fix on fresh tests — Wang, Pradel et
+al., ICSE 2026). The measured remedy that recurs across that work is the
+same: tests the patch author never saw (DiffTGen, Opad, UTBoost), and
+ImpossibleBench (ICLR 2026) shows that test visibility is exactly what
+drives special-casing to a test's inputs.
+
+So after the defect-scope audit, an `acceptance_writer` worker — an
+acting worker in a disposable worktree at the **validity base** (the
+tree the report was filed against: the earliest same-task run's starting
+HEAD, else this run's) — writes tests from the report alone. It sees the
+report, the audited `defect_shape` and the report's `inline_examples`;
+it never sees the plan or any code the run will write. It writes several
+independent *sets*, each split into **defect files** (must fail on the
+validity base) and **control files** (correct behaviour that must keep
+passing), driving the behaviour through the module's stable entry points
+rather than internal helpers whose signatures a fix may change. Python
+validates each set mechanically, by exit code only (no runner-output
+parsing, so the mechanism is language-agnostic): a defect file that
+passes on the validity base cannot discriminate and is dropped; a set
+needs at least one discriminating defect file and every control passing.
+Measured: on the page-advance report, five sets written this way
+classified all 8 trees correctly (40/40: run 1's broken fix, two other
+example-shaped or test-skipping fixes, four correct ones); on the
+generate report all sets failed every broken tree including barnacle's
+HEAD, which leerie had declared "no work required"; on a Python repo
+with a planted defect, 3/3 sets were valid, passed the fixed code and
+flagged an example-shaped patch.
+
+**The gate runs after the run's own final conformance.** Each valid set
+is copied into staging, run file by file, and removed. A majority of
+failing sets triggers **at most two repair rounds**: the conformer is
+told which declared cases failed and the defect contract — never the
+runner output or the test source, because a conformer shown the failing
+output special-cased it (one shown runner output patched the visible
+redirect parameter; failing names plus the contract got 2/4 page fixes
+at the root against 1/4). The last two valid sets are never shown at
+all; every round is re-judged on all sets, so a fix fitted to the shown
+names still fails the hidden ones. Repair rounds run the conformer at
+**high effort**: on the multi-mechanism generate report the low-effort
+pinned conformer fixed the contract from HEAD 1/2 times, medium 2/3,
+high every time it finished (6/6) — effort, not turn budget, was the
+lever, and only failing runs pay for it.
+
+**Non-blocking, with a mechanical safety net.** Held-out tests can be
+wrong: on a report that states no expected behaviour (a diagnostic
+report) or needs a heavily mocked harness, all three sets failed a task
+the operator had confirmed finished. So a residual after two rounds
+never blocks the PR; it is recorded and handed to the next same-task
+run's planner (`prior_delivery_residual`), where a full plan-and-
+implement cycle settled the generate residual 2/3 times. And a repair
+round must not trade the report for a regression: if the repo's test
+axis goes from passing to failing across the repair rounds, their
+commits are reset away and the residual is recorded instead. Measured
+on the finished task with wrong held-out tests: the repair conformer
+changed code in 3/3 trials, but 0 of the task's 247 regression tests
+and 0 attributable scraper tests (of 1,605) regressed.
+
+**Hidden from the fixers.** The sets live under the run's state root,
+and implementers and conformers carry a `Read` deny on that directory —
+the same deny mechanism that keeps acting workers out of the user's
+checkout. A shell `cat` is not covered by a `Read` deny; hiding is a
+best-effort reduction of the special-casing incentive, not a guarantee.
+
 ### Mechanical-feedback loops (the CRITIC pattern)
 
 Research shows that LLMs cannot self-correct reasoning without external

@@ -497,7 +497,11 @@ The orchestrator gives you, in your prompt:
    than another hypothesis-scoped fix; if they are still absent, say
    so in `confidence.basis` and keep the plan minimal — stacking more
    unverifiable fixes on an unverifiable pile is how the same task
-   loops. Do not re-plan work the record does not
+   loops. An `acceptance_unmet` entry names held-out acceptance cases —
+   tests written from the report alone, which that run's fix still
+   failed after its repair rounds: plan the root-cause change that makes
+   the report's contract hold for those cases in general, not a change
+   shaped to the case names. Do not re-plan work the record does not
    dispute. If the tree contradicts the record (someone fixed it since),
    trust the tree and say so in `confidence.basis`.
 
