@@ -465,6 +465,13 @@ STATE_FIELDS = (
     "acceptance",
     # skip_acceptance_check: --skip-acceptance-check resolved at run start.
     "skip_acceptance_check",
+    # no_work_pending / no_work_acceptance / acceptance_dispute (DESIGN §8
+    # *No work is declared on executed evidence, and disputed at most
+    # once*): a judge confirmation held for the held-out check, the check's
+    # verdict, and the dispute record the next run's dispute-once reads.
+    "no_work_pending",
+    "no_work_acceptance",
+    "acceptance_dispute",
     # delivery_gate: audit record of the finalize-side required-items
     # verification on the integrated staging tree (DESIGN §8 *The
     # delivery gate*): {unmet_before[], unmet_after[], samples_before,
@@ -21614,6 +21621,15 @@ async def _confirm_no_work_on_converged_gate(
             "judge_evidence": judge_evidence,
             "checked": list(out.get("checked", []) or []),
         }
+        if _acceptance_can_check(st):
+            # DESIGN §8 *No work is declared on executed evidence*: hold the
+            # confirmation until the held-out sets have run on HEAD, which
+            # needs provisioning first (`_settle_pending_no_work`).
+            st.data["no_work_pending"] = True
+            st.save()
+            log("  no-work confirmation held pending the held-out "
+                "acceptance check on HEAD")
+            return False
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence})
         return True
@@ -33190,6 +33206,112 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
     st.save()
 
 
+def _acceptance_can_check(st: "State") -> bool:
+    """Whether held-out acceptance sets can be produced for this run —
+    the precondition for holding a no-work confirmation pending them."""
+    return (not st.data.get("skip_acceptance_check")
+            and "bug-fixing" in (st.data.get("categories") or [])
+            and bool(resolve_blt_scoped(st.repo_root).get("test")))
+
+
+async def _acceptance_results_on_head(st: "State", caps: dict
+                                      ) -> list[dict] | None:
+    """Run the valid acceptance sets on HEAD (the planning worktree), or
+    None when there are none."""
+    sets = (st.data.get("acceptance") or {}).get("sets") or []
+    if not sets:
+        return None
+    await _ensure_planning_worktree(st)
+    tree = str(_judgment_cwd(st))
+    await _ensure_worktree_deps(
+        tree, st, caps, log_path=st.run_dir / "logs" / "acceptance-head.log",
+        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+        label_prefix="acceptance-head", log_prefix="acceptance")
+    return await _evaluate_acceptance_sets(st, caps, tree, sets, "head")
+
+
+async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
+    res = await _acceptance_results_on_head(st, caps)
+    return res is not None and not _acceptance_majority_fails(res)
+
+
+def _prior_acceptance_dispute(st: "State") -> bool:
+    """Whether the most recent COMPLETED same-task run already raised an
+    acceptance dispute (DESIGN §8 *disputed at most once*). Same sibling
+    rules as `_prior_delivery_residual`: exact task match, newest first,
+    completed runs only."""
+    task = (st.data.get("task") or "").strip()
+    try:
+        candidates = sorted(
+            (d for d in st.run_dir.parent.iterdir()
+             if d.is_dir() and d.name != st.run_dir.name),
+            key=lambda d: d.stat().st_mtime, reverse=True)
+    except OSError:
+        return False
+    for d in candidates:
+        try:
+            data = json.loads((d / "state.json").read_text())
+            if (data.get("task") or "").strip() != task:
+                continue
+            if (d / "orchestrator.exit_code").read_text().strip() != "0":
+                continue
+        except (OSError, ValueError):
+            continue
+        return bool(data.get("acceptance_dispute"))
+    return False
+
+
+async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
+    """Decide a held no-work confirmation on executed evidence (DESIGN §8
+    *No work is declared on executed evidence, and disputed at most
+    once*). Returns True when the run ended as no work."""
+    conf = st.data.get("no_work_confirmation") or {}
+    judge_evidence = conf.get("judge_evidence") or ""
+    res = await _acceptance_results_on_head(st, caps)
+    if res is None:
+        st.data["no_work_acceptance"] = {"verdict": "no valid sets"}
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence})
+        return True
+    if not _acceptance_majority_fails(res):
+        st.data["no_work_acceptance"] = {"verdict": "pass", "results": res}
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence + " — and the held-out "
+                                 "acceptance sets pass on HEAD"})
+        return True
+    sets = {s_["index"]: s_ for s_ in
+            (st.data.get("acceptance") or {}).get("sets") or []}
+    cases = [c for r in res if not r["passed"] for rel in r["failing_files"]
+             for c in sets[r["index"]]["cases"].get(rel, [])][:20]
+    if _prior_acceptance_dispute(st):
+        st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
+                                         "results": res, "cases": cases}
+        log("  WARNING: held-out acceptance sets still fail on HEAD, but the "
+            "previous run of this task already disputed on them — accepting "
+            "no work (disputed at most once). Failing cases: "
+            + "; ".join(cases[:5]))
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence + " — accepted after one "
+                                 "acceptance dispute; residual recorded"})
+        return True
+    st.data["no_work_acceptance"] = {"verdict": "dispute", "results": res,
+                                     "cases": cases}
+    st.data["acceptance_dispute"] = {
+        "failing_sets": sum(1 for r in res if not r["passed"]),
+        "total_sets": len(res), "cases": cases}
+    st.data["no_work_dispute"] = {
+        "classifier_evidence": conf.get("classifier_evidence", ""),
+        "judge_evidence": ("Held-out acceptance tests written from the "
+                           "report fail on HEAD: " + "; ".join(cases)),
+        "checked": []}
+    st.data.pop("no_work_pending", None)
+    st.save()
+    log("  no-work confirmation DISPUTED by the held-out acceptance sets on "
+        f"HEAD ({st.data['acceptance_dispute']['failing_sets']} of {len(res)} "
+        "fail) — planning the work")
+    return False
+
+
 def _site_tokens_from_scope(defect_scope: object) -> list[str]:
     """Lower-cased, de-duplicated site tokens across every inline example
     the audit recorded."""
@@ -36683,6 +36805,10 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                     f"{e} — gate disabled for this run")
                 st.data["acceptance"] = {"skipped": f"error: {type(e).__name__}"}
             st.save()
+        if (st.data.get("no_work_pending")
+                and "no_work_acceptance" not in st.data
+                and await _settle_pending_no_work(st, caps)):
+            return
 
         if "plans_after_plan" not in st.data:
             plans = await phase_plan(task, st, caps, models, efforts)
@@ -36857,10 +36983,27 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # moves across a pause; keyed off the detached worktree instead it
             # would be constant by construction and the invalidation would
             # silently never fire.
+            fix_ids_before = {s_["id"] for p_ in plans
+                              for s_ in (p_.get("subtasks") or [])
+                              if s_.get("fixes_reported_symptom")}
             satisfied_no_work = await _filter_satisfied_subtasks(
                 plans, Path(os.getcwd()), st, caps, models, efforts)
             if satisfied_no_work is not None:
                 _finish_no_work_run(st, satisfied_no_work)
+                return
+            # DESIGN §8 *A plan whose fixes are all already on HEAD ends as
+            # no work*: only test/verification survivors left, and the
+            # held-out sets agree.
+            fix_ids_after = {s_["id"] for p_ in plans
+                             for s_ in (p_.get("subtasks") or [])
+                             if s_.get("fixes_reported_symptom")}
+            if (fix_ids_before and not fix_ids_after
+                    and await _acceptance_passes_on_head(st, caps)):
+                _finish_no_work_run(st, {
+                    "<every fix already on HEAD>": (
+                        "every subtask fixing the reported symptom was "
+                        "dropped as already satisfied, and the held-out "
+                        "acceptance sets pass on HEAD")})
                 return
             # Resumable-planning checkpoint: the filtered `plans`
             # immediately before _schedule() — the last plans_after_*

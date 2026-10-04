@@ -4293,3 +4293,31 @@ non-discriminating defect files; no Read deny.
 than its position (the acceptance Read deny follows it for implementer and
 conformer), and the registry tests (`test_resolve_models`,
 `test_resolve_efforts`) list the new worker.
+
+## No work on executed evidence, disputed at most once (2026-10-04)
+
+A no-work confirmation used to end the run on the read-only judge's word;
+one such confirmation declared done a defect that report-shaped tests still
+reproduce on barnacle's HEAD (DESIGN §8 *No work is declared on executed
+evidence, and disputed at most once*).
+
+`tests/test_acceptance_no_work.py`:
+
+- **Hold.** With acceptance available (not skipped, `bug-fixing`, a scoped
+  test template), a confirming judge leaves `no_work_pending` and does not
+  finish; without any of the three it finishes at once, as before.
+  Falsified by disabling the hold.
+- **Settle.** Passing sets → no work (`verdict: pass`); failing sets with no
+  prior dispute → `acceptance_dispute` plus a `no_work_dispute` whose evidence
+  names only the failing cases, pending cleared, planning continues; failing
+  sets after a prior dispute → no work with a WARNING and no second dispute
+  record (falsified by removing the dispute-once branch); no valid sets → the
+  judge's confirmation stands.
+- **Dispute-once lookup.** Only the newest COMPLETED same-task sibling counts;
+  another task's or a crashed run's record is ignored.
+- **A4.** `_acceptance_passes_on_head` over no sets, a passing and a failing
+  majority; in `_run_phases` the fix-subtask set is taken before the
+  satisfied-probe sweep and re-checked after it, gated on that helper, and the
+  pending settle runs after the acceptance write and before planning. (The A4
+  routing is pinned structurally; driving the real filters block end to end is
+  left to the live run.)

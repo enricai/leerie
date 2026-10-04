@@ -5315,6 +5315,36 @@ completed. The identity write is therefore hoisted to run start, before
 `phase_classify`, so every early-exit path sees a correctly-identified
 `run.json`.
 
+**No work is declared on executed evidence, and disputed at most once.**
+A confirmed claim used to end the run on the judge's reading alone, and the
+judge can neither run tests nor, as measured, see the report's contract:
+43% of no-work confirmations since v0.31.0 carried no contract item, and one
+of them (generate-1.12.74) declared done a defect that report-shaped tests
+still reproduce on barnacle's HEAD. So on a defect-fix task with held-out
+acceptance available, the judge's confirmation is held as *pending*; the
+run continues through provisioning, the defect-scope audit and the
+acceptance sets (§ *Held-out acceptance tests* — they need the installed
+dependencies, which is why the decision moves after provisioning), and the
+sets are run on HEAD. A majority passing ends the run as no work. A
+majority failing is a dispute: the failing case names become the
+`no_work_dispute` evidence and the run plans the work. But held-out tests
+can be wrong — on a finished task whose report states no expected behaviour,
+all three sets failed it — and a wrong dispute repeated on every re-run
+would be a new infinite loop. So a dispute is raised at most once per task:
+when the previous same-task run already disputed on acceptance evidence, a
+still-failing majority ends the run as no work with a loud warning and the
+residual recorded. The cost of a wrong dispute is bounded to one extra run.
+With no valid sets the judge's confirmation stands, as before.
+
+**A plan whose fixes are all already on HEAD ends as no work.** The
+satisfied-probe sweep could drop every subtask that fixes the reported
+symptom and still let the run ship, because the survivors (verification
+and test-only subtasks) are never judged satisfied by a read-only probe —
+three of the six measured CHURN pairs shipped such a test-only PR. When
+every subtask flagged `fixes_reported_symptom` was dropped as already
+satisfied and the held-out sets pass on HEAD, the run ends as no work;
+otherwise it proceeds as before.
+
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
 tree — but only at the START of the run AFTER the one that shipped.
