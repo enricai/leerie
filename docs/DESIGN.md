@@ -4981,6 +4981,28 @@ rewrote *nothing* is reported once, at the end, as a probable rename.
 rather than proceeding unconstrained, so an operator who asked for the
 guarantee is never quietly given the old behaviour.
 
+**On some CLI builds, strict decoding turns leaked markup into silent data
+loss.** The grammar guarantees syntactically valid JSON, not that the model
+stayed inside it: when the model starts emitting its own tool-call markup
+mid-answer (`</defect_shape><parameter name="sites">…`), strict decoding
+absorbs those characters *into* the string field it was writing and the
+remaining fields come out empty — schema-valid, content destroyed. Without
+`strict`, the CLI's own post-hoc validator rejects that payload and the
+model retries cleanly. Measured on a recorded v0.36.0 `defect_scope_auditor`
+call: CLI 2.1.280 with the proxy leaked 4/4 (zero sites kept), 0/4 without
+it, and 0/4 with it on CLI 2.1.289; in production the same worker leaked in
+7 of 17 recorded v0.36.0 calls (one per run), two of which came back with
+`sites: []`. Two layers answer it.
+The flag refuses a CLI below `MIN_CLAUDE_CLI_STRICT_OUTPUT` at startup — the
+same refuse-rather-than-silently-degrade contract as the
+`ANTHROPIC_BASE_URL` and Bedrock collisions. And every worker's structured
+output, strict or not, passes a protocol-markup check in `claude_p`: a hit
+is handled exactly like a schema miss (one corrective re-prompt, then the
+ordinary schema-failure `WorkerError`). That generalizes the implementer-only
+`corrupted_envelope` check (upstream anthropics/claude-code#64690) to every
+worker; the tokens it looks for are wire syntax, not prose (§12
+*Language-to-JSON*).
+
 **Two distinct limits, both undocumented.** The API refuses an over-large
 schema two ways — *"Schema is too complex for compilation"* and *"The
 compiled grammar is too large"* — with no numeric bound documented anywhere.
@@ -7175,6 +7197,13 @@ silently on inputs the author didn't anticipate. Regex remains legitimate
 only where the string matched is itself mechanical rather than natural
 language — a semver, a shell command, a fixed CLI output string, a file
 path — never prose a human wrote to communicate intent.
+The tool-call protocol tokens a model can leak into a structured field
+(`antml:`, `<parameter name="`, `<invoke name="`, a closing tag named after
+one of the worker's own schema properties) are mechanical in this sense:
+they are the CLI's wire syntax, never a worker's way of saying something,
+so `claude_p`'s check for them (§7 *Forcing constrained decoding*) is
+inside the rule. It answers "is this payload corrupted?", not "what does
+this text mean?".
 
 An earlier audit found several orchestrator sites that violated this by
 regexing natural-language prose (task text, planner intent,

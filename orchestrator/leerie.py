@@ -104,6 +104,15 @@ def _load_prompt(name: str) -> str:
 # have the flag at all. Enforced at preflight by _check_claude_cli_version().
 MIN_CLAUDE_CLI = (2, 1, 22)
 
+# Floor for --dangerously-force-strict-output only (DESIGN §7 *Forcing
+# constrained decoding*). On CLI 2.1.280, forcing `strict: true` let the
+# model's leaked tool-call markup be decoded into a string field and the
+# remaining fields come out empty — a recorded defect_scope_auditor call
+# leaked 4/4 with the proxy, 0/4 without it, and 0/4 with it on 2.1.289.
+# Not folded into MIN_CLAUDE_CLI: without the flag the CLI's own validator
+# rejects that payload, so an older host CLI is still fine for normal runs.
+MIN_CLAUDE_CLI_STRICT_OUTPUT = (2, 1, 289)
+
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
     # Runaway backstop, not a routine capacity limit (N3+N4, corpus-derived
@@ -4674,6 +4683,33 @@ def _check_claude_cli_version() -> None:
             "`curl -fsSL https://claude.ai/install.sh | bash`. "
             "(npm/pnpm installs are now an advanced/legacy option per the "
             "Claude Code docs.)"
+        )
+
+
+def _check_strict_output_cli_version() -> None:
+    """die() if --dangerously-force-strict-output is on and `claude` is
+    below MIN_CLAUDE_CLI_STRICT_OUTPUT — the same refuse-rather-than-
+    silently-degrade contract as the ANTHROPIC_BASE_URL and Bedrock
+    refusals beside its call site. An unrecognized version string falls
+    through, as in `_check_claude_cli_version`."""
+    try:
+        out = subprocess.run(
+            ["claude", "--version"],
+            capture_output=True, text=True, timeout=30, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        die("`claude --version` timed out — investigate the CLI install.")
+    found = _parse_claude_version(out.stdout)
+    if found is None:
+        return
+    if found < MIN_CLAUDE_CLI_STRICT_OUTPUT:
+        die(
+            f"--dangerously-force-strict-output needs claude CLI >= "
+            f"{'.'.join(map(str, MIN_CLAUDE_CLI_STRICT_OUTPUT))}, found "
+            f"{'.'.join(map(str, found))}. On older builds strict decoding "
+            "can absorb leaked tool-call markup into a string field and "
+            "empty the rest of the worker's answer while still passing the "
+            "schema. Upgrade the CLI, or drop the flag."
         )
 
 
@@ -14895,23 +14931,61 @@ def _parse_touched_file_line(line: str) -> tuple[str | None, bool]:
     return (None, False)
 
 
-def _find_antml_markup(value: object) -> str | None:
-    """Recursively scan a JSON-shaped value for a string containing
-    literal `antml:` markup. Returns the offending string on the first
-    hit, None if clean. Structured recursion (dict/list), not a
-    top-level-only check — the incident showed corruption landing in
-    arbitrary nested fields (e.g. inside `clarification_question`)."""
+# Tool-call wire syntax a model can leak into a structured-output string
+# field (DESIGN §7 *Forcing constrained decoding*, §12 *Language-to-JSON*:
+# protocol tokens are mechanical strings, not prose). A closing tag named
+# after one of the worker's own schema properties is matched too — that is
+# how the observed leak reads (`…</defect_shape><parameter name="sites">`).
+_PROTOCOL_MARKUP_TOKENS = (
+    "antml:", '<parameter name="', "</parameter>", '<invoke name="',
+    "</invoke>",
+)
+# Backtick-quoted spans are code the worker is quoting (a repo that is
+# itself about this protocol), not leaked syntax — the one legitimate hit
+# in a 120-sample corpus audit was exactly that shape.
+_BACKTICK_SPAN_RE = re.compile(r"`[^`\n]*`")
+
+
+def _schema_property_names(schema: object) -> frozenset[str]:
+    """Every property name declared anywhere in a JSON schema."""
+    names: set[str] = set()
+    stack = [schema]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            props = node.get("properties")
+            if isinstance(props, dict):
+                names.update(props)
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return frozenset(names)
+
+
+def _find_protocol_markup(value: object,
+                          prop_names: frozenset[str] = frozenset()
+                          ) -> str | None:
+    """Recursively scan a JSON-shaped value for a string carrying leaked
+    tool-call markup. Returns the offending string on the first hit, None
+    if clean. Structured recursion (dict/list), not a top-level-only check
+    — the corruption lands in arbitrary nested fields (e.g. inside
+    `clarification_question`)."""
     if isinstance(value, str):
-        return value if "antml:" in value else None
+        bare = _BACKTICK_SPAN_RE.sub("", value)
+        if any(t in bare for t in _PROTOCOL_MARKUP_TOKENS):
+            return value
+        if "</" in bare and any(f"</{p}>" in bare for p in prop_names):
+            return value
+        return None
     if isinstance(value, dict):
         for v in value.values():
-            hit = _find_antml_markup(v)
+            hit = _find_protocol_markup(v, prop_names)
             if hit is not None:
                 return hit
         return None
     if isinstance(value, list):
         for v in value:
-            hit = _find_antml_markup(v)
+            hit = _find_protocol_markup(v, prop_names)
             if hit is not None:
                 return hit
         return None
@@ -14947,9 +15021,10 @@ def _validate_result(result: dict) -> tuple[str, str] | None:
     than the terminal `"broken"` the status dispatch below would
     otherwise assign it via a coincidentally-matching shape (e.g. a
     corrupted `checkpoint_path`)."""
-    if _find_antml_markup(result) is not None:
+    if _find_protocol_markup(
+            result, _schema_property_names(SCHEMAS["implementer"])) is not None:
         return ("corrupted_envelope",
-                "result contains literal 'antml:' markup in a string field "
+                "result contains leaked tool-call markup in a string field "
                 "— upstream anthropics/claude-code#64690 token-generation "
                 "corruption")
     status = result.get("status")
@@ -19632,6 +19707,20 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             if structured is None:
                 last_problem = ("the run produced no structured_output — the final "
                                 "output did not satisfy the JSON schema")
+                continue
+            # Schema-valid is not the same as intact: leaked tool-call markup
+            # inside a string field passes the schema (and, under strict
+            # decoding, empties the fields after it). Handled exactly like a
+            # schema miss (DESIGN §7 *Forcing constrained decoding*).
+            if _find_protocol_markup(
+                    structured,
+                    _schema_property_names(SCHEMAS[schema_key])) is not None:
+                last_problem = ("a string field in your answer contains leaked "
+                                "tool-call markup (e.g. `<parameter name=` or a "
+                                "closing tag named after a schema field) — "
+                                "write each field's value as plain text only")
+                log(f"  [{sid}] structured output carried leaked tool-call "
+                    f"markup (attempt {attempt} of 2) — re-prompting")
                 continue
             return structured
 
@@ -37147,6 +37236,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
             "endpoint. leerie will not silently run without the constrained "
             "decoding you asked for. Drop the flag, or use subscription/API "
             "auth for this run.")
+    if caps["force_strict_output"]:
+        _check_strict_output_cli_version()
 
     # Resolve --pr-template: free-form string (no enum). Re-attach to
     # args so phase_finalize sees the resolved value via

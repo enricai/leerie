@@ -461,13 +461,13 @@ def test_validate_result_clean_result_unaffected(leerie):
     assert leerie._validate_result(res) is None
 
 
-def test_find_antml_markup_recurses_lists_and_dicts(leerie):
+def test_find_protocol_markup_recurses_lists_and_dicts(leerie):
     """Unit coverage for the detector helper itself: hits inside a list,
     inside a nested dict, and a clean structure returning None."""
-    assert leerie._find_antml_markup("clean string") is None
-    assert leerie._find_antml_markup(_ANTML_SNIPPET) == _ANTML_SNIPPET
-    assert leerie._find_antml_markup({"a": {"b": [1, 2, _ANTML_SNIPPET]}}) == _ANTML_SNIPPET
-    assert leerie._find_antml_markup({"a": "clean", "b": ["also clean"]}) is None
-    assert leerie._find_antml_markup(None) is None
-    assert leerie._find_antml_markup(42) is None
+    assert leerie._find_protocol_markup("clean string") is None
+    assert leerie._find_protocol_markup(_ANTML_SNIPPET) == _ANTML_SNIPPET
+    assert leerie._find_protocol_markup({"a": {"b": [1, 2, _ANTML_SNIPPET]}}) == _ANTML_SNIPPET
+    assert leerie._find_protocol_markup({"a": "clean", "b": ["also clean"]}) is None
+    assert leerie._find_protocol_markup(None) is None
+    assert leerie._find_protocol_markup(42) is None
 

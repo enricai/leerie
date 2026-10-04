@@ -308,10 +308,11 @@ Base layers (top-down):
 - corepack activated via `MISE_NODE_COREPACK=true` so a repo's
   `package.json` `packageManager` field selects its own pnpm/yarn (no
   globally pinned pnpm baked). `npm install -g
-  '@anthropic-ai/claude-code@>=2.1.219'` installs the `claude` CLI
-  (leerie enforces ≥2.1.22 at runtime for `--json-schema`; the image pin
-  is ≥2.1.219 for the `claude -p` mid-stream-drop fix — §3 "Transient
-  transport disconnect").
+  '@anthropic-ai/claude-code@>=2.1.289'` installs the `claude` CLI
+  (leerie enforces ≥2.1.22 at runtime for `--json-schema`, and ≥2.1.289
+  only under `--dangerously-force-strict-output` — §2½ *Forced constrained
+  decoding*; the image pin covers both that and the ≥2.1.219 `claude -p`
+  mid-stream-drop fix — §3 "Transient transport disconnect").
 - `ENV PATH` order is load-bearing: `<system mise shims>` : `<LTS Node
   bin>` : `<MISE_DATA_DIR/shims>` : `$PATH` : `/home/leerie/.local/bin`.
   Baked tooling (LTS Node hosting `claude`) comes first so a repo's own
@@ -2931,6 +2932,15 @@ injects the schema as a synthetic `StructuredOutput` tool with no
 submissions come back malformed. Setting `strict: true` compiles the schema
 into a sampling grammar and makes those shapes unrepresentable.
 
+**CLI floor.** `main()` calls `_check_strict_output_cli_version()` right
+after the `ANTHROPIC_BASE_URL` and Bedrock refusals when the flag resolves
+on, and `die()`s when `claude --version` parses below
+`MIN_CLAUDE_CLI_STRICT_OUTPUT = (2, 1, 289)`: on CLI 2.1.280, strict
+decoding absorbed the model's leaked tool-call markup into a string field
+and emptied the rest of the payload (DESIGN §7 *Forcing constrained
+decoding*). An unparseable version string falls through, the same as
+`_check_claude_cli_version`. The image pins `@anthropic-ai/claude-code@>=2.1.289`.
+
 **Context-window side effect.** Owning `ANTHROPIC_BASE_URL` makes the CLI
 treat the session as gateway-routed, applying a conservative client-side
 context ceiling instead of the model's native window. `_model_arg(model)`
@@ -3162,6 +3172,27 @@ above it (out-of-credits, OOM, nonzero exit code) is a named,
 non-retryable condition and still raises — the nonzero-rc arm covers
 leerie's own deliberate kills (SIGTERM/SIGKILL) — and the worker-timeout
 path raises `subprocess.TimeoutExpired` before the block is reached.
+
+#### Protocol-markup check
+
+After `claude_p` reads `structured_output` and before it returns it,
+`_find_protocol_markup(structured, _schema_property_names(SCHEMAS[schema_key]))`
+scans every string value (recursively through dicts and lists) for tool-call
+wire syntax: `antml:`, `<parameter name="`, `</parameter>`, `<invoke name="`,
+`</invoke>`, and `</<prop>>` for each property name of that worker's own
+schema. Backtick-quoted spans are removed first, so code a worker quotes
+(a repo that is itself about this protocol) is not a hit. A hit sets
+`last_problem` and `continue`s into the existing attempt-2 corrective
+re-prompt; a second hit raises the usual `WorkerError("worker failed
+schema-valid output twice: …")`, so every caller's existing schema-failure
+handling applies unchanged. Applies to every worker, strict output or not.
+
+Why: under `--dangerously-force-strict-output` on CLI 2.1.280 the
+`defect_scope_auditor` leaked `</defect_shape><parameter name="sites">…`
+into `defect_shape` and emitted `sites: []` (DESIGN §7). Corpus precision of
+the token set: 119 of 120 sampled hits across 26,408 recorded responses were
+genuine leaks; the one legitimate hit was backtick-quoted, which the strip
+above excludes. Pinned by `tests/test_protocol_markup_guard.py`.
 
 #### Auth/quota backoff
 
@@ -3714,6 +3745,7 @@ All in `leerie.py`, in execution order. This is the concrete catalogue behind
 | `git user.email` / `user.name` set | commits would fail silently without identity |
 | working tree clean | dirty tree → ambiguous diffs, corrupt merge history |
 | `claude --version` ≥ `MIN_CLAUDE_CLI` (currently `(2, 1, 22)`) | CLI too old for `--json-schema` (introduced for `claude -p` in v2.1.22) — replaces the cryptic "unknown option" message a stale CLI used to produce |
+| `claude --version` ≥ `MIN_CLAUDE_CLI_STRICT_OUTPUT` (currently `(2, 1, 289)`), only when `--dangerously-force-strict-output` is on | a CLI on which strict decoding turns leaked tool-call markup into a schema-valid payload with its fields emptied (DESIGN §7) |
 | `gh auth status` + `origin` remote (launcher bash, before container) | finalize would fail at push/PR after the full run already ran. Short-circuited when `--no-push` is passed (env / TOML mirrors). |
 | live `claude -p` smoke test | auth failure or network problem |
 | live `claude -p` smoke test — client-side context refusal | `ContextOverflow` -> resumable `EXIT_LOCKED` pause naming the remedy, not a bare `Prompt is too long` |
@@ -5405,7 +5437,7 @@ extend the enum and update the producer in the same change.
 | `new-worktree.sh` could not create the worktree | Retryable (infrastructure) | `"worktree_setup"` from `_run_implementer`'s `WorktreeSetupError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: the raise happens before any worker runs, so `_retryable_failure`'s terminal rationale ("the worker is broken or dishonest, and re-running burns an invocation for no expected gain") does not apply — re-running is exactly what clears it |
 | worker's cgroup exhausted its PID table (fork denials climbing / at `pids.max`) | Retryable (infrastructure) | `"pid_exhausted"` from `_invoke`'s `PidExhaustedError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: a fresh worker gets a clean PID table, which is exactly the remedy the raise site's own log message already promised ("Terminating early so a fresh worker retries with a clean PID table") |
 | worker's tool subtree (a build/test command) overshot `memory.max` and was kernel-killed mid-turn | Retryable (infrastructure) | `"oom_killed"` from `_invoke`'s `OomKilledError`, caught by its own arm in `_settle_subtask` **before** the generic `except WorkerError` (it is a subclass, so a generic-first order swallows it). Infrastructure, not a broken worker: a resource limit killed it, not the worker's own behaviour, so a fresh attempt is the remedy |
-| structured-output envelope contains literal `antml:`-shaped markup inside a string field value | Retryable | `"corrupted_envelope"` from `_validate_result`, checked at the TOP of the function before the status dispatch. Upstream anthropics/claude-code#64690: a model-side token-generation bug can leak tool-call markup (`antml:parameter`, `antml:invoke`, …) into a structured-output field's own string value. No legitimate output contains this substring (per CLAUDE.md's Language-to-JSON rule), so it is an unambiguous corruption signal — the underlying work may well have succeeded, so it is retryable rather than the terminal `"broken"` a coincidentally-matching field shape (e.g. a corrupted `checkpoint_path`) would otherwise fall through to |
+| structured-output envelope contains literal `antml:`-shaped markup inside a string field value | Retryable | `"corrupted_envelope"` from `_validate_result`, checked at the TOP of the function before the status dispatch. Upstream anthropics/claude-code#64690: a model-side token-generation bug can leak tool-call markup (`antml:parameter`, `antml:invoke`, …) into a structured-output field's own string value. No legitimate output contains this substring (per CLAUDE.md's Language-to-JSON rule), so it is an unambiguous corruption signal — the underlying work may well have succeeded, so it is retryable rather than the terminal `"broken"` a coincidentally-matching field shape (e.g. a corrupted `checkpoint_path`) would otherwise fall through to. Since the protocol-markup check moved into `claude_p` (see *Protocol-markup check*), a corrupted implementer payload is normally re-prompted there first; `_validate_result` delegates to the same `_find_protocol_markup`. |
 
 **Two categories, one source of truth.** `_INFRASTRUCTURE_FAILURE_KINDS` is
 the single place a kind is declared *not the worker's doing*; everything else

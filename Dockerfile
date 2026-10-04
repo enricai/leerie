@@ -297,10 +297,14 @@ ENV PATH=/usr/local/share/mise/shims:/usr/local/share/mise/installs/node/lts-cur
 # backoff is the second line of defense, not the only one. The runtime floor
 # is deliberately NOT bumped to 219 — a resilience nicety must not hard-die a
 # valid older host CLI the way the --json-schema hard requirement does.
+# The install floor is now 2.1.289: on 2.1.280, --dangerously-force-strict-output
+# let leaked tool-call markup be decoded into a worker's string field and
+# emptied the rest of its answer (DESIGN §7 *Forcing constrained decoding*;
+# enforced for that flag only by MIN_CLAUDE_CLI_STRICT_OUTPUT).
 # Installs globally against the LTS Node — lands at
 # /usr/local/share/mise/installs/node/lts-current/lib/node_modules
 # with a bin shim at .../bin/claude (on PATH via the line above).
-RUN npm install -g '@anthropic-ai/claude-code@>=2.1.219'
+RUN npm install -g '@anthropic-ai/claude-code@>=2.1.289'
 
 # Non-root user matching the host UID/GID so bind-mounted files keep their
 # host ownership. Defaults are macOS-typical; the launcher overrides them

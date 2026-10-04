@@ -4167,3 +4167,33 @@ rejected as unaffordable (an item object, an enum on the disposition
 strings) are recorded in `_risk_dispositions_schema`'s docstring; the
 value set is enforced in Python instead, which is also why
 `risk_dispositions` carries no enum for the parity sweep to require.
+
+## Leaked tool-call markup and the strict-output CLI floor (2026-10-04)
+
+On CLI 2.1.280 with `--dangerously-force-strict-output`, strict decoding
+absorbed the model's own tool-call markup into a string field
+(`…</defect_shape><parameter name="sites">…`) and emptied the remaining
+fields — schema-valid, content destroyed (DESIGN §7). Measured on a recorded
+v0.36.0 `defect_scope_auditor` call: 4/4 leaks with the proxy, 0/4 without,
+0/4 with it on 2.1.289.
+
+`tests/test_protocol_markup_guard.py` pins both layers:
+
+- **The detector** (`_find_protocol_markup`): each fixed token; a closing tag
+  named after one of the worker's own schema properties (and NOT an
+  unrelated `</div>`); backtick-quoted protocol text ignored (the one
+  legitimate hit in a 120-sample corpus audit had that shape); recursion into
+  nested dicts/lists; `_schema_property_names` reaching nested `items`; and
+  `_validate_result`'s `corrupted_envelope` arm delegating to it.
+- **`claude_p`**: a leaked first answer is re-prompted (attempt-2 prompt names
+  the leak) and the clean retry is returned; two leaks raise `WorkerError`;
+  a clean first answer is untouched. Falsified: disabling the check turns the
+  re-prompt and two-leak tests red.
+- **The floor**: `MIN_CLAUDE_CLI_STRICT_OUTPUT == (2, 1, 289)` and stays above
+  `MIN_CLAUDE_CLI`; `_check_strict_output_cli_version` dies below, passes at
+  the floor, defers on an unparseable version; and real `main()` with the flag
+  on and a 2.1.280 stub dies with the floor's own message (falsified by
+  removing the call).
+
+`tests/test_retryable_failure.py` follows the rename
+(`_find_antml_markup` → `_find_protocol_markup`).
