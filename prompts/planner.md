@@ -405,7 +405,10 @@ The orchestrator gives you, in your prompt:
    subtask's `scope_note` with the reason.
    List each covered site's file in that subtask's
    `files_likely_touched`: the orchestrator mechanically warns when an
-   audited site's file appears in no subtask.
+   audited site's file appears in no subtask. Every site the audit
+   disposed `fix` must be covered; a `ruled_out` site carries the
+   auditor's evidence and needs no subtask unless you find that evidence
+   wrong (then cover it and say why in `scope_note`).
 
    When the `ground_truth` object inside your `defect_scope` ctx
    lists the report's named inputs with every one PRESENT (each

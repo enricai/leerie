@@ -4227,3 +4227,26 @@ report's own example inputs are captured too*).
 
 `tests/test_defect_scope_audit.py::test_ground_truth_attestations_are_schema_required`
 now pins `inline_examples` (and its item's four fields) as required.
+
+## Per-site dispositions in the defect-scope audit (2026-10-04)
+
+The dominant cause of serial narrow fixing (5 of 11 historical repeat pairs)
+was the audit: the site a later run had to fix was usually already LISTED,
+as a "consumer" left to mechanical consequence (DESIGN §5 *Every site
+carries a disposition*).
+
+`tests/test_site_dispositions.py`: the site schema requires `disposition`
+(`fix` | `ruled_out`) and has no separate `evidence` field, and the
+top-level schema has no `already_resolved_on_tree` (both pinned as absent,
+with the measured strict-decoding reason in the test); the executed audit
+phase keeps each site's disposition and its `note` evidence;
+`_warn_defect_sites_uncovered` names an uncovered `fix` site and never a
+`ruled_out` one (falsified by removing the filter: 2 red), stays quiet when
+every `fix` site is claimed, and still warns on a legacy site without a
+disposition; both prompts carry their rule.
+
+Live strict-mode replays of a recorded v0.36.0 auditor call (CLI 2.1.289)
+chose the shape: dispositions alone came back non-empty 6/6, the prior schema
+10/10, while every variant that also carried a top-level
+`already_resolved_on_tree` boolean returned `sites: []` in 5 of 18 calls —
+so that flag was dropped.

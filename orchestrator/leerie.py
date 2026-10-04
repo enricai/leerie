@@ -3187,7 +3187,14 @@ SCHEMAS: dict[str, dict] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["file", "symbol", "role"],
+                    # disposition (DESIGN §5 *Every site carries a
+                    # disposition*): listing a site is not deciding it —
+                    # the measured SCOPE repeats mostly LISTED the
+                    # later-fixed site as a "consumer" and left it to
+                    # mechanical consequence. The evidence goes in `note`,
+                    # not a new required string: free-form strings are
+                    # the strict grammar's expensive element (§7).
+                    "required": ["file", "symbol", "role", "disposition"],
                     "properties": {
                         "file": {"type": "string"},
                         "symbol": {"type": "string"},
@@ -3195,6 +3202,8 @@ SCHEMAS: dict[str, dict] = {
                         "role": {"type": "string",
                                  "enum": ["decision_site", "producer",
                                           "consumer", "bypass"]},
+                        "disposition": {"type": "string",
+                                        "enum": ["fix", "ruled_out"]},
                         "note": {"type": "string"},
                     },
                 },
@@ -22688,7 +22697,11 @@ def _warn_defect_sites_uncovered(plans: list[dict],
     able to block a run."""
     if not defect_scope.get("applicable"):
         return
-    sites = defect_scope.get("sites") or []
+    # Only sites the audit disposed `fix` must be claimed; a `ruled_out`
+    # site carries its own evidence (DESIGN §5 *Every site carries a
+    # disposition*). A legacy site without a disposition counts as `fix`.
+    sites = [st_ for st_ in (defect_scope.get("sites") or [])
+             if st_.get("disposition", "fix") == "fix"]
     if not sites:
         return
     def _norm(path: str) -> str:

@@ -59,6 +59,28 @@ Cite real files and symbols you actually read. An enumerated site you
 did not read is worse than an omitted one: the planner will scope work
 to what you list.
 
+## Dispose of every site
+
+Listing a site is not deciding it. Trace each reported symptom back
+through the code to every function that can produce it, list each such
+function as its own site, then give each a `disposition`, and put the
+evidence behind it (file:line and what it does) in the site's `note`:
+
+- `fix` — the site must change for the report's symptoms to be gone.
+  This is the default.
+- `ruled_out` — permitted ONLY with code evidence showing this site
+  cannot exhibit the reported symptom on its own.
+
+"A mechanical consequence of the chokepoint" is not a ruling-out by
+itself: show concretely that the chokepoint fix alone changes THIS
+site's output on the report's inputs, or dispose it `fix`. A site with
+its own matching, ranking, filtering, threshold or fallback logic that
+could produce the symptom on correct inputs is `fix`. When the report
+describes several symptoms, each needs at least one `fix` site whose own
+logic explains it. (Measured: the sites later runs had to fix were
+mostly already in an earlier audit's list — as a "consumer" left to
+mechanical consequence.)
+
 ## Unconfirmed-cause reports ARE applicable
 
 A report that describes one live symptom, says the cause is
@@ -180,11 +202,11 @@ Return **only** a JSON object per your schema:
   "defect_shape": "candidate matching keys on positional index instead of the declared identity field",
   "sites": [
     {"file": "src/example_module.py", "symbol": "merge_candidates",
-     "line_hint": 120, "role": "decision_site",
-     "note": "three branches share the idiom"},
+     "line_hint": 120, "role": "decision_site", "disposition": "fix",
+     "note": "example_module.py:120-134 compares rows by position; three branches share the idiom"},
     {"file": "src/example_module.py", "symbol": "collect_pending_rows",
-     "line_hint": 480, "role": "bypass",
-     "note": "builds its own plan list; never consults the shared resolver"}
+     "line_hint": 480, "role": "bypass", "disposition": "fix",
+     "note": "example_module.py:480 builds its own plan list; never calls resolve_identity_key"}
   ],
   "chokepoint": {"exists": true, "file": "src/example_module.py",
                  "symbol": "resolve_identity_key",

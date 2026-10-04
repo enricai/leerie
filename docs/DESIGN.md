@@ -410,6 +410,35 @@ subtask it tests). Three mechanisms reconcile that coupling:
   only 1 of 3 leaking commits across 36 shipped commits, because a
   leak already present in the base tree hides later ones.
 
+  **Every site carries a disposition.** Listing a site is not deciding
+  it. The dominant cause of serial narrow fixing — 5 of 11 historical
+  repeat pairs where run N+1 fixed a site run N never touched — was the
+  audit, and in most of those the site was *listed*: as a "consumer"
+  read as a mechanical consequence of the chokepoint, or explicitly
+  ruled out without evidence. So each site carries a required
+  `disposition` (`fix` | `ruled_out`), with the evidence behind it
+  (file:line and what it does) in the site's `note` — not a separate
+  required string, the grammar-cost driver §7 measures — and "a mechanical consequence of the
+  chokepoint" is not by itself a ruling-out: the auditor must show the
+  chokepoint fix alone changes that site's output on the report's
+  inputs, or dispose it `fix`. Measured on the post-0.33 repeat pairs
+  (replayed against run N's base tree): the later-fixed symbol came back
+  disposed `fix` 8/8 (`deriveBaseUrl`), 3/3, 7/8 and 5/8, with no growth
+  in mean site count (12.0 vs 12.8). One blind spot stayed (a helper
+  1/8), which is why the planner's coverage warning remains advisory.
+  The planner must cover every `fix` site; `ruled_out` sites travel with
+  their evidence (in `note`) for the record. A per-site judge on the integrated tree
+  was tried and dropped: it caught every missed site but at 16%
+  precision — on long site lists it defaulted to "unfixed" instead of
+  reading the code.
+
+  A top-level `already_resolved_on_tree` flag was tried alongside and
+  dropped: under strict decoding, every schema variant carrying that one
+  extra required boolean returned `sites: []` in 5 of 18 calls combined,
+  against 0 of 6 with dispositions alone and 0 of 10 on the prior schema
+  — the no-work routing (§8) relies on the
+  satisfied-probe sweep and the held-out acceptance tests instead.
+
   **An applicable audit with zero sites is re-asked once.**
   `applicable: true` with an empty `sites` list disarms both
   consumers of the audit — planner injection and the gate's contract
