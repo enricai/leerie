@@ -15,9 +15,9 @@ unconsumed claim: three consecutive re-runs of an already-merged task each
 correctly cited the landed commits, then planned, executed, and opened a
 pull request anyway — one of which introduced a regression the next run had
 to fix. Your confirmation is what turns that claim into a clean "no work
-required" exit (on a defect fix, once independent tests written from the
-report also pass on this checkout); your dispute sends the run to ordinary
-planning.
+required" exit — on a defect fix, the run may first check it against
+independent tests written from the report; your dispute sends the run to
+ordinary planning.
 
 ## The one rule that matters: judge the current checkout, nothing else
 

@@ -32462,7 +32462,8 @@ def _prior_delivery_residual(st: "State") -> dict | None:
     `acceptance_unmet` (DESIGN §8 *Held-out acceptance tests*) — or None
     (DESIGN §8 *The gate judges the finding, not only the items* — the
     cross-run half: a fresh run's planners plan at the recorded gap
-    instead of rediscovering it one sub-shape at a time). Task match is exact string equality on the stored task text
+    instead of rediscovering it one sub-shape at a time). Task match is
+    exact string equality on the stored task text
     (mechanical — Language-to-JSON forbids fuzzier matching here, and
     the live loop shape is the operator re-running an unchanged task
     file). Read-only over sibling run dirs, newest mtime first;
@@ -33426,19 +33427,20 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
     st.save()
     gate: dict = dict(acc.get("gate") or {})
     gate.setdefault("rounds", [])
-    # The pre-repair verdict is reused on resume: re-measured, it would read
-    # an already-repaired tree, and a rolled-back tree would be recorded with
-    # the repaired tree's verdict. It reaches disk with before_sha, before
-    # any repair can commit.
     async def _measure(label: str) -> tuple[list[dict], str]:
-        # Every verdict is pinned to the commit it describes: after an
-        # interrupted round, HEAD can hold commits no saved verdict saw, and
-        # only a recorded sha shows that. "" (HEAD unreadable) never matches
-        # a later read, so it always counts as moved.
+        # Every verdict of staging's HEAD is pinned to the commit it
+        # describes: after an interrupted round, HEAD can hold commits no
+        # saved verdict saw, and only a recorded sha shows that. A "" sha
+        # (HEAD unreadable) is handled at the comparison, which treats an
+        # unreadable HEAD as moved.
         sha = await _branch_head_sha(str(staging))
         return (await _evaluate_acceptance_sets(
             st, caps, str(staging), sets, label, rev=sha or "HEAD"), sha)
 
+    # The pre-repair verdict is reused on resume: re-measured, it would read
+    # an already-repaired tree, and a rolled-back tree would be recorded with
+    # the repaired tree's verdict. It reaches disk with before_sha, before
+    # any repair can commit.
     if "initial" in gate:
         initial = gate["initial"]
     else:
