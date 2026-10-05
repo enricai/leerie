@@ -31677,10 +31677,12 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     is already classified (`_runner_missing` demotes a missing runner to
     "could not measure" rather than RED).
 
-    Returns False when an entry exited non-zero, timed out or raised on
-    this call, else True (a memo hit included). The held-out acceptance
-    tests judge by exit code alone, so their callers need this: a failed
-    install would otherwise read as every test failing."""
+    Returns False when an `install` entry exited non-zero, timed out or
+    raised on this call, else True (a memo hit included). The held-out
+    acceptance tests judge by exit code alone, so their callers need this:
+    a failed install would otherwise read as every test failing. A failed
+    `build` entry does not count — a fix that breaks the build is evidence
+    against the fix, which the tests then show."""
     key = os.path.realpath(tree)
     if key in _DEPS_INSTALLED:
         return True
@@ -31704,14 +31706,14 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                 log_path=log_path,
                 label=f"{label_prefix}-install: {' '.join(e['command'])}",
                 verbosity=verbosity)
-            if rc != 0:
+            if rc != 0 and e.get("kind") == "install":
                 ok = False
         except subprocess.TimeoutExpired:
-            ok = False
+            ok = ok and e.get("kind") != "install"
             log(f"  {log_prefix}: install timed out: "
                 f"{' '.join(e['command'])}")
         except Exception as ex:  # non-fatal: BLT below will show the effect
-            ok = False
+            ok = ok and e.get("kind") != "install"
             log(f"  {log_prefix}: install error "
                 f"({type(ex).__name__}): {' '.join(e['command'])}")
     return ok
@@ -32933,10 +32935,12 @@ def _acceptance_is_cache_path(rel: str) -> bool:
 
 # Exit codes a known runner uses for "ran no test", not "a test failed" —
 # a defect file that never ran must not count as failing on the base.
-# pytest: 2 interrupted/collection error, 3 internal error, 4 usage error,
-# 5 no tests collected.
+# pytest: 3 internal error, 4 usage error, 5 no tests collected. NOT 2: a
+# collection error is also what an unimportable module under test produces
+# — a fix that broke the module, or an import-time defect at the base —
+# and that is evidence.
 _RUNNER_NO_VERDICT_EXITS: dict[str, frozenset[int]] = {
-    "pytest": frozenset({2, 3, 4, 5}),
+    "pytest": frozenset({3, 4, 5}),
 }
 
 
@@ -33233,6 +33237,23 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
 async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
                                     sets: list[dict], label: str
                                     ) -> list[dict]:
+    """`_evaluate_acceptance_sets_inner`, never raising: any failure to set
+    up or run the evaluation (a fork failure on `git worktree add`, a full
+    disk) is no evidence from any set — never an exception that would skip
+    a repair's rollback check."""
+    try:
+        return await _evaluate_acceptance_sets_inner(st, caps, tree, sets,
+                                                     label)
+    except Exception as e:
+        log(f"  acceptance: evaluation failed ({type(e).__name__}: {e}) — "
+            "no evidence either way")
+        return [{"index": s_["index"], "passed": False, "unmeasured": True,
+                 "failing_files": []} for s_ in sets]
+
+
+async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
+                                          sets: list[dict], label: str
+                                          ) -> list[dict]:
     """Run each valid set against `tree`'s HEAD commit, in a disposable
     worktree at that commit — never in `tree` itself. Nothing of a set can
     then linger where a fixer works, not even after a crash mid-run (no
@@ -33396,8 +33417,9 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         initial = await _evaluate_acceptance_sets(st, caps, str(staging),
                                                   sets, "gate-initial")
         gate["initial"] = initial
-    # The latest verdict with results: an errored round committed nothing
-    # new, so the round before it still describes the tree.
+    # The latest verdict with results: an errored round carries results
+    # only when it committed (and was measured again); otherwise the round
+    # before it still describes the tree.
     final = next((r["results"] for r in reversed(gate["rounds"])
                   if r.get("results")), initial)
     # A recorded before_sha means a repair already started: resume it, so
@@ -33486,7 +33508,9 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                 # A worker can commit and then fail (a schema miss, a
                 # timeout): the previous verdict no longer describes the
                 # tree, so measure it again.
-                if await _branch_head_sha(str(staging)) != round_start:
+                # An unreadable HEAD before or after counts as moved.
+                now = await _branch_head_sha(str(staging))
+                if not round_start or not now or now != round_start:
                     final = await _evaluate_acceptance_sets(
                         st, caps, str(staging), sets, f"gate-r{rnd}")
                     entry["results"] = final
@@ -33539,15 +33563,27 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                         "commits were reset away; residual recorded")
                     final = initial
     gate["final"] = final
-    if _acceptance_measured(final) and _acceptance_majority_fails(final):
+    # A repair that left nothing measurable (it broke the dependency
+    # manifest, say) must not erase a failing verdict: the last measured
+    # one becomes the residual, marked as such.
+    basis, unmeasured_final = final, False
+    if not _acceptance_measured(final):
+        for r in reversed([initial] + [x.get("results") or []
+                                       for x in gate["rounds"]]):
+            if _acceptance_measured(r):
+                basis, unmeasured_final = r, True
+                break
+    if _acceptance_measured(basis) and _acceptance_majority_fails(basis):
         by_index = {s_["index"]: s_ for s_ in sets}
-        measured = _acceptance_measured(final)
+        measured = _acceptance_measured(basis)
         names = [c for r in measured if not r["passed"]
                  for rel in r["failing_files"]
                  for c in by_index[r["index"]]["cases"].get(rel, [])]
         gate["residual"] = {
             "failing_sets": sum(1 for r in measured if not r["passed"]),
             "total_sets": len(measured), "cases": names[:20]}
+        if unmeasured_final:
+            gate["residual"]["unmeasured_final"] = True
         log(f"  WARNING: held-out acceptance residual — "
             f"{gate['residual']['failing_sets']} of "
             f"{gate['residual']['total_sets']} measured set(s) still "

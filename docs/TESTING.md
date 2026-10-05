@@ -4456,7 +4456,8 @@ made to commit before erroring).
 
 ### Review round 5 fixes (2026-10-05)
 
-12 reversions, each against its named test, 12 caught.
+11 distinct reversions run 12 times (one edit against two tests), 12 caught;
+the `.cache` pin was reverted separately afterwards and caught too.
 
 - **A failed install is no evidence** (`test_a_failed_install_is_no_evidence`,
   `test_a_failed_install_in_the_writer_discards_the_set`,
@@ -4467,7 +4468,8 @@ made to commit before erroring).
   `test_a_red_repair_rolls_back_even_when_evaluation_breaks`).
 - **A round that commits then errors is measured again**
   (`test_a_round_that_commits_then_errors_is_measured_again`).
-- **"Ran no test" is no verdict** (`test_a_file_that_ran_no_test_is_no_verdict`,
+- **"Ran no test" is no verdict** — narrowed in round 6 to exclude pytest's
+  exit 2 (`test_a_file_that_ran_no_test_is_no_verdict`,
   `test_no_verdict_exits_are_matched_on_command_tokens`); fork exhaustion is
   none either and a timeout fails (`test_a_fork_exhaustion_kill_is_no_verdict`,
   `test_a_timeout_fails`).
@@ -4476,6 +4478,23 @@ made to commit before erroring).
   (`test_ignored_build_output_elsewhere_does_not_travel`,
   `test_a_gitignored_helper_still_travels`); `.cache` is not a by-product
   (`test_cache_and_provision_paths`).
+
+### Review round 6 fixes (2026-10-05)
+
+6 distinct reversions run 7 times, 7 caught (the `round_start` pin only after
+its test made both HEAD reads unreadable).
+
+- **pytest's collection error is evidence**
+  (`test_an_unimportable_module_under_test_is_a_failure`: an import-time
+  defect at the base, a fix that broke the module).
+- **A failing build step is not a failed install**
+  (`test_a_failing_build_step_is_not_a_failed_install`).
+- **Evaluation never raises** (`test_an_evaluation_that_cannot_be_set_up_is_no_evidence`,
+  `test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up`).
+- **An unmeasurable final keeps the last measured residual**
+  (`test_an_unmeasurable_final_keeps_the_last_measured_residual`), and an
+  unreadable HEAD counts as moved
+  (`test_an_unreadable_round_start_still_measures_a_committing_error`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

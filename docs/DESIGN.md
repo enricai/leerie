@@ -6002,7 +6002,7 @@ validates each set mechanically, by exit code only (no runner-output
 parsing, so the mechanism is language-agnostic): a defect file that
 passes on the validity base cannot discriminate and is dropped; a set
 needs at least one discriminating defect file and every control passing.
-A set carries exactly the tree its validation ran on: a writer that
+A set carries what its validation ran on: a writer that
 edited an existing file loses the set, and every other new file it left
 (a helper or fixture beside the tests, even one the repo's ignore rules
 match — though an ignored file elsewhere, likely build output from the
@@ -6022,8 +6022,11 @@ own — never in staging itself, where a crash mid-run (which no cleanup
 survives) would leave hidden tests for the next fixer to read or commit.
 Verdicts are by exit code alone: a command the shell could not run, one
 the container's limits killed, a known runner's own "ran no test" codes
-(pytest's collection, usage and no-tests exits), or any set run where the
-dependency install failed is no verdict — a defect file that never ran
+(pytest's internal-error, usage and no-tests exits — not its collection
+error, which is also what an unimportable module under test produces, and
+that is evidence), or any set run where a dependency install failed (a
+failing build step is not that: a fix that breaks the build is evidence
+against the fix) is no verdict — a defect file that never ran
 must not count as failing — but a test that fails for any other reason,
 including a missing-file defect whose failure prints "No such file or
 directory", fails. A set that cannot even be placed is no verdict too,
@@ -6063,7 +6066,9 @@ commits are reset away and the residual is recorded instead. The
 pre-repair verdict and HEAD are persisted before the first round and
 every round after it runs (a round whose worker committed and then
 failed is measured again, since the previous verdict no longer describes
-the tree), and the rollback decision before the reset
+the tree; a repair that leaves nothing measurable keeps the last
+measured failing verdict as its residual), and the rollback decision
+before the reset
 it orders, so a resumed gate always reaches this check and never records
 the repaired tree's verdict for the reset one: re-measured on resume,
 the verdict would read the already-repaired tree and skip it. Measured

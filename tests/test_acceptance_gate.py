@@ -352,6 +352,36 @@ def test_a_failed_install_is_no_evidence(leerie, tmp_path):
     assert all(r["passed"] for r in res)
 
 
+def test_a_failing_build_step_is_not_a_failed_install(leerie, tmp_path):
+    """Round-6: a fix that breaks the build is evidence against the fix,
+    not a missing dependency."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    st.data["provision"] = {"recipe": [
+        {"kind": "install", "command": ["bash", "-c", "true"]},
+        {"kind": "build", "command": ["bash", "-c", "exit 1"]}]}
+    assert asyncio.run(leerie._ensure_worktree_deps(
+        str(repo), st, _caps(leerie, 1),
+        log_path=st.run_dir / "logs" / "d.log", verbosity="quiet")) is True
+
+
+def test_an_evaluation_that_cannot_be_set_up_is_no_evidence(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    real = leerie.subprocess.run
+
+    def eagain(argv, *a, **k):
+        if "worktree" in argv and "add" in argv:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return real(argv, *a, **k)
+    monkeypatch.setattr(leerie.subprocess, "run", eagain)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 2), str(staging), _make_sets(leerie, st, 2), "t"))
+    assert all(r["unmeasured"] for r in res)
+
+
 def test_ensure_worktree_deps_reports_failure(leerie, tmp_path):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
@@ -727,7 +757,6 @@ def test_verdict_is_by_exit_code(leerie, tmp_path, body, want):
 
 @pytest.mark.parametrize("body", [
     "x = 1\n",                         # no test collected: pytest exit 5
-    "def test_x(:\n    pass\n",        # collection error: pytest exit 2
 ])
 def test_a_file_that_ran_no_test_is_no_verdict(leerie, tmp_path, body):
     """Round-5 L1: a defect file that never ran must not count as failing on
@@ -765,10 +794,29 @@ def test_a_timeout_fails(leerie, tmp_path):
         st.run_dir / "logs" / "p.log", "p")) is False
 
 
+@pytest.mark.parametrize("module", [
+    "def f():\n    return 1\n",           # the entry point the fix must add
+    "def add(a, b):\n    return a +\n",  # a fix that broke the module
+])
+def test_an_unimportable_module_under_test_is_a_failure(leerie, tmp_path,
+                                                        module):
+    """Round-6 M1: pytest's collection error (exit 2) is also what an
+    import-time defect, or a fix that broke the module, produces — that is
+    evidence, not "ran no test"."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "calcmod.py").write_text(module)
+    (repo / "test_probe.py").write_text(
+        "from calcmod import g\n\ndef test_g():\n    assert g() == 2\n")
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_probe.py",
+        st.run_dir / "logs" / "p.log", "p")) is False
+
+
 def test_no_verdict_exits_are_matched_on_command_tokens(leerie):
     f = leerie._acceptance_no_verdict_exits
-    assert f("python3 -m pytest -q acc/test_a.py") == frozenset({2, 3, 4, 5})
-    assert f("uv run /usr/bin/pytest x") == frozenset({2, 3, 4, 5})
+    assert f("python3 -m pytest -q acc/test_a.py") == frozenset({3, 4, 5})
+    assert f("uv run /usr/bin/pytest x") == frozenset({3, 4, 5})
     assert f("npx jest acc/a.test.js") == frozenset()
     assert f("echo pytestish") == frozenset()
 
@@ -1433,6 +1481,89 @@ def test_a_red_repair_rolls_back_even_when_evaluation_breaks(
     gate = st.data["acceptance"]["gate"]
     assert gate["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
+
+
+def test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up(
+        leerie, tmp_path, monkeypatch):
+    """Round-6 M2: an exception setting up the evaluation worktree after a
+    repair commit escaped the gate before the rollback check."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    real = leerie.subprocess.run
+    repaired = []
+
+    def eagain(argv, *a, **k):
+        if repaired and "worktree" in argv and "add" in argv:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return real(argv, *a, **k)
+    monkeypatch.setattr(leerie.subprocess, "run", eagain)
+
+    def fixer(p):
+        _commit_fix(p)
+        repaired.append(1)
+    _run_gate(leerie, monkeypatch, st, fixer,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": False, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert gate["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == before
+
+
+def test_an_unmeasurable_final_keeps_the_last_measured_residual(
+        leerie, tmp_path, monkeypatch):
+    """A repair that leaves nothing measurable must not erase the failing
+    verdict the next run's planner needs."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    real = leerie._evaluate_acceptance_sets_inner
+    calls = []
+
+    async def second_unmeasured(st_, caps, tree, sets, label):
+        calls.append(label)
+        if len(calls) == 1:
+            return await real(st_, caps, tree, sets, label)
+        return [{"index": s_["index"], "passed": False, "unmeasured": True,
+                 "failing_files": []} for s_ in sets]
+    monkeypatch.setattr(leerie, "_evaluate_acceptance_sets_inner",
+                        second_unmeasured)
+    _run_gate(leerie, monkeypatch, st, lambda _p: None)
+    res = st.data["acceptance"]["gate"]["residual"]
+    assert res["failing_sets"] == 5 and res["unmeasured_final"] is True
+
+
+def test_an_unreadable_round_start_still_measures_a_committing_error(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    real = leerie._branch_head_sha
+    n = []
+
+    async def flaky(wt):
+        n.append(1)
+        # 1: before_sha; 2 and 3: round_start and the HEAD after the
+        # errored round, both unreadable ("" == "" must not read as
+        # "unchanged"); later: real.
+        return "" if len(n) in (2, 3) else await real(wt)
+    monkeypatch.setattr(leerie, "_branch_head_sha", flaky)
+
+    async def commits_then_fails(**kw):
+        _commit_fix(Path(kw["cwd"]))
+        raise leerie.WorkerError("schema miss")
+    monkeypatch.setattr(leerie, "claude_p", commits_then_fails)
+
+    async def axes(tree, axes_, st_, caps, **kw):
+        return {"tests": {"passed": True, "measured": True}}
+    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    assert st.data["acceptance"]["gate"]["rounds"][0].get("results")
 
 
 def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):
