@@ -696,7 +696,7 @@ def test_the_parse_check_runs_under_the_projects_own_interpreter(
     # behaves as python3. Invoked as `<it> -m pytest`, so the runner (and
     # its report) is still recognised.
     wrapper.write_text(
-        "#!/bin/sh\ncase \"$*\" in *parse_probe*) exit 1;; esac\n"
+        "#!/bin/sh\ncase \"$*\" in *leerie_probe*) exit 1;; esac\n"
         "exec python3 \"$@\"\n")
     wrapper.chmod(0o755)
     (repo / ".leerie" / "config.toml").write_text(
@@ -709,6 +709,65 @@ def test_the_parse_check_runs_under_the_projects_own_interpreter(
         st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
     assert acc["sets"] == []
     assert "declaration not honoured" in capsys.readouterr().out
+
+
+def test_the_parse_probe_follows_a_repos_own_test_naming(
+        leerie, tmp_path, monkeypatch):
+    """PR #282 review: the probe was always `test_leerie_parse_probe_*.py`,
+    which a `*_test.py` repo's scoped command will not render — so its
+    import declarations were never honoured."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_file_globs = "*_test.py"\n'
+        'test_scoped = "python3 -m pytest -q -p no:cacheprovider '
+        '-o python_files=*_test.py {test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/defect_mul_test.py": (_IMPORT_DEFECT, "import")})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["modes"] == {"acc/defect_mul_test.py": "import"}
+
+
+@pytest.mark.parametrize("globs,declared,want_end", [
+    ("", "acc/test_defect_mul.py", "acc/test_defect_mul_leerie_probe_"),
+    ("*_test.py", "acc/defect_mul_test.py", "acc/leerie_probe_"),
+    ("**/*_test.py", "acc/defect_mul_test.py", "acc/leerie_probe_"),
+    ("*.spec.py", "acc/defect_mul.spec.py", "acc/leerie_probe_"),
+    ("check_*.py", "acc/defect_mul.py", None),
+])
+def test_the_probe_name_matches_the_declared_files_convention(
+        leerie, tmp_path, globs, declared, want_end):
+    repo, head = _repo(tmp_path)
+    if globs:
+        (repo / ".leerie" / "config.toml").write_text(
+            f'test_file_globs = "{globs}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    got = leerie._acceptance_probe_rel(st, declared)
+    if want_end is None:
+        assert got is None
+    else:
+        assert got.startswith(want_end)
+        assert leerie._is_test_file(got,
+                                    leerie.resolve_test_file_globs(repo))
+
+
+def test_an_unrunnable_probe_is_reported_as_such(leerie, tmp_path,
+                                                monkeypatch, capsys):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+
+    async def unrunnable(*a, **k):
+        return None
+    monkeypatch.setattr(leerie, "_acceptance_parse_probe", unrunnable)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/test_defect_mul.py": (_IMPORT_DEFECT, "import")})
+    asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    out = capsys.readouterr().out
+    assert "no test command here could run the parse check" in out
+    assert "does not parse" not in out
 
 
 def test_the_parse_probe_leaves_nothing_in_the_set(leerie, tmp_path,
@@ -725,7 +784,7 @@ def test_the_parse_probe_leaves_nothing_in_the_set(leerie, tmp_path,
     assert s["support_files"] == ["acc/helpers_mul.py"]
     stored = sorted(str(p.relative_to(s["dir"]))
                     for p in Path(s["dir"]).rglob("*") if p.is_file())
-    assert not any("parse_probe" in p for p in stored)
+    assert not any("leerie_probe" in p for p in stored)
 
 
 def test_import_cases_are_named_as_import_failures_in_the_repair_section(

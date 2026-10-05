@@ -33094,24 +33094,44 @@ class LeerieParseProbe(unittest.TestCase):
 """
 
 
+def _acceptance_probe_rel(st: "State", test_rel: str) -> str | None:
+    """A name for the parse probe beside `test_rel` that the repository's
+    own test globs accept — so its own test command will run it. A tag
+    inserted after the declared file's stem suits a prefix convention
+    (`test_*.py`), one before its name a suffix convention (`*_test.py`,
+    `*.spec.py`); None when neither is test-shaped here."""
+    tag = f"leerie_probe_{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}"
+    parent, name = Path(test_rel).parent, Path(test_rel).name
+    stem, ext = os.path.splitext(name)
+    globs = resolve_test_file_globs(st.repo_root)
+    for candidate in (f"{stem}_{tag}{ext}", f"{tag}_{name}"):
+        rel = str(parent / candidate)
+        if _is_test_file(rel, globs):
+            return rel
+    return None
+
+
 async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
                                   test_rel: str, targets: list[str],
-                                  log_path: Path, label: str) -> bool:
+                                  log_path: Path, label: str) -> bool | None:
     """Whether every one of `targets` (a writer's import-declared test file
-    and the Python files it wrote beside it) parses under the PROJECT's own
+    and the other Python files it wrote) parses under the PROJECT's own
     interpreter — not the orchestrator's, which may be a different version.
 
     A throwaway test file beside `test_rel` compiles each target, and runs
     through the repo's own scoped test command, so it gets that command's
     interpreter and environment; a `unittest.TestCase` so any Python runner
-    collects it. True only on exit 0; no command, a shell that cannot run
-    it, or any failure is False — the declaration then is not honoured."""
-    probe = Path(test_rel).parent / (
-        "test_leerie_parse_probe_"
-        f"{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}.py")
-    cmd = _acceptance_cmd(st, [str(probe)])
+    collects it. True on exit 0, False on any other exit. None when the
+    probe could not be run at all (no test-shaped name, no command, a shell
+    that cannot run it, or an error) — reported apart, since it says
+    nothing about whether the files parse. Either way short of True, the
+    declaration is not honoured."""
+    probe = _acceptance_probe_rel(st, test_rel)
+    if probe is None:
+        return None
+    cmd = _acceptance_cmd(st, [probe])
     if cmd is None:
-        return False
+        return None
     path = Path(tree) / probe
     try:
         path.write_text(_PARSE_PROBE_SOURCE.format(
@@ -33123,12 +33143,14 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-parse-probe: {cmd}",
                 verbosity="quiet")
-        return rc == 0
-    except (OSError, subprocess.TimeoutExpired):
-        return False
+    except Exception:
+        return None
     finally:
         with contextlib.suppress(OSError):
             path.unlink()
+    if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(_tail or "")):
+        return None
+    return rc == 0
 
 
 def _acceptance_declared_rel(declared: dict) -> str:
@@ -33356,19 +33378,25 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 log(f"  acceptance set {k}: {rel} declared an import defect, "
                     "honoured only for Python test files — file dropped")
                 continue
-            if mode == "import" and not await _acceptance_parse_probe(
+            if mode == "import":
+                parses = await _acceptance_parse_probe(
                     st, caps, str(wt), rel,
                     [rel] + [n for n in new_files
                              if n.endswith(".py") and n != rel],
-                    log_path, f"acceptance-{k}-base"):
-                # A file — or a helper beside it — that does not parse under
-                # the project's interpreter fails to load by the writer's own
-                # fault: validate it as an ordinary file, so a load failure
-                # is no verdict and discards the set.
-                log(f"  acceptance set {k}: {rel} declared an import defect, "
-                    "but it or a Python file beside it does not parse under "
-                    "the project's interpreter — declaration not honoured")
-                mode = "assertion"
+                    log_path, f"acceptance-{k}-base")
+                if parses is not True:
+                    # A file — or another Python file the writer wrote — that
+                    # does not parse under the project's interpreter fails to
+                    # load by the writer's own fault; and an unrunnable probe
+                    # cannot show otherwise. Validate it as an ordinary file,
+                    # so a load failure is no verdict and discards the set.
+                    why = ("it or another Python file the writer wrote does "
+                           "not parse under the project's interpreter"
+                           if parses is False else
+                           "no test command here could run the parse check")
+                    log(f"  acceptance set {k}: {rel} declared an import "
+                        f"defect, but {why} — declaration not honoured")
+                    mode = "assertion"
             verdict = await _run_acceptance_file(
                 st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
                 validating=True, failure_mode=mode)

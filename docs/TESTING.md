@@ -4616,6 +4616,11 @@ is kept for hygiene.
   `test_the_parse_probe_leaves_nothing_in_the_set`).
 - **The repair prompt names import-mode cases apart**
   (`test_import_cases_are_named_as_import_failures_in_the_repair_section`).
+- **The probe follows the repository's own test-file naming**, and a probe
+  that cannot run is logged apart from one that finds a parse error
+  (`test_the_parse_probe_follows_a_repos_own_test_naming`, real pytest on a
+  `*_test.py` repo; `test_the_probe_name_matches_the_declared_files_convention`;
+  `test_an_unrunnable_probe_is_reported_as_such`). 3 reversions, 3 caught.
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

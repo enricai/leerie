@@ -6047,10 +6047,12 @@ to check, never a false failure) — with one exception. When the report's
 defect is itself that loading fails (a missing entry point, a module that
 raises on import), the writer says so for that file, and a file that
 cannot load on the base is then the defect showing — provided the file,
-and every other Python file the writer wrote beside it (a broken helper
-would fail every fix just the same), parses under the project's own
-interpreter: a throwaway compile check run through the repository's own
-test command, so its interpreter version decides, not the orchestrator's.
+and every other Python file the writer wrote (a broken helper would fail
+every fix just the same), parses under the project's own interpreter: a
+throwaway compile check, named to fit the repository's own test-file
+convention, run through its own test command, so its interpreter version
+decides, not the orchestrator's. A check that cannot run there proves
+nothing, and the declaration is not honoured either; the log says which.
 That is checked only where it can be checked reliably, in Python; a
 declared import defect in any other language is dropped on its own,
 leaving the rest of its set (`node
