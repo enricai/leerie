@@ -33094,21 +33094,31 @@ class LeerieParseProbe(unittest.TestCase):
 """
 
 
-def _acceptance_probe_rel(st: "State", test_rel: str) -> str | None:
+# Comfortably under the common 255-byte NAME_MAX.
+_PROBE_NAME_MAX = 200
+
+
+def _acceptance_probe_rel(st: "State", test_rel: str) -> str:
     """A name for the parse probe beside `test_rel` that the repository's
-    own test globs accept — so its own test command will run it. A tag
-    inserted after the declared file's stem suits a prefix convention
-    (`test_*.py`), one before its name a suffix convention (`*_test.py`,
-    `*.spec.py`); None when neither is test-shaped here."""
-    tag = f"leerie_probe_{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}"
+    own test globs accept, so its own test command will run it: a tag after
+    the declared file's stem suits a prefix convention (`test_*.py`), one
+    before its name a suffix convention (`*_test.py`, `*_spec.py`), and
+    short hash-only names cover a declared name too long to extend. When no
+    candidate is test-shaped here, the first one is returned anyway: a
+    `{files}` template runs any name, and for a `{test_files}` one
+    `_acceptance_cmd` then renders nothing."""
+    digest = hashlib.sha256(test_rel.encode()).hexdigest()[:12]
+    tag = f"leerie_probe_{digest}"
     parent, name = Path(test_rel).parent, Path(test_rel).name
     stem, ext = os.path.splitext(name)
     globs = resolve_test_file_globs(st.repo_root)
-    for candidate in (f"{stem}_{tag}{ext}", f"{tag}_{name}"):
-        rel = str(parent / candidate)
-        if _is_test_file(rel, globs):
-            return rel
-    return None
+    candidates = [c for c in (f"{stem}_{tag}{ext}", f"{tag}_{name}",
+                              f"test_{tag}{ext}", f"{tag}_test{ext}")
+                  if len(c.encode()) <= _PROBE_NAME_MAX]
+    for candidate in candidates:
+        if _is_test_file(str(parent / candidate), globs):
+            return str(parent / candidate)
+    return str(parent / candidates[0])
 
 
 async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
@@ -33122,13 +33132,12 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     through the repo's own scoped test command, so it gets that command's
     interpreter and environment; a `unittest.TestCase` so any Python runner
     collects it. True on exit 0, False on any other exit. None when the
-    probe could not be run at all (no test-shaped name, no command, a shell
-    that cannot run it, or an error) — reported apart, since it says
-    nothing about whether the files parse. Either way short of True, the
+    probe could not be run at all (no command for its name, a shell that
+    cannot run it, a runner's "ran no test" exit, a timeout or another
+    error) — reported apart, since it says nothing about whether the files
+    parse. Either way short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
-    if probe is None:
-        return None
     cmd = _acceptance_cmd(st, [probe])
     if cmd is None:
         return None
@@ -33137,7 +33146,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
         path.write_text(_PARSE_PROBE_SOURCE.format(
             targets=[str(Path(tree) / t) for t in targets]))
         async with _blt_semaphore(caps):
-            rc, _tail = await _run_streaming(
+            rc, tail = await _run_streaming(
                 ["bash", "-c", cmd], cwd=str(tree),
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
@@ -33148,7 +33157,11 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     finally:
         with contextlib.suppress(OSError):
             path.unlink()
-    if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(_tail or "")):
+    if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
+        return None
+    # A runner's "ran no test" exits (a `-k`/`-m` in the template that
+    # deselects the probe, `-p no:unittest`) say nothing about parsing.
+    if rc in _acceptance_no_verdict_exits(cmd):
         return None
     return rc == 0
 

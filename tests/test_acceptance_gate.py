@@ -745,12 +745,53 @@ def test_the_probe_name_matches_the_declared_files_convention(
             f'test_file_globs = "{globs}"\n')
     st = _st(leerie, tmp_path, repo, head)
     got = leerie._acceptance_probe_rel(st, declared)
+    shaped = leerie._is_test_file(got, leerie.resolve_test_file_globs(repo))
     if want_end is None:
-        assert got is None
+        # No test-shaped candidate: the first is returned anyway, and a
+        # `{test_files}` template then renders no command for it.
+        assert not shaped
     else:
-        assert got.startswith(want_end)
-        assert leerie._is_test_file(got,
-                                    leerie.resolve_test_file_globs(repo))
+        assert got.startswith(want_end) and shaped
+
+
+def test_a_long_declared_name_still_gets_a_probe_name(leerie, tmp_path):
+    """A declared name near NAME_MAX cannot be extended; the probe falls
+    back to a short hash-only name the globs still accept."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    got = leerie._acceptance_probe_rel(st, "tests/test_" + "a" * 233 + ".py")
+    assert len(Path(got).name.encode()) <= 200
+    assert leerie._is_test_file(got, [])
+
+
+def test_a_probe_the_template_deselects_is_unrunnable_not_unparseable(
+        leerie, tmp_path):
+    """pytest exits 5 when a `-k` in the template deselects the probe:
+    that says nothing about parsing."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_scoped = "python3 -m pytest -q -p no:cacheprovider '
+        '-k nothing_matches {test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe_me.py").write_text("x = 1\n")
+    assert asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "test_probe_me.py",
+        ["test_probe_me.py"], st.run_dir / "logs" / "p.log", "p")) is None
+
+
+def test_a_files_template_runs_the_probe_whatever_its_name(leerie, tmp_path):
+    """A `{files}` template renders any name, so the probe runs even where
+    no candidate is test-shaped (round-18 LOW: it had returned None)."""
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_file_globs = "check_*.py"\n'
+        'test_scoped = "python3 -m pytest -q -p no:cacheprovider {files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "src").mkdir()
+    (repo / "src" / "defect_mul.py").write_text("x = 1\n")
+    assert asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "src/defect_mul.py",
+        ["src/defect_mul.py"], st.run_dir / "logs" / "p.log", "p")) is True
 
 
 def test_an_unrunnable_probe_is_reported_as_such(leerie, tmp_path,

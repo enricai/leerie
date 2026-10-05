@@ -4572,7 +4572,8 @@ dropping the both-unreadable clause.
 
 ### Runner reports, writer-declared import defects, in-loop retry (2026-10-05)
 
-12 distinct reversions, each against its named test, 12 caught.
+The first commit's 12 distinct reversions, each against its named test, all
+caught; the later entries in this list carry their own counts.
 
 - **Structured runner reports while validating**
   (`test_runner_reports_are_read_mechanically`: JUnit and jest-compatible JSON,
@@ -4621,6 +4622,12 @@ is kept for hygiene.
   (`test_the_parse_probe_follows_a_repos_own_test_naming`, real pytest on a
   `*_test.py` repo; `test_the_probe_name_matches_the_declared_files_convention`;
   `test_an_unrunnable_probe_is_reported_as_such`). 3 reversions, 3 caught.
+- **The probe's last edges**: a declared name too long to extend
+  (`test_a_long_declared_name_still_gets_a_probe_name`), a probe the template
+  deselects reported as unrunnable rather than unparseable
+  (`test_a_probe_the_template_deselects_is_unrunnable_not_unparseable`), and a
+  `{files}` template running the probe whatever its name
+  (`test_a_files_template_runs_the_probe_whatever_its_name`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.
