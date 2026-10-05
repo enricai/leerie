@@ -460,9 +460,11 @@ STATE_FIELDS = (
     # Never gates.
     "site_token_warnings",
     # acceptance: the held-out acceptance record (DESIGN §8 *Held-out
-    # acceptance tests*): {validity_base, sets[], skipped?, gate?} — each
-    # valid set {index, dir, defect_files[], control_files[], cases{}};
-    # `gate` {initial[], rounds[], final[], residual?, rolled_back?}.
+    # acceptance tests*): {validity_base, written, sets[], skipped?, gate?}
+    # — each valid set {index, dir, defect_files[], control_files[],
+    # support_files[], cases{}}; `gate` {initial[], rounds[], final[],
+    # before_sha?, pre_tests_passed?, residual?, rolled_back?,
+    # rollback_reason?, rollback_failed?} (IMPLEMENTATION §8 state table).
     # Presence-keyed resume checkpoint for the write half; gate.final is
     # the gate half's sentinel.
     "acceptance",
@@ -33249,15 +33251,15 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
 
 
 async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
-                                    sets: list[dict], label: str
-                                    ) -> list[dict]:
+                                    sets: list[dict], label: str, *,
+                                    rev: str = "HEAD") -> list[dict]:
     """`_evaluate_acceptance_sets_inner`, never raising: any failure to set
     up or run the evaluation (a fork failure on `git worktree add`, a full
     disk) is no evidence from any set — never an exception that would skip
     a repair's rollback check."""
     try:
         return await _evaluate_acceptance_sets_inner(st, caps, tree, sets,
-                                                     label)
+                                                     label, rev=rev)
     except Exception as e:
         log(f"  acceptance: evaluation failed ({type(e).__name__}: {e}) — "
             "no evidence either way")
@@ -33266,9 +33268,9 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
 
 
 async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
-                                          sets: list[dict], label: str
-                                          ) -> list[dict]:
-    """Run each valid set against `tree`'s HEAD commit, in a disposable
+                                          sets: list[dict], label: str, *,
+                                          rev: str = "HEAD") -> list[dict]:
+    """Run each valid set against `tree`'s `rev` commit (HEAD by default), in a disposable
     worktree at that commit — never in `tree` itself. Nothing of a set can
     then linger where a fixer works, not even after a crash mid-run (no
     `finally` survives a SIGKILL), and no runner cache in `tree` records
@@ -33289,7 +33291,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
     unmeasured_all = [{"index": s_["index"], "passed": False,
                        "unmeasured": True, "failing_files": []}
                       for s_ in sets]
-    head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"],
+    head = subprocess.run(["git", "-C", tree, "rev-parse", rev],
                           capture_output=True, text=True, check=False)
     if head.returncode != 0:
         return unmeasured_all
@@ -33527,7 +33529,11 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     model=models.get("conformer", MODEL_DEFAULT),
                     effort=EFFORT_ACCEPTANCE_REPAIR,
                     sid=f"acceptance-repair-r{rnd}")
-            except (WorkerError, subprocess.TimeoutExpired) as e:
+            except Exception as e:
+                # Any failure, not only WorkerError/timeout: `claude_p` lets
+                # an OSError spawning the worker (EAGAIN) through unchanged,
+                # and after an earlier round's commit that must not skip the
+                # rollback check below.
                 entry = {"round": rnd, "error": _brief_worker_exc(e)}
                 # A worker can commit and then fail (a schema miss, a
                 # timeout): the previous verdict no longer describes the
@@ -33581,8 +33587,27 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                         and not _acceptance_measured(final)):
                     # Nor make the held-out sets unmeasurable (a broken
                     # dependency manifest): the staging test axis would not
-                    # notice, its install being memoised from earlier.
-                    reason = "left the held-out sets unmeasurable"
+                    # notice, its install being memoised from earlier. But
+                    # every evaluation installs afresh, so a one-off failure
+                    # (a network blip) looks the same. Measure the repaired
+                    # tree once more; only if it still measures nothing while
+                    # the pre-repair tree does is the repair to blame.
+                    retry = await _evaluate_acceptance_sets(
+                        st, caps, str(staging), sets, "gate-retry")
+                    if _acceptance_measured(retry):
+                        final = retry
+                        if gate["rounds"]:
+                            gate["rounds"][-1]["results"] = retry
+                    else:
+                        control = await _evaluate_acceptance_sets(
+                            st, caps, str(staging), sets, "gate-before",
+                            rev=before_sha)
+                        if _acceptance_measured(control):
+                            reason = "left the held-out sets unmeasurable"
+                        else:
+                            log("  acceptance: the pre-repair tree cannot be "
+                                "measured now either — an environment "
+                                "failure, not the repair; the repair is kept")
             if reason:
                 # The decision is saved before the reset, so a crash between
                 # them cannot record the repaired tree's verdict for the
@@ -33598,13 +33623,15 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             if await _acceptance_rollback(str(staging), before_sha):
                 log(f"  acceptance repair {gate.get('rollback_reason') or ''}"
                     " — its commits were reset away; residual recorded")
+                final = initial
             else:
                 gate["rollback_failed"] = True
                 log(f"  WARNING: acceptance repair "
                     f"{gate.get('rollback_reason') or ''} but resetting staging "
                     f"to {before_sha[:12] or '(unknown)'} FAILED — the "
                     "repair's commits remain on the branch")
-            final = initial
+                # `final` keeps describing the repair's tree: it is what
+                # ships.
     gate["final"] = final
     # A repair that left nothing measurable (it broke the dependency
     # manifest, say) must not erase a failing verdict: the last measured
@@ -33658,7 +33685,13 @@ async def _acceptance_rollback(staging: str, before_sha: str) -> bool:
                        capture_output=True, check=False)
     except OSError:
         return False
-    return await _branch_head_sha(staging) == before_sha
+    # An unreadable HEAD is not a failed reset: read again before saying so.
+    for _ in range(3):
+        head = await _branch_head_sha(staging)
+        if head:
+            return head == before_sha
+        await asyncio.sleep(1)
+    return False
 
 
 async def _acceptance_write_or_skip(task: str, st: "State", caps: dict,

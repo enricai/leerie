@@ -4485,8 +4485,9 @@ the `.cache` pin was reverted separately afterwards and caught too.
 its test made both HEAD reads unreadable).
 
 - **pytest's collection error is evidence**
-  (`test_an_unimportable_module_under_test_is_a_failure`: an import-time
-  defect at the base, a fix that broke the module).
+  (`test_an_unimportable_module_under_test_is_a_failure`: a fix that broke the
+  module). The "import-time defect at the base" half was undone in round 7,
+  which discards such a set while validating (fail-open).
 - **A failing build step is not a failed install**
   (`test_only_a_failed_install_counts`, renamed in round 7 and widened to
   timeouts and raised errors).
@@ -4519,6 +4520,21 @@ the two test-axis measurement guards only after
 - **Build failures of every shape are evidence; install failures are not**
   (`test_only_a_failed_install_counts`, 6 cases). `unmeasured_final` reaches the
   planner (`test_residual_reaches_the_next_runs_planner_ctx`).
+
+### Review round 8 fixes (2026-10-05)
+
+7 distinct reversions, each against its named test, 7 caught.
+
+- **A one-off install failure keeps a correct repair**
+  (`test_a_one_off_install_failure_keeps_a_correct_repair`,
+  `test_a_lasting_environment_failure_keeps_the_repair`): the repaired tree is
+  measured again, and the pre-repair tree is the control, before the
+  unmeasurable-sets rule rolls anything back.
+- **Any failure spawning a later round still reaches the rollback**
+  (`test_a_failure_spawning_a_later_round_still_rolls_back`).
+- **A failed reset leaves the repair tree's verdict**, and an unreadable HEAD
+  after a reset is read again (`test_a_failed_reset_is_recorded_not_assumed`,
+  `test_an_unreadable_head_after_a_reset_is_read_again`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

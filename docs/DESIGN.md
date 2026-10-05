@@ -6027,8 +6027,10 @@ build is evidence against it — at the cost that a transient build failure
 reads as the fix failing). A known runner's "ran no test" exits (pytest's
 collection, internal, usage and no-tests codes) are ambiguous — the test
 file may be broken, or the code under test may be — so they are no
-verdict only while validating a set on the base, where such a file is
-discarded (the gate then has less to check, never a false failure); once
+verdict only while validating a set on the base, where such a file
+discards its set (the gate then has less to check, never a false
+failure — the price is that a report whose defect is itself an import
+failure gets no held-out check); once
 a file has run on the base, the same exit on a fix is the fix's doing and
 fails — a defect file that never ran
 must not count as failing — but a test that fails for any other reason,
@@ -6069,13 +6071,18 @@ axis goes from passing to failing across the repair rounds, their
 commits are reset away and the residual is recorded instead — likewise
 if the repair turned measurable held-out sets unmeasurable (a broken
 dependency manifest, which the staging test axis, installed long before,
-would not notice). The reset is confirmed, never assumed: a failed one is
-recorded as such. With no readable HEAD to reset to, no repair starts. The
+would not notice) — but only after the repaired tree is measured once
+more and the pre-repair tree measures where it does not, since every
+evaluation installs afresh and a one-off failure looks the same. The
+reset is confirmed, never assumed: a failed one is recorded as such, and
+the record then describes the repair's tree, which is what ships. With no readable HEAD to reset to, no repair starts. The
 pre-repair verdict and HEAD are persisted before the first round and
 every round after it runs (a round whose worker committed and then
 failed is measured again, since the previous verdict no longer describes
-the tree; a repair that leaves nothing measurable keeps the last
-measured failing verdict as its residual), and the rollback decision
+the tree; when the shipped tree cannot be measured at all — an
+environment failure, since a repair that made the sets unmeasurable is
+rolled back below — the last measured failing verdict is the residual,
+marked as such), and the rollback decision
 before the reset
 it orders, so a resumed gate always reaches this check and never records
 the repaired tree's verdict for the reset one: re-measured on resume,

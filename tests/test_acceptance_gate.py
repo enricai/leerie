@@ -806,7 +806,7 @@ def test_a_timeout_fails(leerie, tmp_path):
 
 
 @pytest.mark.parametrize("module", [
-    "def f():\n    return 1\n",           # the entry point the fix must add
+    "def f():\n    return 1\n",           # a fix that removed the entry point
     "def add(a, b):\n    return a +\n",  # a fix that broke the module
 ])
 def test_an_unimportable_module_under_test_is_a_failure(leerie, tmp_path,
@@ -1243,6 +1243,10 @@ def test_residual_counts_only_measured_sets(leerie, tmp_path, monkeypatch):
     assert (res["failing_sets"], res["total_sets"]) == (4, 4)
 
 
+async def _no_sleep(*a, **k):
+    return None
+
+
 class _Killed(BaseException):
     """A process kill, as the gate sees it: not an `Exception`, so nothing
     the gate catches on purpose can absorb it."""
@@ -1559,8 +1563,9 @@ def test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up(
 
 def test_an_unmeasurable_final_keeps_the_last_measured_residual(
         leerie, tmp_path, monkeypatch):
-    """A repair that leaves nothing measurable must not erase the failing
-    verdict the next run's planner needs."""
+    """A final tree that cannot be measured at all (here: no repair commit,
+    and the round's evaluation fails) must not erase the failing verdict
+    the next run's planner needs."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
@@ -1568,10 +1573,10 @@ def test_an_unmeasurable_final_keeps_the_last_measured_residual(
     real = leerie._evaluate_acceptance_sets_inner
     calls = []
 
-    async def second_unmeasured(st_, caps, tree, sets, label):
+    async def second_unmeasured(st_, caps, tree, sets, label, **kw):
         calls.append(label)
         if len(calls) == 1:
-            return await real(st_, caps, tree, sets, label)
+            return await real(st_, caps, tree, sets, label, **kw)
         return [{"index": s_["index"], "passed": False, "unmeasured": True,
                  "failing_files": []} for s_ in sets]
     monkeypatch.setattr(leerie, "_evaluate_acceptance_sets_inner",
@@ -1658,6 +1663,41 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
+def test_a_failure_spawning_a_later_round_still_rolls_back(
+        leerie, tmp_path, monkeypatch):
+    """Round-8 M1: `claude_p` lets an OSError spawning the worker through;
+    raised in round 2 after round 1's red commit, it escaped the gate past
+    the rollback check."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    calls = []
+
+    async def red_then_eagain(**kw):
+        calls.append(1)
+        if len(calls) == 2:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        (Path(kw["cwd"]) / "calc.py").write_text(
+            "def add(a, b):\n    return 99\n")
+        _git(kw["cwd"], "commit", "-qam", "conformer: red")
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", red_then_eagain)
+    seq = [{"passed": True, "measured": True},
+           {"passed": False, "measured": True}]
+
+    async def axes(tree, axes_, st_, caps, **kw):
+        return {"tests": seq.pop(0)}
+    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    gate = st.data["acceptance"]["gate"]
+    assert len(calls) == 2 and "error" in gate["rounds"][1]
+    assert gate["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == before
+
+
 def test_a_repair_that_breaks_the_install_is_rolled_back(
         leerie, tmp_path, monkeypatch):
     """Round-7 M4: staging's memoised install never noticed; every set went
@@ -1686,6 +1726,51 @@ def test_a_repair_that_breaks_the_install_is_rolled_back(
     assert gate["residual"]["failing_sets"] == 5
 
 
+def _counted_recipe(st, tmp_path, fail_from: int, fail_to: int):
+    """An install that fails on calls fail_from..fail_to (1-based)."""
+    counter = tmp_path / "install-calls"
+    st.data["provision"] = {"recipe": [{"kind": "install", "command": [
+        "bash", "-c",
+        f'n=$(( $(cat {counter} 2>/dev/null || echo 0) + 1 )); '
+        f'echo $n > {counter}; '
+        f'[ $n -lt {fail_from} ] || [ $n -gt {fail_to} ]']}]}
+
+
+def test_a_one_off_install_failure_keeps_a_correct_repair(
+        leerie, tmp_path, monkeypatch):
+    """Round-8 M1: the unmeasurable-sets rollback reset a correct fix when
+    the post-repair evaluation's fresh install failed once."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    _counted_recipe(st, tmp_path, 2, 2)       # the round-1 evaluation fails
+    _run_gate(leerie, monkeypatch, st, _commit_fix,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": True, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert "rolled_back" not in gate
+    assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
+    assert all(r["passed"] for r in gate["final"]) and "residual" not in gate
+
+
+def test_a_lasting_environment_failure_keeps_the_repair(
+        leerie, tmp_path, monkeypatch, capsys):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    _counted_recipe(st, tmp_path, 2, 99)      # every later install fails
+    _run_gate(leerie, monkeypatch, st, _commit_fix,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": True, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert "rolled_back" not in gate
+    assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
+    assert "an environment failure" in capsys.readouterr().out
+    assert gate["residual"]["unmeasured_final"] is True
+
+
 def test_a_failed_reset_is_recorded_not_assumed(leerie, tmp_path,
                                                 monkeypatch, capsys):
     """Round-7 L1: a stale index.lock makes `reset --hard` fail; the gate
@@ -1705,6 +1790,27 @@ def test_a_failed_reset_is_recorded_not_assumed(leerie, tmp_path,
     assert gate["rolled_back"] is True and gate["rollback_failed"] is True
     assert "FAILED" in capsys.readouterr().out
     assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
+    # What ships is the repair's tree, so the record describes it, not the
+    # pre-repair tree (round-8 L).
+    assert all(r["passed"] for r in gate["final"])
+
+
+def test_an_unreadable_head_after_a_reset_is_read_again(leerie, tmp_path,
+                                                        monkeypatch):
+    repo, head = _repo(tmp_path)
+    staging = repo
+    before = _git(repo, "rev-parse", "HEAD")
+    _commit_fix(repo)
+    real = leerie._branch_head_sha
+    n = []
+
+    async def blip(wt):
+        n.append(1)
+        return "" if len(n) == 1 else await real(wt)
+    monkeypatch.setattr(leerie, "_branch_head_sha", blip)
+    monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
+    assert asyncio.run(leerie._acceptance_rollback(str(staging), before))
+    assert _git(repo, "rev-parse", "HEAD") == before
 
 
 @pytest.mark.parametrize("raises_on", ["pre", "post"])

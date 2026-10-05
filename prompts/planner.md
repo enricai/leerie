@@ -502,9 +502,10 @@ The orchestrator gives you, in your prompt:
    tests written from the report alone, which that run's fix still
    failed after its repair rounds: plan the root-cause change that makes
    the report's contract hold for those cases in general, not a change
-   shaped to the case names. `unmeasured_final: true` means that verdict
-   predates the run's last repair, which left the tests unrunnable —
-   check the tree before trusting it. Do not re-plan work the record does not
+   shaped to the case names. `unmeasured_final: true` means the shipped
+   tree could not be measured at all (an environment failure), so the
+   verdict is the last one that could be, possibly from before that
+   run's last repair — check the tree before trusting it. Do not re-plan work the record does not
    dispute. If the tree contradicts the record (someone fixed it since),
    trust the tree and say so in `confidence.basis`.
 
