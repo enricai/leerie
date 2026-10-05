@@ -637,6 +637,42 @@ def test_a_declared_import_defect_that_does_not_parse_is_no_verdict(
     assert _validate(leerie, st, repo, "test_probe.py", "import") is None
 
 
+@pytest.mark.parametrize("name,data,want", [
+    ("test_ok.py", b"from calc import mul\n", True),
+    # Valid Python the old text-mode read rejected: a BOM, a coding cookie.
+    ("test_bom.py", b"\xef\xbb\xbffrom calc import mul\n", True),
+    ("test_latin.py", b"# -*- coding: latin-1 -*-\ns = '\xe9'\n", True),
+    ("test_bad.py", b"from calc import mul(\n", False),
+    # Uncheckable languages: the declaration is not honoured (round-14 M2).
+    ("acc/a.test.js", b"import { mul } from '../calc.js';\n", False),
+    ("acc/a.test.ts", b"import { mul } from '../calc';\n", False),
+])
+def test_only_reliably_parsed_files_honour_an_import_declaration(
+        leerie, tmp_path, name, data, want):
+    p = tmp_path / name
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(data)
+    assert leerie._acceptance_file_parses(str(tmp_path), name) is want
+
+
+def test_the_writer_prompt_example_matches_the_schema(leerie):
+    """test_prompt_schema_parity checks field NAMES appear in the prompt;
+    this checks the example's file items carry exactly the schema's fields
+    with values its enums allow."""
+    import re
+    prompt = leerie._load_prompt("acceptance_writer")
+    example = json.loads(re.search(r"```json\n(.*?)```", prompt,
+                                   re.S).group(1))
+    item = leerie.SCHEMAS["acceptance_writer"]["properties"]["files"][
+        "items"]
+    for f in example["files"]:
+        assert set(f) == set(item["properties"])
+        assert set(item["required"]) <= set(f)
+        for key, spec in item["properties"].items():
+            if "enum" in spec:
+                assert f[key] in spec["enum"]
+
+
 def test_an_import_defect_set_validates_and_passes_on_the_fix(
         leerie, tmp_path, monkeypatch):
     repo, head = _repo(tmp_path)

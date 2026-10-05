@@ -48,7 +48,10 @@ report is among the files the task references; read it in full first.
    defect. Declare it `failure_mode: "import"`. Declare it only then: a
    file that fails to load because of your own mistake (a typo, a guessed
    helper name, a library this repository does not have) is never an
-   import defect, and would fail against every fix.
+   import defect, and would fail against every fix. The harness honours
+   the declaration only for Python test files, whose syntax it can check;
+   in any other language such a file is discarded, so prefer a case that
+   loads and asserts on the missing behaviour when the language allows.
 
 ## Output
 

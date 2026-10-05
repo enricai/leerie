@@ -4584,6 +4584,13 @@ dropping the both-unreadable clause.
 - **Writer-declared import defects** (`test_a_declared_import_defect_counts_as_failing`,
   `test_a_declared_import_defect_that_does_not_parse_is_no_verdict`,
   `test_an_import_defect_set_validates_and_passes_on_the_fix`).
+- **An import declaration is honoured only where parsing is checked
+  reliably** — Python, compiled from bytes
+  (`test_only_reliably_parsed_files_honour_an_import_declaration`; a BOM and a
+  coding cookie parse, `.js`/`.ts` are uncheckable). The writer prompt's JSON
+  example is checked against the schema
+  (`test_the_writer_prompt_example_matches_the_schema`). Three more reversions,
+  3 caught.
 - **Retry inside the repair loop**
   (`test_a_one_off_install_failure_mid_loop_keeps_the_next_round`), and the
   post-loop retry skipped for a commit already retried

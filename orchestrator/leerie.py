@@ -50,7 +50,8 @@ import uuid
 import weakref
 import xml.etree.ElementTree as ElementTree
 from collections import deque
-from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
+from collections.abc import (AsyncIterator, Awaitable, Callable, Iterable,
+                             Iterator)
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TextIO
@@ -32966,7 +32967,7 @@ _RUNNER_NO_VERDICT_EXITS: dict[str, frozenset[int]] = {
 }
 
 
-def _acceptance_runner(cmd: str, known: object) -> str | None:
+def _acceptance_runner(cmd: str, known: Iterable[str]) -> str | None:
     """Which of the `known` runner names a shell command invokes, matched on
     the basenames of its own tokens (a mechanical string, DESIGN §12)."""
     try:
@@ -33073,24 +33074,20 @@ def _parse_runner_report(kind: str, path: Path) -> dict | None:
 
 
 def _acceptance_file_parses(tree: str, rel: str) -> bool:
-    """A mechanical syntax check of a test file itself: Python through the
-    stdlib parser, JavaScript through `node --check` when node is present;
-    other languages are not checked (True). Guards a writer-declared import
-    defect against a file that merely fails to parse."""
+    """A mechanical syntax check of a test file itself, guarding a
+    writer-declared import defect against a file that merely fails to
+    parse. Only where the check is reliable: a Python file, compiled from
+    its bytes (so an encoding cookie or BOM is honoured). Anything else is
+    False — uncheckable, so the declaration is not honoured: `node --check`
+    accepts a syntax error in an ES-module file run through babel, and
+    TypeScript has no parser check short of a build."""
+    if not rel.endswith(".py"):
+        return False
     p = Path(tree) / rel
-    if rel.endswith(".py"):
-        try:
-            compile(p.read_text(), str(p), "exec", dont_inherit=True)
-        except (SyntaxError, ValueError, OSError):
-            return False
-        return True
-    if rel.endswith((".js", ".mjs", ".cjs")) and shutil.which("node"):
-        try:
-            return subprocess.run(["node", "--check", str(p)],
-                                  capture_output=True, check=False,
-                                  timeout=60).returncode == 0
-        except (OSError, subprocess.TimeoutExpired):
-            return False
+    try:
+        compile(p.read_bytes(), str(p), "exec", dont_inherit=True)
+    except (SyntaxError, ValueError, OSError):
+        return False
     return True
 
 

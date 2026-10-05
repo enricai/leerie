@@ -6033,23 +6033,33 @@ error that skips the rollback check below.
 
 Validating a set on the base asks more, because a defect file that never
 ran must not count as failing. Exit codes cannot say whether a file ran:
-jest, vitest and `go test` exit 1 alike for "no tests", "could not load"
-and "a test failed", and cargo 101 for a build or a test failure. So
-where the runner can write a structured report of the run — pytest's
-JUnit XML, the jest-compatible JSON of jest and vitest — validation asks
-for one and reads how many tests executed and whether the file loaded. A
-file that ran no test, or could not be loaded, is no verdict and discards
-its set (the gate then has less to check, never a false failure) — with
-one exception. When the report's defect is itself that loading fails (a
-missing entry point, a module that raises on import), the writer says so
-for that file, and a file that cannot load on the base is then the defect
-showing — provided the file itself parses, checked mechanically. Reading
-the report to know which case applies is the writer's job, never
+jest and vitest exit 1 alike for "no tests", "could not load" and "a test
+failed"; cargo exits 101 for a build or a test failure; and `go test`
+exits 0 when nothing ran. So where the runner can write a structured
+report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
+and vitest — validation asks for one and reads how many tests executed
+(a test whose fixture failed to set up counts as executed: it ran and
+failed) and whether the file loaded. A file that ran no test, or could
+not be loaded, is no verdict and discards its set (the gate then has less
+to check, never a false failure) — with one exception. When the report's
+defect is itself that loading fails (a missing entry point, a module that
+raises on import), the writer says so for that file, and a file that
+cannot load on the base is then the defect showing — provided the file
+itself parses, which is checked mechanically and only where it can be
+checked reliably: Python, through the interpreter's own parser. A
+declared import defect in any other language stays no verdict (`node
+--check` was measured accepting a syntax error in an ES-module test file
+run through babel, and TypeScript has no parser check short of a build).
+Reading the report to know which case applies is the writer's job, never
 Python's (§12); the price is that a writer who declares a guessed import
 produces a test no fix can pass, which costs two repair rounds and a
-residual, never the run. Runners without a known report fall back to the
+residual, never the run. Without a readable report (a runner with none
+known, or a report that was not written) validation falls back to the
 runner's own "ran no test" exits where they exist (pytest's), and
-otherwise to the exit code alone. A majority of
+otherwise to the exit code alone — so on `go test`, a file that ran
+nothing reads as passing: it cannot become a defect file (it does not
+fail on the base), but it can be accepted as a control that proves
+nothing. A majority of
 failing sets triggers **at most two repair rounds**: the conformer is
 told which declared cases failed and the defect contract — never the
 runner output or the test source, because a conformer shown the failing
