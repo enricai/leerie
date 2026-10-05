@@ -327,6 +327,65 @@ def test_each_evaluation_installs_into_its_fresh_worktree(
     assert installs == [True, True]
 
 
+def _failing_recipe(st, *, fail: bool):
+    st.data["provision"] = {"recipe": [{
+        "kind": "install",
+        "command": ["bash", "-c", "exit 3" if fail else "true"]}]}
+
+
+def test_a_failed_install_is_no_evidence(leerie, tmp_path):
+    """Round-5 M3: verdicts are by exit code, so a dependency install that
+    failed in the evaluation worktree would read as every test failing."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    _commit_fix(staging)
+    sets = _make_sets(leerie, st, 3)
+    _failing_recipe(st, fail=True)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 3), str(staging), sets, "t"))
+    assert all(r["unmeasured"] for r in res)
+    assert not leerie._acceptance_majority_fails(res)
+    _failing_recipe(st, fail=False)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 3), str(staging), sets, "t2"))
+    assert all(r["passed"] for r in res)
+
+
+def test_ensure_worktree_deps_reports_failure(leerie, tmp_path):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    kw = dict(log_path=st.run_dir / "logs" / "d.log", verbosity="quiet")
+    _failing_recipe(st, fail=True)
+    assert asyncio.run(leerie._ensure_worktree_deps(
+        str(repo), st, _caps(leerie, 1), **kw)) is False
+    leerie._DEPS_INSTALLED.clear()
+    _failing_recipe(st, fail=False)
+    assert asyncio.run(leerie._ensure_worktree_deps(
+        str(repo), st, _caps(leerie, 1), **kw)) is True
+
+
+def test_a_set_that_cannot_be_placed_is_no_evidence(leerie, tmp_path,
+                                                    monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    real = leerie.shutil.copy2
+    calls = []
+
+    def full(src, dst, *a, **k):
+        calls.append(dst)
+        if len(calls) == 1:
+            raise OSError(28, "No space left on device")
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(leerie.shutil, "copy2", full)
+    _commit_fix(staging)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 2), str(staging), _make_sets(leerie, st, 2), "t"))
+    assert [(r["passed"], r["unmeasured"]) for r in res] == [
+        (False, True), (True, False)]
+
+
 def test_sets_are_isolated_from_one_another(leerie, tmp_path):
     """Two sets carrying the same helper path: each set's files are gone
     before the next set's go in, or the second would collide."""
@@ -359,6 +418,7 @@ def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
 
     async def fake_deps(tree, *a, **k):
         (Path(tree) / "provisioned.txt").write_text("from the install\n")
+        return True
     monkeypatch.setattr(leerie, "_ensure_worktree_deps", fake_deps)
 
     async def fake_claude_p(**kw):
@@ -390,15 +450,14 @@ def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
 
 
 def test_cache_and_provision_paths(leerie):
-    byp, cache = (leerie._acceptance_is_byproduct_path,
-                  leerie._acceptance_is_cache_path)
-    assert byp("__pycache__/calc.cpython-314.pyc")
-    assert byp(".pytest_cache/v/cache/lastfailed")
-    assert byp("tests/x.pyc")
-    assert not byp(".venv/lib/__pycache__/site.cpython-314.pyc")
-    assert not byp("tests/acc_helpers.py")
+    cache = leerie._acceptance_is_cache_path
+    assert cache("__pycache__/calc.cpython-314.pyc")
+    assert cache(".pytest_cache/v/cache/lastfailed")
+    assert cache("tests/x.pyc")
     assert cache(".venv/lib/site.py") and cache("web/node_modules/a/b.js")
-    assert not cache("tests/conftest.py")
+    assert not cache("tests/acc_helpers.py") and not cache("tests/conftest.py")
+    # Too broad to drop (round-4 L3): a fixture may live under it.
+    assert not cache("tests/.cache/fixture.json")
 
 
 def test_a_runner_cache_in_the_tree_is_never_touched(
@@ -574,8 +633,10 @@ def test_dot_slash_declared_paths_are_not_also_support_files(
 
     async def dotted(**kw):
         out = await real(**kw)
-        for f in out["files"]:
-            f["path"] = "./" + f["path"]
+        # Round-5 L2: `a/./b` and `a//b` too, not only a leading `./`.
+        for f, form in zip(out["files"], ("./{}", "acc/./{}")):
+            f["path"] = form.format(f["path"].split("/", 1)[1]) \
+                if form.startswith("acc") else form.format(f["path"])
         return out
     monkeypatch.setattr(leerie, "claude_p", dotted)
     acc = asyncio.run(leerie.phase_acceptance_write(
@@ -587,6 +648,32 @@ def test_dot_slash_declared_paths_are_not_also_support_files(
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
     assert res[0]["passed"] is True
+
+
+def test_ignored_build_output_elsewhere_does_not_travel(leerie, tmp_path,
+                                                        monkeypatch):
+    """Round-5 (claims) LOW: build output from the UNFIXED tree, ignored and
+    away from the tests, would shadow a correct fix."""
+    repo, head = _repo(tmp_path)
+    (repo / ".gitignore").write_text("dist/\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "ignore dist")
+    head = _git(repo, "rev-parse", "HEAD")
+    st = _st(leerie, tmp_path, repo, head)
+
+    async def fake_claude_p(**kw):
+        wt = Path(kw["cwd"])
+        (wt / "dist").mkdir()
+        (wt / "dist" / "calc_built.py").write_text(BUGGY)
+        (wt / "acc").mkdir()
+        (wt / "acc" / "test_defect_x.py").write_text(DEFECT_TEST)
+        return {"files": [{"path": "acc/test_defect_x.py", "kind": "defect",
+                           "cases": ["sums"]}]}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["support_files"] == []
 
 
 def test_a_gitignored_helper_still_travels(leerie, tmp_path, monkeypatch):
@@ -638,6 +725,54 @@ def test_verdict_is_by_exit_code(leerie, tmp_path, body, want):
     assert got is want
 
 
+@pytest.mark.parametrize("body", [
+    "x = 1\n",                         # no test collected: pytest exit 5
+    "def test_x(:\n    pass\n",        # collection error: pytest exit 2
+])
+def test_a_file_that_ran_no_test_is_no_verdict(leerie, tmp_path, body):
+    """Round-5 L1: a defect file that never ran must not count as failing on
+    the base — it would fail on every fix forever."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text(body)
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_probe.py",
+        st.run_dir / "logs" / "p.log", "p")) is None
+
+
+def test_a_fork_exhaustion_kill_is_no_verdict(leerie, tmp_path):
+    repo, head = _repo(tmp_path)
+    (repo / ".leerie" / "config.toml").write_text(
+        'test_scoped = "echo \'bash: fork: retry: Resource temporarily '
+        'unavailable\'; exit 1; {test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text("def test_x():\n    pass\n")
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_probe.py",
+        st.run_dir / "logs" / "p.log", "p")) is None
+
+
+def test_a_timeout_fails(leerie, tmp_path):
+    """A hung test is the fix failing to finish, not "no verdict"."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text(
+        "import time\n\ndef test_x():\n    time.sleep(30)\n")
+    caps = _caps(leerie, 1)
+    caps["worker_timeout_sec"] = 2
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, caps, str(repo), "test_probe.py",
+        st.run_dir / "logs" / "p.log", "p")) is False
+
+
+def test_no_verdict_exits_are_matched_on_command_tokens(leerie):
+    f = leerie._acceptance_no_verdict_exits
+    assert f("python3 -m pytest -q acc/test_a.py") == frozenset({2, 3, 4, 5})
+    assert f("uv run /usr/bin/pytest x") == frozenset({2, 3, 4, 5})
+    assert f("npx jest acc/a.test.js") == frozenset()
+    assert f("echo pytestish") == frozenset()
+
+
 def test_an_unrunnable_command_is_no_verdict(leerie, tmp_path):
     repo, head = _repo(tmp_path)
     (repo / ".leerie" / "config.toml").write_text(
@@ -661,6 +796,19 @@ def test_runner_output_never_reaches_the_orchestrator_log(
     out = capsys.readouterr().out
     assert "assert add(2, 3) == 5" not in out
     assert "test_defect_1" not in out
+
+
+def test_a_failed_install_in_the_writer_discards_the_set(
+        leerie, tmp_path, monkeypatch, capsys):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _failing_recipe(st, fail=True)
+    _writer_stub(leerie, monkeypatch, {1: {
+        "acc/test_defect_sum.py": ("defect", DEFECT_TEST, ["sums"])}})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    assert acc["sets"] == []
+    assert "dependency install failed" in capsys.readouterr().out
 
 
 def test_writer_budget_exhaustion_propagates(leerie, tmp_path, monkeypatch):
@@ -919,6 +1067,7 @@ def test_evaluation_installs_deps_before_running(leerie, tmp_path, monkeypatch):
 
     async def fake_deps(tree, *a, **k):
         events.append(("deps", tree))
+        return True
 
     async def spy_run_file(st_, caps, tree, *a, **k):
         events.append(("run", tree))
@@ -1228,6 +1377,62 @@ def test_an_errored_round_is_saved_and_the_round_before_still_counts(
                    {"round": 2, "error": "x"}]}
     _run_gate(leerie, monkeypatch, st, lambda _p: None)
     assert st.data["acceptance"]["gate"]["residual"]["failing_sets"] == 4
+
+
+def test_a_round_that_commits_then_errors_is_measured_again(
+        leerie, tmp_path, monkeypatch):
+    """Round-5 M1: the conformer committed a correct fix and then failed
+    (a schema miss); the gate kept the stale failing verdict and handed a
+    false residual to the next run."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+
+    async def commits_then_fails(**kw):
+        _commit_fix(Path(kw["cwd"]))
+        raise leerie.WorkerError("schema-valid output twice: no")
+    monkeypatch.setattr(leerie, "claude_p", commits_then_fails)
+
+    async def axes(tree, axes_, st_, caps, **kw):
+        return {"tests": {"passed": True, "measured": True}}
+    monkeypatch.setattr(leerie, "_measure_axes", axes)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    gate = st.data["acceptance"]["gate"]
+    assert gate["rounds"][0]["error"] and gate["rounds"][0]["results"]
+    assert all(r["passed"] for r in gate["final"])
+    assert "residual" not in gate
+
+
+def test_a_red_repair_rolls_back_even_when_evaluation_breaks(
+        leerie, tmp_path, monkeypatch):
+    """Round-5 M2: an exception while placing a set after a red repair
+    escaped the gate before the rollback check, and the red repair
+    shipped."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    before = _git(staging, "rev-parse", "HEAD")
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    real = leerie.shutil.copy2
+    repaired = []
+
+    def full(src, dst, *a, **k):
+        if repaired:
+            raise OSError(28, "No space left on device")
+        return real(src, dst, *a, **k)
+    monkeypatch.setattr(leerie.shutil, "copy2", full)
+
+    def fixer(p):
+        _commit_fix(p)
+        repaired.append(1)
+    _run_gate(leerie, monkeypatch, st, fixer,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": False, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert gate["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == before
 
 
 def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):

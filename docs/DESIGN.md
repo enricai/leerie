@@ -6005,7 +6005,8 @@ needs at least one discriminating defect file and every control passing.
 A set carries exactly the tree its validation ran on: a writer that
 edited an existing file loses the set, and every other new file it left
 (a helper or fixture beside the tests, even one the repo's ignore rules
-match) travels with the set — minus what the dependency install made
+match — though an ignored file elsewhere, likely build output from the
+unfixed tree, does not) travels with the set — minus what the dependency install made
 and the runner's caches and bytecode, which would only collide with the
 target tree's own. Without its helper, a correct fix fails the set. Measured: on the page-advance report, five sets written this way
 classified all 8 trees correctly (40/40: run 1's broken fix, two other
@@ -6019,10 +6020,14 @@ flagged an example-shaped patch.
 runs against staging's committed HEAD in a disposable worktree of its
 own — never in staging itself, where a crash mid-run (which no cleanup
 survives) would leave hidden tests for the next fixer to read or commit.
-Verdicts are by exit code alone: a command the shell could not run, or
-one the container's limits killed, is no verdict, but a test that fails
-for any other reason — including a missing-file defect whose failure
-prints "No such file or directory" — fails. A majority of
+Verdicts are by exit code alone: a command the shell could not run, one
+the container's limits killed, a known runner's own "ran no test" codes
+(pytest's collection, usage and no-tests exits), or any set run where the
+dependency install failed is no verdict — a defect file that never ran
+must not count as failing — but a test that fails for any other reason,
+including a missing-file defect whose failure prints "No such file or
+directory", fails. A set that cannot even be placed is no verdict too,
+never an error that skips the rollback check below. A majority of
 failing sets triggers **at most two repair rounds**: the conformer is
 told which declared cases failed and the defect contract — never the
 runner output or the test source, because a conformer shown the failing
@@ -6056,7 +6061,9 @@ round must not trade the report for a regression: if the repo's test
 axis goes from passing to failing across the repair rounds, their
 commits are reset away and the residual is recorded instead. The
 pre-repair verdict and HEAD are persisted before the first round and
-every round after it runs, and the rollback decision before the reset
+every round after it runs (a round whose worker committed and then
+failed is measured again, since the previous verdict no longer describes
+the tree), and the rollback decision before the reset
 it orders, so a resumed gate always reaches this check and never records
 the repaired tree's verdict for the reset one: re-measured on resume,
 the verdict would read the already-repaired tree and skip it. Measured

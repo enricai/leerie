@@ -4454,5 +4454,28 @@ made to commit before erroring).
   `test_a_recorded_rollback_runs_no_further_round`); the reused evaluation
   path drops its install memo (`test_each_evaluation_installs_into_its_fresh_worktree`).
 
+### Review round 5 fixes (2026-10-05)
+
+12 reversions, each against its named test, 12 caught.
+
+- **A failed install is no evidence** (`test_a_failed_install_is_no_evidence`,
+  `test_a_failed_install_in_the_writer_discards_the_set`,
+  `test_ensure_worktree_deps_reports_failure`): exit-code verdicts cannot tell
+  a missing dependency from a failing fix.
+- **A set that cannot be placed is no evidence, and the rollback still runs**
+  (`test_a_set_that_cannot_be_placed_is_no_evidence`,
+  `test_a_red_repair_rolls_back_even_when_evaluation_breaks`).
+- **A round that commits then errors is measured again**
+  (`test_a_round_that_commits_then_errors_is_measured_again`).
+- **"Ran no test" is no verdict** (`test_a_file_that_ran_no_test_is_no_verdict`,
+  `test_no_verdict_exits_are_matched_on_command_tokens`); fork exhaustion is
+  none either and a timeout fails (`test_a_fork_exhaustion_kill_is_no_verdict`,
+  `test_a_timeout_fails`).
+- **Paths normalised** (`test_dot_slash_declared_paths_are_not_also_support_files`,
+  now `a/./b` too); **ignored files travel only beside a test**
+  (`test_ignored_build_output_elsewhere_does_not_travel`,
+  `test_a_gitignored_helper_still_travels`); `.cache` is not a by-product
+  (`test_cache_and_provision_paths`).
+
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

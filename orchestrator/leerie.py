@@ -31662,7 +31662,7 @@ _DEPS_INSTALLED: set[str] = set()
 async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
                                 log_path: Path, verbosity: str,
                                 label_prefix: str = "baseline",
-                                log_prefix: str = "base-baseline") -> None:
+                                log_prefix: str = "base-baseline") -> bool:
     """Apply the persisted provision recipe's install/build entries in
     `tree`, at most once per worktree per orchestrator process.
 
@@ -31675,11 +31675,17 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
     as whatever the subsequent build/lint/test command reports, rather than
     raising here — that reported failure is the more useful signal, and it
     is already classified (`_runner_missing` demotes a missing runner to
-    "could not measure" rather than RED)."""
+    "could not measure" rather than RED).
+
+    Returns False when an entry exited non-zero, timed out or raised on
+    this call, else True (a memo hit included). The held-out acceptance
+    tests judge by exit code alone, so their callers need this: a failed
+    install would otherwise read as every test failing."""
     key = os.path.realpath(tree)
     if key in _DEPS_INSTALLED:
-        return
+        return True
     _DEPS_INSTALLED.add(key)
+    ok = True
     recipe = (st.data.get("provision") or {}).get("recipe") or []
     for e in recipe:
         if e.get("kind") not in ("install", "build") or not e.get("command"):
@@ -31692,18 +31698,23 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
         # PATH etc.
         entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
         try:
-            await _run_streaming(
+            rc, _tail = await _run_streaming(
                 e["command"], cwd=str(wd), env=entry_env,
                 timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
                 log_path=log_path,
                 label=f"{label_prefix}-install: {' '.join(e['command'])}",
                 verbosity=verbosity)
+            if rc != 0:
+                ok = False
         except subprocess.TimeoutExpired:
+            ok = False
             log(f"  {log_prefix}: install timed out: "
                 f"{' '.join(e['command'])}")
         except Exception as ex:  # non-fatal: BLT below will show the effect
+            ok = False
             log(f"  {log_prefix}: install error "
                 f"({type(ex).__name__}): {' '.join(e['command'])}")
+    return ok
 
 
 # Bounds concurrent orchestrator-run BLT commands, keyed by (running loop,
@@ -32901,32 +32912,45 @@ def _acceptance_validity_base(st: "State") -> str | None:
 
 
 # Path components a test runner or interpreter writes as a by-product.
-# Carried with a set, they collide with the target tree's own copies and
-# turn every set unmeasurable; left behind, `.pytest_cache` records the
-# hidden tests' names in the tree a fixer works in.
+# Carried with a set, they would collide with the evaluation tree's own
+# copies and turn every set unmeasurable.
 _ACCEPTANCE_BYPRODUCT_PARTS = frozenset({
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".hypothesis"})
-# Environments a runner provisions: never a set's file, never cleaned.
+# Environments a runner provisions: never a set's file.
 _ACCEPTANCE_PROVISION_PARTS = frozenset({
     "node_modules", ".venv", "venv", ".tox", ".nox"})
 
 
-def _acceptance_is_byproduct_path(rel: str) -> bool:
-    """Mechanical path check (DESIGN §12): a cache or bytecode by-product
-    outside any provisioned environment."""
+def _acceptance_is_cache_path(rel: str) -> bool:
+    """Mechanical path check (DESIGN §12): a runner by-product, bytecode or
+    a provisioned environment — never a file a set needs."""
     parts = set(Path(rel).parts)
-    if parts & _ACCEPTANCE_PROVISION_PARTS:
-        return False
-    return (bool(parts & _ACCEPTANCE_BYPRODUCT_PARTS)
+    return (bool(parts & (_ACCEPTANCE_BYPRODUCT_PARTS
+                          | _ACCEPTANCE_PROVISION_PARTS))
             or rel.endswith((".pyc", ".pyo")))
 
 
-def _acceptance_is_cache_path(rel: str) -> bool:
-    """A by-product or a provisioned environment — never a file a set
-    needs."""
-    return (_acceptance_is_byproduct_path(rel)
-            or bool(set(Path(rel).parts) & _ACCEPTANCE_PROVISION_PARTS))
+# Exit codes a known runner uses for "ran no test", not "a test failed" —
+# a defect file that never ran must not count as failing on the base.
+# pytest: 2 interrupted/collection error, 3 internal error, 4 usage error,
+# 5 no tests collected.
+_RUNNER_NO_VERDICT_EXITS: dict[str, frozenset[int]] = {
+    "pytest": frozenset({2, 3, 4, 5}),
+}
+
+
+def _acceptance_no_verdict_exits(cmd: str) -> frozenset[int]:
+    """The no-verdict exit codes of the runner a shell command invokes,
+    matched on the command's own tokens (a mechanical string, DESIGN §12)."""
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return frozenset()
+    for runner, codes in _RUNNER_NO_VERDICT_EXITS.items():
+        if any(os.path.basename(t) == runner for t in tokens):
+            return codes
+    return frozenset()
 
 
 def _acceptance_declared_rel(declared: dict) -> str:
@@ -32934,10 +32958,10 @@ def _acceptance_declared_rel(declared: dict) -> str:
     prefix `./`, and a declared file compared unnormalised against git's
     list would also be carried as a support file — and then collide with
     itself at evaluation."""
-    rel = str(declared.get("path") or "")
-    while rel.startswith("./"):
-        rel = rel[2:]
-    return rel
+    raw = str(declared.get("path") or "")
+    # normpath also folds `a/./b` and `a//b`; a `..` it leaves in place is
+    # rejected by the caller.
+    return os.path.normpath(raw) if raw else ""
 
 
 def _acceptance_cmd(st: "State", files: list[str]) -> str | None:
@@ -32986,6 +33010,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             return None
     if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
         return None
+    if rc in _acceptance_no_verdict_exits(cmd):
+        return None
     return rc == 0
 
 
@@ -33021,10 +33047,14 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(f, dst)
             refs.append(rel)
-        await _ensure_worktree_deps(
-            str(wt), st, caps, log_path=log_path,
-            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-            label_prefix=f"acceptance-{k}", log_prefix="acceptance")
+        if not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"acceptance-{k}", log_prefix="acceptance"):
+            # Validated without its dependencies, a defect file "fails" on
+            # the base for the wrong reason and could never pass anywhere.
+            out["reason"] = "dependency install failed in the writer worktree"
+            return out
         scope = st.data.get("defect_scope") or {}
         gt = scope.get("ground_truth") or {}
         user = "\n".join([
@@ -33072,7 +33102,11 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
                                "-z"], capture_output=True, text=True,
                               check=False)
-        if porcelain.returncode != 0 or post.returncode != 0:
+        visible = subprocess.run(["git", "-C", str(wt), "ls-files",
+                                  "--others", "--exclude-standard", "-z"],
+                                 capture_output=True, text=True, check=False)
+        if (porcelain.returncode != 0 or post.returncode != 0
+                or visible.returncode != 0):
             out["reason"] = "could not read the writer's worktree status"
             return out
         for entry in porcelain.stdout.split("\0"):
@@ -33127,7 +33161,18 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         # were dropped (a defect file that passes on base) are not carried.
         declared_any = {_acceptance_declared_rel(f) for f in
                         (res.get("files") or [])}
-        support = sorted(f for f in new_files if f not in declared_any)
+        not_ignored = {p for p in visible.stdout.split("\0") if p}
+        test_dirs = {os.path.dirname(f) for f in defect + control}
+
+        def _beside_a_test(f: str) -> bool:
+            d = os.path.dirname(f)
+            return any(d == t or (t and d.startswith(t + "/"))
+                       for t in test_dirs)
+        # An ignored file travels only beside a kept test file (fixture
+        # data): elsewhere it is likely build output from the UNFIXED tree
+        # (dist/, target/), which would shadow a correct fix.
+        support = sorted(f for f in new_files if f not in declared_any
+                         and (f in not_ignored or _beside_a_test(f)))
         dest = leerie_dir / "acceptance" / f"set-{k}"
         shutil.rmtree(dest, ignore_errors=True)
         for rel in defect + control + support:
@@ -33223,10 +33268,15 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
         return unmeasured_all
     results = []
     try:
-        await _ensure_worktree_deps(
-            str(wt), st, caps, log_path=log_path,
-            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-            label_prefix=f"acceptance-{label}", log_prefix="acceptance")
+        if not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"acceptance-{label}", log_prefix="acceptance"):
+            # Every test would fail for want of a dependency, which an
+            # exit-code verdict cannot tell from the fix failing.
+            log("  acceptance: dependency install failed in the evaluation "
+                "worktree — no evidence either way")
+            return unmeasured_all
         for s_ in sets:
             failing, copied, ran = [], [], []
             unmeasured = False
@@ -33253,6 +33303,12 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
                         unmeasured = True
                     elif verdict is False:
                         failing.append(rel)
+            except Exception as e:
+                # A copy that fails (a full disk) is no verdict on this set —
+                # and must not escape: a repair's rollback check runs after.
+                log(f"  acceptance: set {s_['index']} could not be placed "
+                    f"({type(e).__name__}) — no evidence from it")
+                unmeasured = True
             finally:
                 # Sets are isolated from one another: one set's files are
                 # gone before the next set's go in.
@@ -33410,6 +33466,7 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     final, sets, shown, rnd, shape, rounds,
                     held_back=bool(hidden)),
             ]
+            round_start = await _branch_head_sha(str(staging))
             try:
                 # Inside the try: an exhausted worker budget ends the
                 # repair like any worker failure, and the rollback check
@@ -33425,12 +33482,22 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     effort=EFFORT_ACCEPTANCE_REPAIR,
                     sid=f"acceptance-repair-r{rnd}")
             except (WorkerError, subprocess.TimeoutExpired) as e:
-                gate["rounds"].append({"round": rnd,
-                                       "error": _brief_worker_exc(e)})
+                entry = {"round": rnd, "error": _brief_worker_exc(e)}
+                # A worker can commit and then fail (a schema miss, a
+                # timeout): the previous verdict no longer describes the
+                # tree, so measure it again.
+                if await _branch_head_sha(str(staging)) != round_start:
+                    final = await _evaluate_acceptance_sets(
+                        st, caps, str(staging), sets, f"gate-r{rnd}")
+                    entry["results"] = final
+                gate["rounds"].append(entry)
                 acc["gate"] = gate
                 st.data["acceptance"] = acc
                 st.save()
                 break
+            # `_evaluate_acceptance_sets` turns a set it cannot place into
+            # no evidence rather than raising, so the rollback check below
+            # always runs on what this round committed.
             final = await _evaluate_acceptance_sets(
                 st, caps, str(staging), sets, f"gate-r{rnd}")
             # Saved per round: a crash before the rollback check must not
