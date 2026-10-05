@@ -6039,14 +6039,19 @@ exits 0 when nothing ran. So where the runner can write a structured
 report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
 and vitest — validation asks for one and reads how many tests executed
 (a test whose fixture failed to set up counts as executed: it ran and
-failed) and whether the file loaded. A file that ran no test, or could
+failed) and whether the file loaded — pytest marks a file it could not
+collect with a fixed "collection failure" message, which no report option
+renames. A file that ran no test, or could
 not be loaded, is no verdict and discards its set (the gate then has less
 to check, never a false failure) — with one exception. When the report's
 defect is itself that loading fails (a missing entry point, a module that
 raises on import), the writer says so for that file, and a file that
-cannot load on the base is then the defect showing — provided the file
-itself parses, which is checked mechanically and only where it can be
-checked reliably: Python, through the interpreter's own parser. A
+cannot load on the base is then the defect showing — provided the file,
+and every other Python file the writer wrote beside it (a broken helper
+would fail every fix just the same), parses under the project's own
+interpreter: a throwaway compile check run through the repository's own
+test command, so its interpreter version decides, not the orchestrator's.
+That is checked only where it can be checked reliably, in Python; a
 declared import defect in any other language is dropped on its own,
 leaving the rest of its set (`node
 --check` was measured accepting a syntax error in an ES-module test file
@@ -6062,7 +6067,9 @@ nothing reads as passing: it cannot become a defect file (it does not
 fail on the base), but it can be accepted as a control that proves
 nothing. A majority of
 failing sets triggers **at most two repair rounds**: the conformer is
-told which declared cases failed and the defect contract — never the
+told which declared cases failed and the defect contract — cases the
+writer declared import defects listed apart, as the entry point failing
+to import, which a case name alone does not say — never the
 runner output or the test source, because a conformer shown the failing
 output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes

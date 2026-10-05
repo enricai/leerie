@@ -4582,22 +4582,40 @@ dropping the both-unreadable clause.
   tests all skip exits 0, so only the report shows it ran nothing
   (`test_a_file_whose_tests_all_skip_is_no_verdict_while_validating`).
 - **Writer-declared import defects** (`test_a_declared_import_defect_counts_as_failing`,
-  `test_a_declared_import_defect_that_does_not_parse_is_no_verdict`,
   `test_an_import_defect_set_validates_and_passes_on_the_fix`).
 - **An import declaration is honoured only where parsing is checked
-  reliably** — Python, compiled from bytes
-  (`test_only_reliably_parsed_files_honour_an_import_declaration`; a BOM and a
-  coding cookie parse, `.js`/`.ts` are uncheckable). The writer prompt's JSON
-  example is checked against the schema
-  (`test_the_writer_prompt_example_matches_the_schema`). Three more reversions,
-  3 caught. A non-Python file declared an import defect is dropped alone, not
-  with its whole set
+  reliably** — Python only. First pinned by an in-process compile test,
+  since replaced by the project-interpreter probe (see the next subsection).
+  The writer prompt's JSON example is checked against the schema
+  (`test_the_writer_prompt_example_matches_the_schema`). A non-Python file
+  declared an import defect is dropped alone, not with its whole set
   (`test_an_unhonourable_import_declaration_drops_only_its_file`; reverting
   the drop turns it red).
 - **Retry inside the repair loop**
   (`test_a_one_off_install_failure_mid_loop_keeps_the_next_round`), and the
   post-loop retry skipped for a commit already retried
   (`test_a_commit_already_retried_in_the_loop_is_not_retried_again`).
+
+### The parse probe, the collection-error signal, modes in the repair prompt (2026-10-05)
+
+6 distinct reversions run 7 times (one edit against two tests); 5 caught. The
+survivor — not deleting the probe file — is an equivalent mutant: the writer's
+new files are snapshotted before the probe exists, and its worktree is
+discarded after validation, so nothing ever reads the leftover. The deletion
+is kept for hygiene.
+
+- **pytest's fixed "collection failure" message marks a load failure**,
+  whatever `--junit-prefix` does to the classname
+  (`test_runner_reports_are_read_mechanically`, prefixed sample;
+  `test_a_junit_prefix_does_not_turn_a_load_failure_into_a_run`, real pytest).
+- **The import-declaration parse check runs under the project's own
+  interpreter and covers the writer's helpers**
+  (`test_an_import_declaration_over_unparseable_writer_files_is_not_honoured`:
+  the test file, then a helper beside it;
+  `test_the_parse_check_runs_under_the_projects_own_interpreter`;
+  `test_the_parse_probe_leaves_nothing_in_the_set`).
+- **The repair prompt names import-mode cases apart**
+  (`test_import_cases_are_named_as_import_failures_in_the_repair_section`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

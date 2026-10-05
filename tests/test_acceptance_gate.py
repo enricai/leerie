@@ -530,12 +530,20 @@ _JUNIT_NONE = '<testsuites><testsuite tests="0"/></testsuites>'
 _JUNIT_SKIPPED = ('<testsuites><testsuite tests="1"><testcase classname="t" '
                   'name="test_a"><skipped/></testcase></testsuite>'
                   '</testsuites>')
+# pytest's fixed messages (src/_pytest/junitxml.py): "collection failure"
+# for a file it could not collect, 'failed on setup with "…"' for a setup
+# error on a case that ran.
 _JUNIT_COLLECT = ('<testsuites><testsuite tests="1" errors="1"><testcase '
-                  'classname="" name="t"><error message="x"/></testcase>'
-                  '</testsuite></testsuites>')
+                  'classname="" name="t"><error message="collection failure"/>'
+                  '</testcase></testsuite></testsuites>')
+_JUNIT_COLLECT_PREFIXED = (
+    '<testsuites><testsuite tests="1" errors="1"><testcase classname="pfx" '
+    'name="t"><error message="collection failure"/></testcase></testsuite>'
+    '</testsuites>')
 _JUNIT_SETUP = ('<testsuites><testsuite tests="1" errors="1"><testcase '
-                'classname="t" name="test_a"><error message="fixture"/>'
-                '</testcase></testsuite></testsuites>')
+                'classname="t" name="test_a"><error message='
+                '\'failed on setup with "boom"\'/></testcase></testsuite>'
+                '</testsuites>')
 _JEST_PASS = json.dumps({"testResults": [{"status": "passed",
     "assertionResults": [{"status": "passed"}, {"status": "failed"}]}]})
 _JEST_NONE = json.dumps({"testResults": []})
@@ -548,6 +556,9 @@ _JEST_BROKEN = json.dumps({"testResults": [{"status": "failed",
     ("junit", _JUNIT_NONE, {"executed": 0, "collection_error": False}),
     ("junit", _JUNIT_SKIPPED, {"executed": 0, "collection_error": False}),
     ("junit", _JUNIT_COLLECT, {"executed": 0, "collection_error": True}),
+    # `--junit-prefix` fills in the classname; the message still says it.
+    ("junit", _JUNIT_COLLECT_PREFIXED,
+     {"executed": 0, "collection_error": True}),
     # A setup error sits on a real, named case: a test that ran.
     ("junit", _JUNIT_SETUP, {"executed": 1, "collection_error": False}),
     ("jest-json", _JEST_PASS, {"executed": 2, "collection_error": False}),
@@ -629,30 +640,106 @@ def test_a_declared_import_defect_counts_as_failing(leerie, tmp_path, mode,
     assert _validate(leerie, st, repo, "test_probe.py", mode) is want
 
 
-def test_a_declared_import_defect_that_does_not_parse_is_no_verdict(
-        leerie, tmp_path):
+def test_a_junit_prefix_does_not_turn_a_load_failure_into_a_run(
+        leerie, tmp_path, monkeypatch):
+    """`--junit-prefix` gave pytest's collection-error case a classname, so
+    the old empty-classname rule read it as an executed test, and an
+    assertion-mode defect file that could not even load counted as
+    failing on the base."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
-    (repo / "test_probe.py").write_text("from calc import mul(\n")
-    assert _validate(leerie, st, repo, "test_probe.py", "import") is None
+    monkeypatch.setenv("PYTEST_ADDOPTS", "--junit-prefix=pfx")
+    (repo / "test_probe.py").write_text(_IMPORT_DEFECT)
+    assert _validate(leerie, st, repo, "test_probe.py") is None
 
 
-@pytest.mark.parametrize("name,data,want", [
-    ("test_ok.py", b"from calc import mul\n", True),
-    # Valid Python the old text-mode read rejected: a BOM, a coding cookie.
-    ("test_bom.py", b"\xef\xbb\xbffrom calc import mul\n", True),
-    ("test_latin.py", b"# -*- coding: latin-1 -*-\ns = '\xe9'\n", True),
-    ("test_bad.py", b"from calc import mul(\n", False),
-    # Uncheckable languages: the declaration is not honoured (round-14 M2).
-    ("acc/a.test.js", b"import { mul } from '../calc.js';\n", False),
-    ("acc/a.test.ts", b"import { mul } from '../calc';\n", False),
+def _import_writer(leerie, monkeypatch, files):
+    async def fake_claude_p(**kw):
+        wt = Path(kw["cwd"])
+        decl = []
+        for rel, (text, mode) in files.items():
+            (wt / rel).parent.mkdir(parents=True, exist_ok=True)
+            (wt / rel).write_text(text)
+            if mode:
+                decl.append({"path": rel, "kind": "defect",
+                             "cases": ["mul exists"], "failure_mode": mode})
+        return {"files": decl}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+
+@pytest.mark.parametrize("files", [
+    # The test file itself does not parse.
+    {"acc/test_defect_mul.py": ("from calc import mul(\n", "import")},
+    # It parses, but a helper the writer wrote beside it does not.
+    {"acc/test_defect_mul.py": (_IMPORT_DEFECT, "import"),
+     "acc/helpers_mul.py": ("def broken(:\n    pass\n", None)},
 ])
-def test_only_reliably_parsed_files_honour_an_import_declaration(
-        leerie, tmp_path, name, data, want):
-    p = tmp_path / name
-    p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_bytes(data)
-    assert leerie._acceptance_file_parses(str(tmp_path), name) is want
+def test_an_import_declaration_over_unparseable_writer_files_is_not_honoured(
+        leerie, tmp_path, monkeypatch, capsys, files):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch, files)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    assert acc["sets"] == []
+    assert "declaration not honoured" in capsys.readouterr().out
+
+
+def test_the_parse_check_runs_under_the_projects_own_interpreter(
+        leerie, tmp_path, monkeypatch, capsys):
+    """The scoped command runs the probe, so its interpreter decides. Here
+    the project's "interpreter" (a wrapper) rejects the probe outright: an
+    in-process check by the orchestrator's own Python would have passed."""
+    repo, head = _repo(tmp_path)
+    wrapper = tmp_path / "project-python"
+    # The project's interpreter: it rejects the probe file, and otherwise
+    # behaves as python3. Invoked as `<it> -m pytest`, so the runner (and
+    # its report) is still recognised.
+    wrapper.write_text(
+        "#!/bin/sh\ncase \"$*\" in *parse_probe*) exit 1;; esac\n"
+        "exec python3 \"$@\"\n")
+    wrapper.chmod(0o755)
+    (repo / ".leerie" / "config.toml").write_text(
+        f'test_scoped = "{wrapper} -m pytest -q -p no:cacheprovider '
+        '{test_files}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/test_defect_mul.py": (_IMPORT_DEFECT, "import")})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    assert acc["sets"] == []
+    assert "declaration not honoured" in capsys.readouterr().out
+
+
+def test_the_parse_probe_leaves_nothing_in_the_set(leerie, tmp_path,
+                                                  monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch, {
+        "acc/test_defect_mul.py": (_IMPORT_DEFECT, "import"),
+        "acc/helpers_mul.py": ("VALUE = 6\n", None)})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_mul.py"]
+    assert s["support_files"] == ["acc/helpers_mul.py"]
+    stored = sorted(str(p.relative_to(s["dir"]))
+                    for p in Path(s["dir"]).rglob("*") if p.is_file())
+    assert not any("parse_probe" in p for p in stored)
+
+
+def test_import_cases_are_named_as_import_failures_in_the_repair_section(
+        leerie):
+    sets = [{"index": 1, "modes": {"acc/test_defect_mul.py": "import"},
+             "cases": {"acc/test_defect_mul.py": ["mul exists"],
+                       "acc/test_defect_add.py": ["add sums"]}}]
+    res = [{"index": 1, "passed": False,
+            "failing_files": ["acc/test_defect_mul.py",
+                              "acc/test_defect_add.py"]}]
+    text = leerie._format_acceptance_failures_section(res, sets, {1}, 1, "x")
+    head, _, tail = text.partition("cannot be imported")
+    assert "  - add sums" in head and "mul exists" not in head
+    assert "  - mul exists" in tail
 
 
 def test_an_unhonourable_import_declaration_drops_only_its_file(

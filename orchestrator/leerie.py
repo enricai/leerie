@@ -33046,9 +33046,15 @@ def _parse_runner_report(kind: str, path: Path) -> dict | None:
             for case in root.iter("testcase"):
                 tags = {child.tag for child in case}
                 # pytest records a file it could not collect (a syntax
-                # error, a failed import) as a case with no class name and
-                # an <error>; a setup error sits on a real, named case.
-                if not case.get("classname") and "error" in tags:
+                # error, a failed import) as a case whose <error> carries
+                # the fixed message "collection failure"
+                # (`append_collect_error` in its junitxml plugin). Keyed on
+                # that, not on an empty classname, which `--junit-prefix`
+                # fills in. A setup error ("failed on setup with …") sits on
+                # a real case that ran.
+                if any(child.tag == "error"
+                       and child.get("message") == "collection failure"
+                       for child in case):
                     collection_error = True
                 elif "skipped" not in tags:
                     executed += 1
@@ -33073,22 +33079,56 @@ def _parse_runner_report(kind: str, path: Path) -> dict | None:
     return None
 
 
-def _acceptance_file_parses(tree: str, rel: str) -> bool:
-    """A mechanical syntax check of a test file itself, guarding a
-    writer-declared import defect against a file that merely fails to
-    parse. Only where the check is reliable: a Python file, compiled from
-    its bytes (so an encoding cookie or BOM is honoured). Anything else is
-    False — uncheckable, so the declaration is not honoured: `node --check`
-    accepts a syntax error in an ES-module file run through babel, and
-    TypeScript has no parser check short of a build."""
-    if not rel.endswith(".py"):
+_PARSE_PROBE_SOURCE = """\
+import pathlib
+import unittest
+
+_TARGETS = {targets!r}
+
+
+class LeerieParseProbe(unittest.TestCase):
+    def test_targets_parse(self):
+        for path in _TARGETS:
+            compile(pathlib.Path(path).read_bytes(), path, "exec",
+                    dont_inherit=True)
+"""
+
+
+async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
+                                  test_rel: str, targets: list[str],
+                                  log_path: Path, label: str) -> bool:
+    """Whether every one of `targets` (a writer's import-declared test file
+    and the Python files it wrote beside it) parses under the PROJECT's own
+    interpreter — not the orchestrator's, which may be a different version.
+
+    A throwaway test file beside `test_rel` compiles each target, and runs
+    through the repo's own scoped test command, so it gets that command's
+    interpreter and environment; a `unittest.TestCase` so any Python runner
+    collects it. True only on exit 0; no command, a shell that cannot run
+    it, or any failure is False — the declaration then is not honoured."""
+    probe = Path(test_rel).parent / (
+        "test_leerie_parse_probe_"
+        f"{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}.py")
+    cmd = _acceptance_cmd(st, [str(probe)])
+    if cmd is None:
         return False
-    p = Path(tree) / rel
+    path = Path(tree) / probe
     try:
-        compile(p.read_bytes(), str(p), "exec", dont_inherit=True)
-    except (SyntaxError, ValueError, OSError):
+        path.write_text(_PARSE_PROBE_SOURCE.format(
+            targets=[str(Path(tree) / t) for t in targets]))
+        async with _blt_semaphore(caps):
+            rc, _tail = await _run_streaming(
+                ["bash", "-c", cmd], cwd=str(tree),
+                timeout=float(caps.get("worker_timeout_sec",
+                                       DEFAULT_CAPS["worker_timeout_sec"])),
+                log_path=log_path, label=f"{label}-parse-probe: {cmd}",
+                verbosity="quiet")
+        return rc == 0
+    except (OSError, subprocess.TimeoutExpired):
         return False
-    return True
+    finally:
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def _acceptance_declared_rel(declared: dict) -> str:
@@ -33132,8 +33172,9 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     Only when `validating` (on the base, by the writer): the runner is asked
     for a structured report (`_acceptance_report_spec`). A file that ran no
     test is no verdict, and so is one that could not be loaded — unless the
-    writer declared its defect an import failure (`failure_mode="import"`)
-    and the file itself parses, when not loading IS the defect showing.
+    writer declared its defect an import failure (`failure_mode="import"`,
+    passed only once `_acceptance_parse_probe` has shown the file and its
+    helpers parse), when not loading IS the defect showing.
     Without a report, a runner's ran-no-test exit (`_RUNNER_NO_VERDICT_EXITS`)
     is no verdict.
 
@@ -33177,7 +33218,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             return None
         return rc == 0
     if parsed["collection_error"]:
-        if failure_mode == "import" and _acceptance_file_parses(tree, rel):
+        if failure_mode == "import":
             return False
         return None
     if parsed["executed"] == 0:
@@ -33315,6 +33356,19 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 log(f"  acceptance set {k}: {rel} declared an import defect, "
                     "honoured only for Python test files — file dropped")
                 continue
+            if mode == "import" and not await _acceptance_parse_probe(
+                    st, caps, str(wt), rel,
+                    [rel] + [n for n in new_files
+                             if n.endswith(".py") and n != rel],
+                    log_path, f"acceptance-{k}-base"):
+                # A file — or a helper beside it — that does not parse under
+                # the project's interpreter fails to load by the writer's own
+                # fault: validate it as an ordinary file, so a load failure
+                # is no verdict and discards the set.
+                log(f"  acceptance set {k}: {rel} declared an import defect, "
+                    "but it or a Python file beside it does not parse under "
+                    "the project's interpreter — declaration not honoured")
+                mode = "assertion"
             verdict = await _run_acceptance_file(
                 st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
                 validating=True, failure_mode=mode)
@@ -33561,12 +33615,25 @@ def _format_acceptance_failures_section(results: list[dict],
            "Fitting these names alone does not fix the defect. ")
         + "Re-derive the cause from the report itself (the task names it).",
     ]
+    import_cases: list[str] = []
     for r in results:
         if r["passed"] or r["index"] not in shown:
             continue
+        set_ = by_index[r["index"]]
         for rel in r["failing_files"]:
-            for c in by_index[r["index"]]["cases"].get(rel, [])[:12]:
-                lines.append(f"  - {c}")
+            names = set_["cases"].get(rel, [])[:12]
+            # The writer's own declaration (`modes`), never runner output:
+            # these cases fail because the entry point cannot be imported,
+            # which case names alone do not say.
+            if (set_.get("modes") or {}).get(rel) == "import":
+                import_cases.extend(names)
+            else:
+                lines.extend(f"  - {c}" for c in names)
+    if import_cases:
+        lines.append("These cases fail because the module or entry point the "
+                     "report names cannot be imported — the contract starts "
+                     "with it existing and importing cleanly:")
+        lines.extend(f"  - {c}" for c in import_cases)
     lines.append("DEFECT CONTRACT: " + (defect_shape or "(none recorded)"))
     return "\n".join(lines)
 

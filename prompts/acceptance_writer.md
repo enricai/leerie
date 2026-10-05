@@ -39,9 +39,10 @@ report is among the files the task references; read it in full first.
 6. **Run them here.** Every defect file must FAIL on this unfixed tree
    and every control file must PASS. Run each file on its own with the
    repository's test runner and iterate until that holds. The harness
-   re-checks this by exit code and drops a defect file that passes here.
-   A file that runs no test at all, or that cannot be loaded, discards
-   your WHOLE set — every file in it — unless rule 7 applies.
+   re-checks this by exit code and, where the runner can write one, by
+   its report of which tests ran; it drops a defect file that passes
+   here. A file that runs no test at all, or that cannot be loaded,
+   discards your WHOLE set — every file in it — unless rule 7 applies.
 7. **Import defects.** When the report's defect IS that loading fails —
    the entry point the report names is missing, or importing the module
    raises — a defect file that cannot load on this tree is showing the
@@ -49,8 +50,10 @@ report is among the files the task references; read it in full first.
    file that fails to load because of your own mistake (a typo, a guessed
    helper name, a library this repository does not have) is never an
    import defect, and would fail against every fix. The harness honours
-   the declaration only for Python test files, whose syntax it can check;
-   in any other language a file declared `"import"` is dropped on its own
+   the declaration only for Python test files, and only when that file
+   and every other Python file you wrote parse under the repository's own
+   interpreter (it checks); in any other language a file declared
+   `"import"` is dropped on its own
    (the rest of the set stays), so it adds nothing — there, write a case
    that loads and asserts on the missing behaviour instead.
 
