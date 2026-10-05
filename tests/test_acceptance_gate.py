@@ -655,6 +655,28 @@ def test_only_reliably_parsed_files_honour_an_import_declaration(
     assert leerie._acceptance_file_parses(str(tmp_path), name) is want
 
 
+def test_an_unhonourable_import_declaration_drops_only_its_file(
+        leerie, tmp_path, monkeypatch, capsys):
+    """PR #282 review round 2: a non-Python file declared "import" cannot
+    load, which made its verdict None and discarded the WHOLE set — the
+    valid defect file and control with it — while the prompt promised only
+    the file was lost. It is now dropped alone, before running."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {1: {
+        "acc/test_defect_sum.py": ("defect", DEFECT_TEST, ["sums"]),
+        "acc/mul.test.ts": ("defect", "import { mul } from '../mathx';\n",
+                            ["mul exists"], "import"),
+        "acc/test_control_zero.py": ("control", CONTROL_TEST, ["zero"])}})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_sum.py"]
+    assert s["control_files"] == ["acc/test_control_zero.py"]
+    assert "acc/mul.test.ts" not in s["support_files"]
+    assert "honoured only for Python test files" in capsys.readouterr().out
+
+
 def test_the_writer_prompt_example_matches_the_schema(leerie):
     """test_prompt_schema_parity checks field NAMES appear in the prompt;
     this checks the example's file items carry exactly the schema's fields

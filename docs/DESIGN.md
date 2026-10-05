@@ -6047,7 +6047,8 @@ raises on import), the writer says so for that file, and a file that
 cannot load on the base is then the defect showing — provided the file
 itself parses, which is checked mechanically and only where it can be
 checked reliably: Python, through the interpreter's own parser. A
-declared import defect in any other language stays no verdict (`node
+declared import defect in any other language is dropped on its own,
+leaving the rest of its set (`node
 --check` was measured accepting a syntax error in an ES-module test file
 run through babel, and TypeScript has no parser check short of a build).
 Reading the report to know which case applies is the writer's job, never

@@ -4590,7 +4590,10 @@ dropping the both-unreadable clause.
   coding cookie parse, `.js`/`.ts` are uncheckable). The writer prompt's JSON
   example is checked against the schema
   (`test_the_writer_prompt_example_matches_the_schema`). Three more reversions,
-  3 caught.
+  3 caught. A non-Python file declared an import defect is dropped alone, not
+  with its whole set
+  (`test_an_unhonourable_import_declaration_drops_only_its_file`; reverting
+  the drop turns it red).
 - **Retry inside the repair loop**
   (`test_a_one_off_install_failure_mid_loop_keeps_the_next_round`), and the
   post-loop retry skipped for a commit already retried

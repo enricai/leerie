@@ -33307,6 +33307,14 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 continue
             mode = ("import" if f.get("kind") == "defect"
                     and f.get("failure_mode") == "import" else "assertion")
+            if mode == "import" and not rel.endswith(".py"):
+                # The declaration cannot be honoured (no reliable parse
+                # check outside Python), and an unloadable file would
+                # otherwise discard the whole set: drop just this file, and
+                # say why — the writer was told so.
+                log(f"  acceptance set {k}: {rel} declared an import defect, "
+                    "honoured only for Python test files — file dropped")
+                continue
             verdict = await _run_acceptance_file(
                 st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
                 validating=True, failure_mode=mode)
