@@ -15,9 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
-import subprocess
 
 from tests.conftest import init_git_repo
+from tests.conftest import run_git_cwd_first_stdout as _git
 from tests.test_defect_scope_audit import (AUDIT, EFFORTS, MODELS, _caps,
                                            _drive_phase_plan, _patch_auditor,
                                            _state)
@@ -80,11 +80,6 @@ def test_inline_example_literal_reaches_the_planner_prompt(leerie, tmp_path,
 
 
 # --- the advisory site-token check ------------------------------------------
-
-def _git(cwd, *args):
-    subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                   capture_output=True)
-
 
 def _staged_run(tmp_path, base_text, added_files):
     """A run dir whose staging worktree is on a run branch that adds

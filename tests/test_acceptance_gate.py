@@ -25,6 +25,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.conftest import run_git_cwd_first_stdout as _git
+
 BUGGY = "def add(a, b):\n    return a - b\n"
 FIXED = "def add(a, b):\n    return a + b\n"
 DEFECT_TEST = ("from calc import add\n\n"
@@ -44,11 +46,6 @@ def _clear_deps_memo(leerie):
     leerie._DEPS_INSTALLED.clear()
     yield
     leerie._DEPS_INSTALLED.clear()
-
-
-def _git(cwd, *args):
-    return subprocess.run(["git", "-C", str(cwd), *args], check=True,
-                          capture_output=True, text=True).stdout.strip()
 
 
 def _repo(tmp_path: Path) -> tuple[Path, str]:

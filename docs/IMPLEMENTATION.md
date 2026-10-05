@@ -3195,7 +3195,7 @@ wire syntax: `antml:`, `<parameter name="`, `</parameter>`, `<invoke name="`,
 schema. Markdown code spans — fenced blocks (a line-anchored ```` ``` ````,
 optionally indented, to the next one; an unclosed fence followed by a leak
 that itself contains a line-anchored fence is a known miss) and inline backtick spans — are
-removed first (`_BACKTICK_SPAN_RE`), so code a worker quotes (a repo that is
+removed first (`_QUOTED_CODE_SPAN_RE`), so code a worker quotes (a repo that is
 itself about this protocol) is not a hit. A hit sets
 `last_problem` and `continue`s into the existing attempt-2 corrective
 re-prompt; a second hit raises the usual `WorkerError("worker failed

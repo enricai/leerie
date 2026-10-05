@@ -15070,7 +15070,7 @@ _PROTOCOL_MARKUP_TOKENS = (
 # worker is quoting (a repo that is itself about this protocol, an HTML
 # snippet in a PR body), not leaked syntax; the one legitimate hit in a
 # 120-sample corpus audit was exactly that shape.
-_BACKTICK_SPAN_RE = re.compile(r"^[ \t]*```[^\n]*\n.*?^[ \t]*```|`[^`\n]*`",
+_QUOTED_CODE_SPAN_RE = re.compile(r"^[ \t]*```[^\n]*\n.*?^[ \t]*```|`[^`\n]*`",
                                re.S | re.M)
 
 
@@ -15120,7 +15120,7 @@ def _find_protocol_markup(value: object,
     — the corruption lands in arbitrary nested fields (e.g. inside
     `clarification_question`)."""
     if isinstance(value, str):
-        bare = _BACKTICK_SPAN_RE.sub("", value)
+        bare = _QUOTED_CODE_SPAN_RE.sub("", value)
         if any(t in bare for t in _PROTOCOL_MARKUP_TOKENS):
             return value
         if "</" in bare and _closing_tag_leak(bare, prop_names):
