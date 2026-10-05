@@ -6079,9 +6079,10 @@ record then describes the repair's tree, which is what ships, and the
 next run's planner is told the repair it should not have inherited is
 still on the branch. With no readable HEAD to reset to, no repair starts. The
 pre-repair verdict and HEAD are persisted before the first round and
-every round after it runs (a round whose worker committed and then
-failed is measured again, since the previous verdict no longer describes
-the tree; when the shipped tree cannot be measured at all — usually an
+every round after it runs, each verdict pinned to the commit it was
+measured on (a round whose worker failed is measured again whenever HEAD
+is not that commit — whether its worker committed before failing or an
+interrupted earlier attempt at the round did, before a resume; when the shipped tree cannot be measured at all — usually an
 environment failure, since a repair that made the sets unmeasurable is
 rolled back below, unless that rollback itself fails — the last measured
 failing verdict is the residual, marked as such), and the rollback decision

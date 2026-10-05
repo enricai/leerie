@@ -4310,8 +4310,9 @@ evidence, and disputed at most once*).
 - **Settle.** Passing sets → no work (`verdict: pass`); failing sets with no
   prior dispute → `acceptance_dispute` plus a `no_work_dispute` whose evidence
   names only the failing cases, pending cleared, planning continues; failing
-  sets after a prior dispute → no work with a WARNING and no second dispute
-  record (falsified by removing the dispute-once branch); no valid sets → the
+  sets after a prior dispute → no work with a WARNING and the dispute marker
+  re-recorded with `accepted: true` — carried forward, not a new dispute
+  (falsified by removing the dispute-once branch); no valid sets → the
   judge's confirmation stands.
 - **Dispute-once lookup.** Only the newest COMPLETED same-task sibling counts;
   another task's or a crashed run's record is ignored.
@@ -4495,8 +4496,8 @@ its test made both HEAD reads unreadable).
   `test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up`).
 - **An unmeasurable final keeps the last measured residual**
   (`test_an_unmeasurable_final_keeps_the_last_measured_residual`), and an
-  unreadable HEAD counts as moved
-  (`test_an_unreadable_round_start_still_measures_a_committing_error`).
+  unreadable HEAD counts as moved (pinned since the post-merge fix by
+  `test_two_unreadable_heads_still_count_as_moved`).
 
 ### Review round 7 fixes (2026-10-05)
 
@@ -4550,6 +4551,24 @@ the two test-axis measurement guards only after
 - **The reset itself is retried** (`test_a_reset_that_cannot_spawn_is_tried_again`).
 - **A measured retry replaces the round's record**
   (`test_a_one_off_install_failure_keeps_a_correct_repair`).
+
+### Post-merge review fixes (2026-10-05)
+
+Both reversions caught: restoring the HEAD-at-round-start comparison, and
+dropping the both-unreadable clause.
+
+- **A resumed round after a lost commit is measured again**
+  (`test_a_resumed_round_after_a_lost_commit_is_measured_again`): every
+  verdict now records the commit it was measured on (`initial_sha`,
+  `rounds[].sha`), and an errored round compares HEAD against that, not
+  against HEAD at the round's start — which, after an interrupted attempt,
+  already held the lost commit.
+- **Two unreadable HEADs still count as moved**
+  (`test_two_unreadable_heads_still_count_as_moved`, replacing
+  `test_an_unreadable_round_start_still_measures_a_committing_error`, whose
+  read order no longer exists).
+- `test_each_evaluation_installs_into_its_fresh_worktree`'s spy now returns the
+  install's verdict, and the test asserts both evaluations measured.
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

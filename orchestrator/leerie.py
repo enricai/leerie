@@ -15070,8 +15070,8 @@ _PROTOCOL_MARKUP_TOKENS = (
 # worker is quoting (a repo that is itself about this protocol, an HTML
 # snippet in a PR body), not leaked syntax; the one legitimate hit in a
 # 120-sample corpus audit was exactly that shape.
-_QUOTED_CODE_SPAN_RE = re.compile(r"^[ \t]*```[^\n]*\n.*?^[ \t]*```|`[^`\n]*`",
-                               re.S | re.M)
+_QUOTED_CODE_SPAN_RE = re.compile(
+    r"^[ \t]*```[^\n]*\n.*?^[ \t]*```|`[^`\n]*`", re.S | re.M)
 
 
 def _schema_property_names(schema: object) -> frozenset[str]:
@@ -32458,10 +32458,11 @@ def _downgrade_ungrounded_met(contract: dict | None,
 
 def _prior_delivery_residual(st: "State") -> dict | None:
     """The most recent OTHER run's recorded delivery-gate residual for
-    the SAME task, or None (DESIGN §8 *The gate judges the finding, not
-    only the items* — the cross-run half: a fresh run's planners plan
-    at the recorded gap instead of rediscovering it one sub-shape at a
-    time). Task match is exact string equality on the stored task text
+    the SAME task — and its held-out acceptance residual, as
+    `acceptance_unmet` (DESIGN §8 *Held-out acceptance tests*) — or None
+    (DESIGN §8 *The gate judges the finding, not only the items* — the
+    cross-run half: a fresh run's planners plan at the recorded gap
+    instead of rediscovering it one sub-shape at a time). Task match is exact string equality on the stored task text
     (mechanical — Language-to-JSON forbids fuzzier matching here, and
     the live loop shape is the operator re-running an unchanged task
     file). Read-only over sibling run dirs, newest mtime first;
@@ -33429,17 +33430,29 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
     # an already-repaired tree, and a rolled-back tree would be recorded with
     # the repaired tree's verdict. It reaches disk with before_sha, before
     # any repair can commit.
+    async def _measure(label: str) -> tuple[list[dict], str]:
+        # Every verdict is pinned to the commit it describes: after an
+        # interrupted round, HEAD can hold commits no saved verdict saw, and
+        # only a recorded sha shows that. "" (HEAD unreadable) never matches
+        # a later read, so it always counts as moved.
+        sha = await _branch_head_sha(str(staging))
+        return (await _evaluate_acceptance_sets(
+            st, caps, str(staging), sets, label, rev=sha or "HEAD"), sha)
+
     if "initial" in gate:
         initial = gate["initial"]
     else:
-        initial = await _evaluate_acceptance_sets(st, caps, str(staging),
-                                                  sets, "gate-initial")
+        initial, gate["initial_sha"] = await _measure("gate-initial")
         gate["initial"] = initial
     # The latest verdict with results: an errored round carries results
     # only when it committed (and was measured again); otherwise the round
-    # before it still describes the tree.
-    final = next((r["results"] for r in reversed(gate["rounds"])
-                  if r.get("results")), initial)
+    # before it still describes the tree. `final_sha` is the commit that
+    # verdict was measured on.
+    final, final_sha = initial, gate.get("initial_sha", "")
+    for r in reversed(gate["rounds"]):
+        if r.get("results"):
+            final, final_sha = r["results"], r.get("sha", "")
+            break
     # A recorded before_sha means a repair already started: resume it, so
     # the rollback check below always runs on what it committed.
     resumed_repair = bool(gate.get("before_sha"))
@@ -33516,7 +33529,6 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     final, sets, shown, rnd, shape, rounds,
                     held_back=bool(hidden)),
             ]
-            round_start = await _branch_head_sha(str(staging))
             try:
                 # Inside the try: an exhausted worker budget ends the
                 # repair like any worker failure, and the rollback check
@@ -33538,15 +33550,17 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                 # rollback check below.
                 entry = {"round": rnd, "error": _brief_worker_exc(e)}
                 # A worker can commit and then fail (a schema miss, a
-                # timeout): the previous verdict no longer describes the
-                # tree, so measure it again.
-                # An unreadable HEAD before or after counts as moved: two
-                # failed reads ("" == "") must not read as "unchanged".
+                # timeout) — or an interrupted earlier attempt at this round
+                # committed before the resume: when HEAD is not the commit
+                # the current verdict was measured on, measure it again.
+                # Compared against the verdict's sha, not the HEAD at the
+                # round's start, which already includes a lost attempt's
+                # commits. An unreadable HEAD counts as moved.
                 now = await _branch_head_sha(str(staging))
-                if not now or now != round_start:
-                    final = await _evaluate_acceptance_sets(
-                        st, caps, str(staging), sets, f"gate-r{rnd}")
+                if not now or now != final_sha:
+                    final, final_sha = await _measure(f"gate-r{rnd}")
                     entry["results"] = final
+                    entry["sha"] = final_sha
                 gate["rounds"].append(entry)
                 acc["gate"] = gate
                 st.data["acceptance"] = acc
@@ -33555,11 +33569,11 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             # `_evaluate_acceptance_sets` turns a set it cannot place into
             # no evidence rather than raising, so the rollback check below
             # always runs on what this round committed.
-            final = await _evaluate_acceptance_sets(
-                st, caps, str(staging), sets, f"gate-r{rnd}")
+            final, final_sha = await _measure(f"gate-r{rnd}")
             # Saved per round: a crash before the rollback check must not
             # lose a spent round, or a resume would run it past the cap.
-            gate["rounds"].append({"round": rnd, "results": final})
+            gate["rounds"].append({"round": rnd, "results": final,
+                                   "sha": final_sha})
             acc["gate"] = gate
             st.data["acceptance"] = acc
             st.save()
@@ -33594,12 +33608,12 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     # (a network blip) looks the same. Measure the repaired
                     # tree once more; only if it still measures nothing while
                     # the pre-repair tree does is the repair to blame.
-                    retry = await _evaluate_acceptance_sets(
-                        st, caps, str(staging), sets, "gate-retry")
+                    retry, retry_sha = await _measure("gate-retry")
                     if _acceptance_measured(retry):
-                        final = retry
+                        final, final_sha = retry, retry_sha
                         if gate["rounds"]:
                             gate["rounds"][-1]["results"] = retry
+                            gate["rounds"][-1]["sha"] = retry_sha
                     else:
                         control = await _evaluate_acceptance_sets(
                             st, caps, str(staging), sets, "gate-before",

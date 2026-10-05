@@ -314,14 +314,17 @@ def test_each_evaluation_installs_into_its_fresh_worktree(
 
     async def spy(tree, *a, **k):
         before = len(leerie._DEPS_INSTALLED)
-        await real(tree, *a, **k)
+        ok = await real(tree, *a, **k)
         installs.append(len(leerie._DEPS_INSTALLED) > before)
+        return ok
     monkeypatch.setattr(leerie, "_ensure_worktree_deps", spy)
     sets = _make_sets(leerie, st, 1)
-    for label in ("one", "two"):
-        asyncio.run(leerie._evaluate_acceptance_sets(
-            st, _caps(leerie, 1), str(staging), sets, label))
+    results = [asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), sets, label))
+        for label in ("one", "two")]
     assert installs == [True, True]
+    # The spy passes the install's verdict on, so both runs measured.
+    assert all(not r[0]["unmeasured"] for r in results)
 
 
 def _failing_recipe(st, *, fail: bool):
@@ -1583,8 +1586,11 @@ def test_an_unmeasurable_final_keeps_the_last_measured_residual(
     assert res["failing_sets"] == 5 and res["unmeasured_final"] is True
 
 
-def test_an_unreadable_round_start_still_measures_a_committing_error(
-        leerie, tmp_path, monkeypatch):
+def test_two_unreadable_heads_still_count_as_moved(leerie, tmp_path,
+                                                   monkeypatch):
+    """The verdict's commit and the HEAD after an errored round both
+    unreadable: "" == "" must not read as "unchanged", so the tree is
+    measured again."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
@@ -1594,16 +1600,14 @@ def test_an_unreadable_round_start_still_measures_a_committing_error(
 
     async def flaky(wt):
         n.append(1)
-        # 1: before_sha; 2 and 3: round_start and the HEAD after the
-        # errored round, both unreadable ("" == "" must not read as
-        # "unchanged"); later: real.
-        return "" if len(n) in (2, 3) else await real(wt)
+        # 1: the initial verdict's sha, 3: HEAD after the errored round —
+        # both unreadable; 2 (before_sha) and later reads are real.
+        return "" if len(n) in (1, 3) else await real(wt)
     monkeypatch.setattr(leerie, "_branch_head_sha", flaky)
 
-    async def commits_then_fails(**kw):
-        _commit_fix(Path(kw["cwd"]))
+    async def fails(**kw):
         raise leerie.WorkerError("schema miss")
-    monkeypatch.setattr(leerie, "claude_p", commits_then_fails)
+    monkeypatch.setattr(leerie, "claude_p", fails)
 
     async def axes(tree, axes_, st_, caps, **kw):
         return {"tests": {"passed": True, "measured": True}}
@@ -1611,6 +1615,46 @@ def test_an_unreadable_round_start_still_measures_a_committing_error(
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     assert st.data["acceptance"]["gate"]["rounds"][0].get("results")
+
+
+def test_a_resumed_round_after_a_lost_commit_is_measured_again(
+        leerie, tmp_path, monkeypatch):
+    """Post-merge review M: round 1 committed, the process died before the
+    round was saved, and the resumed round 1 failed without committing.
+    HEAD at the resumed round's start already held the lost commit, so a
+    "did this round move HEAD" check saw nothing and kept the stale
+    verdict — a false residual for a correct fix. The comparison is now
+    against the commit the verdict was measured on."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+
+    async def axes(tree, axes_, st_, caps, **kw):
+        return {"tests": {"passed": True, "measured": True}}
+    monkeypatch.setattr(leerie, "_measure_axes", axes)
+
+    async def commits_then_dies(**kw):
+        _commit_fix(Path(kw["cwd"]))
+        raise _Killed("interrupted mid-round")
+    monkeypatch.setattr(leerie, "claude_p", commits_then_dies)
+    with pytest.raises(_Killed):
+        asyncio.run(leerie._run_acceptance_gate(
+            st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    # Resume: state as saved on disk, the lost commit still on staging.
+    st.data = json.loads((st.run_dir / "state.json").read_text())
+    assert st.data["acceptance"]["gate"]["rounds"] == []
+
+    async def fails(**kw):
+        raise leerie.WorkerError("worker timed out")
+    monkeypatch.setattr(leerie, "claude_p", fails)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    gate = st.data["acceptance"]["gate"]
+    assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
+    assert gate["rounds"][0]["results"] and all(
+        r["passed"] for r in gate["final"])
+    assert "residual" not in gate
 
 
 def test_branch_head_sha_never_raises(leerie, tmp_path, monkeypatch):
