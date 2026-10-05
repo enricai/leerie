@@ -19250,19 +19250,26 @@ def _warn_denial_skipped_once(root: Path) -> None:
 def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
     """Keep the held-out acceptance sets out of the fixers' reach (DESIGN §8
     *Held-out acceptance tests*): `Read` denies for implementer and
-    conformer on the run's acceptance directory, on every `acceptance-*`
-    log (the writers' stream transcripts carry the test source; evaluation
-    logs carry runner output) and on `calls.ndjson` (the writers' captured
-    responses), joined with `_repo_write_denials`' rules at the call site.
-    A shell `cat` is not covered; hiding reduces the special-casing
-    incentive, it does not guarantee it."""
+    conformer on every run-directory file that records a set — the sets
+    themselves, the evaluation worktree, every log (the writers' stream
+    transcripts carry the test source), `orchestrator.log` (where streamed
+    output is echoed), `calls.ndjson` (the writers' responses) and
+    `state.json` (case names and paths) — and on the CLI's own session
+    transcripts. The fixers' prompts read only `subtasks/`, `criteria/` and
+    `checkpoints/` there. Joined with `_repo_write_denials`' rules at the
+    call site. A shell `cat` is not covered; hiding reduces the
+    special-casing incentive, it does not guarantee it."""
     if schema_key not in ("implementer", "conformer"):
         return ""
     rd = Path(run_dir)
     # `//` anchors an absolute path for the CLI, as in _repo_write_denials.
     return ",".join([f"Read(/{rd / 'acceptance'}/**)",
-                     f"Read(/{rd / 'logs'}/acceptance-*)",
-                     f"Read(/{rd / 'calls.ndjson'})"])
+                     f"Read(/{rd / 'worktrees' / 'acceptance-eval'}/**)",
+                     f"Read(/{rd / 'logs'}/**)",
+                     f"Read(/{rd / 'orchestrator.log'})",
+                     f"Read(/{rd / 'calls.ndjson'})",
+                     f"Read(/{rd / 'state.json'})",
+                     "Read(~/.claude/projects/**)"])
 
 
 def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
@@ -32899,7 +32906,7 @@ def _acceptance_validity_base(st: "State") -> str | None:
 # hidden tests' names in the tree a fixer works in.
 _ACCEPTANCE_BYPRODUCT_PARTS = frozenset({
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
-    ".hypothesis", ".cache"})
+    ".hypothesis"})
 # Environments a runner provisions: never a set's file, never cleaned.
 _ACCEPTANCE_PROVISION_PARTS = frozenset({
     "node_modules", ".venv", "venv", ".tox", ".nox"})
@@ -32920,6 +32927,17 @@ def _acceptance_is_cache_path(rel: str) -> bool:
     needs."""
     return (_acceptance_is_byproduct_path(rel)
             or bool(set(Path(rel).parts) & _ACCEPTANCE_PROVISION_PARTS))
+
+
+def _acceptance_declared_rel(declared: dict) -> str:
+    """A writer-declared path in the form git reports it: writers often
+    prefix `./`, and a declared file compared unnormalised against git's
+    list would also be carried as a support file — and then collide with
+    itself at evaluation."""
+    rel = str(declared.get("path") or "")
+    while rel.startswith("./"):
+        rel = rel[2:]
+    return rel
 
 
 def _acceptance_cmd(st: "State", files: list[str]) -> str | None:
@@ -32943,20 +32961,32 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                rel: str, log_path: Path,
                                label: str) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
-    False failed, None not measurable (no command / runner missing)."""
+    False failed, None not measurable (no command, the shell could not run
+    it — exit 126/127 — or the container's limits killed it).
+
+    Not `_measure_blt`: its "could not measure" test reads the whole output
+    for `No such file or directory`, which is also what a test of a missing-
+    file defect prints when it fails — exactly the failure a defect file
+    exists to show. And always quiet: a streamed echo would put the hidden
+    test's source and output in `orchestrator.log`."""
     cmd = _acceptance_cmd(st, [rel])
     if cmd is None:
         return None
-    res = await _measure_blt(
-        "tests", cmd, tree,
-        timeout=float(caps.get("worker_timeout_sec",
-                               DEFAULT_CAPS["worker_timeout_sec"])),
-        log_path=log_path,
-        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-        label_prefix=label)
-    if not res.get("measured", True):
+    async with _blt_semaphore(caps):
+        try:
+            rc, tail = await _run_streaming(
+                ["bash", "-c", cmd], cwd=str(tree),
+                timeout=float(caps.get("worker_timeout_sec",
+                                       DEFAULT_CAPS["worker_timeout_sec"])),
+                log_path=log_path, label=f"{label}-tests: {cmd}",
+                verbosity="quiet")
+        except subprocess.TimeoutExpired:
+            return False
+        except Exception:
+            return None
+    if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
         return None
-    return bool(res.get("passed"))
+    return rc == 0
 
 
 async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
@@ -33035,28 +33065,27 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         # fails the set elsewhere.
         porcelain = subprocess.run(
             ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
-             "--untracked-files=all"],
+             "--untracked-files=no"],
             capture_output=True, text=True, check=False)
-        if porcelain.returncode != 0:
+        # Untracked files INCLUDING ignored ones (no --exclude-standard): a
+        # helper the repo's .gitignore happens to match is still needed.
+        post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
+                               "-z"], capture_output=True, text=True,
+                              check=False)
+        if porcelain.returncode != 0 or post.returncode != 0:
             out["reason"] = "could not read the writer's worktree status"
             return out
-        new_files: list[str] = []
         for entry in porcelain.stdout.split("\0"):
-            if len(entry) < 4:
-                continue
-            code, path = entry[:2], entry[3:]
-            if code == "??":
-                if (path not in refs and path not in pre_untracked
-                        and not _acceptance_is_cache_path(path)):
-                    new_files.append(path)
-            else:
-                out["reason"] = f"writer modified a tracked file: {path}"
+            if len(entry) >= 4:
+                out["reason"] = f"writer modified a tracked file: {entry[3:]}"
                 return out
+        new_files = sorted(
+            p for p in post.stdout.split("\0")
+            if p and p not in refs and p not in pre_untracked
+            and not _acceptance_is_cache_path(p))
         defect, control, cases = [], [], {}
         for f in (res.get("files") or []):
-            rel = str(f.get("path") or "")
-            while rel.startswith("./"):
-                rel = rel[2:]
+            rel = _acceptance_declared_rel(f)
             # Relative, inside the worktree, a real file, not the report.
             if (not rel or os.path.isabs(rel) or ".." in Path(rel).parts
                     or rel in refs):
@@ -33096,7 +33125,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         # Every undeclared new file travels — a conftest or helper beside the
         # tests is test-shaped by path and still needed. Declared files that
         # were dropped (a defect file that passes on base) are not carried.
-        declared_any = {str(f.get("path") or "") for f in
+        declared_any = {_acceptance_declared_rel(f) for f in
                         (res.get("files") or [])}
         support = sorted(f for f in new_files if f not in declared_any)
         dest = leerie_dir / "acceptance" / f"set-{k}"
@@ -33159,121 +33188,83 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
 async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
                                     sets: list[dict], label: str
                                     ) -> list[dict]:
-    """Run each valid set in `tree` (copy in, run file by file, remove).
-    A set fails when any of its files fails. Files that already exist in
-    the tree are never overwritten."""
+    """Run each valid set against `tree`'s HEAD commit, in a disposable
+    worktree at that commit — never in `tree` itself. Nothing of a set can
+    then linger where a fixer works, not even after a crash mid-run (no
+    `finally` survives a SIGKILL), and no runner cache in `tree` records
+    the hidden tests' ids. A set fails when any of its files fails; a set
+    file whose path the tree already uses is never overwritten and makes
+    the set unmeasured."""
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    wt = st.run_dir / "worktrees" / "acceptance-eval"
 
-    def _untracked() -> set[str] | None:
-        # --others without --exclude-standard: ignored residue (bytecode,
-        # caches) counts too. -z: no quoting of unusual names. None on
-        # failure — then nothing is cleaned rather than everything.
-        out = subprocess.run(["git", "-C", tree, "ls-files", "--others", "-z"],
-                             capture_output=True, text=True, check=False)
-        if out.returncode != 0:
-            return None
-        return {p for p in out.stdout.split("\0") if p}
+    def _teardown() -> None:
+        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+        # A later evaluation recreates the same path: its install memo must
+        # not survive the tree it describes.
+        _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
-    untracked_before = _untracked()
-    # A runner cache that already existed is restored byte for byte after:
-    # pytest's records the ids of the tests it ran, hidden ones included.
-    saved_cache: dict[str, bytes] = {}
-    for rel in (untracked_before or ()):
-        if ".pytest_cache" in Path(rel).parts:
-            with contextlib.suppress(OSError):
-                saved_cache[rel] = (Path(tree) / rel).read_bytes()
-    touched_dirs: set[str] = set()
+    unmeasured_all = [{"index": s_["index"], "passed": False,
+                       "unmeasured": True, "failing_files": []}
+                      for s_ in sets]
+    head = subprocess.run(["git", "-C", tree, "rev-parse", "HEAD"],
+                          capture_output=True, text=True, check=False)
+    if head.returncode != 0:
+        return unmeasured_all
+    _teardown()                     # what a crashed evaluation left
+    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
+                          "--detach", str(wt), head.stdout.strip()],
+                         capture_output=True, text=True, check=False)
+    if add.returncode != 0:
+        log(f"  acceptance: could not create the evaluation worktree: "
+            f"{add.stderr.strip()[:200]} — no evidence either way")
+        return unmeasured_all
     results = []
-    for s_ in sets:
-        failing, copied, ran, created_dirs = [], [], [], []
-        unmeasured = False
-        try:
-            for rel in (s_.get("support_files") or []):
-                dst = Path(tree) / rel
-                if dst.exists():
-                    unmeasured = True
-                    continue
-                d = dst.parent
-                while not d.exists():
-                    created_dirs.append(d)
-                    d = d.parent
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(Path(s_["dir"]) / rel, dst)
-                copied.append(dst)
-                touched_dirs.add(str(Path(rel).parent))
-            for rel in s_["defect_files"] + s_["control_files"]:
-                dst = Path(tree) / rel
-                if dst.exists():
-                    # Never overwrite (or run in its place) a file the run
-                    # itself put at that path — and never count the set as
-                    # passing on a file it could not run.
-                    unmeasured = True
-                    continue
-                d = dst.parent
-                while not d.exists():
-                    created_dirs.append(d)
-                    d = d.parent
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(Path(s_["dir"]) / rel, dst)
-                copied.append(dst)
-                ran.append(rel)
-                touched_dirs.add(str(Path(rel).parent))
-            for rel in ran:
-                verdict = await _run_acceptance_file(
-                    st, caps, tree, rel, log_path, f"acceptance-{label}")
-                if verdict is None:
-                    unmeasured = True
-                elif verdict is False:
-                    failing.append(rel)
-        finally:
-            for dst in copied:
-                with contextlib.suppress(OSError):
-                    dst.unlink()
-            # Directories this call created (and any bytecode the runner
-            # left in them) go too: nothing of a hidden set may linger in
-            # the tree a fixer works in.
-            for d in sorted(created_dirs, key=lambda x: len(x.parts)):
-                shutil.rmtree(d, ignore_errors=True)
-        results.append({"index": s_["index"],
-                        "passed": not failing and not unmeasured,
-                        "unmeasured": unmeasured and not failing,
-                        "failing_files": failing})
-    # Anything else the runs left in the tree (a runner's caches beside a
-    # pre-existing directory) goes too: nothing of a hidden set may linger
-    # where a fixer works, and nothing may reach a commit.
-    # Only beneath directories a held-out file was placed in: a runner that
-    # provisions elsewhere on first call (a virtualenv, a build dir) keeps
-    # what it made.
-    after = _untracked()
-    if untracked_before is not None and after is not None:
-        def _under(rel: str) -> bool:
-            # A by-product cache anywhere goes (a root `.pytest_cache` names
-            # the hidden tests); otherwise only beneath a directory a held-out
-            # file was placed in — for a file placed at the root, only other
-            # root-level files, so a runner's provisioning elsewhere stays.
-            if _acceptance_is_byproduct_path(rel):
-                return True
-            if set(Path(rel).parts) & _ACCEPTANCE_PROVISION_PARTS:
-                return False
-            return any(("/" not in rel) if d in (".", "")
-                       else (rel == d or rel.startswith(d + "/"))
-                       for d in touched_dirs)
-        for rel in sorted(after - untracked_before):
-            if _under(rel):
-                with contextlib.suppress(OSError):
-                    (Path(tree) / rel).unlink()
-                # Directories this emptied go too (a removed cache leaves its
-                # directory; git never lists an empty one).
-                d = (Path(tree) / rel).parent
-                while d != Path(tree):
-                    try:
-                        d.rmdir()
-                    except OSError:
-                        break
-                    d = d.parent
-    for rel, data in saved_cache.items():
-        with contextlib.suppress(OSError):
-            (Path(tree) / rel).write_bytes(data)
+    try:
+        await _ensure_worktree_deps(
+            str(wt), st, caps, log_path=log_path,
+            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+            label_prefix=f"acceptance-{label}", log_prefix="acceptance")
+        for s_ in sets:
+            failing, copied, ran = [], [], []
+            unmeasured = False
+            try:
+                for rel in ((s_.get("support_files") or [])
+                            + s_["defect_files"] + s_["control_files"]):
+                    dst = wt / rel
+                    if dst.exists():
+                        # Never overwrite (or run in its place) a file the
+                        # tree already has — and never count the set as
+                        # passing on a file it could not run.
+                        unmeasured = True
+                        continue
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(Path(s_["dir"]) / rel, dst)
+                    copied.append(dst)
+                    if rel not in (s_.get("support_files") or []):
+                        ran.append(rel)
+                for rel in ran:
+                    verdict = await _run_acceptance_file(
+                        st, caps, str(wt), rel, log_path,
+                        f"acceptance-{label}")
+                    if verdict is None:
+                        unmeasured = True
+                    elif verdict is False:
+                        failing.append(rel)
+            finally:
+                # Sets are isolated from one another: one set's files are
+                # gone before the next set's go in.
+                for dst in copied:
+                    with contextlib.suppress(OSError):
+                        dst.unlink()
+            results.append({"index": s_["index"],
+                            "passed": not failing and not unmeasured,
+                            "unmeasured": unmeasured and not failing,
+                            "failing_files": failing})
+    finally:
+        _teardown()
     return results
 
 
@@ -33337,11 +33328,6 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         return
     st.data["current_phase"] = "phase 5: acceptance gate"
     st.save()
-    await _ensure_worktree_deps(
-        str(staging), st, caps,
-        log_path=leerie_dir / "logs" / "acceptance-gate.log",
-        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-        label_prefix="acceptance-gate", log_prefix="acceptance")
     gate: dict = dict(acc.get("gate") or {})
     gate.setdefault("rounds", [])
     # The pre-repair verdict is reused on resume: re-measured, it would read
@@ -33354,8 +33340,10 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         initial = await _evaluate_acceptance_sets(st, caps, str(staging),
                                                   sets, "gate-initial")
         gate["initial"] = initial
-    final = (gate["rounds"][-1].get("results") or initial
-             if gate["rounds"] else initial)
+    # The latest verdict with results: an errored round committed nothing
+    # new, so the round before it still describes the tree.
+    final = next((r["results"] for r in reversed(gate["rounds"])
+                  if r.get("results")), initial)
     # A recorded before_sha means a repair already started: resume it, so
     # the rollback check below always runs on what it committed.
     resumed_repair = bool(gate.get("before_sha"))
@@ -33406,8 +33394,9 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         # Rounds already spent before a resume count against the cap.
         for rnd in range(len(gate["rounds"]) + 1, rounds + 1):
             # At the top, not only after a round: a resume after a round
-            # that already passed must not run another.
-            if not _acceptance_majority_fails(final):
+            # that already passed — or after the rollback decision — must
+            # not run another.
+            if gate.get("rolled_back") or not _acceptance_majority_fails(final):
                 break
             up = [
                 "Run the acceptance repair pass on the merged run branch.",
@@ -33450,23 +33439,38 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             acc["gate"] = gate
             st.data["acceptance"] = acc
             st.save()
-        after_sha = await _branch_head_sha(str(staging))
-        if (pre_tests and pre_tests.get("passed") and test_cmd
-                and after_sha != before_sha):
-            post_tests = (await _measure_axes(
-                str(staging), {"tests": test_cmd}, st, caps,
-                log_path=leerie_dir / "logs" / "acceptance-repair.log",
-                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                label_prefix="acceptance-post",
-                log_prefix="acceptance")).get("tests") or {}
-            if post_tests.get("measured", True) and not post_tests.get("passed"):
-                # A repair must not trade the report for a regression.
-                subprocess.run(["git", "-C", str(staging), "reset", "--hard",
-                                before_sha], capture_output=True, check=False)
-                gate["rolled_back"] = True
-                log("  acceptance repair turned the test axis red — its "
-                    "commits were reset away; residual recorded")
-                final = initial
+        if gate.get("rolled_back"):
+            # A resume after the rollback decision: finish the reset it
+            # recorded (idempotent) and keep the pre-repair verdict.
+            subprocess.run(["git", "-C", str(staging), "reset", "--hard",
+                            before_sha], capture_output=True, check=False)
+            final = initial
+        else:
+            after_sha = await _branch_head_sha(str(staging))
+            if (pre_tests and pre_tests.get("passed") and test_cmd
+                    and after_sha != before_sha):
+                post_tests = (await _measure_axes(
+                    str(staging), {"tests": test_cmd}, st, caps,
+                    log_path=leerie_dir / "logs" / "acceptance-repair.log",
+                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                    label_prefix="acceptance-post",
+                    log_prefix="acceptance")).get("tests") or {}
+                if (post_tests.get("measured", True)
+                        and not post_tests.get("passed")):
+                    # A repair must not trade the report for a regression.
+                    # The decision is saved before the reset, so a crash
+                    # between them cannot record the repaired tree's verdict
+                    # for the reset one.
+                    gate["rolled_back"] = True
+                    acc["gate"] = gate
+                    st.data["acceptance"] = acc
+                    st.save()
+                    subprocess.run(["git", "-C", str(staging), "reset",
+                                    "--hard", before_sha],
+                                   capture_output=True, check=False)
+                    log("  acceptance repair turned the test axis red — its "
+                        "commits were reset away; residual recorded")
+                    final = initial
     gate["final"] = final
     if _acceptance_measured(final) and _acceptance_majority_fails(final):
         by_index = {s_["index"]: s_ for s_ in sets}
@@ -33520,12 +33524,8 @@ async def _acceptance_results_on_head(st: "State", caps: dict
     if not sets:
         return None
     await _ensure_planning_worktree(st)
-    tree = str(_judgment_cwd(st))
-    await _ensure_worktree_deps(
-        tree, st, caps, log_path=st.run_dir / "logs" / "acceptance-head.log",
-        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-        label_prefix="acceptance-head", log_prefix="acceptance")
-    return await _evaluate_acceptance_sets(st, caps, tree, sets, "head")
+    return await _evaluate_acceptance_sets(st, caps, str(_judgment_cwd(st)),
+                                           sets, "head")
 
 
 async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
@@ -37153,7 +37153,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # Held-out acceptance sets (DESIGN §8 *Held-out acceptance tests*):
         # written from the report alone, before the plan exists. Presence-
         # keyed checkpoint like defect_scope; advisory (a failure records a
-        # skip and the gate never runs).
+        # skip and the gate never runs) except budget exhaustion, which
+        # stops the run.
         if ("acceptance" not in st.data
                 and "plans_after_plan" not in st.data):
             st.data["acceptance"] = await _acceptance_write_or_skip(

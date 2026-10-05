@@ -4345,8 +4345,8 @@ tests; see below.)
 - **Disputed at most once, really** (`test_a_second_failing_run_accepts_no_work`
   asserts the carried-forward marker; `test_a_third_run_still_does_not_dispute`).
 - **Ties are not a passing majority** (`test_majority_rule`).
-- **No residue** (`test_evaluation_leaves_the_tree_clean_and_never_overwrites`):
-  every untracked path an evaluation introduced, bytecode included, is removed.
+- **No residue** — superseded in round 4: evaluation no longer writes the
+  target tree at all (`test_evaluation_never_touches_the_tree_and_never_overwrites`).
 - **Markup check precision** (`test_ordinary_markup_named_like_a_schema_field_is_not_a_hit`):
   fenced code is stripped, and a schema-named closing tag counts only where
   leaked syntax sits; the leaked shapes still hit.
@@ -4360,10 +4360,10 @@ The round-2 commit claimed 18 reversions of its fixes, 17 caught. Round 3
 measured five more of that commit's fixes with no catching test (the
 call-site `WorkerError` re-raise, `_gather_or_cancel`, the scoped cleanup, a
 failed snapshot cleaning nothing, the per-round save); round 3 added them (see
-below). The removed explicit save after `pre_tests_passed` remains an
-equivalent mutant: `bump_workers` saves state before the round's worker
-starts, with nothing awaited in between; the save stays so persistence does
-not rest on that coincidence.
+below). Removing the explicit save after `pre_tests_passed` is an equivalent
+mutant: `bump_workers` saves state before the round's worker starts, with
+nothing awaited in between. The save is kept so persistence does not rest on
+that coincidence.
 
 - **Undeclared helpers travel with the set**
   (`test_undeclared_helper_travels_with_the_set`): a file the writer created
@@ -4382,10 +4382,10 @@ not rest on that coincidence.
   (`test_budget_exhaustion_mid_repair_still_rolls_back`); in the writer it
   still propagates (`test_writer_budget_exhaustion_propagates`).
 - **Cap, concurrency, deps** (`test_repair_rounds_follow_the_cap`,
-  `test_writers_respect_max_parallel`, `test_gate_installs_deps_in_staging`).
-- **Created directories** (`test_evaluation_removes_the_directories_it_created`)
-  — a round-1 behaviour first pinned in round 2: `git ls-files --others` never
-  lists an empty directory, so this is the only pin.
+  `test_writers_respect_max_parallel`, and — since round 4 installs in the
+  evaluation worktree — `test_evaluation_installs_deps_before_running`).
+- **Created directories** — a round-1 behaviour first pinned in round 2, removed
+  in round 4 with in-tree evaluation (a disposable worktree makes it moot).
 - **Validity base** skips an undated sibling
   (`test_validity_base_prefers_the_earliest_same_task_sibling`).
 - **No claim of hidden tests that do not exist**
@@ -4402,8 +4402,10 @@ not rest on that coincidence.
 ### Review round 3 fixes (2026-10-04)
 
 Each pin was falsified by reverting its fix and running the named test: 19
-reversions (14 round-3 fixes, the 5 previously unpinned round-2 fixes), 19
-caught.
+reversions (14 covering round-3 fixes, 5 covering previously unpinned round-2
+fixes), 19 caught. One round-3 fix — saving an errored round — had no
+reversion and no catching test; round 4 added it. Round 4 replaced the
+in-staging cleanup pins below with a disposable evaluation worktree.
 
 - **Resume never skips the rollback check**
   (`test_resume_after_a_passing_but_red_round_still_rolls_back`, with and
@@ -4417,15 +4419,40 @@ caught.
   (`test_helper_beside_the_tests_travels_with_the_set`,
   `test_cache_and_provision_paths`).
 - **Fixers cannot Read the writers' transcripts, evaluation logs or
-  `calls.ndjson`** (`test_fixers_cannot_read_the_sets`).
+  `calls.ndjson`** (`test_fixers_cannot_read_the_sets`; widened in round 4).
 - **No hidden test id survives in staging**
-  (`test_existing_pytest_cache_is_restored_and_a_new_one_removed`).
-- **Cleanup is scoped** (`test_runner_provisioning_outside_the_set_survives_cleanup`,
-  for a set beneath `acc/` and at the root; `test_a_failed_snapshot_cleans_nothing`).
+  (now `test_a_runner_cache_in_the_tree_is_never_touched`).
+- **Cleanup is scoped** — removed in round 4 together with in-staging
+  evaluation (its two tests went with it).
 - **Budget exhaustion stops the run and the other writers**
   (`test_write_or_skip_lets_budget_exhaustion_stop_the_run`,
   `test_budget_exhaustion_cancels_the_other_writers`).
 - **Indented fences are quoting** (`test_indented_fenced_code_is_quoting_not_a_leak`).
+
+### Review round 4 fixes (2026-10-05)
+
+Each pin was falsified by reverting its fix and running the named test: 19
+reversions, 19 caught (one, the errored-round save, only after its test was
+made to commit before erroring).
+
+- **Evaluation in a disposable worktree**
+  (`test_evaluation_never_touches_the_tree_and_never_overwrites`,
+  `test_a_crashed_evaluations_worktree_is_replaced`,
+  `test_sets_are_isolated_from_one_another`): a crash mid-evaluation used to
+  leave hidden tests in staging for the next fixer to read or commit, and make
+  every later evaluation of those sets unmeasured.
+- **Declared `./` paths** (`test_dot_slash_declared_paths_are_not_also_support_files`)
+  and **gitignored helpers** (`test_a_gitignored_helper_still_travels`).
+- **Exit-code verdicts** (`test_verdict_is_by_exit_code`,
+  `test_an_unrunnable_command_is_no_verdict`): a failing missing-file test is a
+  failure, not an unrunnable runner.
+- **No echo** (`test_runner_output_never_reaches_the_orchestrator_log`) and the
+  widened deny list (`test_fixers_cannot_read_the_sets`).
+- **Rollback decision first** (`test_the_rollback_decision_is_on_disk_before_the_reset`,
+  `test_resume_after_the_rollback_decision_finishes_the_reset`) and **errored
+  rounds** (`test_an_errored_round_is_saved_and_the_round_before_still_counts`,
+  `test_a_recorded_rollback_runs_no_further_round`); the reused evaluation
+  path drops its install memo (`test_each_evaluation_installs_into_its_fresh_worktree`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

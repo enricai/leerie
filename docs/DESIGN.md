@@ -6004,9 +6004,10 @@ passes on the validity base cannot discriminate and is dropped; a set
 needs at least one discriminating defect file and every control passing.
 A set carries exactly the tree its validation ran on: a writer that
 edited an existing file loses the set, and every other new file it left
-(a helper or fixture beside the tests) travels with the set — minus the
-runner's caches and bytecode, which would only collide with the target
-tree's own. Without its helper, a correct fix fails the set. Measured: on the page-advance report, five sets written this way
+(a helper or fixture beside the tests, even one the repo's ignore rules
+match) travels with the set — minus what the dependency install made
+and the runner's caches and bytecode, which would only collide with the
+target tree's own. Without its helper, a correct fix fails the set. Measured: on the page-advance report, five sets written this way
 classified all 8 trees correctly (40/40: run 1's broken fix, two other
 example-shaped or test-skipping fixes, four correct ones); on the
 generate report all sets failed every broken tree including barnacle's
@@ -6015,7 +6016,13 @@ with a planted defect, 3/3 sets were valid, passed the fixed code and
 flagged an example-shaped patch.
 
 **The gate runs after the run's own final conformance.** Each valid set
-is copied into staging, run file by file, and removed. A majority of
+runs against staging's committed HEAD in a disposable worktree of its
+own — never in staging itself, where a crash mid-run (which no cleanup
+survives) would leave hidden tests for the next fixer to read or commit.
+Verdicts are by exit code alone: a command the shell could not run, or
+one the container's limits killed, is no verdict, but a test that fails
+for any other reason — including a missing-file defect whose failure
+prints "No such file or directory" — fails. A majority of
 failing sets triggers **at most two repair rounds**: the conformer is
 told which declared cases failed and the defect contract — never the
 runner output or the test source, because a conformer shown the failing
@@ -6049,24 +6056,26 @@ round must not trade the report for a regression: if the repo's test
 axis goes from passing to failing across the repair rounds, their
 commits are reset away and the residual is recorded instead. The
 pre-repair verdict and HEAD are persisted before the first round and
-every round after it runs, so a resumed gate always reaches this check:
-re-measured on resume, the verdict would read the already-repaired tree
-and skip it. Measured
+every round after it runs, and the rollback decision before the reset
+it orders, so a resumed gate always reaches this check and never records
+the repaired tree's verdict for the reset one: re-measured on resume,
+the verdict would read the already-repaired tree and skip it. Measured
 on the finished task with wrong held-out tests: the repair conformer
 changed code in 3/3 trials, but 0 of the task's 247 regression tests
 and 0 attributable scraper tests (of 1,605) regressed.
 
 **Hidden from the fixers.** The sets live under the run's state root,
 and implementers and conformers carry `Read` denies on that directory
-and on everything else that records them — the writers' transcripts and
-the evaluation logs (test source, runner output) and the captured-call
-log — the same deny mechanism that keeps acting workers out of the
-user's checkout. Nothing of a set may linger in staging either: the
-evaluation removes what it copied, the directories it created and the
-runner by-products it left, and restores a runner cache that existed
-before it (pytest's records the ids of the tests it ran). A shell `cat`
-is not covered by a `Read` deny; hiding is a best-effort reduction of
-the special-casing incentive, not a guarantee.
+and on every run-directory file that records them — the evaluation
+worktree, the logs (the writers' transcripts carry the test source), the
+orchestrator log, the captured-call log and the run state (case names
+and paths) — and on the CLI's own session transcripts; the fixers read
+nothing else there but their subtask specs, criteria and checkpoints.
+It is the same deny mechanism that keeps acting workers out of the
+user's checkout, and evaluation output is never echoed. Nothing of a set
+reaches staging at all (above). A shell `cat` is not covered by a `Read`
+deny; hiding is a best-effort reduction of the special-casing incentive,
+not a guarantee.
 
 ### Mechanical-feedback loops (the CRITIC pattern)
 

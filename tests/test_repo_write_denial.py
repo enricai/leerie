@@ -135,7 +135,7 @@ class TestReachesTheArgv:
         if schema_key == "implementer":
             deny = _deny_value(argv)
             assert "/acceptance/**)," in deny
-            assert deny.endswith("/calls.ndjson)")
+            assert deny.endswith(",Read(~/.claude/projects/**)")
 
     def test_the_acting_worker_really_does_carry_the_bypass_flag(
             self, leerie, monkeypatch):
