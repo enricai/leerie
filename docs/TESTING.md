@@ -4488,13 +4488,37 @@ its test made both HEAD reads unreadable).
   (`test_an_unimportable_module_under_test_is_a_failure`: an import-time
   defect at the base, a fix that broke the module).
 - **A failing build step is not a failed install**
-  (`test_a_failing_build_step_is_not_a_failed_install`).
+  (`test_only_a_failed_install_counts`, renamed in round 7 and widened to
+  timeouts and raised errors).
 - **Evaluation never raises** (`test_an_evaluation_that_cannot_be_set_up_is_no_evidence`,
   `test_a_red_repair_rolls_back_when_evaluation_cannot_be_set_up`).
 - **An unmeasurable final keeps the last measured residual**
   (`test_an_unmeasurable_final_keeps_the_last_measured_residual`), and an
   unreadable HEAD counts as moved
   (`test_an_unreadable_round_start_still_measures_a_committing_error`).
+
+### Review round 7 fixes (2026-10-05)
+
+13 distinct reversions run 14 times (one edit against two tests), 14 caught —
+the two test-axis measurement guards only after
+`test_a_test_axis_measurement_that_raises_never_escapes` was added for them.
+
+- **Runner "ran no test" exits only while validating**
+  (`test_a_file_that_ran_no_test_is_no_verdict` — no verdict validating, a
+  failure evaluating; `test_a_writer_file_broken_in_itself_discards_the_set`;
+  `test_a_broken_module_a_conftest_imports_is_a_failure` — pytest's exit 4;
+  `test_an_unimportable_module_under_test_is_a_failure`). Round 6 had dropped
+  exit 2 entirely, reopening the broken-test-file case round 5 had closed.
+- **Nothing reading HEAD can raise past the rollback**
+  (`test_branch_head_sha_never_raises`,
+  `test_a_fork_failure_reading_head_after_a_repair_still_rolls_back`).
+- **A repair that makes the sets unmeasurable is rolled back**
+  (`test_a_repair_that_breaks_the_install_is_rolled_back`); **a failed reset is
+  recorded, not assumed** (`test_a_failed_reset_is_recorded_not_assumed`); **no
+  rollback target, no repair** (`test_no_rollback_target_means_no_repair`).
+- **Build failures of every shape are evidence; install failures are not**
+  (`test_only_a_failed_install_counts`, 6 cases). `unmeasured_final` reaches the
+  planner (`test_residual_reaches_the_next_runs_planner_ctx`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

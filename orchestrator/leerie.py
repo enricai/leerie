@@ -30137,9 +30137,14 @@ def _format_solution_defects(defects: list[dict]) -> str:
 
 
 async def _branch_head_sha(worktree: str) -> str:
-    """HEAD sha in the worktree, or empty string on failure. Used as the
-    rollback target before the conformer adds commits."""
-    r = await run_proc(["git", "rev-parse", "HEAD"], cwd=worktree)
+    """HEAD sha in the worktree, or empty string on failure — including a
+    failure to spawn git at all (EAGAIN under fork exhaustion), which a
+    caller about to decide a rollback must not see as an exception. Used as
+    the rollback target before the conformer adds commits."""
+    try:
+        r = await run_proc(["git", "rev-parse", "HEAD"], cwd=worktree)
+    except OSError:
+        return ""
     if r.returncode != 0:
         return ""
     return r.stdout.strip()
@@ -32514,6 +32519,9 @@ def _prior_delivery_residual(st: "State") -> dict | None:
             residual["acceptance_unmet"] = {
                 "failing_sets": acc_residual.get("failing_sets"),
                 "total_sets": acc_residual.get("total_sets"),
+                # The verdict predates the shipped tree's last repair (which
+                # left nothing measurable), so the planner can weigh it.
+                "unmeasured_final": bool(acc_residual.get("unmeasured_final")),
                 "cases": [str(c)[:200] for c in
                           (acc_residual.get("cases") or [])][:10]}
         if unmet_after:
@@ -32933,14 +32941,16 @@ def _acceptance_is_cache_path(rel: str) -> bool:
             or rel.endswith((".pyc", ".pyo")))
 
 
-# Exit codes a known runner uses for "ran no test", not "a test failed" —
-# a defect file that never ran must not count as failing on the base.
-# pytest: 3 internal error, 4 usage error, 5 no tests collected. NOT 2: a
-# collection error is also what an unimportable module under test produces
-# — a fix that broke the module, or an import-time defect at the base —
-# and that is evidence.
+# Exit codes with which a known runner may report that it ran no test at
+# all — pytest: 2 collection error, 3 internal error, 4 usage error (a
+# conftest that fails to import), 5 no tests collected. Each is ambiguous:
+# the test file may be broken (a writer bug) or the code under test may be
+# (evidence). So they are applied only when VALIDATING a set on the base,
+# where a file that ran no test is discarded (fail-open: the gate then has
+# less to check); never when evaluating a fix, where a file that already
+# ran on the base and now cannot is the fix's doing.
 _RUNNER_NO_VERDICT_EXITS: dict[str, frozenset[int]] = {
-    "pytest": frozenset({3, 4, 5}),
+    "pytest": frozenset({2, 3, 4, 5}),
 }
 
 
@@ -32987,10 +32997,12 @@ def _acceptance_cmd(st: "State", files: list[str]) -> str | None:
 
 async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                rel: str, log_path: Path,
-                               label: str) -> bool | None:
+                               label: str, *,
+                               validating: bool = False) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
     False failed, None not measurable (no command, the shell could not run
-    it — exit 126/127 — or the container's limits killed it).
+    it — exit 126/127 — or the container's limits killed it; and, only when
+    `validating`, a runner's ran-no-test exit, `_RUNNER_NO_VERDICT_EXITS`).
 
     Not `_measure_blt`: its "could not measure" test reads the whole output
     for `No such file or directory`, which is also what a test of a missing-
@@ -33014,7 +33026,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             return None
     if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
         return None
-    if rc in _acceptance_no_verdict_exits(cmd):
+    if validating and rc in _acceptance_no_verdict_exits(cmd):
         return None
     return rc == 0
 
@@ -33140,10 +33152,12 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                               check=False).returncode == 0:
                 continue
             verdict = await _run_acceptance_file(
-                st, caps, str(wt), rel, log_path, f"acceptance-{k}-base")
+                st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
+                validating=True)
             if verdict is None:
-                # Not measurable (no test command for this file, or the
-                # runner is missing) — never mistaken for pass or fail.
+                # Not measurable (no test command for this file, the runner
+                # is missing, or it ran no test) — never mistaken for pass
+                # or fail.
                 out["reason"] = f"could not run {rel} on the validity base"
                 return out
             if f.get("kind") == "defect":
@@ -33454,12 +33468,17 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         # on resume it would read the already-repaired tree, and a red
         # repair would then escape the rollback.
         if test_cmd and "pre_tests_passed" not in gate:
-            pre = (await _measure_axes(
-                str(staging), {"tests": test_cmd}, st, caps,
-                log_path=leerie_dir / "logs" / "acceptance-repair.log",
-                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                label_prefix="acceptance-pre",
-                log_prefix="acceptance")).get("tests") or {}
+            try:
+                pre = (await _measure_axes(
+                    str(staging), {"tests": test_cmd}, st, caps,
+                    log_path=leerie_dir / "logs" / "acceptance-repair.log",
+                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                    label_prefix="acceptance-pre",
+                    log_prefix="acceptance")).get("tests") or {}
+            except Exception:
+                # Unmeasured: the test-axis rollback rule then cannot fire,
+                # the unmeasurable-sets rule still can.
+                pre = {"measured": False}
             gate["pre_tests_passed"] = bool(
                 pre.get("passed") and pre.get("measured", True))
             acc["gate"] = gate
@@ -33469,6 +33488,11 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
         shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
         rounds = int(caps.get("acceptance_repair_rounds",
                               DEFAULT_CAPS["acceptance_repair_rounds"]))
+        if not before_sha:
+            # No rollback target, no repair: nothing could undo a bad one.
+            log("  acceptance: staging HEAD unreadable — no rollback target, "
+                "so no repair; residual recorded")
+            rounds = 0
         # Rounds already spent before a resume count against the cap.
         for rnd in range(len(gate["rounds"]) + 1, rounds + 1):
             # At the top, not only after a round: a resume after a round
@@ -33508,9 +33532,10 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                 # A worker can commit and then fail (a schema miss, a
                 # timeout): the previous verdict no longer describes the
                 # tree, so measure it again.
-                # An unreadable HEAD before or after counts as moved.
+                # An unreadable HEAD before or after counts as moved: two
+                # failed reads ("" == "") must not read as "unchanged".
                 now = await _branch_head_sha(str(staging))
-                if not round_start or not now or now != round_start:
+                if not now or now != round_start:
                     final = await _evaluate_acceptance_sets(
                         st, caps, str(staging), sets, f"gate-r{rnd}")
                     entry["results"] = final
@@ -33530,38 +33555,56 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             acc["gate"] = gate
             st.data["acceptance"] = acc
             st.save()
-        if gate.get("rolled_back"):
-            # A resume after the rollback decision: finish the reset it
-            # recorded (idempotent) and keep the pre-repair verdict.
-            subprocess.run(["git", "-C", str(staging), "reset", "--hard",
-                            before_sha], capture_output=True, check=False)
-            final = initial
-        else:
+        reason = ""
+        if not gate.get("rolled_back") and before_sha:
             after_sha = await _branch_head_sha(str(staging))
-            if (pre_tests and pre_tests.get("passed") and test_cmd
-                    and after_sha != before_sha):
-                post_tests = (await _measure_axes(
-                    str(staging), {"tests": test_cmd}, st, caps,
-                    log_path=leerie_dir / "logs" / "acceptance-repair.log",
-                    verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                    label_prefix="acceptance-post",
-                    log_prefix="acceptance")).get("tests") or {}
-                if (post_tests.get("measured", True)
-                        and not post_tests.get("passed")):
-                    # A repair must not trade the report for a regression.
-                    # The decision is saved before the reset, so a crash
-                    # between them cannot record the repaired tree's verdict
-                    # for the reset one.
-                    gate["rolled_back"] = True
-                    acc["gate"] = gate
-                    st.data["acceptance"] = acc
-                    st.save()
-                    subprocess.run(["git", "-C", str(staging), "reset",
-                                    "--hard", before_sha],
-                                   capture_output=True, check=False)
-                    log("  acceptance repair turned the test axis red — its "
-                        "commits were reset away; residual recorded")
-                    final = initial
+            # An unreadable HEAD counts as moved.
+            if not after_sha or after_sha != before_sha:
+                if pre_tests and pre_tests.get("passed") and test_cmd:
+                    try:
+                        post_tests = (await _measure_axes(
+                            str(staging), {"tests": test_cmd}, st, caps,
+                            log_path=(leerie_dir / "logs"
+                                      / "acceptance-repair.log"),
+                            verbosity=st.data.get("verbosity",
+                                                  VERBOSITY_DEFAULT),
+                            label_prefix="acceptance-post",
+                            log_prefix="acceptance")).get("tests") or {}
+                    except Exception:
+                        post_tests = {"measured": False}
+                    if (post_tests.get("measured", True)
+                            and not post_tests.get("passed")):
+                        # A repair must not trade the report for a
+                        # regression.
+                        reason = "turned the test axis red"
+                if (not reason and _acceptance_measured(initial)
+                        and not _acceptance_measured(final)):
+                    # Nor make the held-out sets unmeasurable (a broken
+                    # dependency manifest): the staging test axis would not
+                    # notice, its install being memoised from earlier.
+                    reason = "left the held-out sets unmeasurable"
+            if reason:
+                # The decision is saved before the reset, so a crash between
+                # them cannot record the repaired tree's verdict for the
+                # reset one.
+                gate["rolled_back"] = True
+                gate["rollback_reason"] = reason
+                acc["gate"] = gate
+                st.data["acceptance"] = acc
+                st.save()
+        if gate.get("rolled_back"):
+            # Also the path a resume after the decision takes: the reset is
+            # idempotent. Its result is checked, never assumed.
+            if await _acceptance_rollback(str(staging), before_sha):
+                log(f"  acceptance repair {gate.get('rollback_reason') or ''}"
+                    " — its commits were reset away; residual recorded")
+            else:
+                gate["rollback_failed"] = True
+                log(f"  WARNING: acceptance repair "
+                    f"{gate.get('rollback_reason') or ''} but resetting staging "
+                    f"to {before_sha[:12] or '(unknown)'} FAILED — the "
+                    "repair's commits remain on the branch")
+            final = initial
     gate["final"] = final
     # A repair that left nothing measurable (it broke the dependency
     # manifest, say) must not erase a failing verdict: the last measured
@@ -33602,6 +33645,20 @@ def _acceptance_can_check(st: "State") -> bool:
     return (not st.data.get("skip_acceptance_check")
             and "bug-fixing" in (st.data.get("categories") or [])
             and bool(resolve_blt_scoped(st.repo_root).get("test")))
+
+
+async def _acceptance_rollback(staging: str, before_sha: str) -> bool:
+    """Reset staging to `before_sha` and confirm HEAD is there — the same
+    don't-trust-the-report discipline applied to leerie's own git step (a
+    stale index.lock makes `reset --hard` fail)."""
+    if not before_sha:
+        return False
+    try:
+        subprocess.run(["git", "-C", staging, "reset", "--hard", before_sha],
+                       capture_output=True, check=False)
+    except OSError:
+        return False
+    return await _branch_head_sha(staging) == before_sha
 
 
 async def _acceptance_write_or_skip(task: str, st: "State", caps: dict,

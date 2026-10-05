@@ -6021,12 +6021,16 @@ runs against staging's committed HEAD in a disposable worktree of its
 own — never in staging itself, where a crash mid-run (which no cleanup
 survives) would leave hidden tests for the next fixer to read or commit.
 Verdicts are by exit code alone: a command the shell could not run, one
-the container's limits killed, a known runner's own "ran no test" codes
-(pytest's internal-error, usage and no-tests exits — not its collection
-error, which is also what an unimportable module under test produces, and
-that is evidence), or any set run where a dependency install failed (a
-failing build step is not that: a fix that breaks the build is evidence
-against the fix) is no verdict — a defect file that never ran
+the container's limits killed, or any set run where a dependency install
+failed is no verdict (a failing build step is not: a fix that breaks the
+build is evidence against it — at the cost that a transient build failure
+reads as the fix failing). A known runner's "ran no test" exits (pytest's
+collection, internal, usage and no-tests codes) are ambiguous — the test
+file may be broken, or the code under test may be — so they are no
+verdict only while validating a set on the base, where such a file is
+discarded (the gate then has less to check, never a false failure); once
+a file has run on the base, the same exit on a fix is the fix's doing and
+fails — a defect file that never ran
 must not count as failing — but a test that fails for any other reason,
 including a missing-file defect whose failure prints "No such file or
 directory", fails. A set that cannot even be placed is no verdict too,
@@ -6062,7 +6066,11 @@ run's planner (`prior_delivery_residual`), where a full plan-and-
 implement cycle settled the generate residual 2/3 times. And a repair
 round must not trade the report for a regression: if the repo's test
 axis goes from passing to failing across the repair rounds, their
-commits are reset away and the residual is recorded instead. The
+commits are reset away and the residual is recorded instead — likewise
+if the repair turned measurable held-out sets unmeasurable (a broken
+dependency manifest, which the staging test axis, installed long before,
+would not notice). The reset is confirmed, never assumed: a failed one is
+recorded as such. With no readable HEAD to reset to, no repair starts. The
 pre-repair verdict and HEAD are persisted before the first round and
 every round after it runs (a round whose worker committed and then
 failed is measured again, since the previous verdict no longer describes
