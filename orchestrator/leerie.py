@@ -461,7 +461,7 @@ STATE_FIELDS = (
     "site_token_warnings",
     # acceptance: the held-out acceptance record (DESIGN §8 *Held-out
     # acceptance tests*): {validity_base, written, sets[], skipped?, gate?}
-    # — each valid set {index, dir, defect_files[], control_files[],
+    # — each valid set {index, valid, dir, defect_files[], control_files[],
     # support_files[], cases{}}; `gate` {initial[], rounds[], final[],
     # before_sha?, pre_tests_passed?, residual?, rolled_back?,
     # rollback_reason?, rollback_failed?} (IMPLEMENTATION §8 state table).
@@ -32521,9 +32521,11 @@ def _prior_delivery_residual(st: "State") -> dict | None:
             residual["acceptance_unmet"] = {
                 "failing_sets": acc_residual.get("failing_sets"),
                 "total_sets": acc_residual.get("total_sets"),
-                # The verdict predates the shipped tree's last repair (which
-                # left nothing measurable), so the planner can weigh it.
+                # The shipped tree could not be measured, so this is the last
+                # verdict that could be — usually an environment failure.
                 "unmeasured_final": bool(acc_residual.get("unmeasured_final")),
+                # A repair the gate decided to revert is still on the branch.
+                "rollback_failed": bool(acc_residual.get("rollback_failed")),
                 "cases": [str(c)[:200] for c in
                           (acc_residual.get("cases") or [])][:10]}
         if unmet_after:
@@ -33270,8 +33272,8 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
 async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
                                           sets: list[dict], label: str, *,
                                           rev: str = "HEAD") -> list[dict]:
-    """Run each valid set against `tree`'s `rev` commit (HEAD by default), in a disposable
-    worktree at that commit — never in `tree` itself. Nothing of a set can
+    """Run each valid set against `tree`'s `rev` commit (default HEAD), in
+    a disposable worktree at that commit — never in `tree` itself. Nothing of a set can
     then linger where a fixer works, not even after a crash mid-run (no
     `finally` survives a SIGKILL), and no runner cache in `tree` records
     the hidden tests' ids. A set fails when any of its files fails; a set
@@ -33661,6 +33663,13 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
     elif _acceptance_measured(final):
         log("phase 5: acceptance gate — held-out sets pass on the "
             "integrated tree")
+    if gate.get("rollback_failed"):
+        # The repair the gate decided to revert ships anyway: the next run
+        # must hear of it even when its sets pass (a red test axis).
+        res = gate.setdefault("residual", {
+            "failing_sets": 0,
+            "total_sets": len(_acceptance_measured(final)), "cases": []})
+        res["rollback_failed"] = True
     acc["gate"] = gate
     st.data["acceptance"] = acc
     st.save()
@@ -33680,17 +33689,19 @@ async def _acceptance_rollback(staging: str, before_sha: str) -> bool:
     stale index.lock makes `reset --hard` fail)."""
     if not before_sha:
         return False
-    try:
-        subprocess.run(["git", "-C", staging, "reset", "--hard", before_sha],
-                       capture_output=True, check=False)
-    except OSError:
-        return False
-    # An unreadable HEAD is not a failed reset: read again before saying so.
-    for _ in range(3):
+    # Up to three attempts, a second apart: a spawn failure (EAGAIN) on the
+    # reset or an unreadable HEAD afterwards is not yet a failed reset.
+    for attempt in range(3):
+        if attempt:
+            await asyncio.sleep(1)
+        try:
+            subprocess.run(["git", "-C", staging, "reset", "--hard",
+                            before_sha], capture_output=True, check=False)
+        except OSError:
+            continue
         head = await _branch_head_sha(staging)
         if head:
             return head == before_sha
-        await asyncio.sleep(1)
     return False
 
 

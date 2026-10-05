@@ -1752,6 +1752,8 @@ def test_a_one_off_install_failure_keeps_a_correct_repair(
     assert "rolled_back" not in gate
     assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
     assert all(r["passed"] for r in gate["final"]) and "residual" not in gate
+    # The measured retry replaces the round's unmeasured record.
+    assert all(r["passed"] for r in gate["rounds"][-1]["results"])
 
 
 def test_a_lasting_environment_failure_keeps_the_repair(
@@ -1791,8 +1793,67 @@ def test_a_failed_reset_is_recorded_not_assumed(leerie, tmp_path,
     assert "FAILED" in capsys.readouterr().out
     assert _git(staging, "log", "-1", "--format=%s") == "conformer: fix add"
     # What ships is the repair's tree, so the record describes it, not the
-    # pre-repair tree (round-8 L).
+    # pre-repair tree (round-8 L) — and the next run hears that a repair
+    # the gate meant to revert is on the branch, though its sets pass
+    # (round-9 L).
     assert all(r["passed"] for r in gate["final"])
+    assert gate["residual"] == {"failing_sets": 0, "total_sets": 5,
+                                "cases": [], "rollback_failed": True}
+
+
+def test_an_unmeasurable_repair_whose_reset_fails_says_so(
+        leerie, tmp_path, monkeypatch):
+    """Round-9 M: the residual read "environment failure" when a repair had
+    broken the measurement and its rollback then failed."""
+    repo, head = _repo(tmp_path)
+    (repo / "requirements.txt").write_text("ok\n")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "manifest")
+    head = _git(repo, "rev-parse", "HEAD")
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    st.data["provision"] = {"recipe": [{"kind": "install", "command": [
+        "bash", "-c", "grep -qx ok requirements.txt"]}]}
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+
+    def breaks_and_locks(p):
+        (p / "requirements.txt").write_text("nonexistent-pkg==0.0.0\n")
+        _git(p, "commit", "-qam", "conformer: deps")
+        (Path(_git(p, "rev-parse", "--git-dir")) / "index.lock").write_text("")
+    monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
+    _run_gate(leerie, monkeypatch, st, breaks_and_locks,
+              measured=[{"passed": False, "measured": True}])
+    res = st.data["acceptance"]["gate"]["residual"]
+    assert res["rollback_failed"] is True and res["unmeasured_final"] is True
+    d = st.run_dir.parent / "run-next"
+    d.mkdir()
+    (d / "orchestrator.exit_code").write_text("0")
+    nxt = leerie.State(st.run_dir.parent.parent, "run-next", repo_root=repo)
+    nxt.data = {"task": st.data["task"]}
+    st.save()
+    (st.run_dir / "orchestrator.exit_code").write_text("0")
+    unmet = leerie._prior_delivery_residual(nxt)["acceptance_unmet"]
+    assert unmet["rollback_failed"] is True
+    assert unmet["unmeasured_final"] is True
+
+
+def test_a_reset_that_cannot_spawn_is_tried_again(leerie, tmp_path,
+                                                 monkeypatch):
+    repo, head = _repo(tmp_path)
+    before = _git(repo, "rev-parse", "HEAD")
+    _commit_fix(repo)
+    real = leerie.subprocess.run
+    n = []
+
+    def eagain_once(argv, *a, **k):
+        if "reset" in argv and not n:
+            n.append(1)
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+        return real(argv, *a, **k)
+    monkeypatch.setattr(leerie.subprocess, "run", eagain_once)
+    monkeypatch.setattr(leerie.asyncio, "sleep", _no_sleep)
+    assert asyncio.run(leerie._acceptance_rollback(str(repo), before))
+    assert _git(repo, "rev-parse", "HEAD") == before
 
 
 def test_an_unreadable_head_after_a_reset_is_read_again(leerie, tmp_path,

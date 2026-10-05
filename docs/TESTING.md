@@ -4513,7 +4513,8 @@ the two test-axis measurement guards only after
 - **Nothing reading HEAD can raise past the rollback**
   (`test_branch_head_sha_never_raises`,
   `test_a_fork_failure_reading_head_after_a_repair_still_rolls_back`).
-- **A repair that makes the sets unmeasurable is rolled back**
+- **A repair that makes the sets unmeasurable is rolled back** — since round
+  8, only after a retry of the repaired tree and a pre-repair control
   (`test_a_repair_that_breaks_the_install_is_rolled_back`); **a failed reset is
   recorded, not assumed** (`test_a_failed_reset_is_recorded_not_assumed`); **no
   rollback target, no repair** (`test_no_rollback_target_means_no_repair`).
@@ -4535,6 +4536,20 @@ the two test-axis measurement guards only after
 - **A failed reset leaves the repair tree's verdict**, and an unreadable HEAD
   after a reset is read again (`test_a_failed_reset_is_recorded_not_assumed`,
   `test_an_unreadable_head_after_a_reset_is_read_again`).
+
+### Review round 9 fixes (2026-10-05)
+
+4 distinct reversions, each against its named test, 4 caught.
+
+- **A failed rollback reaches the next run**
+  (`test_an_unmeasurable_repair_whose_reset_fails_says_so`,
+  `test_a_failed_reset_is_recorded_not_assumed`): `rollback_failed` rides the
+  residual — created if the sets pass — and `_prior_delivery_residual`
+  forwards it; `unmeasured_final` no longer claims to mean only an
+  environment failure.
+- **The reset itself is retried** (`test_a_reset_that_cannot_spawn_is_tried_again`).
+- **A measured retry replaces the round's record**
+  (`test_a_one_off_install_failure_keeps_a_correct_repair`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

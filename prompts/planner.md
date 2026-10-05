@@ -503,9 +503,12 @@ The orchestrator gives you, in your prompt:
    failed after its repair rounds: plan the root-cause change that makes
    the report's contract hold for those cases in general, not a change
    shaped to the case names. `unmeasured_final: true` means the shipped
-   tree could not be measured at all (an environment failure), so the
-   verdict is the last one that could be, possibly from before that
-   run's last repair — check the tree before trusting it. Do not re-plan work the record does not
+   tree could not be measured at all — usually an environment failure —
+   so the verdict is the last one that could be, possibly from before
+   that run's last repair; check the tree before trusting it.
+   `rollback_failed: true` means that run's last repair should have been
+   reverted (it broke the repository's own tests or the held-out tests'
+   setup) and was not: its commits are on the branch — inspect them first. Do not re-plan work the record does not
    dispute. If the tree contradicts the record (someone fixed it since),
    trust the tree and say so in `confidence.basis`.
 
