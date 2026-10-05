@@ -4570,5 +4570,24 @@ dropping the both-unreadable clause.
 - `test_each_evaluation_installs_into_its_fresh_worktree`'s spy now returns the
   install's verdict, and the test asserts both evaluations measured.
 
+### Runner reports, writer-declared import defects, in-loop retry (2026-10-05)
+
+12 distinct reversions, each against its named test, 12 caught.
+
+- **Structured runner reports while validating**
+  (`test_runner_reports_are_read_mechanically`: JUnit and jest-compatible JSON,
+  pass / no tests / skipped only / collection error / setup error / unreadable;
+  `test_report_flags_are_placed_only_where_they_reach_the_runner`;
+  `test_pytest_is_asked_for_junit_through_its_environment`). A file whose
+  tests all skip exits 0, so only the report shows it ran nothing
+  (`test_a_file_whose_tests_all_skip_is_no_verdict_while_validating`).
+- **Writer-declared import defects** (`test_a_declared_import_defect_counts_as_failing`,
+  `test_a_declared_import_defect_that_does_not_parse_is_no_verdict`,
+  `test_an_import_defect_set_validates_and_passes_on_the_fix`).
+- **Retry inside the repair loop**
+  (`test_a_one_off_install_failure_mid_loop_keeps_the_next_round`), and the
+  post-loop retry skipped for a commit already retried
+  (`test_a_commit_already_retried_in_the_loop_is_not_retried_again`).
+
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

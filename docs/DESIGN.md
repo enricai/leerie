@@ -6020,23 +6020,36 @@ flagged an example-shaped patch.
 runs against staging's committed HEAD in a disposable worktree of its
 own — never in staging itself, where a crash mid-run (which no cleanup
 survives) would leave hidden tests for the next fixer to read or commit.
-Verdicts are by exit code alone: a command the shell could not run, one
-the container's limits killed, or any set run where a dependency install
-failed is no verdict (a failing build step is not: a fix that breaks the
-build is evidence against it — at the cost that a transient build failure
-reads as the fix failing). A known runner's "ran no test" exits (pytest's
-collection, internal, usage and no-tests codes) are ambiguous — the test
-file may be broken, or the code under test may be — so they are no
-verdict only while validating a set on the base, where such a file
-discards its set (the gate then has less to check, never a false
-failure — the price is that a report whose defect is itself an import
-failure gets no held-out check); once
-a file has run on the base, the same exit on a fix is the fix's doing and
-fails — a defect file that never ran
-must not count as failing — but a test that fails for any other reason,
-including a missing-file defect whose failure prints "No such file or
-directory", fails. A set that cannot even be placed is no verdict too,
-never an error that skips the rollback check below. A majority of
+Judging a fix, the verdict is the exit code: a command the shell could
+not run, one the container's limits killed (a fork-exhaustion message in
+the output's tail), or any set run where a dependency install failed is
+no verdict (a failing build step is not: a fix that breaks the build is
+evidence against it — at the cost that a transient build failure reads as
+the fix failing). Every other non-zero exit fails, including a
+missing-file defect whose failure prints "No such file or directory", and
+including a file that no longer loads: it ran on the base, so the fix is
+what stopped it. A set that cannot even be placed is no verdict, never an
+error that skips the rollback check below.
+
+Validating a set on the base asks more, because a defect file that never
+ran must not count as failing. Exit codes cannot say whether a file ran:
+jest, vitest and `go test` exit 1 alike for "no tests", "could not load"
+and "a test failed", and cargo 101 for a build or a test failure. So
+where the runner can write a structured report of the run — pytest's
+JUnit XML, the jest-compatible JSON of jest and vitest — validation asks
+for one and reads how many tests executed and whether the file loaded. A
+file that ran no test, or could not be loaded, is no verdict and discards
+its set (the gate then has less to check, never a false failure) — with
+one exception. When the report's defect is itself that loading fails (a
+missing entry point, a module that raises on import), the writer says so
+for that file, and a file that cannot load on the base is then the defect
+showing — provided the file itself parses, checked mechanically. Reading
+the report to know which case applies is the writer's job, never
+Python's (§12); the price is that a writer who declares a guessed import
+produces a test no fix can pass, which costs two repair rounds and a
+residual, never the run. Runners without a known report fall back to the
+runner's own "ran no test" exits where they exist (pytest's), and
+otherwise to the exit code alone. A majority of
 failing sets triggers **at most two repair rounds**: the conformer is
 told which declared cases failed and the defect contract — never the
 runner output or the test source, because a conformer shown the failing
@@ -6044,7 +6057,11 @@ output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes
 at the root against 1/4). When four or more sets are valid, the two
 highest-indexed are never shown at all; every round is re-judged on all
-sets, so a fix fitted to the shown names still fails the hidden ones. With
+sets, so a fix fitted to the shown names still fails the hidden ones. A
+round whose verdict measures nothing where the one before it measured is
+measured once more before the rounds stop on it: every evaluation installs
+afresh, and a one-off install failure would otherwise end the repair with
+a round left. With
 fewer valid sets every failing set is shown and nothing is held back — a
 weaker check, logged as such, and the repair is not told of hidden tests
 that do not exist. A set whose files could not all be run (a

@@ -93,11 +93,14 @@ def _writer_stub(leerie, monkeypatch, files_by_set):
         k = int(kw["sid"].split("-")[-1])
         seen.append(kw)
         decl = []
-        for rel, (kind, text, cases) in files_by_set.get(k, {}).items():
+        for rel, spec in files_by_set.get(k, {}).items():
+            kind, text, cases = spec[:3]
+            mode = spec[3] if len(spec) > 3 else "assertion"
             p = Path(kw["cwd"]) / rel
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(text)
-            decl.append({"path": rel, "kind": kind, "cases": cases})
+            decl.append({"path": rel, "kind": kind, "cases": cases,
+                         "failure_mode": mode})
         return {"files": decl}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
@@ -518,6 +521,142 @@ def test_a_runner_cache_in_the_tree_is_never_touched(
     left = subprocess.run(["git", "-C", str(staging), "ls-files", "--others"],
                           capture_output=True, text=True).stdout
     assert "test_defect_" not in left
+
+
+_JUNIT_PASS = ('<testsuites><testsuite tests="1" errors="0">'
+               '<testcase classname="t" name="test_a"/></testsuite>'
+               '</testsuites>')
+_JUNIT_NONE = '<testsuites><testsuite tests="0"/></testsuites>'
+_JUNIT_SKIPPED = ('<testsuites><testsuite tests="1"><testcase classname="t" '
+                  'name="test_a"><skipped/></testcase></testsuite>'
+                  '</testsuites>')
+_JUNIT_COLLECT = ('<testsuites><testsuite tests="1" errors="1"><testcase '
+                  'classname="" name="t"><error message="x"/></testcase>'
+                  '</testsuite></testsuites>')
+_JUNIT_SETUP = ('<testsuites><testsuite tests="1" errors="1"><testcase '
+                'classname="t" name="test_a"><error message="fixture"/>'
+                '</testcase></testsuite></testsuites>')
+_JEST_PASS = json.dumps({"testResults": [{"status": "passed",
+    "assertionResults": [{"status": "passed"}, {"status": "failed"}]}]})
+_JEST_NONE = json.dumps({"testResults": []})
+_JEST_BROKEN = json.dumps({"testResults": [{"status": "failed",
+    "assertionResults": [], "message": "Test suite failed to run"}]})
+
+
+@pytest.mark.parametrize("kind,text,want", [
+    ("junit", _JUNIT_PASS, {"executed": 1, "collection_error": False}),
+    ("junit", _JUNIT_NONE, {"executed": 0, "collection_error": False}),
+    ("junit", _JUNIT_SKIPPED, {"executed": 0, "collection_error": False}),
+    ("junit", _JUNIT_COLLECT, {"executed": 0, "collection_error": True}),
+    # A setup error sits on a real, named case: a test that ran.
+    ("junit", _JUNIT_SETUP, {"executed": 1, "collection_error": False}),
+    ("jest-json", _JEST_PASS, {"executed": 2, "collection_error": False}),
+    ("jest-json", _JEST_NONE, {"executed": 0, "collection_error": False}),
+    ("jest-json", _JEST_BROKEN, {"executed": 0, "collection_error": True}),
+    ("junit", "<not xml", None),
+    ("jest-json", "{not json", None),
+])
+def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
+                                              want):
+    p = tmp_path / "report"
+    p.write_text(text)
+    assert leerie._parse_runner_report(kind, p) == want
+    assert leerie._parse_runner_report(kind, tmp_path / "absent") is None
+
+
+@pytest.mark.parametrize("cmd,placed", [
+    ("cd web && npx jest acc/a.test.js", True),
+    ("npx vitest run acc/a.test.ts", True),
+    ("npx jest acc/a.test.js | tee log", False),
+    ("npx jest acc/a.test.js > out.txt", False),
+    ("npx jest acc/a.test.js && echo done", False),
+    ("npm test -- acc/a.test.js", False),
+])
+def test_report_flags_are_placed_only_where_they_reach_the_runner(
+        leerie, tmp_path, cmd, placed):
+    spec = leerie._acceptance_report_spec(cmd, tmp_path / "r.json")
+    assert (spec is not None) is placed
+    if placed:
+        assert spec[0].startswith(cmd) and "--outputFile=" in spec[0]
+        assert spec[1] is None and spec[2] == "jest-json"
+
+
+def test_pytest_is_asked_for_junit_through_its_environment(
+        leerie, tmp_path, monkeypatch):
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-x")
+    cmd = "cd sub && python3 -m pytest -q acc/test_a.py | cat"
+    run_cmd, env, kind = leerie._acceptance_report_spec(
+        cmd, tmp_path / "r.xml")
+    assert run_cmd == cmd and kind == "junit"
+    assert env["PYTEST_ADDOPTS"] == f"-x --junitxml={tmp_path / 'r.xml'}"
+
+
+def _validate(leerie, st, repo, rel, mode="assertion"):
+    return asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), rel, st.run_dir / "logs" / "v.log",
+        "v", validating=True, failure_mode=mode))
+
+
+def test_a_file_whose_tests_all_skip_is_no_verdict_while_validating(
+        leerie, tmp_path):
+    """Exit code 0, but nothing ran: only the report shows it. As a control
+    it used to be accepted, proving nothing."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text(
+        "import pytest\n\n@pytest.mark.skip\ndef test_x():\n    pass\n")
+    assert _validate(leerie, st, repo, "test_probe.py") is None
+    # Evaluating a fix is unchanged: exit code alone.
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_probe.py",
+        st.run_dir / "logs" / "v.log", "v")) is True
+
+
+_IMPORT_DEFECT = ("from calc import mul\n\n"
+                  "def test_mul():\n    assert mul(2, 3) == 6\n")
+
+
+@pytest.mark.parametrize("mode,want", [("import", False),
+                                       ("assertion", None)])
+def test_a_declared_import_defect_counts_as_failing(leerie, tmp_path, mode,
+                                                    want):
+    """The report's defect is that `mul` does not exist: a defect file that
+    cannot load on the base is showing it — but only when the writer said
+    so (Language-to-JSON: the writer, not Python, reads the report)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text(_IMPORT_DEFECT)
+    assert _validate(leerie, st, repo, "test_probe.py", mode) is want
+
+
+def test_a_declared_import_defect_that_does_not_parse_is_no_verdict(
+        leerie, tmp_path):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_probe.py").write_text("from calc import mul(\n")
+    assert _validate(leerie, st, repo, "test_probe.py", "import") is None
+
+
+def test_an_import_defect_set_validates_and_passes_on_the_fix(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _writer_stub(leerie, monkeypatch, {1: {
+        "acc/test_defect_mul.py": ("defect", _IMPORT_DEFECT, ["mul exists"],
+                                   "import"),
+        "acc/test_control_add.py": ("control", CONTROL_TEST, ["add zero"])}})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_mul.py"]
+    assert s["modes"] == {"acc/test_defect_mul.py": "import"}
+    staging = _staging(st, repo)
+    (staging / "calc.py").write_text(
+        BUGGY + "\n\ndef mul(a, b):\n    return a * b\n")
+    _git(staging, "commit", "-qam", "conformer: add mul")
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    assert res[0]["passed"] is True
 
 
 def test_majority_rule(leerie):
@@ -1948,6 +2087,47 @@ def test_no_rollback_target_means_no_repair(leerie, tmp_path, monkeypatch):
     gate = st.data["acceptance"]["gate"]
     assert calls == []
     assert gate["residual"]["failing_sets"] == 5
+
+
+def test_a_one_off_install_failure_mid_loop_keeps_the_next_round(
+        leerie, tmp_path, monkeypatch):
+    """Round-9 LOW: the round's own evaluation failed to install once, read
+    as "nothing measured", and the loop stopped with a round left. It is
+    measured again inside the loop now."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    _counted_recipe(st, tmp_path, 2, 2)       # round 1's evaluation fails
+    calls = _run_gate(leerie, monkeypatch, st, lambda _p: None,
+                      measured=[{"passed": True, "measured": True}])
+    gate = st.data["acceptance"]["gate"]
+    assert len(calls) == 2
+    assert gate["rounds"][0]["retried"] is True
+    assert leerie._acceptance_measured(gate["rounds"][0]["results"])
+
+
+def test_a_commit_already_retried_in_the_loop_is_not_retried_again(
+        leerie, tmp_path, monkeypatch):
+    """The post-loop retry is skipped for a commit the round's own retry
+    already measured: straight to the pre-repair control."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    _counted_recipe(st, tmp_path, 2, 99)      # every later install fails
+    labels = []
+    real = leerie._evaluate_acceptance_sets_inner
+
+    async def spy(st_, caps, tree, sets, label, **kw):
+        labels.append(label)
+        return await real(st_, caps, tree, sets, label, **kw)
+    monkeypatch.setattr(leerie, "_evaluate_acceptance_sets_inner", spy)
+    _run_gate(leerie, monkeypatch, st, _commit_fix,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": True, "measured": True}])
+    assert labels == ["gate-initial", "gate-r1", "gate-r1-retry",
+                      "gate-before"]
 
 
 def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):

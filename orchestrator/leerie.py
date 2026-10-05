@@ -48,6 +48,7 @@ import urllib.error
 import urllib.request
 import uuid
 import weakref
+import xml.etree.ElementTree as ElementTree
 from collections import deque
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
 from datetime import datetime, timedelta, timezone
@@ -2512,9 +2513,12 @@ SCHEMAS: dict[str, dict] = {
     "acceptance_writer": {
         # Held-out acceptance tests written from the report alone, in a
         # disposable worktree at the validity base (DESIGN §8 *Held-out
-        # acceptance tests*). Python validates each file by exit code
-        # only; `cases` are the names the repair rounds are shown — never
-        # the runner output or the test source.
+        # acceptance tests*). Python validates each file by exit code and,
+        # where the runner can write one, a structured report; `cases` are
+        # the names the repair rounds are shown — never the runner output or
+        # the test source. `failure_mode` is required (a fact the validity
+        # rule depends on must never be silently omitted): "import" says the
+        # defect shows as the file failing to load against the unfixed tree.
         "type": "object",
         "additionalProperties": False,
         "required": ["files"],
@@ -2524,13 +2528,15 @@ SCHEMAS: dict[str, dict] = {
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["path", "kind", "cases"],
+                    "required": ["path", "kind", "cases", "failure_mode"],
                     "properties": {
                         "path": {"type": "string"},
                         "kind": {"type": "string",
                                  "enum": ["defect", "control"]},
                         "cases": {"type": "array",
                                   "items": {"type": "string"}},
+                        "failure_mode": {"type": "string",
+                                         "enum": ["assertion", "import"]},
                     },
                 },
             },
@@ -32960,17 +32966,132 @@ _RUNNER_NO_VERDICT_EXITS: dict[str, frozenset[int]] = {
 }
 
 
-def _acceptance_no_verdict_exits(cmd: str) -> frozenset[int]:
-    """The no-verdict exit codes of the runner a shell command invokes,
-    matched on the command's own tokens (a mechanical string, DESIGN §12)."""
+def _acceptance_runner(cmd: str, known: object) -> str | None:
+    """Which of the `known` runner names a shell command invokes, matched on
+    the basenames of its own tokens (a mechanical string, DESIGN §12)."""
     try:
         tokens = shlex.split(cmd)
     except ValueError:
-        return frozenset()
-    for runner, codes in _RUNNER_NO_VERDICT_EXITS.items():
+        return None
+    for runner in known:
         if any(os.path.basename(t) == runner for t in tokens):
-            return codes
-    return frozenset()
+            return runner
+    return None
+
+
+def _acceptance_no_verdict_exits(cmd: str) -> frozenset[int]:
+    """The no-verdict exit codes of the runner a shell command invokes."""
+    runner = _acceptance_runner(cmd, _RUNNER_NO_VERDICT_EXITS)
+    return _RUNNER_NO_VERDICT_EXITS[runner] if runner else frozenset()
+
+
+# How a known runner is asked for a structured report of one run, so that
+# validation can tell "ran no test" and "could not load the file" from "a
+# test failed" — which jest's and vitest's exit codes cannot (1 for all
+# three), and pytest's only approximately. Each value is (report kind, how):
+# "env" sets PYTEST_ADDOPTS and so works whatever the command's shape; a flag
+# string is appended to the command, which is only safe when the runner is
+# the command's last simple command (`_acceptance_report_spec`).
+_RUNNER_REPORTS: dict[str, tuple[str, str]] = {
+    "pytest": ("junit", "env"),
+    "jest": ("jest-json", "--json --outputFile={path}"),
+    "vitest": ("jest-json", "--reporter=json --outputFile={path}"),
+}
+
+# Shell tokens after which appended flags would no longer reach the runner
+# (a pipe or a redirect) or would reach a different command (a separator).
+_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "&", "|", ";;"})
+_SHELL_REDIRECTS = frozenset({">", ">>", "<", "<<", ">&", "<&", "|&"})
+
+
+def _acceptance_report_spec(cmd: str, path: Path
+                            ) -> tuple[str, dict[str, str] | None, str] | None:
+    """`(command, env, report kind)` asking the invoked runner to write a
+    structured report to `path`, or None when the runner has no known report
+    or the flags cannot be placed safely."""
+    runner = _acceptance_runner(cmd, _RUNNER_REPORTS)
+    if runner is None:
+        return None
+    kind, how = _RUNNER_REPORTS[runner]
+    if how == "env":
+        prior = os.environ.get("PYTEST_ADDOPTS", "")
+        opt = f"--junitxml={shlex.quote(str(path))}"
+        return cmd, {**os.environ,
+                     "PYTEST_ADDOPTS": f"{prior} {opt}".strip()}, kind
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    try:
+        tokens = list(lexer)
+    except ValueError:
+        return None
+    last_sep = max((i for i, t in enumerate(tokens)
+                    if t in _SHELL_SEPARATORS), default=-1)
+    runner_at = max((i for i, t in enumerate(tokens)
+                     if os.path.basename(t) == runner), default=-1)
+    if runner_at <= last_sep or any(
+            t in _SHELL_REDIRECTS for t in tokens[runner_at:]):
+        return None
+    return (f"{cmd} {how.format(path=shlex.quote(str(path)))}", None, kind)
+
+
+def _parse_runner_report(kind: str, path: Path) -> dict | None:
+    """`{executed, collection_error}` from a runner's structured report, or
+    None when there is none to read (the runner ignored the request, or it
+    died before writing). Reads fixed machine formats only (DESIGN §12)."""
+    try:
+        if kind == "junit":
+            root = ElementTree.parse(path).getroot()
+            executed, collection_error = 0, False
+            for case in root.iter("testcase"):
+                tags = {child.tag for child in case}
+                # pytest records a file it could not collect (a syntax
+                # error, a failed import) as a case with no class name and
+                # an <error>; a setup error sits on a real, named case.
+                if not case.get("classname") and "error" in tags:
+                    collection_error = True
+                elif "skipped" not in tags:
+                    executed += 1
+            return {"executed": executed,
+                    "collection_error": collection_error}
+        if kind == "jest-json":
+            data = json.loads(Path(path).read_text())
+            executed, collection_error = 0, False
+            for suite in data.get("testResults") or []:
+                results = suite.get("assertionResults") or []
+                # A suite that failed with no assertion run never loaded.
+                if (suite.get("testExecError")
+                        or (suite.get("status") == "failed" and not results)):
+                    collection_error = True
+                executed += sum(1 for r in results
+                                if r.get("status") in ("passed", "failed"))
+            return {"executed": executed,
+                    "collection_error": collection_error}
+    except (OSError, ValueError, ElementTree.ParseError, AttributeError,
+            TypeError):
+        return None
+    return None
+
+
+def _acceptance_file_parses(tree: str, rel: str) -> bool:
+    """A mechanical syntax check of a test file itself: Python through the
+    stdlib parser, JavaScript through `node --check` when node is present;
+    other languages are not checked (True). Guards a writer-declared import
+    defect against a file that merely fails to parse."""
+    p = Path(tree) / rel
+    if rel.endswith(".py"):
+        try:
+            compile(p.read_text(), str(p), "exec", dont_inherit=True)
+        except (SyntaxError, ValueError, OSError):
+            return False
+        return True
+    if rel.endswith((".js", ".mjs", ".cjs")) and shutil.which("node"):
+        try:
+            return subprocess.run(["node", "--check", str(p)],
+                                  capture_output=True, check=False,
+                                  timeout=60).returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+    return True
 
 
 def _acceptance_declared_rel(declared: dict) -> str:
@@ -33004,11 +33125,20 @@ def _acceptance_cmd(st: "State", files: list[str]) -> str | None:
 async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                rel: str, log_path: Path,
                                label: str, *,
-                               validating: bool = False) -> bool | None:
+                               validating: bool = False,
+                               failure_mode: str = "assertion"
+                               ) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
     False failed, None not measurable (no command, the shell could not run
-    it — exit 126/127 — or the container's limits killed it; and, only when
-    `validating`, a runner's ran-no-test exit, `_RUNNER_NO_VERDICT_EXITS`).
+    it — exit 126/127 — or the container's limits killed it).
+
+    Only when `validating` (on the base, by the writer): the runner is asked
+    for a structured report (`_acceptance_report_spec`). A file that ran no
+    test is no verdict, and so is one that could not be loaded — unless the
+    writer declared its defect an import failure (`failure_mode="import"`)
+    and the file itself parses, when not loading IS the defect showing.
+    Without a report, a runner's ran-no-test exit (`_RUNNER_NO_VERDICT_EXITS`)
+    is no verdict.
 
     Not `_measure_blt`: its "could not measure" test reads the whole output
     for `No such file or directory`, which is also what a test of a missing-
@@ -33018,13 +33148,23 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     cmd = _acceptance_cmd(st, [rel])
     if cmd is None:
         return None
+    run_cmd, env, spec = cmd, None, None
+    report = st.run_dir / "acceptance" / "reports" / (
+        f"{label}-{hashlib.sha256(rel.encode()).hexdigest()[:12]}")
+    if validating:
+        spec = _acceptance_report_spec(cmd, report)
+        if spec is not None:
+            run_cmd, env, _kind = spec
+            report.parent.mkdir(parents=True, exist_ok=True)
+            with contextlib.suppress(OSError):
+                report.unlink()
     async with _blt_semaphore(caps):
         try:
             rc, tail = await _run_streaming(
-                ["bash", "-c", cmd], cwd=str(tree),
+                ["bash", "-c", run_cmd], cwd=str(tree), env=env,
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
-                log_path=log_path, label=f"{label}-tests: {cmd}",
+                log_path=log_path, label=f"{label}-tests: {run_cmd}",
                 verbosity="quiet")
         except subprocess.TimeoutExpired:
             return False
@@ -33032,7 +33172,18 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             return None
     if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
         return None
-    if validating and rc in _acceptance_no_verdict_exits(cmd):
+    if not validating:
+        return rc == 0
+    parsed = _parse_runner_report(spec[2], report) if spec else None
+    if parsed is None:
+        if rc in _acceptance_no_verdict_exits(cmd):
+            return None
+        return rc == 0
+    if parsed["collection_error"]:
+        if failure_mode == "import" and _acceptance_file_parses(tree, rel):
+            return False
+        return None
+    if parsed["executed"] == 0:
         return None
     return rc == 0
 
@@ -33139,7 +33290,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             p for p in post.stdout.split("\0")
             if p and p not in refs and p not in pre_untracked
             and not _acceptance_is_cache_path(p))
-        defect, control, cases = [], [], {}
+        defect, control, cases, modes = [], [], {}, {}
         for f in (res.get("files") or []):
             rel = _acceptance_declared_rel(f)
             # Relative, inside the worktree, a real file, not the report.
@@ -33157,9 +33308,11 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                                f"{base}:{rel}"], capture_output=True,
                               check=False).returncode == 0:
                 continue
+            mode = ("import" if f.get("kind") == "defect"
+                    and f.get("failure_mode") == "import" else "assertion")
             verdict = await _run_acceptance_file(
                 st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
-                validating=True)
+                validating=True, failure_mode=mode)
             if verdict is None:
                 # Not measurable (no test command for this file, the runner
                 # is missing, or it ran no test) — never mistaken for pass
@@ -33170,6 +33323,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 # Must FAIL on the unfixed tree, or it cannot discriminate.
                 if verdict is False:
                     defect.append(rel)
+                    modes[rel] = mode
                     cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
             elif verdict is True:
                 control.append(rel)
@@ -33203,7 +33357,8 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             (dest / rel).parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(wt / rel, dest / rel)
         out.update(valid=True, dir=str(dest), defect_files=defect,
-                   control_files=control, support_files=support, cases=cases)
+                   control_files=control, support_files=support, cases=cases,
+                   modes=modes)
         return out
     except (WorkerError, subprocess.TimeoutExpired) as e:
         out["reason"] = _brief_worker_exc(e)
@@ -33571,11 +33726,23 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             # `_evaluate_acceptance_sets` turns a set it cannot place into
             # no evidence rather than raising, so the rollback check below
             # always runs on what this round committed.
+            prev = final
             final, final_sha = await _measure(f"gate-r{rnd}")
+            entry = {"round": rnd, "results": final, "sha": final_sha}
+            if (not _acceptance_measured(final)
+                    and _acceptance_measured(prev)):
+                # Every evaluation installs afresh, so a one-off failure (a
+                # network blip) reads as "nothing measured" — and the loop
+                # stops on a verdict that cannot fail, losing the rounds
+                # left. Measure once more before trusting it.
+                retry, retry_sha = await _measure(f"gate-r{rnd}-retry")
+                entry["retried"] = True
+                if _acceptance_measured(retry):
+                    final, final_sha = retry, retry_sha
+                    entry.update(results=final, sha=final_sha)
             # Saved per round: a crash before the rollback check must not
             # lose a spent round, or a resume would run it past the cap.
-            gate["rounds"].append({"round": rnd, "results": final,
-                                   "sha": final_sha})
+            gate["rounds"].append(entry)
             acc["gate"] = gate
             st.data["acceptance"] = acc
             st.save()
@@ -33610,7 +33777,12 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     # (a network blip) looks the same. Measure the repaired
                     # tree once more; only if it still measures nothing while
                     # the pre-repair tree does is the repair to blame.
-                    retry, retry_sha = await _measure("gate-retry")
+                    last = gate["rounds"][-1] if gate["rounds"] else {}
+                    if last.get("retried") and last.get("sha") == final_sha:
+                        # The round already measured this commit twice.
+                        retry, retry_sha = final, final_sha
+                    else:
+                        retry, retry_sha = await _measure("gate-retry")
                     if _acceptance_measured(retry):
                         final, final_sha = retry, retry_sha
                         if gate["rounds"]:
