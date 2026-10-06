@@ -586,6 +586,9 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
     ("npm test -- acc/a.test.js", False),
     ("(cd web && npx jest acc/a.test.js)", False),
     ("npx jest -- acc/a.test.js", False),
+    # The wrapper names the runner as a package before its own `--`: the
+    # runner proper comes after it, so the flags reach it (#284 review).
+    ("npx -p jest -- jest acc/a.test.js", True),
 ])
 def test_report_flags_are_placed_only_where_they_reach_the_runner(
         leerie, tmp_path, cmd, placed):
@@ -616,6 +619,8 @@ def test_pytest_is_asked_for_junit_through_its_environment(
     # either turned a working template into a discarded set (#283 review).
     ("pytest --junitxml=own.xml -- {f}", False),
     ("(cd sub && python3 -m pytest --junitxml=own.xml {f})", False),
+    # A wrapper's own `--` before the runner proper is not the runner's.
+    ("uv run --with pytest -- pytest --junitxml=own.xml {f}", True),
 ])
 def test_a_command_naming_its_own_junit_path_gets_ours_appended(
         leerie, tmp_path, monkeypatch, cmd, placed):
@@ -1810,6 +1815,25 @@ def test_a_shown_set_naming_no_cases_is_not_called_hidden(leerie):
         res, sets, {1, 2, 3}, 1, "c", held_back=False)
     assert "not shown" not in text and "named below" not in text
     assert "declared no case names" in text
+
+
+def test_an_unmeasured_shown_set_is_not_a_failure_without_names(leerie):
+    """A shown set with no verdict on HEAD (`passed: False, unmeasured`) is
+    not a failing shown set: with only held-back sets failing, the section
+    still says every failing test is unseen (#284 review)."""
+    sets = [{"index": k, "cases": {f"acc/test_defect_{k}.py": [f"c{k}"]}}
+            for k in range(1, 5)]
+    res = [{"index": 1, "passed": False, "unmeasured": True,
+            "failing_files": []},
+           {"index": 2, "passed": True, "failing_files": []},
+           {"index": 3, "passed": False,
+            "failing_files": ["acc/test_defect_3.py"]},
+           {"index": 4, "passed": False,
+            "failing_files": ["acc/test_defect_4.py"]}]
+    text = leerie._format_acceptance_failures_section(
+        res, sets, {1, 2}, 1, "c", held_back=True)
+    assert "Every failing test is one you are not shown" in text
+    assert "declared no case names" not in text
 
 
 def test_shown_indices_hold_back_the_two_highest_from_four(leerie):

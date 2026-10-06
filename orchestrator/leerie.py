@@ -33073,9 +33073,11 @@ def _flags_reach_runner(tokens: list[str], runner: str) -> bool:
                     if t in _SHELL_SEPARATORS), default=-1)
     runner_at = [i for i, t in enumerate(tokens)
                  if os.path.basename(t) == runner]
+    # Stoppers count only after the LAST runner token: a wrapper can name
+    # the runner as a package before its own `--` (`npx -p jest -- jest x`).
     return bool(runner_at) and min(runner_at) > last_sep and not any(
-        t in _SHELL_REDIRECTS or t in _FLAG_STOPPERS
-        for t in tokens[min(runner_at):])
+        t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]) and not any(
+        t in _FLAG_STOPPERS for t in tokens[max(runner_at):])
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:
@@ -33756,7 +33758,8 @@ def _format_acceptance_failures_section(results: list[dict],
     import_cases: list[str] = []
     shown_fails = False
     for r in results:
-        if r["passed"] or r["index"] not in shown:
+        # An unmeasured set is no verdict, never a failure to describe.
+        if r["passed"] or r.get("unmeasured") or r["index"] not in shown:
             continue
         shown_fails = True
         set_ = by_index[r["index"]]
