@@ -6050,7 +6050,8 @@ cannot load on the base is then the defect showing — provided the file,
 and every other Python file the writer wrote (a broken helper would fail
 every fix just the same), parses under the project's own interpreter: a
 throwaway compile check, named to fit the repository's own test-file
-convention, run through its own test command, so its interpreter version
+convention where any candidate name does, run through its own test
+command, so its interpreter version
 decides, not the orchestrator's. A check that cannot run there proves
 nothing, and the declaration is not honoured either; the log says which.
 That is checked only where it can be checked reliably, in Python; a

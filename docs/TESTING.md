@@ -4573,7 +4573,8 @@ dropping the both-unreadable clause.
 ### Runner reports, writer-declared import defects, in-loop retry (2026-10-05)
 
 The first commit's 12 distinct reversions, each against its named test, all
-caught; the later entries in this list carry their own counts.
+caught — they cover the report, import-defect and retry entries below; the
+entries added by later commits carry their own counts.
 
 - **Structured runner reports while validating**
   (`test_runner_reports_are_read_mechanically`: JUnit and jest-compatible JSON,
@@ -4627,7 +4628,10 @@ is kept for hygiene.
   deselects reported as unrunnable rather than unparseable
   (`test_a_probe_the_template_deselects_is_unrunnable_not_unparseable`), and a
   `{files}` template running the probe whatever its name
-  (`test_a_files_template_runs_the_probe_whatever_its_name`).
+  (`test_a_files_template_runs_the_probe_whatever_its_name`). 3 reversions, 3
+  caught. Only pytest's "no test collected" (5) makes the probe unrunnable; a
+  conftest the writer added that does not parse (exit 4) is a parse failure
+  (`test_a_broken_conftest_the_writer_added_reads_as_does_not_parse`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

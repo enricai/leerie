@@ -33094,6 +33094,11 @@ class LeerieParseProbe(unittest.TestCase):
 """
 
 
+# Exits with which a known runner says the parse probe ran no test at all.
+_PROBE_RAN_NOTHING_EXITS: dict[str, frozenset[int]] = {
+    "pytest": frozenset({5}),
+}
+
 # Comfortably under the common 255-byte NAME_MAX.
 _PROBE_NAME_MAX = 200
 
@@ -33133,9 +33138,9 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     interpreter and environment; a `unittest.TestCase` so any Python runner
     collects it. True on exit 0, False on any other exit. None when the
     probe could not be run at all (no command for its name, a shell that
-    cannot run it, a runner's "ran no test" exit, a timeout or another
-    error) — reported apart, since it says nothing about whether the files
-    parse. Either way short of True, the
+    cannot run it, the runner reporting that it collected no test, a
+    timeout or another error) — reported apart, since it says nothing about
+    whether the files parse. Either way short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
     cmd = _acceptance_cmd(st, [probe])
@@ -33159,9 +33164,12 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
             path.unlink()
     if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
         return None
-    # A runner's "ran no test" exits (a `-k`/`-m` in the template that
-    # deselects the probe, `-p no:unittest`) say nothing about parsing.
-    if rc in _acceptance_no_verdict_exits(cmd):
+    # Only "no test collected" (pytest's 5: a `-k`/`-m` in the template
+    # deselected the probe, or `-p no:unittest`) says nothing about parsing.
+    # Its other no-verdict exits do: a conftest the writer added that does
+    # not parse is exit 4, a broken import beside it exit 2.
+    if rc in _PROBE_RAN_NOTHING_EXITS.get(
+            _acceptance_runner(cmd, _PROBE_RAN_NOTHING_EXITS) or "", ()):
         return None
     return rc == 0
 

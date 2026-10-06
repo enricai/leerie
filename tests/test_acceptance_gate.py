@@ -779,6 +779,22 @@ def test_a_probe_the_template_deselects_is_unrunnable_not_unparseable(
         ["test_probe_me.py"], st.run_dir / "logs" / "p.log", "p")) is None
 
 
+def test_a_broken_conftest_the_writer_added_reads_as_does_not_parse(
+        leerie, tmp_path):
+    """pytest exits 4 on a conftest that does not parse: that IS a parse
+    failure of a file the writer wrote, not "the probe could not run" —
+    only "no test collected" (5) is."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    (repo / "acc" / "conftest.py").write_text("def broken(:\n    pass\n")
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    assert asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log",
+        "p")) is False
+
+
 def test_a_files_template_runs_the_probe_whatever_its_name(leerie, tmp_path):
     """A `{files}` template renders any name, so the probe runs even where
     no candidate is test-shaped (round-18 LOW: it had returned None)."""
