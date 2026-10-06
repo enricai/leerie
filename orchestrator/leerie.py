@@ -32994,10 +32994,14 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
         # inside `$(…)`) still names its runner: its exit codes matter even
         # where no report can be placed.
         try:
-            tokens = [("word", t, 0)
-                      for t in shlex.split(cmd, comments=True)]
+            words = shlex.split(cmd)
         except ValueError:
             return None
+        # A comment starts at a word that begins with `#` (`shlex`'s own
+        # comment handling would also cut a mid-word one, `r.git#sub=py`).
+        cut = next((n for n, w in enumerate(words) if w.startswith("#")),
+                   len(words))
+        tokens = [("word", w, 0) for w in words[:cut]]
     for runner in known:
         if _runner_positions(tokens, runner, files, top_level=False):
             return runner
@@ -33029,12 +33033,18 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
 # (`_acceptance_report_spec`).
 _CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
                              "kubectl"})
-# Commands that take what follows as shell text or a script to run, not a
-# program and its arguments: appended flags become their own arguments
-# (`sh -c jest` -> `$0`, `. run.sh jest` -> `$2`) or are re-parsed as
-# commands (`eval jest \;`).
-_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "eval", "source",
-                     "."})
+# Shells: they take what follows as shell text or a script to run, not a
+# program and its arguments, so appended flags become their own arguments
+# (`sh -c jest` -> `$0`). Recognised anywhere before the runner in its
+# command, since a wrapper can start one (`timeout 60 sh -c jest`).
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+# Builtins that take what follows as text or a script — appended flags are
+# re-parsed as commands (`eval jest \;`) or become a script's arguments
+# (`. run.sh jest`) — recognised only as the command word
+# (`_takes_runner_as_text`).
+_TEXT_BUILTINS = frozenset({"eval", "source", "."})
+# A shell variable assignment word (`FOO=bar`), a fixed syntax.
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 # Unquoted characters that end a word and form operators (parens apart).
 _SHELL_OPERATOR_CHARS = frozenset(";&|<>\n")
 # A word appended to check where appended flags would land.
@@ -33123,7 +33133,8 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
     tokens: list[tuple[str, str, int]] = []
     heredoc = False
     # Frames: [kind, word chars or None, open subshell parens]. Splitting
-    # frames (top, `$(`/`<(`/`>(` "sub", backtick "bt") hold words; the rest
+    # frames (top, `$(`/`<(`/`>(` "sub") hold words — a backtick body is
+    # scanned as a command of its own, below; the rest
     # ("dq", "sq", "ansi", "brace") add to the word of the nearest splitting
     # frame. A `$((…))` scans as a substitution holding a subshell: the
     # same word boundaries.
@@ -33131,10 +33142,10 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
 
     def split_frame() -> list:
         return next(f for f in reversed(frames)
-                    if f[0] in ("top", "sub", "bt"))
+                    if f[0] in ("top", "sub"))
 
     def depth() -> int:
-        return sum(f[0] in ("sub", "bt") for f in frames)
+        return sum(f[0] == "sub" for f in frames)
 
     def add(text: str) -> None:
         f = split_frame()
@@ -33159,8 +33170,9 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             continue
         if kind == "ansi":
             if ch == "\\":
-                add(nxt)
-                i += 2
+                text, used = _ansi_c_escape(cmd, i)
+                add(text)
+                i += used
                 continue
             if ch == "'":
                 frames.pop()
@@ -33198,14 +33210,32 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             i += 2
             continue
         if ch == "`":
-            if kind == "bt":
-                end_word()
-                frames.pop()
-                add("`")
-            else:
-                add("`")
-                frames.append(["bt", None, 0])
-            i += 1
+            # As bash does: take the body up to the closing backtick, drop
+            # the backslash before `$`, `` ` `` and `\` (and `"` inside
+            # double quotes), then read the result as a command of its own,
+            # one substitution deeper. `\\"` in a body is thus `\"` there.
+            j = i + 1
+            while j < len(cmd) and cmd[j] != "`":
+                j += 2 if cmd[j] == "\\" else 1
+            if j >= len(cmd):
+                return None
+            keep = '$`\\"' if kind == "dq" else "$`\\"
+            body, k = [], i + 1
+            while k < j:
+                if cmd[k] == "\\" and k + 1 < j and cmd[k + 1] in keep:
+                    body.append(cmd[k + 1])
+                    k += 2
+                else:
+                    body.append(cmd[k])
+                    k += 1
+            inner = _shell_scan("".join(body))
+            if inner is None:
+                return None
+            base = depth() + 1
+            tokens.extend((tk, tt, td + base) for tk, tt, td in inner[0])
+            heredoc = heredoc or inner[1]
+            add("``")
+            i = j + 1
             continue
         if kind == "dq":
             add(ch)
@@ -33249,9 +33279,7 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             i += 1
             continue
         if ch == "#" and frames[-1][1] is None:
-            # Inside backticks a comment also ends at the closing backtick.
-            stop = "\n`" if kind == "bt" else "\n"
-            while i < len(cmd) and cmd[i] not in stop:
+            while i < len(cmd) and cmd[i] != "\n":
                 i += 1
             continue
         if ch == "(":
@@ -33279,7 +33307,8 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
                 j += 1
             j = max(j, i + 1)  # always advance, whatever the input
             op = cmd[i:j]
-            heredoc = heredoc or "<<" in op.replace("<<<", "")
+            heredoc = heredoc or any(
+                o in ("<<", "<<-") for o in _split_shell_ops(op))
             end_word()
             tokens.append(("op", op, depth()))
             i = j
@@ -33290,6 +33319,35 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
         return None
     end_word()
     return tokens, heredoc
+
+
+# `$'…'` escapes with a fixed one-character meaning (bash's ANSI-C quoting).
+_ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b",
+                  "f": "\f", "n": "\n", "r": "\r", "t": "\t",
+                  "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+
+
+def _ansi_c_escape(cmd: str, i: int) -> tuple[str, int]:
+    r"""The text of the `$'…'` escape starting at the backslash `cmd[i]`, and
+    how many characters it spans: bash's simple escapes, octal `\nnn`, hex
+    `\xHH`, `\uHHHH`/`\UHHHHHHHH` and control `\cX`; any other escape
+    keeps its backslash, as bash does (`$'\}'` is `\}`)."""
+    nxt = cmd[i + 1:i + 2]
+    if nxt in _ANSI_C_SIMPLE:
+        return _ANSI_C_SIMPLE[nxt], 2
+    if nxt in "01234567" and nxt:
+        digits = re.match(r"[0-7]{1,3}", cmd[i + 1:]).group()
+        return chr(int(digits, 8) & 0xFF), 1 + len(digits)
+    for lead, width in (("x", 2), ("u", 4), ("U", 8)):
+        if nxt == lead:
+            digits = re.match(r"[0-9a-fA-F]{0,%d}" % width,
+                              cmd[i + 2:]).group()
+            if digits:
+                return chr(int(digits, 16)), 2 + len(digits)
+            return "\\" + lead, 2
+    if nxt == "c" and i + 2 < len(cmd):
+        return chr(ord(cmd[i + 2]) & 0x1F), 3
+    return "\\" + nxt, 2
 
 
 def _runner_positions(tokens: list[tuple[str, str, int]], runner: str,
@@ -33315,13 +33373,36 @@ def _command_start(tokens: list[tuple[str, str, int]], at: int) -> int:
                default=-1) + 1
 
 
+# bash's operators, longest first so a run splits as bash splits it: `>|`
+# (a redirect overriding noclobber) is not `>` then a pipe, and `&>` is not
+# `&` then `>`.
+_SHELL_CONTROL_OPS = (";;&", "||", "&&", ";;", ";&", "|&", ";", "&", "|",
+                      "\n")
+_SHELL_REDIRECT_OPS = ("&>>", "<<<", "<<-", "<<", "<>", "<&", ">&", ">>",
+                       ">|", "&>", "<", ">")
+
+
+def _split_shell_ops(run: str) -> list[str]:
+    """A run of operator characters split into bash's operators, longest
+    match first."""
+    ops: list[str] = []
+    i = 0
+    known = sorted(_SHELL_CONTROL_OPS + _SHELL_REDIRECT_OPS, key=len,
+                   reverse=True)
+    while i < len(run):
+        op = next((o for o in known if run.startswith(o, i)), run[i])
+        ops.append(op)
+        i += len(op)
+    return ops
+
+
 def _is_control_op(op: str) -> bool:
-    """Whether an operator token ends a command (`;`, `&`, `|`, `&&`, `||`,
-    `|&`, a newline, a paren) rather than redirecting one (`>`, `2>&1` read
-    as `>&`, `&>`, `<<<`)."""
-    if op in ("(", ")") or any(c in op for c in ";|\n"):
-        return True
-    return "&" in op and "<" not in op and ">" not in op
+    """Whether an operator token ends a command — a paren, or a run holding
+    a control operator (`;`, `&`, `|`, `&&`, `||`, `|&`, a newline) — rather
+    than only redirecting one (`>`, `>|`, `2>&1` read as `>&`, `&>`,
+    `<<<`)."""
+    return op in ("(", ")") or any(
+        o in _SHELL_CONTROL_OPS for o in _split_shell_ops(op))
 
 
 def _runner_in_container(tokens: list[tuple[str, str, int]],
@@ -33347,10 +33428,11 @@ def _flags_reach_runner(tokens: list[tuple[str, str, int]], runner: str,
     separator, pipe, redirect or subshell paren, so the runner's command is
     the last one and nothing closes around it; no `--` after its last
     occurrence (the flags would be file arguments; a wrapper's own `--`
-    before it is fine, `npx -p jest -- jest x`); and its command does not
-    start with a shell, which would take the runner as text (`sh -c
-    jest`). Words inside a substitution are the substitution's, not the
-    runner's (`--maxWorkers=$(nproc)`)."""
+    before it is fine, `npx -p jest -- jest x`); and no shell comes before
+    it in its command (`timeout 60 sh -c jest`), nor `eval`, `source` or
+    `.` as the command itself (`_takes_runner_as_text`): each would take
+    the runner as text or a script. Words inside a substitution are the
+    substitution's, not the runner's (`--maxWorkers=$(nproc)`)."""
     runner_at = _runner_positions(tokens, runner, files)
     if not runner_at:
         return False
@@ -33359,9 +33441,22 @@ def _flags_reach_runner(tokens: list[tuple[str, str, int]], runner: str,
         return False
     if any(t == "--" and d == 0 for _k, t, d in tokens[last + 1:]):
         return False
-    return not any(
-        k == "word" and d == 0 and os.path.basename(t) in _SHELLS
-        for k, t, d in tokens[_command_start(tokens, first):first])
+    return not _takes_runner_as_text(tokens, first)
+
+
+def _takes_runner_as_text(tokens: list[tuple[str, str, int]],
+                          at: int) -> bool:
+    """Whether the runner at `tokens[at]` is text for another program: a
+    shell anywhere before it in its command (`timeout 60 sh -c jest`), or
+    the builtin `eval`, `source` or `.` as the command word — after any
+    `NAME=value` assignments. A builtin cannot be wrapped, and a bare `.`
+    elsewhere is an ordinary argument (`npx --prefix . jest`)."""
+    start = _command_start(tokens, at)
+    words = [t for k, t, d in tokens[start:at] if k == "word" and d == 0]
+    if any(os.path.basename(t) in _SHELLS for t in words):
+        return True
+    command = next((t for t in words if not _ASSIGNMENT_RE.match(t)), None)
+    return command in _TEXT_BUILTINS
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:

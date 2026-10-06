@@ -708,6 +708,9 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     # (#285 round-8 review).
     ("docker compose run --rm web 2>&1 npx jest acc/a.test.js", False),
     ("docker run -i img <in.txt npx jest acc/a.test.js", False),
+    # `>|` is a redirect (noclobber override), not `>` and a pipe.
+    ("docker run img >|out npx jest acc/a.test.js", False),
+    ("docker compose up -d db >|log && npx jest acc/a.test.js", True),
     ("docker compose up -d db 2>&1 && npx jest acc/a.test.js", True),
     # A subshell's `)` and a following `&&` end the container's command.
     ("(docker compose up -d db)&&pytest acc/test_a.py", True),
@@ -775,6 +778,13 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     ("eval >o jest acc/a.test.js", False),
     (". run.sh jest acc/a.test.js", False),
     ("source run.sh jest acc/a.test.js", False),
+    ("sh >|o -c jest", False),
+    ("FOO=1 . run.sh jest acc/a.test.js", False),
+    # `.`, `source` and `eval` are builtins: only the command word counts,
+    # and a bare `.` argument is just a path.
+    ("npx --prefix . jest acc/a.test.js", True),
+    # A `;` then `>` run is a separator then a redirect of the next command.
+    ("ls ;>o npx jest acc/a.test.js", True),
     # A redirect in an earlier command ends nothing that matters here.
     ("cd web 2>/dev/null && npx jest acc/a.test.js", True),
     # An escaped quote inside `${…}` opens nothing: the runner's command
@@ -834,8 +844,11 @@ def test_placed_flags_arrive_as_the_runners_last_arguments(leerie, tmp_path,
 
 def _bash_argv(args: str) -> list[str]:
     """The arguments bash passes for `args`, read back as bytes (a CR must
-    survive the round trip)."""
-    out = subprocess.run(["bash", "-c", "printf '%s\\0' " + args],
+    survive the round trip). `IFS=` and `set -f` stop bash splitting and
+    globbing the RESULT of an unquoted expansion — which the scan cannot
+    know — so word boundaries come from the command's syntax alone."""
+    out = subprocess.run(["bash", "-c",
+                          "IFS=; set -f; printf '%s\\0' " + args],
                          capture_output=True, check=False).stdout
     return out.decode().split("\0")[:-1]
 
@@ -852,6 +865,10 @@ def _scanned_args(leerie, args: str) -> list[str]:
     '-t "(" x', "-t \\( x",
     # `$"…"` is a double-quoted string; a lone trailing backslash stays.
     '$"x y" z', "a \\",
+    # `$'…'` escapes decode as bash decodes them; an unknown one keeps its
+    # backslash.
+    "$'\\t'x", "$'\\x41B'", "$'\\101'", "$'\\cA'", "$'\\e'",
+    "$'\\}'", "$'\\q'",
 ])
 def test_scanned_words_are_the_words_bash_passes(leerie, args):
     """Literal words: the scan's top-level words are bash's argv exactly."""
@@ -866,10 +883,14 @@ def test_scanned_words_are_the_words_bash_passes(leerie, args):
     '"${x:-a #b}" c', '"${x#y}" z', "$# q", "$((16#ff))",
     # Quotes nest inside a substitution inside quotes.
     '"$(echo "a b")" c',
-    # Escaped braces and quotes inside `${…}` are literal characters.
-    "${U:-x\\}y} c", "${U:-\\'q} c", '${U:-\\"q} c',
+    # Escaped braces and quotes inside `${…}` are literal characters: an
+    # escaped `}` does not end the expansion before the space.
+    "${U:-x\\} y} c", "${U:-\\'q} c", '${U:-\\"q} c',
     # A comment inside backticks ends at the closing backtick.
     "`echo a #b` c",
+    # A backtick body is a command of its own once `\\` becomes `\`
+    # there, so `\\"` in it is an escaped quote.
+    '`echo a\\\\";` c',
 ])
 def test_expanding_words_split_where_bash_splits_them(leerie, args):
     """Expanding words: the scan keeps a substitution as its brackets, so
@@ -905,6 +926,9 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     # named only in a comment.
     ("X=$(case a in a) echo 1;; esac) pytest acc/t.py", "pytest"),
     ("X=$(case a in a) echo 1;; esac) go test ./... # pytest later", None),
+    # ...and a mid-word `#` there is not a comment either.
+    ("X=$(case a in a) echo 1;; esac) uvx --from git+https://e.test/r.git"
+     "#subdirectory=py pytest acc/t.py", "pytest"),
     # A `#` inside a word is not a comment (shlex's comment handling would
     # start one there).
     ("uvx --from git+https://e.test/r.git#subdirectory=py pytest acc/t.py",

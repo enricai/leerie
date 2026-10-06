@@ -4995,3 +4995,38 @@ Six reversions, each caught: a redirect ending the command, no `source`
 or `.`, a fallback that keeps comments, `$"…"` keeping its `$`, a
 backtick comment running to the newline, and no `${…}` escapes.
 
+
+#### Edge cases in reading test commands, after 0.37.0 (2026-10-06)
+
+The ninth review of #285's last commit (which merged as 97aa2b2 and
+shipped in 0.37.0) and fuzzing against real bash left these, fixed here:
+
+- **`>|` is a redirect** (`_split_shell_ops`): a `|` test per character
+  read it as a pipe, so `docker run img >|out npx jest …` and
+  `sh >|o -c jest` hid the container CLI and the shell. Operator runs now
+  split into bash's operators longest first. Cases in
+  `test_only_a_container_that_starts_the_runner_withholds_the_report` and
+  `test_continuations_and_comments_are_read_as_bash_reads_them`, with
+  `ls ;>o npx jest …` still placing.
+- **`eval`, `source` and `.` only as the command word**
+  (`_takes_runner_as_text`): a bare `.` argument (`npx --prefix . jest`)
+  no longer refuses placement; `FOO=1 . run.sh jest` still does.
+- **Backtick bodies read as bash reads them**: the body up to the closing
+  backtick, its backslash before `$`, `` ` ``, `\` (and `"` in double
+  quotes) removed, scanned as a command of its own. `` `echo a\\";` `` was
+  the one command of 6,104 valid fuzzed ones the scan rejected; after the
+  change none of 14,315 (three seeds) is. A case in
+  `test_expanding_words_split_where_bash_splits_them` pins it.
+- **`$'…'` decodes like bash** (`_ansi_c_escape`; seven cases in
+  `test_scanned_words_are_the_words_bash_passes`).
+- **The detection fallback keeps a mid-word `#`**
+  (`test_runner_detection_reads_operators_as_the_shell_does`).
+- **Word boundaries from syntax alone**: `_bash_argv` sets `IFS=` and
+  `set -f`, so bash no longer splits an unquoted expansion's result — which
+  the scan cannot know — and the escaped-`}` case now fails without the
+  `${…}` escape fix (`"${U:-x\} y} c"`).
+
+Seven reversions, each caught: no backslash removal in backtick bodies,
+the old per-character control test, builtins anywhere, a fallback with
+`shlex`'s comments, keeping `$'…'` escapes verbatim, no `${…}` escapes,
+and a heredoc only as a bare `<<`.
