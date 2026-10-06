@@ -33066,9 +33066,10 @@ def _shell_tokens(cmd: str) -> list[str] | None:
 
 def _flags_reach_runner(tokens: list[str], runner: str) -> bool:
     """Whether flags appended to the command reach `runner`: every
-    occurrence of it sits in the final simple command, with no pipe,
-    redirect, `)` or `--` after it — in `npx jest x; echo jest` the runner is the first
-    command and the flags would reach `echo`."""
+    occurrence of it sits in the final simple command, with no pipe or
+    redirect after it, nor a `)` or `--` after its last occurrence — in
+    `npx jest x; echo jest` the runner is the first command and the flags
+    would reach `echo`."""
     last_sep = max((i for i, t in enumerate(tokens)
                     if t in _SHELL_SEPARATORS), default=-1)
     runner_at = [i for i, t in enumerate(tokens)
