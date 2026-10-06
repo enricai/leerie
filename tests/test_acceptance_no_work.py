@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -158,7 +160,6 @@ def test_a_third_run_still_does_not_dispute(leerie, tmp_path, monkeypatch,
     accept — never dispute, accept, dispute."""
     st = _st(leerie, tmp_path)
     _sibling(st, "run-1", dispute={"failing_sets": 2, "cases": ["x"]})
-    import os, time
     d2 = _sibling(st, "run-2", dispute={"failing_sets": 2, "cases": ["x"],
                                         "accepted": True})
     t = time.time() + 10
@@ -262,6 +263,43 @@ def test_accepted_warning_never_ends_in_an_empty_case_list(
     assert warning.rstrip().endswith("held back from planning")
 
 
+def test_dispute_evidence_says_when_names_are_partial(
+        leerie, tmp_path, monkeypatch, finished):
+    st = _st(leerie, tmp_path)
+    mixed = [{"index": 1, "cases": {"t/test_1.py": ["case 1"],
+                                    "t/test_u.py": []}},
+             {"index": 2, "cases": {"t/test_2.py": ["case 2"]}},
+             {"index": 3, "cases": {"t/test_3.py": ["case 3"]}}]
+
+    async def fake(st_, caps):
+        return [{"index": 1, "passed": False,
+                 "failing_files": ["t/test_1.py", "t/test_u.py"]},
+                {"index": 2, "passed": False,
+                 "failing_files": ["t/test_2.py"]},
+                {"index": 3, "passed": True, "failing_files": []}]
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    st.data.update(acceptance={"sets": mixed}, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, dict(leerie.DEFAULT_CAPS))) is False
+    assert st.data["no_work_dispute"]["judge_evidence"].endswith(
+        "case 1; case 2; other failing tests named no cases")
+
+
+def test_the_planner_prompt_names_the_evidence_prefix_the_settle_writes(
+        leerie, tmp_path, monkeypatch, finished):
+    """The planner is told how to read acceptance-sourced evidence by its
+    opening words; the settle must still write exactly those words."""
+    st = _st(leerie, tmp_path)
+    assert _settle(leerie, monkeypatch, st, _results([False, False, True])) is False
+    ev = st.data["no_work_dispute"]["judge_evidence"]
+    prompt = (Path(leerie.__file__).resolve().parents[1] / "prompts"
+              / "planner.md").read_text()
+    prefix = "Held-out acceptance tests written from the report fail on HEAD"
+    assert ev.startswith(prefix)
+    assert " ".join(prompt.split()).count(f'"{prefix}"') == 1
+
+
 def test_unmeasurable_sets_keep_the_judges_confirmation(leerie, tmp_path,
                                                        monkeypatch, finished):
     st = _st(leerie, tmp_path)
@@ -332,7 +370,6 @@ def test_a_wrong_dispute_that_goes_unacted_is_bounded(leerie, tmp_path,
     nothing. Run 1's dispute goes unacted; run 2 re-disputes (marked
     `redispute`); when that goes unacted too, run 3 accepts — two extra
     runs, never one per re-run forever."""
-    import os, time
     st = _st(leerie, tmp_path)
     _sibling(st, "run-1", dispute={"failing_sets": 2, "cases": ["x"],
                                    "unacted": True})
@@ -443,6 +480,42 @@ def test_pre_sweep_protect_on_the_validity_base_skips_the_run(
     # The caller ensured the worktree: the shortcut never resets it again
     # (only the measuring path's `_acceptance_results_on_head` would).
     assert ensured == []
+
+
+def test_head_results_are_measured_once_per_commit(leerie, tmp_path,
+                                                   monkeypatch):
+    """The settle, the pre-sweep check and the already-fixed check read one
+    HEAD: one evaluation serves all three. A measurement that measured
+    nothing is not kept, and a new commit is measured afresh."""
+    wt = tmp_path / "planning"
+    wt.mkdir()
+    st = _st(leerie, tmp_path, acceptance={"sets": _SETS},
+             planning_worktree=str(wt))
+    head = {"sha": "aaa"}
+    calls = []
+    outcome = {"res": _results([False, False, True])}
+
+    async def evaluate(st_, caps, tree, sets, label, *, rev="HEAD"):
+        calls.append(rev)
+        return outcome["res"]
+
+    async def sha(path):
+        return head["sha"]
+
+    async def no_wt(st_):
+        return None
+    monkeypatch.setattr(leerie, "_evaluate_acceptance_sets", evaluate)
+    monkeypatch.setattr(leerie, "_branch_head_sha", sha)
+    monkeypatch.setattr(leerie, "_ensure_planning_worktree", no_wt)
+    caps = dict(leerie.DEFAULT_CAPS)
+    for _ in range(3):
+        asyncio.run(leerie._acceptance_results_on_head(st, caps))
+    assert calls == ["aaa"]
+    head["sha"] = "bbb"
+    outcome["res"] = [dict(r, unmeasured=True) for r in _results([False] * 3)]
+    asyncio.run(leerie._acceptance_results_on_head(st, caps))
+    asyncio.run(leerie._acceptance_results_on_head(st, caps))
+    assert calls == ["aaa", "bbb", "bbb"]
 
 
 def test_pre_sweep_protect_errors_protect_nothing(leerie, tmp_path,

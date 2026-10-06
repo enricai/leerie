@@ -5315,7 +5315,7 @@ completed. The identity write is therefore hoisted to run start, before
 `phase_classify`, so every early-exit path sees a correctly-identified
 `run.json`.
 
-**No work is declared on executed evidence, and disputed at most once.**
+**No work is declared on executed evidence, and a dispute is bounded.**
 A confirmed claim used to end the run on the judge's reading alone, and the
 judge can neither run tests nor, as measured, see the report's contract:
 6 of the 14 no-work confirmations recorded from v0.31.0 through 2026-10-03
@@ -5333,11 +5333,13 @@ sets a repair round would be shown are used: the planners' words reach the
 implementers, and the held-back sets must stay unseen until the gate
 re-judges on them. When no case names are left — only held-back sets fail,
 or the failing shown sets named no cases — the evidence gives the counts,
-saying which of the two it is. But held-out tests
+saying which of the two it is; when some failing shown tests named cases
+and others did not, it says so after the names. But held-out tests
 can be wrong — on a finished task whose report states no expected behaviour,
 all three sets failed it — and a wrong dispute repeated on every re-run
-would be a new infinite loop. So a dispute is raised at most once per task:
-when the previous same-task run already disputed on acceptance evidence, a
+would be a new infinite loop. So a dispute is raised once per task (twice
+when the first goes unacted, below): when the previous same-task run
+already disputed on acceptance evidence, a
 still-failing majority ends the run as no work with a loud warning and the
 residual recorded. The cost of a wrong dispute is bounded to one extra run
 (two when the first dispute goes unacted, below).
@@ -5348,9 +5350,10 @@ still end as no work by another exit — its planners return nothing, or
 the satisfied-probe sweep drops every subtask — and the next run would
 then accept "no work" after a dispute no run ever acted on, leaving the
 defect the tests still show on HEAD unfixed for good. So executed
-evidence outranks the probe: whenever held-out sets exist and a majority
-of them fails on HEAD, the sweep is not offered the subtasks that fix
-the reported symptom (below). And a disputing run that still ends as no
+evidence outranks the probe: whenever held-out sets exist and no strict
+majority of them passes on HEAD (a tie counts as failing, as everywhere in
+the gate), the sweep is not offered the subtasks that fix the reported
+symptom (below). And a disputing run that still ends as no
 work by either of those two planning-time exits records its dispute as not
 acted on, which the next run does not count — once. That re-dispute is
 recorded as such, and if it too ends unacted it counts: two runs have
@@ -5708,7 +5711,10 @@ represent.
 
 The fix is the per-subtask analogue: before scheduling, a read-only
 **satisfied-probe** evaluates each subtask's `success_criteria_seed` against
-the base tree and soft-drops the ones already met (same shape as
+the base tree — except the subtasks that fix the reported symptom while
+held-out acceptance sets fail on HEAD, which are never offered to it (§8
+*A dispute counts only once it is acted on*) — and soft-drops the ones
+already met (same shape as
 dead-subtask elimination, §5, recorded in `dropped_subtasks`). If all
 subtasks drop, the run routes to `no_work_required`. This is a soft,
 advisory prune subordinate to the no-commits backstop, which remains the
@@ -6072,8 +6078,14 @@ report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
 and vitest — validation asks for one (a test command that already names
 its own JUnit report path would override the request, so the request is
 then appended after it, where it is the one that counts; where nothing can
-be appended safely — after the runner's command ends, or past a `--` that
-would make the option a file argument — there is no report) and reads how many tests executed
+be appended safely — after the runner's command ends (a `)` closing a
+subshell the runner sits in; a `$(…)` inside its arguments is not that), or
+past a `--` that would make the option a file argument — there is no
+report; the file under test never counts as the runner, even when named
+like one). A test command that starts its runner through a container CLI
+(`docker`, `podman`, `nerdctl`, `kubectl`) gets no report request at all:
+the runner there cannot see the orchestrator's environment, and a report
+path it cannot create would fail a run whose tests pass and reads how many tests executed
 (a test whose fixture failed to set up counts as executed: it ran and
 failed) and whether the file loaded — pytest marks a file it could not
 collect with a fixed "collection failure" message, which no report option
@@ -6107,7 +6119,7 @@ Python's (§12); the price is that a writer who declares a guessed import
 produces a test no fix can pass, which costs two repair rounds and a
 residual, never the run. Without a readable report (a runner with none
 known, a report that was not written, or a runner the test command starts
-inside another container, whose files the orchestrator cannot read) validation falls back to the
+inside another container, which is never asked for one) validation falls back to the
 runner's own "ran no test" exits where they exist (pytest's), and
 otherwise to the exit code alone — so on `go test`, a file that ran
 nothing reads as passing: it cannot become a defect file (it does not
@@ -6130,7 +6142,11 @@ When only hidden sets fail, the round is told exactly that — every failing
 test is one it is not shown — and works from the contract alone, rather
 than being promised a list of failing cases that is empty; when a shown set
 fails but names no cases, it is told that instead, never that tests are
-hidden. A
+hidden; and when named and unnamed failures mix, the names are followed by
+a note that other failing tests declared none. The sets are evaluated on a
+given commit once per run: the no-work settle, the pre-sweep protection
+check and the already-fixed check all read the same HEAD during planning,
+so the later ones reuse the first measurement. A
 round whose verdict measures nothing where the one before it measured is
 measured once more before the rounds stop on it: every evaluation installs
 afresh, and a one-off install failure would otherwise end the repair with

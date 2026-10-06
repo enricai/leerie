@@ -1846,13 +1846,15 @@ against `max_total_workers`, spanning v0.9.95–v0.16.0. The first fix
 (#198: a `create_task` feeder at the spawn plus `to_thread` on both broker
 calls) narrowed the window but still depended on the event loop scheduling
 the feeder within 3 s, and lost every prompt under bursts of synchronous
-work on the loop; #200 replaced it by staging the prompt to a file that is
-the child's stdin before it exists.
-`test_only_a_staged_file_survives_a_blocked_event_loop` drives both
-transports against a blocked loop behaviourally (pipe: lost; file:
+work on the loop; #200 replaced the feeder by staging the prompt to a file
+that is the child's stdin before it exists (the `to_thread` broker calls
+stayed). `test_only_a_staged_file_survives_a_blocked_event_loop` drives
+both transports against a blocked loop behaviourally (pipe: lost; file:
 delivered) rather than trusting source order, and the remaining tests pin
-the staging order, that stdin is never a pipe when a prompt is given, and
-the staged file's cleanup. One harness
+the staging order, that no writer task exists, that stdin is never a pipe
+when a prompt is given, that the broker calls stay off the loop
+(`test_cgroup_calls_do_not_block_the_event_loop`), that `gather` awaits no
+stdin task, and the staged file's cleanup. One harness
 trap: `_invoke_src` strips comments via `tokenize`, not a `#` heuristic (a
 `#` inside a string literal would corrupt the result), because the region's
 comments name the old feeder, `await` and `_cgroup_enroll` while explaining
@@ -4297,12 +4299,13 @@ than its position (the acceptance Read deny follows it for implementer and
 conformer), and the registry tests (`test_resolve_models`,
 `test_resolve_efforts`) list the new worker.
 
-## No work on executed evidence, disputed at most once (2026-10-04)
+## No work on executed evidence, with a bounded dispute (2026-10-04)
 
 A no-work confirmation used to end the run on the read-only judge's word;
 one such confirmation declared done a defect that report-shaped tests still
 reproduce on barnacle's HEAD (DESIGN §8 *No work is declared on executed
-evidence, and disputed at most once*).
+evidence, and a dispute is bounded*; "at most once" until 2026-10-06, when
+an unacted dispute gained one re-dispute).
 
 `tests/test_acceptance_no_work.py`:
 
@@ -4754,3 +4757,34 @@ Seven reversions, each caught by at least one test: dropping the `)`/`--`
 check, keeping only `)`, keeping only `--`, the unnamed-shown section branch,
 the evidence's not-named reason, the WARNING's empty list, and the
 re-added worktree reset.
+
+#### Post-merge review of #283 and #284 (2026-10-06)
+
+- **Placement** (`test_report_flags_are_placed_only_where_they_reach_the_runner`
+  and `test_a_command_naming_its_own_junit_path_gets_ours_appended` gained
+  `$(…)`, grouped-operator and container cases;
+  `test_a_file_named_like_the_runner_is_never_the_runner`, two cases;
+  `test_a_containerised_pytest_gets_no_environment_request_either`;
+  `test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes`): a
+  `$(…)` among the runner's arguments no longer stops placement (#284 had
+  made `--maxWorkers=$(nproc)` lose jest's report); a `)` stops it only when
+  it closes a subshell the runner runs in; operator characters `shlex`
+  groups (`))`, `)&&`) are read one at a time; the rendered file is never a
+  runner token; and a runner started through a container CLI gets no
+  report request (an appended path it cannot create failed a passing run).
+- **Mixed named and unnamed failures**
+  (`test_mixed_named_and_unnamed_failures_say_the_list_is_partial`,
+  `test_dispute_evidence_says_when_names_are_partial`).
+- **The planner's reading of acceptance evidence**
+  (`test_the_planner_prompt_names_the_evidence_prefix_the_settle_writes`):
+  `prompts/planner.md` tells planners how to read counts-only evidence by
+  its opening words; the test pins that the settle still writes them.
+- **One evaluation per commit** (`test_head_results_are_measured_once_per_commit`):
+  the settle, the pre-sweep check and the already-fixed check share one
+  measurement; one that measured nothing is not kept.
+
+Ten reversions, each caught by at least one test: the file exclusion in
+placement and in runner detection, the paren depth, the character-wise
+operator scan, the `--` stop, the container check, the mixed-name note in
+the section and in the evidence, the cache read, and the rule never to
+cache a measurement that measured nothing.

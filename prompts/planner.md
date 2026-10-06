@@ -477,6 +477,19 @@ The orchestrator gives you, in your prompt:
    contradicts the dispute (the evidence has gone stale), trust the tree
    and say so in your `confidence.basis`.
 
+   The dispute may instead come from held-out acceptance tests: then
+   `judge_evidence` begins "Held-out acceptance tests written from the
+   report fail on HEAD", and it lists the failing case names — or, when
+   none may be shown, only how many test sets fail. Those tests were
+   written from the report alone and RAN on the current tree, so the
+   defect the report describes is still present there even when no case
+   is named. With no names, plan the fix the report itself describes,
+   and flag the subtask that fixes the symptom
+   (`fixes_reported_symptom`); do not return an empty plan for want of
+   named points. The tree outranks this evidence only if you can show the
+   report's described behaviour already holds — say how in your
+   `confidence.basis`.
+
    If your CONTEXT includes `prior_delivery_residual` (absent on most
    runs), the most recent completed run of THIS SAME task shipped with
    its delivery gate recording exactly what was still unmet: the

@@ -32980,22 +32980,28 @@ _RUNNER_NO_VERDICT_EXITS: dict[str, frozenset[int]] = {
 }
 
 
-def _acceptance_runner(cmd: str, known: Iterable[str]) -> str | None:
+def _acceptance_runner(cmd: str, known: Iterable[str],
+                       files: Iterable[str] = ()) -> str | None:
     """Which of the `known` runner names a shell command invokes, matched on
-    the basenames of its own tokens (a mechanical string, DESIGN §12)."""
+    the basenames of its own tokens (a mechanical string, DESIGN §12). The
+    `files` the command was rendered over are never the runner, even when
+    one is named like it."""
     try:
         tokens = shlex.split(cmd)
     except ValueError:
         return None
+    skip = set(files)
     for runner in known:
-        if any(os.path.basename(t) == runner for t in tokens):
+        if any(os.path.basename(t) == runner and t not in skip
+               for t in tokens):
             return runner
     return None
 
 
-def _acceptance_no_verdict_exits(cmd: str) -> frozenset[int]:
+def _acceptance_no_verdict_exits(cmd: str, files: Iterable[str] = ()
+                                 ) -> frozenset[int]:
     """The no-verdict exit codes of the runner a shell command invokes."""
-    runner = _acceptance_runner(cmd, _RUNNER_NO_VERDICT_EXITS)
+    runner = _acceptance_runner(cmd, _RUNNER_NO_VERDICT_EXITS, files)
     return _RUNNER_NO_VERDICT_EXITS[runner] if runner else frozenset()
 
 
@@ -33003,9 +33009,10 @@ def _acceptance_no_verdict_exits(cmd: str) -> frozenset[int]:
 # validation can tell "ran no test" and "could not load the file" from "a
 # test failed" — which jest's and vitest's exit codes cannot (1 for all
 # three), and pytest's only approximately. Each value is (report kind, how):
-# "env" sets PYTEST_ADDOPTS and so works whatever the command's shape; a flag
-# string is appended to the command, which is only safe when the runner is
-# the command's last simple command (`_acceptance_report_spec`).
+# "env" sets PYTEST_ADDOPTS and so works whatever the command's shape — unless
+# the command names its own JUnit path, which beats it, when the option is
+# appended instead; a flag string is appended to the command. Appending is
+# only safe where `_flags_reach_runner` holds (`_acceptance_report_spec`).
 _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
     "pytest": ("junit", "env"),
     "jest": ("jest-json", "--json --outputFile={path}"),
@@ -33016,22 +33023,28 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
 # (a pipe or a redirect) or would reach a different command (a separator).
 _SHELL_SEPARATORS = frozenset({"&&", "||", ";", "&", "|", ";;"})
 _SHELL_REDIRECTS = frozenset({">", ">>", "<", "<<", ">&", "<&", "|&"})
-# Tokens after which an appended flag no longer reaches the runner as an
-# option: `)` closes the subshell it runs in (the flag would follow it and
-# break the command), and `--` makes everything after it a file argument.
-_FLAG_STOPPERS = frozenset({")", "--"})
+# Container CLIs: a runner started through one gets no report request
+# (`_acceptance_report_spec`).
+_CONTAINER_CLIS = frozenset({"docker", "podman", "nerdctl", "kubectl"})
+# The characters `shlex` (punctuation_chars=True) splits out as operators.
+_SHELL_OPERATOR_CHARS = frozenset("();<>|&")
 
 
-def _acceptance_report_spec(cmd: str, path: Path
+def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
                             ) -> tuple[str, dict[str, str] | None, str] | None:
     """`(command, env, report kind)` asking the invoked runner to write a
-    structured report to `path`, or None when the runner has no known report
-    or the flags cannot be placed safely."""
-    runner = _acceptance_runner(cmd, _RUNNER_REPORTS)
+    structured report to `path`, or None when the runner has no known report,
+    runs in another container, or the flags cannot be placed safely."""
+    runner = _acceptance_runner(cmd, _RUNNER_REPORTS, files)
     if runner is None:
         return None
     kind, how = _RUNNER_REPORTS[runner]
     tokens = _shell_tokens(cmd)
+    # A runner started through a container CLI cannot see our environment,
+    # and a report path it cannot create fails a run whose tests pass.
+    if tokens is not None and any(os.path.basename(t) in _CONTAINER_CLIS
+                                  for t in tokens):
+        return None
     if how == "env":
         flags = f"--junitxml={shlex.quote(str(path))}"
         if tokens is None or not any(
@@ -33044,7 +33057,7 @@ def _acceptance_report_spec(cmd: str, path: Path
         # ours is the one pytest keeps.
     else:
         flags = how.format(path=shlex.quote(str(path)))
-    if tokens is None or not _flags_reach_runner(tokens, runner):
+    if tokens is None or not _flags_reach_runner(tokens, runner, files):
         return None
     return f"{cmd} {flags}", None, kind
 
@@ -33064,21 +33077,44 @@ def _shell_tokens(cmd: str) -> list[str] | None:
         return None
 
 
-def _flags_reach_runner(tokens: list[str], runner: str) -> bool:
+def _flags_reach_runner(tokens: list[str], runner: str,
+                        files: Iterable[str] = ()) -> bool:
     """Whether flags appended to the command reach `runner`: every
-    occurrence of it sits in the final simple command, with no pipe or
-    redirect after it, nor a `)` or `--` after its last occurrence — in
+    occurrence of it (never one of the `files` under test) sits in the final
+    simple command, with no pipe or redirect after it; after its last
+    occurrence, no `--` and no `)` closing a subshell it runs in — in
     `npx jest x; echo jest` the runner is the first command and the flags
     would reach `echo`."""
     last_sep = max((i for i, t in enumerate(tokens)
                     if t in _SHELL_SEPARATORS), default=-1)
+    skip = set(files)
     runner_at = [i for i, t in enumerate(tokens)
-                 if os.path.basename(t) == runner]
-    # Stoppers count only after the LAST runner token: a wrapper can name
+                 if os.path.basename(t) == runner and t not in skip]
+    if not runner_at or min(runner_at) <= last_sep or any(
+            t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]):
+        return False
+    # The rest count only after the LAST runner token: a wrapper can name
     # the runner as a package before its own `--` (`npx -p jest -- jest x`).
-    return bool(runner_at) and min(runner_at) > last_sep and not any(
-        t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]) and not any(
-        t in _FLAG_STOPPERS for t in tokens[max(runner_at):])
+    # A `)` stops only when it closes a paren opened before the runner; a
+    # `$(…)` among its arguments opens and closes its own.
+    # shlex groups adjacent operator characters (`))`, `)&&`), so operator
+    # tokens are read a character at a time.
+    depth = 0
+    for t in tokens[max(runner_at) + 1:]:
+        if t == "--":
+            return False
+        if not t or not set(t) <= _SHELL_OPERATOR_CHARS:
+            continue
+        for ch in t:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth < 0:
+                    return False
+            elif depth == 0:
+                return False
+    return True
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:
@@ -33254,7 +33290,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
         return None, f"the test command could not be run (exit {rc})"
     if rc != 0 and _is_fork_exhaustion(out or ""):
         return None, "the test command was killed by the container's limits"
-    runner = _acceptance_runner(cmd, _RUNNER_NOTHING_COLLECTED_EXIT)
+    runner = _acceptance_runner(cmd, _RUNNER_NOTHING_COLLECTED_EXIT, [probe])
     if rc == 0 or (runner and rc == _RUNNER_NOTHING_COLLECTED_EXIT[runner]):
         return None, (f"the test command collected or selected no test "
                       f"(exit {rc}: the probe was deselected or skipped)")
@@ -33322,7 +33358,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     report = st.run_dir / "acceptance" / "reports" / (
         f"{label}-{hashlib.sha256(rel.encode()).hexdigest()[:12]}")
     if validating:
-        spec = _acceptance_report_spec(cmd, report)
+        spec = _acceptance_report_spec(cmd, report, [rel])
         if spec is not None:
             run_cmd, env, _kind = spec
             report.parent.mkdir(parents=True, exist_ok=True)
@@ -33346,7 +33382,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
         return rc == 0
     parsed = _parse_runner_report(spec[2], report) if spec else None
     if parsed is None:
-        if rc in _acceptance_no_verdict_exits(cmd):
+        if rc in _acceptance_no_verdict_exits(cmd, [rel]):
             return None
         return rc == 0
     if parsed["collection_error"]:
@@ -33757,7 +33793,7 @@ def _format_acceptance_failures_section(results: list[dict],
     by_index = {s_["index"]: s_ for s_ in sets}
     case_lines: list[str] = []
     import_cases: list[str] = []
-    shown_fails = False
+    shown_fails = unnamed = False
     for r in results:
         # An unmeasured set is no verdict, never a failure to describe.
         if r["passed"] or r.get("unmeasured") or r["index"] not in shown:
@@ -33766,6 +33802,7 @@ def _format_acceptance_failures_section(results: list[dict],
         set_ = by_index[r["index"]]
         for rel in r["failing_files"]:
             names = set_["cases"].get(rel, [])[:12]
+            unnamed = unnamed or not names
             # `modes` records what validation SAW on the base (a declared
             # import defect whose file failed to load there), never runner
             # output: a fact about the unfixed tree that case names alone do
@@ -33804,6 +33841,9 @@ def _format_acceptance_failures_section(results: list[dict],
                  "general. ")
     lines = [head + "Re-derive the cause from the report itself (the task "
              "names it).", *case_lines]
+    if (case_lines or import_cases) and unnamed:
+        # Named and unnamed failures mixed: the names are not the whole list.
+        lines.append("  (other failing tests declared no case names)")
     if import_cases:
         lines.append("These cases' tests could not even load against the "
                      "UNFIXED tree: the module or entry point the report names "
@@ -34156,16 +34196,37 @@ async def _acceptance_write_or_skip(task: str, st: "State", caps: dict,
         return {"skipped": f"error: {type(e).__name__}"}
 
 
+# (run dir, HEAD sha) -> a measured `_acceptance_results_on_head` result.
+# Planning reads one HEAD: the settle, the pre-sweep protection check and
+# the already-fixed check reuse one measurement instead of each installing
+# and running every set again (DESIGN §8). In memory only: a resume measures
+# afresh.
+_HEAD_ACCEPTANCE_RESULTS: dict[tuple[str, str], list[dict]] = {}
+
+
 async def _acceptance_results_on_head(st: "State", caps: dict
                                       ) -> list[dict] | None:
     """Run the valid acceptance sets on HEAD (the planning worktree), or
-    None when there are none."""
+    None when there are none. A measured result is reused for the same
+    commit within the run; one that measured nothing is not, so a later
+    check can still succeed after a one-off install failure."""
     sets = (st.data.get("acceptance") or {}).get("sets") or []
     if not sets:
         return None
+    wt = st.data.get("planning_worktree")
+    if wt and Path(wt).is_dir():
+        sha = await _branch_head_sha(wt)
+        hit = _HEAD_ACCEPTANCE_RESULTS.get((str(st.run_dir), sha))
+        if sha and hit is not None:
+            return hit
     await _ensure_planning_worktree(st)
-    return await _evaluate_acceptance_sets(st, caps, str(_judgment_cwd(st)),
-                                           sets, "head")
+    tree = str(_judgment_cwd(st))
+    sha = await _branch_head_sha(tree)
+    res = await _evaluate_acceptance_sets(st, caps, tree, sets, "head",
+                                          rev=sha or "HEAD")
+    if sha and _acceptance_measured(res):
+        _HEAD_ACCEPTANCE_RESULTS[(str(st.run_dir), sha)] = res
+    return res
 
 
 async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
@@ -34202,7 +34263,8 @@ def _prior_acceptance_dispute_record(st: "State") -> dict | None:
 
 def _prior_acceptance_dispute(st: "State") -> bool:
     """Whether the previous completed same-task run already raised an
-    acceptance dispute that counts (DESIGN §8 *disputed at most once*). An
+    acceptance dispute that counts (DESIGN §8 *No work is declared on
+    executed evidence, and a dispute is bounded*). An
     unacted dispute — its run still ended as no work by another exit — does
     not count, so the next run disputes again; but only once: a re-dispute
     that also goes unacted counts, or wrong held-out tests would be
@@ -34244,8 +34306,7 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
         if acc.get("sets") and base:
             # Sets validated on this very commit each have a defect file that
             # failed here: the answer is known without running them again.
-            # The caller has just ensured the planning worktree; ensuring it
-            # again would re-run its reset script for nothing.
+            # The caller has just ensured the planning worktree.
             if await _branch_head_sha(str(_judgment_cwd(st))) == base:
                 return set(fix_ids)
         res = await _acceptance_results_on_head(st, caps)
@@ -34324,6 +34385,14 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     no_names = ("the failing cases were not named" if any(
         not r["passed"] and r["index"] in shown for r in measured)
         else "every failing case is held back from planning")
+    # Named and unnamed failures mixed: say the names are not the whole list.
+    if cases and any(not sets[r["index"]]["cases"].get(rel)
+                     for r in measured
+                     if not r["passed"] and r["index"] in shown
+                     for rel in r["failing_files"]):
+        cases_note = "; other failing tests named no cases"
+    else:
+        cases_note = ""
     if _prior_acceptance_dispute(st):
         st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
                                          "results": res, "cases": cases}
@@ -34335,7 +34404,7 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
             "cases": cases, "accepted": True}
         log("  WARNING: held-out acceptance sets still fail on HEAD, but the "
             "previous run of this task already disputed on them — accepting "
-            "no work (disputed at most once). "
+            "no work (the dispute bound). "
             + (f"Failing cases: {'; '.join(cases[:5])}" if cases
                else no_names))
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
@@ -34354,7 +34423,8 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     st.data["no_work_dispute"] = {
         "classifier_evidence": conf.get("classifier_evidence", ""),
         "judge_evidence": ("Held-out acceptance tests written from the "
-                           "report fail on HEAD: " + ("; ".join(cases) if cases
+                           "report fail on HEAD: " + ("; ".join(cases)
+                           + cases_note if cases
                            else f"{failing_sets} of {len(measured)} sets; "
                            + no_names)),
         "checked": []}

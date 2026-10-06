@@ -589,6 +589,13 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
     # The wrapper names the runner as a package before its own `--`: the
     # runner proper comes after it, so the flags reach it (#284 review).
     ("npx -p jest -- jest acc/a.test.js", True),
+    # A `$(…)` among the runner's arguments is not a subshell it runs in.
+    ("npx jest --maxWorkers=$(nproc) acc/a.test.js", True),
+    # Operator characters grouped into one token are still read.
+    ("((npx jest acc/a.test.js))", False),
+    ("npx jest acc/a.test.js)&&echo", False),
+    # A container's runner gets no request: it cannot write our path.
+    ("docker compose run web npx jest acc/a.test.js", False),
 ])
 def test_report_flags_are_placed_only_where_they_reach_the_runner(
         leerie, tmp_path, cmd, placed):
@@ -621,6 +628,8 @@ def test_pytest_is_asked_for_junit_through_its_environment(
     ("(cd sub && python3 -m pytest --junitxml=own.xml {f})", False),
     # A wrapper's own `--` before the runner proper is not the runner's.
     ("uv run --with pytest -- pytest --junitxml=own.xml {f}", True),
+    ("pytest --junitxml=own.xml $(echo -q) {f}", True),
+    ("docker compose run app pytest --junitxml=own.xml {f}", False),
 ])
 def test_a_command_naming_its_own_junit_path_gets_ours_appended(
         leerie, tmp_path, monkeypatch, cmd, placed):
@@ -648,6 +657,37 @@ def test_an_appended_junit_path_is_the_report_pytest_writes(
                    capture_output=True, check=False)
     assert leerie._parse_runner_report(kind, tmp_path / "r.xml") == {
         "executed": 1, "collection_error": False}
+
+
+@pytest.mark.parametrize("cmd,rel", [
+    ("pytest --junitxml=own.xml -- tests/pytest", "tests/pytest"),
+    ("npx jest -- t/jest", "t/jest"),
+])
+def test_a_file_named_like_the_runner_is_never_the_runner(
+        leerie, tmp_path, cmd, rel):
+    """#284 review: a file argument named like the runner moved the stopper
+    scan past the template's own `--`, so ours landed after it as a file
+    argument (measured: pytest exit 4, no report). The rendered file is
+    excluded; the `--` then stops placement — no report, never a broken
+    run."""
+    assert leerie._acceptance_report_spec(cmd, tmp_path / "r", [rel]) is None
+
+
+def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
+    """A repo script run over a file named `pytest` is not pytest: its exit
+    5 must not read as pytest's "collected nothing" no-verdict."""
+    cmd = "./run-tests tests/pytest"
+    assert leerie._acceptance_no_verdict_exits(cmd, ["tests/pytest"]) == \
+        frozenset()
+    assert 5 in leerie._acceptance_no_verdict_exits(cmd)
+
+
+def test_a_containerised_pytest_gets_no_environment_request_either(
+        leerie, tmp_path, monkeypatch):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    assert leerie._acceptance_report_spec(
+        "podman exec box python3 -m pytest acc/test_a.py",
+        tmp_path / "r.xml") is None
 
 
 def _validate(leerie, st, repo, rel, mode="assertion"):
@@ -1834,6 +1874,21 @@ def test_an_unmeasured_shown_set_is_not_a_failure_without_names(leerie):
         res, sets, {1, 2}, 1, "c", held_back=True)
     assert "Every failing test is one you are not shown" in text
     assert "declared no case names" not in text
+
+
+def test_mixed_named_and_unnamed_failures_say_the_list_is_partial(leerie):
+    sets = [{"index": 1, "cases": {"acc/test_a.py": ["c1"],
+                                   "acc/test_u.py": []}}]
+    res = [{"index": 1, "passed": False,
+            "failing_files": ["acc/test_a.py", "acc/test_u.py"]}]
+    text = leerie._format_acceptance_failures_section(
+        res, sets, {1}, 1, "c", held_back=False)
+    assert "  - c1" in text
+    assert "other failing tests declared no case names" in text
+    only_named = leerie._format_acceptance_failures_section(
+        [dict(res[0], failing_files=["acc/test_a.py"])], sets, {1}, 1, "c",
+        held_back=False)
+    assert "declared no case names" not in only_named
 
 
 def test_shown_indices_hold_back_the_two_highest_from_four(leerie):
