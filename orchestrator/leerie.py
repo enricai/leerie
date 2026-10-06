@@ -32986,9 +32986,8 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
     the basenames of its own tokens (a mechanical string, DESIGN §12). The
     `files` the command was rendered over are never the runner, even when
     one is named like it."""
-    try:
-        tokens = shlex.split(cmd)
-    except ValueError:
+    tokens = _shell_tokens(cmd)
+    if tokens is None:
         return None
     for runner in known:
         if _runner_positions(tokens, runner, files):
@@ -33019,13 +33018,14 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
 
 # Shell tokens after which appended flags would no longer reach the runner
 # (a pipe or a redirect) or would reach a different command (a separator).
-_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "&", "|", ";;"})
+_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "&", "|", ";;", "\n"})
 _SHELL_REDIRECTS = frozenset({">", ">>", "<", "<<", ">&", "<&", "|&"})
 # Container CLIs: a runner started through one gets no report request
 # (`_acceptance_report_spec`).
-_CONTAINER_CLIS = frozenset({"docker", "podman", "nerdctl", "kubectl"})
+_CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
+                             "kubectl"})
 # The characters `shlex` (punctuation_chars=True) splits out as operators.
-_SHELL_OPERATOR_CHARS = frozenset("();<>|&")
+_SHELL_OPERATOR_CHARS = frozenset("();<>|&\n")
 
 
 def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
@@ -33037,18 +33037,13 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     if runner is None:
         return None
     kind, how = _RUNNER_REPORTS[runner]
+    # A trailing newline (a multi-line TOML string) would put appended flags
+    # on a line of their own.
+    cmd = cmd.rstrip()
     tokens = _shell_tokens(cmd)
-    # A runner started through a container CLI cannot see our environment,
-    # and a report path it cannot create fails a run whose tests pass. Only
-    # a CLI in the runner's own simple command counts: `docker compose up -d
-    # db && pytest x` runs pytest on the host.
-    if tokens is not None:
-        at = _runner_positions(tokens, runner, files)
-        last_sep = max((i for i, t in enumerate(tokens)
-                        if t in _SHELL_SEPARATORS), default=-1)
-        if at and any(os.path.basename(t) in _CONTAINER_CLIS
-                      for t in tokens[last_sep + 1:min(at)]):
-            return None
+    if tokens is not None and _runner_in_container(
+            tokens, _runner_positions(tokens, runner, files)):
+        return None
     if how == "env":
         flags = f"--junitxml={shlex.quote(str(path))}"
         if tokens is None or not any(
@@ -33070,10 +33065,49 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
 _PYTEST_JUNIT_OPTS = frozenset({"--junitxml", "--junit-xml"})
 
 
+def _is_shell_separator(token: str) -> bool:
+    """A token ending one command: `&&`, `;`, a pipe, a newline — also when
+    `shlex` grouped it with other operator characters (`)&&`, `;\n`), but
+    never a redirect (`>&`)."""
+    if token in _SHELL_SEPARATORS:
+        return True
+    chars = set(token)
+    return bool(token) and chars <= _SHELL_OPERATOR_CHARS and not (
+        chars & {"<", ">"}) and bool(chars & {";", "&", "|", "\n"})
+
+
+def _runner_in_container(tokens: list[str], runner_at: list[int]) -> bool:
+    """Whether a container CLI starts any occurrence of the runner: one sits
+    in that occurrence's own simple command, before it — not in an earlier
+    command (`docker compose up -d db && pytest x`), not among its
+    arguments, and not inside a `$(…)` that only computes a value
+    (`PORT=$(docker port db) pytest x`). Such a runner cannot see our
+    environment, and a report path it cannot create fails a run whose tests
+    pass."""
+    for at in runner_at:
+        start = max((i for i, t in enumerate(tokens[:at])
+                     if _is_shell_separator(t)), default=-1) + 1
+        substitution: list[bool] = []
+        prev = tokens[start - 1] if start else ""
+        for t in tokens[start:at]:
+            if t and set(t) <= _SHELL_OPERATOR_CHARS:
+                for k, ch in enumerate(t):
+                    if ch == "(":
+                        substitution.append(k == 0 and prev.endswith("$"))
+                    elif ch == ")" and substitution:
+                        substitution.pop()
+            elif (not any(substitution)
+                  and os.path.basename(t) in _CONTAINER_CLIS):
+                return True
+            prev = t
+    return False
+
+
 def _shell_tokens(cmd: str) -> list[str] | None:
-    """`cmd` split as the shell would, operators as their own tokens, or
-    None when it does not lex (an unbalanced quote)."""
-    lexer = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+    """`cmd` split as the shell would, operators — a newline included — as
+    their own tokens, or None when it does not lex (an unbalanced quote)."""
+    lexer = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+    lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     try:
         return list(lexer)
@@ -33101,7 +33135,7 @@ def _flags_reach_runner(tokens: list[str], runner: str,
     `npx jest x; echo jest` the runner is the first command and the flags
     would reach `echo`."""
     last_sep = max((i for i, t in enumerate(tokens)
-                    if t in _SHELL_SEPARATORS), default=-1)
+                    if _is_shell_separator(t)), default=-1)
     runner_at = _runner_positions(tokens, runner, files)
     if not runner_at or min(runner_at) <= last_sep or any(
             t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]):
@@ -34221,7 +34255,7 @@ async def _acceptance_results_on_head(st: "State", caps: dict
                                       ) -> list[dict] | None:
     """Run the valid acceptance sets on HEAD (the planning worktree), or
     None when there are none. A measured result is reused for the same
-    commit within the run; one that measured nothing is not, so a later
+    commit within this invocation (a resume measures afresh); one that measured nothing is not, so a later
     check can still succeed after a one-off install failure."""
     sets = (st.data.get("acceptance") or {}).get("sets") or []
     if not sets:

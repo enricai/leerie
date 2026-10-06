@@ -4318,9 +4318,9 @@ an unacted dispute gained one re-dispute).
   names only the failing cases, pending cleared, planning continues; failing
   sets after a prior dispute → no work with a WARNING and the dispute marker
   re-recorded with `accepted: true` — carried forward, not a new dispute
-  (falsified by removing the dispute-once branch); no valid sets → the
+  (falsified by removing the accept-after-dispute branch); no valid sets → the
   judge's confirmation stands.
-- **Dispute-once lookup.** Only the newest COMPLETED same-task sibling counts;
+- **Prior-dispute lookup.** Only the newest COMPLETED same-task sibling counts;
   another task's or a crashed run's record is ignored.
 - **A4.** `_acceptance_passes_on_head` over no sets, a passing and a failing
   majority; in `_run_phases` the fix-subtask set is taken before the
@@ -4815,3 +4815,25 @@ cache a measurement that measured nothing.
 Five reversions, each caught: the container check over the whole command,
 raw-token file comparison, a whole-token operator reading, the note before
 the import list, and the old accept message.
+
+##### Review round 2 of the post-merge fixes (2026-10-06)
+
+- **The container check per runner occurrence, from the separator before
+  it** (`test_only_a_container_that_starts_the_runner_withholds_the_report`,
+  seven cases): round 1 sliced from the command's LAST separator, so a
+  runner in a container followed by `&& docker compose down`, `| tee` or
+  `|| true` was missed; a later containerised occurrence after a host
+  `pytest --version` was missed; `docker-compose` (v1) was unknown; and a
+  `$(docker port db)` computing a value counted as starting the runner.
+  The `)&&` case pins that grouped operator tokens still separate.
+- **A newline ends a command** (`test_a_newline_ends_the_runner_command`);
+  a trailing one is stripped.
+- **Runner detection reads operators as placement does**
+  (`test_runner_detection_reads_operators_as_the_shell_does`, three cases):
+  `(pytest x)` and `cd w&&pytest x` used to find no runner.
+
+Eight reversions, each caught: slicing from the last separator, checking
+only the first occurrence, counting a container inside `$(…)`, dropping
+`docker-compose`, lexing newlines as whitespace, not stripping the trailing
+newline, plain `shlex.split` for runner detection, and not reading grouped
+separators.

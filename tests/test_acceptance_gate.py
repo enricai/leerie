@@ -690,6 +690,47 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     assert 5 in leerie._acceptance_no_verdict_exits(cmd)
 
 
+@pytest.mark.parametrize("cmd,asked", [
+    # The runner in a container even though it is not the last command.
+    ("docker compose run --rm app pytest acc/test_a.py && docker compose down",
+     False),
+    ("docker run img pytest acc/test_a.py | tee out", False),
+    # Any occurrence counts: here the host pytest only prints its version.
+    ("pytest --version && docker run img pytest acc/test_a.py", False),
+    ("docker-compose run app pytest acc/test_a.py", False),
+    # A container queried for a value leaves the runner on the host.
+    ("DB_PORT=$(docker port db 5432) pytest acc/test_a.py", True),
+    ("DB_PORT=$(docker port db 5432) npx jest acc/a.test.js", True),
+    # `)&&` is one grouped token, and still ends the container's command.
+    ("(docker compose up -d db)&&pytest acc/test_a.py", True),
+])
+def test_only_a_container_that_starts_the_runner_withholds_the_report(
+        leerie, tmp_path, monkeypatch, cmd, asked):
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    assert (leerie._acceptance_report_spec(cmd, tmp_path / "r")
+            is not None) is asked
+
+
+def test_a_newline_ends_the_runner_command(leerie, tmp_path):
+    """Appended after `echo done`, the flags would never reach jest; a
+    trailing newline alone does not count."""
+    assert leerie._acceptance_report_spec(
+        "npx jest acc/a.test.js\necho done", tmp_path / "r") is None
+    cmd, _env, _kind = leerie._acceptance_report_spec(
+        "npx jest acc/a.test.js\n", tmp_path / "r")
+    assert cmd.startswith("npx jest acc/a.test.js --json ")
+
+
+@pytest.mark.parametrize("cmd,runner", [
+    ("(python3 -m pytest acc/test_a.py)", "pytest"),
+    ("cd w&&pytest acc/test_a.py", "pytest"),
+    ("(npx jest acc/a.test.js)", "jest"),
+])
+def test_runner_detection_reads_operators_as_the_shell_does(
+        leerie, cmd, runner):
+    assert leerie._acceptance_runner(cmd, leerie._RUNNER_REPORTS) == runner
+
+
 def test_a_containerised_pytest_gets_no_environment_request_either(
         leerie, tmp_path, monkeypatch):
     monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
