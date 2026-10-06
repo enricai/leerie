@@ -782,7 +782,9 @@ def test_a_probe_the_template_deselects_is_unrunnable_not_unparseable(
 
 
 @pytest.mark.parametrize("conftest,addopts", [
-    ("def broken(:\n    pass\n", ""),               # does not parse: exit 4
+    # pytest cannot load the conftest (exit 4) before the probe's body runs,
+    # so the probe cannot judge parsing — None, not "does not parse".
+    ("def broken(:\n    pass\n", ""),
     # Imports the very entry point an import defect lacks — every file
     # parses (post-merge review of 11e9431).
     ("from calc import mul\n", ""),
@@ -808,6 +810,43 @@ def test_a_probe_that_never_reaches_its_check_says_so(leerie, tmp_path,
     assert got is None
     assert "before reaching the parse check" in why and "exit " in why
     assert "does not parse" not in why
+
+
+_PASSING_THEN_TEARDOWN_FAILS = (
+    "import pytest\n\n@pytest.fixture(autouse=True)\ndef boom():\n"
+    "    yield\n    raise RuntimeError('teardown')\n")
+_SKIPS_EVERYTHING = (
+    "import pytest\n\ndef pytest_collection_modifyitems(items):\n"
+    "    for item in items:\n"
+    "        item.add_marker(pytest.mark.skip(reason='x'))\n")
+
+
+@pytest.mark.parametrize("conftest,template,want_reason", [
+    # The check passed ("ok"), then a teardown failed the run.
+    (_PASSING_THEN_TEARDOWN_FAILS, None, "passed but the test run failed"),
+    # Exit 0, but the probe's body never ran.
+    (_SKIPS_EVERYTHING, None, "without reaching the parse check"),
+    # The runner does not exist.
+    ("", "no-such-runner-xyz {test_files}", "could not be run (exit 127)"),
+])
+def test_a_probe_failure_that_is_not_about_parsing_says_what_it_was(
+        leerie, tmp_path, conftest, template, want_reason):
+    """Post-merge review of 5f22a2e: a teardown error after the body read as
+    "does not parse"; a probe skipped by the repo read as True; exit 127
+    blamed a conftest."""
+    repo, head = _repo(tmp_path)
+    if template:
+        (repo / ".leerie" / "config.toml").write_text(
+            f'test_scoped = "{template}"\n')
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    if conftest:
+        (repo / "acc" / "conftest.py").write_text(conftest)
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert got is None and want_reason in why
 
 
 def test_a_target_that_does_not_compile_is_a_parse_failure(leerie, tmp_path):

@@ -4637,6 +4637,10 @@ is kept for hygiene.
   missing entry point, an unknown plugin flag (None, with the exit code;
   `test_a_probe_that_never_reaches_its_check_says_so`). It replaces an
   exit-code mapping that labelled pytest's 2/3/4 as parse failures.
+- **…and only when it ran to the end**: the marker records "ran" then "ok", so
+  a teardown error after a passing check, a probe the repository skips (exit
+  0, no marker), and a runner that does not exist (127) each read as what they
+  are (`test_a_probe_failure_that_is_not_about_parsing_says_what_it_was`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

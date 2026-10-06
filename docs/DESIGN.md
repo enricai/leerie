@@ -6053,9 +6053,11 @@ throwaway compile check, named to fit the repository's own test-file
 convention where any candidate name does, run through its own test
 command, so its interpreter version
 decides, not the orchestrator's. The check marks when its own body is
-reached, because a failure before that point (a conftest or package that
+reached and when every file compiled, because only a failure between
+the two is about parsing: one before it (a conftest or package that
 cannot import — perhaps the very entry point the defect lacks — or a
-runner that collected nothing) says nothing about parsing. A check that
+runner that collected or skipped nothing) or after it (a teardown, a
+coverage threshold) says nothing about it. A check that
 did not reach its body proves nothing, and the declaration is not
 honoured either; the log says which, with the exit code.
 That is checked only where it can be checked reliably, in Python; a

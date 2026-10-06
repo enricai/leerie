@@ -33088,12 +33088,15 @@ _TARGETS = {targets!r}
 
 class LeerieParseProbe(unittest.TestCase):
     def test_targets_parse(self):
-        # Written first: it shows the runner reached this body, so a failure
-        # after it can only be a target that does not compile.
-        pathlib.Path({marker!r}).write_text("ran")
+        # "ran" first: the runner reached this body. "ok" last: every
+        # target compiled. A failure with "ran" alone is a compile failure;
+        # one with "ok" came after the check (a teardown, a threshold).
+        marker = pathlib.Path({marker!r})
+        marker.write_text("ran")
         for path in _TARGETS:
             compile(pathlib.Path(path).read_bytes(), path, "exec",
                     dont_inherit=True)
+        marker.write_text("ok")
 """
 
 
@@ -33135,15 +33138,19 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     A throwaway test file beside `test_rel` compiles each target, and runs
     through the repo's own scoped test command, so it gets that command's
     interpreter and environment; a `unittest.TestCase` so any Python runner
-    collects it. Its body first writes a marker, so the verdict is about
-    parsing only when the body was reached:
-      True  — exit 0;
-      False — the body ran and a target did not compile;
-      None  — the body never ran: no command for the probe's name, a shell
-              that cannot run it, a runner that collected nothing, a conftest,
-              plugin or package import that failed before it (say a conftest
-              importing the very entry point an import defect lacks), a
-              timeout or another error. That says nothing about parsing.
+    collects it. Its body writes a marker "ran" first and "ok" after every
+    target compiled, so the verdict is about parsing only when the body
+    was reached:
+      True  — exit 0 and the marker reads "ok";
+      False — the marker reads "ran": a target did not compile;
+      None  — anything else, which says nothing about parsing: the body
+              never ran (no command for the probe's name, a shell that cannot
+              run it, fork exhaustion, a runner that collected nothing or
+              skipped the probe, a conftest, plugin or package import that
+              failed first — say a conftest importing the very entry point
+              an import defect lacks, a timeout or another error), or it
+              passed and the run failed afterwards (a teardown error, a
+              coverage threshold).
     Returned with a short reason for the log. Short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
@@ -33161,7 +33168,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
             targets=[str(Path(tree) / t) for t in targets],
             marker=str(marker)))
         async with _blt_semaphore(caps):
-            rc, _out = await _run_streaming(
+            rc, out = await _run_streaming(
                 ["bash", "-c", cmd], cwd=str(tree),
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
@@ -33172,11 +33179,25 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     finally:
         with contextlib.suppress(OSError):
             path.unlink()
-    if rc == 0:
-        return True, ""
-    if marker.exists():
+    try:
+        state = marker.read_text()
+    except OSError:
+        state = ""
+    if state == "ok":
+        if rc == 0:
+            return True, ""
+        return None, (f"the parse check passed but the test run failed after "
+                      f"it (exit {rc}: a teardown error or a threshold)")
+    if state == "ran":
         return False, ("it or another Python file the writer wrote does not "
                        "parse under the project's interpreter")
+    if rc in (126, 127):
+        return None, f"the test command could not be run (exit {rc})"
+    if rc != 0 and _is_fork_exhaustion(out or ""):
+        return None, "the test command was killed by the container's limits"
+    if rc == 0:
+        return None, ("the test command ran without reaching the parse check "
+                      "(it was skipped or deselected)")
     return None, (f"the test command failed before reaching the parse check "
                   f"(exit {rc}: a conftest, plugin or package import, or "
                   "nothing collected)")
