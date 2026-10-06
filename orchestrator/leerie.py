@@ -34126,7 +34126,7 @@ def _prior_acceptance_dispute_record(st: "State") -> dict | None:
              if d.is_dir() and d.name != st.run_dir.name),
             key=lambda d: d.stat().st_mtime, reverse=True)
     except OSError:
-        return False
+        return None
     for d in candidates:
         try:
             data = json.loads((d / "state.json").read_text())

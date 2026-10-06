@@ -5334,7 +5334,8 @@ all three sets failed it — and a wrong dispute repeated on every re-run
 would be a new infinite loop. So a dispute is raised at most once per task:
 when the previous same-task run already disputed on acceptance evidence, a
 still-failing majority ends the run as no work with a loud warning and the
-residual recorded. The cost of a wrong dispute is bounded to one extra run.
+residual recorded. The cost of a wrong dispute is bounded to one extra run
+(two when the first dispute goes unacted, below).
 With no valid sets the judge's confirmation stands, as before.
 
 A dispute counts only once it is acted on. The run that disputed could
@@ -5347,9 +5348,11 @@ of them fails on HEAD, the sweep is not offered the subtasks that fix
 the reported symptom (below). And a disputing run that still ends as no
 work by either of those two planning-time exits records its dispute as not
 acted on, which the next run does not count — once. That re-dispute is
-recorded as such, and if it too ends unacted it counts: the planners have
-then twice been shown the failing cases and twice found nothing to do,
-which is the wrong-tests case the at-most-once rule exists for, and
+recorded as such, and if it too ends unacted it counts: two runs have
+then been shown the failing cases and twice produced no work for them —
+the planners found nothing, or none of what they planned was flagged as
+fixing the symptom and the probe judged all of it satisfied — which is
+the wrong-tests case the at-most-once rule exists for, and
 re-disputing it on every run would reopen that loop. So the cost of a wrong
 dispute is bounded to two extra runs, not one, when the first goes unacted.
 (A run that reaches implementation has acted on its dispute, whatever its
