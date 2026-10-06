@@ -33024,7 +33024,8 @@ _SHELL_REDIRECTS = frozenset({">", ">>", "<", "<<", ">&", "<&", "|&"})
 # (`_acceptance_report_spec`).
 _CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
                              "kubectl"})
-# The characters `shlex` (punctuation_chars=True) splits out as operators.
+# The characters `_shell_tokens` splits out as operator tokens: shlex's own
+# punctuation plus the newline, which ends a command as `;` does.
 _SHELL_OPERATOR_CHARS = frozenset("();<>|&\n")
 
 
@@ -33037,10 +33038,11 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     if runner is None:
         return None
     kind, how = _RUNNER_REPORTS[runner]
-    # A trailing newline (a multi-line TOML string) would put appended flags
-    # on a line of their own.
-    cmd = cmd.rstrip()
-    tokens = _shell_tokens(cmd)
+    # The form the shell runs: continuations and comments gone, and no
+    # trailing newline (a multi-line TOML string) to put appended flags on
+    # a line of their own.
+    unfolded = _shell_unfold(cmd).rstrip()
+    tokens = _shell_tokens(unfolded)
     if tokens is not None and _runner_in_container(
             tokens, _runner_positions(tokens, runner, files)):
         return None
@@ -33058,7 +33060,9 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
         flags = how.format(path=shlex.quote(str(path)))
     if tokens is None or not _flags_reach_runner(tokens, runner, files):
         return None
-    return f"{cmd} {flags}", None, kind
+    # Appended to the unfolded command, the form the tokens describe: on the
+    # raw one, flags after a trailing comment would be commented out.
+    return f"{unfolded} {flags}", None, kind
 
 
 # pytest's spellings of its JUnit report option (fixed CLI surface).
@@ -33085,30 +33089,77 @@ def _runner_in_container(tokens: list[str], runner_at: list[int]) -> bool:
     environment, and a report path it cannot create fails a run whose tests
     pass."""
     for at in runner_at:
-        start = max((i for i, t in enumerate(tokens[:at])
-                     if _is_shell_separator(t)), default=-1) + 1
+        # One pass from the start: a separator inside a `$(…)` ends a
+        # command of the substitution, not of the runner's command.
         substitution: list[bool] = []
-        prev = tokens[start - 1] if start else ""
-        for t in tokens[start:at]:
+        container = False
+        prev = ""
+        for t in tokens[:at]:
             if t and set(t) <= _SHELL_OPERATOR_CHARS:
+                redirect = bool(set(t) & {"<", ">"})
                 for k, ch in enumerate(t):
                     if ch == "(":
                         substitution.append(k == 0 and prev.endswith("$"))
-                    elif ch == ")" and substitution:
-                        substitution.pop()
+                    elif ch == ")":
+                        if substitution:
+                            substitution.pop()
+                    elif (ch in ";&|\n" and not redirect
+                          and not any(substitution)):
+                        container = False
             elif (not any(substitution)
                   and os.path.basename(t) in _CONTAINER_CLIS):
-                return True
+                container = True
             prev = t
+        if container:
+            return True
     return False
 
 
+def _shell_unfold(cmd: str) -> str:
+    """`cmd` with what bash removes before splitting words removed too: an
+    unquoted or double-quoted backslash-newline (a line continuation) and a
+    comment — a `#` that starts an unquoted word, up to the newline. shlex
+    gets both wrong: it turns a continuation into a newline token, and its
+    `#` handling starts a comment mid-word (`r.git#subdirectory=py`)."""
+    out: list[str] = []
+    quote = ""
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        nxt = cmd[i + 1] if i + 1 < len(cmd) else ""
+        if quote == "'":
+            quote = "" if ch == "'" else quote
+        elif ch == "\\" and nxt == "\n":
+            i += 2
+            continue
+        elif ch == "\\":
+            out.append(ch + nxt)
+            i += 2
+            continue
+        elif quote == '"':
+            quote = "" if ch == '"' else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (not out or out[-1] in " \t\r"
+                            or out[-1] in _SHELL_OPERATOR_CHARS):
+            while i < len(cmd) and cmd[i] != "\n":
+                i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
 def _shell_tokens(cmd: str) -> list[str] | None:
-    """`cmd` split as the shell would, operators — a newline included — as
-    their own tokens, or None when it does not lex (an unbalanced quote)."""
-    lexer = shlex.shlex(cmd, posix=True, punctuation_chars="();<>|&\n")
+    """`cmd` split as the shell would — continuations and comments removed
+    first (`_shell_unfold`) — with operators, a newline included, as their
+    own tokens; or None when it does not lex (an unbalanced quote)."""
+    lexer = shlex.shlex(_shell_unfold(cmd), posix=True,
+                        punctuation_chars="".join(sorted(
+                            _SHELL_OPERATOR_CHARS)))
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
+    lexer.commenters = ""
     try:
         return list(lexer)
     except ValueError:
@@ -34255,8 +34306,9 @@ async def _acceptance_results_on_head(st: "State", caps: dict
                                       ) -> list[dict] | None:
     """Run the valid acceptance sets on HEAD (the planning worktree), or
     None when there are none. A measured result is reused for the same
-    commit within this invocation (a resume measures afresh); one that measured nothing is not, so a later
-    check can still succeed after a one-off install failure."""
+    commit within this invocation (a resume measures afresh); one that
+    measured nothing is not, so a later check can still succeed after a
+    one-off install failure."""
     sets = (st.data.get("acceptance") or {}).get("sets") or []
     if not sets:
         return None

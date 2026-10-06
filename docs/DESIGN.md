@@ -6083,13 +6083,16 @@ be appended safely — after the runner's command ends (a `)` closing a
 subshell the runner sits in; a `$(…)` inside its arguments is not that), or
 past a `--` that would make the option a file argument — there is no
 report; the file under test never counts as the runner, even when named
-like one; a newline ends a command as `;` does; and a runner started
-through a container CLI — `docker`, `docker-compose`, `podman`, `nerdctl`
-or `kubectl` earlier in the simple command of any occurrence of the
-runner, not a container started by an earlier command nor one queried
-inside a `$(…)` for a value — is not asked at all, since it cannot see the orchestrator's environment and a report path
-it cannot create would fail a run whose tests pass) and reads how many
-tests executed
+like one; the command is read as bash reads it — a line continuation
+joins lines, a comment starts only at a word, and a newline ends a
+command as `;` does — and flags are appended to that unfolded form; and a
+runner started through a container CLI — `docker`, `docker-compose`,
+`podman`, `nerdctl` or `kubectl` earlier in the simple command of any
+occurrence of the runner, not a container started by an earlier command
+nor one queried inside a `$(…)` for a value — is not asked at all, since
+it cannot see the orchestrator's environment and a report path it cannot
+create would fail a run whose tests pass) and reads how many tests
+executed
 (a test whose fixture failed to set up counts as executed: it ran and
 failed) and whether the file loaded — pytest marks a file it could not
 collect with a fixed "collection failure" message, which no report option

@@ -688,6 +688,9 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     assert leerie._acceptance_no_verdict_exits(cmd, ["tests/pytest"]) == \
         frozenset()
     assert 5 in leerie._acceptance_no_verdict_exits(cmd)
+    # Nor does a runner named only in a comment.
+    assert leerie._acceptance_no_verdict_exits(
+        "./run-tests acc/test_a.py  # wraps pytest") == frozenset()
 
 
 @pytest.mark.parametrize("cmd,asked", [
@@ -703,6 +706,14 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     ("DB_PORT=$(docker port db 5432) npx jest acc/a.test.js", True),
     # `)&&` is one grouped token, and still ends the container's command.
     ("(docker compose up -d db)&&pytest acc/test_a.py", True),
+    # A separator inside a `$(…)` ends the substitution's command only —
+    # whether the container CLI is inside it or before it.
+    ("X=$(cd db; docker port db 5432) pytest acc/test_a.py", True),
+    ("docker run img env T=$(date; true) pytest acc/test_a.py", False),
+    # A line continuation does not end the container's command.
+    ("docker run --rm \\\n  -v $PWD:/app img \\\n  pytest acc/test_a.py",
+     False),
+    ("docker compose run app \\\n  npx jest acc/a.test.js", False),
 ])
 def test_only_a_container_that_starts_the_runner_withholds_the_report(
         leerie, tmp_path, monkeypatch, cmd, asked):
@@ -721,10 +732,44 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     assert cmd.startswith("npx jest acc/a.test.js --json ")
 
 
+@pytest.mark.parametrize("cmd,placed", [
+    ("npx jest \\\n  acc/a.test.js", "npx jest   acc/a.test.js"),
+    ("npx jest acc/a.test.js \\\n  --ci", "npx jest acc/a.test.js   --ci"),
+    # A trailing comment would swallow raw-appended flags.
+    ("npx jest acc/a.test.js # c", "npx jest acc/a.test.js"),
+    # A comment does not swallow the newline that ends the command.
+    ("npx jest acc/a.test.js # c\necho done", None),
+])
+def test_continuations_and_comments_are_read_as_bash_reads_them(
+        leerie, tmp_path, cmd, placed):
+    spec = leerie._acceptance_report_spec(cmd, tmp_path / "r")
+    if placed is None:
+        assert spec is None
+    else:
+        assert spec[0] == f"{placed} --json --outputFile={tmp_path / 'r'}"
+
+
+@pytest.mark.parametrize("cmd", [
+    "echo a \\\n  b", "echo a # c d", 'echo "x\\\ny" z',
+    "echo 'p\\\nq' r", "echo u#v w", "echo a\\ #b c",
+    "echo $(echo m # n\n) o",
+])
+def test_unfolding_does_not_change_what_bash_runs(leerie, cmd):
+    def run(c):
+        return subprocess.run(["bash", "-c", c], capture_output=True,
+                              text=True, check=False).stdout
+    assert run(leerie._shell_unfold(cmd)) == run(cmd)
+
+
 @pytest.mark.parametrize("cmd,runner", [
-    ("(python3 -m pytest acc/test_a.py)", "pytest"),
+    # Each case finds no runner under plain `shlex.split`: `(pytest`,
+    # `w&&pytest` and `(jest` are single words there.
+    ("(pytest acc/test_a.py)", "pytest"),
     ("cd w&&pytest acc/test_a.py", "pytest"),
-    ("(npx jest acc/a.test.js)", "jest"),
+    ("(jest acc/a.test.js)", "jest"),
+    # A `#` inside a word is not a comment (shlex's default thinks it is).
+    ("uvx --from git+https://e.test/r.git#subdirectory=py pytest acc/t.py",
+     "pytest"),
 ])
 def test_runner_detection_reads_operators_as_the_shell_does(
         leerie, cmd, runner):

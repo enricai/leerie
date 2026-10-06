@@ -4349,7 +4349,9 @@ tests; see below.)
   (`test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest`):
   absolute and `..` paths are rejected, and any per-writer exception only
   discards that set.
-- **Disputed at most once, really** (`test_a_second_failing_run_accepts_no_work`
+- **Disputed at most once, really** (the rule as of this round; since
+  2026-10-06 an unacted dispute is re-raised once —
+  `test_a_second_failing_run_accepts_no_work`
   asserts the carried-forward marker; `test_a_third_run_still_does_not_dispute`).
 - **Ties are not a passing majority** (`test_majority_rule`).
 - **No residue** — superseded in round 4: evaluation no longer writes the
@@ -4837,3 +4839,26 @@ only the first occurrence, counting a container inside `$(…)`, dropping
 `docker-compose`, lexing newlines as whitespace, not stripping the trailing
 newline, plain `shlex.split` for runner detection, and not reading grouped
 separators.
+
+##### Review round 3 of the post-merge fixes (2026-10-06)
+
+- **The command is read as bash reads it** (`_shell_unfold`):
+  `test_continuations_and_comments_are_read_as_bash_reads_them` (four
+  cases) and the container cases for multi-line `docker run \`/`docker
+  compose run \` templates pin that a backslash-newline joins lines (shlex
+  had made it a newline token, which round 2 then read as a separator), a
+  trailing comment does not swallow appended flags, and a comment does not
+  swallow the newline after it. `test_unfolding_does_not_change_what_bash_runs`
+  (seven cases) runs each raw and unfolded command through real bash.
+- **A `#` inside a word is not a comment** (the `uvx --from …#subdirectory`
+  case in `test_runner_detection_reads_operators_as_the_shell_does`, whose
+  three other cases now each fail under plain `shlex.split`), and a runner
+  named only in a comment is not detected
+  (`test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes`).
+- **A separator inside a `$(…)`** ends the substitution's command only, both
+  for a container CLI inside it and one before it.
+
+Seven reversions, each caught: tokenising the raw command, keeping
+continuations, a comment at any `#`, shlex's default commenters, separators
+inside `$(…)` ending the runner's command, appending to the raw command,
+and ignoring single quotes.
