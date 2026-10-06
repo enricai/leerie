@@ -4573,8 +4573,8 @@ dropping the both-unreadable clause.
 ### Runner reports, writer-declared import defects, in-loop retry (2026-10-05)
 
 The first commit's 12 distinct reversions, each against its named test, all
-caught — they cover the report, import-defect and retry entries below; the
-entries added by later commits carry their own counts.
+caught — they cover the report, import-defect and retry entries below.
+Later entries record their own falsification where one was run.
 
 - **Structured runner reports while validating**
   (`test_runner_reports_are_read_mechanically`: JUnit and jest-compatible JSON,
@@ -4645,6 +4645,14 @@ is kept for hygiene.
   (`test_an_unwritable_marker_directory_is_named_as_such`), and a probe the
   template deselects reads "collected or selected no test (exit 5)"
   (`test_a_probe_the_template_deselects_is_unrunnable_not_unparseable`).
+- **The repair prompt's import line states only what validation saw**: a
+  declared import defect whose file loaded on the base and failed an
+  assertion is recorded `"assertion"`
+  (`test_a_declared_import_defect_that_loaded_is_recorded_as_an_assertion`),
+  and the line describes the UNFIXED tree
+  (`test_import_cases_are_named_as_import_failures_in_the_repair_section`).
+  Report flags are never placed when the runner also appears before a
+  separator (`test_report_flags_are_placed_only_where_they_reach_the_runner`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

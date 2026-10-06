@@ -581,6 +581,8 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
     ("npx jest acc/a.test.js | tee log", False),
     ("npx jest acc/a.test.js > out.txt", False),
     ("npx jest acc/a.test.js && echo done", False),
+    # The runner also appears after a separator: the flags would reach echo.
+    ("npx jest acc/a.test.js; echo jest", False),
     ("npm test -- acc/a.test.js", False),
 ])
 def test_report_flags_are_placed_only_where_they_reach_the_runner(
@@ -946,7 +948,9 @@ def test_import_cases_are_named_as_import_failures_in_the_repair_section(
             "failing_files": ["acc/test_defect_mul.py",
                               "acc/test_defect_add.py"]}]
     text = leerie._format_acceptance_failures_section(res, sets, {1}, 1, "x")
-    head, _, tail = text.partition("cannot be imported")
+    # A fact about the UNFIXED tree, never a claim about the current one
+    # (final review of #282: the entry point may exist by now).
+    head, _, tail = text.partition("could not even load against the UNFIXED")
     assert "  - add sums" in head and "mul exists" not in head
     assert "  - mul exists" in tail
 
@@ -989,6 +993,22 @@ def test_the_writer_prompt_example_matches_the_schema(leerie):
         for key, spec in item["properties"].items():
             if "enum" in spec:
                 assert f[key] in spec["enum"]
+
+
+def test_a_declared_import_defect_that_loaded_is_recorded_as_an_assertion(
+        leerie, tmp_path, monkeypatch):
+    """Final review of #282: `modes` stored the writer's declaration as-is,
+    so a file that loaded fine on the base and failed an assertion was
+    later described to the repair rounds as an import failure."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    _import_writer(leerie, monkeypatch,
+                   {"acc/test_defect_sum.py": (DEFECT_TEST, "import")})
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
+    (s,) = acc["sets"]
+    assert s["defect_files"] == ["acc/test_defect_sum.py"]
+    assert s["modes"] == {"acc/test_defect_sum.py": "assertion"}
 
 
 def test_an_import_defect_set_validates_and_passes_on_the_fix(

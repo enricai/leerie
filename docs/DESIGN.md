@@ -6056,10 +6056,11 @@ decides, not the orchestrator's. The check marks when its own body is
 reached and when every file compiled, because only a failure between
 the two is about parsing: one before it (a conftest or package that
 cannot import — perhaps the very entry point the defect lacks — or a
-runner that collected or skipped nothing) or after it (a teardown, a
+runner that collected or selected no test) or after it (a teardown, a
 coverage threshold) says nothing about it. A check that
 did not reach its body proves nothing, and the declaration is not
-honoured either; the log says which, with the exit code.
+honoured either; the log says which, with the exit code where the
+command ran.
 That is checked only where it can be checked reliably, in Python; a
 declared import defect in any other language is dropped on its own,
 leaving the rest of its set (`node
@@ -6076,9 +6077,12 @@ nothing reads as passing: it cannot become a defect file (it does not
 fail on the base), but it can be accepted as a control that proves
 nothing. A majority of
 failing sets triggers **at most two repair rounds**: the conformer is
-told which declared cases failed and the defect contract — cases the
-writer declared import defects listed apart, as the entry point failing
-to import, which a case name alone does not say — never the
+told which declared cases failed and the defect contract — cases whose
+file was SEEN failing to load against the unfixed tree (declared an
+import defect by the writer and confirmed by the runner's report) listed
+apart, as a fact about that tree, which a case name alone does not say;
+a declaration the base run did not confirm is recorded as an ordinary
+failure — never the
 runner output or the test source, because a conformer shown the failing
 output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes

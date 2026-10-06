@@ -33027,10 +33027,13 @@ def _acceptance_report_spec(cmd: str, path: Path
         return None
     last_sep = max((i for i, t in enumerate(tokens)
                     if t in _SHELL_SEPARATORS), default=-1)
-    runner_at = max((i for i, t in enumerate(tokens)
-                     if os.path.basename(t) == runner), default=-1)
-    if runner_at <= last_sep or any(
-            t in _SHELL_REDIRECTS for t in tokens[runner_at:]):
+    runner_at = [i for i, t in enumerate(tokens)
+                 if os.path.basename(t) == runner]
+    # Every occurrence must sit in the final simple command: in
+    # `npx jest x; echo jest`, the runner is the first command and the flags
+    # would reach `echo`.
+    if not runner_at or min(runner_at) <= last_sep or any(
+            t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]):
         return None
     return (f"{cmd} {how.format(path=shlex.quote(str(path)))}", None, kind)
 
@@ -33248,7 +33251,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                rel: str, log_path: Path,
                                label: str, *,
                                validating: bool = False,
-                               failure_mode: str = "assertion"
+                               failure_mode: str = "assertion",
+                               observed: dict | None = None
                                ) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
     False failed, None not measurable (no command, the shell could not run
@@ -33304,6 +33308,10 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
         return rc == 0
     if parsed["collection_error"]:
         if failure_mode == "import":
+            # Recorded so the set says what was SEEN on the base, not only
+            # what the writer declared (the repair prompt relies on it).
+            if observed is not None:
+                observed["load_failure"] = True
             return False
         return None
     if parsed["executed"] == 0:
@@ -33457,9 +33465,10 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                     log(f"  acceptance set {k}: {rel} declared an import "
                         f"defect, but {why} — declaration not honoured")
                     mode = "assertion"
+            observed: dict = {}
             verdict = await _run_acceptance_file(
                 st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
-                validating=True, failure_mode=mode)
+                validating=True, failure_mode=mode, observed=observed)
             if verdict is None:
                 # Not measurable (no test command for this file, the runner
                 # is missing, or it ran no test) — never mistaken for pass
@@ -33470,7 +33479,11 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 # Must FAIL on the unfixed tree, or it cannot discriminate.
                 if verdict is False:
                     defect.append(rel)
-                    modes[rel] = mode
+                    # "import" only when the base run showed the file failing
+                    # to load; a declared import defect that loaded and failed
+                    # an assertion is an ordinary failure.
+                    modes[rel] = ("import" if observed.get("load_failure")
+                                  else "assertion")
                     cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
             elif verdict is True:
                 control.append(rel)
@@ -33710,17 +33723,20 @@ def _format_acceptance_failures_section(results: list[dict],
         set_ = by_index[r["index"]]
         for rel in r["failing_files"]:
             names = set_["cases"].get(rel, [])[:12]
-            # The writer's own declaration (`modes`), never runner output:
-            # these cases fail because the entry point cannot be imported,
-            # which case names alone do not say.
+            # `modes` records what validation SAW on the base (a declared
+            # import defect whose file failed to load there), never runner
+            # output: a fact about the unfixed tree that case names alone do
+            # not say.
             if (set_.get("modes") or {}).get(rel) == "import":
                 import_cases.extend(names)
             else:
                 lines.extend(f"  - {c}" for c in names)
     if import_cases:
-        lines.append("These cases fail because the module or entry point the "
-                     "report names cannot be imported — the contract starts "
-                     "with it existing and importing cleanly:")
+        lines.append("These cases' tests could not even load against the "
+                     "UNFIXED tree: the module or entry point the report names "
+                     "was missing there or failed to import. The contract "
+                     "starts with it existing and importing cleanly, and then "
+                     "behaving as the report says:")
         lines.extend(f"  - {c}" for c in import_cases)
     lines.append("DEFECT CONTRACT: " + (defect_shape or "(none recorded)"))
     return "\n".join(lines)
