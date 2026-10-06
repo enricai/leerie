@@ -596,6 +596,12 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
     ("npx jest acc/a.test.js)&&echo", False),
     # A container's runner gets no request: it cannot write our path.
     ("docker compose run web npx jest acc/a.test.js", False),
+    # A container an EARLIER command starts, or `docker` among the
+    # runner's arguments, leaves the runner on the host.
+    ("docker compose up -d db && npx jest acc/a.test.js", True),
+    ("npx jest --rootDir docker acc/a.test.js", True),
+    # A `))` closing a `$(…)` and the subshell at once: read per character.
+    ("(cd w && npx jest $(echo acc/a.test.js))", False),
 ])
 def test_report_flags_are_placed_only_where_they_reach_the_runner(
         leerie, tmp_path, cmd, placed):
@@ -662,6 +668,8 @@ def test_an_appended_junit_path_is_the_report_pytest_writes(
 @pytest.mark.parametrize("cmd,rel", [
     ("pytest --junitxml=own.xml -- tests/pytest", "tests/pytest"),
     ("npx jest -- t/jest", "t/jest"),
+    # Compared normalised: `./` does not make the file a runner.
+    ("npx jest -- ./t/jest", "t/jest"),
 ])
 def test_a_file_named_like_the_runner_is_never_the_runner(
         leerie, tmp_path, cmd, rel):
@@ -688,6 +696,11 @@ def test_a_containerised_pytest_gets_no_environment_request_either(
     assert leerie._acceptance_report_spec(
         "podman exec box python3 -m pytest acc/test_a.py",
         tmp_path / "r.xml") is None
+    # A database container started first still leaves pytest on the host.
+    spec = leerie._acceptance_report_spec(
+        "docker compose up -d db && pytest acc/test_a.py",
+        tmp_path / "r.xml")
+    assert spec is not None and "--junitxml=" in spec[1]["PYTEST_ADDOPTS"]
 
 
 def _validate(leerie, st, repo, rel, mode="assertion"):
@@ -1885,6 +1898,13 @@ def test_mixed_named_and_unnamed_failures_say_the_list_is_partial(leerie):
         res, sets, {1}, 1, "c", held_back=False)
     assert "  - c1" in text
     assert "other failing tests declared no case names" in text
+    # Only import-mode names: the note still follows them, never precedes.
+    imp = [{"index": 1, "modes": {"acc/test_a.py": "import"},
+            "cases": sets[0]["cases"]}]
+    imp_text = leerie._format_acceptance_failures_section(
+        res, imp, {1}, 1, "c", held_back=False)
+    assert imp_text.index("  - c1") < imp_text.index(
+        "other failing tests declared no case names")
     only_named = leerie._format_acceptance_failures_section(
         [dict(res[0], failing_files=["acc/test_a.py"])], sets, {1}, 1, "c",
         held_back=False)

@@ -289,6 +289,15 @@ def child_subreaper_restored():
 
 
 @pytest.fixture(autouse=True)
+def _fresh_head_acceptance_results(leerie, monkeypatch):
+    """Give every test an empty `_HEAD_ACCEPTANCE_RESULTS`: the `leerie`
+    module is session-scoped, so a measurement cached by one test would
+    otherwise be readable by the next one that reuses its (run dir, sha)
+    key."""
+    monkeypatch.setattr(leerie, "_HEAD_ACCEPTANCE_RESULTS", {})
+
+
+@pytest.fixture(autouse=True)
 def _no_real_planning_worktree(request, monkeypatch):
     """Keep `_ensure_planning_worktree` from shelling out to real git.
 

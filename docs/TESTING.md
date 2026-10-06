@@ -4788,3 +4788,30 @@ placement and in runner detection, the paren depth, the character-wise
 operator scan, the `--` stop, the container check, the mixed-name note in
 the section and in the evidence, the cache read, and the rule never to
 cache a measurement that measured nothing.
+
+##### Review round 1 of the post-merge fixes (2026-10-06)
+
+- **Container check scoped to the runner's own command**
+  (`test_report_flags_are_placed_only_where_they_reach_the_runner` gained
+  `docker compose up -d db && npx jest …` and `--rootDir docker`, both
+  placed; `test_a_containerised_pytest_gets_no_environment_request_either`
+  now also asserts a host pytest after `docker compose up` keeps its
+  environment request). The first version matched `docker` anywhere and
+  cost a common start-the-database template its report.
+- **Files compared normalised** (`test_a_file_named_like_the_runner_is_never_the_runner`
+  gained `./t/jest`).
+- **Operator characters read one at a time, really**: a `))` closing a
+  `$(…)` and the runner's subshell at once (the earlier grouped cases sat at
+  depth 0, where a whole-token reading also refused, so that reversion
+  passed).
+- **The mixed-name note follows every name**, the import list included
+  (`test_mixed_named_and_unnamed_failures_say_the_list_is_partial`).
+- **The accept message names the bound, not "one dispute"**
+  (`test_a_second_failing_run_accepts_no_work`).
+- **A fresh `_HEAD_ACCEPTANCE_RESULTS` per test** (`tests/conftest.py`'s
+  autouse `_fresh_head_acceptance_results`): the `leerie` module is
+  session-scoped.
+
+Five reversions, each caught: the container check over the whole command,
+raw-token file comparison, a whole-token operator reading, the note before
+the import list, and the old accept message.

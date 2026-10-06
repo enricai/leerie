@@ -5350,9 +5350,10 @@ still end as no work by another exit — its planners return nothing, or
 the satisfied-probe sweep drops every subtask — and the next run would
 then accept "no work" after a dispute no run ever acted on, leaving the
 defect the tests still show on HEAD unfixed for good. So executed
-evidence outranks the probe: whenever held-out sets exist and no strict
-majority of them passes on HEAD (a tie counts as failing, as everywhere in
-the gate), the sweep is not offered the subtasks that fix the reported
+evidence outranks the probe: whenever held-out sets exist, some of them
+could be run on HEAD, and no strict majority of those passes (a tie counts
+as failing, as everywhere in the gate; nothing measured protects nothing),
+the sweep is not offered the subtasks that fix the reported
 symptom (below). And a disputing run that still ends as no
 work by either of those two planning-time exits records its dispute as not
 acted on, which the next run does not count — once. That re-dispute is
@@ -5360,7 +5361,7 @@ recorded as such, and if it too ends unacted it counts: two runs have
 then been shown the failing cases and twice produced no work for them —
 the planners found nothing, or none of what they planned was flagged as
 fixing the symptom and the probe judged all of it satisfied — which is
-the wrong-tests case the at-most-once rule exists for, and
+the wrong-tests case the dispute bound exists for, and
 re-disputing it on every run would reopen that loop. So the cost of a wrong
 dispute is bounded to two extra runs, not one, when the first goes unacted.
 (A run that reaches implementation has acted on its dispute, whatever its
@@ -6082,10 +6083,12 @@ be appended safely — after the runner's command ends (a `)` closing a
 subshell the runner sits in; a `$(…)` inside its arguments is not that), or
 past a `--` that would make the option a file argument — there is no
 report; the file under test never counts as the runner, even when named
-like one). A test command that starts its runner through a container CLI
-(`docker`, `podman`, `nerdctl`, `kubectl`) gets no report request at all:
-the runner there cannot see the orchestrator's environment, and a report
-path it cannot create would fail a run whose tests pass and reads how many tests executed
+like one; and a runner started through a container CLI — `docker`,
+`podman`, `nerdctl` or `kubectl` earlier in the runner's own simple
+command, not a container started by an earlier command — is not asked at
+all, since it cannot see the orchestrator's environment and a report path
+it cannot create would fail a run whose tests pass) and reads how many
+tests executed
 (a test whose fixture failed to set up counts as executed: it ran and
 failed) and whether the file loaded — pytest marks a file it could not
 collect with a fixed "collection failure" message, which no report option
@@ -6144,9 +6147,10 @@ than being promised a list of failing cases that is empty; when a shown set
 fails but names no cases, it is told that instead, never that tests are
 hidden; and when named and unnamed failures mix, the names are followed by
 a note that other failing tests declared none. The sets are evaluated on a
-given commit once per run: the no-work settle, the pre-sweep protection
-check and the already-fixed check all read the same HEAD during planning,
-so the later ones reuse the first measurement. A
+given commit once per invocation (a resume measures afresh): the no-work
+settle, the pre-sweep protection check and the already-fixed check all
+read the same HEAD during planning, so the later ones reuse the first
+measurement. A
 round whose verdict measures nothing where the one before it measured is
 measured once more before the rounds stop on it: every evaluation installs
 afresh, and a one-off install failure would otherwise end the repair with

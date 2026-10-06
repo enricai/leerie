@@ -1,4 +1,4 @@
-"""No work is declared on executed evidence, and disputed at most once
+"""No work is declared on executed evidence, and a dispute is bounded
 (DESIGN §8).
 
 A confirmed no-work claim used to end the run on the judge's reading alone;
@@ -8,6 +8,7 @@ with held-out acceptance available the confirmation is now held pending, and
 settled after the acceptance sets run on HEAD: pass → no work; fail → one
 dispute (plan the work); fail again on the next run → accept with a warning,
 because held-out tests can be wrong and a repeated dispute would loop forever.
+A dispute no run acted on is re-raised once before it counts.
 """
 from __future__ import annotations
 
@@ -152,6 +153,9 @@ def test_a_second_failing_run_accepts_no_work(leerie, tmp_path, monkeypatch,
     assert st.data["acceptance_dispute"]["accepted"] is True
     assert "WARNING" in capsys.readouterr().out
     assert len(finished) == 1
+    # The bound, not a count: after an unacted re-dispute it is the second.
+    assert finished[0]["<confirmed already-satisfied>"].endswith(
+        "accepted at the acceptance-dispute bound; residual recorded")
 
 
 def test_a_third_run_still_does_not_dispute(leerie, tmp_path, monkeypatch,

@@ -473,9 +473,9 @@ STATE_FIELDS = (
     # skip_acceptance_check: --skip-acceptance-check resolved at run start.
     "skip_acceptance_check",
     # no_work_pending / no_work_acceptance / acceptance_dispute (DESIGN §8
-    # *No work is declared on executed evidence, and disputed at most
-    # once*): a judge confirmation held for the held-out check, the check's
-    # verdict, and the dispute record the next run's dispute-once reads.
+    # *No work is declared on executed evidence, and a dispute is
+    # bounded*): a judge confirmation held for the held-out check, the
+    # check's verdict, and the dispute record the next run's bound reads.
     "no_work_pending",
     "no_work_acceptance",
     "acceptance_dispute",
@@ -32990,10 +32990,8 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
         tokens = shlex.split(cmd)
     except ValueError:
         return None
-    skip = set(files)
     for runner in known:
-        if any(os.path.basename(t) == runner and t not in skip
-               for t in tokens):
+        if _runner_positions(tokens, runner, files):
             return runner
     return None
 
@@ -33041,10 +33039,16 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     kind, how = _RUNNER_REPORTS[runner]
     tokens = _shell_tokens(cmd)
     # A runner started through a container CLI cannot see our environment,
-    # and a report path it cannot create fails a run whose tests pass.
-    if tokens is not None and any(os.path.basename(t) in _CONTAINER_CLIS
-                                  for t in tokens):
-        return None
+    # and a report path it cannot create fails a run whose tests pass. Only
+    # a CLI in the runner's own simple command counts: `docker compose up -d
+    # db && pytest x` runs pytest on the host.
+    if tokens is not None:
+        at = _runner_positions(tokens, runner, files)
+        last_sep = max((i for i, t in enumerate(tokens)
+                        if t in _SHELL_SEPARATORS), default=-1)
+        if at and any(os.path.basename(t) in _CONTAINER_CLIS
+                      for t in tokens[last_sep + 1:min(at)]):
+            return None
     if how == "env":
         flags = f"--junitxml={shlex.quote(str(path))}"
         if tokens is None or not any(
@@ -33077,6 +33081,17 @@ def _shell_tokens(cmd: str) -> list[str] | None:
         return None
 
 
+def _runner_positions(tokens: list[str], runner: str,
+                      files: Iterable[str] = ()) -> list[int]:
+    """Indices of the tokens naming `runner` (by basename), never one of the
+    `files` the command was rendered over — compared in normalised form, so
+    `./sub/jest` is still the file `sub/jest`."""
+    skip = {os.path.normpath(f) for f in files}
+    return [i for i, t in enumerate(tokens)
+            if os.path.basename(t) == runner
+            and os.path.normpath(t) not in skip]
+
+
 def _flags_reach_runner(tokens: list[str], runner: str,
                         files: Iterable[str] = ()) -> bool:
     """Whether flags appended to the command reach `runner`: every
@@ -33087,9 +33102,7 @@ def _flags_reach_runner(tokens: list[str], runner: str,
     would reach `echo`."""
     last_sep = max((i for i, t in enumerate(tokens)
                     if t in _SHELL_SEPARATORS), default=-1)
-    skip = set(files)
-    runner_at = [i for i, t in enumerate(tokens)
-                 if os.path.basename(t) == runner and t not in skip]
+    runner_at = _runner_positions(tokens, runner, files)
     if not runner_at or min(runner_at) <= last_sep or any(
             t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]):
         return False
@@ -33841,9 +33854,6 @@ def _format_acceptance_failures_section(results: list[dict],
                  "general. ")
     lines = [head + "Re-derive the cause from the report itself (the task "
              "names it).", *case_lines]
-    if (case_lines or import_cases) and unnamed:
-        # Named and unnamed failures mixed: the names are not the whole list.
-        lines.append("  (other failing tests declared no case names)")
     if import_cases:
         lines.append("These cases' tests could not even load against the "
                      "UNFIXED tree: the module or entry point the report names "
@@ -33851,6 +33861,9 @@ def _format_acceptance_failures_section(results: list[dict],
                      "starts with it existing and importing cleanly, and then "
                      "behaving as the report says:")
         lines.extend(f"  - {c}" for c in import_cases)
+    if (case_lines or import_cases) and unnamed:
+        # Named and unnamed failures mixed: the names are not the whole list.
+        lines.append("  (other failing tests declared no case names)")
     lines.append("DEFECT CONTRACT: " + (defect_shape or "(none recorded)"))
     return "\n".join(lines)
 
@@ -34350,8 +34363,8 @@ async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
 
 async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     """Decide a held no-work confirmation on executed evidence (DESIGN §8
-    *No work is declared on executed evidence, and disputed at most
-    once*). Returns True when the run ended as no work."""
+    *No work is declared on executed evidence, and a dispute is
+    bounded*). Returns True when the run ended as no work."""
     conf = st.data.get("no_work_confirmation") or {}
     judge_evidence = conf.get("judge_evidence") or ""
     res = await _acceptance_results_on_head(st, caps)
@@ -34396,7 +34409,7 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     if _prior_acceptance_dispute(st):
         st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
                                          "results": res, "cases": cases}
-        # Carry the marker forward: the dispute-once rule reads only the
+        # Carry the marker forward: the dispute bound reads only the
         # newest completed same-task run, so without this the run after an
         # accepted one would dispute again — every other re-run.
         st.data["acceptance_dispute"] = {
@@ -34408,8 +34421,9 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
             + (f"Failing cases: {'; '.join(cases[:5])}" if cases
                else no_names))
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
-                                 judge_evidence + " — accepted after one "
-                                 "acceptance dispute; residual recorded"})
+                                 judge_evidence + " — accepted at the "
+                                 "acceptance-dispute bound; residual "
+                                 "recorded"})
         return True
     st.data["no_work_acceptance"] = {"verdict": "dispute", "results": res,
                                      "cases": cases}

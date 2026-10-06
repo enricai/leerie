@@ -480,7 +480,8 @@ The orchestrator gives you, in your prompt:
    The dispute may instead come from held-out acceptance tests: then
    `judge_evidence` begins "Held-out acceptance tests written from the
    report fail on HEAD", and it lists the failing case names — or, when
-   none may be shown, only how many test sets fail. Those tests were
+   none may be shown or the failing tests named none, only how many test
+   sets fail. Those tests were
    written from the report alone and RAN on the current tree, so the
    defect the report describes is still present there even when no case
    is named. With no names, plan the fix the report itself describes,
