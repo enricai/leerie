@@ -130,6 +130,30 @@ def test_unsatisfied_all_survive_no_drop_key(leerie, tmp_path, monkeypatch):
     assert "dropped_subtasks" not in st.data
 
 
+def test_protected_subtask_is_never_probed_or_dropped(leerie, tmp_path,
+                                                     monkeypatch):
+    """DESIGN §8: while held-out sets fail on HEAD the caller protects the
+    symptom-fixing subtasks. A probe that would call every subtask
+    satisfied must neither see the protected one nor empty the plan."""
+    st = _make_state(leerie, tmp_path / "run")
+    plans = [{"domain": "bug-fixing", "status": "ready",
+              "subtasks": [_sub("fix-001", fixes_reported_symptom=True),
+                           _sub("doc-001")]}]
+    seen: list[str] = []
+
+    async def fake_claude_p(*, user_prompt, sid, **_kw):
+        seen.append(sid)
+        return {"satisfied": True, "evidence": "looks done"}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    res = _run(leerie._filter_satisfied_subtasks(
+        plans, tmp_path, st, _CAPS, _MODELS, _EFFORTS,
+        protect={"fix-001"}))
+    assert res is None
+    assert [s["id"] for s in plans[0]["subtasks"]] == ["fix-001"]
+    assert seen == ["satisfied_probe-doc-001"]
+    assert "fix-001" not in st.data["dropped_subtasks"]
+
+
 # ---------------------------------------------------------------------------
 # all-dropped → no_work_map routing
 # ---------------------------------------------------------------------------

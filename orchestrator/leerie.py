@@ -13020,6 +13020,7 @@ def _probe_drop_reason(verdict: dict) -> str | None:
 async def _filter_satisfied_subtasks(
     plans: list[dict], repo_root: Path, st: "State", caps: dict,
     models: dict[str, str], efforts: dict[str, str | None],
+    protect: set[str] | None = None,
 ) -> dict[str, str] | None:
     """Mutate `plans` in place: drop any subtask whose success criteria
     are already met on the base tree (DESIGN §8 *Already-satisfied
@@ -13056,7 +13057,12 @@ async def _filter_satisfied_subtasks(
     to prefer that over a false-positive that would silently delete real
     work. The probe runs with `SATISFIED_PROBE_TOOLS` (a base-tree-only
     subset of INSPECT_TOOLS — no history-spanning git, see that
-    constant's rationale)."""
+    constant's rationale).
+
+    Ids in `protect` are never probed, so never dropped: the caller passes
+    the symptom-fixing subtasks while the held-out acceptance sets fail on
+    HEAD (`_fix_ids_held_out_sets_protect`, DESIGN §8 — executed evidence
+    outranks the probe's reading)."""
     if st.data.get("skip_satisfied_check"):
         log("phase 3: satisfied-check skipped (--skip-satisfied-check / "
             "LEERIE_SKIP_SATISFIED_CHECK / skip_satisfied_check=true)")
@@ -13068,11 +13074,18 @@ async def _filter_satisfied_subtasks(
     # judge "already met" against, so such a subtask always survives.
     probeable: list[dict] = []
     total = 0
+    protect = protect or set()
     for plan in plans:
         for s in plan.get("subtasks", []) or []:
             total += 1
+            if s.get("id") in protect:
+                continue
             if (s.get("success_criteria_seed") or "").strip():
                 probeable.append(s)
+    if protect:
+        log(f"phase 3: {len(protect)} subtask(s) fixing the reported symptom "
+            "kept out of the satisfied-probe — the held-out acceptance sets "
+            f"fail on HEAD: {', '.join(sorted(protect))}")
     if not probeable:
         return None
 
@@ -34124,8 +34137,44 @@ def _prior_acceptance_dispute(st: "State") -> bool:
                 continue
         except (OSError, ValueError):
             continue
-        return bool(data.get("acceptance_dispute"))
+        # A dispute its own run never acted on (it still ended as no work by
+        # another exit) does not count: accepting on it would leave the
+        # defect the tests show unfixed with no run ever planning the fix.
+        dispute = data.get("acceptance_dispute")
+        return bool(dispute) and not (isinstance(dispute, dict)
+                                      and dispute.get("unacted"))
     return False
+
+
+def _mark_dispute_unacted(st: "State") -> None:
+    """Before a no-work exit other than the settle itself: mark this run's
+    own dispute (not a carried-forward acceptance) as never acted on, so
+    the next run disputes again rather than accepting (DESIGN §8 *A
+    dispute counts only once it is acted on*)."""
+    dispute = st.data.get("acceptance_dispute")
+    if isinstance(dispute, dict) and not dispute.get("accepted"):
+        dispute["unacted"] = True
+        st.save()
+
+
+async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
+                                         fix_ids: set[str]) -> set[str]:
+    """`fix_ids` when held-out sets exist, some were measured on HEAD, and
+    no strict majority of those passed (`_acceptance_majority_fails`, the
+    settle's rule; a tie protects), else empty — the subtasks the
+    satisfied-probe sweep must not be offered (DESIGN §8). Exit codes and
+    typed fields only. Fail-open: any error protects nothing, as before."""
+    if not fix_ids:
+        return set()
+    try:
+        res = await _acceptance_results_on_head(st, caps)
+    except Exception as e:
+        log(f"acceptance: the pre-sweep check raised {type(e).__name__}: "
+            f"{e} — the satisfied-probe sees every subtask")
+        return set()
+    if res is None or not _acceptance_measured(res):
+        return set()
+    return set(fix_ids) if _acceptance_majority_fails(res) else set()
 
 
 async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
@@ -37772,6 +37821,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # time it ran.
             no_work_map = _detect_no_work(plans)
             if no_work_map is not None:
+                _mark_dispute_unacted(st)
                 _finish_no_work_run(st, no_work_map)
                 return
         else:
@@ -37909,9 +37959,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             fix_ids_before = {s_["id"] for p_ in plans
                               for s_ in (p_.get("subtasks") or [])
                               if s_.get("fixes_reported_symptom")}
+            protect = await _fix_ids_held_out_sets_protect(
+                st, caps, fix_ids_before)
             satisfied_no_work = await _filter_satisfied_subtasks(
-                plans, Path(os.getcwd()), st, caps, models, efforts)
+                plans, Path(os.getcwd()), st, caps, models, efforts,
+                protect=protect)
             if satisfied_no_work is not None:
+                _mark_dispute_unacted(st)
                 _finish_no_work_run(st, satisfied_no_work)
                 return
             if await _finish_if_every_fix_already_on_head(

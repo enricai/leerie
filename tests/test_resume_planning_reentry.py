@@ -210,7 +210,8 @@ def _stub_common(leerie, monkeypatch, calls: dict):
             "_filter_offtree_subtasks",
             calls.get("_filter_offtree_subtasks", 0) + 1))
 
-    async def _satisfied(plans, repo_root, st, caps, models, efforts):
+    async def _satisfied(plans, repo_root, st, caps, models, efforts,
+                         protect=None):
         calls["_filter_satisfied_subtasks"] = calls.get(
             "_filter_satisfied_subtasks", 0) + 1
         return None
@@ -953,7 +954,8 @@ def test_satisfied_filter_detecting_no_work_stops_the_pipeline(
     calls: dict = {}
     _stub_common(leerie, monkeypatch, calls)
 
-    async def _satisfied_to_no_work(plans, repo_root, st, caps, models, efforts):
+    async def _satisfied_to_no_work(plans, repo_root, st, caps, models, efforts,
+                                    protect=None):
         calls["_filter_satisfied_subtasks"] = calls.get(
             "_filter_satisfied_subtasks", 0) + 1
         return {"bug-fixing": "sibling run already merged this"}

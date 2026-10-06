@@ -5337,6 +5337,17 @@ still-failing majority ends the run as no work with a loud warning and the
 residual recorded. The cost of a wrong dispute is bounded to one extra run.
 With no valid sets the judge's confirmation stands, as before.
 
+A dispute counts only once it is acted on. The run that disputed could
+still end as no work by another exit — its planners return nothing, or
+the satisfied-probe sweep drops every subtask — and the next run would
+then accept "no work" after a dispute no run ever acted on, leaving the
+defect the tests still show on HEAD unfixed for good. So executed
+evidence outranks the probe: whenever held-out sets exist and a majority
+of them fails on HEAD, the sweep is not offered the subtasks that fix
+the reported symptom (below). And a disputing run that still ends as no
+work records its dispute as not acted on, which the next run does not
+count.
+
 **A plan whose fixes are all already on HEAD ends as no work.** The
 satisfied-probe sweep could drop every subtask that fixes the reported
 symptom and still let the run ship, because the survivors (verification
@@ -5344,7 +5355,9 @@ and test-only subtasks) are never judged satisfied by a read-only probe —
 three of the six measured CHURN pairs shipped such a test-only PR. When
 every subtask flagged `fixes_reported_symptom` was dropped as already
 satisfied and the held-out sets pass on HEAD, the run ends as no work;
-otherwise it proceeds as before.
+otherwise it proceeds as before. When the held-out sets FAIL on HEAD,
+those subtasks are never offered to the probe — the tests outrank its
+reading — so the plan cannot lose its fixes and ship without them.
 
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
@@ -5998,8 +6011,9 @@ independent *sets*, each split into **defect files** (must fail on the
 validity base) and **control files** (correct behaviour that must keep
 passing), driving the behaviour through the module's stable entry points
 rather than internal helpers whose signatures a fix may change. Python
-validates each set mechanically, by exit code only (no runner-output
-parsing, so the mechanism is language-agnostic): a defect file that
+validates each set mechanically — by exit code, and where the runner can
+write one by its structured report of what ran (below), never by reading
+runner prose: a defect file that
 passes on the validity base cannot discriminate and is dropped; a set
 needs at least one discriminating defect file and every control passing.
 A set carries what its validation ran on: a writer that

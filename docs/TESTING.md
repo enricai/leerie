@@ -4656,3 +4656,30 @@ is kept for hygiene.
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.
+
+### A dispute counts only once it is acted on (2026-10-06)
+
+Post-merge review of #282 found a disputing run could still end as no work by
+another exit (empty plans, or the satisfied-probe sweep dropping every
+subtask), and the next run then accepted "no work" on a dispute nobody acted
+on. Seven reversions of the fix, each caught by at least one test below:
+
+- **Protect** (`tests/test_filter_satisfied_subtasks.py::test_protected_subtask_is_never_probed_or_dropped`):
+  a protected subtask is never handed to the probe, even when the probe would
+  call everything satisfied, and the plan is not emptied.
+- **When to protect** (`test_pre_sweep_protect`, five cases;
+  `test_pre_sweep_protect_errors_protect_nothing`): only a measured failing
+  majority protects; passing, no sets, nothing measured, no fix subtasks
+  (which also skips running the sets) and any error protect nothing.
+- **The reviewer's scenario end to end**
+  (`test_dispute_then_probe_drops_everything_keeps_the_fix`): a dispute, then a
+  sweep whose probe says "satisfied" to everything, keeps the fix subtask and
+  fires neither the sweep's nor A4's no-work exit.
+- **Unacted** (`test_mark_dispute_unacted`, three cases;
+  `test_an_unacted_dispute_does_not_count`): this run's own dispute is marked
+  and persisted, a carried-forward acceptance is not, and the lookup ignores an
+  unacted dispute.
+- **Wiring** (`test_run_phases_wiring`, `test_both_other_no_work_exits_mark_the_dispute_unacted`):
+  source-order pins that the protect set is computed before the sweep and
+  passed to it, and that each of the two other no-work exits marks the dispute
+  first. The behaviour of each helper is pinned by the tests above.
