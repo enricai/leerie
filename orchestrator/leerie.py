@@ -34115,11 +34115,10 @@ async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
             and not _acceptance_majority_fails(res))
 
 
-def _prior_acceptance_dispute(st: "State") -> bool:
-    """Whether the most recent COMPLETED same-task run already raised an
-    acceptance dispute (DESIGN §8 *disputed at most once*). Same sibling
-    rules as `_prior_delivery_residual`: exact task match, newest first,
-    completed runs only."""
+def _prior_acceptance_dispute_record(st: "State") -> dict | None:
+    """The `acceptance_dispute` of the most recent COMPLETED same-task run,
+    or None. Same sibling rules as `_prior_delivery_residual`: exact task
+    match, newest first, completed runs only."""
     task = (st.data.get("task") or "").strip()
     try:
         candidates = sorted(
@@ -34137,13 +34136,22 @@ def _prior_acceptance_dispute(st: "State") -> bool:
                 continue
         except (OSError, ValueError):
             continue
-        # A dispute its own run never acted on (it still ended as no work by
-        # another exit) does not count: accepting on it would leave the
-        # defect the tests show unfixed with no run ever planning the fix.
         dispute = data.get("acceptance_dispute")
-        return bool(dispute) and not (isinstance(dispute, dict)
-                                      and dispute.get("unacted"))
-    return False
+        return dispute if isinstance(dispute, dict) and dispute else None
+    return None
+
+
+def _prior_acceptance_dispute(st: "State") -> bool:
+    """Whether the previous completed same-task run already raised an
+    acceptance dispute that counts (DESIGN §8 *disputed at most once*). An
+    unacted dispute — its run still ended as no work by another exit — does
+    not count, so the next run disputes again; but only once: a re-dispute
+    that also goes unacted counts, or wrong held-out tests would be
+    re-disputed on every run (DESIGN §8 *A dispute counts only once it is
+    acted on*)."""
+    dispute = _prior_acceptance_dispute_record(st)
+    return bool(dispute) and (not dispute.get("unacted")
+                              or bool(dispute.get("redispute")))
 
 
 def _mark_dispute_unacted(st: "State") -> None:
@@ -34163,8 +34171,10 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
     no strict majority of those passed (`_acceptance_majority_fails`, the
     settle's rule; a tie protects), else empty — the subtasks the
     satisfied-probe sweep must not be offered (DESIGN §8). Exit codes and
-    typed fields only. Fail-open: any error protects nothing, as before."""
-    if not fix_ids:
+    typed fields only. Fail-open: any error protects nothing, as before.
+    Under `skip_satisfied_check` there is no sweep to protect from, so the
+    sets are not run."""
+    if not fix_ids or st.data.get("skip_satisfied_check"):
         return set()
     try:
         res = await _acceptance_results_on_head(st, caps)
@@ -34257,6 +34267,10 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     st.data["acceptance_dispute"] = {
         "failing_sets": failing_sets, "total_sets": len(measured),
         "cases": cases}
+    # Reaching here past an unacted prior dispute makes this the one
+    # allowed re-dispute; if it too goes unacted, the next run accepts.
+    if (_prior_acceptance_dispute_record(st) or {}).get("unacted"):
+        st.data["acceptance_dispute"]["redispute"] = True
     st.data["no_work_dispute"] = {
         "classifier_evidence": conf.get("classifier_evidence", ""),
         "judge_evidence": ("Held-out acceptance tests written from the "

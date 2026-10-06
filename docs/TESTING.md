@@ -4667,10 +4667,12 @@ on. Seven reversions of the fix, each caught by at least one test below:
 - **Protect** (`tests/test_filter_satisfied_subtasks.py::test_protected_subtask_is_never_probed_or_dropped`):
   a protected subtask is never handed to the probe, even when the probe would
   call everything satisfied, and the plan is not emptied.
-- **When to protect** (`test_pre_sweep_protect`, five cases;
-  `test_pre_sweep_protect_errors_protect_nothing`): only a measured failing
-  majority protects; passing, no sets, nothing measured, no fix subtasks
-  (which also skips running the sets) and any error protect nothing.
+- **When to protect** (`test_pre_sweep_protect`, six cases;
+  `test_pre_sweep_protect_errors_protect_nothing`,
+  `test_pre_sweep_protect_skipped_with_the_sweep`): a measured failing
+  majority protects, a tie included; passing, no sets, nothing measured, no
+  fix subtasks and `skip_satisfied_check` (both of which also skip running
+  the sets) and any error protect nothing.
 - **The reviewer's scenario end to end**
   (`test_dispute_then_probe_drops_everything_keeps_the_fix`): a dispute, then a
   sweep whose probe says "satisfied" to everything, keeps the fix subtask and
@@ -4683,3 +4685,17 @@ on. Seven reversions of the fix, each caught by at least one test below:
   source-order pins that the protect set is computed before the sweep and
   passed to it, and that each of the two other no-work exits marks the dispute
   first. The behaviour of each helper is pinned by the tests above.
+
+#### Review round 1 fixes (2026-10-06)
+
+The first review of #283 found that an unacted dispute was re-raised on every
+run when the held-out tests themselves are wrong: the planners, shown the
+failing cases, correctly return nothing, the dispute goes unacted, and the
+next run disputes again — the loop the at-most-once rule exists to prevent.
+A re-dispute raised past an unacted one is now marked `redispute`, and counts
+even if it too goes unacted (`test_a_wrong_dispute_that_goes_unacted_is_bounded`,
+three runs' state; `test_a_first_dispute_is_not_a_redispute`). The tie case
+and the skip flag gained the cases named above. Five reversions (the
+`redispute` write, counting it, the skip flag, a strict-majority rule in place
+of `_acceptance_majority_fails`, and counting unacted disputes) are each
+caught by at least one test.

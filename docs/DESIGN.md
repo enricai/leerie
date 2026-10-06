@@ -5345,8 +5345,15 @@ defect the tests still show on HEAD unfixed for good. So executed
 evidence outranks the probe: whenever held-out sets exist and a majority
 of them fails on HEAD, the sweep is not offered the subtasks that fix
 the reported symptom (below). And a disputing run that still ends as no
-work records its dispute as not acted on, which the next run does not
-count.
+work by either of those two planning-time exits records its dispute as not
+acted on, which the next run does not count — once. That re-dispute is
+recorded as such, and if it too ends unacted it counts: the planners have
+then twice been shown the failing cases and twice found nothing to do,
+which is the wrong-tests case the at-most-once rule exists for, and
+re-disputing it on every run would reopen that loop. So the cost of a wrong
+dispute is bounded to two extra runs, not one, when the first goes unacted.
+(A run that reaches implementation has acted on its dispute, whatever its
+outcome.)
 
 **A plan whose fixes are all already on HEAD ends as no work.** The
 satisfied-probe sweep could drop every subtask that fixes the reported
