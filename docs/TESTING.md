@@ -4629,9 +4629,14 @@ is kept for hygiene.
   (`test_a_probe_the_template_deselects_is_unrunnable_not_unparseable`), and a
   `{files}` template running the probe whatever its name
   (`test_a_files_template_runs_the_probe_whatever_its_name`). 3 reversions, 3
-  caught. Only pytest's "no test collected" (5) makes the probe unrunnable; a
-  conftest the writer added that does not parse (exit 4) is a parse failure
-  (`test_a_broken_conftest_the_writer_added_reads_as_does_not_parse`).
+  caught.
+- **The probe judges parsing only when its body ran**: a marker it writes
+  first separates "a target does not compile" (False,
+  `test_a_target_that_does_not_compile_is_a_parse_failure`) from "the runner
+  failed before reaching it" — a broken conftest, a conftest importing the
+  missing entry point, an unknown plugin flag (None, with the exit code;
+  `test_a_probe_that_never_reaches_its_check_says_so`). It replaces an
+  exit-code mapping that labelled pytest's 2/3/4 as parse failures.
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

@@ -682,7 +682,8 @@ def test_an_import_declaration_over_unparseable_writer_files_is_not_honoured(
     acc = asyncio.run(leerie.phase_acceptance_write(
         st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
     assert acc["sets"] == []
-    assert "declaration not honoured" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "declaration not honoured" in out and "does not parse" in out
 
 
 def test_the_parse_check_runs_under_the_projects_own_interpreter(
@@ -774,25 +775,54 @@ def test_a_probe_the_template_deselects_is_unrunnable_not_unparseable(
         '-k nothing_matches {test_files}"\n')
     st = _st(leerie, tmp_path, repo, head)
     (repo / "test_probe_me.py").write_text("x = 1\n")
-    assert asyncio.run(leerie._acceptance_parse_probe(
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
         st, _caps(leerie, 1), str(repo), "test_probe_me.py",
-        ["test_probe_me.py"], st.run_dir / "logs" / "p.log", "p")) is None
+        ["test_probe_me.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert got is None and "before reaching the parse check" in why
 
 
-def test_a_broken_conftest_the_writer_added_reads_as_does_not_parse(
-        leerie, tmp_path):
-    """pytest exits 4 on a conftest that does not parse: that IS a parse
-    failure of a file the writer wrote, not "the probe could not run" —
-    only "no test collected" (5) is."""
+@pytest.mark.parametrize("conftest,addopts", [
+    ("def broken(:\n    pass\n", ""),               # does not parse: exit 4
+    # Imports the very entry point an import defect lacks — every file
+    # parses (post-merge review of 11e9431).
+    ("from calc import mul\n", ""),
+    ("", "--no-such-plugin-flag"),                    # unknown option: exit 4
+])
+def test_a_probe_that_never_reaches_its_check_says_so(leerie, tmp_path,
+                                                     monkeypatch, conftest,
+                                                     addopts):
+    """pytest exits 2/3/4 before the probe's body runs, so whether the
+    targets parse is unknown: None, with the exit code in the reason —
+    never "does not parse"."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     (repo / "acc").mkdir()
-    (repo / "acc" / "conftest.py").write_text("def broken(:\n    pass\n")
+    if conftest:
+        (repo / "acc" / "conftest.py").write_text(conftest)
+    if addopts:
+        monkeypatch.setenv("PYTEST_ADDOPTS", addopts)
     (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
-    assert asyncio.run(leerie._acceptance_parse_probe(
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
         st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
-        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log",
-        "p")) is False
+        ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    assert got is None
+    assert "before reaching the parse check" in why and "exit " in why
+    assert "does not parse" not in why
+
+
+def test_a_target_that_does_not_compile_is_a_parse_failure(leerie, tmp_path):
+    """The probe's body ran (its marker exists) and a target failed to
+    compile: that, and only that, is "does not parse"."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    (repo / "acc" / "helpers_mul.py").write_text("def broken(:\n")
+    got, why = asyncio.run(leerie._acceptance_parse_probe(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+        ["acc/test_defect_mul.py", "acc/helpers_mul.py"],
+        st.run_dir / "logs" / "p.log", "p"))
+    assert got is False and "does not parse" in why
 
 
 def test_a_files_template_runs_the_probe_whatever_its_name(leerie, tmp_path):
@@ -807,7 +837,8 @@ def test_a_files_template_runs_the_probe_whatever_its_name(leerie, tmp_path):
     (repo / "src" / "defect_mul.py").write_text("x = 1\n")
     assert asyncio.run(leerie._acceptance_parse_probe(
         st, _caps(leerie, 1), str(repo), "src/defect_mul.py",
-        ["src/defect_mul.py"], st.run_dir / "logs" / "p.log", "p")) is True
+        ["src/defect_mul.py"], st.run_dir / "logs" / "p.log", "p")) == (
+            True, "")
 
 
 def test_an_unrunnable_probe_is_reported_as_such(leerie, tmp_path,
@@ -816,7 +847,7 @@ def test_an_unrunnable_probe_is_reported_as_such(leerie, tmp_path,
     st = _st(leerie, tmp_path, repo, head)
 
     async def unrunnable(*a, **k):
-        return None
+        return None, "no test command here could run the parse check"
     monkeypatch.setattr(leerie, "_acceptance_parse_probe", unrunnable)
     _import_writer(leerie, monkeypatch,
                    {"acc/test_defect_mul.py": (_IMPORT_DEFECT, "import")})

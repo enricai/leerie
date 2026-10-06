@@ -6052,8 +6052,12 @@ every fix just the same), parses under the project's own interpreter: a
 throwaway compile check, named to fit the repository's own test-file
 convention where any candidate name does, run through its own test
 command, so its interpreter version
-decides, not the orchestrator's. A check that cannot run there proves
-nothing, and the declaration is not honoured either; the log says which.
+decides, not the orchestrator's. The check marks when its own body is
+reached, because a failure before that point (a conftest or package that
+cannot import — perhaps the very entry point the defect lacks — or a
+runner that collected nothing) says nothing about parsing. A check that
+did not reach its body proves nothing, and the declaration is not
+honoured either; the log says which, with the exit code.
 That is checked only where it can be checked reliably, in Python; a
 declared import defect in any other language is dropped on its own,
 leaving the rest of its set (`node

@@ -33088,16 +33088,14 @@ _TARGETS = {targets!r}
 
 class LeerieParseProbe(unittest.TestCase):
     def test_targets_parse(self):
+        # Written first: it shows the runner reached this body, so a failure
+        # after it can only be a target that does not compile.
+        pathlib.Path({marker!r}).write_text("ran")
         for path in _TARGETS:
             compile(pathlib.Path(path).read_bytes(), path, "exec",
                     dont_inherit=True)
 """
 
-
-# Exits with which a known runner says the parse probe ran no test at all.
-_PROBE_RAN_NOTHING_EXITS: dict[str, frozenset[int]] = {
-    "pytest": frozenset({5}),
-}
 
 # Comfortably under the common 255-byte NAME_MAX.
 _PROBE_NAME_MAX = 200
@@ -33128,7 +33126,8 @@ def _acceptance_probe_rel(st: "State", test_rel: str) -> str:
 
 async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
                                   test_rel: str, targets: list[str],
-                                  log_path: Path, label: str) -> bool | None:
+                                  log_path: Path, label: str
+                                  ) -> tuple[bool | None, str]:
     """Whether every one of `targets` (a writer's import-declared test file
     and the other Python files it wrote) parses under the PROJECT's own
     interpreter — not the orchestrator's, which may be a different version.
@@ -33136,42 +33135,51 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     A throwaway test file beside `test_rel` compiles each target, and runs
     through the repo's own scoped test command, so it gets that command's
     interpreter and environment; a `unittest.TestCase` so any Python runner
-    collects it. True on exit 0, False on any other exit. None when the
-    probe could not be run at all (no command for its name, a shell that
-    cannot run it, the runner reporting that it collected no test, a
-    timeout or another error) — reported apart, since it says nothing about
-    whether the files parse. Either way short of True, the
+    collects it. Its body first writes a marker, so the verdict is about
+    parsing only when the body was reached:
+      True  — exit 0;
+      False — the body ran and a target did not compile;
+      None  — the body never ran: no command for the probe's name, a shell
+              that cannot run it, a runner that collected nothing, a conftest,
+              plugin or package import that failed before it (say a conftest
+              importing the very entry point an import defect lacks), a
+              timeout or another error. That says nothing about parsing.
+    Returned with a short reason for the log. Short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
     cmd = _acceptance_cmd(st, [probe])
     if cmd is None:
-        return None
+        return None, "no test command here could run the parse check"
     path = Path(tree) / probe
+    marker = st.run_dir / "acceptance" / "reports" / (
+        f"{label}-probe-{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}")
     try:
+        marker.parent.mkdir(parents=True, exist_ok=True)
+        with contextlib.suppress(OSError):
+            marker.unlink()
         path.write_text(_PARSE_PROBE_SOURCE.format(
-            targets=[str(Path(tree) / t) for t in targets]))
+            targets=[str(Path(tree) / t) for t in targets],
+            marker=str(marker)))
         async with _blt_semaphore(caps):
-            rc, tail = await _run_streaming(
+            rc, _out = await _run_streaming(
                 ["bash", "-c", cmd], cwd=str(tree),
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-parse-probe: {cmd}",
                 verbosity="quiet")
-    except Exception:
-        return None
+    except Exception as e:
+        return None, f"the parse check could not run ({type(e).__name__})"
     finally:
         with contextlib.suppress(OSError):
             path.unlink()
-    if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
-        return None
-    # Only "no test collected" (pytest's 5: a `-k`/`-m` in the template
-    # deselected the probe, or `-p no:unittest`) says nothing about parsing.
-    # Its other no-verdict exits do: a conftest the writer added that does
-    # not parse is exit 4, a broken import beside it exit 2.
-    if rc in _PROBE_RAN_NOTHING_EXITS.get(
-            _acceptance_runner(cmd, _PROBE_RAN_NOTHING_EXITS) or "", ()):
-        return None
-    return rc == 0
+    if rc == 0:
+        return True, ""
+    if marker.exists():
+        return False, ("it or another Python file the writer wrote does not "
+                       "parse under the project's interpreter")
+    return None, (f"the test command failed before reaching the parse check "
+                  f"(exit {rc}: a conftest, plugin or package import, or "
+                  "nothing collected)")
 
 
 def _acceptance_declared_rel(declared: dict) -> str:
@@ -33400,7 +33408,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                     "honoured only for Python test files — file dropped")
                 continue
             if mode == "import":
-                parses = await _acceptance_parse_probe(
+                parses, why = await _acceptance_parse_probe(
                     st, caps, str(wt), rel,
                     [rel] + [n for n in new_files
                              if n.endswith(".py") and n != rel],
@@ -33408,13 +33416,10 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 if parses is not True:
                     # A file — or another Python file the writer wrote — that
                     # does not parse under the project's interpreter fails to
-                    # load by the writer's own fault; and an unrunnable probe
-                    # cannot show otherwise. Validate it as an ordinary file,
-                    # so a load failure is no verdict and discards the set.
-                    why = ("it or another Python file the writer wrote does "
-                           "not parse under the project's interpreter"
-                           if parses is False else
-                           "no test command here could run the parse check")
+                    # load by the writer's own fault; and a probe that never
+                    # reached its check cannot show otherwise. Validate it as
+                    # an ordinary file, so a load failure is no verdict and
+                    # discards the set. The log says which it was.
                     log(f"  acceptance set {k}: {rel} declared an import "
                         f"defect, but {why} — declaration not honoured")
                     mode = "assertion"
