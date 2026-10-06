@@ -591,7 +591,7 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
     ("npx -p jest -- jest acc/a.test.js", True),
     # A `$(…)` among the runner's arguments is not a subshell it runs in.
     ("npx jest --maxWorkers=$(nproc) acc/a.test.js", True),
-    # Operator characters grouped into one token are still read.
+    # Nested subshell parens close around the runner.
     ("((npx jest acc/a.test.js))", False),
     ("npx jest acc/a.test.js)&&echo", False),
     # A container's runner gets no request: it cannot write our path.
@@ -704,7 +704,7 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     # A container queried for a value leaves the runner on the host.
     ("DB_PORT=$(docker port db 5432) pytest acc/test_a.py", True),
     ("DB_PORT=$(docker port db 5432) npx jest acc/a.test.js", True),
-    # `)&&` is one grouped token, and still ends the container's command.
+    # A subshell's `)` and a following `&&` end the container's command.
     ("(docker compose up -d db)&&pytest acc/test_a.py", True),
     # A separator inside a `$(…)` ends the substitution's command only —
     # whether the container CLI is inside it or before it.
@@ -748,18 +748,28 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     # A comment does not swallow the newline that ends the command.
     ("npx jest acc/a.test.js # c\necho done", False),
     # A heredoc body is text, not commands: never placed into — also when
-    # `<<` is grouped with another operator.
+    # `<<` follows another operator character in one run (`|<<`).
     ("cat > s.sh <<'EOF'\n# prep\nEOF\nnpx jest acc/a.test.js", False),
     ("(cat)<<EOF\nx\nEOF\nnpx jest acc/a.test.js", False),
+    ("echo|<<EOF cat\nx\nEOF\nnpx jest acc/a.test.js", False),
     # A trailing continuation joins nothing; left bare, its backslash would
     # escape the space before the flags.
     ("npx jest acc/a.test.js \\\n", True),
-    # The lexer cannot see where words land inside a substitution, or in
-    # text handed to another shell: refused.
+    # A runner inside a substitution, or handed to a shell or `eval` as
+    # text: refused.
     ("OUT=`npx jest acc/a.test.js`", False),
     ('echo "$(echo " ; npx jest acc/a.test.js "y)"', False),
     ("X=$(npx jest acc/a.test.js)", False),
     ("sh -c jest", False),
+    ("sh -xc jest", False),
+    ("eval jest \\;", False),
+    # An escaped quote inside `${…}` opens nothing: the runner's command
+    # still ends at the `&&` (#285 round-7 review).
+    ("T=a; npx jest ${T//\\'/} && cd ${T//\\'/}", False),
+    # Substitutions among the runner's arguments are the substitutions'
+    # words: placement goes ahead.
+    ("npx jest --maxWorkers=`nproc` acc/a.test.js", True),
+    ('npx jest -t "$(echo "a b")" acc/a.test.js', True),
 ])
 def test_continuations_and_comments_are_read_as_bash_reads_them(
         leerie, tmp_path, cmd, placed):
@@ -769,6 +779,15 @@ def test_continuations_and_comments_are_read_as_bash_reads_them(
     else:
         assert spec[0] == (f"{leerie._strip_trailing_blank(cmd)} --json "
                            f"--outputFile={tmp_path / 'r'}")
+
+
+def test_a_trailing_carriage_return_stays_in_the_command_that_runs(
+        leerie, tmp_path):
+    """bash reads a trailing CR as part of the last word; validation must
+    run that same word, not a stripped one (#285 round-7 review)."""
+    cmd, _env, _kind = leerie._acceptance_report_spec(
+        "npx jest acc/a.test.js\r", tmp_path / "r")
+    assert cmd.startswith("npx jest acc/a.test.js\r --json ")
 
 
 def test_a_carriage_return_is_part_of_a_word_as_in_bash(leerie):
@@ -862,6 +881,8 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     ("(pytest acc/test_a.py)", "pytest"),
     ("cd w&&pytest acc/test_a.py", "pytest"),
     ("(jest acc/a.test.js)", "jest"),
+    # A shape the scan cannot close still names its runner.
+    ("X=$(case a in a) echo 1;; esac) pytest acc/t.py", "pytest"),
     # A `#` inside a word is not a comment (shlex's comment handling would
     # start one there).
     ("uvx --from git+https://e.test/r.git#subdirectory=py pytest acc/t.py",

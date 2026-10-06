@@ -4937,7 +4937,9 @@ statements over those tokens.
   container and detection tests, unchanged in intent): a quoted paren, a
   runner inside a substitution and `sh -xc jest` are refused; a backtick
   among the runner's arguments (`--maxWorkers=`nproc``) and a quoted
-  substitution there (`-t "$(echo "a b")"`) place again.
+  substitution there (`-t "$(echo "a b")"`) place again. (Round 7 found
+  no test held `sh -xc jest` or the two placements; they are pinned from
+  round 7 on.)
 - **Fuzzing, not committed as tests:** 40,000 random inputs scanned with no
   exception or hang; and of 20,000 random valid templates with the runner
   in command position, all 4,739 that were placed delivered the flags as
@@ -4948,3 +4950,24 @@ separators, dropping the `--` check, dropping the shell check, no comments,
 no continuations, no backtick frames, ignoring heredocs, dropping the probe
 check, container CLIs at any depth, no `${…}` frames, unquoted handling
 inside double quotes, no `$'…'`, and no `<(…)` frames.
+
+##### Review round 7 of the post-merge fixes (2026-10-06)
+
+- **Escaped quotes and braces inside `${…}`**: in
+  `T=a; npx jest ${T//\'/} && cd …` the scan opened a quote at `\'`, so
+  flags went to `cd`. A case in
+  `test_continuations_and_comments_are_read_as_bash_reads_them` pins it.
+  That test also gained a `|<<` heredoc run, and the shapes round 6
+  claimed but did not test: `sh -xc jest`, `eval jest \;`,
+  `--maxWorkers=`nproc`` and `-t "$(echo "a b")"`.
+- **`eval`** joins `_SHELLS`: it re-parses appended flags as a command.
+- **Runner detection survives a scan that cannot close**
+  (`test_runner_detection_reads_operators_as_the_shell_does` gained an
+  unparenthesised `case` inside `$(…)`): exit codes still apply.
+- **A trailing CR stays in the command that runs**
+  (`test_a_trailing_carriage_return_stays_in_the_command_that_runs`).
+
+Seven reversions, each caught: no `${…}` escapes, no `eval`, no fallback
+detection, stripping a trailing CR, the old exact `-c` check, a backtick
+after the runner refusing placement, and matching only a bare `<<`.
+

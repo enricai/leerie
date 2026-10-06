@@ -32987,10 +32987,18 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
     `files` the command was rendered over are never the runner, even when
     one is named like it."""
     scanned = _shell_scan(cmd)
-    if scanned is None:
-        return None
+    if scanned is not None:
+        tokens = scanned[0]
+    else:
+        # A shape the scan cannot close (an unparenthesised `case` pattern
+        # inside `$(…)`) still names its runner: its exit codes matter even
+        # where no report can be placed.
+        try:
+            tokens = [("word", t, 0) for t in shlex.split(cmd)]
+        except ValueError:
+            return None
     for runner in known:
-        if _runner_positions(scanned[0], runner, files, top_level=False):
+        if _runner_positions(tokens, runner, files, top_level=False):
             return runner
     return None
 
@@ -33020,9 +33028,10 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
 # (`_acceptance_report_spec`).
 _CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
                              "kubectl"})
-# Shells: a runner handed to one is text, and appended flags become the
-# shell's own arguments (`sh -c jest` -> `$0`).
-_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+# Commands that take what follows as shell text or a script to run, not a
+# program and its arguments: appended flags become their own arguments
+# (`sh -c jest` -> `$0`) or are re-parsed as commands (`eval jest \;`).
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "eval"})
 # Unquoted characters that end a word and form operators (parens apart).
 _SHELL_OPERATOR_CHARS = frozenset(";&|<>\n")
 # A word appended to check where appended flags would land.
@@ -33076,12 +33085,14 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
 
 
 def _strip_trailing_blank(cmd: str) -> str:
-    """`cmd` without trailing whitespace — a trailing newline (a multi-line
-    TOML string) would put appended flags on a line of their own — and
-    without a trailing line continuation, which joins nothing: left as a
-    bare backslash it would escape the space before appended flags."""
+    """`cmd` without trailing blanks and newlines — a trailing newline (a
+    multi-line TOML string) would put appended flags on a line of their own
+    — and without a trailing line continuation, which joins nothing: left
+    as a bare backslash it would escape the space before appended flags. A
+    CR is kept: bash reads it as part of the last word, so stripping it
+    would run a different command."""
     while True:
-        stripped = cmd.rstrip()
+        stripped = cmd.rstrip(" \t\n")
         if (stripped != cmd and stripped.endswith("\\")
                 and cmd[len(stripped)] == "\n"
                 and (len(stripped) - len(stripped.rstrip("\\"))) % 2):
@@ -33096,14 +33107,16 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
     substitution or paren is left open. Each token is `(kind, text,
     depth)`: kind `"op"` for a run of unquoted operator characters
     (`_SHELL_OPERATOR_CHARS`; `(` and `)` each alone), `"word"` for a word
-    with its quotes and escapes removed (a `$(…)`, backtick, `<(…)` or
-    `${…}` in it kept as its brackets only), and depth the
-    number of command substitutions the token sits in. Line continuations
-    and comments (a `#` that starts an unquoted word) are dropped, as bash
-    drops them. shlex cannot do this: it removes the quotes that tell a
-    quoted `"("` from a subshell's paren, and has no notion of depth.
-    Fixed shell syntax only (DESIGN §12); a misread costs a report, since
-    the command that runs is never rewritten."""
+    with its quotes and escapes removed (a `$(…)`, backtick or `<(…)` in
+    it kept as its brackets only, a `${…}` with its contents), and depth
+    the number of command substitutions the token sits in. Line
+    continuations and comments (a `#` that starts an unquoted word) are
+    dropped, as bash drops them. shlex cannot do this: it removes the
+    quotes that tell a quoted `"("` from a subshell's paren, and has no
+    notion of depth. Fixed shell syntax only (DESIGN §12). It follows
+    bash's rules closely but is not bash: where it reads a command
+    differently, placement built on it can be wrong, so its reading is
+    pinned against bash's own in the tests."""
     tokens: list[tuple[str, str, int]] = []
     heredoc = False
     # Frames: [kind, word chars or None, open subshell parens]. Splitting
@@ -33164,6 +33177,12 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
                 frames.pop()
                 i += 1
                 continue
+        if kind == "brace" and ch == "\\":
+            # An escaped quote or brace inside `${…}` is a literal pattern
+            # character, never a quote that opens or a `}` that closes.
+            add(nxt or ch)
+            i += 2
+            continue
         if ch == "$" and nxt == "(" or (ch in "<>" and nxt == "("
                                         and kind not in ("dq", "brace")):
             add(ch + "(")
