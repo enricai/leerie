@@ -32994,7 +32994,8 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
         # inside `$(…)`) still names its runner: its exit codes matter even
         # where no report can be placed.
         try:
-            tokens = [("word", t, 0) for t in shlex.split(cmd)]
+            tokens = [("word", t, 0)
+                      for t in shlex.split(cmd, comments=True)]
         except ValueError:
             return None
     for runner in known:
@@ -33030,8 +33031,10 @@ _CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
                              "kubectl"})
 # Commands that take what follows as shell text or a script to run, not a
 # program and its arguments: appended flags become their own arguments
-# (`sh -c jest` -> `$0`) or are re-parsed as commands (`eval jest \;`).
-_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "eval"})
+# (`sh -c jest` -> `$0`, `. run.sh jest` -> `$2`) or are re-parsed as
+# commands (`eval jest \;`).
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "eval", "source",
+                     "."})
 # Unquoted characters that end a word and form operators (parens apart).
 _SHELL_OPERATOR_CHARS = frozenset(";&|<>\n")
 # A word appended to check where appended flags would land.
@@ -33213,6 +33216,12 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             frames.append(["ansi", None, 0])
             i += 2
             continue
+        if ch == "$" and nxt == '"':
+            # `$"…"` is a double-quoted string (locale-translated): no `$`.
+            add("")
+            frames.append(["dq", None, 0])
+            i += 2
+            continue
         if ch == "'":
             add("")
             frames.append(["sq", None, 0])
@@ -33230,6 +33239,8 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             i += 1
             continue
         if ch == "\\":
+            # A lone backslash at the very end stays a literal word, as in
+            # bash.
             add(nxt or ch)
             i += 2
             continue
@@ -33238,7 +33249,9 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             i += 1
             continue
         if ch == "#" and frames[-1][1] is None:
-            while i < len(cmd) and cmd[i] != "\n":
+            # Inside backticks a comment also ends at the closing backtick.
+            stop = "\n`" if kind == "bt" else "\n"
+            while i < len(cmd) and cmd[i] not in stop:
                 i += 1
             continue
         if ch == "(":
@@ -33295,9 +33308,20 @@ def _runner_positions(tokens: list[tuple[str, str, int]], runner: str,
 
 def _command_start(tokens: list[tuple[str, str, int]], at: int) -> int:
     """Index of the first token of the simple command holding `tokens[at]`:
-    the one after the last top-level operator before it."""
-    return max((i for i, (k, _t, d) in enumerate(tokens[:at])
-                if k == "op" and d == 0), default=-1) + 1
+    the one after the last top-level control operator before it. A redirect
+    (`2>&1`, `<in.txt`) is part of its command, not the end of one."""
+    return max((i for i, (k, t, d) in enumerate(tokens[:at])
+                if k == "op" and d == 0 and _is_control_op(t)),
+               default=-1) + 1
+
+
+def _is_control_op(op: str) -> bool:
+    """Whether an operator token ends a command (`;`, `&`, `|`, `&&`, `||`,
+    `|&`, a newline, a paren) rather than redirecting one (`>`, `2>&1` read
+    as `>&`, `&>`, `<<<`)."""
+    if op in ("(", ")") or any(c in op for c in ";|\n"):
+        return True
+    return "&" in op and "<" not in op and ">" not in op
 
 
 def _runner_in_container(tokens: list[tuple[str, str, int]],

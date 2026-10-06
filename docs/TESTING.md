@@ -4957,8 +4957,8 @@ inside double quotes, no `$'…'`, and no `<(…)` frames.
   `T=a; npx jest ${T//\'/} && cd …` the scan opened a quote at `\'`, so
   flags went to `cd`. A case in
   `test_continuations_and_comments_are_read_as_bash_reads_them` pins it.
-  That test also gained a `|<<` heredoc run, and the shapes round 6
-  claimed but did not test: `sh -xc jest`, `eval jest \;`,
+  That test also gained a `|<<` heredoc run, `eval jest \;` (new this
+  round), and the shapes round 6 claimed but did not test: `sh -xc jest`,
   `--maxWorkers=`nproc`` and `-t "$(echo "a b")"`.
 - **`eval`** joins `_SHELLS`: it re-parses appended flags as a command.
 - **Runner detection survives a scan that cannot close**
@@ -4970,4 +4970,28 @@ inside double quotes, no `$'…'`, and no `<(…)` frames.
 Seven reversions, each caught: no `${…}` escapes, no `eval`, no fallback
 detection, stripping a trailing CR, the old exact `-c` check, a backtick
 after the runner refusing placement, and matching only a bare `<<`.
+
+##### Review round 8 of the post-merge fixes (2026-10-06)
+
+- **A redirect ends no command** (`_is_control_op`): `docker compose run
+  web 2>&1 npx jest …` had `2>&1` taken for the end of the container's
+  command, so the containerised jest got the flags; `sh 2>/dev/null -c
+  jest` and `eval >o jest x` hid the shell and `eval` the same way. Cases
+  in `test_only_a_container_that_starts_the_runner_withholds_the_report`
+  and `test_continuations_and_comments_are_read_as_bash_reads_them` pin
+  both, with a redirect in an earlier command still placing.
+- **`source` and `.`** join `_SHELLS`; a shell anywhere before the runner
+  in its command is refused (`timeout 60 sh -c jest`).
+- **The scan against bash, for what round 7 changed and more**
+  (`test_expanding_words_split_where_bash_splits_them` gained escaped
+  `}`, `'` and `"` inside `${…}` and a comment inside backticks, which
+  ends at the backtick; `test_scanned_words_are_the_words_bash_passes`
+  gained `$"…"` and a lone trailing backslash, which bash keeps).
+- **The detection fallback drops comments**
+  (`test_runner_detection_reads_operators_as_the_shell_does`: a runner
+  named only in a comment after an unclosable `case` is not detected).
+
+Six reversions, each caught: a redirect ending the command, no `source`
+or `.`, a fallback that keeps comments, `$"…"` keeping its `$`, a
+backtick comment running to the newline, and no `${…}` escapes.
 

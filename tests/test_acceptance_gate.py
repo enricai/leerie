@@ -704,6 +704,11 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     # A container queried for a value leaves the runner on the host.
     ("DB_PORT=$(docker port db 5432) pytest acc/test_a.py", True),
     ("DB_PORT=$(docker port db 5432) npx jest acc/a.test.js", True),
+    # A redirect belongs to its command: it hides no container CLI
+    # (#285 round-8 review).
+    ("docker compose run --rm web 2>&1 npx jest acc/a.test.js", False),
+    ("docker run -i img <in.txt npx jest acc/a.test.js", False),
+    ("docker compose up -d db 2>&1 && npx jest acc/a.test.js", True),
     # A subshell's `)` and a following `&&` end the container's command.
     ("(docker compose up -d db)&&pytest acc/test_a.py", True),
     # A separator inside a `$(…)` ends the substitution's command only —
@@ -763,6 +768,15 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     ("sh -c jest", False),
     ("sh -xc jest", False),
     ("eval jest \\;", False),
+    # A shell, `eval`, `source` or `.` anywhere before the runner in its
+    # command, a redirect in between or not.
+    ("timeout 60 sh -c jest", False),
+    ("sh 2>/dev/null -c jest", False),
+    ("eval >o jest acc/a.test.js", False),
+    (". run.sh jest acc/a.test.js", False),
+    ("source run.sh jest acc/a.test.js", False),
+    # A redirect in an earlier command ends nothing that matters here.
+    ("cd web 2>/dev/null && npx jest acc/a.test.js", True),
     # An escaped quote inside `${…}` opens nothing: the runner's command
     # still ends at the `&&` (#285 round-7 review).
     ("T=a; npx jest ${T//\\'/} && cd ${T//\\'/}", False),
@@ -836,6 +850,8 @@ def _scanned_args(leerie, args: str) -> list[str]:
     "a\\ #b c", "a\r#b c", "$'a\\'b # c' d", "'a b' c", "\"a'b\" c",
     # A quoted or escaped paren is a word, never an operator.
     '-t "(" x', "-t \\( x",
+    # `$"…"` is a double-quoted string; a lone trailing backslash stays.
+    '$"x y" z', "a \\",
 ])
 def test_scanned_words_are_the_words_bash_passes(leerie, args):
     """Literal words: the scan's top-level words are bash's argv exactly."""
@@ -850,6 +866,10 @@ def test_scanned_words_are_the_words_bash_passes(leerie, args):
     '"${x:-a #b}" c', '"${x#y}" z', "$# q", "$((16#ff))",
     # Quotes nest inside a substitution inside quotes.
     '"$(echo "a b")" c',
+    # Escaped braces and quotes inside `${…}` are literal characters.
+    "${U:-x\\}y} c", "${U:-\\'q} c", '${U:-\\"q} c',
+    # A comment inside backticks ends at the closing backtick.
+    "`echo a #b` c",
 ])
 def test_expanding_words_split_where_bash_splits_them(leerie, args):
     """Expanding words: the scan keeps a substitution as its brackets, so
@@ -881,8 +901,10 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     ("(pytest acc/test_a.py)", "pytest"),
     ("cd w&&pytest acc/test_a.py", "pytest"),
     ("(jest acc/a.test.js)", "jest"),
-    # A shape the scan cannot close still names its runner.
+    # A shape the scan cannot close still names its runner — but not one
+    # named only in a comment.
     ("X=$(case a in a) echo 1;; esac) pytest acc/t.py", "pytest"),
+    ("X=$(case a in a) echo 1;; esac) go test ./... # pytest later", None),
     # A `#` inside a word is not a comment (shlex's comment handling would
     # start one there).
     ("uvx --from git+https://e.test/r.git#subdirectory=py pytest acc/t.py",

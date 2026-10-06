@@ -6100,9 +6100,12 @@ separator, pipe, redirect, or a `)` closing a subshell the runner runs in
 make the flags file arguments, when the appended word would fall into a
 trailing comment or be joined by a trailing backslash, when the command
 has a heredoc (its body is text, not commands), when the runner runs
-inside a substitution, or when its command is a shell or `eval` — which
-takes what follows as text or as a script, not as a program and its
-arguments (`sh -c jest`, `bash run.sh jest`, `eval jest`). The placement
+inside a substitution, or when a shell, `eval`, `source` or `.` comes
+before it in its command — each takes what follows as text or as a
+script, not as a program and its arguments (`sh -c jest`, `timeout 60 sh
+-c jest`, `bash run.sh jest`, `eval jest`). A redirect (`2>&1`, `<in.txt`)
+belongs to its command and ends nothing, so neither this nor the container
+check below can be hidden behind one. The placement
 is syntactic: the flags reach the runner when its command is the runner
 or a wrapper that passes arguments on (`npx jest`, `uv run pytest`). A
 command that merely names the runner as an argument (`./run.sh jest`) is
