@@ -32986,11 +32986,11 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
     the basenames of its own tokens (a mechanical string, DESIGN §12). The
     `files` the command was rendered over are never the runner, even when
     one is named like it."""
-    tokens = _shell_tokens(cmd)
-    if tokens is None:
+    scanned = _shell_scan(cmd)
+    if scanned is None:
         return None
     for runner in known:
-        if _runner_positions(tokens, runner, files):
+        if _runner_positions(scanned[0], runner, files, top_level=False):
             return runner
     return None
 
@@ -33016,17 +33016,19 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
     "vitest": ("jest-json", "--reporter=json --outputFile={path}"),
 }
 
-# Shell tokens after which appended flags would no longer reach the runner
-# (a pipe or a redirect) or would reach a different command (a separator).
-_SHELL_SEPARATORS = frozenset({"&&", "||", ";", "&", "|", ";;", "\n"})
-_SHELL_REDIRECTS = frozenset({">", ">>", "<", "<<", ">&", "<&", "|&"})
 # Container CLIs: a runner started through one gets no report request
 # (`_acceptance_report_spec`).
 _CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
                              "kubectl"})
-# The characters `_shell_tokens` splits out as operator tokens: shlex's own
-# punctuation plus the newline, which ends a command as `;` does.
-_SHELL_OPERATOR_CHARS = frozenset("();<>|&\n")
+# Shells: a runner handed to one is text, and appended flags become the
+# shell's own arguments (`sh -c jest` -> `$0`).
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+# Unquoted characters that end a word and form operators (parens apart).
+_SHELL_OPERATOR_CHARS = frozenset(";&|<>\n")
+# A word appended to check where appended flags would land.
+_PLACEMENT_PROBE = "--leerie-placement-probe"
+# pytest's spellings of its JUnit report option (fixed CLI surface).
+_PYTEST_JUNIT_OPTS = frozenset({"--junitxml", "--junit-xml"})
 
 
 def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
@@ -33039,14 +33041,17 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
         return None
     kind, how = _RUNNER_REPORTS[runner]
     raw = _strip_trailing_blank(cmd)
-    tokens = _shell_tokens(raw)
+    scanned = _shell_scan(raw)
+    tokens = scanned[0] if scanned is not None else None
     if tokens is not None and _runner_in_container(
             tokens, _runner_positions(tokens, runner, files)):
         return None
     if how == "env":
         flags = f"--junitxml={shlex.quote(str(path))}"
         if tokens is None or not any(
-                t.split("=", 1)[0] in _PYTEST_JUNIT_OPTS for t in tokens):
+                k == "word" and d == 0
+                and t.split("=", 1)[0] in _PYTEST_JUNIT_OPTS
+                for k, t, d in tokens):
             prior = os.environ.get("PYTEST_ADDOPTS", "")
             return cmd, {**os.environ,
                          "PYTEST_ADDOPTS": f"{prior} {flags}".strip()}, kind
@@ -33055,23 +33060,19 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
         # ours is the one pytest keeps.
     else:
         flags = how.format(path=shlex.quote(str(path)))
-    if (tokens is None or any(
-            set(t) <= _SHELL_OPERATOR_CHARS and "<<" in t.replace("<<<", "")
-            for t in tokens)
+    # A heredoc body is text, not commands, which the scan cannot read.
+    if (scanned is None or scanned[1]
             or not _flags_reach_runner(tokens, runner, files)):
         return None
     # The template runs as written, flags appended: a rewritten command
-    # would run whatever the lexer got wrong (a heredoc body, say). So the
-    # appended word must lex as the last word of the same command — not
-    # swallowed by a trailing comment or joined by a trailing backslash.
-    if _shell_tokens(f"{raw} {_PLACEMENT_PROBE}") != [*tokens,
-                                                      _PLACEMENT_PROBE]:
+    # would run whatever the scan got wrong. So the appended word must scan
+    # as the last word of the same command — not swallowed by a trailing
+    # comment, not joined by a trailing backslash.
+    probed = _shell_scan(f"{raw} {_PLACEMENT_PROBE}")
+    if probed is None or probed[0] != [*tokens,
+                                       ("word", _PLACEMENT_PROBE, 0)]:
         return None
     return f"{raw} {flags}", None, kind
-
-
-# A word appended to check where appended flags would land.
-_PLACEMENT_PROBE = "--leerie-placement-probe"
 
 
 def _strip_trailing_blank(cmd: str) -> str:
@@ -33089,214 +33090,235 @@ def _strip_trailing_blank(cmd: str) -> str:
         return stripped
 
 
-# pytest's spellings of its JUnit report option (fixed CLI surface).
-_PYTEST_JUNIT_OPTS = frozenset({"--junitxml", "--junit-xml"})
+def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
+    """`cmd` split into tokens as bash splits it, with whether it has a
+    heredoc (`<<`; a `<<<` here-string is not one) — or None when a quote,
+    substitution or paren is left open. Each token is `(kind, text,
+    depth)`: kind `"op"` for a run of unquoted operator characters
+    (`_SHELL_OPERATOR_CHARS`; `(` and `)` each alone), `"word"` for a word
+    with its quotes and escapes removed (a `$(…)`, backtick, `<(…)` or
+    `${…}` in it kept as its brackets only), and depth the
+    number of command substitutions the token sits in. Line continuations
+    and comments (a `#` that starts an unquoted word) are dropped, as bash
+    drops them. shlex cannot do this: it removes the quotes that tell a
+    quoted `"("` from a subshell's paren, and has no notion of depth.
+    Fixed shell syntax only (DESIGN §12); a misread costs a report, since
+    the command that runs is never rewritten."""
+    tokens: list[tuple[str, str, int]] = []
+    heredoc = False
+    # Frames: [kind, word chars or None, open subshell parens]. Splitting
+    # frames (top, `$(`/`<(`/`>(` "sub", backtick "bt") hold words; the rest
+    # ("dq", "sq", "ansi", "brace") add to the word of the nearest splitting
+    # frame. A `$((…))` scans as a substitution holding a subshell: the
+    # same word boundaries.
+    frames: list[list] = [["top", None, 0]]
 
+    def split_frame() -> list:
+        return next(f for f in reversed(frames)
+                    if f[0] in ("top", "sub", "bt"))
 
-def _is_shell_separator(token: str) -> bool:
-    """A token ending one command: `&&`, `;`, a pipe, a newline — also when
-    `shlex` grouped it with other operator characters (`)&&`, `;\n`), but
-    never a redirect (`>&`)."""
-    if token in _SHELL_SEPARATORS:
-        return True
-    chars = set(token)
-    return bool(token) and chars <= _SHELL_OPERATOR_CHARS and not (
-        chars & {"<", ">"}) and bool(chars & {";", "&", "|", "\n"})
+    def depth() -> int:
+        return sum(f[0] in ("sub", "bt") for f in frames)
 
+    def add(text: str) -> None:
+        f = split_frame()
+        f[1] = (f[1] or []) + [text]
 
-def _runner_in_container(tokens: list[str], runner_at: list[int]) -> bool:
-    """Whether a container CLI starts any occurrence of the runner: one sits
-    in that occurrence's own simple command, before it — not in an earlier
-    command (`docker compose up -d db && pytest x`), not among its
-    arguments, and not inside a `$(…)` that only computes a value
-    (`PORT=$(docker port db) pytest x`). Such a runner cannot see our
-    environment, and a report path it cannot create fails a run whose tests
-    pass."""
-    for at in runner_at:
-        # One pass from the start: a separator inside a `$(…)` ends a
-        # command of the substitution, not of the runner's command.
-        substitution: list[bool] = []
-        # Inside a backtick substitution: the older spelling of `$(…)`.
-        backtick = False
-        container = False
-        prev = ""
-        for t in tokens[:at]:
-            inside = backtick or "`" in t
-            if t and set(t) <= _SHELL_OPERATOR_CHARS:
-                redirect = bool(set(t) & {"<", ">"})
-                for k, ch in enumerate(t):
-                    if ch == "(":
-                        substitution.append(k == 0 and prev.endswith("$"))
-                    elif ch == ")":
-                        if substitution:
-                            substitution.pop()
-                    elif (ch in ";&|\n" and not redirect and not backtick
-                          and not any(substitution)):
-                        container = False
-            elif (not inside and not any(substitution)
-                  and os.path.basename(t) in _CONTAINER_CLIS):
-                container = True
-            if t.count("`") % 2:
-                backtick = not backtick
-            prev = t
-        if container:
-            return True
-    return False
+    def end_word() -> None:
+        f = frames[-1]
+        if f[1] is not None:
+            tokens.append(("word", "".join(f[1]), depth()))
+            f[1] = None
 
-
-def _shell_unfold(cmd: str) -> str:
-    """`cmd` with what bash removes before splitting words removed too: an
-    unquoted or double-quoted backslash-newline (a line continuation) and a
-    comment — a `#` that starts an unquoted word, up to the newline. shlex
-    gets both wrong: it turns a continuation into a newline token, and its
-    `#` handling starts a comment mid-word (`r.git#subdirectory=py`). For
-    reading a command only: the command that runs is never this form, so a
-    shape it reads differently from bash (a heredoc body, a `#` inside
-    backticks) can cost a report but never change what runs."""
-    out: list[str] = []
-    quote = ""
-    # Open parens: True for a `$(…)` (its `)` ends a word part, so a `#`
-    # after it is mid-word), False for a subshell (its `)` is an operator).
-    parens: list[bool] = []
-    # Depth inside `${…}`: a `#` there is an operator (`${x#y}`, `${x:-a
-    # #b}`), never a comment.
-    braces = 0
-    boundary = True
     i = 0
     while i < len(cmd):
-        ch = cmd[i]
-        nxt = cmd[i + 1] if i + 1 < len(cmd) else ""
-        if quote == "'":
-            quote = "" if ch == "'" else quote
-        elif quote == "$'":
+        ch, nxt = cmd[i], cmd[i + 1:i + 2]
+        kind = frames[-1][0]
+        if kind == "sq":
+            if ch == "'":
+                frames.pop()
+            else:
+                add(ch)
+            i += 1
+            continue
+        if kind == "ansi":
             if ch == "\\":
-                out.append(ch + nxt)
+                add(nxt)
                 i += 2
                 continue
-            quote = "" if ch == "'" else quote
-        elif ch == "\\" and nxt == "\n":
+            if ch == "'":
+                frames.pop()
+            else:
+                add(ch)
+            i += 1
+            continue
+        if ch == "\\" and nxt == "\n":
             i += 2
             continue
-        elif ch == "\\":
-            out.append(ch + nxt)
-            boundary = False
+        if kind == "dq":
+            if ch == "\\" and nxt and nxt in '$`"\\':
+                add(nxt)
+                i += 2
+                continue
+            if ch == '"':
+                frames.pop()
+                i += 1
+                continue
+        if ch == "$" and nxt == "(" or (ch in "<>" and nxt == "("
+                                        and kind not in ("dq", "brace")):
+            add(ch + "(")
+            frames.append(["sub", None, 0])
             i += 2
             continue
-        elif quote == '"':
-            quote = "" if ch == '"' else quote
-        elif ch == "'" and out and out[-1] == "$":
-            quote = "$'"
-        elif ch in "'\"":
-            quote = ch
-        elif ch == "#" and boundary and not braces:
+        if ch == "$" and nxt == "{":
+            add("${")
+            frames.append(["brace", None, 0])
+            i += 2
+            continue
+        if ch == "`":
+            if kind == "bt":
+                end_word()
+                frames.pop()
+                add("`")
+            else:
+                add("`")
+                frames.append(["bt", None, 0])
+            i += 1
+            continue
+        if kind == "dq":
+            add(ch)
+            i += 1
+            continue
+        if ch == "$" and nxt == "'":
+            add("")
+            frames.append(["ansi", None, 0])
+            i += 2
+            continue
+        if ch == "'":
+            add("")
+            frames.append(["sq", None, 0])
+            i += 1
+            continue
+        if ch == '"':
+            add("")
+            frames.append(["dq", None, 0])
+            i += 1
+            continue
+        if kind == "brace":
+            if ch == "}":
+                frames.pop()
+            add(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            add(nxt or ch)
+            i += 2
+            continue
+        if ch in " \t":
+            end_word()
+            i += 1
+            continue
+        if ch == "#" and frames[-1][1] is None:
             while i < len(cmd) and cmd[i] != "\n":
                 i += 1
             continue
-        if not quote and ch not in "'\"":
-            if ch == "{" and out and out[-1] == "$":
-                braces += 1
-                boundary = False
-            elif ch == "}" and braces:
-                braces -= 1
-                boundary = False
-            elif ch == "(":
-                # `$(`, `<(` and `>(` substitute; a bare `(` is a subshell.
-                parens.append(bool(out) and out[-1] in ("$", "<", ">"))
-                boundary = True
-            elif ch == ")":
-                boundary = not (parens and parens.pop())
+        if ch == "(":
+            end_word()
+            tokens.append(("op", "(", depth()))
+            frames[-1][2] += 1
+            i += 1
+            continue
+        if ch == ")":
+            end_word()
+            if frames[-1][2]:
+                tokens.append(("op", ")", depth()))
+                frames[-1][2] -= 1
+            elif kind == "sub":
+                frames.pop()
+                add(")")
             else:
-                boundary = ch in " \t\n;&|<>"
-        else:
-            boundary = False
-        out.append(ch)
+                return None
+            i += 1
+            continue
+        if ch in _SHELL_OPERATOR_CHARS:
+            j = i
+            while (j < len(cmd) and cmd[j] in _SHELL_OPERATOR_CHARS
+                   and not (cmd[j] in "<>" and cmd[j + 1:j + 2] == "(")):
+                j += 1
+            j = max(j, i + 1)  # always advance, whatever the input
+            op = cmd[i:j]
+            heredoc = heredoc or "<<" in op.replace("<<<", "")
+            end_word()
+            tokens.append(("op", op, depth()))
+            i = j
+            continue
+        add(ch)
         i += 1
-    return "".join(out)
-
-
-def _shell_tokens(cmd: str) -> list[str] | None:
-    """`cmd` split as the shell would — continuations and comments removed
-    first (`_shell_unfold`) — with operators, a newline included, as their
-    own tokens; or None when it does not lex (an unbalanced quote)."""
-    lexer = shlex.shlex(_shell_unfold(cmd), posix=True,
-                        punctuation_chars="".join(sorted(
-                            _SHELL_OPERATOR_CHARS)))
-    lexer.whitespace = " \t"
-    lexer.whitespace_split = True
-    lexer.commenters = ""
-    try:
-        return list(lexer)
-    except ValueError:
+    if len(frames) > 1 or frames[0][2]:
         return None
+    end_word()
+    return tokens, heredoc
 
 
-def _runner_positions(tokens: list[str], runner: str,
-                      files: Iterable[str] = ()) -> list[int]:
-    """Indices of the tokens naming `runner` (by basename), never one of the
-    `files` the command was rendered over — compared in normalised form, so
+def _runner_positions(tokens: list[tuple[str, str, int]], runner: str,
+                      files: Iterable[str] = (), *,
+                      top_level: bool = True) -> list[int]:
+    """Indices of the words naming `runner` (by basename) — only those
+    outside any substitution unless `top_level` is False — never one of the
+    `files` the command was rendered over, compared in normalised form, so
     `./sub/jest` is still the file `sub/jest`."""
     skip = {os.path.normpath(f) for f in files}
-    return [i for i, t in enumerate(tokens)
-            if os.path.basename(t) == runner
+    return [i for i, (k, t, d) in enumerate(tokens)
+            if k == "word" and (d == 0 or not top_level)
+            and os.path.basename(t) == runner
             and os.path.normpath(t) not in skip]
 
 
-def _runner_unplaceable(tokens: list[str], runner_at: list[int]) -> bool:
-    """Shapes where appended words would not reach the runner and the token
-    scan in `_flags_reach_runner` cannot tell: a backtick after the last
-    runner (the flags could land inside a backtick substitution — a runner
-    inside one always has its closing backtick after it); a quoted `$(…)`
-    left open within its word (`"$(echo " ; npx jest x "y)"` — the quotes
-    hide that the runner is inside the substitution); and a runner handed
-    to another shell as `-c` text (`sh -c jest`, where the flags become
-    `$0`). A runner inside an unquoted `$(…)` is refused there, by the
-    `)` after it."""
-    if any("`" in t for t in tokens[max(runner_at):]):
-        return True
-    if any(t.count("$(") > t.count(")") for t in tokens
-           if not set(t) <= _SHELL_OPERATOR_CHARS):
-        return True
-    return any(at and tokens[at - 1] == "-c" for at in runner_at)
+def _command_start(tokens: list[tuple[str, str, int]], at: int) -> int:
+    """Index of the first token of the simple command holding `tokens[at]`:
+    the one after the last top-level operator before it."""
+    return max((i for i, (k, _t, d) in enumerate(tokens[:at])
+                if k == "op" and d == 0), default=-1) + 1
 
 
-def _flags_reach_runner(tokens: list[str], runner: str,
+def _runner_in_container(tokens: list[tuple[str, str, int]],
+                         runner_at: list[int]) -> bool:
+    """Whether a container CLI starts any occurrence of the runner: a
+    top-level word in that occurrence's own simple command, before it — not
+    in an earlier command (`docker compose up -d db && pytest x`), not among
+    its arguments, and not inside a substitution that only computes a value
+    (`PORT=$(docker port db) pytest x`). Such a runner cannot see our
+    environment, and a report path it cannot create fails a run whose tests
+    pass."""
+    return any(
+        k == "word" and d == 0 and os.path.basename(t) in _CONTAINER_CLIS
+        for at in runner_at
+        for k, t, d in tokens[_command_start(tokens, at):at])
+
+
+def _flags_reach_runner(tokens: list[tuple[str, str, int]], runner: str,
                         files: Iterable[str] = ()) -> bool:
-    """Whether flags appended to the command reach `runner`: every
-    occurrence of it (never one of the `files` under test) sits in the final
-    simple command, with no pipe or redirect after it; after its last
-    occurrence, no `--` and no `)` closing a subshell it runs in — in
-    `npx jest x; echo jest` the runner is the first command and the flags
-    would reach `echo`."""
+    """Whether flags appended to the command arrive as the runner's last
+    arguments: from its first top-level occurrence (never one of the
+    `files` under test) to the end, every top-level token is a word — no
+    separator, pipe, redirect or subshell paren, so the runner's command is
+    the last one and nothing closes around it; no `--` after its last
+    occurrence (the flags would be file arguments; a wrapper's own `--`
+    before it is fine, `npx -p jest -- jest x`); and its command does not
+    start with a shell, which would take the runner as text (`sh -c
+    jest`). Words inside a substitution are the substitution's, not the
+    runner's (`--maxWorkers=$(nproc)`)."""
     runner_at = _runner_positions(tokens, runner, files)
-    if not runner_at or _runner_unplaceable(tokens, runner_at):
+    if not runner_at:
         return False
-    last_sep = max((i for i, t in enumerate(tokens)
-                    if _is_shell_separator(t)), default=-1)
-    if min(runner_at) <= last_sep or any(
-            t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]):
+    first, last = min(runner_at), max(runner_at)
+    if any(k == "op" and d == 0 for k, _t, d in tokens[first:]):
         return False
-    # The rest count only after the LAST runner token: a wrapper can name
-    # the runner as a package before its own `--` (`npx -p jest -- jest x`).
-    # A `)` stops only when it closes a paren opened before the runner; a
-    # `$(…)` among its arguments opens and closes its own.
-    # shlex groups adjacent operator characters (`))`, `)&&`), so operator
-    # tokens are read a character at a time.
-    depth = 0
-    for t in tokens[max(runner_at) + 1:]:
-        if t == "--":
-            return False
-        if not t or not set(t) <= _SHELL_OPERATOR_CHARS:
-            continue
-        for ch in t:
-            if ch == "(":
-                depth += 1
-            elif ch == ")":
-                depth -= 1
-                if depth < 0:
-                    return False
-            elif depth == 0:
-                return False
-    return True
+    if any(t == "--" and d == 0 for _k, t, d in tokens[last + 1:]):
+        return False
+    return not any(
+        k == "word" and d == 0 and os.path.basename(t) in _SHELLS
+        for k, t, d in tokens[_command_start(tokens, first):first])
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:

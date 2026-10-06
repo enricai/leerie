@@ -4848,14 +4848,15 @@ separators.
 
 ##### Review round 3 of the post-merge fixes (2026-10-06)
 
-- **The command is read as bash reads it** (`_shell_unfold`):
-  `test_continuations_and_comments_are_read_as_bash_reads_them` (four
-  cases) and the container cases for multi-line `docker run \`/`docker
-  compose run \` templates pin that a backslash-newline joins lines (shlex
-  had made it a newline token, which round 2 then read as a separator), a
-  trailing comment does not swallow appended flags, and a comment does not
-  swallow the newline after it. `test_unfolding_does_not_change_what_bash_runs`
-  (seven cases) runs each raw and unfolded command through real bash.
+- **The command is read as bash reads it** (`_shell_unfold`, replaced in round
+  6 by `_shell_scan`):
+  `test_continuations_and_comments_are_read_as_bash_reads_them` (four cases)
+  and the container cases for multi-line `docker run \`/`docker compose run \`
+  templates pin that a backslash-newline joins lines (shlex had made it a
+  newline token, which round 2 then read as a separator), a trailing comment
+  does not swallow appended flags, and a comment does not swallow the newline
+  after it. `test_unfolding_does_not_change_what_bash_runs` (replaced in round
+  6) (seven cases) runs each raw and unfolded command through real bash.
 - **A `#` inside a word is not a comment** (the `uvx --from …#subdirectory`
   case in `test_runner_detection_reads_operators_as_the_shell_does`, whose
   three other cases now each fail under plain `shlex.split`), and a runner
@@ -4879,10 +4880,10 @@ and ignoring single quotes.
   Placement now also needs the appended word to lex as the last word of
   the same command, and never enters a command with a heredoc.
 - **`_shell_unfold` closer to bash**
-  (`test_unfolding_does_not_change_what_bash_runs`, now fourteen cases): a `#`
-  after a substitution's `)` is mid-word and after a subshell's starts a
-  comment; `$'…'` takes backslash escapes; a CR is a word character; `${x#y}`,
-  `$#` and `$((16#ff))` are untouched.
+  (`test_unfolding_does_not_change_what_bash_runs` (replaced in round 6), now
+  fourteen cases): a `#` after a substitution's `)` is mid-word and after a
+  subshell's starts a comment; `$'…'` takes backslash escapes; a CR is a word
+  character; `${x#y}`, `$#` and `$((16#ff))` are untouched.
 - **Backtick substitutions in the container check**
   (`test_only_a_container_that_starts_the_runner_withholds_the_report`,
   now thirteen cases).
@@ -4906,10 +4907,44 @@ backtick tracking.
   its arguments. Two cases have an earlier occurrence of the runner inside a
   `$(…)` or backticks, which must not stop placement.
 - **A CR stays in its word**
-  (`test_a_carriage_return_is_part_of_a_word_as_in_bash`), and `_shell_unfold` handles `${…}` and `<(…)`
-  (`test_unfolding_does_not_change_what_bash_runs`, now sixteen cases).
+  (`test_a_carriage_return_is_part_of_a_word_as_in_bash`), and `_shell_unfold`
+  handles `${…}` and `<(…)` (`test_unfolding_does_not_change_what_bash_runs`
+  (replaced in round 6), now sixteen cases).
 
 Nine reversions, each caught: dropping the backtick-after check, widening
 it to any backtick, splitting words on CR, dropping the quoted-`$(…)` check,
 dropping the `-c` check, matching only a bare `<<`, keeping a trailing
 continuation, ignoring `${…}`, and treating `<(` as a subshell.
+
+##### Review round 6 of the post-merge fixes (2026-10-06)
+
+Round 6 found that the rules layered on `shlex` could not be made right:
+`shlex` drops the quotes that tell a quoted `"("` from a subshell's paren,
+so `(npx jest -t "(" x)` and `X=$(npx jest -t "(" x)` placed flags where
+they broke the command or reached `echo`. `_shell_scan` replaces `shlex`,
+`_shell_unfold` and the rules over them: it splits a command into words and
+operators as bash does, keeping quoting in mind and recording how deep in
+command substitutions each token sits, and the placement rules become plain
+statements over those tokens.
+
+- **Scanner against bash** (`test_scanned_words_are_the_words_bash_passes`,
+  twelve cases, exact argv; `test_expanding_words_split_where_bash_splits_them`,
+  nine cases, word boundaries; `test_expansions_keep_their_words_whole`, two
+  cases; `test_a_subshell_paren_is_an_operator_and_a_comment_may_follow`;
+  `test_a_carriage_return_is_part_of_a_word_as_in_bash`).
+- **Placement** (`test_continuations_and_comments_are_read_as_bash_reads_them`,
+  `test_placed_flags_arrive_as_the_runners_last_arguments` and the
+  container and detection tests, unchanged in intent): a quoted paren, a
+  runner inside a substitution and `sh -xc jest` are refused; a backtick
+  among the runner's arguments (`--maxWorkers=`nproc``) and a quoted
+  substitution there (`-t "$(echo "a b")"`) place again.
+- **Fuzzing, not committed as tests:** 40,000 random inputs scanned with no
+  exception or hang; and of 20,000 random valid templates with the runner
+  in command position, all 4,739 that were placed delivered the flags as
+  the runner's last two arguments under real bash.
+
+Fourteen reversions, each caught: placing at any depth, refusing only
+separators, dropping the `--` check, dropping the shell check, no comments,
+no continuations, no backtick frames, ignoring heredocs, dropping the probe
+check, container CLIs at any depth, no `${…}` frames, unquoted handling
+inside double quotes, no `$'…'`, and no `<(…)` frames.

@@ -774,7 +774,8 @@ def test_continuations_and_comments_are_read_as_bash_reads_them(
 def test_a_carriage_return_is_part_of_a_word_as_in_bash(leerie):
     """bash splits words on space, tab and newline only: a CR stays in the
     word, so `jest\\r` is not jest."""
-    assert leerie._shell_tokens("echo a\r#b c") == ["echo", "a\r#b", "c"]
+    tokens, _heredoc = leerie._shell_scan("echo a\r#b c")
+    assert [t for _k, t, _d in tokens] == ["echo", "a\r#b", "c"]
 
 
 @pytest.mark.parametrize("cmd", [
@@ -798,23 +799,61 @@ def test_placed_flags_arrive_as_the_runners_last_arguments(leerie, tmp_path,
     assert out[-2:] == ["--json", f"--outputFile={tmp_path / 'r.json'}"]
 
 
-@pytest.mark.parametrize("cmd", [
-    "echo a \\\n  b", "echo a # c d", 'echo "x\\\ny" z',
-    "echo 'p\\\nq' r", "echo u#v w", "echo a\\ #b c",
-    "echo $(echo m # n\n) o",
-    # A substitution's `)` ends a word part, a subshell's is an operator.
-    "echo $(echo a)#b", "(echo a)#b",
-    # ANSI-C quotes take backslash escapes; a CR is a word character.
-    "echo $'a\\'b # c' d", "echo a\r#b",
-    "echo ${x#y} z", "echo $# q", "echo $((16#ff))",
-    # A `#` inside `${…}` is an operator; `<(…)` substitutes like `$(…)`.
-    "echo ${x:-a #b} c", "echo <(echo a)#c d",
+def _bash_argv(args: str) -> list[str]:
+    """The arguments bash passes for `args`, read back as bytes (a CR must
+    survive the round trip)."""
+    out = subprocess.run(["bash", "-c", "printf '%s\\0' " + args],
+                         capture_output=True, check=False).stdout
+    return out.decode().split("\0")[:-1]
+
+
+def _scanned_args(leerie, args: str) -> list[str]:
+    tokens, _heredoc = leerie._shell_scan("printf '%s\\0' " + args)
+    return [t for k, t, d in tokens if k == "word" and d == 0][2:]
+
+
+@pytest.mark.parametrize("args", [
+    "a \\\n  b", "a # c d", '"x\\\ny" z', "'p\\\nq' r", "u#v w",
+    "a\\ #b c", "a\r#b c", "$'a\\'b # c' d", "'a b' c", "\"a'b\" c",
+    # A quoted or escaped paren is a word, never an operator.
+    '-t "(" x', "-t \\( x",
 ])
-def test_unfolding_does_not_change_what_bash_runs(leerie, cmd):
-    def run(c):
-        return subprocess.run(["bash", "-c", c], capture_output=True,
-                              text=True, check=False).stdout
-    assert run(leerie._shell_unfold(cmd)) == run(cmd)
+def test_scanned_words_are_the_words_bash_passes(leerie, args):
+    """Literal words: the scan's top-level words are bash's argv exactly."""
+    assert _scanned_args(leerie, args) == _bash_argv(args)
+
+
+@pytest.mark.parametrize("args", [
+    "$(echo m # n\n) o",
+    # A substitution's `)` ends a word part; `<(…)` substitutes too.
+    "$(echo a)#b", "<(echo a)#c d", "--w=`echo 2` x",
+    # A `#` inside `${…}` or `$((…))` is an operator, never a comment.
+    '"${x:-a #b}" c', '"${x#y}" z', "$# q", "$((16#ff))",
+    # Quotes nest inside a substitution inside quotes.
+    '"$(echo "a b")" c',
+])
+def test_expanding_words_split_where_bash_splits_them(leerie, args):
+    """Expanding words: the scan keeps a substitution as its brackets, so
+    only the word boundaries are compared — one word per argument bash
+    passes."""
+    assert len(_scanned_args(leerie, args)) == len(_bash_argv(args))
+
+
+@pytest.mark.parametrize("cmd,words", [
+    # A `#` inside `${…}` is never a comment.
+    ("echo ${x:-a #b} c", ["echo", "${x:-a #b}", "c"]),
+    # `<(…)` substitutes, so its `)` ends a word part and `#c` is mid-word.
+    ("echo <(echo a)#c d", ["echo", "<()#c", "d"]),
+])
+def test_expansions_keep_their_words_whole(leerie, cmd, words):
+    tokens, _heredoc = leerie._shell_scan(cmd)
+    assert [t for k, t, d in tokens if k == "word" and d == 0] == words
+
+
+def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
+    tokens, _heredoc = leerie._shell_scan("(echo a)#b")
+    assert tokens == [("op", "(", 0), ("word", "echo", 0),
+                      ("word", "a", 0), ("op", ")", 0)]
 
 
 @pytest.mark.parametrize("cmd,runner", [
@@ -823,8 +862,8 @@ def test_unfolding_does_not_change_what_bash_runs(leerie, cmd):
     ("(pytest acc/test_a.py)", "pytest"),
     ("cd w&&pytest acc/test_a.py", "pytest"),
     ("(jest acc/a.test.js)", "jest"),
-    # A `#` inside a word is not a comment (shlex's own comment handling,
-    # which `_shell_tokens` turns off, starts one there).
+    # A `#` inside a word is not a comment (shlex's comment handling would
+    # start one there).
     ("uvx --from git+https://e.test/r.git#subdirectory=py pytest acc/t.py",
      "pytest"),
 ])
