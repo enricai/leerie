@@ -167,6 +167,57 @@ def test_a_third_run_still_does_not_dispute(leerie, tmp_path, monkeypatch,
     assert _settle(leerie, monkeypatch, st, _results([False, False, False])) is True
 
 
+_FIVE = [{"index": k, "cases": {f"t/test_{k}.py": [f"case {k}"]}}
+         for k in range(1, 6)]
+
+
+@pytest.mark.parametrize("failing,named,evidence", [
+    # Five sets: 1-3 shown, 4-5 held back. Shown 1, 2 and held-back 4, 5
+    # fail: only the shown names leave the gate.
+    ({1, 2, 4, 5}, ["case 1", "case 2"], "case 1; case 2"),
+    # Shown 3 and held-back 4, 5 fail (3 of 5, a majority): one name.
+    ({3, 4, 5}, ["case 3"], "case 3"),
+])
+def test_dispute_evidence_names_only_shown_sets(
+        leerie, tmp_path, monkeypatch, finished, failing, named, evidence):
+    st = _st(leerie, tmp_path)
+
+    async def fake(st_, caps):
+        return [{"index": k, "passed": k not in failing,
+                 "failing_files": [f"t/test_{k}.py"] if k in failing else []}
+                for k in range(1, 6)]
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    st.data.update(acceptance={"sets": _FIVE}, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, dict(leerie.DEFAULT_CAPS))) is False
+    assert st.data["acceptance_dispute"]["cases"] == named
+    assert st.data["no_work_dispute"]["judge_evidence"].endswith(evidence)
+
+
+def test_dispute_with_only_hidden_failures_gives_counts_alone(
+        leerie, tmp_path, monkeypatch, finished):
+    """Four sets, 3 and 4 held back. Those two fail and 1, 2 pass — a tie,
+    which counts as failing — so every failing case is held back and the
+    evidence carries the counts alone."""
+    st = _st(leerie, tmp_path)
+    four = _FIVE[:4]
+
+    async def fake(st_, caps):
+        return [{"index": k, "passed": k <= 2,
+                 "failing_files": [] if k <= 2 else [f"t/test_{k}.py"]}
+                for k in range(1, 5)]
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    st.data.update(acceptance={"sets": four}, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, dict(leerie.DEFAULT_CAPS))) is False
+    ev = st.data["no_work_dispute"]["judge_evidence"]
+    assert "case 3" not in ev and "case 4" not in ev
+    assert "2 of 4 sets" in ev and "held back" in ev
+    assert st.data["acceptance_dispute"]["cases"] == []
+
+
 def test_unmeasurable_sets_keep_the_judges_confirmation(leerie, tmp_path,
                                                        monkeypatch, finished):
     st = _st(leerie, tmp_path)
@@ -314,6 +365,35 @@ def test_pre_sweep_protect_skipped_with_the_sweep(leerie, tmp_path,
     assert asyncio.run(leerie._fix_ids_held_out_sets_protect(
         st, dict(leerie.DEFAULT_CAPS), {"s0"})) == set()
     assert ran == []
+
+
+@pytest.mark.parametrize("head,runs", [("base-sha", False),
+                                       ("later-sha", True)])
+def test_pre_sweep_protect_on_the_validity_base_skips_the_run(
+        leerie, tmp_path, monkeypatch, head, runs):
+    """On the commit the sets were validated on, every set already failed:
+    protect without running them again. Elsewhere, measure."""
+    st = _st(leerie, tmp_path, acceptance={"sets": _SETS,
+                                           "validity_base": "base-sha"},
+             planning_worktree=str(tmp_path))
+    ran = []
+
+    async def fake(st_, caps):
+        ran.append(1)
+        return _results([True, True, True])
+
+    async def no_wt(st_):
+        return None
+
+    async def sha(path):
+        return head
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    monkeypatch.setattr(leerie, "_ensure_planning_worktree", no_wt)
+    monkeypatch.setattr(leerie, "_branch_head_sha", sha)
+    got = asyncio.run(leerie._fix_ids_held_out_sets_protect(
+        st, dict(leerie.DEFAULT_CAPS), {"s0"}))
+    assert bool(ran) is runs
+    assert got == (set() if runs else {"s0"})
 
 
 def test_pre_sweep_protect_errors_protect_nothing(leerie, tmp_path,

@@ -5328,7 +5328,11 @@ acceptance sets (§8 *Held-out acceptance tests* — they need the installed
 dependencies, which is why the decision moves after provisioning), and the
 sets are run on HEAD. A majority passing ends the run as no work. A
 majority failing is a dispute: the failing case names become the
-`no_work_dispute` evidence and the run plans the work. But held-out tests
+`no_work_dispute` evidence and the run plans the work. Only the names from
+sets a repair round would be shown are used: the planners' words reach the
+implementers, and the held-back sets must stay unseen until the gate
+re-judges on them. When only held-back sets fail, the evidence gives the
+counts alone. But held-out tests
 can be wrong — on a finished task whose report states no expected behaviour,
 all three sets failed it — and a wrong dispute repeated on every re-run
 would be a new infinite loop. So a dispute is raised at most once per task:
@@ -5367,7 +5371,10 @@ every subtask flagged `fixes_reported_symptom` was dropped as already
 satisfied and the held-out sets pass on HEAD, the run ends as no work;
 otherwise it proceeds as before. When the held-out sets FAIL on HEAD,
 those subtasks are never offered to the probe — the tests outrank its
-reading — so the plan cannot lose its fixes and ship without them.
+reading — so the plan cannot lose its fixes and ship without them. When
+the sets were validated on HEAD itself (a task's first run, nothing merged
+since), every one has a defect file that failed there, so the answer is
+already known: the fixes are protected without running the sets again.
 
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
@@ -6061,7 +6068,10 @@ jest and vitest exit 1 alike for "no tests", "could not load" and "a test
 failed"; cargo exits 101 for a build or a test failure; and `go test`
 exits 0 when nothing ran. So where the runner can write a structured
 report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
-and vitest — validation asks for one and reads how many tests executed
+and vitest — validation asks for one (a test command that already names
+its own JUnit report path would override the request, so the request is
+then appended after it, where it is the one that counts; where nothing can
+be appended safely there is no report) and reads how many tests executed
 (a test whose fixture failed to set up counts as executed: it ran and
 failed) and whether the file loaded — pytest marks a file it could not
 collect with a fixed "collection failure" message, which no report option
@@ -6094,7 +6104,8 @@ Reading the report to know which case applies is the writer's job, never
 Python's (§12); the price is that a writer who declares a guessed import
 produces a test no fix can pass, which costs two repair rounds and a
 residual, never the run. Without a readable report (a runner with none
-known, or a report that was not written) validation falls back to the
+known, a report that was not written, or a runner the test command starts
+inside another container, whose files the orchestrator cannot read) validation falls back to the
 runner's own "ran no test" exits where they exist (pytest's), and
 otherwise to the exit code alone — so on `go test`, a file that ran
 nothing reads as passing: it cannot become a defect file (it does not
@@ -6112,7 +6123,10 @@ output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes
 at the root against 1/4). When four or more sets are valid, the two
 highest-indexed are never shown at all; every round is re-judged on all
-sets, so a fix fitted to the shown names still fails the hidden ones. A
+sets, so a fix fitted to the shown names still fails the hidden ones.
+When only hidden sets fail, the round is told exactly that — every failing
+test is one it is not shown — and works from the contract alone, rather
+than being promised a list of failing cases that is empty. A
 round whose verdict measures nothing where the one before it measured is
 measured once more before the rounds stop on it: every evaluation installs
 afresh, and a one-off install failure would otherwise end the repair with

@@ -604,6 +604,41 @@ def test_pytest_is_asked_for_junit_through_its_environment(
     assert env["PYTEST_ADDOPTS"] == f"-x --junitxml={tmp_path / 'r.xml'}"
 
 
+@pytest.mark.parametrize("cmd,placed", [
+    ("python3 -m pytest -q --junitxml=own.xml {f}", True),
+    ("pytest --junit-xml own.xml {f}", True),
+    # Our flag cannot be placed after the runner's own: no report at all,
+    # rather than an environment request the command would override.
+    ("python3 -m pytest --junitxml=own.xml {f} | tee log", False),
+])
+def test_a_command_naming_its_own_junit_path_gets_ours_appended(
+        leerie, tmp_path, monkeypatch, cmd, placed):
+    """The template's own --junitxml beats PYTEST_ADDOPTS (measured: pytest
+    writes only the command line's), so the request moves to the end of
+    the command, where pytest keeps the last one given."""
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    cmd = cmd.format(f="acc/test_a.py")
+    spec = leerie._acceptance_report_spec(cmd, tmp_path / "r.xml")
+    assert (spec is not None) is placed
+    if placed:
+        assert spec == (f"{cmd} --junitxml={tmp_path / 'r.xml'}", None,
+                        "junit")
+
+
+def test_an_appended_junit_path_is_the_report_pytest_writes(
+        leerie, tmp_path):
+    """Behavioural: run the spec'd command and read the report back."""
+    (tmp_path / "test_a.py").write_text("def test_a():\n    assert True\n")
+    cmd = ("python3 -m pytest -q -p no:cacheprovider "
+           "--junitxml=own.xml test_a.py")
+    run_cmd, env, kind = leerie._acceptance_report_spec(
+        cmd, tmp_path / "r.xml")
+    subprocess.run(run_cmd, shell=True, cwd=tmp_path, env=env,
+                   capture_output=True, check=False)
+    assert leerie._parse_runner_report(kind, tmp_path / "r.xml") == {
+        "executed": 1, "collection_error": False}
+
+
 def _validate(leerie, st, repo, rel, mode="assertion"):
     return asyncio.run(leerie._run_acceptance_file(
         st, _caps(leerie, 1), str(repo), rel, st.run_dir / "logs" / "v.log",
@@ -1738,6 +1773,30 @@ def test_no_hidden_sets_means_no_claim_of_hidden_tests(leerie, tmp_path,
     held = leerie._format_acceptance_failures_section(
         res, sets, {1, 2, 3}, 1, "x", held_back=True)
     assert "further tests you are not shown" in held
+
+
+def test_a_section_with_only_hidden_failures_promises_no_names(leerie):
+    """Only held-back sets fail: the round is told every failing test is
+    one it is not shown, never that names follow an empty list."""
+    sets = [{"index": k, "cases": {f"acc/test_defect_{k}.py": [f"c{k}"]}}
+            for k in range(1, 6)]
+    res = [{"index": k, "passed": k <= 3,
+            "failing_files": [] if k <= 3 else [f"acc/test_defect_{k}.py"]}
+           for k in range(1, 6)]
+    text = leerie._format_acceptance_failures_section(
+        res, sets, {1, 2, 3}, 1, "the contract", held_back=True)
+    assert "named below" not in text
+    assert "Every failing test is one you are not shown" in text
+    assert "c4" not in text and "c5" not in text
+    assert text.rstrip().endswith("DEFECT CONTRACT: the contract")
+
+
+def test_shown_indices_hold_back_the_two_highest_from_four(leerie):
+    def sets(*ix):
+        return [{"index": i} for i in ix]
+    assert leerie._acceptance_shown_indices(sets(1, 2, 3)) == {1, 2, 3}
+    assert leerie._acceptance_shown_indices(sets(4, 1, 3, 2)) == {1, 2}
+    assert leerie._acceptance_shown_indices(sets(1, 2, 3, 5, 7)) == {1, 2, 3}
 
 
 def test_residual_counts_only_measured_sets(leerie, tmp_path, monkeypatch):

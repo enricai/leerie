@@ -800,8 +800,9 @@ each `claude_p` call against the real signature so a missing
 `..._injects_repo_map_into_worker_prompts`, `..._no_repo_map_when_none`),
 in `tests/test_check_functions.py` (G3:
 `test_low_decomposition_quality_does_not_gate`,
-`test_low_task_understanding_still_gates` — the axis is advisory, only
-`task_understanding` gates), and in `tests/test_repo_map_degrade_warning.py`
+`test_low_task_understanding_does_not_gate` — both axes are advisory
+self-reports; the independent `task_coverage_judge` is the coverage gate),
+and in `tests/test_repo_map_degrade_warning.py`
 (G6: `_build_repo_map` warns exactly once per process when source files
 exist but the graph is empty, stays quiet for a non-code repo).
 `tests/test_repo_map.py` now carries a `HAS_TREESITTER` module skip gate
@@ -1841,19 +1842,21 @@ provided`. leerie made two SYNCHRONOUS broker round-trips between spawn and
 first write, each bounded by `_cgroup_request`'s 5 s timeout — a stall
 larger than the deadline in front of it. Measured: **218 workers lost,
 12.4% of all invocations in the affected runs**, retried up to 4x each
-against `max_total_workers`, spanning v0.9.95–v0.16.0. **Both halves of the
-fix are load-bearing**: a reproduction harness scored all four combinations
-and only `create_task` at the spawn AND `to_thread` on both broker calls
-delivers the prompt — hoisting alone fails (blocked loop never schedules
-the task), `to_thread` alone fails (write lands after the child is gone).
-`test_only_both_halves_deliver_the_prompt_in_time` drives all four
-combinations behaviourally rather than trusting source order. Two harness
-traps: `_invoke_src` strips comments via `tokenize`, not a `#` heuristic (a
-`#` inside a string literal would corrupt the result), since the region
-names `_feed_stdin`/`await`/`_cgroup_enroll` in comments; and
-`async def _feed_stdin():` contains `_feed_stdin()` as a substring, so a
-bare `.count()` over-reports and the call-site scan excludes the
-definition.
+against `max_total_workers`, spanning v0.9.95–v0.16.0. The first fix
+(#198: a `create_task` feeder at the spawn plus `to_thread` on both broker
+calls) narrowed the window but still depended on the event loop scheduling
+the feeder within 3 s, and lost every prompt under bursts of synchronous
+work on the loop; #200 replaced it by staging the prompt to a file that is
+the child's stdin before it exists.
+`test_only_a_staged_file_survives_a_blocked_event_loop` drives both
+transports against a blocked loop behaviourally (pipe: lost; file:
+delivered) rather than trusting source order, and the remaining tests pin
+the staging order, that stdin is never a pipe when a prompt is given, and
+the staged file's cleanup. One harness
+trap: `_invoke_src` strips comments via `tokenize`, not a `#` heuristic (a
+`#` inside a string literal would corrupt the result), because the region's
+comments name the old feeder, `await` and `_cgroup_enroll` while explaining
+the history, and `test_no_writer_task_exists` asserts a name is absent.
 
 ## Appended system prompt transport
 
@@ -4699,3 +4702,29 @@ and the skip flag gained the cases named above. Five reversions (the
 `redispute` write, counting it, the skip flag, a strict-majority rule in place
 of `_acceptance_majority_fails`, and counting unacted disputes) are each
 caught by at least one test.
+
+#### The open #282 LOWs (2026-10-06)
+
+- **Held-back names stay held back at the settle**
+  (`test_dispute_evidence_names_only_shown_sets`, two cases;
+  `test_dispute_with_only_hidden_failures_gives_counts_alone`): the dispute
+  evidence reaches the planners, so it names only `_acceptance_shown_indices`
+  sets, and gives counts alone when only held-back sets fail
+  (`test_shown_indices_hold_back_the_two_highest_from_four` pins the split).
+- **No empty promise to the repair**
+  (`test_a_section_with_only_hidden_failures_promises_no_names`): when only
+  held-back sets fail, the section says every failing test is unseen
+  rather than "the failing cases are named below".
+- **A template naming its own JUnit path**
+  (`test_a_command_naming_its_own_junit_path_gets_ours_appended`, three
+  cases; `test_an_appended_junit_path_is_the_report_pytest_writes`, which
+  runs pytest and reads the report back): the command's own `--junitxml`
+  beat the `PYTEST_ADDOPTS` request, so validation silently had no report;
+  ours is now appended after it where it reaches the runner.
+- **A first run skips the foregone pre-sweep evaluation**
+  (`test_pre_sweep_protect_on_the_validity_base_skips_the_run`, two cases).
+
+Seven reversions, each caught by at least one test: the shown filter on the
+dispute names, the counts-only evidence, the hidden-only section header, the
+validity-base shortcut, detecting the command's own JUnit option, the
+held-back split itself, and the placement check on the appended option.
