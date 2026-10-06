@@ -4641,6 +4641,10 @@ is kept for hygiene.
   a teardown error after a passing check, a probe the repository skips (exit
   0, no marker), and a runner that does not exist (127) each read as what they
   are (`test_a_probe_failure_that_is_not_about_parsing_says_what_it_was`).
+  An unwritable marker directory is named as such
+  (`test_an_unwritable_marker_directory_is_named_as_such`), and a probe the
+  template deselects reads "collected or selected no test (exit 5)"
+  (`test_a_probe_the_template_deselects_is_unrunnable_not_unparseable`).
 
 `tests/test_resolve_skip_acceptance_check.py` pins the flag's resolution order
 (CLI → env → leerie.toml → off), mirroring its sibling resolvers.

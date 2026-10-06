@@ -778,7 +778,8 @@ def test_a_probe_the_template_deselects_is_unrunnable_not_unparseable(
     got, why = asyncio.run(leerie._acceptance_parse_probe(
         st, _caps(leerie, 1), str(repo), "test_probe_me.py",
         ["test_probe_me.py"], st.run_dir / "logs" / "p.log", "p"))
-    assert got is None and "before reaching the parse check" in why
+    assert got is None and "collected or selected no test" in why
+    assert "exit 5" in why
 
 
 @pytest.mark.parametrize("conftest,addopts", [
@@ -825,7 +826,7 @@ _SKIPS_EVERYTHING = (
     # The check passed ("ok"), then a teardown failed the run.
     (_PASSING_THEN_TEARDOWN_FAILS, None, "passed but the test run failed"),
     # Exit 0, but the probe's body never ran.
-    (_SKIPS_EVERYTHING, None, "without reaching the parse check"),
+    (_SKIPS_EVERYTHING, None, "collected or selected no test"),
     # The runner does not exist.
     ("", "no-such-runner-xyz {test_files}", "could not be run (exit 127)"),
 ])
@@ -847,6 +848,28 @@ def test_a_probe_failure_that_is_not_about_parsing_says_what_it_was(
         st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
         ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
     assert got is None and want_reason in why
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root ignores directory permissions")
+def test_an_unwritable_marker_directory_is_named_as_such(leerie, tmp_path):
+    """The probe's body could not write its marker, which read as "failed
+    before reaching the parse check (… a conftest …)"."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    (repo / "acc" / "test_defect_mul.py").write_text(_IMPORT_DEFECT)
+    reports = st.run_dir / "acceptance" / "reports"
+    reports.mkdir(parents=True)
+    reports.chmod(0o555)
+    try:
+        got, why = asyncio.run(leerie._acceptance_parse_probe(
+            st, _caps(leerie, 1), str(repo), "acc/test_defect_mul.py",
+            ["acc/test_defect_mul.py"], st.run_dir / "logs" / "p.log", "p"))
+    finally:
+        reports.chmod(0o755)
+    assert got is None and "could not be prepared" in why
+    assert "conftest" not in why
 
 
 def test_a_target_that_does_not_compile_is_a_parse_failure(leerie, tmp_path):

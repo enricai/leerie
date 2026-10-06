@@ -33100,6 +33100,10 @@ class LeerieParseProbe(unittest.TestCase):
 """
 
 
+# The exit with which a known runner reports it collected or selected no
+# test — named apart in the parse probe's reason, never a verdict.
+_RUNNER_NOTHING_COLLECTED_EXIT: dict[str, int] = {"pytest": 5}
+
 # Comfortably under the common 255-byte NAME_MAX.
 _PROBE_NAME_MAX = 200
 
@@ -33161,9 +33165,17 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     marker = st.run_dir / "acceptance" / "reports" / (
         f"{label}-probe-{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}")
     try:
+        # The probe writes this marker as the same user, so proving the
+        # orchestrator can write it first keeps an unwritable directory from
+        # reading as "failed before reaching the parse check".
         marker.parent.mkdir(parents=True, exist_ok=True)
-        with contextlib.suppress(OSError):
-            marker.unlink()
+        marker.write_text("")
+        marker.unlink()
+    except OSError as e:
+        return None, (f"the parse check could not be prepared "
+                      f"({type(e).__name__}: its marker directory is not "
+                      "writable)")
+    try:
         path.write_text(_PARSE_PROBE_SOURCE.format(
             targets=[str(Path(tree) / t) for t in targets],
             marker=str(marker)))
@@ -33187,7 +33199,8 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
         if rc == 0:
             return True, ""
         return None, (f"the parse check passed but the test run failed after "
-                      f"it (exit {rc}: a teardown error or a threshold)")
+                      f"it (exit {rc}: a teardown error, a threshold, or "
+                      "another test the command ran)")
     if state == "ran":
         return False, ("it or another Python file the writer wrote does not "
                        "parse under the project's interpreter")
@@ -33195,12 +33208,12 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
         return None, f"the test command could not be run (exit {rc})"
     if rc != 0 and _is_fork_exhaustion(out or ""):
         return None, "the test command was killed by the container's limits"
-    if rc == 0:
-        return None, ("the test command ran without reaching the parse check "
-                      "(it was skipped or deselected)")
+    runner = _acceptance_runner(cmd, _RUNNER_NOTHING_COLLECTED_EXIT)
+    if rc == 0 or (runner and rc == _RUNNER_NOTHING_COLLECTED_EXIT[runner]):
+        return None, (f"the test command collected or selected no test "
+                      f"(exit {rc}: the probe was deselected or skipped)")
     return None, (f"the test command failed before reaching the parse check "
-                  f"(exit {rc}: a conftest, plugin or package import, or "
-                  "nothing collected)")
+                  f"(exit {rc}: a conftest, plugin or package import)")
 
 
 def _acceptance_declared_rel(declared: dict) -> str:
