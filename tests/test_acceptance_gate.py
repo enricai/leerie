@@ -747,8 +747,19 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     ("npx jest acc/a.test.js \\", False),
     # A comment does not swallow the newline that ends the command.
     ("npx jest acc/a.test.js # c\necho done", False),
-    # A heredoc body is text bash keeps verbatim: never placed into.
+    # A heredoc body is text, not commands: never placed into — also when
+    # `<<` is grouped with another operator.
     ("cat > s.sh <<'EOF'\n# prep\nEOF\nnpx jest acc/a.test.js", False),
+    ("(cat)<<EOF\nx\nEOF\nnpx jest acc/a.test.js", False),
+    # A trailing continuation joins nothing; left bare, its backslash would
+    # escape the space before the flags.
+    ("npx jest acc/a.test.js \\\n", True),
+    # The lexer cannot see where words land inside a substitution, or in
+    # text handed to another shell: refused.
+    ("OUT=`npx jest acc/a.test.js`", False),
+    ('echo "$(echo " ; npx jest acc/a.test.js "y)"', False),
+    ("X=$(npx jest acc/a.test.js)", False),
+    ("sh -c jest", False),
 ])
 def test_continuations_and_comments_are_read_as_bash_reads_them(
         leerie, tmp_path, cmd, placed):
@@ -756,8 +767,35 @@ def test_continuations_and_comments_are_read_as_bash_reads_them(
     if not placed:
         assert spec is None
     else:
-        assert spec[0] == (f"{cmd.rstrip()} --json "
+        assert spec[0] == (f"{leerie._strip_trailing_blank(cmd)} --json "
                            f"--outputFile={tmp_path / 'r'}")
+
+
+def test_a_carriage_return_is_part_of_a_word_as_in_bash(leerie):
+    """bash splits words on space, tab and newline only: a CR stays in the
+    word, so `jest\\r` is not jest."""
+    assert leerie._shell_tokens("echo a\r#b c") == ["echo", "a\r#b", "c"]
+
+
+@pytest.mark.parametrize("cmd", [
+    "jest acc/a.test.js", "cd . && jest acc/a.test.js",
+    # An earlier occurrence inside a substitution does not stop placement:
+    # the flags reach the last one.
+    "X=$(jest --version) jest acc/a.test.js",
+    "X=`jest --version` jest acc/a.test.js",
+    "jest \\\n  acc/a.test.js \\\n", "jest --maxWorkers=$(echo 2) acc/a.test.js",
+    "jest acc/a.test.js\r\n",
+])
+def test_placed_flags_arrive_as_the_runners_last_arguments(leerie, tmp_path,
+                                                           cmd):
+    """Behavioural: run the placed command through real bash with `jest`
+    defined to print its arguments; ours must be the last two."""
+    run_cmd, _env, _kind = leerie._acceptance_report_spec(
+        cmd, tmp_path / "r.json")
+    out = subprocess.run(
+        ["bash", "-c", "jest() { printf '%s\\n' \"$@\"; }\n" + run_cmd],
+        capture_output=True, text=True, check=False).stdout.splitlines()
+    assert out[-2:] == ["--json", f"--outputFile={tmp_path / 'r.json'}"]
 
 
 @pytest.mark.parametrize("cmd", [
@@ -769,6 +807,8 @@ def test_continuations_and_comments_are_read_as_bash_reads_them(
     # ANSI-C quotes take backslash escapes; a CR is a word character.
     "echo $'a\\'b # c' d", "echo a\r#b",
     "echo ${x#y} z", "echo $# q", "echo $((16#ff))",
+    # A `#` inside `${…}` is an operator; `<(…)` substitutes like `$(…)`.
+    "echo ${x:-a #b} c", "echo <(echo a)#c d",
 ])
 def test_unfolding_does_not_change_what_bash_runs(leerie, cmd):
     def run(c):
@@ -783,7 +823,8 @@ def test_unfolding_does_not_change_what_bash_runs(leerie, cmd):
     ("(pytest acc/test_a.py)", "pytest"),
     ("cd w&&pytest acc/test_a.py", "pytest"),
     ("(jest acc/a.test.js)", "jest"),
-    # A `#` inside a word is not a comment (shlex's default thinks it is).
+    # A `#` inside a word is not a comment (shlex's own comment handling,
+    # which `_shell_tokens` turns off, starts one there).
     ("uvx --from git+https://e.test/r.git#subdirectory=py pytest acc/t.py",
      "pytest"),
 ])

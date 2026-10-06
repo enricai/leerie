@@ -4672,7 +4672,8 @@ another exit (empty plans, or the satisfied-probe sweep dropping every
 subtask), and the next run then accepted "no work" on a dispute nobody acted
 on. Seven reversions of the fix, each caught by at least one test below:
 
-- **Protect** (`tests/test_filter_satisfied_subtasks.py::test_protected_subtask_is_never_probed_or_dropped`):
+- **Protect**
+  (`tests/test_filter_satisfied_subtasks.py::test_protected_subtask_is_never_probed_or_dropped`):
   a protected subtask is never handed to the probe, even when the probe would
   call everything satisfied, and the plan is not emptied.
 - **When to protect** (`test_pre_sweep_protect`, six cases;
@@ -4689,24 +4690,26 @@ on. Seven reversions of the fix, each caught by at least one test below:
   `test_an_unacted_dispute_does_not_count`): this run's own dispute is marked
   and persisted, a carried-forward acceptance is not, and the lookup ignores an
   unacted dispute.
-- **Wiring** (`test_run_phases_wiring`, `test_both_other_no_work_exits_mark_the_dispute_unacted`):
-  source-order pins that the protect set is computed before the sweep and
-  passed to it, and that each of the two other no-work exits marks the dispute
-  first. The behaviour of each helper is pinned by the tests above.
+- **Wiring** (`test_run_phases_wiring`,
+  `test_both_other_no_work_exits_mark_the_dispute_unacted`): source-order
+  pins that the protect set is computed before the sweep and passed to it,
+  and that each of the two other no-work exits marks the dispute first. The
+  behaviour of each helper is pinned by the tests above.
 
 #### Review round 1 fixes (2026-10-06)
 
 The first review of #283 found that an unacted dispute was re-raised on every
 run when the held-out tests themselves are wrong: the planners, shown the
 failing cases, correctly return nothing, the dispute goes unacted, and the
-next run disputes again — the loop the at-most-once rule exists to prevent.
-A re-dispute raised past an unacted one is now marked `redispute`, and counts
-even if it too goes unacted (`test_a_wrong_dispute_that_goes_unacted_is_bounded`,
-three runs' state; `test_a_first_dispute_is_not_a_redispute`). The tie case
-and the skip flag gained the cases named above. Five reversions (the
-`redispute` write, counting it, the skip flag, a strict-majority rule in place
-of `_acceptance_majority_fails`, and counting unacted disputes) are each
-caught by at least one test.
+next run disputes again — the loop the at-most-once rule exists to prevent. A
+re-dispute raised past an unacted one is now marked `redispute`, and counts
+even if it too goes unacted
+(`test_a_wrong_dispute_that_goes_unacted_is_bounded`, three runs' state;
+`test_a_first_dispute_is_not_a_redispute`). The tie case and the skip flag
+gained the cases named above. Five reversions (the `redispute` write, counting
+it, the skip flag, a strict-majority rule in place of
+`_acceptance_majority_fails`, and counting unacted disputes) are each caught
+by at least one test.
 
 #### The open #282 LOWs (2026-10-06)
 
@@ -4738,16 +4741,17 @@ held-back split itself, and the placement check on the appended option.
 
 - **An appended option past `--` or `)`**
   (`test_a_command_naming_its_own_junit_path_gets_ours_appended`, now six
-  cases; `test_report_flags_are_placed_only_where_they_reach_the_runner`,
-  now ten — each with a wrapper form whose `--` precedes the runner proper,
-  which must still place): #283 appended `--junitxml=<path>` after a template's own,
-  which after `--` is a file argument and after `)` a syntax error — a
-  working template became a discarded set. `_flags_reach_runner` now
-  refuses both, which means no report, as before #283.
-- **A failing shown set that named no cases** (`test_a_shown_set_naming_no_cases_is_not_called_hidden`,
-  `test_unnamed_shown_failures_are_not_called_held_back`): neither the
-  repair section nor the dispute evidence calls it held back; and a shown
-  set with no verdict is not such a failure
+  cases; `test_report_flags_are_placed_only_where_they_reach_the_runner`, now
+  ten — each with a wrapper form whose `--` precedes the runner proper, which
+  must still place): #283 appended `--junitxml=<path>` after a template's own,
+  which after `--` is a file argument and after `)` a syntax error — a working
+  template became a discarded set. `_flags_reach_runner` now refuses both,
+  which means no report, as before #283.
+- **A failing shown set that named no cases**
+  (`test_a_shown_set_naming_no_cases_is_not_called_hidden`,
+  `test_unnamed_shown_failures_are_not_called_held_back`): neither the repair
+  section nor the dispute evidence calls it held back; and a shown set with no
+  verdict is not such a failure
   (`test_an_unmeasured_shown_set_is_not_a_failure_without_names`).
 - **The accepted-after-dispute WARNING**
   (`test_accepted_warning_never_ends_in_an_empty_case_list`).
@@ -4782,8 +4786,9 @@ re-added worktree reset.
   `prompts/planner.md` tells planners how to read counts-only evidence by
   its opening words; the test pins that the settle still writes them.
 - **One evaluation per commit**
-  (`test_head_results_are_measured_once_per_commit`): the settle, the pre-sweep check and the already-fixed check share one
-  measurement; one that measured nothing is not kept.
+  (`test_head_results_are_measured_once_per_commit`): the settle, the
+  pre-sweep check and the already-fixed check share one measurement; one that
+  measured nothing is not kept.
 
 Ten reversions, each caught by at least one test: the file exclusion in
 placement and in runner detection, the paren depth, the character-wise
@@ -4873,10 +4878,11 @@ and ignoring single quotes.
   lines, a backslash-newline in a quoted heredoc — changed what ran.
   Placement now also needs the appended word to lex as the last word of
   the same command, and never enters a command with a heredoc.
-- **`_shell_unfold` closer to bash** (`test_unfolding_does_not_change_what_bash_runs`,
-  now fourteen cases): a `#` after a substitution's `)` is mid-word and
-  after a subshell's starts a comment; `$'…'` takes backslash escapes; a
-  CR is a word character; `${x#y}`, `$#` and `$((16#ff))` are untouched.
+- **`_shell_unfold` closer to bash**
+  (`test_unfolding_does_not_change_what_bash_runs`, now fourteen cases): a `#`
+  after a substitution's `)` is mid-word and after a subshell's starts a
+  comment; `$'…'` takes backslash escapes; a CR is a word character; `${x#y}`,
+  `$#` and `$((16#ff))` are untouched.
 - **Backtick substitutions in the container check**
   (`test_only_a_container_that_starts_the_runner_withholds_the_report`,
   now thirteen cases).
@@ -4885,3 +4891,25 @@ Seven reversions, each caught: running the unfolded form, dropping the
 appended-word check, dropping the heredoc check, a substitution's `)`
 read as an operator, a CR read as whitespace, no `$'…'` quoting, and no
 backtick tracking.
+
+##### Review round 5 of the post-merge fixes (2026-10-06)
+
+- **Placement refuses what the token scan cannot see into**
+  (`test_continuations_and_comments_are_read_as_bash_reads_them`, now
+  thirteen cases): a backtick after the runner, a quoted `$(…)` hiding that
+  the runner runs inside it, a runner handed to `sh -c` as text, and a
+  heredoc `<<` grouped with another operator (`(cat)<<EOF`). A trailing
+  line continuation is dropped rather than refused.
+- **The flags arrive as the runner's last arguments**
+  (`test_placed_flags_arrive_as_the_runners_last_arguments`, seven cases):
+  each placed command runs through real bash with `jest` defined to print
+  its arguments. Two cases have an earlier occurrence of the runner inside a
+  `$(…)` or backticks, which must not stop placement.
+- **A CR stays in its word**
+  (`test_a_carriage_return_is_part_of_a_word_as_in_bash`), and `_shell_unfold` handles `${…}` and `<(…)`
+  (`test_unfolding_does_not_change_what_bash_runs`, now sixteen cases).
+
+Nine reversions, each caught: dropping the backtick-after check, widening
+it to any backtick, splitting words on CR, dropping the quoted-`$(…)` check,
+dropping the `-c` check, matching only a bare `<<`, keeping a trailing
+continuation, ignoring `${…}`, and treating `<(` as a subshell.

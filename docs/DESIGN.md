@@ -6076,31 +6076,36 @@ jest and vitest exit 1 alike for "no tests", "could not load" and "a test
 failed"; cargo exits 101 for a build or a test failure; and `go test`
 exits 0 when nothing ran. So where the runner can write a structured
 report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
-and vitest — validation asks for one (a test command that already names
-its own JUnit report path would override the request, so the request is
-then appended after it, where it is the one that counts; where nothing can
-be appended safely — after the runner's command ends (a `)` closing a
-subshell the runner sits in; a `$(…)` inside its arguments is not that), or
-past a `--` that would make the option a file argument — there is no
-report; the file under test never counts as the runner, even when named
-like one; the command is read as bash reads it — a line continuation
-joins lines, a comment starts only at a word, and a newline ends a
-command as `;` does — but what runs is always the template as written
-with the flags appended, and only when the appended words would land as
-the last words of the runner's command (not inside a trailing comment,
-not joined by a trailing backslash, never in a command with a heredoc,
-whose body bash keeps verbatim): a reading that differs from bash can
-then cost a report, never change what runs; and a runner started through a container CLI — `docker`, `docker-compose`,
-`podman`, `nerdctl` or `kubectl` earlier in the simple command of any
-occurrence of the runner, not a container started by an earlier command
-nor one queried inside a `$(…)` for a value — is not asked at all, since
-it cannot see the orchestrator's environment and a report path it cannot
-create would fail a run whose tests pass) and reads how many tests
-executed
-(a test whose fixture failed to set up counts as executed: it ran and
-failed) and whether the file loaded — pytest marks a file it could not
-collect with a fixed "collection failure" message, which no report option
-renames. A file that ran no test, or could
+and vitest — validation asks for one and reads how many tests executed (a
+test whose fixture failed to set up counts as executed: it ran and failed)
+and whether the file loaded — pytest marks a file it could not collect
+with a fixed "collection failure" message, which no report option
+renames.
+
+Asking means appending report flags to the test command (or, for pytest,
+setting `PYTEST_ADDOPTS`, unless the command names its own JUnit path,
+which would override it). What runs is the template as written with the
+flags appended, and only when the appended words would land as the
+runner's last arguments. The command is read as bash reads it — a line
+continuation joins lines, a comment starts only at a word, a newline ends
+a command as `;` does — and the file under test never counts as the
+runner, even when named like one. There is no report when the flags would
+land after the runner's command ends (after a `)` closing a subshell it
+runs in — a `$(…)` among its arguments is not that), past a `--` that
+makes them file arguments, inside a trailing comment, joined by a trailing
+backslash, after a backtick, in a command with a heredoc (its body is
+text, not commands), or where the runner is handed to another shell as
+`-c` text or a quoted `$(…)` hides where it runs. That is a reading of the
+command, not a proof: within the shapes it reads, a misreading costs a
+report rather than changing what runs, and the shapes it refuses are
+those where it cannot tell. A runner started through a container CLI —
+`docker`, `docker-compose`, `podman`, `nerdctl` or `kubectl` earlier in
+the simple command of any occurrence of the runner, not a container
+started by an earlier command nor one queried inside a `$(…)` for a value
+— is not asked at all: it cannot see the orchestrator's environment, and
+a report path it cannot create would fail a run whose tests pass.
+
+A file that ran no test, or could
 not be loaded, is no verdict and discards its set (the gate then has less
 to check, never a false failure) — with one exception. When the report's
 defect is itself that loading fails (a missing entry point, a module that

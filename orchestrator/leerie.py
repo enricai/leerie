@@ -33038,9 +33038,7 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     if runner is None:
         return None
     kind, how = _RUNNER_REPORTS[runner]
-    # A trailing newline (a multi-line TOML string) would put appended flags
-    # on a line of their own.
-    raw = cmd.rstrip()
+    raw = _strip_trailing_blank(cmd)
     tokens = _shell_tokens(raw)
     if tokens is not None and _runner_in_container(
             tokens, _runner_positions(tokens, runner, files)):
@@ -33057,7 +33055,9 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
         # ours is the one pytest keeps.
     else:
         flags = how.format(path=shlex.quote(str(path)))
-    if (tokens is None or any(t in _HEREDOC_OPS for t in tokens)
+    if (tokens is None or any(
+            set(t) <= _SHELL_OPERATOR_CHARS and "<<" in t.replace("<<<", "")
+            for t in tokens)
             or not _flags_reach_runner(tokens, runner, files)):
         return None
     # The template runs as written, flags appended: a rewritten command
@@ -33070,11 +33070,23 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     return f"{raw} {flags}", None, kind
 
 
-# Heredoc operators: a body is text bash keeps verbatim, which the lexer
-# would read as commands, so a command with one gets no appended flags.
-_HEREDOC_OPS = frozenset({"<<", "<<-"})
 # A word appended to check where appended flags would land.
 _PLACEMENT_PROBE = "--leerie-placement-probe"
+
+
+def _strip_trailing_blank(cmd: str) -> str:
+    """`cmd` without trailing whitespace — a trailing newline (a multi-line
+    TOML string) would put appended flags on a line of their own — and
+    without a trailing line continuation, which joins nothing: left as a
+    bare backslash it would escape the space before appended flags."""
+    while True:
+        stripped = cmd.rstrip()
+        if (stripped != cmd and stripped.endswith("\\")
+                and cmd[len(stripped)] == "\n"
+                and (len(stripped) - len(stripped.rstrip("\\"))) % 2):
+            cmd = stripped[:-1]
+            continue
+        return stripped
 
 
 # pytest's spellings of its JUnit report option (fixed CLI surface).
@@ -33146,6 +33158,9 @@ def _shell_unfold(cmd: str) -> str:
     # Open parens: True for a `$(…)` (its `)` ends a word part, so a `#`
     # after it is mid-word), False for a subshell (its `)` is an operator).
     parens: list[bool] = []
+    # Depth inside `${…}`: a `#` there is an operator (`${x#y}`, `${x:-a
+    # #b}`), never a comment.
+    braces = 0
     boundary = True
     i = 0
     while i < len(cmd):
@@ -33173,13 +33188,20 @@ def _shell_unfold(cmd: str) -> str:
             quote = "$'"
         elif ch in "'\"":
             quote = ch
-        elif ch == "#" and boundary:
+        elif ch == "#" and boundary and not braces:
             while i < len(cmd) and cmd[i] != "\n":
                 i += 1
             continue
         if not quote and ch not in "'\"":
-            if ch == "(":
-                parens.append(bool(out) and out[-1] == "$")
+            if ch == "{" and out and out[-1] == "$":
+                braces += 1
+                boundary = False
+            elif ch == "}" and braces:
+                braces -= 1
+                boundary = False
+            elif ch == "(":
+                # `$(`, `<(` and `>(` substitute; a bare `(` is a subshell.
+                parens.append(bool(out) and out[-1] in ("$", "<", ">"))
                 boundary = True
             elif ch == ")":
                 boundary = not (parens and parens.pop())
@@ -33199,7 +33221,7 @@ def _shell_tokens(cmd: str) -> list[str] | None:
     lexer = shlex.shlex(_shell_unfold(cmd), posix=True,
                         punctuation_chars="".join(sorted(
                             _SHELL_OPERATOR_CHARS)))
-    lexer.whitespace = " \t\r"
+    lexer.whitespace = " \t"
     lexer.whitespace_split = True
     lexer.commenters = ""
     try:
@@ -33219,6 +33241,24 @@ def _runner_positions(tokens: list[str], runner: str,
             and os.path.normpath(t) not in skip]
 
 
+def _runner_unplaceable(tokens: list[str], runner_at: list[int]) -> bool:
+    """Shapes where appended words would not reach the runner and the token
+    scan in `_flags_reach_runner` cannot tell: a backtick after the last
+    runner (the flags could land inside a backtick substitution — a runner
+    inside one always has its closing backtick after it); a quoted `$(…)`
+    left open within its word (`"$(echo " ; npx jest x "y)"` — the quotes
+    hide that the runner is inside the substitution); and a runner handed
+    to another shell as `-c` text (`sh -c jest`, where the flags become
+    `$0`). A runner inside an unquoted `$(…)` is refused there, by the
+    `)` after it."""
+    if any("`" in t for t in tokens[max(runner_at):]):
+        return True
+    if any(t.count("$(") > t.count(")") for t in tokens
+           if not set(t) <= _SHELL_OPERATOR_CHARS):
+        return True
+    return any(at and tokens[at - 1] == "-c" for at in runner_at)
+
+
 def _flags_reach_runner(tokens: list[str], runner: str,
                         files: Iterable[str] = ()) -> bool:
     """Whether flags appended to the command reach `runner`: every
@@ -33227,10 +33267,12 @@ def _flags_reach_runner(tokens: list[str], runner: str,
     occurrence, no `--` and no `)` closing a subshell it runs in — in
     `npx jest x; echo jest` the runner is the first command and the flags
     would reach `echo`."""
+    runner_at = _runner_positions(tokens, runner, files)
+    if not runner_at or _runner_unplaceable(tokens, runner_at):
+        return False
     last_sep = max((i for i, t in enumerate(tokens)
                     if _is_shell_separator(t)), default=-1)
-    runner_at = _runner_positions(tokens, runner, files)
-    if not runner_at or min(runner_at) <= last_sep or any(
+    if min(runner_at) <= last_sep or any(
             t in _SHELL_REDIRECTS for t in tokens[min(runner_at):]):
         return False
     # The rest count only after the LAST runner token: a wrapper can name
