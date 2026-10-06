@@ -598,8 +598,9 @@ class TestCheckPlannerOutput:
 
 # --- instruction-adherence gate: advisory-vs-gating split --------------- #
 #
-# Mirrors the G3 decomposition_quality-does-not-gate / task_understanding-
-# still-gates pair above, but for the instruction-adherence gate (DESIGN:
+# Mirrors the G3 decomposition_quality / task_understanding does-not-gate
+# pair above (both axes advisory; the task_coverage_judge gates), but for
+# the instruction-adherence gate (DESIGN:
 # instruction-adherence is code-enforced, sibling to §12). The deterministic
 # floor (check_prescribed_command_coverage) is a SEPARATE function from
 # check_planner_output — it is wired into phase_adherence_gate, not into the

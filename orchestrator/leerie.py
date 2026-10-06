@@ -33016,6 +33016,10 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
 # (a pipe or a redirect) or would reach a different command (a separator).
 _SHELL_SEPARATORS = frozenset({"&&", "||", ";", "&", "|", ";;"})
 _SHELL_REDIRECTS = frozenset({">", ">>", "<", "<<", ">&", "<&", "|&"})
+# Tokens after which an appended flag no longer reaches the runner as an
+# option: `)` closes the subshell it runs in (the flag would follow it and
+# break the command), and `--` makes everything after it a file argument.
+_FLAG_STOPPERS = frozenset({")", "--"})
 
 
 def _acceptance_report_spec(cmd: str, path: Path
@@ -33062,15 +33066,16 @@ def _shell_tokens(cmd: str) -> list[str] | None:
 
 def _flags_reach_runner(tokens: list[str], runner: str) -> bool:
     """Whether flags appended to the command reach `runner`: every
-    occurrence of it sits in the final simple command, with no pipe or
-    redirect after it — in `npx jest x; echo jest` the runner is the first
+    occurrence of it sits in the final simple command, with no pipe,
+    redirect, `)` or `--` after it — in `npx jest x; echo jest` the runner is the first
     command and the flags would reach `echo`."""
     last_sep = max((i for i, t in enumerate(tokens)
                     if t in _SHELL_SEPARATORS), default=-1)
     runner_at = [i for i, t in enumerate(tokens)
                  if os.path.basename(t) == runner]
     return bool(runner_at) and min(runner_at) > last_sep and not any(
-        t in _SHELL_REDIRECTS for t in tokens[min(runner_at):])
+        t in _SHELL_REDIRECTS or t in _FLAG_STOPPERS
+        for t in tokens[min(runner_at):])
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:
@@ -33749,9 +33754,11 @@ def _format_acceptance_failures_section(results: list[dict],
     by_index = {s_["index"]: s_ for s_ in sets}
     case_lines: list[str] = []
     import_cases: list[str] = []
+    shown_fails = False
     for r in results:
         if r["passed"] or r["index"] not in shown:
             continue
+        shown_fails = True
         set_ = by_index[r["index"]]
         for rel in r["failing_files"]:
             names = set_["cases"].get(rel, [])[:12]
@@ -33776,6 +33783,14 @@ def _format_acceptance_failures_section(results: list[dict],
                  + ("Fitting these names will fail the recheck, which also "
                     "runs further tests you are not shown. " if held_back
                     else "Fitting these names alone does not fix the defect. "))
+    elif shown_fails:
+        # A shown set failed on a file that declared no case names (the
+        # schema allows it): nothing is hidden, there is just nothing to name.
+        head += ("The failing tests declared no case names, so none follow. "
+                 "They encode the REPORT'S contract — fix the defect at its "
+                 "root so the contract below holds in general. "
+                 + ("Further tests you are not shown also run on the "
+                    "recheck. " if held_back else ""))
     else:
         # Only held-back sets fail: say so, rather than promise a list that
         # is empty (DESIGN §8).
@@ -34215,7 +34230,8 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
     Under `skip_satisfied_check` there is no sweep to protect from, so the
     sets are not run; nor are they when the planning worktree's HEAD is the
     sets' `validity_base`, where every set failed during validation, so
-    `fix_ids` is returned outright."""
+    `fix_ids` is returned outright. The caller ensures the planning
+    worktree first."""
     if not fix_ids or st.data.get("skip_satisfied_check"):
         return set()
     try:
@@ -34224,7 +34240,8 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
         if acc.get("sets") and base:
             # Sets validated on this very commit each have a defect file that
             # failed here: the answer is known without running them again.
-            await _ensure_planning_worktree(st)
+            # The caller has just ensured the planning worktree; ensuring it
+            # again would re-run its reset script for nothing.
             if await _branch_head_sha(str(_judgment_cwd(st))) == base:
                 return set(fix_ids)
         res = await _acceptance_results_on_head(st, caps)
@@ -34299,6 +34316,10 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     cases = [c for r in measured if not r["passed"] and r["index"] in shown
              for rel in r["failing_files"]
              for c in sets[r["index"]]["cases"].get(rel, [])][:20]
+    # With no names, say why: held back, or a failing shown set named none.
+    no_names = ("the failing cases were not named" if any(
+        not r["passed"] and r["index"] in shown for r in measured)
+        else "every failing case is held back from planning")
     if _prior_acceptance_dispute(st):
         st.data["no_work_acceptance"] = {"verdict": "accepted after dispute",
                                          "results": res, "cases": cases}
@@ -34310,8 +34331,9 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
             "cases": cases, "accepted": True}
         log("  WARNING: held-out acceptance sets still fail on HEAD, but the "
             "previous run of this task already disputed on them — accepting "
-            "no work (disputed at most once). Failing cases: "
-            + "; ".join(cases[:5]))
+            "no work (disputed at most once). "
+            + (f"Failing cases: {'; '.join(cases[:5])}" if cases
+               else no_names))
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence + " — accepted after one "
                                  "acceptance dispute; residual recorded"})
@@ -34329,8 +34351,8 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
         "classifier_evidence": conf.get("classifier_evidence", ""),
         "judge_evidence": ("Held-out acceptance tests written from the "
                            "report fail on HEAD: " + ("; ".join(cases) if cases
-                           else f"{failing_sets} of {len(measured)} sets, "
-                           "every failing case held back from planning")),
+                           else f"{failing_sets} of {len(measured)} sets; "
+                           + no_names)),
         "checked": []}
     st.data.pop("no_work_pending", None)
     st.save()

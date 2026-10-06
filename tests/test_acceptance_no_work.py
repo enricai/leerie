@@ -218,6 +218,50 @@ def test_dispute_with_only_hidden_failures_gives_counts_alone(
     assert st.data["acceptance_dispute"]["cases"] == []
 
 
+def test_unnamed_shown_failures_are_not_called_held_back(
+        leerie, tmp_path, monkeypatch, finished):
+    """Three sets, all shown; two fail on files that named no cases. The
+    evidence must not claim anything is held back (#283 review)."""
+    st = _st(leerie, tmp_path)
+    unnamed = [{"index": k, "cases": {f"t/test_{k}.py": []}}
+               for k in range(1, 4)]
+
+    async def fake(st_, caps):
+        return [{"index": k, "passed": k == 3,
+                 "failing_files": [] if k == 3 else [f"t/test_{k}.py"]}
+                for k in range(1, 4)]
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    st.data.update(acceptance={"sets": unnamed}, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, dict(leerie.DEFAULT_CAPS))) is False
+    ev = st.data["no_work_dispute"]["judge_evidence"]
+    assert "held back" not in ev and "were not named" in ev
+
+
+def test_accepted_warning_never_ends_in_an_empty_case_list(
+        leerie, tmp_path, monkeypatch, finished, capsys):
+    """Only held-back sets fail on the accepting run: the WARNING says so
+    rather than ending in "Failing cases: " (#283 review)."""
+    st = _st(leerie, tmp_path)
+    _sibling(st, "run-prev", dispute={"failing_sets": 2, "cases": ["x"]})
+    four = _FIVE[:4]
+
+    async def fake(st_, caps):
+        return [{"index": k, "passed": k <= 2,
+                 "failing_files": [] if k <= 2 else [f"t/test_{k}.py"]}
+                for k in range(1, 5)]
+    monkeypatch.setattr(leerie, "_acceptance_results_on_head", fake)
+    st.data.update(acceptance={"sets": four}, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, dict(leerie.DEFAULT_CAPS))) is True
+    warning = [l for l in capsys.readouterr().out.splitlines()
+               if "WARNING" in l][0]
+    assert "Failing cases:" not in warning
+    assert warning.rstrip().endswith("held back from planning")
+
+
 def test_unmeasurable_sets_keep_the_judges_confirmation(leerie, tmp_path,
                                                        monkeypatch, finished):
     st = _st(leerie, tmp_path)
@@ -382,8 +426,10 @@ def test_pre_sweep_protect_on_the_validity_base_skips_the_run(
         ran.append(1)
         return _results([True, True, True])
 
+    ensured = []
+
     async def no_wt(st_):
-        return None
+        ensured.append(1)
 
     async def sha(path):
         return head
@@ -394,6 +440,9 @@ def test_pre_sweep_protect_on_the_validity_base_skips_the_run(
         st, dict(leerie.DEFAULT_CAPS), {"s0"}))
     assert bool(ran) is runs
     assert got == (set() if runs else {"s0"})
+    # The caller ensured the worktree: the shortcut never resets it again
+    # (only the measuring path's `_acceptance_results_on_head` would).
+    assert ensured == []
 
 
 def test_pre_sweep_protect_errors_protect_nothing(leerie, tmp_path,

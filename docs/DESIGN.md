@@ -5331,8 +5331,9 @@ majority failing is a dispute: the failing case names become the
 `no_work_dispute` evidence and the run plans the work. Only the names from
 sets a repair round would be shown are used: the planners' words reach the
 implementers, and the held-back sets must stay unseen until the gate
-re-judges on them. When only held-back sets fail, the evidence gives the
-counts alone. But held-out tests
+re-judges on them. When no case names are left — only held-back sets fail,
+or the failing shown sets named no cases — the evidence gives the counts,
+saying which of the two it is. But held-out tests
 can be wrong — on a finished task whose report states no expected behaviour,
 all three sets failed it — and a wrong dispute repeated on every re-run
 would be a new infinite loop. So a dispute is raised at most once per task:
@@ -6071,7 +6072,8 @@ report of the run — pytest's JUnit XML, the jest-compatible JSON of jest
 and vitest — validation asks for one (a test command that already names
 its own JUnit report path would override the request, so the request is
 then appended after it, where it is the one that counts; where nothing can
-be appended safely there is no report) and reads how many tests executed
+be appended safely — after the runner's command ends, or past a `--` that
+would make the option a file argument — there is no report) and reads how many tests executed
 (a test whose fixture failed to set up counts as executed: it ran and
 failed) and whether the file loaded — pytest marks a file it could not
 collect with a fixed "collection failure" message, which no report option
@@ -6126,7 +6128,9 @@ highest-indexed are never shown at all; every round is re-judged on all
 sets, so a fix fitted to the shown names still fails the hidden ones.
 When only hidden sets fail, the round is told exactly that — every failing
 test is one it is not shown — and works from the contract alone, rather
-than being promised a list of failing cases that is empty. A
+than being promised a list of failing cases that is empty; when a shown set
+fails but names no cases, it is told that instead, never that tests are
+hidden. A
 round whose verdict measures nothing where the one before it measured is
 measured once more before the rounds stop on it: every evaluation installs
 afresh, and a one-off install failure would otherwise end the repair with

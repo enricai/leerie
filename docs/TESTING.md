@@ -4728,3 +4728,26 @@ Seven reversions, each caught by at least one test: the shown filter on the
 dispute names, the counts-only evidence, the hidden-only section header, the
 validity-base shortcut, detecting the command's own JUnit option, the
 held-back split itself, and the placement check on the appended option.
+
+#### Follow-up: the final #283 review's LOWs (2026-10-06)
+
+- **An appended option past `--` or `)`**
+  (`test_a_command_naming_its_own_junit_path_gets_ours_appended`, now five
+  cases; `test_report_flags_are_placed_only_where_they_reach_the_runner`,
+  now nine): #283 appended `--junitxml=<path>` after a template's own,
+  which after `--` is a file argument and after `)` a syntax error — a
+  working template became a discarded set. `_flags_reach_runner` now
+  refuses both, which means no report, as before #283.
+- **A failing shown set that named no cases** (`test_a_shown_set_naming_no_cases_is_not_called_hidden`,
+  `test_unnamed_shown_failures_are_not_called_held_back`): neither the
+  repair section nor the dispute evidence calls it held back.
+- **The accepted-after-dispute WARNING**
+  (`test_accepted_warning_never_ends_in_an_empty_case_list`).
+- **No second worktree reset on the first-run shortcut**
+  (`test_pre_sweep_protect_on_the_validity_base_skips_the_run` counts
+  `_ensure_planning_worktree` calls).
+
+Seven reversions, each caught by at least one test: dropping the `)`/`--`
+check, keeping only `)`, keeping only `--`, the unnamed-shown section branch,
+the evidence's not-named reason, the WARNING's empty list, and the
+re-added worktree reset.
