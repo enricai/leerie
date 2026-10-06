@@ -4781,8 +4781,8 @@ re-added worktree reset.
   (`test_the_planner_prompt_names_the_evidence_prefix_the_settle_writes`):
   `prompts/planner.md` tells planners how to read counts-only evidence by
   its opening words; the test pins that the settle still writes them.
-- **One evaluation per commit** (`test_head_results_are_measured_once_per_commit`):
-  the settle, the pre-sweep check and the already-fixed check share one
+- **One evaluation per commit**
+  (`test_head_results_are_measured_once_per_commit`): the settle, the pre-sweep check and the already-fixed check share one
   measurement; one that measured nothing is not kept.
 
 Ten reversions, each caught by at least one test: the file exclusion in
@@ -4800,8 +4800,9 @@ cache a measurement that measured nothing.
   now also asserts a host pytest after `docker compose up` keeps its
   environment request). The first version matched `docker` anywhere and
   cost a common start-the-database template its report.
-- **Files compared normalised** (`test_a_file_named_like_the_runner_is_never_the_runner`
-  gained `./t/jest`).
+- **Files compared normalised**
+  (`test_a_file_named_like_the_runner_is_never_the_runner` gained
+  `./t/jest`).
 - **Operator characters read one at a time, really**: a `))` closing a
   `$(…)` and the runner's subshell at once (the earlier grouped cases sat at
   depth 0, where a whole-token reading also refused, so that reversion
@@ -4862,3 +4863,25 @@ Seven reversions, each caught: tokenising the raw command, keeping
 continuations, a comment at any `#`, shlex's default commenters, separators
 inside `$(…)` ending the runner's command, appending to the raw command,
 and ignoring single quotes.
+
+##### Review round 4 of the post-merge fixes (2026-10-06)
+
+- **What runs is the template as written, flags appended**
+  (`test_continuations_and_comments_are_read_as_bash_reads_them`, now
+  seven cases, asserts the exact command): round 3 ran the unfolded
+  rewrite, so any reading that differed from bash — a heredoc body's `#`
+  lines, a backslash-newline in a quoted heredoc — changed what ran.
+  Placement now also needs the appended word to lex as the last word of
+  the same command, and never enters a command with a heredoc.
+- **`_shell_unfold` closer to bash** (`test_unfolding_does_not_change_what_bash_runs`,
+  now fourteen cases): a `#` after a substitution's `)` is mid-word and
+  after a subshell's starts a comment; `$'…'` takes backslash escapes; a
+  CR is a word character; `${x#y}`, `$#` and `$((16#ff))` are untouched.
+- **Backtick substitutions in the container check**
+  (`test_only_a_container_that_starts_the_runner_withholds_the_report`,
+  now thirteen cases).
+
+Seven reversions, each caught: running the unfolded form, dropping the
+appended-word check, dropping the heredoc check, a substitution's `)`
+read as an operator, a CR read as whitespace, no `$'…'` quoting, and no
+backtick tracking.

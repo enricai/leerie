@@ -33038,11 +33038,10 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     if runner is None:
         return None
     kind, how = _RUNNER_REPORTS[runner]
-    # The form the shell runs: continuations and comments gone, and no
-    # trailing newline (a multi-line TOML string) to put appended flags on
-    # a line of their own.
-    unfolded = _shell_unfold(cmd).rstrip()
-    tokens = _shell_tokens(unfolded)
+    # A trailing newline (a multi-line TOML string) would put appended flags
+    # on a line of their own.
+    raw = cmd.rstrip()
+    tokens = _shell_tokens(raw)
     if tokens is not None and _runner_in_container(
             tokens, _runner_positions(tokens, runner, files)):
         return None
@@ -33058,11 +33057,24 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
         # ours is the one pytest keeps.
     else:
         flags = how.format(path=shlex.quote(str(path)))
-    if tokens is None or not _flags_reach_runner(tokens, runner, files):
+    if (tokens is None or any(t in _HEREDOC_OPS for t in tokens)
+            or not _flags_reach_runner(tokens, runner, files)):
         return None
-    # Appended to the unfolded command, the form the tokens describe: on the
-    # raw one, flags after a trailing comment would be commented out.
-    return f"{unfolded} {flags}", None, kind
+    # The template runs as written, flags appended: a rewritten command
+    # would run whatever the lexer got wrong (a heredoc body, say). So the
+    # appended word must lex as the last word of the same command — not
+    # swallowed by a trailing comment or joined by a trailing backslash.
+    if _shell_tokens(f"{raw} {_PLACEMENT_PROBE}") != [*tokens,
+                                                      _PLACEMENT_PROBE]:
+        return None
+    return f"{raw} {flags}", None, kind
+
+
+# Heredoc operators: a body is text bash keeps verbatim, which the lexer
+# would read as commands, so a command with one gets no appended flags.
+_HEREDOC_OPS = frozenset({"<<", "<<-"})
+# A word appended to check where appended flags would land.
+_PLACEMENT_PROBE = "--leerie-placement-probe"
 
 
 # pytest's spellings of its JUnit report option (fixed CLI surface).
@@ -33092,9 +33104,12 @@ def _runner_in_container(tokens: list[str], runner_at: list[int]) -> bool:
         # One pass from the start: a separator inside a `$(…)` ends a
         # command of the substitution, not of the runner's command.
         substitution: list[bool] = []
+        # Inside a backtick substitution: the older spelling of `$(…)`.
+        backtick = False
         container = False
         prev = ""
         for t in tokens[:at]:
+            inside = backtick or "`" in t
             if t and set(t) <= _SHELL_OPERATOR_CHARS:
                 redirect = bool(set(t) & {"<", ">"})
                 for k, ch in enumerate(t):
@@ -33103,12 +33118,14 @@ def _runner_in_container(tokens: list[str], runner_at: list[int]) -> bool:
                     elif ch == ")":
                         if substitution:
                             substitution.pop()
-                    elif (ch in ";&|\n" and not redirect
+                    elif (ch in ";&|\n" and not redirect and not backtick
                           and not any(substitution)):
                         container = False
-            elif (not any(substitution)
+            elif (not inside and not any(substitution)
                   and os.path.basename(t) in _CONTAINER_CLIS):
                 container = True
+            if t.count("`") % 2:
+                backtick = not backtick
             prev = t
         if container:
             return True
@@ -33120,31 +33137,56 @@ def _shell_unfold(cmd: str) -> str:
     unquoted or double-quoted backslash-newline (a line continuation) and a
     comment — a `#` that starts an unquoted word, up to the newline. shlex
     gets both wrong: it turns a continuation into a newline token, and its
-    `#` handling starts a comment mid-word (`r.git#subdirectory=py`)."""
+    `#` handling starts a comment mid-word (`r.git#subdirectory=py`). For
+    reading a command only: the command that runs is never this form, so a
+    shape it reads differently from bash (a heredoc body, a `#` inside
+    backticks) can cost a report but never change what runs."""
     out: list[str] = []
     quote = ""
+    # Open parens: True for a `$(…)` (its `)` ends a word part, so a `#`
+    # after it is mid-word), False for a subshell (its `)` is an operator).
+    parens: list[bool] = []
+    boundary = True
     i = 0
     while i < len(cmd):
         ch = cmd[i]
         nxt = cmd[i + 1] if i + 1 < len(cmd) else ""
         if quote == "'":
             quote = "" if ch == "'" else quote
+        elif quote == "$'":
+            if ch == "\\":
+                out.append(ch + nxt)
+                i += 2
+                continue
+            quote = "" if ch == "'" else quote
         elif ch == "\\" and nxt == "\n":
             i += 2
             continue
         elif ch == "\\":
             out.append(ch + nxt)
+            boundary = False
             i += 2
             continue
         elif quote == '"':
             quote = "" if ch == '"' else quote
+        elif ch == "'" and out and out[-1] == "$":
+            quote = "$'"
         elif ch in "'\"":
             quote = ch
-        elif ch == "#" and (not out or out[-1] in " \t\r"
-                            or out[-1] in _SHELL_OPERATOR_CHARS):
+        elif ch == "#" and boundary:
             while i < len(cmd) and cmd[i] != "\n":
                 i += 1
             continue
+        if not quote and ch not in "'\"":
+            if ch == "(":
+                parens.append(bool(out) and out[-1] == "$")
+                boundary = True
+            elif ch == ")":
+                boundary = not (parens and parens.pop())
+            else:
+                boundary = ch in " \t\n;&|<>"
+        else:
+            boundary = False
         out.append(ch)
         i += 1
     return "".join(out)

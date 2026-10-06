@@ -710,6 +710,9 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     # whether the container CLI is inside it or before it.
     ("X=$(cd db; docker port db 5432) pytest acc/test_a.py", True),
     ("docker run img env T=$(date; true) pytest acc/test_a.py", False),
+    # Backticks are the older spelling of `$(…)`.
+    ("X=`cd db; docker port db` npx jest acc/a.test.js", True),
+    ("docker run img env T=`date; true` pytest acc/test_a.py", False),
     # A line continuation does not end the container's command.
     ("docker run --rm \\\n  -v $PWD:/app img \\\n  pytest acc/test_a.py",
      False),
@@ -733,26 +736,39 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
 
 
 @pytest.mark.parametrize("cmd,placed", [
-    ("npx jest \\\n  acc/a.test.js", "npx jest   acc/a.test.js"),
-    ("npx jest acc/a.test.js \\\n  --ci", "npx jest acc/a.test.js   --ci"),
-    # A trailing comment would swallow raw-appended flags.
-    ("npx jest acc/a.test.js # c", "npx jest acc/a.test.js"),
+    # Continuations are read as joined lines, and the template still runs
+    # exactly as written, the flags appended (#285 round-4 review: running
+    # an unfolded rewrite ran whatever the lexer got wrong).
+    ("npx jest \\\n  acc/a.test.js", True),
+    ("npx jest acc/a.test.js \\\n  --ci", True),
+    ("npx jest --testNamePattern=$(cat pat)#x acc/a.test.js", True),
+    # Appended flags would be commented out, or joined into the last word.
+    ("npx jest acc/a.test.js # c", False),
+    ("npx jest acc/a.test.js \\", False),
     # A comment does not swallow the newline that ends the command.
-    ("npx jest acc/a.test.js # c\necho done", None),
+    ("npx jest acc/a.test.js # c\necho done", False),
+    # A heredoc body is text bash keeps verbatim: never placed into.
+    ("cat > s.sh <<'EOF'\n# prep\nEOF\nnpx jest acc/a.test.js", False),
 ])
 def test_continuations_and_comments_are_read_as_bash_reads_them(
         leerie, tmp_path, cmd, placed):
     spec = leerie._acceptance_report_spec(cmd, tmp_path / "r")
-    if placed is None:
+    if not placed:
         assert spec is None
     else:
-        assert spec[0] == f"{placed} --json --outputFile={tmp_path / 'r'}"
+        assert spec[0] == (f"{cmd.rstrip()} --json "
+                           f"--outputFile={tmp_path / 'r'}")
 
 
 @pytest.mark.parametrize("cmd", [
     "echo a \\\n  b", "echo a # c d", 'echo "x\\\ny" z',
     "echo 'p\\\nq' r", "echo u#v w", "echo a\\ #b c",
     "echo $(echo m # n\n) o",
+    # A substitution's `)` ends a word part, a subshell's is an operator.
+    "echo $(echo a)#b", "(echo a)#b",
+    # ANSI-C quotes take backslash escapes; a CR is a word character.
+    "echo $'a\\'b # c' d", "echo a\r#b",
+    "echo ${x#y} z", "echo $# q", "echo $((16#ff))",
 ])
 def test_unfolding_does_not_change_what_bash_runs(leerie, cmd):
     def run(c):
@@ -762,7 +778,7 @@ def test_unfolding_does_not_change_what_bash_runs(leerie, cmd):
 
 
 @pytest.mark.parametrize("cmd,runner", [
-    # Each case finds no runner under plain `shlex.split`: `(pytest`,
+    # The first three find no runner under plain `shlex.split`: `(pytest`,
     # `w&&pytest` and `(jest` are single words there.
     ("(pytest acc/test_a.py)", "pytest"),
     ("cd w&&pytest acc/test_a.py", "pytest"),

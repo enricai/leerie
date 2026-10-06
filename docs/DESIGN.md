@@ -6085,8 +6085,12 @@ past a `--` that would make the option a file argument — there is no
 report; the file under test never counts as the runner, even when named
 like one; the command is read as bash reads it — a line continuation
 joins lines, a comment starts only at a word, and a newline ends a
-command as `;` does — and flags are appended to that unfolded form; and a
-runner started through a container CLI — `docker`, `docker-compose`,
+command as `;` does — but what runs is always the template as written
+with the flags appended, and only when the appended words would land as
+the last words of the runner's command (not inside a trailing comment,
+not joined by a trailing backslash, never in a command with a heredoc,
+whose body bash keeps verbatim): a reading that differs from bash can
+then cost a report, never change what runs; and a runner started through a container CLI — `docker`, `docker-compose`,
 `podman`, `nerdctl` or `kubectl` earlier in the simple command of any
 occurrence of the runner, not a container started by an earlier command
 nor one queried inside a `$(…)` for a value — is not asked at all, since
@@ -6126,8 +6130,8 @@ Python's (§12); the price is that a writer who declares a guessed import
 produces a test no fix can pass, which costs two repair rounds and a
 residual, never the run. Without a readable report (a runner with none
 known, a report that was not written, or a runner the test command starts
-inside another container, which is never asked for one) validation falls back to the
-runner's own "ran no test" exits where they exist (pytest's), and
+inside another container, which is never asked for one) validation falls
+back to the runner's own "ran no test" exits where they exist (pytest's), and
 otherwise to the exit code alone — so on `go test`, a file that ran
 nothing reads as passing: it cannot become a defect file (it does not
 fail on the base), but it can be accepted as a control that proves
