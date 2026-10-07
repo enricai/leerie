@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from tests.conftest import _run
 from tests.test_oom_naming import env  # noqa: F401  (pytest fixture)
 
@@ -244,13 +246,18 @@ def _settle(leerie_mod, env, **caps_overrides):  # noqa: F811
         env["models"], env["efforts"]))
 
 
+@pytest.mark.parametrize("stop_on_blocked", [True, False])
 def test_unexecuted_declared_command_blocks_after_redrive(
-        env, monkeypatch, capsys):  # noqa: F811
+        env, monkeypatch, capsys, stop_on_blocked):  # noqa: F811
     """The full escalation: re-drive with feedback naming the command,
     then convert to `blocked` (never `complete`) when the budget
-    exhausts with the command still unexecuted — with the N21
-    accept-blocked remedy logged at the moment of the status write."""
+    exhausts with the command still unexecuted. Under --stop-on-blocked
+    the N21 accept-blocked remedy is logged at the moment of the status
+    write; by default the log says the subtask will be auto-accepted at
+    wave end instead, and must not tell the operator to run a verb the
+    run no longer waits for."""
     leerie_mod = env["leerie"]
+    env["st"].data["stop_on_blocked"] = stop_on_blocked
     _declare(env, ["pnpm build"])
     calls: list = []
 
@@ -271,7 +278,13 @@ def test_unexecuted_declared_command_blocks_after_redrive(
     assert len(calls) == 2
     assert "DECLARED_CMD_UNRUN" in calls[1] and "pnpm build" in calls[1]
     out = capsys.readouterr().out
-    assert f"accept-blocked {env['st'].run_id} {env['sid']}" in out
+    remedy = f"accept-blocked {env['st'].run_id} {env['sid']}"
+    if stop_on_blocked:
+        assert remedy in out
+        assert "will be auto-accepted" not in out
+    else:
+        assert "will be auto-accepted at wave end" in out
+        assert remedy not in out
 
 
 def test_empty_handoff_rescue_completes_with_persisted_warning(
