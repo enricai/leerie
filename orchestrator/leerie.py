@@ -36203,9 +36203,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 + "; ".join(declared_unrun))
             log(f"  {sid}: {blocker}")
             st.data.setdefault("subtask_status", {})[sid] = "blocked"
-            log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
-                f"{st.run_id} {sid}` once addressed, then `leerie "
-                "resume` to continue without re-running it")
+            log(f"  {sid}: BLOCKED — "
+                + (f"run `leerie accept-blocked {st.run_id} {sid}` once "
+                   "addressed, then `leerie resume` to continue without "
+                   "re-running it" if st.data.get("stop_on_blocked")
+                   else "will be auto-accepted at wave end"))
             st.save()
             return {"subtask_id": sid, "status": "blocked",
                     "blocker": blocker,
@@ -36494,9 +36496,11 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     + " (fix + resume)")
                 log(f"  {sid}: {blocker}")
                 st.data.setdefault("subtask_status", {})[sid] = "blocked"
-                log(f"  {sid}: BLOCKED — run `leerie accept-blocked "
-                    f"{st.run_id} {sid}` once addressed, then `leerie "
-                    "resume` to continue without re-running it")
+                log(f"  {sid}: BLOCKED — "
+                    + (f"run `leerie accept-blocked {st.run_id} {sid}` once "
+                       "addressed, then `leerie resume` to continue without "
+                       "re-running it" if st.data.get("stop_on_blocked")
+                       else "will be auto-accepted at wave end"))
                 st.save()
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": blocker, "summary": blocker}
@@ -37179,11 +37183,39 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             if integrated:
                 log(f"  integrated {len(integrated)} successful subtask(s) "
                     f"before reporting {len(blocked)} failure(s)")
-            st.data["blocked"] = {s: results[s].get("blocker")
-                                  or results[s].get("summary") for s in blocked}
+            if st.data.get("stop_on_blocked"):
+                st.data["blocked"] = {s: results[s].get("blocker")
+                                      or results[s].get("summary")
+                                      for s in blocked}
+                st.save()
+                die(f"wave {wi + 1} has unresolved subtasks: "
+                    f"{', '.join(blocked)}. "
+                    f"See {_operator_path(st.path)}; resolve and re-run with "
+                    "resume.")
+            # Default: settle exactly as the launcher's `accept-blocked` verb
+            # does (same accepted_blocked schema) so the run continues; the
+            # integrate_wave above already merged the successful subtasks.
+            accepted = st.data.setdefault("accepted_blocked", {})
+            reg = st.data.get("blocked")
+            for s in blocked:
+                blocker_text = (results[s].get("blocker")
+                                or results[s].get("summary"))
+                log(f"  WARNING: {s} {results[s].get('status')} — "
+                    f"auto-accepted and skipped (pass --stop-on-blocked to "
+                    f"halt instead): {blocker_text}")
+                accepted[s] = {
+                    "at": datetime.datetime.now(datetime.timezone.utc)
+                          .strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "previous_status": results[s].get("status"),
+                    "blocker": blocker_text,
+                    "forced": False,
+                }
+                st.data.setdefault("subtask_status", {})[s] = "complete"
+                if isinstance(reg, dict):
+                    reg.pop(s, None)
+            if isinstance(reg, dict) and not reg:
+                st.data.pop("blocked", None)
             st.save()
-            die(f"wave {wi + 1} has unresolved subtasks: {', '.join(blocked)}. "
-                f"See {_operator_path(st.path)}; resolve and re-run with resume.")
 
         # Integration-integrity gate (DESIGN §6: "the completion signal is
         # completed_waves == len(waves)"). A wave must not be counted
