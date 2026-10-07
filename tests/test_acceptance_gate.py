@@ -718,6 +718,13 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     ("lima npx jest acc/a.test.js", False),
     # The environment route is withheld too.
     ("{docker,} run img pytest acc/test_a.py", False),
+    # Bash brace-expands no `NAME=` assignment, so a JSON value is not one
+    # (#286 round 5).
+    ("TS_NODE_COMPILER_OPTIONS='{\"module\":\"commonjs\",\"strict\":true}' "
+     "npx jest acc/a.test.js", True),
+    # Another user's command: the environment is reset.
+    ("sudo -u ci npx jest acc/a.test.js", False),
+    ("incus exec box -- npx jest acc/a.test.js", False),
     ("ssh ci-host npx jest acc/a.test.js", False),
     ("{docker,} run img npx jest acc/a.test.js", False),
     ("apptainer exec img.sif npx jest acc/a.test.js", False),
@@ -821,6 +828,8 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     # An expansion-built command word could be anything: refused, at the
     # cost of the report.
     ("$NPX jest acc/a.test.js", False),
+    # A `/` inside a nested expansion is not a literal one.
+    ("${E:-${F}/} npx jest acc/a.test.js", False),
     # More shells take the runner as text.
     ("2>&1 ash -c jest acc/a.test.js", False),
     ("fish run.fish jest acc/a.test.js", False),
@@ -1006,6 +1015,8 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     # boundary before it.
     ("X=$(case a in a) echo;; esac) echo $$'\\' #c\npytest x", "pytest"),
     ("X=$(case a in a) echo;; esac) echo $$'\\' # pytest\ntrue", None),
+    # `$${` and `\${` open no `${…}` (#286 round 5).
+    ("X=$(case a in a) echo;; esac) echo $${ #c don't\npytest y", "pytest"),
     ("X=$(case a in a) echo;; esac) echo a \\\n#c'\npytest x", "pytest"),
     # ...and a mid-word `#` there is not a comment either.
     ("X=$(case a in a) echo 1;; esac) uvx --from git+https://e.test/r.git"

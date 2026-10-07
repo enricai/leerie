@@ -5129,3 +5129,24 @@ the stripper, a continuation clearing the boundary, no `$$` in
 `lima`. A first-draft brace check in `_takes_runner_as_text`
 survived its reversion — the container check already withholds the whole
 report — and was dropped.
+
+##### Review round 5 of the edge-case fixes (2026-10-07)
+
+No HIGH or MEDIUM. Fixed:
+
+- **A JSON value in an assignment is not a brace expansion**
+  (`TS_NODE_COMPILER_OPTIONS='{"module":…,"strict":true}' npx jest`):
+  bash brace-expands no `NAME=` word, so the container check skips them.
+- **`$${` and `\${` open no `${…}`** in the fallback's comment pass.
+- **A `/` inside a nested expansion** (`${E:-${F}/}`) is no longer taken
+  for a literal one (`_outside_expansions`).
+- **Commands that run as another user** (`sudo`, `runuser`, `doas`) and
+  `incus`, `devcontainer`, `podman-compose`, `multipass` withhold the
+  report, as `su` already did.
+
+Five reversions, each caught. Disclosed rather than fixed, both contrived:
+an unquoted expansion whose value holds a space can split a command word
+(`E='eval '; $E/x jest`), and a heredoc body with an odd number of
+backticks can mislead the fallback's backtick tracking. A package or
+folder named like a listed CLI before the runner (`yarn workspace
+toolbox jest`) loses its report.

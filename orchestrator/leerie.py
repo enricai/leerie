@@ -33070,7 +33070,7 @@ def _strip_comments(cmd: str) -> str:
             continue
         if ch in "'\"":
             quote = ch
-        elif ch == "{" and out and out[-1].endswith("$"):
+        elif ch == "{" and out and out[-1] == "$":
             braces += 1
         elif ch == "}" and braces:
             braces -= 1
@@ -33157,16 +33157,19 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
     "vitest": ("jest-json", "--reporter=json --outputFile={path}"),
 }
 
-# Container and remote CLIs (and `su`, which runs its command elsewhere as
-# another user): a runner started through one gets no report request
-# (`_acceptance_report_spec`) — it cannot see our environment, and a report
-# path it cannot create fails a run whose tests pass.
+# Container and remote CLIs, and commands that run their argument as another
+# user (`su`, `sudo`, `runuser`, `doas`, which reset the environment and may
+# not write our report path): a runner started through one gets no report
+# request (`_acceptance_report_spec`) — it cannot see our environment, and a
+# report path it cannot create fails a run whose tests pass.
 _CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman",
                              "podman-remote", "nerdctl", "nerdctl.lima",
                              "lima", "colima", "kubectl", "oc", "finch",
                              "ctr", "buildah", "apptainer", "singularity",
                              "lxc", "distrobox", "toolbox", "flatpak", "ssh",
-                             "fly", "gcloud", "su"})
+                             "fly", "gcloud", "incus", "devcontainer",
+                             "podman-compose", "multipass", "su", "sudo",
+                             "runuser", "doas"})
 # Shells: they take what follows as shell text or a script to run, not a
 # program and its arguments, so appended flags become their own arguments
 # (`sh -c jest` -> `$0`). Recognised anywhere before the runner in its
@@ -33580,7 +33583,8 @@ def _is_control_op(op: str) -> bool:
 
 def _runner_in_container(tokens: list[tuple[str, str, int]],
                          runner_at: list[int]) -> bool:
-    """Whether a container CLI starts any occurrence of the runner: a
+    """Whether a container or remote CLI, or another user's shell
+    (`_CONTAINER_CLIS`), starts any occurrence of the runner: a
     top-level word in that occurrence's own simple command, before it — not
     in an earlier command (`docker compose up -d db && pytest x`), not among
     its arguments, and not inside a substitution that only computes a value
@@ -33588,10 +33592,17 @@ def _runner_in_container(tokens: list[tuple[str, str, int]],
     environment, and a report path it cannot create fails a run whose tests
     pass. A brace expansion there could build any name — a container CLI,
     a shell, `eval` (`{docker,} run img pytest x`, `{eval,} jest`) — so it
-    counts too, and withholds the report on both routes."""
+    counts too, and withholds the report on both routes; bash expands none
+    in a `NAME=` assignment (`X='{"a":1,"b":2}' npx jest`), so those are
+    skipped. The braces are read from unquoted text, which the scan has
+    lost by now, so a quoted `'{a,b}'` argument before the runner refuses
+    too — a report lost, never a misplacement. So does a package or folder
+    named like a listed CLI (`yarn workspace toolbox jest`)."""
     return any(
-        k == "word" and d == 0 and (os.path.basename(t) in _CONTAINER_CLIS
-                                    or _BRACE_EXPANSION_RE.search(t))
+        k == "word" and d == 0 and (
+            os.path.basename(t) in _CONTAINER_CLIS
+            or (_BRACE_EXPANSION_RE.search(t)
+                and not _ASSIGNMENT_RE.match(t)))
         for at in runner_at
         for k, t, d in tokens[_command_start(tokens, at):at])
 
@@ -33642,13 +33653,39 @@ def _may_expand_to_builtin(word: str) -> bool:
     """Whether a command word an expansion builds (`$E jest`,
     `$(echo eval) jest`) could be a builtin: unknowable, so yes — unless a
     `/` stands in it outside any `${…}`, `$(…)` or backticks, since a name
-    with a `/` is never looked up as a builtin (`$VENV/bin/python`, while
+    with a `/` is not looked up as a builtin (`$VENV/bin/python`, while
     `${E%/}` could still be `eval`). This refuses `$NPX jest`, which then
-    runs without a report."""
+    runs without a report. A reading, not a proof: an unquoted expansion
+    whose value holds a space splits the word (`E='eval '; $E/x jest`),
+    which no reading of the text can know — taken as a contrived shape."""
     if "$" not in word and "`" not in word:
         return False
-    literal = re.sub(r"\$\{[^}]*\}|\$\([^)]*\)|`[^`]*`", "", word)
-    return "/" not in literal
+    return "/" not in _outside_expansions(word)
+
+
+def _outside_expansions(word: str) -> str:
+    """`word` without its `${…}`, `$(…)` and backtick parts, nesting
+    included (`${E:-${F}/}` is wholly an expansion)."""
+    out: list[str] = []
+    depth = 0
+    in_backticks = False
+    i = 0
+    while i < len(word):
+        two = word[i:i + 2]
+        if not in_backticks and two in ("${", "$("):
+            depth += 1
+            i += 2
+            continue
+        if word[i] == "`" and not depth:
+            in_backticks = not in_backticks
+        elif depth and word[i] in "})":
+            depth -= 1
+        elif depth and word[i] in "{(":
+            depth += 1
+        elif not depth and not in_backticks:
+            out.append(word[i])
+        i += 1
+    return "".join(out)
 
 
 def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:

@@ -6119,14 +6119,17 @@ syntactic: the flags reach the runner when its command is the runner or a
 wrapper that passes arguments on (`npx jest`, `uv run pytest`). A command
 that merely names the runner as an argument (`./run.sh jest`) is not told
 apart and receives the flags itself, as it has since reports were
-introduced. A runner started through a container or remote CLI — `docker`,
-`podman`, `nerdctl`, `kubectl`, `oc`, `lima`, `finch`, `apptainer`, `ssh`,
-`su` and the rest of `_CONTAINER_CLIS`, or a brace expansion that could
-build one — earlier in the simple command of any occurrence of the runner,
-not a container started by an earlier command nor one queried inside a
-`$(…)` for a value — is not asked at all: it cannot see the orchestrator's
-environment, and a report path it cannot create would fail a run whose
-tests pass.
+introduced. A runner started through a container or remote CLI, or as
+another user — `docker`, `podman`, `nerdctl`, `kubectl`, `oc`, `lima`,
+`finch`, `apptainer`, `ssh`, `su`, `sudo` and the rest of
+`_CONTAINER_CLIS`, or a brace expansion that could build one (never a
+`NAME=` value, which bash does not brace-expand) — earlier in the simple
+command of any occurrence of the runner, not a container started by an
+earlier command nor one queried inside a `$(…)` for a value — is not asked
+at all: it cannot see the orchestrator's environment, and a report path it
+cannot create would fail a run whose tests pass. Matching is by name, so a
+package or folder named like one of these before the runner (`yarn
+workspace toolbox jest`) also loses the report.
 
 A file that ran no test, or could not be loaded, is no verdict and
 discards its set (the gate then has less to check, never a false failure)
