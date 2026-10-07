@@ -32994,19 +32994,39 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
         # inside `$(…)`) still names its runner: its exit codes matter even
         # where no report can be placed.
         try:
-            words = shlex.split(cmd, posix=False)
+            words = shlex.split(cmd[:_first_comment(cmd)])
         except ValueError:
             return None
-        # A comment starts at an unquoted word beginning with `#`: quotes
-        # are kept here so a quoted `'#x'` is not one, and `shlex`'s own
-        # comment handling would also cut a mid-word one (`r.git#sub=py`).
-        cut = next((n for n, w in enumerate(words) if w.startswith("#")),
-                   len(words))
-        tokens = [("word", w.strip("'\""), 0) for w in words[:cut]]
+        tokens = [("word", w, 0) for w in words]
     for runner in known:
         if _runner_positions(tokens, runner, files, top_level=False):
             return runner
     return None
+
+
+def _first_comment(cmd: str) -> int:
+    """Index of the first comment in `cmd` — a `#` that starts an unquoted
+    word — or its length. For the detection fallback only, where the scan
+    could not close the command: `shlex`'s own comment handling would also
+    cut a mid-word `#` (`r.git#sub=py`), and its non-POSIX mode, which keeps
+    quotes, also splits a quoted word at its spaces."""
+    quote = ""
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote == "'":
+            quote = "" if ch == "'" else quote
+        elif ch == "\\":
+            i += 2
+            continue
+        elif quote == '"':
+            quote = "" if ch == '"' else quote
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|()<>"):
+            return i
+        i += 1
+    return len(cmd)
 
 
 def _acceptance_no_verdict_exits(cmd: str, files: Iterable[str] = ()
@@ -33047,7 +33067,9 @@ _TEXT_BUILTINS = frozenset({"eval", "source", "."})
 # A shell variable assignment word (`FOO=bar`), a fixed syntax.
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 # Words that still run what follows as the command (`_command_word`).
-_COMMAND_PREFIXES = frozenset({"!", "time", "command", "builtin"})
+_COMMAND_PREFIXES = frozenset({"!", "time", "command", "builtin", "coproc"})
+# A redirect's fd word: a number, or a `{name}` the shell allocates.
+_FD_WORD_RE = re.compile(r"\d+|\{[A-Za-z_][A-Za-z0-9_]*\}")
 # Unquoted characters that end a word and form operators (parens apart).
 _SHELL_OPERATOR_CHARS = frozenset(";&|<>\n")
 # A word appended to check where appended flags would land.
@@ -33341,7 +33363,8 @@ def _ansi_c_escape(cmd: str, i: int) -> tuple[str, int]:
     keeps its backslash, as bash does (`$'\}'` is `\}`). The span always
     matches bash's, so word boundaries do; the text can differ where bash
     emits raw bytes (`\x80`-`\xff`, octal above `\177`, `\U` beyond
-    Unicode) or ends the string at a NUL."""
+    Unicode, a lone surrogate `\uD800`, `\c` before a non-ASCII
+    character) or ends the string at a NUL."""
     nxt = cmd[i + 1:i + 2]
     if nxt in _ANSI_C_SIMPLE:
         return _ANSI_C_SIMPLE[nxt], 2
@@ -33387,10 +33410,22 @@ def _runner_positions(tokens: list[tuple[str, str, int]], runner: str,
 def _command_start(tokens: list[tuple[str, str, int]], at: int) -> int:
     """Index of the first token of the simple command holding `tokens[at]`:
     the one after the last top-level control operator before it. A redirect
-    (`2>&1`, `<in.txt`) is part of its command, not the end of one."""
-    return max((i for i, (k, t, d) in enumerate(tokens[:at])
-                if k == "op" and d == 0 and _is_control_op(t)),
-               default=-1) + 1
+    (`2>&1`, `<in.txt`) is part of its command, not the end of one — also
+    when it shares an operator run with the control operator before it
+    (`true;>o eval x`): the command then starts at that run, whose redirect
+    part is its own."""
+    last = max((i for i, (k, t, d) in enumerate(tokens[:at])
+                if k == "op" and d == 0 and _is_control_op(t)), default=-1)
+    if last >= 0 and _ends_in_redirect(tokens[last][1]):
+        return last
+    return last + 1
+
+
+def _ends_in_redirect(op: str) -> bool:
+    """Whether an operator run's last operator is a redirect, so the word
+    after the run is that redirect's target."""
+    return op not in ("(", ")") and _split_shell_ops(op)[-1] in (
+        _SHELL_REDIRECT_OPS)
 
 
 # bash's operators, longest first so a run splits as bash splits it: `>|`
@@ -33470,9 +33505,11 @@ def _takes_runner_as_text(tokens: list[tuple[str, str, int]],
                           at: int) -> bool:
     """Whether the runner at `tokens[at]` is text for another program: a
     shell anywhere before it in its command (`timeout 60 sh -c jest`), or
-    the builtin `eval`, `source` or `.` as the command word — after any
-    `NAME=value` assignments. A builtin cannot be wrapped, and a bare `.`
-    elsewhere is an ordinary argument (`npx --prefix . jest`)."""
+    the builtin `eval`, `source` or `.` as the command word, found as bash
+    finds it (`_command_word`: past redirects, assignments and the prefixes
+    that still run what follows). A builtin cannot be wrapped by another
+    program, and a bare `.` elsewhere is an ordinary argument
+    (`npx --prefix . jest`)."""
     start = _command_start(tokens, at)
     words = [t for k, t, d in tokens[start:at] if k == "word" and d == 0]
     if any(os.path.basename(t) in _SHELLS for t in words):
@@ -33482,28 +33519,36 @@ def _takes_runner_as_text(tokens: list[tuple[str, str, int]],
 
 def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:
     """The word bash runs as the command of a simple command's leading
-    `tokens`: past redirects and their targets (`>o`, `2>&1`, `<in`), `NAME=`
-    / `NAME+=` / `NAME[i]=` assignments, and the prefixes that still run
-    what follows as the command (`!`, `time [-p]`, `command`, `builtin`)."""
+    `tokens`: past redirects, their fds and targets (`>o`, `2>&1`, `<in`,
+    `{fd}>x`), `NAME=` / `NAME+=` / `NAME[i]=` assignments, and the
+    prefixes that still run what follows as the command, with their options
+    (`!`, `time -p`, `command -p`, `builtin --`, `coproc`)."""
     words: list[str] = []
     skip_target = False
     for n, (k, t, d) in enumerate(tokens):
         if d:
             continue
         if k == "op":
-            skip_target = not _is_control_op(t)
+            skip_target = _ends_in_redirect(t)
             continue
         if skip_target:
             skip_target = False
             continue
         nxt = tokens[n + 1] if n + 1 < len(tokens) else None
-        if (t.isdigit() and nxt is not None and nxt[0] == "op"
-                and not _is_control_op(nxt[1])):
-            continue  # the fd number of a redirect (`2>&1`)
+        if (_FD_WORD_RE.fullmatch(t) and nxt is not None
+                and nxt[0] == "op" and nxt[1] not in ("(", ")")
+                and _split_shell_ops(nxt[1])[0] in _SHELL_REDIRECT_OPS):
+            continue  # the fd of a redirect (`2>&1`, `{fd}>x`)
         words.append(t)
-    for n, t in enumerate(words):
-        if _ASSIGNMENT_RE.match(t) or t in _COMMAND_PREFIXES or (
-                t == "-p" and n and words[n - 1] == "time"):
+    options_of_prefix = False
+    for t in words:
+        if t in _COMMAND_PREFIXES:
+            options_of_prefix = True
+            continue
+        if options_of_prefix and t.startswith("-"):
+            continue  # `command -p`, `time -p`, `builtin --`
+        options_of_prefix = False
+        if _ASSIGNMENT_RE.match(t):
             continue
         return t
     return None

@@ -5057,3 +5057,22 @@ Fuzz, not committed: 15,000 templates with shells, `eval`, `source`, `.`,
 containers and wrappers behind random redirects, assignments and
 prefixes; of the 5,880 placed, none put the flags into `eval`, a sourced
 script, a shell or a container stub under real bash.
+
+##### Review round 2 of the edge-case fixes (2026-10-07)
+
+- **Four shapes the command-word finder still missed** — a separator and
+  a redirect fused in one operator run (`true;>o eval jest \;`, where the
+  command now starts at the run, `_ends_in_redirect`), a `{fd}>x`
+  redirect (`_FD_WORD_RE`), prefix options (`command -p`, `time -p --`,
+  `builtin --`) and `coproc`. Seven cases in
+  `test_continuations_and_comments_are_read_as_bash_reads_them`, one of
+  them a fused run that still places.
+- **The detection fallback** (`_first_comment`) cuts at the first comment
+  found by a quote-aware pass, then splits POSIX-style: round 1's
+  `posix=False` split a quoted word at its spaces (`-run='Foo pytest'`
+  named pytest) and read a quoted `#` as a comment. Two cases in
+  `test_runner_detection_reads_operators_as_the_shell_does`.
+
+Six reversions, each caught: no fused-run start, no `{fd}`, no prefix
+options, no `coproc`, the `posix=False` fallback, and a comment finder
+blind to quotes.

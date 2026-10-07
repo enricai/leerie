@@ -791,6 +791,16 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     ("A+=1 eval jest \\;", False),
     ("a[0]=1 eval jest acc/a.test.js", False),
     ("2>&1 npx jest acc/a.test.js", True),
+    # A separator fused with a redirect in one operator run, a `{fd}`
+    # redirect, prefix options and `coproc` hide no builtin either
+    # (#286 round-2 review).
+    ("true;>o eval jest \\;", False),
+    ("false ||>o . ./run.sh jest acc/a.test.js", False),
+    ("{fd}>x eval jest \\;", False),
+    ("command -p eval jest \\;", False),
+    ("time -p -- eval jest \\;", False),
+    ("coproc eval jest \\;", False),
+    ("true;>o npx jest acc/a.test.js", True),
     # `.`, `source` and `eval` are builtins: only the command word counts,
     # and a bare `.` argument is just a path.
     ("npx --prefix . jest acc/a.test.js", True),
@@ -946,6 +956,11 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     ("X=$(case a in a) echo 1;; esac) go test ./... # pytest later", None),
     # ...nor is a quoted `'#x'` a comment there...
     ("X=$(case a in a) echo;; esac) '#x' pytest acc/t.py", "pytest"),
+    # ...nor is a runner named inside a quoted word...
+    ("X=$(case a in a) echo;; esac) go test -run='Foo pytest'", None),
+    # ...and a quoted `#` does not hide a later runner.
+    ("X=$(case a in a) echo;; esac) go test --x='a #b' && pytest x",
+     "pytest"),
     # ...and a mid-word `#` there is not a comment either.
     ("X=$(case a in a) echo 1;; esac) uvx --from git+https://e.test/r.git"
      "#subdirectory=py pytest acc/t.py", "pytest"),
