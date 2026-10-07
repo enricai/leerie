@@ -79,12 +79,39 @@ def test_blocked_subtask_dies_after_integrating_the_rest(leerie, tmp_path, monke
     monkeypatch.setattr(leerie, "integrate_wave",
                         mock.AsyncMock(return_value=["feat-001"]))
 
+    st.data["stop_on_blocked"] = True
     with pytest.raises(SystemExit):
         asyncio.run(leerie.phase_execute(tmp_path, st, caps, {}, {}))
 
     assert st.data["blocked"]["feat-002"] == "missing API key"
     # completed_waves must NOT advance — the wave never fully settled.
     assert st.data["completed_waves"] == 0
+
+
+def test_blocked_subtask_auto_accepted_by_default(leerie, tmp_path, monkeypatch):
+    st = _mock_st([["feat-001", "feat-002"]])
+    caps = dict(leerie.DEFAULT_CAPS)
+    caps["max_parallel"] = 5
+    _patch_common(leerie, monkeypatch)
+
+    async def fake_settle(sid, *a, **k):
+        if sid == "feat-001":
+            return {"status": "complete", "intent": "x", "criteria_results": []}
+        return {"status": "blocked", "blocker": "missing API key"}
+
+    monkeypatch.setattr(leerie, "_settle_subtask", fake_settle)
+    monkeypatch.setattr(leerie, "integrate_wave",
+                        mock.AsyncMock(return_value=["feat-001"]))
+    st.data["stop_on_blocked"] = False
+    asyncio.run(leerie.phase_execute(tmp_path, st, caps, {}, {}))
+
+    rec = st.data["accepted_blocked"]["feat-002"]
+    assert rec["blocker"] == "missing API key"
+    assert rec["previous_status"] == "blocked" and rec["forced"] is False
+    assert rec["at"]
+    assert st.data["subtask_status"]["feat-002"] == "complete"
+    assert "feat-002" not in (st.data.get("blocked") or {})
+    assert st.data["completed_waves"] == 1
 
 
 def test_conflict_marker_left_behind_dies(leerie, tmp_path, monkeypatch):

@@ -37204,7 +37204,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                     f"auto-accepted and skipped (pass --stop-on-blocked to "
                     f"halt instead): {blocker_text}")
                 accepted[s] = {
-                    "at": datetime.datetime.now(datetime.timezone.utc)
+                    "at": datetime.now(timezone.utc)
                           .strftime("%Y-%m-%dT%H:%M:%SZ"),
                     "previous_status": results[s].get("status"),
                     "blocker": blocker_text,
