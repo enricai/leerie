@@ -7192,6 +7192,12 @@ external` prerequisites (DESIGN §5), `resume` retries it — which
 blocks again indefinitely. The `accept-blocked` verb lets the operator
 acknowledge the external block so `resume` skips that subtask.
 
+By default the wave loop auto-accepts blocked subtasks with a warning
+(writing the same `accepted_blocked` entry, `forced: false`), so this
+verb is the manual path used under `--stop-on-blocked`
+(`LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked`), where a blocked wave
+`die()`s with `wave N has unresolved subtasks`.
+
 - **`leerie accept-blocked <run-id> <subtask-id> [--runtime fly|local|ec2] [--force]`**
   — sets `subtask_status[sid]` to `"complete"` in state.json and
   removes the sid from the `blocked` dict (if present). On `resume`,

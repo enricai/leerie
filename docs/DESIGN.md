@@ -600,9 +600,15 @@ unsatisfied prerequisites are `extent: external`, the worker discovers
 the dependency is missing (e.g. no Postgres server in the container) and
 returns `status: blocked`; the orchestrator doesn't gate dispatch on
 external preconditions, so `resume` would block again indefinitely.
-`accept-blocked <run-id> <subtask-id>` sets `subtask_status[sid]` to
-`complete` so `resume` skips it, keeping external preconditions a human
-concern.
+By default the orchestrator itself settles a blocked or failed subtask
+once its wave finishes: it logs a warning, records the same
+`accepted_blocked` entry the verb would, marks the subtask `complete`
+and continues (the wave's successful subtasks are integrated first).
+With `--stop-on-blocked` (`LEERIE_STOP_ON_BLOCKED`, `stop_on_blocked` in
+`leerie.toml`) the run instead halts with `wave has unresolved
+subtasks`, and `accept-blocked <run-id> <subtask-id>` is the manual path:
+it sets `subtask_status[sid]` to `complete` so `resume` skips it,
+keeping external preconditions a human concern.
 
 **The integration gate needs the same escape hatch, for a sharper
 reason:** `integrate_wave` dies on a behavioral defect from
