@@ -32994,14 +32994,15 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
         # inside `$(…)`) still names its runner: its exit codes matter even
         # where no report can be placed.
         try:
-            words = shlex.split(cmd)
+            words = shlex.split(cmd, posix=False)
         except ValueError:
             return None
-        # A comment starts at a word that begins with `#` (`shlex`'s own
-        # comment handling would also cut a mid-word one, `r.git#sub=py`).
+        # A comment starts at an unquoted word beginning with `#`: quotes
+        # are kept here so a quoted `'#x'` is not one, and `shlex`'s own
+        # comment handling would also cut a mid-word one (`r.git#sub=py`).
         cut = next((n for n, w in enumerate(words) if w.startswith("#")),
                    len(words))
-        tokens = [("word", w, 0) for w in words[:cut]]
+        tokens = [("word", w.strip("'\""), 0) for w in words[:cut]]
     for runner in known:
         if _runner_positions(tokens, runner, files, top_level=False):
             return runner
@@ -33044,7 +33045,9 @@ _SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
 # (`_takes_runner_as_text`).
 _TEXT_BUILTINS = frozenset({"eval", "source", "."})
 # A shell variable assignment word (`FOO=bar`), a fixed syntax.
-_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
+_ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
+# Words that still run what follows as the command (`_command_word`).
+_COMMAND_PREFIXES = frozenset({"!", "time", "command", "builtin"})
 # Unquoted characters that end a word and form operators (parens apart).
 _SHELL_OPERATOR_CHARS = frozenset(";&|<>\n")
 # A word appended to check where appended flags would land.
@@ -33204,6 +33207,10 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             frames.append(["sub", None, 0])
             i += 2
             continue
+        if ch == "$" and nxt == "$":
+            add("$$")  # the PID parameter: `$${` is not `${`
+            i += 2
+            continue
         if ch == "$" and nxt == "{":
             add("${")
             frames.append(["brace", None, 0])
@@ -33308,7 +33315,7 @@ def _shell_scan(cmd: str) -> tuple[list[tuple[str, str, int]], bool] | None:
             j = max(j, i + 1)  # always advance, whatever the input
             op = cmd[i:j]
             heredoc = heredoc or any(
-                o in ("<<", "<<-") for o in _split_shell_ops(op))
+                o == "<<" for o in _split_shell_ops(op))
             end_word()
             tokens.append(("op", op, depth()))
             i = j
@@ -33331,7 +33338,10 @@ def _ansi_c_escape(cmd: str, i: int) -> tuple[str, int]:
     r"""The text of the `$'…'` escape starting at the backslash `cmd[i]`, and
     how many characters it spans: bash's simple escapes, octal `\nnn`, hex
     `\xHH`, `\uHHHH`/`\UHHHHHHHH` and control `\cX`; any other escape
-    keeps its backslash, as bash does (`$'\}'` is `\}`)."""
+    keeps its backslash, as bash does (`$'\}'` is `\}`). The span always
+    matches bash's, so word boundaries do; the text can differ where bash
+    emits raw bytes (`\x80`-`\xff`, octal above `\177`, `\U` beyond
+    Unicode) or ends the string at a NUL."""
     nxt = cmd[i + 1:i + 2]
     if nxt in _ANSI_C_SIMPLE:
         return _ANSI_C_SIMPLE[nxt], 2
@@ -33343,10 +33353,20 @@ def _ansi_c_escape(cmd: str, i: int) -> tuple[str, int]:
             digits = re.match(r"[0-9a-fA-F]{0,%d}" % width,
                               cmd[i + 2:]).group()
             if digits:
-                return chr(int(digits, 16)), 2 + len(digits)
+                value = int(digits, 16)
+                # Beyond Unicode bash emits bytes; this is word text only.
+                return (chr(value) if value <= 0x10FFFF else "\ufffd",
+                        2 + len(digits))
             return "\\" + lead, 2
-    if nxt == "c" and i + 2 < len(cmd):
-        return chr(ord(cmd[i + 2]) & 0x1F), 3
+    if nxt == "c":
+        ctl = cmd[i + 2:i + 3]
+        if ctl in ("", "'"):
+            return "\\c", 2  # nothing to control: kept, as bash keeps it
+        if ctl == "\\":
+            # `\c\\` is 0x1c; `\c\X` is 0x1c then X.
+            follow = cmd[i + 3:i + 4]
+            return "\x1c" + ("" if follow == "\\" else follow), 4
+        return ("\x7f" if ctl == "?" else chr(ord(ctl) & 0x1F)), 3
     return "\\" + nxt, 2
 
 
@@ -33378,7 +33398,9 @@ def _command_start(tokens: list[tuple[str, str, int]], at: int) -> int:
 # `&` then `>`.
 _SHELL_CONTROL_OPS = (";;&", "||", "&&", ";;", ";&", "|&", ";", "&", "|",
                       "\n")
-_SHELL_REDIRECT_OPS = ("&>>", "<<<", "<<-", "<<", "<>", "<&", ">&", ">>",
+# (`<<-` lexes as `<<` then a `-EOF` word: `-` is not an operator
+# character.)
+_SHELL_REDIRECT_OPS = ("&>>", "<<<", "<<", "<>", "<&", ">&", ">>",
                        ">|", "&>", "<", ">")
 
 
@@ -33455,8 +33477,36 @@ def _takes_runner_as_text(tokens: list[tuple[str, str, int]],
     words = [t for k, t, d in tokens[start:at] if k == "word" and d == 0]
     if any(os.path.basename(t) in _SHELLS for t in words):
         return True
-    command = next((t for t in words if not _ASSIGNMENT_RE.match(t)), None)
-    return command in _TEXT_BUILTINS
+    return _command_word(tokens[start:at]) in _TEXT_BUILTINS
+
+
+def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:
+    """The word bash runs as the command of a simple command's leading
+    `tokens`: past redirects and their targets (`>o`, `2>&1`, `<in`), `NAME=`
+    / `NAME+=` / `NAME[i]=` assignments, and the prefixes that still run
+    what follows as the command (`!`, `time [-p]`, `command`, `builtin`)."""
+    words: list[str] = []
+    skip_target = False
+    for n, (k, t, d) in enumerate(tokens):
+        if d:
+            continue
+        if k == "op":
+            skip_target = not _is_control_op(t)
+            continue
+        if skip_target:
+            skip_target = False
+            continue
+        nxt = tokens[n + 1] if n + 1 < len(tokens) else None
+        if (t.isdigit() and nxt is not None and nxt[0] == "op"
+                and not _is_control_op(nxt[1])):
+            continue  # the fd number of a redirect (`2>&1`)
+        words.append(t)
+    for n, t in enumerate(words):
+        if _ASSIGNMENT_RE.match(t) or t in _COMMAND_PREFIXES or (
+                t == "-p" and n and words[n - 1] == "time"):
+            continue
+        return t
+    return None
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:

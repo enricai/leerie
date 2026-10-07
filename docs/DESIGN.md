@@ -6093,9 +6093,8 @@ mind (a quoted `"("` is a word, not a paren; an escaped quote inside
 command of its own once its backslashes are undone), a line continuation
 joining lines, a comment starting only at a word, a newline ending a
 command as `;` does — noting how deep in command substitutions each token
-sits. It is a reading, not
-bash: the tests pin it against bash's own argv. The file under test never
-counts as the runner, even when named like one. There is no report when,
+sits. It is a reading, not bash: the tests pin it against bash's own argv.
+The file under test never counts as the runner, even when named like one. There is no report when,
 from the runner on, anything but words follows at the top level (a
 separator, pipe, redirect, or a `)` closing a subshell the runner runs in
 — a `$(…)` among its arguments is not that), when a `--` after it would
@@ -6103,7 +6102,9 @@ make the flags file arguments, when the appended word would fall into a
 trailing comment or be joined by a trailing backslash, when the command
 has a heredoc (its body is text, not commands), when the runner runs
 inside a substitution, or when a shell comes before it in its command,
-or `eval`, `source` or `.` is that command — each takes what follows as
+or `eval`, `source` or `.` is that command (found as bash finds it: past
+redirects, assignments and the `!`, `time`, `command` and `builtin`
+prefixes) — each takes what follows as
 text or as a script, not as a program and its arguments (`sh -c jest`,
 `timeout 60 sh -c jest`, `bash run.sh jest`, `eval jest`), while a bare
 `.` argument is just a path (`npx --prefix . jest`). Operators are read

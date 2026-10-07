@@ -5030,3 +5030,30 @@ Seven reversions, each caught: no backslash removal in backtick bodies,
 the old per-character control test, builtins anywhere, a fallback with
 `shlex`'s comments, keeping `$'…'` escapes verbatim, no `${…}` escapes,
 and a heredoc only as a bare `<<`.
+
+##### Review round 1 of the edge-case fixes (2026-10-07)
+
+- **The command word is found as bash finds it** (`_command_word`): the
+  first version took a redirect's target (`>o eval jest \;`), an fd number
+  (`2>/dev/null eval …`) or a prefix (`!`, `time -p`, `command`,
+  `builtin`) for the command, so `eval`, `source` and `.` hid behind them
+  again — 140 of 2,934 fuzzed placements sent flags to `eval` or a sourced
+  script. `_ASSIGNMENT_RE` now also matches `NAME+=` and `NAME[i]=`. Nine
+  cases in `test_continuations_and_comments_are_read_as_bash_reads_them`.
+- **`\c` spans what bash spans** (`$'\c'`, `$'\c\\'`, `$'\c\''`,
+  `$'\c?'` in `test_scanned_words_are_the_words_bash_passes`), and `\U`
+  beyond Unicode no longer raises
+  (`test_expanding_words_split_where_bash_splits_them`, which also gained
+  `$${`, read as the PID parameter).
+- **A quoted `'#x'` is not a comment in the detection fallback**
+  (`test_runner_detection_reads_operators_as_the_shell_does`).
+
+Eleven reversions, each caught: no redirect-target skip, no fd skip, no
+prefixes, no `time -p`, the old assignment pattern, `$'\c'` consuming the
+quote, no `\c\` case, `\c?` as 0x1f, `chr` beyond Unicode, `$$` as `$`
+then `${`, and a fallback that drops quotes.
+
+Fuzz, not committed: 15,000 templates with shells, `eval`, `source`, `.`,
+containers and wrappers behind random redirects, assignments and
+prefixes; of the 5,880 placed, none put the flags into `eval`, a sourced
+script, a shell or a container stub under real bash.

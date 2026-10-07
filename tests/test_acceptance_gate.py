@@ -780,6 +780,17 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     ("source run.sh jest acc/a.test.js", False),
     ("sh >|o -c jest", False),
     ("FOO=1 . run.sh jest acc/a.test.js", False),
+    # The command word is found as bash finds it: past redirects, their fd
+    # numbers, any assignment form, and `!`/`time`/`command`/`builtin`.
+    (">o eval jest \\;", False),
+    ("2>/dev/null eval jest \\;", False),
+    ("<in . run.sh jest acc/a.test.js", False),
+    ("! eval jest \\;", False),
+    ("time -p eval jest acc/a.test.js", False),
+    ("command . run.sh jest acc/a.test.js", False),
+    ("A+=1 eval jest \\;", False),
+    ("a[0]=1 eval jest acc/a.test.js", False),
+    ("2>&1 npx jest acc/a.test.js", True),
     # `.`, `source` and `eval` are builtins: only the command word counts,
     # and a bare `.` argument is just a path.
     ("npx --prefix . jest acc/a.test.js", True),
@@ -850,7 +861,8 @@ def _bash_argv(args: str) -> list[str]:
     out = subprocess.run(["bash", "-c",
                           "IFS=; set -f; printf '%s\\0' " + args],
                          capture_output=True, check=False).stdout
-    return out.decode().split("\0")[:-1]
+    # Bytes that are not UTF-8 (`$'\U00110000'`) survive as surrogates.
+    return out.decode(errors="surrogateescape").split("\0")[:-1]
 
 
 def _scanned_args(leerie, args: str) -> list[str]:
@@ -869,6 +881,8 @@ def _scanned_args(leerie, args: str) -> list[str]:
     # backslash.
     "$'\\t'x", "$'\\x41B'", "$'\\101'", "$'\\cA'", "$'\\e'",
     "$'\\}'", "$'\\q'",
+    # `\c` with nothing to control, with a backslash, with `?`.
+    "$'\\c' x", "$'\\c\\\\'", "$'\\c\\''", "$'\\c?'",
 ])
 def test_scanned_words_are_the_words_bash_passes(leerie, args):
     """Literal words: the scan's top-level words are bash's argv exactly."""
@@ -888,6 +902,10 @@ def test_scanned_words_are_the_words_bash_passes(leerie, args):
     "${U:-x\\} y} c", "${U:-\\'q} c", '${U:-\\"q} c',
     # A comment inside backticks ends at the closing backtick.
     "`echo a #b` c",
+    # `$$` is the PID parameter: `$${` opens no `${…}`.
+    "$${ x",
+    # Beyond Unicode, `\U` is still one word (bash emits bytes).
+    "$'\\U00110000' x",
     # A backtick body is a command of its own once `\\` becomes `\`
     # there, so `\\"` in it is an escaped quote.
     '`echo a\\\\";` c',
@@ -926,6 +944,8 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     # named only in a comment.
     ("X=$(case a in a) echo 1;; esac) pytest acc/t.py", "pytest"),
     ("X=$(case a in a) echo 1;; esac) go test ./... # pytest later", None),
+    # ...nor is a quoted `'#x'` a comment there...
+    ("X=$(case a in a) echo;; esac) '#x' pytest acc/t.py", "pytest"),
     # ...and a mid-word `#` there is not a comment either.
     ("X=$(case a in a) echo 1;; esac) uvx --from git+https://e.test/r.git"
      "#subdirectory=py pytest acc/t.py", "pytest"),
