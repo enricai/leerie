@@ -156,10 +156,14 @@ past run, use `--all-runs --branches`.
 
 **A subtask reports `blocked`.** The implementer hit something it cannot
 resolve (an external dependency, an ambiguous spec, a failing test it
-cannot fix). The wave aborts *before* integration, the blocker reason
-lands in `<state-root>/runs/<run-id>/state.json`, and Leerie exits
-non-zero. You read the blocker, fix the upstream issue, then `./leerie
-resume`. See [`DESIGN.md`](DESIGN.md) §8 for the evidence-gated loop
+cannot fix). By default Leerie logs a warning, auto-accepts the subtask
+(it is marked complete and skipped), integrates the wave's successful
+subtasks and continues. Pass `--stop-on-blocked` (or set
+`LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked` in `leerie.toml`) to halt
+instead: the blocker reason lands in
+`<state-root>/runs/<run-id>/state.json` and Leerie exits non-zero. You
+read the blocker, fix the upstream issue (or `./leerie accept-blocked`),
+then `./leerie resume`. See [`DESIGN.md`](DESIGN.md) §8 for the evidence-gated loop
 logic that produces this signal.
 
 **Integration fails.** The integrator can't merge a subtask branch into
