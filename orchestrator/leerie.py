@@ -32993,40 +32993,127 @@ def _acceptance_runner(cmd: str, known: Iterable[str],
         # A shape the scan cannot close (an unparenthesised `case` pattern
         # inside `$(…)`) still names its runner: its exit codes matter even
         # where no report can be placed.
-        try:
-            words = shlex.split(cmd[:_first_comment(cmd)])
-        except ValueError:
-            return None
-        tokens = [("word", w, 0) for w in words]
+        tokens = [("word", w, 0)
+                  for w in _rough_words(_strip_comments(cmd))]
     for runner in known:
         if _runner_positions(tokens, runner, files, top_level=False):
             return runner
     return None
 
 
-def _first_comment(cmd: str) -> int:
-    """Index of the first comment in `cmd` — a `#` that starts an unquoted
-    word — or its length. For the detection fallback only, where the scan
-    could not close the command: `shlex`'s own comment handling would also
-    cut a mid-word `#` (`r.git#sub=py`), and its non-POSIX mode, which keeps
-    quotes, also splits a quoted word at its spaces."""
+def _strip_comments(cmd: str) -> str:
+    r"""`cmd` with every comment removed up to (not including) its newline —
+    a comment being a `#` that starts an unquoted word, as bash reads it.
+    For the detection fallback only, where `_shell_scan` could not close
+    the command, so this pass must not need to close it either. Quotes
+    (including `$'…'` with its escapes), backslash escapes, `${…}` (a `#`
+    there is an operator) and backticks are tracked; a `)` that closes a
+    `$(…)`, `<(…)` or `>(…)` ends a word part (`$(echo u)#sub` is one word)
+    while a subshell's `)` is an operator a comment may follow. `shlex`'s
+    own comment handling would cut a mid-word `#` (`r.git#sub=py`), and its
+    non-POSIX mode, which keeps quotes, splits a quoted word at its spaces.
+    """
+    out: list[str] = []
     quote = ""
+    braces = 0
+    parens: list[bool] = []  # True for a substitution's paren
+    boundary = True
     i = 0
     while i < len(cmd):
-        ch = cmd[i]
-        if quote == "'":
-            quote = "" if ch == "'" else quote
-        elif ch == "\\":
+        ch, nxt = cmd[i], cmd[i + 1:i + 2]
+        if quote in ("'", "$'"):
+            if quote == "$'" and ch == "\\":
+                out.append(cmd[i:i + 2])
+                i += 2
+                continue
+            if ch == "'":
+                quote = ""
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            out.append(cmd[i:i + 2])
+            boundary = False
             i += 2
             continue
-        elif quote == '"':
-            quote = "" if ch == '"' else quote
-        elif ch in "'\"":
+        if quote == '"':
+            if ch == '"':
+                quote = ""
+            out.append(ch)
+            i += 1
+            continue
+        if ch == "#" and boundary:
+            while i < len(cmd) and cmd[i] not in "\n`":
+                i += 1
+            continue
+        if ch == "$" and nxt == "'":
+            quote = "$'"
+            out.append("$'")
+            i += 2
+            boundary = False
+            continue
+        if ch in "'\"":
             quote = ch
-        elif ch == "#" and (i == 0 or cmd[i - 1] in " \t\n;&|()<>"):
-            return i
+        elif ch == "{" and out and out[-1].endswith("$"):
+            braces += 1
+        elif ch == "}" and braces:
+            braces -= 1
+        elif ch == "(":
+            parens.append(bool(out) and out[-1][-1:] in ("$", "<", ">"))
+        elif ch == ")" and parens:
+            subst = parens.pop()
+            out.append(ch)
+            i += 1
+            boundary = not subst
+            continue
+        out.append(ch)
+        boundary = ch in " \t\n;&|<>(" and not braces
         i += 1
-    return len(cmd)
+    return "".join(out)
+
+
+def _rough_words(text: str) -> list[str]:
+    """`text` split at unquoted blanks and operator characters, quotes
+    removed (`$'…'` with its escapes) — enough to match runner names in a
+    command `_shell_scan` could not close, where `shlex` fails on `$'…'`
+    and an unbalanced quote just ends the last word."""
+    words: list[str] = []
+    word: list[str] | None = None
+    quote = ""
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if quote:
+            if ch == "\\" and quote != "'" and i + 1 < len(text):
+                word.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote[-1]:
+                quote = ""
+            else:
+                word.append(ch)
+            i += 1
+            continue
+        if ch == "\\":
+            word = (word or []) + [text[i + 1:i + 2]]
+            i += 2
+            continue
+        if ch == "$" and text[i + 1:i + 2] == "'":
+            word, quote = word or [], "$'"
+            i += 2
+            continue
+        if ch in "'\"":
+            word, quote = word or [], ch
+        elif ch in " \t\n;&|<>()":
+            if word is not None:
+                words.append("".join(word))
+            word = None
+        else:
+            word = (word or []) + [ch]
+        i += 1
+    if word is not None:
+        words.append("".join(word))
+    return words
 
 
 def _acceptance_no_verdict_exits(cmd: str, files: Iterable[str] = ()
@@ -33053,12 +33140,14 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
 # Container CLIs: a runner started through one gets no report request
 # (`_acceptance_report_spec`).
 _CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
-                             "kubectl"})
+                             "kubectl", "finch", "ctr", "buildah",
+                             "apptainer", "singularity"})
 # Shells: they take what follows as shell text or a script to run, not a
 # program and its arguments, so appended flags become their own arguments
 # (`sh -c jest` -> `$0`). Recognised anywhere before the runner in its
 # command, since a wrapper can start one (`timeout 60 sh -c jest`).
-_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh"})
+_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash",
+                     "yash", "fish", "csh", "tcsh"})
 # Builtins that take what follows as text or a script — appended flags are
 # re-parsed as commands (`eval jest \;`) or become a script's arguments
 # (`. run.sh jest`) — recognised only as the command word
@@ -33514,7 +33603,11 @@ def _takes_runner_as_text(tokens: list[tuple[str, str, int]],
     words = [t for k, t, d in tokens[start:at] if k == "word" and d == 0]
     if any(os.path.basename(t) in _SHELLS for t in words):
         return True
-    return _command_word(tokens[start:at]) in _TEXT_BUILTINS
+    command = _command_word(tokens[start:at])
+    # A command word an expansion builds (`$E jest`, `$(echo eval) jest`)
+    # may be any of them: unknowable, so treated as one.
+    return command is not None and (command in _TEXT_BUILTINS
+                                    or "$" in command or "`" in command)
 
 
 def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:

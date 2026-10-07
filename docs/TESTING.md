@@ -5067,7 +5067,8 @@ script, a shell or a container stub under real bash.
   `builtin --`) and `coproc`. Seven cases in
   `test_continuations_and_comments_are_read_as_bash_reads_them`, one of
   them a fused run that still places.
-- **The detection fallback** (`_first_comment`) cuts at the first comment
+- **The detection fallback** (`_first_comment`, replaced in round 3 by
+  `_strip_comments`) cuts at the first comment
   found by a quote-aware pass, then splits POSIX-style: round 1's
   `posix=False` split a quoted word at its spaces (`-run='Foo pytest'`
   named pytest) and read a quoted `#` as a comment. Two cases in
@@ -5076,3 +5077,26 @@ script, a shell or a container stub under real bash.
 Six reversions, each caught: no fused-run start, no `{fd}`, no prefix
 options, no `coproc`, the `posix=False` fallback, and a comment finder
 blind to quotes.
+
+##### Review round 3 of the edge-case fixes (2026-10-07)
+
+- **A comment ends at its newline in the detection fallback too**
+  (`_strip_comments`, which replaces round 2's `_first_comment`): round 1
+  and 2 cut the command from the first comment to its end, so a runner on
+  a later line was lost. The pass also tracks `$'…'`, `${…}`, backticks
+  and substitution parens, so `$(echo u)#sub` and `${A:-a #b}` hide
+  nothing; `_rough_words` replaces `shlex.split` there, which fails on
+  `$'…'`. Six cases in
+  `test_runner_detection_reads_operators_as_the_shell_does`.
+- **A command word an expansion builds** (`$E jest`, `$(echo eval) jest`)
+  is treated as a builtin that takes the runner as text: it may be one.
+- **More shells and container CLIs**: `ash`, `mksh`, `yash`, `fish`,
+  `csh`, `tcsh`; `finch`, `ctr`, `buildah`, `apptainer`, `singularity`.
+  Six cases across the placement and container tests.
+
+Eight reversions, each caught: a comment to the end of the command, a
+substitution's `)` as an operator, `${…}` ignored, `$'…'` ignored,
+expansion command words allowed, the old shell list, the old container
+list, and `shlex.split` in the fallback. Two more pieces of the first
+draft (a second `${…}` check and a backtick boundary) survived their
+reversions as redundant and were dropped.

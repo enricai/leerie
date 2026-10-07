@@ -710,6 +710,8 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     ("docker run -i img <in.txt npx jest acc/a.test.js", False),
     # `>|` is a redirect (noclobber override), not `>` and a pipe.
     ("docker run img >|out npx jest acc/a.test.js", False),
+    ("finch run img npx jest acc/a.test.js", False),
+    ("apptainer exec img.sif npx jest acc/a.test.js", False),
     ("docker compose up -d db >|log && npx jest acc/a.test.js", True),
     ("docker compose up -d db 2>&1 && npx jest acc/a.test.js", True),
     # A subshell's `)` and a following `&&` end the container's command.
@@ -801,6 +803,12 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     ("time -p -- eval jest \\;", False),
     ("coproc eval jest \\;", False),
     ("true;>o npx jest acc/a.test.js", True),
+    # A command word an expansion builds could be `eval` (#286 round 3).
+    ("$(echo eval) jest \\;", False),
+    ("E=eval; $E jest \\;", False),
+    # More shells take the runner as text.
+    ("2>&1 ash -c jest acc/a.test.js", False),
+    ("fish run.fish jest acc/a.test.js", False),
     # `.`, `source` and `eval` are builtins: only the command word counts,
     # and a bare `.` argument is just a path.
     ("npx --prefix . jest acc/a.test.js", True),
@@ -960,6 +968,19 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     ("X=$(case a in a) echo;; esac) go test -run='Foo pytest'", None),
     # ...and a quoted `#` does not hide a later runner.
     ("X=$(case a in a) echo;; esac) go test --x='a #b' && pytest x",
+     "pytest"),
+    # A comment ends at its newline: a runner on a later line counts
+    # (#286 round 3).
+    ("X=$(case a in a) echo;; esac)\n# run it\npytest acc/t.py", "pytest"),
+    ("X=$(case a in a) echo;; esac)\ngo test # unit\npytest acc/t.py",
+     "pytest"),
+    # A `#` after a substitution's `)`, inside `${…}`, inside `$'…'` or
+    # inside backticks does not hide the rest of the line.
+    ("X=$(case a in a) echo;; esac) uvx --from git+$(echo u)#sub=py "
+     "pytest acc/t.py", "pytest"),
+    ("X=$(case a in a) echo;; esac) go ${A:-a #b} && pytest x", "pytest"),
+    ("X=$(case a in a) echo;; esac) go $'a\\'b #c' && pytest x", "pytest"),
+    ("X=$(case a in a) echo;; esac) go test `echo #x` pytest acc/t.py",
      "pytest"),
     # ...and a mid-word `#` there is not a comment either.
     ("X=$(case a in a) echo 1;; esac) uvx --from git+https://e.test/r.git"

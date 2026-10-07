@@ -6104,24 +6104,25 @@ when the command has a heredoc (its body is text, not commands), when the
 runner runs inside a substitution, or when a shell comes before it in its
 command, or `eval`, `source` or `.` is that command (found as bash finds
 it: past redirects and their fds, assignments, and the `!`, `time`,
-`command`, `builtin` and `coproc` prefixes with their options) — each
-takes what follows as text or as a script, not as a program and its
-arguments (`sh -c jest`, `timeout 60 sh -c jest`, `bash run.sh jest`,
-`eval jest`), while a bare `.` argument is just a path (`npx --prefix .
-jest`). Operators are read as bash reads them, longest first, so a
-redirect (`2>&1`, `<in.txt`, `>|out`) belongs to its command and ends
+`command`, `builtin` and `coproc` prefixes with their options) or a
+command word an expansion builds (`$E jest` could be `eval`) — each takes
+what follows as text or as a script, not as a program and its arguments
+(`sh -c jest`, `timeout 60 sh -c jest`, `fish run.fish jest`, `bash run.sh
+jest`, `eval jest`), while a bare `.` argument is just a path (`npx
+--prefix . jest`). Operators are read as bash reads them, longest first,
+so a redirect (`2>&1`, `<in.txt`, `>|out`) belongs to its command and ends
 nothing, and neither this nor the container check below can be hidden
 behind one. The placement is syntactic: the flags reach the runner when
 its command is the runner or a wrapper that passes arguments on (`npx
 jest`, `uv run pytest`). A command that merely names the runner as an
 argument (`./run.sh jest`) is not told apart and receives the flags
 itself, as it has since reports were introduced. A runner started through
-a container CLI — `docker`, `docker-compose`, `podman`, `nerdctl` or
-`kubectl` earlier in the simple command of any occurrence of the runner,
-not a container started by an earlier command nor one queried inside a
-`$(…)` for a value — is not asked at all: it cannot see the orchestrator's
-environment, and a report path it cannot create would fail a run whose
-tests pass.
+a container CLI — `docker`, `docker-compose`, `podman`, `nerdctl`,
+`kubectl`, `finch`, `ctr`, `buildah`, `apptainer` or `singularity` earlier
+in the simple command of any occurrence of the runner, not a container
+started by an earlier command nor one queried inside a `$(…)` for a value
+— is not asked at all: it cannot see the orchestrator's environment, and a
+report path it cannot create would fail a run whose tests pass.
 
 A file that ran no test, or could not be loaded, is no verdict and
 discards its set (the gate then has less to check, never a false failure)
