@@ -634,6 +634,10 @@ def test_pytest_is_asked_for_junit_through_its_environment(
     ("(cd sub && python3 -m pytest --junitxml=own.xml {f})", False),
     # A wrapper's own `--` before the runner proper is not the runner's.
     ("uv run --with pytest -- pytest --junitxml=own.xml {f}", True),
+    # A `/` outside the expansion means no builtin lookup: placed; without
+    # one the word could be `eval`: refused (#286 round 4).
+    ("$VENV/bin/python -m pytest --junitxml=own.xml {f}", True),
+    ("$PYTHON -m pytest --junitxml=own.xml {f}", False),
     ("pytest --junitxml=own.xml $(echo -q) {f}", True),
     ("docker compose run app pytest --junitxml=own.xml {f}", False),
 ])
@@ -711,6 +715,11 @@ def test_a_file_named_like_a_runner_does_not_borrow_its_exit_codes(leerie):
     # `>|` is a redirect (noclobber override), not `>` and a pipe.
     ("docker run img >|out npx jest acc/a.test.js", False),
     ("finch run img npx jest acc/a.test.js", False),
+    ("lima npx jest acc/a.test.js", False),
+    # The environment route is withheld too.
+    ("{docker,} run img pytest acc/test_a.py", False),
+    ("ssh ci-host npx jest acc/a.test.js", False),
+    ("{docker,} run img npx jest acc/a.test.js", False),
     ("apptainer exec img.sif npx jest acc/a.test.js", False),
     ("docker compose up -d db >|log && npx jest acc/a.test.js", True),
     ("docker compose up -d db 2>&1 && npx jest acc/a.test.js", True),
@@ -806,6 +815,12 @@ def test_a_newline_ends_the_runner_command(leerie, tmp_path):
     # A command word an expansion builds could be `eval` (#286 round 3).
     ("$(echo eval) jest \\;", False),
     ("E=eval; $E jest \\;", False),
+    # A brace expansion builds names too (#286 round 4).
+    ("{eval,} jest acc/a.test.js \\;", False),
+    ("{sh,} -c jest", False),
+    # An expansion-built command word could be anything: refused, at the
+    # cost of the report.
+    ("$NPX jest acc/a.test.js", False),
     # More shells take the runner as text.
     ("2>&1 ash -c jest acc/a.test.js", False),
     ("fish run.fish jest acc/a.test.js", False),
@@ -982,6 +997,16 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
     ("X=$(case a in a) echo;; esac) go $'a\\'b #c' && pytest x", "pytest"),
     ("X=$(case a in a) echo;; esac) go test `echo #x` pytest acc/t.py",
      "pytest"),
+    # A backtick inside a comment is part of the comment (#286 round 4)...
+    ("X=$(case a in a) echo;; esac)\n# see `foo`, don't\npytest acc/t.py",
+     "pytest"),
+    ("X=$(case a in a) echo;; esac)\n# don't run `x` pytest here\ntrue",
+     None),
+    # ...`$$'` is the PID then a quote, and a continuation keeps the word
+    # boundary before it.
+    ("X=$(case a in a) echo;; esac) echo $$'\\' #c\npytest x", "pytest"),
+    ("X=$(case a in a) echo;; esac) echo $$'\\' # pytest\ntrue", None),
+    ("X=$(case a in a) echo;; esac) echo a \\\n#c'\npytest x", "pytest"),
     # ...and a mid-word `#` there is not a comment either.
     ("X=$(case a in a) echo 1;; esac) uvx --from git+https://e.test/r.git"
      "#subdirectory=py pytest acc/t.py", "pytest"),

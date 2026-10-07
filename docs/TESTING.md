@@ -5092,7 +5092,8 @@ blind to quotes.
   is treated as a builtin that takes the runner as text: it may be one.
 - **More shells and container CLIs**: `ash`, `mksh`, `yash`, `fish`,
   `csh`, `tcsh`; `finch`, `ctr`, `buildah`, `apptainer`, `singularity`.
-  Six cases across the placement and container tests.
+  Four cases across the placement and container tests (the two
+  expansion-word cases above make six).
 
 Eight reversions, each caught: a comment to the end of the command, a
 substitution's `)` as an operator, `${…}` ignored, `$'…'` ignored,
@@ -5100,3 +5101,31 @@ expansion command words allowed, the old shell list, the old container
 list, and `shlex.split` in the fallback. Two more pieces of the first
 draft (a second `${…}` check and a backtick boundary) survived their
 reversions as redundant and were dropped.
+
+##### Review round 4 of the edge-case fixes (2026-10-07)
+
+- **A backtick in a comment is part of the comment**: `_strip_comments`
+  now knows whether it is inside a backtick body, and only there does a
+  backtick end a comment. Round 3's version stopped at any backtick, so
+  `# see `foo`, don't` opened a quote that hid the next line's runner
+  (a regression against main). It also reads `$$` as the PID and keeps
+  the word boundary across a line continuation; `_rough_words` reads `$$`
+  too. Five cases in `test_runner_detection_reads_operators_as_the_shell_does`.
+- **The expansion rule narrowed** (`_may_expand_to_builtin`): a `/` outside
+  `${…}`, `$(…)` and backticks means no builtin lookup, so
+  `$VENV/bin/python -m pytest --junitxml=…` places again; `$NPX jest` and
+  `$PYTHON -m pytest --junitxml=…` are still refused, at their report's
+  cost (cases in `test_a_command_naming_its_own_junit_path_gets_ours_appended`
+  and `test_continuations_and_comments_are_read_as_bash_reads_them`).
+- **Brace expansion** (`{eval,} jest`, `{sh,} -c jest`,
+  `{docker,} run img pytest …`) withholds the report in the container
+  check; more shells (`rbash`) and container or remote CLIs (`oc`,
+  `lima`, `colima`, `podman-remote`, `nerdctl.lima`, `lxc`, `distrobox`,
+  `toolbox`, `flatpak`, `ssh`, `fly`, `gcloud`, `su`).
+
+Eight reversions, each caught: a backtick ending any comment, no `$$` in
+the stripper, a continuation clearing the boundary, no `$$` in
+`_rough_words`, no `/` narrowing, no brace check, no `ssh`, and no
+`lima`. A first-draft brace check in `_takes_runner_as_text`
+survived its reversion — the container check already withholds the whole
+report — and was dropped.

@@ -33007,9 +33007,11 @@ def _strip_comments(cmd: str) -> str:
     For the detection fallback only, where `_shell_scan` could not close
     the command, so this pass must not need to close it either. Quotes
     (including `$'…'` with its escapes), backslash escapes, `${…}` (a `#`
-    there is an operator) and backticks are tracked; a `)` that closes a
-    `$(…)`, `<(…)` or `>(…)` ends a word part (`$(echo u)#sub` is one word)
-    while a subshell's `)` is an operator a comment may follow. `shlex`'s
+    there is an operator), backticks (a comment in a backtick body ends at
+    its closing backtick, one outside it does not) and `$$` are tracked;
+    a `)` that closes a `$(…)`, `<(…)` or `>(…)` ends a word part
+    (`$(echo u)#sub` is one word) while a subshell's `)` is an operator a
+    comment may follow. `shlex`'s
     own comment handling would cut a mid-word `#` (`r.git#sub=py`), and its
     non-POSIX mode, which keeps quotes, splits a quoted word at its spaces.
     """
@@ -33017,6 +33019,7 @@ def _strip_comments(cmd: str) -> str:
     quote = ""
     braces = 0
     parens: list[bool] = []  # True for a substitution's paren
+    in_backticks = False
     boundary = True
     i = 0
     while i < len(cmd):
@@ -33033,9 +33036,14 @@ def _strip_comments(cmd: str) -> str:
             continue
         if ch == "\\":
             out.append(cmd[i:i + 2])
-            boundary = False
+            # A line continuation is removed by bash: a `#` after it still
+            # starts a word if one would have before it.
+            if nxt != "\n":
+                boundary = False
             i += 2
             continue
+        if ch == "`":
+            in_backticks = not in_backticks
         if quote == '"':
             if ch == '"':
                 quote = ""
@@ -33043,8 +33051,16 @@ def _strip_comments(cmd: str) -> str:
             i += 1
             continue
         if ch == "#" and boundary:
-            while i < len(cmd) and cmd[i] not in "\n`":
+            # A comment inside a backtick body ends at its closing backtick;
+            # elsewhere a backtick is just part of the comment.
+            stop = "\n`" if in_backticks else "\n"
+            while i < len(cmd) and cmd[i] not in stop:
                 i += 1
+            continue
+        if ch == "$" and nxt == "$":
+            out.append("$$")  # the PID parameter, so `$$'` opens no `$'…'`
+            boundary = False
+            i += 2
             continue
         if ch == "$" and nxt == "'":
             quote = "$'"
@@ -33098,6 +33114,10 @@ def _rough_words(text: str) -> list[str]:
             word = (word or []) + [text[i + 1:i + 2]]
             i += 2
             continue
+        if ch == "$" and text[i + 1:i + 2] == "$":
+            word = (word or []) + ["$$"]  # the PID: `$$'` opens no `$'…'`
+            i += 2
+            continue
         if ch == "$" and text[i + 1:i + 2] == "'":
             word, quote = word or [], "$'"
             i += 2
@@ -33137,22 +33157,29 @@ _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
     "vitest": ("jest-json", "--reporter=json --outputFile={path}"),
 }
 
-# Container CLIs: a runner started through one gets no report request
-# (`_acceptance_report_spec`).
-_CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman", "nerdctl",
-                             "kubectl", "finch", "ctr", "buildah",
-                             "apptainer", "singularity"})
+# Container and remote CLIs (and `su`, which runs its command elsewhere as
+# another user): a runner started through one gets no report request
+# (`_acceptance_report_spec`) — it cannot see our environment, and a report
+# path it cannot create fails a run whose tests pass.
+_CONTAINER_CLIS = frozenset({"docker", "docker-compose", "podman",
+                             "podman-remote", "nerdctl", "nerdctl.lima",
+                             "lima", "colima", "kubectl", "oc", "finch",
+                             "ctr", "buildah", "apptainer", "singularity",
+                             "lxc", "distrobox", "toolbox", "flatpak", "ssh",
+                             "fly", "gcloud", "su"})
 # Shells: they take what follows as shell text or a script to run, not a
 # program and its arguments, so appended flags become their own arguments
 # (`sh -c jest` -> `$0`). Recognised anywhere before the runner in its
 # command, since a wrapper can start one (`timeout 60 sh -c jest`).
-_SHELLS = frozenset({"sh", "bash", "dash", "zsh", "ksh", "mksh", "ash",
-                     "yash", "fish", "csh", "tcsh"})
+_SHELLS = frozenset({"sh", "bash", "rbash", "dash", "zsh", "ksh", "mksh",
+                     "ash", "yash", "fish", "csh", "tcsh"})
 # Builtins that take what follows as text or a script — appended flags are
 # re-parsed as commands (`eval jest \;`) or become a script's arguments
 # (`. run.sh jest`) — recognised only as the command word
 # (`_takes_runner_as_text`).
 _TEXT_BUILTINS = frozenset({"eval", "source", "."})
+# An unquoted brace expansion (`{a,b}`, `{1..3}`), a fixed syntax.
+_BRACE_EXPANSION_RE = re.compile(r"\{[^{}]*(,|\.\.)[^{}]*\}")
 # A shell variable assignment word (`FOO=bar`), a fixed syntax.
 _ASSIGNMENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(\[[^]]*\])?\+?=")
 # Words that still run what follows as the command (`_command_word`).
@@ -33559,9 +33586,12 @@ def _runner_in_container(tokens: list[tuple[str, str, int]],
     its arguments, and not inside a substitution that only computes a value
     (`PORT=$(docker port db) pytest x`). Such a runner cannot see our
     environment, and a report path it cannot create fails a run whose tests
-    pass."""
+    pass. A brace expansion there could build any name — a container CLI,
+    a shell, `eval` (`{docker,} run img pytest x`, `{eval,} jest`) — so it
+    counts too, and withholds the report on both routes."""
     return any(
-        k == "word" and d == 0 and os.path.basename(t) in _CONTAINER_CLIS
+        k == "word" and d == 0 and (os.path.basename(t) in _CONTAINER_CLIS
+                                    or _BRACE_EXPANSION_RE.search(t))
         for at in runner_at
         for k, t, d in tokens[_command_start(tokens, at):at])
 
@@ -33604,10 +33634,21 @@ def _takes_runner_as_text(tokens: list[tuple[str, str, int]],
     if any(os.path.basename(t) in _SHELLS for t in words):
         return True
     command = _command_word(tokens[start:at])
-    # A command word an expansion builds (`$E jest`, `$(echo eval) jest`)
-    # may be any of them: unknowable, so treated as one.
     return command is not None and (command in _TEXT_BUILTINS
-                                    or "$" in command or "`" in command)
+                                    or _may_expand_to_builtin(command))
+
+
+def _may_expand_to_builtin(word: str) -> bool:
+    """Whether a command word an expansion builds (`$E jest`,
+    `$(echo eval) jest`) could be a builtin: unknowable, so yes — unless a
+    `/` stands in it outside any `${…}`, `$(…)` or backticks, since a name
+    with a `/` is never looked up as a builtin (`$VENV/bin/python`, while
+    `${E%/}` could still be `eval`). This refuses `$NPX jest`, which then
+    runs without a report."""
+    if "$" not in word and "`" not in word:
+        return False
+    literal = re.sub(r"\$\{[^}]*\}|\$\([^)]*\)|`[^`]*`", "", word)
+    return "/" not in literal
 
 
 def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:
