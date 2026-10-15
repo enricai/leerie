@@ -509,12 +509,14 @@ STATE_FIELDS = (
     "stop_on_blocked",
     # stop_on_repo_change: halt (die) when the real checkout changes mid-run
     # instead of warning and continuing (DESIGN §12 L4). Off by default
-    # because 71 of 73 measured halts were the operator's own activity and
-    # none of the other two was a confirmed escape.
+    # because 71 of 73 measured halts carried only operator signatures and
+    # neither of the other two was a confirmed escape.
     "stop_on_repo_change",
-    # repo_change_warned: the `_diff_repo_state` delta strings already logged
-    # as a WARNING. The baseline is never refreshed, so without this every
-    # later phase and wave re-logs a delta the operator has already seen.
+    # repo_change_warned: {delta string: `_delta_fingerprint`} for every delta
+    # already logged as a WARNING. The baseline is never refreshed, so without
+    # it every later phase and wave re-logs a delta the operator has already
+    # seen; the fingerprint re-warns when that path's content moves again, so
+    # a later write to an already-warned path is not hidden.
     "repo_change_warned",
     "skip_satisfied_check",
     "skip_budget_check",
@@ -8033,12 +8035,11 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                 dst = wt / rel
                 if dst.exists():
                     continue          # tracked — the worktree already has it
-                if _tracked_in_checkout(repo_root, src):
-                    # Tracked in the checkout yet absent from the worktree:
-                    # branch content the worktree's commit lacks (the
-                    # operator checked out another branch mid-run). Staging
-                    # it would show the satisfied-probe a deliverable its
-                    # tree does not have.
+                if _switched_branch_only(repo_root, src, st):
+                    # Committed on the branch the operator switched to
+                    # mid-run, absent from the run's own branch: staging it
+                    # would show the satisfied-probe a deliverable its tree
+                    # does not have.
                     continue
                 try:
                     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -8050,7 +8051,8 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                 except Exception:
                     continue
         claude_src, claude_dst = repo_root / ".claude", wt / ".claude"
-        if claude_src.is_dir() and not claude_dst.exists():
+        if (claude_src.is_dir() and not claude_dst.exists()
+                and not _switched_branch_only(repo_root, claude_src, st)):
             try:
                 shutil.copytree(claude_src, claude_dst, dirs_exist_ok=True)
                 staged += 1
@@ -8062,6 +8064,64 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
     except Exception as e:
         log(f"planning worktree: could not stage untracked paths "
             f"(non-fatal): {e}")
+
+
+def _working_branch_ref(repo_root: str | Path, st: "State") -> str | None:
+    """The full ref (`refs/heads/<name>`) of the branch the run started on,
+    or None when there is none to follow (not yet recorded, a detached
+    start, or the branch no longer exists). Tries the recorded name, then
+    the name without a leading `heads/`: `git rev-parse --abbrev-ref HEAD`
+    prints `heads/<name>` when a tag shares the branch's name. The same
+    two-step as `setup-run.sh` / `planning-worktree.sh`, so all three agree
+    on which tree the run follows."""
+    args = _working_branch_arg(st)
+    if not args:
+        return None
+    wb = args[0]
+    candidates = [f"refs/heads/{wb}"]
+    if wb.startswith("heads/"):
+        candidates.append(f"refs/heads/{wb[len('heads/'):]}")
+    for ref in candidates:
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo_root), "show-ref", "--verify",
+                 "--quiet", ref],
+                capture_output=True, text=True, check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode == 0:
+            return ref
+    return None
+
+
+def _switched_branch_only(repo_root: Path, path: Path, st: "State") -> bool:
+    """True when *path* is committed on the branch currently checked out but
+    not on the run's working branch — content of a branch the operator
+    switched to mid-run (DESIGN §12 L2/L4), which must not be staged into
+    the planning worktree. A staged-but-uncommitted or untracked task
+    document answers False, as does any git failure or a run with no branch
+    to follow: the copy then proceeds exactly as before. `git ls-tree`
+    matches paths literally (no pathspec globbing) — mechanical output."""
+    wb_ref = _working_branch_ref(repo_root, st)
+    if wb_ref is None:
+        return False
+    rel = _repo_rel(path, repo_root)
+
+    def _committed(rev: str) -> bool | None:
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only",
+                 rev, "--", rel],
+                capture_output=True, text=True, check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode != 0:
+            return None
+        return bool(r.stdout.strip())
+
+    on_head = _committed("HEAD")
+    on_wb = _committed(wb_ref)
+    return on_head is True and on_wb is False
 
 
 def _working_branch_arg(st: "State") -> list[str]:
@@ -8081,20 +8141,35 @@ async def _base_tree_sha(repo_root: str, st: "State") -> str:
     branch's tip when `_working_branch_arg` names a local branch, else the
     real checkout's HEAD — the same choice `planning-worktree.sh` makes.
 
-    The satisfied-probe cache is keyed on this. Keyed on the live HEAD
+    Resolved through `_working_branch_ref`, the same lookup the script
+    makes. The satisfied-probe cache is keyed on this. Keyed on the live HEAD
     instead, an operator's mid-run branch switch would file verdicts about
     the working branch's tree under the other branch's sha, and a later
     advance of the working branch would never invalidate them (DESIGN §6,
     §12 L4)."""
-    for wb in _working_branch_arg(st):
+    ref = _working_branch_ref(repo_root, st)
+    if ref is not None:
         try:
             r = await run_proc(["git", "rev-parse", "--verify", "--quiet",
-                                f"refs/heads/{wb}"], cwd=repo_root)
+                                ref], cwd=repo_root)
         except OSError:
-            break
-        if r.returncode == 0 and r.stdout.strip():
+            r = None
+        if r is not None and r.returncode == 0 and r.stdout.strip():
             return r.stdout.strip()
     return await _branch_head_sha(repo_root)
+
+
+def _log_working_branch_fallback(proc: subprocess.CompletedProcess,
+                                 where: str) -> None:
+    """Surface the scripts' `warning: working branch '<name>' not found`
+    line. They exit 0 on that fallback, and both callers otherwise print
+    stderr only on failure — so a deleted working branch would silently put
+    the run back on whatever is checked out. Matches the scripts' own fixed
+    prefix: mechanical output, not prose."""
+    err = getattr(proc, "stderr", "")
+    for ln in (err if isinstance(err, str) else "").splitlines():
+        if ln.startswith("warning: working branch "):
+            log(f"WARNING: {where}: {ln[len('warning: '):]}")
 
 
 async def _ensure_planning_worktree(st: "State") -> str:
@@ -8128,6 +8203,7 @@ async def _ensure_planning_worktree(st: "State") -> str:
             "If a previous run left a stale registration behind:\n"
             f"  bash scripts/cleanup.sh --run-id {st.run_id}\n"
             "  ./leerie prune --apply")
+    _log_working_branch_fallback(proc, "planning worktree")
     # The script echoes `planning-worktree: <abs path>` as its last line.
     line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
     path = line.split("planning-worktree:", 1)[-1].strip() if line else ""
@@ -8224,6 +8300,53 @@ def _diff_repo_state(before: dict, after: dict, *,
     return out
 
 
+def _delta_fingerprint(repo_root: Path, delta: str) -> str:
+    """Content fingerprint for one `_diff_repo_state` delta, so a warned
+    delta re-warns when its content moves again. Working-tree deltas are
+    `working tree changed: <porcelain line>` (mechanical git output; a
+    rename's `old -> new` keeps the new path): a file hashes its bytes, a
+    directory (porcelain collapses an untracked one to `dir/`) hashes its
+    sorted (path, size, mtime) entries, capped so a huge tree stays cheap,
+    and a missing path is `absent`. HEAD/ref deltas already carry their
+    sha in the string, so they need none."""
+    prefix = "working tree changed: "
+    if not delta.startswith(prefix):
+        return ""
+    rel = delta[len(prefix):][3:]
+    if " -> " in rel:
+        rel = rel.split(" -> ", 1)[1]
+    rel = rel.strip().strip('"')
+    path = repo_root / rel
+    h = hashlib.sha256()
+    try:
+        if path.is_file():
+            with open(path, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1 << 20), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        if path.is_dir():
+            entries: list[str] = []
+            for dirpath, dirnames, filenames in os.walk(path):
+                dirnames.sort()
+                for name in sorted(filenames):
+                    fp = Path(dirpath) / name
+                    try:
+                        stt = fp.stat()
+                    except OSError:
+                        continue
+                    entries.append(f"{fp.relative_to(path)}\0{stt.st_size}"
+                                   f"\0{stt.st_mtime_ns}")
+                    if len(entries) >= 5000:
+                        break
+                if len(entries) >= 5000:
+                    break
+            h.update("\n".join(entries).encode())
+            return h.hexdigest()
+    except OSError:
+        return "unreadable"
+    return "absent"
+
+
 def _tripwire_operator_overlap(deltas: list[str]) -> bool:
     """True when EVERY delta is a newly-appeared untracked file (porcelain
     `??`) — the measured signature of the operator dropping task/report
@@ -8266,11 +8389,13 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
 
     By default a delta is a WARNING and the run continues; only
     `stop_on_repo_change` makes it die() (DESIGN §12 L4). Measured: 71 of 73
-    halted runs were the operator's own activity and none was a confirmed
+    halted runs carried only operator signatures and none was a confirmed
     escape, while nothing committed or pushed is built from the checkout's
-    working tree. Each distinct delta is warned once (`repo_change_warned`):
-    the baseline is deliberately never refreshed — `_acceptance_validity_base`
-    reads it — so every later check would otherwise repeat it.
+    working tree. Each distinct delta is warned once, and again only if its
+    content moves (`repo_change_warned`, `_delta_fingerprint`): the baseline
+    is deliberately never refreshed — `_acceptance_validity_base` reads it —
+    so every later check would otherwise repeat it. The operator/escape hint
+    classifies each newly-warned batch, not every delta since the baseline.
 
     The execute-phase call passes `porcelain_only` unless the flag is set —
     see `_diff_repo_state`.
@@ -8296,11 +8421,21 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
     if not deltas:
         return
     if not st.data.get("stop_on_repo_change"):
-        warned = st.data.setdefault("repo_change_warned", [])
-        new = [d for d in deltas if d not in warned]
+        warned = st.data.setdefault("repo_change_warned", {})
+        new: list[str] = []
+        prints: dict[str, str] = {}
+        for d in deltas:
+            fp = _delta_fingerprint(Path(st.repo_root), d)
+            if warned.get(d) != fp:
+                # New delta, or one already warned whose content moved since:
+                # the porcelain line alone would hide a later write to a path
+                # the operator had already touched.
+                new.append(d + (" (changed again)" if d in warned else ""))
+                prints[d] = fp
         if not new:
             return
-        if _tripwire_operator_overlap(new):
+        if _tripwire_operator_overlap(
+                [d.removesuffix(" (changed again)") for d in new]):
             hint = ("every change is a newly-added untracked file — most "
                     "likely your own (a task or report file for another "
                     "run), not a worker escape")
@@ -8313,7 +8448,7 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
             + f"\n  ({hint}). Continuing: nothing leerie commits or pushes "
               "is built from your working tree. Pass --stop-on-repo-change "
               "to halt instead.")
-        warned.extend(new)
+        warned.update(prints)
         st.save()
         return
     if _tripwire_operator_overlap(deltas):
@@ -8327,9 +8462,12 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
               "signature of operator activity in this checkout (dropping a "
               "task or report file for another run) rather than a worker "
               "escape, which shows up as tracked-file modifications. The "
-              "run still stops, because its planning baseline moved. If "
-              "those files are yours, no restore is needed — resume "
-              "directly:\n"
+              "run still stops (--stop-on-repo-change), because its planning "
+              "baseline moved — and it stays moved, so resuming with the "
+              "flag still set stops again. If those files are yours, no "
+              "restore is needed — resume without the flag (set "
+              "LEERIE_STOP_ON_REPO_CHANGE=0 if leerie.toml turns it on), and "
+              "the change is logged as a warning instead:\n"
               f"  ./leerie resume {st.run_id}\n"
             "If they are NOT yours, treat this as an escape:\n"
             f"  git -C {st.repo_root} status\n"
@@ -8345,7 +8483,12 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
           f"  git -C {st.repo_root} status\n"
           f"  git -C {st.repo_root} checkout -- <paths>   # tracked edits\n"
           f"  git -C {st.repo_root} clean -i               # files it created\n"
-          f"  ./leerie resume {st.run_id}")
+          f"  ./leerie resume {st.run_id}\n"
+          "If these changes are yours (a pull, a commit, your own edits), "
+          "restoring cannot undo them and resuming with "
+          "--stop-on-repo-change still set stops again: resume without the "
+          "flag (set LEERIE_STOP_ON_REPO_CHANGE=0 if leerie.toml turns it "
+          "on), and they are logged as a warning instead.")
 
 
 def _judgment_cwd(st: "State") -> str:
@@ -11442,24 +11585,6 @@ def _expand_braces(pattern: str) -> list[str]:
     for alt in m.group(1).split(","):
         expanded.extend(_expand_braces(prefix + alt.strip() + suffix))
     return expanded
-
-
-def _tracked_in_checkout(repo_root: Path, path: Path) -> bool:
-    """True when git tracks *path* (or anything beneath it) in the real
-    checkout's current index. Task-reference staging exists for UNTRACKED
-    task documents a fresh worktree cannot see; a tracked path missing from
-    the target worktree is content of whatever branch is checked out, which
-    after a mid-run branch switch (DESIGN §12 L4) is not the run's tree.
-    `git ls-files` output is a mechanical path list. Any failure answers
-    False, keeping the pre-existing copy behaviour."""
-    try:
-        r = subprocess.run(
-            ["git", "-C", str(repo_root), "ls-files", "--",
-             _repo_rel(path, repo_root)],
-            capture_output=True, text=True, check=False, timeout=30)
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return r.returncode == 0 and bool(r.stdout.strip())
 
 
 def _repo_rel(path: Path, repo_root: Path) -> str:
@@ -34294,11 +34419,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         for f in _glob_task_references(task, st.repo_root):
             rel = _repo_rel(f, st.repo_root)
             dst = wt / rel
-            # A path tracked in the checkout but absent at the validity base
-            # is a later commit's (or another branch's) file, not the
-            # untracked report this copy exists for — never copy it in.
-            if (not dst.exists()
-                    and not _tracked_in_checkout(Path(st.repo_root), f)):
+            if not dst.exists():
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(f, dst)
             refs.append(rel)
@@ -37138,6 +37259,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                              *_working_branch_arg(st))
     if proc.returncode != 0:
         die(f"run setup failed: {proc.stderr.strip()}")
+    _log_working_branch_fallback(proc, "phase 4")
 
     # On Fly, machine stop SIGKILLs the orchestrator (PID 1 is sleep
     # infinity; SIGTERM reaps it, kernel SIGKILLs children) — the

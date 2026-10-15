@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import hashlib
 import sys
 from pathlib import Path
 
@@ -32,6 +33,7 @@ def _init(repo: Path) -> Path:
     run_git_repo_first(repo, "init", "-q", ".")
     run_git_repo_first(repo, "config", "user.email", "t@t")
     run_git_repo_first(repo, "config", "user.name", "t")
+    run_git_repo_first(repo, "config", "commit.gpgsign", "false")
     (repo / "src.txt").write_text("original\n")
     run_git_repo_first(repo, "add", "-A")
     run_git_repo_first(repo, "commit", "-qm", "init")
@@ -131,8 +133,10 @@ class TestWarnsOnce:
         _check(leerie, st, "phase 2.5 (reconcile)")
         _check(leerie, st, "phase 3 (filters)")
         assert len(_warnings(logs)) == 1
-        assert st.data["repo_change_warned"] == [
-            "working tree changed: ?? notes.md"]
+        warned = st.data["repo_change_warned"]
+        assert list(warned) == ["working tree changed: ?? notes.md"]
+        assert warned["working tree changed: ?? notes.md"] == \
+            hashlib.sha256(b"x\n").hexdigest()
         assert st.saves == 1
 
     def test_a_new_delta_warns_alone(self, leerie, armed):
@@ -159,6 +163,48 @@ class TestWarnsOnce:
         first, second = _warnings(logs)
         assert "may have escaped" in first
         assert "mine.md" in second and "most likely your own" in second
+
+
+class TestRewarnsWhenContentMoves:
+    """Warn-once must not become warn-never: a write to a path the operator
+    already touched (the shape of a later worker escape) re-warns."""
+
+    def test_a_re_edit_of_a_warned_file_re_warns(self, leerie, armed):
+        repo, st, logs = armed
+        (repo / "src.txt").write_text("operator edit\n")
+        _check(leerie, st, "phase 2 (plan)")
+        _check(leerie, st, "phase 2.5 (reconcile)")
+        (repo / "src.txt").write_text("a later write\n")
+        _check(leerie, st, "phase 5 (wave 1)", porcelain_only=True)
+        first, second = _warnings(logs)
+        assert "src.txt" in first and "changed again" not in first
+        assert "src.txt (changed again)" in second
+        assert "phase 5 (wave 1)" in second
+
+    def test_a_new_file_in_a_warned_untracked_dir_re_warns(
+            self, leerie, armed):
+        """Porcelain collapses an untracked directory to `?? dir/`, so the
+        delta string alone never changes as files land inside it."""
+        repo, st, logs = armed
+        (repo / "notes").mkdir()
+        (repo / "notes" / "a.md").write_text("a\n")
+        _check(leerie, st, "phase 2 (plan)")
+        (repo / "notes" / "b.md").write_text("b\n")
+        _check(leerie, st, "phase 3 (filters)")
+        first, second = _warnings(logs)
+        assert "?? notes/" in first
+        assert "?? notes/ (changed again)" in second
+
+    def test_fingerprint(self, leerie, tmp_path):
+        repo = _init(tmp_path / "repo")
+        fp = leerie._delta_fingerprint
+        assert fp(repo, "working tree changed:  M src.txt") == \
+            hashlib.sha256(b"original\n").hexdigest()
+        assert fp(repo, "working tree changed: ?? gone.md") == "absent"
+        assert fp(repo, "HEAD moved: aaa -> bbb") == ""
+        (repo / "new.txt").write_text("n\n")
+        assert fp(repo, "working tree changed: R  src.txt -> new.txt") == \
+            hashlib.sha256(b"n\n").hexdigest()
 
 
 class TestBaselineUntouched:
@@ -194,6 +240,31 @@ class TestFlagRestoresTheHalt:
             _check(leerie, st)
         assert "recon-next-task.md" in str(ei.value)
         assert _warnings(logs) == []
+
+    @pytest.mark.parametrize("change", ["untracked", "commit"])
+    def test_die_names_the_way_to_continue(
+            self, leerie, tmp_path, monkeypatch, change):
+        """The baseline is never refreshed, so a resume with the flag still
+        set stops again on the same change — and no restore can undo a
+        pull. Both framings must name the path that works."""
+        repo = _init(tmp_path / "repo")
+        st = _St(repo, {"stop_on_repo_change": True})
+        st.data["repo_state_before_planning"] = asyncio.run(
+            leerie._snapshot_repo_state(str(repo)))
+        monkeypatch.setattr(leerie, "die",
+                            lambda m, code=1: (_ for _ in ()).throw(
+                                SystemExit(m)))
+        if change == "untracked":
+            (repo / "mine.md").write_text("x\n")
+        else:
+            (repo / "src.txt").write_text("pulled\n")
+            run_git_repo_first(repo, "commit", "-qam", "pull")
+        with pytest.raises(SystemExit) as ei:
+            _check(leerie, st)
+        msg = str(ei.value)
+        assert "resume without the flag" in msg
+        assert "LEERIE_STOP_ON_REPO_CHANGE=0" in msg
+        assert "./leerie resume r1" in msg
 
     @pytest.mark.parametrize("halt", [False, True])
     def test_execute_wave_call_shape_halts_on_commits_only_with_flag(
@@ -283,7 +354,7 @@ def _resolved_by_main(leerie, monkeypatch, tmp_path: Path,
     monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
     seen: dict[str, bool] = {}
 
-    async def _capture(args, *_a, **_k):
+    async def _capture(args: object, *_a: object, **_k: object) -> None:
         seen["v"] = args.stop_on_repo_change
         raise _ReachedOrchestrate()
 

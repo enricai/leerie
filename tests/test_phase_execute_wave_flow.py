@@ -208,3 +208,40 @@ def test_baseline_exception_is_defense_in_depth_and_does_not_abort(
     asyncio.run(leerie.phase_execute(tmp_path, st, caps, {}, {}))
 
     assert st.data["completed_waves"] == 1
+
+
+@pytest.mark.parametrize("halt", [False, True])
+def test_wave_check_and_setup_run_get_the_working_branch_wiring(
+        leerie, tmp_path, monkeypatch, halt):
+    """Behavioural partner of the source pins in tests/test_work_sentinel.py
+    and tests/test_working_branch_follow.py (DESIGN §12 L4): driven through
+    the real wave loop, setup-run.sh receives the recorded working branch,
+    its fallback warning reaches the log, and the per-wave checkout check is
+    porcelain-only exactly when --stop-on-repo-change is off."""
+    st = _mock_st([["feat-001"]], working_branch="main",
+                  stop_on_repo_change=halt)
+    caps = dict(leerie.DEFAULT_CAPS)
+    caps["max_parallel"] = 5
+    _patch_common(leerie, monkeypatch)
+    run_script = mock.AsyncMock(return_value=mock.Mock(
+        returncode=0,
+        stderr="warning: working branch 'main' not found; using HEAD\n"))
+    monkeypatch.setattr(leerie, "_run_script", run_script)
+    check = mock.AsyncMock()
+    monkeypatch.setattr(leerie, "_assert_repo_unchanged", check)
+    logs: list[str] = []
+    monkeypatch.setattr(leerie, "log", logs.append)
+    monkeypatch.setattr(
+        leerie, "_settle_subtask",
+        mock.AsyncMock(return_value={"status": "complete", "intent": "x",
+                                     "criteria_results": []}))
+    monkeypatch.setattr(leerie, "integrate_wave",
+                        mock.AsyncMock(return_value=["feat-001"]))
+
+    asyncio.run(leerie.phase_execute(tmp_path, st, caps, {}, {}))
+
+    assert run_script.await_args_list[0].args == (
+        "setup-run.sh", st.run_id, "main")
+    assert any("working branch 'main' not found" in m for m in logs)
+    check.assert_awaited_once()
+    assert check.await_args.kwargs["porcelain_only"] is (not halt)

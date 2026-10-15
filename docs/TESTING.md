@@ -3880,24 +3880,31 @@ ahead/diverged/no-origin/detached silent, and launcher wiring pins
 **Operator-overlap tripwire framing**, in
 `tests/test_tripwire_operator_signature.py`: predicate truth table
 (all-untracked true; tracked / mixed / HEAD / ref / empty false) paired
-with behavioral message tests through the real `_assert_repo_unchanged` —
-including that a worker adding a file ON TOP of a tracked edit is never
-softened.
+with behavioral message tests through the real `_assert_repo_unchanged`
+under `--stop-on-repo-change` — including that a worker adding a file ON
+TOP of a tracked edit is never softened there (the warn-by-default path
+classifies each newly-warned batch instead; see below).
 
 **Warn-by-default sentinel**, in `tests/test_repo_change_warn_default.py`:
 drives the real `_assert_repo_unchanged` against a real git repo with
 `stop_on_repo_change` off — no exit, the WARNING carries the delta and the
 operator/escape hint (asserted by value, not by the absence of a raise);
 a persisting delta is warned once across repeated checks and a new one
-warns alone; the baseline is untouched after a warning (it feeds
+warns alone, but a re-edit of a warned file, or a new file inside a warned
+`?? dir/`, re-warns as "changed again" (`_delta_fingerprint`); the
+baseline is untouched after a warning (it feeds
 `_acceptance_validity_base`); with the flag on, a HEAD move dies under the
-execute-wave call shape that is silent by default. Plus
+execute-wave call shape (through the real `_execute_check_porcelain_only`)
+that is silent by default, and both die framings name the way to continue
+past one's own changes (resume without the flag). Plus
 `resolve_stop_on_repo_change` precedence with disagreeing inputs, and
 `main()` wiring driven for real up to `_orchestrate` (env alone, flag
-alone, neither). The execute call shape goes through the real
-`_execute_check_porcelain_only`. The
-die-asserting tests in `tests/test_work_sentinel.py` and
-`tests/test_tripwire_operator_signature.py` set the flag explicitly.
+alone, neither). The die-asserting tests in `tests/test_work_sentinel.py`
+and `tests/test_tripwire_operator_signature.py` set the flag explicitly.
+`tests/test_phase_execute_wave_flow.py` drives the real wave loop:
+`setup-run.sh` receives the working branch, its fallback warning is
+logged, and the per-wave check is porcelain-only exactly when the flag is
+off.
 
 **Run follows its working branch**, in `tests/test_working_branch_follow.py`:
 real repos and the real `setup-run.sh` / `planning-worktree.sh` — with the
@@ -3911,14 +3918,19 @@ wiring at both call sites, and the satisfied-probe cache key:
 the worktree on (a live-HEAD key, the pre-fix behaviour, fails it after a
 branch switch), with the HEAD fallback for no / `HEAD` / unknown branch.
 Behavioural partners for what was first pinned only by source: the
-switch-then-advance incident driven through the real
-`_filter_satisfied_subtasks` (one re-probe, entry re-filed under the
-advanced tip — red against a live-HEAD key); a vanished recorded branch
-warns on stderr in both scripts, and `setup-run.sh` still records the
-requested name. Task-reference staging: a task-named file that only the
-switched-to branch tracks is not staged into the planning worktree, while
-the untracked task document still is (`_tracked_in_checkout`, plus a pin
-that the acceptance writer's copy applies the same rule).
+switch-then-advance incident driven through two real
+`_filter_satisfied_subtasks` sweeps (two probes; a live-HEAD key trusts
+the stale verdict and probes once); a vanished recorded branch warns on
+stderr in both scripts, `setup-run.sh` still records the requested name,
+and `_ensure_planning_worktree` logs the warning while ordinary git stderr
+stays quiet; a branch shadowed by a same-named tag (recorded as
+`heads/<name>`) is still followed by both scripts and `_base_tree_sha`.
+Task-reference staging (`_switched_branch_only`): a deliverable or
+`.claude/` committed only on the switched-to branch is not staged, while
+an untracked report, a `git add`-ed-but-uncommitted document, an
+untracked `.claude/` and a file committed on the run's own branch after
+the reset all are; a truth table includes literal matching of
+`[`-bearing names and a git failure answering False.
 
 **Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
 the observable (1 on a clean first pass, 3 when flagged — a gate that

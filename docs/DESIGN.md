@@ -1787,12 +1787,12 @@ subtask that was never really judged.
 
 **Correctness-critical: the cache is scoped to the base-tree commit sha,
 and a resume across a moved base tree (the working branch's tip, else
-`HEAD`) invalidates it.** This is a distinct
-hazard from the mid-run sibling case §8 describes (where the run's *own*
-later wave changes what's satisfied): here the gap is between a *pause*
-and a *resume* of the same run, during which some other process —
-commonly a sibling run merging its own PR into the same base branch — can
-move `HEAD` out from under a cached verdict. A stale hit is not a harmless
+`HEAD`) invalidates it.** This is a distinct hazard from the mid-run
+sibling case §8 describes (where the run's *own* later wave changes
+what's satisfied): here the gap is between a *pause* and a *resume* of
+the same run, during which some other process — commonly a sibling run
+merging its own PR into the same base branch — can move that base out
+from under a cached verdict. A stale hit is not a harmless
 inefficiency: it can keep a subtask whose deliverable now already exists
 (which a fresh probe would catch), or drop one that no longer holds
 (silently discarding real work). So the cache is keyed on the base commit
@@ -7016,7 +7016,8 @@ is often a prior run's branch.
 
 The fix is a **base-health checkpoint**, code-computed and advisory (never a
 gate — same §12 reasoning as the conformer's own axes). Once per run, after
-the staging worktree is created off the base HEAD but **before any wave
+the staging worktree is created off the base (the working branch's tip,
+else HEAD — §12 L4) but **before any wave
 mutates it**, the orchestrator installs the provision recipe into staging
 and runs the resolved build/lint/test commands there directly — the
 earliest tree where an accurate baseline can be taken, since deps live only
@@ -7358,11 +7359,12 @@ its branch — the result behind L2's caveat below.
 
 **L2 — they run in a disposable worktree.** A detached worktree per run,
 reset on entry to the recorded working branch's tip, else the checkout's
-HEAD (`scripts/planning-worktree.sh`; see L4). Only untracked task
-documents and an untracked `.claude/` are copied in
-(`_stage_worktree_extras`): a task-named path the checkout *tracks* is
-branch content, and after a mid-run branch switch it would be the wrong
-branch's (`_tracked_in_checkout`).
+HEAD (`scripts/planning-worktree.sh`; see L4). Task-named documents and
+`.claude/` the worktree lacks are copied in from the checkout
+(`_stage_worktree_extras`) — untracked or merely `git add`-ed ones
+included — except content committed only on a branch the operator
+switched to mid-run, which is not the run's tree (`_switched_branch_only`:
+in `HEAD`, absent from the working branch).
 **L2 is worth nothing without L1** — a worktree is not a boundary, it is
 where the boundary lands once L1 restores one (confirmed above: with the
 flag on, the worktree did not stop the checkout being overwritten).
@@ -7390,41 +7392,52 @@ deliberately, since a worker *creating* files is exactly what a
 clean-tree `??`-filtered gate cannot see.
 
 What it does with a delta is the operator's choice. **By default it logs a
-WARNING and the run continues**; each distinct delta is warned once
-(`repo_change_warned`), since the baseline is never refreshed and every
-later phase would otherwise repeat it. With `--stop-on-repo-change`
-(`LEERIE_STOP_ON_REPO_CHANGE`, `stop_on_repo_change` in `leerie.toml`) it
-`die()`s instead — and, unlike before, also on commits and HEAD moves
-during execute (see *Acting-worker isolation*). The default flipped on
-measured
-cost: across one host's corpus (731 logged runs, 2026-07-26 →
-2026-10-15) the sentinel halted 73 runs, and 71 of them carried only
-operator signatures — `prompt-N.txt`, editor swap files, report `.md`s
-copied in for the next task (the triggering incident: four reports
-`scp`'d into the checkout two minutes into planning, byte-identical to the
-operator's local copies), or
-`main` fast-forwarding under a merged sibling PR. The other two are
+WARNING and the run continues.** Each distinct delta is warned once, and
+again only if its content moves (`repo_change_warned` maps each warned
+delta to a `_delta_fingerprint`): the baseline is never refreshed, so
+every later phase would otherwise repeat it, while a bare warn-once would
+hide a later write to a path the operator had already touched. With
+`--stop-on-repo-change` (`LEERIE_STOP_ON_REPO_CHANGE`,
+`stop_on_repo_change` in `leerie.toml`) it `die()`s instead, during
+execute on commits and HEAD moves as well (see *Acting-worker
+isolation*). Because the baseline stays put, a resume with the flag still
+set stops again on the same change, so the die message names the path
+that works for changes that are the operator's own: resume without the
+flag (`LEERIE_STOP_ON_REPO_CHANGE=0` overrides `leerie.toml`). The
+default flipped on measured cost: across one host's corpus (731 logged
+runs, 2026-07-26 → 2026-10-15) the sentinel halted 73 runs, and 71 of
+them carried only operator signatures — `prompt-N.txt`, editor swap
+files, report `.md`s copied in for the next task (the triggering
+incident: four reports `scp`'d into the checkout two minutes into
+planning, byte-identical to the operator's local copies), or `main`
+fast-forwarding under a merged sibling PR. The other two are
 unattributed — one tracked-file edit, and one HEAD that moved onto a
 commit from another run's branch (the shape of an operator checking that
 branch out to test it) — and no halt was a confirmed escape. Meanwhile
 27 of the 29 runs halted on a HEAD move never got past planning — their
 spend was simply lost. A guard that cries wolf gets switched off, the
 same reasoning behind `porcelain_only` and `_snapshot_repo_state`'s `ok`
-field; downgrading it to a loud warning
-keeps the detection without the cost.
+field; downgrading it to a loud warning keeps the detection without the
+cost.
 
 Continuing past a delta is safe because nothing that is committed, merged
 or pushed is built from the checkout's working tree: the run branch,
 staging and subtask worktrees are all git refs. Both `setup-run.sh` (the
 run branch, cut at phase 4) and `planning-worktree.sh` (re-reset on every
 re-entry) follow the tip of the *recorded working branch*
-(`working_branch`), not whatever happens to be checked out. A pull of that
+(`working_branch`, resolved by `_working_branch_ref` — which also accepts
+the `heads/<name>` form `--abbrev-ref` records when a tag shares the
+name), not whatever happens to be checked out. A pull of that
 branch therefore lands exactly where die-then-`resume` already lands —
 the run executes on the advanced tip — so the default merely skips the
 manual step; and a branch switch (an operator checking out another run's
 branch to test it, the shape behind one of the two unattributed halts)
-cannot silently re-base the run onto the wrong branch. Only a run started
-on a detached HEAD, with no branch to follow, still tracks the live HEAD.
+cannot silently re-base the run onto the wrong branch. The live HEAD is
+still used in three cases: a run started on a detached HEAD (no branch to
+follow), the first planning-worktree reset (before `working_branch` is
+recorded, when nothing can have moved yet), and a recorded branch that no
+longer exists — the scripts warn on that fallback and the orchestrator
+logs it (`_log_working_branch_fallback`).
 The accepted residual: some inputs read the checkout directly — the repo
 map, provisioning, decomposition greps, dependency capture's manifests,
 the build/lint/test commands in `.leerie/config.toml`
@@ -7441,6 +7454,11 @@ message blamed a worker escape and framed resume behind a restore step).
 That signature reads as "likely your own files"; any tracked-file, HEAD,
 or ref delta keeps the worker-escape framing — in the warning a pointer
 to inspect the checkout, under the flag the restore-then-resume steps.
+Under the flag the classification covers every delta since the baseline,
+so a worker's new file beside a tracked edit is never softened; the
+warning classifies each newly-warned batch, so a later batch of only new
+untracked files reads as the operator's even after an earlier batch
+carried a tracked edit — that earlier warning already pointed at it.
 
 This does **not** achieve kernel-level confinement: `/work` is a read-write
 bind mount in the same container for the whole run, and nothing short of a

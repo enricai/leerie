@@ -55,7 +55,8 @@ def _switch_to_other_branch(repo: Path) -> str:
     return _sha(repo, "HEAD")
 
 
-def _run(script: Path, repo: Path, state: Path, *args: str):
+def _run(script: Path, repo: Path, state: Path,
+         *args: str) -> subprocess.CompletedProcess:
     env = dict(os.environ)
     env["LEERIE_STATE_DIR"] = str(state)
     return subprocess.run(["bash", str(script), "r1", *args], cwd=str(repo),
@@ -167,11 +168,11 @@ class TestPlanningWorktree:
 # --- orchestrator wiring ----------------------------------------------------
 
 class _St:
-    def __init__(self, data):
+    def __init__(self, data: dict) -> None:
         self.data = data
         self.run_id = "r1"
 
-    def save(self):
+    def save(self) -> None:
         pass
 
 
@@ -191,7 +192,7 @@ class TestWiring:
             self, leerie, monkeypatch, tmp_path):
         calls = []
 
-        async def fake(name, *args):
+        async def fake(name: str, *args: str) -> subprocess.CompletedProcess:
             calls.append((name, args))
             return subprocess.CompletedProcess(
                 [], 0, stdout=f"planning-worktree: {tmp_path}\n", stderr="")
@@ -253,14 +254,14 @@ class TestSatisfiedCacheKey:
 
     def test_switch_then_advance_reprobes_through_the_real_filter(
             self, leerie, tmp_path, monkeypatch):
-        """The incident the cache-key change exists for, end to end through
-        `_filter_satisfied_subtasks`: a verdict cached at `main`'s tip, the
-        operator switches to another branch, then `main` advances (a sibling
-        PR merges) while HEAD stays put. A live-HEAD key would still match
-        and trust the stale verdict; the base-tree key must re-probe once
-        and re-file the verdict under `main`'s new tip."""
+        """The incident end to end through `_filter_satisfied_subtasks`:
+        the operator is on another branch when the probe runs, then `main`
+        (the run's branch) advances while HEAD stays put. A live-HEAD key
+        files the first verdict under the other branch's sha and, HEAD
+        never having moved, trusts it on the second sweep — one probe. The
+        base-tree key files it under `main`'s tip, sees that tip move, and
+        re-probes — two."""
         repo = _make_repo(tmp_path)
-        sha_a = _sha(repo, "main")
         _switch_to_other_branch(repo)
         st = leerie.State.__new__(leerie.State)
         st.repo_root = "/leerie-test-user-repo"
@@ -275,88 +276,233 @@ class TestSatisfiedCacheKey:
                           "input_tokens": 0, "output_tokens": 0},
             "verbosity": "quiet", "worker_count": 0,
             "working_branch": "main",
-            "satisfied_probe_cache": {
-                "feat-001": {"satisfied": True, "evidence": "at A",
-                             "checked": ["file.txt"], "base_sha": sha_a}},
         }
-        # main advances while the operator stays on `other`.
+        calls: list[str] = []
+
+        async def fake_claude_p(*, user_prompt: str, sid: str,
+                                **_kw: object) -> dict:
+            calls.append(sid)
+            return {"satisfied": False, "evidence": "not yet"}
+
+        monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+        def sweep() -> None:
+            plans = [{"domain": "d", "status": "ready",
+                      "subtasks": [{"id": "feat-001", "title": "feat-001",
+                                    "success_criteria_seed": "done"}]}]
+            assert asyncio.run(leerie._filter_satisfied_subtasks(
+                plans, repo, st,
+                {"max_parallel": 4, "max_total_workers": 999},
+                {"satisfied_probe": "sonnet"},
+                {"satisfied_probe": None})) is None
+
+        sweep()
+        head_before = _sha(repo, "HEAD")
+        # main advances (a sibling PR merges) while HEAD stays on `other`.
         _git("checkout", "-q", "main", cwd=repo)
         (repo / "file.txt").write_text("advanced\n")
         _git("commit", "-q", "-am", "advance", cwd=repo)
-        sha_b = _sha(repo, "main")
         _git("checkout", "-q", "other", cwd=repo)
-        head_sha = _sha(repo, "HEAD")
-        assert head_sha not in (sha_a, sha_b)
-
-        calls: list[str] = []
-
-        async def fake_claude_p(*, user_prompt, sid, **_kw):
-            calls.append(sid)
-            return {"satisfied": False, "evidence": "not on the new tip"}
-
-        monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-        plans = [{"domain": "d", "status": "ready",
-                  "subtasks": [{"id": "feat-001", "title": "feat-001",
-                                "success_criteria_seed": "done"}]}]
-        res = asyncio.run(leerie._filter_satisfied_subtasks(
-            plans, repo, st, {"max_parallel": 4, "max_total_workers": 999},
-            {"satisfied_probe": "sonnet"}, {"satisfied_probe": None}))
-        assert res is None
-        assert calls == ["satisfied_probe-feat-001"]
-        assert [s["id"] for s in plans[0]["subtasks"]] == ["feat-001"]
+        assert _sha(repo, "HEAD") == head_before
+        sweep()
+        assert calls == ["satisfied_probe-feat-001"] * 2
         assert st.data["satisfied_probe_cache"]["feat-001"]["base_sha"] == \
-            sha_b
+            _sha(repo, "main")
+
+
+# --- branch shadowed by a same-named tag ------------------------------------
+
+def _repo_with_tag_shadowed_branch(tmp_path: Path) -> tuple[Path, str]:
+    """Branch `feat` with a tag `feat` on the same commit: `--abbrev-ref`
+    records the branch as `heads/feat`. Then the operator switches to
+    `other`. Returns the repo and `feat`'s sha."""
+    repo = _make_repo(tmp_path)
+    _git("checkout", "-q", "-b", "feat", cwd=repo)
+    (repo / "file.txt").write_text("feat\n")
+    _git("commit", "-q", "-am", "feat", cwd=repo)
+    _git("tag", "feat", cwd=repo)
+    recorded = _git("rev-parse", "--abbrev-ref", "HEAD", cwd=repo).stdout
+    assert recorded.strip() == "heads/feat"
+    feat_sha = _sha(repo, "refs/heads/feat")
+    _switch_to_other_branch(repo)
+    return repo, feat_sha
+
+
+class TestTagShadowedBranch:
+    def test_setup_run_follows_it(self, tmp_path):
+        repo, feat_sha = _repo_with_tag_shadowed_branch(tmp_path)
+        r = _run(SETUP_RUN, repo, tmp_path / "state", "heads/feat")
+        assert r.returncode == 0, r.stderr
+        assert "not found" not in r.stderr
+        assert _sha(repo, "leerie/runs/r1") == feat_sha
+        wb = tmp_path / "state" / "runs" / "r1" / "working-branch"
+        # Recorded verbatim: `heads/feat` is the unambiguous revision the
+        # diff base needs (`feat` alone would resolve to the tag).
+        assert wb.read_text().strip() == "heads/feat"
+
+    def test_planning_worktree_follows_it(self, tmp_path):
+        repo, feat_sha = _repo_with_tag_shadowed_branch(tmp_path)
+        state = tmp_path / "state"
+        r = _run(PLANNING_WT, repo, state, "heads/feat")
+        assert r.returncode == 0, r.stderr
+        assert _planning_head(state) == feat_sha
+
+    def test_base_tree_sha_follows_it(self, leerie, tmp_path):
+        repo, feat_sha = _repo_with_tag_shadowed_branch(tmp_path)
+        st = _St({"working_branch": "heads/feat"})
+        assert asyncio.run(leerie._base_tree_sha(str(repo), st)) == feat_sha
+
+
+# --- fallback warning is surfaced -------------------------------------------
+
+class TestFallbackWarningSurfaced:
+    @pytest.mark.real_planning_worktree
+    def test_ensure_planning_worktree_logs_it(
+            self, leerie, monkeypatch, tmp_path):
+        async def fake(name: str, *args: str) -> subprocess.CompletedProcess:
+            return subprocess.CompletedProcess(
+                [], 0, stdout=f"planning-worktree: {tmp_path}\n",
+                stderr="warning: working branch 'gone' not found; "
+                       "using HEAD\n")
+
+        logs: list[str] = []
+        monkeypatch.setattr(leerie, "_run_script", fake)
+        monkeypatch.setattr(leerie, "log", logs.append)
+        st = _St({"working_branch": "gone"})
+        st.run_dir = tmp_path
+        st.repo_root = tmp_path
+        asyncio.run(leerie._ensure_planning_worktree(st))
+        assert any("working branch 'gone' not found" in m
+                   and m.startswith("WARNING:") for m in logs)
+
+    def test_ordinary_git_stderr_is_not_echoed(self, leerie, monkeypatch):
+        """git prints progress such as `Preparing worktree` on stderr; only
+        the scripts' own fallback line is surfaced."""
+        logs: list[str] = []
+        monkeypatch.setattr(leerie, "log", logs.append)
+        leerie._log_working_branch_fallback(
+            subprocess.CompletedProcess(
+                [], 0, stdout="", stderr="Preparing worktree (detached)\n"),
+            "phase 4")
+        assert logs == []
 
 
 # --- task-reference staging ---------------------------------------------------
 
-def _repo_with_switched_branch_deliverable(tmp_path: Path) -> Path:
-    """`main` lacks `feature.py`; branch `other` tracks it and is checked
-    out; `report.md` is the operator's untracked task document."""
+def _repo_on_switched_branch(tmp_path: Path) -> Path:
+    """`main` is the run's branch. Branch `other` commits `feature.py` and
+    a `.claude/settings.json` that `main` lacks, and is checked out.
+    `report.md` is the operator's untracked task document; `notes.md` is
+    staged (`git add`) but never committed."""
     repo = _make_repo(tmp_path)
     _git("checkout", "-q", "-b", "other", cwd=repo)
     (repo / "feature.py").write_text("DELIVERED = True\n")
-    _git("add", "feature.py", cwd=repo)
-    _git("commit", "-q", "-m", "deliverable", cwd=repo)
+    (repo / ".claude").mkdir()
+    (repo / ".claude" / "settings.json").write_text("{}\n")
+    _git("add", "feature.py", ".claude/settings.json", cwd=repo)
+    _git("commit", "-q", "-m", "other-branch content", cwd=repo)
     (repo / "report.md").write_text("bug report\n")
+    (repo / "notes.md").write_text("spec notes\n")
+    _git("add", "notes.md", cwd=repo)
     return repo
 
 
 class _TaskSt:
-    def __init__(self, repo: Path, task: str) -> None:
+    def __init__(self, repo: Path, task: str, wb: str = "main") -> None:
         self.repo_root = repo
-        self.data = {"task": task}
+        self.data = {"task": task, "working_branch": wb}
 
 
-class TestStagingSkipsTrackedPaths:
+def _stage(leerie, tmp_path: Path, repo: Path, task: str) -> Path:
+    state = tmp_path / "state"
+    r = _run(PLANNING_WT, repo, state, "main")
+    assert r.returncode == 0, r.stderr
+    wt = state / "runs" / "r1" / "worktrees" / "planning"
+    leerie._stage_worktree_extras(_TaskSt(repo, task), str(wt))
+    return wt
+
+
+class TestStagingSkipsSwitchedBranchContent:
+    TASK = "fix per report.md and notes.md, then add feature.py"
+
     def test_switched_branch_deliverable_is_not_staged(self, leerie, tmp_path):
-        """A file the task names that another branch tracks would show the
-        satisfied-probe a deliverable the run's tree does not have."""
-        repo = _repo_with_switched_branch_deliverable(tmp_path)
-        state = tmp_path / "state"
-        r = _run(PLANNING_WT, repo, state, "main")
-        assert r.returncode == 0, r.stderr
-        wt = state / "runs" / "r1" / "worktrees" / "planning"
-        leerie._stage_worktree_extras(
-            _TaskSt(repo, "fix per report.md and add feature.py"), str(wt))
+        """It would show the satisfied-probe a deliverable the run's tree
+        does not have."""
+        repo = _repo_on_switched_branch(tmp_path)
+        wt = _stage(leerie, tmp_path, repo, self.TASK)
         assert not (wt / "feature.py").exists()
-        # Partner: the untracked task document IS still staged.
+
+    def test_task_documents_are_still_staged(self, leerie, tmp_path):
+        """The untracked report and the staged-but-uncommitted notes are
+        both the spec; losing either is the failure staging exists for."""
+        repo = _repo_on_switched_branch(tmp_path)
+        wt = _stage(leerie, tmp_path, repo, self.TASK)
         assert (wt / "report.md").read_text() == "bug report\n"
+        assert (wt / "notes.md").read_text() == "spec notes\n"
 
-    def test_tracked_in_checkout(self, leerie, tmp_path):
-        repo = _repo_with_switched_branch_deliverable(tmp_path)
-        assert leerie._tracked_in_checkout(repo, repo / "feature.py") is True
-        assert leerie._tracked_in_checkout(repo, repo / "report.md") is False
-        (repo / "pkg").mkdir()
-        (repo / "pkg" / "m.py").write_text("x = 1\n")
-        _git("add", "pkg/m.py", cwd=repo)
-        assert leerie._tracked_in_checkout(repo, repo / "pkg") is True
-        not_a_repo = tmp_path / "plain"
-        not_a_repo.mkdir()
-        assert leerie._tracked_in_checkout(
-            not_a_repo, not_a_repo / "x.md") is False
+    def test_switched_branch_claude_dir_is_not_staged(self, leerie, tmp_path):
+        repo = _repo_on_switched_branch(tmp_path)
+        wt = _stage(leerie, tmp_path, repo, self.TASK)
+        assert not (wt / ".claude").exists()
 
-    def test_acceptance_copy_applies_the_same_rule(self, leerie):
-        src = inspect.getsource(leerie._write_acceptance_set)
-        i = src.index("_glob_task_references(task, st.repo_root)")
-        assert "_tracked_in_checkout(Path(st.repo_root), f)" in src[i:i + 700]
+    def test_untracked_claude_dir_is_still_staged(self, leerie, tmp_path):
+        repo = _make_repo(tmp_path)
+        (repo / ".claude").mkdir()
+        (repo / ".claude" / "settings.json").write_text("{}\n")
+        wt = _stage(leerie, tmp_path, repo, "fix it")
+        assert (wt / ".claude" / "settings.json").exists()
+
+    def test_working_branch_commit_missing_from_worktree_is_staged(
+            self, leerie, tmp_path):
+        """A file committed on the run's own branch after the worktree was
+        reset is the run's content, not a switched branch's."""
+        repo = _make_repo(tmp_path)
+        state = tmp_path / "state"
+        assert _run(PLANNING_WT, repo, state, "main").returncode == 0
+        (repo / "report.md").write_text("committed later\n")
+        _git("add", "report.md", cwd=repo)
+        _git("commit", "-q", "-m", "report", cwd=repo)
+        wt = state / "runs" / "r1" / "worktrees" / "planning"
+        leerie._stage_worktree_extras(_TaskSt(repo, "see report.md"), str(wt))
+        assert (wt / "report.md").read_text() == "committed later\n"
+
+
+class TestSwitchedBranchOnly:
+    def test_truth_table(self, leerie, tmp_path):
+        repo = _repo_on_switched_branch(tmp_path)
+        st = _TaskSt(repo, "")
+        f = leerie._switched_branch_only
+        assert f(repo, repo / "feature.py", st) is True
+        assert f(repo, repo / ".claude", st) is True
+        assert f(repo, repo / "report.md", st) is False      # untracked
+        assert f(repo, repo / "notes.md", st) is False       # staged only
+        assert f(repo, repo / "file.txt", st) is False       # on both
+        # No branch to follow: never skip.
+        assert f(repo, repo / "feature.py", _TaskSt(repo, "", "")) is False
+        assert f(repo, repo / "feature.py",
+                 _TaskSt(repo, "", "gone")) is False
+
+    def test_glob_characters_match_literally(self, leerie, tmp_path):
+        """`notes/run[1].md` must not match a committed `notes/run1.md`
+        (a pathspec glob would)."""
+        repo = _repo_on_switched_branch(tmp_path)
+        (repo / "notes").mkdir()
+        (repo / "notes" / "run1.md").write_text("x\n")
+        _git("add", "notes/run1.md", cwd=repo)
+        _git("commit", "-q", "-m", "run1", cwd=repo)
+        (repo / "notes" / "run[1].md").write_text("y\n")
+        st = _TaskSt(repo, "")
+        assert leerie._switched_branch_only(
+            repo, repo / "notes" / "run1.md", st) is True
+        assert leerie._switched_branch_only(
+            repo, repo / "notes" / "run[1].md", st) is False
+
+    def test_git_failure_answers_false(self, leerie, tmp_path, monkeypatch):
+        repo = _repo_on_switched_branch(tmp_path)
+
+        def boom(*_a: object, **_k: object) -> None:
+            raise OSError("no git")
+
+        monkeypatch.setattr(leerie.subprocess, "run", boom)
+        assert leerie._switched_branch_only(
+            repo, repo / "feature.py", _TaskSt(repo, "")) is False

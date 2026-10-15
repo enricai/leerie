@@ -73,10 +73,15 @@ mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/criteria" "${R
 # file keeps agreeing with the orchestrator's working_branch (the diff base
 # and PR base): a deleted branch then fails loudly at finalize rather than
 # silently diffing against whatever is checked out.
+# `git rev-parse --abbrev-ref HEAD` prints `heads/<name>` when a tag shares
+# the branch's name, so the name without that prefix is tried second.
 BASE_REF="HEAD"
 if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
   if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
     BASE_REF="refs/heads/${REQUESTED_BRANCH}"
+  elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
+     && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
+    BASE_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
   else
     echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
   fi
