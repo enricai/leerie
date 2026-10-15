@@ -44,7 +44,11 @@ class _St:
     def __init__(self, repo):
         self.repo_root = repo
         self.run_id = "r1"
-        self.data = {}
+        # Halt mode (--stop-on-repo-change): these tests pin the die()
+        # framings, and their "must not fire" partners only mean something
+        # when firing is a die. The warn-by-default path is pinned in
+        # tests/test_repo_change_warn_default.py.
+        self.data = {"stop_on_repo_change": True}
 
     def save(self):
         pass
@@ -376,12 +380,14 @@ class TestExecuteWiring:
             "phase_execute never verifies the checkout; the execute phase is "
             "where the measured escape occurred")
 
-    def test_the_execute_check_is_porcelain_only(self, leerie):
-        """A HEAD-sensitive check here would kill any run whose operator
-        pulled — see TestPorcelainOnlyMode."""
+    def test_the_execute_check_is_porcelain_only_unless_halting(self, leerie):
+        """A HEAD-sensitive check here would report every operator pull —
+        see TestPorcelainOnlyMode. Only --stop-on-repo-change widens it, since
+        that operator asked to halt on commits too."""
         src = inspect.getsource(leerie.phase_execute)
         i = src.index("_assert_repo_unchanged(")
-        assert "porcelain_only=True" in src[i:i + 200]
+        assert ('porcelain_only=not st.data.get("stop_on_repo_change")'
+                in src[i:i + 200])
 
     def test_it_runs_per_wave_inside_the_loop(self, leerie):
         """Per wave, so it fires within one wave of the damage rather than

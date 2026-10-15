@@ -3883,6 +3883,27 @@ with behavioral message tests through the real `_assert_repo_unchanged` —
 including that a worker adding a file ON TOP of a tracked edit is never
 softened.
 
+**Warn-by-default sentinel**, in `tests/test_repo_change_warn_default.py`:
+drives the real `_assert_repo_unchanged` against a real git repo with
+`stop_on_repo_change` off — no exit, the WARNING carries the delta and the
+operator/escape hint (asserted by value, not by the absence of a raise);
+a persisting delta is warned once across repeated checks and a new one
+warns alone; the baseline is untouched after a warning (it feeds
+`_acceptance_validity_base`); with the flag on, a HEAD move dies under the
+execute-wave call shape that is silent by default. Plus
+`resolve_stop_on_repo_change` precedence with disagreeing inputs. The
+die-asserting tests in `tests/test_work_sentinel.py` and
+`tests/test_tripwire_operator_signature.py` set the flag explicitly.
+
+**Run follows its working branch**, in `tests/test_working_branch_follow.py`:
+real repos and the real `setup-run.sh` / `planning-worktree.sh` — with the
+operator switched to another branch mid-run, the run branch and the planning
+worktree still land on `refs/heads/<working_branch>` (both red against the
+pre-change scripts), paired with partners that must stay green either way: a
+pull of the same branch is followed, and no argument / `HEAD` / an unknown
+branch falls back to the live HEAD. Plus `_working_branch_arg` and the
+wiring at both call sites.
+
 **Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
 the observable (1 on a clean first pass, 3 when flagged — a gate that
 always or never votes fails the count assertions); majority truth table

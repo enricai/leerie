@@ -7372,25 +7372,61 @@ The residual is real: a build verb runs arbitrary code, so an allowlisted
 path was rejected) — a strictly narrower hole than the flag it replaces,
 and L4 covers it.
 
-**L4 — the sentinel, which is the actual guarantee.** `_snapshot_repo_state`
-records the real checkout's HEAD, porcelain status and refs before phase 1;
-`_assert_repo_unchanged` re-checks after every planning phase and `die()`s
-on any delta — same discipline as `check_rebaser_worktree_state` (trust the
-worker, then mechanically re-check the claim), run per-phase so it fires
-within one worker of the damage. Untracked files are compared deliberately,
-since a worker *creating* files is exactly what a clean-tree `??`-filtered
-gate cannot see. The die message classifies the delta signature
-mechanically: when every delta is a newly-appeared untracked file, the
-likely cause is the *operator* dropping task/report files into the
-checkout for another run while this one executes (measured: a run died
-mid-phase-5 over exactly one untracked report `.md` the operator had just
-created for the next run, and the operator then re-ran from scratch —
-a full replan — because the message blamed a worker escape and framed
-resume behind a restore step). The run still stops either way — its
-baseline moved — but the operator-signature message leads with
-`resume` and says no restore is needed if the files are the operator's
-own; any tracked-file, HEAD, or ref delta keeps the full worker-escape
-framing.
+**L4 — the sentinel: always reports, halts only on request.**
+`_snapshot_repo_state` records the real checkout's HEAD, porcelain status
+and refs before phase 1; `_assert_repo_unchanged` re-checks after every
+planning phase — same discipline as `check_rebaser_worktree_state` (trust
+the worker, then mechanically re-check the claim), run per-phase so it
+reports within one worker of the damage. Untracked files are compared
+deliberately, since a worker *creating* files is exactly what a
+clean-tree `??`-filtered gate cannot see.
+
+What it does with a delta is the operator's choice. **By default it logs a
+WARNING and the run continues**; each distinct delta is warned once
+(`repo_change_warned`), since the baseline is never refreshed and every
+later phase would otherwise repeat it. With `--stop-on-repo-change`
+(`LEERIE_STOP_ON_REPO_CHANGE`, `stop_on_repo_change` in `leerie.toml`) it
+`die()`s instead, as it always used to. The default flipped on measured
+cost: across one host's corpus (731 logged runs, 2026-07-26 →
+2026-10-15) the sentinel halted 73 runs, and 71 of them carried only
+operator signatures —
+`prompt-N.txt`, editor swap files, report `.md`s copied in for the next
+task (the triggering incident: four reports `scp`'d into the checkout two
+minutes into planning, byte-identical to the operator's local copies), or
+`main` fast-forwarding under a merged sibling PR. The other two are
+unattributed — one tracked-file edit, and one HEAD that moved onto a
+commit from another run's branch (the shape of an operator checking that
+branch out to test it) — and no halt was a confirmed escape. Meanwhile
+27 of the 29 runs halted on a HEAD move never got past planning — their
+spend was simply lost. A guard that cries wolf gets switched off, the same reasoning behind `porcelain_only` and
+`_snapshot_repo_state`'s `ok` field; downgrading it to a loud warning
+keeps the detection without the cost.
+
+Continuing past a delta is safe because nothing that is committed, merged
+or pushed is built from the checkout's working tree: the run branch,
+staging and subtask worktrees are all git refs. Both `setup-run.sh` (the
+run branch, cut at phase 4) and `planning-worktree.sh` (re-reset on every
+re-entry) follow the tip of the *recorded working branch*
+(`working_branch`), not whatever happens to be checked out. A pull of that
+branch therefore lands exactly where die-then-`resume` already lands —
+the run executes on the advanced tip — so the default merely skips the
+manual step; and a branch switch (an operator checking out another run's
+branch to test it, the shape behind one of the two unattributed halts)
+cannot silently re-base the run onto the wrong branch. Only a run started
+on a detached HEAD, with no branch to follow, still tracks the live HEAD. The accepted residual: some planning inputs
+read the checkout directly (repo map, provisioning, decomposition greps,
+the PR template), so an operator's mid-run edits can colour them.
+
+The message classifies the delta signature mechanically
+(`_tripwire_operator_overlap`): when every delta is a newly-appeared
+untracked file, the likely cause is the *operator* dropping task/report
+files into the checkout for another run (measured: a run died mid-phase-5
+over exactly one untracked report `.md` the operator had just created,
+and the operator then re-ran from scratch — a full replan — because the
+message blamed a worker escape and framed resume behind a restore step).
+That signature reads as "likely your own files"; any tracked-file, HEAD,
+or ref delta keeps the worker-escape framing — in the warning a pointer
+to inspect the checkout, under the flag the restore-then-resume steps.
 
 This does **not** achieve kernel-level confinement: `/work` is a read-write
 bind mount in the same container for the whole run, and nothing short of a
@@ -7446,7 +7482,9 @@ execute too**, after every wave, closing the phase that previously had no
 check at all — passing `porcelain_only` (dropping HEAD/ref comparisons,
 since the execute phase runs for hours and an operator legitimately pulls
 their own checkout mid-run; a `HEAD moved` false alarm there is worse than
-the escape). Its own blind spot: `git status --porcelain` never lists
+the escape). Under `--stop-on-repo-change` the operator has asked for a
+halt on commits as well as files, so the execute check compares HEAD and
+refs too. Its own blind spot: `git status --porcelain` never lists
 gitignored paths, so in-checkout `node_modules/` installs stay invisible —
 closing that needs the underlying motive fixed (a worktree with no
 dependencies), not a wider guard.
