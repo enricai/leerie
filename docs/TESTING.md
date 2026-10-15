@@ -1412,7 +1412,8 @@ the CURRENT `base_sha` is consulted before `async with sem:` and
 `claude_p` is never invoked; a fresh probe persists its verdict for BOTH
 outcomes, carrying `satisfied`/`evidence`/`checked`/`base_sha`; the
 `WorkerError` crash-keep path writes no cache entry; a cached verdict
-whose `base_sha` differs from current `HEAD` is invalidated and
+whose `base_sha` differs from the current base tree (the working
+branch's tip, else `HEAD` — `_base_tree_sha`) is invalidated and
 re-probed (the mid-run-sibling hazard — DESIGN §6); and THE REPORTED
 FAILURE PINNED — a partial cache resumes, re-probes only uncached
 subtasks, reaches scheduling. All 17 pre-existing tests unchanged (17 + 5
@@ -3879,9 +3880,72 @@ ahead/diverged/no-origin/detached silent, and launcher wiring pins
 **Operator-overlap tripwire framing**, in
 `tests/test_tripwire_operator_signature.py`: predicate truth table
 (all-untracked true; tracked / mixed / HEAD / ref / empty false) paired
-with behavioral message tests through the real `_assert_repo_unchanged` —
-including that a worker adding a file ON TOP of a tracked edit is never
-softened.
+with behavioral message tests through the real `_assert_repo_unchanged`
+under `--stop-on-repo-change` — including that a worker adding a file ON
+TOP of a tracked edit is never softened there (the warn-by-default path
+classifies each newly-warned batch instead; see below).
+
+**Warn-by-default sentinel**, in `tests/test_repo_change_warn_default.py`:
+drives the real `_assert_repo_unchanged` against a real git repo with
+`stop_on_repo_change` off — no exit, the WARNING carries the delta and the
+operator/escape hint (asserted by value, not by the absence of a raise);
+a persisting delta is warned once across repeated checks and a new one
+warns alone, but a re-edit of a warned file, or a new file inside a warned
+`?? dir/`, re-warns as "changed again" (`_delta_fingerprint`), while
+gitignored churn inside a warned directory does not; the fingerprint is
+`lstat`-only (a test forbids `open`), resolves C-quoted porcelain names,
+and never mistakes an untracked `x -> src.txt` for a rename; a list-form
+`repo_change_warned` from an earlier build is adopted on resume without
+a crash or a repeat warning; the fingerprint never raises (a non-UTF-8
+directory listing, an undecodable porcelain escape, any unexpected
+error all give a value); a commit during planning is warned as becoming
+part of what the run builds on and pushes, a file edit is not; the
+baseline is untouched after a warning (it feeds
+`_acceptance_validity_base`); with the flag on, a HEAD move dies under the
+execute-wave call shape (through the real `_execute_check_porcelain_only`)
+that is silent by default, and both die framings name the way to continue
+past one's own changes (resume without the flag). Plus
+`resolve_stop_on_repo_change` precedence with disagreeing inputs, and
+`main()` wiring driven for real up to `_orchestrate` (env alone, flag
+alone, neither). The die-asserting tests in `tests/test_work_sentinel.py`
+and `tests/test_tripwire_operator_signature.py` set the flag explicitly.
+`tests/test_phase_execute_wave_flow.py` drives the real wave loop:
+`setup-run.sh` receives the working branch, its fallback warning is
+logged, and the per-wave check is porcelain-only exactly when the flag is
+off.
+
+**Run follows its working branch**, in `tests/test_working_branch_follow.py`:
+real repos and the real `setup-run.sh` / `planning-worktree.sh` — with the
+operator switched to another branch mid-run, the run branch and the planning
+worktree still land on `refs/heads/<working_branch>` (both red against the
+pre-change scripts), paired with partners that must stay green either way: a
+pull of the same branch is followed, and no argument / `HEAD` / an unknown
+branch falls back to the live HEAD. Plus `_working_branch_arg` and the
+wiring at both call sites, and the satisfied-probe cache key:
+`_base_tree_sha` must equal the HEAD the real `planning-worktree.sh` leaves
+the worktree on (a live-HEAD key, the pre-fix behaviour, fails it after a
+branch switch), with the HEAD fallback for no / `HEAD` / unknown branch.
+Behavioural partners for what was first pinned only by source: the
+switch-then-advance incident driven through two real
+`_filter_satisfied_subtasks` sweeps (two probes; a live-HEAD key trusts
+the stale verdict and probes once); a vanished recorded branch warns on
+stderr in both scripts, `setup-run.sh` still records the requested name,
+and `_ensure_planning_worktree` logs the warning while ordinary git stderr
+stays quiet; a branch shadowed by a same-named tag (recorded as
+`heads/<name>`) is still followed by both scripts and `_base_tree_sha`.
+Task-reference staging (`_switched_branch_only_paths`): a deliverable or a
+`.claude/` file committed only on the switched-to branch is not staged,
+while an untracked report, a `git add`-ed-but-uncommitted document, an
+untracked `.claude/` and a file committed on the run's own branch after
+the reset all are — and gating is per file, so an untracked spec beside a
+switched-branch file under the same glob, and an untracked
+`.claude/settings.local.json` beside a switched-branch `.claude/` file,
+are still staged. Set tests cover literal matching of `[`-bearing names
+and an `ls-tree` failure (only that call fails) giving the empty set; the
+`refs/heads/<name>` form is accepted by `_working_branch_ref` and both
+scripts. A skipped task-named file is named in a WARNING, and an
+undecodable `ls-tree` gives the empty set while staging carries on with
+the other references.
 
 **Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
 the observable (1 on a clean first pass, 3 when flagged — a gate that

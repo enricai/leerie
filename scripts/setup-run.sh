@@ -1,10 +1,20 @@
 #!/usr/bin/env bash
-# setup-run.sh <run-id> — initialize the per-run branch and worktree.
+# setup-run.sh <run-id> [<working-branch>] — initialize the per-run branch
+# and worktree.
 #
 # Each leerie invocation has a unique run_id; this script sets up the
-# directory and branch for that run. Records the current working branch,
-# creates `leerie/runs/<run-id>` off the current HEAD, and adds a worktree
-# at `<state-root>/runs/<run-id>/worktrees/staging`.
+# directory and branch for that run. Records the working branch, creates
+# `leerie/runs/<run-id>` off its tip, and adds a worktree at
+# `<state-root>/runs/<run-id>/worktrees/staging`.
+#
+# <working-branch> is the branch the run started on (the orchestrator's
+# `working_branch`). When given and it names a local branch, the run follows
+# THAT branch's tip rather than whatever is checked out now: the checkout
+# sentinel no longer halts on a mid-run change (DESIGN §12 L4), so an
+# operator who checks out another branch while planning runs must not
+# silently re-base this run onto it. A pull of the same branch is still
+# followed. Without the argument (detached start, older callers such as
+# collect-subtrees.sh) the live HEAD is used, as before.
 #
 # State root: $LEERIE_STATE_DIR when set (centralized, outside the repo);
 # falls back to `.leerie` (repo-relative; used by tests and direct invocations).
@@ -24,7 +34,8 @@ set -euo pipefail
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
 
-RUN_ID="${1:?usage: setup-run.sh <run-id>}"
+RUN_ID="${1:?usage: setup-run.sh <run-id> [<working-branch>]}"
+REQUESTED_BRANCH="${2:-}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
 BRANCH="leerie/runs/${RUN_ID}"
@@ -58,8 +69,34 @@ mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/criteria" "${R
 
 # Record the working branch only on first setup. On a resume the file already
 # exists and the live HEAD may be anything; the original value must be kept.
+# A requested branch is recorded even when it no longer resolves, so this
+# file keeps agreeing with the orchestrator's working_branch (the diff base
+# and PR base): a deleted branch then fails loudly at finalize rather than
+# silently diffing against whatever is checked out.
+# `git rev-parse --abbrev-ref HEAD` prints `heads/<name>` when a tag shares
+# the branch's name (and `refs/heads/<name>` when even that is ambiguous),
+# so those forms are tried after the name itself — the same lookup as the
+# orchestrator's `_working_branch_ref`.
+BASE_REF="HEAD"
+if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
+  if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
+    BASE_REF="refs/heads/${REQUESTED_BRANCH}"
+  elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
+     && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
+    BASE_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
+  elif [ "${REQUESTED_BRANCH#refs/heads/}" != "$REQUESTED_BRANCH" ] \
+     && git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
+    BASE_REF="$REQUESTED_BRANCH"
+  else
+    echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
+  fi
+fi
 if [ ! -f "${WORKING_BRANCH_FILE}" ]; then
-  git rev-parse --abbrev-ref HEAD > "${WORKING_BRANCH_FILE}"
+  if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
+    printf '%s\n' "$REQUESTED_BRANCH" > "${WORKING_BRANCH_FILE}"
+  else
+    git rev-parse --abbrev-ref HEAD > "${WORKING_BRANCH_FILE}"
+  fi
 fi
 WORKING_BRANCH="$(cat "${WORKING_BRANCH_FILE}")"
 
@@ -68,8 +105,8 @@ WORKING_BRANCH="$(cat "${WORKING_BRANCH_FILE}")"
 if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
   echo "run-branch: ${BRANCH} (existing — preserved, not reset)"
 else
-  git branch "${BRANCH}" HEAD
-  echo "run-branch: ${BRANCH} (created at HEAD)"
+  git branch "${BRANCH}" "${BASE_REF}"
+  echo "run-branch: ${BRANCH} (created at ${BASE_REF})"
 fi
 
 # Drop an orphaned staging directory that git no longer knows about. On Fly,

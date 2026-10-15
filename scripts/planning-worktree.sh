@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# planning-worktree.sh <run-id> — create/reset the disposable worktree that
-# every judgment worker runs in (DESIGN §12 *Judgment-worker isolation*).
+# planning-worktree.sh <run-id> [<working-branch>] — create/reset the
+# disposable worktree that every judgment worker runs in (DESIGN §12
+# *Judgment-worker isolation*).
 #
 # Judgment workers (classifier, planner, reconciler, the judges, the
 # satisfied-probe) used to run with cwd = the user's real checkout. Combined
@@ -16,7 +17,8 @@
 # fourth namespace would leak forever, which is the stale-branch problem
 # `prune` exists to fix. Nothing downstream reads these commits: planning
 # output is JSON in state.json, and setup-run.sh cuts the run branch from the
-# real checkout's HEAD, so a commit made here is unreachable by construction.
+# real checkout's working branch, so a commit made here is unreachable by
+# construction.
 #
 # PER-RUN, under <run-dir>/worktrees/, so it inherits the cleanup that already
 # sweeps that directory (cleanup.sh's clean_one_run, and
@@ -30,6 +32,15 @@
 #   2. On resume the real checkout's HEAD may have moved (a sibling run merged
 #      its PR). A worktree pinned at the old sha would plan against a tree that
 #      no longer exists.
+#
+# FOLLOWS THE WORKING BRANCH when <working-branch> is given and names a local
+# branch — its tip, not whatever is checked out. The checkout sentinel no
+# longer halts on a mid-run change (DESIGN §12 L4), so an operator checking
+# out another branch must not move later judges (the satisfied-probe, the
+# acceptance-on-HEAD run) onto it; a pull of the same branch is still
+# followed, which is reason 2. The first call, before the orchestrator has
+# recorded the branch, passes none and mirrors HEAD.
+#
 # `clean -fd` and NOT `-fdx`: gitignored content (node_modules, .venv) must
 # survive, or every resume re-pays the install. That is deliberate — do not
 # "fix" it to -fdx.
@@ -38,7 +49,8 @@ set -euo pipefail
 # shellcheck source=scripts/worktree-lib.sh
 . "$(dirname "${BASH_SOURCE[0]}")/worktree-lib.sh"
 
-RUN_ID="${1:?usage: planning-worktree.sh <run-id>}"
+RUN_ID="${1:?usage: planning-worktree.sh <run-id> [<working-branch>]}"
+REQUESTED_BRANCH="${2:-}"
 LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"
 RUN_DIR="${LEERIE_ROOT}/runs/${RUN_ID}"
 WT="${RUN_DIR}/worktrees/planning"
@@ -57,10 +69,28 @@ if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   exit 1
 fi
 
-# The tree to mirror: the real checkout's current HEAD. Read here, in the main
+# The tree to mirror: the working branch's tip when one was passed (see the
+# header), else the real checkout's current HEAD. Read here, in the main
 # checkout, rather than inside the worktree — a detached worktree reports its
 # own (possibly stale) HEAD, which is the value this reset exists to correct.
-TARGET_SHA="$(git rev-parse HEAD)"
+# Same lookup as setup-run.sh, including the `heads/<name>` and
+# `refs/heads/<name>` forms `--abbrev-ref` prints when a tag shares the
+# branch's name.
+TARGET_REF="HEAD"
+if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
+  if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
+    TARGET_REF="refs/heads/${REQUESTED_BRANCH}"
+  elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
+     && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
+    TARGET_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
+  elif [ "${REQUESTED_BRANCH#refs/heads/}" != "$REQUESTED_BRANCH" ] \
+     && git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
+    TARGET_REF="$REQUESTED_BRANCH"
+  else
+    echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
+  fi
+fi
+TARGET_SHA="$(git rev-parse "$TARGET_REF")"
 
 mkdir -p "${RUN_DIR}/worktrees"
 
@@ -78,7 +108,7 @@ fi
 prune_leerie_worktrees "${LEERIE_ROOT}"
 
 if git worktree list --porcelain | grep -qxF "worktree $WT"; then
-  # Reuse: force the tree back to the current HEAD and drop anything a
+  # Reuse: force the tree back to the target and drop anything a
   # previous judgment worker left behind. --force because the checkout is
   # detached and may carry commits; that is expected and discarded.
   git -C "$WT" reset --hard "$TARGET_SHA" >/dev/null

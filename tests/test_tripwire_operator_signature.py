@@ -41,7 +41,11 @@ class _St:
     def __init__(self, repo):
         self.repo_root = repo
         self.run_id = "r1"
-        self.data = {}
+        # Halt mode (--stop-on-repo-change): these tests pin the die()
+        # framings, and their "must not fire" partners only mean something
+        # when firing is a die. The warn-by-default path is pinned in
+        # tests/test_repo_change_warn_default.py.
+        self.data = {"stop_on_repo_change": True}
 
     def save(self):
         pass

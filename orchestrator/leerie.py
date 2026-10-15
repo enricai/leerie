@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import concurrent.futures
 import contextlib
 import copy
@@ -507,6 +508,17 @@ STATE_FIELDS = (
     "skip_integration_check",
     "skip_classification_check",
     "stop_on_blocked",
+    # stop_on_repo_change: halt (die) when the real checkout changes mid-run
+    # instead of warning and continuing (DESIGN §12 L4). Off by default
+    # because 71 of 73 measured halts carried only operator signatures and
+    # neither of the other two was a confirmed escape.
+    "stop_on_repo_change",
+    # repo_change_warned: {delta string: `_delta_fingerprint`} for every delta
+    # already logged as a WARNING. The baseline is never refreshed, so without
+    # it every later phase and wave re-logs a delta the operator has already
+    # seen; the fingerprint re-warns when that path's content moves again, so
+    # a later write to an already-warned path is not hidden.
+    "repo_change_warned",
     "skip_satisfied_check",
     "skip_budget_check",
     "strict_conformer",
@@ -1436,6 +1448,12 @@ SKIP_CLASSIFICATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 # LEERIE_STOP_ON_BLOCKED env → stop_on_blocked in leerie.toml → False.
 STOP_ON_BLOCKED_ENV = "LEERIE_STOP_ON_BLOCKED"
 STOP_ON_BLOCKED_FILE = SOURCE_OF_TRUTH_FILE
+
+# --stop-on-repo-change: restore the halt when the real checkout changes
+# mid-run (by default it is a WARNING). Resolution order: CLI flag →
+# LEERIE_STOP_ON_REPO_CHANGE env → stop_on_repo_change in leerie.toml → False.
+STOP_ON_REPO_CHANGE_ENV = "LEERIE_STOP_ON_REPO_CHANGE"
+STOP_ON_REPO_CHANGE_FILE = SOURCE_OF_TRUTH_FILE
 
 # <state-root>/repo-map-cache/ directory (relative to leerie_root). Stores
 # the mtime-keyed per-file parse results produced by _build_repo_map() so
@@ -7475,6 +7493,22 @@ def resolve_stop_on_blocked(repo_root: Path, cli_value: bool) -> bool:
         file_name=STOP_ON_BLOCKED_FILE)
 
 
+def resolve_stop_on_repo_change(repo_root: Path, cli_value: bool) -> bool:
+    """Resolve the --stop-on-repo-change preference. Order:
+    --stop-on-repo-change CLI flag (action='store_true') →
+    LEERIE_STOP_ON_REPO_CHANGE env var →
+    stop_on_repo_change in leerie.toml → False.
+
+    When True, `_assert_repo_unchanged` die()s on a checkout delta instead
+    of logging a WARNING, and the execute-wave check also compares HEAD and
+    refs. Off by default."""
+    return _resolve_bool_pref(
+        repo_root, cli_value,
+        env_var=STOP_ON_REPO_CHANGE_ENV,
+        file_key="stop_on_repo_change",
+        file_name=STOP_ON_REPO_CHANGE_FILE)
+
+
 def _positive_int(s: str) -> int:
     """argparse `type=` helper. Rejects non-positive integers with the
     standard argparse error message. Used by --confidence-rounds."""
@@ -7993,6 +8027,9 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
         wt = Path(worktree)
         task = st.data.get("task") or ""
         staged = 0
+        # Resolved once per call: every skip decision below compares HEAD
+        # with this same ref.
+        wb_ref = _working_branch_ref(repo_root, st)
         if task:
             for src in _glob_task_references(task, repo_root):
                 try:
@@ -8002,10 +8039,24 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                 dst = wt / rel
                 if dst.exists():
                     continue          # tracked — the worktree already has it
+                # Files committed on the branch the operator switched to
+                # mid-run and absent from the run's own branch: staging one
+                # would show the satisfied-probe a deliverable its tree does
+                # not have. Skipped file by file, so untracked task documents
+                # beside them in the same directory are still staged.
+                skip = _switched_branch_only_paths(repo_root, str(rel), wb_ref)
+                if str(rel) in skip:
+                    log(f"WARNING: planning worktree: not staging {rel} — it "
+                        "is committed only on the branch now checked out, "
+                        "not on the run's working branch; workers will not "
+                        "see it")
+                    continue
                 try:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     if src.is_dir():
-                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                        shutil.copytree(
+                            src, dst, dirs_exist_ok=True,
+                            ignore=_ignore_repo_paths(repo_root, skip))
                     else:
                         shutil.copy2(src, dst)
                     staged += 1
@@ -8013,8 +8064,10 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                     continue
         claude_src, claude_dst = repo_root / ".claude", wt / ".claude"
         if claude_src.is_dir() and not claude_dst.exists():
+            skip = _switched_branch_only_paths(repo_root, ".claude", wb_ref)
             try:
-                shutil.copytree(claude_src, claude_dst, dirs_exist_ok=True)
+                shutil.copytree(claude_src, claude_dst, dirs_exist_ok=True,
+                                ignore=_ignore_repo_paths(repo_root, skip))
                 staged += 1
             except Exception:
                 pass
@@ -8024,6 +8077,143 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
     except Exception as e:
         log(f"planning worktree: could not stage untracked paths "
             f"(non-fatal): {e}")
+
+
+def _working_branch_ref(repo_root: str | Path, st: "State") -> str | None:
+    """The full ref (`refs/heads/<name>`) of the branch the run started on,
+    or None when there is none to follow (not yet recorded, a detached
+    start, the branch no longer exists, or git could not be run). Tries the
+    recorded name, then the name without a leading `heads/` (`git rev-parse
+    --abbrev-ref HEAD` prints `heads/<name>` when a tag shares the branch's
+    name), then a name already of the form `refs/heads/<name>` (printed when
+    even `heads/<name>` is ambiguous). The same lookup as `setup-run.sh` /
+    `planning-worktree.sh`, so all three agree on which tree the run
+    follows."""
+    args = _working_branch_arg(st)
+    if not args:
+        return None
+    wb = args[0]
+    candidates = [f"refs/heads/{wb}"]
+    if wb.startswith("heads/"):
+        candidates.append(f"refs/heads/{wb[len('heads/'):]}")
+    if wb.startswith("refs/heads/"):
+        candidates.append(wb)
+    for ref in candidates:
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo_root), "show-ref", "--verify",
+                 "--quiet", ref],
+                capture_output=True, text=True, check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if r.returncode == 0:
+            return ref
+    return None
+
+
+def _switched_branch_only_paths(repo_root: Path, rel: str,
+                                wb_ref: str | None) -> set[str]:
+    """Repo-relative files under *rel* (a file or a directory) that are
+    committed on the branch currently checked out but not on the run's
+    working branch (*wb_ref*, from `_working_branch_ref`) — content of a
+    branch the operator switched to mid-run (DESIGN §12 L2/L4), which must
+    not be staged into the planning worktree. Untracked and
+    staged-but-uncommitted files are never in it, so task documents beside
+    such content are still staged. `git ls-tree` reads commits and matches
+    paths literally (no pathspec globbing) — mechanical output. No branch
+    to follow, or any git failure, answers the empty set: the copy then
+    proceeds exactly as before."""
+    if wb_ref is None:
+        return set()
+
+    def _committed(rev: str) -> set[str] | None:
+        # Bytes, decoded as the filesystem does, and any failure is None: an
+        # exception here would reach `_stage_worktree_extras`'s outer catch
+        # and abandon every later task reference, the spec included.
+        try:
+            r = subprocess.run(
+                ["git", "-C", str(repo_root), "ls-tree", "-r", "-z",
+                 "--name-only", rev, "--", rel],
+                capture_output=True, check=False, timeout=30)
+            if r.returncode != 0:
+                return None
+            return {os.fsdecode(p) for p in r.stdout.split(b"\0") if p}
+        except Exception:
+            return None
+
+    on_head = _committed("HEAD")
+    on_wb = _committed(wb_ref)
+    if on_head is None or on_wb is None:
+        return set()
+    return on_head - on_wb
+
+
+def _ignore_repo_paths(
+        repo_root: Path,
+        skip: set[str]) -> Callable[[str, list[str]], set[str]]:
+    """A `shutil.copytree` *ignore* callable dropping exactly the
+    repo-relative paths in *skip*."""
+    root = repo_root.resolve()
+
+    def _ignore(directory: str, names: list[str]) -> set[str]:
+        if not skip:
+            return set()
+        try:
+            base = Path(directory).resolve().relative_to(root)
+        except ValueError:
+            return set()
+        return {n for n in names
+                if (base / n).as_posix() in skip}
+
+    return _ignore
+
+
+def _working_branch_arg(st: "State") -> list[str]:
+    """The optional `<working-branch>` argument for `setup-run.sh` and
+    `planning-worktree.sh`: the branch the run started on, so both follow its
+    tip rather than whatever is checked out now. The checkout sentinel only
+    warns on a mid-run change (DESIGN §12 L4), so an operator checking out
+    another branch must not re-base the run onto it. Empty — the scripts then
+    use the live HEAD — before the branch is recorded, or when the run
+    started detached (`git rev-parse --abbrev-ref` printed `HEAD`)."""
+    wb = st.data.get("working_branch") or ""
+    return [wb] if wb and wb != "HEAD" else []
+
+
+async def _base_tree_sha(repo_root: str, st: "State") -> str:
+    """The sha of the tree the planning worktree mirrors: the working
+    branch's tip when `_working_branch_ref` resolves, else the real
+    checkout's HEAD — the same choice `planning-worktree.sh` makes.
+
+    Resolved through `_working_branch_ref`, the same lookup the script
+    makes. The satisfied-probe cache is keyed on this. Keyed on the live HEAD
+    instead, an operator's mid-run branch switch would file verdicts about
+    the working branch's tree under the other branch's sha, and a later
+    advance of the working branch would never invalidate them (DESIGN §6,
+    §12 L4)."""
+    ref = await asyncio.to_thread(_working_branch_ref, repo_root, st)
+    if ref is not None:
+        try:
+            r = await run_proc(["git", "rev-parse", "--verify", "--quiet",
+                                ref], cwd=repo_root)
+        except OSError:
+            r = None
+        if r is not None and r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return await _branch_head_sha(repo_root)
+
+
+def _log_working_branch_fallback(proc: subprocess.CompletedProcess,
+                                 where: str) -> None:
+    """Surface the scripts' `warning: working branch '<name>' not found`
+    line. They exit 0 on that fallback, and both callers otherwise print
+    stderr only on failure — so a deleted working branch would silently put
+    the run back on whatever is checked out. Matches the scripts' own fixed
+    prefix: mechanical output, not prose."""
+    err = getattr(proc, "stderr", "")
+    for ln in (err if isinstance(err, str) else "").splitlines():
+        if ln.startswith("warning: working branch "):
+            log(f"WARNING: {where}: {ln[len('warning: '):]}")
 
 
 async def _ensure_planning_worktree(st: "State") -> str:
@@ -8045,7 +8235,8 @@ async def _ensure_planning_worktree(st: "State") -> str:
     still die() despite real spend already sunk by then; the "cheapest
     possible moment to refuse" argument applies only to the first,
     pre-phase-1 call (DESIGN §13)."""
-    proc = await _run_script("planning-worktree.sh", st.run_id)
+    proc = await _run_script("planning-worktree.sh", st.run_id,
+                             *_working_branch_arg(st))
     if proc.returncode != 0:
         die("could not create the judgment-worker worktree "
             f"(planning-worktree.sh exited {proc.returncode}).\n"
@@ -8056,6 +8247,7 @@ async def _ensure_planning_worktree(st: "State") -> str:
             "If a previous run left a stale registration behind:\n"
             f"  bash scripts/cleanup.sh --run-id {st.run_id}\n"
             "  ./leerie prune --apply")
+    _log_working_branch_fallback(proc, "planning worktree")
     # The script echoes `planning-worktree: <abs path>` as its last line.
     line = proc.stdout.strip().splitlines()[-1] if proc.stdout.strip() else ""
     path = line.split("planning-worktree:", 1)[-1].strip() if line else ""
@@ -8125,10 +8317,12 @@ def _diff_repo_state(before: dict, after: dict, *,
     working-tree one. Planning phases take minutes and the operator is
     waiting, so any movement there is suspicious; the execute phase runs for
     hours (measured p90 285 min, n=87) and an operator legitimately pulls
-    their own checkout mid-run. Killing a five-hour run because someone ran
-    `git pull` is worse than the escape being guarded, and a guard that cries
-    wolf gets switched off — the same reasoning that put the `ok` field on
-    `_snapshot_repo_state`. File mutation is the damage class that matters.
+    their own checkout mid-run. Reporting a `git pull` on every wave is noise,
+    and a guard that cries wolf gets switched off — the same reasoning that
+    put the `ok` field on `_snapshot_repo_state`. File mutation is the damage
+    class that matters. The execute call keeps the HEAD/ref comparison only
+    under `stop_on_repo_change`, where the operator asked to halt on commits
+    too (`_execute_check_porcelain_only`).
     """
     out: list[str] = []
     if not porcelain_only and before.get("head") != after.get("head"):
@@ -8150,6 +8344,104 @@ def _diff_repo_state(before: dict, after: dict, *,
     return out
 
 
+def _porcelain_path(line: str) -> str:
+    """The (target) path of one `git status --porcelain` v1 line —
+    mechanical git output, never prose. `XY <path>`, or `XY <old> -> <new>`
+    for a rename/copy (an `R`/`C` status). Porcelain C-quotes any name with
+    whitespace, a quote, a backslash or a non-ASCII byte, so ` -> ` can only
+    separate two names when the status says rename/copy and the old name is
+    unquoted-and-spaceless or a complete quoted string; a quoted name is
+    decoded (octal escapes back to UTF-8 bytes)."""
+    status, rest = line[:2], line[3:]
+    if "R" in status or "C" in status:
+        if rest.startswith('"'):
+            k, escaped = 1, False
+            while k < len(rest):
+                ch = rest[k]
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    break
+                k += 1
+            tail = rest[k + 1:]
+            if tail.startswith(" -> "):
+                rest = tail[len(" -> "):]
+        elif " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+    if len(rest) >= 2 and rest.startswith('"') and rest.endswith('"'):
+        try:
+            raw = codecs.escape_decode(rest[1:-1].encode("utf-8"))[0]
+        except ValueError:
+            # Not a whole quoted name (e.g. a fragment a U+2028 in a name
+            # split off): keep the raw text rather than raise.
+            return rest
+        return raw.decode("utf-8", "surrogateescape")
+    return rest
+
+
+def _delta_fingerprint(repo_root: Path, delta: str) -> str:
+    """Change fingerprint for one `_diff_repo_state` delta, so a warned
+    delta re-warns when its path changes again. Working-tree deltas are
+    `working tree changed: <porcelain line>` (path from `_porcelain_path`).
+    Metadata only — never file contents, so a huge untracked file costs one
+    `lstat`, and symlinks are not followed: a file is its `lstat`
+    (size, mtime_ns, inode); a directory (porcelain collapses an untracked
+    one to `dir/`) is the sorted `lstat`s of the untracked, NOT gitignored
+    entries `git ls-files -o --exclude-standard` lists under it (so ignored
+    build output or a nested repo's churn inside it does not re-warn; an
+    embedded repo is one entry), capped at 5000; a missing path is
+    `absent`; an unreadable one `unreadable`. HEAD/ref deltas already carry
+    their sha in the string, so they need none.
+
+    Never raises: it runs inside the checkout sentinel, which must not be
+    able to kill a run (a non-UTF-8 name, an odd porcelain line), so any
+    failure is `unreadable`."""
+    try:
+        return _delta_fingerprint_unguarded(repo_root, delta)
+    except Exception:
+        return "unreadable"
+
+
+def _delta_fingerprint_unguarded(repo_root: Path, delta: str) -> str:
+    """`_delta_fingerprint` without its catch-all; see there."""
+    prefix = "working tree changed: "
+    if not delta.startswith(prefix):
+        return ""
+    rel = _porcelain_path(delta[len(prefix):]).rstrip("/")
+    path = repo_root / rel
+    try:
+        st_ = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
+    except OSError:
+        return "unreadable"
+    if not stat.S_ISDIR(st_.st_mode):
+        return f"{st_.st_size}:{st_.st_mtime_ns}:{st_.st_ino}"
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_root), "--literal-pathspecs", "ls-files",
+             "-o", "--exclude-standard", "-z", "--", rel + "/"],
+            capture_output=True, check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "unreadable"
+    if r.returncode != 0:
+        return "unreadable"
+    # Bytes, decoded as the filesystem does: `-z` prints names unquoted, and
+    # a non-UTF-8 name must not raise.
+    names = [os.fsdecode(n) for n in r.stdout.split(b"\0") if n]
+    entries: list[str] = []
+    for name in sorted(names)[:5000]:
+        try:
+            e = os.lstat(repo_root / name)
+        except OSError:
+            continue
+        entries.append(f"{name}\0{e.st_size}\0{e.st_mtime_ns}")
+    return hashlib.sha256("\n".join(entries).encode(
+        "utf-8", "surrogateescape")).hexdigest()
+
+
 def _tripwire_operator_overlap(deltas: list[str]) -> bool:
     """True when EVERY delta is a newly-appeared untracked file (porcelain
     `??`) — the measured signature of the operator dropping task/report
@@ -8162,6 +8454,15 @@ def _tripwire_operator_overlap(deltas: list[str]) -> bool:
     and keeps the full worker-escape framing (DESIGN §12 L4)."""
     return bool(deltas) and all(
         d.startswith("working tree changed: ?? ") for d in deltas)
+
+
+def _execute_check_porcelain_only(st: "State") -> bool:
+    """`porcelain_only` for the per-wave execute check. The execute phase
+    runs for hours and an operator legitimately pulls mid-run, so by default
+    only working-tree changes are compared; under `stop_on_repo_change` the
+    operator asked to halt on commits too, which is what HEAD/refs cover
+    (DESIGN §12 L4)."""
+    return not st.data.get("stop_on_repo_change")
 
 
 async def _assert_repo_unchanged(st: "State", phase: str, *,
@@ -8181,7 +8482,18 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
     every execute wave rather than once at the end, so it fires within one
     worker (or one wave) of the damage instead of after the whole spend.
 
-    The execute-phase call passes `porcelain_only` — see `_diff_repo_state`.
+    By default a delta is a WARNING and the run continues; only
+    `stop_on_repo_change` makes it die() (DESIGN §12 L4). Measured: 71 of 73
+    halted runs carried only operator signatures and none was a confirmed
+    escape, while nothing committed or pushed is built from the checkout's
+    working tree. Each distinct delta is warned once, and again only if its
+    content moves (`repo_change_warned`, `_delta_fingerprint`): the baseline
+    is deliberately never refreshed — `_acceptance_validity_base` reads it —
+    so every later check would otherwise repeat it. The operator/escape hint
+    classifies each newly-warned batch, not every delta since the baseline.
+
+    The execute-phase call passes `porcelain_only` unless the flag is set —
+    see `_diff_repo_state`.
     Its known blind spot is a gitignored write: `git status --porcelain` never
     lists `node_modules/`, so the in-checkout dependency installs observed in
     the run corpus stay invisible here. That is an accepted residual, recorded
@@ -8203,20 +8515,66 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
     deltas = _diff_repo_state(before, after, porcelain_only=porcelain_only)
     if not deltas:
         return
+    if not st.data.get("stop_on_repo_change"):
+        warned = st.data.setdefault("repo_change_warned", {})
+        root = Path(st.repo_root)
+        fps = {d: await asyncio.to_thread(_delta_fingerprint, root, d)
+               for d in deltas}
+        if isinstance(warned, list):
+            # Written by an earlier build that kept only the delta strings;
+            # those were warned already, so adopt their current prints.
+            warned = st.data["repo_change_warned"] = {
+                d: fps.get(d, "") for d in warned}
+        new: list[str] = []
+        prints: dict[str, str] = {}
+        for d in deltas:
+            fp = fps[d]
+            if warned.get(d) != fp:
+                # New delta, or one already warned whose content moved since:
+                # the porcelain line alone would hide a later write to a path
+                # the operator had already touched.
+                new.append(d + (" (changed again)" if d in warned else ""))
+                prints[d] = fp
+        if not new:
+            return
+        if _tripwire_operator_overlap(
+                [d.removesuffix(" (changed again)") for d in new]):
+            hint = ("every change is a newly-added untracked file — most "
+                    "likely your own (a task or report file for another "
+                    "run), not a worker escape")
+        else:
+            hint = ("a tracked file, HEAD or a branch changed — if that "
+                    "was not you, a worker may have escaped its worktree; "
+                    f"inspect with `git -C {st.repo_root} status`")
+            if any(d.startswith(("HEAD moved", "ref ")) for d in new):
+                # Mechanical delta prefixes from `_diff_repo_state`.
+                hint += ("; note that commits on the run's working branch "
+                         "become part of what this run builds on and pushes")
+        log(f"WARNING: your real checkout changed during {phase}:\n  "
+            + "\n  ".join(new)
+            + f"\n  ({hint}). Continuing: nothing leerie commits or pushes "
+              "is built from your working tree. Pass --stop-on-repo-change "
+              "to halt instead.")
+        warned.update(prints)
+        st.save()
+        return
     if _tripwire_operator_overlap(deltas):
-        # Same stop, different framing: the measured cost of blaming a
-        # worker escape here was a from-scratch re-run (full replan)
-        # because the message put resume behind a restore step the
-        # operator's own files never needed (DESIGN §12 L4).
+        # Under --stop-on-repo-change. Same stop, different framing: the
+        # measured cost of blaming a worker escape here was a from-scratch
+        # re-run (full replan) because the message put resume behind a
+        # restore step the operator's own files never needed (DESIGN §12 L4).
         die("your real checkout changed during " + phase + ".\n  "
             + "\n  ".join(deltas)
             + "\n\nEvery delta above is a newly-added untracked file — the "
               "signature of operator activity in this checkout (dropping a "
               "task or report file for another run) rather than a worker "
               "escape, which shows up as tracked-file modifications. The "
-              "run still stops, because its planning baseline moved. If "
-              "those files are yours, no restore is needed — resume "
-              "directly:\n"
+              "run still stops (--stop-on-repo-change), because its planning "
+              "baseline moved — and it stays moved, so resuming with the "
+              "flag still set stops again. If those files are yours, no "
+              "restore is needed — resume without the flag (set "
+              "LEERIE_STOP_ON_REPO_CHANGE=0 if leerie.toml turns it on), and "
+              "the change is logged as a warning instead:\n"
               f"  ./leerie resume {st.run_id}\n"
             "If they are NOT yours, treat this as an escape:\n"
             f"  git -C {st.repo_root} status\n"
@@ -8232,7 +8590,12 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
           f"  git -C {st.repo_root} status\n"
           f"  git -C {st.repo_root} checkout -- <paths>   # tracked edits\n"
           f"  git -C {st.repo_root} clean -i               # files it created\n"
-          f"  ./leerie resume {st.run_id}")
+          f"  ./leerie resume {st.run_id}\n"
+          "If these changes are yours (a pull, a commit, your own edits), "
+          "restoring cannot undo them and resuming with "
+          "--stop-on-repo-change still set stops again: resume without the "
+          "flag (set LEERIE_STOP_ON_REPO_CHANGE=0 if leerie.toml turns it "
+          "on), and they are logged as a warning instead.")
 
 
 def _judgment_cwd(st: "State") -> str:
@@ -13121,8 +13484,9 @@ async def _filter_satisfied_subtasks(
     # sha"). A cached verdict recorded under a different sha describes a
     # tree that no longer exists (HEAD moved between a pause and a resume
     # — e.g. a sibling run merged its own PR) and must be treated as
-    # absent, never trusted stale.
-    base_sha = await _branch_head_sha(str(repo_root))
+    # absent, never trusted stale. It names the tree the probe judges (the
+    # working branch's tip, see `_base_tree_sha`), not the live HEAD.
+    base_sha = await _base_tree_sha(str(repo_root), st)
     cache: dict[str, dict] = st.data.setdefault("satisfied_probe_cache", {})
 
     sys_prompt = _load_prompt("satisfied_probe")
@@ -36998,9 +37362,11 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
     log("phase 4: creating run-branch worktree")
     st.data["current_phase"] = "phase 4-5: implementing"
     st.save()
-    proc = await _run_script("setup-run.sh", st.run_id)
+    proc = await _run_script("setup-run.sh", st.run_id,
+                             *_working_branch_arg(st))
     if proc.returncode != 0:
         die(f"run setup failed: {proc.stderr.strip()}")
+    _log_working_branch_fallback(proc, "phase 4")
 
     # On Fly, machine stop SIGKILLs the orchestrator (PID 1 is sleep
     # infinity; SIGTERM reaps it, kernel SIGKILLs children) — the
@@ -37156,8 +37522,11 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # concurrently against one shared checkout, so a per-subtask check
         # races itself for no extra coverage. Placed before the marker-scan
         # and blocked-subtask die()s so it still runs on those paths.
+        # Porcelain-only unless the operator opted into halting: then they
+        # have asked to stop on commits too, which is what HEAD/refs cover.
         await _assert_repo_unchanged(
-            st, f"phase 5 (wave {wi + 1})", porcelain_only=True)
+            st, f"phase 5 (wave {wi + 1})",
+            porcelain_only=_execute_check_porcelain_only(st))
 
         # N31: the worktree (including node_modules) is dead weight once
         # its branch is merged into staging — pruning it here, instead of
@@ -38337,6 +38706,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             getattr(args, "skip_classification_check", False))
         st.data["stop_on_blocked"] = bool(
             getattr(args, "stop_on_blocked", False))
+        st.data["stop_on_repo_change"] = bool(
+            getattr(args, "stop_on_repo_change", False))
         st.data["skip_satisfied_check"] = bool(
             getattr(args, "skip_satisfied_check", False))
         st.data["skip_budget_check"] = bool(args.skip_budget_check)
@@ -38443,6 +38814,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
                        getattr(args, "skip_classification_check", False)),
                    "stop_on_blocked": bool(
                        getattr(args, "stop_on_blocked", False)),
+                   "stop_on_repo_change": bool(
+                       getattr(args, "stop_on_repo_change", False)),
                    "skip_satisfied_check": bool(
                        getattr(args, "skip_satisfied_check", False)),
                    "skip_budget_check": bool(args.skip_budget_check),
@@ -38892,10 +39265,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # was calibrated against (12/12, see SATISFIED_PROBE_TOOLS).
             await _ensure_planning_worktree(st)
             # NOTE the repo_root argument stays the REAL checkout. It feeds
-            # `base_sha`, the cache key that invalidates verdicts when HEAD
-            # moves across a pause; keyed off the detached worktree instead it
-            # would be constant by construction and the invalidation would
-            # silently never fire.
+            # `base_sha`, the cache key that invalidates verdicts when the
+            # working branch (else HEAD) moves across a pause — resolved by
+            # `_base_tree_sha` to the same ref `planning-worktree.sh`
+            # mirrors, so the key names the tree the probe judges. (A move
+            # of that ref between the reset above and the probe is a narrow
+            # window this ordering has always had.)
             fix_ids_before = {s_["id"] for p_ in plans
                               for s_ in (p_.get("subtasks") or [])
                               if s_.get("fixes_reported_symptom")}
@@ -39391,6 +39766,12 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "subtask is blocked, instead of auto-accepting it. "
                          f"Also {STOP_ON_BLOCKED_ENV} env or "
                          "stop_on_blocked in leerie.toml. Default: off.")
+    ap.add_argument("--stop-on-repo-change", action="store_true",
+                    help="stop the run when your real checkout changes "
+                         "mid-run (files, or commits/branch moves), instead "
+                         "of logging a warning and continuing. Also "
+                         f"{STOP_ON_REPO_CHANGE_ENV} env or "
+                         "stop_on_repo_change in leerie.toml. Default: off.")
     ap.add_argument("--skip-satisfied-check", action="store_true",
                     help="skip the phase 3 per-subtask satisfied-probe that "
                          "drops subtasks already met on the base tree (DESIGN "
@@ -39865,6 +40246,10 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     # Resolve --stop-on-blocked; _orchestrate() folds it into state.json.
     args.stop_on_blocked = resolve_stop_on_blocked(
         repo_root, getattr(args, "stop_on_blocked", False))
+
+    # Resolve --stop-on-repo-change; _orchestrate() folds it into state.json.
+    args.stop_on_repo_change = resolve_stop_on_repo_change(
+        repo_root, getattr(args, "stop_on_repo_change", False))
 
     # Resolve --skip-satisfied-check (DESIGN §8 *Already-satisfied subtask
     # elimination*). Same precedence shape as the other skip flags.

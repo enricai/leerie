@@ -47,7 +47,8 @@ def test_setup_staging_script_is_gone():
 
 def test_setup_run_takes_run_id_arg():
     src = _script("setup-run.sh")
-    assert 'RUN_ID="${1:?usage: setup-run.sh <run-id>}"' in src
+    assert ('RUN_ID="${1:?usage: setup-run.sh <run-id> [<working-branch>]}"'
+            in src)
 
 
 def test_setup_run_uses_per_run_paths():
