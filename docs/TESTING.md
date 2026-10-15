@@ -3902,7 +3902,10 @@ worktree still land on `refs/heads/<working_branch>` (both red against the
 pre-change scripts), paired with partners that must stay green either way: a
 pull of the same branch is followed, and no argument / `HEAD` / an unknown
 branch falls back to the live HEAD. Plus `_working_branch_arg` and the
-wiring at both call sites.
+wiring at both call sites, and the satisfied-probe cache key:
+`_base_tree_sha` must equal the HEAD the real `planning-worktree.sh` leaves
+the worktree on (a live-HEAD key, the pre-fix behaviour, fails it after a
+branch switch), with the HEAD fallback for no / `HEAD` / unknown branch.
 
 **Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
 the observable (1 on a clean first pass, 3 when flagged — a gate that

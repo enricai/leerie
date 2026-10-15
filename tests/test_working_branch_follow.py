@@ -186,3 +186,48 @@ class TestWiring:
         src = inspect.getsource(leerie.phase_execute)
         i = src.index('_run_script("setup-run.sh"')
         assert "*_working_branch_arg(st)" in src[i:i + 120]
+
+
+# --- satisfied-probe cache key ------------------------------------------------
+
+class TestSatisfiedCacheKey:
+    """`satisfied_probe_cache` verdicts are keyed on `base_sha`; the probe
+    judges the planning worktree. The key must name that same tree, or a
+    branch switch files verdicts under the wrong sha and a later advance of
+    the working branch never invalidates them (DESIGN §6)."""
+
+    def test_key_follows_the_working_branch_after_a_switch(
+            self, leerie, tmp_path):
+        repo = _make_repo(tmp_path)
+        main_sha = _sha(repo, "main")
+        other_sha = _switch_to_other_branch(repo)
+        st = _St({"working_branch": "main"})
+        key = asyncio.run(leerie._base_tree_sha(str(repo), st))
+        assert key == main_sha
+        assert key != other_sha
+
+    @pytest.mark.parametrize("wb", [None, "HEAD", "no-such-branch"])
+    def test_key_falls_back_to_head(self, leerie, tmp_path, wb):
+        repo = _make_repo(tmp_path)
+        other_sha = _switch_to_other_branch(repo)
+        data = {} if wb is None else {"working_branch": wb}
+        key = asyncio.run(leerie._base_tree_sha(str(repo), _St(data)))
+        assert key == other_sha
+
+    def test_key_equals_the_tree_the_probe_judges(self, leerie, tmp_path):
+        """The agreement pin: whatever the real script mirrors, the key
+        names. Discriminates against any independently derived key."""
+        repo = _make_repo(tmp_path)
+        state = tmp_path / "state"
+        _switch_to_other_branch(repo)
+        st = _St({"working_branch": "main"})
+        r = _run(PLANNING_WT, repo, state, *leerie._working_branch_arg(st))
+        assert r.returncode == 0, r.stderr
+        key = asyncio.run(leerie._base_tree_sha(str(repo), st))
+        assert key == _planning_head(state)
+
+    def test_filter_uses_the_shared_key(self, leerie):
+        import inspect
+        src = inspect.getsource(leerie._filter_satisfied_subtasks)
+        assert "base_sha = await _base_tree_sha(str(repo_root), st)" in src
+        assert "_branch_head_sha(str(repo_root))" not in src

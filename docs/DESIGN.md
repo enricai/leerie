@@ -1795,8 +1795,10 @@ move `HEAD` out from under a cached verdict. A stale hit is not a harmless
 inefficiency: it can keep a subtask whose deliverable now already exists
 (which a fresh probe would catch), or drop one that no longer holds
 (silently discarding real work). So the cache is keyed on the base commit
-sha recorded at probe time, and any cached verdict whose sha no longer
-matches `HEAD` on resume is treated as absent — re-probed, never trusted
+sha recorded at probe time — the sha of the tree the probe actually judges,
+which is the recorded working branch's tip (the ref `planning-worktree.sh`
+mirrors; §12 L4), else `HEAD` — and any cached verdict whose sha no longer
+matches that base on resume is treated as absent — re-probed, never trusted
 stale. This is mandatory, not an optional refinement: correctness of a
 resumed run must not depend on nothing else having touched the repository
 while it was paused.
@@ -7389,17 +7391,18 @@ later phase would otherwise repeat it. With `--stop-on-repo-change`
 `die()`s instead, as it always used to. The default flipped on measured
 cost: across one host's corpus (731 logged runs, 2026-07-26 →
 2026-10-15) the sentinel halted 73 runs, and 71 of them carried only
-operator signatures —
-`prompt-N.txt`, editor swap files, report `.md`s copied in for the next
-task (the triggering incident: four reports `scp`'d into the checkout two
-minutes into planning, byte-identical to the operator's local copies), or
+operator signatures — `prompt-N.txt`, editor swap files, report `.md`s
+copied in for the next task (the triggering incident: four reports
+`scp`'d into the checkout two minutes into planning, byte-identical to the
+operator's local copies), or
 `main` fast-forwarding under a merged sibling PR. The other two are
 unattributed — one tracked-file edit, and one HEAD that moved onto a
 commit from another run's branch (the shape of an operator checking that
 branch out to test it) — and no halt was a confirmed escape. Meanwhile
 27 of the 29 runs halted on a HEAD move never got past planning — their
-spend was simply lost. A guard that cries wolf gets switched off, the same reasoning behind `porcelain_only` and
-`_snapshot_repo_state`'s `ok` field; downgrading it to a loud warning
+spend was simply lost. A guard that cries wolf gets switched off, the
+same reasoning behind `porcelain_only` and `_snapshot_repo_state`'s `ok`
+field; downgrading it to a loud warning
 keeps the detection without the cost.
 
 Continuing past a delta is safe because nothing that is committed, merged
@@ -7413,9 +7416,10 @@ the run executes on the advanced tip — so the default merely skips the
 manual step; and a branch switch (an operator checking out another run's
 branch to test it, the shape behind one of the two unattributed halts)
 cannot silently re-base the run onto the wrong branch. Only a run started
-on a detached HEAD, with no branch to follow, still tracks the live HEAD. The accepted residual: some planning inputs
-read the checkout directly (repo map, provisioning, decomposition greps,
-the PR template), so an operator's mid-run edits can colour them.
+on a detached HEAD, with no branch to follow, still tracks the live HEAD.
+The accepted residual: some planning inputs read the checkout directly
+(repo map, provisioning, decomposition greps, the PR template), so an
+operator's mid-run edits can colour them.
 
 The message classifies the delta signature mechanically
 (`_tripwire_operator_overlap`): when every delta is a newly-appeared
@@ -7481,13 +7485,13 @@ write to the denied path, and the corpus shows real Bash writes and `cd
 execute too**, after every wave, closing the phase that previously had no
 check at all — passing `porcelain_only` (dropping HEAD/ref comparisons,
 since the execute phase runs for hours and an operator legitimately pulls
-their own checkout mid-run; a `HEAD moved` false alarm there is worse than
-the escape). Under `--stop-on-repo-change` the operator has asked for a
-halt on commits as well as files, so the execute check compares HEAD and
-refs too. Its own blind spot: `git status --porcelain` never lists
-gitignored paths, so in-checkout `node_modules/` installs stay invisible —
-closing that needs the underlying motive fixed (a worktree with no
-dependencies), not a wider guard.
+their own checkout mid-run; reporting every pull there is noise). Under
+`--stop-on-repo-change` the operator has asked for a halt on commits as
+well as files, so the execute check compares HEAD and refs too. Its own
+blind spot: `git status --porcelain` never lists gitignored paths, so
+in-checkout `node_modules/` installs stay invisible — closing that needs
+the underlying motive fixed (a worktree with no dependencies), not a
+wider guard.
 
 **Two further non-coverages, recorded rather than hidden.** The denial is
 skipped when run state lives inside the checkout (`resolve_leerie_root`

@@ -8069,6 +8069,27 @@ def _working_branch_arg(st: "State") -> list[str]:
     return [wb] if wb and wb != "HEAD" else []
 
 
+async def _base_tree_sha(repo_root: str, st: "State") -> str:
+    """The sha of the tree the planning worktree mirrors: the working
+    branch's tip when `_working_branch_arg` names a local branch, else the
+    real checkout's HEAD — the same choice `planning-worktree.sh` makes.
+
+    The satisfied-probe cache is keyed on this. Keyed on the live HEAD
+    instead, an operator's mid-run branch switch would file verdicts about
+    the working branch's tree under the other branch's sha, and a later
+    advance of the working branch would never invalidate them (DESIGN §6,
+    §12 L4)."""
+    for wb in _working_branch_arg(st):
+        try:
+            r = await run_proc(["git", "rev-parse", "--verify", "--quiet",
+                                f"refs/heads/{wb}"], cwd=repo_root)
+        except OSError:
+            break
+        if r.returncode == 0 and r.stdout.strip():
+            return r.stdout.strip()
+    return await _branch_head_sha(repo_root)
+
+
 async def _ensure_planning_worktree(st: "State") -> str:
     """Create (or reset) this run's disposable judgment-worker worktree and
     return its absolute path, recording it in `st.data["planning_worktree"]`.
@@ -13196,8 +13217,9 @@ async def _filter_satisfied_subtasks(
     # sha"). A cached verdict recorded under a different sha describes a
     # tree that no longer exists (HEAD moved between a pause and a resume
     # — e.g. a sibling run merged its own PR) and must be treated as
-    # absent, never trusted stale.
-    base_sha = await _branch_head_sha(str(repo_root))
+    # absent, never trusted stale. It names the tree the probe judges (the
+    # working branch's tip, see `_base_tree_sha`), not the live HEAD.
+    base_sha = await _base_tree_sha(str(repo_root), st)
     cache: dict[str, dict] = st.data.setdefault("satisfied_probe_cache", {})
 
     sys_prompt = _load_prompt("satisfied_probe")
@@ -38975,10 +38997,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # was calibrated against (12/12, see SATISFIED_PROBE_TOOLS).
             await _ensure_planning_worktree(st)
             # NOTE the repo_root argument stays the REAL checkout. It feeds
-            # `base_sha`, the cache key that invalidates verdicts when HEAD
-            # moves across a pause; keyed off the detached worktree instead it
-            # would be constant by construction and the invalidation would
-            # silently never fire.
+            # `base_sha`, the cache key that invalidates verdicts when the
+            # working branch (else HEAD) moves across a pause — resolved by
+            # `_base_tree_sha` to the same ref `planning-worktree.sh`
+            # mirrors; keyed off the detached worktree instead it would be
+            # constant by construction and the invalidation would silently
+            # never fire.
             fix_ids_before = {s_["id"] for p_ in plans
                               for s_ in (p_.get("subtasks") or [])
                               if s_.get("fixes_reported_symptom")}
