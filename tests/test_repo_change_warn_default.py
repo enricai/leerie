@@ -115,6 +115,17 @@ class TestWarnsAndContinues:
         [w] = _warnings(logs)
         assert "HEAD moved" in w
         assert "may have escaped" in w
+        # A commit on the run's branch is cut into the run branch at phase
+        # 4 and ships in the PR; the warning must say so.
+        assert "become part of what this run builds on and pushes" in w
+
+    def test_a_file_edit_warning_does_not_claim_commits_ship(
+            self, leerie, armed):
+        repo, st, logs = armed
+        (repo / "src.txt").write_text("TAMPERED\n")
+        _check(leerie, st)
+        [w] = _warnings(logs)
+        assert "builds on and pushes" not in w
 
     def test_a_clean_tree_logs_nothing(self, leerie, armed):
         """Anti-vacuity: a sentinel that warned unconditionally would pass
@@ -261,6 +272,49 @@ class TestRewarnsWhenContentMoves:
         (repo / "work" / "server.log").write_text("x" * 50)
         _check(leerie, st, "phase 3 (filters)")
         assert len(_warnings(logs)) == 1
+
+
+class TestNeverRaises:
+    """The sentinel must not be able to kill a run on odd input."""
+
+    def test_undecodable_dir_listing(self, leerie, tmp_path, monkeypatch):
+        """`ls-files -z` prints names unquoted; a non-UTF-8 name (possible
+        on Linux) once raised UnicodeDecodeError out of the check."""
+        repo = _init(tmp_path / "repo")
+        (repo / "drop").mkdir()
+        real_run = leerie.subprocess.run
+
+        def fake(argv: list[str], *a: object,
+                 **k: object) -> object:
+            if "ls-files" in argv:
+                return real_run(["printf", "drop/caf\\351\\0"],
+                                capture_output=True,
+                                text=k.get("text", False))
+            return real_run(argv, *a, **k)
+
+        monkeypatch.setattr(leerie.subprocess, "run", fake)
+        fp = leerie._delta_fingerprint
+        first = fp(repo, "working tree changed: ?? drop/")
+        assert first not in ("", "unreadable")
+        assert fp(repo, "working tree changed: ?? drop/") == first
+
+    @pytest.mark.parametrize("line", ['?? "trail\\"', '?? "\\x4"'])
+    def test_undecodable_porcelain_escape(self, leerie, tmp_path, line):
+        repo = _init(tmp_path / "repo")
+        assert isinstance(leerie._porcelain_path(line), str)
+        assert leerie._delta_fingerprint(
+            repo, f"working tree changed: {line}") in ("absent", "unreadable")
+
+    def test_any_unexpected_error_is_unreadable(
+            self, leerie, tmp_path, monkeypatch):
+        repo = _init(tmp_path / "repo")
+
+        def boom(*_a: object) -> str:
+            raise RuntimeError("unexpected")
+
+        monkeypatch.setattr(leerie, "_porcelain_path", boom)
+        assert leerie._delta_fingerprint(
+            repo, "working tree changed: ?? x.md") == "unreadable"
 
 
 class TestResumeFromListForm:

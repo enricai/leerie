@@ -3896,7 +3896,10 @@ gitignored churn inside a warned directory does not; the fingerprint is
 `lstat`-only (a test forbids `open`), resolves C-quoted porcelain names,
 and never mistakes an untracked `x -> src.txt` for a rename; a list-form
 `repo_change_warned` from an earlier build is adopted on resume without
-a crash or a repeat warning; the
+a crash or a repeat warning; the fingerprint never raises (a non-UTF-8
+directory listing, an undecodable porcelain escape, any unexpected
+error all give a value); a commit during planning is warned as becoming
+part of what the run builds on and pushes, a file edit is not; the
 baseline is untouched after a warning (it feeds
 `_acceptance_validity_base`); with the flag on, a HEAD move dies under the
 execute-wave call shape (through the real `_execute_check_porcelain_only`)
@@ -3940,7 +3943,9 @@ switched-branch file under the same glob, and an untracked
 are still staged. Set tests cover literal matching of `[`-bearing names
 and an `ls-tree` failure (only that call fails) giving the empty set; the
 `refs/heads/<name>` form is accepted by `_working_branch_ref` and both
-scripts.
+scripts. A skipped task-named file is named in a WARNING, and an
+undecodable `ls-tree` gives the empty set while staging carries on with
+the other references.
 
 **Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
 the observable (1 on a clean first pass, 3 when flagged — a gate that

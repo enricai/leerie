@@ -427,12 +427,19 @@ def _stage(leerie: ModuleType, tmp_path: Path, repo: Path,
 class TestStagingSkipsSwitchedBranchContent:
     TASK = "fix per report.md and notes.md, then add feature.py"
 
-    def test_switched_branch_deliverable_is_not_staged(self, leerie, tmp_path):
+    def test_switched_branch_deliverable_is_not_staged(
+            self, leerie, tmp_path, monkeypatch):
         """It would show the satisfied-probe a deliverable the run's tree
-        does not have."""
+        does not have — and the skip is announced, since the same rule
+        would also withhold a spec the operator committed on a side
+        branch."""
         repo = _repo_on_switched_branch(tmp_path)
+        logs: list[str] = []
+        monkeypatch.setattr(leerie, "log", logs.append)
         wt = _stage(leerie, tmp_path, repo, self.TASK)
         assert not (wt / "feature.py").exists()
+        assert any(m.startswith("WARNING: planning worktree: not staging "
+                                "feature.py") for m in logs)
 
     def test_task_documents_are_still_staged(self, leerie, tmp_path):
         """The untracked report and the staged-but-uncommitted notes are
@@ -530,6 +537,29 @@ class TestSwitchedBranchOnlyPaths:
         monkeypatch.setattr(leerie.subprocess, "run", flaky)
         assert leerie._switched_branch_only_paths(
             repo, "feature.py", "refs/heads/main") == set()
+
+
+class TestUndecodableLsTree:
+    def test_gives_empty_set_and_staging_continues(
+            self, leerie, tmp_path, monkeypatch):
+        """An undecodable `ls-tree` once raised out of the helper into
+        staging's outer catch, abandoning every later task reference."""
+        repo = _repo_on_switched_branch(tmp_path)
+        real_run = subprocess.run
+
+        def fake(argv: list[str], *a: object,
+                 **k: object) -> subprocess.CompletedProcess:
+            if "ls-tree" in argv:
+                return real_run(["printf", "caf\\351\\0"],
+                                capture_output=True,
+                                text=k.get("text", False))
+            return real_run(argv, *a, **k)
+
+        monkeypatch.setattr(leerie.subprocess, "run", fake)
+        assert leerie._switched_branch_only_paths(
+            repo, "feature.py", "refs/heads/main") == set()
+        wt = _stage(leerie, tmp_path, repo, "fix per report.md")
+        assert (wt / "report.md").read_text() == "bug report\n"
 
 
 class TestRefsHeadsForm:

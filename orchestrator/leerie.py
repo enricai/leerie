@@ -8046,6 +8046,10 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                 # beside them in the same directory are still staged.
                 skip = _switched_branch_only_paths(repo_root, str(rel), wb_ref)
                 if str(rel) in skip:
+                    log(f"WARNING: planning worktree: not staging {rel} — it "
+                        "is committed only on the branch now checked out, "
+                        "not on the run's working branch; workers will not "
+                        "see it")
                     continue
                 try:
                     dst.parent.mkdir(parents=True, exist_ok=True)
@@ -8123,16 +8127,19 @@ def _switched_branch_only_paths(repo_root: Path, rel: str,
         return set()
 
     def _committed(rev: str) -> set[str] | None:
+        # Bytes, decoded as the filesystem does, and any failure is None: an
+        # exception here would reach `_stage_worktree_extras`'s outer catch
+        # and abandon every later task reference, the spec included.
         try:
             r = subprocess.run(
                 ["git", "-C", str(repo_root), "ls-tree", "-r", "-z",
                  "--name-only", rev, "--", rel],
-                capture_output=True, text=True, check=False, timeout=30)
-        except (OSError, subprocess.SubprocessError):
+                capture_output=True, check=False, timeout=30)
+            if r.returncode != 0:
+                return None
+            return {os.fsdecode(p) for p in r.stdout.split(b"\0") if p}
+        except Exception:
             return None
-        if r.returncode != 0:
-            return None
-        return {p for p in r.stdout.split("\0") if p}
 
     on_head = _committed("HEAD")
     on_wb = _committed(wb_ref)
@@ -8364,7 +8371,12 @@ def _porcelain_path(line: str) -> str:
         elif " -> " in rest:
             rest = rest.split(" -> ", 1)[1]
     if len(rest) >= 2 and rest.startswith('"') and rest.endswith('"'):
-        raw = codecs.escape_decode(rest[1:-1].encode("utf-8"))[0]
+        try:
+            raw = codecs.escape_decode(rest[1:-1].encode("utf-8"))[0]
+        except ValueError:
+            # Not a whole quoted name (e.g. a fragment a U+2028 in a name
+            # split off): keep the raw text rather than raise.
+            return rest
         return raw.decode("utf-8", "surrogateescape")
     return rest
 
@@ -8381,7 +8393,19 @@ def _delta_fingerprint(repo_root: Path, delta: str) -> str:
     build output or a nested repo's churn inside it does not re-warn; an
     embedded repo is one entry), capped at 5000; a missing path is
     `absent`; an unreadable one `unreadable`. HEAD/ref deltas already carry
-    their sha in the string, so they need none."""
+    their sha in the string, so they need none.
+
+    Never raises: it runs inside the checkout sentinel, which must not be
+    able to kill a run (a non-UTF-8 name, an odd porcelain line), so any
+    failure is `unreadable`."""
+    try:
+        return _delta_fingerprint_unguarded(repo_root, delta)
+    except Exception:
+        return "unreadable"
+
+
+def _delta_fingerprint_unguarded(repo_root: Path, delta: str) -> str:
+    """`_delta_fingerprint` without its catch-all; see there."""
     prefix = "working tree changed: "
     if not delta.startswith(prefix):
         return ""
@@ -8399,13 +8423,16 @@ def _delta_fingerprint(repo_root: Path, delta: str) -> str:
         r = subprocess.run(
             ["git", "-C", str(repo_root), "--literal-pathspecs", "ls-files",
              "-o", "--exclude-standard", "-z", "--", rel + "/"],
-            capture_output=True, text=True, check=False, timeout=30)
+            capture_output=True, check=False, timeout=30)
     except (OSError, subprocess.SubprocessError):
         return "unreadable"
     if r.returncode != 0:
         return "unreadable"
+    # Bytes, decoded as the filesystem does: `-z` prints names unquoted, and
+    # a non-UTF-8 name must not raise.
+    names = [os.fsdecode(n) for n in r.stdout.split(b"\0") if n]
     entries: list[str] = []
-    for name in sorted(n for n in r.stdout.split("\0") if n)[:5000]:
+    for name in sorted(names)[:5000]:
         try:
             e = os.lstat(repo_root / name)
         except OSError:
@@ -8519,6 +8546,10 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
             hint = ("a tracked file, HEAD or a branch changed — if that "
                     "was not you, a worker may have escaped its worktree; "
                     f"inspect with `git -C {st.repo_root} status`")
+            if any(d.startswith(("HEAD moved", "ref ")) for d in new):
+                # Mechanical delta prefixes from `_diff_repo_state`.
+                hint += ("; note that commits on the run's working branch "
+                         "become part of what this run builds on and pushes")
         log(f"WARNING: your real checkout changed during {phase}:\n  "
             + "\n  ".join(new)
             + f"\n  ({hint}). Continuing: nothing leerie commits or pushes "

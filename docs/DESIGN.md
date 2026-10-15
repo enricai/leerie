@@ -7440,11 +7440,13 @@ the run executes on the advanced tip — so the default merely skips the
 manual step; and a branch switch (an operator checking out another run's
 branch to test it, the shape behind one of the two unattributed halts)
 cannot silently re-base the run onto the wrong branch. The live HEAD is
-still used in three cases: a run started on a detached HEAD (no branch to
+still used in four cases: a run started on a detached HEAD (no branch to
 follow), the first planning-worktree reset (before `working_branch` is
-recorded, when nothing can have moved yet), and a recorded branch that no
+recorded, when nothing can have moved yet), a recorded branch that no
 longer exists — the scripts warn on that fallback and the orchestrator
-logs it (`_log_working_branch_fallback`).
+logs it (`_log_working_branch_fallback`) — and `collect-subtrees.sh`,
+which runs `setup-run.sh` with no argument after the run, when the run
+branch already exists and is never re-cut.
 The accepted residuals, recorded here rather than only in commit
 history: some inputs read the checkout directly — the repo map,
 provisioning, decomposition greps, dependency capture's manifests, the
@@ -7455,10 +7457,16 @@ existence in the checkout rather than the merged staging tree; the
 acceptance writer copies every task-named file its worktree (at the
 validity base) lacks, so a deliverable committed after that base could
 be copied in (independent of branch switching, and predating this
-default); and the run follows the working branch's moving tip rather
-than the baseline's commit, which keeps a pull's parity with
-die-then-`resume` but means a commit landing on that branch during
-planning is executed against without having been planned against.
+default); the run follows the working branch's moving tip rather than
+the baseline's commit, which keeps a pull's parity with die-then-`resume`
+but means a commit landing on that branch during planning is executed
+against, and shipped in the PR, without having been planned against —
+the warning says so whenever HEAD or a ref moved; and a run started on a
+detached HEAD has no branch to follow, so a mid-run checkout re-bases it
+onto whatever is checked out, which only `--stop-on-repo-change` stops.
+A task-named file skipped from staging as switched-branch content is
+named in a WARNING, since the same rule would withhold a spec the
+operator committed on a side branch and stayed on.
 
 The message classifies the delta signature mechanically
 (`_tripwire_operator_overlap`): when every delta is a newly-appeared
