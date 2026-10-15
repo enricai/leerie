@@ -18,9 +18,10 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import hashlib
+import os
 import sys
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -52,7 +53,8 @@ class _St:
 
 
 @pytest.fixture
-def armed(leerie, tmp_path, monkeypatch):
+def armed(leerie: ModuleType, tmp_path: Path,
+          monkeypatch: pytest.MonkeyPatch) -> tuple[Path, _St, list[str]]:
     """A repo, a State with a baseline, a die() that fails the test, and a
     captured log."""
     repo = _init(tmp_path / "repo")
@@ -67,7 +69,7 @@ def armed(leerie, tmp_path, monkeypatch):
     return repo, st, logs
 
 
-def _check(leerie, st: _St, phase: str = "phase 2 (plan)",
+def _check(leerie: ModuleType, st: _St, phase: str = "phase 2 (plan)",
            porcelain_only: bool = False) -> None:
     return asyncio.run(leerie._assert_repo_unchanged(
         st, phase, porcelain_only=porcelain_only))
@@ -136,7 +138,8 @@ class TestWarnsOnce:
         warned = st.data["repo_change_warned"]
         assert list(warned) == ["working tree changed: ?? notes.md"]
         assert warned["working tree changed: ?? notes.md"] == \
-            hashlib.sha256(b"x\n").hexdigest()
+            leerie._delta_fingerprint(
+                repo, "working tree changed: ?? notes.md")
         assert st.saves == 1
 
     def test_a_new_delta_warns_alone(self, leerie, armed):
@@ -174,7 +177,8 @@ class TestRewarnsWhenContentMoves:
         (repo / "src.txt").write_text("operator edit\n")
         _check(leerie, st, "phase 2 (plan)")
         _check(leerie, st, "phase 2.5 (reconcile)")
-        (repo / "src.txt").write_text("a later write\n")
+        # A different size, so the re-warn never rests on mtime granularity.
+        (repo / "src.txt").write_text("a later, longer write\n")
         _check(leerie, st, "phase 5 (wave 1)", porcelain_only=True)
         first, second = _warnings(logs)
         assert "src.txt" in first and "changed again" not in first
@@ -198,13 +202,81 @@ class TestRewarnsWhenContentMoves:
     def test_fingerprint(self, leerie, tmp_path):
         repo = _init(tmp_path / "repo")
         fp = leerie._delta_fingerprint
+        st_ = os.lstat(repo / "src.txt")
         assert fp(repo, "working tree changed:  M src.txt") == \
-            hashlib.sha256(b"original\n").hexdigest()
+            f"{st_.st_size}:{st_.st_mtime_ns}:{st_.st_ino}"
         assert fp(repo, "working tree changed: ?? gone.md") == "absent"
         assert fp(repo, "HEAD moved: aaa -> bbb") == ""
         (repo / "new.txt").write_text("n\n")
+        new_st = os.lstat(repo / "new.txt")
         assert fp(repo, "working tree changed: R  src.txt -> new.txt") == \
-            hashlib.sha256(b"n\n").hexdigest()
+            f"{new_st.st_size}:{new_st.st_mtime_ns}:{new_st.st_ino}"
+
+    def test_fingerprint_never_reads_contents(
+            self, leerie, tmp_path, monkeypatch):
+        """A multi-GB untracked file must cost one lstat per check, not a
+        full read on the event loop."""
+        repo = _init(tmp_path / "repo")
+        (repo / "big.bin").write_bytes(b"\0" * 1024)
+
+        def no_open(*_a: object, **_k: object) -> None:
+            raise AssertionError("fingerprint opened a file")
+
+        monkeypatch.setattr("builtins.open", no_open)
+        assert leerie._delta_fingerprint(
+            repo, "working tree changed: ?? big.bin").startswith("1024:")
+
+    def test_quoted_paths_resolve(self, leerie, tmp_path):
+        """Porcelain C-quotes non-ASCII names; ` -> ` splits only a
+        rename. An untracked `x -> src.txt` must not fingerprint
+        `src.txt`."""
+        repo = _init(tmp_path / "repo")
+        (repo / "café.md").write_text("c\n")
+        porcelain = run_git_repo_first(
+            repo, "status", "--porcelain").stdout.splitlines()
+        line = next(ln for ln in porcelain if ln.startswith("?? "))
+        assert line == '?? "caf\\303\\251.md"'
+        assert leerie._delta_fingerprint(
+            repo, f"working tree changed: {line}") != "absent"
+        (repo / "x -> src.txt").write_text("y\n")
+        own = leerie._delta_fingerprint(
+            repo, 'working tree changed: ?? "x -> src.txt"')
+        assert own != leerie._delta_fingerprint(
+            repo, "working tree changed:  M src.txt")
+        assert own != "absent"
+
+    def test_ignored_churn_in_a_warned_dir_does_not_re_warn(
+            self, leerie, armed):
+        """Build output inside an untracked directory is gitignored; its
+        churn is not a change to the operator's directory."""
+        repo, st, logs = armed
+        (repo / ".gitignore").write_text("*.log\n")
+        run_git_repo_first(repo, "add", ".gitignore")
+        run_git_repo_first(repo, "commit", "-qm", "ignore logs")
+        st.data["repo_state_before_planning"] = asyncio.run(
+            leerie._snapshot_repo_state(str(repo)))
+        (repo / "work").mkdir()
+        (repo / "work" / "plan.md").write_text("p\n")
+        _check(leerie, st, "phase 2 (plan)")
+        (repo / "work" / "server.log").write_text("x" * 50)
+        _check(leerie, st, "phase 3 (filters)")
+        assert len(_warnings(logs)) == 1
+
+
+class TestResumeFromListForm:
+    def test_list_written_by_an_earlier_build_is_adopted(self, leerie, armed):
+        """An earlier build of this feature stored the warned deltas as a
+        list. A resume must neither crash nor repeat those warnings."""
+        repo, st, logs = armed
+        (repo / "notes.md").write_text("x\n")
+        st.data["repo_change_warned"] = ["working tree changed: ?? notes.md"]
+        _check(leerie, st, "phase 3 (filters)")
+        assert _warnings(logs) == []
+        warned = st.data["repo_change_warned"]
+        assert isinstance(warned, dict)
+        assert warned["working tree changed: ?? notes.md"] == \
+            leerie._delta_fingerprint(
+                repo, "working tree changed: ?? notes.md")
 
 
 class TestBaselineUntouched:
@@ -297,7 +369,7 @@ class TestFlagRestoresTheHalt:
 # --- resolver precedence ----------------------------------------------------
 
 @pytest.fixture
-def repo_root(tmp_path, monkeypatch):
+def repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.delenv("LEERIE_STOP_ON_REPO_CHANGE", raising=False)
     return tmp_path
 
@@ -341,7 +413,8 @@ class _ReachedOrchestrate(Exception):
     pass
 
 
-def _resolved_by_main(leerie, monkeypatch, tmp_path: Path,
+def _resolved_by_main(leerie: ModuleType, monkeypatch: pytest.MonkeyPatch,
+                      tmp_path: Path,
                       extra_argv: tuple[str, ...] = ()) -> bool:
     """Run the real `main()` up to `_orchestrate` (harness shape from
     tests/test_main_cli_wiring.py) and return the `stop_on_repo_change` it

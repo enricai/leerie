@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import codecs
 import concurrent.futures
 import contextlib
 import copy
@@ -8026,6 +8027,9 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
         wt = Path(worktree)
         task = st.data.get("task") or ""
         staged = 0
+        # Resolved once per call: every skip decision below compares HEAD
+        # with this same ref.
+        wb_ref = _working_branch_ref(repo_root, st)
         if task:
             for src in _glob_task_references(task, repo_root):
                 try:
@@ -8035,26 +8039,31 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                 dst = wt / rel
                 if dst.exists():
                     continue          # tracked — the worktree already has it
-                if _switched_branch_only(repo_root, src, st):
-                    # Committed on the branch the operator switched to
-                    # mid-run, absent from the run's own branch: staging it
-                    # would show the satisfied-probe a deliverable its tree
-                    # does not have.
+                # Files committed on the branch the operator switched to
+                # mid-run and absent from the run's own branch: staging one
+                # would show the satisfied-probe a deliverable its tree does
+                # not have. Skipped file by file, so untracked task documents
+                # beside them in the same directory are still staged.
+                skip = _switched_branch_only_paths(repo_root, str(rel), wb_ref)
+                if str(rel) in skip:
                     continue
                 try:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     if src.is_dir():
-                        shutil.copytree(src, dst, dirs_exist_ok=True)
+                        shutil.copytree(
+                            src, dst, dirs_exist_ok=True,
+                            ignore=_ignore_repo_paths(repo_root, skip))
                     else:
                         shutil.copy2(src, dst)
                     staged += 1
                 except Exception:
                     continue
         claude_src, claude_dst = repo_root / ".claude", wt / ".claude"
-        if (claude_src.is_dir() and not claude_dst.exists()
-                and not _switched_branch_only(repo_root, claude_src, st)):
+        if claude_src.is_dir() and not claude_dst.exists():
+            skip = _switched_branch_only_paths(repo_root, ".claude", wb_ref)
             try:
-                shutil.copytree(claude_src, claude_dst, dirs_exist_ok=True)
+                shutil.copytree(claude_src, claude_dst, dirs_exist_ok=True,
+                                ignore=_ignore_repo_paths(repo_root, skip))
                 staged += 1
             except Exception:
                 pass
@@ -8069,11 +8078,13 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
 def _working_branch_ref(repo_root: str | Path, st: "State") -> str | None:
     """The full ref (`refs/heads/<name>`) of the branch the run started on,
     or None when there is none to follow (not yet recorded, a detached
-    start, or the branch no longer exists). Tries the recorded name, then
-    the name without a leading `heads/`: `git rev-parse --abbrev-ref HEAD`
-    prints `heads/<name>` when a tag shares the branch's name. The same
-    two-step as `setup-run.sh` / `planning-worktree.sh`, so all three agree
-    on which tree the run follows."""
+    start, the branch no longer exists, or git could not be run). Tries the
+    recorded name, then the name without a leading `heads/` (`git rev-parse
+    --abbrev-ref HEAD` prints `heads/<name>` when a tag shares the branch's
+    name), then a name already of the form `refs/heads/<name>` (printed when
+    even `heads/<name>` is ambiguous). The same lookup as `setup-run.sh` /
+    `planning-worktree.sh`, so all three agree on which tree the run
+    follows."""
     args = _working_branch_arg(st)
     if not args:
         return None
@@ -8081,6 +8092,8 @@ def _working_branch_ref(repo_root: str | Path, st: "State") -> str | None:
     candidates = [f"refs/heads/{wb}"]
     if wb.startswith("heads/"):
         candidates.append(f"refs/heads/{wb[len('heads/'):]}")
+    if wb.startswith("refs/heads/"):
+        candidates.append(wb)
     for ref in candidates:
         try:
             r = subprocess.run(
@@ -8094,34 +8107,58 @@ def _working_branch_ref(repo_root: str | Path, st: "State") -> str | None:
     return None
 
 
-def _switched_branch_only(repo_root: Path, path: Path, st: "State") -> bool:
-    """True when *path* is committed on the branch currently checked out but
-    not on the run's working branch — content of a branch the operator
-    switched to mid-run (DESIGN §12 L2/L4), which must not be staged into
-    the planning worktree. A staged-but-uncommitted or untracked task
-    document answers False, as does any git failure or a run with no branch
-    to follow: the copy then proceeds exactly as before. `git ls-tree`
-    matches paths literally (no pathspec globbing) — mechanical output."""
-    wb_ref = _working_branch_ref(repo_root, st)
+def _switched_branch_only_paths(repo_root: Path, rel: str,
+                                wb_ref: str | None) -> set[str]:
+    """Repo-relative files under *rel* (a file or a directory) that are
+    committed on the branch currently checked out but not on the run's
+    working branch (*wb_ref*, from `_working_branch_ref`) — content of a
+    branch the operator switched to mid-run (DESIGN §12 L2/L4), which must
+    not be staged into the planning worktree. Untracked and
+    staged-but-uncommitted files are never in it, so task documents beside
+    such content are still staged. `git ls-tree` reads commits and matches
+    paths literally (no pathspec globbing) — mechanical output. No branch
+    to follow, or any git failure, answers the empty set: the copy then
+    proceeds exactly as before."""
     if wb_ref is None:
-        return False
-    rel = _repo_rel(path, repo_root)
+        return set()
 
-    def _committed(rev: str) -> bool | None:
+    def _committed(rev: str) -> set[str] | None:
         try:
             r = subprocess.run(
-                ["git", "-C", str(repo_root), "ls-tree", "-r", "--name-only",
-                 rev, "--", rel],
+                ["git", "-C", str(repo_root), "ls-tree", "-r", "-z",
+                 "--name-only", rev, "--", rel],
                 capture_output=True, text=True, check=False, timeout=30)
         except (OSError, subprocess.SubprocessError):
             return None
         if r.returncode != 0:
             return None
-        return bool(r.stdout.strip())
+        return {p for p in r.stdout.split("\0") if p}
 
     on_head = _committed("HEAD")
     on_wb = _committed(wb_ref)
-    return on_head is True and on_wb is False
+    if on_head is None or on_wb is None:
+        return set()
+    return on_head - on_wb
+
+
+def _ignore_repo_paths(
+        repo_root: Path,
+        skip: set[str]) -> Callable[[str, list[str]], set[str]]:
+    """A `shutil.copytree` *ignore* callable dropping exactly the
+    repo-relative paths in *skip*."""
+    root = repo_root.resolve()
+
+    def _ignore(directory: str, names: list[str]) -> set[str]:
+        if not skip:
+            return set()
+        try:
+            base = Path(directory).resolve().relative_to(root)
+        except ValueError:
+            return set()
+        return {n for n in names
+                if (base / n).as_posix() in skip}
+
+    return _ignore
 
 
 def _working_branch_arg(st: "State") -> list[str]:
@@ -8138,8 +8175,8 @@ def _working_branch_arg(st: "State") -> list[str]:
 
 async def _base_tree_sha(repo_root: str, st: "State") -> str:
     """The sha of the tree the planning worktree mirrors: the working
-    branch's tip when `_working_branch_arg` names a local branch, else the
-    real checkout's HEAD — the same choice `planning-worktree.sh` makes.
+    branch's tip when `_working_branch_ref` resolves, else the real
+    checkout's HEAD — the same choice `planning-worktree.sh` makes.
 
     Resolved through `_working_branch_ref`, the same lookup the script
     makes. The satisfied-probe cache is keyed on this. Keyed on the live HEAD
@@ -8147,7 +8184,7 @@ async def _base_tree_sha(repo_root: str, st: "State") -> str:
     the working branch's tree under the other branch's sha, and a later
     advance of the working branch would never invalidate them (DESIGN §6,
     §12 L4)."""
-    ref = _working_branch_ref(repo_root, st)
+    ref = await asyncio.to_thread(_working_branch_ref, repo_root, st)
     if ref is not None:
         try:
             r = await run_proc(["git", "rev-parse", "--verify", "--quiet",
@@ -8300,51 +8337,82 @@ def _diff_repo_state(before: dict, after: dict, *,
     return out
 
 
+def _porcelain_path(line: str) -> str:
+    """The (target) path of one `git status --porcelain` v1 line —
+    mechanical git output, never prose. `XY <path>`, or `XY <old> -> <new>`
+    for a rename/copy (an `R`/`C` status). Porcelain C-quotes any name with
+    whitespace, a quote, a backslash or a non-ASCII byte, so ` -> ` can only
+    separate two names when the status says rename/copy and the old name is
+    unquoted-and-spaceless or a complete quoted string; a quoted name is
+    decoded (octal escapes back to UTF-8 bytes)."""
+    status, rest = line[:2], line[3:]
+    if "R" in status or "C" in status:
+        if rest.startswith('"'):
+            k, escaped = 1, False
+            while k < len(rest):
+                ch = rest[k]
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    break
+                k += 1
+            tail = rest[k + 1:]
+            if tail.startswith(" -> "):
+                rest = tail[len(" -> "):]
+        elif " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+    if len(rest) >= 2 and rest.startswith('"') and rest.endswith('"'):
+        raw = codecs.escape_decode(rest[1:-1].encode("utf-8"))[0]
+        return raw.decode("utf-8", "surrogateescape")
+    return rest
+
+
 def _delta_fingerprint(repo_root: Path, delta: str) -> str:
-    """Content fingerprint for one `_diff_repo_state` delta, so a warned
-    delta re-warns when its content moves again. Working-tree deltas are
-    `working tree changed: <porcelain line>` (mechanical git output; a
-    rename's `old -> new` keeps the new path): a file hashes its bytes, a
-    directory (porcelain collapses an untracked one to `dir/`) hashes its
-    sorted (path, size, mtime) entries, capped so a huge tree stays cheap,
-    and a missing path is `absent`. HEAD/ref deltas already carry their
-    sha in the string, so they need none."""
+    """Change fingerprint for one `_diff_repo_state` delta, so a warned
+    delta re-warns when its path changes again. Working-tree deltas are
+    `working tree changed: <porcelain line>` (path from `_porcelain_path`).
+    Metadata only — never file contents, so a huge untracked file costs one
+    `lstat`, and symlinks are not followed: a file is its `lstat`
+    (size, mtime_ns, inode); a directory (porcelain collapses an untracked
+    one to `dir/`) is the sorted `lstat`s of the untracked, NOT gitignored
+    entries `git ls-files -o --exclude-standard` lists under it (so ignored
+    build output or a nested repo's churn inside it does not re-warn; an
+    embedded repo is one entry), capped at 5000; a missing path is
+    `absent`; an unreadable one `unreadable`. HEAD/ref deltas already carry
+    their sha in the string, so they need none."""
     prefix = "working tree changed: "
     if not delta.startswith(prefix):
         return ""
-    rel = delta[len(prefix):][3:]
-    if " -> " in rel:
-        rel = rel.split(" -> ", 1)[1]
-    rel = rel.strip().strip('"')
+    rel = _porcelain_path(delta[len(prefix):]).rstrip("/")
     path = repo_root / rel
-    h = hashlib.sha256()
     try:
-        if path.is_file():
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(chunk)
-            return h.hexdigest()
-        if path.is_dir():
-            entries: list[str] = []
-            for dirpath, dirnames, filenames in os.walk(path):
-                dirnames.sort()
-                for name in sorted(filenames):
-                    fp = Path(dirpath) / name
-                    try:
-                        stt = fp.stat()
-                    except OSError:
-                        continue
-                    entries.append(f"{fp.relative_to(path)}\0{stt.st_size}"
-                                   f"\0{stt.st_mtime_ns}")
-                    if len(entries) >= 5000:
-                        break
-                if len(entries) >= 5000:
-                    break
-            h.update("\n".join(entries).encode())
-            return h.hexdigest()
+        st_ = os.lstat(path)
+    except FileNotFoundError:
+        return "absent"
     except OSError:
         return "unreadable"
-    return "absent"
+    if not stat.S_ISDIR(st_.st_mode):
+        return f"{st_.st_size}:{st_.st_mtime_ns}:{st_.st_ino}"
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_root), "--literal-pathspecs", "ls-files",
+             "-o", "--exclude-standard", "-z", "--", rel + "/"],
+            capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return "unreadable"
+    if r.returncode != 0:
+        return "unreadable"
+    entries: list[str] = []
+    for name in sorted(n for n in r.stdout.split("\0") if n)[:5000]:
+        try:
+            e = os.lstat(repo_root / name)
+        except OSError:
+            continue
+        entries.append(f"{name}\0{e.st_size}\0{e.st_mtime_ns}")
+    return hashlib.sha256("\n".join(entries).encode(
+        "utf-8", "surrogateescape")).hexdigest()
 
 
 def _tripwire_operator_overlap(deltas: list[str]) -> bool:
@@ -8422,10 +8490,18 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
         return
     if not st.data.get("stop_on_repo_change"):
         warned = st.data.setdefault("repo_change_warned", {})
+        root = Path(st.repo_root)
+        fps = {d: await asyncio.to_thread(_delta_fingerprint, root, d)
+               for d in deltas}
+        if isinstance(warned, list):
+            # Written by an earlier build that kept only the delta strings;
+            # those were warned already, so adopt their current prints.
+            warned = st.data["repo_change_warned"] = {
+                d: fps.get(d, "") for d in warned}
         new: list[str] = []
         prints: dict[str, str] = {}
         for d in deltas:
-            fp = _delta_fingerprint(Path(st.repo_root), d)
+            fp = fps[d]
             if warned.get(d) != fp:
                 # New delta, or one already warned whose content moved since:
                 # the porcelain line alone would hide a later write to a path

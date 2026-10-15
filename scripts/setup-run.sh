@@ -74,7 +74,9 @@ mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/criteria" "${R
 # and PR base): a deleted branch then fails loudly at finalize rather than
 # silently diffing against whatever is checked out.
 # `git rev-parse --abbrev-ref HEAD` prints `heads/<name>` when a tag shares
-# the branch's name, so the name without that prefix is tried second.
+# the branch's name (and `refs/heads/<name>` when even that is ambiguous),
+# so those forms are tried after the name itself — the same lookup as the
+# orchestrator's `_working_branch_ref`.
 BASE_REF="HEAD"
 if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
   if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
@@ -82,6 +84,9 @@ if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
   elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
      && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
     BASE_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
+  elif [ "${REQUESTED_BRANCH#refs/heads/}" != "$REQUESTED_BRANCH" ] \
+     && git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
+    BASE_REF="$REQUESTED_BRANCH"
   else
     echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
   fi

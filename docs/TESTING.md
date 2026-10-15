@@ -3891,7 +3891,12 @@ drives the real `_assert_repo_unchanged` against a real git repo with
 operator/escape hint (asserted by value, not by the absence of a raise);
 a persisting delta is warned once across repeated checks and a new one
 warns alone, but a re-edit of a warned file, or a new file inside a warned
-`?? dir/`, re-warns as "changed again" (`_delta_fingerprint`); the
+`?? dir/`, re-warns as "changed again" (`_delta_fingerprint`), while
+gitignored churn inside a warned directory does not; the fingerprint is
+`lstat`-only (a test forbids `open`), resolves C-quoted porcelain names,
+and never mistakes an untracked `x -> src.txt` for a rename; a list-form
+`repo_change_warned` from an earlier build is adopted on resume without
+a crash or a repeat warning; the
 baseline is untouched after a warning (it feeds
 `_acceptance_validity_base`); with the flag on, a HEAD move dies under the
 execute-wave call shape (through the real `_execute_check_porcelain_only`)
@@ -3925,12 +3930,17 @@ stderr in both scripts, `setup-run.sh` still records the requested name,
 and `_ensure_planning_worktree` logs the warning while ordinary git stderr
 stays quiet; a branch shadowed by a same-named tag (recorded as
 `heads/<name>`) is still followed by both scripts and `_base_tree_sha`.
-Task-reference staging (`_switched_branch_only`): a deliverable or
-`.claude/` committed only on the switched-to branch is not staged, while
-an untracked report, a `git add`-ed-but-uncommitted document, an
+Task-reference staging (`_switched_branch_only_paths`): a deliverable or a
+`.claude/` file committed only on the switched-to branch is not staged,
+while an untracked report, a `git add`-ed-but-uncommitted document, an
 untracked `.claude/` and a file committed on the run's own branch after
-the reset all are; a truth table includes literal matching of
-`[`-bearing names and a git failure answering False.
+the reset all are — and gating is per file, so an untracked spec beside a
+switched-branch file under the same glob, and an untracked
+`.claude/settings.local.json` beside a switched-branch `.claude/` file,
+are still staged. Set tests cover literal matching of `[`-bearing names
+and an `ls-tree` failure (only that call fails) giving the empty set; the
+`refs/heads/<name>` form is accepted by `_working_branch_ref` and both
+scripts.
 
 **Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
 the observable (1 on a clean first pass, 3 when flagged — a gate that

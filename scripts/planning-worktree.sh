@@ -73,8 +73,9 @@ fi
 # header), else the real checkout's current HEAD. Read here, in the main
 # checkout, rather than inside the worktree — a detached worktree reports its
 # own (possibly stale) HEAD, which is the value this reset exists to correct.
-# Same lookup as setup-run.sh, including the `heads/<name>` form
-# `--abbrev-ref` prints when a tag shares the branch's name.
+# Same lookup as setup-run.sh, including the `heads/<name>` and
+# `refs/heads/<name>` forms `--abbrev-ref` prints when a tag shares the
+# branch's name.
 TARGET_REF="HEAD"
 if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
   if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
@@ -82,6 +83,9 @@ if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
   elif [ "${REQUESTED_BRANCH#heads/}" != "$REQUESTED_BRANCH" ] \
      && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH#heads/}"; then
     TARGET_REF="refs/heads/${REQUESTED_BRANCH#heads/}"
+  elif [ "${REQUESTED_BRANCH#refs/heads/}" != "$REQUESTED_BRANCH" ] \
+     && git show-ref --verify --quiet "$REQUESTED_BRANCH"; then
+    TARGET_REF="$REQUESTED_BRANCH"
   else
     echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
   fi

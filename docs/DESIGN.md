@@ -7362,9 +7362,10 @@ reset on entry to the recorded working branch's tip, else the checkout's
 HEAD (`scripts/planning-worktree.sh`; see L4). Task-named documents and
 `.claude/` the worktree lacks are copied in from the checkout
 (`_stage_worktree_extras`) — untracked or merely `git add`-ed ones
-included — except content committed only on a branch the operator
-switched to mid-run, which is not the run's tree (`_switched_branch_only`:
-in `HEAD`, absent from the working branch).
+included — skipping, file by file, only files committed on a branch the
+operator switched to mid-run and absent from the run's own branch, which
+are not the run's tree (`_switched_branch_only_paths`); untracked files
+beside them in the same directory are still staged.
 **L2 is worth nothing without L1** — a worktree is not a boundary, it is
 where the boundary lands once L1 restores one (confirmed above: with the
 flag on, the worktree did not stop the checkout being overwritten).
@@ -7393,10 +7394,16 @@ clean-tree `??`-filtered gate cannot see.
 
 What it does with a delta is the operator's choice. **By default it logs a
 WARNING and the run continues.** Each distinct delta is warned once, and
-again only if its content moves (`repo_change_warned` maps each warned
-delta to a `_delta_fingerprint`): the baseline is never refreshed, so
+again only if its path changes again (`repo_change_warned` maps each
+warned delta to a `_delta_fingerprint`: a file's size, mtime and inode,
+or a directory's untracked, non-ignored entries — metadata only, so a
+huge file costs one `lstat`, and ignored build output churning inside an
+untracked directory does not count): the baseline is never refreshed, so
 every later phase would otherwise repeat it, while a bare warn-once would
-hide a later write to a path the operator had already touched. With
+hide a later write to a path the operator had already touched. A file
+something keeps writing (a log the operator's own server appends to)
+therefore re-warns each wave; that is accepted as information, not
+noise to suppress. With
 `--stop-on-repo-change` (`LEERIE_STOP_ON_REPO_CHANGE`,
 `stop_on_repo_change` in `leerie.toml`) it `die()`s instead, during
 execute on commits and HEAD moves as well (see *Acting-worker
@@ -7438,11 +7445,20 @@ follow), the first planning-worktree reset (before `working_branch` is
 recorded, when nothing can have moved yet), and a recorded branch that no
 longer exists — the scripts warn on that fallback and the orchestrator
 logs it (`_log_working_branch_fallback`).
-The accepted residual: some inputs read the checkout directly — the repo
-map, provisioning, decomposition greps, dependency capture's manifests,
-the build/lint/test commands in `.leerie/config.toml`
-(`resolve_blt_scoped`) and the PR template — so an operator's mid-run
-edits or branch switch can colour them.
+The accepted residuals, recorded here rather than only in commit
+history: some inputs read the checkout directly — the repo map,
+provisioning, decomposition greps, dependency capture's manifests, the
+build/lint/test commands in `.leerie/config.toml` (`resolve_blt_scoped`)
+and the PR template — so an operator's mid-run edits or branch switch
+can colour them; `_coverage_citation_clears` checks a cited path's
+existence in the checkout rather than the merged staging tree; the
+acceptance writer copies every task-named file its worktree (at the
+validity base) lacks, so a deliverable committed after that base could
+be copied in (independent of branch switching, and predating this
+default); and the run follows the working branch's moving tip rather
+than the baseline's commit, which keeps a pull's parity with
+die-then-`resume` but means a commit landing on that branch during
+planning is executed against without having been planned against.
 
 The message classifies the delta signature mechanically
 (`_tripwire_operator_overlap`): when every delta is a newly-appeared

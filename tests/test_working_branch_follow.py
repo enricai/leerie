@@ -19,6 +19,7 @@ import inspect
 import os
 import subprocess
 from pathlib import Path
+from types import ModuleType
 
 import pytest
 
@@ -413,7 +414,8 @@ class _TaskSt:
         self.data = {"task": task, "working_branch": wb}
 
 
-def _stage(leerie, tmp_path: Path, repo: Path, task: str) -> Path:
+def _stage(leerie: ModuleType, tmp_path: Path, repo: Path,
+           task: str) -> Path:
     state = tmp_path / "state"
     r = _run(PLANNING_WT, repo, state, "main")
     assert r.returncode == 0, r.stderr
@@ -440,10 +442,29 @@ class TestStagingSkipsSwitchedBranchContent:
         assert (wt / "report.md").read_text() == "bug report\n"
         assert (wt / "notes.md").read_text() == "spec notes\n"
 
-    def test_switched_branch_claude_dir_is_not_staged(self, leerie, tmp_path):
+    def test_switched_branch_claude_file_is_not_staged(self, leerie, tmp_path):
         repo = _repo_on_switched_branch(tmp_path)
         wt = _stage(leerie, tmp_path, repo, self.TASK)
-        assert not (wt / ".claude").exists()
+        assert not (wt / ".claude" / "settings.json").exists()
+
+    def test_directories_are_gated_file_by_file(self, leerie, tmp_path):
+        """One switched-branch file among a task's globbed spec files, or
+        inside `.claude/`, must not cost the untracked files beside it —
+        the spec loss staging exists to prevent."""
+        repo = _repo_on_switched_branch(tmp_path)
+        (repo / "specs").mkdir()
+        (repo / "specs" / "b.md").write_text("other-branch\n")
+        _git("add", "specs/b.md", cwd=repo)
+        _git("commit", "-q", "-m", "specs b", cwd=repo)
+        (repo / "specs" / "a.md").write_text("untracked spec\n")
+        (repo / ".claude" / "settings.local.json").write_text("{}\n")
+        # Task references reach staging as files (a glob expands to each);
+        # `.claude/` is the directory copy.
+        wt = _stage(leerie, tmp_path, repo, "follow specs/*.md please")
+        assert (wt / "specs" / "a.md").read_text() == "untracked spec\n"
+        assert not (wt / "specs" / "b.md").exists()
+        assert (wt / ".claude" / "settings.local.json").exists()
+        assert not (wt / ".claude" / "settings.json").exists()
 
     def test_untracked_claude_dir_is_still_staged(self, leerie, tmp_path):
         repo = _make_repo(tmp_path)
@@ -467,20 +488,17 @@ class TestStagingSkipsSwitchedBranchContent:
         assert (wt / "report.md").read_text() == "committed later\n"
 
 
-class TestSwitchedBranchOnly:
-    def test_truth_table(self, leerie, tmp_path):
+class TestSwitchedBranchOnlyPaths:
+    def test_sets(self, leerie, tmp_path):
         repo = _repo_on_switched_branch(tmp_path)
-        st = _TaskSt(repo, "")
-        f = leerie._switched_branch_only
-        assert f(repo, repo / "feature.py", st) is True
-        assert f(repo, repo / ".claude", st) is True
-        assert f(repo, repo / "report.md", st) is False      # untracked
-        assert f(repo, repo / "notes.md", st) is False       # staged only
-        assert f(repo, repo / "file.txt", st) is False       # on both
-        # No branch to follow: never skip.
-        assert f(repo, repo / "feature.py", _TaskSt(repo, "", "")) is False
-        assert f(repo, repo / "feature.py",
-                 _TaskSt(repo, "", "gone")) is False
+        f = leerie._switched_branch_only_paths
+        assert f(repo, "feature.py", "refs/heads/main") == {"feature.py"}
+        assert f(repo, ".claude", "refs/heads/main") == {
+            ".claude/settings.json"}
+        assert f(repo, "report.md", "refs/heads/main") == set()  # untracked
+        assert f(repo, "notes.md", "refs/heads/main") == set()   # staged only
+        assert f(repo, "file.txt", "refs/heads/main") == set()   # on both
+        assert f(repo, "feature.py", None) == set()   # no branch to follow
 
     def test_glob_characters_match_literally(self, leerie, tmp_path):
         """`notes/run[1].md` must not match a committed `notes/run1.md`
@@ -491,18 +509,47 @@ class TestSwitchedBranchOnly:
         _git("add", "notes/run1.md", cwd=repo)
         _git("commit", "-q", "-m", "run1", cwd=repo)
         (repo / "notes" / "run[1].md").write_text("y\n")
-        st = _TaskSt(repo, "")
-        assert leerie._switched_branch_only(
-            repo, repo / "notes" / "run1.md", st) is True
-        assert leerie._switched_branch_only(
-            repo, repo / "notes" / "run[1].md", st) is False
+        f = leerie._switched_branch_only_paths
+        assert f(repo, "notes/run1.md", "refs/heads/main") == {
+            "notes/run1.md"}
+        assert f(repo, "notes/run[1].md", "refs/heads/main") == set()
 
-    def test_git_failure_answers_false(self, leerie, tmp_path, monkeypatch):
+    def test_ls_tree_failure_answers_empty(
+            self, leerie, tmp_path, monkeypatch):
+        """Fails only the `ls-tree` calls, so the handler inside the helper
+        is what is exercised; every other git call runs for real."""
         repo = _repo_on_switched_branch(tmp_path)
+        real_run = subprocess.run
 
-        def boom(*_a: object, **_k: object) -> None:
-            raise OSError("no git")
+        def flaky(argv: list[str], *a: object,
+                  **k: object) -> subprocess.CompletedProcess:
+            if "ls-tree" in argv:
+                raise OSError("no git")
+            return real_run(argv, *a, **k)
 
-        monkeypatch.setattr(leerie.subprocess, "run", boom)
-        assert leerie._switched_branch_only(
-            repo, repo / "feature.py", _TaskSt(repo, "")) is False
+        monkeypatch.setattr(leerie.subprocess, "run", flaky)
+        assert leerie._switched_branch_only_paths(
+            repo, "feature.py", "refs/heads/main") == set()
+
+
+class TestRefsHeadsForm:
+    """`--abbrev-ref` prints `refs/heads/<name>` when even `heads/<name>`
+    is ambiguous; all three lookups accept it."""
+
+    def test_python_resolver(self, leerie, tmp_path):
+        repo = _make_repo(tmp_path)
+        st = _TaskSt(repo, "", "refs/heads/main")
+        assert leerie._working_branch_ref(repo, st) == "refs/heads/main"
+
+    @pytest.mark.parametrize("script", [SETUP_RUN, PLANNING_WT])
+    def test_scripts(self, tmp_path, script):
+        repo = _make_repo(tmp_path)
+        main_sha = _sha(repo, "main")
+        _switch_to_other_branch(repo)
+        state = tmp_path / "state"
+        r = _run(script, repo, state, "refs/heads/main")
+        assert r.returncode == 0, r.stderr
+        assert "not found" not in r.stderr
+        got = (_sha(repo, "leerie/runs/r1") if script == SETUP_RUN
+               else _planning_head(state))
+        assert got == main_sha
