@@ -1786,7 +1786,8 @@ reached, and caching "kept" for a crash would wrongly skip re-probing a
 subtask that was never really judged.
 
 **Correctness-critical: the cache is scoped to the base-tree commit sha,
-and a resume across a moved `HEAD` invalidates it.** This is a distinct
+and a resume across a moved base tree (the working branch's tip, else
+`HEAD`) invalidates it.** This is a distinct
 hazard from the mid-run sibling case §8 describes (where the run's *own*
 later wave changes what's satisfied): here the gap is between a *pause*
 and a *resume* of the same run, during which some other process —
@@ -7356,7 +7357,12 @@ the worker overwrote a tracked file in the real checkout and committed on
 its branch — the result behind L2's caveat below.
 
 **L2 — they run in a disposable worktree.** A detached worktree per run,
-reset to the checkout's HEAD on entry (`scripts/planning-worktree.sh`).
+reset on entry to the recorded working branch's tip, else the checkout's
+HEAD (`scripts/planning-worktree.sh`; see L4). Only untracked task
+documents and an untracked `.claude/` are copied in
+(`_stage_worktree_extras`): a task-named path the checkout *tracks* is
+branch content, and after a mid-run branch switch it would be the wrong
+branch's (`_tracked_in_checkout`).
 **L2 is worth nothing without L1** — a worktree is not a boundary, it is
 where the boundary lands once L1 restores one (confirmed above: with the
 flag on, the worktree did not stop the checkout being overwritten).
@@ -7388,7 +7394,9 @@ WARNING and the run continues**; each distinct delta is warned once
 (`repo_change_warned`), since the baseline is never refreshed and every
 later phase would otherwise repeat it. With `--stop-on-repo-change`
 (`LEERIE_STOP_ON_REPO_CHANGE`, `stop_on_repo_change` in `leerie.toml`) it
-`die()`s instead, as it always used to. The default flipped on measured
+`die()`s instead — and, unlike before, also on commits and HEAD moves
+during execute (see *Acting-worker isolation*). The default flipped on
+measured
 cost: across one host's corpus (731 logged runs, 2026-07-26 →
 2026-10-15) the sentinel halted 73 runs, and 71 of them carried only
 operator signatures — `prompt-N.txt`, editor swap files, report `.md`s
@@ -7417,9 +7425,11 @@ manual step; and a branch switch (an operator checking out another run's
 branch to test it, the shape behind one of the two unattributed halts)
 cannot silently re-base the run onto the wrong branch. Only a run started
 on a detached HEAD, with no branch to follow, still tracks the live HEAD.
-The accepted residual: some planning inputs read the checkout directly
-(repo map, provisioning, decomposition greps, the PR template), so an
-operator's mid-run edits can colour them.
+The accepted residual: some inputs read the checkout directly — the repo
+map, provisioning, decomposition greps, dependency capture's manifests,
+the build/lint/test commands in `.leerie/config.toml`
+(`resolve_blt_scoped`) and the PR template — so an operator's mid-run
+edits or branch switch can colour them.
 
 The message classifies the delta signature mechanically
 (`_tripwire_operator_overlap`): when every delta is a newly-appeared

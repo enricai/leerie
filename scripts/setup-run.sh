@@ -69,16 +69,23 @@ mkdir -p "${RUN_DIR}/worktrees" "${RUN_DIR}/subtasks" "${RUN_DIR}/criteria" "${R
 
 # Record the working branch only on first setup. On a resume the file already
 # exists and the live HEAD may be anything; the original value must be kept.
+# A requested branch is recorded even when it no longer resolves, so this
+# file keeps agreeing with the orchestrator's working_branch (the diff base
+# and PR base): a deleted branch then fails loudly at finalize rather than
+# silently diffing against whatever is checked out.
 BASE_REF="HEAD"
-if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ] \
-   && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
-  BASE_REF="refs/heads/${REQUESTED_BRANCH}"
+if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
+  if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
+    BASE_REF="refs/heads/${REQUESTED_BRANCH}"
+  else
+    echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
+  fi
 fi
 if [ ! -f "${WORKING_BRANCH_FILE}" ]; then
-  if [ "$BASE_REF" = "HEAD" ]; then
-    git rev-parse --abbrev-ref HEAD > "${WORKING_BRANCH_FILE}"
-  else
+  if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
     printf '%s\n' "$REQUESTED_BRANCH" > "${WORKING_BRANCH_FILE}"
+  else
+    git rev-parse --abbrev-ref HEAD > "${WORKING_BRANCH_FILE}"
   fi
 fi
 WORKING_BRANCH="$(cat "${WORKING_BRANCH_FILE}")"

@@ -8033,6 +8033,13 @@ def _stage_worktree_extras(st: "State", worktree: str) -> None:
                 dst = wt / rel
                 if dst.exists():
                     continue          # tracked — the worktree already has it
+                if _tracked_in_checkout(repo_root, src):
+                    # Tracked in the checkout yet absent from the worktree:
+                    # branch content the worktree's commit lacks (the
+                    # operator checked out another branch mid-run). Staging
+                    # it would show the satisfied-probe a deliverable its
+                    # tree does not have.
+                    continue
                 try:
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     if src.is_dir():
@@ -8193,8 +8200,9 @@ def _diff_repo_state(before: dict, after: dict, *,
     their own checkout mid-run. Reporting a `git pull` on every wave is noise,
     and a guard that cries wolf gets switched off — the same reasoning that
     put the `ok` field on `_snapshot_repo_state`. File mutation is the damage
-    class that matters. The execute call drops it only under
-    `stop_on_repo_change`, where the operator asked to halt on commits too.
+    class that matters. The execute call keeps the HEAD/ref comparison only
+    under `stop_on_repo_change`, where the operator asked to halt on commits
+    too (`_execute_check_porcelain_only`).
     """
     out: list[str] = []
     if not porcelain_only and before.get("head") != after.get("head"):
@@ -8228,6 +8236,15 @@ def _tripwire_operator_overlap(deltas: list[str]) -> bool:
     and keeps the full worker-escape framing (DESIGN §12 L4)."""
     return bool(deltas) and all(
         d.startswith("working tree changed: ?? ") for d in deltas)
+
+
+def _execute_check_porcelain_only(st: "State") -> bool:
+    """`porcelain_only` for the per-wave execute check. The execute phase
+    runs for hours and an operator legitimately pulls mid-run, so by default
+    only working-tree changes are compared; under `stop_on_repo_change` the
+    operator asked to halt on commits too, which is what HEAD/refs cover
+    (DESIGN §12 L4)."""
+    return not st.data.get("stop_on_repo_change")
 
 
 async def _assert_repo_unchanged(st: "State", phase: str, *,
@@ -11425,6 +11442,24 @@ def _expand_braces(pattern: str) -> list[str]:
     for alt in m.group(1).split(","):
         expanded.extend(_expand_braces(prefix + alt.strip() + suffix))
     return expanded
+
+
+def _tracked_in_checkout(repo_root: Path, path: Path) -> bool:
+    """True when git tracks *path* (or anything beneath it) in the real
+    checkout's current index. Task-reference staging exists for UNTRACKED
+    task documents a fresh worktree cannot see; a tracked path missing from
+    the target worktree is content of whatever branch is checked out, which
+    after a mid-run branch switch (DESIGN §12 L4) is not the run's tree.
+    `git ls-files` output is a mechanical path list. Any failure answers
+    False, keeping the pre-existing copy behaviour."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "--",
+             _repo_rel(path, repo_root)],
+            capture_output=True, text=True, check=False, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0 and bool(r.stdout.strip())
 
 
 def _repo_rel(path: Path, repo_root: Path) -> str:
@@ -34259,7 +34294,11 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         for f in _glob_task_references(task, st.repo_root):
             rel = _repo_rel(f, st.repo_root)
             dst = wt / rel
-            if not dst.exists():
+            # A path tracked in the checkout but absent at the validity base
+            # is a later commit's (or another branch's) file, not the
+            # untracked report this copy exists for — never copy it in.
+            if (not dst.exists()
+                    and not _tracked_in_checkout(Path(st.repo_root), f)):
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(f, dst)
             refs.append(rel)
@@ -37258,7 +37297,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # have asked to stop on commits too, which is what HEAD/refs cover.
         await _assert_repo_unchanged(
             st, f"phase 5 (wave {wi + 1})",
-            porcelain_only=not st.data.get("stop_on_repo_change"))
+            porcelain_only=_execute_check_porcelain_only(st))
 
         # N31: the worktree (including node_modules) is dead weight once
         # its branch is merged into staging — pruning it here, instead of
@@ -39000,9 +39039,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # `base_sha`, the cache key that invalidates verdicts when the
             # working branch (else HEAD) moves across a pause — resolved by
             # `_base_tree_sha` to the same ref `planning-worktree.sh`
-            # mirrors; keyed off the detached worktree instead it would be
-            # constant by construction and the invalidation would silently
-            # never fire.
+            # mirrors, so the key names the tree the probe judges. (A move
+            # of that ref between the reset above and the probe is a narrow
+            # window this ordering has always had.)
             fix_ids_before = {s_["id"] for p_ in plans
                               for s_ in (p_.get("subtasks") or [])
                               if s_.get("fixes_reported_symptom")}

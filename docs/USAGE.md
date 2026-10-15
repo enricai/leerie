@@ -168,11 +168,12 @@ logic that produces this signal.
 
 **Your checkout changes during a run.** Leerie snapshots your real
 checkout before planning and re-checks it after every phase and wave. If
-it changed (a file you dropped in for the next task, an edit, a pull),
-Leerie logs a WARNING naming each change once and keeps going: nothing it
-commits or pushes is built from your working tree. If the warning says a
-tracked file, HEAD or a branch changed and that wasn't you, inspect it
-with `git status`. Pass `--stop-on-repo-change` (or set
+it changed (a file you dropped in for the next task, an edit, or — during
+planning — a pull or commit; while subtasks execute only file changes are
+compared), Leerie logs a WARNING naming each change once and keeps
+going: nothing it commits or pushes is built from your working tree. If
+the warning says a tracked file, HEAD or a branch changed and that
+wasn't you, inspect it with `git status`. Pass `--stop-on-repo-change` (or set
 `LEERIE_STOP_ON_REPO_CHANGE` / `stop_on_repo_change` in `leerie.toml`)
 to halt instead, on file changes and on commits alike; then fix or
 accept the change and `./leerie resume`. See [`DESIGN.md`](DESIGN.md)

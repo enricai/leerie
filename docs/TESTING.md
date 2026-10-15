@@ -1412,7 +1412,8 @@ the CURRENT `base_sha` is consulted before `async with sem:` and
 `claude_p` is never invoked; a fresh probe persists its verdict for BOTH
 outcomes, carrying `satisfied`/`evidence`/`checked`/`base_sha`; the
 `WorkerError` crash-keep path writes no cache entry; a cached verdict
-whose `base_sha` differs from current `HEAD` is invalidated and
+whose `base_sha` differs from the current base tree (the working
+branch's tip, else `HEAD` — `_base_tree_sha`) is invalidated and
 re-probed (the mid-run-sibling hazard — DESIGN §6); and THE REPORTED
 FAILURE PINNED — a partial cache resumes, re-probes only uncached
 subtasks, reaches scheduling. All 17 pre-existing tests unchanged (17 + 5
@@ -3891,7 +3892,10 @@ a persisting delta is warned once across repeated checks and a new one
 warns alone; the baseline is untouched after a warning (it feeds
 `_acceptance_validity_base`); with the flag on, a HEAD move dies under the
 execute-wave call shape that is silent by default. Plus
-`resolve_stop_on_repo_change` precedence with disagreeing inputs. The
+`resolve_stop_on_repo_change` precedence with disagreeing inputs, and
+`main()` wiring driven for real up to `_orchestrate` (env alone, flag
+alone, neither). The execute call shape goes through the real
+`_execute_check_porcelain_only`. The
 die-asserting tests in `tests/test_work_sentinel.py` and
 `tests/test_tripwire_operator_signature.py` set the flag explicitly.
 
@@ -3906,6 +3910,15 @@ wiring at both call sites, and the satisfied-probe cache key:
 `_base_tree_sha` must equal the HEAD the real `planning-worktree.sh` leaves
 the worktree on (a live-HEAD key, the pre-fix behaviour, fails it after a
 branch switch), with the HEAD fallback for no / `HEAD` / unknown branch.
+Behavioural partners for what was first pinned only by source: the
+switch-then-advance incident driven through the real
+`_filter_satisfied_subtasks` (one re-probe, entry re-filed under the
+advanced tip — red against a live-HEAD key); a vanished recorded branch
+warns on stderr in both scripts, and `setup-run.sh` still records the
+requested name. Task-reference staging: a task-named file that only the
+switched-to branch tracks is not staged into the planning worktree, while
+the untracked task document still is (`_tracked_in_checkout`, plus a pin
+that the acceptance writer's copy applies the same rule).
 
 **Delivery gate**, in `tests/test_delivery_gate.py`: sample counts are
 the observable (1 on a clean first pass, 3 when flagged — a gate that

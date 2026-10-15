@@ -18,13 +18,16 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import sys
+from pathlib import Path
 
 import pytest
 
-from tests.conftest import run_git_repo_first
+from tests.conftest import (fake_claude_on_path, init_git_repo,
+                            run_git_repo_first)
 
 
-def _init(repo):
+def _init(repo: Path) -> Path:
     repo.mkdir(parents=True, exist_ok=True)
     run_git_repo_first(repo, "init", "-q", ".")
     run_git_repo_first(repo, "config", "user.email", "t@t")
@@ -36,13 +39,13 @@ def _init(repo):
 
 
 class _St:
-    def __init__(self, repo, data=None):
+    def __init__(self, repo: Path, data: dict | None = None) -> None:
         self.repo_root = repo
         self.run_id = "r1"
         self.data = data if data is not None else {}
         self.saves = 0
 
-    def save(self):
+    def save(self) -> None:
         self.saves += 1
 
 
@@ -62,12 +65,13 @@ def armed(leerie, tmp_path, monkeypatch):
     return repo, st, logs
 
 
-def _check(leerie, st, phase="phase 2 (plan)", porcelain_only=False):
+def _check(leerie, st: _St, phase: str = "phase 2 (plan)",
+           porcelain_only: bool = False) -> None:
     return asyncio.run(leerie._assert_repo_unchanged(
         st, phase, porcelain_only=porcelain_only))
 
 
-def _warnings(logs):
+def _warnings(logs: list[str]) -> list[str]:
     return [m for m in logs if m.startswith("WARNING: your real checkout")]
 
 
@@ -144,8 +148,9 @@ class TestWarnsOnce:
         assert "phase 3 (filters)" in second
 
     def test_the_hint_classifies_only_the_new_deltas(self, leerie, armed):
-        """An already-warned untracked file must not soften a later tracked
-        edit, and vice versa."""
+        """The hint is classified on the NEW deltas only: an already-warned
+        tracked edit must not keep framing a later untracked addition as a
+        possible escape."""
         repo, st, logs = armed
         (repo / "src.txt").write_text("TAMPERED\n")
         _check(leerie, st, "phase 2 (plan)")
@@ -193,9 +198,10 @@ class TestFlagRestoresTheHalt:
     @pytest.mark.parametrize("halt", [False, True])
     def test_execute_wave_call_shape_halts_on_commits_only_with_flag(
             self, leerie, tmp_path, monkeypatch, halt):
-        """phase_execute passes `porcelain_only=not stop_on_repo_change`.
-        A plain pull mid-execute is silent by default and dies under the
-        flag ("commits or files")."""
+        """phase_execute passes `_execute_check_porcelain_only(st)` (pinned
+        in tests/test_work_sentinel.py). Driven through that real helper: a
+        plain pull mid-execute is silent by default and dies under the flag
+        ("commits or files")."""
         repo = _init(tmp_path / "repo")
         st = _St(repo, {"stop_on_repo_change": halt})
         st.data["repo_state_before_planning"] = asyncio.run(
@@ -207,7 +213,7 @@ class TestFlagRestoresTheHalt:
                                 SystemExit(m)))
         (repo / "src.txt").write_text("upstream\n")
         run_git_repo_first(repo, "commit", "-qam", "pull")
-        porcelain_only = not st.data.get("stop_on_repo_change")
+        porcelain_only = leerie._execute_check_porcelain_only(st)
         if halt:
             with pytest.raises(SystemExit) as ei:
                 _check(leerie, st, "phase 5 (wave 1)", porcelain_only)
@@ -256,3 +262,50 @@ class TestResolver:
         monkeypatch.setenv("LEERIE_STOP_ON_REPO_CHANGE", "maybe")
         with pytest.raises(SystemExit):
             leerie.resolve_stop_on_repo_change(repo_root, cli_value=False)
+
+
+# --- main() wiring -------------------------------------------------------------
+
+class _ReachedOrchestrate(Exception):
+    pass
+
+
+def _resolved_by_main(leerie, monkeypatch, tmp_path: Path,
+                      extra_argv: tuple[str, ...] = ()) -> bool:
+    """Run the real `main()` up to `_orchestrate` (harness shape from
+    tests/test_main_cli_wiring.py) and return the `stop_on_repo_change` it
+    resolved onto `args` — which `_run_phases` then seeds into state."""
+    monkeypatch.setattr(leerie, "_CURRENT_RUN_ID", None, raising=False)
+    repo = tmp_path / "repo"
+    init_git_repo(repo)
+    fake_claude_on_path(tmp_path, monkeypatch)
+    monkeypatch.chdir(repo)
+    monkeypatch.setenv("LEERIE_STATE_DIR", str(tmp_path / "state"))
+    seen: dict[str, bool] = {}
+
+    async def _capture(args, *_a, **_k):
+        seen["v"] = args.stop_on_repo_change
+        raise _ReachedOrchestrate()
+
+    monkeypatch.setattr(leerie, "_orchestrate", _capture)
+    monkeypatch.setattr(sys, "argv",
+                        ["leerie", "--run-id", "run-wiring", *extra_argv])
+    with pytest.raises(_ReachedOrchestrate):
+        leerie.main()
+    return seen["v"]
+
+
+class TestMainWiring:
+    def test_default_is_off(self, leerie, monkeypatch, tmp_path):
+        monkeypatch.delenv("LEERIE_STOP_ON_REPO_CHANGE", raising=False)
+        assert _resolved_by_main(leerie, monkeypatch, tmp_path) is False
+
+    def test_env_alone_turns_it_on(self, leerie, monkeypatch, tmp_path):
+        monkeypatch.setenv("LEERIE_STOP_ON_REPO_CHANGE", "1")
+        assert _resolved_by_main(leerie, monkeypatch, tmp_path) is True
+
+    def test_flag_turns_it_on(self, leerie, monkeypatch, tmp_path):
+        monkeypatch.delenv("LEERIE_STOP_ON_REPO_CHANGE", raising=False)
+        assert _resolved_by_main(
+            leerie, monkeypatch, tmp_path,
+            ("--stop-on-repo-change",)) is True

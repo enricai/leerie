@@ -386,7 +386,7 @@ class TestExecuteWiring:
         that operator asked to halt on commits too."""
         src = inspect.getsource(leerie.phase_execute)
         i = src.index("_assert_repo_unchanged(")
-        assert ('porcelain_only=not st.data.get("stop_on_repo_change")'
+        assert ("porcelain_only=_execute_check_porcelain_only(st)"
                 in src[i:i + 200])
 
     def test_it_runs_per_wave_inside_the_loop(self, leerie):

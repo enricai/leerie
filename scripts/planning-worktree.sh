@@ -40,6 +40,7 @@
 # acceptance-on-HEAD run) onto it; a pull of the same branch is still
 # followed, which is reason 2. The first call, before the orchestrator has
 # recorded the branch, passes none and mirrors HEAD.
+#
 # `clean -fd` and NOT `-fdx`: gitignored content (node_modules, .venv) must
 # survive, or every resume re-pays the install. That is deliberate — do not
 # "fix" it to -fdx.
@@ -73,9 +74,12 @@ fi
 # checkout, rather than inside the worktree — a detached worktree reports its
 # own (possibly stale) HEAD, which is the value this reset exists to correct.
 TARGET_REF="HEAD"
-if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ] \
-   && git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
-  TARGET_REF="refs/heads/${REQUESTED_BRANCH}"
+if [ -n "$REQUESTED_BRANCH" ] && [ "$REQUESTED_BRANCH" != "HEAD" ]; then
+  if git show-ref --verify --quiet "refs/heads/${REQUESTED_BRANCH}"; then
+    TARGET_REF="refs/heads/${REQUESTED_BRANCH}"
+  else
+    echo "warning: working branch '${REQUESTED_BRANCH}' not found; using HEAD" >&2
+  fi
 fi
 TARGET_SHA="$(git rev-parse "$TARGET_REF")"
 
