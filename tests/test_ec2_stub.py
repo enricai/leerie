@@ -406,3 +406,41 @@ def test_iam_instance_profile_calls_are_tracked(tmp_path):
     assert state["instance_profiles"]["p"]["roles"] == ["r"]
     assert state["roles"]["r"]["policies"] == ["arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"]
     assert set(leaked_resources(state)) >= {"instance_profiles", "roles"}
+
+
+def test_create_tags_and_describe_snapshots_filter(tmp_path):
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    ami = _json(_run_aws(aws_dir, "ec2", "create-image", "--name", "x"))["ImageId"]
+    sid = next(iter(read_state(aws_dir)["snapshots"]))
+    _run_aws(aws_dir, "ec2", "create-tags", "--resources", sid, "--tags", "Key=k,Value=v")
+    snaps = _json(_run_aws(aws_dir, "ec2", "describe-snapshots", "--filters", "Name=tag:k,Values=v"))["Snapshots"]
+    assert [s["SnapshotId"] for s in snaps] == [sid]
+    assert _json(_run_aws(aws_dir, "ec2", "describe-snapshots", "--filters", "Name=tag:k,Values=other"))["Snapshots"] == []
+    _run_aws(aws_dir, "ec2", "delete-snapshot", "--snapshot-id", sid)
+    assert _json(_run_aws(aws_dir, "ec2", "describe-snapshots"))["Snapshots"] == []
+    assert ami
+
+
+def test_iam_detach_remove_delete_verbs(tmp_path):
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    _run_aws(aws_dir, "iam", "create-instance-profile", "--instance-profile-name", "p")
+    _run_aws(aws_dir, "iam", "add-role-to-instance-profile", "--instance-profile-name", "p", "--role-name", "r")
+    assert read_state(aws_dir)["instance_profiles"]["p"]["roles"] == ["r"]
+    _run_aws(aws_dir, "iam", "remove-role-from-instance-profile", "--instance-profile-name", "p", "--role-name", "r")
+    assert read_state(aws_dir)["instance_profiles"]["p"]["roles"] == []
+    _run_aws(aws_dir, "iam", "delete-instance-profile", "--instance-profile-name", "p")
+    assert "p" not in read_state(aws_dir)["instance_profiles"]
+
+
+def test_iam_detach_role_policy_and_delete_role(tmp_path):
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    _run_aws(aws_dir, "iam", "create-role", "--role-name", "r")
+    _run_aws(aws_dir, "iam", "attach-role-policy", "--role-name", "r", "--policy-arn", "arn:p")
+    assert read_state(aws_dir)["roles"]["r"]["policies"] == ["arn:p"]
+    _run_aws(aws_dir, "iam", "detach-role-policy", "--role-name", "r", "--policy-arn", "arn:p")
+    assert read_state(aws_dir)["roles"]["r"]["policies"] == []
+    _run_aws(aws_dir, "iam", "delete-role", "--role-name", "r")
+    assert "r" not in read_state(aws_dir)["roles"]
