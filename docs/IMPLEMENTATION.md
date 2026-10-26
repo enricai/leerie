@@ -54,7 +54,11 @@ inside the container (DESIGN §6 / §0.5 below).
 ### Python runtime — provisioned inside the container
 
 Leerie requires Python 3.10+. The container image installs Debian 13's
-`python3` (3.13), so the host needs no Python at all. The orchestrator's
+`python3` (3.13), so the orchestrator's runtime and dependencies never
+touch the host. The launcher itself still shells out to the host's
+`python3` for small helpers (JSON reads, credential checks, language-layer
+generation) and to render `--help` (see *Launcher verbs*); those use only
+the stdlib. The orchestrator's
 source is baked into the image at `/opt/leerie-image/`; on local runs
 the launcher's bind mount (`-v $LEERIE_REPO:/opt/leerie-image:ro`)
 shadows the baked copy, so iterating on `orchestrator/leerie.py` needs
@@ -2695,6 +2699,16 @@ table.
 
 These bare subcommands are handled by the bash launcher before the
 container starts. A summary appears in the `leerie --help` epilog.
+
+**`--help` / `-h` (no container required):** the launcher scans argv for an
+exact `-h`/`--help` (stopping at `--`, and skipping when `$1` is `prune`,
+which has its own usage) right after resolving `LEERIE_REPO`, before any
+state-dir, runtime, preflight, or provisioning work, and `exec`s
+`python3 -B orchestrator/leerie.py --help` on the host. Forwarding help
+into the container ran the full run path first (including a machine
+provision on `--runtime fly|ec2`) and then let the post-run finalize block
+treat the exit 0 as a finished job. Pinned by
+`tests/test_launcher_help_fast_path.py`.
 
 **Per-repo configuration (no container required):** `leerie config` is
 a host-only fast path — it exits before `nerdctl run` and never starts

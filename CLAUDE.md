@@ -26,7 +26,8 @@ Runtime: containerd + nerdctl. On Linux, native. On macOS, via
 
 Python is provisioned *inside the container* by the image (Python 3
 from Debian 13). The launcher itself is a portable bash script; it
-no longer needs `uv` or a host Python. See `docs/IMPLEMENTATION.md`
+no longer needs `uv`, and uses the host's stdlib-only `python3` just for
+small helpers and `--help`. See `docs/IMPLEMENTATION.md`
 §0 (install surface) and §0.5 (container shape).
 
 All control flow lives in one file: `orchestrator/leerie.py`. The
