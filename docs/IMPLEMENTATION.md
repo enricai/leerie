@@ -2710,6 +2710,28 @@ provision on `--runtime fly|ec2`) and then let the post-run finalize block
 treat the exit 0 as a finished job. Pinned by
 `tests/test_launcher_help_fast_path.py`.
 
+**`list` and `--report` (no container required):** both only read
+`<state-root>/runs/*`, so the launcher's `_exec_readonly_on_host` runs
+`LEERIE_STATE_DIR=$LEERIE_STATE_HOST_DIR python3 -B orchestrator/leerie.py`
+on the host. It is called at the end of the `list)` arm (so the
+`list --runtime fly` view, `list chains` and `list --groups` keep their own
+handling) and from a `--report` scan placed after the state-dir ownership
+check. The argv is allowlisted (`list`, `--report [ID]`, `--run-id`,
+`--runtime`, `--status`, and the launcher-only `--state-dir`, which is
+dropped because it is already folded into `LEERIE_STATE_HOST_DIR`); any other
+token, or no `python3`, returns and the invocation takes the container path
+unchanged. An allowlist is used instead of a copy of the `REWRITTEN_ARGS`
+launcher-only-flag filter so it cannot leak a launcher-only flag into the
+orchestrator's strict argparse or drift from that list. Through the
+container these verbs also ran the push preflights and the post-run finalize
+block, which reported on a job that never ran. Pinned by
+`tests/test_launcher_readonly_host_path.py`.
+
+**bash 3.2 parse constraint:** a heredoc nested in `$( ... )` must not
+contain an apostrophe, because macOS `/bin/bash` 3.2 scans the substitution for
+quotes without understanding heredocs and a stray one inverts the quote parity
+of everything after it. Pinned by `tests/test_launcher_bash32_parse.py`.
+
 **Per-repo configuration (no container required):** `leerie config` is
 a host-only fast path — it exits before `nerdctl run` and never starts
 a container.

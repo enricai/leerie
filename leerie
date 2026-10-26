@@ -1133,6 +1133,63 @@ case "${1:-}" in
   *) _validate_state_ownership ;;
 esac
 
+# `list` and `--report` only read <state-root>/runs/*, so they run the
+# orchestrator's own implementation on the host instead of starting a container.
+# Through the container they also ran the push preflights and the post-run
+# finalize block, which reported on a "job" that never ran. The argv is
+# ALLOWLISTED, not filtered: the launcher-only flags are a long list that the
+# REWRITTEN_ARGS loop strips much further down, and a second copy of it here
+# would drift. Anything not listed returns 1 and the caller falls through to
+# the container path unchanged. Returns only when not eligible; otherwise execs.
+_exec_readonly_on_host() {
+  local -a _ro_argv=()
+  local _ro_first=true _ro_has_verb=false
+  command -v python3 >/dev/null 2>&1 || return 1
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      list)
+        [ "$_ro_first" = "true" ] || return 1
+        _ro_argv+=("$1"); _ro_has_verb=true; shift ;;
+      --report)
+        _ro_argv+=("$1"); _ro_has_verb=true; shift
+        # The id is optional: only consume a following non-flag word.
+        if [ "$#" -gt 0 ] && [ "${1#-}" = "$1" ]; then
+          _ro_argv+=("$1"); shift
+        fi ;;
+      --report=*)
+        _ro_argv+=("$1"); _ro_has_verb=true; shift ;;
+      --run-id|--runtime|--status)
+        [ "$#" -ge 2 ] || return 1
+        _ro_argv+=("$1" "$2"); shift 2 ;;
+      --run-id=*|--runtime=*|--status=*)
+        _ro_argv+=("$1"); shift ;;
+      # Already consumed into LEERIE_STATE_HOST_DIR above; the orchestrator
+      # argparse does not know it.
+      --state-dir)
+        [ "$#" -ge 2 ] || return 1
+        shift 2 ;;
+      --state-dir=*)
+        shift ;;
+      *) return 1 ;;
+    esac
+    _ro_first=false
+  done
+  [ "$_ro_has_verb" = "true" ] || return 1
+  LEERIE_STATE_DIR="$LEERIE_STATE_HOST_DIR" \
+    exec python3 -B "$LEERIE_REPO/orchestrator/leerie.py" "${_ro_argv[@]}"
+}
+
+# `--report` (telemetry for one run) can appear anywhere in argv; scanning stops
+# at `--`. Placed after the ownership check so a wrong-repo state dir is still
+# refused exactly as it was when this went through the container.
+for _ro_probe in "$@"; do
+  case "$_ro_probe" in
+    --) break ;;
+    --report|--report=*) _exec_readonly_on_host "$@" || true; break ;;
+  esac
+done
+unset _ro_probe
+
 # COUPLING: every verb arm below that `exit`s must also have a guard in
 # the two REWRITTEN_ARGS filter loops — the IS_RESUME positional-run-id
 # loop (~line 3756) and the _value_flags skip-loop (~line 3790) — so a
@@ -2014,6 +2071,9 @@ PY
     else
       set -- "${_list_rest[@]}"
     fi
+    # Plain local listing, including the flyctl-missing/failed fallbacks above:
+    # no container needed. Returns only for argv outside the allowlist.
+    _exec_readonly_on_host "$@" || true
     ;;
   accept-blocked)
     # Mark a blocked/failed subtask as complete so resume skips it.
@@ -8087,20 +8147,23 @@ print(json.dumps(sys.argv[1:]))
         # per runtime and stays here.
         _launch_script="$(
           _render_launch_prefix fly "$_launch_argv_json"
+          # No apostrophes in this heredoc body: bash 3.2 (macOS /bin/bash) scans a
+          # "$(...)" for quotes even inside a heredoc, so one opens a phantom string
+          # and inverts the quote parity of everything after (tests/test_launcher_bash32_parse.py).
           cat <<PY
 # Build the env from scratch — ssh-console sets HOME=/root which would
 # point claude at the wrong credentials dir. Pin HOME=/home/leerie and
-# leave PATH alone (the image's PATH includes mise + Claude Code CLI
+# leave PATH alone (the image PATH includes mise + Claude Code CLI
 # under /usr/local/share/mise/installs/node/lts-current/bin).
 child_env = dict(os.environ)
 child_env["HOME"] = "/home/leerie"
 child_env["USER"] = "leerie"
 child_env["LOGNAME"] = "leerie"
-# Carry the host repo's basename so the orchestrator's log() prefix
+# Carry the host repo basename so the log() prefix of the orchestrator
 # (Path(USER_REPO).name) matches the host-side remote_log() prefix.
-# Without this the orchestrator's cwd=/work falls back to basename
+# Without this the orchestrator cwd=/work falls back to basename
 # "work" and the [leerie] [<repo>] contract breaks mid-stream once
-# the launcher starts tailing this process's stdout. The host bash
+# the launcher starts tailing the stdout of this process. The host bash
 # heredoc is unquoted (<<PY), so basename runs host-side and the
 # resulting literal is baked into the script piped to the Fly machine.
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"

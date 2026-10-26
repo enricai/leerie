@@ -5251,3 +5251,22 @@ after `--` is not help (and exits non-zero), `prune --help` keeps its own
 usage, and a PATH with no `python3` yields one error line and exit 1 rather
 than a fall-through to the run path. Six of the eight tests fail against the
 pre-change launcher.
+
+## Launcher `list` / `--report` host path and bash 3.2 parse
+
+`tests/test_launcher_readonly_host_path.py` runs the real launcher against a
+tmp `$HOME` holding one finished run, with failing `nerdctl`/`docker`/`colima`/
+`flyctl`/`aws` stubs on PATH. `list` (with `--status`, `--runtime`), and
+`--report` (bare, with an id, `--report=ID`, with `--run-id`) must exit 0,
+print byte-for-byte what the orchestrator prints for the same state root, call
+no stub and print no `finalize` line. `--state-dir` (launcher-only) must be
+honored and not leaked to argparse. Two fallback tests pin that the allowlist
+is closed: an unlisted flag, or no `python3`, keeps the container path. Ten of
+the twelve tests fail against the previous launcher; the two fallback tests
+pass on both.
+
+`tests/test_launcher_bash32_parse.py` has a static scan that runs on every
+platform (no apostrophe in a heredoc body nested in `$(`, with an anti-vacuity
+floor on how many such heredocs it finds) and `/bin/bash -n leerie`, which runs
+only where `/bin/bash` is 3.2 and skips on CI. Two of its three tests fail
+against the previous launcher on a Mac; only the static scan is visible to CI.
