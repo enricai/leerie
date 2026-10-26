@@ -104,3 +104,9 @@ def test_whitespace_only_file_dies(leerie, tmp_path):
     f.write_text("   \n\t\n")
     with pytest.raises(SystemExit):
         leerie.resolve_task_argument(str(f))
+
+
+def test_sentence_ending_in_txt_path_is_literal():
+    from orchestrator.leerie import resolve_task_argument
+    t = "we need to fix the critical security issue reported in ./knox_report.txt"
+    assert resolve_task_argument(t) == t
