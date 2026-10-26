@@ -5239,3 +5239,15 @@ an unquoted expansion whose value holds a space can split a command word
 backticks can mislead the fallback's backtick tracking. A package or
 folder named like a listed CLI before the runner (`yarn workspace
 toolbox jest`) loses its report.
+
+## Launcher `--help` host fast path
+
+`tests/test_launcher_help_fast_path.py` runs the real launcher with
+`nerdctl`/`docker`/`colima`/`flyctl`/`aws` stubs that record and fail any call.
+`--help`/`-h` (including with `--runtime fly|ec2`) must exit 0, print exactly
+the orchestrator's own `--help` text (so a new flag needs no extra step), call
+no stub, print no `finalize` line, and write nothing under `$HOME`; a `--help`
+after `--` is not help (and exits non-zero), `prune --help` keeps its own
+usage, and a PATH with no `python3` yields one error line and exit 1 rather
+than a fall-through to the run path. Six of the eight tests fail against the
+pre-change launcher.

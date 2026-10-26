@@ -66,12 +66,28 @@ LEERIE_COMMIT="$(git -C "$LEERIE_REPO" rev-parse --short HEAD 2>/dev/null || tru
 # — used by the installer's end-to-end smoke test and by anyone who just
 # wants to check what's installed.
 #
-# `--help` is NOT short-circuited: forwarding it through the container makes
-# the orchestrator's argparse render the full flag list (worker model
-# overrides, telemetry knobs, etc.) plus an epilog listing launcher-only
-# verbs (stop, kill, finalize, etc.). The first --help pays a
-# one-time image-build cost; every subsequent invocation reuses the cached
-# image and starts in ~2s.
+# `--help` / `-h` is rendered by the orchestrator's argparse (full flag list
+# plus an epilog listing launcher-only verbs), but on the HOST: the launcher
+# already depends on host python3 throughout, and forwarding help into the
+# container ran the entire run path first (Colima probes, git fetch, preflight,
+# image builds, and on --runtime fly|ec2 a machine provision) and then let the
+# post-run finalize block treat the exit 0 as a finished job. `prune` keeps its
+# own -h arm (it has verb-specific usage), and scanning stops at `--`.
+if [ "${1:-}" != "prune" ]; then
+  for _help_arg in "$@"; do
+    case "$_help_arg" in
+      --) break ;;
+      -h|--help)
+        if ! command -v python3 >/dev/null 2>&1; then
+          echo "leerie: python3 not found on PATH (needed to render --help)" >&2
+          exit 1
+        fi
+        exec python3 -B "$LEERIE_REPO/orchestrator/leerie.py" --help
+        ;;
+    esac
+  done
+fi
+unset _help_arg
 
 
 # Extract the host's Claude OAuth credentials JSON for forwarding to
