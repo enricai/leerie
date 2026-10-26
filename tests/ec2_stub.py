@@ -180,6 +180,50 @@ def volume_doc(volume_id, rec):
     }
 
 
+def parse_tags(spec):
+    """Parse `Tags=[{Key=k,Value=v},...]` / `Key=k,Value=v` shorthand (the
+    only tag syntaxes the launcher scripts emit) into a {key: value} dict."""
+    import re
+    tags = {}
+    for k, v in re.findall(r"Key=([^,}\]]+),Value=([^,}\]]*)", spec or ""):
+        tags[k] = v
+    return tags
+
+
+def parse_filters(argv):
+    """`--filters Name=tag:k,Values=v1,v2 Name=...` -> [(name, [values])]."""
+    out = []
+    for item in get_flag_all(argv, "--filters"):
+        name, _, rest = item.partition(",Values=")
+        out.append((name[len("Name="):] if name.startswith("Name=") else name,
+                    rest.split(",") if rest else []))
+    return out
+
+
+def matches_filters(rec, filters):
+    tags = rec.get("tags", {})
+    for name, values in filters:
+        if name.startswith("tag:"):
+            if tags.get(name[4:]) not in values:
+                return False
+        elif name == "state" or name == "instance-state-name":
+            if rec.get("state") not in values:
+                return False
+        elif name in ("key-name", "group-name", "name", "vpc-id"):
+            field = {"key-name": "name", "group-name": "name", "name": "name", "vpc-id": "vpc_id"}[name]
+            if rec.get(field) not in values:
+                return False
+    return True
+
+
+def tag_list(rec):
+    return [{"Key": k, "Value": v} for k, v in rec.get("tags", {}).items()]
+
+
+def section(state, name):
+    return state.setdefault(name, {})
+
+
 def main(argv):
     with open(LOG_PATH, "a") as f:
         f.write(" ".join(argv) + "\n")
@@ -198,6 +242,43 @@ def main(argv):
         }))
         return 0
 
+    if service == "iam":
+        verb = argv[1] if len(argv) > 1 else ""
+        state = load_state()
+        profs = section(state, "instance_profiles")
+        roles = section(state, "roles")
+        name = get_flag(argv, "--instance-profile-name") or get_flag(argv, "--role-name")
+        if verb == "create-role":
+            roles[name] = {"policies": [], "tags": parse_tags(get_flag(argv, "--tags"))}
+        elif verb == "attach-role-policy":
+            roles.setdefault(name, {"policies": [], "tags": {}})["policies"].append(get_flag(argv, "--policy-arn"))
+        elif verb == "create-instance-profile":
+            profs[name] = {"roles": [], "tags": parse_tags(get_flag(argv, "--tags"))}
+        elif verb == "add-role-to-instance-profile":
+            profs.setdefault(name, {"roles": [], "tags": {}})["roles"].append(get_flag(argv, "--role-name"))
+        elif verb == "get-instance-profile":
+            if name not in profs:
+                print("An error occurred (NoSuchEntity)", file=sys.stderr)
+                return 254
+            print(json.dumps({"InstanceProfile": {"InstanceProfileName": name,
+                "Arn": "arn:aws:iam::123456789012:instance-profile/" + name}}))
+            return 0
+        elif verb == "remove-role-from-instance-profile":
+            r = profs.get(name)
+            if r and get_flag(argv, "--role-name") in r["roles"]:
+                r["roles"].remove(get_flag(argv, "--role-name"))
+        elif verb == "delete-instance-profile":
+            profs.pop(name, None)
+        elif verb == "detach-role-policy":
+            r = roles.get(name)
+            if r and get_flag(argv, "--policy-arn") in r["policies"]:
+                r["policies"].remove(get_flag(argv, "--policy-arn"))
+        elif verb == "delete-role":
+            roles.pop(name, None)
+        save_state(state)
+        print("{}")
+        return 0
+
     if service != "ec2":
         print("{}")
         return 0
@@ -210,7 +291,31 @@ def main(argv):
         created = []
         for _ in range(count):
             iid = next_id(state["instances"], "i-")
-            state["instances"][iid] = {"state": "running", "_ip_gen": 1, "public_ip": "203.0.113.11"}
+            rec = {"state": "running", "_ip_gen": 1, "public_ip": "203.0.113.11"}
+            # Optional launch arguments are recorded only when passed, so
+            # state for plain run-instances calls is unchanged.
+            for flag, field in (
+                ("--image-id", "image_id"),
+                ("--instance-type", "instance_type"),
+                ("--key-name", "key_name"),
+                ("--subnet-id", "subnet_id"),
+                ("--iam-instance-profile", "iam_instance_profile"),
+                ("--user-data", "user_data"),
+            ):
+                v = get_flag(argv, flag)
+                if v is not None:
+                    rec[field] = v
+            if "--associate-public-ip-address" in argv:
+                rec["associate_public_ip"] = True
+            elif "--no-associate-public-ip-address" in argv:
+                rec["associate_public_ip"] = False
+            sgs = get_flag_all(argv, "--security-group-ids")
+            if sgs:
+                rec["security_group_ids"] = sgs
+            tags = parse_tags(get_flag(argv, "--tag-specifications"))
+            if tags:
+                rec["tags"] = tags
+            state["instances"][iid] = rec
             created.append(iid)
         save_state(state)
         print(json.dumps({
@@ -326,6 +431,183 @@ def main(argv):
             rec["state"] = "deleted"
             save_state(state)
         print("{}")
+        return 0
+
+    if action == "describe-images":
+        filters = parse_filters(argv)
+        ids = get_flag_all(argv, "--image-ids")
+        images = []
+        for ami, rec in state.get("images", {}).items():
+            if ids and ami not in ids:
+                continue
+            if rec.get("state") == "deregistered" or not matches_filters(rec, filters):
+                continue
+            images.append({
+                "ImageId": ami, "Name": rec.get("name", ami), "State": rec["state"],
+                "Tags": tag_list(rec),
+                "BlockDeviceMappings": [{"Ebs": {"SnapshotId": rec["snapshot_id"]}}] if rec.get("snapshot_id") else [],
+            })
+        print(json.dumps({"Images": images}))
+        return 0
+
+    if action in ("create-image", "register-image"):
+        images = section(state, "images")
+        snaps = section(state, "snapshots")
+        ami = next_id(images, "ami-")
+        snap = next_id(snaps, "snap-")
+        snaps[snap] = {"state": "completed", "image_id": ami}
+        images[ami] = {
+            "state": "available", "name": get_flag(argv, "--name", ami),
+            "snapshot_id": snap,
+            "tags": parse_tags(get_flag(argv, "--tag-specifications")),
+        }
+        if get_flag(argv, "--instance-id"):
+            images[ami]["source_instance_id"] = get_flag(argv, "--instance-id")
+        save_state(state)
+        print(json.dumps({"ImageId": ami}))
+        return 0
+
+    if action == "create-tags":
+        tags = parse_tags(get_flag(argv, "--tags") or " ".join(get_flag_all(argv, "--tags")))
+        for rid in get_flag_all(argv, "--resources"):
+            for sect in ("images", "snapshots", "instances", "key_pairs", "security_groups"):
+                rec = state.get(sect, {}).get(rid)
+                if rec is not None:
+                    rec.setdefault("tags", {}).update(tags)
+        save_state(state)
+        print("{}")
+        return 0
+
+    if action == "deregister-image":
+        rec = state.get("images", {}).get(get_flag(argv, "--image-id"))
+        if rec is not None:
+            rec["state"] = "deregistered"
+            save_state(state)
+        print("{}")
+        return 0
+
+    if action == "delete-snapshot":
+        rec = state.get("snapshots", {}).get(get_flag(argv, "--snapshot-id"))
+        if rec is not None:
+            rec["state"] = "deleted"
+            save_state(state)
+        print("{}")
+        return 0
+
+    if action == "describe-snapshots":
+        filters = parse_filters(argv)
+        ids = get_flag_all(argv, "--snapshot-ids")
+        snaps = [
+            {"SnapshotId": sid, "State": rec["state"], "Tags": tag_list(rec)}
+            for sid, rec in state.get("snapshots", {}).items()
+            if rec["state"] != "deleted" and (not ids or sid in ids) and matches_filters(rec, filters)
+        ]
+        print(json.dumps({"Snapshots": snaps}))
+        return 0
+
+    if action == "create-key-pair":
+        name = get_flag(argv, "--key-name")
+        kps = section(state, "key_pairs")
+        if name in kps:
+            print("An error occurred (InvalidKeyPair.Duplicate): key pair exists", file=sys.stderr)
+            return 254
+        kps[name] = {"name": name, "tags": parse_tags(get_flag(argv, "--tag-specifications"))}
+        save_state(state)
+        print(json.dumps({
+            "KeyName": name, "KeyPairId": "key-" + format(len(kps), "017x"),
+            "KeyMaterial": "-----BEGIN RSA PRIVATE KEY-----\nSTUB\n-----END RSA PRIVATE KEY-----",
+        }))
+        return 0
+
+    if action == "describe-key-pairs":
+        names = get_flag_all(argv, "--key-names")
+        filters = parse_filters(argv)
+        found = [
+            {"KeyName": n, "Tags": tag_list(rec)}
+            for n, rec in state.get("key_pairs", {}).items()
+            if (not names or n in names) and matches_filters(rec, filters)
+        ]
+        if names and len(found) < len(names):
+            print("An error occurred (InvalidKeyPair.NotFound): key pair does not exist", file=sys.stderr)
+            return 254
+        print(json.dumps({"KeyPairs": found}))
+        return 0
+
+    if action == "delete-key-pair":
+        name = get_flag(argv, "--key-name")
+        state.get("key_pairs", {}).pop(name, None)
+        save_state(state)
+        print("{}")
+        return 0
+
+    if action == "create-security-group":
+        sgs = section(state, "security_groups")
+        gid = next_id(sgs, "sg-")
+        sgs[gid] = {
+            "name": get_flag(argv, "--group-name"), "vpc_id": get_flag(argv, "--vpc-id"),
+            "description": get_flag(argv, "--description"), "ingress": [],
+            "tags": parse_tags(get_flag(argv, "--tag-specifications")),
+        }
+        save_state(state)
+        print(json.dumps({"GroupId": gid}))
+        return 0
+
+    if action == "describe-security-groups":
+        ids = get_flag_all(argv, "--group-ids")
+        filters = parse_filters(argv)
+        groups = [
+            {"GroupId": gid, "GroupName": rec["name"], "VpcId": rec.get("vpc_id"),
+             "Tags": tag_list(rec),
+             "IpPermissions": [
+                 {"IpProtocol": "tcp", "FromPort": r["port"], "ToPort": r["port"],
+                  "IpRanges": [{"CidrIp": r["cidr"]}]} for r in rec.get("ingress", [])
+             ]}
+            for gid, rec in state.get("security_groups", {}).items()
+            if (not ids or gid in ids) and matches_filters(rec, filters)
+        ]
+        print(json.dumps({"SecurityGroups": groups}))
+        return 0
+
+    if action == "authorize-security-group-ingress":
+        rec = state.get("security_groups", {}).get(get_flag(argv, "--group-id"))
+        if rec is None:
+            print("An error occurred (InvalidGroup.NotFound)", file=sys.stderr)
+            return 254
+        rec["ingress"].append({
+            "protocol": get_flag(argv, "--protocol", "tcp"),
+            "port": int(get_flag(argv, "--port", "0")),
+            "cidr": get_flag(argv, "--cidr"),
+        })
+        save_state(state)
+        print(json.dumps({"Return": True}))
+        return 0
+
+    if action == "delete-security-group":
+        gid = get_flag(argv, "--group-id")
+        state.get("security_groups", {}).pop(gid, None)
+        save_state(state)
+        print("{}")
+        return 0
+
+    if action == "describe-vpcs":
+        vpcs = [
+            {"VpcId": vid, "IsDefault": rec.get("is_default", False)}
+            for vid, rec in state.get("vpcs", {}).items()
+            if "isDefault" not in " ".join(argv) or rec.get("is_default", False)
+        ]
+        print(json.dumps({"Vpcs": vpcs}))
+        return 0
+
+    if action == "describe-subnets":
+        filters = parse_filters(argv)
+        subnets = [
+            {"SubnetId": sid, "VpcId": rec.get("vpc_id"),
+             "MapPublicIpOnLaunch": rec.get("public", True),
+             "AvailabilityZone": rec.get("az", "us-east-1a")}
+            for sid, rec in state.get("subnets", {}).items()
+            if matches_filters(rec, filters)
+        ]
+        print(json.dumps({"Subnets": subnets}))
         return 0
 
     print("{}")
@@ -448,7 +730,7 @@ def leaked_resources(state: dict) -> dict:
     only leaking entries — an empty result on both keys means clean
     teardown.
     """
-    return {
+    leaked = {
         "instances": {
             iid: rec for iid, rec in state.get("instances", {}).items()
             if rec.get("state") != "terminated"
@@ -458,6 +740,34 @@ def leaked_resources(state: dict) -> dict:
             if rec.get("state") != "deleted"
         },
     }
+    # Extra keys appear only when non-empty so the two-key shape callers
+    # compare against stays exact for runs that never touch these verbs.
+    extra = {
+        # Unterminated bake instances are a subset of "instances"; surfaced
+        # separately so bake-teardown tests can assert on them by name.
+        "bake_instances": {
+            iid: rec for iid, rec in leaked["instances"].items()
+            if is_bake_instance(rec)
+        },
+        # A deregistered AMI whose snapshot survives is the classic leak.
+        "snapshots": {
+            sid: rec for sid, rec in state.get("snapshots", {}).items()
+            if rec.get("state") != "deleted"
+            and state.get("images", {}).get(rec.get("image_id"), {}).get("state") != "available"
+        },
+        "key_pairs": dict(state.get("key_pairs", {})),
+        "security_groups": dict(state.get("security_groups", {})),
+        "instance_profiles": dict(state.get("instance_profiles", {})),
+        "roles": dict(state.get("roles", {})),
+    }
+    leaked.update({k: v for k, v in extra.items() if v})
+    return leaked
+
+
+def is_bake_instance(rec: dict) -> bool:
+    """An instance launched to bake an AMI: tagged `leerie:purpose=bake`
+    (or any tag whose value is `bake`)."""
+    return "bake" in rec.get("tags", {}).values()
 
 
 def write_ec2_sidecar(
