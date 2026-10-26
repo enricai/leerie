@@ -425,6 +425,7 @@ provision_instance() {
   if [ -z "$instance_id" ]; then
     remote_log "failed to create EC2 instance — aws output:"
     printf '  %s\n' "$create_output" >&2
+    echo "  Fix: check the error above; verify with: aws ec2 describe-subnets --subnet-ids $subnet_id ; then re-run leerie." >&2
     return 1
   fi
 
