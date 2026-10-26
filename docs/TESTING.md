@@ -2149,7 +2149,7 @@ and still writes valid JSON at rc 0, so the byte cut is safe for
 ## Per-subtask delta proxy: the `{test_files}` tier
 
 The per-subtask delta proxy's `{test_files}` tier is covered by
-`tests/test_test_files_proxy.py` (48), `tests/test_scoped_proxy_corpus.py`
+`tests/test_test_files_proxy.py` (51), `tests/test_scoped_proxy_corpus.py`
 (5) and `tests/test_scoped_degrade_warning.py` (11). Three lessons
 generalise. **(1) A non-test path is an ERROR to pytest, not a no-op** —
 `pytest orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4,
@@ -2157,8 +2157,8 @@ and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4. A
 real subtask diff mixes docs/source with tests, so a `{files}` template on
 a runner with no source→test impact analysis reports RED on nearly every
 subtask; fix: filter the substitution (`{test_files}`), with the
-pre-existing empty-list rule falling back to canonical when no test file
-is present. **(2) Scan the author's input, not the rendered output.** The
+pre-existing empty-list rule rendering nothing when no test file is
+present (the axis is then deferred — see the next section). **(2) Scan the author's input, not the rendered output.** The
 unknown-placeholder guard first scanned the SUBSTITUTED command, so a
 changed-file path containing braces (e.g. `src/{locale}/page.test.ts`) was
 misread as an unknown placeholder, disabling the proxy and misdiagnosing
@@ -2172,6 +2172,31 @@ own run branches, each row an integration merge's **first-parent** diff (a
 plain two-dot diff against the run base folds in siblings — the first
 recovery attempt reported 0% source-only this way).
 shipped a fixture that could not exercise the canonical fallback at all.
+
+## The whole suite is orchestrator-owned
+
+`tests/test_full_suite_ownership.py` (32) covers DESIGN §9's two
+whole-suite mechanisms: *absence means deferred, never full*
+(`_select_subtask_axes`, `_DEFERRED_AXIS`) and *strip + deny + notice*
+(`_strip_canonical_suite_commands`, `_full_suite_denials`,
+`FULL_SUITE_NOTICE`). Inputs are the 2026-10-26 incident's real
+`runs_commands` and barnacle-shaped `pnpm` configs, so a matcher that only
+understands pytest fails the negative controls. Every component was
+falsified by ablation before landing: restoring the canonical fallback
+fails 5 tests; dropping the deferred-axis record, the notice, the
+`deny_extra` wiring, the prescribed-command exclusion, or the
+`_run_phases` call site each fails exactly the test written for it. Two
+lessons generalise. **(1) Omitted is not recorded.**
+`_apply_measured_axes` overwrites only the axes present in a measurement,
+so a deferred axis left out would let a conformer's self-reported "9373
+passed" survive into the persisted entry;
+`test_docs_only_subtask_defers_tests_end_to_end` has the conformer *lie*,
+and asserts the lie is gone. **(2) A deny without a reason produces
+`blocked`, not compliance.** Replayed against the incident spec, workers
+that only hit the deny returned `blocked` 2/2 (which auto-accept then
+drops), and the same workers told why completed 5/5. So the deny and the
+notice are pinned together, and `test_no_notice_without_a_deny` pins the
+converse.
 
 ## Pre-push preflight probe
 

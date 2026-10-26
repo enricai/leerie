@@ -121,31 +121,40 @@ def test_scoped_mode_uses_the_proxy_and_labels_itself(leerie):
     assert scope == "scoped"
 
 
-def test_an_axis_without_a_proxy_falls_back_to_the_canonical_command(leerie):
-    """Never silently skipped — assert the canonical STRING, not merely
-    'not None'."""
+def test_an_axis_without_a_proxy_is_deferred_not_run_canonically(leerie):
+    """DESIGN §9: absence means deferred, never full. `build` has no proxy
+    here, so it must be ABSENT from the command map -- the canonical string
+    is exactly what must not come back. `lint`, which has no proxy tier,
+    keeps its canonical command (asserted as the string, not 'not None')."""
     axes, _ = leerie._select_subtask_axes(
         BLT, {"test": "npx vitest related --run {files}"},
         ["a.ts"], "base", "scoped")
-    assert axes["build"] == "next build"
+    assert "build" not in axes
+    assert "next build" not in axes.values()
+    assert axes["lint"] == "biome check"
+    assert leerie._deferred_axes(axes, BLT, "scoped") == ["build"]
+
+
+def test_scope_reports_deferred_when_no_proxy_actually_applied(leerie):
+    """The label must not claim a narrowing that did not happen — the
+    conformer prompt renders it verbatim. Nothing narrowed and nothing ran
+    in full, so the honest label is `deferred`."""
+    axes, scope = leerie._select_subtask_axes(BLT, {}, ["a.ts"], "base",
+                                              "scoped")
+    assert scope == "deferred"
+    assert "tests" not in axes and "build" not in axes
     assert axes["lint"] == "biome check"
 
 
-def test_scope_reports_full_when_no_proxy_actually_applied(leerie):
-    """The label must not claim a narrowing that did not happen — the
-    conformer prompt renders it verbatim."""
-    axes, scope = leerie._select_subtask_axes(BLT, {}, ["a.ts"], "base",
-                                              "scoped")
-    assert scope == "full"
-    assert axes["tests"] == "vitest run"
-
-
-def test_empty_diff_falls_back_rather_than_running_everything(leerie):
+def test_empty_diff_defers_rather_than_running_everything(leerie):
+    """An empty diff must neither render a bare runner nor fall back to the
+    canonical suite."""
     axes, scope = leerie._select_subtask_axes(
         BLT, {"test": "npx vitest related --run {files}"}, [], "base",
         "scoped")
-    assert axes["tests"] == "vitest run"
-    assert scope == "full"
+    assert "tests" not in axes
+    assert "vitest run" not in axes.values()
+    assert scope == "deferred"
 
 
 def test_full_mode_ignores_available_proxies(leerie):

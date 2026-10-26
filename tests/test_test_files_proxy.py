@@ -178,16 +178,19 @@ def test_both_placeholders_in_one_template(leerie):
 # _select_subtask_axes: the fallback that makes the narrowing non-silent
 # --------------------------------------------------------------------------
 
-def test_axis_falls_back_to_canonical_when_no_test_file_changed(leerie):
-    """An unrenderable proxy must yield the CANONICAL command string, not be
-    dropped and not be left empty — asserting `!= None` would pass against a
-    silently skipped axis."""
+def test_axis_is_deferred_when_no_test_file_changed(leerie):
+    """The incident shape (DESIGN §9): a diff with no test file used to run
+    the canonical `pytest` -- the whole suite -- per subtask. It must now be
+    deferred: absent from the command map AND reported by `_deferred_axes`,
+    so the caller records it rather than dropping it silently."""
+    blt = {"build": "", "lint": "", "test": "pytest"}
     axes, scope = leerie._select_subtask_axes(
-        {"build": "", "lint": "", "test": "pytest"},
-        {"test": "python3 -m pytest {test_files} -q"},
+        blt, {"test": "python3 -m pytest {test_files} -q"},
         ["orchestrator/leerie.py"], "base", "scoped")
-    assert axes["tests"] == "pytest"
-    assert scope == "full"          # nothing actually narrowed
+    assert "tests" not in axes
+    assert "pytest" not in axes.values()
+    assert scope == "deferred"
+    assert leerie._deferred_axes(axes, blt, "scoped") == ["tests"]
 
 
 def test_axis_uses_the_proxy_when_a_test_file_changed(leerie):

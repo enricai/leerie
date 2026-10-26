@@ -75,7 +75,8 @@ def test_names_every_degraded_axis_and_both_remedies(leerie, capture):
     assert len(got) == 1
     msg = got[0]
     assert "tests" in msg and "build" not in msg.split("for:")[1].split(".")[0]
-    assert "test_scoped" in msg and "--subtask-tests off" in msg
+    assert "test_scoped" in msg and "--subtask-tests full" in msg
+    assert "deferred" in msg, "must say the axis is deferred, not run in full"
     assert "{test_files}" in msg, "must point pytest repos at the right placeholder"
 
 
