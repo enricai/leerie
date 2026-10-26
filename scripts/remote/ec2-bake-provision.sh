@@ -80,7 +80,7 @@ export XDG_CACHE_HOME=/tmp/.cache
 export MISE_STATE_DIR=/tmp/.mise-state
 mise install --system node@lts python@3.12
 
-node_dir="$(ls -d /usr/local/share/mise/installs/node/*/ | head -n1)"
+node_dir="$(find /usr/local/share/mise/installs/node -mindepth 1 -maxdepth 1 -type d | head -n1)/"
 ln -sfn "${node_dir%/}" /usr/local/share/mise/installs/node/lts-current
 
 # Login-shell environment mirroring the Dockerfile ENV lines.
