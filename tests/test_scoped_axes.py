@@ -121,28 +121,30 @@ def test_scoped_mode_uses_the_proxy_and_labels_itself(leerie):
     assert scope == "scoped"
 
 
-def test_an_axis_without_a_proxy_is_deferred_not_run_canonically(leerie):
-    """DESIGN §9: absence means deferred, never full. `build` has no proxy
-    here, so it must be ABSENT from the command map -- the canonical string
-    is exactly what must not come back. `lint`, which has no proxy tier,
-    keeps its canonical command (asserted as the string, not 'not None')."""
+def test_only_the_tests_axis_is_ever_deferred(leerie):
+    """DESIGN §9: absence means deferred, never full -- for `tests`. `build`
+    has no proxy here and keeps its canonical STRING (a compiled repo's
+    cheapest per-subtask signal); `lint` has no proxy tier and keeps its
+    own. `tests`, with a resolvable proxy, is scoped."""
     axes, _ = leerie._select_subtask_axes(
         BLT, {"test": "npx vitest related --run {files}"},
         ["a.ts"], "base", "scoped")
-    assert "build" not in axes
-    assert "next build" not in axes.values()
+    assert axes["build"] == "next build"
     assert axes["lint"] == "biome check"
-    assert leerie._deferred_axes(axes, BLT, "scoped") == ["build"]
+    assert axes["tests"].startswith("npx vitest related")
+    assert leerie._deferred_axes(axes, BLT, "scoped") == []
 
 
 def test_scope_reports_deferred_when_no_proxy_actually_applied(leerie):
     """The label must not claim a narrowing that did not happen — the
-    conformer prompt renders it verbatim. Nothing narrowed and nothing ran
-    in full, so the honest label is `deferred`."""
+    conformer prompt renders it verbatim. Nothing narrowed and the tests
+    were deferred, so the honest label is `deferred`; build and lint still
+    ran their canonical commands, which the per-axis lines state."""
     axes, scope = leerie._select_subtask_axes(BLT, {}, ["a.ts"], "base",
                                               "scoped")
     assert scope == "deferred"
-    assert "tests" not in axes and "build" not in axes
+    assert "tests" not in axes
+    assert axes["build"] == "next build"
     assert axes["lint"] == "biome check"
 
 

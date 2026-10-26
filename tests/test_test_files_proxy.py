@@ -106,7 +106,7 @@ def test_no_test_file_returns_None_not_a_bare_runner(leerie):
     empty-list guard does not fire — but every member is a non-test path.
     Rendering here yields a bare `pytest`, which runs EVERYTHING: the exact
     inversion the `{files}` rule already forbids, arrived at by a different
-    route. None makes `_select_subtask_axes` fall back to canonical instead.
+    route. None makes `_select_subtask_axes` defer the axis instead.
 
     This is the shape of the 2-in-36 real subtask diffs that carried no test
     file: bugfix-002 of run 7aa46cce (docs + orchestrator), and bugfix-004 of

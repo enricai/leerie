@@ -1,11 +1,13 @@
-"""`scoped` silently behaving as `full` must be said out loud (DESIGN §9).
+"""An unnarrowed `scoped` axis must be said out loud (DESIGN §9).
 
-`scoped` is the default and an axis with no resolvable proxy falls back to the
-canonical command — correct, and deliberately not a silent skip. But nothing
-told the operator, so a pytest repo paid the full oracle once per subtask
-while believing it had asked for a cheap falsifier. Measured across the run
-corpus: every other repo resolved a proxy on ~99% of subtasks; this one
-resolved none on 16 of 16, spending 6.9 h in orchestrator-run full suites.
+`scoped` is the default. A `tests` axis with no resolvable proxy is deferred
+to the whole-tree pass (no per-subtask test signal at all), and a `build`
+axis with none still runs its canonical command per subtask. Before the
+warning nothing told the operator: a pytest repo paid the full oracle once
+per subtask while believing it had asked for a cheap falsifier. Measured
+across the run corpus: every other repo resolved a proxy on ~99% of
+subtasks; this one resolved none on 16 of 16, spending 6.9 h in
+orchestrator-run full suites.
 """
 from __future__ import annotations
 
@@ -76,8 +78,24 @@ def test_names_every_degraded_axis_and_both_remedies(leerie, capture):
     msg = got[0]
     assert "tests" in msg and "build" not in msg.split("for:")[1].split(".")[0]
     assert "test_scoped" in msg and "--subtask-tests full" in msg
-    assert "deferred" in msg, "must say the axis is deferred, not run in full"
+    assert "deferred to the whole-tree pass" in msg, \
+        "must say the tests axis is deferred, not run in full"
     assert "{test_files}" in msg, "must point pytest repos at the right placeholder"
+
+
+def test_a_build_without_a_proxy_is_said_to_run_canonically(leerie, capture):
+    """`build` is NOT deferred (DESIGN §9) -- the warning must not claim it
+    is, or an operator would believe a compile check was skipped."""
+    got = _warns(leerie, capture, {"build": "go build ./..."},
+                 {})
+    assert len(got) == 1
+    assert "build runs its CANONICAL command once per subtask" in got[0]
+    assert "deferred" not in got[0]
+
+
+def test_lint_is_never_reported(leerie, capture):
+    """`lint` has no proxy tier, so it is never a degrade."""
+    assert _warns(leerie, capture, {"lint": "ruff check ."}, {}) == []
 
 
 def test_partial_degrade_reports_only_the_unresolved_axis(leerie, capture):

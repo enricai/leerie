@@ -24,10 +24,7 @@ import types
 
 import pytest
 
-
-def _git(cmd, cwd):
-    r = subprocess.run(["git", *cmd], cwd=cwd, capture_output=True, text=True)
-    assert r.returncode == 0, f"git {cmd} failed: {r.stderr}"
+from tests.conftest import run_git_repo_first
 
 
 def _repo(tmp_path, *, test="pytest", test_scoped=None, tests_dir=True,
@@ -99,36 +96,76 @@ class TestFullSuiteDenials:
 
 
 # ---------------------------------------------------------------------------
-# the matcher the strip relies on
+# ONE rule list: the matcher must agree with what the CLI actually denied
 # ---------------------------------------------------------------------------
 
-@pytest.mark.parametrize("cmd,whole", [
-    ("pytest tests/", True),
+# Every command here was run against the real CLI with the rules
+# `_full_suite_denials` emits for a pytest repo with a `tests/` root (host
+# claude 2.1.310 and the image's 2.1.302, `--dangerously-skip-permissions`),
+# and the CLI's verdict recorded. The strip and the settle-time exemption
+# must reach the SAME verdict, or a worker is required to run what it is
+# denied -- the defect the first version shipped (`-k` and `cd &&` forms).
+LIVE_PROBED = [
     ("pytest", True),
-    ("python3 -m pytest tests/ -q -x -n 4", True),
-    ("timeout 590 python3 -m pytest tests/ -q", True),
-    ("python3 -m pytest -q -p no:cacheprovider tests/", True),
-    ("pytest tests/test_no_undefined_names.py", False),
-    ("python3 -m pytest -q tests/ -k resolve", False),
-    ("pytest tests/ -m slow", False),
-    ("pytest tests/ && shellcheck x.sh", False),
-    ("shellcheck scripts/remote/ec2-*.sh", False),
+    ("pytest tests/", True),
+    ("timeout 590 python3 -m pytest tests/ -q -x -n 4 2>&1 | tail -15", True),
+    ("timeout 9 python3 -m pytest tests/ -q -x 2>&1 | tail -2", True),
+    ("python3 -m pytest -q -p no:cacheprovider tests/ > /dev/null 2>&1; "
+     "echo done4", True),
+    ("cd . && pytest tests/ -q", True),
+    ("pytest tests/ -k foo", True),
+    ("pytest -m 'not slow' tests/", True),
+    ("python3 -m pytest tests/test_resolve_task_argument.py -q", False),
+    ("python3 -m pytest -q -p no:cacheprovider tests/test_a.py "
+     "tests/test_b.py", False),
+    ("for f in a b; do python3 -m pytest -q tests/acc/test_$f.py; done",
+     False),
+    ("python3 -m pytest tests/test_x.py -q 2>&1 | tail -2", False),
+    ("pytest -q", False),
+]
+
+
+@pytest.mark.parametrize("cmd,denied", LIVE_PROBED)
+def test_matcher_agrees_with_the_live_cli(leerie, tmp_path, cmd, denied):
+    pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
+    assert leerie._denied_by_full_suite_rules(cmd, pats) is denied
+
+
+@pytest.mark.parametrize("cmd", [
+    "run pytest tests/ to verify",
+    "`pytest tests/`",
+    "pytest tests/ && shellcheck x.sh",
+    "pytest tests/ --lf",
+    "pytest tests/ -k=foo",
+    "pytest tests/ --deselect=tests/test_a.py::t",
+    "nice -n 5 nohup pytest tests/",
 ])
-def test_is_canonical_suite_command(leerie, cmd, whole):
-    runners = leerie._full_suite_runners("pytest")
-    assert leerie._is_canonical_suite_command(cmd, runners, ["tests"]) is whole
+def test_paraphrases_and_compounds_only_a_denied_run_could_satisfy(
+        leerie, tmp_path, cmd):
+    """Beyond the CLI: a declared paraphrase or compound the declared-command
+    check would satisfy only with a denied run must be stripped too."""
+    pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
+    assert leerie._denied_by_full_suite_rules(cmd, pats)
 
 
-@pytest.mark.parametrize("cmd,whole", [
+@pytest.mark.parametrize("cmd,denied", [
     ("pnpm run test", True),
     ("pnpm test", True),
     ("pnpm test flow-runner", False),
     ("pnpm test src/site-agnostic.test.ts", False),
     ("pnpm run lint", False),
 ])
-def test_npm_family_matcher(leerie, cmd, whole):
-    runners = leerie._full_suite_runners("pnpm run test")
-    assert leerie._is_canonical_suite_command(cmd, runners, []) is whole
+def test_npm_family_matcher(leerie, tmp_path, cmd, denied):
+    pats = leerie._full_suite_rule_patterns(
+        _repo(tmp_path, test="pnpm run test", tests_dir=False))
+    assert leerie._denied_by_full_suite_rules(cmd, pats) is denied
+
+
+def test_the_emitted_rules_are_exactly_the_patterns(leerie, tmp_path):
+    """The deny string and the matcher's patterns are one list."""
+    root = _repo(tmp_path)
+    assert leerie._full_suite_denials(root) == ",".join(
+        f"Bash({p})" for p in leerie._full_suite_rule_patterns(root))
 
 
 # ---------------------------------------------------------------------------
@@ -162,14 +199,27 @@ class TestStrip:
              "shellcheck scripts/remote/ec2-*.sh"]
         assert "runs_commands" not in subs["feat-001"]
 
-    def test_a_prescribed_command_is_never_stripped(self, leerie, tmp_path):
-        """An explicit user instruction outranks the default (DESIGN §9)."""
+    def test_a_prescribed_whole_suite_command_lifts_strip_deny_and_notice(
+            self, leerie, tmp_path):
+        """An explicit user instruction outranks the default (DESIGN §9).
+        Keeping the entry while still denying it would make the prescribed
+        command impossible to run -- so the whole mechanism stands down."""
+        root = _repo(tmp_path)
+        prescribed = {"is_prescribed": True, "commands": ["pytest  tests/"]}
         plans = _incident_plans()
-        touched = leerie._strip_canonical_suite_commands(
-            plans, _repo(tmp_path),
-            {"is_prescribed": True, "commands": ["pytest  tests/"]})
-        assert touched == []
+        assert leerie._strip_canonical_suite_commands(
+            plans, root, prescribed) == []
         assert plans[0]["subtasks"][0]["runs_commands"][0] == "pytest tests/"
+        assert leerie._full_suite_denials(root, prescribed) == ""
+        assert leerie._full_suite_notice(root, prescribed) is None
+
+    def test_an_unrelated_prescribed_command_keeps_the_deny(self, leerie,
+                                                            tmp_path):
+        root = _repo(tmp_path)
+        prescribed = {"is_prescribed": True,
+                      "commands": ["pytest tests/test_x.py"]}
+        assert "Bash(pytest tests/ *)" in leerie._full_suite_denials(
+            root, prescribed)
 
     def test_npm_filtered_runs_survive(self, leerie, tmp_path):
         """Barnacle's plans declare `pnpm test <filter>` on almost every
@@ -208,20 +258,24 @@ class TestStrip:
 # deny + notice reach the worker together (executed, not source-read)
 # ---------------------------------------------------------------------------
 
-def _argv_for(leerie, monkeypatch, repo_root, schema_key="implementer"):
+def _spawn(leerie, monkeypatch, repo_root, *, schema_key="implementer",
+           allowed_tools=None, data=None):
+    """`(deny value, user prompt sent over stdin)` from the REAL `claude_p`
+    with only `_invoke` stubbed."""
     captured: dict = {}
 
     async def fake_invoke(cmd, cwd, timeout, sid, leerie_dir, verbosity,
                           stdin_data=None, **_kw):
         captured["cmd"] = list(cmd)
+        captured["stdin"] = stdin_data
         return {"type": "result", "subtype": "success", "is_error": False,
                 "result": "{}", "structured_output": {"categories": []}}
 
     st = types.SimpleNamespace(
         path=pathlib.Path("/tmp/leerie-test-nonexistent/state.json"),
         run_dir=pathlib.Path("/tmp/leerie-test-nonexistent"),
-        repo_root=repo_root, data={"verbosity": "quiet"}, run_id="r1",
-        bump_workers=lambda *a, **k: None,
+        repo_root=repo_root, data={"verbosity": "quiet", **(data or {})},
+        run_id="r1", bump_workers=lambda *a, **k: None,
         add_telemetry=lambda *a, **k: None)
     monkeypatch.setattr(leerie, "_invoke", fake_invoke)
     monkeypatch.setattr(leerie, "_capture_call", lambda *a, **k: None)
@@ -229,11 +283,16 @@ def _argv_for(leerie, monkeypatch, repo_root, schema_key="implementer"):
         leerie, "_append_system_prompt_file_supported", lambda: False)
     asyncio.run(leerie.claude_p(
         "u", "s", schema_key=schema_key,
-        cwd="/leerie-state/runs/r1/worktrees/w", allowed_tools="Read",
+        cwd="/leerie-state/runs/r1/worktrees/w",
+        allowed_tools=allowed_tools or leerie.ACT_TOOLS,
         max_turns=40, autonomous=True, caps=dict(leerie.DEFAULT_CAPS),
         st=st, model="sonnet", sid="t"))
     argv = captured["cmd"]
-    return argv[argv.index("--disallowedTools") + 1]
+    return argv[argv.index("--disallowedTools") + 1], captured["stdin"]
+
+
+def _argv_for(leerie, monkeypatch, repo_root):
+    return _spawn(leerie, monkeypatch, repo_root)[0]
 
 
 def test_the_deny_reaches_the_argv(leerie, monkeypatch, tmp_path):
@@ -248,73 +307,63 @@ def test_no_deny_when_the_repo_has_no_test_command(leerie, monkeypatch,
     assert "Bash(" not in deny
 
 
-@pytest.fixture
-def impl_env(leerie, tmp_path):
-    repo = _repo(tmp_path)
-    _git(["init", "-q", "-b", "main"], repo)
-    _git(["config", "user.email", "t@t"], repo)
-    _git(["config", "user.name", "t"], repo)
-    _git(["add", "-A"], repo)
-    _git(["commit", "-q", "-m", "init"], repo)
-    run_dir = repo / ".leerie" / "runs" / "r1"
-    (run_dir / "subtasks").mkdir(parents=True)
-    (run_dir / "checkpoints").mkdir()
-    (run_dir / "artifacts").mkdir()
-    sid = "test-003"
-    (run_dir / "subtasks" / f"{sid}.json").write_text(json.dumps(
-        {"id": sid, "title": "verify", "success_criteria_seed":
-         "`pytest tests/` passes", "files_likely_touched": []}))
-    (run_dir / "plan.json").write_text(json.dumps(
-        {"task": "x", "waves": [], "subtasks": {
-            sid: {"id": sid, "depends_on": [], "requires": []}}}))
-    st = leerie.State(repo / ".leerie", "r1", repo_root=repo)
-    st.data = {"task": "x", "answers": {"source_of_truth": "codebase"}}
-    st.save()
-    return repo, run_dir, st, sid
+def _notice_lines(prompt):
+    return [ln for ln in prompt.splitlines()
+            if ln.startswith("NOTE FROM ORCHESTRATOR:")
+            and "whole test suite" in ln]
 
 
-def _implementer_prompt(leerie, monkeypatch, impl_env):
-    repo, run_dir, st, sid = impl_env
-
-    async def fake_script(name, *args):
-        return subprocess.CompletedProcess(
-            args=["bash"], returncode=0, stdout=f"{repo / 'wt'}\n", stderr="")
-
-    calls: list = []
-
-    async def fake_claude_p(user_prompt, system_prompt, **kw):
-        calls.append(user_prompt)
-        return {"subtask_id": sid, "status": "complete", "branch": "b"}
-
-    monkeypatch.setattr(leerie, "_run_script", fake_script)
-    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    asyncio.run(leerie._run_implementer(
-        sid, run_dir, dict(leerie.DEFAULT_CAPS), st,
-        {w: "sonnet" for w in leerie.WORKER_TYPES},
-        {w: None for w in leerie.WORKER_TYPES}))
-    return calls[0]
-
-
-def test_the_implementer_is_told_whenever_the_deny_is_in_force(
-        leerie, monkeypatch, impl_env):
-    """Behavioural probe on the prose, not a substring: the notice must name
-    the canonical command, say the worker may not run it, and give the exact
+@pytest.mark.parametrize("schema_key", [
+    "implementer", "conformer", "integrator", "acceptance_writer"])
+def test_every_bash_capable_worker_gets_deny_and_notice_together(
+        leerie, monkeypatch, tmp_path, schema_key):
+    """Decided once in `claude_p`, so no caller can send the deny without
+    its reason. Behavioural probe on the prose, not a bare substring: the
+    line names the canonical command, says it is denied, and gives the exact
     `not_applicable` exit the replay validated."""
-    prompt = _implementer_prompt(leerie, monkeypatch, impl_env)
-    line = next(ln for ln in prompt.splitlines()
-                if ln.startswith("NOTE FROM ORCHESTRATOR:")
-                and "whole test suite" in ln)
+    deny, prompt = _spawn(leerie, monkeypatch, _repo(tmp_path),
+                          schema_key=schema_key)
+    assert "Bash(pytest tests/ *)" in deny
+    (line,) = _notice_lines(prompt)
     assert "(`pytest`)" in line
     assert "denied to you" in line
     assert "not_applicable: true" in line
     assert "orchestrator's whole-tree pass owns this" in line
+    assert "once every wave has merged" in line
 
 
-def test_no_notice_without_a_deny(leerie, monkeypatch, impl_env):
-    repo = impl_env[0]
-    (repo / ".leerie" / "config.toml").write_text('test = ""\n')
-    prompt = _implementer_prompt(leerie, monkeypatch, impl_env)
-    assert "whole test suite" not in prompt
+def test_a_worker_that_cannot_reach_the_runner_gets_no_notice(
+        leerie, monkeypatch, tmp_path):
+    """Judgment workers hold a fixed verb allowlist with no runner: the deny
+    is inert for them and the notice would be noise."""
+    _deny, prompt = _spawn(leerie, monkeypatch, _repo(tmp_path),
+                           schema_key="classifier",
+                           allowed_tools=leerie.INSPECT_TOOLS)
+    assert _notice_lines(prompt) == []
+
+
+def test_a_widened_runner_grant_does_get_the_notice(leerie, monkeypatch,
+                                                    tmp_path):
+    _deny, prompt = _spawn(
+        leerie, monkeypatch, _repo(tmp_path), schema_key="classifier",
+        allowed_tools=leerie.INSPECT_TOOLS + ",Bash(pytest:*)")
+    assert len(_notice_lines(prompt)) == 1
+
+
+def test_no_deny_means_no_notice(leerie, monkeypatch, tmp_path):
+    deny, prompt = _spawn(leerie, monkeypatch, _repo(tmp_path, test=""))
+    assert "Bash(" not in deny
+    assert _notice_lines(prompt) == []
+
+
+def test_a_prescribed_whole_suite_lifts_both_at_spawn(leerie, monkeypatch,
+                                                      tmp_path):
+    deny, prompt = _spawn(
+        leerie, monkeypatch, _repo(tmp_path),
+        data={"prescribed_procedure": {"is_prescribed": True,
+                                       "commands": ["pytest tests/"]}})
+    assert "Bash(pytest" not in deny
+    assert _notice_lines(prompt) == []
 
 
 # ---------------------------------------------------------------------------
@@ -325,26 +374,26 @@ def test_no_notice_without_a_deny(leerie, monkeypatch, impl_env):
 def test_docs_only_subtask_defers_tests_end_to_end(leerie, monkeypatch,
                                                    tmp_path):
     repo = _repo(tmp_path, test_scoped="python3 -m pytest {test_files} -q")
-    _git(["init", "-q", "-b", "main"], repo)
-    _git(["config", "user.email", "t@t"], repo)
-    _git(["config", "user.name", "t"], repo)
+    run_git_repo_first(repo, "init", "-q", "-b", "main")
+    run_git_repo_first(repo, "config", "user.email", "t@t")
+    run_git_repo_first(repo, "config", "user.name", "t")
     (repo / "docs").mkdir()
     (repo / "docs" / "DESIGN.md").write_text("# design\n")
-    _git(["add", "-A"], repo)
-    _git(["commit", "-q", "-m", "init"], repo)
+    run_git_repo_first(repo, "add", "-A")
+    run_git_repo_first(repo, "commit", "-q", "-m", "init")
     run_id = "r-docs"
     run_branch = f"leerie/runs/{run_id}"
-    _git(["checkout", "-q", "-b", run_branch], repo)
+    run_git_repo_first(repo, "checkout", "-q", "-b", run_branch)
     run_dir = repo / ".leerie" / "runs" / run_id
     for d in ("subtasks", "criteria", "logs", "worktrees"):
         (run_dir / d).mkdir(parents=True)
     sid = "docs-002"
     wt = run_dir / "worktrees" / sid
-    _git(["worktree", "add", "-q", "-b", f"leerie/subtasks/{run_id}/{sid}",
-          str(wt), run_branch], repo)
+    run_git_repo_first(repo, "worktree", "add", "-q", "-b",
+                       f"leerie/subtasks/{run_id}/{sid}", str(wt), run_branch)
     (wt / "docs" / "DESIGN.md").write_text("# design\n\nnew section\n")
-    _git(["add", "-A"], wt)
-    _git(["commit", "-q", "-m", "docs only"], wt)
+    run_git_repo_first(wt, "add", "-A")
+    run_git_repo_first(wt, "commit", "-q", "-m", "docs only")
     (run_dir / "criteria" / f"{sid}.md").write_text("# Criteria\n- x\n")
     subtask = {"id": sid, "files_likely_touched": ["docs/DESIGN.md"]}
     (run_dir / "subtasks" / f"{sid}.json").write_text(json.dumps(subtask))
@@ -430,3 +479,142 @@ def test_run_phases_strips_before_scheduling(leerie, monkeypatch, tmp_path):
             MODELS, EFFORTS))
     assert st.data["plan_snapshot"]["subtasks"]["test-003"]["runs_commands"] \
         == ["pytest tests/test_no_undefined_names.py"]
+
+
+# ---------------------------------------------------------------------------
+# hostile repo files: the deny runs inside EVERY claude_p call, so it must
+# never raise -- a raise here would kill every worker spawn
+# ---------------------------------------------------------------------------
+
+class TestHostileRepoFiles:
+    @pytest.mark.parametrize("name,content", [
+        ("pytest.ini", b"[pytest]\ntestpaths = tests\n# \xff\xfe\n"),
+        ("pytest.ini", b"[pytest]\ntestpaths = 100%tests\n"),
+        ("setup.cfg", b"[tool:pytest]\ntestpaths = %(x)s\n"),
+        ("tox.ini", b"[pytest\ntestpaths = tests\n"),
+    ])
+    def test_unreadable_or_odd_ini_never_raises(self, leerie, tmp_path,
+                                                name, content):
+        root = _repo(tmp_path)
+        (root / name).write_bytes(content)
+        rules = leerie._full_suite_denials(root)
+        assert "Bash(pytest)" in rules, "falls back to the default root"
+        assert leerie._full_suite_notice(root)
+
+    def test_a_percent_in_testpaths_is_literal(self, leerie, tmp_path):
+        root = _repo(tmp_path, tests_dir=False,
+                     ini="[pytest]\ntestpaths = 100%tests\n")
+        assert "Bash(pytest 100%tests/ *)" in leerie._full_suite_denials(root)
+
+    def test_a_root_that_would_corrupt_the_rule_list_is_dropped(
+            self, leerie, tmp_path):
+        root = _repo(tmp_path, tests_dir=False,
+                     ini="[pytest]\ntestpaths = a,b c(d) e\n")
+        rules = leerie._full_suite_denials(root)
+        assert "Bash(pytest e/ *)" in rules
+        assert "a,b" not in rules and "c(d)" not in rules
+
+    def test_a_derivation_failure_degrades_to_no_deny(self, leerie, tmp_path,
+                                                      monkeypatch):
+        def boom(_root):
+            raise OSError("unreadable checkout")
+        monkeypatch.setattr(leerie, "_canonical_test_command", boom)
+        monkeypatch.setattr(leerie, "_full_suite_deny_skip_warned", False)
+        root = _repo(tmp_path)
+        assert leerie._full_suite_denials(root) == ""
+        assert leerie._full_suite_notice(root) is None
+
+
+# ---------------------------------------------------------------------------
+# settle-time exemption: the choke point that also covers specs written
+# before the strip existed (a resume past `plan_snapshot`)
+# ---------------------------------------------------------------------------
+
+from tests.test_declared_commands_executed import (  # noqa: E402
+    _COMPLETE_RES_EXTRA, _declare, _settle, _write_worker_log)
+from tests.test_oom_naming import env  # noqa: E402,F401  (pytest fixture)
+
+
+def _settle_env(env, monkeypatch, *, declared, prescribed=None):  # noqa: F811
+    leerie_mod = env["leerie"]
+    repo = env["repo"]
+    (repo / ".leerie").mkdir(exist_ok=True)
+    (repo / ".leerie" / "config.toml").write_text('test = "pytest"\n')
+    (repo / "tests").mkdir(exist_ok=True)
+    env["st"].repo_root = repo
+    if prescribed is not None:
+        env["st"].data["prescribed_procedure"] = prescribed
+    _declare(env, declared)
+    _write_worker_log(env["run_dir"] / "logs" / f"{env['sid']}.log",
+                      ["python3 -m pytest tests/test_x.py -q"])
+    calls: list = []
+
+    async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
+                         continuation=False, note=""):
+        calls.append(note)
+        return {"subtask_id": sid_, "status": "complete",
+                **_COMPLETE_RES_EXTRA}
+    monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
+
+    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
+                          label="post"):
+        return {"satisfied": True, "evidence": "on the run branch",
+                "checked": ["src.py"]}
+    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
+                        _stub_probe)
+    res = _settle(leerie_mod, env, failed_retries=0,
+                  implementer_confidence_retries=1)
+    return res, calls
+
+
+def test_settle_exempts_a_denied_declared_command(env, monkeypatch):  # noqa: F811
+    """An OLD spec still declaring `pytest tests/` (never stripped) settles
+    complete on targeted runs alone, with no corrective re-drive."""
+    res, calls = _settle_env(
+        env, monkeypatch,
+        declared=["pytest tests/", "python3 -m pytest tests/test_x.py -q"])
+    assert res["status"] == "complete"
+    assert len(calls) == 1
+
+
+def test_settle_still_demands_a_prescribed_whole_suite_run(env, monkeypatch):  # noqa: F811
+    """Control: when the user PRESCRIBED the whole suite there is no deny,
+    so there is no exemption -- an unrun prescribed command still blocks."""
+    res, calls = _settle_env(
+        env, monkeypatch, declared=["pytest tests/"],
+        prescribed={"is_prescribed": True, "commands": ["pytest tests/"]})
+    assert res["status"] == "blocked"
+    assert "pytest tests/" in res["blocker"]
+    assert len(calls) == 2
+
+
+# ---------------------------------------------------------------------------
+# remaining components, each pinned so its removal is visible
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("mode", ["full", "off"])
+def test_nothing_is_deferred_outside_scoped(leerie, mode):
+    blt = {"build": "make", "lint": "ruff", "test": "pytest"}
+    axes, _ = leerie._select_subtask_axes(blt, {}, ["a.py"], "base", mode)
+    assert leerie._deferred_axes(axes, blt, mode) == []
+
+
+def test_build_without_a_proxy_keeps_its_canonical_command(leerie):
+    """Only `tests` is deferred: a compiled repo keeps its per-subtask
+    compile signal (DESIGN §9)."""
+    blt = {"build": "go build ./...", "lint": "", "test": "go test ./..."}
+    axes, label = leerie._select_subtask_axes(blt, {}, ["a.go"], "base",
+                                              "scoped")
+    assert axes["build"] == "go build ./..."
+    assert "tests" not in axes
+    assert leerie._deferred_axes(axes, blt, "scoped") == ["tests"]
+    assert label == "deferred"
+
+
+def test_the_strip_never_raises_on_a_malformed_plan(leerie, tmp_path):
+    root = _repo(tmp_path)
+    assert leerie._strip_canonical_suite_commands(
+        [None], root, {}) == []
+    assert leerie._strip_canonical_suite_commands(
+        [{"subtasks": [{"id": "x", "runs_commands": "pytest tests/"}]}],
+        root, {}) == []

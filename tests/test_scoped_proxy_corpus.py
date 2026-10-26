@@ -51,7 +51,7 @@ def test_the_proxy_resolves_for_the_measured_share(leerie, corpus):
     assert share >= 0.90, (
         f"only {len(resolved)}/{len(corpus)} ({share:.0%}) of real subtask "
         "diffs resolve a test-file proxy — below this the tier stops being "
-        "worth its complexity and the canonical fallback is the common path")
+        "worth its complexity and deferral is the common path")
 
 
 def test_the_source_only_subtask_is_deferred(leerie, corpus):

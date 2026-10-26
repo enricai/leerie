@@ -1177,7 +1177,8 @@ RUNTIME_FILE = SOURCE_OF_TRUTH_FILE
 
 # How much of the repo's suite a per-subtask conformance round measures
 # (DESIGN §9 *Per-subtask scope: a delta proxy, not the suite*).
-#   scoped — a diff-scoped proxy where one resolves, canonical otherwise
+#   scoped — a diff-scoped proxy where one resolves; otherwise `tests` is
+#            deferred to the final-tree pass and build/lint run canonically
 #   full   — the canonical command, as before this knob existed
 #   off    — measure nothing per subtask; the final-tree pass still runs
 # The canonical command always runs at the base-health baseline and on the
@@ -19873,27 +19874,27 @@ def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
 # comparison of SHELL COMMAND strings -- the canonical command and the
 # `runs_commands` entries a planner declares -- never of prose.
 
-# Leading wrappers the CLI itself strips before matching Bash rules; stripped
-# here too so `_is_canonical_suite_command` sees what the deny rules see.
-_SUITE_WRAPPER_RE = re.compile(r"^(?:timeout\s+\S+|time|nice|nohup)\s+")
-# Options whose NEXT token is a value, so that value is not mistaken for a
-# path argument. `-k`/`-m`/`--deselect` select a subset, so their presence
-# makes a command targeted outright.
-_SUITE_VALUE_OPTS = frozenset({
-    "-n", "-p", "-c", "-o", "-W", "-r", "--maxfail", "--timeout", "--tb",
-    "--rootdir", "--durations", "--basetemp", "--log-level", "--color",
-    "--import-mode", "--dist"})
-_SUITE_SUBSET_OPTS = frozenset({"-k", "-m", "--deselect", "--lf",
-                                "--last-failed", "--ff", "--sw"})
+# Matching mirrors the CLI's own (claude Bash permission rules): drop
+# redirections, split on shell operators, then glob-match each segment, `*`
+# standing for any text and a trailing ` *` also matching the bare command.
+# The CLI also strips leading wrappers (`timeout`, `nice`, ...); here every
+# word-suffix of a segment is tried instead, which subsumes that. ONE rule list feeds the deny, the plan-time strip and the
+# settle-time exemption, so a worker can never be required to run what it is
+# denied (the first version derived them separately and they disagreed).
+_SUITE_SEGMENT_RE = re.compile(r"&&|\|\||;|\||&|\n")
+# Redirections (`> f`, `2>&1`, `< in`) are removed before splitting, as the
+# CLI does: `pytest tests/ > f 2>&1` was denied live by `pytest tests/ *`'s
+# sibling `pytest * tests/`, which only matches once `> f` is gone.
+_SUITE_REDIRECT_RE = re.compile(r"\s+\d*(?:>>|>|<)&?\s*[^\s;&|]*")
 _NPM_FAMILY_TEST_RE = re.compile(r"^(npm|pnpm|yarn|bun)(?: run)? test$")
 _PYTEST_FORMS = ("pytest", "python3 -m pytest", "python -m pytest")
 FULL_SUITE_NOTICE = (
     "this repo's whole test suite (`{cmd}`) is run by the orchestrator "
-    "itself on the integrated tree after every wave, and running it is "
-    "denied to you. Any criterion or repo rule that asks for the whole suite "
-    "is owned by that pass: record it `met: false, not_applicable: true` "
-    "with evidence \"orchestrator's whole-tree pass owns this\" and "
-    "continue with targeted test files.")
+    "itself on the integrated tree once every wave has merged, and running "
+    "it is denied to you. Any criterion or repo rule that asks for the "
+    "whole suite is owned by that pass: record it `met: false, "
+    "not_applicable: true` with evidence \"orchestrator's whole-tree pass "
+    "owns this\" and continue with targeted test files.")
 
 
 def _canonical_test_command(repo_root: str | Path) -> str:
@@ -19917,15 +19918,22 @@ def _test_roots(repo_root: str | Path) -> list[str]:
         f = root / name
         if not f.is_file():
             continue
-        cp = configparser.ConfigParser()
+        # No interpolation: a `%` in a repo's own ini is literal to pytest,
+        # and ConfigParser would raise on it at `get`. Decode errors are read
+        # errors here too -- this file is the target repo's, not ours.
+        cp = configparser.ConfigParser(interpolation=None)
         try:
-            cp.read(f)
-        except configparser.Error:
+            cp.read(f, encoding="utf-8")
+        except (configparser.Error, OSError, UnicodeDecodeError):
             continue
         for sec in sections:
             if cp.has_option(sec, "testpaths"):
-                roots = [t.strip().strip("/") for t in
-                         cp.get(sec, "testpaths").split() if t.strip("/ ")]
+                # A root carrying a rule metacharacter would corrupt the
+                # comma-joined `--disallowedTools` value; it is dropped, not
+                # escaped, since the CLI offers no escape.
+                roots = [r for r in (t.strip().strip("/") for t in
+                                     cp.get(sec, "testpaths").split())
+                         if r and not any(ch in r for ch in ",()*")]
                 if roots:
                     return roots
     return ["tests"] if (root / "tests").is_dir() else []
@@ -19950,115 +19958,157 @@ def _full_suite_runners(canonical: str) -> list[str]:
     return forms
 
 
-def _full_suite_denials(repo_root: str | Path) -> str:
-    """Scoped `Bash(...)` deny rules for the canonical test command run as
-    the whole suite, comma-joined for `deny_extra`; `""` when the repo has
-    no test command.
+def _full_suite_rule_patterns(repo_root: str | Path,
+                              prescribed: dict | None = None) -> list[str]:
+    """Bodies of the whole-suite deny rules (`R`, `R T`, `R T/`, `R T *`,
+    `R T/ *`, `R * T`, `R * T/` for every runner spelling R and test root
+    T), or `[]` when no deny applies.
+
+    `[]` when the repo has no test command, AND when the user's task
+    prescribed a command these rules would deny: an explicit instruction
+    outranks this default, and keeping the rule would make the prescribed
+    command impossible to run while the declared-command check demands it.
+
+    Total: it is read inside every `claude_p` call from the TARGET repo's
+    files, so any failure degrades to `[]` (warned once) rather than
+    killing every worker spawn."""
+    try:
+        runners = _full_suite_runners(_canonical_test_command(repo_root))
+        if not runners:
+            return []
+        roots = _test_roots(repo_root)
+        pats: list[str] = []
+        for r in runners:
+            pats.append(r)
+            for t in roots:
+                pats += [f"{r} {t}", f"{r} {t}/", f"{r} {t} *",
+                         f"{r} {t}/ *", f"{r} * {t}", f"{r} * {t}/"]
+        for c in ((prescribed or {}).get("commands") or []):
+            if isinstance(c, str) and _denied_by_full_suite_rules(c, pats):
+                return []
+        return pats
+    except Exception as e:
+        _warn_full_suite_deny_skipped_once(e)
+        return []
+
+
+_full_suite_deny_skip_warned: bool = False
+
+
+def _warn_full_suite_deny_skipped_once(e: Exception) -> None:
+    global _full_suite_deny_skip_warned
+    if _full_suite_deny_skip_warned:
+        return
+    _full_suite_deny_skip_warned = True
+    log(f"WARNING: could not derive the whole-suite deny rules "
+        f"({type(e).__name__}: {e}); workers run without them this process")
+
+
+def _full_suite_denials(repo_root: str | Path,
+                        prescribed: dict | None = None) -> str:
+    """`_full_suite_rule_patterns` as `Bash(...)` rules, comma-joined for
+    `deny_extra`; `""` when no deny applies.
 
     A deny rule is the only permission control that survives
-    `--dangerously-skip-permissions`. Probed live (claude 2.1.310, flag ON):
-    `timeout 590 python3 -m pytest tests/ -q -x -n 4 2>&1 | tail -15`,
-    `python3 -m pytest -q -p no:cacheprovider tests/ > f; echo` and
-    `cd . && pytest tests/ -q` were all denied, while
-    `python3 -m pytest tests/test_x.py -q`, a two-file run and a `for` loop
-    over files still ran. Not matched, by the CLI's own documented limits:
-    an absolute-path runner, `bash -c '...'`, and a flags-only bare runner
-    (`pytest -q`) -- none appeared among the full-suite invocations on
-    record. Never emitted without `FULL_SUITE_NOTICE`: deny alone ended 2/2
-    replayed workers `blocked`."""
-    runners = _full_suite_runners(_canonical_test_command(repo_root))
-    if not runners:
-        return ""
-    roots = _test_roots(repo_root)
-    rules: list[str] = []
-    for r in runners:
-        rules.append(f"Bash({r})")
-        for t in roots:
-            rules += [f"Bash({r} {t})", f"Bash({r} {t}/)",
-                      f"Bash({r} {t} *)", f"Bash({r} {t}/ *)",
-                      f"Bash({r} * {t})", f"Bash({r} * {t}/)"]
-    return ",".join(rules)
+    `--dangerously-skip-permissions`. Probed live (claude 2.1.310 on the
+    host, 2.1.302 in the image, flag ON): `timeout 590 python3 -m pytest
+    tests/ -q -x -n 4 2>&1 | tail -15`, `python3 -m pytest -q -p
+    no:cacheprovider tests/ > f; echo` and `cd . && pytest tests/ -q` were
+    denied, as is a `-k`/`-m` selection aimed at a test root; `python3 -m
+    pytest tests/test_x.py -q`, a two-file run and a `for` loop over files
+    still ran. Not matched, by the CLI's own documented limits: an
+    absolute-path runner, `bash -c '...'`, and a flags-only bare runner
+    (`pytest -q`). Never emitted without `FULL_SUITE_NOTICE`: deny alone
+    ended 2/2 replayed workers `blocked`."""
+    return ",".join(f"Bash({p})"
+                    for p in _full_suite_rule_patterns(repo_root, prescribed))
 
 
-def _full_suite_notice(repo_root: str | Path) -> str | None:
-    """The implementer's `NOTE FROM ORCHESTRATOR:` body for the full-suite
-    deny, or None when no deny is in force."""
-    if not _full_suite_denials(repo_root):
+def _full_suite_notice(repo_root: str | Path,
+                       prescribed: dict | None = None) -> str | None:
+    """The `NOTE FROM ORCHESTRATOR:` body paired with the whole-suite deny,
+    or None when no deny is in force."""
+    if not _full_suite_denials(repo_root, prescribed):
         return None
-    return FULL_SUITE_NOTICE.format(cmd=_canonical_test_command(repo_root))
-
-
-def _is_canonical_suite_command(cmd: str, runners: list[str],
-                                test_roots: list[str]) -> bool:
-    """True when `cmd` -- one shell command, no operators -- runs the whole
-    suite: a runner form followed only by flags and/or a test root."""
-    c = " ".join((cmd or "").split())
-    if not c or any(op in c for op in ("&&", "||", ";", "|")):
-        return False
-    while True:
-        stripped = _SUITE_WRAPPER_RE.sub("", c, count=1)
-        if stripped == c:
-            break
-        c = stripped
+    # Never None while a deny is in force -- deny without notice is the
+    # measured `blocked` failure -- so a read error degrades the wording only.
     try:
-        toks = shlex.split(c)
-    except ValueError:
-        return False
-    roots = {t.strip("/") for t in test_roots}
-    for r in sorted(runners, key=len, reverse=True):
-        rt = r.split()
-        if toks[:len(rt)] != rt:
-            continue
-        rest = toks[len(rt):]
-        i = 0
-        while i < len(rest):
-            tok = rest[i]
-            if tok in _SUITE_SUBSET_OPTS or tok.split("=")[0] in _SUITE_SUBSET_OPTS:
-                return False
-            if tok in _SUITE_VALUE_OPTS:
-                i += 2
-                continue
-            if tok.startswith("-"):
-                i += 1
-                continue
-            if tok.strip("/").removeprefix("./") not in roots:
-                return False
-            i += 1
+        cmd = _canonical_test_command(repo_root) or "the repo's test command"
+    except Exception:
+        cmd = "the repo's test command"
+    return FULL_SUITE_NOTICE.format(cmd=cmd)
+
+
+def _tools_reach_suite_runner(allowed_tools: str, repo_root: str | Path,
+                              prescribed: dict | None = None) -> bool:
+    """True when a worker with `allowed_tools` could invoke the canonical
+    runner: unrestricted `Bash`, or a `Bash(<runner>...)` grant such as the
+    `_widen_inspect_tools` verbs."""
+    tools = [t.strip() for t in (allowed_tools or "").split(",")]
+    if "Bash" in tools:
         return True
+    heads = {p.split()[0]
+             for p in _full_suite_rule_patterns(repo_root, prescribed)}
+    return any(t.startswith(f"Bash({h}") for t in tools for h in heads)
+
+
+def _rule_matches(text: str, pattern: str) -> bool:
+    """The CLI's Bash rule glob: `*` is any text; a trailing ` *` that is
+    the pattern's only wildcard also matches the bare command."""
+    if pattern.endswith(" *") and pattern.count("*") == 1:
+        base = pattern[:-2]
+        return text == base or text.startswith(base + " ")
+    rx = ".*".join(re.escape(part) for part in pattern.split("*"))
+    return re.fullmatch(rx, text, flags=re.DOTALL) is not None
+
+
+def _denied_by_full_suite_rules(cmd: str, patterns: list[str]) -> bool:
+    """True when the whole-suite deny would refuse `cmd`, or when `cmd` is a
+    paraphrase that only such a command could satisfy.
+
+    Per segment, as the CLI matches, and from every word of the segment: that
+    covers the CLI's wrapper stripping (`timeout 590 pytest tests/`) and also
+    a declared paraphrase ("run pytest tests/ to verify", or the command in
+    backticks), which the declared-command check would accept only the
+    denied command for. Erring wide is the safe direction here -- an
+    over-match only drops a declared requirement, never adds one."""
+    if not patterns or not isinstance(cmd, str):
+        return False
+    text = " ".join(cmd.translate(str.maketrans("", "", "`'\"")).split())
+    text = _SUITE_REDIRECT_RE.sub("", text)
+    for seg in _SUITE_SEGMENT_RE.split(text):
+        words = seg.split()
+        for i in range(len(words)):
+            cand = " ".join(words[i:])
+            if any(_rule_matches(cand, p) for p in patterns):
+                return True
     return False
 
 
 def _strip_canonical_suite_commands(plans: list[dict],
                                     repo_root: str | Path,
                                     prescribed: dict | None) -> list[str]:
-    """Remove `runs_commands` entries that run the whole suite, so the
-    declared-command check never REQUIRES a worker to run what
-    `_full_suite_denials` forbids it. Returns the affected sids; mutates in
-    place; never raises.
+    """Remove `runs_commands` entries the whole-suite deny would refuse, so
+    the declared-command check never REQUIRES a worker to run what it is
+    forbidden. Returns the affected sids; mutates in place; never raises.
 
     Measured (leerie, 2026-10-26): a repo rule auto-loaded from CLAUDE.md led
     planners to declare `pytest tests/` on four verification subtasks across
-    two runs, and the one that ran exhausted its worker timeout. A command
-    the user's task PRESCRIBED is never stripped -- an explicit instruction
-    outranks this default."""
+    two runs, and the one that ran exhausted its worker timeout. When the
+    user's task PRESCRIBED such a command the rule list is empty (see
+    `_full_suite_rule_patterns`), so nothing is stripped and nothing denied."""
     try:
-        runners = _full_suite_runners(_canonical_test_command(repo_root))
-        if not runners:
+        pats = _full_suite_rule_patterns(repo_root, prescribed)
+        if not pats:
             return []
-        roots = _test_roots(repo_root)
-        keep = {" ".join(c.split()) for c in
-                ((prescribed or {}).get("commands") or [])
-                if isinstance(c, str)}
         touched: list[str] = []
         for plan in plans:
             for sub in plan.get("subtasks") or []:
                 rc = sub.get("runs_commands")
                 if not isinstance(rc, list) or not rc:
                     continue
-                kept = [c for c in rc if not (
-                    isinstance(c, str)
-                    and " ".join(c.split()) not in keep
-                    and _is_canonical_suite_command(c, runners, roots))]
+                kept = [c for c in rc
+                        if not _denied_by_full_suite_rules(c, pats)]
                 if len(kept) != len(rc):
                     sub["runs_commands"] = kept
                     touched.append(str(sub.get("id")))
@@ -20222,6 +20272,21 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             allowed_tools = _widen_inspect_tools(
                 allowed_tools, Path(getattr(st, "repo_root", os.getcwd())))
 
+    # The whole-suite deny and its notice travel together, decided once here
+    # so no caller can send one without the other (DESIGN §9 *The whole
+    # suite is orchestrator-owned*): deny alone ended 2/2 replayed workers
+    # `blocked`. The notice goes only to a worker whose tools reach the
+    # runner; a worker that cannot run it has nothing to be told.
+    _suite_root = getattr(st, "repo_root", os.getcwd())
+    _prescribed = st.data.get("prescribed_procedure")
+    suite_deny = _full_suite_denials(_suite_root, _prescribed)
+    suite_notice = (_full_suite_notice(_suite_root, _prescribed)
+                    if suite_deny and _tools_reach_suite_runner(
+                        allowed_tools, _suite_root, _prescribed) else None)
+    if suite_notice:
+        user_prompt = (f"{user_prompt.rstrip()}\n"
+                       f"NOTE FROM ORCHESTRATOR: {suite_notice}")
+
     # The appended system prompt is a second large argv element (reconciler.md
     # is ~25KB) that compounds with the user prompt toward MAX_ARG_STRLEN —
     # see the incident note above `_append_system_prompt_file_supported`.
@@ -20264,7 +20329,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 deny_extra=",".join(d for d in (
                     _repo_write_denials(st.repo_root, st.run_dir),
                     _acceptance_read_denials(schema_key, st.run_dir),
-                    _full_suite_denials(st.repo_root)) if d))
+                    suite_deny) if d))
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
@@ -29914,14 +29979,6 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
                       "read the repo state directly and continue.")
     if note:
         up.append(f"NOTE FROM ORCHESTRATOR: {note}")
-    # Paired with `_full_suite_denials` in `claude_p`, never apart: a worker
-    # whose spec asks for the whole suite and simply hits the deny returns
-    # `blocked` (2/2 replayed); told the suite is the whole-tree pass's, it
-    # completes on targeted files (5/5). DESIGN §9.
-    suite_notice = _full_suite_notice(st.repo_root)
-    if suite_notice:
-        up.append(f"NOTE FROM ORCHESTRATOR: {suite_notice}")
-
     st.bump_workers(caps)
     try:
         return await claude_p(user_prompt="\n".join(up), system_prompt=sys_prompt,
@@ -30264,8 +30321,8 @@ async def _changed_files(tree: str, base_ref: str) -> list[str]:
 # expansion), `{1..3}` (brace expansion, digit start), and `{print $1}` (awk,
 # contains a space). The one residual false positive is a bare `awk '{print}'`
 # inside a proxy template -- accepted deliberately, because the two failure
-# directions are not symmetric: a false positive falls back to the canonical
-# command (exactly today's behaviour), while NOT catching an unknown
+# directions are not symmetric: a false positive is an absence (the axis is
+# handled as if no proxy resolved), while NOT catching an unknown
 # placeholder ships it to the shell literally and `pytest '{test_files}'`
 # exits 4, turning every subtask RED.
 #
@@ -30424,9 +30481,9 @@ def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
     buys nothing and only adds a way to be wrong. No pytest inference either
     — `{files}` for a repo whose changed file is `orchestrator/leerie.py`
     renders `pytest orchestrator/leerie.py`, which collects nothing. Repos
-    like that declare nothing and fall back to the canonical command, which
-    is the honest outcome rather than a template that looks right and selects
-    nothing."""
+    like that declare nothing, and their test axis is deferred to the
+    whole-tree pass (`_select_subtask_axes`) -- the honest outcome rather than
+    a template that looks right and selects nothing."""
     declared = _load_blt_config(repo_root) or {}
     out: dict[str, str] = {}
     for key in ("test_scoped", "build_scoped"):
@@ -30471,17 +30528,17 @@ _scoped_degrade_warned: bool = False
 
 def _warn_scoped_degraded_once(blt: dict[str, str], scoped: dict[str, str],
                                mode: str) -> None:
-    """Warn once when `--subtask-tests scoped` cannot actually narrow anything.
+    """Warn once when `--subtask-tests scoped` cannot actually narrow an axis.
 
-    `scoped` is the default, and a `tests`/`build` axis whose proxy does not
-    resolve is deferred to the whole-tree pass (`_select_subtask_axes`). That
-    is the right cost trade, but it means an operator who asked for a cheap
-    per-subtask falsifier gets no per-subtask signal on that axis at all, and
+    `scoped` is the default. A `tests` axis whose proxy does not resolve is
+    deferred to the whole-tree pass, so the operator gets no per-subtask test
+    signal at all; a `build` axis whose proxy does not resolve still runs its
+    canonical command once per subtask (`_select_subtask_axes`). Either way
     nothing else would say so.
 
-    Only fires for deferrable axes that HAVE a canonical command -- an axis
-    the repo does not define at all is not a degrade, it is simply absent,
-    and `lint` is never deferred."""
+    Only fires for axes that HAVE a canonical command -- an axis the repo does
+    not define at all is not a degrade, it is simply absent -- and never for
+    `lint`, which has no proxy tier."""
     global _scoped_degrade_warned
     if _scoped_degrade_warned or mode != "scoped":
         return
@@ -30491,15 +30548,19 @@ def _warn_scoped_degraded_once(blt: dict[str, str], scoped: dict[str, str],
     if not degraded:
         return
     _scoped_degrade_warned = True
+    effects = []
+    if "tests" in degraded:
+        effects.append("tests are not measured per subtask at all -- they "
+                       "are deferred to the whole-tree pass")
+    if "build" in degraded:
+        effects.append("build runs its CANONICAL command once per subtask")
     log(
         f"WARNING: --subtask-tests is `scoped` but no delta proxy resolved "
-        f"for: {', '.join(degraded)}. Those axes are not measured per "
-        "subtask at all -- they are deferred to the whole-tree pass "
-        "(lint alone still runs its canonical command). Declare "
+        f"for: {', '.join(degraded)}. Here {'; '.join(effects)}. Declare "
         "`test_scoped` / `build_scoped` in .leerie/config.toml (a runner "
         "with no source->test impact analysis, e.g. pytest, wants the "
         "`{test_files}` placeholder rather than `{files}`), or pass "
-        "--subtask-tests full to pay the canonical command once per "
+        "--subtask-tests full to run every canonical command once per "
         "subtask. The baseline and final-tree passes are unaffected."
     )
 
@@ -30511,14 +30572,15 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
     """`(axis name -> command, scope label)` for one subtask's conformance
     round, given the resolved canonical commands and proxy templates.
 
-    Under `scoped`, a `tests`/`build` axis whose proxy does not resolve is
-    DEFERRED to the whole-tree pass -- omitted here, never replaced by the
-    canonical command (DESIGN §9 *Absence ... means deferred, never full*).
-    The canonical fallback this replaced ran leerie's whole suite on 57-64%
-    of its own subtasks, every docs-only one included, and across 50 such
-    runs on record none changed an outcome. `lint` keeps its canonical
-    command: it has no proxy tier and costs seconds. The caller records a
-    deferred axis explicitly (`_deferred_axes`) so it is never silently
+    Under `scoped`, a `tests` axis whose proxy does not resolve is DEFERRED
+    to the whole-tree pass -- omitted here, never replaced by the canonical
+    command (DESIGN §9 *Absence ... means deferred, never full*). The
+    canonical fallback this replaced ran leerie's whole suite on 57-64% of
+    its own subtasks, every docs-only one included, and in none of the 50
+    such per-subtask records on disk did the conformer make a test change. `build` and `lint` keep the canonical
+    fallback: that evidence is about suites, and a compiled language's
+    per-subtask build is its cheapest regression signal. The caller records
+    a deferred axis explicitly (`_deferred_axes`) so it is never silently
     absent. The scope label never claims a narrowing that did not happen."""
     canonical = {"build": (blt.get("build") or "").strip(),
                  "lint": (blt.get("lint") or "").strip(),
@@ -30539,10 +30601,10 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
         if rendered:
             axes[axis] = rendered
             used_proxy = True
-        elif axis == "lint" or not canonical[axis]:
-            axes[axis] = canonical[axis]
-        else:
+        elif axis == "tests" and canonical[axis]:
             deferred = True
+        else:
+            axes[axis] = canonical[axis]
     label = "scoped" if used_proxy else ("deferred" if deferred else "full")
     return axes, label
 
@@ -30562,10 +30624,11 @@ _DEFERRED_AXIS: dict = {"ran": False, "measured": False, "passed": None,
 def _deferred_axes(subtask_axes: dict[str, str], blt: dict[str, str],
                    mode: str) -> list[str]:
     """Axes that have a canonical command but were left out of
-    `subtask_axes` by `_select_subtask_axes`' `scoped` deferral."""
+    `subtask_axes` by `_select_subtask_axes`' `scoped` deferral (only
+    `tests` can be)."""
     if mode != "scoped":
         return []
-    return [axis for axis in ("build", "lint", "tests")
+    return [axis for axis in ("tests",)
             if axis not in subtask_axes
             and (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()]
 
@@ -36722,8 +36785,18 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         # the block.
         declared_unrun: list[str] = []
         if status == "complete":
+            # Exempt what the whole-suite deny forbids (DESIGN §9 *The whole
+            # suite is orchestrator-owned*). This is the choke point, not the
+            # plan-time strip: it also covers a spec written before the strip
+            # existed (a resumed run past `plan_snapshot`) and any paraphrase
+            # the strip's planner input never saw.
+            _suite_pats = _full_suite_rule_patterns(
+                st.repo_root, st.data.get("prescribed_procedure"))
+            _declared = {**subtask, "runs_commands": [
+                c for c in (subtask.get("runs_commands") or [])
+                if not _denied_by_full_suite_rules(c, _suite_pats)]}
             declared_unrun = check_declared_commands_executed(
-                subtask,
+                _declared,
                 _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))
             if not declared_unrun:
                 # A clean later attempt clears a stale warning from an
@@ -40080,7 +40153,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                     help="how much of the repo's suite each per-subtask "
                          "conformance round measures (DESIGN §9). 'scoped' "
                          "(default) runs a diff-scoped proxy where one "
-                         "resolves and the canonical command otherwise; "
+                         "resolves; otherwise the tests axis is deferred to "
+                         "the final integrated tree and build/lint run "
+                         "their canonical commands; "
                          "'full' always runs the canonical command; 'off' "
                          "measures nothing per subtask. The canonical "
                          "command always runs at the base-health baseline "

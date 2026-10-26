@@ -6947,17 +6947,19 @@ tests it *affects*, which is the price of working at all on a runner with
 no impact analysis. The absence rule below makes it safe: a diff with no
 test file renders nothing, and the axis is deferred to the whole-tree pass.
 
-Absence is the default in every direction, and absence means **deferred,
-never full**: under `scoped`, a `tests` or `build` axis with no resolvable
-proxy is deferred to the whole-tree pass rather than run as the canonical
-command; a changed file set that is empty skips the axis rather than
-rendering a bare runner (which would run everything, the exact inversion of
-the feature); and a template naming a placeholder this version cannot
-substitute is likewise an absence rather than a command to run, since
+Absence is the default in every direction, and for the test axis absence
+means **deferred, never full**: under `scoped`, a `tests` axis with no
+resolvable proxy is deferred to the whole-tree pass rather than run as the
+canonical command; a changed file set that is empty skips the axis rather
+than rendering a bare runner (which would run everything, the exact
+inversion of the feature); and a template naming a placeholder this version
+cannot substitute is likewise an absence rather than a command to run, since
 shipping the literal brace to a shell is a hard error on every subtask.
-`lint` alone keeps a canonical per-subtask fallback — it has no proxy tier
-and costs seconds. `--subtask-tests full|scoped|off` lets an operator force
-either end.
+`build` and `lint` keep a canonical per-subtask fallback: `lint` has no
+proxy tier and costs seconds, and the evidence below is about suites — for a
+compiled language the per-subtask build is the cheapest regression signal
+there is, and nothing measured says it is wasted. `--subtask-tests
+full|scoped|off` lets an operator force either end.
 
 The deferred rule replaced a canonical fallback, and the measurement that
 retired it is worth keeping. The `{test_files}` corpus above held 34 of 36
@@ -6965,48 +6967,82 @@ diffs carrying a test file, all of them bug-fix and test subtasks; once
 tasks routinely produced docs-only and test-less source subtasks (the
 three-layer rule writes DESIGN and IMPLEMENTATION first, as their own
 subtasks), leerie's own runs fell back on 57–64% of subtasks, each paying
-the whole suite (17 → 54 minutes as the suite and host load grew). Across
-every per-subtask canonical run on record, 50 across five repos, none
-changed an outcome: on a base that is already red, red-before/red-after is
-never attributable (see the next paragraph), and the one genuine regression
-in the set was written off by its conformer as pre-existing. The question
-those runs could not answer is exactly the one the whole-tree pass exists
-to ask.
+the whole suite (17 → 54 minutes as the suite and host load grew). Of the
+50 per-subtask conformance records on disk on 2026-10-26 (five repos) whose
+test axis was the canonical command, none led its conformer to make a test
+change: on a base that is already red, red-before/red-after is never
+attributable (*The round signal is a regression, not a verdict*,
+below), and the one genuine regression in the set was written off by its
+conformer as pre-existing. The question those runs could not answer is
+exactly the one the whole-tree pass exists to ask.
 
 A deferred axis is recorded, not omitted: the per-subtask result carries an
 explicit unmeasured, not-run axis so the conformer's self-reported value
-cannot survive the overwrite below (*The orchestrator measures; the
+cannot survive the overwrite above (*The orchestrator measures; the
 conformer consumes*), and the `BLT_RESULTS:` block names it as deferred so
-the prompt never claims a measurement that did not happen.
+the prompt never claims a measurement that did not happen. One consequence
+is deliberate: a not-run axis is clean to `_conformance_clean`, so under
+`--strict-conformer` a subtask with a deferred test axis is no longer held
+on tests per subtask — the strict check applies again to the final-tree
+pass, which measures the canonical suite.
 
-**The whole suite is orchestrator-owned, and code enforces it.** Every
-acting-worker prompt already says not to run the full suite; a prompt that
-loses to a repo rule is not enforcement. Measured (leerie, 2026-10-26): the
+**The whole suite is orchestrator-owned, and code enforces it.** The
+implementer, conformer, integrator and rebaser prompts already say not to
+run the full suite; a prompt that loses to a repo rule is not enforcement. Measured (leerie, 2026-10-26): the
 target repo's own CLAUDE.md ("run `pytest tests/` before calling a change
 green"), which `claude -p` auto-loads, led planners to emit verification
 subtasks declaring `runs_commands: ["pytest tests/"]`; the declared-command
-check (§5) then *required* the worker to run it, and one such subtask
-exhausted its worker timeout running suites. Three mechanisms, each needed:
+check (§8 *A declared command must also have been executed*) then
+*required* the worker to run it, and one such subtask exhausted its worker
+timeout running suites.
 
-- **Plan-time repair.** A `runs_commands` entry that is the repo's canonical
-  test command, bare or aimed at a test root directory, is stripped before
-  scheduling, unless the user's task prescribed it (§5 *prescribed
-  procedure*) — an explicit user instruction is never overridden.
-- **Hard deny.** The same shapes are passed as scoped `Bash(...)` rules in
-  `--disallowedTools`, the only permission control that survives
-  `--dangerously-skip-permissions`; the CLI strips `timeout`-style wrappers
-  and checks every segment of a compound command, while file-targeted,
-  `-k`-filtered and looped invocations still run.
-- **An orchestrator notice.** Deny alone is unsafe: in a controlled replay
-  of the incident spec, 2 of 2 workers that hit the deny returned `blocked`
-  (whose commits auto-accept never merges). With a code-authored notice that
-  the suite belongs to the whole-tree pass and that such criteria are
-  `not_applicable`, 5 of 5 completed on targeted tests.
+Everything below derives from **one rule list** — the canonical test
+command in every spelling a worker types (`pytest` / `python3 -m pytest`,
+`npm test` / `npm run test`), alone or aimed at a test root directory. The
+first version derived the plan-time check separately from the deny and the
+two disagreed (a `-k` selection or a `cd … &&` prefix was kept by one and
+refused by the other), which re-created the forced-`blocked` state the
+mechanism exists to remove. Four mechanisms read that list:
 
-The deny is a guard on the invocation a worker writes, not a security
-boundary: an absolute-path runner, `bash -c`, or a flags-only bare runner
-(`pytest -q`) is not matched. None appeared among the full-suite invocations
-on record, which is the honest extent of the claim.
+- **Hard deny.** The rules go into `--disallowedTools` as scoped
+  `Bash(...)` patterns, the only permission control that survives
+  `--dangerously-skip-permissions`, on every worker. The CLI strips
+  `timeout`-style wrappers and redirections and checks every segment of a
+  compound command, so anything aimed at a test root is refused, `-k`/`-m`
+  selections included; file-targeted runs, loops over files and selections
+  that name no test root still run.
+- **Plan-time strip.** A `runs_commands` entry the list would refuse is
+  removed before scheduling. The matcher mirrors the CLI's (redirections,
+  segments, glob) and tries the match from every word of a segment, which
+  covers the CLI's wrapper stripping and errs wide on purpose — it also
+  strips a paraphrase such as "run pytest tests/ to verify", since the
+  declared-command check would accept only the refused command for it, and
+  an over-match only drops a requirement.
+- **Settle-time exemption.** The declared-command check skips any entry the
+  list refuses. This, not the strip, is the choke point: it also covers a
+  spec written before the strip existed (a run resumed past scheduling).
+- **An orchestrator notice**, appended by `claude_p` itself to every worker
+  whose tools can reach the runner (so no caller can send the deny without
+  it), and to no inspect-only judgment worker. Deny alone is unsafe: in a controlled replay of the incident spec, 2 of 2 workers that
+  hit the deny returned `blocked` (whose commits auto-accept never merges).
+  With a code-authored notice that the suite belongs to the whole-tree pass
+  and that such criteria are `not_applicable`, 5 of 5 completed on targeted
+  tests.
+
+A user instruction outranks the default: when the task's prescribed
+procedure (§12 *Instruction adherence is code-enforced*) names a command
+the list would refuse, the list is empty for that run — no deny, no strip,
+no exemption, no notice — because keeping any one of them would make the
+prescribed command impossible to run or impossible to require.
+
+The derivation reads the target repo's files on every worker spawn, so it is
+total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,
+`tox.ini` or `setup.cfg`; `pyproject.toml` is not read, and such a repo gets
+the `tests/` default) degrades to fewer rules or none, with one warning,
+never to a crashed spawn. The deny is a guard on the invocation a worker
+writes, not a security boundary: an absolute-path runner, `bash -c`, or a
+flags-only bare runner (`pytest -q`) is not matched. None appeared among the
+full-suite invocations on record, which is the honest extent of the claim.
 
 **The round signal is a regression, not a verdict.** Because a scoped
 result and a full baseline are not comparable, the base-health baseline

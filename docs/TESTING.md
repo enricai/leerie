@@ -2170,33 +2170,40 @@ was badly wrong — 40% test-touching predicted (109 of 270) vs. 94% real
 prediction. The frozen corpus is 36 REAL per-subtask diffs from leerie's
 own run branches, each row an integration merge's **first-parent** diff (a
 plain two-dot diff against the run base folds in siblings — the first
-recovery attempt reported 0% source-only this way).
-shipped a fixture that could not exercise the canonical fallback at all.
+recovery attempt reported 0% source-only this way, and so shipped a fixture
+that could not exercise the no-test-file path at all).
 
 ## The whole suite is orchestrator-owned
 
-`tests/test_full_suite_ownership.py` (32) covers DESIGN §9's two
-whole-suite mechanisms: *absence means deferred, never full*
-(`_select_subtask_axes`, `_DEFERRED_AXIS`) and *strip + deny + notice*
-(`_strip_canonical_suite_commands`, `_full_suite_denials`,
-`FULL_SUITE_NOTICE`). Inputs are the 2026-10-26 incident's real
-`runs_commands` and barnacle-shaped `pnpm` configs, so a matcher that only
-understands pytest fails the negative controls. Every component was
-falsified by ablation before landing: restoring the canonical fallback
-fails 5 tests; dropping the deferred-axis record, the notice, the
-`deny_extra` wiring, the prescribed-command exclusion, or the
-`_run_phases` call site each fails exactly the test written for it. Two
-lessons generalise. **(1) Omitted is not recorded.**
-`_apply_measured_axes` overwrites only the axes present in a measurement,
-so a deferred axis left out would let a conformer's self-reported "9373
-passed" survive into the persisted entry;
-`test_docs_only_subtask_defers_tests_end_to_end` has the conformer *lie*,
-and asserts the lie is gone. **(2) A deny without a reason produces
-`blocked`, not compliance.** Replayed against the incident spec, workers
-that only hit the deny returned `blocked` 2/2 (which auto-accept then
-drops), and the same workers told why completed 5/5. So the deny and the
-notice are pinned together, and `test_no_notice_without_a_deny` pins the
-converse.
+`tests/test_full_suite_ownership.py` (63) covers DESIGN §9's two
+whole-suite mechanisms: *absence means deferred, never full* for the test
+axis (`_select_subtask_axes`, `_DEFERRED_AXIS`) and the single rule list
+behind the deny, the plan-time strip, the settle-time exemption and the
+notice (`_full_suite_rule_patterns`, `_denied_by_full_suite_rules`,
+`_strip_canonical_suite_commands`, `FULL_SUITE_NOTICE`). Inputs are the
+2026-10-26 incident's real `runs_commands`, commands whose deny verdict was
+observed live on the CLI (`LIVE_PROBED`), and barnacle-shaped `pnpm` configs
+for the negative controls. Sixteen components were ablated one at a time
+against this file and the four repinned scoped-axis files, and every
+ablation fails at least one test (restoring the canonical test fallback
+fails 6); a seventeenth, a leading-wrapper strip, left everything green and
+was removed as subsumed by the word-suffix search. Three lessons
+generalise. **(1) Omitted is not recorded.** `_apply_measured_axes`
+overwrites only the axes present in a measurement, so a deferred axis left
+out would let a conformer's self-reported "9373 passed" survive into the
+persisted entry; `test_docs_only_subtask_defers_tests_end_to_end` has the
+conformer *lie*, and asserts the lie is gone. **(2) A deny without a reason
+produces `blocked`, not compliance.** Replayed against the incident spec,
+workers that only hit the deny returned `blocked` 2/2 (which auto-accept
+then drops), and the same workers told why completed 5/5 — so the pairing
+is decided in `claude_p` and pinned there for every Bash-capable worker,
+with the converse (no notice for an inspect-only worker) pinned too.
+**(3) Two predicates for one rule set drift.** The first version derived
+the plan-time strip separately from the deny; review found `-k` selections
+and `cd … &&` prefixes kept by one and refused by the other, re-creating the
+forced-`blocked` state. One pattern list now feeds both, and
+`test_matcher_agrees_with_the_live_cli` holds the matcher to the CLI's
+observed verdicts rather than to its own reading of them.
 
 ## Pre-push preflight probe
 
