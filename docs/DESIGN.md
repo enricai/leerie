@@ -4143,69 +4143,138 @@ of the same three dispositions (stop / destroy / leave-alone).
 **Image delivery — how the leerie image reaches the instance.** Fly's
 `ensure_image()` pushes a self-contained image to
 `registry.fly.io/$APP:$VERSION[-$HASH]` and `flyctl machine run <tag>`
-pulls it. EC2 has no registry-pull equivalent for an *instance* the way
-`machine run` has for a *container* — it boots from an AMI (a full
-disk-image snapshot), not a per-run pulled artifact. Three strategies:
+pulls it. EC2 has no registry-pull equivalent for an *instance* — it
+boots from an AMI (a full disk-image snapshot). The target is Fly
+parity: `leerie "task" --runtime ec2 --aws-profile X` must work on a
+fresh AWS account with no operator-built artifact. Three strategies:
 
-1. **Bake into the AMI.** The operator builds (once, out of the run's
-   critical path) a custom AMI with the orchestrator source, Python
-   3.10+, and every OS-level dependency `.leerie-setup.sh` would
-   otherwise need root for; `RunInstances` boots straight into a
-   ready-to-seed instance, named by `LEERIE_EC2_AMI`. No push, no pull,
-   no per-run build step — cost is paid once by whoever maintains the
-   AMI (a Packer/EC2 Image Builder pipeline, out of scope for leerie
-   itself). **This is the default this design adopts.**
-2. **Push to a registry (ECR), pull at boot.** The direct Fly analog.
-   Rejected: it reintroduces registry-auth surface a second time
-   (`aws ecr get-login-password`), requires a container runtime inside
-   the EC2 instance, and adds per-provision pull latency with no
-   evidence it's necessary. Worth reconsidering only if leerie ever
-   needs the same image shared verbatim across EC2 and a containerized
-   runtime.
-3. **User-data pull-and-build.** The instance clones leerie fresh on
-   every boot off a generic stock AMI. Rejected as default:
-   multi-minute build cost per `RunInstances` call, requires outbound
-   internet egress at boot (the security-group/NAT surface the
-   SSM-only transport below otherwise avoids), and turns registry
-   flakiness into a provisioning failure mode. Remains a reasonable
-   manual bootstrap fallback (`LEERIE_EC2_AMI` pointing at a stock AMI
-   plus a documented user-data script) for an operator without a
-   custom AMI yet.
+1. **Bake on first use (`ensure_ami()`, the EC2 analog of
+   `ensure_image()`).** **This is the default this design adopts.**
+   On first use leerie bakes an AMI from a stock Debian 13 image so it
+   matches the Dockerfile: base packages, `requirements.txt` deps, `gh`,
+   mise with `node@lts`/`python@3.12` and the `lts-current` symlink, the
+   pinned `claude` CLI, the `leerie` user, `/opt/leerie-image/{orchestrator,
+   scripts,prompts,.claude-plugin}`, `/work`, the `safe.directory`
+   config, the SSM agent, and an `ec2-user` login. Later runs find the
+   AMI by tag and reuse it without rebuilding.
+   - **Mechanism: an SSH-driven bake script on a throwaway instance.**
+     `ensure_ami()` launches a temporary instance from the stock Debian
+     13 AMI (using the same key pair, security group and subnet defaults
+     as a run, below), SSHes in as the stock `admin` user (Debian's
+     cloud-image login; `ec2-user` does not exist yet), pipes the bake
+     script over the existing `ec2_tar_pipe` path, and runs it with
+     `sudo`. The script creates the `leerie` user and the `ec2-user`
+     login (authorized with the same key pair) that the run-time SSH bulk
+     transfer uses. It then calls `ec2:CreateImage` and waits for
+     `available`. Chosen over **user-data** (no exit status or log
+     visible to the launcher, 16 KB limit, failure only discoverable by
+     timeout) and **SSM** (needs the instance profile to exist and
+     register before the first step can run, a chicken-and-egg on a
+     fresh account; the SSH path is already required for bulk transfer
+     and so adds no new prerequisite).
+   - **Tag and rebake rule.** The AMI is tagged with the leerie version
+     and a source hash (over the files baked in: orchestrator, scripts,
+     prompts, plugin manifest, `requirements.txt`, the bake script).
+     Lookup is by those tags plus a leerie ownership tag. A hit is
+     reused; a version or hash change misses and rebakes. Older tagged
+     AMIs are left for `leerie prune` (below), never silently deleted.
+   - **Teardown guarantee.** The bake instance is terminated on every
+     exit path — success, bake-script failure, timeout, and
+     Ctrl-C/SIGTERM (EXIT/INT/TERM trap) — and the orchestrator-side
+     container boundary does not apply here since the bake runs on the
+     host launcher. A failed bake registers no AMI, so a partial image
+     is never tagged as reusable.
+   - **Override.** `LEERIE_EC2_AMI` / `--ec2-ami` / `ec2_ami` name an AMI
+     explicitly and skip the bake entirely.
+   - **What it costs.** First-run latency of several minutes; a
+     temporary instance billed for the bake; AMI plus snapshot storage
+     that persists until pruned; and a broader IAM surface (below). This
+     replaces the earlier default of an operator-built AMI (Packer / EC2
+     Image Builder), which was rejected here because it made a fresh
+     account unusable until someone built an image out of band.
+2. **Push to a registry (ECR), pull at boot.** Rejected: it reintroduces
+   registry-auth surface (`aws ecr get-login-password`), requires a
+   container runtime inside the instance, and adds per-provision pull
+   latency with no evidence it's necessary.
+3. **User-data pull-and-build on every boot.** Rejected: multi-minute
+   build cost per `RunInstances`, outbound internet at boot, and
+   registry flakiness becomes a provisioning failure mode. Strategy 1
+   pays that cost once and caches it.
 
-**IAM actions the chosen strategy requires.** Baking into the AMI keeps
-the build-time IAM surface (Packer/Image Builder's own
-`ec2:CreateImage`/`RegisterImage`/`ec2:RunInstances`) entirely outside
-leerie's per-run credential path — a separate, operator-owned pipeline
-with its own IAM role. leerie's own AWS identity needs exactly this,
-and nothing more:
+**Zero-config defaults.** Every default below is an optional-override
+default: the existing knob still wins, with precedence unchanged —
+CLI flag > `LEERIE_EC2_*` env var > `leerie.toml` > new default.
 
-- `ec2:RunInstances`, `ec2:DescribeInstances`, `ec2:DescribeInstanceStatus`
-  (create, wait-ready)
-- `ec2:StopInstances`, `ec2:StartInstances`, `ec2:TerminateInstances`
-  (teardown, pause/resume)
-- `ec2:CreateTags` (tagging the instance with the run id for
-  `_discover_runs`-style orphan recovery, mirroring how Fly machine
-  metadata carries the run id)
-- `ssm:StartSession`, `ssm:SendCommand`, `ssm:TerminateSession`,
-  `ssm:DescribeSessions`, plus the SSM Agent's own instance-side role
-  (`AmazonSSMManagedInstanceCore` attached to the instance profile
-  named by a future `LEERIE_EC2_INSTANCE_PROFILE`-shaped knob, not to
-  leerie's caller identity) for the transport-substitution stage below
-- No `ecr:*` actions and no `iam:PassRole` beyond the SSM instance
-  profile attachment above — bake-into-AMI needs neither a registry
-  pull permission nor a broad user-data role, a security argument for
-  strategy 1 over 2/3: the run-time IAM surface stays minimal and
-  auditable.
+- **Instance type** (`LEERIE_EC2_INSTANCE_TYPE`): a documented
+  general-purpose default in IMPLEMENTATION.md §2½.
+- **Key pair** (`LEERIE_EC2_KEY_NAME`): create or reuse a
+  leerie-tagged key pair. The private key is stored under the state dir
+  with mode 600 and every `ssh`/`scp` invocation passes `-i` to it
+  explicitly (leerie passed no `-i` before).
+- **Security group** (`LEERIE_EC2_SECURITY_GROUP`): create or reuse a
+  leerie-tagged group allowing port 22 **only** from the launcher's
+  egress IP as a `/32` (or an operator-supplied CIDR), never `0.0.0.0/0`.
+- **Subnet** (`LEERIE_EC2_SUBNET_ID`): a public subnet of the default
+  VPC. If the account has no default VPC the launcher fails with an
+  actionable message naming the fix (create one with `aws ec2
+  create-default-vpc`, or set `LEERIE_EC2_SUBNET_ID`).
+- **Preflight errors** name the missing prerequisite and the exact fix;
+  no bare "X is not set".
 
-**New `LEERIE_EC2_*` knobs implied.** None beyond what IMPLEMENTATION.md
-already reserves. `LEERIE_EC2_AMI` names the chosen artifact under all
-three strategies (a custom AMI under 1, a stock AMI under fallback 3;
-strategy 2 introduces no knob and is rejected). No
-`LEERIE_EC2_INSTANCE_PROFILE` var is added now — that's a
-provisioning-subtask-level `RunInstances` parameter, not an
-image-delivery decision — flagged here so the subtask wiring
-`IamInstanceProfile` doesn't have to rediscover that SSM's instance-side
-role must come from somewhere.
+**Instance profile and public IP.** `LEERIE_EC2_INSTANCE_PROFILE`
+(`--ec2-instance-profile`, `ec2_instance_profile`) names the instance
+profile passed as `IamInstanceProfile` to `RunInstances`. When unset,
+leerie may create a leerie-tagged role/profile carrying
+`AmazonSSMManagedInstanceCore`, so SSM works without Default Host
+Management Configuration. `RunInstances` also requests a public IP
+association, since the SSH bulk-transfer path needs one.
+
+**Finalization parity.** `decide_ec2_teardown` calls the same
+`host_finalize` flow as Fly's `decide_teardown` (see *Finalization*
+above): on a clean exit the host pushes the run branch and opens the PR
+before the instance is terminated, and a finalize failure keeps the
+instance's pause disposition rather than destroying unpushed work.
+
+**Cleanup.** `leerie prune` (dry-run by default, `--apply` to act) and
+`kill`/teardown where appropriate cover leerie-tagged AMIs and their
+snapshots, key pairs, and security groups. Deletion is **tag-scoped**:
+a resource without leerie's ownership tag is never listed or deleted,
+and the AMI matching the current version+hash is kept unless
+explicitly pruned.
+
+**IAM actions required.** Beyond per-run needs, baking and defaults
+widen leerie's AWS identity:
+
+- Run path: `ec2:RunInstances`, `ec2:DescribeInstances`,
+  `ec2:DescribeInstanceStatus`, `ec2:StopInstances`,
+  `ec2:StartInstances`, `ec2:TerminateInstances`, `ec2:CreateTags`.
+- Bake and defaults: `ec2:DescribeImages`, `ec2:CreateImage`,
+  `ec2:RegisterImage`, `ec2:CreateKeyPair`, `ec2:DescribeKeyPairs`,
+  `ec2:CreateSecurityGroup`, `ec2:DescribeSecurityGroups`,
+  `ec2:AuthorizeSecurityGroupIngress`, `ec2:DescribeVpcs`,
+  `ec2:DescribeSubnets`.
+- Cleanup: `ec2:DeregisterImage`, `ec2:DeleteSnapshot`,
+  `ec2:DescribeSnapshots`, `ec2:DeleteKeyPair`,
+  `ec2:DeleteSecurityGroup`.
+- SSM: `ssm:StartSession`, `ssm:SendCommand`, `ssm:TerminateSession`,
+  `ssm:DescribeSessions`, plus the instance-side
+  `AmazonSSMManagedInstanceCore` on the instance profile.
+- `iam:PassRole` for the instance profile, and (only when leerie
+  creates the profile) `iam:CreateRole`, `iam:CreateInstanceProfile`,
+  `iam:AddRoleToInstanceProfile`, `iam:AttachRolePolicy`. No `ecr:*`.
+
+**Ownership and permissions across runtimes.** The EC2 private key and
+state dir are written by the host launcher as the invoking user (mode
+600), so the local rootless and local rootful runtimes are unaffected
+(neither runs the launcher inside the container; the orchestrator
+container never sees the key). On the instance, the baked `leerie` and
+`ec2-user` accounts are real users on a stock Debian host with no
+user-namespace remap, so literal ownership (`chown leerie`) is correct
+there, unlike the rootless-container trap. Fly is unchanged.
+
+**New `LEERIE_EC2_*` knob.** `LEERIE_EC2_INSTANCE_PROFILE` is added
+alongside the existing `LEERIE_EC2_AMI`, `_INSTANCE_TYPE`, `_KEY_NAME`,
+`_SECURITY_GROUP`, `_SUBNET_ID`, each now an optional override.
 
 **EBS volume lifecycle — the opposite default from Fly, not the same
 discipline.** Fly's "Remote disk policy" places a manual reap
@@ -4240,19 +4309,19 @@ replacing: piping the detached-orchestrator launch wrapper, and
 opening a session for `resume`/`--shell` attach and log tailing. This
 design picks SSM Session Manager over SSH:
 
-- **SSM Session Manager** (`aws ssm start-session`) needs no inbound
-  security group rule, no key-pair distribution, and no public IP — the
-  preinstalled SSM Agent calls out to the SSM service over HTTPS, the
-  same "no sshd, no key management, no public exposure" property Fly
-  gets from hallpass + WireGuard. Auth flows through the same AWS
-  credential chain and IAM already established for EC2, rather than a
-  parallel key-pair-management surface.
-- **SSH** (a managed key pair, `LEERIE_EC2_KEY_NAME`, inbound port-22
-  rule) is the closer textual analog to `flyctl ssh console`, but
-  requires provisioning/rotating a key pair and opening network ingress
-  — exactly what SSM avoids. Remains available as a fallback for
-  operators whose account policy disallows SSM, but is not the
-  default.
+- **SSM Session Manager** (`aws ssm start-session`) is the interactive
+  and control-plane transport (launch wrapper, attach, log tail): it
+  needs no inbound rule of its own — the SSM Agent calls out to the SSM
+  service over HTTPS, the same "no sshd, no public exposure" property
+  Fly gets from hallpass + WireGuard — and auth flows through the AWS
+  credential chain and IAM.
+- **SSH** (`ec2-user@<PublicIpAddress>`, `ssh -i` the leerie-tagged key
+  pair, port 22 open only to the launcher's egress CIDR) carries the
+  **bulk transfer** (`ec2_tar_pipe`: seed and sync-back), which SSM
+  sessions cannot stream efficiently. It is therefore required, not a
+  fallback: the instance needs a key pair, the security-group rule and a
+  public IP (see *Zero-config defaults* above), and SSM supplements SSH
+  rather than replacing it.
 
 `aws ssm start-session --target <instance-id> --document-name
 AWS-StartInteractiveCommand --parameters command="python3 -"` is the SSM
