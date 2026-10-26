@@ -76,3 +76,10 @@ def test_launcher_existing_file_passes(tmp_path):
     (tmp_path / "t.txt").write_text("x")
     r = _run_launcher_block("t.txt", tmp_path)
     assert r.returncode == 0
+
+
+@pytest.mark.parametrize("name", ["./missing.Md", "./missing.Txt", "./missing.MD"])
+def test_launcher_mixed_case_missing_token_fails(tmp_path, name):
+    r = _run_launcher_block(name, tmp_path)
+    assert r.returncode == 1
+    assert "task file not found" in r.stdout
