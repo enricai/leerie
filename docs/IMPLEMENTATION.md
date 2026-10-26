@@ -2884,6 +2884,11 @@ a container.
   per-worker default → global default (every worker resolves to
   `sonnet` today). To opt a specific worker into Opus-grade reasoning,
   set `LEERIE_MODEL_<WORKER>=opus` or pass `--model-<worker> opus`.
+- **EC2 knobs** (`ec2_ami`, `ec2_instance_type`, `ec2_key_name`,
+  `ec2_security_group`, `ec2_subnet_id`, `ec2_instance_profile`; highest
+  first): `--ec2-<knob>` → `LEERIE_EC2_<KNOB>` → `<knob>` in `leerie.toml`
+  → the zero-config default from `ec2-defaults.sh` / `ec2-ami.sh`. None
+  is required.
 - **Confidence rounds** (highest first): `--confidence-rounds` →
   `LEERIE_CONFIDENCE_ROUNDS` → `confidence_rounds` in
   `leerie.toml` → default `8`.
