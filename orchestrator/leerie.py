@@ -6051,6 +6051,16 @@ def _read_toml_key(path: Path, key: str) -> str | None:
 
 TASK_FILE_SUFFIXES = (".txt", ".md")
 
+
+def _is_task_file_reference(raw: str) -> bool:
+    """True only for a single whitespace-free token with a task-file suffix.
+
+    A multi-word sentence that merely ends in a path-like token ("... see
+    ./report.txt") is a literal task, not a reference to a missing file.
+    """
+    return (not any(c.isspace() for c in raw)
+            and Path(raw).suffix.lower() in TASK_FILE_SUFFIXES)
+
 # stat() failures that are a definite "no such file": the path was resolvable
 # and the answer is no. ENOTDIR belongs here with ENOENT — a component of the
 # path is a regular file, so the target cannot exist. Every other errno
@@ -6096,7 +6106,7 @@ def resolve_task_argument(raw: str) -> str:
         if not contents:
             die(f"task file {raw!r} is empty")
         return contents
-    if stat_ok and p.suffix.lower() in TASK_FILE_SUFFIXES:
+    if stat_ok and _is_task_file_reference(raw):
         die(f"task file not found: {raw}")
     return raw
 
