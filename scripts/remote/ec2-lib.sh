@@ -233,7 +233,10 @@ ec2_tar_pipe() {
   local extract_dir="$2"
   local _to=""
   _to="$(_seed_timeout_prefix)"
+  local _id=() _a
+  while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args)
   $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
+    ${_id[@]+"${_id[@]}"} \
     "$ssh_target" \
     "sh -c 'mkdir -p '\''$extract_dir'\'' && tar -xzC '\''$extract_dir'\'''"
 }
@@ -266,3 +269,57 @@ resolve_instance_type() { _resolve_ec2_var LEERIE_EC2_INSTANCE_TYPE; }
 resolve_key_name() { _resolve_ec2_var LEERIE_EC2_KEY_NAME; }
 resolve_security_group() { _resolve_ec2_var LEERIE_EC2_SECURITY_GROUP; }
 resolve_subnet_id() { _resolve_ec2_var LEERIE_EC2_SUBNET_ID; }
+
+# --- _aws_region_profile_args ---------------------------------------------
+# Emit, one token per line, the --region/--profile flags to append to
+# every `aws ec2`/`aws sts` invocation in this file. Emits nothing when
+# both are unset — lets the aws CLI's own credential chain resolve
+# region/profile, matching require_aws()'s existing profile-optional
+# pattern in ec2-lib.sh.
+#
+# One-token-per-line (not a bare string) so values containing spaces
+# survive: a named profile may legitimately contain them, and word
+# splitting would shred it. Callers read it back with the `while read`
+# idiom below rather than a nameref (`local -n`), which is bash 4.3+ and
+# fails outright on macOS's /bin/bash 3.2 with "local: -n: invalid
+# option".
+#
+# Usage:
+#   local aws_args=()
+#   while IFS= read -r _a; do aws_args+=("$_a"); done \
+#     < <(_aws_region_profile_args)
+_aws_region_profile_args() {
+  local region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
+  local profile="${LEERIE_AWS_PROFILE:-${AWS_PROFILE:-}}"
+  if [ -n "$region" ]; then
+    printf '%s\n%s\n' --region "$region"
+  fi
+  if [ -n "$profile" ]; then
+    printf '%s\n%s\n' --profile "$profile"
+  fi
+  return 0
+}
+
+# --- ec2_ssh_identity_args --------------------------------------------------
+# Emit, one token per line, `-i <key> -o IdentitiesOnly=yes` when a
+# leerie-created key is in use (LEERIE_EC2_SSH_KEY_FILE set and readable);
+# nothing otherwise, so an operator-supplied LEERIE_EC2_KEY_NAME with no known
+# private key leaves ssh's own identity selection untouched. Read with the
+# `while read` idiom (bash 3.2: no namerefs/mapfile).
+ec2_ssh_identity_args() {
+  local key="${LEERIE_EC2_SSH_KEY_FILE:-}"
+  if [ -n "$key" ] && [ -f "$key" ]; then
+    printf '%s\n%s\n%s\n%s\n' -i "$key" -o IdentitiesOnly=yes
+  fi
+  return 0
+}
+
+# _ec2_ssh_identity_string — same flags as one shell-quoted string, for the
+# generated rsync -e wrapper script.
+_ec2_ssh_identity_string() {
+  local key="${LEERIE_EC2_SSH_KEY_FILE:-}"
+  if [ -n "$key" ] && [ -f "$key" ]; then
+    printf -- "-i '%s' -o IdentitiesOnly=yes" "$key"
+  fi
+  return 0
+}

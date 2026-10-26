@@ -77,35 +77,7 @@ INSTANCE_START_TIMEOUT="${LEERIE_INSTANCE_START_TIMEOUT:-300}"
 # Exported instance ID — empty until provision_instance succeeds.
 LEERIE_EC2_INSTANCE_ID=""
 
-# --- _aws_region_profile_args ---------------------------------------------
-# Emit, one token per line, the --region/--profile flags to append to
-# every `aws ec2`/`aws sts` invocation in this file. Emits nothing when
-# both are unset — lets the aws CLI's own credential chain resolve
-# region/profile, matching require_aws()'s existing profile-optional
-# pattern in ec2-lib.sh.
-#
-# One-token-per-line (not a bare string) so values containing spaces
-# survive: a named profile may legitimately contain them, and word
-# splitting would shred it. Callers read it back with the `while read`
-# idiom below rather than a nameref (`local -n`), which is bash 4.3+ and
-# fails outright on macOS's /bin/bash 3.2 with "local: -n: invalid
-# option".
-#
-# Usage:
-#   local aws_args=()
-#   while IFS= read -r _a; do aws_args+=("$_a"); done \
-#     < <(_aws_region_profile_args)
-_aws_region_profile_args() {
-  local region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
-  local profile="${LEERIE_AWS_PROFILE:-${AWS_PROFILE:-}}"
-  if [ -n "$region" ]; then
-    printf '%s\n%s\n' --region "$region"
-  fi
-  if [ -n "$profile" ]; then
-    printf '%s\n%s\n' --profile "$profile"
-  fi
-  return 0
-}
+# _aws_region_profile_args lives in ec2-lib.sh (shared with ec2-defaults.sh).
 
 # --- stop_instance ---------------------------------------------------------
 # Pause-on-failure path: preserves the root EBS volume (StopInstances
