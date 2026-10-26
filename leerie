@@ -4955,8 +4955,10 @@ export LEERIE_TASK_ARG
 
 # --- fail fast on missing task file ---------------------------------------
 # Matches the eager validation chain already does for prompt files (l.1722).
+# A multi-word sentence is a literal task, never a file path.
 case "$LEERIE_TASK_ARG" in
-  *.txt|*.md|*.TXT|*.MD)
+  *[[:space:]]*) ;;
+  *.[Tt][Xx][Tt]|*.[Mm][Dd])
     if [ -n "$LEERIE_TASK_ARG" ] && [ ! -f "$LEERIE_TASK_ARG" ]; then
       remote_log "task file not found: $LEERIE_TASK_ARG"
       exit 1
