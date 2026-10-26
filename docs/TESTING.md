@@ -2150,7 +2150,7 @@ and still writes valid JSON at rc 0, so the byte cut is safe for
 
 The per-subtask delta proxy's `{test_files}` tier is covered by
 `tests/test_test_files_proxy.py` (51), `tests/test_scoped_proxy_corpus.py`
-(5) and `tests/test_scoped_degrade_warning.py` (11). Three lessons
+(5) and `tests/test_scoped_degrade_warning.py` (13). Three lessons
 generalise. **(1) A non-test path is an ERROR to pytest, not a no-op** —
 `pytest orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4,
 and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4. A
@@ -2175,7 +2175,7 @@ that could not exercise the no-test-file path at all).
 
 ## The whole suite is orchestrator-owned
 
-`tests/test_full_suite_ownership.py` (63) covers DESIGN §9's two
+`tests/test_full_suite_ownership.py` (88) covers DESIGN §9's two
 whole-suite mechanisms: *absence means deferred, never full* for the test
 axis (`_select_subtask_axes`, `_DEFERRED_AXIS`) and the single rule list
 behind the deny, the plan-time strip, the settle-time exemption and the
@@ -2183,12 +2183,14 @@ notice (`_full_suite_rule_patterns`, `_denied_by_full_suite_rules`,
 `_strip_canonical_suite_commands`, `FULL_SUITE_NOTICE`). Inputs are the
 2026-10-26 incident's real `runs_commands`, commands whose deny verdict was
 observed live on the CLI (`LIVE_PROBED`), and barnacle-shaped `pnpm` configs
-for the negative controls. Sixteen components were ablated one at a time
-against this file and the four repinned scoped-axis files, and every
+for the negative controls. Twenty-two components were ablated one at a
+time against this file and the four repinned scoped-axis files, and every
 ablation fails at least one test (restoring the canonical test fallback
-fails 6); a seventeenth, a leading-wrapper strip, left everything green and
-was removed as subsumed by the word-suffix search. Three lessons
-generalise. **(1) Omitted is not recorded.** `_apply_measured_axes`
+fails 6). Two lessons from getting there: a component that left everything
+green was either removed (a leading-wrapper strip, redundant in the
+unanchored match — it returned later, used only by the anchored match) or
+given its own pin (the strip's catch-all, once per-entry skips stopped
+malformed entries from ever reaching it). Three lessons generalise. **(1) Omitted is not recorded.** `_apply_measured_axes`
 overwrites only the axes present in a measurement, so a deferred axis left
 out would let a conformer's self-reported "9373 passed" survive into the
 persisted entry; `test_docs_only_subtask_defers_tests_end_to_end` has the
@@ -2197,13 +2199,17 @@ produces `blocked`, not compliance.** Replayed against the incident spec,
 workers that only hit the deny returned `blocked` 2/2 (which auto-accept
 then drops), and the same workers told why completed 5/5 — so the pairing
 is decided in `claude_p` and pinned there for every Bash-capable worker,
-with the converse (no notice for an inspect-only worker) pinned too.
+with the converse (no notice for an unwidened inspect-only worker) pinned too.
 **(3) Two predicates for one rule set drift.** The first version derived
 the plan-time strip separately from the deny; review found `-k` selections
 and `cd … &&` prefixes kept by one and refused by the other, re-creating the
 forced-`blocked` state. One pattern list now feeds both, and
 `test_matcher_agrees_with_the_live_cli` holds the matcher to the CLI's
-observed verdicts rather than to its own reading of them.
+observed verdicts rather than to its own reading of them — round 2 added
+seven more shapes from live probes (subshells, `$(…)`, unspaced
+redirects) that a split on operators alone had missed. The same list read
+WIDE is safe where an over-match drops one requirement and unsafe where it
+disables the mechanism, so the prescribed-command check reads it anchored.
 
 ## Pre-push preflight probe
 

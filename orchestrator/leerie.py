@@ -19875,17 +19875,27 @@ def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
 # `runs_commands` entries a planner declares -- never of prose.
 
 # Matching mirrors the CLI's own (claude Bash permission rules): drop
-# redirections, split on shell operators, then glob-match each segment, `*`
+# redirections, split into subcommands, then glob-match each one, `*`
 # standing for any text and a trailing ` *` also matching the bare command.
-# The CLI also strips leading wrappers (`timeout`, `nice`, ...); here every
-# word-suffix of a segment is tried instead, which subsumes that. ONE rule list feeds the deny, the plan-time strip and the
-# settle-time exemption, so a worker can never be required to run what it is
-# denied (the first version derived them separately and they disagreed).
-_SUITE_SEGMENT_RE = re.compile(r"&&|\|\||;|\||&|\n")
-# Redirections (`> f`, `2>&1`, `< in`) are removed before splitting, as the
-# CLI does: `pytest tests/ > f 2>&1` was denied live by `pytest tests/ *`'s
-# sibling `pytest * tests/`, which only matches once `> f` is gone.
-_SUITE_REDIRECT_RE = re.compile(r"\s+\d*(?:>>|>|<)&?\s*[^\s;&|]*")
+# ONE rule list feeds the deny, the plan-time strip and the settle-time
+# exemption, so a worker can never be required to run what it is denied (the
+# first version derived them separately and they disagreed).
+#
+# Subcommand boundaries include subshell and substitution brackets: the CLI
+# denied `(cd sub && pytest tests/)`, `echo $(pytest tests/)` and
+# `(pytest tests/)` live, which a split on operators alone would miss.
+_SUITE_SEGMENT_RE = re.compile(r"&&|\|\||;|\||&|\n|\$\(|[(){}]")
+# Redirections (`> f`, `2>&1`, `<in`) are removed before splitting, as the
+# CLI does -- with or without a space before the operator (`tests/>out.txt`
+# was denied live): `pytest tests/ > f 2>&1` only matches `pytest * tests/`
+# once `> f` is gone.
+_SUITE_REDIRECT_RE = re.compile(r"\s*\d*(?:>>|>|<)&?\s*[^\s;&|()]*")
+# Leading wrappers the CLI strips before matching (its documented fixed
+# list). Used only by the ANCHORED match the prescribed-command check needs;
+# the unanchored match tries every word instead, which covers them.
+_SUITE_WRAPPER_RE = re.compile(
+    r"^(?:timeout(?:\s+-\S+)*\s+\S+|time|nice(?:\s+-n\s*\S+)?|nohup"
+    r"|stdbuf(?:\s+-\S+)*|command|builtin|noglob)\s+")
 _NPM_FAMILY_TEST_RE = re.compile(r"^(npm|pnpm|yarn|bun)(?: run)? test$")
 _PYTEST_FORMS = ("pytest", "python3 -m pytest", "python -m pytest")
 FULL_SUITE_NOTICE = (
@@ -19983,9 +19993,15 @@ def _full_suite_rule_patterns(repo_root: str | Path,
             for t in roots:
                 pats += [f"{r} {t}", f"{r} {t}/", f"{r} {t} *",
                          f"{r} {t}/ *", f"{r} * {t}", f"{r} * {t}/"]
-        for c in ((prescribed or {}).get("commands") or []):
-            if isinstance(c, str) and _denied_by_full_suite_rules(c, pats):
-                return []
+        # Anchored: a prescribed command lifts the deny only if it IS a
+        # whole-suite run, not if a runner word merely appears in it (`pip
+        # install pytest`, `-k pytest`) -- an over-match here would switch
+        # the whole mechanism off for the run.
+        if (prescribed or {}).get("is_prescribed"):
+            for c in (prescribed.get("commands") or []):
+                if isinstance(c, str) and _denied_by_full_suite_rules(
+                        c, pats, anchored=True):
+                    return []
         return pats
     except Exception as e:
         _warn_full_suite_deny_skipped_once(e)
@@ -20018,8 +20034,9 @@ def _full_suite_denials(repo_root: str | Path,
     pytest tests/test_x.py -q`, a two-file run and a `for` loop over files
     still ran. Not matched, by the CLI's own documented limits: an
     absolute-path runner, `bash -c '...'`, and a flags-only bare runner
-    (`pytest -q`). Never emitted without `FULL_SUITE_NOTICE`: deny alone
-    ended 2/2 replayed workers `blocked`."""
+    (`pytest -q`). Every worker whose tools can reach the runner gets
+    `FULL_SUITE_NOTICE` with it (`claude_p`): deny alone ended 2/2 replayed
+    workers `blocked`."""
     return ",".join(f"Bash({p})"
                     for p in _full_suite_rule_patterns(repo_root, prescribed))
 
@@ -20062,26 +20079,38 @@ def _rule_matches(text: str, pattern: str) -> bool:
     return re.fullmatch(rx, text, flags=re.DOTALL) is not None
 
 
-def _denied_by_full_suite_rules(cmd: str, patterns: list[str]) -> bool:
-    """True when the whole-suite deny would refuse `cmd`, or when `cmd` is a
-    paraphrase that only such a command could satisfy.
+def _denied_by_full_suite_rules(cmd: str, patterns: list[str], *,
+                                anchored: bool = False) -> bool:
+    """True when the whole-suite deny would refuse `cmd`, or (unanchored)
+    when `cmd` is a paraphrase that only such a command could satisfy.
 
-    Per segment, as the CLI matches, and from every word of the segment: that
-    covers the CLI's wrapper stripping (`timeout 590 pytest tests/`) and also
+    Per subcommand, as the CLI matches. Unanchored -- the strip and the
+    settle-time exemption -- every word of a subcommand is tried as a start:
+    that covers the CLI's wrapper stripping (`timeout 590 pytest tests/`) and
     a declared paraphrase ("run pytest tests/ to verify", or the command in
     backticks), which the declared-command check would accept only the
-    denied command for. Erring wide is the safe direction here -- an
-    over-match only drops a declared requirement, never adds one."""
+    denied command for. That errs wide on purpose: there an over-match only
+    drops a declared requirement. Anchored -- the prescribed-command check,
+    where an over-match would disable the mechanism -- only the subcommand's
+    start after the CLI's own wrappers is tried."""
     if not patterns or not isinstance(cmd, str):
         return False
-    text = " ".join(cmd.translate(str.maketrans("", "", "`'\"")).split())
-    text = _SUITE_REDIRECT_RE.sub("", text)
-    for seg in _SUITE_SEGMENT_RE.split(text):
-        words = seg.split()
-        for i in range(len(words)):
-            cand = " ".join(words[i:])
-            if any(_rule_matches(cand, p) for p in patterns):
-                return True
+    text = cmd.translate(str.maketrans("", "", "`'\""))
+    text = _SUITE_REDIRECT_RE.sub(" ", text)
+    for raw in _SUITE_SEGMENT_RE.split(text):
+        seg = " ".join(raw.split())
+        if anchored:
+            while True:
+                stripped = _SUITE_WRAPPER_RE.sub("", seg, count=1)
+                if stripped == seg:
+                    break
+                seg = stripped
+            starts = [seg] if seg else []
+        else:
+            words = seg.split()
+            starts = [" ".join(words[i:]) for i in range(len(words))]
+        if any(_rule_matches(c, p) for c in starts for p in patterns):
+            return True
     return False
 
 
@@ -20103,7 +20132,11 @@ def _strip_canonical_suite_commands(plans: list[dict],
             return []
         touched: list[str] = []
         for plan in plans:
+            if not isinstance(plan, dict):
+                continue
             for sub in plan.get("subtasks") or []:
+                if not isinstance(sub, dict):
+                    continue
                 rc = sub.get("runs_commands")
                 if not isinstance(rc, list) or not rc:
                     continue
@@ -20114,8 +20147,8 @@ def _strip_canonical_suite_commands(plans: list[dict],
                     touched.append(str(sub.get("id")))
         return touched
     except Exception as e:
-        log(f"  full-suite strip errored ({type(e).__name__}: {e}); "
-            f"plan left unchanged")
+        log(f"  full-suite strip stopped early ({type(e).__name__}: {e}); "
+            f"the settle-time exemption still applies")
         return []
 
 
@@ -30577,8 +30610,8 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
     command (DESIGN §9 *Absence ... means deferred, never full*). The
     canonical fallback this replaced ran leerie's whole suite on 57-64% of
     its own subtasks, every docs-only one included, and in none of the 50
-    such per-subtask records on disk did the conformer make a test change. `build` and `lint` keep the canonical
-    fallback: that evidence is about suites, and a compiled language's
+    such per-subtask records on disk did the conformer make a test change.
+    `build` and `lint` keep the canonical fallback: that evidence is about suites, and a compiled language's
     per-subtask build is its cheapest regression signal. The caller records
     a deferred axis explicitly (`_deferred_axes`) so it is never silently
     absent. The scope label never claims a narrowing that did not happen."""

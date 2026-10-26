@@ -115,6 +115,14 @@ LIVE_PROBED = [
     ("cd . && pytest tests/ -q", True),
     ("pytest tests/ -k foo", True),
     ("pytest -m 'not slow' tests/", True),
+    # Round 2: shapes the CLI denied that a split on operators alone missed.
+    ("(cd sub && pytest tests/)", True),
+    ("true && (pytest tests/ -q)", True),
+    ("echo $(pytest tests/)", True),
+    ("x=$(pytest tests/ -q); echo ok", True),
+    ("pytest tests/>out.txt", True),
+    ("pytest tests/<in.txt", True),
+    ("(pytest tests/)", True),
     ("python3 -m pytest tests/test_resolve_task_argument.py -q", False),
     ("python3 -m pytest -q -p no:cacheprovider tests/test_a.py "
      "tests/test_b.py", False),
@@ -314,7 +322,8 @@ def _notice_lines(prompt):
 
 
 @pytest.mark.parametrize("schema_key", [
-    "implementer", "conformer", "integrator", "acceptance_writer"])
+    "implementer", "conformer", "integrator", "acceptance_writer",
+    "rebaser"])
 def test_every_bash_capable_worker_gets_deny_and_notice_together(
         leerie, monkeypatch, tmp_path, schema_key):
     """Decided once in `claude_p`, so no caller can send the deny without
@@ -618,3 +627,90 @@ def test_the_strip_never_raises_on_a_malformed_plan(leerie, tmp_path):
     assert leerie._strip_canonical_suite_commands(
         [{"subtasks": [{"id": "x", "runs_commands": "pytest tests/"}]}],
         root, {}) == []
+
+
+# ---------------------------------------------------------------------------
+# round 2: anchoring for the prescribed check, the is_prescribed gate, and
+# newline-separated declared commands
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("cmd", [
+    "pip show pytest",                                  # CLI: ran
+    "python3 -m pytest tests/test_a.py -k pytest",      # CLI: ran
+    "pip install pytest",
+    "which pytest",
+])
+def test_anchored_match_ignores_a_runner_word_that_is_not_a_run(
+        leerie, tmp_path, cmd):
+    pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
+    assert not leerie._denied_by_full_suite_rules(cmd, pats, anchored=True)
+
+
+@pytest.mark.parametrize("cmd", [
+    "pytest tests/", "timeout 5 nohup pytest tests/ -q", "(pytest tests/)"])
+def test_anchored_match_still_sees_a_whole_suite_run(leerie, tmp_path, cmd):
+    pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
+    assert leerie._denied_by_full_suite_rules(cmd, pats, anchored=True)
+
+
+@pytest.mark.parametrize("prescribed", [
+    {"is_prescribed": True, "commands": ["pip install pytest"]},
+    {"is_prescribed": True,
+     "commands": ["python3 -m pytest tests/test_a.py -k pytest"]},
+    {"is_prescribed": False, "commands": ["pytest tests/"]},
+    {"commands": ["pytest tests/"]},
+    # Round 2 (claims review): the unanchored match read the suffix
+    # `pytest on the touched tests` as `pytest * tests`.
+    {"is_prescribed": True, "commands": ["run pytest on the touched tests"]},
+])
+def test_only_a_prescribed_whole_suite_run_lifts_the_deny(leerie, tmp_path,
+                                                          prescribed):
+    """A drifted classifier (commands filled while `is_prescribed` is false)
+    or a prescribed command that merely names the runner must not switch
+    the mechanism off for the whole run."""
+    assert "Bash(pytest tests/ *)" in leerie._full_suite_denials(
+        _repo(tmp_path), prescribed)
+
+
+def test_newline_separated_commands_are_separate_segments(leerie, tmp_path):
+    pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
+    assert not leerie._denied_by_full_suite_rules(
+        "python3 -m pytest tests/test_x.py -q\nls tests", pats)
+    assert leerie._denied_by_full_suite_rules(
+        "ls\npytest tests/ -q", pats)
+
+
+def test_the_strip_skips_malformed_entries_and_keeps_going(leerie, tmp_path):
+    plans = [None, {"subtasks": [None, {"id": "t-1",
+                                         "runs_commands": ["pytest tests/"]}]}]
+    assert leerie._strip_canonical_suite_commands(
+        plans, _repo(tmp_path), {}) == ["t-1"]
+    assert plans[1]["subtasks"][1]["runs_commands"] == []
+
+
+def test_a_sole_trailing_wildcard_also_matches_the_bare_command(leerie):
+    """The CLI's documented glob rule (`Bash(ls *)` matches `ls`), mirrored
+    for any pattern -- not only ones that happen to have an exact sibling."""
+    assert leerie._rule_matches("pnpm test", "pnpm test *")
+    assert not leerie._rule_matches("pnpm testx", "pnpm test *")
+    assert not leerie._rule_matches("pytest", "* --help *")
+
+
+def test_testpaths_are_read_as_utf8_whatever_the_locale(leerie, tmp_path,
+                                                        monkeypatch):
+    """`configparser` otherwise decodes with the locale's encoding; a
+    non-ASCII root must not turn into mojibake on a non-UTF-8 host."""
+    import configparser
+    monkeypatch.setattr(configparser.io, "text_encoding",
+                        lambda enc, *a: enc or "latin-1")
+    root = _repo(tmp_path, tests_dir=False, ini="")
+    (root / "pytest.ini").write_bytes(
+        "[pytest]\ntestpaths = tëst\n".encode("utf-8"))
+    assert leerie._test_roots(root) == ["tëst"]
+
+
+def test_the_strip_survives_a_non_iterable_plan_list(leerie, tmp_path):
+    """The catch-all is for what the per-entry skips cannot see: the strip
+    runs on the scheduling path and must never take it down."""
+    assert leerie._strip_canonical_suite_commands(
+        None, _repo(tmp_path), {}) == []
