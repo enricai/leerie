@@ -288,13 +288,8 @@ def test_resolve_ec2_var_prints_value_when_set():
     assert result.stdout == "ami-0123456789abcdef0"
 
 
-def test_resolve_ec2_var_actionable_error_and_rc1_when_unset():
-    """All-unset still produces the existing actionable error naming the
-    var and returns 1 — never a bare ${VAR:?} that kills the sourcing
-    shell under set -u."""
+def test_resolve_ec2_var_empty_success_when_unset():
+    """Knobs have defaults now, so an unset var is empty success, not an error."""
     result = _run_resolve_ami({})
-    assert result.returncode == 1
-    combined = result.stdout + result.stderr
-    assert "LEERIE_EC2_AMI" in combined
-    assert "not set" in combined
-    assert "required for --runtime ec2" in combined
+    assert result.returncode == 0
+    assert result.stdout == ""

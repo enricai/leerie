@@ -255,14 +255,10 @@ ec2_tar_pipe() {
 # Shared here (not in ec2-provision.sh) because ec2-ssm.sh's SSH-fallback
 # transport also needs resolve_key_name/resolve_security_group.
 _resolve_ec2_var() {
-  local var_name="$1"
-  local value="${!var_name:-}"
-  if [ -z "$value" ]; then
-    remote_log "error: $var_name is not set — required for --runtime ec2."
-    echo "  Set $var_name and re-run. See docs/IMPLEMENTATION.md \"EC2 instance-lifecycle vars\"." >&2
-    return 1
-  fi
-  printf '%s' "$value"
+  # Unset is success-with-empty: every knob has a default supplied by
+  # ec2-defaults.sh, so the caller decides whether empty is acceptable and
+  # names the fix (e.g. --aws-region, aws ec2 create-default-vpc).
+  printf '%s' "${!1:-}"
 }
 
 resolve_ami() { _resolve_ec2_var LEERIE_EC2_AMI; }
