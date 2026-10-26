@@ -239,13 +239,13 @@ def test_block_present_in_launcher():
         assert f'{env_name} {toml_key})"' in src or f"{env_name} {toml_key})" in src, (
             f"Launcher's {env_name} resolution (toml key '{toml_key}') has drifted."
         )
-    # The five flags must be stripped from REWRITTEN_ARGS (launcher-only),
+    # The six flags must be stripped from REWRITTEN_ARGS (launcher-only),
     # so they never reach the orchestrator's strict parse_args().
     assert (
-        "--ec2-ami|--ec2-instance-type|--ec2-key-name|--ec2-security-group|--ec2-subnet-id)"
+        "--ec2-ami|--ec2-instance-type|--ec2-key-name|--ec2-security-group|--ec2-subnet-id|--ec2-instance-profile)"
         in src
     ), (
-        "Launcher must strip the five --ec2-* flags from REWRITTEN_ARGS "
+        "Launcher must strip the six --ec2-* flags from REWRITTEN_ARGS "
         "(they are host-only; the orchestrator uses strict parse_args and "
         "would error 'unrecognized arguments')."
     )
