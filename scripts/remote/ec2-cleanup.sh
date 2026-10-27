@@ -42,7 +42,7 @@ _ec2_cleanup_live() { # <ImageId|KeyName>
     | _ec2_cleanup_py "
 for r in d.get('Reservations', []):
     for i in r.get('Instances', []):
-        print(i.get('$1', ''))"
+        print(i.get('$1', '') if '$1' != 'Profile' else i.get('IamInstanceProfile', {}).get('Arn', ''))"
 }
 
 ec2_cleanup() {
@@ -64,6 +64,7 @@ ec2_cleanup() {
     [ -n "$cur_ver" ] && [ -n "$cur_hash" ] || { remote_log "ec2 cleanup: cannot compute current AMI version+hash; keeping all AMIs"; keep=all; }
   fi
   local live_imgs live_keys
+  local live_profiles; live_profiles="$(_ec2_cleanup_live Profile)"
   live_imgs="$(_ec2_cleanup_live ImageId)"; live_keys="$(_ec2_cleanup_live KeyName)"
 
   # --- AMIs + snapshots ---
@@ -134,7 +135,9 @@ for g in d.get('SecurityGroups', []):
 
   # --- IAM role + instance profile created by ensure_instance_profile ---
   local role="$EC2_ROLE_NAME"
-  if _ec2_aws iam get-role --role-name "$role" --output json 2>/dev/null \
+  if printf '%s\n' "$live_profiles" | grep -q "/$role\$"; then
+    echo "  skip IAM role/instance profile $role (in use by an instance)"
+  elif _ec2_aws iam get-role --role-name "$role" --output json 2>/dev/null \
       | _ec2_cleanup_py "sys.exit(0 if tagged(d.get('Role', {}).get('Tags')) else 1)"; then
     echo "  $verb IAM role/instance profile $role"
     if $apply; then
