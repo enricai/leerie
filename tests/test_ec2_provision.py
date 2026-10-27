@@ -160,6 +160,64 @@ def test_provision_instance_id_parsed_from_real_shaped_output(tmp_path):
     assert printed_iid in state["instances"]
 
 
+# --- provision_instance: instance profile and public IP in the argv --------
+
+def _run_instances_line(aws_dir: Path) -> str:
+    calls = [l for l in read_log(aws_dir) if l.startswith("ec2 run-instances")]
+    assert len(calls) == 1, calls
+    return calls[0]
+
+
+def test_instance_profile_knob_reaches_run_instances(tmp_path):
+    """An explicit LEERIE_EC2_INSTANCE_PROFILE is the exact name passed as
+    `--iam-instance-profile Name=<profile>` (IMPLEMENTATION.md, ec2-provision.sh)."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    env = _stub_env(aws_dir, {"LEERIE_EC2_INSTANCE_PROFILE": "operator-ssm-profile"})
+
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert "--iam-instance-profile Name=operator-ssm-profile" in _run_instances_line(aws_dir)
+    (rec,) = read_state(aws_dir)["instances"].values()
+    assert rec["iam_instance_profile"] == "Name=operator-ssm-profile"
+
+
+def test_explicit_instance_profile_beats_a_differing_default(tmp_path):
+    """The operator's profile wins even when the account already holds a
+    leerie-created profile of a different name: nothing else may appear."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    env = _stub_env(aws_dir, {"LEERIE_EC2_INSTANCE_PROFILE": "operator-profile"})
+
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    line = _run_instances_line(aws_dir)
+    assert line.count("--iam-instance-profile") == 1
+    assert "Name=operator-profile" in line
+    assert not any(l.startswith("iam create-") for l in read_log(aws_dir))
+
+
+def test_run_instances_associates_a_public_ip(tmp_path):
+    """The SSH bulk-transfer path needs a public IP: run-instances carries a
+    --network-interfaces spec with AssociatePublicIpAddress=true, naming the
+    resolved subnet and security group (not the bare flags)."""
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    env = _stub_env(aws_dir)
+
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    line = _run_instances_line(aws_dir)
+    assert "--network-interfaces" in line
+    assert "AssociatePublicIpAddress=true" in line
+    assert "SubnetId=subnet-0123456789abcdef0" in line
+    assert "sg-0123456789abcdef0" in line
+    assert "AssociatePublicIpAddress=false" not in line
+
+
 # --- provision_instance: failed create leaks no resources -------------------
 
 def test_failed_create_leaks_no_resources(tmp_path):

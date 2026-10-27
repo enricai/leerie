@@ -43,6 +43,7 @@ _EC2_VARS = [
     ("--ec2-key-name", "LEERIE_EC2_KEY_NAME", "ec2_key_name"),
     ("--ec2-security-group", "LEERIE_EC2_SECURITY_GROUP", "ec2_security_group"),
     ("--ec2-subnet-id", "LEERIE_EC2_SUBNET_ID", "ec2_subnet_id"),
+    ("--ec2-instance-profile", "LEERIE_EC2_INSTANCE_PROFILE", "ec2_instance_profile"),
 ]
 
 def _extract_resolve_ec2_knob() -> str:
@@ -84,6 +85,7 @@ _cli_ec2_instance_type=""
 _cli_ec2_key_name=""
 _cli_ec2_security_group=""
 _cli_ec2_subnet_id=""
+_cli_ec2_instance_profile=""
 _prev_ec2_arg=""
 for arg in "$@"; do
   if [ -n "$_prev_ec2_arg" ]; then
@@ -93,6 +95,7 @@ for arg in "$@"; do
       key-name)        _cli_ec2_key_name="$arg" ;;
       security-group)  _cli_ec2_security_group="$arg" ;;
       subnet-id)       _cli_ec2_subnet_id="$arg" ;;
+      instance-profile) _cli_ec2_instance_profile="$arg" ;;
     esac
     _prev_ec2_arg=""
     continue
@@ -108,6 +111,8 @@ for arg in "$@"; do
     --ec2-security-group)    _prev_ec2_arg="security-group" ;;
     --ec2-subnet-id=*)       _cli_ec2_subnet_id="${arg#--ec2-subnet-id=}" ;;
     --ec2-subnet-id)         _prev_ec2_arg="subnet-id" ;;
+    --ec2-instance-profile=*) _cli_ec2_instance_profile="${arg#--ec2-instance-profile=}" ;;
+    --ec2-instance-profile)  _prev_ec2_arg="instance-profile" ;;
   esac
 done
 LEERIE_EC2_AMI="$(_resolve_ec2_knob "$_cli_ec2_ami" LEERIE_EC2_AMI ec2_ami)"
@@ -115,6 +120,7 @@ LEERIE_EC2_INSTANCE_TYPE="$(_resolve_ec2_knob "$_cli_ec2_instance_type" LEERIE_E
 LEERIE_EC2_KEY_NAME="$(_resolve_ec2_knob "$_cli_ec2_key_name" LEERIE_EC2_KEY_NAME ec2_key_name)"
 LEERIE_EC2_SECURITY_GROUP="$(_resolve_ec2_knob "$_cli_ec2_security_group" LEERIE_EC2_SECURITY_GROUP ec2_security_group)"
 LEERIE_EC2_SUBNET_ID="$(_resolve_ec2_knob "$_cli_ec2_subnet_id" LEERIE_EC2_SUBNET_ID ec2_subnet_id)"
+LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob "$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE ec2_instance_profile)"
 """
 
 _ALL_ENV_VARS = [envname for _, envname, _ in _EC2_VARS]
@@ -123,15 +129,16 @@ _ALL_ENV_VARS = [envname for _, envname, _ in _EC2_VARS]
 def _run(user_repo: Path, *args: str, env_extra: dict | None = None,
           ) -> subprocess.CompletedProcess:
     """Source the launcher's EC2-knob block in a subshell with the given
-    CLI args and USER_REPO. Prints all five resolved values on success."""
+    CLI args and USER_REPO. Prints all six resolved values on success."""
     script = (
         "set -euo pipefail\n"
         f"USER_REPO={user_repo!s}\n"
         f"{_extract_resolve_ec2_knob()}\n"
         f"{_LAUNCHER_EC2_CLI_SCAN}\n"
-        'printf "%s|%s|%s|%s|%s\\n" '
+        'printf "%s|%s|%s|%s|%s|%s\\n" '
         '"$LEERIE_EC2_AMI" "$LEERIE_EC2_INSTANCE_TYPE" "$LEERIE_EC2_KEY_NAME" '
-        '"$LEERIE_EC2_SECURITY_GROUP" "$LEERIE_EC2_SUBNET_ID"\n'
+        '"$LEERIE_EC2_SECURITY_GROUP" "$LEERIE_EC2_SUBNET_ID" '
+        '"$LEERIE_EC2_INSTANCE_PROFILE"\n'
     )
     env = {**os.environ}
     for name in _ALL_ENV_VARS:
@@ -145,7 +152,7 @@ def _run(user_repo: Path, *args: str, env_extra: dict | None = None,
 
 
 def _resolve(user_repo: Path, *args: str, env_extra: dict | None = None,
-             ) -> tuple[str, str, str, str, str]:
+             ) -> tuple[str, ...]:
     result = _run(user_repo, *args, env_extra=env_extra)
     assert result.returncode == 0, f"unexpected failure: {result.stderr}"
     return tuple(result.stdout.strip().split("|"))  # type: ignore[return-value]
@@ -155,7 +162,7 @@ def test_all_unset_resolves_empty(tmp_path):
     """No CLI, no env, no toml → every var resolves empty (no default —
     ec2-lib.sh's _resolve_ec2_var is what turns this into the required-var
     error, not this ladder)."""
-    assert _resolve(tmp_path) == ("", "", "", "", "")
+    assert _resolve(tmp_path) == ("",) * 6
 
 
 @pytest.mark.parametrize("cli_flag,env_name,toml_key", _EC2_VARS)
@@ -194,20 +201,20 @@ def test_toml_honored_when_cli_and_env_unset(tmp_path, cli_flag, env_name, toml_
 def test_per_var_isolation_cli(tmp_path):
     """Overriding one var's CLI flag must not bleed into the others."""
     values = _resolve(tmp_path, "--ec2-ami", "ami-only")
-    assert values == ("ami-only", "", "", "", "")
+    assert values == ("ami-only", "", "", "", "", "")
 
 
 def test_per_var_isolation_env(tmp_path):
     """Overriding one var's env var must not bleed into the others."""
     values = _resolve(tmp_path, env_extra={"LEERIE_EC2_KEY_NAME": "key-only"})
-    assert values == ("", "", "key-only", "", "")
+    assert values == ("", "", "key-only", "", "", "")
 
 
 def test_per_var_isolation_toml(tmp_path):
     """Overriding one var's toml key must not bleed into the others."""
     (tmp_path / "leerie.toml").write_text('ec2_subnet_id = "subnet-only"\n')
     values = _resolve(tmp_path)
-    assert values == ("", "", "", "", "subnet-only")
+    assert values == ("", "", "", "", "subnet-only", "")
 
 
 def test_all_five_resolved_independently_at_once(tmp_path):
@@ -222,7 +229,9 @@ def test_all_five_resolved_independently_at_once(tmp_path):
         "--ec2-key-name=key-cli-eq",
         env_extra={"LEERIE_EC2_INSTANCE_TYPE": "t3.env"},
     )
-    assert values == ("ami-cli", "t3.env", "key-cli-eq", "sg-toml", "subnet-toml")
+    assert values == (
+        "ami-cli", "t3.env", "key-cli-eq", "sg-toml", "subnet-toml", "",
+    )
 
 
 def test_block_present_in_launcher():
@@ -293,3 +302,47 @@ def test_resolve_ec2_var_empty_success_when_unset():
     result = _run_resolve_ami({})
     assert result.returncode == 0
     assert result.stdout == ""
+
+
+# --- the instance-profile knob, asserted by value ---------------------------
+
+def test_instance_profile_three_tiers_disagree(tmp_path):
+    """Each tier carries a different value, so a swapped tier order or a
+    tier read from the wrong key yields a different string."""
+    (tmp_path / "leerie.toml").write_text('ec2_instance_profile = "prof-toml"\n')
+    assert _resolve(tmp_path)[5] == "prof-toml"
+    assert _resolve(
+        tmp_path, env_extra={"LEERIE_EC2_INSTANCE_PROFILE": "prof-env"},
+    )[5] == "prof-env"
+    assert _resolve(
+        tmp_path, "--ec2-instance-profile", "prof-cli",
+        env_extra={"LEERIE_EC2_INSTANCE_PROFILE": "prof-env"},
+    )[5] == "prof-cli"
+    assert _resolve(
+        tmp_path, "--ec2-instance-profile=prof-cli-eq",
+        env_extra={"LEERIE_EC2_INSTANCE_PROFILE": "prof-env"},
+    )[5] == "prof-cli-eq"
+
+
+def test_instance_profile_does_not_bleed_into_other_knobs(tmp_path):
+    assert _resolve(tmp_path, "--ec2-instance-profile", "p-only") == (
+        "", "", "", "", "", "p-only",
+    )
+
+
+def test_resolve_instance_profile_reads_the_env_var():
+    """ec2-lib.sh's resolve_instance_profile prints the launcher-resolved
+    value and is empty success when unset (the knob is optional)."""
+    def run(env: dict) -> subprocess.CompletedProcess:
+        base = {k: v for k, v in os.environ.items()}
+        base.pop("LEERIE_EC2_INSTANCE_PROFILE", None)
+        base.update(env)
+        return subprocess.run(
+            ["bash", "-c",
+             f"source {LOG_SH}; source {EC2_LIB_SH}; resolve_instance_profile"],
+            env=base, capture_output=True, text=True,
+        )
+    set_ = run({"LEERIE_EC2_INSTANCE_PROFILE": "my-profile"})
+    assert (set_.returncode, set_.stdout) == (0, "my-profile"), set_.stderr
+    unset = run({})
+    assert (unset.returncode, unset.stdout) == (0, "")
