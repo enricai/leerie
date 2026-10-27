@@ -62,46 +62,27 @@ def test_ec2_provision_sh_exists_and_is_executable():
 
 # --- provision_instance: required-var failures ------------------------------
 
-def test_provision_instance_fails_when_ami_unset(tmp_path):
-    aws_dir = tmp_path / "bin"
-    _stub_aws(aws_dir)
-    env = _stub_env(aws_dir)
-    env["LEERIE_EC2_AMI"] = ""
-
-    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
-
-    assert result.returncode != 0
-    assert "LEERIE_EC2_AMI" in result.stderr
-
-
 @pytest.mark.parametrize(
-    "missing_var",
+    "blank_var",
     [
-        "LEERIE_EC2_AMI",
         "LEERIE_EC2_INSTANCE_TYPE",
         "LEERIE_EC2_KEY_NAME",
         "LEERIE_EC2_SECURITY_GROUP",
         "LEERIE_EC2_SUBNET_ID",
     ],
 )
-def test_provision_instance_fails_closed_when_required_var_unset(tmp_path, missing_var):
-    """Each of the 5 instance-shape vars is independently required —
-    blanking just one (with the other 4 present) must fail closed before
-    any `aws ec2 run-instances` call reaches the stub, and stderr must
-    name the specific missing var."""
+def test_provision_instance_defaults_a_blank_knob(tmp_path, blank_var):
+    """Zero-config: a blank instance-shape knob is filled by ec2-defaults.sh
+    instead of failing closed; the other knobs still pass through verbatim."""
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
-    env[missing_var] = ""
+    env[blank_var] = ""
 
     result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
 
-    assert result.returncode != 0
-    assert missing_var in result.stderr
-
-    log = read_log(aws_dir)
-    run_instances_calls = [l for l in log if l.startswith("ec2 run-instances")]
-    assert run_instances_calls == []
+    assert result.returncode == 0, f"stderr: {result.stderr}"
+    assert len(_run_instances_calls(aws_dir)) == 1
 
 
 def test_provision_instance_fails_when_aws_missing():
@@ -162,8 +143,12 @@ def test_provision_instance_id_parsed_from_real_shaped_output(tmp_path):
 
 # --- provision_instance: instance profile and public IP in the argv --------
 
+def _run_instances_calls(aws_dir: Path) -> list:
+    return [l for l in read_log(aws_dir) if l.startswith("ec2 run-instances")]
+
+
 def _run_instances_line(aws_dir: Path) -> str:
-    calls = [l for l in read_log(aws_dir) if l.startswith("ec2 run-instances")]
+    calls = _run_instances_calls(aws_dir)
     assert len(calls) == 1, calls
     return calls[0]
 
@@ -242,7 +227,9 @@ def test_failed_create_leaks_no_resources(tmp_path):
     assert result.returncode != 0
     state = read_state(aws_dir)
     assert state["instances"] == {}
-    assert leaked_resources(state) == {"instances": {}, "volumes": {}}
+    leaked = leaked_resources(state)
+    # Tagged SG/key/role defaults are deliberately persistent; only compute leaks.
+    assert (leaked["instances"], leaked["volumes"]) == ({}, {})
 
 
 def test_failed_create_does_not_register_teardown_trap(tmp_path):
@@ -295,7 +282,9 @@ def test_decide_ec2_teardown_terminates_on_clean_exit(tmp_path):
     assert "terminating instance" in result.stderr
 
     state = read_state(aws_dir)
-    assert leaked_resources(state) == {"instances": {}, "volumes": {}}
+    leaked = leaked_resources(state)
+    # Tagged SG/key/role defaults are deliberately persistent; only compute leaks.
+    assert (leaked["instances"], leaked["volumes"]) == ({}, {})
 
 
 def test_decide_ec2_teardown_leaves_instance_running_on_sync_failure(tmp_path):

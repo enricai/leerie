@@ -409,12 +409,20 @@ except (ValueError, KeyError, IndexError):
 provision_instance() {
   require_aws || return 1
 
-  local ami instance_type key_name security_group subnet_id
-  ami="$(resolve_ami)" || return 1
-  instance_type="$(resolve_instance_type)" || return 1
-  key_name="$(resolve_key_name)" || return 1
-  security_group="$(resolve_security_group)" || return 1
-  subnet_id="$(resolve_subnet_id)" || return 1
+  # Each ec2-defaults.sh/ec2-ami.sh function returns the explicit knob
+  # verbatim when set, and otherwise resolves or creates a leerie default.
+  # shellcheck disable=SC1091
+  . "$_EC2_PROVISION_DIR/ec2-defaults.sh"
+  # shellcheck disable=SC1091
+  [ -f "$_EC2_PROVISION_DIR/ec2-ami.sh" ] && . "$_EC2_PROVISION_DIR/ec2-ami.sh"
+
+  local ami instance_type key_name security_group subnet_id instance_profile
+  ami="$(ensure_ami)" || return 1
+  instance_type="$(default_instance_type)" || return 1
+  key_name="$(ensure_key_pair)" || return 1
+  subnet_id="$(default_subnet_id)" || return 1
+  security_group="$(ensure_security_group)" || return 1
+  instance_profile="$(ensure_instance_profile)" || instance_profile=""
 
   local _missing=0
   _need_ec2_var() {
@@ -448,8 +456,8 @@ provision_instance() {
        --image-id "$ami" \
        --instance-type "$instance_type" \
        --key-name "$key_name" \
-       --security-group-ids "$security_group" \
-       --subnet-id "$subnet_id" \
+       --network-interfaces "AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=$subnet_id,Groups=$security_group" \
+       ${instance_profile:+--iam-instance-profile "Name=$instance_profile"} \
        --count 1 \
        ${aws_args[@]+"${aws_args[@]}"} \
        --output json \
