@@ -297,6 +297,14 @@ def _default_aws_region(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_iam_propagation_wait(monkeypatch):
+    """`ensure_instance_profile` sleeps 10s after creating the IAM profile
+    so AWS can propagate it; every provision against the aws stub creates
+    one, and that sleep alone pushed the CI job past its 20-minute cap."""
+    monkeypatch.setenv("LEERIE_EC2_IAM_PROPAGATION_S", "0")
+
+
+@pytest.fixture(autouse=True)
 def _fresh_head_acceptance_results(leerie, monkeypatch):
     """Give every test an empty `_HEAD_ACCEPTANCE_RESULTS`: the `leerie`
     module is session-scoped, so a measurement cached by one test would
