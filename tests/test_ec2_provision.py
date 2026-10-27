@@ -67,13 +67,12 @@ def test_ec2_provision_sh_exists_and_is_executable():
     [
         "LEERIE_EC2_INSTANCE_TYPE",
         "LEERIE_EC2_KEY_NAME",
-        "LEERIE_EC2_SECURITY_GROUP",
-        "LEERIE_EC2_SUBNET_ID",
     ],
 )
 def test_provision_instance_defaults_a_blank_knob(tmp_path, blank_var):
     """Zero-config: a blank instance-shape knob is filled by ec2-defaults.sh
-    instead of failing closed; the other knobs still pass through verbatim."""
+    instead of failing closed; the other knobs still pass through verbatim.
+    SG/subnet defaults need a default VPC and are covered in test_ec2_defaults."""
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)
     env = _stub_env(aws_dir)
