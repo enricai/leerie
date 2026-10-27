@@ -1361,8 +1361,9 @@ test = "$_test_val"
 #
 # {files} expands to the subtask's changed paths (shell-quoted); {base}
 # expands to the git ref it branched from. A proxy naming {files} is skipped
-# when the subtask changed nothing, and any axis without a proxy falls back
-# to its canonical command — an axis is never silently skipped.
+# when the subtask changed nothing. Without a usable proxy the tests axis is
+# deferred to the final integrated tree (leerie records it as deferred), while
+# build and lint fall back to their canonical commands.
 #
 # leerie infers vitest, jest and tsc automatically, so uncomment these only
 # to override or to cover a runner it does not know:

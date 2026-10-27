@@ -954,3 +954,92 @@ def test_resynthesis_ignores_a_gap_the_strip_did_not_cause(
     snap = st.data["plan_snapshot"]["subtasks"]
     assert set(snap) == {"test-001"}
     assert snap["test-001"]["runs_commands"] == []
+
+
+# ---------------------------------------------------------------------------
+# post-merge review: a resume past `plan_snapshot` whose wiring gate repairs
+# must re-schedule the STRIPPED plan, keeping any resynthesised subtask
+# ---------------------------------------------------------------------------
+
+class _GateInterrupted(Exception):
+    pass
+
+
+@pytest.mark.parametrize("prescribed", [
+    None, {"is_prescribed": True, "commands": ["uv run pytest tests/"]}])
+def test_a_gate_repair_on_resume_keeps_the_stripped_plan(
+        leerie, monkeypatch, tmp_path, prescribed):
+    from tests.test_resume_planning_reentry import (
+        _StopAtExecute, _args, _caps, _plan, _stub_common, EFFORTS, MODELS)
+    repo = _repo(tmp_path)
+    leerie_root = tmp_path / ".leerie-state"
+    run_id = "resume-gate-aaa111"
+    run_dir = leerie_root / "runs" / run_id
+    (run_dir / "subtasks").mkdir(parents=True)
+    sub = {"id": "test-001", "depends_on": [], "requires": [],
+           "provides": [], "runs_commands": [
+               "uv run pytest tests/ -q" if prescribed else "pytest tests/"]}
+    plans = [_plan("testing", sub)]
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = leerie.State(leerie_root, run_id, repo_root=repo)
+    st.data = {"task": "t", "worker_count": 3, "categories": ["testing"],
+               "plans_after_classify": [],
+               **({"prescribed_procedure": prescribed} if prescribed else {}),
+               **{k: plans for k in (
+                   "plans_after_plan", "plans_after_reconcile",
+                   "plans_after_overlap_judge", "plans_after_adherence_gate",
+                   "plans_after_coverage_gate", "plans_after_filters")}}
+    st.save()
+
+    async def gate_interrupted(plans, task, st, caps, models, efforts):
+        raise _GateInterrupted()
+    monkeypatch.setattr(leerie, "phase_wiring_gate", gate_interrupted)
+    with pytest.raises(_GateInterrupted):
+        asyncio.run(leerie._run_phases(
+            _args(), _caps(leerie), run_dir, st, "codebase", "normal",
+            MODELS, EFFORTS))
+    first = {k: v.get("runs_commands")
+             for k, v in st.data["plan_snapshot"]["subtasks"].items()}
+
+    async def gate_repairs(plans, task, st, caps, models, efforts):
+        st.data["wiring_gate"] = {"repairs": [{"sid": "test-001"}]}
+        return plans
+    monkeypatch.setattr(leerie, "phase_wiring_gate", gate_repairs)
+    with pytest.raises(_StopAtExecute):
+        asyncio.run(leerie._run_phases(
+            _args(), _caps(leerie), run_dir, st, "codebase", "normal",
+            MODELS, EFFORTS))
+    second = {k: v.get("runs_commands")
+              for k, v in st.data["plan_snapshot"]["subtasks"].items()}
+    assert second == first
+    if prescribed:
+        assert ["uv run pytest tests/"] in second.values(), \
+            "the resynthesised subtask must survive the repair re-schedule"
+
+
+# ---------------------------------------------------------------------------
+# post-merge review: bounds and degenerate inputs
+# ---------------------------------------------------------------------------
+
+def test_a_huge_testpaths_list_stays_under_the_argv_limit(leerie, tmp_path):
+    """Every root adds rules to ONE `--disallowedTools` element; past Linux's
+    per-argument limit (131,071 bytes) every worker spawn would fail."""
+    roots = " ".join(f"dir{i}" for i in range(500))
+    root = _repo(tmp_path, tests_dir=False,
+                 ini=f"[pytest]\ntestpaths = {roots}\n")
+    deny = leerie._full_suite_denials(root)
+    assert len(deny) < 131_071 // 4
+    assert "Bash(pytest dir0/ *)" in deny
+
+
+def test_a_canonical_command_with_a_wildcard_is_declined(leerie, tmp_path):
+    """The CLI would read `*` as a wildcard and deny more than the canonical
+    command (a targeted single-file run of the same shape)."""
+    root = _repo(tmp_path, test="python -m pytest tests/*_test.py")
+    assert leerie._full_suite_denials(root) == ""
+
+
+def test_malformed_prescribed_commands_degrade_to_none(leerie):
+    assert leerie._prescribed_commands(
+        {"is_prescribed": True, "commands": 5}) == set()

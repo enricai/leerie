@@ -2176,7 +2176,7 @@ no-test-file path at all).
 
 ## The whole suite is orchestrator-owned
 
-`tests/test_full_suite_ownership.py` (150) covers DESIGN §9's two
+`tests/test_full_suite_ownership.py` (155) covers DESIGN §9's two
 whole-suite mechanisms: *absence means deferred, never full* for the test
 axis (`_select_subtask_axes`, `_DEFERRED_AXIS`) and the single rule list
 behind the deny, the plan-time strip, the settle-time exemption and the
@@ -2186,12 +2186,15 @@ notice (`_full_suite_rule_patterns`, `_shell_subcommands`,
 `runs_commands`, commands whose deny verdict was observed live on the CLI
 (`LIVE_PROBED`), and barnacle-shaped `pnpm` configs for the negative
 controls. Forty-seven components were ablated one at a time against this
-file and the four repinned scoped-axis files, and every ablation fails at
-least one test (restoring the canonical test fallback fails 6). Getting
-there, every component that left everything green was either removed as
-redundant or given its own pin, the pin taken from a live CLI verdict where
-one existed (single-quote literalness: `echo 'a|pytest tests/'` ran; an
-unquoted substitution keeping its outer command whole: `pytest $(cat k)
+file and the four repinned scoped-axis files at #292's merge, and every
+ablation fails at least one test (restoring the canonical test fallback
+fails 6); the post-merge follow-up's four (the strip running before the
+`plan_snapshot` branch, the root cap, the wildcard decline, the `commands`
+type guard) were each ablated against this file and fail their own test.
+Getting there, every component that left everything green was either removed
+as redundant or given its own pin, the pin taken from a live CLI verdict
+where one existed (single-quote literalness: `echo 'a|pytest tests/'` ran;
+an unquoted substitution keeping its outer command whole: `pytest $(cat k)
 tests/` was denied). Four lessons generalise. **(1) Omitted is not
 recorded.** `_apply_measured_axes` overwrites only the axes present in a
 measurement, so a deferred axis left out would let a conformer's

@@ -7090,12 +7090,17 @@ never to a crashed spawn. The deny is a guard on the invocation a worker
 writes, not a security boundary. The CLI ran each of these live despite the
 rules: a runner behind another command (`uv run pytest tests/`, `coverage
 run -m pytest tests/`, `xvfb-run pytest tests/`, `eval pytest tests/`, `sh
--c 'pytest tests/'`), a quoted or escaped root (`pytest "tests/"`, `pytest
-'tests'`, `pytest tests\/`), and a flags-only bare runner (`pytest -q`); an
-absolute-path runner is likewise unmatched. None appeared among the
-full-suite invocations leerie's own workers ran on record, which is the
-honest extent of the claim; the notice, not the deny, is what such a worker
-is left with.
+-c 'pytest tests/'`), a quoted, escaped or relative-path root (`pytest
+"tests/"`, `pytest 'tests'`, `pytest tests\/`, `pytest ./tests`, `pytest
+.`), and a flags-only bare runner (`pytest -q`); an absolute-path runner is
+likewise unmatched, as is the runner a package script wraps (`npx vitest
+run` when the canonical command is `pnpm run test`). Test roots past the
+first 16 are not denied either: the rules travel in one argv element, which
+a long `testpaths` list would push past Linux's per-argument limit, and a
+canonical command containing `*` is declined outright, since the CLI would
+read it as a wildcard. None appeared among the full-suite invocations
+leerie's own workers ran on record, which is the honest extent of the claim;
+the notice, not the deny, is what such a worker is left with.
 
 **The round signal is a regression, not a verdict.** Because a scoped
 result and a full baseline are not comparable, the base-health baseline
