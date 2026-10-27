@@ -153,9 +153,12 @@ to `registry.fly.io`; not nerdctl-in-Colima.
 
 `--runtime ec2` provisions an AWS EC2 instance, seeds it, runs the
 orchestrator detached, and tears it down on exit — the EC2 counterpart to
-`--runtime fly`. **AMI prerequisite:** `LEERIE_EC2_AMI` must name an AMI
-with leerie's source baked in at `/opt/leerie-image/` (DESIGN §6);
-building it (Packer / EC2 Image Builder) is operator-owned, out-of-band.
+`--runtime fly`. **Zero-config:** with no `LEERIE_EC2_*` set, leerie bakes
+(first use) and reuses a tagged AMI holding leerie's source at
+`/opt/leerie-image/` (DESIGN §6 *Image delivery*), and creates or reuses
+the key pair, security group (tcp/22 only from your egress IP as a `/32`),
+default-VPC public subnet and, optionally, an SSM instance profile — each
+tagged `leerie:managed=true`. `leerie prune` lists/cleans them.
 
 Prerequisites: AWS CLI v2 (`brew install awscli`; not auto-installed, it
 commonly needs `sudo`) and credentials resolving via `aws sts
@@ -163,28 +166,33 @@ get-caller-identity` (preflight prints `aws sso login` if expired/missing)
 — same precedence as the AWS CLI/SDKs: env vars > named profile > EC2
 instance role; region: `AWS_REGION` > `AWS_DEFAULT_REGION` > profile
 `region`. `LEERIE_AWS_REGION`/`LEERIE_AWS_PROFILE` are **leerie's own**
-knobs for which region/profile it uses to provision machines.
+knobs for which region/profile it uses to provision machines. The account
+needs a default VPC, else set `LEERIE_EC2_SUBNET_ID` (or run `aws ec2
+create-default-vpc`).
 
-Five `RunInstances` parameters have no defaults and `--runtime ec2` fails
-fast if any is unresolved. **CLI flag > env var > `leerie.toml` key**:
+Six `RunInstances` parameters are **optional overrides** of those defaults.
+**CLI flag > env var > `leerie.toml` key > default**:
 
-| Var | CLI flag | `leerie.toml` key |
-|---|---|---|
-| `LEERIE_EC2_AMI` | `--ec2-ami` | `ec2_ami` |
-| `LEERIE_EC2_INSTANCE_TYPE` | `--ec2-instance-type` | `ec2_instance_type` |
-| `LEERIE_EC2_KEY_NAME` | `--ec2-key-name` | `ec2_key_name` |
-| `LEERIE_EC2_SECURITY_GROUP` | `--ec2-security-group` | `ec2_security_group` |
-| `LEERIE_EC2_SUBNET_ID` | `--ec2-subnet-id` | `ec2_subnet_id` |
+| Var | CLI flag | `leerie.toml` key | Default |
+|---|---|---|---|
+| `LEERIE_EC2_AMI` | `--ec2-ami` | `ec2_ami` | baked/reused tagged AMI |
+| `LEERIE_EC2_INSTANCE_TYPE` | `--ec2-instance-type` | `ec2_instance_type` | `m5.xlarge` |
+| `LEERIE_EC2_KEY_NAME` | `--ec2-key-name` | `ec2_key_name` | created/reused key pair |
+| `LEERIE_EC2_SECURITY_GROUP` | `--ec2-security-group` | `ec2_security_group` | created/reused group |
+| `LEERIE_EC2_SUBNET_ID` | `--ec2-subnet-id` | `ec2_subnet_id` | default-VPC public subnet |
+| `LEERIE_EC2_INSTANCE_PROFILE` | `--ec2-instance-profile` | `ec2_instance_profile` | optional SSM profile |
 
 ```bash
+leerie "task" --runtime ec2          # zero-config
+# Optional overrides:
 export LEERIE_AWS_REGION=us-east-1
 export LEERIE_EC2_AMI=ami-0abcdef1234567890
 export LEERIE_EC2_INSTANCE_TYPE=t3.large
-export LEERIE_EC2_KEY_NAME=my-ec2-keypair
-export LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
-export LEERIE_EC2_SUBNET_ID=subnet-0123456789abcdef0
 leerie "task" --runtime ec2
 ```
+
+Behavior against real AWS (AMI bake, resource creation, teardown) is
+covered only by stubbed tests, not exercised without an AWS account.
 
 ## What leerie mounts into the container
 
