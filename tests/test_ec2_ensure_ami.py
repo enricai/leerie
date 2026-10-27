@@ -52,6 +52,8 @@ SSH = (
     '#!/bin/sh\n'
     'echo "$@" >> "$T/ssh_calls"\n'
     'n=$(wc -c | tr -d " "); echo "$n" >> "$T/ssh_stdin_bytes"\n'
+    # The real bake prints apt/pip output on stdout; so does this stub.
+    'echo "Get:1 http://deb.debian.org stub-noise"\n'
     'case "$*" in *ec2-bake.sh*) [ -n "$SSH_FAIL" ] && exit 1; [ -n "$SSH_HANG" ] && sleep 30 ;; esac\n'
     'exit 0\n'
 )
@@ -86,14 +88,17 @@ def _run(tmp_path, **extra):
 def test_miss_bakes_in_order_then_hit(tmp_path):
     r = _run(tmp_path)
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip().splitlines()[-1] == "ami-baked"
+    # Exactly the id: the caller does ami="$(ensure_ami)", so any bake
+    # output on stdout becomes the --image-id (a real run hit this).
+    assert r.stdout == "ami-baked\n"
+    assert "stub-noise" in r.stderr
     c = _calls(tmp_path)
     i = [c.index(f"ec2 {x}") for x in ("run-instances", "create-image", "terminate-instances")]
     assert i == sorted(i)
     assert "leerie:source-hash" in (tmp_path / "calls").read_text()
     n = len(c)
     r2 = _run(tmp_path)
-    assert r2.stdout.strip() == "ami-baked"
+    assert r2.stdout == "ami-baked\n"
     assert "ec2 run-instances" not in _calls(tmp_path)[n:]
 
 
@@ -218,7 +223,7 @@ def test_image_wait_outlasts_pending_polls(tmp_path):
     # keeps going and the bake succeeds.
     r = _run(tmp_path, PENDING_POLLS="45", LEERIE_EC2_AMI_WAIT_S="1000")
     assert r.returncode == 0, r.stderr
-    assert r.stdout.strip().splitlines()[-1] == "ami-baked"
+    assert r.stdout == "ami-baked\n"
     assert int((tmp_path / "polls").read_text()) == 46
     assert "ec2 deregister-image" not in _calls(tmp_path)
     assert "ec2 wait" not in _calls(tmp_path)
@@ -239,3 +244,24 @@ def test_image_wait_budget_is_bounded(tmp_path):
     assert int((tmp_path / "polls").read_text()) == 4
     assert "LEERIE_EC2_AMI_WAIT_S" in r.stderr
     assert "ec2 deregister-image" in _calls(tmp_path)
+
+
+def test_bake_never_runs_the_callers_exit_trap(tmp_path):
+    # The launcher holds `trap 'rm -rf "$STAGE"' EXIT` and calls
+    # ami="$(ensure_ami)". A bake that re-installs the caller's trap inside
+    # that subshell runs it on the subshell's exit — on a real run that
+    # deleted the staged credentials before seeding.
+    stage = tmp_path / "stage"
+    stage.mkdir()
+    (stage / ".credentials.json").write_text("{}")
+    script = (
+        f"source {SCRIPT}; "
+        f"trap 'rm -rf {stage}' EXIT; "
+        'ami="$(ensure_ami)"; rc=$?; '
+        f'[ -d {stage} ] && echo "stage-intact ami=$ami rc=$rc" || echo "stage-deleted"; '
+        "trap - EXIT"
+    )
+    r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                       env=_ensure_ami_env(tmp_path))
+    assert r.stdout.strip() == "stage-intact ami=ami-baked rc=0", r.stderr
+    assert (stage / ".credentials.json").exists()

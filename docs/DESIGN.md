@@ -3934,8 +3934,9 @@ push an incomplete branch.
 
 `accept-blocked`'s EC2 action mirrors Fly's wake-mutate-pause dance:
 resolve AWS credentials, wake the instance via `resume_instance()` if
-stopped, mutate `state.json` over SSM (`ec2_remote_exec` — no ssh
-keypair or hallpass wait needed), mirror onto the host copy when one
+stopped, mutate `state.json` over the instance's SSH transport
+(`ec2_remote_exec`, see *Transport substitution* below), mirror onto the
+host copy when one
 exists, and re-pause only if this verb woke it. `stop`'s EC2 action
 resolves credentials, gates on `require_aws()`, resolves
 `LEERIE_EC2_INSTANCE_ID` from the sidecar, and calls `stop_instance()`
@@ -4193,6 +4194,18 @@ fresh AWS account with no operator-built artifact. Three strategies:
      Debian 13 mounts `/tmp` as a RAM-backed tmpfs by default, where the
      seed bundles and the tool caches the container keeps under `/tmp`
      would compete with the workers for memory and vanish on every boot.
+     And it takes over what `container-entry.sh` does as the container's
+     PID 1, since an instance has no such process: a root systemd unit
+     runs the cgroup broker (*Memory containment* — without it the
+     orchestrator's fail-closed containment gate refuses to start any
+     worker), after a boot-time step that creates `leerie.slice` with the
+     memory and pids controllers and the same aggregate memory cap the
+     container sets, and re-creates the `/tmp` cache directory the boot
+     cleans. Root on a real host is the rootful case, so the slice sits
+     at the top of the cgroup hierarchy exactly as it does in a rootful
+     container; a `Delegate=yes` unit cgroup would not do, since the
+     broker itself would occupy it and cgroup v2 forbids enabling
+     controllers on a cgroup that holds processes.
    - **Tag and rebake rule.** The AMI is tagged with the leerie version
      and a source hash (over the files baked in: orchestrator, scripts,
      prompts, plugin manifest, `requirements.txt`, the bake script).
@@ -4273,7 +4286,13 @@ one.
 `host_finalize` flow as Fly's `decide_teardown` (see *Finalization*
 above): on a clean exit the host pushes the run branch and opens the PR
 before the instance is terminated, and a finalize failure keeps the
-instance's pause disposition rather than destroying unpushed work.
+instance's pause disposition rather than destroying unpushed work. A
+launch-time `--no-push` is honored here: the instance sidecar records it as
+`host_no_push`, the same intent field Fly records for `leerie finalize`,
+because the fetched `run.json` cannot carry it — the fetch strips
+`no_push=true` whenever a run branch exists. With it set, the run branch is
+left on the host for a later `leerie finalize`, no push or PR is attempted,
+and the instance is terminated (the work is already on the host).
 
 **Cleanup.** `leerie prune` (dry-run by default, `--apply` to act) and
 `kill`/teardown where appropriate cover leerie-tagged AMIs and their
@@ -4349,46 +4368,56 @@ EC2 shape the reap is AWS's problem, not leerie's. Three cases:
    no secondary volume exists; flagged so a future subtask doesn't
    assume EC2 is exempt from the discipline Fly needed.
 
-**Transport substitution for `flyctl ssh console`.** Two roles need
-replacing: piping the detached-orchestrator launch wrapper, and
-opening a session for `resume`/`--shell` attach and log tailing. This
-design picks SSM Session Manager over SSH:
+**Transport substitution for `flyctl ssh console`.** Three roles need
+replacing: small remote commands (wipe, chown, the flock probe, state
+edits), piping the detached-orchestrator launch wrapper, and opening a
+session for `resume`/`--shell` attach and log tailing. Every
+non-interactive role goes over **SSH**; **SSM Session Manager** serves
+only the interactive `--shell`:
 
-- **Neither transport lands as root.** Session Manager runs every
-  session as `ssm-user` (it does not support root), and SSH logs in as
-  `ec2-user`. Both have passwordless sudo (the SSM agent's
-  `ssm-agent-users` sudoers entry; the default-user config above), so
-  every remote command that writes leerie-owned paths, changes ownership
-  or drops to the `leerie` user runs under `sudo -n`. `-n` makes a
-  missing sudo grant fail at once instead of hanging on a prompt.
-- **SSM Session Manager** (`aws ssm start-session`) is the interactive
-  and control-plane transport (launch wrapper, attach, log tail): it
-  needs no inbound rule of its own — the SSM Agent calls out to the SSM
-  service over HTTPS, the same "no sshd, no public exposure" property
-  Fly gets from hallpass + WireGuard — and auth flows through the AWS
-  credential chain and IAM.
 - **SSH** (`ec2-user@<PublicIpAddress>`, `ssh -i` the leerie-tagged key
-  pair, port 22 open only to the launcher's egress CIDR) carries the
-  **bulk transfer** (`ec2_tar_pipe`: seed and sync-back), which SSM
-  sessions cannot stream efficiently. It is therefore required, not a
-  fallback: the instance needs a key pair, the security-group rule and a
-  public IP (see *Zero-config defaults* above), and SSM supplements SSH
-  rather than replacing it. Host keys are trusted on first use **per
-  instance**, in a known-hosts file keyed by instance id, never the
-  user's own `known_hosts`: EC2 recycles public IPs, so a later instance
-  on an address an earlier one used presents a different host key, and a
-  shared file would make ssh refuse it. A stopped-and-started instance
-  keeps its host key, so resume still matches.
+  pair, port 22 open only to the launcher's egress CIDR) carries every
+  non-interactive command, the launch wrapper, the log tail, and the
+  bulk transfer (`ec2_tar_pipe`: seed and sync-back). A non-pty SSH
+  channel is what these need: the payload arrives intact on stdin, the
+  remote exit status comes back natively (the launch wrapper's rc=75
+  smart-resume pivot depends on it), output streams as it is produced,
+  and there is no command-size ceiling. It is required, not a fallback:
+  the instance needs a key pair, the security-group rule and a public IP
+  (see *Zero-config defaults* above). Host keys are trusted on first
+  use **per instance**, in a known-hosts file keyed by instance id,
+  never the user's own `known_hosts`: EC2 recycles public IPs, so a later
+  instance on an address an earlier one used presents a different host
+  key, and a shared file would make ssh refuse it. A stopped-and-started
+  instance keeps its host key, so resume still matches.
+- **SSM Session Manager** (`aws ssm start-session`) is rejected for the
+  non-interactive roles on measured evidence, not preference. An
+  `AWS-StartInteractiveCommand` session runs its command on a pty: a
+  payload piped into it is read by an interpreter that sees a terminal
+  (`python3 -` opens its interactive prompt, `sh -s` prints a prompt),
+  the plugin ends the session at host-stdin EOF before the payload is
+  consumed, every output line arrives CRLF-terminated, and the session
+  itself always exits 0 so the remote status needs an in-band sentinel.
+  None of that is fixable from the caller. What SSM is good at — a human
+  at a terminal — is exactly the `--shell` role, and there it keeps its
+  advantages: no inbound rule, auth through IAM. The instance profile
+  (above) keeps SSM available for that and for operators who reach
+  instances through it.
+- **Neither transport lands as root.** SSH logs in as `ec2-user` and
+  Session Manager as `ssm-user` (it does not support root). Both have
+  passwordless sudo (the default-user config above; the SSM agent's
+  `ssm-agent-users` sudoers entry), so every remote command that writes
+  leerie-owned paths, changes ownership or drops to the `leerie` user
+  runs under `sudo -n`. `-n` makes a missing sudo grant fail at once
+  instead of hanging on a prompt.
 
-`aws ssm start-session --target <instance-id> --document-name
-AWS-StartInteractiveCommand --parameters command="python3 -"` is the SSM
-analog of `flyctl ssh console --pty=false -C "python3 -"` for the
-detached-launch wrapper; the same analog with `command="tail -F
-orchestrator.log"` (or a bare interactive shell for `--shell`) serves
-the attach/tail role. The detached-`Popen` pattern itself — session
-leader inside the instance, independent host-side tail process, stream
-death does not touch the orchestrator — is transport-agnostic and
-carries over unchanged from the Fly design (lines 2185-2206 above).
+`ssh … ec2-user@<ip> "sudo -n python3 -"` with the launch wrapper on
+stdin is the analog of `flyctl ssh console --pty=false -C "python3 -"`;
+the same with `sudo -n sh -s` and the tail wrapper serves the attach/tail
+role. The detached-`Popen` pattern itself — session leader inside the
+instance, independent host-side tail process, stream death does not
+touch the orchestrator — is transport-agnostic and carries over
+unchanged from the Fly design (lines 2185-2206 above).
 
 **Pause/resume semantics.** EC2 `stop`/`start` maps directly onto Fly's
 `machine stop`/`machine start`: `StopInstances` preserves the root EBS

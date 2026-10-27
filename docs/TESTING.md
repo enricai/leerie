@@ -133,7 +133,13 @@ the install checkout).
   install`; `ec2-user` is cloud-init's default user with passwordless sudo
   and no key is baked in — proven by executing the script's own cloud-cfg
   heredoc with a group name and comparing every key; `tmp.mount` is masked
-  (disk-backed `/tmp`) before `cloud-init clean`, which runs last; leerie's home is
+  (disk-backed `/tmp`) before `cloud-init clean`, which runs last; the
+  baked `leerie-instance-setup` (container-entry.sh's boot-time half) is
+  executed against a fake cgroup root and meminfo and writes the same
+  slice memory cap container-entry.sh computes (14 GiB for 16 GiB, the
+  1 GiB floor for 4 GiB), honours the `max` opt-out, and re-creates
+  `/tmp/.cache` 1777; `leerie-cgroup-broker.service` is an enabled root
+  unit running the shipped broker after that setup; leerie's home is
   chowned after its dirs exist; the SSM agent prefers the regional bucket.
 - `tests/test_ec2_defaults.py` (`ec2-defaults.sh`): per knob, the default
   and the override. Instance type; subnet (public subnet in the default VPC,
@@ -170,6 +176,16 @@ the install checkout).
   refused and no rc sentinel comes back, and `ec2_tar_pipe` extracts under
   `sudo -n`; the fetch ssh and rsync receiver are elevated too. Neither
   transport lands as root (DESIGN §6).
+- `tests/test_ec2_decide_teardown_auto_finalize.py` also pins the
+  launch-time `--no-push`: with `host_no_push` in the run's
+  `ec2-instance.json` (or `NO_PUSH=true` on the tearing-down launcher) the
+  clean exit fetches and terminates without `host_finalize`; the same
+  sidecar with `host_no_push=false` still finalizes. `tests/test_ec2_provision.py`
+  pins that `provision_instance` records that intent in the sidecar.
+- `tests/test_ec2_launch_env.py` also executes the shared launch suffix's
+  argv assembly: `--no-push` goes after the forwarded args (before a
+  literal `--`), so `resume <run-id>` keeps the verb first — a leading flag
+  made a real EC2 resume reject its own run id.
 - `tests/test_ec2_launch_env.py`: renders the launcher's EC2 `child_env`
   heredoc and executes it: the baked `leerie.env` overrides the session env,
   splits on the first `=`, and the wrapper's own `HOME`/`USER_REPO`/`TZ` win
@@ -1877,30 +1893,40 @@ clobbered when the host already has one, and are non-fatal when absent on the
 instance; and both `aws` and `ssh` appear in the transport log while `flyctl`
 never does.
 
-## EC2 SSM launch/attach
+## EC2 launch/attach transport
 
 The launch/attach counterpart to `flyctl ssh console` — `scripts/remote/
-ec2-ssm.sh`'s `ec2_launch_detached()`/`ec2_attach()` — is tested in
-`tests/test_ec2_ssm.py` against a stubbed `aws` binary modeling
-`ssm start-session`'s two quirks: it always exits 0 regardless of the wrapped
-remote command's real exit status (the documented session-manager-plugin
-limitation both `ec2_remote_exec` and this file work around via an
-rc-sentinel), and it is a genuinely interactive session that drains its own
-stdin and execs it as the bootstrap interpreter's program. Pinned: both functions issue
-`aws ssm start-session --target <id> --document-name AWS-StartInteractiveCommand`;
-rc=75 (the flock-loser smart-resume pivot) and other nonzero remote rcs
-survive the round trip uncorrupted; both fail closed (rc 1, actionable
-stderr, no `aws` call) on an empty `LEERIE_EC2_INSTANCE_ID`; a stalled session
-yields 124/137 via the same `_seed_timeout_prefix` convention
-`ec2_remote_exec` uses; `--profile`/`--region` passthrough; a payload well
-over SSM's ~4 KB `--parameters` ceiling still round-trips cleanly since only
-the interpreter name (`python3 -` / `sh -s`) goes in `--parameters` and the
-real payload travels over the session's stdin; `ec2_attach`'s `sh -s`
-bootstrap is verified by decoding the base64-wrapped `command=[...]` value
-rather than asserting on plaintext no longer in the log; and double-sourcing
-is idempotent and does not clobber `ec2_remote_exec`. `flyctl` never appears
-in the transport log. Also added to `tests/test_ec2_bash32_portability.py`'s
-`_EC2_SCRIPTS` list for bash 3.2 sourcing coverage.
+ec2-ssm.sh`'s `ec2_launch_detached()`/`ec2_attach()` — goes over SSH and is
+tested in `tests/test_ec2_ssm.py` against an `ssh` stub that runs the remote
+command locally with the caller's stdin attached, as sshd does. That models
+the property the transport exists for; the earlier SSM-session stub modeled
+a stdin pass-through that a real `AWS-StartInteractiveCommand` session does
+not have (on a real instance its pty turned `python3 -` into an interactive
+prompt and the session ended at host-stdin EOF), which is how the SSM design
+passed every test while being unable to launch. Pinned: launch runs
+`sudo -n python3 -` over SSH and prints the payload's output; rc=75 (the
+flock-loser smart-resume pivot) comes back natively; a multi-KB payload
+arrives intact (the computed result proves every line was read); attach
+streams `sudo -n sh -s` output and returns its rc; attach is *not* wrapped
+in the seed timeout (a tail is long-lived); both fail closed on an empty
+`LEERIE_EC2_INSTANCE_ID` with no ssh call; `--shell` on a live run is an
+SSM `AWS-StartInteractiveCommand` session running
+`cd /work && exec sudo -n bash -i` with region/profile, and no ssh; the
+live-run tail goes over ssh; double-sourcing is idempotent. Also listed in
+`tests/test_ec2_bash32_portability.py`'s `_EC2_SCRIPTS` for bash 3.2
+sourcing coverage.
+
+`ec2_remote_exec` (ec2-lib.sh) is pinned in `tests/test_ec2_transport.py`
+the same way: exact stdout, the remote rc (42), a program on stdin with
+quoted/spaced argv reaching `python3 -` intact and returning 75, target
+resolution through `describe-instances` when `LEERIE_EC2_SSH_TARGET` names
+another instance, a fail-closed error when the instance has no public IP,
+no SSM call, `sudo -n bash -c <cmd>` as the elevated form, failure when
+sudo is refused, and the seed timeout. The shared fixtures
+(`tests/ec2_stub.py`'s `make_ssm_stub_ssh` + `make_remote_exec_stub`) route
+`sudo -n bash -c <cmd>` through an `ec2-remote-exec` helper that applies
+the instance-path rewrites, so the seed/fetch/kill/accept-blocked tests
+drive the same SSH form.
 
 ## EC2 launcher dispatch branch (`RUNTIME=ec2`)
 
@@ -2614,11 +2640,9 @@ syncing state via `_try_fetch_state_for_ec2_teardown` BEFORE calling
 `terminate_instance()` (the one-way-ratchet invariant
 `ec2-provision.sh:262-272` documents) — is tested end to end in
 `tests/test_ec2_launcher_kill.py` against the real `leerie` launcher
-binary. The `aws` stub combines two behaviors behind one binary since
-`kill`'s EC2 path exercises both surfaces in a single run: `ssm
-start-session` (the transport `ec2_remote_exec`/`fetch_state_ec2` use)
-decodes and execs the wrapped command locally against a real git repo
-standing in for the instance's `/work` (reusing
+binary. Remote commands go over the `ssh` stub (the transport
+`ec2_remote_exec`/`fetch_state_ec2` use), which execs them locally against
+a real git repo standing in for the instance's `/work` (reusing
 `tests/test_ec2_fetch_branch.py`'s `_make_stub_ssh`/
 `_init_instance_repo_with_run`/`_setup_instance` helpers directly rather
 than reimplementing them, so `fetch_state_ec2` runs for real instead of
@@ -2627,7 +2651,8 @@ being hand-waved), while `sts`/`ec2 <action>` route to
 reused as the lifecycle backend) so credential/instance-lifecycle calls
 are tracked too — both halves append to the same `aws.log`/`state.json`
 so `tests/ec2_stub.py`'s `read_log`/`read_state`/`leaked_resources` work
-unmodified. Pinned: the fetch step's `ssm start-session` call precedes
+unmodified; a thin wrapper logs every ssh call into the same `aws.log`.
+Pinned: every fetch-step ssh call (including the bundle download) precedes
 `terminate-instances` by call index (falsified live — reordering the
 launcher's fetch/terminate calls makes this test fail, since
 `terminate_instance()` clears `LEERIE_EC2_INSTANCE_ID` and the

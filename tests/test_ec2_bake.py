@@ -118,6 +118,13 @@ def test_ec2_user_is_cloud_inits_default_user_with_sudo_and_no_baked_key():
     assert "rm -f /home/admin/.ssh/authorized_keys" in BODY
 
 
+def test_leerie_user_exists_before_mise_writes_under_its_home():
+    # MISE_DATA_DIR is under /home/leerie; creating the user afterwards made
+    # `useradd -m` warn and skip the skeleton files (seen on a real bake).
+    assert BODY.index('useradd -u "$LEERIE_UID"') < BODY.index("mise install --system node@lts python@3.12")
+    assert BODY.index('useradd -u "$LEERIE_UID"') < BODY.index('. "$LEERIE_ENV_FILE"')
+
+
 def test_tmp_is_disk_backed_before_cloud_init_is_reset():
     assert BODY.index("systemctl mask tmp.mount") < BODY.index("cloud-init clean --logs --machine-id")
 
@@ -159,3 +166,57 @@ def test_opt_leerie_image_matches_dockerfile_copy_list():
     ]
     # the script iterates the Dockerfile's COPY lines rather than a hand list
     assert "grep '^COPY ' \"$DOCKERFILE\"" in BODY
+
+
+def _setup_script() -> str:
+    return re.search(r"cat > /usr/local/sbin/leerie-instance-setup <<'SETUP'\n(.*?)\nSETUP\n", BODY, re.S).group(1)
+
+
+def _run_setup(tmp_path, mem_kb: int, **env) -> Path:
+    script = tmp_path / "setup.sh"
+    script.write_text(_setup_script())
+    meminfo = tmp_path / "meminfo"
+    meminfo.write_text(f"MemTotal:       {mem_kb} kB\nMemFree:        1 kB\n")
+    root = tmp_path / "cgroup"
+    root.mkdir(exist_ok=True)
+    full = {"PATH": "/usr/bin:/bin", "LEERIE_CGROUP_V2_ROOT": str(root),
+            "LEERIE_MEMINFO": str(meminfo), "LEERIE_TMP": str(tmp_path / "tmp"), **env}
+    subprocess.run(["sh", str(script)], env=full, check=True)
+    return root / "leerie.slice"
+
+
+@pytest.mark.parametrize("mem_kb,expected", [
+    (16 * 1024 * 1024, 14 * 1024 ** 3),        # 12.5% reserve = 2 GiB
+    (4 * 1024 * 1024, 3 * 1024 ** 3),          # 1 GiB floor wins over 512 MiB
+])
+def test_instance_setup_writes_the_container_entry_memory_cap(tmp_path, mem_kb, expected):
+    slice_dir = _run_setup(tmp_path, mem_kb)
+    assert (slice_dir / "memory.max").read_text().strip() == str(expected)
+    assert (slice_dir / "cgroup.subtree_control").read_text().strip() == "+memory +pids"
+    cache = tmp_path / "tmp" / ".cache"
+    assert cache.is_dir() and (cache.stat().st_mode & 0o7777) == 0o1777
+
+
+def test_instance_setup_cap_formula_matches_container_entry():
+    # One formula, two copies: pin that container-entry.sh still uses it.
+    entry = (ROOT / "scripts" / "container-entry.sh").read_text()
+    for needle in ("_reserve=$((_total_bytes / 8))", "_min_reserve=$((1024 * 1024 * 1024))",
+                   '"$_cap" = "0" ] || [ "$_cap" = "max" ]'):
+        assert needle in entry
+
+
+def test_instance_setup_honours_the_cap_opt_out(tmp_path):
+    slice_dir = _run_setup(tmp_path, 16 * 1024 * 1024, LEERIE_CONTAINER_MEMORY_MAX_BYTES="max")
+    assert not (slice_dir / "memory.max").exists()
+
+
+def test_broker_runs_as_an_enabled_root_unit_after_the_setup():
+    unit = re.search(r"cat > /etc/systemd/system/leerie-cgroup-broker.service <<'UNIT'\n(.*?)\nUNIT\n", BODY, re.S).group(1)
+    lines = dict(l.split("=", 1) for l in unit.splitlines() if "=" in l)
+    assert lines["ExecStartPre"] == "/usr/local/sbin/leerie-instance-setup"
+    assert lines["ExecStart"] == "/usr/bin/python3 /opt/leerie-image/scripts/cgroup-broker.py"
+    assert lines["Restart"] == "always" and lines["WantedBy"] == "multi-user.target"
+    assert "User" not in lines and "Delegate" not in lines   # root, top-level slice
+    assert "systemctl enable leerie-cgroup-broker.service" in BODY
+    # The broker it launches is the shipped one, at the path the image copies.
+    assert (ROOT / "scripts" / "cgroup-broker.py").is_file()

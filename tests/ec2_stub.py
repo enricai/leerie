@@ -711,6 +711,13 @@ def _stub_aws(dir: Path) -> Path:
     stub = dir / "aws"
     stub.write_text(_STUB_SOURCE)
     stub.chmod(0o755)
+    # Remote commands go over ssh to the instances this stub tracks, whose
+    # addresses are test IPs. Unless the test brings its own, refuse at once
+    # like an unreachable host instead of letting real ssh wait it out.
+    ssh = dir / "ssh"
+    if not ssh.exists():
+        ssh.write_text("#!/bin/sh\necho 'ssh: connect to host: Connection refused' >&2\nexit 255\n")
+        ssh.chmod(0o755)
     (dir / LOG_FILENAME).write_text("")
     (dir / STATE_FILENAME).write_text(json.dumps(_EMPTY_STATE))
     return stub
@@ -944,7 +951,7 @@ def _bash_rewrite_lines(var: str, rewrites: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def make_ssm_stub_aws(
+def make_remote_exec_stub(
     stub_path: Path,
     exec_log: Path,
     dest_dir: Path,
@@ -954,27 +961,23 @@ def make_ssm_stub_aws(
     chown_log: Path | None = None,
     swallow_runuser: bool = False,
 ) -> None:
-    """Write a stub `aws` that decodes+executes ec2_remote_exec's
-    base64-wrapped SSM command locally, rewriting absolute instance-side
-    path prefixes (per `rewrites`, applied in order to the decoded
-    command text) so it operates against `dest_dir` instead of the real
-    instance filesystem — then re-encodes the (possibly nonzero) real
-    exit code as the rc sentinel ec2_remote_exec expects, while itself
-    always exiting 0 (mirroring the real SSM session-manager-plugin's
-    documented always-exit-0 behavior, which is exactly what
-    ec2_remote_exec's sentinel-recovery logic is designed to work
-    around).
+    """Write the instance side of ec2_remote_exec for tests: a stub `aws`
+    at `stub_path` (logs and exits 0 — ec2_remote_exec makes no aws call,
+    but require_aws still probes `sts`) and, beside it, an
+    `ec2-remote-exec` helper that make_ssm_stub_ssh hands every
+    `sudo -n bash -c <cmd>` command to. The helper runs <cmd> locally with
+    the caller's stdin and returns its real exit status, as SSH does,
+    after rewriting absolute instance-side path prefixes (per `rewrites`,
+    applied in order) so it operates against `dest_dir`.
 
     `rewrites` maps an unescaped instance-side path prefix (e.g.
     `"/work"`) to its bash replacement expression (e.g. `"$DEST/work"` —
-    `DEST` is bound to `dest_dir.resolve()` inside the stub).
-    `mkdir_subdir`, when given, pre-creates `$DEST/<mkdir_subdir>` before
-    the command runs, matching a directory the real AMI/image bakes in
-    ahead of any seed. `chown -R leerie: ` / `chown leerie: ` calls are
-    always replaced with a logging no-op (no leerie user exists in the
-    test sandbox); pass `chown_log` to make that log assertable,
-    otherwise it is discarded to /dev/null. `swallow_runuser`
-    additionally drops a `runuser -u leerie -- ` prefix.
+    `DEST` is bound to `dest_dir.resolve()`). `mkdir_subdir`, when given,
+    pre-creates `$DEST/<mkdir_subdir>`, matching a directory the real image
+    bakes in ahead of any seed. `chown -R leerie: ` / `chown leerie: `
+    calls are replaced with a logging no-op (no leerie user exists in the
+    test sandbox); pass `chown_log` to make that log assertable.
+    `swallow_runuser` additionally drops a `runuser -u leerie -- ` prefix.
     """
     dest = str(dest_dir.resolve())
     chown_sink = str(chown_log.resolve()) if chown_log else "/dev/null"
@@ -983,60 +986,27 @@ def make_ssm_stub_aws(
     runuser_line = (
         'decoded="${decoded//runuser -u leerie -- /}"' if swallow_runuser else ""
     )
-    stub_path.write_text(
+    stub_path.write_text(f'#!/usr/bin/env bash\necho "aws $*" >> {exec_log}\nexit 0\n')
+    stub_path.chmod(0o755)
+    helper = stub_path.parent / "ec2-remote-exec"
+    helper.write_text(
         f"""#!/usr/bin/env bash
-echo "aws $*" >> {exec_log}
-
+echo "remote-exec $1" >> {exec_log}
 DEST={dest!r}
 CHOWN_LOG={chown_sink!r}
 {mkdir_line}
-
-# Find the --parameters "command=[...]" argument.
-param=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "--parameters" ]; then
-    param="$arg"
-  fi
-  prev="$arg"
-done
-
-if [ -z "$param" ]; then
-  exit 0
-fi
-
-# param looks like: command=["f=$(mktemp) && echo <b64> | base64 -d > $f && sudo -n bash $f; ..."]
-# (ec2-lib.sh _ec2_ssm_sudo_command); the sudo half is the instance's, so
-# the decoded script runs directly here.
-inner="${{param#command=[\\"}}"
-inner="${{inner%\\"]}}"
-# Every SSM payload must arrive in exactly the elevated-wrapper shape the
-# instance runs; anything else (an old pipe-to-bash form, a lost sudo) fails
-# the calling test instead of being decoded leniently.
-case "$inner" in
-  'f=$(mktemp) && echo '*' | base64 -d > $f && sudo -n bash $f; __r=$?; rm -f $f; exit $__r') ;;
-  *) echo "ec2_stub: unexpected SSM command shape: $inner" >&2; exit 97 ;;
-esac
-b64="${{inner#*echo }}"
-b64="${{b64%% | base64*}}"
-decoded="$(printf '%s' "$b64" | base64 -d)"
-
+decoded="$1"
 # Rewrite absolute instance-side paths to land inside DEST.
 {rewrite_lines}
 {runuser_line}
 # No leerie user in the test sandbox — swallow chown, logging it when
 # a caller wants to assert the ownership fix actually happened.
-decoded="${{decoded//chown -R leerie: /echo chown-R >> \\"\\$CHOWN_LOG\\"; true }}"
-decoded="${{decoded//chown leerie: /echo chown >> \\"\\$CHOWN_LOG\\"; true }}"
-
-CHOWN_LOG="$CHOWN_LOG" bash -c "$decoded"
-# SSM's own process always exits 0 regardless of the wrapped command's
-# real exit status; the sentinel inside `decoded` already carried the
-# real rc back over stdout, which ec2_remote_exec parses.
-exit 0
+decoded="${{decoded//chown -R leerie: /echo chown-R >> \"\$CHOWN_LOG\"; true }}"
+decoded="${{decoded//chown leerie: /echo chown >> \"\$CHOWN_LOG\"; true }}"
+CHOWN_LOG="$CHOWN_LOG" exec bash -c "$decoded"
 """
     )
-    stub_path.chmod(0o755)
+    helper.chmod(0o755)
 
 
 def make_ssm_stub_ssh(
@@ -1159,6 +1129,19 @@ if [ "${{#rest[@]}}" -eq 0 ]; then
 fi
 
 case "${{rest[0]}}" in
+  "bash -c "*)
+    # ec2_remote_exec: `sudo -n bash -c <printf %q of cmd>` as one argv
+    # element (sudo already stripped above). Unquote it the way the
+    # remote login shell would, then run it with this stub's stdin.
+    eval "set -- ${{rest[0]#bash -c }}"
+    here="$(cd "$(dirname "$0")" && pwd)"
+    if [ -x "$here/ec2-remote-exec" ]; then
+      exec "$here/ec2-remote-exec" "$1"
+    fi
+    remote_cmd="$1"
+    {sh_rewrite_lines}
+    exec bash -c "$remote_cmd"
+    ;;
   sh*)
     # ec2_tar_pipe passes its whole receiver as ONE argv element:
     # "sh -c 'mkdir -p '\\''<dir>'\\'' && tar -xzC '\\''<dir>'\\'''"

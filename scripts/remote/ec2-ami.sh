@@ -241,22 +241,26 @@ _ec2_ami_bake() {
   sg="$(ec2_default_security_group)" || return 1
   key="$(ec2_default_key_name)" || return 1
 
-  local prev_exit prev_int prev_term
-  prev_exit="$(trap -p EXIT)"; prev_int="$(trap -p INT)"; prev_term="$(trap -p TERM)"
-  trap '_ec2_ami_bake_cleanup' EXIT
-  trap '_ec2_ami_bake_cleanup; exit 130' INT
-  trap '_ec2_ami_bake_cleanup; exit 143' TERM
-
-  local rc=0 image_id=""
-  _ec2_ami_bake_steps "$base_ami" "$itype" "$subnet" "$sg" "$key" "$version" "$hash" || rc=$?
-  image_id="$_EC2_AMI_BAKE_RESULT"
-  _ec2_ami_bake_cleanup
-  trap - EXIT INT TERM
-  [ -n "$prev_exit" ] && eval "$prev_exit"
-  [ -n "$prev_int" ] && eval "$prev_int"
-  [ -n "$prev_term" ] && eval "$prev_term"
-  [ "$rc" -eq 0 ] || return "$rc"
-  printf '%s\n' "$image_id"
+  # The teardown traps live in their own subshell, so the caller's traps
+  # are never touched. Saving and re-eval'ing them instead (`trap -p`) is
+  # wrong here: ensure_ami runs inside the launcher's $(...), where
+  # `trap -p` still reports the launcher's EXIT trap, and re-installing it
+  # ran the launcher's `rm -rf "$STAGE"` when this subshell exited —
+  # deleting the staged credentials before seeding (seen on a real run).
+  (
+    trap '_ec2_ami_bake_cleanup' EXIT
+    trap '_ec2_ami_bake_cleanup; exit 130' INT
+    trap '_ec2_ami_bake_cleanup; exit 143' TERM
+    rc=0
+    # stdout is the result (the AMI id, captured by ensure_ami's caller);
+    # the steps report through _EC2_AMI_BAKE_RESULT, so everything they or
+    # the bake instance print goes to stderr.
+    _ec2_ami_bake_steps "$base_ami" "$itype" "$subnet" "$sg" "$key" "$version" "$hash" >&2 || rc=$?
+    _ec2_ami_bake_cleanup
+    trap - EXIT INT TERM
+    [ "$rc" -eq 0 ] || exit "$rc"
+    printf '%s\n' "$_EC2_AMI_BAKE_RESULT"
+  )
 }
 
 _EC2_AMI_BAKE_RESULT=""

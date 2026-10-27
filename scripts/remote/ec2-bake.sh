@@ -87,6 +87,14 @@ mkdir -p /etc/chromium.d
 grep -m1 "^RUN echo 'CHROMIUM_FLAGS=" "$DOCKERFILE" | sed "s/^RUN echo '//; s/' *\\\\\$//" \
   > /etc/chromium.d/leerie-container-flags
 
+# --- leerie user ---
+# Before mise: its data dir (MISE_DATA_DIR) is under /home/leerie, and a home
+# that already exists makes `useradd -m` skip the skeleton files.
+if ! getent group "$LEERIE_GID" >/dev/null 2>&1; then
+  groupadd -g "$LEERIE_GID" leerie
+fi
+useradd -u "$LEERIE_UID" -g "$LEERIE_GID" -m -s /bin/bash leerie
+
 # --- mise + system-wide LTS runtimes ---
 curl -fsSL https://mise.run | MISE_VERSION="$MISE_VERSION" sh
 mv /root/.local/bin/mise /usr/local/bin/mise
@@ -107,12 +115,6 @@ printf 'set -a\n. %s\nset +a\n' "$LEERIE_ENV_FILE" > /etc/profile.d/leerie.sh
 # --- Claude Code CLI (pinned spec comes from the Dockerfile) ---
 export PATH=/usr/local/share/mise/installs/node/lts-current/bin:$PATH
 npm install -g "$CLAUDE_SPEC"
-
-# --- leerie user ---
-if ! getent group "$LEERIE_GID" >/dev/null 2>&1; then
-  groupadd -g "$LEERIE_GID" leerie
-fi
-useradd -u "$LEERIE_UID" -g "$LEERIE_GID" -m -s /bin/bash leerie
 
 git config --system --add safe.directory '*'
 
@@ -187,6 +189,56 @@ system_info:
     shell: /bin/bash
 CFG
 chmod g+w /work
+
+# --- What container-entry.sh does as PID 1, for an instance that has none ---
+# The cgroup broker (DESIGN §6 *Memory containment*): without it the
+# orchestrator's fail-closed containment gate refuses to start any worker.
+# Root on a real host is the rootful case, so leerie.slice sits at the top
+# of the hierarchy as in a rootful container. Not a Delegate=yes unit
+# cgroup: the broker would occupy it, and cgroup v2 forbids enabling
+# controllers on a cgroup that holds processes.
+cat > /usr/local/sbin/leerie-instance-setup <<'SETUP'
+#!/bin/sh
+# Boot-time half of container-entry.sh (scripts/remote/ec2-bake.sh).
+SLICE="${LEERIE_CGROUP_V2_ROOT:-/sys/fs/cgroup}/leerie.slice"
+mkdir -p "$SLICE" 2>/dev/null || true
+echo "+memory +pids" > "$SLICE/cgroup.subtree_control" 2>/dev/null || true
+# Aggregate cap, same formula as container-entry.sh: MemTotal minus
+# max(1 GiB, 12.5%), so the slice OOMs before the host does.
+cap="${LEERIE_CONTAINER_MEMORY_MAX_BYTES:-}"
+case "$cap" in 0|max) cap="" ;; "")
+  kb="$(awk '/^MemTotal:/ {print $2; exit}' "${LEERIE_MEMINFO:-/proc/meminfo}" 2>/dev/null)"
+  if [ -n "$kb" ] && [ "$kb" -gt 0 ] 2>/dev/null; then
+    total=$((kb * 1024)); reserve=$((total / 8)); min=$((1024 * 1024 * 1024))
+    [ "$reserve" -lt "$min" ] && reserve="$min"
+    [ "$total" -gt "$reserve" ] && cap=$((total - reserve))
+  fi ;;
+esac
+if [ -n "$cap" ] && [ "$cap" -gt 0 ] 2>/dev/null; then
+  echo "$cap" > "$SLICE/memory.max" 2>/dev/null || true
+fi
+# The boot empties /tmp; XDG_CACHE_HOME points at /tmp/.cache.
+cache="${LEERIE_TMP:-/tmp}/.cache"
+mkdir -p "$cache" && chown leerie: "$cache" 2>/dev/null; chmod 1777 "$cache" 2>/dev/null || true
+exit 0
+SETUP
+chmod 755 /usr/local/sbin/leerie-instance-setup
+cat > /etc/systemd/system/leerie-cgroup-broker.service <<'UNIT'
+[Unit]
+Description=leerie cgroup broker (worker containment)
+After=local-fs.target
+
+[Service]
+Type=simple
+ExecStartPre=/usr/local/sbin/leerie-instance-setup
+ExecStart=/usr/bin/python3 /opt/leerie-image/scripts/cgroup-broker.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+systemctl enable leerie-cgroup-broker.service
 
 # Disk-backed /tmp, as in the container. Debian 13 mounts /tmp as a RAM
 # tmpfs by default; seed bundles land there and XDG_CACHE_HOME points there,

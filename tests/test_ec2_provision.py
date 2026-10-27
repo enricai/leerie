@@ -572,3 +572,19 @@ def test_no_profile_means_no_profile_retry(tmp_path):
     assert result.returncode != 0
     assert _attempts(aws_dir) == 1
     assert "--iam-instance-profile" not in (aws_dir / "attempts.log").read_text()
+
+
+@pytest.mark.parametrize("no_push,expected", [("true", True), ("false", False), ("", False)])
+def test_sidecar_records_the_launch_time_no_push_intent(tmp_path, no_push, expected):
+    # decide_ec2_teardown reads this; the fetched run.json cannot carry it.
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    state_host_dir = tmp_path / "state"
+    run_dir = state_host_dir / "runs" / "run-np1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text("{}")
+    env = _stub_env(aws_dir, {"LEERIE_STATE_HOST_DIR": str(state_host_dir),
+                              "LEERIE_RUN_ID": "run-np1", "NO_PUSH": no_push})
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((run_dir / "ec2-instance.json").read_text())["host_no_push"] is expected

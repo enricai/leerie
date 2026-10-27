@@ -1,93 +1,65 @@
-"""Tests for scripts/remote/ec2-ssm.sh (`ec2_launch_detached` / `ec2_attach`).
+"""Tests for scripts/remote/ec2-ssm.sh (`ec2_launch_detached` / `ec2_attach`
+/ the `--shell` session).
 
-ec2-ssm.sh is the SSM Session Manager transport substitution for `flyctl
-ssh console`'s *launch* and *attach* roles (DESIGN §6 "Transport
-substitution for `flyctl ssh console`"). `aws ssm start-session
---target <id> --document-name AWS-StartInteractiveCommand --parameters
-command="python3 -"` (or `command="sh -s"` for attach) is the SSM analog
-of `flyctl ssh console --pty=false -C "python3 -"` — a short bootstrap
-command naming the interpreter, with the real (multi-KB) payload piped
-through as stdin, which the session-manager-plugin's interactive session
-forwards to the remote interpreter exactly like a normal ssh session
-would. This is distinct from ec2_remote_exec (ec2-lib.sh), which embeds
-its *entire* wrapped command inside the `--parameters command=[...]`
-document parameter — fine for ec2_remote_exec's short probe/mkdir/chown
-commands, but that parameter has a ~4 KB ceiling, far under the size of
-a real launch-wrapper or tail-wrapper script.
+Launch and attach go over SSH (DESIGN §6 "Transport substitution for
+`flyctl ssh console`"): `ssh … <target> "sudo -n python3 -"` with the
+launch wrapper on stdin, and `"sudo -n sh -s"` with the tail wrapper. Not
+an SSM AWS-StartInteractiveCommand session — on a real instance its pty
+turned `python3 -` into an interactive prompt and the session ended at
+host-stdin EOF before the payload was read. SSM is kept for the one
+interactive role, `--shell` on a live run.
 
-Exercised via subprocess against a stubbed `aws` binary that models
-`ssm start-session`'s two defining quirks: (1) it always exits 0 itself
-regardless of the wrapped remote command's real exit status (the
-documented session-manager-plugin limitation both ec2_remote_exec and
-this file work around via an rc-sentinel), and (2) it is a genuinely
-interactive session, i.e. it drains its own stdin and executes it as the
-bootstrap interpreter's program — unlike test_ec2_transport.py's
-`_stub_aws_ssm`, which only ever inspects the `--parameters` value and
-never touches stdin (ec2_remote_exec never pipes anything to it). No
-real AWS calls are made.
+The ssh stub runs the remote command locally through bash with the
+caller's stdin attached, so payload delivery and exit codes (rc=75, the
+flock-loser smart-resume pivot) are exercised for real. No real AWS or
+SSH calls are made.
 """
 from __future__ import annotations
 
-import base64
 import os
 from pathlib import Path
 
 from tests.conftest import run_bash
 from tests.ec2_stub import write_sudo_shim
-from tests.stub_helpers import _stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
 EC2_SSM_SH = REPO_ROOT / "scripts" / "remote" / "ec2-ssm.sh"
 LOG_SH = REPO_ROOT / "scripts" / "remote" / "_log.sh"
+SOURCES = f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; set +e; "
 
 
-def _stub_aws_interactive_session(bin_dir: Path, *, stall: bool = False) -> Path:
-    """Write a stub `aws` binary modeling `ssm start-session`'s real
-    behavior for AWS-StartInteractiveCommand: an interactive session
-    that drains its own stdin and forwards it to the wrapped command's
-    interpreter, then always exits 0 itself regardless of the wrapped
-    program's real exit status (the documented session-manager-plugin
-    limitation).
-
-    ec2-ssm.sh base64-wraps its `command=[...]` value (same idiom as
-    ec2_remote_exec in ec2-lib.sh, for the same reason — the wrapper
-    contains literal double quotes that would otherwise have to survive
-    the CLI's own JSON-array parsing): the stub decodes and execs it via
-    `bash -c`, with the interactive session's own stdin (the caller's
-    real, potentially multi-KB payload) forwarded straight through to
-    whatever interpreter (`python3 -` / `sh -s`) that decoded command
-    invokes — mirroring what the real session-manager-plugin does.
-    """
-    stub = bin_dir / "aws"
-    if stall:
-        stub.write_text(
-            "#!/usr/bin/env bash\n"
-            f"echo \"$@\" >> {bin_dir}/aws.log\n"
-            "cat >/dev/null\n"
-            "sleep 600\n"
-        )
-        stub.chmod(0o755)
-        return stub
-
+def _stub_ssh(bin_dir: Path) -> Path:
+    """Log argv; run the remote command (last argument) through bash with
+    this process's stdin, returning its exit status — as sshd would."""
+    stub = bin_dir / "ssh"
     stub.write_text(
         "#!/usr/bin/env bash\n"
-        f"echo \"$@\" >> {bin_dir}/aws.log\n"
-        'for arg in "$@"; do\n'
-        '  if [[ "$arg" == command=* ]]; then\n'
-        '    inner="${arg#command=[\\\"}"\n'
-        '    inner="${inner%\\\"]}"\n'
-        '    bash -c "$inner"\n'
-        "  fi\n"
-        "done\n"
-        # SSM's own process always exits 0 regardless of the wrapped
-        # program's real exit status.
-        "exit 0\n"
+        f'printf "%s\\n" "$*" >> {bin_dir}/ssh.log\n'
+        'for a; do last="$a"; done\n'
+        'exec bash -c "$last"\n'
     )
     stub.chmod(0o755)
-    # The wrapped command elevates with `sudo -n` on the instance.
     write_sudo_shim(bin_dir)
     return stub
+
+
+def _stub_aws(bin_dir: Path) -> Path:
+    stub = bin_dir / "aws"
+    stub.write_text(f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> {bin_dir}/aws.log\n')
+    stub.chmod(0o755)
+    return stub
+
+
+def _ssh_env(bin_dir: Path, **extra) -> dict:
+    return {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(bin_dir.parent),
+            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
+            "LEERIE_EC2_SSH_TARGET": "ec2-user@203.0.113.5", **extra}
+
+
+def _ssh_lines(bin_dir: Path) -> list[str]:
+    p = bin_dir / "ssh.log"
+    return p.read_text().splitlines() if p.exists() else []
 
 
 def test_ec2_ssm_sh_exists_and_is_executable():
@@ -95,265 +67,132 @@ def test_ec2_ssm_sh_exists_and_is_executable():
     assert os.access(EC2_SSM_SH, os.X_OK)
 
 
-def test_ec2_ssm_sh_defines_transport_functions():
-    src = EC2_SSM_SH.read_text()
-    assert "ec2_launch_detached()" in src
-    assert "ec2_attach()" in src
-
-
-# --- ec2_launch_detached -----------------------------------------------
-
-
-def test_ec2_launch_detached_pipes_payload_and_uses_start_interactive_command(tmp_path):
+def test_ec2_launch_detached_runs_the_payload_over_ssh_as_root(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    # ec2_launch_detached bootstraps `python3 -`, so the piped payload
-    # must be valid Python — mirrors the real launch-wrapper script.
-    payload = "print('launched-ok')"
+    _stub_ssh(bin_dir)
+    _stub_aws(bin_dir)
     result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' \"{payload}\" | ec2_launch_detached",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-        },
+        SOURCES + "printf '%s' \"print('launched-ok')\" | ec2_launch_detached",
+        env=_ssh_env(bin_dir),
     )
     assert result.returncode == 0, result.stderr
-    assert "launched-ok" in result.stdout
-    assert "__LEERIE_EC2_RC__" not in result.stdout
-
-    log = (bin_dir / "aws.log").read_text()
-    assert "ssm" in log
-    assert "start-session" in log
-    assert "--target i-0123456789abcdef0" in log
-    assert "AWS-StartInteractiveCommand" in log
-    assert "flyctl" not in log
+    assert result.stdout == "launched-ok\n"
+    (line,) = _ssh_lines(bin_dir)
+    assert line.endswith("ec2-user@203.0.113.5 sudo -n python3 -")
+    assert "BatchMode=yes" in line
+    # No SSM session for a non-interactive payload.
+    assert not any("ssm" in l for l in (bin_dir / "aws.log").read_text().splitlines()) \
+        if (bin_dir / "aws.log").exists() else True
 
 
-def test_ec2_launch_detached_propagates_rc_75_flock_loser_pivot(tmp_path):
-    """rc=75 (State.__init__'s EXIT_LOCKED / the launch wrapper's own
-    flock fast-path) must survive the SSM round trip uncorrupted — this
-    is the exact rc the launcher's smart-resume pivot branches on."""
+def test_ec2_launch_detached_returns_rc_75_flock_loser_pivot(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    payload = "import sys; sys.exit(75)"
+    _stub_ssh(bin_dir)
     result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' \"{payload}\" | ec2_launch_detached",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-        },
+        SOURCES + "printf '%s' 'import sys; sys.exit(75)' | ec2_launch_detached",
+        env=_ssh_env(bin_dir),
     )
     assert result.returncode == 75
 
 
-def test_ec2_launch_detached_propagates_other_nonzero_rc(tmp_path):
+def test_ec2_launch_detached_delivers_a_large_payload_intact(tmp_path):
+    # The real launch wrapper is several KB; it must arrive byte-for-byte.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' \"import sys; sys.exit(42)\" | ec2_launch_detached",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-        },
-    )
-    assert result.returncode == 42
-
-
-def test_ec2_launch_detached_fails_closed_on_empty_instance_id(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' \"print('should-not-run')\" | ec2_launch_detached",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "",
-        },
-    )
-    assert result.returncode == 1
-    assert "LEERIE_EC2_INSTANCE_ID" in result.stderr
-    assert not (bin_dir / "aws.log").exists()
-
-
-def test_ec2_launch_detached_timeout_yields_124_or_137(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir, stall=True)
-    _stub_timeout(bin_dir)
-
-    result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' \"pass\" | ec2_launch_detached",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-            "LEERIE_SEED_TIMEOUT_S": "1",
-        },
-    )
-    assert result.returncode in (124, 137), (
-        f"expected timeout rc 124/137, got {result.returncode}: {result.stderr}"
-    )
-
-
-def test_ec2_launch_detached_passes_profile_and_region(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' \"pass\" | ec2_launch_detached",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-            "LEERIE_AWS_PROFILE": "myprofile",
-            "LEERIE_AWS_REGION": "us-west-2",
-        },
-    )
+    _stub_ssh(bin_dir)
+    filler = "\n".join(f"x{i} = {i}" for i in range(2000))
+    payload = filler + "\nprint(sum(int(k[1:]) for k in dir() if k.startswith('x') and k[1:].isdigit()))\n"
+    script_file = tmp_path / "payload.py"
+    script_file.write_text(payload)
+    result = run_bash(SOURCES + f"ec2_launch_detached < {script_file}", env=_ssh_env(bin_dir))
     assert result.returncode == 0, result.stderr
-    log = (bin_dir / "aws.log").read_text()
-    assert "--profile myprofile" in log
-    assert "--region us-west-2" in log
+    assert result.stdout.strip() == str(sum(range(2000)))
 
 
-def test_ec2_launch_detached_handles_large_payload_over_4kb(tmp_path):
-    """The whole point of piping via stdin rather than embedding in
-    --parameters: a payload well over SSM's ~4 KB document-parameter
-    ceiling must still round-trip cleanly."""
+def test_ec2_attach_streams_the_tail_payload_and_returns_its_rc(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    # ~8 KB payload, comfortably over the 4 KB document-parameter cap.
-    # Valid Python — ec2_launch_detached bootstraps `python3 -`.
-    filler = "# " + ("x" * 100) + "\n"
-    payload = (filler * 80) + "print('LARGE_PAYLOAD_OK')"
-    assert len(payload) > 4096
-
+    _stub_ssh(bin_dir)
     result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"ec2_launch_detached",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-        },
-        input=payload,
-    )
-    assert result.returncode == 0, result.stderr
-    assert "LARGE_PAYLOAD_OK" in result.stdout
-
-
-# --- ec2_attach ----------------------------------------------------------
-
-
-def test_ec2_attach_uses_sh_s_bootstrap(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' 'echo attached-ok' | ec2_attach",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-        },
-    )
-    assert result.returncode == 0, result.stderr
-    assert "attached-ok" in result.stdout
-
-    log = (bin_dir / "aws.log").read_text()
-    assert "AWS-StartInteractiveCommand" in log
-    assert "flyctl" not in log
-    # The `command=[...]` value is base64-wrapped (see ec2-ssm.sh's
-    # docstring on why: the raw wrapper has literal double quotes that
-    # can't survive the CLI's own JSON-array parsing) — decode it back
-    # to confirm the "sh -s" bootstrap is really what got sent, rather
-    # than asserting on plaintext that's no longer in the log.
-    assert "sudo -n bash $f" in log
-    b64_start = log.index("&& echo ") + len("&& echo ")
-    b64_end = log.index(" | base64 -d", b64_start)
-    decoded = base64.b64decode(log[b64_start:b64_end]).decode()
-    assert decoded.startswith("sh -s;")
-
-
-def test_ec2_attach_propagates_nonzero_rc(tmp_path):
-    bin_dir = tmp_path / "bin"
-    bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' 'exit 17' | ec2_attach",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-        },
+        SOURCES + "printf 'echo tail-one\\necho tail-two\\nexit 17\\n' | ec2_attach",
+        env=_ssh_env(bin_dir),
     )
     assert result.returncode == 17
+    assert result.stdout == "tail-one\ntail-two\n"
+    (line,) = _ssh_lines(bin_dir)
+    assert line.endswith("sudo -n sh -s")
 
 
-def test_ec2_attach_fails_closed_on_empty_instance_id(tmp_path):
+def test_ec2_attach_is_not_wrapped_in_the_seed_timeout(tmp_path):
+    # A tail is long-lived by design; the seed timeout must not kill it.
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
-    result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' 'echo should-not-run' | ec2_attach",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "",
-        },
-    )
-    assert result.returncode == 1
-    assert "LEERIE_EC2_INSTANCE_ID" in result.stderr
-    assert not (bin_dir / "aws.log").exists()
+    _stub_ssh(bin_dir)
+    timeout = bin_dir / "timeout"
+    timeout.write_text(f'#!/usr/bin/env bash\necho used >> {bin_dir}/timeout.log\nshift; exec "$@"\n')
+    timeout.chmod(0o755)
+    result = run_bash(SOURCES + "printf 'exit 0' | ec2_attach",
+                      env=_ssh_env(bin_dir, LEERIE_SEED_TIMEOUT_S="1"))
+    assert result.returncode == 0, result.stderr
+    assert not (bin_dir / "timeout.log").exists()
 
 
-def test_ec2_attach_timeout_yields_124_or_137(tmp_path):
+def test_launch_and_attach_fail_closed_on_empty_instance_id(tmp_path):
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir, stall=True)
-    _stub_timeout(bin_dir)
+    _stub_ssh(bin_dir)
+    for fn in ("ec2_launch_detached", "ec2_attach"):
+        result = run_bash(SOURCES + f"printf 'echo should-not-run' | {fn}",
+                          env=_ssh_env(bin_dir, LEERIE_EC2_INSTANCE_ID=""))
+        assert result.returncode == 1, fn
+        assert "LEERIE_EC2_INSTANCE_ID" in result.stderr
+        assert "should-not-run" not in result.stdout
+    assert _ssh_lines(bin_dir) == []
 
+
+def test_shell_on_a_live_run_is_an_ssm_session_at_work_as_root(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stub_ssh(bin_dir)
+    _stub_aws(bin_dir)
     result = run_bash(
-        f"source {LOG_SH}; source {EC2_LIB_SH}; source {EC2_SSM_SH}; "
-        f"printf '%s' 'true' | ec2_attach",
-        env={
-            "PATH": f"{bin_dir}:/usr/bin:/bin",
-            "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
-            "LEERIE_SEED_TIMEOUT_S": "1",
-        },
+        SOURCES + "RESUME_SHELL=true; LEERIE_RUN_ID=r1; _attach_to_live_orchestrator_ec2; echo rc=$container_rc",
+        env=_ssh_env(bin_dir, LEERIE_AWS_PROFILE="p1", LEERIE_AWS_REGION="us-east-2"),
     )
-    assert result.returncode in (124, 137), (
-        f"expected timeout rc 124/137, got {result.returncode}: {result.stderr}"
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().endswith("rc=130")
+    (call,) = (bin_dir / "aws.log").read_text().splitlines()
+    assert call == ('ssm start-session --target i-0123456789abcdef0 --document-name '
+                    'AWS-StartInteractiveCommand --parameters command=["cd /work && exec sudo -n bash -i"] '
+                    '--region us-east-2 --profile p1')
+    assert _ssh_lines(bin_dir) == []
+
+
+def test_tail_on_a_live_run_goes_over_ssh(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stub_ssh(bin_dir)
+    _stub_aws(bin_dir)
+    result = run_bash(
+        SOURCES + "render_tail_wrapper() { echo 'echo tailing-$LEERIE_TAIL_RUN_ID'; }; "
+        "RESUME_SHELL=false; LEERIE_RUN_ID=r9; _attach_to_live_orchestrator_ec2; echo rc=$container_rc",
+        env=_ssh_env(bin_dir),
     )
+    assert result.returncode == 0, result.stderr
+    assert "tailing-r9" in result.stdout and result.stdout.strip().endswith("rc=130")
+    assert _ssh_lines(bin_dir)[-1].endswith("sudo -n sh -s")
 
 
 def test_ec2_ssm_sourcing_is_idempotent_and_independent(tmp_path):
-    """ec2-ssm.sh must be independently sourceable (it pulls in
-    ec2-lib.sh itself when not already loaded) and safe to source twice
-    without clobbering ec2_remote_exec — mirrors
-    ec2-fetch-branch.sh's/ec2-seed-repo.sh's double-source guard."""
+    """ec2-ssm.sh must be independently sourceable (it pulls in ec2-lib.sh
+    itself when not already loaded) and safe to source twice."""
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
-    _stub_aws_interactive_session(bin_dir)
-
     result = run_bash(
         f"source {EC2_SSM_SH}; source {EC2_SSM_SH}; "
-        f"type ec2_launch_detached >/dev/null && type ec2_remote_exec >/dev/null && echo SOURCED_OK",
+        "type ec2_launch_detached >/dev/null && type ec2_remote_exec >/dev/null && echo SOURCED_OK",
         env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
     )
     assert result.returncode == 0, result.stderr

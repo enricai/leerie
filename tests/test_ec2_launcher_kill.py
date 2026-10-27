@@ -22,12 +22,13 @@ EC2 path exercises both surfaces in one run:
   - `sts` / `ec2 <action>` subcommands route to the resource-tracking
     state machine (`tests/ec2_stub.py`), so assertions can read tracked
     instance/volume state and leaks, not just argv.
-  - `ssm start-session` (the transport `ec2_remote_exec` — and therefore
-    `fetch_state_ec2`'s run-discovery step — uses) routes to
-    `tests/test_ec2_fetch_branch.py`'s decode-and-exec-locally stub
-    (imported directly rather than reimplemented), against a real git
-    repo standing in for the instance's `/work`, so `fetch_state_ec2`
-    runs for real rather than being hand-waved.
+  - `ssh` (the transport `ec2_remote_exec` — and therefore
+    `fetch_state_ec2`'s run-discovery and download steps — uses) is
+    `tests/test_ec2_fetch_branch.py`'s exec-locally stub (imported directly
+    rather than reimplemented), against a real git repo standing in for the
+    instance's `/work`, so `fetch_state_ec2` runs for real rather than
+    being hand-waved. A thin wrapper also logs each ssh call into aws.log,
+    so ssh and EC2 calls share one ordered timeline.
 
 A hard-failing `flyctl` stub (records invocation, exits nonzero) is also
 on PATH so any accidental hand-off to the Fly path is caught immediately
@@ -60,53 +61,24 @@ LAUNCHER = REPO_ROOT / "leerie"
 
 INSTANCE_ID = "i-0123456789abcdef0"
 
-# Combined `aws` stub: ssm start-session decodes+execs locally against the
-# instance fixture (mirroring test_ec2_fetch_branch.py's _make_stub_aws);
-# everything else (sts, ec2 <action>) delegates to a Python resource-
-# tracking backend (mirroring tests/ec2_stub.py's state machine) so
-# kill's credential/instance-lifecycle calls are tracked too. Both
-# halves append to the same aws.log / state.json so
-# tests/ec2_stub.py's read_log/read_state/leaked_resources work
-# unmodified.
+# `aws` stub: every subcommand (sts, ec2 <action>) goes to the Python
+# resource-tracking backend (tests/ec2_stub.py's state machine) so kill's
+# credential/instance-lifecycle calls are tracked; it appends to the same
+# aws.log / state.json so read_log/read_state/leaked_resources work
+# unmodified. Remote commands go over ssh (see _setup_fixture).
 _COMBINED_AWS_STUB = r'''#!/usr/bin/env bash
 echo "$@" >> "{aws_dir}/aws.log"
-
-if [ "$1" = "ssm" ] && [ "$2" = "start-session" ]; then
-  DEST={dest!r}
-  param=""
-  prev=""
-  for arg in "$@"; do
-    if [ "$prev" = "--parameters" ]; then
-      param="$arg"
-    fi
-    prev="$arg"
-  done
-  if [ -z "$param" ]; then
-    exit 0
-  fi
-  inner="${{param#command=[\"}}"
-  inner="${{inner%\"]}}"
-  b64="${{inner#*echo }}"
-  b64="${{b64%% | base64*}}"
-  decoded="$(printf '%s' "$b64" | base64 -d)"
-  decoded="${{decoded//\/work/$DEST/work}}"
-  bash -c "$decoded"
-  exit 0
-fi
-
 exec python3 "{aws_dir}/_ec2_lifecycle_stub.py" "$@"
 '''
 
 
 def _write_combined_aws_stub(aws_dir: Path, instance_work: Path) -> None:
     aws_dir.mkdir(parents=True, exist_ok=True)
-    dest = str(instance_work.parent.resolve())
     stub = aws_dir / "aws"
-    stub.write_text(_COMBINED_AWS_STUB.format(aws_dir=str(aws_dir), dest=dest))
+    stub.write_text(_COMBINED_AWS_STUB.format(aws_dir=str(aws_dir)))
     stub.chmod(0o755)
     # Reuse tests/ec2_stub.py's Python stub source as the lifecycle
-    # backend, installed as a separate script the bash wrapper execs into
-    # for anything that isn't `ssm start-session`.
+    # backend, installed as a separate script the bash wrapper execs into.
     from tests.ec2_stub import _STUB_SOURCE
     (aws_dir / "_ec2_lifecycle_stub.py").write_text(_STUB_SOURCE)
     (aws_dir / "aws.log").write_text("")
@@ -169,7 +141,10 @@ def _setup_fixture(tmp_path: Path, *, with_completed_run: bool = True):
         _init_instance_repo_with_run(instance_work, fetch_run_id, run_branch)
 
     _write_combined_aws_stub(bin_dir, instance_work)
-    _make_stub_ssh(bin_dir / "ssh", tmp_path / "exec_log.txt", instance_work)
+    _make_stub_ssh(bin_dir / "ssh.real", tmp_path / "exec_log.txt", instance_work)
+    ssh = bin_dir / "ssh"
+    ssh.write_text(f'#!/usr/bin/env bash\necho "ssh $*" >> "{bin_dir}/aws.log"\nexec "{bin_dir}/ssh.real" "$@"\n')
+    ssh.chmod(0o755)
     _make_stub_timeout(bin_dir)
     _write_failing_flyctl(bin_dir)
 
@@ -212,12 +187,15 @@ def test_fetch_precedes_terminate_by_call_index(tmp_path):
     assert result.returncode == 0, f"stdout={result.stdout} stderr={result.stderr}"
 
     log = read_log(aws_dir)
-    ssm_calls = [i for i, l in enumerate(log) if l.startswith("ssm start-session")]
+    fetch_calls = [i for i, l in enumerate(log) if l.startswith("ssh ") and "sudo -n" in l]
     terminate_calls = [i for i, l in enumerate(log) if l.startswith("ec2 terminate-instances")]
-    assert ssm_calls, f"expected the fetch step's ssm start-session call; log={log}"
+    assert fetch_calls, f"expected the fetch step's ssh calls; log={log}"
     assert terminate_calls, f"expected a terminate-instances call; log={log}"
-    assert max(ssm_calls) < min(terminate_calls), (
-        f"fetch-before-terminate ordering violated: ssm_calls={ssm_calls} "
+    # Every fetch call — discovery over ec2_remote_exec and the bundle
+    # download — lands before the instance is destroyed.
+    assert any("bundle create" in log[i] for i in fetch_calls), log
+    assert max(fetch_calls) < min(terminate_calls), (
+        f"fetch-before-terminate ordering violated: fetch_calls={fetch_calls} "
         f"terminate_calls={terminate_calls}; log={log}"
     )
 

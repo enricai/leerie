@@ -151,6 +151,16 @@ _try_fetch_state_for_ec2_teardown() {
   return 0
 }
 
+# _ec2_host_no_push <run-dir> — "true" when the launch recorded --no-push in
+# the run's ec2-instance.json sidecar (or this launcher has NO_PUSH=true).
+_ec2_host_no_push() {
+  if [ "${NO_PUSH:-false}" = "true" ]; then echo true; return 0; fi
+  python3 -c '
+import json, sys
+try: print("true" if json.load(open(sys.argv[1])).get("host_no_push") else "false")
+except Exception: print("false")' "$1/ec2-instance.json" 2>/dev/null || echo false
+}
+
 # --- decide_ec2_teardown (registered as EXIT/INT/TERM trap) ----------------
 # The EC2 counterpart of decide_teardown() in provision.sh. Classifies
 # $LEERIE_REMOTE_EXIT_RC (set by the launcher just before exit) and
@@ -172,6 +182,19 @@ _try_fetch_state_for_ec2_teardown() {
 # Idempotent: the trap fires on every exit, including success; the
 # stop/terminate primitives no-op on an empty LEERIE_EC2_INSTANCE_ID.
 decide_ec2_teardown() {
+  local _rc=0
+  _decide_ec2_teardown_body || _rc=$?
+  # provision_instance/resume_instance replaced the launcher's EXIT trap
+  # with this function, which dropped the launcher's own duty to kill the
+  # $STAGE keepalive and remove $STAGE (staged ~/.ssh, ~/.aws, Claude
+  # credentials). The launcher defines the hook; standalone callers don't.
+  if declare -F _ec2_launcher_exit_cleanup >/dev/null 2>&1; then
+    _ec2_launcher_exit_cleanup
+  fi
+  return "$_rc"
+}
+
+_decide_ec2_teardown_body() {
   # Idempotency: mirrors provision.sh:222-230's LEERIE_TEARDOWN_DONE
   # guard — skip every pass after the first so a SIGINT-then-EXIT
   # double-fire can't re-run teardown with a clobbered rc.
@@ -218,6 +241,11 @@ decide_ec2_teardown() {
           if [ -n "$_rid" ]; then
             remote_log "remote: run 'leerie finalize $_rid' to push and open a PR after the run completes"
           fi
+          terminate_instance
+        elif [ -n "$run_dir" ] && [ -d "$run_dir" ] \
+             && [ "$(_ec2_host_no_push "$run_dir")" = "true" ]; then
+          remote_log "auto-finalize: --no-push was set at launch; run branch left on the host, no push or PR"
+          remote_log "remote: run 'leerie finalize $_rid' to push and open a PR later"
           terminate_instance
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
           local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
@@ -540,15 +568,20 @@ provision_instance() {
     local remote_dir="$_state_base/remote"
     mkdir -p "$remote_dir" 2>/dev/null || true
     local pid_record="$remote_dir/$$.json"
-    python3 - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" <<'PY'
+    # host_no_push: the user's launch-time --no-push intent, which the
+    # fetched run.json cannot carry (fetch_state_ec2 strips no_push=true
+    # whenever a run branch exists); decide_ec2_teardown reads it here.
+    # Same field fly-machine.json records for Fly.
+    python3 - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" "${NO_PUSH:-false}" <<'PY'
 import json, sys, datetime
-path, iid, region, run_id, pid = sys.argv[1:]
+path, iid, region, run_id, pid, no_push = sys.argv[1:]
 data = {
     "ec2_instance_id": iid,
     "region": region or None,
     "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "run_id": run_id or None,
     "launcher_pid": int(pid),
+    "host_no_push": no_push in ("true", "1", "yes"),
 }
 with open(path, "w") as f:
     json.dump(data, f, indent=2)

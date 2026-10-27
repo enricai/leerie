@@ -8386,6 +8386,15 @@ elif [ "$RUNTIME" = "ec2" ]; then
     REWRITTEN_ARGS+=("--host-no-push" "false")
   fi
 
+  # provision_instance/resume_instance replace this launcher's EXIT trap
+  # with decide_ec2_teardown, which calls this hook last so the STAGE
+  # keepalive and the staged credentials still go away on every exit.
+  _ec2_launcher_exit_cleanup() {
+    [ -n "${_stage_keepalive_pid:-}" ] && kill "$_stage_keepalive_pid" 2>/dev/null
+    [ -n "${STAGE:-}" ] && rm -rf "$STAGE" 2>/dev/null
+    return 0
+  }
+
   EC2_PROVISION_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-provision.sh"
   EC2_RESUME_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"
   EC2_SEED_AUTH_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-seed-auth.sh"
