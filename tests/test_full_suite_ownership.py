@@ -139,6 +139,24 @@ LIVE_PROBED = [
     ("pytest tests/{test_a,test_b}.py", False),
     ("pytest tests/test_a.py::test_x>out", False),
     ('pytest -k "a>b" tests/test_a.py', False),
+    # Round 4: `$(...)` and backticks stay live inside double quotes; a
+    # double-quote backslash escape keeps the quote open; a quoted redirect
+    # target is skipped whole; `$(` glued to a word is no boundary of its
+    # own (the `(` is).
+    ('echo "$(pytest tests/)"', True),
+    ('x="$(pytest tests/ -q)"; echo ok', True),
+    ('out="$(pytest tests/ -q 2>&1)"; echo "$out" | tail -5', True),
+    ('echo "`pytest tests/`"', True),
+    ('echo "result: `pytest tests/ -q`"', True),
+    ('pytest -k "a\\"|b" tests/', True),
+    ('pytest -k "a\\"; echo \\"b" tests/', True),
+    ('echo x > "a b"; pytest tests/; echo "c d"', True),
+    ("pytest tests/$(echo)", False),
+    # An unquoted substitution leaves the outer command whole too, and a
+    # single-quoted `|` is literal.
+    ("pytest $(cat k) tests/", True),
+    ("pytest `cat k` tests/", True),
+    ("echo 'a|pytest tests/'", False),
     ("python3 -m pytest tests/test_resolve_task_argument.py -q", False),
     ("python3 -m pytest -q -p no:cacheprovider tests/test_a.py "
      "tests/test_b.py", False),
@@ -673,7 +691,10 @@ def test_anchored_match_ignores_a_runner_word_that_is_not_a_run(
     "FOO=1 pytest tests/", "timeout -s KILL 60 pytest tests/",
     "timeout --signal KILL 50 pytest tests/",
     "if true; then pytest tests/; fi", "{ pytest tests/; }",
-    'pytest -k "not (slow)" tests/', "pytest \\\n  tests/"])
+    'pytest -k "not (slow)" tests/', "pytest \\\n  tests/",
+    # Round 4: a quoted assignment value with a space, and `env -u NAME`.
+    'PYTEST_ADDOPTS="-x -q" pytest tests/',
+    'PYTHONPATH="src lib" pytest tests/', "env -u HOME pytest tests/"])
 def test_anchored_match_still_sees_a_whole_suite_run(leerie, tmp_path, cmd):
     pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
     assert leerie._denied_by_full_suite_rules(cmd, pats, anchored=True)
@@ -781,3 +802,43 @@ def test_settle_keeps_requiring_a_prescribed_command(
         prescribed={"is_prescribed": True, "commands": [cmd]})
     assert res["status"] == "blocked"
     assert cmd in res["blocker"]
+
+
+def test_a_paraphrased_prescribed_command_is_resynthesised(
+        leerie, monkeypatch, tmp_path):
+    """Round 4: the planner covered a prescribed `uv run pytest tests/` with a
+    paraphrase (`… -q`); the paraphrase is not immune, so the strip removed
+    the only entry carrying the user's command. `_run_phases` re-runs the
+    adherence floor's repair, which synthesises the EXACT command (immune)."""
+    from tests.test_resume_planning_reentry import (
+        _StopAtExecute, _args, _caps, _plan, _stub_common, EFFORTS, MODELS)
+    repo = _repo(tmp_path)
+    leerie_root = tmp_path / ".leerie-state"
+    run_id = "strip-resynth-aaa111"
+    run_dir = leerie_root / "runs" / run_id
+    (run_dir / "subtasks").mkdir(parents=True)
+    sub = {"id": "test-001", "depends_on": [], "requires": [],
+           "provides": [], "runs_commands": ["uv run pytest tests/ -q"]}
+    plans = [_plan("testing", sub)]
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = leerie.State(leerie_root, run_id, repo_root=repo)
+    st.data = {"task": "t", "worker_count": 3, "categories": ["testing"],
+               "prescribed_procedure": {"is_prescribed": True,
+                                        "commands": ["uv run pytest tests/"]},
+               "plans_after_classify": [],
+               **{k: plans for k in (
+                   "plans_after_plan", "plans_after_reconcile",
+                   "plans_after_overlap_judge", "plans_after_adherence_gate",
+                   "plans_after_coverage_gate", "plans_after_filters")}}
+    st.save()
+    with pytest.raises(_StopAtExecute):
+        asyncio.run(leerie._run_phases(
+            _args(), _caps(leerie), run_dir, st, "codebase", "normal",
+            MODELS, EFFORTS))
+    snap = st.data["plan_snapshot"]["subtasks"]
+    carriers = [sid for sid, s in snap.items()
+                if "uv run pytest tests/" in (s.get("runs_commands") or [])]
+    assert carriers, "the exact prescribed command must survive scheduling"
+    assert leerie._full_suite_denials(
+        repo, st.data["prescribed_procedure"]), "and the deny stays on"

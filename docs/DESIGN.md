@@ -7017,12 +7017,17 @@ mechanism exists to remove. Four mechanisms read that list:
   with a quote-aware scan, not a regex: two review rounds of regex splits
   each broke a shape the CLI denies (operators alone missed `(pytest
   tests/)`; splitting on brackets after dropping quotes broke `pytest -k
-  "not (slow)" tests/`). Inside quotes everything is literal; outside, the
-  boundaries are the shell operators, newlines, `$(`, `(`, `)`, backticks
-  and brace *groups* — brace *expansion* (`tests/{a,b}.py`) stays part of a
-  word, as the CLI read it. Redirections are dropped and a backslash-newline
+  "not (slow)" tests/`). Single quotes are wholly literal; double quotes are
+  literal except for a backslash escape and a command substitution. A
+  substitution — `$(…)` or backticks, quoted or not — is a subcommand of its
+  own and leaves the command around it whole, because the CLI matched both
+  live (`echo "$(pytest tests/)"` and `pytest -k "$(cat k)" tests/` were
+  each denied). Outside quotes the boundaries are the shell operators,
+  newlines, a subshell's brackets and brace *groups* — brace *expansion*
+  (`tests/{a,b}.py`) stays part of a word, as the CLI read it. Redirections
+  are dropped with their target, quoted or not, and a backslash-newline
   continues the line. It then tries the match from every word of a
-  subcommand, which covers the CLI's wrapper stripping and errs wide on
+  subcommand, which covers the CLI's prefix stripping and errs wide on
   purpose: it also strips a paraphrase such as "run pytest tests/ to
   verify", since the declared-command check would accept only the refused
   command for it, and an over-match only drops a requirement. Agreement with
@@ -7042,22 +7047,31 @@ mechanism exists to remove. Four mechanisms read that list:
   whole-tree pass and that such criteria are `not_applicable`, 5 of 5
   completed on targeted tests.
 
-A user instruction outranks the default, in two parts. When the task's
+A user instruction outranks the default, in three parts. When the task's
 prescribed procedure (§12 *Instruction adherence is code-enforced*) is
 marked prescribed and one of its commands *is* a whole-suite run, the list
-is empty for that run — no deny, no strip, no exemption, no notice —
-because keeping any one of them would make the prescribed command
-impossible to run or impossible to require. That check is anchored: the
-command must start with the runner once the prefixes the CLI strips are
-removed (its documented wrappers, `timeout`'s option arguments, environment
-assignments and `env`, and a compound command's `then`/`do`/`else`), each
-because the CLI denied the prefixed form live. It is anchored because here,
-unlike the strip, an over-match would not drop one requirement but switch
-the whole mechanism off, and a prescribed `pip install pytest` is not a
-suite run. Second, a prescribed command is never stripped or exempted,
-whichever way the anchored check reads it: if the two match modes ever
-disagree about it, the worker that cannot satisfy it ends `blocked` and the
-operator sees why, rather than the instruction disappearing silently.
+is empty for that run — no deny, no strip, no exemption, no notice — because
+keeping any one of them would make the prescribed command impossible to run
+or impossible to require. That check is anchored: the command must start
+with the runner once the prefixes the CLI strips are removed (its documented
+wrappers, `timeout`'s option arguments, environment assignments — quoted
+values included — and `env` with its options, and a compound command's
+`then`/`do`/`else`/`!`), each because the CLI denied the prefixed form live.
+It is anchored because here, unlike the strip, an over-match would not drop
+one requirement but switch the whole mechanism off, and a prescribed `pip
+install pytest` is not a suite run. Second, a prescribed command is never
+stripped or exempted, whichever way the anchored check reads it: if the two
+match modes ever disagree about it, the worker that cannot satisfy it ends
+`blocked` and the operator sees why, rather than the instruction
+disappearing silently. Third, immunity is exact, and a planner usually
+paraphrases (`uv run pytest tests/ -q` for a prescribed `uv run pytest
+tests/`), which the adherence floor accepts as coverage but the strip may
+remove; so after the strip the floor's own repair
+(`_repair_prescribed_commands`) runs again, and synthesises a subtask
+carrying the exact, immune commands whenever coverage no longer holds.
+Immunity is deliberately not widened to paraphrases: a prescribed `pytest
+tests/test_a.py` would then shield a planner's `pytest tests/
+tests/test_a.py`, which the CLI denies.
 
 The derivation reads the target repo's files on every worker spawn, so it is
 total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,

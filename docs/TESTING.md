@@ -2176,7 +2176,7 @@ no-test-file path at all).
 
 ## The whole suite is orchestrator-owned
 
-`tests/test_full_suite_ownership.py` (115) covers DESIGN §9's two
+`tests/test_full_suite_ownership.py` (131) covers DESIGN §9's two
 whole-suite mechanisms: *absence means deferred, never full* for the test
 axis (`_select_subtask_axes`, `_DEFERRED_AXIS`) and the single rule list
 behind the deny, the plan-time strip, the settle-time exemption and the
@@ -2185,19 +2185,17 @@ notice (`_full_suite_rule_patterns`, `_shell_subcommands`,
 `FULL_SUITE_NOTICE`). Inputs are the 2026-10-26 incident's real
 `runs_commands`, commands whose deny verdict was observed live on the CLI
 (`LIVE_PROBED`), and barnacle-shaped `pnpm` configs for the negative
-controls. Twenty-seven components were ablated one at a time against this
+controls. Thirty-five components were ablated one at a time against this
 file and the four repinned scoped-axis files, and every ablation fails at
 least one test (restoring the canonical test fallback fails 6). Getting
 there, every component that left everything green was either removed as
-redundant or given its own pin: a leading-wrapper strip (redundant in the
-unanchored match; it returned, used only by the anchored match), the
-scanner's explicit `&&`/`||` and backslash-newline handling (subsumed by its
-single-character boundaries and its escape rule), and the strip's catch-all
-(pinned once per-entry skips stopped malformed entries from reaching it).
-Four lessons generalise. **(1) Omitted is not recorded.**
-`_apply_measured_axes` overwrites only the axes present in a measurement, so
-a deferred axis left out would let a conformer's self-reported "9373 passed"
-survive into the persisted entry;
+redundant or given its own pin, the pin taken from a live CLI verdict where
+one existed (single-quote literalness: `echo 'a|pytest tests/'` ran; an
+unquoted substitution keeping its outer command whole: `pytest $(cat k)
+tests/` was denied). Four lessons generalise. **(1) Omitted is not
+recorded.** `_apply_measured_axes` overwrites only the axes present in a
+measurement, so a deferred axis left out would let a conformer's
+self-reported "9373 passed" survive into the persisted entry;
 `test_docs_only_subtask_defers_tests_end_to_end` has the conformer *lie*,
 and asserts the lie is gone. **(2) A deny without a reason produces
 `blocked`, not compliance.** Replayed against the incident spec, workers
@@ -2210,14 +2208,18 @@ plan-time strip separately from the deny; review found `-k` selections and
 `cd … &&` prefixes kept by one and refused by the other, re-creating the
 forced-`blocked` state. One pattern list now feeds both, and
 `test_matcher_agrees_with_the_live_cli` holds the matcher to the CLI's
-observed verdicts rather than to its own reading of them. **(4) Replace a
-lossy primitive, don't patch it.** Two rounds of regex splits each fixed one
-family of shapes and broke another (operators alone missed subshells;
-splitting on brackets after dropping quotes broke `pytest -k "not (slow)"
-tests/`); a quote-aware scan ended the cycle. The same list read WIDE is
-safe where an over-match drops one requirement and unsafe where it disables
-the mechanism, so the prescribed-command check reads it anchored, and a
-prescribed command is never stripped or exempted at all.
+observed verdicts rather than to its own reading of them; 105 further live
+verdicts from review were replayed with no case where the CLI denied and the
+matcher did not. **(4) Replace a lossy primitive, don't patch it.** Two
+rounds of regex splits each fixed one family of shapes and broke another
+(operators alone missed subshells; splitting on brackets after dropping
+quotes broke `pytest -k "not (slow)" tests/`); a quote-aware scan ended the
+cycle, and its own first version still needed double-quoted substitutions
+and the outer command kept whole. The same list read WIDE is safe where an
+over-match drops one requirement and unsafe where it disables the mechanism,
+so the prescribed-command check reads it anchored, a prescribed command is
+never stripped or exempted, and a stripped paraphrase of one is
+resynthesised exactly.
 
 ## Pre-push preflight probe
 

@@ -19897,7 +19897,7 @@ def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
 # unanchored match tries every word instead, which covers them all.
 _SUITE_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
 _SUITE_WRAPPER_RE = re.compile(
-    r"^(?:env(?:\s+-\S+)*"
+    r"^(?:env(?:\s+(?:-u\s+\S+|--unset\s+\S+|-\S+))*"
     r"|timeout(?:\s+(?:-[sk]\s+\S+|--(?:signal|kill-after)\s+\S+|--?\S+))*"
     r"\s+\S+"
     r"|time(?:\s+-p)?|nice(?:\s+-n\s*\S+|\s+-\d+)?|nohup"
@@ -20083,40 +20083,73 @@ def _rule_matches(text: str, pattern: str) -> bool:
     return re.fullmatch(rx, text, flags=re.DOTALL) is not None
 
 
+# Stands in for whitespace inside quotes while a command is scanned, so a
+# quoted argument stays ONE word to the prefix strip and the word-suffix
+# search (`PYTEST_ADDOPTS="-x -q" pytest tests/`); turned back into a space
+# before any glob match.
+_QUOTED_SPACE = "\x00"  # not str.isspace(), unlike the ASCII separators
+
+
 def _shell_subcommands(cmd: str) -> list[str]:
     """`cmd` split into the subcommands the CLI matches rules against.
 
-    Quote-aware: inside quotes every character is literal (the quotes
-    themselves are dropped), so `pytest -k "not (slow)" tests/` stays one
-    subcommand. Outside quotes the boundaries are `;`, `|`, `&` (so `&&` and
-    `||` too), newline, `$(`, `(`, `)`, a backtick, and `{`/`}` only as group
-    words (whitespace on both sides) -- brace expansion such as
-    `tests/{a,b}.py` is part of a word, which is how the CLI read it live. A
-    backslash escapes the next character outside quotes, which is also what
-    makes a backslash-newline continue the line. Redirections outside quotes
-    (`> f`, `2>&1`, `<in`) are dropped with their target. Whitespace is
+    Quote-aware. Inside single quotes everything is literal. Inside double
+    quotes everything is literal except a backslash escape and a command
+    substitution. A substitution -- `$(...)` or backticks, quoted or not --
+    is its own subcommand AND leaves the command around it whole, as the CLI
+    matched both live: it denied `echo "$(pytest tests/)"` (the inner one)
+    and `pytest -k "$(cat k)" tests/` (the outer one); the substitution's
+    place in the outer text is held by a `$_` word. Quotes are dropped, and
+    whitespace inside them is kept as `_QUOTED_SPACE` so a quoted argument
+    stays one word. Outside quotes the boundaries are `;`, `|`, `&` (so `&&`
+    and `||` too), newline, a subshell's `(`/`)`, and `{`/`}` only as group
+    words
+    (whitespace or `;` after, whitespace or start before) -- brace expansion
+    such as `tests/{a,b}.py` is part of a word, which is how the CLI read it
+    live. A backslash escapes the next character, which is also what makes a
+    backslash-newline continue the line. Redirections outside quotes (`> f`,
+    `2>&1`, `<in`, `> "a b"`) are dropped with their target. Whitespace is
     collapsed per subcommand."""
     s = cmd
     n = len(s)
     segs: list[str] = []
     buf: list[str] = []
     quote: str | None = None
+    # Open substitutions: (closing char, quote to restore, outer text).
+    subst: list[tuple[str, str | None, list[str]]] = []
     i = 0
 
     def cut() -> None:
         segs.append("".join(buf))
         buf.clear()
 
+    def open_subst(closer: str, width: int) -> None:
+        nonlocal quote, i
+        subst.append((closer, quote, buf[:]))
+        buf.clear()
+        quote = None
+        i += width
+
     while i < n:
         ch = s[i]
-        if quote:
-            if ch == quote:
+        if quote == "'":
+            if ch == "'":
                 quote = None
-            elif ch == "\\" and quote == '"' and i + 1 < n:
+            else:
+                buf.append(_QUOTED_SPACE if ch.isspace() else ch)
+            i += 1
+            continue
+        if quote == '"':
+            if ch == '"':
+                quote = None
+            elif ch == "\\" and i + 1 < n:
                 i += 1
                 buf.append(s[i])
+            elif s.startswith("$(", i) or ch == "`":
+                open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
+                continue
             else:
-                buf.append(ch)
+                buf.append(_QUOTED_SPACE if ch.isspace() else ch)
             i += 1
             continue
         if ch in "'\"":
@@ -20127,11 +20160,17 @@ def _shell_subcommands(cmd: str) -> list[str]:
             buf.append(s[i + 1])
             i += 2
             continue
-        if s.startswith("$(", i):
+        if subst and ch == subst[-1][0]:
             cut()
-            i += 2
+            _closer, quote, outer = subst.pop()
+            buf.extend(outer)
+            buf.append("$_")
+            i += 1
             continue
-        if ch in ";|&\n()`":
+        if s.startswith("$(", i) or ch == "`":
+            open_subst(")" if ch == "$" else "`", 2 if ch == "$" else 1)
+            continue
+        if ch in ";|&\n()":
             cut()
             i += 1
             continue
@@ -20142,7 +20181,7 @@ def _shell_subcommands(cmd: str) -> list[str]:
             continue
         if ch in "<>":
             # Drop an fd number glued to the operator (`2>`), the operator,
-            # an `&` dup, and the target word.
+            # an `&` dup, and the target word -- quoted targets included.
             while buf and buf[-1].isdigit():
                 buf.pop()
             i += 1
@@ -20151,7 +20190,11 @@ def _shell_subcommands(cmd: str) -> list[str]:
             while i < n and s[i] in " \t":
                 i += 1
             while i < n and not s[i].isspace() and s[i] not in ";|&()":
-                i += 1
+                if s[i] in "'\"":
+                    close = s.find(s[i], i + 1)
+                    i = n if close < 0 else close + 1
+                else:
+                    i += 1
             buf.append(" ")
             continue
         buf.append(ch)
@@ -20202,6 +20245,7 @@ def _denied_by_full_suite_rules(cmd: str, patterns: list[str], *,
         else:
             words = seg.split()
             starts = [" ".join(words[i:]) for i in range(len(words))]
+        starts = [c.replace(_QUOTED_SPACE, " ") for c in starts]
         if any(_rule_matches(c, p) for c in starts for p in patterns):
             return True
     return False
@@ -39777,10 +39821,21 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # check would then force a worker to run (DESIGN §9 *The whole
             # suite is orchestrator-owned*). Idempotent, so a resume from
             # `plans_after_filters` re-applies it harmlessly.
+            _prescribed = st.data.get("prescribed_procedure") or {}
             for _sid in _strip_canonical_suite_commands(
-                    plans, st.repo_root, st.data.get("prescribed_procedure")):
+                    plans, st.repo_root, _prescribed):
                 log(f"  {_sid}: dropped its whole-suite runs_commands entry — "
                     f"the orchestrator's whole-tree pass runs the suite")
+            # A planner paraphrase of a prescribed command (`… -q`, "run …
+            # to verify") covers it for the adherence floor but is not
+            # immune, so the strip can remove the only entry carrying the
+            # user's command. Re-run the floor's repair: it synthesises a
+            # subtask running the EXACT prescribed commands, which are
+            # immune, whenever coverage no longer holds.
+            _resynth = _repair_prescribed_commands(plans, _prescribed)
+            if _resynth:
+                log(f"  {_resynth}: synthesised to run the prescribed "
+                    f"commands the whole-suite strip had uncovered")
             subtasks, waves = _schedule(plans)
             # Diagnostic snapshot BEFORE the two gates that can die()
             # below. Both are terminal, and the planner/fit_judge/splitter
