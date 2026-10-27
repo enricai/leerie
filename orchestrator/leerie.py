@@ -19874,28 +19874,34 @@ def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
 # comparison of SHELL COMMAND strings -- the canonical command and the
 # `runs_commands` entries a planner declares -- never of prose.
 
-# Matching mirrors the CLI's own (claude Bash permission rules): drop
-# redirections, split into subcommands, then glob-match each one, `*`
-# standing for any text and a trailing ` *` also matching the bare command.
-# ONE rule list feeds the deny, the plan-time strip and the settle-time
-# exemption, so a worker can never be required to run what it is denied (the
-# first version derived them separately and they disagreed).
+# Matching mirrors the CLI's own (claude Bash permission rules): split into
+# subcommands, drop redirections, then glob-match each one, `*` standing for
+# any text and a trailing ` *` also matching the bare command. ONE rule list
+# feeds the deny, the plan-time strip and the settle-time exemption, so the
+# three agree by construction (the first version derived them separately and
+# they disagreed). Agreement with the CLI itself is a per-shape claim, pinned
+# by `tests/test_full_suite_ownership.py::LIVE_PROBED` against verdicts the
+# CLI returned live -- a shape not in that list is unverified.
 #
-# Subcommand boundaries include subshell and substitution brackets: the CLI
-# denied `(cd sub && pytest tests/)`, `echo $(pytest tests/)` and
-# `(pytest tests/)` live, which a split on operators alone would miss.
-_SUITE_SEGMENT_RE = re.compile(r"&&|\|\||;|\||&|\n|\$\(|[(){}]")
-# Redirections (`> f`, `2>&1`, `<in`) are removed before splitting, as the
-# CLI does -- with or without a space before the operator (`tests/>out.txt`
-# was denied live): `pytest tests/ > f 2>&1` only matches `pytest * tests/`
-# once `> f` is gone.
-_SUITE_REDIRECT_RE = re.compile(r"\s*\d*(?:>>|>|<)&?\s*[^\s;&|()]*")
-# Leading wrappers the CLI strips before matching (its documented fixed
-# list). Used only by the ANCHORED match the prescribed-command check needs;
-# the unanchored match tries every word instead, which covers them.
+# The split is a quote-aware scan (`_shell_subcommands`), not a regex: two
+# review rounds of regex splits each broke a shape the CLI denies -- operators
+# alone missed `(pytest tests/)` and `echo $(pytest tests/)`, and splitting on
+# brackets after dropping quotes broke `pytest -k "not (slow)" tests/`.
+#
+# Prefixes stripped before an ANCHORED match, each because the CLI denied the
+# prefixed form live: its documented wrappers (`timeout`, including option
+# arguments such as `-s KILL`; `time`, `nice`, `nohup`, `stdbuf`, `command`,
+# `builtin`, `noglob`), environment assignments and `env` (`PYTHONPATH=.
+# pytest tests/`, `env X=1 pytest tests/`), and the shell keywords that open
+# a compound command's body (`if true; then pytest tests/; fi`). The
+# unanchored match tries every word instead, which covers them all.
+_SUITE_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
 _SUITE_WRAPPER_RE = re.compile(
-    r"^(?:timeout(?:\s+-\S+)*\s+\S+|time|nice(?:\s+-n\s*\S+)?|nohup"
-    r"|stdbuf(?:\s+-\S+)*|command|builtin|noglob)\s+")
+    r"^(?:env(?:\s+-\S+)*"
+    r"|timeout(?:\s+(?:-[sk]\s+\S+|--(?:signal|kill-after)\s+\S+|--?\S+))*"
+    r"\s+\S+"
+    r"|time(?:\s+-p)?|nice(?:\s+-n\s*\S+|\s+-\d+)?|nohup"
+    r"|stdbuf(?:\s+-\S+)*|command|builtin|noglob|then|do|else|!)\s+")
 _NPM_FAMILY_TEST_RE = re.compile(r"^(npm|pnpm|yarn|bun)(?: run)? test$")
 _PYTEST_FORMS = ("pytest", "python3 -m pytest", "python -m pytest")
 FULL_SUITE_NOTICE = (
@@ -19997,11 +20003,9 @@ def _full_suite_rule_patterns(repo_root: str | Path,
         # whole-suite run, not if a runner word merely appears in it (`pip
         # install pytest`, `-k pytest`) -- an over-match here would switch
         # the whole mechanism off for the run.
-        if (prescribed or {}).get("is_prescribed"):
-            for c in (prescribed.get("commands") or []):
-                if isinstance(c, str) and _denied_by_full_suite_rules(
-                        c, pats, anchored=True):
-                    return []
+        for c in _prescribed_commands(prescribed):
+            if _denied_by_full_suite_rules(c, pats, anchored=True):
+                return []
         return pats
     except Exception as e:
         _warn_full_suite_deny_skipped_once(e)
@@ -20079,6 +20083,103 @@ def _rule_matches(text: str, pattern: str) -> bool:
     return re.fullmatch(rx, text, flags=re.DOTALL) is not None
 
 
+def _shell_subcommands(cmd: str) -> list[str]:
+    """`cmd` split into the subcommands the CLI matches rules against.
+
+    Quote-aware: inside quotes every character is literal (the quotes
+    themselves are dropped), so `pytest -k "not (slow)" tests/` stays one
+    subcommand. Outside quotes the boundaries are `;`, `|`, `&` (so `&&` and
+    `||` too), newline, `$(`, `(`, `)`, a backtick, and `{`/`}` only as group
+    words (whitespace on both sides) -- brace expansion such as
+    `tests/{a,b}.py` is part of a word, which is how the CLI read it live. A
+    backslash escapes the next character outside quotes, which is also what
+    makes a backslash-newline continue the line. Redirections outside quotes
+    (`> f`, `2>&1`, `<in`) are dropped with their target. Whitespace is
+    collapsed per subcommand."""
+    s = cmd
+    n = len(s)
+    segs: list[str] = []
+    buf: list[str] = []
+    quote: str | None = None
+    i = 0
+
+    def cut() -> None:
+        segs.append("".join(buf))
+        buf.clear()
+
+    while i < n:
+        ch = s[i]
+        if quote:
+            if ch == quote:
+                quote = None
+            elif ch == "\\" and quote == '"' and i + 1 < n:
+                i += 1
+                buf.append(s[i])
+            else:
+                buf.append(ch)
+            i += 1
+            continue
+        if ch in "'\"":
+            quote = ch
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            buf.append(s[i + 1])
+            i += 2
+            continue
+        if s.startswith("$(", i):
+            cut()
+            i += 2
+            continue
+        if ch in ";|&\n()`":
+            cut()
+            i += 1
+            continue
+        if (ch in "{}" and (i == 0 or s[i - 1].isspace())
+                and (i + 1 == n or s[i + 1].isspace() or s[i + 1] == ";")):
+            cut()
+            i += 1
+            continue
+        if ch in "<>":
+            # Drop an fd number glued to the operator (`2>`), the operator,
+            # an `&` dup, and the target word.
+            while buf and buf[-1].isdigit():
+                buf.pop()
+            i += 1
+            while i < n and s[i] in "<>&":
+                i += 1
+            while i < n and s[i] in " \t":
+                i += 1
+            while i < n and not s[i].isspace() and s[i] not in ";|&()":
+                i += 1
+            buf.append(" ")
+            continue
+        buf.append(ch)
+        i += 1
+    cut()
+    return [seg for seg in (" ".join(x.split()) for x in segs) if seg]
+
+
+def _strip_command_prefixes(seg: str) -> str:
+    """`seg` without the leading wrappers and environment assignments the
+    CLI strips before matching (`_SUITE_WRAPPER_RE`, `_SUITE_ASSIGN_RE`)."""
+    while True:
+        out = _SUITE_ASSIGN_RE.sub("", _SUITE_WRAPPER_RE.sub("", seg, count=1),
+                                   count=1)
+        if out == seg:
+            return seg
+        seg = out
+
+
+def _prescribed_commands(prescribed: dict | None) -> set[str]:
+    """Whitespace-normalised commands the user's task PRESCRIBED, or an empty
+    set unless `is_prescribed` is set (every consumer gates on it)."""
+    if not isinstance(prescribed, dict) or not prescribed.get("is_prescribed"):
+        return set()
+    return {" ".join(c.split()) for c in (prescribed.get("commands") or [])
+            if isinstance(c, str)}
+
+
 def _denied_by_full_suite_rules(cmd: str, patterns: list[str], *,
                                 anchored: bool = False) -> bool:
     """True when the whole-suite deny would refuse `cmd`, or (unanchored)
@@ -20095,17 +20196,9 @@ def _denied_by_full_suite_rules(cmd: str, patterns: list[str], *,
     start after the CLI's own wrappers is tried."""
     if not patterns or not isinstance(cmd, str):
         return False
-    text = cmd.translate(str.maketrans("", "", "`'\""))
-    text = _SUITE_REDIRECT_RE.sub(" ", text)
-    for raw in _SUITE_SEGMENT_RE.split(text):
-        seg = " ".join(raw.split())
+    for seg in _shell_subcommands(cmd):
         if anchored:
-            while True:
-                stripped = _SUITE_WRAPPER_RE.sub("", seg, count=1)
-                if stripped == seg:
-                    break
-                seg = stripped
-            starts = [seg] if seg else []
+            starts = [_strip_command_prefixes(seg)]
         else:
             words = seg.split()
             starts = [" ".join(words[i:]) for i in range(len(words))]
@@ -20123,13 +20216,17 @@ def _strip_canonical_suite_commands(plans: list[dict],
 
     Measured (leerie, 2026-10-26): a repo rule auto-loaded from CLAUDE.md led
     planners to declare `pytest tests/` on four verification subtasks across
-    two runs, and the one that ran exhausted its worker timeout. When the
-    user's task PRESCRIBED such a command the rule list is empty (see
-    `_full_suite_rule_patterns`), so nothing is stripped and nothing denied."""
+    two runs, and the one that ran exhausted its worker timeout. A command
+    the user's task PRESCRIBED is never stripped (`_prescribed_commands`):
+    if it is itself a whole-suite run the rule list is already empty (see
+    `_full_suite_rule_patterns`); if the anchored match does not see it as
+    one, keeping it means a worker that cannot satisfy it ends `blocked`
+    loudly rather than the user's instruction being dropped silently."""
     try:
         pats = _full_suite_rule_patterns(repo_root, prescribed)
         if not pats:
             return []
+        keep = _prescribed_commands(prescribed)
         touched: list[str] = []
         for plan in plans:
             if not isinstance(plan, dict):
@@ -20141,7 +20238,9 @@ def _strip_canonical_suite_commands(plans: list[dict],
                 if not isinstance(rc, list) or not rc:
                     continue
                 kept = [c for c in rc
-                        if not _denied_by_full_suite_rules(c, pats)]
+                        if (isinstance(c, str)
+                            and " ".join(c.split()) in keep)
+                        or not _denied_by_full_suite_rules(c, pats)]
                 if len(kept) != len(rc):
                     sub["runs_commands"] = kept
                     touched.append(str(sub.get("id")))
@@ -30607,12 +30706,13 @@ def _select_subtask_axes(blt: dict[str, str], scoped: dict[str, str],
 
     Under `scoped`, a `tests` axis whose proxy does not resolve is DEFERRED
     to the whole-tree pass -- omitted here, never replaced by the canonical
-    command (DESIGN §9 *Absence ... means deferred, never full*). The
+    command (DESIGN §9 *Per-subtask scope*, the absence rule). The
     canonical fallback this replaced ran leerie's whole suite on 57-64% of
     its own subtasks, every docs-only one included, and in none of the 50
     such per-subtask records on disk did the conformer make a test change.
-    `build` and `lint` keep the canonical fallback: that evidence is about suites, and a compiled language's
-    per-subtask build is its cheapest regression signal. The caller records
+    `build` and `lint` keep the canonical fallback: that evidence is about
+    suites, and a compiled language's per-subtask build is its cheapest
+    regression signal. The caller records
     a deferred axis explicitly (`_deferred_axes`) so it is never silently
     absent. The scope label never claims a narrowing that did not happen."""
     canonical = {"build": (blt.get("build") or "").strip(),
@@ -36823,11 +36923,13 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # plan-time strip: it also covers a spec written before the strip
             # existed (a resumed run past `plan_snapshot`) and any paraphrase
             # the strip's planner input never saw.
-            _suite_pats = _full_suite_rule_patterns(
-                st.repo_root, st.data.get("prescribed_procedure"))
+            _prescribed = st.data.get("prescribed_procedure")
+            _suite_pats = _full_suite_rule_patterns(st.repo_root, _prescribed)
+            _keep = _prescribed_commands(_prescribed)
             _declared = {**subtask, "runs_commands": [
                 c for c in (subtask.get("runs_commands") or [])
-                if not _denied_by_full_suite_rules(c, _suite_pats)]}
+                if (isinstance(c, str) and " ".join(c.split()) in _keep)
+                or not _denied_by_full_suite_rules(c, _suite_pats)]}
             declared_unrun = check_declared_commands_executed(
                 _declared,
                 _executed_bash_commands(leerie_dir / "logs" / f"{sid}.log"))

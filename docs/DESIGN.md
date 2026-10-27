@@ -6918,9 +6918,9 @@ So the per-subtask axes may run a **delta proxy** — a cheaper command
 scoped to the changed files — while the canonical test command runs exactly
 twice per run: once at the base-health baseline and once (per round) on the
 integrated tree (a `build` with no proxy still runs canonically per subtask;
-see the absence rule below). Measured, the median subtask in one run touched a single
-source file, yet every conformer round ran the whole ~990-file suite at
-~499s a time against ~23s for a scoped run of the same repo.
+see the absence rule below). Measured, the median subtask in one run touched
+a single source file, yet every conformer round ran the whole ~990-file
+suite at ~499s a time against ~23s for a scoped run of the same repo.
 
 A proxy is repo-declared (`test_scoped` / `build_scoped` in
 `.leerie/config.toml`) or inferred from two narrow signals, rendered from a
@@ -6990,12 +6990,12 @@ pass, which measures the canonical suite.
 **The whole suite is orchestrator-owned, and code enforces it.** The
 implementer, conformer, integrator and rebaser prompts already say not to
 run the full suite; a prompt that loses to a repo rule is not enforcement.
-Measured (leerie, 2026-10-26): the target repo's own CLAUDE.md ("run `pytest tests/` before calling a change
-green"), which `claude -p` auto-loads, led planners to emit verification
-subtasks declaring `runs_commands: ["pytest tests/"]`; the declared-command
-check (§8 *A declared command must also have been executed*) then
-*required* the worker to run it, and one such subtask exhausted its worker
-timeout running suites.
+Measured (leerie, 2026-10-26): the target repo's own CLAUDE.md ("run `pytest
+tests/` before calling a change green"), which `claude -p` auto-loads, led
+planners to emit verification subtasks declaring `runs_commands: ["pytest
+tests/"]`; the declared-command check (§8 *A declared command must also have
+been executed*) then *required* the worker to run it, and one such subtask
+exhausted its worker timeout running suites.
 
 Everything below derives from **one rule list** — the canonical test
 command in every spelling a worker types (`pytest` / `python3 -m pytest`,
@@ -7013,13 +7013,21 @@ mechanism exists to remove. Four mechanisms read that list:
   selections included; file-targeted runs, loops over files and selections
   that name no test root still run.
 - **Plan-time strip.** A `runs_commands` entry the list would refuse is
-  removed before scheduling. The matcher mirrors the CLI's (redirections,
-  subcommands — operators, newlines, subshell and substitution brackets —
-  glob) and tries the match from every word of a subcommand, which covers
-  the CLI's wrapper stripping and errs wide on purpose — it also
-  strips a paraphrase such as "run pytest tests/ to verify", since the
-  declared-command check would accept only the refused command for it, and
-  an over-match only drops a requirement.
+  removed before scheduling. The matcher splits a command into subcommands
+  with a quote-aware scan, not a regex: two review rounds of regex splits
+  each broke a shape the CLI denies (operators alone missed `(pytest
+  tests/)`; splitting on brackets after dropping quotes broke `pytest -k
+  "not (slow)" tests/`). Inside quotes everything is literal; outside, the
+  boundaries are the shell operators, newlines, `$(`, `(`, `)`, backticks
+  and brace *groups* — brace *expansion* (`tests/{a,b}.py`) stays part of a
+  word, as the CLI read it. Redirections are dropped and a backslash-newline
+  continues the line. It then tries the match from every word of a
+  subcommand, which covers the CLI's wrapper stripping and errs wide on
+  purpose: it also strips a paraphrase such as "run pytest tests/ to
+  verify", since the declared-command check would accept only the refused
+  command for it, and an over-match only drops a requirement. Agreement with
+  the CLI is a per-shape claim, pinned against verdicts the CLI returned
+  live; a shape outside that set is unverified.
 - **Settle-time exemption.** The declared-command check skips any entry the
   list refuses. This, not the strip, is the choke point: it also covers a
   spec written before the strip existed (a run resumed past scheduling).
@@ -7029,21 +7037,27 @@ mechanism exists to remove. Four mechanisms read that list:
   `--dangerously-skip-permissions` widened with the runner's verb, and
   excludes the unwidened inspect-only ones, for which the deny is inert.
   Deny alone is unsafe: in a controlled replay of the incident spec, 2 of 2
-  workers that hit the deny returned `blocked` (whose commits auto-accept never merges).
-  With a code-authored notice that the suite belongs to the whole-tree pass
-  and that such criteria are `not_applicable`, 5 of 5 completed on targeted
-  tests.
+  workers that hit the deny returned `blocked` (whose commits auto-accept
+  never merges). With a code-authored notice that the suite belongs to the
+  whole-tree pass and that such criteria are `not_applicable`, 5 of 5
+  completed on targeted tests.
 
-A user instruction outranks the default: when the task's prescribed
-procedure (§12 *Instruction adherence is code-enforced*) is marked
-prescribed and one of its commands *is* a whole-suite run, the list is
-empty for that run — no deny, no strip, no exemption, no notice — because
-keeping any one of them would make the prescribed command impossible to run
-or impossible to require. That check is anchored (the command must start
-with the runner, after the CLI's own wrappers), unlike the strip's wide
-match: there an over-match would not drop one requirement but switch the
-whole mechanism off, and a prescribed `pip install pytest` is not a suite
-run.
+A user instruction outranks the default, in two parts. When the task's
+prescribed procedure (§12 *Instruction adherence is code-enforced*) is
+marked prescribed and one of its commands *is* a whole-suite run, the list
+is empty for that run — no deny, no strip, no exemption, no notice —
+because keeping any one of them would make the prescribed command
+impossible to run or impossible to require. That check is anchored: the
+command must start with the runner once the prefixes the CLI strips are
+removed (its documented wrappers, `timeout`'s option arguments, environment
+assignments and `env`, and a compound command's `then`/`do`/`else`), each
+because the CLI denied the prefixed form live. It is anchored because here,
+unlike the strip, an over-match would not drop one requirement but switch
+the whole mechanism off, and a prescribed `pip install pytest` is not a
+suite run. Second, a prescribed command is never stripped or exempted,
+whichever way the anchored check reads it: if the two match modes ever
+disagree about it, the worker that cannot satisfy it ends `blocked` and the
+operator sees why, rather than the instruction disappearing silently.
 
 The derivation reads the target repo's files on every worker spawn, so it is
 total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,

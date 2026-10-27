@@ -64,7 +64,8 @@ def test_the_source_only_subtask_is_deferred(leerie, corpus):
     blt = {"build": "", "lint": "", "test": "pytest"}
     src_only = [r for r in corpus
                 if not any(f.startswith("tests/") for f in r["files"])]
-    assert src_only, "fixture lost its source-only row; the deferral is untested"
+    assert src_only, \
+        "fixture lost its source-only row; the deferral is untested"
     for r in src_only:
         assert leerie._render_scoped(PROXY, r["files"], "base") is None, r["sid"]
         axes, scope = leerie._select_subtask_axes(

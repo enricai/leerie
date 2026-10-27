@@ -123,6 +123,22 @@ LIVE_PROBED = [
     ("pytest tests/>out.txt", True),
     ("pytest tests/<in.txt", True),
     ("(pytest tests/)", True),
+    # Round 3: quoted brackets, separators and substitutions are literal to
+    # the CLI; a backslash-newline continues the line; a brace GROUP is a
+    # subcommand while brace EXPANSION is part of a word.
+    ('pytest -k "not (slow)" tests/', True),
+    ('pytest -m "(unit or fast)" tests/', True),
+    ('pytest -k "{a}" tests/', True),
+    ('pytest -k "$(cat k)" tests/', True),
+    ("pytest \\\n  tests/", True),
+    ('pytest -k "a|b" tests/', True),
+    ('pytest -k "x;y" tests/', True),
+    ('pytest --deselect "tests/test_a.py::t[1|2]" tests/', True),
+    ("{ pytest tests/; }", True),
+    ("if true; then pytest tests/; fi", True),
+    ("pytest tests/{test_a,test_b}.py", False),
+    ("pytest tests/test_a.py::test_x>out", False),
+    ('pytest -k "a>b" tests/test_a.py', False),
     ("python3 -m pytest tests/test_resolve_task_argument.py -q", False),
     ("python3 -m pytest -q -p no:cacheprovider tests/test_a.py "
      "tests/test_b.py", False),
@@ -576,7 +592,8 @@ def _settle_env(env, monkeypatch, *, declared, prescribed=None):  # noqa: F811
     return res, calls
 
 
-def test_settle_exempts_a_denied_declared_command(env, monkeypatch):  # noqa: F811
+def test_settle_exempts_a_denied_declared_command(
+        env, monkeypatch):  # noqa: F811
     """An OLD spec still declaring `pytest tests/` (never stripped) settles
     complete on targeted runs alone, with no corrective re-drive."""
     res, calls = _settle_env(
@@ -586,7 +603,8 @@ def test_settle_exempts_a_denied_declared_command(env, monkeypatch):  # noqa: F8
     assert len(calls) == 1
 
 
-def test_settle_still_demands_a_prescribed_whole_suite_run(env, monkeypatch):  # noqa: F811
+def test_settle_still_demands_a_prescribed_whole_suite_run(
+        env, monkeypatch):  # noqa: F811
     """Control: when the user PRESCRIBED the whole suite there is no deny,
     so there is no exemption -- an unrun prescribed command still blocks."""
     res, calls = _settle_env(
@@ -635,6 +653,8 @@ def test_the_strip_never_raises_on_a_malformed_plan(leerie, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cmd", [
+    "pytest tests/{test_a,test_b}.py",                  # CLI: ran
+    "timeout 60 pytest tests/test_a.py",
     "pip show pytest",                                  # CLI: ran
     "python3 -m pytest tests/test_a.py -k pytest",      # CLI: ran
     "pip install pytest",
@@ -647,7 +667,13 @@ def test_anchored_match_ignores_a_runner_word_that_is_not_a_run(
 
 
 @pytest.mark.parametrize("cmd", [
-    "pytest tests/", "timeout 5 nohup pytest tests/ -q", "(pytest tests/)"])
+    "pytest tests/", "timeout 5 nohup pytest tests/ -q", "(pytest tests/)",
+    # Round 3: prefixes the CLI strips, each denied live in prefixed form.
+    "PYTHONPATH=. pytest tests/", "env X=1 pytest tests/",
+    "FOO=1 pytest tests/", "timeout -s KILL 60 pytest tests/",
+    "timeout --signal KILL 50 pytest tests/",
+    "if true; then pytest tests/; fi", "{ pytest tests/; }",
+    'pytest -k "not (slow)" tests/', "pytest \\\n  tests/"])
 def test_anchored_match_still_sees_a_whole_suite_run(leerie, tmp_path, cmd):
     pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
     assert leerie._denied_by_full_suite_rules(cmd, pats, anchored=True)
@@ -714,3 +740,44 @@ def test_the_strip_survives_a_non_iterable_plan_list(leerie, tmp_path):
     runs on the scheduling path and must never take it down."""
     assert leerie._strip_canonical_suite_commands(
         None, _repo(tmp_path), {}) == []
+
+
+# ---------------------------------------------------------------------------
+# round 3: a prescribed command is never stripped or exempted, so the two
+# match modes cannot disagree about it silently
+# ---------------------------------------------------------------------------
+
+def test_a_prescribed_prefixed_suite_run_lifts_the_deny(leerie, tmp_path):
+    prescribed = {"is_prescribed": True,
+                  "commands": ["PYTHONPATH=. pytest tests/"]}
+    assert leerie._full_suite_denials(_repo(tmp_path), prescribed) == ""
+
+
+def test_a_prescribed_command_the_wide_match_would_strip_is_kept(
+        leerie, tmp_path):
+    """`run pytest on the touched tests` reads as `pytest * tests` to the
+    wide match but is no suite run to the anchored one, so the deny stays --
+    and the entry must stay too: dropping it would discard the user's
+    instruction without a word."""
+    cmd = "run pytest on the touched tests"
+    prescribed = {"is_prescribed": True, "commands": [cmd]}
+    root = _repo(tmp_path)
+    assert leerie._full_suite_denials(root, prescribed)
+    plans = [{"subtasks": [{"id": "t-1", "runs_commands": [
+        cmd, "pytest tests/"]}]}]
+    assert leerie._strip_canonical_suite_commands(
+        plans, root, prescribed) == ["t-1"]
+    assert plans[0]["subtasks"][0]["runs_commands"] == [cmd]
+
+
+def test_settle_keeps_requiring_a_prescribed_command(
+        env, monkeypatch):  # noqa: F811
+    """Settle-side twin: the exemption must not drop a prescribed entry the
+    wide match would refuse -- the subtask ends `blocked`, loudly, rather
+    than `complete` without the user's command ever running."""
+    cmd = "run pytest on the touched tests"
+    res, calls = _settle_env(
+        env, monkeypatch, declared=[cmd],
+        prescribed={"is_prescribed": True, "commands": [cmd]})
+    assert res["status"] == "blocked"
+    assert cmd in res["blocker"]
