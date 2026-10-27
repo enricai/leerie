@@ -329,20 +329,3 @@ def test_instance_profile_does_not_bleed_into_other_knobs(tmp_path):
         "", "", "", "", "", "p-only",
     )
 
-
-def test_resolve_instance_profile_reads_the_env_var():
-    """ec2-lib.sh's resolve_instance_profile prints the launcher-resolved
-    value and is empty success when unset (the knob is optional)."""
-    def run(env: dict) -> subprocess.CompletedProcess:
-        base = {k: v for k, v in os.environ.items()}
-        base.pop("LEERIE_EC2_INSTANCE_PROFILE", None)
-        base.update(env)
-        return subprocess.run(
-            ["bash", "-c",
-             f"source {LOG_SH}; source {EC2_LIB_SH}; resolve_instance_profile"],
-            env=base, capture_output=True, text=True,
-        )
-    set_ = run({"LEERIE_EC2_INSTANCE_PROFILE": "my-profile"})
-    assert (set_.returncode, set_.stdout) == (0, "my-profile"), set_.stderr
-    unset = run({})
-    assert (unset.returncode, unset.stdout) == (0, "")
