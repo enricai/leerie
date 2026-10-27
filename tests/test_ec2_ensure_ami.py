@@ -23,7 +23,7 @@ exit 0
 SSH = '#!/bin/sh\ncat >/dev/null 2>&1 || true\n[ -n "$SSH_FAIL" ] && [ "$*" != "${*%bash -s}" ] && exit 1\n[ -n "$SSH_HANG" ] && [ "$*" != "${*%bash -s}" ] && sleep 30\nexit 0\n'
 
 
-def _env(tmp_path, **extra):
+def _ensure_ami_env(tmp_path, **extra):
     b = tmp_path / "bin"
     b.mkdir(exist_ok=True)
     for name, body in (("aws", AWS), ("ssh", SSH)):
@@ -46,7 +46,7 @@ def _calls(tmp_path):
 
 def _run(tmp_path, **extra):
     return subprocess.run(["bash", "-c", f"source {SCRIPT}; ensure_ami"],
-                          capture_output=True, text=True, env=_env(tmp_path, **extra))
+                          capture_output=True, text=True, env=_ensure_ami_env(tmp_path, **extra))
 
 
 def test_miss_bakes_in_order_then_hit(tmp_path):
@@ -72,7 +72,7 @@ def test_payload_failure_terminates_and_creates_no_image(tmp_path):
 
 def test_sigint_terminates(tmp_path):
     p = subprocess.Popen(["bash", "-c", f"source {SCRIPT}; ensure_ami"],
-                         env=_env(tmp_path, SSH_HANG="1"), stdout=subprocess.PIPE,
+                         env=_ensure_ami_env(tmp_path, SSH_HANG="1"), stdout=subprocess.PIPE,
                          stderr=subprocess.PIPE, start_new_session=True)
     for _ in range(100):
         time.sleep(0.1)

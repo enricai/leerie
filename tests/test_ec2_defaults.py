@@ -51,7 +51,7 @@ def _seed(aws_dir: Path, *, default_vpc: bool = True) -> None:
     (aws_dir / "state.json").write_text(json.dumps(state))
 
 
-def _env(tmp_path: Path, extra: dict | None = None, *, default_vpc: bool = True):
+def _defaults_env(tmp_path: Path, extra: dict | None = None, *, default_vpc: bool = True):
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)
     _seed(aws_dir, default_vpc=default_vpc)
@@ -80,7 +80,7 @@ def _mutating(aws_dir: Path) -> list[str]:
 # --- instance type -----------------------------------------------------------
 
 def test_instance_type_default_and_override(tmp_path):
-    aws_dir, _, env = _env(tmp_path)
+    aws_dir, _, env = _defaults_env(tmp_path)
     r = _call("default_instance_type", env)
     assert r.returncode == 0 and r.stdout == "m5.xlarge"
     r = _call("default_instance_type", {**env, "LEERIE_EC2_INSTANCE_TYPE": "c7g.large"})
@@ -90,7 +90,7 @@ def test_instance_type_default_and_override(tmp_path):
 # --- subnet ------------------------------------------------------------------
 
 def test_subnet_default_is_public_subnet_in_default_vpc(tmp_path):
-    aws_dir, _, env = _env(tmp_path)
+    aws_dir, _, env = _defaults_env(tmp_path)
     r = _call("default_subnet_id", env)
     assert r.returncode == 0, r.stderr
     # sorted by AZ: -aaaa wins; private and non-default-VPC subnets never chosen.
@@ -98,14 +98,14 @@ def test_subnet_default_is_public_subnet_in_default_vpc(tmp_path):
 
 
 def test_subnet_override_wins_and_makes_no_aws_call(tmp_path):
-    aws_dir, _, env = _env(tmp_path, {"LEERIE_EC2_SUBNET_ID": "subnet-mine"})
+    aws_dir, _, env = _defaults_env(tmp_path, {"LEERIE_EC2_SUBNET_ID": "subnet-mine"})
     r = _call("default_subnet_id", env)
     assert r.stdout == "subnet-mine"
     assert read_log(aws_dir) == []
 
 
 def test_no_default_vpc_fails_naming_the_fix(tmp_path):
-    aws_dir, _, env = _env(tmp_path, default_vpc=False)
+    aws_dir, _, env = _defaults_env(tmp_path, default_vpc=False)
     r = _call("default_subnet_id", env)
     assert r.returncode != 0
     assert r.stdout == ""
@@ -117,7 +117,7 @@ def test_no_default_vpc_fails_naming_the_fix(tmp_path):
 # --- security group ----------------------------------------------------------
 
 def test_security_group_created_tagged_with_22_from_egress_cidr_only(tmp_path):
-    aws_dir, _, env = _env(tmp_path)
+    aws_dir, _, env = _defaults_env(tmp_path)
     r = _call("ensure_security_group", env)
     assert r.returncode == 0, r.stderr
     state = read_state(aws_dir)
@@ -129,7 +129,7 @@ def test_security_group_created_tagged_with_22_from_egress_cidr_only(tmp_path):
 
 
 def test_security_group_reused_not_duplicated_on_second_run(tmp_path):
-    aws_dir, _, env = _env(tmp_path)
+    aws_dir, _, env = _defaults_env(tmp_path)
     first = _call("ensure_security_group", env).stdout
     second = _call("ensure_security_group", env).stdout
     assert first == second
@@ -139,7 +139,7 @@ def test_security_group_reused_not_duplicated_on_second_run(tmp_path):
 
 
 def test_security_group_rule_follows_a_changed_egress_ip(tmp_path):
-    aws_dir, _, env = _env(tmp_path)
+    aws_dir, _, env = _defaults_env(tmp_path)
     _call("ensure_security_group", env)
     _call("ensure_security_group", {**env, "LEERIE_EC2_SSH_CIDR": "203.0.113.9/32"})
     log = read_log(aws_dir)
@@ -149,14 +149,14 @@ def test_security_group_rule_follows_a_changed_egress_ip(tmp_path):
 
 
 def test_security_group_override_wins_and_creates_nothing(tmp_path):
-    aws_dir, _, env = _env(tmp_path, {"LEERIE_EC2_SECURITY_GROUP": "sg-operator"})
+    aws_dir, _, env = _defaults_env(tmp_path, {"LEERIE_EC2_SECURITY_GROUP": "sg-operator"})
     r = _call("ensure_security_group", env)
     assert r.stdout == "sg-operator"
     assert read_log(aws_dir) == []
 
 
 def test_open_world_cidr_is_refused(tmp_path):
-    aws_dir, _, env = _env(tmp_path, {"LEERIE_EC2_SSH_CIDR": "0.0.0.0/0"})
+    aws_dir, _, env = _defaults_env(tmp_path, {"LEERIE_EC2_SSH_CIDR": "0.0.0.0/0"})
     r = _call("ensure_security_group", env)
     assert r.returncode != 0
     assert "security_groups" not in read_state(aws_dir) or not read_state(aws_dir)["security_groups"]
@@ -165,7 +165,7 @@ def test_open_world_cidr_is_refused(tmp_path):
 # --- key pair ----------------------------------------------------------------
 
 def test_key_pair_created_with_0600_pem_under_state_dir(tmp_path):
-    aws_dir, state_dir, env = _env(tmp_path)
+    aws_dir, state_dir, env = _defaults_env(tmp_path)
     r = _call("ensure_key_pair >/dev/null; echo \"$LEERIE_EC2_KEY_NAME|$LEERIE_EC2_SSH_KEY_FILE\"", env)
     assert r.returncode == 0, r.stderr
     pem = state_dir / "leerie-ssh.pem"
@@ -177,7 +177,7 @@ def test_key_pair_created_with_0600_pem_under_state_dir(tmp_path):
 
 
 def test_key_pair_reused_on_second_run(tmp_path):
-    aws_dir, state_dir, env = _env(tmp_path)
+    aws_dir, state_dir, env = _defaults_env(tmp_path)
     _call("ensure_key_pair", env)
     before = (state_dir / "leerie-ssh.pem").read_text()
     r = _call("ensure_key_pair", env)
@@ -187,7 +187,7 @@ def test_key_pair_reused_on_second_run(tmp_path):
 
 
 def test_key_pair_in_aws_but_pem_missing_fails_with_fix(tmp_path):
-    aws_dir, state_dir, env = _env(tmp_path)
+    aws_dir, state_dir, env = _defaults_env(tmp_path)
     _call("ensure_key_pair", env)
     (state_dir / "leerie-ssh.pem").unlink()
     r = _call("ensure_key_pair", env)
@@ -197,7 +197,7 @@ def test_key_pair_in_aws_but_pem_missing_fails_with_fix(tmp_path):
 
 
 def test_key_pair_override_wins_and_creates_nothing(tmp_path):
-    aws_dir, state_dir, env = _env(tmp_path, {"LEERIE_EC2_KEY_NAME": "my-key"})
+    aws_dir, state_dir, env = _defaults_env(tmp_path, {"LEERIE_EC2_KEY_NAME": "my-key"})
     r = _call("ensure_key_pair", env)
     assert r.stdout == "my-key"
     assert read_log(aws_dir) == []
@@ -207,7 +207,7 @@ def test_key_pair_override_wins_and_creates_nothing(tmp_path):
 # --- instance profile --------------------------------------------------------
 
 def test_instance_profile_default_created_and_tagged(tmp_path):
-    aws_dir, _, env = _env(tmp_path)
+    aws_dir, _, env = _defaults_env(tmp_path)
     r = _call("ensure_instance_profile", env)
     assert r.returncode == 0, r.stderr
     assert r.stdout == "leerie-ssm"
@@ -222,7 +222,7 @@ def test_instance_profile_default_created_and_tagged(tmp_path):
 
 
 def test_instance_profile_override_wins_and_creates_nothing(tmp_path):
-    aws_dir, _, env = _env(tmp_path, {"LEERIE_EC2_INSTANCE_PROFILE": "operator-profile"})
+    aws_dir, _, env = _defaults_env(tmp_path, {"LEERIE_EC2_INSTANCE_PROFILE": "operator-profile"})
     r = _call("ensure_instance_profile", env)
     assert r.stdout == "operator-profile"
     assert not any(l.startswith("iam") for l in read_log(aws_dir))
@@ -231,7 +231,7 @@ def test_instance_profile_override_wins_and_creates_nothing(tmp_path):
 # --- all knobs set: nothing is created ---------------------------------------
 
 def test_every_knob_set_means_no_create_calls(tmp_path):
-    aws_dir, state_dir, env = _env(tmp_path, {
+    aws_dir, state_dir, env = _defaults_env(tmp_path, {
         "LEERIE_EC2_INSTANCE_TYPE": "t3.medium", "LEERIE_EC2_KEY_NAME": "k",
         "LEERIE_EC2_SECURITY_GROUP": "sg-x", "LEERIE_EC2_SUBNET_ID": "subnet-x",
         "LEERIE_EC2_INSTANCE_PROFILE": "p"})
