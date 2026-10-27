@@ -39,7 +39,7 @@ dockerfile_apt_packages() {
 
 MISE_VERSION="$(sed -n 's/^ARG MISE_VERSION=//p' "$DOCKERFILE" | head -n1)"
 CLAUDE_SPEC="$(sed -n "s/.*npm install -g '\\(@anthropic-ai\\/claude-code@[^']*\\)'.*/\\1/p" "$DOCKERFILE" | head -n1)"
-[ -n "$MISE_VERSION" ] && [ -n "$CLAUDE_SPEC" ] || { log "could not derive pins from Dockerfile"; exit 1; }
+if [ -z "$MISE_VERSION" ] || [ -z "$CLAUDE_SPEC" ]; then log "could not derive pins from Dockerfile"; exit 1; fi
 
 # --- apt base packages (base + gh prerequisites + chromium blocks) ---
 mapfile -t APT_PKGS < <(dockerfile_apt_packages)

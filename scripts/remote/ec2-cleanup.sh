@@ -61,7 +61,9 @@ ec2_cleanup() {
   if $keep; then
     cur_ver="$(ec2_ami_version 2>/dev/null)" || cur_ver=""
     cur_hash="$(ec2_ami_source_hash 2>/dev/null)" || cur_hash=""
-    [ -n "$cur_ver" ] && [ -n "$cur_hash" ] || { remote_log "ec2 cleanup: cannot compute current AMI version+hash; keeping all AMIs"; keep=all; }
+    if [ -z "$cur_ver" ] || [ -z "$cur_hash" ]; then
+      remote_log "ec2 cleanup: cannot compute current AMI version+hash; keeping all AMIs"; keep=all
+    fi
   fi
   local live_imgs live_keys
   local live_profiles; live_profiles="$(_ec2_cleanup_live Profile)"

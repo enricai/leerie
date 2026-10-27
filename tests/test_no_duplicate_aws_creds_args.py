@@ -87,7 +87,7 @@ def test_shared_function_defined_exactly_once() -> None:
     )
 
 
-def test_shared_function_called_at_all_six_sites() -> None:
+def test_shared_function_called_at_all_seven_sites() -> None:
     src = LAUNCHER.read_text()
     # The definition's own usage-example comment also contains the call
     # marker, so the call-site count is (occurrences - 1 for the def body's
@@ -99,10 +99,11 @@ def test_shared_function_called_at_all_six_sites() -> None:
     # function definition; the rest are real call sites.
     comment_occurrences = src.count(f"#     {_CALL_MARKER}")
     call_sites = total - comment_occurrences
-    assert call_sites == 6, (
-        f"expected 6 real call sites of `_leerie_aws_creds_args_tokens` "
+    assert call_sites == 7, (
+        f"expected 7 real call sites of `_leerie_aws_creds_args_tokens` "
         f"(accept-blocked, accept-integration, stop, kill --runtime ec2, "
-        f"finalize --runtime ec2, main RUNTIME=ec2 dispatch), found "
+        f"finalize --runtime ec2, prune's EC2 cleanup, main RUNTIME=ec2 "
+        f"dispatch), found "
         f"{call_sites} (total occurrences of the call marker: {total}, "
         f"comment occurrences: {comment_occurrences})"
     )

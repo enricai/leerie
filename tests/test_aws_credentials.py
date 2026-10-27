@@ -20,12 +20,23 @@ import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import pytest
+
 from tests.conftest import run_bash
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 AWS_CREDS_SH = REPO_ROOT / "scripts" / "remote" / "aws-credentials.sh"
 
 SSO_START_URL = "https://my-sso-portal.awsapps.com/start"
+
+
+@pytest.fixture(autouse=True)
+def _no_inherited_aws_region(monkeypatch):
+    """`run_bash` merges os.environ, and conftest's `_default_aws_region`
+    sets AWS_REGION there; these tests exercise region resolution itself,
+    so an inherited value would win every precedence check."""
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
 
 
 def _base_env(home: Path, **extra: str) -> dict:
