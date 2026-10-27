@@ -107,3 +107,17 @@ def test_consumers_extract_rather_than_reproduce() -> None:
         f"expected at least the two known consumers "
         f"(test_resolve_ec2_vars.py, test_resolve_aws_launcher.py) to "
         f"extract the helper from the launcher, found {extractors}")
+
+
+def test_instance_profile_knob_has_one_launcher_resolution() -> None:
+    """The sixth knob goes through the same single helper, not a bespoke
+    read: exactly one launcher resolution line names it, and it calls
+    `_resolve_ec2_knob` with the env var and toml key that disagree in name
+    from every other knob's."""
+    src = LAUNCHER.read_text()
+    needle = 'LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob '
+    assert src.count(needle) == 1, src.count(needle)
+    line = next(l for l in src.splitlines() if l.startswith(needle))
+    assert line.endswith(
+        '"$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE ec2_instance_profile)"'
+    ), line

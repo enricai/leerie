@@ -140,6 +140,7 @@ resume_instance() {
         < <(_aws_region_profile_args)
       if ! aws ec2 start-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} >/dev/null 2>&1; then
         remote_log "error: failed to start instance $iid"
+        echo "  Run: aws ec2 start-instances --instance-ids $iid  (to see the AWS error), then re-run leerie resume." >&2
         return 1
       fi
       ;;

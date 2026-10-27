@@ -97,6 +97,7 @@ _ec2_ssm_session() {
   local instance_id="${LEERIE_EC2_INSTANCE_ID:-}"
   if [ -z "$instance_id" ]; then
     remote_log "error: LEERIE_EC2_INSTANCE_ID is not set — cannot open an SSM session."
+    echo "  Run: leerie list --runtime ec2  (to find the run's instance), then re-run leerie resume." >&2
     return 1
   fi
 

@@ -1504,6 +1504,9 @@ PY
           echo "  Removes terminal run dirs and stale repo-map cache entries" >&2
           echo "  older than DAYS (default 14), and subtask branches whose run" >&2
           echo "  dir is gone. Dry-run unless --apply is given." >&2
+          echo "  With AWS credentials resolvable, also lists (--apply: deletes)" >&2
+          echo "  leerie-tagged EC2 AMIs older than DAYS (current version kept)," >&2
+          echo "  snapshots, key pairs, security groups and the IAM role." >&2
           exit 0 ;;
         *) echo "leerie prune: unknown option '$1'" >&2; exit 1 ;;
       esac
@@ -1815,6 +1818,27 @@ print(f"  {verb} ~{freed / 1048576:.1f} MiB")
 if not apply:
     print("  (dry-run — re-run with --apply to delete)")
 PY
+    # AWS section: opt-in on credentials resolving, so local-only users see
+    # no change. Never fails the prune.
+    if [ -f "$LEERIE_REPO/scripts/remote/ec2-cleanup.sh" ] && command -v aws >/dev/null 2>&1; then
+      (
+        # shellcheck disable=SC1091
+        . "$LEERIE_REPO/scripts/remote/aws-credentials.sh"
+        _pr_args=()
+        while IFS= read -r _pr_a; do _pr_args+=("$_pr_a"); done < <(_leerie_aws_creds_args_tokens)
+        _pr_exports="$(resolve_aws_credentials ${_pr_args[@]+"${_pr_args[@]}"} 2>/dev/null)" || {
+          echo "  (AWS: no credentials resolved, skipping EC2 cleanup; run aws sso login to include it)"
+          exit 0
+        }
+        eval "$_pr_exports"
+        # shellcheck disable=SC1091
+        . "$LEERIE_REPO/scripts/remote/ec2-cleanup.sh"
+        echo "leerie prune: EC2 leerie-tagged resources ($($_prune_apply && echo apply || echo dry-run))"
+        _pr_flags=(--keep-current --older-than "$_prune_days")
+        $_prune_apply && _pr_flags+=(--apply)
+        ec2_cleanup "${_pr_flags[@]}" || true
+      ) || true
+    fi
     exit 0
     ;;
   list)
@@ -3128,6 +3152,13 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
             killed_at "$(iso_now)" \
             ec2_instance_id "$_kill_ec2_instance_id" || true
         fi
+      fi
+      # Report only: the AMI/key/SG are shared by other runs, never deleted here.
+      if [ -f "$LEERIE_REPO/scripts/remote/ec2-cleanup.sh" ]; then
+        # shellcheck disable=SC1091
+        . "$LEERIE_REPO/scripts/remote/ec2-cleanup.sh"
+        remote_log "kill: leerie-tagged EC2 resources (not deleted; \`leerie prune --apply\` reclaims stale ones):"
+        ec2_cleanup_report || true
       fi
       remote_log "kill: destroyed. Run is no longer resumable."
       exit 0
@@ -5275,6 +5306,7 @@ _cli_ec2_instance_type=""
 _cli_ec2_key_name=""
 _cli_ec2_security_group=""
 _cli_ec2_subnet_id=""
+_cli_ec2_instance_profile=""
 _prev_ec2_arg=""
 for arg in "$@"; do
   if [ -n "$_prev_ec2_arg" ]; then
@@ -5284,6 +5316,7 @@ for arg in "$@"; do
       key-name)        _cli_ec2_key_name="$arg" ;;
       security-group)  _cli_ec2_security_group="$arg" ;;
       subnet-id)       _cli_ec2_subnet_id="$arg" ;;
+      instance-profile) _cli_ec2_instance_profile="$arg" ;;
     esac
     _prev_ec2_arg=""
     continue
@@ -5299,6 +5332,8 @@ for arg in "$@"; do
     --ec2-security-group)    _prev_ec2_arg="security-group" ;;
     --ec2-subnet-id=*)       _cli_ec2_subnet_id="${arg#--ec2-subnet-id=}" ;;
     --ec2-subnet-id)         _prev_ec2_arg="subnet-id" ;;
+    --ec2-instance-profile=*) _cli_ec2_instance_profile="${arg#--ec2-instance-profile=}" ;;
+    --ec2-instance-profile)  _prev_ec2_arg="instance-profile" ;;
   esac
 done
 LEERIE_EC2_AMI="$(_resolve_ec2_knob "$_cli_ec2_ami" LEERIE_EC2_AMI ec2_ami)"
@@ -5306,10 +5341,11 @@ LEERIE_EC2_INSTANCE_TYPE="$(_resolve_ec2_knob "$_cli_ec2_instance_type" LEERIE_E
 LEERIE_EC2_KEY_NAME="$(_resolve_ec2_knob "$_cli_ec2_key_name" LEERIE_EC2_KEY_NAME ec2_key_name)"
 LEERIE_EC2_SECURITY_GROUP="$(_resolve_ec2_knob "$_cli_ec2_security_group" LEERIE_EC2_SECURITY_GROUP ec2_security_group)"
 LEERIE_EC2_SUBNET_ID="$(_resolve_ec2_knob "$_cli_ec2_subnet_id" LEERIE_EC2_SUBNET_ID ec2_subnet_id)"
+LEERIE_EC2_INSTANCE_PROFILE="$(_resolve_ec2_knob "$_cli_ec2_instance_profile" LEERIE_EC2_INSTANCE_PROFILE ec2_instance_profile)"
 unset _cli_ec2_ami _cli_ec2_instance_type _cli_ec2_key_name \
-      _cli_ec2_security_group _cli_ec2_subnet_id _prev_ec2_arg
+      _cli_ec2_security_group _cli_ec2_subnet_id _cli_ec2_instance_profile _prev_ec2_arg
 export LEERIE_EC2_AMI LEERIE_EC2_INSTANCE_TYPE LEERIE_EC2_KEY_NAME \
-       LEERIE_EC2_SECURITY_GROUP LEERIE_EC2_SUBNET_ID
+       LEERIE_EC2_SECURITY_GROUP LEERIE_EC2_SUBNET_ID LEERIE_EC2_INSTANCE_PROFILE
 
 # DRY_RUN is referenced by scripts/runtime-install.sh; default to false
 # in the launcher (the launcher has no --dry-run flag — that's install.sh).
@@ -6724,7 +6760,7 @@ for arg in "$@"; do
   fi
   if [ "$_prev_was_ec2_knob" = "true" ]; then
     # Consume the value of --ec2-ami / --ec2-instance-type / --ec2-key-name /
-    # --ec2-security-group / --ec2-subnet-id.
+    # --ec2-security-group / --ec2-subnet-id / --ec2-instance-profile.
     _prev_was_ec2_knob=false
     continue
   fi
@@ -6801,7 +6837,7 @@ for arg in "$@"; do
     --seed-depth=*|--seed-shallow-threshold-mb=*)
       # =form; consumed above.
       ;;
-    --ec2-ami|--ec2-instance-type|--ec2-key-name|--ec2-security-group|--ec2-subnet-id)
+    --ec2-ami|--ec2-instance-type|--ec2-key-name|--ec2-security-group|--ec2-subnet-id|--ec2-instance-profile)
       # Launcher-only flags (EC2 instance-shape CLI tier); resolved into
       # LEERIE_EC2_AMI / LEERIE_EC2_INSTANCE_TYPE / LEERIE_EC2_KEY_NAME /
       # LEERIE_EC2_SECURITY_GROUP / LEERIE_EC2_SUBNET_ID above and consumed
@@ -6810,7 +6846,7 @@ for arg in "$@"; do
       # leak to parse_args() (which is strict, not parse_known_args).
       _prev_was_ec2_knob=true
       ;;
-    --ec2-ami=*|--ec2-instance-type=*|--ec2-key-name=*|--ec2-security-group=*|--ec2-subnet-id=*)
+    --ec2-ami=*|--ec2-instance-type=*|--ec2-key-name=*|--ec2-security-group=*|--ec2-subnet-id=*|--ec2-instance-profile=*)
       # =form; consumed above.
       ;;
     --aws-region|--aws-profile)
@@ -8858,7 +8894,7 @@ else
     LEERIE_WAVE_IDX LEERIE_TAIL_RUN_ID LEERIE_LIST_FLY_JSON \
     LEERIE_EC2_INSTANCE_ID LEERIE_EC2_AMI LEERIE_EC2_INSTANCE_TYPE \
     LEERIE_EC2_KEY_NAME LEERIE_EC2_SECURITY_GROUP LEERIE_EC2_SUBNET_ID \
-    LEERIE_AWS_REGION LEERIE_AWS_PROFILE "
+    LEERIE_EC2_INSTANCE_PROFILE LEERIE_AWS_REGION LEERIE_AWS_PROFILE "
   _leerie_env_args=()
   # `compgen -v` lists shell + env variable names; filter to LEERIE_* and skip
   # the deny-list and empty values. Bare `-e NAME` passes the host value.

@@ -77,35 +77,7 @@ INSTANCE_START_TIMEOUT="${LEERIE_INSTANCE_START_TIMEOUT:-300}"
 # Exported instance ID — empty until provision_instance succeeds.
 LEERIE_EC2_INSTANCE_ID=""
 
-# --- _aws_region_profile_args ---------------------------------------------
-# Emit, one token per line, the --region/--profile flags to append to
-# every `aws ec2`/`aws sts` invocation in this file. Emits nothing when
-# both are unset — lets the aws CLI's own credential chain resolve
-# region/profile, matching require_aws()'s existing profile-optional
-# pattern in ec2-lib.sh.
-#
-# One-token-per-line (not a bare string) so values containing spaces
-# survive: a named profile may legitimately contain them, and word
-# splitting would shred it. Callers read it back with the `while read`
-# idiom below rather than a nameref (`local -n`), which is bash 4.3+ and
-# fails outright on macOS's /bin/bash 3.2 with "local: -n: invalid
-# option".
-#
-# Usage:
-#   local aws_args=()
-#   while IFS= read -r _a; do aws_args+=("$_a"); done \
-#     < <(_aws_region_profile_args)
-_aws_region_profile_args() {
-  local region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
-  local profile="${LEERIE_AWS_PROFILE:-${AWS_PROFILE:-}}"
-  if [ -n "$region" ]; then
-    printf '%s\n%s\n' --region "$region"
-  fi
-  if [ -n "$profile" ]; then
-    printf '%s\n%s\n' --profile "$profile"
-  fi
-  return 0
-}
+# _aws_region_profile_args lives in ec2-lib.sh (shared with ec2-defaults.sh).
 
 # --- stop_instance ---------------------------------------------------------
 # Pause-on-failure path: preserves the root EBS volume (StopInstances
@@ -226,7 +198,58 @@ decide_ec2_teardown() {
       # is gated on confirmed host-side state.
       if _try_fetch_state_for_ec2_teardown; then
         remote_log "remote: run branch + state synced to host"
-        terminate_instance
+        # Auto-finalize (push + PR), mirroring provision.sh's
+        # decide_teardown. host_finalize honors run.json.no_push itself.
+        # Push failure leaves the instance RUNNING, as on Fly.
+        local run_dir="" _rid="${LEERIE_RUN_ID:-${LEERIE_REMOTE_RUN_ID:-}}"
+        if [ -n "$_rid" ]; then
+          if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+            run_dir="$LEERIE_STATE_HOST_DIR/runs/$_rid"
+          elif [ -n "${USER_REPO:-}" ]; then
+            run_dir="$USER_REPO/.leerie/runs/$_rid"
+          fi
+        fi
+        local _run_finished_at=""
+        if [ -n "$run_dir" ] && [ -f "$run_dir/run.json" ]; then
+          _run_finished_at="$(jq -r '.finished_at // ""' "$run_dir/run.json" 2>/dev/null || true)"
+        fi
+        if [ -n "$run_dir" ] && [ -d "$run_dir" ] && [ -z "$_run_finished_at" ]; then
+          remote_log "remote: run did not reach finalize; skipping auto-finalize"
+          if [ -n "$_rid" ]; then
+            remote_log "remote: run 'leerie finalize $_rid' to push and open a PR after the run completes"
+          fi
+          terminate_instance
+        elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
+          local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
+          if [ -f "$_leerie_dir/scripts/host-finalize.sh" ]; then
+            # shellcheck disable=SC1091
+            . "$_leerie_dir/scripts/host-finalize.sh"
+            remote_log "auto-finalize: pushing + opening PR"
+            if host_finalize "$run_dir"; then
+              terminate_instance
+            else
+              echo "" >&2
+              echo "================================================================" >&2
+              remote_log "WARNING — auto-finalize push FAILED."
+              echo "  The run synced to host cleanly but git push failed." >&2
+              echo "  Retry the push from the host:" >&2
+              echo "    leerie finalize $_rid --runtime ec2" >&2
+              echo "  Instance is being LEFT RUNNING. When recovered:" >&2
+              echo "    leerie kill $_rid --runtime ec2" >&2
+              echo "  Instance: $iid (still running on EC2)" >&2
+              echo "================================================================" >&2
+              # Intentionally NO terminate_instance.
+            fi
+          else
+            remote_log "remote: run 'leerie finalize $_rid' to push and open a PR"
+            terminate_instance
+          fi
+        else
+          if [ -n "$_rid" ]; then
+            remote_log "remote: run 'leerie finalize $_rid' to push and open a PR"
+          fi
+          terminate_instance
+        fi
       else
         local sync_reason="sync-failed-on-clean-exit"
         local sidecar=""
@@ -386,12 +409,34 @@ except (ValueError, KeyError, IndexError):
 provision_instance() {
   require_aws || return 1
 
-  local ami instance_type key_name security_group subnet_id
-  ami="$(resolve_ami)" || return 1
-  instance_type="$(resolve_instance_type)" || return 1
-  key_name="$(resolve_key_name)" || return 1
-  security_group="$(resolve_security_group)" || return 1
-  subnet_id="$(resolve_subnet_id)" || return 1
+  # Each ec2-defaults.sh/ec2-ami.sh function returns the explicit knob
+  # verbatim when set, and otherwise resolves or creates a leerie default.
+  # shellcheck disable=SC1091
+  . "$_EC2_PROVISION_DIR/ec2-defaults.sh"
+  # shellcheck disable=SC1091
+  [ -f "$_EC2_PROVISION_DIR/ec2-ami.sh" ] && . "$_EC2_PROVISION_DIR/ec2-ami.sh"
+
+  local ami instance_type key_name security_group subnet_id instance_profile
+  ami="$(ensure_ami)" || return 1
+  instance_type="$(default_instance_type)" || return 1
+  key_name="$(ensure_key_pair)" || return 1
+  subnet_id="$(default_subnet_id)" || return 1
+  security_group="$(ensure_security_group)" || return 1
+  instance_profile="$(ensure_instance_profile)" || instance_profile=""
+
+  local _missing=0
+  _need_ec2_var() {
+    [ -n "$2" ] && return 0
+    remote_log "error: no EC2 $1 resolved."
+    echo "  Set: $3, then re-run leerie." >&2
+    _missing=1
+  }
+  _need_ec2_var AMI "$ami" "--ec2-ami <ami-id> or LEERIE_EC2_AMI"
+  _need_ec2_var "instance type" "$instance_type" "--ec2-instance-type <type> or LEERIE_EC2_INSTANCE_TYPE"
+  _need_ec2_var "key pair" "$key_name" "--ec2-key-name <name> or LEERIE_EC2_KEY_NAME"
+  _need_ec2_var "security group" "$security_group" "--ec2-security-group <sg-id> or LEERIE_EC2_SECURITY_GROUP"
+  _need_ec2_var subnet "$subnet_id" "--ec2-subnet-id <subnet-id> or LEERIE_EC2_SUBNET_ID (no default VPC? run: aws ec2 create-default-vpc)"
+  [ "$_missing" -eq 0 ] || return 1
 
   local aws_args=() _a
   while IFS= read -r _a; do aws_args+=("$_a"); done \
@@ -411,8 +456,8 @@ provision_instance() {
        --image-id "$ami" \
        --instance-type "$instance_type" \
        --key-name "$key_name" \
-       --security-group-ids "$security_group" \
-       --subnet-id "$subnet_id" \
+       --network-interfaces "AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=$subnet_id,Groups=$security_group" \
+       ${instance_profile:+--iam-instance-profile "Name=$instance_profile"} \
        --count 1 \
        ${aws_args[@]+"${aws_args[@]}"} \
        --output json \
@@ -425,6 +470,8 @@ provision_instance() {
   if [ -z "$instance_id" ]; then
     remote_log "failed to create EC2 instance — aws output:"
     printf '  %s\n' "$create_output" >&2
+    echo "  If the error mentions UnauthorizedOperation, attach ec2:RunInstances/ec2:TerminateInstances/ssm:StartSession permissions to your IAM identity or instance profile (--ec2-instance-profile <name>)." >&2
+    echo "  Fix: check the error above; verify with: aws ec2 describe-subnets --subnet-ids $subnet_id ; then re-run leerie." >&2
     return 1
   fi
 

@@ -225,3 +225,36 @@ def test_dispatch_block_extraction_reused_from_e2e_provision_module():
     block = extract_ec2_dispatch_block()
     assert "resolve_aws_credentials" in block
     assert "require_aws" in block
+
+
+def test_unresolvable_region_message_names_env_var_and_config_key(tmp_path):
+    """Not a bare 'region not set': names the env var to export and the
+    profile config key to add, and is distinct from the credentials error."""
+    aws_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    _stub_aws_recording_region(aws_dir)
+    env = _env_credentials_env(aws_dir, home)
+
+    result = run_ec2_dispatch(env, run_provision=False)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "AWS_REGION" in combined
+    assert "region = " in combined
+    assert "aws configure" not in combined
+
+
+def test_missing_credentials_message_names_env_vars_and_aws_configure(tmp_path):
+    aws_dir = tmp_path / "bin"
+    home = tmp_path / "home"
+    _stub_aws_recording_region(aws_dir)
+    env = _env_credentials_env(aws_dir, home, AWS_REGION="us-east-1")
+    env.pop("AWS_ACCESS_KEY_ID")
+    env.pop("AWS_SECRET_ACCESS_KEY")
+
+    result = run_ec2_dispatch(env, run_provision=False)
+
+    assert result.returncode != 0
+    combined = result.stdout + result.stderr
+    assert "aws configure" in combined
+    assert "AWS_ACCESS_KEY_ID" in combined

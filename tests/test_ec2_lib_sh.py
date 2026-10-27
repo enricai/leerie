@@ -163,3 +163,88 @@ def test_require_aws_leerie_aws_profile_wins_over_aws_profile(tmp_path):
     log = (aws_dir / "aws.log").read_text()
     assert "--profile preferred" in log
     assert "fallback-profile" not in log
+
+
+# ---------------------------------------------------------------------------
+# Actionable preflight errors: each failing precondition exits nonzero and
+# names the knob (env var / flag) AND the fix command, and the messages differ
+# per failure so one generic message cannot satisfy all of them. Asserted on
+# documented tokens only, never full prose.
+# ---------------------------------------------------------------------------
+
+EC2_DEFAULTS_SH = REPO_ROOT / "scripts" / "remote" / "ec2-defaults.sh"
+
+
+def _run_defaults(fn: str, aws_dir: Path, env: dict) -> subprocess.CompletedProcess:
+    base_env = {k: v for k, v in os.environ.items()
+                if not k.startswith(("LEERIE_EC2_", "AWS_"))}
+    base_env["PATH"] = f"{aws_dir}:{base_env.get('PATH', '')}"
+    base_env.update(env)
+    script = f"source {LOG_SH}; source {EC2_DEFAULTS_SH}; {fn}"
+    return subprocess.run(["bash", "-c", script], env=base_env,
+                          capture_output=True, text=True)
+
+
+def _no_vpc_aws(aws_dir: Path) -> None:
+    aws = aws_dir / "aws"
+    aws.write_text('#!/usr/bin/env bash\necho \'{"Vpcs": []}\'\n')
+    aws.chmod(0o755)
+
+
+def _no_ip_curl(aws_dir: Path) -> None:
+    curl = aws_dir / "curl"
+    curl.write_text("#!/usr/bin/env bash\nexit 7\n")
+    curl.chmod(0o755)
+
+
+def test_no_default_vpc_names_create_default_vpc_and_subnet_override(tmp_path):
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _no_vpc_aws(aws_dir)
+
+    result = _run_defaults("default_subnet_id", aws_dir, {})
+
+    assert result.returncode != 0
+    assert "aws ec2 create-default-vpc" in result.stderr
+    assert "LEERIE_EC2_SUBNET_ID" in result.stderr
+    assert "--ec2-subnet-id" in result.stderr
+
+
+def test_unreachable_egress_lookup_names_ssh_cidr_override(tmp_path):
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _no_ip_curl(aws_dir)
+
+    result = _run_defaults("ec2_egress_cidr", aws_dir, {})
+
+    assert result.returncode != 0
+    assert "LEERIE_EC2_SSH_CIDR" in result.stderr
+
+
+def test_missing_aws_cli_and_bad_credentials_messages_differ(tmp_path):
+    missing = _run_require_aws({"USER_REPO": "/tmp/repo"})
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _stub_aws(aws_dir, identity_succeeds=False)
+    creds = _run_require_aws({"USER_REPO": str(tmp_path)}, aws_dir=aws_dir)
+
+    assert missing.returncode != 0 and creds.returncode != 0
+    assert "brew install awscli" in missing.stderr
+    assert "aws sso login" not in missing.stderr
+    assert "aws sso login" in creds.stderr
+    assert "brew install awscli" not in creds.stderr
+    # the credentials hint also names the profile env knobs
+    assert "AWS_PROFILE" in creds.stderr
+
+
+def test_each_preflight_failure_names_a_distinct_fix_command(tmp_path):
+    aws_dir = tmp_path / "bin"
+    aws_dir.mkdir()
+    _no_vpc_aws(aws_dir)
+    _no_ip_curl(aws_dir)
+    vpc = _run_defaults("default_subnet_id", aws_dir, {}).stderr
+    cidr = _run_defaults("ec2_egress_cidr", aws_dir, {}).stderr
+
+    assert vpc != cidr
+    assert "LEERIE_EC2_SSH_CIDR" not in vpc
+    assert "create-default-vpc" not in cidr
