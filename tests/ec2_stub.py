@@ -263,6 +263,12 @@ def main(argv):
             print(json.dumps({"InstanceProfile": {"InstanceProfileName": name,
                 "Arn": "arn:aws:iam::123456789012:instance-profile/" + name}}))
             return 0
+        elif verb == "get-role":
+            if name not in roles:
+                print("An error occurred (NoSuchEntity)", file=sys.stderr)
+                return 254
+            print(json.dumps({"Role": {"RoleName": name, "Tags": tag_list(roles[name])}}))
+            return 0
         elif verb == "remove-role-from-instance-profile":
             r = profs.get(name)
             if r and get_flag(argv, "--role-name") in r["roles"]:
@@ -446,6 +452,7 @@ def main(argv):
                 "ImageId": ami, "Name": rec.get("name", ami), "State": rec["state"],
                 "Tags": tag_list(rec),
                 "BlockDeviceMappings": [{"Ebs": {"SnapshotId": rec["snapshot_id"]}}] if rec.get("snapshot_id") else [],
+                **({"CreationDate": rec["created"]} if rec.get("created") else {}),
             })
         print(json.dumps({"Images": images}))
         return 0
