@@ -87,6 +87,58 @@ denylist guard (these vars must never leak into the container), and
 success, actionable "not set — required for --runtime ec2" error + rc 1 on
 an unresolved var, never a bare `${VAR:?}`).
 
+The zero-config EC2 defaults add one more launcher knob,
+`LEERIE_EC2_INSTANCE_PROFILE` (the IAM instance profile attached at
+`run-instances`; unset means leerie creates and tags its own). Its
+override-wins/creates-nothing contract is pinned in
+`tests/test_ec2_defaults.py` (see *EC2 zero-config defaults, AMI bake and
+cleanup* below); the sibling `--ec2-*` knobs keep the ladder above.
+
+## EC2 zero-config defaults, AMI bake and cleanup
+
+Three files, all driving the real scripts under `scripts/remote/` against
+stubbed `aws`/`ssh` binaries (no network, no real AWS):
+
+- `tests/test_ec2_ensure_ami.py` (`ec2-ami.sh`'s `ensure_ami`): a cache miss
+  bakes in order (stock-AMI lookup, bake instance, payload, stop,
+  `create-image`) and the second call is a cache hit with no further
+  `run-instances`; a failing payload (`SSH_FAIL`) terminates the bake
+  instance and never calls `create-image` (bake teardown on failure);
+  SIGINT mid-bake also terminates; `LEERIE_EC2_AMI` set makes no AWS call at
+  all; a changed content hash (Dockerfile edit under a throwaway repo root)
+  rebakes and tags the new image with the new hash.
+- `tests/test_ec2_defaults.py` (`ec2-defaults.sh`): per knob, the default
+  and the override. Instance type; subnet (public subnet in the default VPC,
+  override wins with no AWS call, no default VPC fails naming the fix);
+  security group (created and tagged, 22/tcp from the egress CIDR only,
+  reused on a second run, rule follows a changed egress IP, override creates
+  nothing, a `0.0.0.0/0` CIDR is refused); key pair (0600 pem under the
+  state dir, reused, key-in-AWS-but-pem-missing fails with the fix,
+  override creates nothing); instance profile (created and tagged; override
+  wins); with every knob set no `create-*` call happens. The transport
+  half pins `ssh -i` ahead of the target in the tar-pipe argv, its absence
+  without a managed key, the rsync ssh wrapper, and the AMI-bake ssh opts.
+- `tests/test_ec2_cleanup.py` (`ec2-cleanup.sh` and `leerie prune`'s AWS
+  section): tagged-only prune. The stub ignores `tag-key` filters, so
+  untagged lookalikes reach the script and its client-side re-check is what
+  is exercised. Dry-run is the default and changes nothing; `--apply`
+  removes exactly the tagged set; an untagged snapshot of a tagged AMI, an
+  AMI in use by a live instance, a still-attached security group and an
+  in-use or untagged IAM role are all left alone; `--keep-current` spares
+  only the matching AMI; report mode never deletes; unknown options are
+  rejected before any AWS call. Launcher integration: `prune` without
+  credentials skips AWS and succeeds, with credentials a dry run lists
+  tagged resources and deletes nothing, `--apply` deletes tagged only.
+
+`tests/test_ec2_decide_teardown_auto_finalize.py` pins `decide_ec2_teardown`'s
+clean-exit order (fetch, finalize, terminate): finalize failure leaves the
+instance running, an unfinished run skips finalize but terminates, a sync
+failure or non-clean rc never finalizes, and rc 130 (detach) neither
+finalizes nor terminates. It parses `run.json` with real `jq`, so it is
+gated on `HAS_JQ` (module-level `skipif`); `tests/test_jq_gate_wiring.py`
+lists it in `GATED_MODULES` and asserts it imports `HAS_JQ` and carries the
+`skipif`, so the file skips cleanly in the jq-less image instead of failing.
+
 ## Fly.io remote surface
 
 The remote (Fly.io) bash surface — `ensure_image`, `provision_machine`,
