@@ -1,0 +1,12 @@
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "mul_small" }
+{ "type": "test", "event": "started", "name": "mul_zero" }
+{ "type": "test", "name": "mul_small", "event": "ok", "exec_time": 0.000001553 }
+{ "type": "test", "name": "mul_zero", "event": "ok", "exec_time": 0.000001751 }
+{ "type": "suite", "event": "ok", "passed": 2, "failed": 0, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.003925046 }
+{ "type": "suite", "event": "started", "test_count": 2 }
+{ "type": "test", "event": "started", "name": "add_small" }
+{ "type": "test", "event": "started", "name": "add_zero" }
+{ "type": "test", "name": "add_small", "event": "failed", "exec_time": 0.000079119, "stdout": "\nthread 'add_small' (187) panicked at tests/defect.rs:2:26:\nassertion `left == right` failed\n  left: -1\n right: 3\nnote: run with `RUST_BACKTRACE=1` environment variable to display a backtrace\n" }
+{ "type": "test", "name": "add_zero", "event": "ok", "exec_time": 0.000000942 }
+{ "type": "suite", "event": "failed", "passed": 1, "failed": 1, "ignored": 0, "measured": 0, "filtered_out": 0, "exec_time": 0.003020629 }

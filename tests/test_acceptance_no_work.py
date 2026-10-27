@@ -126,9 +126,19 @@ def _settle(leerie, monkeypatch, st, results):
 def test_passing_sets_end_the_run_as_no_work(leerie, tmp_path, monkeypatch,
                                             finished):
     st = _st(leerie, tmp_path)
-    assert _settle(leerie, monkeypatch, st, _results([True, True, False])) is True
+    assert _settle(leerie, monkeypatch, st, _results([True, True, True])) is True
     assert st.data["no_work_acceptance"]["verdict"] == "pass"
     assert len(finished) == 1
+
+
+def test_one_failing_set_of_three_disputes(leerie, tmp_path, monkeypatch,
+                                           finished):
+    """Rewritten from the majority rule (A2): a passing majority with one
+    failing set used to end the run as no work; any failing set disputes."""
+    st = _st(leerie, tmp_path)
+    assert _settle(leerie, monkeypatch, st, _results([True, True, False])) is False
+    assert finished == []
+    assert st.data["acceptance_dispute"]["failing_sets"] == 1
 
 
 def test_failing_sets_dispute_once_and_plan(leerie, tmp_path, monkeypatch,
@@ -414,8 +424,9 @@ def test_mark_dispute_unacted(leerie, tmp_path, dispute, marked):
 
 
 @pytest.mark.parametrize("res,fix_ids,want", [
-    (_results([False, False, True]), {"s0"}, {"s0"}),   # majority fails
-    (_results([True, True, False]), {"s0"}, set()),     # majority passes
+    (_results([False, False, True]), {"s0"}, {"s0"}),   # two fail
+    (_results([True, True, False]), {"s0"}, {"s0"}),    # one fails (A2)
+    (_results([True, True, True]), {"s0"}, set()),      # all pass
     (None, {"s0"}, set()),                              # no valid sets
     ([dict(r, unmeasured=True) for r in _results([False] * 3)],
      {"s0"}, set()),                                    # nothing measured
@@ -568,7 +579,8 @@ def test_dispute_then_probe_drops_everything_keeps_the_fix(
 def test_passes_on_head_helper(leerie, tmp_path, monkeypatch):
     st = _st(leerie, tmp_path)
     unmeasured = [dict(r, unmeasured=True) for r in _results([False] * 3)]
-    for res, want in ((None, False), (_results([True, True, False]), True),
+    for res, want in ((None, False), (_results([True, True, True]), True),
+                      (_results([True, True, False]), False),
                       (_results([False, False, True]), False),
                       # Nothing measured is no evidence, never "already
                       # fixed" (round-2 review).

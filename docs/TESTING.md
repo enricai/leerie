@@ -4468,10 +4468,10 @@ stubbed, and the stubs write files the way the workers would.
   user's checkout stays clean. The writer is shown the defect contract, the
   inline examples and the referenced report, at `medium` effort, as an acting
   worker.
-- **Skips** (audit not applicable, `--skip-acceptance-check`) are recorded with
-  their reason.
-- **Validity base**: the earliest same-task sibling's starting HEAD; a
-  different task is ignored.
+- **Skips** (no `bug-fixing` category, `--skip-acceptance-check`) are recorded
+  with their reason.
+- **Report base** (informational since Stage 2a): the earliest same-task
+  sibling's starting HEAD; a different task is ignored.
 - **Evaluation** never overwrites, or runs in place of, a file the run itself
   put at the same path, and removes what it copied.
 - **Repair**: one fixing round at `EFFORT_ACCEPTANCE_REPAIR == "high"`, its
@@ -5457,3 +5457,43 @@ guard, executed with `chown` faked, chowns `/leerie-host` (the directory
 only) under rootful and nothing under rootless. `tests/test_cgroup_broker.py`
 and `tests/test_broker_wire_contract.py` cover the broker's `peak` verb and
 its parse in `_cgroup_peak`.
+
+## Held-out sets at own start, every failing set repaired, scoped runners
+
+`tests/test_acceptance_own_start.py` (DESIGN §8 *The validity tree is the
+run's own start*, *Written whenever the defect-scope audit ran*, *A set typed
+broken is not handed on*, *Scoped runners for every runner leerie can read*;
+§5 *`applicable: false` is honoured only when three samples agree*) runs the
+real writer/validation/evaluation code against real git repos and a real
+pytest command, `claude_p` stubbed and the host PSI pinned quiet:
+
+- **A1.** Sets are written and validated at the run's own start while an
+  earlier same-task run started on an older tree (the writer's HEAD is the
+  own start; `report_reproduced` is True there, False where the older base
+  passes); the writer's clone has no ref, no remote and cannot reach an
+  earlier run's fix, and a failed clone falls back to a worktree, logged.
+  Per case: one failing case among passing ones keeps a defect file (its
+  failing IDs recorded), and a session hook forcing exit 1 with every case
+  passing no longer discards a control.
+- **A2.** One failing set of three fails (`_acceptance_any_fails`, which
+  replaced the majority rule — its tests in `test_acceptance_gate.py` and
+  `test_acceptance_no_work.py` were rewritten, including a passing-majority
+  settle that now disputes); a set that fails once and then passes its B*
+  reruns is `resource_affected` and no evidence, a consistent failure is
+  confirmed; `_confirm_still_failing` needs every rerun and escalates on a
+  gate timeout; HEAD at the validity base is answered without running the
+  sets; a set typed broken leaves the next run's residual (all broken: no
+  residual), and a residual without set indices is kept.
+- **A4.** `_infer_scoped_test_template` over bare pytest/rspec/minitest/go/
+  cargo commands and the typed `no_scoped_runner` reasons for everything
+  else; `{test_packages}`/`{test_targets}` rendering and their absence rule;
+  pytest inferred by `resolve_blt_scoped` (the `test_scoped_axes.py`
+  "infers nothing" test was rewritten); the go `-run` selector and report
+  request; cargo's `RUSTC_BOOTSTRAP`; rspec and minitest report requests
+  (the plugin written); per-case statuses from the real C9 bench reports of
+  every runner (`tests/fixtures/runner_reports/`); a go package that never
+  built is a load error; B*'s JUnit IDs keep their shape.
+- **N1-L.** Sets are written when the audit said not applicable (no contract
+  in the payload), none when no audit ran; no scoped runner is a loud typed
+  skip; `applicable: false` needs three agreeing samples, a crashed sample
+  being no vote.

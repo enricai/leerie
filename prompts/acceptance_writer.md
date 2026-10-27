@@ -36,13 +36,15 @@ report is among the files the task references; read it in full first.
    that must keep working, so an over-broad fix fails too.
 5. **Split by kind.** Defect cases go in DEFECT files; control cases go
    in separate CONTROL files. A file is one kind only.
-6. **Run them here.** Every defect file must FAIL on this unfixed tree
-   and every control file must PASS. Run each file on its own with the
-   repository's test runner and iterate until that holds. The harness
-   re-checks this by exit code and, where the runner can write one, by
-   its report of which tests ran; it drops a defect file that passes
-   here. A file that runs no test at all, or that cannot be loaded,
-   discards your WHOLE set — every file in it — unless rule 7 applies.
+6. **Run them here.** Every defect file must have a case that FAILS on
+   this unfixed tree and every control case must PASS. Run each file on
+   its own with the repository's test runner and iterate until that
+   holds. The harness re-checks this case by case from the runner's
+   report of which tests ran and how each ended (by exit code only where
+   the runner can write no report); it drops a defect file none of whose
+   cases fails here, and discards the set if any control case fails. A
+   file that runs no test at all, or that cannot be loaded, discards your
+   WHOLE set — every file in it — unless rule 7 applies.
 7. **Import defects.** When the report's defect IS that loading fails —
    the entry point the report names is missing, or importing the module
    raises — a defect file that cannot load on this tree is showing the

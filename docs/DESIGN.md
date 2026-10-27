@@ -322,6 +322,19 @@ subtask it tests). Three mechanisms reconcile that coupling:
   all, and for defects with a single obvious location and no repeated
   or multi-candidate structure.
 
+  **`applicable: false` is honoured only when three samples agree.** A
+  false answer is drawn again — up to `applicability_samples` (3)
+  independent samples in all, a crashed sample being no vote and drawn
+  again within two extra attempts — and the first `applicable: true`
+  sample is the one used; false stands only when every sample says so.
+  Measured (Q5/N1, production-faithful strict decoding, 9 audits whose
+  task was a real open defect): the single sample said false on 8, the
+  3/3 rule on 3 (rescued 5 of 8), and on 5 not-needed tasks the rule
+  turned no correct false into a true (0/5). The false that survives is
+  stable, not sampling noise — it is judgment ("feature build, not a
+  defect fix") — which is why the held-out sets no longer depend on it
+  (§8: they are written whenever the audit ran).
+
   **Report-named ground truth is extracted and mechanically
   checked.** A data-triggered report pins its defect to evidence
   outside the repository — a capture archive, a configuration file, a
@@ -5503,8 +5516,8 @@ acceptance available, the judge's confirmation is held as *pending*; the
 run continues through provisioning, the defect-scope audit and the
 acceptance sets (§8 *Held-out acceptance tests* — they need the installed
 dependencies, which is why the decision moves after provisioning), and the
-sets are run on HEAD. A majority passing ends the run as no work. A
-majority failing is a dispute: the failing case names become the
+sets are run on HEAD. Every measured set passing ends the run as no work.
+Any set failing is a dispute: the failing case names become the
 `no_work_dispute` evidence and the run plans the work. Only the names from
 sets a repair round would be shown are used: the planners' words reach the
 implementers, and the held-back sets must stay unseen until the gate
@@ -5517,7 +5530,7 @@ all three sets failed it — and a wrong dispute repeated on every re-run
 would be a new infinite loop. So a dispute is raised once per task (twice
 when the first goes unacted, below): when the previous same-task run
 already disputed on acceptance evidence, a
-still-failing majority ends the run as no work with a loud warning and the
+still-failing set ends the run as no work with a loud warning and the
 residual recorded. The cost of a wrong dispute is bounded to one extra run
 (two when the first dispute goes unacted, below).
 With no valid sets the judge's confirmation stands, as before.
@@ -5528,8 +5541,8 @@ the satisfied-probe sweep drops every subtask — and the next run would
 then accept "no work" after a dispute no run ever acted on, leaving the
 defect the tests still show on HEAD unfixed for good. So executed
 evidence outranks the probe: whenever held-out sets exist, some of them
-could be run on HEAD, and no strict majority of those passes (a tie counts
-as failing, as everywhere in the gate; nothing measured protects nothing),
+could be run on HEAD, and any of those fails (as everywhere in the gate;
+nothing measured protects nothing),
 the sweep is not offered the subtasks that fix the reported
 symptom (below). And a disputing run that still ends as no
 work by either of those two planning-time exits records its dispute as not
@@ -5553,10 +5566,11 @@ every subtask flagged `fixes_reported_symptom` was dropped as already
 satisfied and the held-out sets pass on HEAD, the run ends as no work;
 otherwise it proceeds as before. When the held-out sets FAIL on HEAD,
 those subtasks are never offered to the probe — the tests outrank its
-reading — so the plan cannot lose its fixes and ship without them. When
-the sets were validated on HEAD itself (a task's first run, nothing merged
-since), every one has a defect file that failed there, so the answer is
-already known: the fixes are protected without running the sets again.
+reading — so the plan cannot lose its fixes and ship without them. Since
+the sets are validated on the run's own start (§8), planning's HEAD is
+normally that very commit: every set has a defect case that failed there,
+so the answer is already known and the sets are not run again — the
+fixes are protected and a held no-work confirmation is disputed.
 
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
@@ -6239,20 +6253,56 @@ ImpossibleBench (ICLR 2026) shows that test visibility is exactly what
 drives special-casing to a test's inputs.
 
 So after the defect-scope audit, an `acceptance_writer` worker — an
-acting worker in a disposable worktree at the **validity base** (the
-tree the report was filed against: the earliest same-task run's starting
-HEAD, else this run's) — writes tests from the report alone. It sees the
-report, the audited `defect_shape` and the report's `inline_examples`;
-it never sees the plan or any code the run will write. It writes several
+acting worker in a disposable checkout at the **validity base**, which is
+the run's **own start** (the HEAD the run started from) — writes tests
+from the report alone. It sees the report, the audited `defect_shape` and
+the report's `inline_examples`; it never sees the plan or any code the run
+will write. It writes several
 independent *sets*, each split into **defect files** (must fail on the
 validity base) and **control files** (correct behaviour that must keep
 passing), driving the behaviour through the module's stable entry points
 rather than internal helpers whose signatures a fix may change. Python
-validates each set mechanically — by exit code, and where the runner can
-write one by its structured report of what ran (below), never by reading
-runner prose: a defect file that
-passes on the validity base cannot discriminate and is dropped; a set
-needs at least one discriminating defect file and every control passing.
+validates each set mechanically, **per case** — from the runner's
+structured report of what ran (below), and by exit code only where the
+runner can write none, never by reading runner prose: a set is valid when
+every control case passes and at least one defect case fails; a defect
+file none of whose cases fails cannot discriminate and is dropped.
+
+**The validity tree is the run's own start, not the report's.** It used
+to be the tree the report was filed against — the earliest same-task
+run's starting HEAD — so a chain's later runs validated against a tree
+the chain had long since changed. Measured (Q6, 6/7 sets of one failing
+cluster): those sets were written at a base where the production probe
+the report concerns did not exist yet, while at the run's own start both
+the probe and the repository's own helper that answers it (imported by
+59 tests) did; the sets then demanded a shape no later tree had. Written
+and validated at own start, a set says what is still wrong *now*, on the
+tree this run will change: a defect the chain already fixed yields no
+failing defect case and so no set. The earliest same-task base is still
+looked up, but only as information: each valid set records
+`report_reproduced` — whether it also fails there — and nothing filters
+on it. Sets from earlier runs are never carried forward or re-validated;
+each run writes its own. The writer's checkout is a clone whose only
+reachable commit is the own start — no branch, tag or run branch — so
+neither a later commit nor an earlier run's fix can steer the tests, and
+everything the writer runs runs on that base tree (fail-open to a plain
+worktree, logged, when the clone cannot be made).
+
+**Written whenever the defect-scope audit ran.** The sets used to be
+written only when the audit said `applicable`. Measured over 152
+historical audits, 18 said `applicable: false`, and on those runs no set
+was ever written — including runs whose task was a real, still-open
+defect (Q5/N1: of 9 such strict-decoding cases labelled *needs*, 8 had a
+false first sample). Ungated (Q7/N1-L), the writer put adjudicated
+right-reason work on 14 of 16 *needs* tasks, and on the not-needed side
+0 of 22 lever-covered sets created false work (CI 0–15); on a task that
+is already done, own-start validity discards the sets by itself, because
+no defect case fails. So every run whose classification triggered the
+audit gets sets, whatever the audit returned — its fail-open
+`{"applicable": false}` included — and a set left failing feeds the
+run-outcome decider (§6 *The run outcome is decided once*) like any other
+unfinished work. When the audit is not applicable the writer's payload
+simply carries no contract and no examples.
 A set carries what its validation ran on: a writer that
 edited an existing file loses the set, and every other new file it left
 (a helper or fixture beside the tests, even one the repo's ignore rules
@@ -6292,7 +6342,16 @@ and vitest — validation asks for one and reads how many tests executed (a
 test whose fixture failed to set up counts as executed: it ran and failed)
 and whether the file loaded — pytest marks a file it could not collect
 with a fixed "collection failure" message, which no report option
-renames.
+renames. The same report carries each case's own status, and that, not
+the exit code, is the verdict: a defect file fails on the base when one
+of its cases failed, and a control passes when none of its cases failed
+— so a coverage threshold or a teardown error that turns the exit code
+red no longer discards a set whose cases all passed, and a failing
+case sitting in an otherwise-passing file still counts. The reports read
+are pytest's JUnit XML, the jest-compatible JSON, rspec's JSON formatter,
+a minitest reporter leerie supplies (a plugin found through `RUBYLIB`,
+writing one record per case), `go test -json` and libtest's JSON events
+(`cargo test`, through `RUSTC_BOOTSTRAP=1`).
 
 Asking means appending report flags to the test command (or, for pytest,
 setting `PYTEST_ADDOPTS`, unless the command names its own JUnit path,
@@ -6378,8 +6437,19 @@ back to the runner's own "ran no test" exits where they exist (pytest's), and
 otherwise to the exit code alone — so on `go test`, a file that ran
 nothing reads as passing: it cannot become a defect file (it does not
 fail on the base), but it can be accepted as a control that proves
-nothing. A majority of
-failing sets triggers **at most two repair rounds**: the conformer is
+nothing. **Every failing validated set is repaired** — not only when a
+majority fails. Under the old majority rule a minority of failing sets
+was shipped as a residual with no repair round at all (G1: a failing
+validated set left unrepaired because the majority passed). A set
+failure is a verdict like a new test failure and is confirmed the same
+way (§9 *Which failures are new*): a set file that fails on the tree is
+rerun serially behind the host-pressure gate, `confirm_pairs` times (or
+`confirm_pairs_escalated` after a gate timeout) inside
+`confirm_budget_sec`, and it stays failing only if it failed on every
+rerun that produced a verdict; anything else is `resource_affected`, and a
+set whose only failures were resource-affected is no evidence either way —
+so a load flake never forces a repair round, nor a residual. A failing
+set triggers **at most two repair rounds**: the conformer is
 told which declared cases failed and the defect contract — cases whose
 file was SEEN failing to load against the unfixed tree (declared an
 import defect by the writer and confirmed by the runner's report) listed
@@ -6389,7 +6459,11 @@ failure — never the
 runner output or the test source, because a conformer shown the failing
 output special-cased it (one shown runner output patched the visible
 redirect parameter; failing names plus the contract got 2/4 page fixes
-at the root against 1/4). When four or more sets are valid, the two
+at the root against 1/4). The repair note stays **names-only** even when
+richer evidence is at hand: measured as P1, the held-back sets of 9
+repairs passed 7 times when the note named the failing cases and only 4
+when it also carried the failure evidence — the evidence taught the
+repair the shown cases, not the defect. When four or more sets are valid, the two
 highest-indexed are never shown at all; every round is re-judged on all
 sets, so a fix fitted to the shown names still fails the hidden ones.
 When only hidden sets fail, the round is told exactly that — every failing
@@ -6411,8 +6485,7 @@ weaker check, logged as such, and the repair is not told of hidden tests
 that do not exist. A set whose files could not all be run (a
 missing runner, a path the target tree already uses) is no evidence either
 way: it is left out of the vote rather than counted as passing, and when
-no set can be run the gate records no evidence instead of a pass. A tie is
-not a passing majority. Repair rounds run the conformer at **high
+no set can be run the gate records no evidence instead of a pass. Repair rounds run the conformer at **high
 effort**, regardless of the operator's `--effort`/`--effort-conformer`
 settings — the rounds exist only on failing runs, and effort is the
 measured lever: on the multi-mechanism generate report the low-effort
@@ -6454,6 +6527,36 @@ the verdict would read the already-repaired tree and skip it. Measured
 on the finished task with wrong held-out tests: the repair conformer
 changed code in 3/3 trials, but 0 of the task's 247 regression tests
 and 0 attributable scraper tests (of 1,605) regressed.
+
+**A set typed broken is not handed on.** The residual records which sets
+still failed, by index. A set that a later check types `broken` (its
+`broken` field — a test no correct fix could pass, which the set audit
+decides) is left out of the next run's `prior_delivery_residual`: the next
+planner is not sent after a contract the set itself got wrong. The filter
+is applied when the residual is read, so a set typed after its run
+finished is excluded all the same.
+
+**Scoped runners for every runner leerie can read.** A set runs only
+through a scoped test template — the canonical command over the set's own
+files — so a repo with no template got no sets at all, silently. The
+template is inferred, when the repo declares none, from a canonical test
+command that is a bare runner invocation (only options after the runner,
+read from its argv, never from prose): `pytest` (also `python -m pytest`,
+`uv run pytest`), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
+minitest's `rails test` take `{test_files}` as written; `rake test`, which
+takes one path, becomes a `ruby -Itest -Ilib` loader over `{test_files}`;
+`go test` takes the test files' packages (`{test_packages}`, with a
+`-run` selector naming the set's own test functions, read from the Go
+source, so a package's existing tests stay out of the set's verdict); and
+`cargo test` takes `--test <name>` per integration-test file
+(`{test_targets}`, `--no-fail-fast`). Benched as C9 on one fixture per
+runner (pytest, rspec, minitest through the loader and `bin/rails test`,
+go, cargo): every derived command ran exactly the set's files and the
+per-case report gave the expected verdict, 6/6, and the minitest pair
+matched on the rootful runtime. When no scoped runner applies — `npm test`,
+`make test`, a runner invocation with its own selectors, a cargo file that
+is not an integration test — the skip is typed (`no_scoped_runner`, with
+the command) and logged as a warning, never silent.
 
 **Hidden from the fixers.** The sets live under the run's state root,
 and implementers and conformers carry `Read` denies on that directory
@@ -7126,7 +7229,9 @@ ran the whole ~990-file suite at ~499s a time against ~23s for a scoped run
 of the same repo.
 
 A proxy is repo-declared (`test_scoped` / `build_scoped` in
-`.leerie/config.toml`) or inferred from two narrow signals, rendered from a
+`.leerie/config.toml`) or inferred — from a vitest or jest config, or, for
+the test axis, from a canonical test command that is a bare pytest, rspec,
+minitest, `go test` or `cargo test` invocation (below) — rendered from a
 template with `{files}` and `{base}`. It is **not a subset** of the
 canonical command and is not expected to be — `tsc --noEmit` catches a
 different set than `next build`. It is a cheap falsifier run once per
@@ -7150,6 +7255,21 @@ import-graph kind, running the tests the diff *touched* rather than the
 tests it *affects*, which is the price of working at all on a runner with
 no impact analysis. The absence rule below makes it safe: a diff with no
 test file renders nothing, and the axis is deferred to the whole-tree pass.
+
+That is why the test proxy is now also **inferred for runners with no
+impact analysis**, which it once was not: with only `{files}` available,
+inferring `pytest {files}` would have rendered `pytest
+orchestrator/leerie.py` and collected nothing. Under `{test_files}` the
+same diff renders no command and defers, so a bare canonical runner
+invocation becomes `<canonical> {test_files}` (pytest, rspec, `rails
+test`), a `ruby -Itest -Ilib` loader over `{test_files}` (`rake test`),
+`go test <its options> {test_packages}` (the test files' packages) or
+`cargo test <its options> --no-fail-fast {test_targets}` (`--test <name>`
+per integration-test file). A canonical command with selectors of its own
+(`pytest -k smoke tests/`), shell operators or anything but options after
+the runner infers nothing. The held-out acceptance sets (§8) need the same
+template, and the reversal was made for them: without it a pytest, Ruby,
+Go or Rust repo got no sets.
 
 Absence is the default in every direction, and for the test axis absence
 means **deferred, never full**: under `scoped`, a `tests` axis with no

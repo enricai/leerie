@@ -256,9 +256,16 @@ DEFAULT_CAPS = {
     # acceptance tests*). Five so the last two can stay unseen by the
     # repair rounds while three are shown (by case name only).
     "acceptance_sets": 5,
-    # Repair rounds when a majority of held-out sets fail on the integrated
-    # tree; the residual then ships and feeds the next run.
+    # Repair rounds when any held-out set fails on the integrated tree
+    # (confirmed under B*); the residual then ships and feeds the next run.
     "acceptance_repair_rounds": 2,
+    # Independent defect_scope_auditor samples drawn when the first says
+    # `applicable: false` (DESIGN §5 *`applicable: false` is honoured only
+    # when three samples agree*): the first true is used, false stands only
+    # when every sample says so. Q5/N1 (strict decoding, 9 open-defect
+    # audits): one sample said false on 8, the 3/3 rule on 3; 0/5 correct
+    # falses on not-needed tasks turned true.
+    "applicability_samples": 3,
     # Longest rate-limit reset `main()` will sleep through before it stops
     # auto-resuming and pauses resumably instead (the `out_of_credits`
     # disposition). Sized to the subscription's own windows: the five-hour
@@ -1484,7 +1491,8 @@ SKIP_CLASSIFICATION_CHECK_ENV = "LEERIE_SKIP_CLASSIFICATION_CHECK"
 SKIP_CLASSIFICATION_CHECK_FILE = SOURCE_OF_TRUTH_FILE
 
 # --stop-on-blocked: restore stop-and-wait for blocked subtasks (by default
-# they are auto-accepted). Resolution order: --stop-on-blocked CLI flag →
+# they are re-driven from the shared budget, then settle `unconverged`).
+# Resolution order: --stop-on-blocked CLI flag →
 # LEERIE_STOP_ON_BLOCKED env → stop_on_blocked in leerie.toml → False.
 STOP_ON_BLOCKED_ENV = "LEERIE_STOP_ON_BLOCKED"
 STOP_ON_BLOCKED_FILE = SOURCE_OF_TRUTH_FILE
@@ -7586,7 +7594,8 @@ def resolve_stop_on_blocked(repo_root: Path, cli_value: bool) -> bool:
     stop_on_blocked in leerie.toml → False.
 
     When True, a blocked subtask halts the run for `accept-blocked` instead
-    of being auto-accepted. Off by default."""
+    of being re-driven from the shared budget and then settled `unconverged`
+    (DESIGN §13). Off by default."""
     return _resolve_bool_pref(
         repo_root, cli_value,
         env_var=STOP_ON_BLOCKED_ENV,
@@ -8615,8 +8624,9 @@ async def _assert_repo_unchanged(st: "State", phase: str, *,
     escape, while nothing committed or pushed is built from the checkout's
     working tree. Each distinct delta is warned once, and again only if its
     content moves (`repo_change_warned`, `_delta_fingerprint`): the baseline
-    is deliberately never refreshed — `_acceptance_validity_base` reads it —
-    so every later check would otherwise repeat it. The operator/escape hint
+    is deliberately never refreshed — `_acceptance_own_start` and
+    `_acceptance_report_base` read it — so every later check would otherwise
+    repeat it. The operator/escape hint
     classifies each newly-warned batch, not every delta since the baseline.
 
     The execute-phase call passes `porcelain_only` unless the flag is set —
@@ -23954,8 +23964,36 @@ async def phase_defect_scope_audit(
             "(planners run without the site enumeration) — non-fatal")
         return {"applicable": False}
     if not result.get("applicable"):
-        log("  defect-scope audit: not applicable — no enumeration")
-        return {"applicable": False}
+        # `applicable: false` stands only when every one of
+        # `applicability_samples` independent samples says so (DESIGN §5);
+        # the first `true` is the answer used. A crashed sample is no vote
+        # and is drawn again, within two extra attempts.
+        need = int(caps.get("applicability_samples",
+                            DEFAULT_CAPS["applicability_samples"]))
+        votes, attempts = 1, 1
+        while votes < need and attempts < need + 2:
+            attempts += 1
+            try:
+                sample = await _invoke()
+            except (WorkerError, subprocess.TimeoutExpired) as e:
+                # Budget exhaustion stops the run, as everywhere else.
+                if (isinstance(e, WorkerError)
+                        and int(st.data.get("worker_count") or 0)
+                        > int(caps["max_total_workers"])):
+                    raise
+                log(f"  defect-scope audit: applicability sample crashed "
+                    f"({_brief_worker_exc(e)}) — no vote, drawn again")
+                continue
+            votes += 1
+            if sample.get("applicable"):
+                log(f"  defect-scope audit: sample {votes} of {need} says "
+                    "applicable — the not-applicable answer is overruled")
+                result = sample
+                break
+        if not result.get("applicable"):
+            log(f"  defect-scope audit: not applicable ({votes} of {need} "
+                "sample(s) agree) — no enumeration")
+            return {"applicable": False}
 
     def _valid_sites(r: dict) -> list[dict]:
         return [s for s in (r.get("sites") or [])
@@ -30819,7 +30857,9 @@ _UNKNOWN_PLACEHOLDER_RE: re.Pattern[str] = re.compile(r"(?<!\$)\{[a-z][a-z0-9_]*
 # shell literally, which is what the guard exists to prevent.
 # `tests/test_test_files_proxy.py` derives the substituted set from the AST and
 # compares, so the two cannot silently disagree.
-_SCOPED_PLACEHOLDERS: tuple[str, ...] = ("{files}", "{test_files}", "{base}")
+_SCOPED_PLACEHOLDERS: tuple[str, ...] = ("{files}", "{test_files}",
+                                         "{test_packages}", "{test_targets}",
+                                         "{base}")
 
 _unknown_placeholder_warned: bool = False
 
@@ -30879,8 +30919,8 @@ def _is_test_file(path: str, globs: list[str] | None = None) -> bool:
 def _render_scoped(template: str | None, files: list[str],
                    base_ref: str,
                    test_globs: list[str] | None = None) -> str | None:
-    """Substitute `{files}`, `{test_files}` and `{base}` into a delta-proxy
-    template.
+    """Substitute `{files}`, `{test_files}`, `{test_packages}`,
+    `{test_targets}` and `{base}` into a delta-proxy template.
 
     Returns None when the template wants `{files}` and there are none. That
     case must be a hard skip, not a bare runner invocation: rendering
@@ -30902,7 +30942,10 @@ def _render_scoped(template: str | None, files: list[str],
     A diff with no test file therefore renders nothing and the caller falls
     back to the canonical command (`_select_subtask_axes`), which is the same
     outcome as an unresolvable proxy and is why the narrowing is never
-    silent.
+    silent. `{test_packages}` (go: the `./dir` of each `_test.go` file) and
+    `{test_targets}` (cargo: `--test <stem>` per `tests/*.rs` file) are the
+    same tier for runners that select by package or target, under the same
+    absence rule.
 
     Returns None for a third reason: a template naming a placeholder THIS
     version cannot substitute. Version skew is the realistic cause --
@@ -30935,7 +30978,35 @@ def _render_scoped(template: str | None, files: list[str],
             return None
         template = template.replace(
             "{test_files}", " ".join(shlex.quote(f) for f in tf))
+    if "{test_packages}" in template:
+        # `go test` takes packages, not files: the directory of every
+        # test-shaped Go file, as a relative package path.
+        pkgs = sorted({"./" + os.path.dirname(f) if os.path.dirname(f)
+                       else "."
+                       for f in files
+                       if f.endswith("_test.go")
+                       and _is_test_file(f, test_globs)})
+        if not pkgs:
+            return None
+        template = template.replace(
+            "{test_packages}", " ".join(shlex.quote(p) for p in pkgs))
+    if "{test_targets}" in template:
+        # `cargo test` selects an integration test by its target name: the
+        # stem of a `.rs` file directly under the crate's `tests/`.
+        targets = [f"--test {shlex.quote(Path(f).stem)}" for f in files
+                   if _is_cargo_integration_test(f)]
+        if not targets:
+            return None
+        template = template.replace("{test_targets}", " ".join(targets))
     return template.replace("{base}", base_ref)
+
+
+def _is_cargo_integration_test(path: str) -> bool:
+    """A `.rs` file directly under a `tests/` directory — the only test file
+    `cargo test --test <name>` can select by itself (mechanical path check)."""
+    parts = path.replace("\\", "/").removeprefix("./").split("/")
+    return (len(parts) >= 2 and parts[-2] == "tests"
+            and parts[-1].endswith(".rs"))
 
 
 def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
@@ -30948,18 +31019,22 @@ def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
     expensive oracle run at the baseline and on the final tree (DESIGN §9).
 
     Config-declared (`test_scoped` / `build_scoped` in `.leerie/config.toml`)
-    wins outright. Otherwise two narrow inferences, kept in this separate
+    wins outright. Otherwise narrow inferences, kept in this separate
     function rather than folded into `_infer_build_lint_test` so the
     launcher's mirrored bash inference and its parity guard
     (`tests/test_config_verb.py`) stay untouched.
 
     No lint tier: lint was measured at 0.4 h across a 51 h run, so scoping it
-    buys nothing and only adds a way to be wrong. No pytest inference either
-    — `{files}` for a repo whose changed file is `orchestrator/leerie.py`
-    renders `pytest orchestrator/leerie.py`, which collects nothing. Repos
-    like that declare nothing, and their test axis is deferred to the
-    whole-tree pass (`_select_subtask_axes`) -- the honest outcome rather than
-    a template that looks right and selects nothing."""
+    buys nothing and only adds a way to be wrong. Runners with no source->test
+    impact analysis (pytest, rspec, minitest, go, cargo) ARE inferred, from a
+    canonical test command that is a bare invocation of one
+    (`_infer_scoped_test_template`), but only over `{test_files}` and its
+    package/target forms: `{files}` would render `pytest
+    orchestrator/leerie.py`, which collects nothing, while `{test_files}`
+    renders nothing for that diff and the axis defers to the whole-tree pass
+    (`_select_subtask_axes`). The held-out acceptance sets need the same
+    template (DESIGN §8 *Scoped runners for every runner leerie can
+    read*)."""
     declared = _load_blt_config(repo_root) or {}
     out: dict[str, str] = {}
     for key in ("test_scoped", "build_scoped"):
@@ -30980,9 +31055,113 @@ def resolve_blt_scoped(repo_root: Path) -> dict[str, str]:
         elif next(repo_root.glob("jest.config.*"), None) is not None:
             out["test"] = ("npx jest --findRelatedTests {files} "
                            "--passWithNoTests")
+        else:
+            template, _why = _infer_scoped_test_template(
+                _canonical_test_command(repo_root, declared))
+            if template:
+                out["test"] = template
     if "build" not in out and (repo_root / "tsconfig.json").is_file():
         out["build"] = "npx tsc --noEmit"
     return out
+
+
+# Bare invocations of runners with no source->test impact analysis, as argv
+# prefixes (a fixed CLI surface), and the runner each one is. "Bare" means
+# only options follow the prefix: a positional selector of the repo's own
+# (`pytest tests/unit`, `rspec spec/models`) says the canonical command is
+# narrower than "the suite", and appending the set's files to it would run
+# both. `go test` is the exception — its positionals are package patterns,
+# replaced by the test files' packages.
+_SCOPED_RUNNER_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
+    (("pytest",), "pytest"), (("py.test",), "pytest"),
+    (("python", "-m", "pytest"), "pytest"),
+    (("python3", "-m", "pytest"), "pytest"),
+    (("uv", "run", "pytest"), "pytest"),
+    (("rspec",), "rspec"), (("bin/rspec",), "rspec"),
+    (("bundle", "exec", "rspec"), "rspec"),
+    (("bin/rails", "test"), "minitest"), (("rails", "test"), "minitest"),
+    (("bundle", "exec", "rails", "test"), "minitest"),
+    (("rake", "test"), "rake"), (("bundle", "exec", "rake", "test"), "rake"),
+    (("go", "test"), "go"), (("cargo", "test"), "cargo"),
+)
+# Options of each runner that take their value as the NEXT word — that word
+# is the option's, not a positional selector. Selecting options (`-k`, `-m`,
+# `--tag`) are deliberately absent: they narrow the suite, so a command
+# carrying one is not bare. Fixed CLI surface.
+_SCOPED_RUNNER_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "pytest": frozenset({"-p", "-n", "-c", "-W", "-o", "-r", "--maxfail",
+                         "--tb", "--durations", "--rootdir", "--basetemp",
+                         "--import-mode", "--cov", "--cov-report",
+                         "--timeout", "--dist", "--numprocesses"}),
+    "rspec": frozenset({"-f", "--format", "-r", "--require", "--order",
+                        "--seed", "-o", "--out"}),
+    "cargo": frozenset({"-F", "--features", "-p", "--package", "-j",
+                        "--jobs", "--target", "--profile", "--manifest-path"}),
+}
+# `rake test` takes one path (`TEST=`), so a set's files go through a ruby
+# loader instead: each is required, then minitest's autorun runs them.
+_RUBY_TEST_LOADER = ("ruby -Itest -Ilib -e "
+                     + shlex.quote("ARGV.dup.each { |f| require "
+                                   "File.expand_path(f) }; ARGV.clear"))
+
+
+def _canonical_test_command(repo_root: Path,
+                            declared: dict[str, str] | None = None) -> str:
+    """`resolve_blt(repo_root)["test"]` without its log lines — read once
+    per acceptance file, where `resolve_blt`'s provenance log would repeat
+    on every call."""
+    if declared is None:
+        declared = _load_blt_config(repo_root) or {}
+    if "test" in declared:
+        return (declared.get("test") or "").strip()
+    return (_infer_build_lint_test(repo_root).get("test") or "").strip()
+
+
+def _infer_scoped_test_template(canonical: str) -> tuple[str | None, str]:
+    """`(template, reason)`: a `{test_files}`-tier scoped test template
+    derived from a canonical test command that is a bare pytest, rspec,
+    minitest, go or cargo invocation, or `(None, "no_scoped_runner:<what>")`
+    naming why none applies. Reads the command's argv (`shlex`, a mechanical
+    string — DESIGN §12): shell operators, environment assignments or a
+    wrapper of the repo's own make it not a bare invocation."""
+    if not canonical:
+        return None, "no_scoped_runner:no test command"
+    try:
+        argv = shlex.split(canonical)
+    except ValueError:
+        return None, "no_scoped_runner:unparseable test command"
+    for prefix, runner in _SCOPED_RUNNER_PREFIXES:
+        if tuple(argv[:len(prefix)]) != prefix:
+            continue
+        rest = argv[len(prefix):]
+        value_opts = _SCOPED_RUNNER_VALUE_OPTS.get(runner, frozenset())
+        options: list[str] = []
+        for i, a in enumerate(rest):
+            if a.startswith("-") or (i and rest[i - 1] in value_opts):
+                options.append(a)
+        if runner == "go":
+            # Positionals are package patterns (`./...`); options that take
+            # a separate value cannot be told from them, so any non-option
+            # other than a package pattern disqualifies.
+            if any(not a.startswith("-") and not a.startswith(".")
+                   for a in rest):
+                return None, f"no_scoped_runner:not a bare {runner} command"
+            return (shlex.join(["go", "test", *options])
+                    + " {test_packages}"), runner
+        if len(options) != len(rest):
+            return None, f"no_scoped_runner:not a bare {runner} command"
+        if runner == "cargo":
+            if "--" in rest:
+                return None, "no_scoped_runner:cargo test passes runner flags"
+            flags = [] if "--no-fail-fast" in rest else ["--no-fail-fast"]
+            return shlex.join([*argv, *flags]) + " {test_targets}", runner
+        if runner == "rake":
+            bundled = argv[0] == "bundle"
+            return ((("bundle exec " if bundled else "") + _RUBY_TEST_LOADER
+                     + " {test_files}"), "minitest")
+        return shlex.join(argv) + " {test_files}", runner
+    return None, ("no_scoped_runner:"
+                  + (os.path.basename(argv[0]) if argv else "empty command"))
 
 
 def resolve_test_file_globs(repo_root: Path) -> list[str]:
@@ -33737,61 +33916,80 @@ async def _confirm_new_failures(
     return out
 
 
+async def _confirm_still_failing(
+        candidates: Iterable[str],
+        run_final: Callable[[float], Awaitable[set[str] | None]],
+        caps: dict, *, label: str,
+        read_psi: Callable[[], float | None] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        clock: Callable[[], float] | None = None) -> dict:
+    """B*'s blocks for a failure verdict with no base side to pair against —
+    a held-out set failing on a tree (DESIGN §8: a set failure is confirmed
+    like a new test failure). The same host-pressure gate, then
+    `confirm_pairs` serial reruns of the tree (`confirm_pairs_escalated` when
+    the gate timed out) inside `confirm_budget_sec`. A candidate is
+    `confirmed` only if every required rerun ran, produced a verdict and
+    failed it; anything else is `resource_affected` — so a load flake never
+    forces a repair. `run_final` gets the remaining budget and returns the
+    failing candidates of one rerun (None: no verdict)."""
+    cand = sorted(set(candidates))
+    out: dict = {"candidates": cand, "confirmed": [], "resource_affected": [],
+                 "reruns_required": 0, "reruns_run": 0,
+                 "budget_exhausted": False, "gate": None}
+    if not cand:
+        return out
+    clock = clock or time.monotonic
+    async with _confirm_lock():
+        budget = float(caps.get("confirm_budget_sec",
+                                DEFAULT_CAPS["confirm_budget_sec"]))
+        t0 = clock()
+        gate = await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
+                                   clock=clock)
+        out["gate"] = gate
+        k = int(caps.get("confirm_pairs_escalated",
+                         DEFAULT_CAPS["confirm_pairs_escalated"])
+                if gate["timed_out"] else
+                caps.get("confirm_pairs", DEFAULT_CAPS["confirm_pairs"]))
+        out["reruns_required"] = k
+        runs: list[set[str] | None] = []
+        for _ in range(k):
+            left = budget - (clock() - t0)
+            if left <= 0:
+                out["budget_exhausted"] = True
+                break
+            try:
+                runs.append(await run_final(left))
+            except Exception as e:
+                log(f"  B* {label}: rerun raised {type(e).__name__}: {e} — "
+                    "no verdict for this run")
+                runs.append(None)
+        out["reruns_run"] = len(runs)
+        complete = len(runs) == k and all(r is not None for r in runs)
+        for cid in cand:
+            if complete and all(cid in r for r in runs if r is not None):
+                out["confirmed"].append(cid)
+            else:
+                out["resource_affected"].append(cid)
+    log(f"  B* {label}: {len(cand)} failing, {len(out['confirmed'])} "
+        f"confirmed, {len(out['resource_affected'])} resource_affected "
+        f"({out['reruns_run']}/{k} rerun(s); gate waited "
+        f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
+        f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
+    return out
+
+
 def _runner_report_failing_ids(kind: str, path: Path,
                                tree: str) -> dict[str, str | None] | None:
     """Failing test ID -> repo-relative file (None when the report does not
-    say) from a runner's structured report — the machine formats
-    `_parse_runner_report` reads (DESIGN §12). None when there is no
+    say) from a runner's structured report — the cases
+    `_runner_report_cases` reads (DESIGN §12). None when there is no
     readable report, or it executed no test and recorded no load failure."""
-    out: dict[str, str | None] = {}
-    executed = 0
-
-    def _rel(name: str) -> str:
-        return (os.path.relpath(name, tree) if os.path.isabs(name)
-                else os.path.normpath(name))
-
-    try:
-        if kind == "junit":
-            root = ElementTree.parse(path).getroot()
-            for case in root.iter("testcase"):
-                tags = {child.tag for child in case}
-                classname = case.get("classname") or ""
-                name = case.get("name") or ""
-                if any(child.tag == "error"
-                       and child.get("message") == "collection failure"
-                       for child in case):
-                    # pytest names the uncollectable module in `name`.
-                    f = case.get("file") or name.replace(".", "/") + ".py"
-                    out[f"{_rel(f)} :: (file failed to load)"] = _rel(f)
-                    continue
-                if "skipped" in tags:
-                    continue
-                executed += 1
-                if "failure" in tags or "error" in tags:
-                    f = case.get("file")
-                    if not f and classname:
-                        f = _junit_class_file(classname, tree)
-                    rel = _rel(f) if f else None
-                    out[f"{rel or classname} :: {classname}.{name}"] = rel
-        elif kind == "jest-json":
-            data = json.loads(Path(path).read_text())
-            for suite in data.get("testResults") or []:
-                rel = _rel(str(suite.get("name") or ""))
-                results = suite.get("assertionResults") or []
-                if (suite.get("testExecError")
-                        or (suite.get("status") == "failed" and not results)):
-                    out[f"{rel} :: (file failed to load)"] = rel
-                for r in results:
-                    if r.get("status") in ("passed", "failed"):
-                        executed += 1
-                    if r.get("status") == "failed":
-                        title = r.get("fullName") or r.get("title") or ""
-                        out[f"{rel} :: {title}"] = rel
-        else:
-            return None
-    except (OSError, ValueError, ElementTree.ParseError, AttributeError,
-            TypeError):
+    cases = _runner_report_cases(kind, path, str(tree))
+    if cases is None:
         return None
+    out = {c["id"]: c["file"] for c in cases
+           if c["status"] in ("failed", "load_error")}
+    executed = sum(1 for c in cases if c["status"] in ("passed", "failed"))
     if executed == 0 and not out:
         return None
     return out
@@ -33824,7 +34022,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     flag the serial one contradicts) is retried once as written."""
     run_files = list(files or [])
     if run_files:
-        scoped = _acceptance_cmd(st, run_files)
+        scoped = _acceptance_cmd(st, run_files, tree)
         if scoped:
             cmd = scoped
         else:
@@ -34519,6 +34717,37 @@ def _downgrade_ungrounded_met(contract: dict | None,
             "evidence": (evidence + "\n" + note).strip()}
 
 
+def _acceptance_set_broken(set_: dict) -> bool:
+    """Whether a held-out set has been typed `broken` — a test no correct
+    fix could pass. The set audit (DESIGN §8) is what types it; this is the
+    one place the residual hand-off reads the type."""
+    return set_.get("broken") is True
+
+
+def _acceptance_residual_unbroken(residual: dict | None,
+                                  sets: list[dict]) -> dict | None:
+    """A run's held-out residual with every set typed broken left out
+    (DESIGN §8 *A set typed broken is not handed on*), applied when the
+    residual is READ, so a set typed after its run finished is excluded
+    too. None when nothing is left to hand on; a residual recorded before
+    per-set indices existed (no `sets`) is returned unchanged."""
+    if not residual or not isinstance(residual.get("sets"), list):
+        return residual
+    by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
+    keep = [i for i in residual["sets"]
+            if not _acceptance_set_broken(by_index.get(i) or {})]
+    if len(keep) == len(residual["sets"]):
+        return residual
+    if not keep and not residual.get("rollback_failed"):
+        return None
+    by_set = residual.get("cases_by_set") or {}
+    out = dict(residual)
+    out["sets"] = keep
+    out["failing_sets"] = len(keep)
+    out["cases"] = [c for i in keep for c in by_set.get(str(i), [])][:20]
+    return out
+
+
 def _prior_delivery_residual(st: "State") -> dict | None:
     """The most recent OTHER run's recorded delivery-gate residual for
     the SAME task — and its held-out acceptance residual, as
@@ -34579,6 +34808,8 @@ def _prior_delivery_residual(st: "State") -> dict | None:
         contract_after = gate.get("contract_after") or {}
         contract_before = gate.get("contract_before") or {}
         residual: dict = {}
+        acc_residual = _acceptance_residual_unbroken(
+            acc_residual, (data.get("acceptance") or {}).get("sets") or [])
         if acc_residual:
             # Held-out acceptance residual (DESIGN §8 *Held-out acceptance
             # tests*): the case NAMES that still failed — never test
@@ -34953,11 +35184,13 @@ async def _delivery_judge_unmet(
 
 # --- held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*) ----
 
-def _acceptance_validity_base(st: "State") -> str | None:
+def _acceptance_report_base(st: "State") -> str | None:
     """The tree the report was filed against: the earliest COMPLETED-or-not
     same-task sibling run's starting HEAD when one exists and is still
     reachable, else this run's own starting HEAD. Same exact-task match as
-    `_prior_delivery_residual` (mechanical string equality)."""
+    `_prior_delivery_residual` (mechanical string equality). Informational
+    only since sets are validated at the own start (`report_reproduced`,
+    DESIGN §8 *The validity tree is the run's own start*)."""
     own = (st.data.get("repo_state_before_planning") or {}).get("head")
     task = (st.data.get("task") or "").strip()
     best: tuple[str, str] | None = None
@@ -35192,13 +35425,60 @@ def _acceptance_no_verdict_exits(cmd: str, files: Iterable[str] = ()
 # three), and pytest's only approximately. Each value is (report kind, how):
 # "env" sets PYTEST_ADDOPTS and so works whatever the command's shape — unless
 # the command names its own JUnit path, which beats it, when the option is
-# appended instead; a flag string is appended to the command. Appending is
-# only safe where `_flags_reach_runner` holds (`_acceptance_report_spec`).
+# appended instead; "rbplugin" puts leerie's minitest reporter on RUBYLIB
+# (`_MINITEST_REPORT_PLUGIN`), also whatever the shape; "stdout:<flags>"
+# appends the flags and sends the runner's stdout — its JSON event stream —
+# to the report path; any other flag string is appended to the command.
+# Appending is only safe where `_flags_reach_runner` holds
+# (`_acceptance_report_spec`). The runners after vitest are the C9 set
+# (DESIGN §8 *Scoped runners for every runner leerie can read*): `rails` and
+# `ruby` (the `rake test` loader) are minitest.
 _RUNNER_REPORTS: dict[str, tuple[str, str]] = {
     "pytest": ("junit", "env"),
     "jest": ("jest-json", "--json --outputFile={path}"),
     "vitest": ("jest-json", "--reporter=json --outputFile={path}"),
+    "rspec": ("rspec-json", "--format progress --format json --out {path}"),
+    "rails": ("minitest-json", "rbplugin"),
+    "ruby": ("minitest-json", "rbplugin"),
+    "go": ("go-json", "stdout:-json"),
+    "cargo": ("libtest-json", "stdout:-- -Z unstable-options --format json"),
 }
+# Extra environment a runner's report request needs: libtest's JSON format
+# is unstable-only, which RUSTC_BOOTSTRAP=1 unlocks on a stable toolchain.
+_RUNNER_REPORT_ENV: dict[str, dict[str, str]] = {
+    "cargo": {"RUSTC_BOOTSTRAP": "1"},
+}
+# leerie's minitest reporter, found by `Minitest.load_plugins` through
+# RUBYLIB: one JSON record per case, written to $LEERIE_MT_REPORT. It
+# requires no minitest itself, so a bundled app's pinned version is the one
+# that loads (benched as C9 with `bin/rails test` and the ruby loader, on
+# the rootless and rootful runtimes).
+_MINITEST_REPORT_PLUGIN = """\
+require "json"
+module Minitest
+  class LeerieReportReporter < AbstractReporter
+    def initialize(path)
+      @path = path
+      @cases = []
+    end
+
+    def record(r)
+      st = r.skipped? ? "skipped" : (r.error? ? "error" : (r.passed? ? "passed" : "failed"))
+      loc = r.respond_to?(:source_location) ? r.source_location : nil
+      @cases << {id: "#{r.klass}##{r.name}", file: loc && loc.first, status: st}
+    end
+
+    def report
+      File.write(@path, JSON.generate({cases: @cases}))
+    end
+  end
+
+  def self.plugin_leeriereport_init(_opts)
+    p = ENV["LEERIE_MT_REPORT"]
+    reporter << LeerieReportReporter.new(p) if p && !p.empty?
+  end
+end
+"""
 
 # Container and remote CLIs, and commands that run their argument as another
 # user (`su`, `sudo`, `runuser`, `doas`, which reset the environment and may
@@ -35255,6 +35535,30 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     if tokens is not None and _runner_in_container(
             tokens, _runner_positions(tokens, runner, files)):
         return None
+    if how == "rbplugin":
+        plugin_dir = Path(path).parent / ".leerie-rbplugin"
+        plugin = plugin_dir / "minitest" / "leeriereport_plugin.rb"
+        try:
+            plugin.parent.mkdir(parents=True, exist_ok=True)
+            if not plugin.is_file():
+                plugin.write_text(_MINITEST_REPORT_PLUGIN)
+        except OSError:
+            return None
+        prior = os.environ.get("RUBYLIB", "")
+        return cmd, {**os.environ,
+                     "RUBYLIB": (f"{plugin_dir}:{prior}" if prior
+                                 else str(plugin_dir)),
+                     "LEERIE_MT_REPORT": str(path)}, kind
+    if how.startswith("stdout:"):
+        placed = _append_runner_flags(cmd, runner, files,
+                                      how[len("stdout:"):])
+        if placed is None:
+            return None
+        env = ({**os.environ, **_RUNNER_REPORT_ENV[runner]}
+               if runner in _RUNNER_REPORT_ENV else None)
+        # The flags landed as the last words of the runner's own simple
+        # command, so a redirect after them is that command's stdout.
+        return f"{placed} >{shlex.quote(str(path))}", env, kind
     if how == "env":
         flags = f"--junitxml={shlex.quote(str(path))}"
         if tokens is None or not any(
@@ -35789,47 +36093,153 @@ def _command_word(tokens: list[tuple[str, str, int]]) -> str | None:
 
 
 def _parse_runner_report(kind: str, path: Path) -> dict | None:
-    """`{executed, collection_error}` from a runner's structured report, or
-    None when there is none to read (the runner ignored the request, or it
-    died before writing). Reads fixed machine formats only (DESIGN §12)."""
+    """`{executed, collection_error, cases}` from a runner's structured
+    report — `cases` maps each case ID to its status (`passed`, `failed`,
+    `skipped` or `load_error`), the per-case verdict validation reads
+    (DESIGN §8 *Held-out acceptance tests*) — or None when there is none to
+    read (the runner ignored the request, or it died before writing). Reads
+    fixed machine formats only (DESIGN §12)."""
+    cases = _runner_report_cases(kind, path)
+    if cases is None:
+        return None
+    return {"executed": sum(1 for c in cases
+                            if c["status"] in ("passed", "failed")),
+            "collection_error": any(c["status"] == "load_error"
+                                    for c in cases),
+            "cases": {c["id"]: c["status"] for c in cases}}
+
+
+def _runner_report_cases(kind: str, path: Path,
+                         tree: str | None = None) -> list[dict] | None:
+    """Every case a runner's structured report records, as
+    `{id, file, status}` — `status` one of `passed`, `failed` (a setup error
+    included: it ran and failed), `skipped`, or `load_error` (the file or
+    package never loaded, recorded as a case of its own) — with `file`
+    repo-relative to `tree` when the report says and `tree` is given. None
+    when there is no readable report of a known kind. Fixed machine formats
+    only (DESIGN §12): pytest's JUnit XML, the jest-compatible JSON of jest
+    and vitest, rspec's JSON formatter, leerie's minitest reporter
+    (`_MINITEST_REPORT_PLUGIN`), `go test -json` and libtest's JSON events."""
+
+    def _rel(name: str) -> str:
+        if tree is not None and os.path.isabs(name):
+            return os.path.relpath(name, tree)
+        return os.path.normpath(name)
+
+    out: list[dict] = []
+
+    def _add(cid: str, file: str | None, status: str) -> None:
+        out.append({"id": cid, "file": file, "status": status})
+
+    def _json_lines() -> list[dict]:
+        events = []
+        for line in Path(path).read_text().splitlines():
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue                  # interleaved non-JSON output
+            if isinstance(ev, dict):
+                events.append(ev)
+        return events
+
     try:
         if kind == "junit":
             root = ElementTree.parse(path).getroot()
-            executed, collection_error = 0, False
             for case in root.iter("testcase"):
                 tags = {child.tag for child in case}
+                classname = case.get("classname") or ""
+                name = case.get("name") or ""
                 # pytest records a file it could not collect (a syntax
                 # error, a failed import) as a case whose <error> carries
                 # the fixed message "collection failure"
                 # (`append_collect_error` in its junitxml plugin). Keyed on
                 # that, not on an empty classname, which `--junit-prefix`
                 # fills in. A setup error ("failed on setup with …") sits on
-                # a real case that ran.
+                # a real case that ran. pytest names the uncollectable
+                # module in `name`.
                 if any(child.tag == "error"
                        and child.get("message") == "collection failure"
                        for child in case):
-                    collection_error = True
-                elif "skipped" not in tags:
-                    executed += 1
-            return {"executed": executed,
-                    "collection_error": collection_error}
-        if kind == "jest-json":
+                    f = case.get("file") or name.replace(".", "/") + ".py"
+                    _add(f"{_rel(f)} :: (file failed to load)", _rel(f),
+                         "load_error")
+                    continue
+                f = case.get("file")
+                if not f and classname and tree is not None:
+                    f = _junit_class_file(classname, tree)
+                rel = _rel(f) if f else None
+                status = ("skipped" if "skipped" in tags
+                          else "failed" if ("failure" in tags
+                                            or "error" in tags)
+                          else "passed")
+                _add(f"{rel or classname} :: {classname}.{name}", rel, status)
+        elif kind == "jest-json":
             data = json.loads(Path(path).read_text())
-            executed, collection_error = 0, False
             for suite in data.get("testResults") or []:
+                rel = _rel(str(suite.get("name") or ""))
                 results = suite.get("assertionResults") or []
                 # A suite that failed with no assertion run never loaded.
                 if (suite.get("testExecError")
                         or (suite.get("status") == "failed" and not results)):
-                    collection_error = True
-                executed += sum(1 for r in results
-                                if r.get("status") in ("passed", "failed"))
-            return {"executed": executed,
-                    "collection_error": collection_error}
+                    _add(f"{rel} :: (file failed to load)", rel, "load_error")
+                for r in results:
+                    title = r.get("fullName") or r.get("title") or ""
+                    st_ = r.get("status")
+                    _add(f"{rel} :: {title}", rel,
+                         st_ if st_ in ("passed", "failed") else "skipped")
+        elif kind == "rspec-json":
+            data = json.loads(Path(path).read_text())
+            for ex in data.get("examples") or []:
+                rel = _rel(str(ex.get("file_path") or ""))
+                title = (ex.get("full_description") or ex.get("description")
+                         or ex.get("id") or "")
+                st_ = ex.get("status")
+                _add(f"{rel} :: {title}", rel,
+                     st_ if st_ in ("passed", "failed") else "skipped")
+            if ((data.get("summary") or {}).get(
+                    "errors_outside_of_examples_count") or 0) > 0:
+                # A spec file that raised while loading.
+                _add("(rspec) :: (file failed to load)", None, "load_error")
+        elif kind == "minitest-json":
+            data = json.loads(Path(path).read_text())
+            for c in data.get("cases") or []:
+                rel = _rel(str(c["file"])) if c.get("file") else None
+                st_ = c.get("status")
+                _add(f"{rel} :: {c.get('id')}" if rel else str(c.get("id")),
+                     rel, ("failed" if st_ in ("failed", "error")
+                           else st_ if st_ in ("passed", "skipped")
+                           else "skipped"))
+        elif kind == "go-json":
+            tested: set[str] = set()
+            failed_pkgs: list[str] = []
+            for ev in _json_lines():
+                pkg, test, action = (ev.get("Package") or "", ev.get("Test"),
+                                     ev.get("Action"))
+                if test and action in ("pass", "fail", "skip"):
+                    tested.add(pkg)
+                    _add(f"{pkg} :: {test}", None,
+                         {"pass": "passed", "fail": "failed",
+                          "skip": "skipped"}[action])
+                elif not test and action == "fail":
+                    failed_pkgs.append(pkg)
+            for pkg in failed_pkgs:
+                # A package that failed without running a test did not build.
+                if pkg not in tested:
+                    _add(f"{pkg} :: (package failed to build)", None,
+                         "load_error")
+        elif kind == "libtest-json":
+            for ev in _json_lines():
+                if ev.get("type") == "test" and ev.get("event") in (
+                        "ok", "failed", "ignored"):
+                    _add(str(ev.get("name") or ""), None,
+                         {"ok": "passed", "failed": "failed",
+                          "ignored": "skipped"}[ev["event"]])
+        else:
+            return None
     except (OSError, ValueError, ElementTree.ParseError, AttributeError,
-            TypeError):
+            TypeError, KeyError):
         return None
-    return None
+    return out
 
 
 _PARSE_PROBE_SOURCE = """\
@@ -35980,9 +36390,14 @@ def _acceptance_declared_rel(declared: dict) -> str:
     return os.path.normpath(raw) if raw else ""
 
 
-def _acceptance_cmd(st: "State", files: list[str]) -> str | None:
+def _acceptance_cmd(st: "State", files: list[str],
+                    tree: str | None = None) -> str | None:
     """The repo's scoped test template rendered over explicit test files,
-    or None when there is no template or a file is not test-shaped."""
+    or None when there is no template or a file is not test-shaped (or, for
+    the package/target forms, not one the runner can select). Over a
+    `{test_packages}` template, which runs whole Go packages, the command
+    also selects the files' own test functions (`-run`, read from `tree`'s
+    copies), so a package's existing tests stay out of the verdict."""
     template = resolve_blt_scoped(st.repo_root).get("test")
     if not template or not files:
         return None
@@ -35994,7 +36409,34 @@ def _acceptance_cmd(st: "State", files: list[str]) -> str | None:
     if "{test_files}" in template and not all(
             _is_test_file(f, globs) for f in files):
         return None
+    if "{test_targets}" in template and not all(
+            _is_cargo_integration_test(f) for f in files):
+        return None
+    if "{test_packages}" in template:
+        if tree is None or not all(f.endswith("_test.go") for f in files):
+            return None
+        names = sorted({n for f in files
+                        for n in _go_test_func_names(Path(tree) / f)})
+        if not names:
+            return None
+        rendered += " -run " + shlex.quote("^(" + "|".join(names) + ")$")
     return rendered
+
+
+# A top-level Go test function (`func TestX(t *testing.T)`): Go source is a
+# mechanical string (DESIGN §12). TestMain is the package's harness, not a
+# test.
+_GO_TEST_FUNC_RE = re.compile(r"^func\s+(Test[A-Za-z0-9_]*)\s*\(",
+                              re.MULTILINE)
+
+
+def _go_test_func_names(path: Path) -> list[str]:
+    """The test functions a Go test file declares, or [] when unreadable."""
+    try:
+        text = path.read_text(errors="replace")
+    except OSError:
+        return []
+    return [n for n in _GO_TEST_FUNC_RE.findall(text) if n != "TestMain"]
 
 
 async def _run_acceptance_file(st: "State", caps: dict, tree: str,
@@ -36009,7 +36451,10 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     it — exit 126/127 — or the container's limits killed it).
 
     Only when `validating` (on the base, by the writer): the runner is asked
-    for a structured report (`_acceptance_report_spec`). A file that ran no
+    for a structured report (`_acceptance_report_spec`) and the verdict is
+    PER CASE — False when any case failed (its IDs in
+    `observed["failing_cases"]`), True when none did, whatever the exit code
+    says (DESIGN §8). A file that ran no
     test is no verdict, and so is one that could not be loaded — unless the
     writer declared its defect an import failure (`failure_mode="import"`,
     passed only once `_acceptance_parse_probe` has shown the file and its
@@ -36022,7 +36467,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     file defect prints when it fails — exactly the failure a defect file
     exists to show. And always quiet: a streamed echo would put the hidden
     test's source and output in `orchestrator.log`."""
-    cmd = _acceptance_cmd(st, [rel])
+    cmd = _acceptance_cmd(st, [rel], tree)
     if cmd is None:
         return None
     run_cmd, env, spec = cmd, None, None
@@ -36066,14 +36511,22 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
         return None
     if parsed["executed"] == 0:
         return None
-    return rc == 0
+    # Per case (DESIGN §8): the report's own case statuses are the verdict,
+    # not the exit code — a coverage threshold or a teardown error turns the
+    # exit red with every case passing, and that file did not fail.
+    failing = [cid for cid, status in (parsed.get("cases") or {}).items()
+               if status == "failed"]
+    if observed is not None:
+        observed["failing_cases"] = failing[:20]
+    return not failing
 
 
 async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                                 models: dict, efforts: dict,
                                 base: str) -> dict:
-    """One acceptance_writer in a disposable worktree at `base`; returns the
-    validated set (`valid` False when nothing discriminates)."""
+    """One acceptance_writer in a disposable checkout of `base` (the run's
+    own start, `_acceptance_writer_checkout`); returns the validated set
+    (`valid` False when nothing discriminates)."""
     leerie_dir = st.run_dir
     wt = leerie_dir / "worktrees" / f"acceptance-{k}"
     log_path = leerie_dir / "logs" / f"acceptance-{k}.log"
@@ -36081,14 +36534,10 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     # Outside every try: budget exhaustion must propagate, not read as an
     # invalid set (the same discipline as the no_work_judge call).
     st.bump_workers(caps)
-    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
-                    "--force", str(wt)], capture_output=True, check=False)
-    shutil.rmtree(wt, ignore_errors=True)
-    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
-                          "--detach", str(wt), base],
-                         capture_output=True, text=True, check=False)
-    if add.returncode != 0:
-        out["reason"] = f"worktree add failed: {add.stderr.strip()[:200]}"
+    _remove_acceptance_checkout(st, wt)
+    made = _acceptance_writer_checkout(st, wt, base)
+    if made.startswith("failed"):
+        out["reason"] = made
         return out
     try:
         # The report is usually an untracked file in the user's checkout,
@@ -36172,6 +36621,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             if p and p not in refs and p not in pre_untracked
             and not _acceptance_is_cache_path(p))
         defect, control, cases, modes = [], [], {}, {}
+        base_failing: dict[str, list[str]] = {}
         for f in (res.get("files") or []):
             rel = _acceptance_declared_rel(f)
             # Relative, inside the worktree, a real file, not the report.
@@ -36229,6 +36679,8 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 # Must FAIL on the unfixed tree, or it cannot discriminate.
                 if verdict is False:
                     defect.append(rel)
+                    if observed.get("failing_cases"):
+                        base_failing[rel] = observed["failing_cases"]
                     # "import" only when the base run showed the file failing
                     # to load; a declared import defect that loaded and failed
                     # an assertion is an ordinary failure.
@@ -36268,7 +36720,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             shutil.copy2(wt / rel, dest / rel)
         out.update(valid=True, dir=str(dest), defect_files=defect,
                    control_files=control, support_files=support, cases=cases,
-                   modes=modes)
+                   modes=modes, base_failing_cases=base_failing)
         return out
     except (WorkerError, subprocess.TimeoutExpired) as e:
         out["reason"] = _brief_worker_exc(e)
@@ -36278,31 +36730,88 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         out["reason"] = f"{type(e).__name__}: {e}"[:200]
         return out
     finally:
-        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
-                        "--force", str(wt)], capture_output=True, check=False)
-        shutil.rmtree(wt, ignore_errors=True)
+        _remove_acceptance_checkout(st, wt)
+
+
+def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
+    """Create the writer's checkout of `base` at `wt` — "clone", "worktree",
+    or "failed: <why>". A clone sharing the repo's objects with every ref
+    deleted, so the only commit the writer can reach is the own start and its
+    history: no branch, tag or earlier run's branch (DESIGN §8 *The validity
+    tree is the run's own start*). Mechanical git plumbing; fails open to a
+    detached worktree (today's checkout, every ref visible), logged."""
+    def _git(*args: str, cwd: Path | None = None
+             ) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", *(["-C", str(cwd)] if cwd else []), *args],
+            capture_output=True, text=True, check=False)
+
+    clone = _git("clone", "--quiet", "--shared", "--no-checkout",
+                 "--no-tags", str(st.repo_root), str(wt))
+    ok = clone.returncode == 0
+    if ok:
+        ok = _git("checkout", "--quiet", "--detach", base,
+                  cwd=wt).returncode == 0
+    if ok:
+        refs = _git("for-each-ref", "--format=%(refname)", cwd=wt)
+        ok = refs.returncode == 0
+        for ref in refs.stdout.split() if ok else []:
+            ok = ok and _git("update-ref", "-d", ref,
+                             cwd=wt).returncode == 0
+        # The remote itself would let `git fetch` reach every ref again.
+        _git("remote", "remove", "origin", cwd=wt)
+        _git("reflog", "expire", "--expire=now", "--all", cwd=wt)
+        left = _git("for-each-ref", "--format=%(refname)", cwd=wt)
+        ok = ok and left.returncode == 0 and not left.stdout.strip()
+    if ok:
+        return "clone"
+    why = (clone.stderr.strip() or "a ref could not be removed")[:200]
+    log(f"  acceptance: no ref-less writer clone ({why}) — using a "
+        "detached worktree, where every ref is visible")
+    shutil.rmtree(wt, ignore_errors=True)
+    add = _git("-C", str(st.repo_root), "worktree", "add", "--detach",
+               str(wt), base)
+    if add.returncode != 0:
+        return f"failed: worktree add failed: {add.stderr.strip()[:200]}"
+    return "worktree"
+
+
+def _remove_acceptance_checkout(st: "State", wt: Path) -> None:
+    """Remove a writer checkout, whichever kind it is."""
+    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                    "--force", str(wt)], capture_output=True, check=False)
+    shutil.rmtree(wt, ignore_errors=True)
+    _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
 
 async def phase_acceptance_write(task: str, st: "State", caps: dict,
                                  models: dict, efforts: dict) -> dict:
     """Write and mechanically validate the held-out acceptance sets
-    (DESIGN §8 *Held-out acceptance tests*). Fail-open: any skip is
-    recorded with its reason and the gate simply does not run."""
+    (DESIGN §8 *Held-out acceptance tests*) at the run's own start.
+    Written whenever the defect-scope audit ran — a `bug-fixing`
+    classification — whatever it returned (N1-L: `applicable` no longer
+    gates them). Fail-open: any skip is recorded with its reason and the
+    gate simply does not run."""
     if st.data.get("skip_acceptance_check"):
         return {"skipped": "--skip-acceptance-check"}
-    scope = st.data.get("defect_scope") or {}
-    if not scope.get("applicable"):
-        return {"skipped": "defect-scope audit not applicable"}
+    if "bug-fixing" not in (st.data.get("categories") or []):
+        return {"skipped": "not a defect-fix run (no defect-scope audit)"}
     if not resolve_blt_scoped(st.repo_root).get("test"):
-        log("  acceptance: no scoped test command — held-out acceptance "
-            "tests skipped (declare test_scoped in .leerie/config.toml)")
-        return {"skipped": "no scoped test command"}
-    base = _acceptance_validity_base(st)
+        canonical = _canonical_test_command(st.repo_root)
+        _template, why = _infer_scoped_test_template(canonical)
+        log(f"  WARNING: acceptance: no scoped test runner for "
+            f"{canonical or '(no test command)'!r} ({why}) — held-out "
+            "acceptance tests skipped; declare test_scoped in "
+            ".leerie/config.toml to get them")
+        return {"skipped": "no scoped test command",
+                "skip_kind": "no_scoped_runner", "reason": why,
+                "test_command": canonical}
+    base = _acceptance_own_start(st)
     if not base:
         return {"skipped": "no validity base"}
     n = int(caps.get("acceptance_sets", DEFAULT_CAPS["acceptance_sets"]))
-    log(f"phase 2: writing {n} held-out acceptance set(s) against "
-        f"{base[:12]} (DESIGN §8)")
+    log(f"phase 2: writing {n} held-out acceptance set(s) against the "
+        f"run's own start {base[:12]} (DESIGN §8)")
     sem = asyncio.Semaphore(max(1, int(caps.get("max_parallel", 1))))
 
     async def _one(k: int) -> dict:
@@ -36316,19 +36825,63 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
             log(f"  acceptance set {r['index']} discarded: "
                 f"{r.get('reason', 'invalid')}")
     log(f"  acceptance: {len(sets)} of {n} set(s) valid")
-    return {"validity_base": base, "sets": sets, "written": n}
+    report_base = _acceptance_report_base(st)
+    await _record_report_reproduced(st, caps, sets, base, report_base)
+    return {"validity_base": base, "report_base": report_base,
+            "sets": sets, "written": n}
+
+
+def _acceptance_own_start(st: "State") -> str | None:
+    """The validity tree (DESIGN §8 *The validity tree is the run's own
+    start*): the HEAD this run started from."""
+    return (st.data.get("repo_state_before_planning") or {}).get("head")
+
+
+async def _record_report_reproduced(st: "State", caps: dict,
+                                    sets: list[dict], own: str,
+                                    report_base: str | None) -> None:
+    """Record on each valid set `report_reproduced`: whether it also fails
+    at the earliest same-task base. Informational only — nothing filters on
+    it (the plan dropped it as a filter). True outright when that base is
+    the own start, where every valid set failed; None when it could not be
+    measured. Never raises."""
+    if not sets:
+        return
+    if not report_base or report_base == own:
+        for s_ in sets:
+            s_["report_reproduced"] = True
+        return
+    try:
+        res = await _evaluate_acceptance_sets(
+            st, caps, str(st.repo_root), sets, "report-base",
+            rev=report_base, confirm=False)
+    except Exception as e:
+        log(f"  acceptance: report_reproduced not measured "
+            f"({type(e).__name__})")
+        res = []
+    by_index = {r["index"]: r for r in res}
+    for s_ in sets:
+        r = by_index.get(s_["index"])
+        s_["report_reproduced"] = (None if r is None or r.get("unmeasured")
+                                  else not r.get("passed"))
+    log("  acceptance: "
+        f"{sum(1 for s_ in sets if s_.get('report_reproduced'))} of "
+        f"{len(sets)} valid set(s) also fail at the earliest same-task base "
+        f"{report_base[:12]} (report_reproduced; informational)")
 
 
 async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
                                     sets: list[dict], label: str, *,
-                                    rev: str = "HEAD") -> list[dict]:
+                                    rev: str = "HEAD",
+                                    confirm: bool = True) -> list[dict]:
     """`_evaluate_acceptance_sets_inner`, never raising: any failure to set
     up or run the evaluation (a fork failure on `git worktree add`, a full
     disk) is no evidence from any set — never an exception that would skip
     a repair's rollback check."""
     try:
         return await _evaluate_acceptance_sets_inner(st, caps, tree, sets,
-                                                     label, rev=rev)
+                                                     label, rev=rev,
+                                                     confirm=confirm)
     except Exception as e:
         log(f"  acceptance: evaluation failed ({type(e).__name__}: {e}) — "
             "no evidence either way")
@@ -36338,14 +36891,20 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
 
 async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
                                           sets: list[dict], label: str, *,
-                                          rev: str = "HEAD") -> list[dict]:
+                                          rev: str = "HEAD",
+                                          confirm: bool = True
+                                          ) -> list[dict]:
     """Run each valid set against `tree`'s `rev` commit (default HEAD), in
     a disposable worktree at that commit — never in `tree` itself. Nothing of a set can
     then linger where a fixer works, not even after a crash mid-run (no
     `finally` survives a SIGKILL), and no runner cache in `tree` records
     the hidden tests' ids. A set fails when any of its files fails; a set
     file whose path the tree already uses is never overwritten and makes
-    the set unmeasured."""
+    the set unmeasured. With `confirm`, a failing file is confirmed under
+    B* (`_confirm_still_failing`) while the set is still placed: only a
+    file that failed every rerun stays failing (`failing_files`); the rest
+    are `resource_affected_files`, and a set whose failures were all
+    resource-affected is no evidence either way (DESIGN §8)."""
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
     wt = st.run_dir / "worktrees" / "acceptance-eval"
 
@@ -36385,6 +36944,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
             return unmeasured_all
         for s_ in sets:
             failing, copied, ran = [], [], []
+            resource_affected: list[str] = []
             unmeasured = False
             try:
                 for rel in ((s_.get("support_files") or [])
@@ -36409,6 +36969,30 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
                         unmeasured = True
                     elif verdict is False:
                         failing.append(rel)
+                if failing and confirm:
+                    n_rerun = {"i": 0}
+
+                    async def _rerun(_left: float, _files=tuple(failing)
+                                     ) -> set[str] | None:
+                        n_rerun["i"] += 1
+                        still: set[str] = set()
+                        for rel in _files:
+                            v = await _run_acceptance_file(
+                                st, caps, str(wt), rel, log_path,
+                                f"acceptance-{label}-confirm{n_rerun['i']}")
+                            if v is None:
+                                return None
+                            if v is False:
+                                still.add(rel)
+                        return still
+                    verdict_ = await _confirm_still_failing(
+                        failing, _rerun, caps,
+                        label=f"acceptance {label} set {s_['index']}")
+                    resource_affected = list(verdict_["resource_affected"])
+                    failing = [r for r in failing
+                               if r in verdict_["confirmed"]]
+                    if resource_affected and not failing:
+                        unmeasured = True
             except Exception as e:
                 # A copy that fails (a full disk) is no verdict on this set —
                 # and must not escape: a repair's rollback check runs after.
@@ -36421,10 +37005,13 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
                 for dst in copied:
                     with contextlib.suppress(OSError):
                         dst.unlink()
-            results.append({"index": s_["index"],
-                            "passed": not failing and not unmeasured,
-                            "unmeasured": unmeasured and not failing,
-                            "failing_files": failing})
+            res_ = {"index": s_["index"],
+                    "passed": not failing and not unmeasured,
+                    "unmeasured": unmeasured and not failing,
+                    "failing_files": failing}
+            if resource_affected:
+                res_["resource_affected_files"] = resource_affected
+            results.append(res_)
     finally:
         _teardown()
     return results
@@ -36436,13 +37023,13 @@ def _acceptance_measured(results: list[dict]) -> list[dict]:
     return [r for r in results if not r.get("unmeasured")]
 
 
-def _acceptance_majority_fails(results: list[dict]) -> bool:
-    """True unless a strict majority of MEASURED sets passed — a tie is not
-    a passing majority. False when nothing was measured: the caller treats
-    that as no evidence, never as a pass."""
-    measured = _acceptance_measured(results)
-    return bool(measured) and sum(1 for r in measured if r["passed"]) * 2 \
-        <= len(measured)
+def _acceptance_any_fails(results: list[dict]) -> bool:
+    """True when any MEASURED set failed — every failing validated set is
+    repaired, not only a majority (DESIGN §8 *Held-out acceptance tests*).
+    False when nothing was measured: the caller treats that as no evidence,
+    never as a pass. A set's failure was already confirmed under B* by the
+    evaluation that produced it."""
+    return any(not r["passed"] for r in _acceptance_measured(results))
 
 
 def _acceptance_shown_indices(sets: list[dict]) -> set[int]:
@@ -36576,7 +37163,7 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
     if not resumed_repair and not _acceptance_measured(initial):
         log("phase 5: acceptance gate — no held-out set could be run on the "
             "integrated tree; no evidence either way")
-    elif resumed_repair or _acceptance_majority_fails(initial):
+    elif resumed_repair or _acceptance_any_fails(initial):
         measured = _acceptance_measured(initial)
         log(f"phase 5: acceptance gate — "
             f"{sum(1 for r in measured if not r['passed'])} of "
@@ -36631,7 +37218,7 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             # At the top, not only after a round: a resume after a round
             # that already passed — or after the rollback decision — must
             # not run another.
-            if gate.get("rolled_back") or not _acceptance_majority_fails(final):
+            if gate.get("rolled_back") or not _acceptance_any_fails(final):
                 break
             up = [
                 "Run the acceptance repair pass on the merged run branch.",
@@ -36792,15 +37379,22 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
             if _acceptance_measured(r):
                 basis, unmeasured_final = r, True
                 break
-    if _acceptance_measured(basis) and _acceptance_majority_fails(basis):
+    if _acceptance_measured(basis) and _acceptance_any_fails(basis):
         by_index = {s_["index"]: s_ for s_ in sets}
         measured = _acceptance_measured(basis)
-        names = [c for r in measured if not r["passed"]
-                 for rel in r["failing_files"]
-                 for c in by_index[r["index"]]["cases"].get(rel, [])]
+        cases_by_set = {
+            str(r["index"]): [c for rel in r["failing_files"]
+                              for c in by_index[r["index"]]["cases"].get(
+                                  rel, [])][:20]
+            for r in measured if not r["passed"]}
+        names = [c for v in cases_by_set.values() for c in v]
         gate["residual"] = {
             "failing_sets": sum(1 for r in measured if not r["passed"]),
-            "total_sets": len(measured), "cases": names[:20]}
+            "total_sets": len(measured), "cases": names[:20],
+            # Which sets, so a set typed broken later can be left out of
+            # the next run's residual (`_acceptance_residual_unbroken`).
+            "sets": [r["index"] for r in measured if not r["passed"]],
+            "cases_by_set": cases_by_set}
         if unmeasured_final:
             gate["residual"]["unmeasured_final"] = True
         log(f"  WARNING: held-out acceptance residual — "
@@ -36882,7 +37476,8 @@ async def _acceptance_results_on_head(st: "State", caps: dict
     commit within this invocation (a resume measures afresh); one that
     measured nothing is not, so a later check can still succeed after a
     one-off install failure."""
-    sets = (st.data.get("acceptance") or {}).get("sets") or []
+    acc = st.data.get("acceptance") or {}
+    sets = acc.get("sets") or []
     if not sets:
         return None
     wt = st.data.get("planning_worktree")
@@ -36894,6 +37489,13 @@ async def _acceptance_results_on_head(st: "State", caps: dict
     await _ensure_planning_worktree(st)
     tree = str(_judgment_cwd(st))
     sha = await _branch_head_sha(tree)
+    if sha and sha == acc.get("validity_base"):
+        # Validated on this very commit (the run's own start, DESIGN §8):
+        # every set has a defect file that failed here, so the verdict is
+        # known without installing and running them again.
+        return [{"index": s_["index"], "passed": False, "unmeasured": False,
+                 "failing_files": list(s_.get("defect_files") or [])}
+                for s_ in sets]
     res = await _evaluate_acceptance_sets(st, caps, tree, sets, "head",
                                           rev=sha or "HEAD")
     if sha and _acceptance_measured(res):
@@ -36904,7 +37506,7 @@ async def _acceptance_results_on_head(st: "State", caps: dict
 async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
     res = await _acceptance_results_on_head(st, caps)
     return (res is not None and bool(_acceptance_measured(res))
-            and not _acceptance_majority_fails(res))
+            and not _acceptance_any_fails(res))
 
 
 def _prior_acceptance_dispute_record(st: "State") -> dict | None:
@@ -36961,8 +37563,8 @@ def _mark_dispute_unacted(st: "State") -> None:
 async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
                                          fix_ids: set[str]) -> set[str]:
     """`fix_ids` when held-out sets exist, some were measured on HEAD, and
-    no strict majority of those passed (`_acceptance_majority_fails`, the
-    settle's rule; a tie protects), else empty — the subtasks the
+    any of those failed (`_acceptance_any_fails`, the settle's rule), else
+    empty — the subtasks the
     satisfied-probe sweep must not be offered (DESIGN §8). Exit codes and
     typed fields only. Fail-open: any error protects nothing, as before.
     Under `skip_satisfied_check` there is no sweep to protect from, so the
@@ -36988,7 +37590,7 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
         return set()
     if res is None or not _acceptance_measured(res):
         return set()
-    return set(fix_ids) if _acceptance_majority_fails(res) else set()
+    return set(fix_ids) if _acceptance_any_fails(res) else set()
 
 
 async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
@@ -37035,7 +37637,7 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence})
         return True
-    if not _acceptance_majority_fails(res):
+    if not _acceptance_any_fails(res):
         st.data["no_work_acceptance"] = {"verdict": "pass", "results": res}
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence + " — and the held-out "
@@ -38883,7 +39485,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     + (f"run `leerie accept-blocked {st.run_id} {sid}` once "
                        "addressed, then `leerie resume` to continue without "
                        "re-running it" if st.data.get("stop_on_blocked")
-                       else "will be auto-accepted at wave end"))
+                       else "re-driven from the shared budget at wave end"))
                 st.save()
                 return {"subtask_id": sid, "status": "blocked",
                         "blocker": blocker, "summary": blocker}
@@ -41850,7 +42452,8 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          "Default: off.")
     ap.add_argument("--stop-on-blocked", action="store_true",
                     help="stop the run and wait for `accept-blocked` when a "
-                         "subtask is blocked, instead of auto-accepting it. "
+                         "subtask is blocked, instead of re-driving it from "
+                         "the shared budget and settling it unconverged. "
                          f"Also {STOP_ON_BLOCKED_ENV} env or "
                          "stop_on_blocked in leerie.toml. Default: off.")
     ap.add_argument("--stop-on-repo-change", action="store_true",

@@ -74,6 +74,7 @@ def _st(leerie, tmp_path, repo, head, **data):
     (run_dir / "logs").mkdir()
     st = leerie.State(root, "run-a", repo_root=repo)
     st.data = {"task": "fix the bug in report.md", "verbosity": "quiet",
+               "categories": ["bug-fixing"],
                "repo_state_before_planning": {"head": head},
                "defect_scope": {"applicable": True, "sites": [],
                                 "defect_shape": "add subtracts"},
@@ -183,20 +184,24 @@ def test_writer_sees_the_report_contract_and_examples(leerie, tmp_path,
     assert seen[0]["effort"] == "medium" and seen[0]["autonomous"] is True
 
 
-@pytest.mark.parametrize("scope,skip,reason", [
-    ({"applicable": False}, False, "not applicable"),
-    ({"applicable": True, "sites": []}, True, "--skip-acceptance-check"),
+@pytest.mark.parametrize("cats,skip,reason", [
+    # N1-L: the audit's `applicable` no longer gates the sets; only a run
+    # whose classification never triggered the audit is skipped.
+    (["feature"], False, "not a defect-fix run"),
+    (["bug-fixing"], True, "--skip-acceptance-check"),
 ])
-def test_skips_are_recorded(leerie, tmp_path, scope, skip, reason):
+def test_skips_are_recorded(leerie, tmp_path, cats, skip, reason):
     repo, head = _repo(tmp_path)
-    st = _st(leerie, tmp_path, repo, head, defect_scope=scope,
+    st = _st(leerie, tmp_path, repo, head, categories=cats,
              skip_acceptance_check=skip)
     acc = asyncio.run(leerie.phase_acceptance_write(
         "t", st, _caps(leerie, 1), MODELS, EFFORTS))
     assert reason in acc["skipped"]
 
 
-def test_validity_base_prefers_the_earliest_same_task_sibling(leerie, tmp_path):
+def test_report_base_prefers_the_earliest_same_task_sibling(leerie, tmp_path):
+    """The earliest same-task base is now informational (`report_reproduced`);
+    the validity tree is the run's own start (DESIGN §8)."""
     repo, head = _repo(tmp_path)
     (repo / "calc.py").write_text(FIXED)
     _git(repo, "commit", "-qam", "later")
@@ -209,17 +214,17 @@ def test_validity_base_prefers_the_earliest_same_task_sibling(leerie, tmp_path):
         (d / "state.json").write_text(json.dumps({
             "task": st.data["task"], "started_at": started,
             "repo_state_before_planning": {"head": h}}))
-    assert leerie._acceptance_validity_base(st) == head
+    assert leerie._acceptance_report_base(st) == head
     # A sibling with no recorded start time cannot be ranked earliest ("" would
     # sort first): it is skipped, not chosen.
     d = st.run_dir.parent / "run-undated"
     d.mkdir()
     (d / "state.json").write_text(json.dumps({
         "task": st.data["task"], "repo_state_before_planning": {"head": later}}))
-    assert leerie._acceptance_validity_base(st) == head
+    assert leerie._acceptance_report_base(st) == head
     # A different task is ignored.
     st.data["task"] = "another task"
-    assert leerie._acceptance_validity_base(st) == later
+    assert leerie._acceptance_report_base(st) == later
 
 
 # --- the gate on the integrated tree -----------------------------------------
@@ -348,7 +353,7 @@ def test_a_failed_install_is_no_evidence(leerie, tmp_path):
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 3), str(staging), sets, "t"))
     assert all(r["unmeasured"] for r in res)
-    assert not leerie._acceptance_majority_fails(res)
+    assert not leerie._acceptance_any_fails(res)
     _failing_recipe(st, fail=False)
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 3), str(staging), sets, "t2"))
@@ -571,7 +576,14 @@ def test_runner_reports_are_read_mechanically(leerie, tmp_path, kind, text,
                                               want):
     p = tmp_path / "report"
     p.write_text(text)
-    assert leerie._parse_runner_report(kind, p) == want
+    got = leerie._parse_runner_report(kind, p)
+    if want is None:
+        assert got is None
+    else:
+        # The per-case statuses ride along (A1); their own test below.
+        assert {k: got[k] for k in ("executed", "collection_error")} == want
+        assert set(got["cases"].values()) <= {"passed", "failed", "skipped",
+                                              "load_error"}
     assert leerie._parse_runner_report(kind, tmp_path / "absent") is None
 
 
@@ -666,7 +678,8 @@ def test_an_appended_junit_path_is_the_report_pytest_writes(
     subprocess.run(run_cmd, shell=True, cwd=tmp_path, env=env,
                    capture_output=True, check=False)
     assert leerie._parse_runner_report(kind, tmp_path / "r.xml") == {
-        "executed": 1, "collection_error": False}
+        "executed": 1, "collection_error": False,
+        "cases": {"test_a :: test_a.test_a": "passed"}}
 
 
 @pytest.mark.parametrize("cmd,rel", [
@@ -1028,7 +1041,19 @@ def test_a_subshell_paren_is_an_operator_and_a_comment_may_follow(leerie):
 ])
 def test_runner_detection_reads_operators_as_the_shell_does(
         leerie, cmd, runner):
-    assert leerie._acceptance_runner(cmd, leerie._RUNNER_REPORTS) == runner
+    # The shell reading is the subject: the JS/Python runners only, since
+    # `go` is a reported runner of its own now (A4) and these commands use
+    # `go test` as the thing that is NOT pytest.
+    known = {k: leerie._RUNNER_REPORTS[k] for k in ("pytest", "jest",
+                                                    "vitest")}
+    assert leerie._acceptance_runner(cmd, known) == runner
+
+
+def test_go_and_cargo_are_reported_runners_now(leerie):
+    assert leerie._acceptance_runner("go test ./...",
+                                     leerie._RUNNER_REPORTS) == "go"
+    assert leerie._acceptance_runner("cargo test --test a",
+                                     leerie._RUNNER_REPORTS) == "cargo"
 
 
 def test_a_containerised_pytest_gets_no_environment_request_either(
@@ -1473,14 +1498,16 @@ def test_an_import_defect_set_validates_and_passes_on_the_fix(
     assert res[0]["passed"] is True
 
 
-def test_majority_rule(leerie):
-    f = leerie._acceptance_majority_fails
+def test_any_failing_set_fails(leerie):
+    """Rewritten from the majority rule (A2): every failing validated set is
+    repaired, so one failing set of three fails."""
+    f = leerie._acceptance_any_fails
     assert f([{"passed": False}, {"passed": False}, {"passed": True}])
-    assert not f([{"passed": True}, {"passed": True}, {"passed": False}])
-    # A tie is not a passing majority.
+    assert f([{"passed": True}, {"passed": True}, {"passed": False}])
     assert f([{"passed": False}, {"passed": True}])
-    # Unmeasured sets are not evidence: excluded from the vote, and nothing
-    # measured is "no evidence", never a failing (or passing) majority.
+    assert not f([{"passed": True}, {"passed": True}])
+    # Unmeasured sets are not evidence, and nothing measured is "no
+    # evidence", never a failure (or a pass).
     assert not f([{"passed": True}, {"passed": False, "unmeasured": True}])
     assert not f([{"passed": False, "unmeasured": True}])
     assert not f([])
