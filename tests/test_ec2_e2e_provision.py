@@ -430,7 +430,10 @@ def test_successful_provision_leaves_exactly_one_instance_and_no_orphaned_volume
         f"that owns it (root EBS is implicit via run-instances, "
         f"DeleteOnTermination=true); state={state}"
     )
-    assert leaked_resources(state) == {
+    # The shared SSM role/instance profile is deliberately long-lived
+    # (reused across runs), so only instances and volumes are compared.
+    leaked = leaked_resources(state)
+    assert {k: leaked[k] for k in ("instances", "volumes")} == {
         "instances": state["instances"],
         "volumes": {},
     }, (
@@ -711,7 +714,12 @@ def test_full_lifecycle_terminates_instance_with_no_leaked_volume(tmp_path):
         f"DeleteOnTermination=true default — no volume should ever be "
         f"tracked independently; state={state}"
     )
-    assert leaked_resources(state) == {"instances": {}, "volumes": {}}, (
+    # shared SSM role/profile is long-lived by design; compare compute only
+    leaked = leaked_resources(state)
+    assert {k: leaked[k] for k in ("instances", "volumes")} == {
+        "instances": {},
+        "volumes": {},
+    }, (
         f"a terminated instance with no tracked volume is not a leak; "
         f"state={state}"
     )
