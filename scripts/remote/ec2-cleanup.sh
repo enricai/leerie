@@ -83,9 +83,9 @@ for im in d.get('Images', []):
             age_ok = (now - c).days >= int(days)
         except Exception: age_ok = False
     snaps = ','.join(b['Ebs']['SnapshotId'] for b in im.get('BlockDeviceMappings', []) if b.get('Ebs', {}).get('SnapshotId'))
-    print('\t'.join([im['ImageId'], t.get('leerie:version', ''), t.get('leerie:source-hash', ''), 'old' if age_ok else 'young', snaps]))")"
+    print('|'.join([im['ImageId'], t.get('leerie:version', ''), t.get('leerie:source-hash', ''), 'old' if age_ok else 'young', snaps]))")"
   local ver hash age
-  while IFS=$'\t' read -r id ver hash age snaps; do
+  while IFS='|' read -r id ver hash age snaps; do
     [ -n "$id" ] || continue
     reason=""
     if [ "$keep" = all ] || { [ "$keep" = true ] && [ "$ver" = "$cur_ver" ] && [ "$hash" = "$cur_hash" ]; }; then reason="current version+hash AMI kept"
