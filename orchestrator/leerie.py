@@ -19891,9 +19891,10 @@ def _repo_write_denials(repo_root: str | Path, run_dir: str | Path) -> str:
 # Prefixes stripped before an ANCHORED match, each because the CLI denied the
 # prefixed form live: its documented wrappers (`timeout`, including option
 # arguments such as `-s KILL`; `time`, `nice`, `nohup`, `stdbuf`, `command`,
-# `builtin`, `noglob`), environment assignments and `env` (`PYTHONPATH=.
-# pytest tests/`, `env X=1 pytest tests/`), and the shell keywords that open
-# a compound command's body (`if true; then pytest tests/; fi`). The
+# `builtin`, `noglob`), `exec`, `sudo` and `xargs`, environment assignments
+# and `env` (`PYTHONPATH=. pytest tests/`, `env X=1 pytest tests/`), and the
+# shell keywords that open a compound command's body (`if true; then pytest
+# tests/; fi`). The
 # unanchored match tries every word instead, which covers them all.
 _SUITE_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*\s+")
 _SUITE_WRAPPER_RE = re.compile(
@@ -19901,7 +19902,8 @@ _SUITE_WRAPPER_RE = re.compile(
     r"|timeout(?:\s+(?:-[sk]\s+\S+|--(?:signal|kill-after)\s+\S+|--?\S+))*"
     r"\s+\S+"
     r"|time(?:\s+-p)?|nice(?:\s+-n\s*\S+|\s+-\d+)?|nohup"
-    r"|stdbuf(?:\s+-\S+)*|command|builtin|noglob|then|do|else|!)\s+")
+    r"|stdbuf(?:\s+-\S+)*|command|builtin|noglob|exec|sudo(?:\s+-\S+)*"
+    r"|xargs(?:\s+-\S+)*|then|do|else|!)\s+")
 _NPM_FAMILY_TEST_RE = re.compile(r"^(npm|pnpm|yarn|bun)(?: run)? test$")
 _PYTEST_FORMS = ("pytest", "python3 -m pytest", "python -m pytest")
 FULL_SUITE_NOTICE = (
@@ -20101,14 +20103,16 @@ def _shell_subcommands(cmd: str) -> list[str]:
     and `pytest -k "$(cat k)" tests/` (the outer one); the substitution's
     place in the outer text is held by a `$_` word. Quotes are dropped, and
     whitespace inside them is kept as `_QUOTED_SPACE` so a quoted argument
-    stays one word. Outside quotes the boundaries are `;`, `|`, `&` (so `&&`
-    and `||` too), newline, a subshell's `(`/`)`, and `{`/`}` only as group
-    words
-    (whitespace or `;` after, whitespace or start before) -- brace expansion
-    such as `tests/{a,b}.py` is part of a word, which is how the CLI read it
-    live. A backslash escapes the next character, which is also what makes a
-    backslash-newline continue the line. Redirections outside quotes (`> f`,
-    `2>&1`, `<in`, `> "a b"`) are dropped with their target. Whitespace is
+    stays one word (an unbalanced quote falls back to plain spaces). Outside
+    quotes the boundaries are `;`, `|`, `&` (so `&&` and `||` too), newline,
+    a subshell's `(`/`)`, and `{`/`}` only as group words (whitespace or the
+    string's edge on both sides) -- brace expansion such as `tests/{a,b}.py`
+    is part of a word, which is how the CLI read it live. An unclosed
+    substitution still contributes its outer command. A backslash escapes
+    the next character, which is also what makes a backslash-newline
+    continue the line. Redirections outside quotes (`> f`,
+    `2>&1`, `<in`, `> "a b"`) are dropped with their target, unless the
+    target holds a substitution, which runs and is scanned. Whitespace is
     collapsed per subcommand."""
     s = cmd
     n = len(s)
@@ -20124,9 +20128,11 @@ def _shell_subcommands(cmd: str) -> list[str]:
         buf.clear()
 
     def open_subst(closer: str, width: int) -> None:
-        nonlocal quote, i
-        subst.append((closer, quote, buf[:]))
-        buf.clear()
+        # The outer list is parked, not copied: copying made a run of
+        # substitutions quadratic.
+        nonlocal buf, quote, i
+        subst.append((closer, quote, buf))
+        buf = []
         quote = None
         i += width
 
@@ -20162,8 +20168,7 @@ def _shell_subcommands(cmd: str) -> list[str]:
             continue
         if subst and ch == subst[-1][0]:
             cut()
-            _closer, quote, outer = subst.pop()
-            buf.extend(outer)
+            _closer, quote, buf = subst.pop()
             buf.append("$_")
             i += 1
             continue
@@ -20175,7 +20180,7 @@ def _shell_subcommands(cmd: str) -> list[str]:
             i += 1
             continue
         if (ch in "{}" and (i == 0 or s[i - 1].isspace())
-                and (i + 1 == n or s[i + 1].isspace() or s[i + 1] == ";")):
+                and (i + 1 == n or s[i + 1].isspace())):
             cut()
             i += 1
             continue
@@ -20190,8 +20195,15 @@ def _shell_subcommands(cmd: str) -> list[str]:
             while i < n and s[i] in " \t":
                 i += 1
             while i < n and not s[i].isspace() and s[i] not in ";|&()":
+                # A substitution in the target runs; leave it to the main
+                # scan (`> "$(pytest tests/)"` was denied live).
+                if s.startswith("$(", i) or s[i] == "`":
+                    break
                 if s[i] in "'\"":
                     close = s.find(s[i], i + 1)
+                    body = s[i + 1:] if close < 0 else s[i + 1:close]
+                    if s[i] == '"' and ("$(" in body or "`" in body):
+                        break
                     i = n if close < 0 else close + 1
                 else:
                     i += 1
@@ -20200,6 +20212,14 @@ def _shell_subcommands(cmd: str) -> list[str]:
         buf.append(ch)
         i += 1
     cut()
+    # An unclosed substitution still leaves its outer command to match.
+    while subst:
+        segs.append("".join(subst.pop()[2]))
+    if quote is not None:
+        # An unbalanced quote (an apostrophe in a comment or here-doc the
+        # scan does not model) must not glue everything after it into one
+        # word: fall back to plain spaces, as before quoted spaces existed.
+        segs = [x.replace(_QUOTED_SPACE, " ") for x in segs]
     return [seg for seg in (" ".join(x.split()) for x in segs) if seg]
 
 
@@ -20241,11 +20261,14 @@ def _denied_by_full_suite_rules(cmd: str, patterns: list[str], *,
         return False
     for seg in _shell_subcommands(cmd):
         if anchored:
+            # Quoted text stays quoted: the CLI ran `"pytest tests/"`.
             starts = [_strip_command_prefixes(seg)]
         else:
+            # Unanchored, a quoted span reads as words again, so a declared
+            # paraphrase (`Run "pytest tests/" to verify`) is still stripped.
             words = seg.split()
-            starts = [" ".join(words[i:]) for i in range(len(words))]
-        starts = [c.replace(_QUOTED_SPACE, " ") for c in starts]
+            starts = [" ".join(words[i:]).replace(_QUOTED_SPACE, " ")
+                      for i in range(len(words))]
         if any(_rule_matches(c, p) for c in starts for p in patterns):
             return True
     return False
@@ -29537,8 +29560,9 @@ def check_budget_feasibility(st: State, caps: dict,
     )
 
 
-def _repair_prescribed_commands(plans: list[dict],
-                               prescribed: dict) -> str | None:
+def _repair_prescribed_commands(plans: list[dict], prescribed: dict,
+                               reserved_ids: frozenset[str] = frozenset()
+                               ) -> str | None:
     """Attach the task's prescribed commands to the plan mechanically.
 
     Returns the synthesised subtask's id, or None when nothing was repaired
@@ -29594,7 +29618,10 @@ def _repair_prescribed_commands(plans: list[dict],
         # ids without one. Decline rather than emit an invalid subtask.
         return None
     prefix += "-"
+    # `reserved_ids`: ids no longer in the plan but still meaningful in state
+    # (`dropped_subtasks`), which a synthesised subtask must not reuse.
     ids = {s["id"] for s in subs if isinstance(s.get("id"), str)}
+    ids |= set(reserved_ids)
     # Sinks: nothing depends on them, so depending on all of them puts the
     # verifier strictly last without inventing an ordering opinion.
     depended = {d for s in subs for d in (s.get("depends_on") or [])}
@@ -39822,8 +39849,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # suite is orchestrator-owned*). Idempotent, so a resume from
             # `plans_after_filters` re-applies it harmlessly.
             _prescribed = st.data.get("prescribed_procedure") or {}
-            for _sid in _strip_canonical_suite_commands(
-                    plans, st.repo_root, _prescribed):
+            _stripped = _strip_canonical_suite_commands(
+                plans, st.repo_root, _prescribed)
+            for _sid in _stripped:
                 log(f"  {_sid}: dropped its whole-suite runs_commands entry — "
                     f"the orchestrator's whole-tree pass runs the suite")
             # A planner paraphrase of a prescribed command (`… -q`, "run …
@@ -39832,7 +39860,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # user's command. Re-run the floor's repair: it synthesises a
             # subtask running the EXACT prescribed commands, which are
             # immune, whenever coverage no longer holds.
-            _resynth = _repair_prescribed_commands(plans, _prescribed)
+            # Only when the strip removed something: otherwise any coverage
+            # gap predates it and is the adherence gate's to report.
+            _resynth = None
+            if _stripped:
+                _resynth = _repair_prescribed_commands(
+                    plans, _prescribed,
+                    frozenset(st.data.get("dropped_subtasks") or {}))
             if _resynth:
                 log(f"  {_resynth}: synthesised to run the prescribed "
                     f"commands the whole-suite strip had uncovered")

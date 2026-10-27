@@ -157,6 +157,21 @@ LIVE_PROBED = [
     ("pytest $(cat k) tests/", True),
     ("pytest `cat k` tests/", True),
     ("echo 'a|pytest tests/'", False),
+    # Round 5: the quote restored after a substitution closes; a
+    # substitution inside a redirect target runs; an unbalanced apostrophe
+    # (comment, here-doc) must not glue the next command into one word; an
+    # unclosed substitution keeps its outer command; single-quoted `$(` is
+    # literal.
+    ('echo "$(date); pytest tests/"', False),
+    ('echo "$(cat k); pytest tests/"', False),
+    ('echo "$(date) it\'s"; pytest tests/', True),
+    ('echo x > "$(pytest tests/)"', True),
+    ('echo x > "$(pytest tests/)" && echo done', True),
+    ("echo x >`pytest tests/`", True),
+    ("echo hi # don't\npytest tests/", True),
+    ("cat <<EOF > notes.txt\ndon't\nEOF\npytest tests/", True),
+    ('pytest tests/ -k "$(cat k"', True),
+    ("echo '$(pytest tests/)'", False),
     ("python3 -m pytest tests/test_resolve_task_argument.py -q", False),
     ("python3 -m pytest -q -p no:cacheprovider tests/test_a.py "
      "tests/test_b.py", False),
@@ -181,6 +196,7 @@ def test_matcher_agrees_with_the_live_cli(leerie, tmp_path, cmd, denied):
     "pytest tests/ -k=foo",
     "pytest tests/ --deselect=tests/test_a.py::t",
     "nice -n 5 nohup pytest tests/",
+    'Run "pytest tests/" to verify',
 ])
 def test_paraphrases_and_compounds_only_a_denied_run_could_satisfy(
         leerie, tmp_path, cmd):
@@ -671,6 +687,7 @@ def test_the_strip_never_raises_on_a_malformed_plan(leerie, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.parametrize("cmd", [
+    '"pytest tests/"',                                  # CLI: ran
     "pytest tests/{test_a,test_b}.py",                  # CLI: ran
     "timeout 60 pytest tests/test_a.py",
     "pip show pytest",                                  # CLI: ran
@@ -694,7 +711,11 @@ def test_anchored_match_ignores_a_runner_word_that_is_not_a_run(
     'pytest -k "not (slow)" tests/', "pytest \\\n  tests/",
     # Round 4: a quoted assignment value with a space, and `env -u NAME`.
     'PYTEST_ADDOPTS="-x -q" pytest tests/',
-    'PYTHONPATH="src lib" pytest tests/', "env -u HOME pytest tests/"])
+    'PYTHONPATH="src lib" pytest tests/', "env -u HOME pytest tests/",
+    # Round 5: single-quoted values, and `exec`/`sudo`/`xargs` (each denied
+    # live).
+    "PYTEST_ADDOPTS='-x -q' pytest tests/", "exec pytest tests/",
+    "sudo pytest tests/", "xargs pytest tests/"])
 def test_anchored_match_still_sees_a_whole_suite_run(leerie, tmp_path, cmd):
     pats = leerie._full_suite_rule_patterns(_repo(tmp_path))
     assert leerie._denied_by_full_suite_rules(cmd, pats, anchored=True)
@@ -842,3 +863,52 @@ def test_a_paraphrased_prescribed_command_is_resynthesised(
     assert carriers, "the exact prescribed command must survive scheduling"
     assert leerie._full_suite_denials(
         repo, st.data["prescribed_procedure"]), "and the deny stays on"
+
+
+# ---------------------------------------------------------------------------
+# round 5: the post-strip resynthesis fires only when the strip removed
+# something, and never reuses a dropped subtask's id
+# ---------------------------------------------------------------------------
+
+def test_resynthesis_never_reuses_a_dropped_id(leerie):
+    plans = [{"domain": "testing", "subtasks": [
+        {"id": "test-001", "depends_on": [], "runs_commands": []}]}]
+    sid = leerie._repair_prescribed_commands(
+        plans, {"is_prescribed": True, "commands": ["make check"]},
+        frozenset({"test-901"}))
+    assert sid == "test-902"
+
+
+def test_resynthesis_does_not_fire_when_nothing_was_stripped(
+        leerie, monkeypatch, tmp_path):
+    """A coverage gap that predates the strip is the adherence gate's to
+    report; the post-strip repair must not paper over it (and must not log
+    that the strip uncovered it)."""
+    from tests.test_resume_planning_reentry import (
+        _StopAtExecute, _args, _caps, _plan, _stub_common, EFFORTS, MODELS)
+    repo = _repo(tmp_path)
+    leerie_root = tmp_path / ".leerie-state"
+    run_id = "strip-noresynth-aaa111"
+    run_dir = leerie_root / "runs" / run_id
+    (run_dir / "subtasks").mkdir(parents=True)
+    sub = {"id": "test-001", "depends_on": [], "requires": [],
+           "provides": [], "runs_commands": []}
+    plans = [_plan("testing", sub)]
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = leerie.State(leerie_root, run_id, repo_root=repo)
+    st.data = {"task": "t", "worker_count": 3, "categories": ["testing"],
+               "prescribed_procedure": {"is_prescribed": True,
+                                        "commands": ["make check"]},
+               "dropped_subtasks": {"test-901": "already_satisfied"},
+               "plans_after_classify": [],
+               **{k: plans for k in (
+                   "plans_after_plan", "plans_after_reconcile",
+                   "plans_after_overlap_judge", "plans_after_adherence_gate",
+                   "plans_after_coverage_gate", "plans_after_filters")}}
+    st.save()
+    with pytest.raises(_StopAtExecute):
+        asyncio.run(leerie._run_phases(
+            _args(), _caps(leerie), run_dir, st, "codebase", "normal",
+            MODELS, EFFORTS))
+    assert set(st.data["plan_snapshot"]["subtasks"]) == {"test-001"}

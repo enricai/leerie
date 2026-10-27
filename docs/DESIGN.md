@@ -7032,7 +7032,10 @@ mechanism exists to remove. Four mechanisms read that list:
   verify", since the declared-command check would accept only the refused
   command for it, and an over-match only drops a requirement. Agreement with
   the CLI is a per-shape claim, pinned against verdicts the CLI returned
-  live; a shape outside that set is unverified.
+  live; a shape outside that set is unverified. The scan does not model
+  here-documents, comments or `$'…'` strings; an apostrophe inside one
+  leaves a quote unbalanced, and the scan then falls back to plain words,
+  which the wide match still catches but the anchored check does not.
 - **Settle-time exemption.** The declared-command check skips any entry the
   list refuses. This, not the strip, is the choke point: it also covers a
   spec written before the strip existed (a run resumed past scheduling).
@@ -7054,22 +7057,24 @@ is empty for that run — no deny, no strip, no exemption, no notice — because
 keeping any one of them would make the prescribed command impossible to run
 or impossible to require. That check is anchored: the command must start
 with the runner once the prefixes the CLI strips are removed (its documented
-wrappers, `timeout`'s option arguments, environment assignments — quoted
-values included — and `env` with its options, and a compound command's
-`then`/`do`/`else`/`!`), each because the CLI denied the prefixed form live.
-It is anchored because here, unlike the strip, an over-match would not drop
-one requirement but switch the whole mechanism off, and a prescribed `pip
-install pytest` is not a suite run. Second, a prescribed command is never
-stripped or exempted, whichever way the anchored check reads it: if the two
-match modes ever disagree about it, the worker that cannot satisfy it ends
-`blocked` and the operator sees why, rather than the instruction
-disappearing silently. Third, immunity is exact, and a planner usually
-paraphrases (`uv run pytest tests/ -q` for a prescribed `uv run pytest
-tests/`), which the adherence floor accepts as coverage but the strip may
-remove; so after the strip the floor's own repair
-(`_repair_prescribed_commands`) runs again, and synthesises a subtask
-carrying the exact, immune commands whenever coverage no longer holds.
-Immunity is deliberately not widened to paraphrases: a prescribed `pytest
+wrappers, `timeout`'s option arguments, `exec`, `sudo` and `xargs`,
+environment assignments — quoted values included — and `env` with its
+options, and a compound command's `then`/`do`/`else`/`!`), each because the
+CLI denied the prefixed form live; quoted text stays one word, since the CLI
+ran `"pytest tests/"`. It is anchored because here, unlike the strip, an
+over-match would not drop one requirement but switch the whole mechanism
+off, and a prescribed `pip install pytest` is not a suite run. Second, a
+prescribed command is never stripped or exempted, whichever way the anchored
+check reads it: if the two match modes ever disagree about it, the worker
+that cannot satisfy it ends `blocked` and the operator sees why, rather than
+the instruction disappearing silently. Third, immunity is exact, and a
+planner usually paraphrases (`uv run pytest tests/ -q` for a prescribed `uv
+run pytest tests/`), which the adherence floor accepts as coverage but the
+strip may remove; so whenever the strip removed an entry, the floor's own
+repair (`_repair_prescribed_commands`) runs again and synthesises a subtask
+carrying the exact, immune commands if coverage no longer holds (a gap that
+predates the strip stays the adherence gate's to report). Immunity is
+deliberately not widened to paraphrases: a prescribed `pytest
 tests/test_a.py` would then shield a planner's `pytest tests/
 tests/test_a.py`, which the CLI denies.
 
