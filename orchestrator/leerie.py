@@ -19904,6 +19904,7 @@ _SUITE_WRAPPER_RE = re.compile(
     r"|time(?:\s+-p)?|nice(?:\s+-n\s*\S+|\s+-\d+)?|nohup"
     r"|stdbuf(?:\s+-\S+)*|command|builtin|noglob|exec|sudo(?:\s+-\S+)*"
     r"|xargs(?:\s+-\S+)*|then|do|else|!)\s+")
+_SUITE_MAX_ROOTS = 16
 _NPM_FAMILY_TEST_RE = re.compile(r"^(npm|pnpm|yarn|bun)(?: run)? test$")
 _PYTEST_FORMS = ("pytest", "python3 -m pytest", "python -m pytest")
 FULL_SUITE_NOTICE = (
@@ -19960,10 +19961,12 @@ def _test_roots(repo_root: str | Path) -> list[str]:
 def _full_suite_runners(canonical: str) -> list[str]:
     """Every spelling of the canonical test runner a worker plausibly types.
     Empty when the canonical command is absent or not expressible as a
-    single permission rule (a compound command, or one carrying characters
-    that would split the comma-joined `--disallowedTools` list)."""
+    single permission rule (a compound command, one carrying characters
+    that would split the comma-joined `--disallowedTools` list, or a `*`,
+    which the CLI would read as a wildcard and so deny more than the
+    canonical command)."""
     c = " ".join((canonical or "").split())
-    if not c or any(ch in c for ch in ",()&|;<>`$"):
+    if not c or any(ch in c for ch in ",()&|;<>`$*"):
         return []
     forms = [c]
     if c in _PYTEST_FORMS or c.split()[0] == "pytest" \
@@ -19994,7 +19997,11 @@ def _full_suite_rule_patterns(repo_root: str | Path,
         runners = _full_suite_runners(_canonical_test_command(repo_root))
         if not runners:
             return []
-        roots = _test_roots(repo_root)
+        # Bounded: every root adds rules to ONE `--disallowedTools` argv
+        # element, and past ~165 roots it would exceed Linux's per-argument
+        # limit (MAX_ARG_STRLEN) and fail every worker spawn. Roots beyond
+        # the cap are simply not denied; the notice still covers them.
+        roots = _test_roots(repo_root)[:_SUITE_MAX_ROOTS]
         pats: list[str] = []
         for r in runners:
             pats.append(r)
@@ -20240,8 +20247,10 @@ def _prescribed_commands(prescribed: dict | None) -> set[str]:
     set unless `is_prescribed` is set (every consumer gates on it)."""
     if not isinstance(prescribed, dict) or not prescribed.get("is_prescribed"):
         return set()
-    return {" ".join(c.split()) for c in (prescribed.get("commands") or [])
-            if isinstance(c, str)}
+    commands = prescribed.get("commands")
+    if not isinstance(commands, list):
+        return set()
+    return {" ".join(c.split()) for c in commands if isinstance(c, str)}
 
 
 def _denied_by_full_suite_rules(cmd: str, patterns: list[str], *,
@@ -39842,45 +39851,51 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         else:
             plans = copy.deepcopy(st.data["plans_after_filters"])
 
+        # Before _schedule(), so the spec files `_write_plan` emits never
+        # carry a whole-suite `runs_commands` entry the declared-command
+        # check would then force a worker to run (DESIGN §9 *The whole
+        # suite is orchestrator-owned*). Outside the `plan_snapshot` branch
+        # on purpose: a resume past the snapshot reloads `plans` unstripped
+        # from `plans_after_filters`, and a wiring-gate repair below
+        # re-schedules from `plans` -- which used to overwrite the snapshot
+        # with the unstripped plan and lose any resynthesised subtask.
+        # Deterministic over the same input, so re-applying it reproduces
+        # the same plan.
+        _prescribed = st.data.get("prescribed_procedure") or {}
+
+        def _uncovered() -> set[str]:
+            return set(check_prescribed_command_coverage(
+                _prescribed, [s_ for p_ in plans
+                              for s_ in (p_.get("subtasks") or [])
+                              if isinstance(s_, dict)]))
+
+        _uncovered_before = _uncovered()
+        _stripped = _strip_canonical_suite_commands(
+            plans, st.repo_root, _prescribed)
+        for _sid in _stripped:
+            log(f"  {_sid}: dropped its whole-suite runs_commands entry — "
+                f"the orchestrator's whole-tree pass runs the suite")
+        # A planner paraphrase of a prescribed command (`… -q`, "run …
+        # to verify") covers it for the adherence floor but is not
+        # immune, so the strip can remove the only entry carrying the
+        # user's command. Re-run the floor's repair: it synthesises a
+        # subtask running the EXACT prescribed commands, which are
+        # immune, whenever coverage no longer holds.
+        # Only when the strip itself uncovered a prescribed command: a gap
+        # that predates it is the adherence gate's to report (or the
+        # operator's, under --skip-adherence-check), never this repair's.
+        _resynth = None
+        if _stripped and not _uncovered() <= _uncovered_before:
+            _resynth = _repair_prescribed_commands(
+                plans, _prescribed,
+                frozenset(st.data.get("dropped_subtasks") or {}))
+        if _resynth:
+            log(f"  {_resynth}: synthesised to run the prescribed "
+                f"commands the whole-suite strip had uncovered")
+
         if "plan_snapshot" not in st.data:
             st.data["current_phase"] = "phase 3: scheduling"
             st.save()
-            # Before _schedule(), so the spec files `_write_plan` emits never
-            # carry a whole-suite `runs_commands` entry the declared-command
-            # check would then force a worker to run (DESIGN §9 *The whole
-            # suite is orchestrator-owned*). Idempotent, so a resume from
-            # `plans_after_filters` re-applies it harmlessly.
-            _prescribed = st.data.get("prescribed_procedure") or {}
-
-            def _uncovered() -> set[str]:
-                return set(check_prescribed_command_coverage(
-                    _prescribed, [s_ for p_ in plans
-                                  for s_ in (p_.get("subtasks") or [])
-                                  if isinstance(s_, dict)]))
-
-            _uncovered_before = _uncovered()
-            _stripped = _strip_canonical_suite_commands(
-                plans, st.repo_root, _prescribed)
-            for _sid in _stripped:
-                log(f"  {_sid}: dropped its whole-suite runs_commands entry — "
-                    f"the orchestrator's whole-tree pass runs the suite")
-            # A planner paraphrase of a prescribed command (`… -q`, "run …
-            # to verify") covers it for the adherence floor but is not
-            # immune, so the strip can remove the only entry carrying the
-            # user's command. Re-run the floor's repair: it synthesises a
-            # subtask running the EXACT prescribed commands, which are
-            # immune, whenever coverage no longer holds.
-            # Only when the strip itself uncovered a prescribed command: a gap
-            # that predates it is the adherence gate's to report (or the
-            # operator's, under --skip-adherence-check), never this repair's.
-            _resynth = None
-            if _stripped and not _uncovered() <= _uncovered_before:
-                _resynth = _repair_prescribed_commands(
-                    plans, _prescribed,
-                    frozenset(st.data.get("dropped_subtasks") or {}))
-            if _resynth:
-                log(f"  {_resynth}: synthesised to run the prescribed "
-                    f"commands the whole-suite strip had uncovered")
             subtasks, waves = _schedule(plans)
             # Diagnostic snapshot BEFORE the two gates that can die()
             # below. Both are terminal, and the planner/fit_judge/splitter
