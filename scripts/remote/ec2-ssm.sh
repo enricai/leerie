@@ -112,10 +112,10 @@ ec2_attach() {
 # Reads from caller's scope: RESUME_SHELL, LEERIE_RUN_ID,
 # LEERIE_EC2_INSTANCE_ID.
 #
-# No auto-finalize plumbing here (unlike lib.sh's
-# tail_with_optional_autofinalize) — EC2 auto-finalize integration is
-# deferred to a later subtask, mirroring decide_ec2_teardown's own "no
-# auto-finalize integration yet" scope note.
+# No `resume --auto-finalize` token plumbing on this attach path (unlike
+# lib.sh's tail_with_optional_autofinalize; a documented EC2 gap). The
+# clean-exit auto-finalize itself lives in decide_ec2_teardown, which calls
+# host_finalize (DESIGN §6 "Finalization parity").
 #
 # Side-effect: sets container_rc=130 in the caller's scope so
 # decide_ec2_teardown leaves the instance alone (DESIGN §6 "Smart resume

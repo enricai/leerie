@@ -3588,8 +3588,9 @@ except Exception:
       _fin_ec2_woke="false"
       if [ "$_fin_ec2_state" = "stopped" ] || [ "$_fin_ec2_state" = "stopping" ]; then
         remote_log "finalize: instance $_fin_ec2_iid is $_fin_ec2_state; waking it to stream the run back"
-        # resume_instance() re-arms `trap decide_ec2_teardown EXIT INT TERM`
-        # for the normal launch path. In finalize that trap could TERMINATE
+        # resume_instance() re-arms the teardown traps (`decide_ec2_teardown
+        # exit` on EXIT, `decide_ec2_teardown` on INT TERM) for the normal
+        # launch path. In finalize that trap could TERMINATE
         # the instance on exit, which finalize must never do — so neutralize
         # it both ways: the LEERIE_TEARDOWN_DONE guard short-circuits
         # decide_ec2_teardown, and the trap is cleared right after.
