@@ -220,6 +220,19 @@ _try_fetch_branch_for_teardown() {
 # Idempotent: the trap fires on every exit, including success; the
 # stop/destroy primitives no-op on an empty LEERIE_MACHINE_ID.
 decide_teardown() {
+  local _rc=0
+  _decide_teardown_body || _rc=$?
+  # provision_machine/resume_machine replaced the launcher's EXIT trap with
+  # this function, which dropped the launcher's own duty to kill the $STAGE
+  # keepalive and remove $STAGE (staged ~/.ssh, ~/.aws, Claude credentials).
+  # The launcher defines the hook; standalone callers don't.
+  if declare -F _remote_launcher_exit_cleanup >/dev/null 2>&1; then
+    _remote_launcher_exit_cleanup
+  fi
+  return "$_rc"
+}
+
+_decide_teardown_body() {
   # Idempotency: when the launcher takes SIGINT, the INT trap fires
   # decide_teardown once, then the subsequent EXIT trap would fire it
   # a second time with a clobbered rc (the launcher's post-INT
@@ -327,6 +340,14 @@ decide_teardown() {
               remote_log "remote: run 'leerie finalize $LEERIE_REMOTE_RUN_ID' to push and open a PR after the run completes"
             fi
           fi
+          destroy_machine
+        elif [ -n "$run_dir" ] && [ -d "$run_dir" ] \
+             && [ "$(remote_host_no_push "$run_dir/fly-machine.json")" = "true" ]; then
+          # --no-push at launch: the work is already on the host; leave
+          # the run branch there (run.json.no_push was stripped by the
+          # fetch, so the sidecar is the intent of record).
+          remote_log "auto-finalize: --no-push was set at launch; run branch left on the host, no push or PR"
+          remote_log "remote: run 'leerie finalize $LEERIE_REMOTE_RUN_ID --runtime fly' to push and open a PR later"
           destroy_machine
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
           local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"

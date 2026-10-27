@@ -4286,13 +4286,26 @@ one.
 `host_finalize` flow as Fly's `decide_teardown` (see *Finalization*
 above): on a clean exit the host pushes the run branch and opens the PR
 before the instance is terminated, and a finalize failure keeps the
-instance's pause disposition rather than destroying unpushed work. A
-launch-time `--no-push` is honored here: the instance sidecar records it as
-`host_no_push`, the same intent field Fly records for `leerie finalize`,
-because the fetched `run.json` cannot carry it — the fetch strips
-`no_push=true` whenever a run branch exists. With it set, the run branch is
-left on the host for a later `leerie finalize`, no push or PR is attempted,
-and the instance is terminated (the work is already on the host).
+instance's pause disposition rather than destroying unpushed work.
+
+Two rules hold for both remote runtimes' teardown (Fly's `decide_teardown`
+and EC2's `decide_ec2_teardown` alike):
+
+- **A launch-time `--no-push` is honored by auto-finalize.** The runtime
+  sidecar (`fly-machine.json` / `ec2-instance.json`) records it as
+  `host_no_push`, and teardown reads it there, because the fetched
+  `run.json` cannot carry it — the fetch strips `no_push=true` whenever a
+  run branch exists (a defense against old images that wrote the
+  mechanism flag). With it set, the run branch is left on the host for a
+  later `leerie finalize`, no push or PR is attempted, and the machine or
+  instance is destroyed (the work is already on the host).
+- **The teardown trap keeps the launcher's exit duties.** Provisioning
+  replaces the launcher's EXIT trap with the teardown function, so the
+  teardown ends by running the launcher's own cleanup: killing the
+  `$STAGE` keepalive and removing `$STAGE`, which holds copies of
+  `~/.ssh`, `~/.aws` and the Claude credentials. Without it every remote
+  run leaked that directory, and the orphaned keepalive kept it fresh
+  enough to escape the one-day sweep.
 
 **Cleanup.** `leerie prune` (dry-run by default, `--apply` to act) and
 `kill`/teardown where appropriate cover leerie-tagged AMIs and their

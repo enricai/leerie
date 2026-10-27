@@ -47,7 +47,7 @@ update_run_json() {{ :; }}
 export LEERIE_EC2_INSTANCE_ID=i-123 LEERIE_REMOTE_EXIT_RC={rc}
 export LEERIE_RUN_ID=rid-001 USER_REPO={user_repo} LEERIE_REPO={leerie_repo}
 NO_PUSH={no_push_env}
-{'_ec2_launcher_exit_cleanup() { echo "CALL cleanup"; }' if launcher_hook else ''}
+{'_remote_launcher_exit_cleanup() { echo "CALL cleanup"; }' if launcher_hook else ''}
 decide_ec2_teardown
 decide_ec2_teardown
 """

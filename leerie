@@ -7066,6 +7066,14 @@ _stage_keepalive_pid=$!
 # the container arm re-sets it (adding container-kill) and still removes $STAGE
 # + kills the keepalive, so this early trap only matters for exits before that.
 trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE" 2>/dev/null' EXIT
+# The same duty as a named hook: the remote runtimes replace the EXIT trap
+# with their teardown (decide_teardown / decide_ec2_teardown), which calls
+# this last so the keepalive and the staged credentials still go away.
+_remote_launcher_exit_cleanup() {
+  [ -n "${_stage_keepalive_pid:-}" ] && kill "$_stage_keepalive_pid" 2>/dev/null
+  [ -n "${STAGE:-}" ] && rm -rf "$STAGE" 2>/dev/null
+  return 0
+}
 
 # -- .claude.json: copy with projects[] stripped. --
 # The projects[] block stores prior-session per-project state
@@ -8385,15 +8393,6 @@ elif [ "$RUNTIME" = "ec2" ]; then
   else
     REWRITTEN_ARGS+=("--host-no-push" "false")
   fi
-
-  # provision_instance/resume_instance replace this launcher's EXIT trap
-  # with decide_ec2_teardown, which calls this hook last so the STAGE
-  # keepalive and the staged credentials still go away on every exit.
-  _ec2_launcher_exit_cleanup() {
-    [ -n "${_stage_keepalive_pid:-}" ] && kill "$_stage_keepalive_pid" 2>/dev/null
-    [ -n "${STAGE:-}" ] && rm -rf "$STAGE" 2>/dev/null
-    return 0
-  }
 
   EC2_PROVISION_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-provision.sh"
   EC2_RESUME_SCRIPT="$LEERIE_REPO/scripts/remote/ec2-resume-instance.sh"

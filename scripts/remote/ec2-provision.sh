@@ -151,16 +151,6 @@ _try_fetch_state_for_ec2_teardown() {
   return 0
 }
 
-# _ec2_host_no_push <run-dir> — "true" when the launch recorded --no-push in
-# the run's ec2-instance.json sidecar (or this launcher has NO_PUSH=true).
-_ec2_host_no_push() {
-  if [ "${NO_PUSH:-false}" = "true" ]; then echo true; return 0; fi
-  python3 -c '
-import json, sys
-try: print("true" if json.load(open(sys.argv[1])).get("host_no_push") else "false")
-except Exception: print("false")' "$1/ec2-instance.json" 2>/dev/null || echo false
-}
-
 # --- decide_ec2_teardown (registered as EXIT/INT/TERM trap) ----------------
 # The EC2 counterpart of decide_teardown() in provision.sh. Classifies
 # $LEERIE_REMOTE_EXIT_RC (set by the launcher just before exit) and
@@ -188,8 +178,8 @@ decide_ec2_teardown() {
   # with this function, which dropped the launcher's own duty to kill the
   # $STAGE keepalive and remove $STAGE (staged ~/.ssh, ~/.aws, Claude
   # credentials). The launcher defines the hook; standalone callers don't.
-  if declare -F _ec2_launcher_exit_cleanup >/dev/null 2>&1; then
-    _ec2_launcher_exit_cleanup
+  if declare -F _remote_launcher_exit_cleanup >/dev/null 2>&1; then
+    _remote_launcher_exit_cleanup
   fi
   return "$_rc"
 }
@@ -243,7 +233,7 @@ _decide_ec2_teardown_body() {
           fi
           terminate_instance
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ] \
-             && [ "$(_ec2_host_no_push "$run_dir")" = "true" ]; then
+             && [ "$(remote_host_no_push "$run_dir/ec2-instance.json")" = "true" ]; then
           remote_log "auto-finalize: --no-push was set at launch; run branch left on the host, no push or PR"
           remote_log "remote: run 'leerie finalize $_rid' to push and open a PR later"
           terminate_instance

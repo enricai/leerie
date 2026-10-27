@@ -97,6 +97,20 @@ PY
   mv "$tmp" "$sidecar"
 }
 
+# --- remote_host_no_push ---------------------------------------------------
+# Print "true" when the user opted out of pushing at launch, else "false":
+# the launcher's NO_PUSH, or host_no_push in the runtime sidecar
+# (fly-machine.json / ec2-instance.json). Both remote teardowns gate
+# auto-finalize on this. run.json cannot carry the intent: the fetch strips
+# no_push=true whenever a run branch exists. A missing sidecar reads false.
+remote_host_no_push() {
+  if [ "${NO_PUSH:-false}" = "true" ]; then echo true; return 0; fi
+  python3 -c '
+import json, sys
+try: print("true" if json.load(open(sys.argv[1])).get("host_no_push") is True else "false")
+except Exception: print("false")' "$1" 2>/dev/null || echo false
+}
+
 # --- iso_now -------------------------------------------------------------
 # Emit an ISO-8601 UTC timestamp (sub-second precision). Used as
 # paused_at / similar event markers.

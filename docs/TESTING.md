@@ -182,6 +182,20 @@ the install checkout).
   clean exit fetches and terminates without `host_finalize`; the same
   sidecar with `host_no_push=false` still finalizes. `tests/test_ec2_provision.py`
   pins that `provision_instance` records that intent in the sidecar.
+  `tests/test_decide_teardown_auto_finalize.py` pins the same for Fly: with
+  `host_no_push` in `fly-machine.json` (or `NO_PUSH=true`) the ordered
+  stub calls are fetch → destroy with no `host_finalize`, and a
+  `host_no_push=false` control still runs fetch → finalize → destroy.
+  `tests/test_remote_host_no_push.py` covers the shared `lib.sh` reader
+  both teardowns use: either sidecar, missing or malformed reads `false`,
+  only a real `true` counts, and the launcher's `NO_PUSH` overrides.
+- Both teardown files also pin the launcher's STAGE-cleanup hook
+  (`_remote_launcher_exit_cleanup`): it runs last, on the idempotent
+  second call too, and when the machine/instance is left running after a
+  failed sync. `tests/test_ec2_launch_env.py` executes the launcher's real
+  hook — the keepalive is killed and STAGE removed — and runs it under
+  `set -u` with nothing staged. Without it every remote run leaked a
+  `cfg-*` dir of staged credentials (DESIGN §6 *Finalization parity*).
 - `tests/test_ec2_launch_env.py` also executes the shared launch suffix's
   argv assembly: `--no-push` goes after the forwarded args (before a
   literal `--`), so `resume <run-id>` keeps the verb first — a leading flag

@@ -98,24 +98,24 @@ def test_launch_argv_parses_as_resume_in_the_orchestrator(leerie):
     assert run_id == "i-0abc" and "--no-push" in rest
 
 
-def test_ec2_launcher_exit_cleanup_kills_the_keepalive_and_removes_stage(tmp_path):
+def test_remote_launcher_exit_cleanup_kills_the_keepalive_and_removes_stage(tmp_path):
     # Executes the launcher's own hook: the staged credentials must go.
-    body = re.search(r"\n  _ec2_launcher_exit_cleanup\(\) \{\n.*?\n  \}\n", LAUNCHER, re.S).group(0)
+    body = re.search(r"\n_remote_launcher_exit_cleanup\(\) \{\n.*?\n\}\n", LAUNCHER, re.S).group(0)
     stage = tmp_path / "cfg-x"
     (stage / ".claude").mkdir(parents=True)
     (stage / ".claude" / ".credentials.json").write_text("{}")
     script = (f"( while :; do sleep 1; done ) & _stage_keepalive_pid=$!; STAGE={stage}\n"
-              + body + "\n_ec2_launcher_exit_cleanup; sleep 0.2; "
+              + body + "\n_remote_launcher_exit_cleanup; sleep 0.2; "
               "kill -0 $_stage_keepalive_pid 2>/dev/null && echo alive || echo gone")
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True, check=True)
     assert r.stdout.strip() == "gone"
     assert not stage.exists()
 
 
-def test_ec2_launcher_exit_cleanup_is_safe_with_nothing_staged():
+def test_remote_launcher_exit_cleanup_is_safe_with_nothing_staged():
     # Under the launcher's `set -u`, an unset keepalive pid or STAGE must not
     # turn a clean teardown into an unbound-variable failure.
-    body = re.search(r"\n  _ec2_launcher_exit_cleanup\(\) \{\n.*?\n  \}\n", LAUNCHER, re.S).group(0)
-    r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + body + "\n_ec2_launcher_exit_cleanup; echo ok"],
+    body = re.search(r"\n_remote_launcher_exit_cleanup\(\) \{\n.*?\n\}\n", LAUNCHER, re.S).group(0)
+    r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + body + "\n_remote_launcher_exit_cleanup; echo ok"],
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
