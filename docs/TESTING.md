@@ -3661,12 +3661,17 @@ mislabeling an EC2 run) and `list` (keyed its runtime view on
 in `tests/test_ec2_launcher_readonly_verbs.py`. `accept-blocked` now
 auto-detects EC2 (`_auto_detect_run_runtime`), accepts an explicit
 `--runtime ec2`, and — mirroring the Fly wake-mutate-pause dance — wakes a
-stopped instance, mutates `state.json` over SSM (`ec2_remote_exec`), mirrors
+stopped instance, mutates `state.json` over SSH (`ec2_remote_exec`), mirrors
 onto the host copy, and re-pauses only if this verb woke it, failing closed
-on a missing `ec2_instance_id`. Tests invoke the real launcher against a
-stubbed `aws` composing `tests/ec2_stub.py`'s instance tracking with an `ssm
-start-session` handler decoding the base64 command through stdin (the same
-mechanism `tests/test_ec2_launcher_dispatch_e2e.py` relies on).
+on a missing `ec2_instance_id`. The wake must not fire the run-launch
+teardown `resume_instance` arms: before the fix, both `accept-blocked` and
+`accept-integration` exited into `decide_ec2_teardown`, which tried to fetch
+from the instance they had just re-stopped and stamped `sync_failed_at` plus
+a false "LEFT RUNNING" banner (`*_wake_does_not_fire_run_teardown`). Tests
+invoke the real launcher against a stubbed `aws` composing
+`tests/ec2_stub.py`'s instance tracking with an `ssh` stub that plays the
+instance, running the remote command against a fixture `/work` with its
+stdin attached.
 `_collect_run_rows`/`_list_runs` now track an `is_ec2` axis alongside
 `is_fly`, so `list --runtime ec2`/`--runtime local` filter correctly, a plain
 `list` renders an EC2 status column without `LEERIE_FLY_APP`, and detection

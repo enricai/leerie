@@ -2294,10 +2294,17 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       _ab_started_instance=false
       if [ "$_ab_ec2_state" != "running" ]; then
         remote_log "accept-blocked: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        # resume_instance() arms the run-launch teardown traps. Left armed,
+        # this verb's exit would run decide_ec2_teardown as a clean run exit
+        # (sync, then finalize or terminate) against the run being unblocked;
+        # neutralize them as the finalize arm does.
+        LEERIE_TEARDOWN_DONE=1
+        export LEERIE_TEARDOWN_DONE
         if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
           remote_log "accept-blocked: instance $LEERIE_EC2_INSTANCE_ID never became ready"
           exit 1
         fi
+        trap - EXIT INT TERM
         _ab_started_instance=true
       fi
       _ab_teardown_ec2() {
@@ -2593,10 +2600,17 @@ print(f"ACCEPTED: {sid!r} integration finding accepted")
       _ai_started_instance=false
       if [ "$_ai_ec2_state" != "running" ]; then
         remote_log "accept-integration: starting stopped instance $LEERIE_EC2_INSTANCE_ID..."
+        # resume_instance() arms the run-launch teardown traps. Left armed,
+        # this verb's exit would run decide_ec2_teardown as a clean run exit
+        # (sync, then finalize or terminate) against the run being unblocked;
+        # neutralize them as the finalize arm does.
+        LEERIE_TEARDOWN_DONE=1
+        export LEERIE_TEARDOWN_DONE
         if ! resume_instance "$LEERIE_EC2_INSTANCE_ID"; then
           remote_log "accept-integration: instance $LEERIE_EC2_INSTANCE_ID never became ready"
           exit 1
         fi
+        trap - EXIT INT TERM
         _ai_started_instance=true
       fi
       _ai_teardown_ec2() {
@@ -8622,7 +8636,8 @@ child_env = dict(os.environ)
 # The Dockerfile ENV set, written by the bake (ec2-bake.sh): an instance
 # does not inherit the image ENV the way a container does. Absent on an
 # operator AMI, which keeps the session environment. (No apostrophes in
-# this heredoc: it is nested in $(...), which bash 3.2 cannot parse then.)
+# this heredoc: it sits inside a command substitution, which bash 3.2
+# cannot parse then. No dollar-paren either: the heredoc is unquoted.)
 try:
     with open("/opt/leerie-image/leerie.env") as _env_f:
         for _line in _env_f:

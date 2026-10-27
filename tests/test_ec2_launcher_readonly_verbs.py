@@ -16,7 +16,7 @@ EC2 runs, and the underlying row-collection (`_collect_run_rows` in
 This file pins the fix: `accept-blocked` now auto-detects EC2 the
 same way `stop` already does (`_auto_detect_run_runtime`), accepts an
 explicit `--runtime ec2`, and — mirroring the Fly path's wake-mutate-
-pause dance — wakes a stopped instance, mutates state.json over SSM
+pause dance — wakes a stopped instance, mutates state.json over SSH
 (`ec2_remote_exec`, DESIGN §6 "Transport substitution for `flyctl ssh
 console`"), mirrors the mutation onto the host copy if one exists, and
 re-pauses the instance only if this verb woke it. `_collect_run_rows`/
@@ -396,3 +396,64 @@ def test_list_ec2_run_detected_via_sidecar_only(leerie, tmp_path, capsys):
     leerie._list_runs(tmp_path, runtime_filter="ec2")
     out = capsys.readouterr().out
     assert RUN_ID in out
+
+
+# --- accept verbs must not fire the run-launch teardown --------------------
+#
+# Waking a stopped instance goes through resume_instance(), which arms the
+# run-launch teardown traps (`decide_ec2_teardown exit` on EXIT, the bare
+# form on INT/TERM). Left armed, the accept verb's own exit ran
+# decide_ec2_teardown with LEERIE_REMOTE_EXIT_RC unset (read as 0, a clean
+# run exit) and tried to fetch the run back. Against the instance the verb
+# had just re-stopped, that fetch failed: run.json gained sync_failed_at and
+# the operator got a "LEFT RUNNING" banner for a stopped instance. (Had the
+# fetch reached a running instance, the clean-exit branch terminates a run
+# with no finished_at.) The arms now neutralize those traps the way
+# `finalize` does.
+
+_ACCEPT_VERB_CASES = {
+    "accept-blocked": {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}},
+    "accept-integration": {"integration_gate": {SID: {"accepted": False}},
+                           "integration_defects": {SID: ["d"]}},
+}
+
+
+def _assert_accept_on_stopped_instance_skips_run_teardown(tmp_path: Path, verb: str) -> None:
+    aws_dir = tmp_path / "bin"
+    _stub_aws_with_ssm(aws_dir)
+    iid = _seed_stopped_instance(aws_dir)
+    env, state_dir, work_dest = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
+    run_dir = state_dir / "runs" / RUN_ID
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
+    _seed_remote_state(work_dest, RUN_ID, _ACCEPT_VERB_CASES[verb])
+
+    result = _run([verb, RUN_ID, SID], env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "ACCEPTED:" in out, out
+
+    # The verb's own re-pause still happens — and is the LAST lifecycle call.
+    log = read_log(aws_dir)
+    lifecycle = [l.split()[1] for l in log
+                 if l.startswith("ec2 ") and l.split()[1].endswith("-instances")
+                 and not l.split()[1].startswith("describe")]
+    assert lifecycle == ["start-instances", "stop-instances"], log
+    assert read_state(aws_dir)["instances"][iid]["state"] == "stopped"
+    stop_at = max(i for i, l in enumerate(log) if l.startswith("ec2 stop-instances"))
+    assert not any(l.startswith("ssh ") for l in log[stop_at + 1:]), log[stop_at:]
+
+    run_json = json.loads((run_dir / "run.json").read_text())
+    assert run_json.get("pause_reason") == "user-requested"
+    assert run_json.get("paused_at")
+    assert "sync_failed_at" not in run_json
+    for teardown_line in ("synced to host", "LEFT RUNNING", "did not reach finalize",
+                          "auto-finalize"):
+        assert teardown_line not in out, out
+
+
+def test_accept_blocked_ec2_wake_does_not_fire_run_teardown(tmp_path: Path) -> None:
+    _assert_accept_on_stopped_instance_skips_run_teardown(tmp_path, "accept-blocked")
+
+
+def test_accept_integration_ec2_wake_does_not_fire_run_teardown(tmp_path: Path) -> None:
+    _assert_accept_on_stopped_instance_skips_run_teardown(tmp_path, "accept-integration")

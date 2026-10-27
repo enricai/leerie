@@ -142,3 +142,17 @@ def test_launchers_own_stage_traps_tolerate_a_gone_keepalive(tmp_path):
     # shape: each kill must be followed by `|| true`.
     traps = re.findall(r"""trap 'kill "\$_stage_keepalive_pid" 2>/dev/null([^;]*);""", LAUNCHER)
     assert len(traps) == 3 and all(t == " || true" for t in traps), traps
+
+
+def test_rendering_the_child_env_heredoc_runs_no_stray_command():
+    """The heredoc is unquoted (`<<PY`) so the host expands its variables;
+    any `$(` in its text therefore runs as a command on every EC2 launch.
+    b9b1676 put `$(...)` in a comment there: each launch ran a command named
+    `...` ("command not found" on stderr) and the comment lost that text."""
+    shell = (
+        'USER_REPO=/repos/demo; _ec2_host_tz=UTC; _ec2_leerie_commit_json=\'""\'; '
+        "_ec2_oauth_token_json='\"\"'; _ec2_oauth_tokens_json='\"\"'\n" + _child_env_heredoc()
+    )
+    r = subprocess.run(["bash", "-c", shell], capture_output=True, text=True)
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    assert "# cannot parse then. No dollar-paren either" in r.stdout

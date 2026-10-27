@@ -1406,10 +1406,13 @@ run): bare `resume` PID-record auto-discovery (an explicit
 `resume <run-id>` is required), mid-run re-seed (`re-seed`/auto-re-seed on
 `resume`), `--inspect-dir` seeding, chain-wave tagging, and
 auto-finalize token plumbing on the tail/attach path (the clean-exit
-`decide_ec2_teardown` arm itself does call `host_finalize`). `finalize
---runtime ec2` is also not yet wired — that verb remains Fly-only
-today; `stop --runtime ec2` and `kill --runtime ec2` *are* both
-wired (see "Explicit pause and destroy verbs" above). DESIGN §6 *EC2
+`decide_ec2_teardown` arm itself does call `host_finalize`), and
+`finalize --runtime ec2 --force`, which is refused because the force path
+(`force_finalize_remote()`/`collect_subtrees_remote()`) is flyctl-transport
+only. Plain `finalize --runtime ec2` *is* wired (wake → `fetch_state_ec2` →
+`host_finalize` → re-stop if it woke the instance; DESIGN §6 *The
+user-visible verb surface*), as are `stop --runtime ec2` and `kill --runtime
+ec2` (see "Explicit pause and destroy verbs" above). DESIGN §6 *EC2
 runtime lifecycle* is the canonical architecture. Default is `local`
 so existing behavior is unchanged for users who have not opted in.
 
@@ -7402,6 +7405,12 @@ verb is the manual path used under `--stop-on-blocked`
     `ec2_remote_exec` (SSH, with the caller's stdin passed through)
     and greps the same sentinels; host-side copy mirrored
     best-effort. Teardown is **conditional** the same way as Fly.
+    Because `resume_instance` arms the run-launch teardown traps
+    (`decide_ec2_teardown`), the wake sets `LEERIE_TEARDOWN_DONE=1`
+    first and clears `EXIT`/`INT`/`TERM` after, as `finalize`'s EC2 arm
+    does — otherwise the verb's own exit would run a clean-exit run
+    teardown (sync, then finalize or terminate) against the run being
+    unblocked. `accept-integration` shares this arm shape.
   - The mutation program validates the subtask's current status is
     `"blocked"` or `"failed"` before mutating (atomic temp-file +
     `os.replace`). No-ops with `NOOP:` if already `"complete"`.
@@ -7417,8 +7426,11 @@ verb is the manual path used under `--stop-on-blocked`
     genuinely bogus value is still rejected), the accept-record
     mutation landing on both the remote state.json and the
     mirrored host copy, the wake/re-pause discipline (and its
-    already-running no-op counterpart), and the missing-`ec2_instance_id`
-    fail-closed path.
+    already-running no-op counterpart), the missing-`ec2_instance_id`
+    fail-closed path, and — for both `accept-blocked` and
+    `accept-integration` — that waking a stopped instance does not fire
+    the run-launch teardown (the re-pause is the last lifecycle call, no
+    fetch follows it, no `sync_failed_at`).
 
 Maps to `DESIGN.md`: §5 *`requires.extent` — in-graph vs. external
 prerequisites*, *Accepting external-blocked subtasks*.
