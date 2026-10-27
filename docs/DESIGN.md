@@ -6356,8 +6356,9 @@ every run finalized green. The settle-time half closes this: the
 orchestrator already holds every Bash invocation the worker actually made
 as structured `tool_use` JSON in the per-worker log (`_iter_log_tool_use`
 — JSON→JSON, no prose is read), so `_settle_subtask` requires every
-`runs_commands` entry on a `complete` result to match some executed
-invocation under normalized token matching, per shell segment
+`runs_commands` entry on a `complete` result — except one the whole-suite
+deny refuses (§9 *The whole suite is orchestrator-owned*) — to match some
+executed invocation under normalized token matching, per shell segment
 (segments split first, so a match inside a pipeline or a `cd … && …`
 prefix still counts — but never a cross-segment token union, which would
 credit `pnpm install && ls test` for a declared "pnpm test"). Matching
@@ -6914,13 +6915,14 @@ whole-tree pass (§6) is where that question is asked, and it is the only
 place cross-subtask interaction can be answered. What the per-subtask pass
 needs is whether *this diff* broke something.
 
-So the per-subtask axes may run a **delta proxy** — a cheaper command
-scoped to the changed files — while the canonical test command runs exactly
-twice per run: once at the base-health baseline and once (per round) on the
-integrated tree (a `build` with no proxy still runs canonically per subtask;
-see the absence rule below). Measured, the median subtask in one run touched
-a single source file, yet every conformer round ran the whole ~990-file
-suite at ~499s a time against ~23s for a scoped run of the same repo.
+So the per-subtask axes may run a **delta proxy** — a cheaper command scoped
+to the changed files — while, under `scoped`, the canonical test command
+runs exactly twice per run: once at the base-health baseline and once (per
+round) on the integrated tree (a `build` with no proxy still runs
+canonically per subtask; see the absence rule below). Measured, the median
+subtask in one run touched a single source file, yet every conformer round
+ran the whole ~990-file suite at ~499s a time against ~23s for a scoped run
+of the same repo.
 
 A proxy is repo-declared (`test_scoped` / `build_scoped` in
 `.leerie/config.toml`) or inferred from two narrow signals, rendered from a
@@ -7007,7 +7009,9 @@ mechanism exists to remove. Four mechanisms read that list:
 
 - **Hard deny.** The rules go into `--disallowedTools` as scoped
   `Bash(...)` patterns, the only permission control that survives
-  `--dangerously-skip-permissions`, on every worker. The CLI strips
+  `--dangerously-skip-permissions`, on every worker `claude_p` spawns (the
+  Fly remote integrator and the preflight smoke test build their own argv
+  and carry neither the deny nor the notice). The CLI strips
   `timeout`-style wrappers and redirections and checks every segment of a
   compound command, so anything aimed at a test root is refused, `-k`/`-m`
   selections included; file-targeted runs, loops over files and selections
@@ -7070,22 +7074,28 @@ that cannot satisfy it ends `blocked` and the operator sees why, rather than
 the instruction disappearing silently. Third, immunity is exact, and a
 planner usually paraphrases (`uv run pytest tests/ -q` for a prescribed `uv
 run pytest tests/`), which the adherence floor accepts as coverage but the
-strip may remove; so whenever the strip removed an entry, the floor's own
-repair (`_repair_prescribed_commands`) runs again and synthesises a subtask
-carrying the exact, immune commands if coverage no longer holds (a gap that
-predates the strip stays the adherence gate's to report). Immunity is
-deliberately not widened to paraphrases: a prescribed `pytest
-tests/test_a.py` would then shield a planner's `pytest tests/
-tests/test_a.py`, which the CLI denies.
+strip may remove; so when the strip itself uncovers a prescribed command,
+the floor's own repair (`_repair_prescribed_commands`) runs again and
+synthesises a subtask carrying the exact, immune commands (a gap that
+predates the strip stays the adherence gate's to report, or the operator's
+under `--skip-adherence-check`). Immunity is deliberately not widened to
+paraphrases: a prescribed `pytest tests/test_a.py` would then shield a
+planner's `pytest tests/ tests/test_a.py`, which the CLI denies.
 
 The derivation reads the target repo's files on every worker spawn, so it is
 total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,
 `tox.ini` or `setup.cfg`; `pyproject.toml` is not read, and such a repo gets
 the `tests/` default) degrades to fewer rules or none, with one warning,
 never to a crashed spawn. The deny is a guard on the invocation a worker
-writes, not a security boundary: an absolute-path runner, `bash -c`, or a
-flags-only bare runner (`pytest -q`) is not matched. None appeared among the
-full-suite invocations on record, which is the honest extent of the claim.
+writes, not a security boundary. The CLI ran each of these live despite the
+rules: a runner behind another command (`uv run pytest tests/`, `coverage
+run -m pytest tests/`, `xvfb-run pytest tests/`, `eval pytest tests/`, `sh
+-c 'pytest tests/'`), a quoted or escaped root (`pytest "tests/"`, `pytest
+'tests'`, `pytest tests\/`), and a flags-only bare runner (`pytest -q`); an
+absolute-path runner is likewise unmatched. None appeared among the
+full-suite invocations leerie's own workers ran on record, which is the
+honest extent of the claim; the notice, not the deny, is what such a worker
+is left with.
 
 **The round signal is a regression, not a verdict.** Because a scoped
 result and a full baseline are not comparable, the base-health baseline

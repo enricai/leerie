@@ -20038,11 +20038,12 @@ def _full_suite_denials(repo_root: str | Path,
     no:cacheprovider tests/ > f; echo` and `cd . && pytest tests/ -q` were
     denied, as is a `-k`/`-m` selection aimed at a test root; `python3 -m
     pytest tests/test_x.py -q`, a two-file run and a `for` loop over files
-    still ran. Not matched, by the CLI's own documented limits: an
-    absolute-path runner, `bash -c '...'`, and a flags-only bare runner
-    (`pytest -q`). Every worker whose tools can reach the runner gets
-    `FULL_SUITE_NOTICE` with it (`claude_p`): deny alone ended 2/2 replayed
-    workers `blocked`."""
+    still ran. Not matched (the CLI ran each live): a runner behind another
+    command (`uv run`, `coverage run -m`, `xvfb-run`, `eval`, `sh -c`), a
+    quoted or escaped root (`pytest "tests/"`), a flags-only bare runner
+    (`pytest -q`), and an absolute-path runner. Every worker whose tools can
+    reach the runner gets `FULL_SUITE_NOTICE` with it (`claude_p`): deny
+    alone ended 2/2 replayed workers `blocked`."""
     return ",".join(f"Bash({p})"
                     for p in _full_suite_rule_patterns(repo_root, prescribed))
 
@@ -29618,16 +29619,17 @@ def _repair_prescribed_commands(plans: list[dict], prescribed: dict,
         # ids without one. Decline rather than emit an invalid subtask.
         return None
     prefix += "-"
-    # `reserved_ids`: ids no longer in the plan but still meaningful in state
-    # (`dropped_subtasks`), which a synthesised subtask must not reuse.
     ids = {s["id"] for s in subs if isinstance(s.get("id"), str)}
-    ids |= set(reserved_ids)
+    # `reserved_ids`: ids no longer in the plan but still meaningful in state
+    # (`dropped_subtasks`). Excluded from minting only -- never from `ids`,
+    # which also yields the sinks, or a dropped id becomes a dependency.
+    taken = ids | set(reserved_ids)
     # Sinks: nothing depends on them, so depending on all of them puts the
     # verifier strictly last without inventing an ordering opinion.
     depended = {d for s in subs for d in (s.get("depends_on") or [])}
     sinks = sorted(i for i in ids if i not in depended)
     n = 1
-    while f"{prefix}{900 + n:03d}" in ids:
+    while f"{prefix}{900 + n:03d}" in taken:
         n += 1
     sid = f"{prefix}{900 + n:03d}"
     host["subtasks"].append({
@@ -39849,6 +39851,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # suite is orchestrator-owned*). Idempotent, so a resume from
             # `plans_after_filters` re-applies it harmlessly.
             _prescribed = st.data.get("prescribed_procedure") or {}
+
+            def _uncovered() -> set[str]:
+                return set(check_prescribed_command_coverage(
+                    _prescribed, [s_ for p_ in plans
+                                  for s_ in (p_.get("subtasks") or [])
+                                  if isinstance(s_, dict)]))
+
+            _uncovered_before = _uncovered()
             _stripped = _strip_canonical_suite_commands(
                 plans, st.repo_root, _prescribed)
             for _sid in _stripped:
@@ -39860,10 +39870,11 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # user's command. Re-run the floor's repair: it synthesises a
             # subtask running the EXACT prescribed commands, which are
             # immune, whenever coverage no longer holds.
-            # Only when the strip removed something: otherwise any coverage
-            # gap predates it and is the adherence gate's to report.
+            # Only when the strip itself uncovered a prescribed command: a gap
+            # that predates it is the adherence gate's to report (or the
+            # operator's, under --skip-adherence-check), never this repair's.
             _resynth = None
-            if _stripped:
+            if _stripped and not _uncovered() <= _uncovered_before:
                 _resynth = _repair_prescribed_commands(
                     plans, _prescribed,
                     frozenset(st.data.get("dropped_subtasks") or {}))

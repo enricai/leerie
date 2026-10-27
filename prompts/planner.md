@@ -154,14 +154,14 @@ The orchestrator gives you, in your prompt:
    prose. Leave `runs_commands` empty (or omit it) for subtasks that
    invoke no prescribed command — most subtasks do not.
 
-   **Never plan a run of the repository's whole test suite.** Do not create a
-   subtask whose job is to run the full suite, and do not declare the bare
-   suite command in `runs_commands`. The orchestrator runs the whole suite
-   itself on the integrated tree once every wave has merged, so a repo rule
-   such as "run the full suite before calling a change green" is already
-   satisfied — and workers are denied the command. Name the specific test
-   files a subtask should run instead. (The orchestrator also removes such
-   entries mechanically; this is why.)
+   **Never plan a run of the repository's whole test suite** unless the task
+   itself prescribes it. Do not create a subtask whose job is to run the full
+   suite, and do not declare the bare suite command in `runs_commands`. The
+   orchestrator runs the whole suite itself on the integrated tree once every
+   wave has merged, so a repo rule such as "run the full suite before calling
+   a change green" is already satisfied — and workers are denied the command.
+   Name the specific test files a subtask should run instead. (The
+   orchestrator also removes such entries mechanically; this is why.)
 
    **Set `change_shape` on every subtask.** Required — there is no default.
    It declares how many places in the code this subtask actually edits:

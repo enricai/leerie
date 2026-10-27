@@ -875,8 +875,12 @@ def test_resynthesis_never_reuses_a_dropped_id(leerie):
         {"id": "test-001", "depends_on": [], "runs_commands": []}]}]
     sid = leerie._repair_prescribed_commands(
         plans, {"is_prescribed": True, "commands": ["make check"]},
-        frozenset({"test-901"}))
+        frozenset({"test-901", "test-050"}))
     assert sid == "test-902"
+    new = next(s for s in plans[0]["subtasks"] if s["id"] == sid)
+    # Reserved ids are excluded from minting only: depending on a dropped
+    # subtask would leave a dangling edge (final review).
+    assert new["depends_on"] == ["test-001"]
 
 
 def test_resynthesis_does_not_fire_when_nothing_was_stripped(
@@ -912,3 +916,41 @@ def test_resynthesis_does_not_fire_when_nothing_was_stripped(
             _args(), _caps(leerie), run_dir, st, "codebase", "normal",
             MODELS, EFFORTS))
     assert set(st.data["plan_snapshot"]["subtasks"]) == {"test-001"}
+
+
+def test_resynthesis_ignores_a_gap_the_strip_did_not_cause(
+        leerie, monkeypatch, tmp_path):
+    """Final review: the prescribed `make docs` was never covered, and the
+    strip removed an unrelated `pytest tests/`. The gap predates the strip,
+    so it is the adherence gate's (or, with the check skipped, the
+    operator's) -- the post-strip repair must not synthesise for it."""
+    from tests.test_resume_planning_reentry import (
+        _StopAtExecute, _args, _caps, _plan, _stub_common, EFFORTS, MODELS)
+    repo = _repo(tmp_path)
+    leerie_root = tmp_path / ".leerie-state"
+    run_id = "strip-oldgap-aaa111"
+    run_dir = leerie_root / "runs" / run_id
+    (run_dir / "subtasks").mkdir(parents=True)
+    sub = {"id": "test-001", "depends_on": [], "requires": [],
+           "provides": [], "runs_commands": ["pytest tests/"]}
+    plans = [_plan("testing", sub)]
+    calls: dict = {}
+    _stub_common(leerie, monkeypatch, calls)
+    st = leerie.State(leerie_root, run_id, repo_root=repo)
+    st.data = {"task": "t", "worker_count": 3, "categories": ["testing"],
+               "skip_adherence_check": True,
+               "prescribed_procedure": {"is_prescribed": True,
+                                        "commands": ["make docs"]},
+               "plans_after_classify": [],
+               **{k: plans for k in (
+                   "plans_after_plan", "plans_after_reconcile",
+                   "plans_after_overlap_judge", "plans_after_adherence_gate",
+                   "plans_after_coverage_gate", "plans_after_filters")}}
+    st.save()
+    with pytest.raises(_StopAtExecute):
+        asyncio.run(leerie._run_phases(
+            _args(), _caps(leerie), run_dir, st, "codebase", "normal",
+            MODELS, EFFORTS))
+    snap = st.data["plan_snapshot"]["subtasks"]
+    assert set(snap) == {"test-001"}
+    assert snap["test-001"]["runs_commands"] == []
