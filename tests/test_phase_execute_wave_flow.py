@@ -88,8 +88,13 @@ def test_blocked_subtask_dies_after_integrating_the_rest(leerie, tmp_path, monke
     assert st.data["completed_waves"] == 0
 
 
-def test_blocked_subtask_auto_accepted_by_default(leerie, tmp_path, monkeypatch):
+def test_blocked_subtask_settles_unconverged_by_default(leerie, tmp_path, monkeypatch):
+    """Rewritten from the auto-accept default (DESIGN §13 *One re-drive budget
+    per subtask*): a subtask still blocked after its shared re-drives is
+    settled `unconverged` — never accepted as `complete`, never left
+    `blocked` — and the wave still advances."""
     st = _mock_st([["feat-001", "feat-002"]])
+    st.run_id = "r1"
     caps = dict(leerie.DEFAULT_CAPS)
     caps["max_parallel"] = 5
     _patch_common(leerie, monkeypatch)
@@ -105,11 +110,12 @@ def test_blocked_subtask_auto_accepted_by_default(leerie, tmp_path, monkeypatch)
     st.data["stop_on_blocked"] = False
     asyncio.run(leerie.phase_execute(tmp_path, st, caps, {}, {}))
 
-    rec = st.data["accepted_blocked"]["feat-002"]
-    assert rec["blocker"] == "missing API key"
-    assert rec["previous_status"] == "blocked" and rec["forced"] is False
-    assert rec["at"]
-    assert st.data["subtask_status"]["feat-002"] == "complete"
+    assert "accepted_blocked" not in st.data
+    assert st.data["subtask_status"]["feat-002"] == "unconverged"
+    rec = st.data["unconverged_subtasks"]["feat-002"]
+    assert rec["reason"] == "missing API key"
+    assert rec["previous_status"] == "blocked" and rec["at"]
+    assert st.data["redrive_rounds"]["feat-002"] == 2
     assert "feat-002" not in (st.data.get("blocked") or {})
     assert st.data["completed_waves"] == 1
 

@@ -600,15 +600,22 @@ unsatisfied prerequisites are `extent: external`, the worker discovers
 the dependency is missing (e.g. no Postgres server in the container) and
 returns `status: blocked`; the orchestrator doesn't gate dispatch on
 external preconditions, so `resume` would block again indefinitely.
-By default the orchestrator itself settles a blocked or failed subtask
-once its wave finishes: it logs a warning, records the same
-`accepted_blocked` entry the verb would, marks the subtask `complete`
-and continues (the wave's successful subtasks are integrated first).
-With `--stop-on-blocked` (`LEERIE_STOP_ON_BLOCKED`, `stop_on_blocked` in
+By default the orchestrator no longer accepts a blocked subtask as
+done. Once its wave finishes, a `blocked` subtask is re-driven from the
+subtask's shared re-drive budget (§13 *One re-drive budget per subtask*);
+when that budget is spent — or a subtask `failed` (the two-tier retry policy
+already spent its retries) — it is settled **`unconverged`**: a terminal
+status that is never left `blocked`, whose branch is not integrated, whose
+dependents settle `unconverged` without running, and which makes the run's
+outcome `unconverged` (§6 *The run outcome is decided once*), so the PR
+opens as a draft. Accepting an auto-accepted blocker as `complete` used to
+present unfinished work as done; `unconverged` says what happened. With
+`--stop-on-blocked` (`LEERIE_STOP_ON_BLOCKED`, `stop_on_blocked` in
 `leerie.toml`) the run instead halts with `wave has unresolved
-subtasks`, and `accept-blocked <run-id> <subtask-id>` is the manual path:
-it sets `subtask_status[sid]` to `complete` so `resume` skips it,
-keeping external preconditions a human concern.
+subtasks` once the re-drives are spent, and `accept-blocked <run-id>
+<subtask-id>` is the manual path: it sets `subtask_status[sid]` to
+`complete` so `resume` skips it, keeping external preconditions a human
+concern.
 
 **The integration gate needs the same escape hatch, for a sharper
 reason:** `integrate_wave` dies on a behavioral defect from
@@ -1652,7 +1659,10 @@ order: `integrate_wave` runs before `die()`. `completed_waves` is **not**
 incremented for a partially-integrated wave, so `resume` re-enters it.
 Already-integrated subtask branches produce a no-op `git merge --no-ff`
 ("Already up to date.", exit 0) — idempotent on branches that are already
-ancestors of the run branch.
+ancestors of the run branch. That halt is the `--stop-on-blocked` path; by
+default a wave whose re-drives are spent settles its remaining subtasks
+`unconverged` (§5 *Accepting external-blocked subtasks*), so every subtask in
+it is terminal and `completed_waves` advances.
 
 ### The run branch is the resume contract
 
@@ -2450,6 +2460,23 @@ per-run state directory (`state.json`, `run.json`, logs, criteria,
 checkpoints) is also kept as an audit trail. A user who wants to
 completely scrub a finished run can do so with
 `scripts/cleanup.sh --run-id <id> --branches`.
+
+**The run outcome is decided once.** `_decide_outcome` is the single
+writer of state's `outcome` — `done`, `no_work` or `unconverged` — and every
+terminal path reaches it: the planning-time no-work exits and finalize's
+empty-branch exit (both through `_finish_no_work_run`) and the normal
+finalize path. The rule, benched as the P7 outcome simulation (90 historical
+runs, 2000 trials each): the run is `unconverged` when any subtask settled
+`unconverged`, when the failing-test-ID diff confirmed a new failure (§9
+*Which failures are new*), when a measured held-out acceptance set still
+fails, or when a required item is still unmet after the delivery recheck —
+consulted *before* the no-work check, so an empty branch that left work
+unfinished is never reported as "no work required". Otherwise an empty run
+branch is `no_work` and anything else is `done`. The outcome is mirrored
+into `run.json`, and the host launcher opens the PR as a **draft** when it
+is `unconverged` — the PR still carries everything that did converge, but it
+cannot be mistaken for finished work. Before this, no-work was decided in
+five scattered places and a run with unfinished work shipped an ordinary PR.
 
 ### Credential strategy
 
@@ -7262,6 +7289,54 @@ The baseline runs the full suite once (tens of seconds to a few minutes on
 real repos), so it is **skippable**, and each BLT command is bounded by the
 same per-command timeout the provision recipe uses.
 
+**Which failures are new: the failing-test-ID diff, confirmed under load.**
+An axis-level verdict cannot see a regression on a base that is already
+red: the `tests` axis is red before and after, so a new failure hides behind
+the old ones ("treated as pre-existing") and ships. So the baseline and the
+final-tree conformance measurements ask the test runner for its structured
+report (the same machine formats the held-out acceptance sets use: JUnit for
+pytest, jest-compatible JSON for jest and vitest) and record the failing test
+IDs — `baseline_failing_ids` and `final_failing_ids`. A final ID that did
+not fail on the base is only a *candidate*: one failing run is not evidence
+under load. Benched (Q9), "failed twice" — today's informal rule — labelled
+17 of 17 clean trials as having a new failure under sustained host load
+(71 of 77 flaky IDs called new).
+
+The candidate is confirmed by **B\***, one reusable mechanism every "is this
+failure new / does this set still fail" verdict uses:
+
+1. *Gate.* Wait until the **host's** CPU pressure (`/proc/pressure/cpu`,
+   `some avg10`) is below `confirm_psi_cpu_max` (40), for at most
+   `confirm_gate_wait_sec` (300 s). The host file, never the container
+   cgroup's `cpu.pressure`, which reads near zero while the host is
+   saturated; measured from inside a rootless leerie container, the file's
+   cumulative `total` lies between two host reads taken around it, i.e. it
+   is the host's (the benches found it readable as `leerie` on rootless and
+   rootful). An unreadable file is treated as a gate timeout, loudly.
+2. *Pairs.* Rerun serially (`--runInBand` / `--no-file-parallelism
+   --maxWorkers=1` / `-p no:xdist`), only the files that contain a
+   candidate, as interleaved base/final pairs — base, final, base, final … —
+   `confirm_pairs` (3) of them, or `confirm_pairs_escalated` (5) when the
+   gate timed out. One confirm runs at a time, and the whole confirm is
+   bounded by `confirm_budget_sec` (1800 s).
+3. *Verdict.* An ID is **new** only if it failed on every final rerun and
+   passed on every base rerun. Anything else — flaky, failing on both
+   sides, a rerun that produced no report, or pairs cut short by the budget
+   — is typed `resource_affected`: reported, never counted as a regression.
+
+The pairing and `k` carry the guarantee (a p≈0.5 flake goes 3/3 vs 0/3 with
+probability 4⁻³ ≈ 1.6%); the gate only reduces how often `k` must grow.
+Held-out (Q9: 124 trials on three repos, 88 clean, 36 with a reverted real
+fix, host and emulated load up to 17 spinners in a 4-CPU lane): B\* called
+0 of 88 clean trials new (Wilson 95% upper bound 4.2%) and detected 36 of
+36 defects; "failed twice" called 4 of 88 new (3 of 6 under sustained load).
+A confirmed-new ID is a regression even on a red base: it continues the
+final conformer loop like any green→red axis and, if it survives, makes the
+run `unconverged`. On a green base the same rule applies, so a final-tree
+failure that B\* types `resource_affected` no longer spends conformer rounds.
+Where the runner has no structured report, nothing changes — the axis
+verdict stands.
+
 ---
 
 ## 10. Context management — handoff, not compaction
@@ -8017,11 +8092,39 @@ failed at the process level even after the schema retry. Re-running a
 broken worker does not make it honest — a terminal failure ends the
 subtask on first occurrence.
 
-Either way a terminated subtask is fatal at its wave boundary: the run
-stops with state saved rather than carrying a broken subtask forward into
-integration. The specific failure-to-tier mapping is in
+Either way a terminated subtask is never carried forward into
+integration. At its wave boundary a `failed` subtask settles `unconverged`
+(its retries are spent), and a `blocked` one is re-driven from the shared
+budget below, then settled `unconverged` — or, under `--stop-on-blocked`,
+the run stops with state saved. The specific failure-to-tier mapping is in
 `IMPLEMENTATION.md`; the *principle* — correctable-mistake versus
 broken-worker — is the design.
+
+### One re-drive budget per subtask
+
+Re-driving a subtask — running its implementer again because a gate found
+its work incomplete — used to be budgeted per gate, and the budgets
+multiplied: a completeness re-drive inside one settle, then a fresh settle on
+`resume` with every per-attempt budget reset, indefinitely for a subtask left
+`blocked`. One measured run spent 15,017 s. Every re-drive now draws from
+**one persisted counter per subtask**, `redrive_rounds[sid]`, capped by
+`subtask_redrive_rounds` (2): the completeness gate's re-drive and the
+wave-end re-drive of a `blocked` subtask take from the same counter, as will
+every later re-drive kind. The per-attempt budgets (`failed_retries`,
+`implementer_confidence_retries`, `subtask_continuations`) still bound one
+attempt; they are not re-drives. A run-level `redrive_budget_sec` (14,400 s)
+of re-drive wall time is the hard stop — measured per wave as the longest
+in-settle re-drive plus the wave-end re-drive rounds, since siblings re-drive
+in parallel.
+
+An exhausted subtask is settled `unconverged` (§5), never left `blocked`;
+its dependents settle `unconverged` without running; and `resume` treats
+`unconverged` (like `complete`, and `accepted_external` once typed blockers
+exist) as settled, so a resumed run does not loop on it. Every subtask of a
+wave therefore ends terminal and `completed_waves` advances. Benched as the
+P7 replay (90 historical runs, 2000 trials each): the 95th-percentile
+re-drive time fit the budget in 90 of 90 runs, no subtask exceeded 2 rounds,
+and every wave's subtasks ended terminal.
 
 ### Budget feasibility — fail fast at the cheapest moment
 

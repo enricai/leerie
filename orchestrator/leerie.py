@@ -218,6 +218,26 @@ DEFAULT_CAPS = {
     # implementer needs more attempts. Independent of --strict-conformer,
     # which governs only the advisory build/lint/test/residual axes.
     "completeness_retry_rounds": 1,
+    # Shared re-drive budget (DESIGN §13 *One re-drive budget per subtask*).
+    # ONE persisted counter per subtask (`state.data["redrive_rounds"]`)
+    # that every re-drive kind draws from — the completeness re-drive above
+    # and the wave-end re-drive of a `blocked` subtask — so per-gate budgets
+    # cannot multiply across settles and resumes (one measured run spent
+    # 15,017 s re-driving). Exhausted -> the subtask settles `unconverged`,
+    # never left `blocked`. `redrive_budget_sec` is the run-level hard stop
+    # on re-drive wall time. Benched as the P7 replay: p95 re-drive time fit
+    # the budget in 90 of 90 historical runs, max 2 rounds on any subtask.
+    "subtask_redrive_rounds": 2,
+    "redrive_budget_sec": 14400,
+    # B* flake-robust failure verdicts (DESIGN §9 *Which failures are new*):
+    # host-PSI gate, then interleaved serial base/final rerun pairs. Frozen
+    # from the Q9 bench (held-out: 0/88 clean trials called new, 36/36
+    # reverted fixes detected; "failed twice" called 4/88 new).
+    "confirm_psi_cpu_max": 40,
+    "confirm_gate_wait_sec": 300,
+    "confirm_pairs": 3,
+    "confirm_pairs_escalated": 5,
+    "confirm_budget_sec": 1800,
     # CRITIC-pattern mechanical-feedback re-invocation caps. Each worker
     # type gets code-enforced structural checks (file existence, graph
     # cycles, lockfile consistency, etc.) and the orchestrator re-invokes
@@ -694,6 +714,16 @@ STATE_FIELDS = (
     # phases 3-6, and exits 0. Absent on every normal run.
     "no_work_required",
     "no_work_reasons",
+    # outcome / outcome_reasons: the run's single verdict, written only by
+    # _decide_outcome (DESIGN §6 *The run outcome is decided once*).
+    "outcome", "outcome_reasons",
+    # Shared re-drive budget (DESIGN §13): the persisted per-subtask counter,
+    # the run-level wall time charged against `redrive_budget_sec`, and the
+    # record of every subtask settled `unconverged`.
+    "redrive_rounds", "redrive_spent_sec", "unconverged_subtasks",
+    # The failing-test-ID diff (DESIGN §9 *Which failures are new*): base and
+    # final failing IDs, and the latest B* verdict on their difference.
+    "baseline_failing_ids", "final_failing_ids", "test_id_diff",
     # working_branch: the user's branch at the moment phase_classify
     # runs (`git rev-parse --abbrev-ref HEAD`). Mirrored to run.json
     # and to `<state-root>/runs/<id>/working-branch` (setup-run.sh writes
@@ -1515,7 +1545,16 @@ VERBOSITY_ENV = "LEERIE_VERBOSITY"
 VERBOSITY_FILE = SOURCE_OF_TRUTH_FILE
 
 # Subtask statuses that count as "done" for the progress counter.
-_TERMINAL_STATUSES = frozenset({"complete", "failed", "blocked"})
+_TERMINAL_STATUSES = frozenset({"complete", "failed", "blocked",
+                                "unconverged", "accepted_external"})
+# Statuses `resume` treats as done (DESIGN §13 *One re-drive budget per
+# subtask*). `unconverged` is terminal by construction — re-running it on
+# resume is exactly the loop the shared budget exists to end — and
+# `accepted_external` is the one blocker kind a human must settle.
+_SETTLED_STATUSES = frozenset({"complete", "unconverged",
+                               "accepted_external"})
+# The run's single verdict (DESIGN §6 *The run outcome is decided once*).
+OUTCOMES = ("done", "no_work", "unconverged")
 
 # Model selection — see IMPLEMENTATION.md §2 "Model selection". Aliases
 # are passed straight to `claude --model`; the CLI resolves them to the
@@ -29365,6 +29404,57 @@ def _log_run_weight(tel: dict | None, st: State) -> None:
             f"(see {_operator_path(st.path)})")
 
 
+def _decide_outcome(st: State, *, any_commits: bool) -> str:
+    """The run's single verdict — `done`, `no_work` or `unconverged` —
+    written to `st.data["outcome"]` (and run.json) here and nowhere else
+    (DESIGN §6 *The run outcome is decided once*). Unfinished work is
+    consulted BEFORE the empty-branch check, so a run that left work
+    undone is never reported as "no work required". Benched as the P7
+    outcome simulation (90 historical runs)."""
+    reasons: list[str] = []
+    statuses = st.data.get("subtask_status")
+    if isinstance(statuses, dict):
+        unconverged = sorted(s for s, v in statuses.items()
+                             if v == "unconverged")
+        if unconverged:
+            reasons.append(f"{len(unconverged)} subtask(s) unconverged: "
+                           + ", ".join(unconverged))
+    diff = st.data.get("test_id_diff")
+    if isinstance(diff, dict) and diff.get("new"):
+        reasons.append(f"{len(diff['new'])} test(s) newly failing on the "
+                       "final tree, confirmed against the base")
+    gate = ((st.data.get("acceptance") or {}).get("gate") or {})
+    if isinstance(gate, dict):
+        final = gate.get("final")
+        failing = (sum(1 for r in final if isinstance(r, dict)
+                       and r.get("passed") is False and not r.get("unmeasured"))
+                   if isinstance(final, list) else 0)
+        residual = gate.get("residual") or {}
+        if not failing and isinstance(residual, dict):
+            failing = int(residual.get("failing_sets") or 0)
+        if failing:
+            reasons.append(f"{failing} held-out acceptance set(s) still fail")
+    delivery = st.data.get("delivery_gate")
+    if isinstance(delivery, dict):
+        unmet = (delivery.get("unmet_after") if "unmet_after" in delivery
+                 else delivery.get("unmet_before"))
+        if unmet:
+            reasons.append(f"{len(unmet)} required item(s) still unmet")
+    if reasons:
+        outcome = "unconverged"
+    elif not any_commits:
+        outcome = "no_work"
+    else:
+        outcome = "done"
+    st.data["outcome"] = outcome
+    st.data["outcome_reasons"] = reasons
+    st.save()
+    _write_run_json(st.run_dir, outcome=outcome)
+    log(f"outcome: {outcome}"
+        + (f" — {'; '.join(reasons)}" if reasons else ""))
+    return outcome
+
+
 def _finish_no_work_run(st: State, no_work_map: dict[str, str],
                         headline: str | None = None,
                         reset_plan_state: bool = True) -> None:
@@ -29406,13 +29496,18 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
                      "status=ready with zero subtasks"))
     for domain, basis in no_work_map.items():
         log(f"  {domain}: no work (basis: {basis!r})")
-    st.data["no_work_required"] = True
-    st.data["no_work_reasons"] = dict(no_work_map)
-    st.data["finished_at"] = now()
     if reset_plan_state:
         st.data["waves"] = []
         st.data["subtask_status"] = {}
-    st.data["current_phase"] = "done: no work required"
+    # Nothing to push either way; whether that is "no work" or unfinished
+    # work is the decider's call, not this path's (DESIGN §6).
+    outcome = _decide_outcome(st, any_commits=False)
+    st.data["no_work_required"] = outcome == "no_work"
+    st.data["no_work_reasons"] = dict(no_work_map)
+    st.data["finished_at"] = now()
+    st.data["current_phase"] = ("done: no work required"
+                                if outcome == "no_work"
+                                else f"done: {outcome}, nothing to push")
     st.save()
     # Reap the judgment worktree. This path reaches neither `cleanup.sh` (see
     # the docstring) nor `_cleanup_on_abnormal_exit` — it returns normally, so
@@ -29439,7 +29534,8 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
         no_verify=False,
     )
     log("done — task already satisfied on HEAD; no commits made, "
-        "working branch unchanged")
+        "working branch unchanged" if outcome == "no_work" else
+        f"done — {outcome}: no commits to push; working branch unchanged")
     # Surface what the run cost — the classifier + one planner per
     # category still ran. Same shape as phase_finalize's run-weight
     # line so the no-work and normal paths report cost identically.
@@ -32917,9 +33013,17 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                         caps: dict, *, log_path: Path, verbosity: str,
                         label_prefix: str = "baseline",
                         log_prefix: str = "base-baseline",
-                        memo: bool = True) -> dict[str, dict]:
+                        memo: bool = True,
+                        failing_ids_axes: frozenset[str] | set[str] = frozenset()
+                        ) -> dict[str, dict]:
     """Measure each axis in `axes` (axis name → command) on `tree`, serving
     repeat measurements of an unchanged tree from `st.data["blt_results"]`.
+
+    For an axis in `failing_ids_axes` a measured result also carries
+    `failing_ids` / `failing_id_files` (DESIGN §9 *Which failures are new*):
+    `[]` when it passed, captured by a separate report run
+    (`_capture_failing_test_ids`) when it failed, absent when no report
+    could be read. A memo hit on a failed axis without them captures them.
 
     This is what makes measuring before *and* after a conformer round
     affordable: measured across a real 91-subtask run, 182 of 224 conformer
@@ -32955,6 +33059,13 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
             results[axis] = dict(store[key])
             log(f"  {log_prefix}: {axis} unchanged since last measurement "
                 f"— reusing recorded result")
+            if (axis in failing_ids_axes
+                    and "failing_ids" not in results[axis]
+                    and await _attach_failing_ids(
+                        results[axis], tree, cmd, st, caps,
+                        log_path=log_path, label=f"{label_prefix}-{axis}")):
+                store[key] = dict(results[axis])
+                st.save()
             continue
 
         if not installed:
@@ -32981,6 +33092,10 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                               or DEFAULT_CAPS["worker_timeout_sec"]),
                 log_path=log_path, verbosity=verbosity,
                 label_prefix=label_prefix)
+        if axis in failing_ids_axes:
+            await _attach_failing_ids(res, tree, cmd, st, caps,
+                                      log_path=log_path,
+                                      label=f"{label_prefix}-{axis}")
         results[axis] = res
 
         if not (memo and tree_sha):
@@ -32993,6 +33108,425 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         st.save()
 
     return results
+
+
+# --- B*: flake-robust failure verdicts (DESIGN §9 *Which failures are new*) -
+#
+# The HOST's CPU pressure, never a cgroup's `cpu.pressure`: the container
+# cgroup reads near zero while the host is saturated (Q9). PSI in /proc is
+# not namespaced; measured from inside a rootless leerie container, the
+# file's cumulative `total` lies between two host reads taken around it.
+_HOST_PSI_CPU_PATH = "/proc/pressure/cpu"
+_CONFIRM_GATE_POLL_SEC = 2.0
+# Flags that make a known runner run its files in one process, one at a
+# time — a confirm rerun must not compete with itself for the CPU it is
+# trying to rule out. Fixed CLI surface of each runner.
+_SERIAL_RUNNER_FLAGS: dict[str, str] = {
+    "pytest": "-p no:xdist",
+    "jest": "--runInBand",
+    "vitest": "--no-file-parallelism --maxWorkers=1",
+}
+# One confirm at a time per event loop (Q9 ran confirms through a single-
+# slot semaphore), created lazily for the same cross-loop reason as
+# `_BLT_SEMS`.
+_CONFIRM_LOCKS: "weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, asyncio.Lock]" = (
+    weakref.WeakKeyDictionary())
+
+
+def _confirm_lock() -> asyncio.Lock:
+    loop = asyncio.get_running_loop()
+    lock = _CONFIRM_LOCKS.get(loop)
+    if lock is None:
+        lock = asyncio.Lock()
+        _CONFIRM_LOCKS[loop] = lock
+    return lock
+
+
+def _host_cpu_psi(path: str = _HOST_PSI_CPU_PATH) -> float | None:
+    """`some avg10` from a PSI file (a fixed kernel format, DESIGN §12), or
+    None when it cannot be read or parsed."""
+    try:
+        with open(path) as f:
+            for line in f:
+                parts = line.split()
+                if parts and parts[0] == "some":
+                    for part in parts[1:]:
+                        key, _, value = part.partition("=")
+                        if key == "avg10":
+                            return float(value)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+async def _confirm_gate(caps: dict, *,
+                        read_psi: Callable[[], float | None] | None = None,
+                        sleep: Callable[[float], Awaitable[None]] | None = None,
+                        clock: Callable[[], float] | None = None) -> dict:
+    """Wait until host CPU pressure is below `confirm_psi_cpu_max`, at most
+    `confirm_gate_wait_sec`. An unreadable PSI file is the gate timing out —
+    logged, never silently treated as a quiet host — which escalates the
+    pairs. The gate only reduces how often the pairs must grow; the pairing
+    carries the guarantee (Q9: flaky reruns failed 31% even at slice PSI<10
+    while the host was loaded)."""
+    # Resolved at call time, not bound as defaults, so the module's own
+    # reader is what runs (and what a test can replace).
+    read_psi = read_psi or _host_cpu_psi
+    sleep = sleep or asyncio.sleep
+    clock = clock or time.monotonic
+    limit = float(caps.get("confirm_psi_cpu_max",
+                           DEFAULT_CAPS["confirm_psi_cpu_max"]))
+    max_wait = float(caps.get("confirm_gate_wait_sec",
+                              DEFAULT_CAPS["confirm_gate_wait_sec"]))
+    t0 = clock()
+    psi = read_psi()
+    if psi is None:
+        log(f"  B*: {_HOST_PSI_CPU_PATH} is unreadable — treating the "
+            "pressure gate as timed out (escalated pairs)")
+        return {"waited_sec": 0.0, "timed_out": True, "psi": None,
+                "readable": False}
+    while psi is not None and psi >= limit:
+        if clock() - t0 >= max_wait:
+            return {"waited_sec": round(clock() - t0, 1), "timed_out": True,
+                    "psi": psi, "readable": True}
+        await sleep(_CONFIRM_GATE_POLL_SEC)
+        psi = read_psi()
+    if psi is None:
+        log(f"  B*: {_HOST_PSI_CPU_PATH} became unreadable while waiting — "
+            "treating the pressure gate as timed out")
+        return {"waited_sec": round(clock() - t0, 1), "timed_out": True,
+                "psi": None, "readable": False}
+    return {"waited_sec": round(clock() - t0, 1), "timed_out": False,
+            "psi": psi, "readable": True}
+
+
+async def _confirm_new_failures(
+        candidates: Iterable[str],
+        run_base: Callable[[float], Awaitable[set[str] | None]],
+        run_final: Callable[[float], Awaitable[set[str] | None]],
+        caps: dict, *, label: str,
+        read_psi: Callable[[], float | None] | None = None,
+        sleep: Callable[[float], Awaitable[None]] | None = None,
+        clock: Callable[[], float] | None = None) -> dict:
+    """B*: decide which `candidates` (IDs failing on the final tree and not
+    on the base) are NEW. Gate on host pressure, then rerun interleaved
+    base/final pairs — `confirm_pairs`, or `confirm_pairs_escalated` when the
+    gate timed out — inside `confirm_budget_sec`. An ID is new only if every
+    required pair ran, every final rerun failed it, every base rerun passed
+    it, and every rerun produced a verdict; anything else is
+    `resource_affected` — reported, never a regression. `run_base` /
+    `run_final` get the remaining budget as their timeout and return one
+    serial rerun's failing IDs (None: no verdict).
+
+    Frozen from Q9 (held-out, 124 trials): 0/88 clean trials called new,
+    36/36 reverted fixes detected."""
+    cand = sorted(set(candidates))
+    out: dict = {"candidates": cand, "new": [], "resource_affected": [],
+                 "pairs_required": 0, "pairs_run": 0,
+                 "budget_exhausted": False, "gate": None, "per_id": {}}
+    if not cand:
+        return out
+    clock = clock or time.monotonic
+    async with _confirm_lock():
+        budget = float(caps.get("confirm_budget_sec",
+                                DEFAULT_CAPS["confirm_budget_sec"]))
+        t0 = clock()
+        gate = await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
+                                   clock=clock)
+        out["gate"] = gate
+        k = int(caps.get("confirm_pairs_escalated",
+                         DEFAULT_CAPS["confirm_pairs_escalated"])
+                if gate["timed_out"] else
+                caps.get("confirm_pairs", DEFAULT_CAPS["confirm_pairs"]))
+        out["pairs_required"] = k
+        base_runs: list[set[str] | None] = []
+        final_runs: list[set[str] | None] = []
+        for _ in range(k):
+            pair: list[set[str] | None] = []
+            for runner in (run_base, run_final):
+                left = budget - (clock() - t0)
+                if left <= 0:
+                    break
+                try:
+                    pair.append(await runner(left))
+                except Exception as e:
+                    log(f"  B* {label}: rerun raised {type(e).__name__}: "
+                        f"{e} — no verdict for this run")
+                    pair.append(None)
+            if len(pair) < 2:
+                out["budget_exhausted"] = True
+                break
+            base_runs.append(pair[0])
+            final_runs.append(pair[1])
+        out["pairs_run"] = len(base_runs)
+        complete = (len(base_runs) == k
+                    and all(r is not None for r in base_runs + final_runs))
+        for cid in cand:
+            final_failed = sum(1 for r in final_runs
+                               if r is not None and cid in r)
+            base_failed = sum(1 for r in base_runs
+                              if r is not None and cid in r)
+            out["per_id"][cid] = {"final_failed": final_failed,
+                                  "base_failed": base_failed}
+            if complete and final_failed == k and base_failed == 0:
+                out["new"].append(cid)
+            else:
+                out["resource_affected"].append(cid)
+    log(f"  B* {label}: {len(cand)} candidate(s), {len(out['new'])} new, "
+        f"{len(out['resource_affected'])} resource_affected "
+        f"({out['pairs_run']}/{k} pair(s); gate waited "
+        f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
+        f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
+    return out
+
+
+def _runner_report_failing_ids(kind: str, path: Path,
+                               tree: str) -> dict[str, str | None] | None:
+    """Failing test ID -> repo-relative file (None when the report does not
+    say) from a runner's structured report — the machine formats
+    `_parse_runner_report` reads (DESIGN §12). None when there is no
+    readable report, or it executed no test and recorded no load failure."""
+    out: dict[str, str | None] = {}
+    executed = 0
+
+    def _rel(name: str) -> str:
+        return (os.path.relpath(name, tree) if os.path.isabs(name)
+                else os.path.normpath(name))
+
+    try:
+        if kind == "junit":
+            root = ElementTree.parse(path).getroot()
+            for case in root.iter("testcase"):
+                tags = {child.tag for child in case}
+                classname = case.get("classname") or ""
+                name = case.get("name") or ""
+                if any(child.tag == "error"
+                       and child.get("message") == "collection failure"
+                       for child in case):
+                    # pytest names the uncollectable module in `name`.
+                    f = case.get("file") or name.replace(".", "/") + ".py"
+                    out[f"{_rel(f)} :: (file failed to load)"] = _rel(f)
+                    continue
+                if "skipped" in tags:
+                    continue
+                executed += 1
+                if "failure" in tags or "error" in tags:
+                    f = case.get("file")
+                    if not f and classname:
+                        f = _junit_class_file(classname, tree)
+                    rel = _rel(f) if f else None
+                    out[f"{rel or classname} :: {classname}.{name}"] = rel
+        elif kind == "jest-json":
+            data = json.loads(Path(path).read_text())
+            for suite in data.get("testResults") or []:
+                rel = _rel(str(suite.get("name") or ""))
+                results = suite.get("assertionResults") or []
+                if (suite.get("testExecError")
+                        or (suite.get("status") == "failed" and not results)):
+                    out[f"{rel} :: (file failed to load)"] = rel
+                for r in results:
+                    if r.get("status") in ("passed", "failed"):
+                        executed += 1
+                    if r.get("status") == "failed":
+                        title = r.get("fullName") or r.get("title") or ""
+                        out[f"{rel} :: {title}"] = rel
+        else:
+            return None
+    except (OSError, ValueError, ElementTree.ParseError, AttributeError,
+            TypeError):
+        return None
+    if executed == 0 and not out:
+        return None
+    return out
+
+
+def _junit_class_file(classname: str, tree: str) -> str | None:
+    """The module file a JUnit `classname` (`pkg.test_mod.TestCls`) names:
+    the longest dotted prefix that is a `.py` file in `tree`."""
+    parts = classname.split(".")
+    for n in range(len(parts), 0, -1):
+        cand = os.path.join(*parts[:n]) + ".py"
+        if os.path.isfile(os.path.join(tree, cand)):
+            return cand
+    return None
+
+
+async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
+                                    caps: dict, *, label: str,
+                                    log_path: Path, timeout: float,
+                                    serial: bool = False,
+                                    files: list[str] | None = None
+                                    ) -> dict | None:
+    """Run `cmd` (its scoped form over `files` when given and renderable)
+    once in `tree` with a structured report requested, and return
+    `{ids, files, kind}` — or None when the runner has no known report or
+    none was written. A separate run on purpose: the axis verdict
+    `_measure_blt` records is never measured with altered flags. With
+    `serial`, the runner's `_SERIAL_RUNNER_FLAGS` are appended first; a
+    serial form that yields no report (a repo whose config insists on a
+    flag the serial one contradicts) is retried once as written."""
+    run_files = list(files or [])
+    if run_files:
+        scoped = _acceptance_cmd(st, run_files)
+        if scoped:
+            cmd = scoped
+        else:
+            run_files = []
+    runner = _acceptance_runner(cmd, _RUNNER_REPORTS, run_files)
+    if runner is None:
+        return None
+    attempts = []
+    if serial and runner in _SERIAL_RUNNER_FLAGS:
+        flagged = _append_runner_flags(cmd, runner, run_files,
+                                       _SERIAL_RUNNER_FLAGS[runner])
+        if flagged is not None:
+            attempts.append(flagged)
+    attempts.append(cmd)
+    reports = st.run_dir / "confirm" / "reports"
+    for i, attempt in enumerate(attempts):
+        report = reports / f"{label}-{i}-{uuid.uuid4().hex[:8]}"
+        spec = _acceptance_report_spec(attempt, report, run_files)
+        if spec is None:
+            continue
+        run_cmd, env, kind = spec
+        try:
+            report.parent.mkdir(parents=True, exist_ok=True)
+            async with _blt_semaphore(caps):
+                await _run_streaming(
+                    ["bash", "-c", run_cmd], cwd=str(tree), env=env,
+                    timeout=max(1.0, float(timeout)), log_path=log_path,
+                    label=f"{label}-ids: {run_cmd}", verbosity="quiet")
+        except Exception:
+            # A timeout or a spawn failure: no verdict from this run.
+            with contextlib.suppress(OSError):
+                report.unlink()
+            return None
+        ids = _runner_report_failing_ids(kind, report, str(tree))
+        with contextlib.suppress(OSError):
+            report.unlink()
+        if ids is not None:
+            return {"ids": sorted(ids), "files": ids, "kind": kind}
+    return None
+
+
+async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
+                                       post: dict[str, dict], *,
+                                       log_path: Path,
+                                       label: str) -> dict | None:
+    """The failing-test-ID diff (E3) for one final-conformance measurement:
+    final IDs not failing on the base are candidates, confirmed by B*
+    against the base commit. None when either side's IDs are unknown — the
+    axis verdict then stands, as before. Records `final_failing_ids` and the
+    verdict (`test_id_diff`)."""
+    base_ids = st.data.get("baseline_failing_ids")
+    tests = (post or {}).get("tests") or {}
+    if base_ids is None or not tests.get("measured"):
+        return None
+    final_ids = tests.get("failing_ids")
+    if final_ids is None:
+        return None
+    st.data["final_failing_ids"] = list(final_ids)
+    st.save()
+    cand = sorted(set(final_ids) - set(base_ids))
+    id_files = tests.get("failing_id_files") or {}
+    # The same candidates on the same tree were already confirmed (a round
+    # that committed nothing): a second confirm would only re-measure noise.
+    tree_sha = await _worktree_tree_sha(staging)
+    prior = st.data.get("test_id_diff") or {}
+    if (tree_sha and prior.get("tree_sha") == tree_sha
+            and prior.get("candidates") == cand):
+        return prior
+    if not cand:
+        verdict = await _confirm_new_failures([], _no_rerun, _no_rerun, caps,
+                                              label=label)
+        verdict["tree_sha"] = tree_sha
+        st.data["test_id_diff"] = verdict
+        st.save()
+        return verdict
+    cmd = tests.get("command") or ""
+    files = sorted({id_files.get(c) for c in cand})
+    rerun_files = None if (None in files or not files) else list(files)
+    base_sha = ((st.data.get("conformance") or {}).get("_baseline")
+                or {}).get("sha") or ""
+    if not base_sha:
+        base_sha = await _merge_base_sha(
+            staging, st.data.get("working_branch") or "",
+            await _branch_head_sha(staging))
+    wt = st.run_dir / "worktrees" / "confirm-base"
+
+    def _teardown() -> None:
+        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+        _DEPS_INSTALLED.discard(os.path.realpath(wt))
+
+    _teardown()
+    add = (subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
+                           "--detach", str(wt), base_sha],
+                          capture_output=True, text=True, check=False)
+           if base_sha else None)
+    if add is None or add.returncode != 0:
+        log("  B*: could not create the base worktree for the confirm — "
+            "every candidate is resource_affected")
+
+        async def _none(_t: float) -> set[str] | None:
+            return None
+        verdict = await _confirm_new_failures(cand, _none, _none, caps,
+                                              label=label)
+    else:
+        try:
+            await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"{label}-base", log_prefix="confirm")
+            n = {"i": 0}
+
+            def _runner_for(tree: str, side: str):
+                async def _run(timeout: float) -> set[str] | None:
+                    n["i"] += 1
+                    got = await _capture_failing_test_ids(
+                        tree, cmd, st, caps,
+                        label=f"{label}-{side}{n['i']}", log_path=log_path,
+                        timeout=timeout, serial=True, files=rerun_files)
+                    return None if got is None else set(got["ids"])
+                return _run
+            verdict = await _confirm_new_failures(
+                cand, _runner_for(str(wt), "base"),
+                _runner_for(staging, "final"), caps, label=label)
+        finally:
+            _teardown()
+    verdict["tree_sha"] = tree_sha
+    st.data["test_id_diff"] = verdict
+    st.save()
+    return verdict
+
+
+async def _no_rerun(_timeout: float) -> set[str] | None:
+    return None
+
+
+async def _attach_failing_ids(res: dict, tree: str, cmd: str, st: "State",
+                              caps: dict, *, log_path: Path,
+                              label: str) -> bool:
+    """Add `failing_ids` / `failing_id_files` to a measured axis result in
+    place; True when it did. A passing axis has none; a failed one needs a
+    report run; an unmeasured or timed-out one gets nothing (no verdict, so
+    no IDs either)."""
+    if not res.get("ran") or not res.get("measured"):
+        return False
+    if res.get("passed"):
+        res["failing_ids"], res["failing_id_files"] = [], {}
+        return True
+    if str(res.get("summary", "")).startswith("timed out after"):
+        return False
+    got = await _capture_failing_test_ids(
+        tree, cmd, st, caps, label=label, log_path=log_path,
+        timeout=float(caps.get("worker_timeout_sec")
+                      or DEFAULT_CAPS["worker_timeout_sec"]))
+    if got is None:
+        return False
+    res["failing_ids"], res["failing_id_files"] = got["ids"], got["files"]
+    return True
 
 
 def _axis_unmeasurable(output: str) -> bool:
@@ -33196,13 +33730,16 @@ async def _capture_conformance_baseline(
     # actually needs it. On this path that is equivalent to installing up
     # front — the baseline always measures — but it keeps one code path for
     # every caller rather than two that can drift.
+    # The commit measured, so a later B* confirm can rerun the base itself.
+    base_sha = await _branch_head_sha(str(staging))
     axes = await _measure_axes(
         str(staging),
         {axis: (blt.get(_AXIS_CMD_KEY[axis]) or "").strip()
          for axis in ("build", "lint", "tests")},
         st, {**caps, "worker_timeout_sec": timeout},
         log_path=log_path, verbosity=verbosity,
-        label_prefix="baseline", log_prefix="base-baseline")
+        label_prefix="baseline", log_prefix="base-baseline",
+        failing_ids_axes={"tests"})
 
     # An axis is RED only if it actually ran AND was measurable AND failed.
     # Unmeasurable axes (runner missing) are neither red nor green — they
@@ -33210,9 +33747,15 @@ async def _capture_conformance_baseline(
     red = [a for a in ("build", "lint", "tests")
            if axes[a].get("ran") and axes[a].get("measured")
            and not axes[a].get("passed")]
-    baseline = {"axes": axes, "red_axes": red}
+    baseline = {"axes": axes, "red_axes": red, "sha": base_sha}
     conf = st.data.setdefault("conformance", {})
     conf["_baseline"] = baseline
+    # The base side of the failing-test-ID diff (DESIGN §9 *Which failures
+    # are new*): None when no structured report could be read, which keeps
+    # the axis verdict in charge downstream.
+    _ids = (axes.get("tests") or {}).get("failing_ids")
+    st.data["baseline_failing_ids"] = (list(_ids) if isinstance(_ids, list)
+                                       else None)
     st.save()
 
     if red:
@@ -34261,9 +34804,29 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
         # ours is the one pytest keeps.
     else:
         flags = how.format(path=shlex.quote(str(path)))
+    placed = _append_runner_flags(cmd, runner, files, flags)
+    if placed is None:
+        return None
+    return placed, None, kind
+
+
+def _append_runner_flags(cmd: str, runner: str, files: Iterable[str],
+                         flags: str) -> str | None:
+    """`cmd` with `flags` appended as the last arguments of `runner`'s
+    simple command, or None when they cannot be placed safely: the command
+    does not close, has a heredoc, runs the runner through a container CLI,
+    or the runner is not the last command (`_flags_reach_runner`). Shared by
+    the report request and the B* serial-rerun flags, so both place flags
+    by one rule."""
+    raw = _strip_trailing_blank(cmd)
+    scanned = _shell_scan(raw)
     # A heredoc body is text, not commands, which the scan cannot read.
-    if (scanned is None or scanned[1]
-            or not _flags_reach_runner(tokens, runner, files)):
+    if scanned is None or scanned[1]:
+        return None
+    tokens = scanned[0]
+    if _runner_in_container(tokens, _runner_positions(tokens, runner, files)):
+        return None
+    if not _flags_reach_runner(tokens, runner, files):
         return None
     # The template runs as written, flags appended: a rewritten command
     # would run whatever the scan got wrong. So the appended word must scan
@@ -34273,7 +34836,7 @@ def _acceptance_report_spec(cmd: str, path: Path, files: Iterable[str] = ()
     if probed is None or probed[0] != [*tokens,
                                        ("word", _PLACEMENT_PROBE, 0)]:
         return None
-    return f"{raw} {flags}", None, kind
+    return f"{raw} {flags}"
 
 
 def _strip_trailing_blank(cmd: str) -> str:
@@ -36457,7 +37020,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             str(staging), final_axes, st, caps,
             log_path=leerie_dir / "logs" / f"final-conformer-r{rnd}.log",
             verbosity=verbosity, label_prefix=f"final-{label}",
-            log_prefix="final-conformer")
+            log_prefix="final-conformer", failing_ids_axes={"tests"})
+
+    # The baseline `_conformance_clean` judges against. The failing-test-ID
+    # diff (DESIGN §9 *Which failures are new*) refines it per round: when B*
+    # confirms no new failing ID, a red `tests` axis is not this run's.
+    clean_baseline = baseline
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
@@ -36628,6 +37196,20 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         res = _apply_measured_axes(res, post)
         last_res = res
         regressions = _round_axis_regressions(pre, post)
+        id_diff = await _confirm_final_test_failures(
+            st, caps, str(staging), post,
+            log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
+            label=f"final-r{c_round}")
+        clean_baseline = baseline
+        if id_diff is not None:
+            # The `tests:` prefix is this module's own fixed format
+            # (`_round_axis_regressions`), not prose.
+            regressions = [r for r in regressions
+                           if not r.startswith("tests:")]
+            if id_diff["new"]:
+                regressions.append(_format_new_failing_ids(id_diff))
+            else:
+                clean_baseline = _baseline_with_red_tests(baseline)
         for r in regressions:
             warnings.append(f"final conformer round {c_round}: {r}")
 
@@ -36635,7 +37217,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             warnings, regressions, f"final conformer round {c_round}:",
             c_round, caps)
 
-        if _conformance_clean(res, baseline) and not regressions:
+        if _conformance_clean(res, clean_baseline) and not regressions:
             break
 
     if last_res is not None:
@@ -36662,7 +37244,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         caps.get("strict_conformer")
         and (clobbered_files
              or (last_res is not None
-                 and not _conformance_clean(last_res, baseline))))
+                 and not _conformance_clean(last_res, clean_baseline))))
 
     st.data.setdefault("conformance", {})["_final"] = {
         "result": last_res,
@@ -36685,6 +37267,27 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
                f"{clobbered_files}" if clobbered_files else "has residuals")
         die(f"strict-conformer: final-tree conformance {why}; "
             "run blocked. Fix and resume.")
+
+
+def _format_new_failing_ids(id_diff: dict, limit: int = 10) -> str:
+    """The `tests:` regression line for IDs B* confirmed new — the same
+    shape `_round_axis_regressions` uses, so the conformer's feedback treats
+    it like any green-to-red axis."""
+    new = list(id_diff.get("new") or [])
+    shown = "; ".join(new[:limit])
+    more = f" (+{len(new) - limit} more)" if len(new) > limit else ""
+    return (f"tests: {len(new)} test(s) fail on this tree that passed on "
+            f"the base tree, confirmed by {id_diff.get('pairs_run')} "
+            f"interleaved base/final rerun pair(s): {shown}{more}")
+
+
+def _baseline_with_red_tests(baseline: dict | None) -> dict:
+    """`baseline` with `tests` counted red: B* found no new failing test, so
+    whatever still fails is not this run's doing."""
+    b = dict(baseline or {})
+    red = [a for a in (b.get("red_axes") or []) if a != "tests"]
+    b["red_axes"] = [*red, "tests"]
+    return b
 
 
 def _settle_already_satisfied(sid: str, drop: dict, st: State, *,
@@ -36729,10 +37332,145 @@ def _settle_already_satisfied(sid: str, drop: dict, st: State, *,
             "criteria_results": criteria_results or []}
 
 
+# --- Shared re-drive budget (DESIGN §13 *One re-drive budget per subtask*) --
+#
+# When the in-settle re-drive clock of each subtask opened, keyed by
+# (run id, sid). Module-level, not State: a per-process timing fact, closed
+# by the wave loop when the settle returns; a crash loses at most the time
+# of one interrupted re-drive.
+_REDRIVE_CLOCKS: dict[tuple[str, str], float] = {}
+
+
+def _redrive_allowed(st: "State", caps: dict, sid: str) -> bool:
+    """Whether `sid` may be re-driven once more: its shared counter is
+    under `subtask_redrive_rounds` and the run has not spent
+    `redrive_budget_sec` of re-drive wall time."""
+    rounds = int((st.data.get("redrive_rounds") or {}).get(sid, 0))
+    cap = int(caps.get("subtask_redrive_rounds",
+                       DEFAULT_CAPS["subtask_redrive_rounds"]))
+    spent = float(st.data.get("redrive_spent_sec") or 0.0)
+    budget = float(caps.get("redrive_budget_sec",
+                            DEFAULT_CAPS["redrive_budget_sec"]))
+    return rounds < cap and spent < budget
+
+
+def _consume_redrive(st: "State", sid: str) -> int:
+    """Draw one round from `sid`'s shared counter, persisted at once so a
+    resume cannot hand the round back."""
+    rounds = st.data.setdefault("redrive_rounds", {})
+    rounds[sid] = int(rounds.get(sid, 0)) + 1
+    st.save()
+    return rounds[sid]
+
+
+def _open_redrive_clock(st: "State", sid: str) -> None:
+    _REDRIVE_CLOCKS.setdefault((str(st.run_id), sid), time.monotonic())
+
+
+def _close_redrive_clock(st: "State", sid: str) -> float:
+    """Seconds since `sid`'s in-settle re-drive clock opened (0.0 when it
+    never did), closing it."""
+    t0 = _REDRIVE_CLOCKS.pop((str(st.run_id), sid), None)
+    return 0.0 if t0 is None else max(0.0, time.monotonic() - t0)
+
+
+def _charge_redrive_time(st: "State", seconds: float) -> None:
+    if seconds <= 0:
+        return
+    st.data["redrive_spent_sec"] = round(
+        float(st.data.get("redrive_spent_sec") or 0.0) + seconds, 1)
+    st.save()
+
+
+def _settle_unconverged(st: "State", sid: str, reason: str, *,
+                        previous_status: str | None) -> dict:
+    """Settle `sid` terminally as `unconverged`: its work did not converge
+    within the shared re-drive budget, or a predecessor's did not. Never
+    left `blocked` — `resume` treats it as settled (`_SETTLED_STATUSES`) —
+    and the run's outcome becomes `unconverged` (`_decide_outcome`). Its
+    branch is not integrated."""
+    st.data.setdefault("subtask_status", {})[sid] = "unconverged"
+    st.data.setdefault("unconverged_subtasks", {})[sid] = {
+        "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "previous_status": previous_status,
+        "reason": reason,
+    }
+    reg = st.data.get("blocked")
+    if isinstance(reg, dict):
+        reg.pop(sid, None)
+        if not reg:
+            st.data.pop("blocked", None)
+    st.save()
+    log(f"  WARNING: {sid} settled unconverged: {reason}")
+    return {"subtask_id": sid, "status": "unconverged", "blocker": reason,
+            "summary": reason}
+
+
+def _unconverged_predecessors(leerie_dir: Path, st: "State",
+                              sid: str) -> list[str]:
+    """The transitive predecessors of `sid` (the scheduler's graph, from
+    `plan.json`) that settled `unconverged`. A dependent of unfinished work
+    is not run on top of it."""
+    statuses = st.data.get("subtask_status") or {}
+    unconverged = {s for s, v in statuses.items() if v == "unconverged"}
+    if not unconverged:
+        return []
+    try:
+        plan = json.loads((Path(leerie_dir) / "plan.json").read_text())
+    except (OSError, ValueError):
+        return []
+    subtasks = plan.get("subtasks") if isinstance(plan, dict) else None
+    if not isinstance(subtasks, dict) or sid not in subtasks:
+        return []
+    preds, _, _ = _build_predecessor_graph(subtasks, quiet=True)
+    return sorted(_transitive_predecessors(preds).get(sid, set())
+                  & unconverged)
+
+
+async def _redrive_blocked_subtasks(
+        results: dict[str, dict],
+        settle: Callable[[str, str], Awaitable[dict]],
+        st: "State", caps: dict) -> None:
+    """Re-drive this wave's `blocked` subtasks from the shared budget, in
+    rounds, until none is blocked or none may be re-driven. `settle(sid,
+    note)` runs one re-driven settle. Each round's wall time is charged to
+    `redrive_spent_sec` (siblings re-drive in parallel, so a round costs its
+    longest settle). `failed` subtasks are not re-driven: `failed_retries`
+    already spent their retries, and the two-tier policy does not re-run a
+    broken worker. Mutates `results` in place."""
+    while True:
+        due = [s for s, r in results.items()
+               if r.get("status") == "blocked" and _redrive_allowed(st, caps, s)]
+        if not due:
+            return
+        notes = {}
+        for s in due:
+            n = _consume_redrive(st, s)
+            blocker = (results[s].get("blocker")
+                       or results[s].get("summary") or "")
+            notes[s] = (f"RE-DRIVE {n}: the previous attempt at this subtask "
+                        f"ended blocked: {blocker} — resolve that and finish "
+                        "the subtask's success criteria.")
+            log(f"  {s}: blocked — re-driving (round {n} of "
+                f"{caps.get('subtask_redrive_rounds', DEFAULT_CAPS['subtask_redrive_rounds'])}"
+                f"): {blocker}")
+        t0 = time.monotonic()
+        pairs = await _gather_or_cancel(*(settle(s, notes[s]) for s in due))
+        _charge_redrive_time(st, time.monotonic() - t0)
+        for s, r in zip(due, pairs):
+            results[s] = r
+
+
 async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
-                         efforts: dict[str, str | None]) -> dict:
+                         efforts: dict[str, str | None],
+                         redrive_note: str | None = None) -> dict:
     """Drive one subtask to a terminal state.
+
+    `redrive_note` makes this settle a wave-end re-drive (DESIGN §13 *One
+    re-drive budget per subtask*): the first attempt is a continuation of
+    the blocked one, told why it was blocked — the same shape as the
+    completeness re-drive. The caller has already drawn the round.
 
     Three bounded escalation paths, all code-enforced:
       - subtask continuations (cap: caps['subtask_continuations']) —
@@ -36752,8 +37490,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
     # from confidence_retries/retries/continuations so the completeness loop
     # cannot silently consume another budget.
     completeness_retries = 0
-    note = ""
-    continuation = False
+    note = redrive_note or ""
+    continuation = redrive_note is not None
     worktree = str(leerie_dir / "worktrees" / sid)
     subtask_path = leerie_dir / "subtasks" / f"{sid}.json"
     subtask = json.loads(subtask_path.read_text()) if subtask_path.exists() else {}
@@ -37380,13 +38118,20 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 res.setdefault("conformance_warnings", []).append(msg)
                 solution_defects = []
             if solution_defects:
+                # Two budgets, both must allow it: this gate's own round cap
+                # and the subtask's shared re-drive counter, which every
+                # re-drive kind draws from so they cannot multiply (DESIGN §13
+                # *One re-drive budget per subtask*).
                 if completeness_retries < caps.get(
-                        "completeness_retry_rounds", 1):
+                        "completeness_retry_rounds", 1) and \
+                        _redrive_allowed(st, caps, sid):
                     log(f"  {sid}: completeness gate found "
                         f"{len(solution_defects)} unhandled case(s) in the "
                         "diff — re-driving the implementer with them as "
                         "mandatory criteria")
                     completeness_retries += 1
+                    _consume_redrive(st, sid)
+                    _open_redrive_clock(st, sid)
                     continuation = True
                     note = _format_solution_defects(solution_defects)
                     # Record the in-flight attempt before looping (mirrors the
@@ -37407,7 +38152,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 blocker = (
                     f"completeness gate: {len(solution_defects)} unhandled "
                     "case(s) remain after "
-                    f"{caps.get('completeness_retry_rounds', 1)} re-drive(s): "
+                    f"{completeness_retries} re-drive(s): "
                     + "; ".join(
                         f"[{d.get('kind')}] {(d.get('where') or '').strip()}: "
                         f"{(d.get('concrete_case') or '').strip()}"
@@ -37987,17 +38732,49 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             caps.get("worker_demand_estimate_bytes"))
         sem = asyncio.Semaphore(wave_max_parallel)
 
-        async def settle_one(sid: str) -> tuple[str, dict]:
+        # In-settle re-drive time per subtask (the completeness re-drive's
+        # clock), charged once per wave as the longest — siblings re-drive in
+        # parallel (DESIGN §13 *One re-drive budget per subtask*).
+        inner_redrive_sec: dict[str, float] = {}
+
+        async def settle_one(sid: str,
+                             note: str | None = None) -> tuple[str, dict]:
             async with sem:
-                r = await _settle_subtask(sid, leerie_dir, caps, st, models, efforts)
+                try:
+                    if note is None:
+                        r = await _settle_subtask(sid, leerie_dir, caps, st,
+                                                  models, efforts)
+                    else:
+                        r = await _settle_subtask(sid, leerie_dir, caps, st,
+                                                  models, efforts,
+                                                  redrive_note=note)
+                finally:
+                    elapsed = _close_redrive_clock(st, sid)
+                    if note is None:
+                        inner_redrive_sec[sid] = elapsed
                 log(f"  {sid}: {r.get('status')}")
                 return sid, r
 
-        # On resume, skip subtasks already completed in a prior
-        # invocation.  Failed/blocked subtasks are retried — that is
-        # the point of resume.
+        async def redrive_one(sid: str, note: str) -> dict:
+            return (await settle_one(sid, note))[1]
+
+        # On resume, skip subtasks already settled in a prior invocation —
+        # `complete`, and the terminal `unconverged` / `accepted_external`,
+        # whose re-run would be the loop the shared re-drive budget ends.
+        # Failed/blocked subtasks are retried — that is the point of resume.
         prior = st.data.get("subtask_status", {})
-        remaining = [sid for sid in wave if prior.get(sid) != "complete"]
+        remaining = [sid for sid in wave
+                     if prior.get(sid) not in _SETTLED_STATUSES]
+        # A dependent of unfinished work is not run on top of it (DESIGN §13).
+        pre_settled: dict[str, dict] = {}
+        for sid in list(remaining):
+            preds = _unconverged_predecessors(leerie_dir, st, sid)
+            if preds:
+                pre_settled[sid] = _settle_unconverged(
+                    st, sid, f"not run: predecessor(s) {', '.join(preds)} "
+                    "settled unconverged",
+                    previous_status=prior.get(sid))
+                remaining.remove(sid)
         # A sid whose implementer already completed but whose
         # integration_judge finding is still un-`accept`ed must not be
         # silently skipped here: `integrate_wave` was never reached for it
@@ -38010,7 +38787,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                               if gate.get(sid) and not gate[sid].get("accepted")]
         if not remaining and not pending_gate_sids:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
-                f"all {len(wave)} subtask(s) already complete, skipping")
+                f"all {len(wave)} subtask(s) already settled, skipping")
             st.data["completed_waves"] = wi + 1
             st.save()
             continue
@@ -38031,7 +38808,11 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             st.save()
 
         pairs = await _gather_or_cancel(*(settle_one(sid) for sid in remaining))
-        results: dict[str, dict] = dict(pairs)
+        results: dict[str, dict] = {**pre_settled, **dict(pairs)}
+        _charge_redrive_time(st, max(inner_redrive_sec.values(), default=0.0))
+        # Re-drive what ended blocked, from the shared budget, BEFORE
+        # integrating — a re-driven success integrates with its wave.
+        await _redrive_blocked_subtasks(results, redrive_one, st, caps)
         # Stand-in entries for sids whose implementer completed in a prior
         # invocation but who still have a pending, un-accepted
         # integration_gate finding (see `pending_gate_sids` above) — they
@@ -38116,30 +38897,17 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                     f"{', '.join(blocked)}. "
                     f"See {_operator_path(st.path)}; resolve and re-run with "
                     "resume.")
-            # Default: settle exactly as the launcher's `accept-blocked` verb
-            # does (same accepted_blocked schema) so the run continues; the
+            # Default: the shared re-drive budget is spent (or the subtask
+            # failed), so settle it `unconverged` — terminal, never left
+            # `blocked`, and never presented as done: the run's outcome
+            # becomes `unconverged` and its PR a draft (DESIGN §13). The
             # integrate_wave above already merged the successful subtasks.
-            accepted = st.data.setdefault("accepted_blocked", {})
-            reg = st.data.get("blocked")
             for s in blocked:
                 blocker_text = (results[s].get("blocker")
-                                or results[s].get("summary"))
-                log(f"  WARNING: {s} {results[s].get('status')} — "
-                    f"auto-accepted and skipped (pass --stop-on-blocked to "
-                    f"halt instead): {blocker_text}")
-                accepted[s] = {
-                    "at": datetime.now(timezone.utc)
-                          .strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "previous_status": results[s].get("status"),
-                    "blocker": blocker_text,
-                    "forced": False,
-                }
-                st.data.setdefault("subtask_status", {})[s] = "complete"
-                if isinstance(reg, dict):
-                    reg.pop(s, None)
-            if isinstance(reg, dict) and not reg:
-                st.data.pop("blocked", None)
-            st.save()
+                                or results[s].get("summary") or "")
+                results[s] = _settle_unconverged(
+                    st, s, blocker_text,
+                    previous_status=results[s].get("status"))
 
         # Integration-integrity gate (DESIGN §6: "the completion signal is
         # completed_waves == len(waves)"). A wave must not be counted
@@ -38863,6 +39631,9 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
     wc = st.data.get("worker_count", 0)
     nsub = len(st.data.get("subtask_status", {}))
     tel = st.data.get("telemetry", {})
+    # The run branch carries commits; whether they finish the task is the
+    # decider's call — `unconverged` makes the host open a draft PR.
+    outcome = _decide_outcome(st, any_commits=True)
     st.data["finished_at"] = now()
     st.save()
     will_push = push_will_happen(no_push, host_no_push)
@@ -38926,7 +39697,7 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
 
     pr_url = None  # the launcher writes pr_url to run.json after gh pr create
     pr_suffix = ""
-    log(f"done — {nsub} subtasks, {len(st.data['waves'])} waves, "
+    log(f"done ({outcome}) — {nsub} subtasks, {len(st.data['waves'])} waves, "
         f"{wc} worker invocations.{pr_suffix} Work is on "
         f"{_compute_run_branch(st.run_id)}; working branch unchanged.")
     # DESIGN §9: an unreviewed subtask is one whose conformer never

@@ -1111,7 +1111,16 @@ EOF
     fi
   fi
 
-  echo "[leerie] finalize: opening PR against $pr_base_branch" >&2
+  # An `unconverged` run (DESIGN §6 *The run outcome is decided once*) still
+  # opens its PR — it carries everything that did converge — but as a draft,
+  # so it cannot be mistaken for finished work.
+  # A plain string, not an array: an empty array under `set -u` is an
+  # unbound variable on macOS's bash 3.2.
+  local pr_draft=""
+  if [ "$(jq -r '.outcome // ""' "$run_json")" = "unconverged" ]; then
+    pr_draft="--draft"
+  fi
+  echo "[leerie] finalize: opening ${pr_draft:+draft }PR against $pr_base_branch" >&2
   local pr_output pr_ok=false
   # GitHub's API may not have indexed the freshly-pushed refs yet;
   # retry with backoff to ride out the race (symptom: "Head sha
@@ -1125,6 +1134,7 @@ EOF
       sleep "$_pr_delay"
     }
     if pr_output="$(echo "$pr_body" | gh pr create \
+                      ${pr_draft:+"$pr_draft"} \
                       --base "$pr_base_branch" \
                       --head "$run_branch" \
                       --title "$pr_title" \

@@ -5376,3 +5376,34 @@ platform (no apostrophe in a heredoc body nested in `$(`, with an anti-vacuity
 floor on how many such heredocs it finds) and `/bin/bash -n leerie`, which runs
 only where `/bin/bash` is 3.2 and skips on CI. Two of its three tests fail
 against the previous launcher on a Mac; only the static scan is visible to CI.
+
+## B\* verdicts, the shared re-drive budget and the run outcome
+
+`tests/test_bstar_confirm.py` covers B\* (DESIGN §9 *Which failures are
+new*): the host PSI reader and gate (the gate is pinned to
+`/proc/pressure/cpu`, paired with a test that the default reader is the one
+called), the per-ID verdict (interleaved base-first pairs, a flake or a
+base failure is `resource_affected`, a gate timeout or an unreadable PSI
+file escalates to 5 pairs, the budget cuts pairs short), the report parser,
+and two end-to-end runs against a real pytest suite in a real git repo — one
+real regression confirmed new while an alternating flake is typed
+`resource_affected`. Its last test executes `_run_final_conformance`: with
+the `tests` axis red on every round, the loop stops after one round when no
+ID is confirmed new, and spends every round when one is.
+
+`tests/test_redrive_budget.py` drives `phase_execute` (DESIGN §13 *One
+re-drive budget per subtask*): a blocked subtask is re-driven with its
+blocker as the note and at most `subtask_redrive_rounds` times, then settled
+`unconverged`; a `failed` one is never re-driven; a spent run budget or a
+counter already consumed stops every re-drive; dependents of an unconverged
+subtask settle without running; and the resume filter skips
+`unconverged`/`accepted_external`. The default auto-accept test in
+`tests/test_phase_execute_wave_flow.py` was rewritten to the unconverged
+settle.
+
+`tests/test_decide_outcome.py` covers `_decide_outcome` (each unfinished-work
+signal unconverges a run with or without commits — the ordering the P7
+decider requires — an AST pin that it is the only writer of `outcome`, the
+empty-branch `_finish_no_work_run` exit, and an execution of
+`phase_finalize` recording the outcome in `run.json`).
+`tests/test_host_finalize_sh.py` pins `--draft` on `unconverged` only.

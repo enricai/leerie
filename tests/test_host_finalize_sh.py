@@ -1220,3 +1220,22 @@ def test_fallback_no_risk_note_when_register_absent_or_empty(tmp_path):
         proc, body = _run_host_finalize_capturing_body(tmp_path / rid, run_dir)
         assert proc.returncode == 0, proc.stderr
         assert "Residual risks" not in body, body
+
+
+# --- outcome: an unconverged run opens a draft PR (DESIGN §6) --------------
+
+@pytest.mark.parametrize("outcome,draft", [("unconverged", True),
+                                           ("done", False), (None, False)])
+def test_gh_pr_create_is_draft_only_when_unconverged(tmp_path, outcome,
+                                                     draft):
+    run_json = {"branch": "leerie/runs/feat-out-aaaaaa",
+                "working_branch": "main",
+                "finished_at": "2026-05-29T16:00:00+00:00"}
+    if outcome is not None:
+        run_json["outcome"] = outcome
+    run_dir = _make_run(tmp_path, "feat-out-aaaaaa", run_json=run_json)
+    r = _run_host_finalize(tmp_path, run_dir)
+    assert r.returncode == 0, r.stderr
+    gh_log = (tmp_path / "gh.log").read_text()
+    assert ("--draft" in gh_log) is draft, gh_log
+    assert ("opening draft PR against main" in r.stderr) is draft, r.stderr
