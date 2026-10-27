@@ -416,6 +416,20 @@ provision_instance() {
   security_group="$(resolve_security_group)" || return 1
   subnet_id="$(resolve_subnet_id)" || return 1
 
+  local _missing=0
+  _need_ec2_var() {
+    [ -n "$2" ] && return 0
+    remote_log "error: no EC2 $1 resolved."
+    echo "  Set: $3, then re-run leerie." >&2
+    _missing=1
+  }
+  _need_ec2_var AMI "$ami" "--ec2-ami <ami-id> or LEERIE_EC2_AMI"
+  _need_ec2_var "instance type" "$instance_type" "--ec2-instance-type <type> or LEERIE_EC2_INSTANCE_TYPE"
+  _need_ec2_var "key pair" "$key_name" "--ec2-key-name <name> or LEERIE_EC2_KEY_NAME"
+  _need_ec2_var "security group" "$security_group" "--ec2-security-group <sg-id> or LEERIE_EC2_SECURITY_GROUP"
+  _need_ec2_var subnet "$subnet_id" "--ec2-subnet-id <subnet-id> or LEERIE_EC2_SUBNET_ID (no default VPC? run: aws ec2 create-default-vpc)"
+  [ "$_missing" -eq 0 ] || return 1
+
   local aws_args=() _a
   while IFS= read -r _a; do aws_args+=("$_a"); done \
     < <(_aws_region_profile_args)
@@ -448,6 +462,7 @@ provision_instance() {
   if [ -z "$instance_id" ]; then
     remote_log "failed to create EC2 instance — aws output:"
     printf '  %s\n' "$create_output" >&2
+    echo "  If the error mentions UnauthorizedOperation, attach ec2:RunInstances/ec2:TerminateInstances/ssm:StartSession permissions to your IAM identity or instance profile (--ec2-iam-instance-profile <name>)." >&2
     echo "  Fix: check the error above; verify with: aws ec2 describe-subnets --subnet-ids $subnet_id ; then re-run leerie." >&2
     return 1
   fi

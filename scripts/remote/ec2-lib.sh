@@ -57,6 +57,13 @@ require_aws() {
   local aws_args=()
   [ -n "$profile" ] && aws_args+=(--profile "$profile")
 
+  if [ -z "${LEERIE_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}" ] \
+     && [ -z "$(aws configure get region ${aws_args[@]+"${aws_args[@]}"} 2>/dev/null)" ]; then
+    remote_log "error: no AWS region configured."
+    echo "  Set: --aws-region <region> or LEERIE_AWS_REGION (or run: aws configure set region <region>), then re-run leerie." >&2
+    return 1
+  fi
+
   # Use ${arr[@]+"${arr[@]}"} so an empty array expands to nothing under
   # `set -u` (bash 3.2, the macOS system default, otherwise errors with
   # "aws_args[@]: unbound variable"). Same idiom and rationale as the
