@@ -88,3 +88,29 @@ def test_sigint_terminates(tmp_path):
 def test_override_makes_no_aws_call(tmp_path):
     r = _run(tmp_path, LEERIE_EC2_AMI="ami-x")
     assert r.stdout.strip() == "ami-x" and not (tmp_path / "calls").exists()
+
+
+def test_changed_hash_rebakes_with_new_hash_tag(tmp_path):
+    root = tmp_path / "repo"
+    (root / ".claude-plugin").mkdir(parents=True)
+    (root / ".claude-plugin" / "plugin.json").write_text('{"version": "1.0.0"}')
+    for d in ("orchestrator", "scripts", "prompts"):
+        (root / d).mkdir()
+    (root / "requirements.txt").write_text("")
+    (root / "Dockerfile").write_text("one")
+    _run(tmp_path, LEERIE_EC2_AMI_ROOT=str(root))
+    first = (tmp_path / "calls").read_text()
+    n = _calls(tmp_path).count("ec2 run-instances")
+    assert n == 1
+    # The stub treats any tag lookup as a hit once baked; drop that state so a
+    # changed hash is judged on its own, as a real describe-images filter would.
+    (tmp_path / "baked").unlink()
+    (tmp_path / "stopped").unlink()
+    (root / "Dockerfile").write_text("two")
+    _run(tmp_path, LEERIE_EC2_AMI_ROOT=str(root))
+    calls = (tmp_path / "calls").read_text()
+    assert _calls(tmp_path).count("ec2 run-instances") == 2
+    import re
+    tagged = [re.search(r"ResourceType=image,Tags=.*?source-hash,Value=([0-9a-f]{64})", l).group(1)
+              for l in calls.splitlines() if l.startswith("ec2 create-image")]
+    assert len(tagged) == 2 and tagged[0] != tagged[1]
