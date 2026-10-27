@@ -2353,9 +2353,13 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
       # shellcheck disable=SC1091
       . "$LEERIE_REPO/scripts/remote/provision.sh"
       require_flyctl || exit 1
-      # run_id IS the machine ID (DESIGN §6). Export LEERIE_RUN_ID too so
-      # the decide_teardown trap that provision.sh registers on source has
-      # a valid run-id for sidecar resolution / resume hints.
+      # run_id IS the machine ID (DESIGN §6). Sourcing provision.sh registers
+      # no trap: only provision_machine()/resume_machine() arm decide_teardown,
+      # and this arm calls neither (it starts the machine with flyctl
+      # directly), so no run teardown fires on this verb's exit — unlike the
+      # EC2 arm, whose resume_instance() wake must neutralize one.
+      # Nothing this arm calls reads LEERIE_RUN_ID; the export is kept only to
+      # match the EC2 arm.
       LEERIE_MACHINE_ID="$_ab_run_id"
       export LEERIE_MACHINE_ID
       export LEERIE_RUN_ID="$_ab_run_id"
