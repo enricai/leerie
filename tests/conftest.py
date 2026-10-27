@@ -289,6 +289,14 @@ def child_subreaper_restored():
 
 
 @pytest.fixture(autouse=True)
+def _default_aws_region(monkeypatch):
+    """EC2 preflight (`require_aws`) dies without a region, and a dev host
+    may have none configured; subprocess tests inherit os.environ. Tests
+    that assert the missing-region error set their own env explicitly."""
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+
+
+@pytest.fixture(autouse=True)
 def _fresh_head_acceptance_results(leerie, monkeypatch):
     """Give every test an empty `_HEAD_ACCEPTANCE_RESULTS`: the `leerie`
     module is session-scoped, so a measurement cached by one test would

@@ -771,6 +771,14 @@ def leaked_resources(state: dict) -> dict:
     return leaked
 
 
+def leaked_compute(state: dict) -> dict:
+    """`leaked_resources` restricted to instances and volumes. The shared
+    SSM role/instance profile persists across runs by design, so happy-path
+    teardown tests must not count it as a leak."""
+    leaked = leaked_resources(state)
+    return {k: leaked[k] for k in ("instances", "volumes")}
+
+
 def is_bake_instance(rec: dict) -> bool:
     """An instance launched to bake an AMI: tagged `leerie:purpose=bake`
     (or any tag whose value is `bake`)."""

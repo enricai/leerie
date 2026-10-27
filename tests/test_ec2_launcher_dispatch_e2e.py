@@ -25,7 +25,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from tests.ec2_stub import leaked_resources, read_log, read_state
+from tests.ec2_stub import leaked_compute, read_log, read_state
 from tests.test_ec2_e2e_provision import (
     REQUIRED_PROVISION_ENV,
     extract_ec2_dispatch_block,
@@ -104,7 +104,7 @@ def test_full_launch_provisions_seeds_and_reaches_teardown_with_no_leaks(tmp_pat
         f"root EBS is implicit via run-instances' own "
         f"DeleteOnTermination=true default; state={state}"
     )
-    assert leaked_resources(state) == {"instances": {}, "volumes": {}}, (
+    assert leaked_compute(state) == {"instances": {}, "volumes": {}}, (
         f"a terminated instance with no tracked volume is not a leak; "
         f"state={state}"
     )
@@ -169,4 +169,4 @@ def test_failing_credential_probe_aborts_with_zero_tracked_resources(tmp_path):
     state = read_state(aws_dir)
     assert state["instances"] == {}, state
     assert state["volumes"] == {}, state
-    assert leaked_resources(state) == {"instances": {}, "volumes": {}}
+    assert leaked_compute(state) == {"instances": {}, "volumes": {}}

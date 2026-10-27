@@ -55,7 +55,7 @@ from pathlib import Path
 import pytest
 
 from tests.conftest import run_bash
-from tests.ec2_stub import _stub_aws, leaked_resources, read_log, read_state
+from tests.ec2_stub import _stub_aws, leaked_compute, read_log, read_state
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 EC2_PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "ec2-provision.sh"
@@ -202,7 +202,7 @@ def test_terminate_instance_reaps_the_instance_and_leaves_no_leak(tmp_path):
     assert result.returncode == 0, result.stderr
     state = read_state(aws_dir)
     assert state["instances"], "expected an instance to have been created"
-    leaked = leaked_resources(state)
+    leaked = leaked_compute(state)
     assert leaked == {"instances": {}, "volumes": {}}, (
         f"expected clean teardown with no leaked instances or volumes; state={state}"
     )
