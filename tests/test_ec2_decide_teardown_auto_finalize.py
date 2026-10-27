@@ -75,3 +75,9 @@ def test_sync_failure_never_finalizes(tmp_path):
 
 def test_non_clean_rc_does_not_finalize(tmp_path):
     assert "host_finalize" not in _calls(_run(tmp_path, rc=1))
+
+
+def test_detach_rc_130_does_not_finalize_or_terminate(tmp_path):
+    calls = _calls(_run(tmp_path, rc=130))
+    assert "host_finalize" not in calls
+    assert "terminate" not in calls
