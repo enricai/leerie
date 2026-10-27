@@ -198,7 +198,58 @@ decide_ec2_teardown() {
       # is gated on confirmed host-side state.
       if _try_fetch_state_for_ec2_teardown; then
         remote_log "remote: run branch + state synced to host"
-        terminate_instance
+        # Auto-finalize (push + PR), mirroring provision.sh's
+        # decide_teardown. host_finalize honors run.json.no_push itself.
+        # Push failure leaves the instance RUNNING, as on Fly.
+        local run_dir="" _rid="${LEERIE_RUN_ID:-${LEERIE_REMOTE_RUN_ID:-}}"
+        if [ -n "$_rid" ]; then
+          if [ -n "${LEERIE_STATE_HOST_DIR:-}" ]; then
+            run_dir="$LEERIE_STATE_HOST_DIR/runs/$_rid"
+          elif [ -n "${USER_REPO:-}" ]; then
+            run_dir="$USER_REPO/.leerie/runs/$_rid"
+          fi
+        fi
+        local _run_finished_at=""
+        if [ -n "$run_dir" ] && [ -f "$run_dir/run.json" ]; then
+          _run_finished_at="$(jq -r '.finished_at // ""' "$run_dir/run.json" 2>/dev/null || true)"
+        fi
+        if [ -n "$run_dir" ] && [ -d "$run_dir" ] && [ -z "$_run_finished_at" ]; then
+          remote_log "remote: run did not reach finalize; skipping auto-finalize"
+          if [ -n "$_rid" ]; then
+            remote_log "remote: run 'leerie finalize $_rid' to push and open a PR after the run completes"
+          fi
+          terminate_instance
+        elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
+          local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
+          if [ -f "$_leerie_dir/scripts/host-finalize.sh" ]; then
+            # shellcheck disable=SC1091
+            . "$_leerie_dir/scripts/host-finalize.sh"
+            remote_log "auto-finalize: pushing + opening PR"
+            if host_finalize "$run_dir"; then
+              terminate_instance
+            else
+              echo "" >&2
+              echo "================================================================" >&2
+              remote_log "WARNING — auto-finalize push FAILED."
+              echo "  The run synced to host cleanly but git push failed." >&2
+              echo "  Retry the push from the host:" >&2
+              echo "    leerie finalize $_rid --runtime ec2" >&2
+              echo "  Instance is being LEFT RUNNING. When recovered:" >&2
+              echo "    leerie kill $_rid --runtime ec2" >&2
+              echo "  Instance: $iid (still running on EC2)" >&2
+              echo "================================================================" >&2
+              # Intentionally NO terminate_instance.
+            fi
+          else
+            remote_log "remote: run 'leerie finalize $_rid' to push and open a PR"
+            terminate_instance
+          fi
+        else
+          if [ -n "$_rid" ]; then
+            remote_log "remote: run 'leerie finalize $_rid' to push and open a PR"
+          fi
+          terminate_instance
+        fi
       else
         local sync_reason="sync-failed-on-clean-exit"
         local sidecar=""

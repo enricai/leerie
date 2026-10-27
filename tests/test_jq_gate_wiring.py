@@ -43,6 +43,7 @@ TESTS_DIR = REPO_ROOT / "tests"
 GATED_MODULES = [
     "test_host_finalize_sh.py",
     "test_decide_teardown_auto_finalize.py",
+    "test_ec2_decide_teardown_auto_finalize.py",
     "test_launcher_finalize_no_work.py",
     "test_launcher_no_push_skips.py",
     # Inherits the gate transitively: it reuses test_host_finalize_sh.py's
