@@ -179,8 +179,12 @@ sources change. It also creates or reuses, each tagged
   Session Manager works without Default Host Management Configuration;
 - a public subnet of the default VPC.
 
-`leerie prune` lists them (dry-run) and `leerie prune --apply` deletes the
-stale ones; it never touches a resource without leerie's tag.
+`leerie prune` lists them (dry-run) and `leerie prune --apply` deletes
+them: AMIs older than its `--older-than` cutoff (default 14 days; the AMI
+built from the current leerie sources is always kept) with their snapshots, and the key pair,
+security group and instance profile whenever no instance still uses them.
+The next run recreates whatever it needs. It never touches a resource
+without leerie's tag.
 
 Prerequisites: AWS CLI v2 (`brew install awscli`; not auto-installed, it
 commonly needs `sudo`) and credentials resolving via `aws sts

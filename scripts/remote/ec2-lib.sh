@@ -57,8 +57,7 @@ require_aws() {
   local aws_args=()
   [ -n "$profile" ] && aws_args+=(--profile "$profile")
 
-  if [ -z "${LEERIE_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}" ] \
-     && [ -z "$(aws configure get region ${aws_args[@]+"${aws_args[@]}"} 2>/dev/null)" ]; then
+  if [ -z "$(_ec2_region)" ]; then
     remote_log "error: no AWS region configured."
     echo "  Set: --aws-region <region> or LEERIE_AWS_REGION (or run: aws configure set region <region>), then re-run leerie." >&2
     return 1
@@ -258,7 +257,7 @@ ec2_tar_pipe() {
   local _to=""
   _to="$(_seed_timeout_prefix)"
   local _id=() _a
-  while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args)
+  while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args; ec2_ssh_known_hosts_args)
   $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     ${_id[@]+"${_id[@]}"} \
     "$ssh_target" \
@@ -321,6 +320,20 @@ _aws_region_profile_args() {
   return 0
 }
 
+# --- _ec2_region -------------------------------------------------------------
+# The region every EC2 helper resolves, in the AWS CLI's own order. One
+# resolver so preflight (require_aws) can never accept a region the key path
+# or the bake cannot find: `aws configure get` reads only the config file,
+# never AWS_DEFAULT_REGION, so the env tiers come first.
+_ec2_region() {
+  local r="${LEERIE_AWS_REGION:-${AWS_REGION:-${AWS_DEFAULT_REGION:-}}}"
+  if [ -z "$r" ]; then
+    local profile="${LEERIE_AWS_PROFILE:-${AWS_PROFILE:-}}"
+    r="$(aws configure get region ${profile:+--profile "$profile"} 2>/dev/null || true)"
+  fi
+  printf '%s' "$r"
+}
+
 # --- ec2_default_key_file ---------------------------------------------------
 # Path of leerie's own private key for the active account + region. The AWS
 # key pair is account- and region-scoped, so the file is too — a per-repo
@@ -335,11 +348,7 @@ ec2_default_key_file() {
     | python3 -c 'import json,sys
 try: print(json.load(sys.stdin).get("Account",""))
 except Exception: pass' 2>/dev/null)"
-  region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
-  if [ -z "$region" ]; then
-    local profile="${LEERIE_AWS_PROFILE:-${AWS_PROFILE:-}}"
-    region="$(aws configure get region ${profile:+--profile "$profile"} 2>/dev/null)"
-  fi
+  region="$(_ec2_region)"
   [ -n "$account" ] && [ -n "$region" ] || return 1
   printf '%s/.leerie/.ec2-keys/%s/%s/%s.pem' "$HOME" "$account" "$region" "$EC2_KEY_NAME_DEFAULT"
 }
@@ -367,6 +376,33 @@ ec2_ssh_identity_args() {
   if [ -n "$key" ] && [ -f "$key" ]; then
     printf '%s\n%s\n%s\n%s\n' -i "$key" -o IdentitiesOnly=yes
   fi
+  return 0
+}
+
+# --- ec2_ssh_known_hosts_args -----------------------------------------------
+# Emit, one token per line, `-o UserKnownHostsFile=<file>` for the instance in
+# LEERIE_EC2_INSTANCE_ID; nothing when it is unset. Host keys are trusted on
+# first use per instance, never in the user's own known_hosts: EC2 recycles
+# public IPs, and accept-new refuses a reused address's new host key.
+_ec2_known_hosts_file() {
+  local iid="${LEERIE_EC2_INSTANCE_ID:-}"
+  [ -n "$iid" ] || return 0
+  local dir="$HOME/.leerie/.ec2-keys/known_hosts"
+  ( umask 077; mkdir -p "$dir" ) 2>/dev/null || return 0
+  printf '%s/%s' "$dir" "$iid"
+}
+
+ec2_ssh_known_hosts_args() {
+  local f
+  f="$(_ec2_known_hosts_file)"
+  [ -n "$f" ] && printf '%s\n%s\n' -o "UserKnownHostsFile=$f"
+  return 0
+}
+
+_ec2_ssh_known_hosts_string() {
+  local f
+  f="$(_ec2_known_hosts_file)"
+  [ -n "$f" ] && printf -- "-o UserKnownHostsFile='%s'" "$f"
   return 0
 }
 

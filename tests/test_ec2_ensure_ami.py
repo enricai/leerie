@@ -11,8 +11,17 @@ AWS = r"""#!/bin/sh
 echo "$@" >> "$T/calls"
 case "$1 $2" in
   "ec2 describe-images")
-    [ -f "$T/baked" ] && echo '{"Images":[{"ImageId":"ami-baked","State":"available","CreationDate":"2026-01-01T00:00:00Z"}]}' \
-      || echo '{"Images":[]}' ;;
+    case "$*" in
+      *--image-ids*)
+        # The post-create poll: pending for PENDING_POLLS calls, then the
+        # IMAGE_END state (default available).
+        n=$(( $(cat "$T/polls" 2>/dev/null || echo 0) + 1 )); echo "$n" > "$T/polls"
+        if [ "$n" -le "${PENDING_POLLS:-0}" ]; then st=pending; else st="${IMAGE_END:-available}"; fi
+        echo "{\"Images\":[{\"ImageId\":\"ami-baked\",\"State\":\"$st\"}]}" ;;
+      *)
+        [ -f "$T/baked" ] && echo '{"Images":[{"ImageId":"ami-baked","State":"available","CreationDate":"2026-01-01T00:00:00Z"}]}' \
+          || echo '{"Images":[]}' ;;
+    esac ;;
   "ssm get-parameter") echo '{"Parameter":{"Value":"ami-stock"}}' ;;
   "ec2 run-instances")
     # The instance exists (tagged) before the call returns its id; an
@@ -37,7 +46,15 @@ case "$1 $2" in
 esac
 exit 0
 """
-SSH = '#!/bin/sh\necho "$@" >> "$T/ssh_calls"\ncat >/dev/null 2>&1 || true\n[ -n "$SSH_FAIL" ] && [ "$*" != "${*%bash -s}" ] && exit 1\n[ -n "$SSH_HANG" ] && [ "$*" != "${*%bash -s}" ] && sleep 30\nexit 0\n'
+# Records argv and how many stdin bytes each call received; the bake-script
+# run is the call naming ec2-bake.sh, which SSH_FAIL / SSH_HANG target.
+SSH = (
+    '#!/bin/sh\n'
+    'echo "$@" >> "$T/ssh_calls"\n'
+    'n=$(wc -c | tr -d " "); echo "$n" >> "$T/ssh_stdin_bytes"\n'
+    'case "$*" in *ec2-bake.sh*) [ -n "$SSH_FAIL" ] && exit 1; [ -n "$SSH_HANG" ] && sleep 30 ;; esac\n'
+    'exit 0\n'
+)
 
 
 def _ensure_ami_env(tmp_path, **extra):
@@ -144,7 +161,7 @@ def test_bake_instance_gets_public_ip_nonce_tag_and_identity(tmp_path):
     ssh = (tmp_path / "ssh_calls").read_text().splitlines()
     assert ssh and all(f"-i {tmp_path / 'k.pem'}" in l for l in ssh)
     # The bake script learns the region (regional SSM-agent bucket).
-    assert any("LEERIE_BAKE_REGION=us-east-1 bash -s" in l for l in ssh)
+    assert any("LEERIE_BAKE_REGION=us-east-1 bash /tmp/leerie-bake/scripts/remote/ec2-bake.sh" in l for l in ssh)
 
 
 def test_sigint_while_run_instances_in_flight_terminates_by_nonce(tmp_path):
@@ -165,3 +182,60 @@ def test_sigint_while_run_instances_in_flight_terminates_by_nonce(tmp_path):
     term = [l for l in calls if l.startswith("ec2 terminate-instances")]
     assert term and "i-inflight" in term[0]
     assert not any(l.startswith("ec2 create-image") for l in calls)
+
+
+def _ssh_calls(tmp_path):
+    return (tmp_path / "ssh_calls").read_text().splitlines()
+
+
+SHIP_TAIL = "sudo -n sh -c 'mkdir -p '\\''/tmp/leerie-bake'\\'' && tar -xzC '\\''/tmp/leerie-bake'\\'''"
+
+
+def test_bake_ships_via_tar_pipe_and_runs_the_script_by_path_with_stdin_closed(tmp_path):
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stderr
+    calls = _ssh_calls(tmp_path)
+    stdin = (tmp_path / "ssh_stdin_bytes").read_text().split()
+    ship = [i for i, l in enumerate(calls) if l.endswith(SHIP_TAIL)]
+    run = [i for i, l in enumerate(calls) if "bash /tmp/leerie-bake/scripts/remote/ec2-bake.sh" in l]
+    assert ship and run and ship[0] < run[0]
+    assert int(stdin[ship[0]]) > 0          # the gzip tar went over the pipe
+    assert int(stdin[run[0]]) == 0          # the script run reads nothing on stdin
+    assert not any(l.endswith("bash -s") for l in calls)
+
+
+def test_bake_ssh_uses_the_bake_instances_own_known_hosts(tmp_path):
+    r = _run(tmp_path, HOME=str(tmp_path / "home"))
+    assert r.returncode == 0, r.stderr
+    kh = f"UserKnownHostsFile={tmp_path / 'home'}/.leerie/.ec2-keys/known_hosts/i-bake"
+    calls = _ssh_calls(tmp_path)
+    assert calls and all(kh in l for l in calls)
+    assert not any("StrictHostKeyChecking=no" in l or "/dev/null" in l for l in calls)
+
+
+def test_image_wait_outlasts_pending_polls(tmp_path):
+    # More pending polls than the CLI waiter's 40 attempts; the bounded poll
+    # keeps going and the bake succeeds.
+    r = _run(tmp_path, PENDING_POLLS="45", LEERIE_EC2_AMI_WAIT_S="1000")
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().splitlines()[-1] == "ami-baked"
+    assert int((tmp_path / "polls").read_text()) == 46
+    assert "ec2 deregister-image" not in _calls(tmp_path)
+    assert "ec2 wait" not in _calls(tmp_path)
+
+
+def test_failed_image_is_deregistered_and_the_bake_fails(tmp_path):
+    r = _run(tmp_path, IMAGE_END="failed")
+    assert r.returncode != 0
+    assert "ec2 deregister-image" in _calls(tmp_path)
+    assert "ec2 terminate-instances" in _calls(tmp_path)
+    assert int((tmp_path / "polls").read_text()) == 1   # terminal state ends the wait at once
+
+
+def test_image_wait_budget_is_bounded(tmp_path):
+    r = _run(tmp_path, PENDING_POLLS="1000", LEERIE_EC2_AMI_WAIT_S="3")
+    assert r.returncode != 0
+    # step 0 under test counts 1s per wait: polls at 0,1,2,3 waited seconds.
+    assert int((tmp_path / "polls").read_text()) == 4
+    assert "LEERIE_EC2_AMI_WAIT_S" in r.stderr
+    assert "ec2 deregister-image" in _calls(tmp_path)

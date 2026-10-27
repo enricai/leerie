@@ -188,6 +188,12 @@ system_info:
 CFG
 chmod g+w /work
 
+# Disk-backed /tmp, as in the container. Debian 13 mounts /tmp as a RAM
+# tmpfs by default; seed bundles land there and XDG_CACHE_HOME points there,
+# so on a tmpfs they would compete with the workers for memory and the
+# /tmp/.cache set up above would vanish on every boot.
+systemctl mask tmp.mount
+
 # The bootstrap login's key is the bake's, not any run's; the image
 # carries none. Then reset cloud-init so the image's first boot is a
 # fresh instance (new machine id, host keys, default user, key pair).

@@ -113,7 +113,13 @@ the install checkout).
   in flight (no id yet) terminates the instance found by the bake's
   `leerie:bake` nonce tag; the bake launch carries
   `AssociatePublicIpAddress=true` with the subnet/SG override, the nonce tag,
-  `-i <key>` on every ssh and `LEERIE_BAKE_REGION` for the payload;
+  `-i <key>` on every ssh and `LEERIE_BAKE_REGION` for the payload; the
+  sources ship through `ec2_tar_pipe` (`sudo -n sh -c … tar -xzC
+  /tmp/leerie-bake`) before the script runs *from that copy* with zero bytes
+  on stdin (never `bash -s`), and every bake ssh uses the bake instance's own
+  known-hosts file; the image poll outlasts 45 pending states (more than the
+  CLI waiter's 40), a `failed` image is deregistered on the first poll, and
+  `LEERIE_EC2_AMI_WAIT_S` bounds the wait;
   `LEERIE_EC2_AMI` set makes no AWS call at all; a changed content hash
   (Dockerfile edit under a throwaway repo root) rebakes and tags the new
   image with the new hash. `tests/test_ec2_ami_lookup.py` pins the
@@ -125,7 +131,9 @@ the install checkout).
   else (`$PATH` expanded, a `RUN echo ENV …` line ignored), and complete
   against the real one; it is written before, and sourced for, `mise
   install`; `ec2-user` is cloud-init's default user with passwordless sudo
-  and no key is baked in; `cloud-init clean` runs last; leerie's home is
+  and no key is baked in — proven by executing the script's own cloud-cfg
+  heredoc with a group name and comparing every key; `tmp.mount` is masked
+  (disk-backed `/tmp`) before `cloud-init clean`, which runs last; leerie's home is
   chowned after its dirs exist; the SSM agent prefers the regional bucket.
 - `tests/test_ec2_defaults.py` (`ec2-defaults.sh`): per knob, the default
   and the override. Instance type; subnet (public subnet in the default VPC,
@@ -144,7 +152,12 @@ the install checkout).
   target in the tar-pipe argv, its absence without a known key, the
   fallback to leerie's own key in a process that never received
   `LEERIE_EC2_SSH_KEY_FILE`, no guess for an operator key, and the rsync
-  ssh wrapper.
+  ssh wrapper. A region set only through `AWS_DEFAULT_REGION` (which
+  preflight accepts and `aws configure get` never reads) still resolves the
+  key path via `_ec2_region`; a key pair left by the per-repo layout has its
+  pem moved into place with no new key pair created; and the known-hosts
+  file is per instance id at `ec2_tar_pipe`, `_ec2_fetch_ssh` and the rsync
+  wrapper, differs for another instance, and is absent without an id.
 - `tests/test_ec2_provision.py`: `provision_instance` leaves
   `LEERIE_EC2_SSH_KEY_FILE` set in the *calling* shell, so the later seed
   and fetch ssh calls carry `-i` (the defect: the key pair was resolved in
@@ -162,7 +175,17 @@ the install checkout).
   splits on the first `=`, and the wrapper's own `HOME`/`USER_REPO`/`TZ` win
   after it; an operator AMI without the file keeps the session env.
 - `tests/test_ec2_resume_instance.py`: resuming from a new egress IP adds it
-  to leerie's group (old rule kept); an operator group is never touched.
+  to the leerie group *attached to that instance* (old rule kept), after the
+  start and before the ssh target is resolved, even when the resuming shell
+  has no group id; an attached operator group is never changed and no group
+  is created; an already-admitted IP changes nothing.
+- `tests/ec2_stub.py`'s shared SSM stub refuses (exit 97) any command not in
+  the exact `sudo -n bash <file>` wrapper shape, so the provision, seed and
+  fetch tests exercise the real elevated wrapper, not a lenient decode.
+- `tests/test_launcher_env_forwarding.py`: every launcher-only EC2 knob
+  (the six instance-shape knobs plus the key file, SSH CIDR, IAM retry, AMI
+  wait and bake budgets) stays out of the local container, with a control
+  showing the same harness forwards an ordinary knob.
 - `tests/test_ec2_cleanup.py` (`ec2-cleanup.sh` and `leerie prune`'s AWS
   section): tagged-only prune. The stub ignores `tag-key` filters, so
   untagged lookalikes reach the script and its client-side re-check is what

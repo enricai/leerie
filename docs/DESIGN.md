@@ -4161,9 +4161,12 @@ fresh AWS account with no operator-built artifact. Three strategies:
      `ensure_ami()` launches a temporary instance from the stock Debian
      13 AMI (using the same key pair, security group and subnet defaults
      as a run, below), SSHes in as the stock `admin` user (Debian's
-     cloud-image login; `ec2-user` does not exist yet), pipes the bake
-     script over the existing `ec2_tar_pipe` path, and runs it with
-     `sudo`. The script creates the `leerie` user and the `ec2-user`
+     cloud-image login; `ec2-user` does not exist yet), ships the baked-in
+     sources — the bake script among them — over the existing
+     `ec2_tar_pipe` path, and runs the script from that copy with `sudo`
+     and stdin closed (a script fed over stdin can be consumed mid-run by
+     any step that reads stdin, such as a package's maintainer script).
+     The script creates the `leerie` user and the `ec2-user`
      login that the run-time SSH bulk transfer uses. `ec2-user` is made
      cloud-init's *default user* (passwordless sudo, member of the leerie
      group) rather than authorized with the bake-time key: cloud-init
@@ -4171,20 +4174,25 @@ fresh AWS account with no operator-built artifact. Three strategies:
      that instance's launch key pair into the default user, so an AMI baked
      with one key keeps working when the key pair is overridden or
      recreated. The script ends with `cloud-init clean` so the image's first
-     boot is a fresh instance. It then calls `ec2:CreateImage` and waits for
-     `available`.
-   - **The image carries what the container's `ENV` provided.** A container
+     boot is a fresh instance. It then calls `ec2:CreateImage` and polls the
+     image state until `available` within a bounded budget sized for a
+     first snapshot (the CLI's stock waiter gives up after ten minutes,
+     which a first snapshot can exceed). Chosen over **user-data** (no
+     exit status or log visible to the launcher, 16 KB limit, failure only
+     discoverable by timeout) and **SSM** (needs the instance profile to
+     exist and register before the first step can run, a chicken-and-egg
+     on a fresh account; the SSH path is already required for bulk
+     transfer and so adds no new prerequisite).
+   - **The image carries what the container provided.** A container
      gets the Dockerfile's `ENV` lines for free; an EC2 instance does not,
      and `container-entry.sh` (which chowns leerie's home dirs in the
      rootful case) never runs there. The bake therefore writes the
      Dockerfile's `ENV` set to an env file in the image, which the EC2
      launch wrapper merges into the orchestrator's environment, and leaves
-     leerie's home directory leerie-owned. Chosen over **user-data** (no exit status or log
-     visible to the launcher, 16 KB limit, failure only discoverable by
-     timeout) and **SSM** (needs the instance profile to exist and
-     register before the first step can run, a chicken-and-egg on a
-     fresh account; the SSH path is already required for bulk transfer
-     and so adds no new prerequisite).
+     leerie's home directory leerie-owned. It also keeps `/tmp` on disk:
+     Debian 13 mounts `/tmp` as a RAM-backed tmpfs by default, where the
+     seed bundles and the tool caches the container keeps under `/tmp`
+     would compete with the workers for memory and vanish on every boot.
    - **Tag and rebake rule.** The AMI is tagged with the leerie version
      and a source hash (over the files baked in: orchestrator, scripts,
      prompts, plugin manifest, `requirements.txt`, the bake script).
@@ -4229,14 +4237,19 @@ CLI flag > `LEERIE_EC2_*` env var > `leerie.toml` > new default.
   mode 600, and every `ssh`/`scp`/`rsync` invocation passes `-i` to it
   explicitly (leerie passed no `-i` before). Every launcher process
   derives the same path, so `resume`, `finalize` and `kill` find the key
-  without it being threaded through.
+  without it being threaded through. A key pair created before this
+  layout (its private key in the per-repo state dir) is adopted by moving
+  that file into place rather than failing.
 - **Security group** (`LEERIE_EC2_SECURITY_GROUP`): create or reuse a
   leerie-tagged group allowing port 22 **only** from the launcher's
   egress IP as a `/32` (or an operator-supplied CIDR), never `0.0.0.0/0`.
   The rule is additive: a launcher never revokes another launcher's CIDR
   (that would cut a concurrent run's transport), and `resume` re-adds the
   current egress IP, since a laptop that changed networks would otherwise
-  be locked out of its own paused instance. `prune` reclaims the group.
+  be locked out of its own paused instance. Resume touches only a
+  leerie-tagged group that is actually attached to that instance, never
+  creates one, and leaves an operator's group alone. `prune` reclaims the
+  group.
 - **Subnet** (`LEERIE_EC2_SUBNET_ID`): a public subnet of the default
   VPC. If the account has no default VPC the launcher fails with an
   actionable message naming the fix (create one with `aws ec2
@@ -4360,7 +4373,12 @@ design picks SSM Session Manager over SSH:
   sessions cannot stream efficiently. It is therefore required, not a
   fallback: the instance needs a key pair, the security-group rule and a
   public IP (see *Zero-config defaults* above), and SSM supplements SSH
-  rather than replacing it.
+  rather than replacing it. Host keys are trusted on first use **per
+  instance**, in a known-hosts file keyed by instance id, never the
+  user's own `known_hosts`: EC2 recycles public IPs, so a later instance
+  on an address an earlier one used presents a different host key, and a
+  shared file would make ssh refuse it. A stopped-and-started instance
+  keeps its host key, so resume still matches.
 
 `aws ssm start-session --target <instance-id> --document-name
 AWS-StartInteractiveCommand --parameters command="python3 -"` is the SSM

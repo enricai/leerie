@@ -466,12 +466,13 @@ ec2_seed_repo_dirty() {
 _ec2_ssh_wrapper() {
   local wrapper
   wrapper="$(mktemp -t leerie-ec2-ssh-wrapper.XXXXXX)"
-  local _to="" _idstr=""
+  local _to="" _idstr="" _khstr=""
   _to="$(_seed_timeout_prefix)"
   _idstr="$(_ec2_ssh_identity_string)"
+  _khstr="$(_ec2_ssh_known_hosts_string)"
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
-exec $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $_idstr "\$@"
+exec $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $_idstr $_khstr "\$@"
 EOF
   chmod +x "$wrapper"
   printf '%s' "$wrapper"

@@ -165,6 +165,48 @@ for p in d["SecurityGroups"][0].get("IpPermissions",[]):
   printf '%s' "$gid"
 }
 
+# --- ec2_reauthorize_instance_sg ---------------------------------------------
+# Resume's counterpart to ec2_default_security_group: add the current egress
+# CIDR to a leerie-tagged group that is attached to <instance-id>. Never
+# creates a group and never touches an operator's — whether the run used
+# leerie's group is read off the instance, not off this invocation's knobs.
+ec2_reauthorize_instance_sg() {
+  local iid="$1" out gids gid cidr have
+  out="$(_ec2_aws ec2 describe-instances --instance-ids "$iid" --output json 2>/dev/null)" || out=""
+  gids="$(printf '%s' "$out" | python3 -c '
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+for r in d.get("Reservations",[]):
+    for i in r.get("Instances",[]):
+        for g in i.get("SecurityGroups",[]): print(g.get("GroupId",""))' 2>/dev/null)"
+  [ -n "$gids" ] || return 0
+  # shellcheck disable=SC2086  # one or more group ids
+  out="$(_ec2_aws ec2 describe-security-groups --group-ids $gids --output json 2>/dev/null)" || out=""
+  gid="$(printf '%s' "$out" | python3 -c "$_EC2_TAGGED_PY"'
+import json,sys
+try: d=json.load(sys.stdin)
+except Exception: d={}
+for g in d.get("SecurityGroups",[]):
+    if tagged(g.get("Tags")): print(g["GroupId"]); break' 2>/dev/null)"
+  [ -n "$gid" ] || return 0
+  cidr="$(ec2_egress_cidr)" || return 1
+  have="$(printf '%s' "$out" | python3 -c '
+import json,sys
+gid=sys.argv[1]
+for g in json.load(sys.stdin).get("SecurityGroups",[]):
+    if g.get("GroupId")!=gid: continue
+    for p in g.get("IpPermissions",[]):
+        if p.get("FromPort")==22:
+            for r in p.get("IpRanges",[]): print(r.get("CidrIp",""))' "$gid" 2>/dev/null)"
+  printf '%s\n' "$have" | grep -qxF "$cidr" && return 0
+  _ec2_aws ec2 authorize-security-group-ingress --group-id "$gid" --protocol tcp --port 22 --cidr "$cidr" >/dev/null 2>&1 || {
+    remote_log "error: could not authorize 22/tcp from $cidr on $gid."
+    return 1
+  }
+  remote_log "ec2: admitted $cidr on $gid for SSH"
+}
+
 # --- ec2_default_key_name ---------------------------------------------------
 # Prints the key name. The private key lives at ec2_default_key_file (ec2-lib.sh),
 # which every ssh call derives on its own, so nothing needs exporting.
@@ -193,6 +235,14 @@ else: print("untagged")' 2>/dev/null)"
     return 1
   fi
   if [ -n "$found" ]; then
+    # A key pair made before the per-account/region layout kept its private
+    # key in the per-repo state dir: adopt that file rather than fail.
+    local legacy="${LEERIE_STATE_HOST_DIR:-${LEERIE_STATE_DIR:-$HOME/.leerie}}/$EC2_KEY_NAME_DEFAULT.pem"
+    if [ ! -f "$keyfile" ] && [ -f "$legacy" ]; then
+      mkdir -p "$(dirname "$keyfile")" \
+        && ( umask 077; cp "$legacy" "$keyfile" ) && chmod 600 "$keyfile" \
+        && remote_log "ec2: moved leerie's private key from $legacy to $keyfile"
+    fi
     if [ ! -f "$keyfile" ]; then
       remote_log "error: key pair $found exists in AWS but its private key is not at $keyfile."
       echo "  Restore the file, or run: aws ec2 delete-key-pair --key-name $found  (leerie will recreate it)," >&2

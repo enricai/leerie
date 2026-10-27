@@ -89,14 +89,37 @@ def test_env_file_written_before_mise_install_and_sourced_for_it():
     assert write < source < install
 
 
+def _render_cloud_cfg(group: str) -> dict:
+    """Execute the script's own `cat > 99-leerie.cfg <<CFG` heredoc with a
+    group name and parse the result into {key: value} under default_user."""
+    block = re.search(r"cat > /etc/cloud/cloud.cfg.d/99-leerie.cfg <<CFG\n.*?\nCFG\n", BODY, re.S).group(0)
+    block = block.replace("cat > /etc/cloud/cloud.cfg.d/99-leerie.cfg", "cat")
+    out = subprocess.run(["bash", "-c", f"leerie_group={group}\n{block}"],
+                         capture_output=True, text=True, check=True).stdout
+    lines = out.splitlines()
+    assert lines[:2] == ["system_info:", "  default_user:"]
+    return dict(l.strip().split(": ", 1) for l in lines[2:])
+
+
 def test_ec2_user_is_cloud_inits_default_user_with_sudo_and_no_baked_key():
-    cfg = re.search(r"cat > /etc/cloud/cloud.cfg.d/99-leerie.cfg <<CFG\n(.*?)\nCFG\n", BODY, re.S).group(1)
-    assert "default_user:" in cfg and "name: ec2-user" in cfg
-    assert 'sudo: ["ALL=(ALL) NOPASSWD:ALL"]' in cfg
-    assert "groups: [$leerie_group]" in cfg
+    cfg = _render_cloud_cfg("leeriegrp")
+    assert cfg == {
+        "name": "ec2-user",
+        "lock_passwd": "true",
+        "gecos": "leerie transport",
+        "groups": "[leeriegrp]",               # the leerie group, resolved
+        "sudo": '["ALL=(ALL) NOPASSWD:ALL"]',
+        "shell": "/bin/bash",
+    }
+    # The group is the one owning LEERIE_GID, looked up, not hard-coded.
+    assert 'leerie_group="$(getent group "$LEERIE_GID" | cut -d: -f1)"' in BODY
     # No key copied into ec2-user; the bootstrap key is removed from the image.
     assert "/home/ec2-user/.ssh/authorized_keys" not in BODY
     assert "rm -f /home/admin/.ssh/authorized_keys" in BODY
+
+
+def test_tmp_is_disk_backed_before_cloud_init_is_reset():
+    assert BODY.index("systemctl mask tmp.mount") < BODY.index("cloud-init clean --logs --machine-id")
 
 
 def test_cloud_init_is_reset_last():

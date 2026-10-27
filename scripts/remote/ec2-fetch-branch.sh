@@ -87,7 +87,7 @@ _ec2_fetch_ssh() {
   local _to=""
   _to="$(_seed_timeout_prefix)"
   local _id=() _a
-  while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args)
+  while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args; ec2_ssh_known_hosts_args)
   $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     ${_id[@]+"${_id[@]}"} \
     "$LEERIE_EC2_SSH_TARGET" "sudo -n $remote_cmd"

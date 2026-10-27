@@ -191,6 +191,33 @@ _ec2_ami_wait_state() { # <instance-state> <instance-id>
   return 1
 }
 
+# _ec2_ami_wait_image <image-id> — poll until the image is `available`.
+# Not `aws ec2 wait image-available`: that waiter stops after ten minutes,
+# which a first snapshot of the root volume can exceed. Fails at once on a
+# terminal image state, else after LEERIE_EC2_AMI_WAIT_S.
+_ec2_ami_wait_image() {
+  local image_id="$1" st waited=0
+  local step="${LEERIE_EC2_BAKE_POLL_S:-5}" budget="${LEERIE_EC2_AMI_WAIT_S:-3600}"
+  while :; do
+    st="$(_ec2_ami_aws ec2 describe-images --image-ids "$image_id" --output json 2>/dev/null \
+      | _ec2_ami_py "
+imgs = d.get('Images', [])
+print(imgs[0].get('State', '') if imgs else '')" || true)"
+    case "$st" in
+      available) return 0 ;;
+      failed|invalid|error|deregistered)
+        remote_log "ami: image $image_id ended in state $st"; return 1 ;;
+    esac
+    if [ "$waited" -ge "$budget" ]; then
+      remote_log "ami: image $image_id not available after ${budget}s (state: ${st:-unknown})"
+      echo "  Raise LEERIE_EC2_AMI_WAIT_S and re-run; the bake is retried from scratch." >&2
+      return 1
+    fi
+    sleep "$step"
+    waited=$((waited + (step > 0 ? step : 1)))
+  done
+}
+
 # _ec2_ami_bake <version> <hash> — prints the new AMI id. Body runs the
 # bake with the teardown trap armed before the first wait loop.
 _ec2_ami_bake() {
@@ -250,34 +277,41 @@ _ec2_ami_bake_steps() {
     --output json | _ec2_ami_py "print(d['Instances'][0]['InstanceId'])")" || return 1
   [ -n "$iid" ] || return 1
   _EC2_AMI_BAKE_IID="$iid"
+  # This runs inside ensure_ami's $(...) subshell, so the id scopes the
+  # transport helpers' per-instance known-hosts file to the bake instance
+  # without leaking into the caller.
+  # shellcheck disable=SC2034  # read by ec2_ssh_known_hosts_args
+  LEERIE_EC2_INSTANCE_ID="$iid"
   remote_log "ami: bake instance $iid (base $base_ami)"
 
   _ec2_ami_wait_state running "$iid" || { remote_log "ami: bake instance never ran"; return 1; }
   host="$(_ec2_ami_instance_field "$iid" PublicIpAddress)"
   [ -n "$host" ] || { remote_log "ami: bake instance has no public IP"; return 1; }
 
-  # Host-key checking is off: the throwaway instance's key is new by
-  # construction and never trusted afterwards.
+  # Same identity and per-instance known-hosts as every other transport
+  # (ec2_tar_pipe below uses them too).
   local ssh_opts=() _a
-  while IFS= read -r _a; do ssh_opts+=("$_a"); done < <(ec2_ssh_identity_args)
-  ssh_opts+=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-             -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
+  while IFS= read -r _a; do ssh_opts+=("$_a"); done < <(ec2_ssh_identity_args; ec2_ssh_known_hosts_args)
+  ssh_opts+=(-o StrictHostKeyChecking=accept-new -o LogLevel=ERROR
+             -o ConnectTimeout=10 -o BatchMode=yes)
   for i in $(seq 1 "${LEERIE_EC2_BAKE_SSH_RETRIES:-60}"); do
     ssh "${ssh_opts[@]}" "admin@$host" true 2>/dev/null && break
     [ "$i" -lt "${LEERIE_EC2_BAKE_SSH_RETRIES:-60}" ] || { remote_log "ami: bake instance unreachable over SSH"; return 1; }
     sleep "${LEERIE_EC2_BAKE_POLL_S:-5}"
   done
 
+  # The baked-in sources — ec2-bake.sh among them — go over ec2_tar_pipe,
+  # and the script runs from that copy with stdin closed: fed over stdin
+  # (`bash -s`), any step that reads stdin would swallow the rest of it.
   local root; root="$(_ec2_ami_root)"
-  tar -C "$root" --exclude=__pycache__ --exclude='*.pyc' --exclude=.git -cf - "${_EC2_AMI_HASH_PATHS[@]}" \
-    | ssh "${ssh_opts[@]}" "admin@$host" 'rm -rf /tmp/leerie-bake && mkdir -p /tmp/leerie-bake && tar -C /tmp/leerie-bake -xf -' \
+  tar -C "$root" --exclude=__pycache__ --exclude='*.pyc' --exclude=.git -czf - "${_EC2_AMI_HASH_PATHS[@]}" \
+    | ec2_tar_pipe "admin@$host" /tmp/leerie-bake \
     || { remote_log "ami: shipping repo to bake instance failed"; return 1; }
-  local region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
-  [ -n "$region" ] || region="$(aws configure get region ${LEERIE_AWS_PROFILE:+--profile "$LEERIE_AWS_PROFILE"} 2>/dev/null || true)"
+  local region; region="$(_ec2_region)"
   # shellcheck disable=SC2029  # $region is meant to expand host-side
   ssh "${ssh_opts[@]}" "admin@$host" \
-      "sudo env LEERIE_BAKE_DIR=/tmp/leerie-bake LEERIE_BAKE_REGION=$region bash -s" \
-      < "$_EC2_AMI_DIR/ec2-bake.sh" \
+      "sudo env LEERIE_BAKE_DIR=/tmp/leerie-bake LEERIE_BAKE_REGION=$region bash /tmp/leerie-bake/scripts/remote/ec2-bake.sh" \
+      < /dev/null \
     || { remote_log "ami: bake payload failed"; return 1; }
 
   _ec2_ami_aws ec2 stop-instances --instance-ids "$iid" >/dev/null || return 1
@@ -293,7 +327,7 @@ _ec2_ami_bake_steps() {
     --tag-specifications "ResourceType=image,Tags=[$tags]" "ResourceType=snapshot,Tags=[$tags]" \
     --output json | _ec2_ami_py "print(d.get('ImageId', ''))")" || return 1
   [ -n "$image_id" ] || return 1
-  if ! _ec2_ami_aws ec2 wait image-available --image-ids "$image_id"; then
+  if ! _ec2_ami_wait_image "$image_id"; then
     _ec2_ami_aws ec2 deregister-image --image-id "$image_id" >/dev/null 2>&1 || true
     return 1
   fi

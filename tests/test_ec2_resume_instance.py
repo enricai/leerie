@@ -606,42 +606,78 @@ def test_resume_instance_unexpected_state_fails_without_starting(tmp_path):
 
 # --- resume_instance: re-admits the current egress IP ------------------------
 
-def _seed_leerie_sg(aws_dir: Path, cidr: str) -> None:
+def _seed_sg(aws_dir: Path, gid: str, tags: dict, cidr: str) -> None:
     state = read_state(aws_dir)
-    state["vpcs"] = {"vpc-default0001": {"is_default": True}}
-    state["security_groups"] = {"sg-leerie": {
-        "name": "leerie-ssh", "vpc_id": "vpc-default0001",
-        "tags": {"leerie:managed": "true"},
-        "ingress": [{"protocol": "tcp", "port": 22, "cidr": cidr}]}}
+    state.setdefault("security_groups", {})[gid] = {
+        "name": "leerie-ssh" if tags else "team-ssh", "vpc_id": "vpc-default0001",
+        "tags": tags, "ingress": [{"protocol": "tcp", "port": 22, "cidr": cidr}]}
     (aws_dir / "state.json").write_text(json.dumps(state))
 
 
-def test_resume_from_a_new_ip_adds_it_to_leeries_group(tmp_path):
-    # The run paused from 198.51.100.7; the laptop resumes from 203.0.113.9.
+def _attach(aws_dir: Path, iid: str, gid: str) -> None:
+    state = read_state(aws_dir)
+    state["instances"][iid]["security_group_ids"] = [gid]
+    (aws_dir / "state.json").write_text(json.dumps(state))
+
+
+def test_resume_from_a_new_ip_adds_it_to_the_attached_leerie_group(tmp_path):
+    # The run paused from 198.51.100.7; the laptop resumes from 203.0.113.9,
+    # in a shell that does not carry the group id.
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)
-    _seed_leerie_sg(aws_dir, "198.51.100.7/32")
+    _seed_sg(aws_dir, "sg-leerie", {"leerie:managed": "true"}, "198.51.100.7/32")
     iid = _seed_stopped_instance(aws_dir)
+    _attach(aws_dir, iid, "sg-leerie")
     env = _stub_env(aws_dir, {"LEERIE_EC2_SECURITY_GROUP": "", "LEERIE_EC2_SSH_CIDR": "203.0.113.9/32"})
 
-    result = run_bash(f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}", env=env)
+    result = run_bash(
+        f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}", env=env)
 
     assert result.returncode == 0, result.stderr
-    (sg,) = read_state(aws_dir)["security_groups"].values()
+    sg = read_state(aws_dir)["security_groups"]["sg-leerie"]
     assert [r["cidr"] for r in sg["ingress"]] == ["198.51.100.7/32", "203.0.113.9/32"]
     log = read_log(aws_dir)
-    auth = [i for i, l in enumerate(log) if l.startswith("ec2 authorize-security-group-ingress")]
-    start = [i for i, l in enumerate(log) if l.startswith("ec2 start-instances")]
-    assert auth and start and not any("revoke" in l for l in log)
+    auth = next(i for i, l in enumerate(log) if l.startswith("ec2 authorize-security-group-ingress"))
+    start = next(i for i, l in enumerate(log) if l.startswith("ec2 start-instances"))
+    # Re-admitted after the instance is back and before resume returns the
+    # ssh target the seed uses (the IP lookup is the last describe call).
+    last_describe = max(i for i, l in enumerate(log) if l.startswith("ec2 describe-instances"))
+    assert start < auth < last_describe
+    assert not any("revoke" in l or "create-security-group" in l for l in log)
 
 
-def test_resume_leaves_an_operator_group_alone(tmp_path):
+def test_resume_never_touches_an_attached_operator_group(tmp_path):
+    # Launched with an operator group, resumed without the knob: nothing may
+    # be created or changed, and leerie's own group is not involved.
     aws_dir = tmp_path / "bin"
     _stub_aws(aws_dir)
+    _seed_sg(aws_dir, "sg-operator", {}, "10.0.0.0/8")
     iid = _seed_stopped_instance(aws_dir)
-    env = _stub_env(aws_dir)  # LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
+    _attach(aws_dir, iid, "sg-operator")
+    env = _stub_env(aws_dir, {"LEERIE_EC2_SECURITY_GROUP": "", "LEERIE_EC2_SSH_CIDR": "203.0.113.9/32"})
 
-    result = run_bash(f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}", env=env)
+    result = run_bash(
+        f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}", env=env)
 
     assert result.returncode == 0, result.stderr
-    assert not any("security-group" in l for l in read_log(aws_dir))
+    state = read_state(aws_dir)
+    assert list(state["security_groups"]) == ["sg-operator"]
+    assert state["security_groups"]["sg-operator"]["ingress"] == [
+        {"protocol": "tcp", "port": 22, "cidr": "10.0.0.0/8"}]
+    log = read_log(aws_dir)
+    assert not any(l.startswith(("ec2 authorize", "ec2 create-security-group", "ec2 revoke")) for l in log)
+
+
+def test_resume_with_the_ip_already_admitted_changes_nothing(tmp_path):
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    _seed_sg(aws_dir, "sg-leerie", {"leerie:managed": "true"}, "203.0.113.9/32")
+    iid = _seed_stopped_instance(aws_dir)
+    _attach(aws_dir, iid, "sg-leerie")
+    env = _stub_env(aws_dir, {"LEERIE_EC2_SSH_CIDR": "203.0.113.9/32"})
+
+    result = run_bash(
+        f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not any(l.startswith("ec2 authorize") for l in read_log(aws_dir))

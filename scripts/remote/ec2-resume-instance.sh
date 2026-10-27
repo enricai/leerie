@@ -165,16 +165,14 @@ resume_instance() {
   fi
 
   # The launcher may have changed networks since the run paused: re-admit
-  # the current egress IP on leerie's own group (additive; an explicit
-  # LEERIE_EC2_SECURITY_GROUP is the operator's to manage).
-  if [ -z "${LEERIE_EC2_SECURITY_GROUP:-}" ]; then
-    if ! declare -f ec2_default_security_group >/dev/null 2>&1; then
-      # shellcheck disable=SC1091
-      . "$_RESUME_EC2_DIR/ec2-defaults.sh"
-    fi
-    ec2_default_security_group >/dev/null \
-      || remote_log "warning: could not re-authorize SSH from this host; seeding may fail"
+  # the current egress IP — only on a leerie group attached to this
+  # instance; an operator's group is theirs to manage.
+  if ! declare -f ec2_reauthorize_instance_sg >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$_RESUME_EC2_DIR/ec2-defaults.sh"
   fi
+  ec2_reauthorize_instance_sg "$iid" \
+    || remote_log "warning: could not re-authorize SSH from this host; seeding may fail"
 
   local ssh_target=""
   if ssh_target="$(_resolve_ssh_target_from_instance "$iid")"; then

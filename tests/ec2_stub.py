@@ -169,6 +169,8 @@ def instance_doc(instance_id, rec):
     }
     if rec["state"] == "running":
         doc["PublicIpAddress"] = rec.get("public_ip", "203.0.113.10")
+    if rec.get("security_group_ids"):
+        doc["SecurityGroups"] = [{"GroupId": g} for g in rec["security_group_ids"]]
     return doc
 
 
@@ -1008,6 +1010,13 @@ fi
 # the decoded script runs directly here.
 inner="${{param#command=[\\"}}"
 inner="${{inner%\\"]}}"
+# Every SSM payload must arrive in exactly the elevated-wrapper shape the
+# instance runs; anything else (an old pipe-to-bash form, a lost sudo) fails
+# the calling test instead of being decoded leniently.
+case "$inner" in
+  'f=$(mktemp) && echo '*' | base64 -d > $f && sudo -n bash $f; __r=$?; rm -f $f; exit $__r') ;;
+  *) echo "ec2_stub: unexpected SSM command shape: $inner" >&2; exit 97 ;;
+esac
 b64="${{inner#*echo }}"
 b64="${{b64%% | base64*}}"
 decoded="$(printf '%s' "$b64" | base64 -d)"

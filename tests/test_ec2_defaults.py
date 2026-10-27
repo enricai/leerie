@@ -379,3 +379,72 @@ def test_rsync_ssh_wrapper_embeds_identity(tmp_path):
     assert r.returncode == 0, r.stderr
     exec_line = [l for l in r.stdout.splitlines() if l.startswith("exec ")][0]
     assert f"ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new -i '{key}' -o IdentitiesOnly=yes" in exec_line
+
+
+# --- region: whatever preflight accepts, the key path resolves ----------------
+
+def test_region_only_from_aws_default_region_still_resolves_the_key(tmp_path):
+    # require_aws accepts AWS_DEFAULT_REGION; `aws configure get region` never
+    # reads it. The key path must not be the one place that misses it.
+    aws_dir, _, env = _defaults_env(tmp_path)
+    env = {**env, "AWS_REGION": "", "LEERIE_AWS_REGION": "", "AWS_DEFAULT_REGION": "eu-west-3"}
+    r = _call("ec2_default_key_name >/dev/null && ec2_default_key_file", env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == str(_pem(tmp_path, "eu-west-3"))
+    assert _pem(tmp_path, "eu-west-3").is_file()
+
+
+def test_region_precedence_puts_leerie_region_first(tmp_path):
+    _, _, env = _defaults_env(tmp_path)
+    r = _call("_ec2_region", {**env, "LEERIE_AWS_REGION": "ap-south-1",
+                              "AWS_REGION": "us-east-1", "AWS_DEFAULT_REGION": "eu-west-3"})
+    assert r.stdout == "ap-south-1"
+    r = _call("_ec2_region", {**env, "LEERIE_AWS_REGION": "", "AWS_REGION": "",
+                              "AWS_DEFAULT_REGION": "eu-west-3"})
+    assert r.stdout == "eu-west-3"
+
+
+# --- key pair made under the per-repo layout is adopted ----------------------
+
+def test_key_from_the_per_repo_layout_is_moved_into_place(tmp_path):
+    aws_dir, state_dir, env = _defaults_env(tmp_path)
+    state = read_state(aws_dir)
+    state["key_pairs"] = {"leerie-ssh": {"name": "leerie-ssh", "tags": {"leerie": "managed"}}}
+    (aws_dir / "state.json").write_text(json.dumps(state))
+    state_dir.mkdir()
+    (state_dir / "leerie-ssh.pem").write_text("LEGACY-KEY")
+    r = _call("ec2_default_key_name", env)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout == "leerie-ssh"
+    assert _pem(tmp_path).read_text() == "LEGACY-KEY"
+    assert stat.S_IMODE(_pem(tmp_path).stat().st_mode) == 0o600
+    assert _mutating(aws_dir) == []          # no new key pair was created
+
+
+# --- per-instance known_hosts at every ssh site ------------------------------
+
+def test_known_hosts_is_per_instance_at_every_ssh_site(tmp_path):
+    bin_dir = tmp_path / "sshbin"
+    _ssh_stub(bin_dir)
+    home = tmp_path / "home"
+    env = {"PATH": f"{bin_dir}:/usr/bin:/bin", "HOME": str(home),
+           "LEERIE_EC2_INSTANCE_ID": "i-0aaa", "LEERIE_EC2_SSH_TARGET": "ec2-user@h"}
+    kh = f"UserKnownHostsFile={home}/.leerie/.ec2-keys/known_hosts/i-0aaa"
+    run_bash(f"source {LIB_SH}; echo x | ec2_tar_pipe ec2-user@h /tmp/x", env=env)
+    run_bash(f"source {REPO_ROOT}/scripts/remote/ec2-fetch-branch.sh; _ec2_fetch_ssh 'true'", env=env)
+    lines = (bin_dir / "ssh.log").read_text().splitlines()
+    assert len(lines) == 2 and all(kh in l for l in lines)
+    w = run_bash(
+        f"source {REPO_ROOT}/scripts/remote/ec2-seed-repo.sh; w=$(_ec2_ssh_wrapper); cat \"$w\"; rm -f \"$w\"",
+        env=env).stdout
+    assert f"-o UserKnownHostsFile='{home}/.leerie/.ec2-keys/known_hosts/i-0aaa'" in w
+    # A different instance gets a different file, so a recycled IP can't clash.
+    other = run_bash(f"source {LIB_SH}; ec2_ssh_known_hosts_args",
+                     env={**env, "LEERIE_EC2_INSTANCE_ID": "i-0bbb"}).stdout.split("\n")
+    assert other[:2] == ["-o", f"UserKnownHostsFile={home}/.leerie/.ec2-keys/known_hosts/i-0bbb"]
+
+
+def test_no_instance_id_means_no_known_hosts_override(tmp_path):
+    r = run_bash(f"source {LIB_SH}; ec2_ssh_known_hosts_args; _ec2_ssh_known_hosts_string",
+                 env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "LEERIE_EC2_INSTANCE_ID": ""})
+    assert r.returncode == 0 and r.stdout == ""
