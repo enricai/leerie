@@ -238,6 +238,34 @@ def _declare(env, commands):  # noqa: F811
     spec_path.write_text(json.dumps(spec))
 
 
+def _verification_only_harness(env, monkeypatch, verdict="pass"):  # noqa: F811
+    """Make the subtask verification-only with one `verify` argv and stub
+    the execution, so a no-commits `complete` settles without a conformer
+    (DESIGN §8 *Settled by execution*). Returns the list of executions."""
+    spec_path = env["run_dir"] / "subtasks" / f"{env['sid']}.json"
+    spec = json.loads(spec_path.read_text())
+    spec["verification_only"] = True
+    spec["verify"] = [{"criterion": "it builds",
+                       "argv": ["pnpm", "run", "build"]}]
+    spec_path.write_text(json.dumps(spec))
+    ran: list = []
+
+    async def _exec(subtask, worktree, st, caps, *, sid):
+        ran.append(sid)
+        return {"verdict": verdict, "dirty": [],
+                "why": ("every verify command exited 0" if verdict == "pass"
+                        else "`pnpm run build` exited 1 on 4 run(s)"),
+                "commands": [{"argv": ["pnpm", "run", "build"],
+                              "tail": "build output"}]}
+    monkeypatch.setattr(env["leerie"], "_settle_by_execution", _exec)
+
+    async def _no_probe(*a, **k):
+        raise AssertionError("the HEAD probe must not settle a claim")
+    monkeypatch.setattr(env["leerie"], "_probe_criteria_satisfied_on_head",
+                        _no_probe)
+    return ran
+
+
 def _settle(leerie_mod, env, **caps_overrides):  # noqa: F811
     caps = dict(env["caps"])
     caps.update(caps_overrides)
@@ -251,11 +279,12 @@ def test_unexecuted_declared_command_blocks_after_redrive(
         env, monkeypatch, capsys, stop_on_blocked):  # noqa: F811
     """The full escalation: re-drive with feedback naming the command,
     then convert to `blocked` (never `complete`) when the budget
-    exhausts with the command still unexecuted. Under --stop-on-blocked
-    the N21 accept-blocked remedy is logged at the moment of the status
-    write; by default the log says the subtask will be auto-accepted at
-    wave end instead, and must not tell the operator to run a verb the
-    run no longer waits for."""
+    exhausts with the command still unexecuted — here the subtask has
+    neither commits nor `verification_only`, so it cannot be settled by
+    execution. Under --stop-on-blocked the N21 accept-blocked remedy is
+    logged at the moment of the status write; by default the log says the
+    shared budget re-drives it at wave end, and must not tell the operator
+    to run a verb the run no longer waits for."""
     leerie_mod = env["leerie"]
     env["st"].data["stop_on_blocked"] = stop_on_blocked
     _declare(env, ["pnpm build"])
@@ -283,21 +312,12 @@ def test_unexecuted_declared_command_blocks_after_redrive(
         assert remedy in out
         assert "will be auto-accepted" not in out
     else:
-        assert "will be auto-accepted at wave end" in out
+        assert "re-driven from the shared budget at wave end" in out
         assert remedy not in out
 
 
-def test_empty_handoff_rescue_completes_with_persisted_warning(
-        env, monkeypatch, capsys):  # noqa: F811
-    """The empty_handoff rescue with an unrun declared command settles
-    COMPLETE — blocking would strand the very commits the rescue exists
-    to keep (blocked → accept-blocked marks complete → resume excludes
-    the sid → integrate_wave never merges the branch) — but NEVER
-    silently: the warning is logged and persisted to state, so the skip
-    is visible in the run record."""
+def _rescue_harness(env, monkeypatch, calls):  # noqa: F811
     leerie_mod = env["leerie"]
-    _declare(env, ["pnpm build"])
-    calls: list = []
 
     async def _stub_impl(sid_, leerie_dir, caps, st, models, efforts,
                          continuation=False, note=""):
@@ -316,26 +336,50 @@ def test_empty_handoff_rescue_completes_with_persisted_warning(
     monkeypatch.setattr(leerie_mod, "_branch_has_commits_ahead",
                         _has_commits)
 
-    # The rescued result then flows the NORMAL complete path; settle it
-    # via the HEAD-reprobe rescue (the established harness shape from
-    # test_settle_subtask_branch_coverage.py) so no conformer spawns.
-    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
-                          label="post"):
-        return {"satisfied": True, "evidence": "on the run branch",
-                "checked": ["src.py"]}
-    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
-                        _stub_probe)
+
+def test_empty_handoff_rescue_is_settled_by_execution(
+        env, monkeypatch):  # noqa: F811
+    """The empty_handoff rescue with an unrun declared command used to
+    settle complete on a warning alone. It has commits by construction, so
+    the orchestrator now runs the verify commands itself (DESIGN §8
+    *Settled by execution*): a pass lets the claim stand, once, with no
+    warning left behind and no re-drive."""
+    leerie_mod = env["leerie"]
+    _declare(env, ["pnpm build"])
+    calls: list = []
+    _rescue_harness(env, monkeypatch, calls)
+    ran = _verification_only_harness(env, monkeypatch, verdict="pass")
 
     res = _settle(leerie_mod, env, implementer_confidence_retries=2,
                   failed_retries=0)
 
     assert res["status"] == "complete"
     assert len(calls) == 1  # no re-drive on the rescue path
-    # The skip is persisted in state — value, not key presence.
-    warnings = env["st"].data["declared_unrun_warnings"][env["sid"]]
-    assert len(warnings) == 1 and "pnpm build" in warnings[0]
-    out = capsys.readouterr().out
-    assert "WARNING" in out and "pnpm build" in out
+    # Executed once: the no-commits arm reuses the declared arm's verdict.
+    assert ran == [env["sid"]]
+    assert env["sid"] not in env["st"].data.get(
+        "declared_unrun_warnings", {})
+
+
+def test_empty_handoff_rescue_failing_execution_is_blocked(
+        env, monkeypatch):  # noqa: F811
+    """The rescue's unbacked claim is never accepted on a warning any more:
+    a failing execution ends the attempt `blocked` (the wave-end re-drive
+    is a continuation, which keeps the branch and its commits)."""
+    leerie_mod = env["leerie"]
+    _declare(env, ["pnpm build"])
+    calls: list = []
+    _rescue_harness(env, monkeypatch, calls)
+    _verification_only_harness(env, monkeypatch, verdict="fail")
+
+    res = _settle(leerie_mod, env, implementer_confidence_retries=2,
+                  failed_retries=0)
+
+    assert res["status"] == "blocked"
+    assert "DECLARED_CMD_UNRUN" in res["blocker"]
+    assert "settle by execution" in res["blocker"]
+    assert "declared_unrun_warnings" not in env["st"].data
+    assert len(calls) == 1
 
 
 def test_clean_later_attempt_clears_the_stale_warning(env, monkeypatch):  # noqa: F811
@@ -359,12 +403,7 @@ def test_clean_later_attempt_clears_the_stale_warning(env, monkeypatch):  # noqa
                 **_COMPLETE_RES_EXTRA}
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
 
-    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
-                          label="post"):
-        return {"satisfied": True, "evidence": "on the run branch",
-                "checked": ["src.py"]}
-    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
-                        _stub_probe)
+    _verification_only_harness(env, monkeypatch)
 
     res = _settle(leerie_mod, env, failed_retries=0)
 
@@ -388,12 +427,7 @@ def test_executed_declared_command_settles_complete_without_redrive(
                 **_COMPLETE_RES_EXTRA}
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
 
-    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
-                          label="post"):
-        return {"satisfied": True, "evidence": "on the run branch",
-                "checked": ["src.py"]}
-    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
-                        _stub_probe)
+    _verification_only_harness(env, monkeypatch)
 
     res = _settle(leerie_mod, env, failed_retries=0)
 
@@ -414,12 +448,7 @@ def test_undeclared_subtask_is_untouched(env, monkeypatch):  # noqa: F811
                 **_COMPLETE_RES_EXTRA}
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
 
-    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
-                          label="post"):
-        return {"satisfied": True, "evidence": "on the run branch",
-                "checked": ["src.py"]}
-    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
-                        _stub_probe)
+    _verification_only_harness(env, monkeypatch)
 
     res = _settle(leerie_mod, env, failed_retries=0)
 

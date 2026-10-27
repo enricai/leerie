@@ -221,6 +221,15 @@ if [ "$ROOTLESS" != "true" ] && getent passwd leerie >/dev/null 2>&1; then
   chown -R leerie: /tmp/.cache 2>/dev/null || true
   chmod -R a+rwX /tmp/.cache 2>/dev/null || true
   chmod 1777 /tmp/.cache 2>/dev/null || true
+  # The host-wide build-semaphore dir the launcher mounts (`~/.leerie/.host`;
+  # DESIGN §6 *A host-wide build semaphore*). The orchestrator creates its
+  # slot files there, and rootful's `runuser -u leerie` is a real uid
+  # switch, so it needs literal leerie ownership. Rootless needs nothing:
+  # the host user's dir is outer UID 0, which maps to inner leerie. The dir
+  # only, never -R — slot files are opened read-only, whoever made them.
+  if [ -d /leerie-host ]; then
+    chown leerie: /leerie-host 2>/dev/null || true
+  fi
 fi
 
 # Fly path: idle as PID 1 so the machine stays up. The orchestrator is

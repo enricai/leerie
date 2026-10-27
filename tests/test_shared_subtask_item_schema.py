@@ -23,6 +23,7 @@ def test_planner_subtasks_items_built_by_shared_helper(leerie):
         include_runs_commands=True,
         include_fixes_reported_symptom=True,
         include_change_shape=True,
+        include_verify=True,
     )
     assert json.dumps(items, sort_keys=True) == json.dumps(
         rebuilt, sort_keys=True)
@@ -74,3 +75,23 @@ def test_three_call_sites_are_not_independently_written_literals(leerie):
     assert "fixes_reported_symptom" in planner_props
     assert "fixes_reported_symptom" not in reconciler_props
     assert "fixes_reported_symptom" not in splitter_props
+
+    # Settle by execution: only the planner types per-criterion commands; a
+    # split child or a reconciler bridge never claims verification-only.
+    for field in ("verify", "verification_only"):
+        assert field in planner_props
+        assert field not in reconciler_props
+        assert field not in splitter_props
+
+
+def test_planner_prompt_teaches_the_verify_fields(leerie):
+    """The planner can only emit what its prompt names: both settle-by-
+    execution fields, and the rule that one argv-less criterion makes the
+    subtask not verification-only (DESIGN §8 *Settled by execution*)."""
+    from pathlib import Path
+    text = (Path(leerie.__file__).resolve().parent.parent / "prompts"
+            / "planner.md").read_text()
+    assert "`verify`" in text
+    assert "Set `verification_only: true` ONLY when both hold" in text
+    assert "no entry has\n      an empty `argv`" in text
+    assert '"verification_only": false' in text

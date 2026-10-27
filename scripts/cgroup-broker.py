@@ -45,6 +45,12 @@ Protocol (newline-terminated, one request per connection):
   enroll <sid> <pid>            -> OK | ERR <msg>
   destroy <sid>                 -> OK | ERR <msg>
   stat <sid>                    -> OK <pids.current> <pids.max> <pids.events.max> <memory.events.oom_kill> | ERR <msg>
+  peak <sid>                    -> OK <memory peak bytes> <pids peak> | ERR <msg>
+                                    (read-only; -1 when unreadable. v2 reads
+                                    memory.peak / pids.peak; v1 has no pids
+                                    peak, so it reads memory.max_usage_in_bytes
+                                    and reports -1 for pids — the orchestrator
+                                    polls `stat`'s pids.current instead.)
   slice                         -> OK <leerie.slice memory.max, -1 if unset> <live sibling worker cgroups> <unreclaimable bytes, -1 if unreadable>
                                     (read-only. Used to gate worker admission on
                                     measured slice headroom: slice memory.max
@@ -67,6 +73,13 @@ the literal `/sys/fs/cgroup`, since it's only ever observed on Fly
 (rootful Firecracker), never rootless. The hierarchy is detected once
 at startup and reported by `probe` so the orchestrator's telemetry records
 which path was taken.
+
+Enrollment order is the client's, and it matters: a process's children are
+born in whatever cgroup it is in when it forks, so the orchestrator creates
+the cgroup, starts the process as a gate blocked on a pipe, enrolls the
+gate's pid here, and only then releases it to `exec` the real command
+(DESIGN §6 *Enrollment holds the spawn*). Enrolling after a free-running
+spawn leaked 71 of 72 build descendants on rootful.
 """
 
 import contextlib
@@ -306,6 +319,22 @@ def _v2_destroy(sid: str) -> str | None:
     return _drain_then_rmdir(d, _DESTROY_DRAIN_TIMEOUT_SEC)
 
 
+def _peak_value(path: str) -> int:
+    # A peak file holds one integer; absent (kernel without it) or
+    # unreadable degrades to -1, "unknown", never 0, which would read as a
+    # measured zero.
+    raw = _read(path).strip()
+    try:
+        return int(raw)
+    except ValueError:
+        return -1
+
+
+def _v2_peak(sid: str) -> tuple[int, int]:
+    d = _v2_dir(sid)
+    return (_peak_value(f"{d}/memory.peak"), _peak_value(f"{d}/pids.peak"))
+
+
 def _v2_stat(sid: str) -> tuple[int, int, int, int]:
     d = _v2_dir(sid)
     return (_pids_current(f"{d}/pids.current"),
@@ -354,6 +383,13 @@ def _v1_destroy(sid: str) -> str | None:
         if e is not None and err is None:
             err = e
     return err
+
+
+def _v1_peak(sid: str) -> tuple[int, int]:
+    # v1 keeps a high-water mark for memory only; the pids controller has
+    # none, so the client polls pids.current through `stat`.
+    _pdir, mdir = _v1_dirs(sid)
+    return (_peak_value(f"{mdir}/memory.max_usage_in_bytes"), -1)
 
 
 def _v1_stat(sid: str) -> tuple[int, int, int, int]:
@@ -586,6 +622,7 @@ def _do(verb: str, args: list[str]) -> str:
     enroll = _v2_enroll if _HIER == "v2" else _v1_enroll
     destroy = _v2_destroy if _HIER == "v2" else _v1_destroy
     stat = _v2_stat if _HIER == "v2" else _v1_stat
+    peak = _v2_peak if _HIER == "v2" else _v1_peak
 
     if verb == "create":
         sid, mem, pids = args[0], int(args[1]), int(args[2])
@@ -615,6 +652,12 @@ def _do(verb: str, args: list[str]) -> str:
             return "ERR bad sid"
         cur, mx, ev, oom = stat(sid)
         return f"OK {cur} {mx} {ev} {oom}"
+    if verb == "peak":
+        sid = args[0]
+        if not _valid_sid(sid):
+            return "ERR bad sid"
+        mem_peak, pids_peak = peak(sid)
+        return f"OK {mem_peak} {pids_peak}"
     if verb == "slice":
         return (f"OK {_slice_memory_max()} {_live_sibling_count()} "
                 f"{_slice_unreclaimable()}")

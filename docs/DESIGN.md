@@ -3005,6 +3005,28 @@ combined peak, so no VM size could auto-derive a sufficient cap — every
 build-running worker was cgroup-OOM-killed regardless of host RAM. Any
 cap below the combined peak guarantees the OOM it exists to contain.
 
+**Enrollment holds the spawn.** A cgroup bounds only the processes inside
+it, and a process's children are born in whatever cgroup the process is in
+*when it forks*. Enrolling a worker after spawning it therefore races the
+worker's own first forks: everything forked before the enroll lands stays
+in the container scope, uncapped, for the rest of its life. Measured on a
+`pnpm run build` (bench F4/P5): with enroll-after-spawn on rootful, 71 of
+72 descendants escaped the worker cgroup and 16.4 GiB of RSS sat outside
+it, its `memory.peak` reading 0 — `runuser` forks before a 65 ms enroll
+lands; rootless lost 1 of 70. So every process leerie enrolls — each
+worker, and each command the orchestrator runs inside a cgroup — is
+spawned **held**: the cgroup is created first, the process starts as a
+tiny gate that blocks reading one byte from a pipe, the gate's pid is
+enrolled, and only then is the byte written and the gate `exec`s the real
+command. `exec` keeps the pid and the cgroup, and nothing has forked
+before it, so every descendant inherits the cgroup. Measured: 0 escapes
+in every held run (rootless and rootful), and `memory.peak` within 1.5%
+of a whole-container measurement. The per-worker failure policy is
+unchanged: an enroll the broker rejects still releases the gate and the
+worker runs uncapped (the run-level gate below is the fail-closed one);
+an orchestrator that is cancelled before the release closes the pipe
+instead, and the gate exits without running anything.
+
 **Reap the worker's own subprocesses before destroying its cgroup.** The
 `finally` that tears a worker down calls
 `descendant_tracker.stop_and_reap()` *before* `_cgroup_destroy()`.
@@ -3063,6 +3085,52 @@ headroom, but the build peak outranks it: on a slice too small to honour
 both, a `memory.max` above the slice is harmless (the aggregate cap binds
 first) while one below the build peak guarantees the OOM. Being
 load-independent is what makes resolving it once, at startup, correct.
+
+**The repo's own build peak, measured, raises the ceiling.** The constant
+above is one Next.js measurement; a repo whose build is heavier OOMs at it
+however large the host. The base-health baseline (§9) already runs the
+repo's build and test commands once, so it runs each inside its own
+uncapped measurement cgroup (spawn-held, above) and reads the cgroup's
+`memory.peak` and `pids.peak` through the broker (cgroup v1 has no
+`pids.peak`: `memory.max_usage_in_bytes` and a polled `pids.current`
+stand in). From the largest peak the run raises the per-worker ceiling to
+`max(ceiling, 1.25 × peak + 0.3 GiB)` and the PID cap to `max(pids cap,
+⌈1.5 × pids peak⌉)` (2048 is the default floor). Benched on a funeralworks
+build peaking at 17.81 GiB / 2852 PIDs: a 22.56 GiB / 4278-PID ceiling ran
+every build to completion with no OOM (6 of 6 under the semaphore below,
+and the rootful capped run: peak 13.9 GiB, 2767 PIDs), where the
+constant-derived 9.85 GiB ceiling sat 8 GiB below the measured peak. The
+peak is persisted, so a resumed run re-applies it.
+
+**A host-wide build semaphore, not admission by reservation.** Two runs
+each admitting three such builds at once took the host to global reclaim
+thrash: 0 of 6 finished in 1078 s and one was OOM-killed, because each
+admission check passes before the builds it admitted have ramped (bench
+F4/P4 arm D). The same six builds through a flock semaphore finished 6 of
+6 in 562 s (arm S). So the commands that are themselves build or test
+runs — the orchestrator's own BLT measurements and B\* reruns, and a
+settle-by-execution command that is the repo's build or test command —
+take a slot first: `⌊(MemAvailable − 4 GiB) / peak⌋` slots, sized when the
+peak is measured and never fewer than one, so a build too large for the
+host still runs alone rather than deadlocking. Before a peak is known the
+measured-constant build peak sizes it. The slots are lock files in a host
+directory the launcher creates and mounts into every run's container
+(`~/.leerie/.host` → `/leerie-host`), so runs of different repos share
+one count; the kernel drops a slot when its holder dies, even on SIGKILL.
+Workers are never gated as a whole — only these commands. Ownership
+follows the runtime rule (§6 *Rootless exception*): rootless sees the
+host user's directory as its own (outer UID 0 → inner leerie), rootful's
+entry guard `chown`s it to leerie, and the slot files are opened
+read-only (`flock` needs no write access), so a slot another identity
+created still locks. Where no such mount exists (Fly, EC2 — one run per
+machine) the slots live under the state root, which is host-wide there.
+
+**At the measured ceiling, a resource kill is an environment limit.** Once
+the ceiling is the measured one, a worker OOM-killed or PID-exhausted
+inside its cgroup is not a worker mistake a fresh attempt fixes; it is
+typed `environment_limit`, retried in place once, and then settled
+`unconverged` (§13 *One re-drive budget per subtask*), as is a
+settle-by-execution command killed the same way.
 
 **A repo can declare its own memory needs, and the ceiling must honour
 them.** Node 20+ sizes its heap from the container it finds itself in,
@@ -5408,9 +5476,9 @@ sufficient, because the alternative there was dying, not planning.
 `--skip-satisfied-check` suppresses this consumer along with the phase-3
 pre-schedule sweep — one flag governs both already-satisfied *prunes*.
 Two adjacent mechanisms are deliberately outside that flag's scope: the
-post-execution HEAD-probe *rescues* (which settle work, never delete it,
-so skipping them would only re-create the retry-cap failure they exist
-to prevent), and `--skip-classification-check`, which suppresses this
+post-execution settles by execution (§8 *Settled by execution*, which
+settle work, never delete it, so skipping them would only re-create the
+retry-cap failure they exist to prevent), and `--skip-classification-check`, which suppresses this
 consumer as a side effect — the gate it hooks never runs — as does a
 `classification_judge` that crashes every round.
 
@@ -5558,8 +5626,9 @@ dozen items and beyond) can again exhaust the cap and skip the gate
 — an accepted, bounded residual, preferred over an uncapped budget.
 The same failure hit the satisfied-probe
 (§ *satisfied-probe* below). Both of its call sites judge the same
-single criterion (the HEAD-probe helper — serving the no-commit
-rescue and the provider-subset pre-spawn check — sends the same one
+single criterion (the HEAD-probe helper — serving the provider-subset
+pre-spawn check, and until settle-by-execution replaced it the no-commit
+rescue — sends the same one
 `success_criteria_seed` payload the pre-schedule probe sends); what
 balloons the cost, at either site, is a criterion that is met or
 audit-shaped on the judged tree, because a probe cannot say
@@ -5887,32 +5956,66 @@ the time it runs, its work is already on the run branch — it reports
 retry reproduces the identical no-op deterministically until the retry cap
 exhausts and the wave dies.
 
-The resolution is the post-execution analogue: on a no-commits result,
-before failing, the orchestrator re-runs the satisfied-probe against
-`success_criteria_seed` on the **run-branch HEAD** (which *does* contain the
-sibling's commit). If met there, the subtask settles as satisfied (recorded
-as `already_satisfied_mid_run`) rather than routed to the retry cap; a
-genuinely unsatisfied probe leaves the existing retryable-failure path
-unchanged. The base-tree-only-vs-HEAD distinction is deliberate: the
-pre-schedule probe must not span history, while the post-execution probe
-measures against exactly the ref the commit-presence gate uses
-(`_compute_run_branch`).
+The resolution used to be a post-execution satisfied-probe on the
+run-branch HEAD, settling the subtask complete when a reader judged its
+criteria met there. That is an LLM accepting a worker's unbacked claim,
+and it did so wrongly: on the 22 no-commit and unrun-declared-command
+settles sampled from the corpus (bench E4/d4, ground truth by hand), the
+read-and-accept rule settled `e33` complete although its required test
+case was never written.
 
-**Scope: sibling-committed *or* base-tree-already-satisfied.** The probe
-judges *whether* criteria are met on HEAD, not *who* met them, so this
-rescue also covers a subtask satisfied on the seeded base whose pre-schedule
-probe was skipped or false-negatived. That's intended: such a subtask is
-legitimately complete regardless of provenance.
+**Settled by execution (E4).** The planner now types, per success
+criterion, the command that decides it — `verify: [{criterion, argv}]`,
+one entry per criterion, `argv` empty for a criterion no command checks —
+and `verification_only`, true only when the subtask writes nothing and
+every criterion is decided by its command. Code holds the planner to the
+second half: `verification_only` counts only when every `verify` entry
+carries an argv. Where a worker's claim is unbacked, the orchestrator
+decides by running the commands itself, instead of asking a reader:
 
-**Probing a flagged subtask before it spends.** The rescue above is correct
-but wasteful in ordering: `_warn_provider_subset_subtasks` (§5
+- a **verification-only** subtask with no commits, and
+- a subtask with **its own commits** whose declared commands its worker
+  never ran (§9 *A declared command must also have been executed*),
+
+are settled by executing each `argv` — never through `bash -c`, so a path
+like `src/app/[locale]/…` is a literal argument — in the subtask's
+worktree, as `leerie`, inside a capped broker cgroup, spawn-held (§6). A
+command passes on exit 0; a command that fails is re-checked under B\*
+(§9 *Which failures are new*: the host-pressure gate, then up to
+`confirm_pairs` reruns, any exit 0 passing it as `resource_affected`).
+The settle needs every command to pass and the worktree's tracked files
+to be unchanged afterwards (a command that rewrites tracked files has not
+verified the tree it ran on; the change is reverted). Command output is
+data — it is logged, and only a tail ever reaches a worker, fenced as
+untrusted output in a re-drive note, never as instructions. Every other
+unbacked claim — a no-commit subtask that is not verification-only, a
+failed execution, an unrun declared command with no `verify` argv — is
+re-driven from the shared budget (§13) and settles `unconverged` when the
+budget is spent. A command killed by its cgroup at the measured ceiling is
+`environment_limit` and settles `unconverged` without a re-drive (§6).
+
+Benched (E4/d4, the same 22 cases): execution with the verification-only
+or own-commits rule made 0 false settles; its 4 misses (`e163`, `e165`,
+`e78`, `e90`) were all re-drives of work that was in fact met, which
+costs a round, not correctness. The planner's `verification_only` label
+(bench E4-LABEL) was true on 0 of 38 subtasks that must write something
+and on 0 of 6 mixed ones, and on all 18 strict verification subtasks. The
+one first-run build failure in the sample (`e20`, a Next build that exits 1
+once and passes on rerun) is exactly what the re-check absorbs. On rootful
+the five rerun cases settled identically to rootless (bench P5, 5/5).
+The pre-spawn probe of a provider-subset subtask (below) is unchanged: it
+spends a read-only probe to avoid an implementer, and never overrides a
+worker's claim.
+
+**Probing a flagged subtask before it spends.** Settling a no-op only after
+its implementer has run is wasteful in ordering: `_warn_provider_subset_subtasks` (§5
 *Provider-subset subtasks*) already flags, at plan time, every subtask whose
 entire `files_likely_touched` surface belongs to an ordered predecessor —
 measured always right and inert (a run's three flagged subtasks all ran a
-full implementer and committed nothing; twelve corpus-wide reached this
-rescue only after their whole spend). So the flagged sids are persisted
-(`provider_subset_sids`) and `_settle_subtask` runs the same HEAD probe
-against staging *before* spawning the implementer — staging sits at
+full implementer and committed nothing; twelve corpus-wide reached the
+post-execution settle only after their whole spend). So the flagged sids are persisted
+(`provider_subset_sids`) and `_settle_subtask` runs the satisfied-probe on
+HEAD against staging *before* spawning the implementer — staging sits at
 run-branch HEAD, and a provider-subset predecessor is by construction
 already merged there. A hit settles on one read-only probe instead of a
 full implementer (one run's three cost ≈18 worker-minutes/≈$2.6 combined). A
@@ -5923,8 +6026,8 @@ file) and the decision stays the probe's, judged against a real tree; only
 
 **A settle without an implementer still owes the wave a branch.**
 `integrate_wave` filters only on `status == "complete"`, never on whether
-`leerie/subtasks/<run-id>/<sid>` exists. The post-execution rescue is safe
-because its implementer ran and created the branch (zero commits, a true
+`leerie/subtasks/<run-id>/<sid>` exists. A post-execution settle
+(settled by execution, above) is safe because its implementer ran and created the branch (zero commits, a true
 `git merge --no-ff` no-op). The pre-spawn probe returns *before*
 `_run_implementer`, so no branch exists and `integrate.sh` exits 2 on every
 probe hit. So the pre-spawn path creates the branch itself, at the
@@ -6500,24 +6603,26 @@ case for each is the re-drive round then the blocked terminal,
 adjudicated by the operator via `accept-blocked`. A miss first re-drives
 the implementer through the existing mechanical-check feedback loop —
 forgetting to run a declared command is exactly the "retryable mistake"
-shape that loop exists for — and when the confidence-retry budget
-exhausts with the command still unexecuted the
-subtask settles **`blocked`**, naming the command, feeding the existing
-`accept-blocked` escape hatch. That
-terminal is deliberate: a command that cannot run in-container (a live
-site, credentials, an absent fixture) is precisely the
-external-precondition case `accept-blocked` exists to adjudicate, and the
-one thing the run must never do is what it measurably did — settle
-`complete` on a verification it *silently* skipped. One path deliberately
-does not block: a result rescued from `empty_handoff` (§6 *Detecting
-memory OOM* — the worker was reaped mid-turn with
-committed work). Blocking there would strand the very commits the rescue
-exists to keep: `accept-blocked` marks the sid complete, resume then
-excludes it from the remaining set, and integration — which reads
-results, not branches — never merges it. So the rescue settles complete
-with the unrun-command warning logged loudly and persisted to state
-(`declared_unrun_warnings`), which is what keeps the skip visible in the
-run record: not silent, and not stranded. The check binds only
+shape that loop exists for. When the confidence-retry budget exhausts
+with the command still unexecuted, and the subtask has its own commits or
+is verification-only, the orchestrator runs the subtask's typed `verify`
+argvs itself (§8 *Settled by execution*): a pass settles the claim on the
+orchestrator's own execution, not the worker's word. Otherwise — no
+`verify` argv, a failing execution, or neither commits nor
+verification-only — the subtask settles **`blocked`**, naming the
+command, and the wave-end re-drive takes it from the shared budget (§13),
+ending `unconverged` when that is spent. The one thing the run must never
+do is what it measurably did — settle `complete` on a verification it
+*silently* skipped. A result rescued from `empty_handoff` (§6 *Detecting
+memory OOM* — the worker was reaped mid-turn with committed work) used to
+settle complete with only a warning, because blocking it stranded its
+commits behind `accept-blocked`. It has commits by construction, so it is
+now settled the same way: a passing execution settles it complete; an
+unsettled one is re-driven as a continuation, which keeps the branch and
+its commits, and a spent budget ends it `unconverged` — reported, never
+silently merged as done. The warning record that rescue wrote
+(`declared_unrun_warnings`) is therefore no longer written; finalize still
+surfaces one a run recorded before this change. The check binds only
 where the field is populated (under 5% of subtasks), but
 `_repair_prescribed_commands` above makes prescribed commands
 always-declared, so the two halves together close the loop: plan-level
@@ -8110,7 +8215,9 @@ multiplied: a completeness re-drive inside one settle, then a fresh settle on
 **one persisted counter per subtask**, `redrive_rounds[sid]`, capped by
 `subtask_redrive_rounds` (2): the completeness gate's re-drive and the
 wave-end re-drive of a `blocked` subtask take from the same counter, as will
-every later re-drive kind. The per-attempt budgets (`failed_retries`,
+every later re-drive kind. An unbacked claim settle-by-execution cannot
+settle (§8 *Settled by execution*) ends its attempt `blocked` and so enters
+through the wave-end re-drive. The per-attempt budgets (`failed_retries`,
 `implementer_confidence_retries`, `subtask_continuations`) still bound one
 attempt; they are not re-drives. A run-level `redrive_budget_sec` (14,400 s)
 of re-drive wall time is the hard stop — measured per wave as the longest

@@ -10,12 +10,13 @@ see the sibling's mid-run commit. A retry reproduces the identical no-op (the
 work exists on the branch the subtask is measured against), the retry cap is
 exhausted, and the wave dies — a deterministic loop that repeats on `resume`.
 
-The fix (`_settle_subtask`): before failing a no-commits `complete`, re-run the
-`satisfied_probe` against the subtask's `success_criteria_seed` on the
-run-branch HEAD via `_probe_criteria_satisfied_on_head`. If satisfied, settle
-`complete` (recorded in `dropped_subtasks` with reason
-`already_satisfied_mid_run`); if not, the existing `no_commits` retry path is
-unchanged.
+The first fix re-ran the `satisfied_probe` on the run-branch HEAD and settled
+`complete` when it judged the criteria met. Settle-by-execution replaced that
+override (DESIGN §8 *Settled by execution*): a verification-only subtask is
+settled by running its `verify` commands, every other no-commits claim is
+re-driven from the shared budget. `_probe_criteria_satisfied_on_head` now
+serves only the pre-spawn provider-subset check, whose contract the helper
+tests below still pin.
 
 These tests pin the helper's contract (stubbed `claude_p`, mirroring
 test_filter_satisfied_subtasks.py) and source-couple the settle wiring
@@ -178,69 +179,52 @@ def test_budget_exhaustion_propagates(leerie, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestSettleWiring:
-    def test_settle_calls_head_reprobe_on_no_commits(self, leerie):
-        src = inspect.getsource(leerie._settle_subtask)
-        assert "_probe_criteria_satisfied_on_head(" in src
+    """The post-execution no-commits settle is decided by EXECUTION now,
+    not by this probe (DESIGN §8 *Settled by execution*): the probe helper
+    above serves only the pre-spawn provider-subset check. The behavioural
+    half lives in tests/test_settle_subtask_branch_coverage.py and
+    tests/test_settle_by_execution.py; these guards pin where each call
+    sits."""
 
     @staticmethod
-    def _rescue_probe_idx(src: str) -> int:
-        """Index of the POST-EXECUTION rescue's probe call.
+    def _no_commits_region(src: str) -> str:
+        start = src.find("if commit_err")
+        assert start != -1, "the no-commits branch is missing"
+        end = src.find("# uncommitted changes", start)
+        assert end != -1
+        return src[start:end]
 
-        There are two probe call sites since the pre-spawn probe of a
-        plan-time-flagged provider-subset subtask landed (DESIGN §8 *Probing a
-        flagged subtask before it spends*), and that one is textually first —
-        a bare `find` silently retargets these guards onto it, where the
-        assertions below are all trivially true. Anchor on the `commit_err`
-        branch instead, which is the rescue's defining guard."""
-        commit_branch = src.find("if commit_err")
-        assert commit_branch != -1, "the no-commits branch is missing"
-        idx = src.find("_probe_criteria_satisfied_on_head(", commit_branch)
-        assert idx != -1, "the rescue probe must live on the commit_err branch"
-        return idx
+    def test_no_commits_branch_never_asks_the_head_probe(self, leerie):
+        region = self._no_commits_region(
+            inspect.getsource(leerie._settle_subtask))
+        assert "_probe_criteria_satisfied_on_head(" not in region
 
-    def test_reprobe_precedes_the_fail_call(self, leerie):
-        """The HEAD re-probe must run BEFORE the no-commits fail() — fail()
-        burns the retry cap and eventually kills the wave, exactly the loop
-        the rescue prevents. Guard against the FIRST fail() at or after the
-        probe (the commit-path fail), since an earlier empty_handoff fail()
-        also exists above the probe."""
+    def test_no_commits_branch_executes_only_verification_only(self, leerie):
+        region = self._no_commits_region(
+            inspect.getsource(leerie._settle_subtask))
+        gate = region.find("if _verification_only(subtask):")
+        call = region.find("_settle_by_execution(")
+        assert gate != -1 and call != -1 and gate < call
+
+    def test_the_head_probe_survives_only_before_the_implementer(self,
+                                                                 leerie):
+        """One call site remains: the pre-spawn probe, which precedes the
+        first `_run_implementer` call."""
         src = inspect.getsource(leerie._settle_subtask)
-        probe_idx = self._rescue_probe_idx(src)
-        fail_after = src.find("done = await fail(kind, message)", probe_idx)
-        assert fail_after != -1, "the commit-path fail() must follow the probe"
-        assert probe_idx < fail_after
+        calls = [i for i in range(len(src))
+                 if src.startswith("_probe_criteria_satisfied_on_head(", i)]
+        assert len(calls) == 1
+        assert calls[0] < src.find("await _run_implementer(")
 
-    def test_reprobe_gated_on_no_commits_not_empty_handoff(self, leerie):
-        """The re-probe lives on the check_branch_has_commits (`commit_err`)
-        branch, distinct from the empty_handoff rescue above it."""
-        src = inspect.getsource(leerie._settle_subtask)
-        probe_idx = self._rescue_probe_idx(src)
-        # the nearest guard above the probe is the `if commit_err ...` branch
-        region = src[:probe_idx]
-        last_if = region.rfind("if commit_err")
-        assert last_if != -1 and last_if < probe_idx
+    def test_execution_settle_goes_through_the_shared_helper(self, leerie):
+        region = self._no_commits_region(
+            inspect.getsource(leerie._settle_subtask))
+        assert "_settle_already_satisfied(" in region
+        assert '"reason": "settled_by_execution"' in region
 
     @staticmethod
     def _rescue_region(leerie):
-        """The settle the rescue performs.
-
-        This used to be a slice of `_settle_subtask` between the probe call
-        and the rescued return. The same settle is now reached from a second
-        site — the pre-spawn probe of a plan-time-flagged provider-subset
-        subtask (DESIGN §8 *Probing a flagged subtask before it spends*) — so
-        it lives in `_settle_already_satisfied` and both callers share it.
-        These guards follow the code they guard; what they assert is
-        unchanged."""
         return inspect.getsource(leerie._settle_already_satisfied)
-
-    def test_rescue_settles_through_the_shared_helper(self, leerie):
-        """The rescue must not re-implement the settle inline: a second copy
-        of these state writes is exactly how one site loses the conformance
-        sentinel the other has."""
-        src = inspect.getsource(leerie._settle_subtask)
-        probe_idx = self._rescue_probe_idx(src)
-        assert src.find("_settle_already_satisfied(", probe_idx) != -1, (
-            "the rescued path must return through the shared settle helper")
 
     def test_rescued_result_is_complete_with_drop_record(self, leerie):
         region = self._rescue_region(leerie)
@@ -248,14 +232,12 @@ class TestSettleWiring:
         assert 'return {"subtask_id": sid, "status": "complete"' in region
 
     def test_rescue_writes_conformance_sentinel(self, leerie):
-        """The rescue early-returns before the normal conformance block, so it
-        must write a `conformance[sid]` sentinel itself — otherwise
+        """The settle early-returns before the normal conformance block, so
+        it must write a `conformance[sid]` sentinel itself — otherwise
         `_get_progress` (which keys `in_conformer` on a missing conformance
-        entry for a `complete` subtask) would count the rescued subtask as
+        entry for a `complete` subtask) would count the subtask as
         perpetually in-conformer."""
         region = self._rescue_region(leerie)
-        assert 'setdefault("conformance", {})[sid]' in region, \
-            "rescue must write a conformance sentinel before returning"
         conf_idx = region.find('setdefault("conformance", {})[sid]')
         ret_idx = region.find('return {"subtask_id": sid, "status": "complete"')
         assert conf_idx != -1 and ret_idx != -1 and conf_idx < ret_idx

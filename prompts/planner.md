@@ -163,6 +163,33 @@ The orchestrator gives you, in your prompt:
    Name the specific test files a subtask should run instead. (The
    orchestrator also removes such entries mechanically; this is why.)
 
+   **Type how each success criterion is checked: `verify` and
+   `verification_only`.** For every criterion in `success_criteria_seed`,
+   add one `verify` entry: `criterion` names it, and `argv` is the exact
+   command that decides it, split into arguments as it would be exec'd —
+   e.g. `["pnpm", "vitest", "run", "src/app/[locale]/page.test.ts"]`. No
+   shell: no `&&`, pipes, redirections or `cd` (the orchestrator runs the
+   argv itself in the subtask's worktree, so a path with brackets is just
+   an argument). A criterion no command decides — one checked by reading
+   code, inspecting output, or confirming content exists — still gets an
+   entry, with `argv: []`. Every command in `runs_commands` should also
+   appear as some entry's `argv`.
+
+   Set `verification_only: true` ONLY when both hold:
+   1. every criterion is met exactly when its `argv` exits 0 — no entry has
+      an empty `argv`;
+   2. the subtask is not asked to add, write, extend, register or update
+      anything (no new test or test case, no translation key, no docs, no
+      registry entry, no feature or fix). Fixing whatever those commands
+      report as failing is allowed; anything they do not themselves check
+      is not.
+
+   Otherwise set it `false`. The orchestrator settles a
+   `verification_only` subtask that commits nothing by running its `verify`
+   commands: a `false` on a pure verification subtask only costs a re-run
+   of its worker, while a `true` on a subtask that must write something
+   lets unwritten work settle as done. When unsure, choose `false`.
+
    **Set `change_shape` on every subtask.** Required — there is no default.
    It declares how many places in the code this subtask actually edits:
 
@@ -630,6 +657,12 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "success_criteria_seed": "The concrete checkable condition; an automated test where possible.",
       "size": "small | medium",
       "change_shape": "point | localized | sweep",
+      "verify": [
+        {"criterion": "the regression test for the timeout passes",
+         "argv": ["pytest", "tests/test_timeout.py"]},
+        {"criterion": "the retry path logs the cause", "argv": []}
+      ],
+      "verification_only": false,
       "investigation_notes": "What you found that materially helps the implementer.",
       "migration_targets": [
         {"old_pattern": "<literal symbol grepped from this repo>",

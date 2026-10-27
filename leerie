@@ -7503,7 +7503,8 @@ mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/cargo" \
          "$HOME/.cache/leerie/corepack" \
          "$HOME/.cache/leerie/bundle" \
-         "$LEERIE_STATE_HOST_DIR"
+         "$LEERIE_STATE_HOST_DIR" \
+         "$HOME/.leerie/.host"
 
 CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
@@ -8939,6 +8940,13 @@ else
     # the answer; nothing carried it across.
     -e "LEERIE_STATE_HOST_DIR_DISPLAY=${LEERIE_STATE_HOST_DIR:-}"
     ${_leerie_env_args[@]+"${_leerie_env_args[@]}"}
+    # Host-wide directory shared by every run on this host, whatever the
+    # repo: the build-class semaphore's slot files live here (DESIGN §6 *A
+    # host-wide build semaphore*). After the LEERIE_* forward so a host value
+    # of the same name cannot repoint it. Ownership: rootless sees this
+    # host-user dir as its own; rootful's entry guard chowns it to leerie.
+    -v "$HOME/.leerie/.host:/leerie-host"
+    -e LEERIE_HOST_DIR=/leerie-host
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host
     ${ROOTLESS_SECOPT[@]+"${ROOTLESS_SECOPT[@]}"}

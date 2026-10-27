@@ -314,6 +314,17 @@ def _fresh_head_acceptance_results(leerie, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _fresh_cgroup_probe(leerie, monkeypatch):
+    """Give every test an unprobed broker: `_cgroup_probe` memoizes into
+    module globals, and the base-health baseline's peak measurement now
+    probes (DESIGN §6 *The repo's own build peak*) — on a host with no
+    broker one test's `False` would otherwise answer every later test's
+    probe."""
+    monkeypatch.setattr(leerie, "_CGROUP_PROBE_RESULT", None)
+    monkeypatch.setattr(leerie, "_CGROUP_HIERARCHY", None)
+
+
+@pytest.fixture(autouse=True)
 def _no_real_planning_worktree(request, monkeypatch):
     """Keep `_ensure_planning_worktree` from shelling out to real git.
 

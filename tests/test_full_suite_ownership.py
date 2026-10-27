@@ -590,11 +590,13 @@ class TestHostileRepoFiles:
 # ---------------------------------------------------------------------------
 
 from tests.test_declared_commands_executed import (  # noqa: E402
-    _COMPLETE_RES_EXTRA, _declare, _settle, _write_worker_log)
+    _COMPLETE_RES_EXTRA, _declare, _settle, _verification_only_harness,
+    _write_worker_log)
 from tests.test_oom_naming import env  # noqa: E402,F401  (pytest fixture)
 
 
-def _settle_env(env, monkeypatch, *, declared, prescribed=None):  # noqa: F811
+def _settle_env(env, monkeypatch, *, declared, prescribed=None,
+                settle_by_execution=False):  # noqa: F811
     leerie_mod = env["leerie"]
     repo = env["repo"]
     (repo / ".leerie").mkdir(exist_ok=True)
@@ -615,12 +617,12 @@ def _settle_env(env, monkeypatch, *, declared, prescribed=None):  # noqa: F811
                 **_COMPLETE_RES_EXTRA}
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub_impl)
 
-    async def _stub_probe(subtask, worktree_, st, caps, models, efforts,
-                          label="post"):
-        return {"satisfied": True, "evidence": "on the run branch",
-                "checked": ["src.py"]}
-    monkeypatch.setattr(leerie_mod, "_probe_criteria_satisfied_on_head",
-                        _stub_probe)
+    if settle_by_execution:
+        # Settle the no-commits claim by (stubbed) execution so no conformer
+        # spawns (DESIGN §8 *Settled by execution*). The controls leave it
+        # off: with neither commits nor `verification_only`, an unrun
+        # declared command can only block.
+        _verification_only_harness(env, monkeypatch)
     res = _settle(leerie_mod, env, failed_retries=0,
                   implementer_confidence_retries=1)
     return res, calls
@@ -632,7 +634,8 @@ def test_settle_exempts_a_denied_declared_command(
     complete on targeted runs alone, with no corrective re-drive."""
     res, calls = _settle_env(
         env, monkeypatch,
-        declared=["pytest tests/", "python3 -m pytest tests/test_x.py -q"])
+        declared=["pytest tests/", "python3 -m pytest tests/test_x.py -q"],
+        settle_by_execution=True)
     assert res["status"] == "complete"
     assert len(calls) == 1
 

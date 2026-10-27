@@ -5407,3 +5407,53 @@ decider requires — an AST pin that it is the only writer of `outcome`, the
 empty-branch `_finish_no_work_run` exit, and an execution of
 `phase_finalize` recording the outcome in `run.json`).
 `tests/test_host_finalize_sh.py` pins `--draft` on `unconverged` only.
+
+## Settle by execution, spawn-held enrollment and measured sizing
+
+`tests/test_settle_by_execution.py` drives the real `_settle_by_execution`
+(DESIGN §8 *Settled by execution*) in a real git worktree with real child
+processes, the broker and the pressure gate stubbed: the
+`verification_only` truth table (one argv-less criterion refuses the label),
+a bracketed path reaching the command as a literal argument (paired with a
+`bash -c` control that glob-expands it), a failure re-checked
+`confirm_pairs` times (escalated on a gate timeout), a flaky failure passing
+as `resource_affected`, a command that rewrites a tracked file failing and
+being reverted, a dirty worktree never run over, a cgroup kill at the
+measured ceiling typed `environment_limit` without a re-check (an ordinary
+failure below it), only build/test argvs taking a build slot, and the
+re-drive blocker fencing output as data. The `_settle_subtask` arms are
+executed in `tests/test_settle_subtask_branch_coverage.py` (verification-only
+no-commits settles by execution; a failing execution or a
+non-verification-only claim is `blocked` for the shared budget, the HEAD
+probe never asked) and `tests/test_declared_commands_executed.py` (the
+`empty_handoff` rescue settles by execution once, or is blocked — the
+warning-only settle was rewritten). The wiring guards in
+`tests/test_mid_run_satisfied_no_commits.py` were rewritten to the new
+placement: the HEAD probe survives only before the implementer.
+
+`tests/test_spawn_held_enrollment.py` spawns real processes through
+`_run_streaming`: at the moment the broker would enroll, after a pause long
+enough for an unheld child to have finished, the command has not run; the
+enrolled pid is the command's own; an interrupted enroll never runs it; the
+gate refuses anything but the release byte. `_invoke` is executed with the
+spawn mocked: create, spawn (the worker argv behind the gate, its read end in
+`pass_fds`), enroll, release — in that order — and a failed spawn destroys the
+pre-created cgroup. An AST-level guard pins `_invoke` and `_run_streaming` as
+the only enrollment sites.
+
+`tests/test_build_peak_sizing.py` covers F1 sizing: the benched funeralworks
+peak (17.81 GiB / 2852 PIDs) yields the benched 22.56 GiB / 4278-PID caps;
+caps only rise; the slot count floors at one; slots are shared through the
+host directory, a slot held by another process makes the acquirer wait until
+that process is killed, a read-only slot file still locks; only the build and
+tests axes take a slot; the baseline measures every axis uncapped and raises
+the caps, and a resumed baseline re-applies without re-measuring; and the
+environment-limit retry-then-unconverged. Its rootless-shape test (an
+`unshare --user --map-user` child locking a slot in the outer user's
+directory) skips where unprivileged user namespaces are disabled.
+`tests/test_host_dir_ownership.py` pins the `.host` mount: the launcher
+creates and mounts it after the `LEERIE_*` forward, and the real rootful
+guard, executed with `chown` faked, chowns `/leerie-host` (the directory
+only) under rootful and nothing under rootless. `tests/test_cgroup_broker.py`
+and `tests/test_broker_wire_contract.py` cover the broker's `peak` verb and
+its parse in `_cgroup_peak`.

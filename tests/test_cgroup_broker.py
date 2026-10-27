@@ -419,6 +419,32 @@ def _seed_pids_files(broker, sid, current, maxval, events_max, oom_kill=0):
     return d
 
 
+def test_peak_reads_v2_high_water_marks(broker):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-wsid"
+    d.mkdir(parents=True)
+    (d / "memory.peak").write_text("19123456789\n")
+    (d / "pids.peak").write_text("2852\n")
+    assert broker._handle("peak wsid") == "OK 19123456789 2852"
+
+
+def test_peak_unreadable_is_minus_one_not_zero(broker):
+    """A kernel without the files (or a cgroup already gone) reports -1 —
+    "unknown" — never 0, which would read as a measured zero."""
+    assert broker._handle("peak ghost") == "OK -1 -1"
+
+
+def test_peak_v1_reads_max_usage_and_has_no_pids_peak(broker, monkeypatch):
+    monkeypatch.setattr(broker, "_HIER", "v1")
+    mdir = Path(broker.V2_ROOT) / "memory" / broker.SLICE / "leerie-w-wsid"
+    mdir.mkdir(parents=True)
+    (mdir / "memory.max_usage_in_bytes").write_text("7340032\n")
+    assert broker._handle("peak wsid") == "OK 7340032 -1"
+
+
+def test_peak_rejects_bad_sid(broker):
+    assert broker._handle("peak ../evil") == "ERR bad sid"
+
+
 def test_stat_reads_v2_counters(broker):
     _seed_pids_files(broker, "wsid", current=256, maxval=256, events_max=42)
     assert broker._handle("stat wsid") == "OK 256 256 42 0"

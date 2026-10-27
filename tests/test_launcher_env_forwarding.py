@@ -103,6 +103,7 @@ set -euo pipefail
 USER_REPO=/Users/andres/src/enric/sibling-service
 LEERIE_REPO=/opt/leerie
 LEERIE_STATE_HOST_DIR=/tmp/state
+HOME=/home/test
 TTY_FLAGS=""
 _cidfile=/tmp/cid
 REPO_IMAGE_TAG=""
