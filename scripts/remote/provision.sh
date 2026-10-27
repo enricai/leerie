@@ -225,8 +225,10 @@ decide_teardown() {
   # provision_machine/resume_machine replaced the launcher's EXIT trap with
   # this function, which dropped the launcher's own duty to kill the $STAGE
   # keepalive and remove $STAGE (staged ~/.ssh, ~/.aws, Claude credentials).
-  # The launcher defines the hook; standalone callers don't.
-  if declare -F _remote_launcher_exit_cleanup >/dev/null 2>&1; then
+  # Exit pass only (`decide_teardown exit`): an INT/TERM pass can be
+  # survived, and the rest of the run still needs $STAGE. The launcher
+  # defines the hook; standalone callers don't.
+  if [ "${1:-}" = "exit" ] && declare -F _remote_launcher_exit_cleanup >/dev/null 2>&1; then
     _remote_launcher_exit_cleanup
   fi
   return "$_rc"
@@ -725,7 +727,10 @@ provision_machine() {
   # or any error after this point cannot leak the machine. decide_teardown
   # classifies $LEERIE_REMOTE_EXIT_RC and dispatches to stop or destroy.
   # shellcheck disable=SC2064
-  trap 'decide_teardown' EXIT INT TERM
+  # EXIT passes `exit` so only that pass runs the launcher's STAGE cleanup;
+  # the launcher can survive an INT/TERM pass and still needs $STAGE.
+  trap 'decide_teardown exit' EXIT
+  trap 'decide_teardown' INT TERM
 
   # Persist fly_machine_id to the run sidecar immediately so a launcher
   # crash before classification still leaves a recoverable pointer.

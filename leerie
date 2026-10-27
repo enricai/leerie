@@ -2258,8 +2258,8 @@ print(f"ACCEPTED: {sid!r} status changed from {cur!r} to complete "
 '
     if [ "$_ab_runtime" = "ec2" ]; then
       # EC2 counterpart of the Fly branch below: wake the instance if it
-      # is stopped, mutate state.json over SSM (ec2_remote_exec — no ssh
-      # keypair / hallpass wait needed, unlike Fly), mirror the mutation
+      # is stopped, mutate state.json over SSH (ec2_remote_exec — no
+      # hallpass wait needed, unlike Fly), mirror the mutation
       # onto the host copy if one exists, then pause the instance again
       # only if we were the ones who woke it.
       # shellcheck disable=SC1091
@@ -7065,13 +7065,16 @@ _stage_keepalive_pid=$!
 # container-arm EXIT trap is set. Bash keeps only the last EXIT trap per scope;
 # the container arm re-sets it (adding container-kill) and still removes $STAGE
 # + kills the keepalive, so this early trap only matters for exits before that.
-trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE" 2>/dev/null' EXIT
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; rm -rf "$STAGE" 2>/dev/null' EXIT
+# `|| true`: under set -e a failed kill (keepalive already gone) would end
+# the trap before $STAGE — staged credentials — is removed.
 # The same duty as a named hook: the remote runtimes replace the EXIT trap
 # with their teardown (decide_teardown / decide_ec2_teardown), which calls
-# this last so the keepalive and the staged credentials still go away.
+# this last on the exit pass so the keepalive and the staged credentials
+# still go away. Each step tolerates failure (see the trap above).
 _remote_launcher_exit_cleanup() {
-  [ -n "${_stage_keepalive_pid:-}" ] && kill "$_stage_keepalive_pid" 2>/dev/null
-  [ -n "${STAGE:-}" ] && rm -rf "$STAGE" 2>/dev/null
+  { [ -n "${_stage_keepalive_pid:-}" ] && kill "$_stage_keepalive_pid" 2>/dev/null; } || true
+  { [ -n "${STAGE:-}" ] && rm -rf "$STAGE" 2>/dev/null; } || true
   return 0
 }
 
@@ -7484,7 +7487,7 @@ fi
 
 # Best-effort host cleanup. Container is --rm; its writes inside the
 # mounts vanish with the container. This removes the host scratch.
-trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
 
 # --- finalize-phase auth is host-side now -------------------------------
 # Previous versions of leerie bind-mounted ~/.config/gh, ~/.git-credentials,
@@ -8615,9 +8618,10 @@ print(json.dumps(sys.argv[1:]))
             _render_launch_prefix ec2 "$_ec2_launch_argv_json"
             cat <<PY
 child_env = dict(os.environ)
-# The Dockerfile's ENV set, written by the bake (ec2-bake.sh): an instance
-# does not inherit an image's ENV the way a container does. Absent on an
-# operator AMI, which keeps the session environment.
+# The Dockerfile ENV set, written by the bake (ec2-bake.sh): an instance
+# does not inherit the image ENV the way a container does. Absent on an
+# operator AMI, which keeps the session environment. (No apostrophes in
+# this heredoc: it is nested in $(...), which bash 3.2 cannot parse then.)
 try:
     with open("/opt/leerie-image/leerie.env") as _env_f:
         for _line in _env_f:
@@ -8877,7 +8881,7 @@ else
       _run_log=""
     fi
   }
-  trap 'kill "$_stage_keepalive_pid" 2>/dev/null; _reap_tail; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
+  trap 'kill "$_stage_keepalive_pid" 2>/dev/null || true; _reap_tail; _kill_container_from_cidfile; rm -rf "$STAGE"; rm -f "${_cidfile:-}" 2>/dev/null' EXIT
   trap '_reap_tail; _kill_container_from_cidfile; exit 130' INT
   trap '_reap_tail; _kill_container_from_cidfile; exit 143' TERM
 

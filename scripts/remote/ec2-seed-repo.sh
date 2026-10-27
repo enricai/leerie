@@ -13,8 +13,8 @@
 #   EC2: `ec2_tar_pipe` (plain ssh, DESIGN §6 "Transport substitution")
 #        for bulk data — SSM's AWS-StartInteractiveCommand has no stdin
 #        pipe and a ~4 KB document-parameter ceiling, so it cannot carry
-#        a bundle/tar payload — and `ec2_remote_exec` (SSM Session
-#        Manager, the default transport) for small remote commands.
+#        a bundle/tar payload — and `ec2_remote_exec` (SSH, under
+#        `sudo -n`; ec2-lib.sh) for small remote commands.
 #
 # Two-phase seeding, same split as seed-repo.sh:
 #

@@ -163,7 +163,9 @@ resume_instance() {
   # same as resume_machine.sh does for the Fly path.
   if declare -f decide_ec2_teardown >/dev/null 2>&1; then
     # shellcheck disable=SC2064
-    trap 'decide_ec2_teardown' EXIT INT TERM
+    # EXIT passes `exit`: only that pass runs the launcher's STAGE cleanup.
+    trap 'decide_ec2_teardown exit' EXIT
+    trap 'decide_ec2_teardown' INT TERM
   fi
 
   local sidecar=""

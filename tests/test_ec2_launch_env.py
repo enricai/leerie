@@ -119,3 +119,26 @@ def test_remote_launcher_exit_cleanup_is_safe_with_nothing_staged():
     r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + body + "\n_remote_launcher_exit_cleanup; echo ok"],
                        capture_output=True, text=True)
     assert r.returncode == 0 and r.stdout.strip() == "ok", r.stderr
+
+
+def test_launcher_exit_cleanup_removes_stage_when_the_keepalive_is_already_gone(tmp_path):
+    # Under the launcher's set -euo pipefail, a failed kill inside the EXIT
+    # trap used to end the trap before STAGE (staged credentials) was removed
+    # — reproduced on bash 3.2. The keepalive here has already exited.
+    body = re.search(r"\n_remote_launcher_exit_cleanup\(\) \{\n.*?\n\}\n", LAUNCHER, re.S).group(0)
+    stage = tmp_path / "cfg-y"
+    (stage / ".claude").mkdir(parents=True)
+    script = ("set -euo pipefail\n"
+              f"STAGE={stage}\n( exit 0 ) & _stage_keepalive_pid=$!; wait $_stage_keepalive_pid\n"
+              + body + "\ntrap _remote_launcher_exit_cleanup EXIT\necho done")
+    r = subprocess.run(["/bin/bash", "-c", script], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "done"
+    assert not stage.exists()
+
+
+def test_launchers_own_stage_traps_tolerate_a_gone_keepalive(tmp_path):
+    # The early STAGE trap and the local-runtime traps share the kill-first
+    # shape: each kill must be followed by `|| true`.
+    traps = re.findall(r"""trap 'kill "\$_stage_keepalive_pid" 2>/dev/null([^;]*);""", LAUNCHER)
+    assert len(traps) == 3 and all(t == " || true" for t in traps), traps

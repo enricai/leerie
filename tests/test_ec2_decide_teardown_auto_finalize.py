@@ -23,7 +23,7 @@ EC2_PROVISION_SH = REPO_ROOT / "scripts" / "remote" / "ec2-provision.sh"
 def _run(tmp_path: Path, *, rc: int = 0, fetch_rc: int = 0,
          finalize_rc: int = 0, finished_at: str | None = "2026-06-02T10:30:00Z",
          sidecar_no_push: bool | None = None, no_push_env: str = "",
-         launcher_hook: bool = False,
+         launcher_hook: bool = False, exit_pass: bool = True,
          ) -> str:
     user_repo = tmp_path / "user_repo"
     run_dir = user_repo / ".leerie" / "runs" / "rid-001"
@@ -49,7 +49,7 @@ export LEERIE_RUN_ID=rid-001 USER_REPO={user_repo} LEERIE_REPO={leerie_repo}
 NO_PUSH={no_push_env}
 {'_remote_launcher_exit_cleanup() { echo "CALL cleanup"; }' if launcher_hook else ''}
 decide_ec2_teardown
-decide_ec2_teardown
+{'decide_ec2_teardown exit' if exit_pass else ''}
 """
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                        env={**os.environ})
@@ -108,11 +108,17 @@ def test_recorded_push_intent_still_finalizes(tmp_path):
         "fetch", "host_finalize", "terminate"]
 
 
-def test_launcher_cleanup_runs_after_teardown_on_every_call(tmp_path):
-    # The replacement EXIT trap must still run the launcher's STAGE cleanup,
-    # last, and the idempotent second call (INT then EXIT) runs it too.
+def test_launcher_cleanup_runs_once_on_the_exit_pass(tmp_path):
+    # The replacement EXIT trap keeps the launcher's STAGE cleanup: after
+    # the teardown, once, on the `exit` pass (the INT pass before it skips).
     calls = _calls(_run(tmp_path, launcher_hook=True))
-    assert calls == ["fetch", "host_finalize", "terminate", "cleanup", "cleanup"]
+    assert calls == ["fetch", "host_finalize", "terminate", "cleanup"]
+
+
+def test_an_int_pass_alone_keeps_stage(tmp_path):
+    # A Ctrl-C the launcher survives must not delete the staged credentials.
+    calls = _calls(_run(tmp_path, launcher_hook=True, exit_pass=False))
+    assert calls == ["fetch", "host_finalize", "terminate"]
 
 
 def test_launcher_cleanup_runs_when_the_instance_is_left_running(tmp_path):

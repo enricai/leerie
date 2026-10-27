@@ -190,11 +190,20 @@ the install checkout).
   both teardowns use: either sidecar, missing or malformed reads `false`,
   only a real `true` counts, and the launcher's `NO_PUSH` overrides.
 - Both teardown files also pin the launcher's STAGE-cleanup hook
-  (`_remote_launcher_exit_cleanup`): it runs last, on the idempotent
-  second call too, and when the machine/instance is left running after a
-  failed sync. `tests/test_ec2_launch_env.py` executes the launcher's real
-  hook — the keepalive is killed and STAGE removed — and runs it under
-  `set -u` with nothing staged. Without it every remote run leaked a
+  (`_remote_launcher_exit_cleanup`): it runs once, last, on the `exit`
+  pass (after an INT-style pass that skips it), also when the
+  machine/instance is left running after a failed sync, and an INT pass
+  alone keeps STAGE — a Ctrl-C the launcher survives must not strip the
+  credentials seeding still needs. `tests/test_teardown_trap_registration.py`
+  drives the real `provision_machine` / `provision_instance` and reads the
+  traps they leave: EXIT is `decide_*teardown exit`, INT and TERM the bare
+  form; the two resume paths carry the same split.
+  `tests/test_ec2_launch_env.py` executes the launcher's real hook — the
+  keepalive is killed and STAGE removed — runs it under `set -u` with
+  nothing staged, and as an EXIT trap under `set -euo pipefail` with the
+  keepalive already gone (bash 3.2 used to end the trap on the failed
+  `kill` and leak STAGE); the launcher's three STAGE traps each tolerate
+  a failed `kill`. Without it every remote run leaked a
   `cfg-*` dir of staged credentials (DESIGN §6 *Finalization parity*).
 - `tests/test_ec2_launch_env.py` also executes the shared launch suffix's
   argv assembly: `--no-push` goes after the forwarded args (before a

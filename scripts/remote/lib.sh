@@ -383,7 +383,7 @@ tail_with_optional_autofinalize() {
     # NOTE: no `trap '... EXIT'` here. This function is *sourced* into
     # the launcher's shell (the launcher sources lib.sh, then calls this
     # via the rc=75 pivot), and the launcher already has
-    # `trap 'decide_teardown' EXIT INT TERM` registered by provision.sh.
+    # the `decide_teardown` EXIT/INT/TERM traps registered by provision.sh.
     # An EXIT trap here would clobber decide_teardown and the Fly
     # machine would never receive its host-side teardown disposition.
     # Instead, clean up the tempfile inline before each terminal path.

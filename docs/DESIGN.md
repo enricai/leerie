@@ -4285,8 +4285,9 @@ one.
 **Finalization parity.** `decide_ec2_teardown` calls the same
 `host_finalize` flow as Fly's `decide_teardown` (see *Finalization*
 above): on a clean exit the host pushes the run branch and opens the PR
-before the instance is terminated, and a finalize failure keeps the
-instance's pause disposition rather than destroying unpushed work.
+before the instance is terminated, and a finalize failure leaves the
+instance running (as Fly leaves the machine running) rather than
+destroying unpushed work.
 
 Two rules hold for both remote runtimes' teardown (Fly's `decide_teardown`
 and EC2's `decide_ec2_teardown` alike):
@@ -4301,11 +4302,17 @@ and EC2's `decide_ec2_teardown` alike):
   instance is destroyed (the work is already on the host).
 - **The teardown trap keeps the launcher's exit duties.** Provisioning
   replaces the launcher's EXIT trap with the teardown function, so the
-  teardown ends by running the launcher's own cleanup: killing the
-  `$STAGE` keepalive and removing `$STAGE`, which holds copies of
-  `~/.ssh`, `~/.aws` and the Claude credentials. Without it every remote
-  run leaked that directory, and the orphaned keepalive kept it fresh
-  enough to escape the one-day sweep.
+  teardown's exit pass ends by running the launcher's own cleanup:
+  killing the `$STAGE` keepalive and removing `$STAGE`, which holds
+  copies of `~/.ssh`, `~/.aws` and the Claude credentials. Without it
+  every remote run leaked that directory, and the orphaned keepalive kept
+  it fresh enough to escape the one-day sweep. Only the exit pass runs it:
+  the same function also handles INT/TERM, which the launcher can
+  survive, and deleting `$STAGE` there would strip the credentials from
+  the rest of the run (seeding still needs them). The cleanup must also
+  tolerate a keepalive that is already gone; under the launcher's
+  `set -e` a failed `kill` would otherwise end the trap before `$STAGE`
+  is removed.
 
 **Cleanup.** `leerie prune` (dry-run by default, `--apply` to act) and
 `kill`/teardown where appropriate cover leerie-tagged AMIs and their

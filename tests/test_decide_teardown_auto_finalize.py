@@ -43,6 +43,7 @@ def _run_decide_teardown(
     no_push_env: str = "",
     launcher_hook: bool = False,
     fetch_rc: int = 0,
+    exit_pass: bool = True,
 ) -> subprocess.CompletedProcess:
     """Invoke decide_teardown with stubs for fetch_branch + host_finalize
     + destroy_machine; return the completed process so callers can
@@ -92,8 +93,10 @@ export USER_REPO={user_repo}
 export LEERIE_REPO={leerie_repo}
 NO_PUSH={no_push_env}
 {'_remote_launcher_exit_cleanup() { echo "[stub] launcher cleanup called"; }' if launcher_hook else ''}
+# The INT/TERM registration (no arg), then the EXIT one — the order a
+# Ctrl-C followed by the launcher's own exit produces.
 decide_teardown
-decide_teardown
+{'decide_teardown exit' if exit_pass else ''}
 """
     return subprocess.run(
         ["bash", "-c", script],
@@ -301,13 +304,23 @@ def test_recorded_push_intent_still_finalizes(tmp_path):
     assert _events(result) == ["fetch", "finalize", "destroy"]
 
 
-def test_launcher_cleanup_runs_last_on_every_teardown_call(tmp_path):
-    # The replacement EXIT trap keeps the launcher's STAGE cleanup, after
-    # the teardown and on the idempotent second call (INT, then EXIT).
+def test_launcher_cleanup_runs_once_on_the_exit_pass(tmp_path):
+    # The replacement EXIT trap keeps the launcher's STAGE cleanup: after the
+    # teardown, once, on the `exit` pass (the INT pass before it skips it).
     result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
                                   tmp_path=tmp_path, launcher_hook=True)
     assert result.returncode == 0, result.stderr
-    assert _events(result) == ["fetch", "finalize", "destroy", "cleanup", "cleanup"]
+    assert _events(result) == ["fetch", "finalize", "destroy", "cleanup"]
+
+
+def test_an_int_pass_alone_keeps_stage(tmp_path):
+    # A Ctrl-C the launcher survives must not delete the staged credentials
+    # the rest of the run (seeding) still needs.
+    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
+                                  tmp_path=tmp_path, launcher_hook=True,
+                                  exit_pass=False)
+    assert "cleanup" not in _events(result)
+    assert _events(result) == ["fetch", "finalize", "destroy"]
 
 
 def test_launcher_cleanup_runs_when_the_machine_is_left_running(tmp_path):

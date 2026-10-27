@@ -202,7 +202,7 @@ except (ValueError, KeyError, IndexError):
 # Wrapped in $(_seed_timeout_prefix) so a stalled SSH session yields rc
 # 124/137 instead of hanging. Returns the remote tar extraction's exit
 # code (SSH forwards it natively — no rc-muxing workaround needed here,
-# unlike ec2_remote_exec's SSM path).
+# like ec2_remote_exec).
 ec2_tar_pipe() {
   local ssh_target="$1"
   local extract_dir="$2"
@@ -225,8 +225,9 @@ ec2_tar_pipe() {
 # or nothing when unset: every knob is an optional override, and the
 # empty case is filled by ec2-defaults.sh / ec2-ami.sh.
 #
-# Shared here (not in ec2-provision.sh) because ec2-ssm.sh's SSH-fallback
-# transport also needs resolve_key_name/resolve_security_group.
+# Shared here (not in ec2-provision.sh) because ec2-defaults.sh, the SSH
+# transport helpers (ec2_ssh_identity_args reads LEERIE_EC2_KEY_NAME) and
+# provisioning all read them.
 _resolve_ec2_var() {
   # Unset is success-with-empty: every knob has a default supplied by
   # ec2-defaults.sh, so the caller decides whether empty is acceptable and

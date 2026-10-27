@@ -15,9 +15,8 @@
 #        for the bulk $STAGE tar — SSM's AWS-StartInteractiveCommand has
 #        no stdin-pipe facility and a ~4 KB document-parameter ceiling,
 #        so it cannot carry a multi-MB tar payload — and `ec2_remote_exec`
-#        (SSM Session Manager, the default transport) for every small
-#        remote command (credential write, git identity, pre-warm,
-#        plugin-cache rebuild).
+#        (SSH, under `sudo -n`; ec2-lib.sh) for every small remote command
+#        (credential write, git identity, pre-warm, plugin-cache rebuild).
 #
 # Usage (invoked from the leerie launcher's RUNTIME=ec2 branch after
 # provisioning succeeds):
@@ -66,7 +65,7 @@
 # Seeding mechanism:
 #   The $STAGE tree is delivered via a gzipped tar over `ec2_tar_pipe`
 #   (plain ssh), landing at /home/leerie on the instance, followed by a
-#   `chown -R leerie:` over `ec2_remote_exec` (SSM) — the instance's ssh
+#   `chown -R leerie:` over `ec2_remote_exec` (SSH, as root) — the instance's ssh
 #   target may land as the AMI default user (e.g. ec2-user/ubuntu) or
 #   root depending on transport, so the chown step is unconditional,
 #   mirroring seed-auth.sh's own "ssh-console session lands as root by

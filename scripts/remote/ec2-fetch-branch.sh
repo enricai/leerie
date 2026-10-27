@@ -9,12 +9,11 @@
 # "Transport substitution for `flyctl ssh console`":
 #
 #   - Small text commands (run discovery, branch-existence probe,
-#     .leerie/ file existence probes) go over `ec2_remote_exec` (SSM
-#     Session Manager, ec2-lib.sh). ec2_remote_exec captures the remote
-#     command's stdout via bash command substitution, which is fine for
-#     short text output but is NOT binary-safe (it drops trailing
-#     newlines/NUL bytes) — it must never be used to carry bundle/tar
-#     bytes.
+#     .leerie/ file existence probes) go over `ec2_remote_exec` (SSH,
+#     ec2-lib.sh). Its callers here capture that stdout via bash command
+#     substitution, which is fine for short text output but is NOT
+#     binary-safe (it drops trailing newlines/NUL bytes) — it must never
+#     be used to carry bundle/tar bytes.
 #   - Bulk binary data (the git bundle, the run-state tar, each
 #     .leerie/ file's bytes) goes over plain `ssh` directly — the same
 #     "closer textual analog to `flyctl ssh console`" transport
