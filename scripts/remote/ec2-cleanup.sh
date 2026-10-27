@@ -46,7 +46,7 @@ for r in d.get('Reservations', []):
 }
 
 ec2_cleanup() {
-  local apply=false keep=false days="" a
+  local apply=false keep=false days=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --apply) apply=true ;;
