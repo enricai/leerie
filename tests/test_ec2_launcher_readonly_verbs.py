@@ -89,8 +89,8 @@ def _handle_ssm(argv):
     if cmd is None:
         print("{}")
         return 0
-    # ec2_remote_exec wraps its real command as a *local* shell pipeline
-    # string: "echo <b64> | base64 -d | bash". A literal `bash -c cmd`
+    # ec2_remote_exec wraps its real command as a *local* shell string
+    # that decodes "echo <b64> | base64 -d" and runs it under sudo. A literal `bash -c cmd`
     # here would run that pipeline verbatim, but the final `bash` in a
     # shell pipe gets its stdin from the pipe, not from this stub
     # process's own stdin — so a naive reproduction can never forward an
@@ -100,7 +100,7 @@ def _handle_ssm(argv):
     # the payload ourselves and exec it directly with this process's
     # stdin attached, modeling that real behavior rather than the
     # local-pipe artifact of the wrapper string.
-    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
+    m = re.search(r"echo (\S+) \| base64 -d", cmd)
     decoded = base64.b64decode(m.group(1)).decode() if m else cmd
     # The real remote path convention is /work/.leerie/runs/<id>/... (an
     # actual EC2 instance's mounted repo root). This stub never leaves

@@ -22,6 +22,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from tests.conftest import run_bash
+from tests.ec2_stub import write_sudo_shim
 from tests.stub_helpers import _stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -72,6 +73,8 @@ def _stub_aws_ssm(bin_dir: Path, *, remote_rc: int = 0,
             "exit 0\n"
         )
     stub.chmod(0o755)
+    # The wrapped command elevates with `sudo -n` on the instance.
+    write_sudo_shim(bin_dir)
     return stub
 
 
@@ -242,3 +245,67 @@ def test_ec2_tar_pipe_timeout_yields_124_or_137(tmp_path):
     assert result.returncode in (124, 137), (
         f"expected timeout rc 124/137, got {result.returncode}: {result.stderr}"
     )
+
+
+# --- neither transport lands as root: remote side runs under sudo -n --------
+
+def _logging_sudo(bin_dir: Path, *, deny: bool = False) -> Path:
+    """A sudo that records its argv (and can refuse, like a host with no
+    grant) — overrides write_sudo_shim's pass-through version."""
+    shim = bin_dir / "sudo"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$*" >> {bin_dir}/sudo.log\n'
+        + ("echo 'sudo: a password is required' >&2; exit 1\n" if deny else "")
+        + 'while [ $# -gt 0 ]; do case "$1" in -n) shift ;; *) break ;; esac; done\n'
+        'exec "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
+def test_ec2_remote_exec_runs_the_command_through_sudo(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stub_aws_ssm(bin_dir)
+    _logging_sudo(bin_dir)
+    result = run_bash(
+        f"source {LOG_SH}; source {EC2_LIB_SH}; ec2_remote_exec i-0abc 'id -un >/dev/null; echo ran-as-elevated'",
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert "ran-as-elevated" in result.stdout
+    (call,) = (bin_dir / "sudo.log").read_text().splitlines()
+    assert call.startswith("-n bash /")  # the decoded script file, non-interactive
+
+
+def test_ec2_remote_exec_fails_when_sudo_is_refused(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _stub_aws_ssm(bin_dir)
+    _logging_sudo(bin_dir, deny=True)
+    result = run_bash(
+        f"source {LOG_SH}; source {EC2_LIB_SH}; ec2_remote_exec i-0abc 'echo should-not-run'",
+        env={"PATH": f"{bin_dir}:/usr/bin:/bin"},
+    )
+    assert result.returncode != 0
+    assert "should-not-run" not in result.stdout
+
+
+def test_ec2_tar_pipe_extracts_under_sudo(tmp_path):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    ssh = bin_dir / "ssh"
+    ssh.write_text(f'#!/bin/sh\nfor a; do last="$a"; done\nprintf "%s\\n" "$last" > {bin_dir}/remote_cmd\ncat >/dev/null\n')
+    ssh.chmod(0o755)
+    run_bash(f"source {LOG_SH}; source {EC2_LIB_SH}; echo x | ec2_tar_pipe ec2-user@h /home/leerie",
+             env={"PATH": f"{bin_dir}:/usr/bin:/bin"})
+    remote = (bin_dir / "remote_cmd").read_text().strip()
+    assert remote == "sudo -n sh -c 'mkdir -p '\\''/home/leerie'\\'' && tar -xzC '\\''/home/leerie'\\'''"
+
+
+def test_fetch_ssh_and_rsync_receiver_run_under_sudo():
+    fetch = (REPO_ROOT / "scripts" / "remote" / "ec2-fetch-branch.sh").read_text()
+    seed = (REPO_ROOT / "scripts" / "remote" / "ec2-seed-repo.sh").read_text()
+    assert '"$LEERIE_EC2_SSH_TARGET" "sudo -n $remote_cmd"' in fetch
+    assert '-e "$wrapper" --rsync-path="sudo -n rsync"' in seed

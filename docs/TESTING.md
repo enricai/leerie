@@ -96,33 +96,79 @@ cleanup* below); the sibling `--ec2-*` knobs keep the ladder above.
 
 ## EC2 zero-config defaults, AMI bake and cleanup
 
-Three files, all driving the real scripts under `scripts/remote/` against
-stubbed `aws`/`ssh` binaries (no network, no real AWS):
+These files drive the real scripts under `scripts/remote/` against stubbed
+`aws`/`ssh`/`sudo` binaries (no network, no real AWS). `tests/conftest.py`'s
+`_ec2_tests_isolated_home` gives every EC2 test module a throwaway `HOME`:
+`run_bash` merges `os.environ`, and `ec2_default_key_file` writes under
+`$HOME/.leerie/.ec2-keys`, so a test leaving `LEERIE_EC2_KEY_NAME` blank once
+dropped a stub key into the developer's real home (`~/.leerie`, which is also
+the install checkout).
 
 - `tests/test_ec2_ensure_ami.py` (`ec2-ami.sh`'s `ensure_ami`): a cache miss
   bakes in order (stock-AMI lookup, bake instance, payload, stop,
   `create-image`) and the second call is a cache hit with no further
   `run-instances`; a failing payload (`SSH_FAIL`) terminates the bake
   instance and never calls `create-image` (bake teardown on failure);
-  SIGINT mid-bake also terminates; `LEERIE_EC2_AMI` set makes no AWS call at
-  all; a changed content hash (Dockerfile edit under a throwaway repo root)
-  rebakes and tags the new image with the new hash.
+  SIGINT mid-bake also terminates, and SIGINT while `run-instances` is still
+  in flight (no id yet) terminates the instance found by the bake's
+  `leerie:bake` nonce tag; the bake launch carries
+  `AssociatePublicIpAddress=true` with the subnet/SG override, the nonce tag,
+  `-i <key>` on every ssh and `LEERIE_BAKE_REGION` for the payload;
+  `LEERIE_EC2_AMI` set makes no AWS call at all; a changed content hash
+  (Dockerfile edit under a throwaway repo root) rebakes and tags the new
+  image with the new hash. `tests/test_ec2_ami_lookup.py` pins the
+  newest-*available* pick with images listed out of date order and a newer
+  one still pending, parsed from JSON (no `--query`).
+- `tests/test_ec2_bake.py` (`ec2-bake.sh`, the instance-side script): pins
+  and apt packages derived from the Dockerfile; the env file derived from
+  `ENV` lines, proven on a synthetic Dockerfile whose values exist nowhere
+  else (`$PATH` expanded, a `RUN echo ENV …` line ignored), and complete
+  against the real one; it is written before, and sourced for, `mise
+  install`; `ec2-user` is cloud-init's default user with passwordless sudo
+  and no key is baked in; `cloud-init clean` runs last; leerie's home is
+  chowned after its dirs exist; the SSM agent prefers the regional bucket.
 - `tests/test_ec2_defaults.py` (`ec2-defaults.sh`): per knob, the default
   and the override. Instance type; subnet (public subnet in the default VPC,
   override wins with no AWS call, no default VPC fails naming the fix);
-  security group (created and tagged, 22/tcp from the egress CIDR only,
-  reused on a second run, rule follows a changed egress IP, override creates
-  nothing, a `0.0.0.0/0` CIDR is refused); key pair (0600 pem under the
-  state dir, reused, key-in-AWS-but-pem-missing fails with the fix,
-  override creates nothing); instance profile (created and tagged; override
-  wins); with every knob set no `create-*` call happens. The transport
-  half pins `ssh -i` ahead of the target in the tar-pipe argv, its absence
-  without a managed key, the rsync ssh wrapper, and the AMI-bake ssh opts.
+  security group (created and tagged `leerie:managed=true`, 22/tcp from the
+  egress CIDR only, reused on a second run, a changed egress IP is *added*
+  and the old one kept with no revoke, a group with the pre-rename
+  `leerie=managed` tag is reused, a same-named group leerie did not create
+  is refused, override creates nothing, a `0.0.0.0/0` CIDR is refused); key
+  pair (0600 pem under `~/.leerie/.ec2-keys/<account>/<region>/`, never the
+  per-repo state dir; a second repo reuses it without error; regions get
+  distinct files; legacy-tagged key reused, untagged same-named key refused,
+  key-in-AWS-but-pem-missing fails with the fix, override creates nothing);
+  instance profile (created and tagged; override wins); with every knob set
+  no `create-*` call happens. The transport half pins `ssh -i` ahead of the
+  target in the tar-pipe argv, its absence without a known key, the
+  fallback to leerie's own key in a process that never received
+  `LEERIE_EC2_SSH_KEY_FILE`, no guess for an operator key, and the rsync
+  ssh wrapper.
+- `tests/test_ec2_provision.py`: `provision_instance` leaves
+  `LEERIE_EC2_SSH_KEY_FILE` set in the *calling* shell, so the later seed
+  and fetch ssh calls carry `-i` (the defect: the key pair was resolved in
+  `$(...)` and its export died with the subshell); `run-instances` retries
+  while EC2 rejects a just-created profile (`InvalidParameterValue` naming
+  `iamInstanceProfile`), not on other errors, not without a profile, and
+  only within `LEERIE_EC2_IAM_RETRY_BUDGET_S`.
+- `tests/test_ec2_transport.py`: `ec2_remote_exec` runs its command as
+  `sudo -n bash <decoded file>`, fails (not a silent success) when sudo is
+  refused and no rc sentinel comes back, and `ec2_tar_pipe` extracts under
+  `sudo -n`; the fetch ssh and rsync receiver are elevated too. Neither
+  transport lands as root (DESIGN §6).
+- `tests/test_ec2_launch_env.py`: renders the launcher's EC2 `child_env`
+  heredoc and executes it: the baked `leerie.env` overrides the session env,
+  splits on the first `=`, and the wrapper's own `HOME`/`USER_REPO`/`TZ` win
+  after it; an operator AMI without the file keeps the session env.
+- `tests/test_ec2_resume_instance.py`: resuming from a new egress IP adds it
+  to leerie's group (old rule kept); an operator group is never touched.
 - `tests/test_ec2_cleanup.py` (`ec2-cleanup.sh` and `leerie prune`'s AWS
   section): tagged-only prune. The stub ignores `tag-key` filters, so
   untagged lookalikes reach the script and its client-side re-check is what
   is exercised. Dry-run is the default and changes nothing; `--apply`
-  removes exactly the tagged set; an untagged snapshot of a tagged AMI, an
+  removes exactly the tagged set (and leerie's own pem at its
+  account/region path); an untagged snapshot of a tagged AMI, an
   AMI in use by a live instance, a still-attached security group and an
   in-use or untagged IAM role are all left alone; `--keep-current` spares
   only the matching AMI; report mode never deletes; unknown options are

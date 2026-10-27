@@ -33,6 +33,7 @@ import os
 from pathlib import Path
 
 from tests.conftest import run_bash
+from tests.ec2_stub import write_sudo_shim
 from tests.stub_helpers import _stub_timeout
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -84,6 +85,8 @@ def _stub_aws_interactive_session(bin_dir: Path, *, stall: bool = False) -> Path
         "exit 0\n"
     )
     stub.chmod(0o755)
+    # The wrapped command elevates with `sudo -n` on the instance.
+    write_sudo_shim(bin_dir)
     return stub
 
 
@@ -278,9 +281,9 @@ def test_ec2_attach_uses_sh_s_bootstrap(tmp_path):
     # can't survive the CLI's own JSON-array parsing) — decode it back
     # to confirm the "sh -s" bootstrap is really what got sent, rather
     # than asserting on plaintext that's no longer in the log.
-    assert "bash <(echo " in log
-    b64_start = log.index("bash <(echo ") + len("bash <(echo ")
-    b64_end = log.index(" | base64 -d)", b64_start)
+    assert "sudo -n bash $f" in log
+    b64_start = log.index("&& echo ") + len("&& echo ")
+    b64_end = log.index(" | base64 -d", b64_start)
     decoded = base64.b64decode(log[b64_start:b64_end]).decode()
     assert decoded.startswith("sh -s;")
 

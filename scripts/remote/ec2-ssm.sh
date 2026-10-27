@@ -112,20 +112,16 @@ _ec2_ssm_session() {
   # like ec2_remote_exec does for its own wrapped command: the wrapper
   # embeds literal double quotes (the `printf "..."` call), which would
   # otherwise have to survive the CLI's own JSON-array parsing of
-  # `command=[...]` — base64 sidesteps that entirely, no escaping to get
-  # wrong. The remote side decodes and runs it via `bash <(...)` — a
-  # process substitution, NOT `... | bash`: piping the decode into bash
-  # would consume bash's own stdin as the final stage of that pipeline,
-  # shadowing the interactive session's real stdin (the caller's
-  # payload) before `<interpreter>` ever gets to read it. Process
-  # substitution hands bash the decoded script as a file argument
-  # instead, leaving bash's stdin — and therefore the payload — free to
-  # flow through to `<interpreter>` unmodified.
+  # `command=[...]` — base64 sidesteps that entirely. The remote side runs
+  # it as root through _ec2_ssm_sudo_command (ec2-lib.sh): the session
+  # lands as ssm-user, and the launch wrapper chowns and spawns as leerie.
+  # That helper leaves the session's stdin — the caller's payload — free
+  # to flow through to `<interpreter>` unmodified.
   local wrapper_b64
   wrapper_b64="$(printf '%s' "$wrapper" | base64 | tr -d '\n')"
   local aws_args=(--target "$instance_id" \
                    --document-name AWS-StartInteractiveCommand \
-                   --parameters "command=[\"bash <(echo $wrapper_b64 | base64 -d)\"]")
+                   --parameters "command=[\"$(_ec2_ssm_sudo_command "$wrapper_b64")\"]")
   [ -n "$profile" ] && aws_args+=(--profile "$profile")
   [ -n "$region" ] && aws_args+=(--region "$region")
 

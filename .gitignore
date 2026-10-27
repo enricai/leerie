@@ -23,6 +23,9 @@ venv/
 .leerie/*
 !.leerie/config.toml
 !.leerie/Dockerfile
+# leerie's own EC2 private keys (scripts/remote/ec2-lib.sh ec2_default_key_file)
+# live under $HOME/.leerie, which is this checkout for a standard install.
+/.ec2-keys/
 # Top-level log when the CLI is teed (`./leerie "..." | tee leerie.log`).
 # The `leerie-*.log` form covers per-task tees, e.g.
 # `leerie prompts/fix-x.md | tee leerie-fix-x.log`.

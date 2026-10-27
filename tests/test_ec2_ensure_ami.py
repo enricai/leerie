@@ -1,4 +1,5 @@
 import os
+import re
 import signal
 import subprocess
 import time
@@ -9,18 +10,34 @@ SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "remote" / "ec2-am
 AWS = r"""#!/bin/sh
 echo "$@" >> "$T/calls"
 case "$1 $2" in
-  "ec2 describe-images") [ -f "$T/baked" ] && echo ami-baked || echo None ;;
-  "ssm get-parameter") echo ami-stock ;;
-  "ec2 run-instances") echo i-bake ;;
+  "ec2 describe-images")
+    [ -f "$T/baked" ] && echo '{"Images":[{"ImageId":"ami-baked","State":"available","CreationDate":"2026-01-01T00:00:00Z"}]}' \
+      || echo '{"Images":[]}' ;;
+  "ssm get-parameter") echo '{"Parameter":{"Value":"ami-stock"}}' ;;
+  "ec2 run-instances")
+    # The instance exists (tagged) before the call returns its id; an
+    # interrupt can land in that window.
+    echo "$*" | sed -n 's/.*leerie:bake,Value=\([0-9a-f]*\).*/\1/p' > "$T/inflight"
+    [ -n "$RUN_HANG" ] && sleep 30
+    echo '{"Instances":[{"InstanceId":"i-bake"}]}' ;;
   "ec2 describe-instances")
-    case "$*" in *PublicIp*) echo 1.2.3.4 ;; *) [ -f "$T/stopped" ] && echo stopped || echo running ;; esac ;;
+    case "$*" in
+      *tag:leerie:bake,Values=*)
+        nonce="$(cat "$T/inflight" 2>/dev/null)"
+        case "$*" in *"tag:leerie:bake,Values=$nonce "*|*"tag:leerie:bake,Values=$nonce") ;; *) nonce="" ;; esac
+        [ -n "$nonce" ] && echo '{"Reservations":[{"Instances":[{"InstanceId":"i-inflight","State":{"Name":"pending"}}]}]}' \
+          || echo '{"Reservations":[]}' ;;
+      *)
+        st=running; [ -f "$T/stopped" ] && st=stopped
+        echo "{\"Reservations\":[{\"Instances\":[{\"InstanceId\":\"i-bake\",\"State\":{\"Name\":\"$st\"},\"PublicIpAddress\":\"1.2.3.4\"}]}]}" ;;
+    esac ;;
   "ec2 stop-instances") touch "$T/stopped" ;;
-  "ec2 create-image") echo ami-baked; touch "$T/baked" ;;
+  "ec2 create-image") echo '{"ImageId":"ami-baked"}'; touch "$T/baked" ;;
   "ec2 describe-subnets") echo '{"Subnets":[]}' ;;
 esac
 exit 0
 """
-SSH = '#!/bin/sh\ncat >/dev/null 2>&1 || true\n[ -n "$SSH_FAIL" ] && [ "$*" != "${*%bash -s}" ] && exit 1\n[ -n "$SSH_HANG" ] && [ "$*" != "${*%bash -s}" ] && sleep 30\nexit 0\n'
+SSH = '#!/bin/sh\necho "$@" >> "$T/ssh_calls"\ncat >/dev/null 2>&1 || true\n[ -n "$SSH_FAIL" ] && [ "$*" != "${*%bash -s}" ] && exit 1\n[ -n "$SSH_HANG" ] && [ "$*" != "${*%bash -s}" ] && sleep 30\nexit 0\n'
 
 
 def _ensure_ami_env(tmp_path, **extra):
@@ -114,3 +131,37 @@ def test_changed_hash_rebakes_with_new_hash_tag(tmp_path):
     tagged = [re.search(r"ResourceType=image,Tags=.*?source-hash,Value=([0-9a-f]{64})", l).group(1)
               for l in calls.splitlines() if l.startswith("ec2 create-image")]
     assert len(tagged) == 2 and tagged[0] != tagged[1]
+
+
+def test_bake_instance_gets_public_ip_nonce_tag_and_identity(tmp_path):
+    r = _run(tmp_path)
+    assert r.returncode == 0, r.stderr
+    run = next(l for l in (tmp_path / "calls").read_text().splitlines() if l.startswith("ec2 run-instances"))
+    # The subnet override (subnet-1) need not auto-assign: the public IP is asked for.
+    assert "--network-interfaces AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=subnet-1,Groups=sg-1" in run
+    assert "--subnet-id" not in run and "--security-group-ids" not in run
+    assert re.search(r"Key=leerie:managed,Value=true\},\{Key=leerie:bake,Value=[0-9a-f]{32}\}", run)
+    ssh = (tmp_path / "ssh_calls").read_text().splitlines()
+    assert ssh and all(f"-i {tmp_path / 'k.pem'}" in l for l in ssh)
+    # The bake script learns the region (regional SSM-agent bucket).
+    assert any("LEERIE_BAKE_REGION=us-east-1 bash -s" in l for l in ssh)
+
+
+def test_sigint_while_run_instances_in_flight_terminates_by_nonce(tmp_path):
+    p = subprocess.Popen(["bash", "-c", f"source {SCRIPT}; ensure_ami"],
+                         env=_ensure_ami_env(tmp_path, RUN_HANG="1"), stdout=subprocess.PIPE,
+                         stderr=subprocess.PIPE, start_new_session=True)
+    for _ in range(100):
+        time.sleep(0.1)
+        if (tmp_path / "inflight").exists() and (tmp_path / "inflight").read_text().strip():
+            break
+    time.sleep(0.5)
+    os.killpg(p.pid, signal.SIGINT)
+    p.wait(timeout=40)
+    calls = (tmp_path / "calls").read_text().splitlines()
+    nonce = (tmp_path / "inflight").read_text().strip()
+    lookup = [l for l in calls if l.startswith("ec2 describe-instances") and "tag:leerie:bake" in l]
+    assert lookup and f"Values={nonce}" in lookup[0]
+    term = [l for l in calls if l.startswith("ec2 terminate-instances")]
+    assert term and "i-inflight" in term[0]
+    assert not any(l.startswith("ec2 create-image") for l in calls)

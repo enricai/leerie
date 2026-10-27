@@ -3,7 +3,7 @@
 # rule"). ec2_ami_lookup is the cache half: source hash + version tag, look
 # up an already-baked AMI by tag (a miss prints nothing, returns 0).
 # ensure_ami adds the bake half: on a miss, launch a stock Debian 13
-# instance, run ec2-bake-provision.sh over SSH, stop, create-image with the
+# instance, run ec2-bake.sh over SSH, stop, create-image with the
 # tags, wait available, and terminate the bake instance on every exit path.
 #
 # Usage:
@@ -102,16 +102,22 @@ ec2_ami_lookup() {
   [ -n "$region" ] && aws_args+=(--region "$region")
   [ -n "$profile" ] && aws_args+=(--profile "$profile")
 
-  local ami
-  ami="$(aws ec2 describe-images ${aws_args[@]+"${aws_args[@]}"} \
+  local ami out
+  out="$(aws ec2 describe-images ${aws_args[@]+"${aws_args[@]}"} \
     --owners self \
     --filters "Name=tag:$EC2_AMI_TAG_MANAGED,Values=true" \
               "Name=tag:$EC2_AMI_TAG_VERSION,Values=$version" \
               "Name=tag:$EC2_AMI_TAG_HASH,Values=$hash" \
               "Name=state,Values=available" \
-    --query 'sort_by(Images,&CreationDate)[-1].ImageId' \
-    --output text)" || return 1
-  if [ -z "$ami" ] || [ "$ami" = "None" ]; then
+    --output json)" || return 1
+  ami="$(printf '%s' "$out" | python3 -c '
+import json, sys
+try: imgs = json.load(sys.stdin).get("Images", [])
+except Exception: imgs = []
+imgs = [i for i in imgs if i.get("State", "available") == "available"]
+imgs.sort(key=lambda i: i.get("CreationDate", ""))
+print(imgs[-1]["ImageId"] if imgs else "")')"
+  if [ -z "$ami" ]; then
     remote_log "ami: cache miss (version=$version hash=${hash:0:12})"
     return 0
   fi
@@ -121,6 +127,7 @@ ec2_ami_lookup() {
 
 EC2_AMI_BASE_SSM_PARAM="/aws/service/debian/release/13/latest/amd64"
 _EC2_AMI_BAKE_IID=""
+_EC2_AMI_BAKE_NONCE=""
 
 _ec2_ami_aws() {
   local args=() region profile
@@ -135,18 +142,48 @@ _ec2_ami_aws() {
 # is cleared first so EXIT after INT does not terminate twice).
 _ec2_ami_bake_cleanup() {
   local iid="$_EC2_AMI_BAKE_IID"
+  if [ -z "$iid" ] && [ -n "$_EC2_AMI_BAKE_NONCE" ]; then
+    # Interrupted while run-instances was in flight: the id never came
+    # back, but the instance (if any) carries this bake's nonce tag.
+    iid="$(_ec2_ami_aws ec2 describe-instances \
+      --filters "Name=tag:leerie:bake,Values=$_EC2_AMI_BAKE_NONCE" \
+                "Name=instance-state-name,Values=pending,running,stopping,stopped" \
+      --output json 2>/dev/null | _ec2_ami_py '
+for r in d.get("Reservations", []):
+    for i in r.get("Instances", []):
+        print(i["InstanceId"])' | tr '\n' ' ')"
+    iid="${iid% }"
+  fi
+  _EC2_AMI_BAKE_NONCE=""
   [ -n "$iid" ] || return 0
   _EC2_AMI_BAKE_IID=""
   remote_log "ami: terminating bake instance $iid"
-  _ec2_ami_aws ec2 terminate-instances --instance-ids "$iid" >/dev/null 2>&1 \
+  # shellcheck disable=SC2086  # one or more ids from the nonce lookup
+  _ec2_ami_aws ec2 terminate-instances --instance-ids $iid >/dev/null 2>&1 \
     || remote_log "ami: terminate of $iid attempted (may already be gone)"
+}
+
+# _ec2_ami_py <body> — python3 over JSON on stdin; body sees `d`.
+_ec2_ami_py() {
+  python3 -I -c "import json, sys
+try: d = json.load(sys.stdin)
+except Exception: d = {}
+$1"
+}
+
+# _ec2_ami_instance_field <instance-id> <field> — State.Name / PublicIpAddress.
+_ec2_ami_instance_field() {
+  _ec2_ami_aws ec2 describe-instances --instance-ids "$1" --output json 2>/dev/null \
+    | _ec2_ami_py "
+try: i = d['Reservations'][0]['Instances'][0]
+except (KeyError, IndexError): sys.exit(0)
+print(i['State']['Name'] if '$2' == 'State' else i.get('$2', ''))"
 }
 
 _ec2_ami_wait_state() { # <instance-state> <instance-id>
   local want="$1" iid="$2" i st
   for i in $(seq 1 "${LEERIE_EC2_BAKE_WAIT_TRIES:-120}"); do
-    st="$(_ec2_ami_aws ec2 describe-instances --instance-ids "$iid" \
-      --query 'Reservations[0].Instances[0].State.Name' --output text 2>/dev/null || true)"
+    st="$(_ec2_ami_instance_field "$iid" State || true)"
     [ "$st" = "$want" ] && return 0
     case "$st" in terminated|shutting-down) return 1 ;; esac
     sleep "${LEERIE_EC2_BAKE_POLL_S:-5}"
@@ -160,20 +197,22 @@ _ec2_ami_bake() {
   local version="$1" hash="$2"
   # shellcheck disable=SC1091
   . "$_EC2_AMI_DIR/ec2-defaults.sh"
-  # shellcheck disable=SC1091
-  . "$_EC2_AMI_DIR/ec2-bake.sh"
 
   local base_ami="${LEERIE_EC2_BAKE_BASE_AMI:-}"
   if [ -z "$base_ami" ]; then
-    base_ami="$(_ec2_ami_aws ssm get-parameter --name "$EC2_AMI_BASE_SSM_PARAM" \
-      --query 'Parameter.Value' --output text)" || return 1
+    base_ami="$(_ec2_ami_aws ssm get-parameter --name "$EC2_AMI_BASE_SSM_PARAM" --output json \
+      | _ec2_ami_py "print(d.get('Parameter', {}).get('Value', ''))")" || base_ami=""
+    if [ -z "$base_ami" ]; then
+      remote_log "error: could not resolve the stock Debian 13 AMI from $EC2_AMI_BASE_SSM_PARAM."
+      echo "  Check ssm:GetParameter, or set LEERIE_EC2_BAKE_BASE_AMI (or LEERIE_EC2_AMI to skip the bake)." >&2
+      return 1
+    fi
   fi
-  local itype subnet sg key keyfile
-  itype="$(default_instance_type)" || return 1
-  subnet="$(default_subnet_id)" || return 1
-  sg="$(ensure_security_group)" || return 1
-  key="$(ensure_key_pair)" || return 1
-  keyfile="${LEERIE_EC2_SSH_KEY_FILE:-$(_ec2_state_dir)/$key.pem}"
+  local itype subnet sg key
+  itype="$(ec2_default_instance_type)" || return 1
+  subnet="$(ec2_default_subnet_id)" || return 1
+  sg="$(ec2_default_security_group)" || return 1
+  key="$(ec2_default_key_name)" || return 1
 
   local prev_exit prev_int prev_term
   prev_exit="$(trap -p EXIT)"; prev_int="$(trap -p INT)"; prev_term="$(trap -p TERM)"
@@ -182,7 +221,7 @@ _ec2_ami_bake() {
   trap '_ec2_ami_bake_cleanup; exit 143' TERM
 
   local rc=0 image_id=""
-  _ec2_ami_bake_steps "$base_ami" "$itype" "$subnet" "$sg" "$key" "$keyfile" "$version" "$hash" || rc=$?
+  _ec2_ami_bake_steps "$base_ami" "$itype" "$subnet" "$sg" "$key" "$version" "$hash" || rc=$?
   image_id="$_EC2_AMI_BAKE_RESULT"
   _ec2_ami_bake_cleanup
   trap - EXIT INT TERM
@@ -195,24 +234,34 @@ _ec2_ami_bake() {
 
 _EC2_AMI_BAKE_RESULT=""
 _ec2_ami_bake_steps() {
-  local base_ami="$1" itype="$2" subnet="$3" sg="$4" key="$5" keyfile="$6" version="$7" hash="$8"
+  local base_ami="$1" itype="$2" subnet="$3" sg="$4" key="$5" version="$6" hash="$7"
   local iid host i
   _EC2_AMI_BAKE_RESULT=""
+  # The nonce is set before run-instances so an interrupt that lands while
+  # the call is in flight can still find and terminate the instance.
+  _EC2_AMI_BAKE_NONCE="$(python3 -c 'import uuid; print(uuid.uuid4().hex)')"
+  # --network-interfaces carries the public IP explicitly: a subnet
+  # override need not auto-assign one, and the bake is driven over SSH.
   iid="$(_ec2_ami_aws ec2 run-instances --image-id "$base_ami" --instance-type "$itype" \
-    --key-name "$key" --security-group-ids "$sg" --subnet-id "$subnet" --count 1 \
+    --key-name "$key" --count 1 \
+    --network-interfaces "AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=$subnet,Groups=$sg" \
     --block-device-mappings 'DeviceName=/dev/xvda,Ebs={VolumeSize=30,DeleteOnTermination=true}' \
-    --tag-specifications "$(_ec2_tag_spec instance)" \
-    --query 'Instances[0].InstanceId' --output text)" || return 1
-  [ -n "$iid" ] && [ "$iid" != "None" ] || return 1
+    --tag-specifications "$(_ec2_tag_spec instance leerie:bake "$_EC2_AMI_BAKE_NONCE")" \
+    --output json | _ec2_ami_py "print(d['Instances'][0]['InstanceId'])")" || return 1
+  [ -n "$iid" ] || return 1
   _EC2_AMI_BAKE_IID="$iid"
   remote_log "ami: bake instance $iid (base $base_ami)"
 
   _ec2_ami_wait_state running "$iid" || { remote_log "ami: bake instance never ran"; return 1; }
-  host="$(_ec2_ami_aws ec2 describe-instances --instance-ids "$iid" \
-    --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)" || return 1
+  host="$(_ec2_ami_instance_field "$iid" PublicIpAddress)"
+  [ -n "$host" ] || { remote_log "ami: bake instance has no public IP"; return 1; }
 
-  local ssh_opts=(-i "$keyfile" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
-                  -o LogLevel=ERROR -o ConnectTimeout=10 -o IdentitiesOnly=yes)
+  # Host-key checking is off: the throwaway instance's key is new by
+  # construction and never trusted afterwards.
+  local ssh_opts=() _a
+  while IFS= read -r _a; do ssh_opts+=("$_a"); done < <(ec2_ssh_identity_args)
+  ssh_opts+=(-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null
+             -o LogLevel=ERROR -o ConnectTimeout=10 -o BatchMode=yes)
   for i in $(seq 1 "${LEERIE_EC2_BAKE_SSH_RETRIES:-60}"); do
     ssh "${ssh_opts[@]}" "admin@$host" true 2>/dev/null && break
     [ "$i" -lt "${LEERIE_EC2_BAKE_SSH_RETRIES:-60}" ] || { remote_log "ami: bake instance unreachable over SSH"; return 1; }
@@ -223,7 +272,12 @@ _ec2_ami_bake_steps() {
   tar -C "$root" --exclude=__pycache__ --exclude='*.pyc' --exclude=.git -cf - "${_EC2_AMI_HASH_PATHS[@]}" \
     | ssh "${ssh_opts[@]}" "admin@$host" 'rm -rf /tmp/leerie-bake && mkdir -p /tmp/leerie-bake && tar -C /tmp/leerie-bake -xf -' \
     || { remote_log "ami: shipping repo to bake instance failed"; return 1; }
-  ec2_bake_emit | ssh "${ssh_opts[@]}" "admin@$host" 'sudo env LEERIE_BAKE_DIR=/tmp/leerie-bake bash -s' \
+  local region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
+  [ -n "$region" ] || region="$(aws configure get region ${LEERIE_AWS_PROFILE:+--profile "$LEERIE_AWS_PROFILE"} 2>/dev/null || true)"
+  # shellcheck disable=SC2029  # $region is meant to expand host-side
+  ssh "${ssh_opts[@]}" "admin@$host" \
+      "sudo env LEERIE_BAKE_DIR=/tmp/leerie-bake LEERIE_BAKE_REGION=$region bash -s" \
+      < "$_EC2_AMI_DIR/ec2-bake.sh" \
     || { remote_log "ami: bake payload failed"; return 1; }
 
   _ec2_ami_aws ec2 stop-instances --instance-ids "$iid" >/dev/null || return 1
@@ -237,7 +291,8 @@ _ec2_ami_bake_steps() {
   image_id="$(_ec2_ami_aws ec2 create-image --instance-id "$iid" \
     --name "leerie-$version-${hash:0:12}-$(date +%s)" \
     --tag-specifications "ResourceType=image,Tags=[$tags]" "ResourceType=snapshot,Tags=[$tags]" \
-    --query 'ImageId' --output text)" || return 1
+    --output json | _ec2_ami_py "print(d.get('ImageId', ''))")" || return 1
+  [ -n "$image_id" ] || return 1
   if ! _ec2_ami_aws ec2 wait image-available --image-ids "$image_id"; then
     _ec2_ami_aws ec2 deregister-image --image-id "$image_id" >/dev/null 2>&1 || true
     return 1

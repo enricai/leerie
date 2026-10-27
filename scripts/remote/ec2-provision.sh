@@ -417,12 +417,19 @@ provision_instance() {
   [ -f "$_EC2_PROVISION_DIR/ec2-ami.sh" ] && . "$_EC2_PROVISION_DIR/ec2-ami.sh"
 
   local ami instance_type key_name security_group subnet_id instance_profile
+  # Resolved here, in this shell, never inside one of the $(...) calls
+  # below: a subshell's export would not reach the ssh calls that bake,
+  # seed and fetch.
+  if [ -z "${LEERIE_EC2_SSH_KEY_FILE:-}" ] && [ -z "${LEERIE_EC2_KEY_NAME:-}" ]; then
+    LEERIE_EC2_SSH_KEY_FILE="$(ec2_default_key_file)" || LEERIE_EC2_SSH_KEY_FILE=""
+    export LEERIE_EC2_SSH_KEY_FILE
+  fi
   ami="$(ensure_ami)" || return 1
-  instance_type="$(default_instance_type)" || return 1
-  key_name="$(ensure_key_pair)" || return 1
-  subnet_id="$(default_subnet_id)" || return 1
-  security_group="$(ensure_security_group)" || return 1
-  instance_profile="$(ensure_instance_profile)" || instance_profile=""
+  instance_type="$(ec2_default_instance_type)" || return 1
+  key_name="$(ec2_default_key_name)" || return 1
+  subnet_id="$(ec2_default_subnet_id)" || return 1
+  security_group="$(ec2_default_security_group)" || return 1
+  instance_profile="$(ec2_default_instance_profile)" || instance_profile=""
 
   local _missing=0
   _need_ec2_var() {
@@ -450,22 +457,41 @@ provision_instance() {
   # default). No volume-orphan cleanup path exists here because there is
   # nothing created before the instance itself that could be orphaned by
   # a failed create.
+  # A just-created instance profile is eventually consistent: EC2 can
+  # reject it for tens of seconds after IAM reports it. Retry only on that
+  # rejection (the CLI's error code plus the parameter it names — a
+  # mechanical string), within a bounded budget.
   local create_output=""
   local instance_id=""
-  if create_output="$(aws ec2 run-instances \
-       --image-id "$ami" \
-       --instance-type "$instance_type" \
-       --key-name "$key_name" \
-       --network-interfaces "AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=$subnet_id,Groups=$security_group" \
-       ${instance_profile:+--iam-instance-profile "Name=$instance_profile"} \
-       --count 1 \
-       ${aws_args[@]+"${aws_args[@]}"} \
-       --output json \
-       2>&1)"; then
-    instance_id="$(printf '%s' "$create_output" \
-                    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
-                    2>/dev/null || true)"
-  fi
+  local _iam_waited=0
+  local _iam_step="${LEERIE_EC2_IAM_RETRY_S:-5}"
+  local _iam_budget="${LEERIE_EC2_IAM_RETRY_BUDGET_S:-120}"
+  while :; do
+    if create_output="$(aws ec2 run-instances \
+         --image-id "$ami" \
+         --instance-type "$instance_type" \
+         --key-name "$key_name" \
+         --network-interfaces "AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=$subnet_id,Groups=$security_group" \
+         ${instance_profile:+--iam-instance-profile "Name=$instance_profile"} \
+         --count 1 \
+         ${aws_args[@]+"${aws_args[@]}"} \
+         --output json \
+         2>&1)"; then
+      instance_id="$(printf '%s' "$create_output" \
+                      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
+                      2>/dev/null || true)"
+      break
+    fi
+    if [ -n "$instance_profile" ] && [ "$_iam_waited" -lt "$_iam_budget" ] \
+       && printf '%s' "$create_output" | grep -q '(InvalidParameterValue)' \
+       && printf '%s' "$create_output" | grep -q 'iamInstanceProfile'; then
+      remote_log "remote: instance profile $instance_profile not visible to EC2 yet; retrying (${_iam_waited}s/${_iam_budget}s)"
+      sleep "$_iam_step"
+      _iam_waited=$((_iam_waited + (_iam_step > 0 ? _iam_step : 1)))
+      continue
+    fi
+    break
+  done
 
   if [ -z "$instance_id" ]; then
     remote_log "failed to create EC2 instance — aws output:"

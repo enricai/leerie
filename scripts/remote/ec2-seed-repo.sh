@@ -422,9 +422,11 @@ ec2_seed_repo_dirty() {
 
   local rsync_err
   rsync_err="$(mktemp -t leerie-reseed-err.XXXXXX)"
+  # --rsync-path: ec2-user cannot write leerie-owned /work files; the
+  # chown below restores ownership after the root-side receive.
   rsync -a -H \
     --from0 --files-from="$file_list" \
-    -e "$wrapper" \
+    -e "$wrapper" --rsync-path="sudo -n rsync" \
     "$USER_REPO/" "$LEERIE_EC2_SSH_TARGET:/work/" \
     >/dev/null 2>"$rsync_err"
   rsync_rc=$?

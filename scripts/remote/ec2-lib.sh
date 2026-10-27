@@ -167,7 +167,7 @@ ec2_remote_exec() {
   wrapped_cmd="$(printf '( %s ); __rc=$?; printf "\n%s:%%d\n" "$__rc"' "$cmd" "$marker")"
   local wrapped_b64
   wrapped_b64="$(printf '%s' "$wrapped_cmd" | base64 | tr -d '\n')"
-  aws_args+=(--parameters "command=[\"echo $wrapped_b64 | base64 -d | bash\"]")
+  aws_args+=(--parameters "command=[\"$(_ec2_ssm_sudo_command "$wrapped_b64")\"]")
 
   local _to=""
   _to="$(_seed_timeout_prefix)"
@@ -185,11 +185,29 @@ ec2_remote_exec() {
   printf '%s\n' "$out" | sed "/^${marker}:[0-9]*\$/d"
   if [ -z "$remote_rc" ]; then
     # Sentinel never arrived — the session itself failed before the
-    # remote command could run (e.g. instance unreachable). Surface the
-    # transport's own rc rather than fabricating a 0.
+    # remote command could run (e.g. instance unreachable, or sudo
+    # refused). Surface the transport's own rc rather than fabricating a
+    # 0, and since `aws ssm start-session` exits 0 regardless, a 0 here
+    # is still a failure (same rule as ec2-ssm.sh's _ec2_ssm_session).
+    [ "$transport_rc" -eq 0 ] && return 1
     return "$transport_rc"
   fi
   return "$remote_rc"
+}
+
+# --- _ec2_ssm_sudo_command -------------------------------------------------
+# The --parameters command for an SSM session that runs a base64-encoded
+# script as root. Session Manager lands as ssm-user, never root (DESIGN §6
+# "Neither transport lands as root"), and the payloads chown, write
+# leerie-owned paths and drop to the leerie user. The decoded script goes
+# to a temp file rather than `bash <(...)` (sudo closes inherited fds, so
+# the /dev/fd path is gone for the elevated shell) or `... | bash` (that
+# would consume the session's stdin, which carries ec2_launch_detached's
+# payload). No double quotes: the result is embedded in the CLI's
+# `command=["..."]` shorthand. -n fails fast instead of prompting.
+_ec2_ssm_sudo_command() {
+  # shellcheck disable=SC2016  # expanded by the REMOTE shell
+  printf 'f=$(mktemp) && echo %s | base64 -d > $f && sudo -n bash $f; __r=$?; rm -f $f; exit $__r' "$1"
 }
 
 # --- ec2_tar_pipe --------------------------------------------------------
@@ -225,11 +243,10 @@ ec2_remote_exec() {
 # (e.g. "ec2-user@<public-ip>" or an ssh_config Host alias) — this
 # function does not resolve instance id → address; the caller does.
 #
-# The extract command runs as whichever user the ssh target logs in as
-# (typically the AMI's default user, e.g. `ec2-user`/`ubuntu`), NOT root
-# — unlike `flyctl ssh console`, which always lands as root. Callers
-# needing a different owner must `sudo chown` after, the EC2 analog of
-# seed-auth.sh's `chown -R leerie:` step.
+# The ssh target logs in as `ec2-user`, not root (unlike `flyctl ssh
+# console`), and the extract dirs (/home/leerie, /work) are leerie-owned,
+# so the extract runs under `sudo -n`; callers still `chown -R leerie:`
+# afterwards, the EC2 analog of seed-auth.sh's step.
 #
 # Wrapped in $(_seed_timeout_prefix) so a stalled SSH session yields rc
 # 124/137 instead of hanging. Returns the remote tar extraction's exit
@@ -245,7 +262,7 @@ ec2_tar_pipe() {
   $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     ${_id[@]+"${_id[@]}"} \
     "$ssh_target" \
-    "sh -c 'mkdir -p '\''$extract_dir'\'' && tar -xzC '\''$extract_dir'\'''"
+    "sudo -n sh -c 'mkdir -p '\''$extract_dir'\'' && tar -xzC '\''$extract_dir'\'''"
 }
 
 # --- resolve_* (LEERIE_EC2_* required-var reads) ---------------------------
@@ -254,13 +271,9 @@ ec2_tar_pipe() {
 # launcher has already resolved each LEERIE_EC2_* var through its own
 # CLI > env > leerie.toml tier (mirroring FLY_VM_DISK_GB / the seed knobs)
 # and exported the result — this helper is just the final required-var
-# read against whatever that ladder produced. Each prints the var's value
-# on success; on an unset/empty var (all three tiers missed — no defaults
-# exist for any of these, since there is no sensible AMI/instance-type/
-# key-pair/security-group/subnet leerie can pick on the operator's behalf),
-# prints an actionable error naming the missing var to stderr and returns 1
-# rather than letting `${VAR:?}` under `set -u` kill the whole sourcing
-# shell with bash's generic "parameter null or not set" message.
+# read against whatever that ladder produced. Each prints the var's value,
+# or nothing when unset: every knob is an optional override, and the
+# empty case is filled by ec2-defaults.sh / ec2-ami.sh.
 #
 # Shared here (not in ec2-provision.sh) because ec2-ssm.sh's SSH-fallback
 # transport also needs resolve_key_name/resolve_security_group.
@@ -276,6 +289,7 @@ resolve_instance_type() { _resolve_ec2_var LEERIE_EC2_INSTANCE_TYPE; }
 resolve_key_name() { _resolve_ec2_var LEERIE_EC2_KEY_NAME; }
 resolve_security_group() { _resolve_ec2_var LEERIE_EC2_SECURITY_GROUP; }
 resolve_subnet_id() { _resolve_ec2_var LEERIE_EC2_SUBNET_ID; }
+resolve_instance_profile() { _resolve_ec2_var LEERIE_EC2_INSTANCE_PROFILE; }
 
 # --- _aws_region_profile_args ---------------------------------------------
 # Emit, one token per line, the --region/--profile flags to append to
@@ -307,14 +321,49 @@ _aws_region_profile_args() {
   return 0
 }
 
+# --- ec2_default_key_file ---------------------------------------------------
+# Path of leerie's own private key for the active account + region. The AWS
+# key pair is account- and region-scoped, so the file is too — a per-repo
+# location made a second repo find the key pair but not its key. The dot
+# prefix keeps per-repo `$HOME/.leerie/*` globs (prune, list --groups) off
+# it. Prints nothing and returns 1 when the account cannot be resolved.
+EC2_KEY_NAME_DEFAULT="leerie-ssh"
+ec2_default_key_file() {
+  local args=() _a account region
+  while IFS= read -r _a; do args+=("$_a"); done < <(_aws_region_profile_args)
+  account="$(aws sts get-caller-identity ${args[@]+"${args[@]}"} --output json 2>/dev/null \
+    | python3 -c 'import json,sys
+try: print(json.load(sys.stdin).get("Account",""))
+except Exception: pass' 2>/dev/null)"
+  region="${LEERIE_AWS_REGION:-${AWS_REGION:-}}"
+  if [ -z "$region" ]; then
+    local profile="${LEERIE_AWS_PROFILE:-${AWS_PROFILE:-}}"
+    region="$(aws configure get region ${profile:+--profile "$profile"} 2>/dev/null)"
+  fi
+  [ -n "$account" ] && [ -n "$region" ] || return 1
+  printf '%s/.leerie/.ec2-keys/%s/%s/%s.pem' "$HOME" "$account" "$region" "$EC2_KEY_NAME_DEFAULT"
+}
+
+# _ec2_ssh_key_file — the private key ssh should use: LEERIE_EC2_SSH_KEY_FILE
+# when set, else leerie's own key when no explicit LEERIE_EC2_KEY_NAME says
+# the operator owns the key pair. Empty when neither applies.
+_ec2_ssh_key_file() {
+  if [ -n "${LEERIE_EC2_SSH_KEY_FILE:-}" ]; then
+    printf '%s' "$LEERIE_EC2_SSH_KEY_FILE"
+  elif [ -z "${LEERIE_EC2_KEY_NAME:-}" ]; then
+    ec2_default_key_file || true
+  fi
+}
+
 # --- ec2_ssh_identity_args --------------------------------------------------
-# Emit, one token per line, `-i <key> -o IdentitiesOnly=yes` when a
-# leerie-created key is in use (LEERIE_EC2_SSH_KEY_FILE set and readable);
-# nothing otherwise, so an operator-supplied LEERIE_EC2_KEY_NAME with no known
-# private key leaves ssh's own identity selection untouched. Read with the
-# `while read` idiom (bash 3.2: no namerefs/mapfile).
+# Emit, one token per line, `-i <key> -o IdentitiesOnly=yes` when a known
+# private key exists (_ec2_ssh_key_file); nothing otherwise, so an
+# operator-supplied LEERIE_EC2_KEY_NAME with no known private key leaves
+# ssh's own identity selection untouched. Read with the `while read` idiom
+# (bash 3.2: no namerefs/mapfile).
 ec2_ssh_identity_args() {
-  local key="${LEERIE_EC2_SSH_KEY_FILE:-}"
+  local key
+  key="$(_ec2_ssh_key_file)"
   if [ -n "$key" ] && [ -f "$key" ]; then
     printf '%s\n%s\n%s\n%s\n' -i "$key" -o IdentitiesOnly=yes
   fi
@@ -324,7 +373,8 @@ ec2_ssh_identity_args() {
 # _ec2_ssh_identity_string — same flags as one shell-quoted string, for the
 # generated rsync -e wrapper script.
 _ec2_ssh_identity_string() {
-  local key="${LEERIE_EC2_SSH_KEY_FILE:-}"
+  local key
+  key="$(_ec2_ssh_key_file)"
   if [ -n "$key" ] && [ -f "$key" ]; then
     printf -- "-i '%s' -o IdentitiesOnly=yes" "$key"
   fi

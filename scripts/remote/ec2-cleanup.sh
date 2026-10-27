@@ -6,8 +6,8 @@
 #   ec2_cleanup_report          # kill path: list only, never deletes
 #
 # Dry-run unless --apply. A resource is eligible only if the aws call that
-# described it returned a leerie tag (`leerie=managed` from ec2-defaults.sh or
-# `leerie:managed=true` from ec2-ami.sh); the server-side tag-key filter is
+# described it returned a leerie tag (`leerie:managed=true`, or the
+# `leerie=managed` that ec2-defaults.sh used before); the server-side tag-key filter is
 # re-checked client-side in python3 before every mutating call, and snapshots
 # are re-described by id before delete. Order: AMI deregister, then its
 # snapshots. AMIs backing a live instance, and key pairs / SGs / the IAM role
@@ -116,7 +116,9 @@ for k in d.get('KeyPairs', []):
     if printf '%s\n' "$live_keys" | grep -qFx "$id"; then echo "  skip key pair $id (in use by an instance)"; continue; fi
     echo "  $verb key pair $id"
     $apply || continue
-    _ec2_aws ec2 delete-key-pair --key-name "$id" >/dev/null && rm -f "$(_ec2_state_dir)/$id.pem"
+    if _ec2_aws ec2 delete-key-pair --key-name "$id" >/dev/null && [ "$id" = "$EC2_KEY_NAME_DEFAULT" ]; then
+      local pem; pem="$(ec2_default_key_file)" && rm -f "$pem"
+    fi
   done <<<"$rows"
 
   # --- security groups ---
@@ -135,7 +137,7 @@ for g in d.get('SecurityGroups', []):
     _ec2_aws ec2 delete-security-group --group-id "$id" >/dev/null || echo "  failed to delete $id"
   done <<<"$rows"
 
-  # --- IAM role + instance profile created by ensure_instance_profile ---
+  # --- IAM role + instance profile created by ec2_default_instance_profile ---
   local role="$EC2_ROLE_NAME"
   if printf '%s\n' "$live_profiles" | grep -q "/$role\$"; then
     echo "  skip IAM role/instance profile $role (in use by an instance)"

@@ -318,6 +318,19 @@ def main(argv):
             sgs = get_flag_all(argv, "--security-group-ids")
             if sgs:
                 rec["security_group_ids"] = sgs
+            # --network-interfaces shorthand carries subnet, groups and the
+            # public-IP flag in one value; Groups= is last, so it takes the
+            # rest of the string (it may list several ids).
+            nic = get_flag(argv, "--network-interfaces")
+            if nic is not None:
+                head, _, groups = nic.partition("Groups=")
+                fields = dict(kv.split("=", 1) for kv in head.strip(",").split(",") if "=" in kv)
+                if "SubnetId" in fields:
+                    rec["subnet_id"] = fields["SubnetId"]
+                if "AssociatePublicIpAddress" in fields:
+                    rec["associate_public_ip"] = fields["AssociatePublicIpAddress"] == "true"
+                if groups:
+                    rec["security_group_ids"] = groups.split(",")
             tags = parse_tags(get_flag(argv, "--tag-specifications"))
             if tags:
                 rec["tags"] = tags
@@ -331,10 +344,11 @@ def main(argv):
 
     if action == "describe-instances":
         ids = get_flag_all(argv, "--instance-ids") or list(state["instances"].keys())
+        filters = parse_filters(argv)
         reservations = []
         for iid in ids:
             rec = state["instances"].get(iid)
-            if rec is None:
+            if rec is None or not matches_filters(rec, filters):
                 continue
             reservations.append({"Instances": [instance_doc(iid, rec)]})
         print(json.dumps({"Reservations": reservations}))
@@ -668,6 +682,21 @@ def make_sts_only_stub_aws(
     return stub
 
 
+def write_sudo_shim(dir: Path) -> Path:
+    """A `sudo` that runs its command unprivileged. The transports wrap
+    instance-side commands in `sudo -n` (neither SSM nor SSH lands as root);
+    stubs that execute those commands locally put this ahead of the host's
+    real sudo, which would prompt or fail."""
+    shim = dir / "sudo"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'while [ $# -gt 0 ]; do case "$1" in -n|-E|-H) shift ;; *) break ;; esac; done\n'
+        'exec "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
 def _stub_aws(dir: Path) -> Path:
     """Write the stateful `aws` stub binary into `dir`.
 
@@ -974,11 +1003,12 @@ if [ -z "$param" ]; then
   exit 0
 fi
 
-# param looks like: command=["echo <b64> | base64 -d | bash"]
+# param looks like: command=["f=$(mktemp) && echo <b64> | base64 -d > $f && sudo -n bash $f; ..."]
+# (ec2-lib.sh _ec2_ssm_sudo_command); the sudo half is the instance's, so
+# the decoded script runs directly here.
 inner="${{param#command=[\\"}}"
 inner="${{inner%\\"]}}"
-# inner is: echo <b64> | base64 -d | bash
-b64="${{inner#echo }}"
+b64="${{inner#*echo }}"
 b64="${{b64%% | base64*}}"
 decoded="$(printf '%s' "$b64" | base64 -d)"
 
@@ -1102,6 +1132,14 @@ while [ $i -lt ${{#args[@]}} ]; do
 done
 target="${{args[$i]}}"
 rest=("${{args[@]:$((i+1))}}")
+# The transports elevate on the instance (`sudo -n <cmd>` as one string,
+# or rsync's --rsync-path splitting into `sudo -n rsync ...`); this stub
+# has no instance, so it runs the command itself.
+if [ "${{rest[0]:-}}" = "sudo" ] && [ "${{rest[1]:-}}" = "-n" ]; then
+  rest=("${{rest[@]:2}}")
+elif [ "${{rest[0]#sudo -n }}" != "${{rest[0]:-}}" ]; then
+  rest=("${{rest[0]#sudo -n }}" "${{rest[@]:1}}")
+fi
 
 if [ "${{#rest[@]}}" -eq 0 ]; then
   # No remote command — this is ec2_tar_pipe's bare-target invocation

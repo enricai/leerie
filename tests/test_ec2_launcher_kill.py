@@ -86,7 +86,7 @@ if [ "$1" = "ssm" ] && [ "$2" = "start-session" ]; then
   fi
   inner="${{param#command=[\"}}"
   inner="${{inner%\"]}}"
-  b64="${{inner#echo }}"
+  b64="${{inner#*echo }}"
   b64="${{b64%% | base64*}}"
   decoded="$(printf '%s' "$b64" | base64 -d)"
   decoded="${{decoded//\/work/$DEST/work}}"

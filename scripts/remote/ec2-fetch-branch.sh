@@ -78,6 +78,9 @@ fi
 # Wrapped in $(_seed_timeout_prefix) so a stalled session yields rc
 # 124/137 instead of hanging. Returns the remote command's exit code
 # (ssh forwards it natively).
+#
+# Runs under `sudo -n`: the login is ec2-user, and the run state and repo it
+# reads were written by leerie (DESIGN §6 "Neither transport lands as root").
 # ---------------------------------------------------------------------------
 _ec2_fetch_ssh() {
   local remote_cmd="$1"
@@ -87,7 +90,7 @@ _ec2_fetch_ssh() {
   while IFS= read -r _a; do _id+=("$_a"); done < <(ec2_ssh_identity_args)
   $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new \
     ${_id[@]+"${_id[@]}"} \
-    "$LEERIE_EC2_SSH_TARGET" "$remote_cmd"
+    "$LEERIE_EC2_SSH_TARGET" "sudo -n $remote_cmd"
 }
 
 # ---------------------------------------------------------------------------

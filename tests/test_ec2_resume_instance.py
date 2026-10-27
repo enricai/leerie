@@ -602,3 +602,46 @@ def test_resume_instance_unexpected_state_fails_without_starting(tmp_path):
 
     log = read_log(aws_dir)
     assert not any(l.startswith("ec2 start-instances") for l in log)
+
+
+# --- resume_instance: re-admits the current egress IP ------------------------
+
+def _seed_leerie_sg(aws_dir: Path, cidr: str) -> None:
+    state = read_state(aws_dir)
+    state["vpcs"] = {"vpc-default0001": {"is_default": True}}
+    state["security_groups"] = {"sg-leerie": {
+        "name": "leerie-ssh", "vpc_id": "vpc-default0001",
+        "tags": {"leerie:managed": "true"},
+        "ingress": [{"protocol": "tcp", "port": 22, "cidr": cidr}]}}
+    (aws_dir / "state.json").write_text(json.dumps(state))
+
+
+def test_resume_from_a_new_ip_adds_it_to_leeries_group(tmp_path):
+    # The run paused from 198.51.100.7; the laptop resumes from 203.0.113.9.
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    _seed_leerie_sg(aws_dir, "198.51.100.7/32")
+    iid = _seed_stopped_instance(aws_dir)
+    env = _stub_env(aws_dir, {"LEERIE_EC2_SECURITY_GROUP": "", "LEERIE_EC2_SSH_CIDR": "203.0.113.9/32"})
+
+    result = run_bash(f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}", env=env)
+
+    assert result.returncode == 0, result.stderr
+    (sg,) = read_state(aws_dir)["security_groups"].values()
+    assert [r["cidr"] for r in sg["ingress"]] == ["198.51.100.7/32", "203.0.113.9/32"]
+    log = read_log(aws_dir)
+    auth = [i for i, l in enumerate(log) if l.startswith("ec2 authorize-security-group-ingress")]
+    start = [i for i, l in enumerate(log) if l.startswith("ec2 start-instances")]
+    assert auth and start and not any("revoke" in l for l in log)
+
+
+def test_resume_leaves_an_operator_group_alone(tmp_path):
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    iid = _seed_stopped_instance(aws_dir)
+    env = _stub_env(aws_dir)  # LEERIE_EC2_SECURITY_GROUP=sg-0123456789abcdef0
+
+    result = run_bash(f"source {EC2_PROVISION_SH}; source {EC2_RESUME_SH}; resume_instance {iid}", env=env)
+
+    assert result.returncode == 0, result.stderr
+    assert not any("security-group" in l for l in read_log(aws_dir))
