@@ -51,20 +51,26 @@ def test_the_proxy_resolves_for_the_measured_share(leerie, corpus):
     assert share >= 0.90, (
         f"only {len(resolved)}/{len(corpus)} ({share:.0%}) of real subtask "
         "diffs resolve a test-file proxy — below this the tier stops being "
-        "worth its complexity and the canonical fallback is the common path")
+        "worth its complexity and deferral is the common path")
 
 
-def test_the_source_only_subtask_falls_back(leerie, corpus):
+def test_the_source_only_subtask_is_deferred(leerie, corpus):
     """The other half of the contract, and the reason the fixture keeps a
-    source-only row at all: a diff with no test file must render NOTHING so
-    `_select_subtask_axes` uses the canonical command. A corpus of only
-    test-touching diffs would pass the ratio test above while proving the
-    safety property not at all."""
+    source-only row at all: a diff with no test file must render NOTHING, and
+    `_select_subtask_axes` must then DEFER the axis -- neither a bare runner
+    nor the canonical suite (DESIGN §9). A corpus of only test-touching diffs
+    would pass the ratio test above while proving the safety property not at
+    all."""
+    blt = {"build": "", "lint": "", "test": "pytest"}
     src_only = [r for r in corpus
                 if not any(f.startswith("tests/") for f in r["files"])]
-    assert src_only, "fixture lost its source-only row; the fallback is untested"
+    assert src_only, \
+        "fixture lost its source-only row; the deferral is untested"
     for r in src_only:
         assert leerie._render_scoped(PROXY, r["files"], "base") is None, r["sid"]
+        axes, scope = leerie._select_subtask_axes(
+            blt, {"test": PROXY}, r["files"], "base", "scoped")
+        assert "tests" not in axes and scope == "deferred", r["sid"]
 
 
 def test_no_resolved_command_carries_a_non_test_path(leerie, corpus):

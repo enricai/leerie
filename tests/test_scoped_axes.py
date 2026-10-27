@@ -121,31 +121,42 @@ def test_scoped_mode_uses_the_proxy_and_labels_itself(leerie):
     assert scope == "scoped"
 
 
-def test_an_axis_without_a_proxy_falls_back_to_the_canonical_command(leerie):
-    """Never silently skipped — assert the canonical STRING, not merely
-    'not None'."""
+def test_only_the_tests_axis_is_ever_deferred(leerie):
+    """DESIGN §9: absence means deferred, never full -- for `tests`. `build`
+    has no proxy here and keeps its canonical STRING (a compiled repo's
+    cheapest per-subtask signal); `lint` has no proxy tier and keeps its
+    own. `tests`, with a resolvable proxy, is scoped."""
     axes, _ = leerie._select_subtask_axes(
         BLT, {"test": "npx vitest related --run {files}"},
         ["a.ts"], "base", "scoped")
     assert axes["build"] == "next build"
     assert axes["lint"] == "biome check"
+    assert axes["tests"].startswith("npx vitest related")
+    assert leerie._deferred_axes(axes, BLT, "scoped") == []
 
 
-def test_scope_reports_full_when_no_proxy_actually_applied(leerie):
+def test_scope_reports_deferred_when_no_proxy_actually_applied(leerie):
     """The label must not claim a narrowing that did not happen — the
-    conformer prompt renders it verbatim."""
+    conformer prompt renders it verbatim. Nothing narrowed and the tests
+    were deferred, so the honest label is `deferred`; build and lint still
+    ran their canonical commands, which the per-axis lines state."""
     axes, scope = leerie._select_subtask_axes(BLT, {}, ["a.ts"], "base",
                                               "scoped")
-    assert scope == "full"
-    assert axes["tests"] == "vitest run"
+    assert scope == "deferred"
+    assert "tests" not in axes
+    assert axes["build"] == "next build"
+    assert axes["lint"] == "biome check"
 
 
-def test_empty_diff_falls_back_rather_than_running_everything(leerie):
+def test_empty_diff_defers_rather_than_running_everything(leerie):
+    """An empty diff must neither render a bare runner nor fall back to the
+    canonical suite."""
     axes, scope = leerie._select_subtask_axes(
         BLT, {"test": "npx vitest related --run {files}"}, [], "base",
         "scoped")
-    assert axes["tests"] == "vitest run"
-    assert scope == "full"
+    assert "tests" not in axes
+    assert "vitest run" not in axes.values()
+    assert scope == "deferred"
 
 
 def test_full_mode_ignores_available_proxies(leerie):

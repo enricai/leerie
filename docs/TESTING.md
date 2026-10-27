@@ -2149,29 +2149,80 @@ and still writes valid JSON at rc 0, so the byte cut is safe for
 ## Per-subtask delta proxy: the `{test_files}` tier
 
 The per-subtask delta proxy's `{test_files}` tier is covered by
-`tests/test_test_files_proxy.py` (48), `tests/test_scoped_proxy_corpus.py`
-(5) and `tests/test_scoped_degrade_warning.py` (11). Three lessons
+`tests/test_test_files_proxy.py` (51), `tests/test_scoped_proxy_corpus.py`
+(5) and `tests/test_scoped_degrade_warning.py` (13). Three lessons
 generalise. **(1) A non-test path is an ERROR to pytest, not a no-op** —
 `pytest orchestrator/leerie.py` exits 5, `pytest docs/DESIGN.md` exits 4,
-and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4. A
-real subtask diff mixes docs/source with tests, so a `{files}` template on
-a runner with no source→test impact analysis reports RED on nearly every
+and `pytest docs/DESIGN.md tests/test_blt_semaphore.py` ALSO exits 4. A real
+subtask diff mixes docs/source with tests, so a `{files}` template on a
+runner with no source→test impact analysis reports RED on nearly every
 subtask; fix: filter the substitution (`{test_files}`), with the
-pre-existing empty-list rule falling back to canonical when no test file
-is present. **(2) Scan the author's input, not the rendered output.** The
-unknown-placeholder guard first scanned the SUBSTITUTED command, so a
-changed-file path containing braces (e.g. `src/{locale}/page.test.ts`) was
-misread as an unknown placeholder, disabling the proxy and misdiagnosing
-it as install skew. Scanning the template with `_SCOPED_PLACEHOLDERS`
-stripped removes the hazard by construction. **(3) A planner prediction is
-not a diff.** The ratio was first taken from `files_likely_touched` and
-was badly wrong — 40% test-touching predicted (109 of 270) vs. 94% real
-(34 of 36) — since CLAUDE.md mandates tests regardless of planner
-prediction. The frozen corpus is 36 REAL per-subtask diffs from leerie's
-own run branches, each row an integration merge's **first-parent** diff (a
-plain two-dot diff against the run base folds in siblings — the first
-recovery attempt reported 0% source-only this way).
-shipped a fixture that could not exercise the canonical fallback at all.
+pre-existing empty-list rule rendering nothing when no test file is present
+(the axis is then deferred — see the next section). **(2) Scan the author's
+input, not the rendered output.** The unknown-placeholder guard first
+scanned the SUBSTITUTED command, so a changed-file path containing braces
+(e.g. `src/{locale}/page.test.ts`) was misread as an unknown placeholder,
+disabling the proxy and misdiagnosing it as install skew. Scanning the
+template with `_SCOPED_PLACEHOLDERS` stripped removes the hazard by
+construction. **(3) A planner prediction is not a diff.** The ratio was
+first taken from `files_likely_touched` and was badly wrong — 40%
+test-touching predicted (109 of 270) vs. 94% real (34 of 36) — since
+CLAUDE.md mandates tests regardless of planner prediction. The frozen corpus
+is 36 REAL per-subtask diffs from leerie's own run branches, each row an
+integration merge's **first-parent** diff (a plain two-dot diff against the
+run base folds in siblings — the first recovery attempt reported 0%
+source-only this way, and so shipped a fixture that could not exercise the
+no-test-file path at all).
+
+## The whole suite is orchestrator-owned
+
+`tests/test_full_suite_ownership.py` (150) covers DESIGN §9's two
+whole-suite mechanisms: *absence means deferred, never full* for the test
+axis (`_select_subtask_axes`, `_DEFERRED_AXIS`) and the single rule list
+behind the deny, the plan-time strip, the settle-time exemption and the
+notice (`_full_suite_rule_patterns`, `_shell_subcommands`,
+`_denied_by_full_suite_rules`, `_strip_canonical_suite_commands`,
+`FULL_SUITE_NOTICE`). Inputs are the 2026-10-26 incident's real
+`runs_commands`, commands whose deny verdict was observed live on the CLI
+(`LIVE_PROBED`), and barnacle-shaped `pnpm` configs for the negative
+controls. Forty-seven components were ablated one at a time against this
+file and the four repinned scoped-axis files, and every ablation fails at
+least one test (restoring the canonical test fallback fails 6). Getting
+there, every component that left everything green was either removed as
+redundant or given its own pin, the pin taken from a live CLI verdict where
+one existed (single-quote literalness: `echo 'a|pytest tests/'` ran; an
+unquoted substitution keeping its outer command whole: `pytest $(cat k)
+tests/` was denied). Four lessons generalise. **(1) Omitted is not
+recorded.** `_apply_measured_axes` overwrites only the axes present in a
+measurement, so a deferred axis left out would let a conformer's
+self-reported "9373 passed" survive into the persisted entry;
+`test_docs_only_subtask_defers_tests_end_to_end` has the conformer *lie*,
+and asserts the lie is gone. **(2) A deny without a reason produces
+`blocked`, not compliance.** Replayed against the incident spec, workers
+that only hit the deny returned `blocked` 2/2 (which auto-accept then
+drops), and the same workers told why completed 5/5 — so the pairing is
+decided in `claude_p` and pinned there for every Bash-capable worker, with
+the converse (no notice for an unwidened inspect-only worker) pinned too.
+**(3) Two predicates for one rule set drift.** The first version derived the
+plan-time strip separately from the deny; review found `-k` selections and
+`cd … &&` prefixes kept by one and refused by the other, re-creating the
+forced-`blocked` state. One pattern list now feeds both, and
+`test_matcher_agrees_with_the_live_cli` holds the matcher to the CLI's
+observed verdicts rather than to its own reading of them; all 161 live
+verdicts gathered in review replay with no case where the CLI denied and the
+unanchored matcher did not (the anchored prescribed check misses 5 of the
+117 denials, all here-document, comment or `$'…'` shapes the scan does not
+model). **(4) Replace a lossy primitive, don't patch it.** Two rounds of
+regex splits each fixed one family of shapes and broke another (operators
+alone missed subshells; splitting on brackets after dropping quotes broke
+`pytest -k "not (slow)" tests/`); a quote-aware scan ended the cycle, and
+its own first versions still needed double-quoted substitutions, the outer
+command kept whole, and a fallback for quotes left unbalanced by constructs
+it does not model. The same list read WIDE is safe where an over-match drops
+one requirement and unsafe where it disables the mechanism, so the
+prescribed-command check reads it anchored, a prescribed command is never
+stripped or exempted, and a stripped paraphrase of one is resynthesised
+exactly.
 
 ## Pre-push preflight probe
 

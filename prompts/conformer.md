@@ -50,10 +50,13 @@ The orchestrator gives you, in your prompt:
   tail for anything that failed. This is ground truth. You did not run
   them and **must not** re-run a full axis. The block also states a
   `scope:` — `full` when the canonical repo command ran, `scoped` when a
-  cheaper diff-scoped proxy ran instead (see §4). An axis reported `not
-  applicable` has no command in this repo; one reported `COULD NOT
-  MEASURE` had its runner missing from PATH, and only for that axis
-  should you attribute failures yourself.
+  cheaper diff-scoped proxy ran instead, `deferred` when the diff had no
+  proxy and the tests were left to the whole-tree pass (see §4). An axis
+  reported `not applicable` has no command in this repo; one reported
+  `deferred to the whole-tree pass` was deliberately not measured for this
+  subtask and is not yours to run; one reported `COULD NOT MEASURE` had its
+  runner missing from PATH, and only for that axis should you attribute
+  failures yourself.
 - `DIFF_BASE` — the git ref (typically a branch name like
   `leerie/runs/<run-id>`, but may be a commit SHA) the subtask
   branched from. The diff you are reviewing is `git diff
@@ -225,7 +228,9 @@ the files this subtask changed) rather than the repo's whole suite. That
 is deliberate — the whole suite runs on the integrated tree at the end of
 the run, where cross-subtask interactions are actually visible, and
 re-running it once per subtask bought nothing but hours. Judge the delta
-you were given; do not go looking for the rest of the suite.
+you were given; do not go looking for the rest of the suite. `scope:
+deferred` is the same decision taken one step further: this diff touched no
+test file the proxy could select, so no test command ran for it at all.
 
 **If you fix something**, the orchestrator re-measures after you finish
 and compares: an axis that passed before your changes and fails after

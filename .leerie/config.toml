@@ -9,6 +9,7 @@ setup_packages = "python3-pip python3-venv"
 # or source path is an ERROR that poisons the whole invocation (`pytest
 # docs/DESIGN.md tests/test_x.py` exits 4), and a real subtask diff nearly
 # always mixes both. A diff carrying no test file renders nothing and the axis
-# falls back to the canonical `pytest` — measured over 36 real subtask diffs
-# on this repo, 34 carried a test file and 2 did not.
+# is DEFERRED to the whole-tree pass — it no longer falls back to the canonical
+# `pytest` (DESIGN §9: that fallback ran the whole suite on 57–64% of this
+# repo's subtasks once tasks started producing docs-only subtasks).
 test_scoped = "python3 -m pytest {test_files} -q"
