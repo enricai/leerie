@@ -111,7 +111,7 @@ def test_resume_abandons_the_interrupted_merge(leerie, tmp_path, monkeypatch):
     assert log.splitlines()[:2] == ["leerie: integrate b",
                                     "leerie: integrate a"], log
     # The killed integrator's half-resolution is kept on a rescue ref.
-    shown = _git(staging, "show", f"refs/leerie/rescue/{RUN_ID}/b:f.txt",
+    shown = _git(staging, "show", f"refs/leerie/rescue/{RUN_ID}/b/1:f.txt",
                  check=False)
     assert shown == "half-resolved"
 

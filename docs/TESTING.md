@@ -1997,7 +1997,8 @@ round's output.
 The integrator-crash salvage path (DESIGN §12 *salvage if there is something
 to salvage*) is tested in `tests/test_rescue_integrator_work.py` against real
 temp git repos left mid-merge. `_rescue_integrator_work` captures a crashed
-integrator's in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>`
+integrator's in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>/<n>`
+(a new ref per rescue, never overwritten: `tests/test_rescue_ref_unique.py`)
 before `git merge --abort` destroys it (verified: abort reverts a resolved
 file to its pre-merge content, leaving no stash and no reachable object). The
 load-bearing pin is `test_rescue_does_not_require_a_merge_commit`: the rescue

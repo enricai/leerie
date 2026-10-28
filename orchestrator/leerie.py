@@ -53608,6 +53608,32 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         return res
 
 
+def _next_rescue_ref(staging: Path, run_id: str, sid: str) -> str | None:
+    """A rescue ref no rescue has used: `refs/leerie/rescue/<run>/<sid>/<n>`
+    with `n` one past the highest there (DESIGN §6: a second crash on
+    resume overwrote the first rescue under one fixed name, and
+    `refs/leerie/*` keeps no reflog). A flat `…/<sid>` ref an older leerie
+    wrote cannot also be a directory, so beside one the name is
+    `…/<sid>.<n>`. None when git cannot list the refs. Plain
+    `subprocess.run`, like the git-dir probe, outside the pinned `run_proc`
+    sequence."""
+    base = f"refs/leerie/rescue/{run_id}/{sid}"
+    try:
+        r = subprocess.run(["git", "for-each-ref", "--format=%(refname)",
+                            f"refs/leerie/rescue/{run_id}/"],
+                           cwd=str(staging), capture_output=True, text=True,
+                           check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if r.returncode != 0:
+        return None
+    names = r.stdout.split()
+    sep = "." if base in names else "/"
+    taken = [int(n[len(base) + 1:]) for n in names
+             if n.startswith(base + sep) and n[len(base) + 1:].isdigit()]
+    return f"{base}{sep}{max(taken, default=0) + 1}"
+
+
 async def _rescue_integrator_work(staging: Path, sid: str,
                                  run_id: str) -> str | None:
     """Capture a crashed integrator's in-progress resolution before the merge
@@ -53680,12 +53706,17 @@ async def _rescue_integrator_work(staging: Path, sid: str,
             cwd=str(staging), env=env)
         if commit.returncode != 0 or not commit.stdout.strip():
             return None
-        ref = f"refs/leerie/rescue/{run_id}/{sid}"
+        ref = _next_rescue_ref(staging, run_id, sid)
+        if ref is None:
+            return None
         # update-ref deliberately runs WITHOUT the throwaway index env: refs
         # live in the repo, not the index, and the temp file is about to go.
+        # The empty old value makes it create-only: a rescue ref is never
+        # overwritten (round-3 review L3).
         stored = await run_proc(
-            ["git", "update-ref", ref, commit.stdout.strip(),
-             "-m", f"leerie: rescued {sid} integrator resolution"],
+            ["git", "update-ref", "-m",
+             f"leerie: rescued {sid} integrator resolution", ref,
+             commit.stdout.strip(), ""],
             cwd=str(staging))
         if stored.returncode != 0:
             return None
@@ -54963,7 +54994,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
       (DESIGN §6 *When integration cannot succeed*).
     - **Crash** (every round raised, so there is no status and no diagnosis):
       infrastructure, not judgment. `_rescue_integrator_work` captures the
-      in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>` *before*
+      in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>/<n>` *before*
       the abort — `git merge --abort` destroys it otherwise, and it is the
       most expensive artifact in the run to recreate. `blocked[sid]` is
       recorded and the die message names the ref and its recovery command;

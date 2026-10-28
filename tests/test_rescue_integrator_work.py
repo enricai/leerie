@@ -327,7 +327,7 @@ def test_rescues_in_a_linked_worktree(leerie, conflicted_repo, tmp_path):
     _git_noraise("merge", "side", cwd=wt)
     (wt / "f.txt").write_text("RESOLVED-IN-WORKTREE\n")
     ref = _run(leerie._rescue_integrator_work(wt, "feat-006", "run1"))
-    assert ref == "refs/leerie/rescue/run1/feat-006"
+    assert ref == "refs/leerie/rescue/run1/feat-006/1"
     shown = _git("show", f"{ref}:f.txt", cwd=wt)
     assert shown.stdout == "RESOLVED-IN-WORKTREE\n"
     # The throwaway index is gone, and the worktree's real index untouched.

@@ -1932,7 +1932,14 @@ counted integrated (driven end to end on the real scripts and the real
 `integrate_wave`). The interrupted integration was never recorded, so
 there is nothing in it to keep: `integrate_wave` checks staging on entry
 and, if it is mid-merge, rescues the work in progress to a ref (as the
-crash path does) and aborts the merge. Its sid is then integrated again
+crash path does) and aborts the merge. Every rescue gets a ref of its own,
+`refs/leerie/rescue/<run-id>/<sid>/<n>` with `n` one past the highest
+already there, and is written only if that ref does not exist: a rescue
+ref is never overwritten. Under one fixed name per sid, a second crash on
+resume replaced the first rescue — the one the operator had been told to
+apply — and `refs/leerie/*` keeps no reflog to get it back; every merge
+whose sid could not be matched landed on the same `…/unknown` (round-3
+review L3). The die message and the `blocked` entry name the exact ref. Its sid is then integrated again
 in its own turn. This runs in the orchestrator, which holds the run
 directory's lock, so no other process is merging into staging.
 `integrate.sh` also refuses to start while staging is mid-merge
