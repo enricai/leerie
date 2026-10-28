@@ -24,6 +24,7 @@ def test_planner_subtasks_items_built_by_shared_helper(leerie):
         include_fixes_reported_symptom=True,
         include_change_shape=True,
         include_verify=True,
+        include_claims=True,
     )
     assert json.dumps(items, sort_keys=True) == json.dumps(
         rebuilt, sort_keys=True)

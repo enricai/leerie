@@ -445,6 +445,47 @@ subtask it tests). Three mechanisms reconcile that coupling:
   precision — on long site lists it defaulted to "unfixed" instead of
   reading the code.
 
+  **Every `fix` site is claimed, with how it is resolved.** Covering a
+  site's *file* is not resolving the site. Measured on a chain whose
+  first run's plan covered every audited file: the audit's fix for one
+  decision site was "re-run the whole flow from the top" on the losing
+  path of a race, the plan's subtask re-raised the error instead, and
+  the defect shipped and was re-planned by later runs. So each
+  audited site carries a code-assigned `site_id` (`D1`, `D2`, … in
+  audit order — Python assigns IDs only) and, when disposed `fix`, a
+  typed `resolution_kind` (`rerun_flow`, `reraise`, `relink`, `guard`,
+  `recompute`, `propagate`, `other`) with a one-sentence `resolution`.
+  Every planner subtask carries a typed `change_kind` (`fix`, `test`,
+  `docs`, `other`) and, per site it changes, a claim listing every
+  resolution kind its change applies there. Only `change_kind: fix`
+  subtasks' claims count. The check is set arithmetic on those typed
+  fields, against an equivalence table that is a code constant: the
+  error-handling kinds `rerun_flow`, `reraise` and `relink` each stay
+  their own class (that is where the measured chain broke), while
+  `guard`, `recompute` and `propagate` form one class (threading a
+  value into a decision, recomputing it and tightening its predicate
+  are routinely one edit described three ways). `other` contradicts
+  nothing — an `other` on either side never makes a mismatch — but the
+  site is recorded as resting on an untyped resolution, for the PR. A
+  `fix` site that no fix subtask claims needs either a claim or a typed
+  `sites_not_needed` entry (`{site_id, reason}`); one claimed only with
+  kinds outside the audit's class is a mismatch. Both are fed back to
+  the bug-fixing planner through its mechanical-check loop — the
+  planner either implements the audit's resolution or, only with code
+  evidence the audit is wrong, keeps its own and says so. What is left
+  when the rounds run out is persisted (`site_claims`) and logged, never
+  fatal: the audit is judgment, and an unclaimed site becomes work only
+  through a validated held-out acceptance set that fails (§8 *Held-out
+  acceptance tests*). Measured (bench D3/P6, live planners with the
+  claims check over the same audits, 9 runs: the PR383 target ×3 and 6
+  converged controls): every target run ended claiming all 4 fix sites
+  with the audit's kinds (two needed the feedback round), 8 of 9 runs
+  ended with no open issue and one control kept one unclaimed site; a
+  blind annotator reading the final plans found no claim on the target
+  whose kind contradicted its intent, and the only contradictions it
+  read on a control (4 sites, one run) were all `other` claims — which
+  is why `other` is surfaced instead of contradicting.
+
   A top-level `already_resolved_on_tree` flag was tried alongside and
   dropped: under strict decoding, every schema variant carrying that one
   extra required boolean returned `sites: []` in 5 of 18 calls combined,
@@ -5508,6 +5549,32 @@ ready+empty, some ready+nonempty) proceeds normally, the empty domains simply
 contributing nothing. The all-blocked case still dies — a blocker is a gate
 failure the user must see.
 
+**A partially blocked plan is recorded, and an external prerequisite stops
+the run.** When some domains plan and others exit blocked, scheduling
+proceeds with the ready domains — but the dropped domains used to leave no
+record beyond a log line. Each blocked plan now also types its blocker:
+`blocker_kind` is `none` on a ready plan, `external_precondition` (with
+`external_resource` naming it) when what is missing can be supplied only
+from outside this run — another task's or team's change that has not
+merged, a credential, a live service, a human decision — and
+`evidence_gap` when the missing fact could be established by reading or
+running this repository. Every blocked domain is persisted in
+`domain_blocked` (`{domain, blocker_kind, external_resource, gap}`)
+whenever a plan is about to be scheduled. A typed external prerequisite
+stops the run there, before any subtask executes, naming each domain and
+its prerequisite: the plan cannot be complete without it, and running the
+ready domains would only ship a partial change the next run must re-plan
+around. An evidence gap keeps today's behaviour (proceed, recorded). No
+re-plan is attempted (the scoped re-plan was benched and deferred).
+Measured (bench P3, live re-planning of 7 historical blocked domains at
+their own base trees, 2 samples each): the 4 domains blocked on unmerged
+prerequisite tasks typed `external_prerequisite` 8/8; the 3 non-external
+cases (a real evidence gap, and the same prerequisite blocks replayed
+after the prerequisite merged) planned `ready` with `none` on every
+sample that returned (6/6), so no non-external block was typed external.
+The kind names follow the implementer's typed blocker (§8) so the two
+read the same.
+
 **Reaching it from finalize, after a plan has fully executed.** The two
 routes above both fire *before* any subtask runs. A third case arrives from
 the other end: every subtask reaches `complete`, yet the run branch carries
@@ -7793,6 +7860,54 @@ predates the strip stays the adherence gate's to report, or the operator's
 under `--skip-adherence-check`). Immunity is deliberately not widened to
 paraphrases: a prescribed `pytest tests/test_a.py` would then shield a
 planner's `pytest tests/ tests/test_a.py`, which the CLI denies.
+
+**A command the task forbids is denied in every spelling, and the
+orchestrator does not run it either.** A task sometimes forbids a command
+outright ("do not run `pnpm test`; it hangs the box"). The classifier
+returns it as typed data — `process_constraints.forbidden_commands` (with
+the task's own phrase in `evidence`) — and Python never reads the task for
+it. Three layers follow, each derived from that one list:
+
+- **Deny rules with a paired notice.** Each forbidden command becomes
+  `Bash(<cmd>)` / `Bash(<cmd> *)` rules in `--disallowedTools` (for a
+  package-manager test script also its `X test` / `X run test` twin), via
+  the same `deny_extra` path as the whole-suite deny, and `claude_p`
+  appends a `NOTE FROM ORCHESTRATOR:` naming the forbidden commands to
+  every worker whose tools reach them. Deny without a notice was measured
+  to block workers (2/2 replayed workers ended `blocked`, above).
+- **A PreToolUse hook for the forms prefix rules cannot match.** A rule
+  sees the literal text; `bash -c '…'`, `sh -c "eval …"`, `npx -c`,
+  `corepack pnpm …`, `node -e "require('child_process').execSync('…')"`,
+  `python3 -c "os.system('…')"`, `env -S '…'`, `xargs`, a command
+  substitution, an absolute-path binary, package-manager global options
+  and the `pnpm test`/`npm run test`/`yarn test` aliases all reach the
+  same script. `claude_p` passes `--settings` carrying one PreToolUse hook
+  on `Bash` that runs leerie's own matcher in a separate process: it
+  splits the command with the same quote-aware scan as the whole-suite
+  rules, unwraps wrappers, shells, `eval`, runner proxies and
+  interpreter eval flags (each string literal in the code is read as a
+  command too), normalises package-manager spellings, and denies a
+  command whose normalised argv starts with a forbidden one. Hooks fire
+  under `--dangerously-skip-permissions`. The hook fails open (a crash
+  allows the call; the deny rules still stand) — a matcher bug must not
+  block every Bash call of a run.
+- **The orchestrator's own measurement skips it.** `_measure_axes` does
+  not run a build/lint/test command the task forbids; that axis is
+  recorded unmeasured with `skip_kind: forbidden_by_task`.
+
+A forbidden command that is also a prescribed command is not forbidden
+(the prescription is the more specific instruction), and `runs_commands`
+entries that match one are stripped before scheduling, as the whole-suite
+strip does, so the declared-command check never requires one. Measured
+(bench C7, P10): deny rules alone let 4 of 9 replayed spellings run
+(`bash -c`, `pnpm test`, `npx pnpm run test`, `/usr/bin/env pnpm run
+test`); with the hook, 0 of 30 offline attack forms escaped the matcher
+and 0 of 12 live attempts by workers told to keep trying escaped, while
+0 of 13 offline and 0 of 10 live legitimate commands (`node -e
+"console.log(1)"`, `bash -c 'echo test'`, `grep 'pnpm run test'`, other
+scripts) were blocked. Not covered, deliberately: running the script's
+body directly (`node scripts/t.js`) — that is a different command, and
+the benched runtime script-shell guard that caught it was not adopted.
 
 The derivation reads the target repo's files on every worker spawn, so it is
 total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,

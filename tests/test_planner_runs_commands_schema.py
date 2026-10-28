@@ -18,7 +18,11 @@ import pytest
 
 
 def _subtask_item_schema(leerie):
-    return leerie.SCHEMAS["planner"]["properties"]["subtasks"]["items"]
+    # The item `$ref`s the planner schema's `$defs` (change_kind, claims),
+    # so it validates standalone only with them attached.
+    planner = leerie.SCHEMAS["planner"]
+    return {**planner["properties"]["subtasks"]["items"],
+            "$defs": planner["$defs"]}
 
 
 def _validate_subtask_item(leerie, instance: dict) -> None:
@@ -49,6 +53,7 @@ def test_subtask_with_runs_commands_validates(leerie):
         "success_criteria_seed": "recon:generate is invoked and succeeds",
         "runs_commands": ["recon:browser", "recon:generate"],
         "change_shape": "point",
+        "change_kind": "fix",
     }
     _validate_subtask_item(leerie, instance)
 
@@ -59,6 +64,7 @@ def test_subtask_without_runs_commands_validates(leerie):
         "title": "Add the /volumes endpoint",
         "success_criteria_seed": "POST /volumes returns 201",
         "change_shape": "point",
+        "change_kind": "fix",
     }
     _validate_subtask_item(leerie, instance)
 
@@ -70,6 +76,7 @@ def test_subtask_with_empty_runs_commands_validates(leerie):
         "success_criteria_seed": "existing auth tests still pass",
         "runs_commands": [],
         "change_shape": "point",
+        "change_kind": "fix",
     }
     _validate_subtask_item(leerie, instance)
 
@@ -82,6 +89,7 @@ def test_runs_commands_rejects_non_string_items(leerie):
         "success_criteria_seed": "n/a",
         "runs_commands": [123],
         "change_shape": "point",
+        "change_kind": "fix",
     }
     with pytest.raises(jsonschema.exceptions.ValidationError):
         jsonschema.validate(instance, _subtask_item_schema(leerie))

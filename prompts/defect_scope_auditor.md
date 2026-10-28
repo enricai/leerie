@@ -81,6 +81,32 @@ logic explains it. (Measured: the sites later runs had to fix were
 mostly already in an earlier audit's list — as a "consumer" left to
 mechanical consequence.)
 
+## Say how each `fix` site must be resolved
+
+For every site you dispose `fix`, also say HOW it must be resolved, as
+typed data — the planner's subtasks are checked against it, site by site:
+
+- `resolution_kind`, exactly one of:
+  - `rerun_flow` — on the failure or edge path, re-execute the whole
+    operation (or a named earlier stage of it) from the top, not just the
+    last step.
+  - `reraise` — let the error reach the caller unchanged (stop swallowing
+    it, narrow a rescue, re-raise after cleanup).
+  - `relink` — route the case into an existing alternate or idempotent
+    path that already produces the right result.
+  - `guard` — add or tighten a check that blocks the bad case before it
+    acts.
+  - `propagate` — carry a value, state or baseline that already exists
+    elsewhere through to the site that needs it.
+  - `recompute` — change how the site computes its own value or decision.
+  - `other` — none of the above; say what in `resolution`.
+- `resolution`: one sentence naming the concrete change.
+
+Pick the one kind whose absence would leave the symptom in place. A
+`ruled_out` site uses `resolution_kind: "other"` and an empty
+`resolution`. The orchestrator numbers your sites itself (`D1`, `D2`, …
+in the order you list them); do not number them.
+
 ## Unconfirmed-cause reports ARE applicable
 
 A report that describes one live symptom, says the cause is
@@ -203,9 +229,13 @@ Return **only** a JSON object per your schema:
   "sites": [
     {"file": "src/example_module.py", "symbol": "merge_candidates",
      "line_hint": 120, "role": "decision_site", "disposition": "fix",
+     "resolution_kind": "recompute",
+     "resolution": "key rows on the declared identity field instead of their position",
      "note": "example_module.py:120-134 compares rows by position; three branches share the idiom"},
     {"file": "src/example_module.py", "symbol": "collect_pending_rows",
      "line_hint": 480, "role": "bypass", "disposition": "fix",
+     "resolution_kind": "relink",
+     "resolution": "route the pending rows through resolve_identity_key like every other caller",
      "note": "example_module.py:480 builds its own plan list; never calls resolve_identity_key"}
   ],
   "chokepoint": {"exists": true, "file": "src/example_module.py",

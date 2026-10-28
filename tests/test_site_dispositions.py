@@ -17,8 +17,10 @@ from tests.test_defect_scope_audit import (AUDIT, EFFORTS, MODELS, _caps,
 def test_schema_requires_disposition_without_extra_fields(leerie):
     sch = leerie.SCHEMAS["defect_scope_auditor"]
     site = sch["properties"]["sites"]["items"]
+    # resolution_kind: how a `fix` site must be resolved (DESIGN §5 *Every
+    # `fix` site is claimed*) — an enum, not a free-form string.
     assert sorted(site["required"]) == [
-        "disposition", "file", "role", "symbol"]
+        "disposition", "file", "resolution_kind", "role", "symbol"]
     # No separate free-form evidence field (the strict grammar's
     # expensive element); the evidence lives in `note`.
     assert "evidence" not in site["properties"]

@@ -100,6 +100,7 @@ def test_a_submission_at_the_observed_maximum_validates(leerie):
         "domain": "feature-implementation",
         "subtasks": [],
         "status": "ready",
+        "blocker_kind": "none",
         "confidence": {
             "task_understanding": 9.0,
             "decomposition_quality": 9.0,

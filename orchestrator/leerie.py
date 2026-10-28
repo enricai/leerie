@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import base64
 import codecs
 import concurrent.futures
 import configparser
@@ -494,6 +495,12 @@ STATE_FIELDS = (
     # (classifier-typed `verifiability: external`), for the PR's list;
     # never handed to the delivery judge.
     "requirement_coverage", "needs_human_verification",
+    # site_claims: per audited `fix` site, who claims it and the verdict
+    # (DESIGN §5 *Every `fix` site is claimed*), for the PR. domain_blocked:
+    # every planner domain that exited blocked, typed (DESIGN §8 *A partially
+    # blocked plan is recorded*). process_constraints: the classifier's
+    # typed forbidden commands (DESIGN §9 *A command the task forbids*).
+    "site_claims", "domain_blocked", "process_constraints",
     # likely_already_satisfied / likely_already_satisfied_evidence:
     # optional, additive classifier-schema fields (DESIGN §8). Written by
     # phase_classify on every invocation (default False / ""); consulted by
@@ -2068,6 +2075,7 @@ def _subtask_item_schema(
     include_fixes_reported_symptom: bool = False,
     include_change_shape: bool = False,
     include_verify: bool = False,
+    include_claims: bool = False,
 ) -> dict:
     """Build the child-subtask item schema shared by planner.subtasks,
     reconciler.added_subtasks, and splitter.children.
@@ -2200,10 +2208,66 @@ def _subtask_item_schema(
             "enum": ["point", "localized", "sweep"],
         }
         required.append("change_shape")
+    if include_claims:
+        # Site claims (DESIGN §5 *Every `fix` site is claimed*). Both are
+        # `$ref`s into the planner schema's `$defs` (`_planner_defs`), so
+        # this flag is only valid on a schema that carries them. `change_kind`
+        # is REQUIRED for the `change_shape` reason: only `fix` subtasks'
+        # claims count, so omitting the type must not be a way to skip it.
+        properties["change_kind"] = {"$ref": "#/$defs/change_kind"}
+        properties["claims"] = {"$ref": "#/$defs/claims"}
+        required.append("change_kind")
     return {
         "type": "object",
         "required": required,
         "properties": properties,
+    }
+
+
+def _planner_defs() -> dict:
+    """`$defs` of `SCHEMAS["planner"]`: the D3 site-claim fields and the
+    D4 typed blocker (DESIGN §5 *Every `fix` site is claimed*, §8 *A
+    partially blocked plan is recorded*). Kept in `$defs` behind `$ref`s
+    rather than inlined in the subtask item: the planner schema's
+    strict-output form is the expensive one, and the CLI resolves and
+    validates `$ref` (probed live, CLI 2.1.310 — a value outside a
+    referenced enum was rejected)."""
+    return {
+        "change_kind": {"type": "string", "enum": list(CHANGE_KINDS)},
+        "claims": {
+            "type": "object",
+            "required": ["sites"],
+            "properties": {
+                "sites": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["site_id", "resolution_kinds"],
+                        "properties": {
+                            "site_id": {"type": "string"},
+                            "resolution_kinds": {
+                                "type": "array", "minItems": 1,
+                                "items": {"type": "string",
+                                          "enum": list(SITE_RESOLUTION_KINDS)},
+                            },
+                        },
+                    },
+                },
+            },
+        },
+        "sites_not_needed": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "required": ["site_id", "reason"],
+                "properties": {
+                    "site_id": {"type": "string"},
+                    "reason": {"type": "string", "minLength": 1},
+                },
+            },
+        },
+        "blocker_kind": {"type": "string",
+                         "enum": list(PLANNER_BLOCKER_KINDS)},
     }
 
 
@@ -2328,13 +2392,54 @@ def _self_reported_risks_schema() -> dict:
 D1_SPAN_KINDS = ("heading", "background", "restatement", "process_note")
 D1_SECTION_ROLES = ("requirement", "evidence", "suggestion", "context")
 
+# Site claims (DESIGN §5 *Every `fix` site is claimed, with how it is
+# resolved*). The auditor types how each `fix` site must be resolved; the
+# planner types, per site a `fix` subtask changes, every kind its change
+# applies. SITE_KIND_CLASS is the equivalence table (IMPLEMENTATION §5½
+# *Site claims*): the error-handling kinds each stay their own class — the
+# measured chain broke where `rerun_flow` became `reraise` — while the
+# decision-logic kinds collapse into one, being routinely one edit
+# described three ways. `other` contradicts nothing; a site resting on it
+# is surfaced in the PR instead.
+SITE_RESOLUTION_KINDS = ("rerun_flow", "reraise", "relink", "guard",
+                         "recompute", "propagate", "other")
+SITE_KIND_CLASS: dict[str, str] = {
+    "rerun_flow": "rerun_flow",
+    "reraise": "reraise",
+    "relink": "relink",
+    "guard": "decide",
+    "recompute": "decide",
+    "propagate": "decide",
+    "other": "other",
+}
+CHANGE_KINDS = ("fix", "test", "docs", "other")
+# The planner's typed blocker (DESIGN §8 *A partially blocked plan is
+# recorded*). Names follow the implementer's typed blocker so both read the
+# same; only `external_precondition` stops the run.
+PLANNER_BLOCKER_KINDS = ("none", "external_precondition", "evidence_gap")
+
 
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
         "required": ["categories", "span_dispositions", "section_roles",
                      "required_items"],
+        # Forbidden commands (DESIGN §9 *A command the task forbids is
+        # denied in every spelling*): language→JSON, like
+        # prescribed_procedure — Python never reads the task for them.
+        "$defs": {
+            "process_constraints": {
+                "type": "object",
+                "required": ["forbidden_commands"],
+                "properties": {
+                    "forbidden_commands": {
+                        "type": "array", "items": {"type": "string"}},
+                    "evidence": {"type": "string"},
+                },
+            },
+        },
         "properties": {
+            "process_constraints": {"$ref": "#/$defs/process_constraints"},
             "categories": {"type": "array", "items": {"type": "string"}},
             "questions": {
                 "type": "array",
@@ -2449,9 +2554,18 @@ SCHEMAS: dict[str, dict] = {
     },
     "planner": {
         "type": "object",
-        "required": ["domain", "subtasks", "status"],
+        "required": ["domain", "subtasks", "status", "blocker_kind"],
+        "$defs": _planner_defs(),
         "properties": {
             "domain": {"type": "string"},
+            # DESIGN §8 *A partially blocked plan is recorded*: `none` on a
+            # ready plan; only `external_precondition` (naming its
+            # `external_resource`) stops the run before execution.
+            "blocker_kind": {"$ref": "#/$defs/blocker_kind"},
+            "external_resource": {"type": "string"},
+            # DESIGN §5 *Every `fix` site is claimed*: an audited `fix` site
+            # the plan deliberately leaves alone, with the reason.
+            "sites_not_needed": {"$ref": "#/$defs/sites_not_needed"},
             # DESIGN §8 planner gate: a planner whose evidence gate cannot
             # clear within confidence_rounds emits status="blocked" with an
             # empty subtasks list and the gap analysis in
@@ -2474,6 +2588,7 @@ SCHEMAS: dict[str, dict] = {
                     include_fixes_reported_symptom=True,
                     include_change_shape=True,
                     include_verify=True,
+                    include_claims=True,
                 ),
             },
         },
@@ -3548,6 +3663,10 @@ SCHEMAS: dict[str, dict] = {
         "type": "object",
         "additionalProperties": False,
         "required": ["applicable", "sites"],
+        "$defs": {
+            "resolution_kind": {"type": "string",
+                                "enum": list(SITE_RESOLUTION_KINDS)},
+        },
         "properties": {
             # False only when the task is not a defect fix at all (a
             # feature, a doc change) or the defect has a single obvious
@@ -3573,7 +3692,8 @@ SCHEMAS: dict[str, dict] = {
                     # mechanical consequence. The evidence goes in `note`,
                     # not a new required string: free-form strings are
                     # the strict grammar's expensive element (§7).
-                    "required": ["file", "symbol", "role", "disposition"],
+                    "required": ["file", "symbol", "role", "disposition",
+                                 "resolution_kind"],
                     "properties": {
                         "file": {"type": "string"},
                         "symbol": {"type": "string"},
@@ -3584,6 +3704,12 @@ SCHEMAS: dict[str, dict] = {
                         "disposition": {"type": "string",
                                         "enum": ["fix", "ruled_out"]},
                         "note": {"type": "string"},
+                        # How a `fix` site must be resolved (DESIGN §5
+                        # *Every `fix` site is claimed*) — the planner's
+                        # claims are checked against it; `site_id` is
+                        # assigned by code, never here.
+                        "resolution_kind": {"$ref": "#/$defs/resolution_kind"},
+                        "resolution": {"type": "string"},
                     },
                 },
             },
@@ -20706,6 +20832,335 @@ def _denied_by_full_suite_rules(cmd: str, patterns: list[str], *,
     return False
 
 
+# --- Forbidden commands (DESIGN §9 *A command the task forbids is denied in
+# every spelling*) ---------------------------------------------------------
+#
+# The classifier types them (`process_constraints.forbidden_commands`);
+# everything below compares SHELL COMMAND strings, never prose. Three
+# consumers read one matcher, `_forbidden_command_hit`: the PreToolUse hook
+# (`scripts/forbidden-command-hook.py`), `_measure_axes`, and the plan strip.
+# The deny rules are derived separately because a CLI rule can only be a
+# literal prefix; the hook is what covers wrappers, shells and interpreters.
+
+FORBIDDEN_COMMANDS_NOTICE = (
+    "this task forbids running {cmds}. Every spelling of these commands is "
+    "denied to you — through a wrapper, a shell (`sh -c`), `eval`, "
+    "`npx`/`corepack`, an interpreter (`node -e`, `python3 -c`), another "
+    "package manager or an absolute path alike — so do not look for another "
+    "way to run them. A criterion or repo rule that needs one is recorded "
+    "`met: false, not_applicable: true` with evidence \"the task forbids "
+    "this command\"; continue with the rest of the work.")
+
+_FORBID_MAX_DEPTH = 5
+_FORBID_WRAPPERS = frozenset({
+    "timeout", "nice", "nohup", "stdbuf", "time", "command", "builtin",
+    "exec", "sudo", "xargs", "ionice", "setsid", "chronic", "unbuffer",
+    "noglob", "env", "then", "do", "else", "!"})
+# Wrapper options that consume the next word. Fixed CLI surface of each tool.
+_FORBID_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "timeout": frozenset({"-s", "--signal", "-k", "--kill-after"}),
+    "nice": frozenset({"-n", "--adjustment"}),
+    "ionice": frozenset({"-c", "-n", "-p"}),
+    "sudo": frozenset({"-u", "-g", "-C", "-D"}),
+    "env": frozenset({"-u", "--unset", "-C", "--chdir"}),
+    "xargs": frozenset({"-I", "-i", "-n", "-P", "-L", "-d", "-E", "-s", "-a"}),
+}
+_FORBID_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
+_FORBID_PROXIES = frozenset({"npx", "pnpx", "bunx", "corepack"})
+_FORBID_PMS = frozenset({"npm", "pnpm", "yarn", "bun"})
+# Package-manager options that consume the next word.
+_FORBID_PM_VALUE_OPTS = frozenset({
+    "-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "-w",
+    "--cwd", "--loglevel", "--reporter"})
+_FORBID_PM_SCRIPT_ALIASES = {"t": "test", "tst": "test"}
+_FORBID_PM_BUILTIN_SCRIPTS = frozenset({"test", "start", "stop", "restart"})
+# Interpreter flags whose next word is code to run.
+_FORBID_INTERP_EVAL: dict[str, frozenset[str]] = {
+    "node": frozenset({"-e", "-p", "--eval", "--print", "-pe"}),
+    "python": frozenset({"-c"}),
+    "python3": frozenset({"-c"}),
+    "perl": frozenset({"-e", "-E"}),
+    "ruby": frozenset({"-e"}),
+    "deno": frozenset({"eval"}),
+    "bun": frozenset({"-e", "--eval"}),
+}
+# A string literal inside interpreter code (JS/Python/Ruby/Perl source —
+# program text, a mechanical string, never prose).
+_FORBID_STR_LIT = re.compile(
+    r"""'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)"|`((?:[^`\\]|\\.)*)`""")
+_FORBID_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+
+def _forbidden_argvs(cmd: str, depth: int = 0) -> list[list[str]]:
+    """Every normalised argv `cmd` runs (IMPLEMENTATION §5½ *Forbidden
+    commands*): split with the whole-suite matcher's quote-aware scan, then
+    each subcommand unwrapped by `_forbidden_normalize`."""
+    if depth > _FORBID_MAX_DEPTH or not isinstance(cmd, str):
+        return []
+    out: list[list[str]] = []
+    for seg in _shell_subcommands(cmd):
+        argv = [w.replace(_QUOTED_SPACE, " ") for w in seg.split()]
+        out.extend(_forbidden_normalize(argv, depth))
+    return out
+
+
+def _forbidden_interp_head(word: str) -> str:
+    """`python3.12` and `/usr/bin/python3` read as `python3` (a binary
+    name — a mechanical string)."""
+    head = os.path.basename(word)
+    return "python3" if re.fullmatch(r"python[0-9.]*", head) else head
+
+
+def _forbidden_normalize(argv: list[str], depth: int) -> list[list[str]]:
+    a = list(argv)
+    while a:
+        head = os.path.basename(a[0])
+        if _FORBID_ASSIGN.match(a[0]):
+            a = a[1:]
+            continue
+        if head in _FORBID_WRAPPERS:
+            vals = _FORBID_WRAPPER_VALUE_OPTS.get(head, frozenset())
+            a = a[1:]
+            while a:
+                opt = a[0]
+                if head == "env" and opt in ("-S", "--split-string") \
+                        and len(a) > 1:
+                    return _forbidden_argvs(a[1], depth + 1)
+                if opt in vals:
+                    a = a[2:]
+                elif opt.startswith("-") or _FORBID_ASSIGN.match(opt) or (
+                        head == "timeout" and opt[:1].isdigit()):
+                    a = a[1:]
+                else:
+                    break
+            continue
+        if head in _FORBID_PROXIES:
+            a = a[1:]
+            while a and a[0].startswith("-"):
+                if a[0] in ("-c", "--call") and len(a) > 1:
+                    return _forbidden_argvs(a[1], depth + 1)
+                a = a[2:] if a[0] in ("-p", "--package") else a[1:]
+            continue
+        if head in _FORBID_SHELLS:
+            for i, w in enumerate(a[1:], 1):
+                if w.startswith("-") and not w.startswith("--") and "c" in w:
+                    return (_forbidden_argvs(a[i + 1], depth + 1)
+                            if i + 1 < len(a) else [])
+            break
+        if head == "eval":
+            return _forbidden_argvs(" ".join(a[1:]), depth + 1)
+        flags = _FORBID_INTERP_EVAL.get(_forbidden_interp_head(a[0]))
+        if flags:
+            for i, w in enumerate(a[1:], 1):
+                if w in flags and i + 1 < len(a):
+                    code = a[i + 1]
+                    out = _forbidden_argvs(code, depth + 1)
+                    for m in _FORBID_STR_LIT.finditer(code):
+                        lit = next(g for g in m.groups() if g is not None)
+                        out.extend(_forbidden_argvs(lit, depth + 1))
+                    return out
+        break
+    if not a:
+        return []
+    a[0] = os.path.basename(a[0])
+    if a[0] in _FORBID_PMS:
+        rest, i = a[1:], 0
+        while i < len(rest) and rest[i].startswith("-"):
+            i += 2 if rest[i] in _FORBID_PM_VALUE_OPTS else 1
+        a = [a[0]] + rest[i:]
+        if len(a) > 1:
+            sub = a[1]
+            if sub in ("exec", "dlx", "x"):
+                r = a[2:]
+                while r and r[0].startswith("-"):
+                    if r[0] in ("-c", "--call") and len(r) > 1:
+                        return _forbidden_argvs(r[1], depth + 1)
+                    r = r[1:]
+                return _forbidden_normalize(r, depth + 1)
+            if sub in ("run", "run-script"):
+                r = [w for w in a[2:]]
+                while r and r[0].startswith("-"):
+                    r = r[1:]
+                a = [a[0], "run"] + r
+            elif sub in _FORBID_PM_SCRIPT_ALIASES:
+                a = [a[0], "run", _FORBID_PM_SCRIPT_ALIASES[sub]] + a[2:]
+            elif sub in _FORBID_PM_BUILTIN_SCRIPTS:
+                a = [a[0], "run"] + a[1:]
+    return [a]
+
+
+def _forbidden_prefix_match(cand: list[str], forb: list[str]) -> bool:
+    if not forb or len(cand) < len(forb):
+        return False
+    if (cand[0] in _FORBID_PMS and forb[0] in _FORBID_PMS
+            and len(forb) > 1 and forb[1] == "run"):
+        # `npm test` runs the same package.json script as `pnpm run test`.
+        return cand[1:len(forb)] == forb[1:]
+    return cand[:len(forb)] == forb
+
+
+def _forbidden_command_hit(command: str, forbidden: list[str]) -> str | None:
+    """The first forbidden command one of `command`'s normalised argvs starts
+    with, or None. Never raises: a matcher error reads as no hit (the deny
+    rules still stand) rather than failing a caller."""
+    try:
+        if not forbidden or not isinstance(command, str) or not command.strip():
+            return None
+        cands = _forbidden_argvs(command)
+        for f in forbidden:
+            for forb in _forbidden_argvs(f):
+                if any(_forbidden_prefix_match(c, forb) for c in cands):
+                    return f
+    except Exception:
+        return None
+    return None
+
+
+def _process_constraints(result: dict, prescribed: dict | None) -> dict:
+    """`state.data["process_constraints"]` from the classifier's typed field:
+    forbidden commands whitespace-normalised and de-duplicated. A command the
+    task also PRESCRIBES is dropped (logged) — the prescription is the more
+    specific instruction, and keeping both would make the prescribed command
+    impossible to run while the declared-command check demands it."""
+    pc = result.get("process_constraints") if isinstance(result, dict) else None
+    pc = pc if isinstance(pc, dict) else {}
+    keep = sorted(_prescribed_commands(prescribed))
+    seen: list[str] = []
+    for c in pc.get("forbidden_commands") or []:
+        if not isinstance(c, str):
+            continue
+        c = " ".join(c.split())
+        if not c or c in seen:
+            continue
+        if any(_forbidden_command_hit(p, [c]) for p in keep):
+            log(f"  forbidden command {c!r} is also a prescribed command — "
+                "not forbidden")
+            continue
+        seen.append(c)
+    ev = pc.get("evidence")
+    return {"forbidden_commands": seen,
+            "evidence": ev if isinstance(ev, str) else ""}
+
+
+def _forbidden_commands(data: object) -> list[str]:
+    pc = data.get("process_constraints") if isinstance(data, dict) else None
+    cmds = pc.get("forbidden_commands") if isinstance(pc, dict) else None
+    if not isinstance(cmds, list):
+        return []
+    return [c for c in cmds if isinstance(c, str) and c.strip()]
+
+
+def _forbidden_command_rule_patterns(forbidden: list[str]) -> list[str]:
+    """Bodies of the deny rules for a list of commands: every spelling
+    `_full_suite_runners` gives each one (a command it cannot express as one
+    rule gives none — the hook still covers it), as `<form>` and
+    `<form> *`. Generic over any command list, so another deny (the N8 kill
+    rules) can reuse it."""
+    pats: list[str] = []
+    for c in forbidden:
+        for form in _full_suite_runners(c):
+            for p in (form, f"{form} *"):
+                if p not in pats:
+                    pats.append(p)
+    return pats
+
+
+def _forbidden_command_denials(forbidden: list[str]) -> str:
+    return ",".join(f"Bash({p})"
+                    for p in _forbidden_command_rule_patterns(forbidden))
+
+
+def _forbidden_commands_notice(forbidden: list[str]) -> str | None:
+    if not forbidden:
+        return None
+    return FORBIDDEN_COMMANDS_NOTICE.format(
+        cmds=", ".join(f"`{c}`" for c in forbidden))
+
+
+def _tools_reach_forbidden(allowed_tools: str, forbidden: list[str]) -> bool:
+    """True when a worker with `allowed_tools` could type a forbidden
+    command: bare `Bash`, or a `Bash(<head>…)` grant for one's first word."""
+    tools = [t.strip() for t in (allowed_tools or "").split(",")]
+    if "Bash" in tools:
+        return True
+    heads = {c.split()[0] for c in forbidden if c.split()}
+    return any(t.startswith(f"Bash({h}") for t in tools for h in heads)
+
+
+FORBIDDEN_COMMAND_HOOK = ROOT / "scripts" / "forbidden-command-hook.py"
+
+
+def _forbidden_command_hook_settings(forbidden: list[str]) -> str | None:
+    """The `--settings` JSON carrying the PreToolUse hook, or None when the
+    task forbids nothing. The list travels base64-encoded in the hook's own
+    argv — no file is shared with the worker, so no ownership question
+    arises on any runtime. The orchestrator's own interpreter runs it, so
+    the hook imports exactly the leerie the orchestrator is running."""
+    if not forbidden:
+        return None
+    payload = base64.b64encode(
+        json.dumps(forbidden).encode("utf-8")).decode("ascii")
+    command = " ".join(shlex.quote(w) for w in (
+        sys.executable, "-I", str(FORBIDDEN_COMMAND_HOOK), payload))
+    return json.dumps({"hooks": {"PreToolUse": [{
+        "matcher": "Bash",
+        "hooks": [{"type": "command", "command": command}],
+    }]}}, separators=(",", ":"))
+
+
+def _forbidden_command_hook_main(argv: list[str], stdin: TextIO,
+                                 stdout: TextIO) -> int:
+    """The hook process: deny a Bash call that runs a forbidden command.
+    Always returns 0 and fails open — a matcher error, a malformed event or
+    payload allows the call (the deny rules still stand); a crash here must
+    not block every Bash call of a run."""
+    try:
+        forbidden = json.loads(base64.b64decode(argv[1]).decode("utf-8"))
+        event = json.load(stdin)
+        command = ((event.get("tool_input") or {}).get("command")
+                   if isinstance(event, dict) else None)
+        hit = _forbidden_command_hit(command, [
+            c for c in forbidden if isinstance(c, str)])
+    except Exception:
+        return 0
+    if hit:
+        stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason":
+                f"forbidden command: {hit} — the task forbids it"}}))
+    return 0
+
+
+def _strip_forbidden_commands(plans: list[dict],
+                              forbidden: list[str]) -> list[str]:
+    """Remove `runs_commands` entries that run a forbidden command, so the
+    declared-command check never requires one. Returns the affected sids;
+    mutates in place; never raises."""
+    if not forbidden:
+        return []
+    touched: list[str] = []
+    try:
+        for plan in plans:
+            if not isinstance(plan, dict):
+                continue
+            for sub in plan.get("subtasks") or []:
+                if not isinstance(sub, dict):
+                    continue
+                rc = sub.get("runs_commands")
+                if not isinstance(rc, list) or not rc:
+                    continue
+                kept = [c for c in rc
+                        if not _forbidden_command_hit(c, forbidden)]
+                if len(kept) != len(rc):
+                    sub["runs_commands"] = kept
+                    touched.append(str(sub.get("id")))
+    except Exception as e:
+        log(f"  forbidden-command strip stopped early "
+            f"({type(e).__name__}: {e})")
+    return touched
+
+
 def _strip_canonical_suite_commands(plans: list[dict],
                                     repo_root: str | Path,
                                     prescribed: dict | None) -> list[str]:
@@ -20752,7 +21207,8 @@ def _strip_canonical_suite_commands(plans: list[dict],
 
 def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
                            model: str, prompt: str | None = None,
-                           deny_extra: str = "") -> list[str]:
+                           deny_extra: str = "",
+                           settings: str | None = None) -> list[str]:
     """The `claude -p` argv every live invocation shares, containment included.
 
     Single owner by design. #216 widened `DISALLOWED_TOOLS` and added
@@ -20790,6 +21246,10 @@ def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
         "--model", _model_arg(model),
         "--strict-mcp-config",
     ])
+    if settings is not None:
+        # The forbidden-command PreToolUse hook (DESIGN §9). Absent unless the
+        # task forbids a command, so every other argv is unchanged.
+        cmd.extend(["--settings", settings])
     return cmd
 
 
@@ -20912,12 +21372,31 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     _suite_root = getattr(st, "repo_root", os.getcwd())
     _prescribed = st.data.get("prescribed_procedure")
     suite_deny = _full_suite_denials(_suite_root, _prescribed)
+    # Forbidden commands (DESIGN §9 *A command the task forbids*): deny rules,
+    # the paired notice and the PreToolUse hook, decided together here for
+    # the same reason as the whole-suite pair.
+    forbidden = _forbidden_commands(st.data)
+    forbidden_deny = _forbidden_command_denials(forbidden)
+    forbidden_notice = (_forbidden_commands_notice(forbidden)
+                        if _tools_reach_forbidden(allowed_tools, forbidden)
+                        else None)
+    hook_settings = _forbidden_command_hook_settings(forbidden)
     suite_notice = (_full_suite_notice(_suite_root, _prescribed)
                     if suite_deny and _tools_reach_suite_runner(
                         allowed_tools, _suite_root, _prescribed) else None)
-    if suite_notice:
-        user_prompt = (f"{user_prompt.rstrip()}\n"
-                       f"NOTE FROM ORCHESTRATOR: {suite_notice}")
+    if suite_notice and forbidden:
+        # The suite notice says the orchestrator runs the suite; when the
+        # task forbids that command, it does not (`_measure_axes`).
+        try:
+            if _forbidden_command_hit(_canonical_test_command(_suite_root),
+                                      forbidden):
+                suite_notice = None
+        except Exception:
+            pass
+    for _notice in (suite_notice, forbidden_notice):
+        if _notice:
+            user_prompt = (f"{user_prompt.rstrip()}\n"
+                           f"NOTE FROM ORCHESTRATOR: {_notice}")
     # The database push/reset deny travels with its notice the same way
     # (DESIGN §8 *Prisma repositories get a real database*).
     db_deny = _db_reset_denials(_suite_root)
@@ -20967,7 +21446,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 deny_extra=",".join(d for d in (
                     _repo_write_denials(st.repo_root, st.run_dir),
                     _acceptance_read_denials(schema_key, st.run_dir),
-                    suite_deny, db_deny) if d))
+                    suite_deny, db_deny, forbidden_deny) if d),
+                settings=hook_settings)
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
@@ -23383,6 +23863,11 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["classifier_questions"] = questions
     st.data["needs_source_of_truth"] = bool(result.get("source_of_truth_question"))
     st.data["prescribed_procedure"] = result.get("prescribed_procedure") or {}
+    st.data["process_constraints"] = _process_constraints(
+        result, st.data["prescribed_procedure"])
+    if st.data["process_constraints"]["forbidden_commands"]:
+        log("  task forbids: " + ", ".join(
+            st.data["process_constraints"]["forbidden_commands"]))
     items = [it for it in result.get("required_items") or []
              if isinstance(it, dict)]
     st.data["required_items"] = items
@@ -24734,7 +25219,9 @@ async def phase_defect_scope_audit(
     scope = {
         "applicable": True,
         "defect_shape": result.get("defect_shape") or "",
-        "sites": sites,
+        # Python assigns the IDs the planner's claims name (DESIGN §5
+        # *Every `fix` site is claimed*); the worker never does.
+        "sites": _scope_sites({"sites": sites}),
         "chokepoint": result.get("chokepoint") or {"exists": False},
     }
     ground_truth = _check_ground_truth_inputs(result.get("ground_truth"))
@@ -24746,6 +25233,128 @@ async def phase_defect_scope_audit(
         + (f"; chokepoint: {chokepoint.get('symbol') or chokepoint.get('file')}"
            if chokepoint.get("exists") else "; no single chokepoint"))
     return scope
+
+
+def _scope_sites(defect_scope: object) -> list[dict]:
+    """The audit's sites, each carrying a `site_id` (`D1`, `D2`, … by
+    position when absent — a `defect_scope` persisted before the field
+    existed gets the same IDs the audit would have stamped). Copies;
+    never mutates its input."""
+    if not isinstance(defect_scope, dict):
+        return []
+    out: list[dict] = []
+    for i, s in enumerate(defect_scope.get("sites") or []):
+        if not isinstance(s, dict):
+            continue
+        s = dict(s)
+        if not isinstance(s.get("site_id"), str) or not s["site_id"]:
+            s["site_id"] = f"D{i + 1}"
+        out.append(s)
+    return out
+
+
+def _site_claim_rows(plan: dict, defect_scope: dict) -> list[dict]:
+    """One row per audited `fix` site: who claims it, with which kinds, and
+    the verdict (DESIGN §5 *Every `fix` site is claimed*). Set arithmetic on
+    typed fields only — `SITE_KIND_CLASS` decides equivalence; no prose is
+    read. A site without a `disposition` counts as `fix` (the legacy rule
+    `_warn_defect_sites_uncovered` also applies)."""
+    claims: dict[str, list[dict]] = {}
+    for s in plan.get("subtasks") or []:
+        if not isinstance(s, dict) or s.get("change_kind") != "fix":
+            continue
+        for c in (s.get("claims") or {}).get("sites") or []:
+            if not isinstance(c, dict) or not isinstance(c.get("site_id"), str):
+                continue
+            kinds = [k for k in (c.get("resolution_kinds") or [])
+                     if isinstance(k, str)]
+            claims.setdefault(c["site_id"], []).append(
+                {"sid": str(s.get("id", "?")), "kinds": kinds})
+    not_needed: dict[str, str] = {}
+    for n in plan.get("sites_not_needed") or []:
+        if (isinstance(n, dict) and isinstance(n.get("site_id"), str)
+                and isinstance(n.get("reason"), str) and n["reason"].strip()):
+            not_needed.setdefault(n["site_id"], n["reason"].strip())
+    rows: list[dict] = []
+    for site in _scope_sites(defect_scope):
+        if site.get("disposition", "fix") != "fix":
+            continue
+        sid = site["site_id"]
+        want_kind = site.get("resolution_kind")
+        want = SITE_KIND_CLASS.get(want_kind, "other") \
+            if isinstance(want_kind, str) else "other"
+        cl = claims.get(sid) or []
+        got = {SITE_KIND_CLASS.get(k, "other") for c in cl for k in c["kinds"]}
+        surface_other = False
+        if not cl:
+            status = "not_needed" if sid in not_needed else "unclaimed"
+        elif want == "other" or "other" in got:
+            # `other` contradicts nothing (DESIGN §5); the site rests on an
+            # untyped resolution, which the PR surfaces.
+            status, surface_other = "claimed", True
+        elif want in got:
+            status = "claimed"
+        else:
+            status = "mismatch"
+        rows.append({
+            "site_id": sid,
+            "file": site.get("file", ""),
+            "symbol": site.get("symbol", ""),
+            "auditor_kind": want_kind if isinstance(want_kind, str) else "",
+            "resolution": site.get("resolution") or "",
+            "claims": cl,
+            "not_needed": None if cl else not_needed.get(sid),
+            "status": status,
+            "surface_other": surface_other,
+        })
+    return rows
+
+
+def _check_site_claims(result: dict, defect_scope: object) -> list[str]:
+    """The bug-fixing planner's site-claims check (DESIGN §5 *Every `fix`
+    site is claimed*): one gating issue per `unclaimed` or `mismatch` row of
+    `_site_claim_rows`. `[]` for a blocked plan (it has no subtasks to
+    claim with, and the blocker is its own report) and when the audit is
+    inapplicable or empty."""
+    if (not isinstance(defect_scope, dict)
+            or not defect_scope.get("applicable")
+            or not defect_scope.get("sites")
+            or result.get("status") == "blocked"):
+        return []
+    issues: list[str] = []
+    for r in _site_claim_rows(result, defect_scope):
+        where = f"{r['file']} :: {r['symbol']}"
+        want = (f"the audit's resolution is `{r['auditor_kind'] or 'other'}`"
+                + (f": {r['resolution']}" if r["resolution"] else ""))
+        if r["status"] == "unclaimed":
+            issues.append(
+                f"SITE_UNCLAIMED: {r['site_id']} — {where} is an audited "
+                f"`fix` site no `change_kind: \"fix\"` subtask claims; "
+                f"{want}. Claim it in `claims.sites` of the fix subtask "
+                "that changes it, with every resolution kind that change "
+                "applies there, or list it in `sites_not_needed` with the "
+                "reason it needs no change.")
+        elif r["status"] == "mismatch":
+            got = "; ".join(f"{c['sid']}: {', '.join(c['kinds']) or '-'}"
+                            for c in r["claims"])
+            issues.append(
+                f"SITE_KIND_MISMATCH: {r['site_id']} — {where} is claimed "
+                f"as [{got}] but {want}. Implement the audit's resolution "
+                "and claim its kind, or keep yours only with code evidence "
+                "that the audit is wrong, stated in that subtask's "
+                "`scope_note`, and claim the kind you implement.")
+    return issues
+
+
+def _site_claim_record(plan: object, defect_scope: object) -> dict | None:
+    """`state.data["site_claims"]`: the bug-fixing plan's per-site claim
+    rows, or None when there is no plan or the audit is inapplicable."""
+    if (not isinstance(plan, dict) or not isinstance(defect_scope, dict)
+            or not defect_scope.get("applicable")
+            or not defect_scope.get("sites")):
+        return None
+    return {"domain": "bug-fixing",
+            "sites": _site_claim_rows(plan, defect_scope)}
 
 
 def _warn_defect_sites_uncovered(plans: list[dict],
@@ -24980,7 +25589,14 @@ async def phase_plan(task: str, st: State, caps: dict,
     # common case carries no false framing.
     defect_scope = st.data.get("defect_scope") or {}
     if defect_scope.get("applicable") and defect_scope.get("sites"):
-        ctx_dict["defect_scope"] = defect_scope
+        # With the `site_id`s the planner's claims name (a scope persisted
+        # before the field existed gets them by position).
+        ctx_dict["defect_scope"] = {**defect_scope,
+                                    "sites": _scope_sites(defect_scope)}
+    # Forbidden commands (DESIGN §9): a plan must not depend on running one.
+    _forbidden_ctx = _forbidden_commands(st.data)
+    if _forbidden_ctx:
+        ctx_dict["process_constraints"] = {"forbidden_commands": _forbidden_ctx}
     # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
     # A pre-planning canonical {description, tag, path} list, injected into
     # EVERY planner's ctx (built once, shared across all plan_one calls) so
@@ -25052,7 +25668,14 @@ async def phase_plan(task: str, st: State, caps: dict,
                 return {}
 
             def _check_planner(r: dict) -> list[str]:
-                return check_planner_output(r, repo_root, category)
+                issues = check_planner_output(r, repo_root, category)
+                # Site claims are the bug-fixing planner's to settle: the
+                # audit belongs to that domain (DESIGN §5 *Every `fix` site
+                # is claimed*). A residual after the rounds is logged and
+                # recorded below, never fatal.
+                if category == "bug-fixing":
+                    issues += _check_site_claims(r, defect_scope)
+                return issues
 
             result, gate_warnings = await _run_checked_loop(
                 invoke=_invoke,
@@ -25105,6 +25728,27 @@ async def phase_plan(task: str, st: State, caps: dict,
             best = _select_best_planner_sample(
                 samples, repo_root, c)
             plans.append(best)
+
+    # Recorded from the first-pass plan, before recursive decomposition
+    # re-homes subtask ids (DESIGN §5 *Every `fix` site is claimed*). A
+    # scoped re-plan that leaves bug-fixing out keeps the earlier record.
+    for category, plan in zip(cats, plans):
+        if category != "bug-fixing":
+            continue
+        record = _site_claim_record(plan, defect_scope)
+        if record is None:
+            break
+        st.data["site_claims"] = record
+        st.save()
+        open_rows = [r for r in record["sites"]
+                     if r["status"] in ("unclaimed", "mismatch")]
+        if open_rows:
+            log(f"  site claims: {len(open_rows)} audited fix site(s) still "
+                "open after the planner's rounds — "
+                + ", ".join(f"{r['site_id']} {r['status']}"
+                            for r in open_rows)
+                + " (recorded; work only through a failing held-out set)")
+        break
 
     # DESIGN §5½ *Wire-in to phase_plan*: depth=0 entry so the depth cap
     # counts from the planner level, not from inside _recursive_decompose itself.
@@ -30621,6 +31265,50 @@ def _serialize_planned_overlap(
     return out, kept
 
 
+def _blocked_domain_rows(plans: list[dict]) -> list[dict]:
+    """Every planner domain that exited `blocked`, with its typed blocker
+    (DESIGN §8 *A partially blocked plan is recorded*). `blocker_kind` is
+    `""` when the plan did not type it — a plan checkpointed before the
+    field existed — and such a row never stops the run."""
+    rows: list[dict] = []
+    for plan in plans:
+        if not isinstance(plan, dict) or plan.get("status") != "blocked":
+            continue
+        kind = plan.get("blocker_kind")
+        resource = plan.get("external_resource")
+        rows.append({
+            "domain": str(plan.get("domain", "<unknown>")),
+            "blocker_kind": kind if kind in PLANNER_BLOCKER_KINDS else "",
+            "external_resource": resource if isinstance(resource, str) else "",
+            "gap": _format_blocked_gap(plan.get("confidence")),
+        })
+    return rows
+
+
+def _settle_blocked_domains(st: State, plans: list[dict]) -> list[dict]:
+    """Record every blocked domain in `state.data["domain_blocked"]` and stop
+    the run, before any subtask executes, when one is blocked on a typed
+    external prerequisite (DESIGN §8 *A partially blocked plan is
+    recorded, and an external prerequisite stops the run*). An evidence
+    gap is recorded and the ready domains proceed, as before. No re-plan.
+    Returns the rows."""
+    rows = _blocked_domain_rows(plans)
+    st.data["domain_blocked"] = rows
+    st.save()
+    external = [r for r in rows if r["blocker_kind"] == "external_precondition"]
+    if external:
+        lines = "\n".join(
+            f"  - {r['domain']}: {r['external_resource'] or r['gap']}"
+            for r in external)
+        die(f"{len(external)} planning domain(s) are blocked on an external "
+            f"prerequisite this run cannot supply:\n{lines}\n"
+            "Nothing was executed. Supply the prerequisite (merge the change "
+            "it names, provide the credential or service, or make the "
+            "decision) and start a new run; the blocked domains are recorded "
+            "in state.json under domain_blocked.")
+    return rows
+
+
 def _schedule(plans: list[dict], overlap_extra_waves: int = 0
               ) -> tuple[dict, list[list[str]]]:
     """Phase 3 (pure Python): merge plans, resolve intra- and cross-domain
@@ -34563,12 +35251,24 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     installed = False
     dirty = False
 
+    forbidden = _forbidden_commands(getattr(st, "data", None))
     for axis, cmd in axes.items():
         cmd = (cmd or "").strip()
         if not cmd:
             results[axis] = await _measure_blt(
                 axis, "", tree, timeout=0.0, log_path=log_path,
                 verbosity=verbosity, label_prefix=label_prefix)
+            continue
+        hit = _forbidden_command_hit(cmd, forbidden)
+        if hit:
+            # The task forbids it (DESIGN §9): the orchestrator does not run
+            # it either. Unmeasured, like an axis with no command, and never
+            # memoised — it is not a verdict.
+            results[axis] = {
+                "ran": False, "measured": False, "passed": None,
+                "command": cmd, "skip_kind": "forbidden_by_task",
+                "summary": f"not run: the task forbids `{hit}`"}
+            log(f"  {log_prefix}: {axis} not run — the task forbids `{hit}`")
             continue
 
         key = _blt_memo_key(axis, cmd, tree_sha) if tree_sha else None
@@ -45023,6 +45723,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             await _assert_repo_unchanged(st, "phase 2 (plan)")
         else:
             plans = copy.deepcopy(st.data["plans_after_plan"])
+        # Before any further spend: a domain blocked on an external
+        # prerequisite stops the run here (DESIGN §8).
+        _settle_blocked_domains(st, plans)
 
         if "plans_after_reconcile" not in st.data:
             # Bridge cross-domain capability-tag mismatches before the
@@ -45238,6 +45941,12 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         for _sid in _stripped:
             log(f"  {_sid}: dropped its whole-suite runs_commands entry — "
                 f"the orchestrator's whole-tree pass runs the suite")
+        # A forbidden command must never be REQUIRED by the declared-command
+        # check (DESIGN §9 *A command the task forbids*). Prescribed commands
+        # were already removed from the forbidden list at classify time.
+        for _sid in _strip_forbidden_commands(
+                plans, _forbidden_commands(st.data)):
+            log(f"  {_sid}: dropped a runs_commands entry the task forbids")
         # A planner paraphrase of a prescribed command (`… -q`, "run …
         # to verify") covers it for the adherence floor but is not
         # immune, so the strip can remove the only entry carrying the
@@ -45259,6 +45968,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if "plan_snapshot" not in st.data:
             st.data["current_phase"] = "phase 3: scheduling"
             st.save()
+            # Again here: a re-plan by a later gate can block a domain.
+            _settle_blocked_domains(st, plans)
             subtasks, waves = _schedule(
                 plans, caps.get("overlap_extra_waves",
                                 DEFAULT_CAPS["overlap_extra_waves"]))

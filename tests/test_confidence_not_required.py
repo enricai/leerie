@@ -53,7 +53,8 @@ _FIXTURES = {
     # Requirement-coverage arrays are schema-required (DESIGN §8).
     "classifier": {"categories": ["bug-fixing"], "span_dispositions": [],
                    "section_roles": [], "required_items": []},
-    "planner": {"domain": "bugfix", "subtasks": [], "status": "ready"},
+    "planner": {"domain": "bugfix", "subtasks": [], "status": "ready",
+                "blocker_kind": "none"},
     "reconciler": {
         "added_subtasks": [],
         "added_requires": [],

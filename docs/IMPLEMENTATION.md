@@ -2996,6 +2996,7 @@ Each worker is one `claude -p` headless process. Flags used:
 | `--add-dir` | repeated per entry in `state.json["inspect_dirs"]` (forwarded by `claude_p`'s `add_dirs` param). Used only by inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision) so their sandboxed Read/Grep/Glob and allowlisted Bash verbs can reach sibling repos referenced in the task. See §2 *Inspect directories* |
 | `--dangerously-skip-permissions` | acting workers only (implementer, integrator, conformer, rebaser, acceptance_writer) — suppresses all permission prompts for unattended Bash and file writes; their blast radius is the worktree they own. **Never** applied to judgment workers (`PLANNING_WORKER_TYPES`) at any setting: the flag removes the CLI's working-directory boundary as well as the prompts, and that boundary is the only thing confining a worker that runs against a tree it does not own — measured, a worker carrying the flag wrote outside its cwd and committed on the user's branch even from a detached worktree. The `Bash(<verb>:*)` patterns in `INSPECT_TOOLS` pre-approve listed verbs at the CLI level; anything else (e.g. `rm`, redirect-to-file) falls through and is rejected in non-interactive mode |
 | `--strict-mcp-config` | unconditional for every `claude -p` argv leerie builds — every worker, **and** `preflight`'s smoke test, and the remote integrator in `collect-subtrees.sh` — independent of and prior to any `mcp__*` denylist enumeration. Cuts MCP tool exposure off at the source regardless of what `.claude.json` seeding copies into the container. Measured single-variable on CLI 2.1.234 (identical argv otherwise, fresh empty cwd): **27 MCP tools / 4 `mcp_servers` -> 0 / 0**, rc 0, at a cost of ~880 prompt tokens — this is a containment fix, not a prompt-size one. No `--mcp-config` is ever passed, so it can't strand a caller with zero server config but a nonzero tool surface |
+| `--settings <json>` | only when the task forbids commands (`state.json["process_constraints"]`): one `PreToolUse` hook on `Bash` running `scripts/forbidden-command-hook.py` with the forbidden list base64-encoded in its own argv (`_forbidden_command_hook_settings`; DESIGN §9 *A command the task forbids is denied in every spelling*). Hooks fire under `--dangerously-skip-permissions`. Built by `_contained_claude_argv(settings=…)`; absent otherwise, so the argv is unchanged for a task that forbids nothing |
 
 `claude_p()` is `async`; every caller awaits it. Its optional
 `env_extra: dict[str, str] | None` (passed to `_invoke_admitted`/`_invoke`
@@ -4978,6 +4979,65 @@ The selection log line lists **every ranked sample**, not just the
 winner (`… — ranked: #0(2i/2s), #2(3i/3s)`), using each sample's index in
 the ORIGINAL `samples` list so the number cross-references the
 `planner-{category}-s{idx}` worker sid.
+
+### Site claims, blocked domains and forbidden commands (DESIGN §5, §8, §9)
+
+**Site claims (D3).** `phase_defect_scope_audit` stamps every kept site
+with `site_id` = `D<n>` in audit order (Python assigns IDs only;
+`_scope_sites` fills the same IDs on a `defect_scope` persisted before
+the field existed). The auditor types each `fix` site's
+`resolution_kind` (one of `SITE_RESOLUTION_KINDS`) and `resolution`; the
+planner types each subtask's `change_kind` (`CHANGE_KINDS`: `fix` /
+`test` / `docs` / `other`) and `claims.sites[] = {site_id,
+resolution_kinds[]}`, and lists sites it leaves alone in the top-level
+`sites_not_needed[] = {site_id, reason}`. The equivalence table is the
+code constant `SITE_KIND_CLASS`:
+
+| `resolution_kind` | class | contradicts |
+|---|---|---|
+| `rerun_flow` | `rerun_flow` | every other class |
+| `reraise` | `reraise` | every other class |
+| `relink` | `relink` | every other class |
+| `guard`, `recompute`, `propagate` | `decide` (one class) | every other class |
+| `other` | `other` | nothing — the site is recorded `surface_other: true` for the PR |
+
+| Function | Purpose |
+|----------|---------|
+| `_scope_sites(defect_scope)` | The audit's sites, each with a `site_id` (`D1`, `D2`, … by position when absent). Never mutates its input. |
+| `_site_claim_rows(plan, defect_scope)` | One row per `fix` site (a site with no `disposition` counts as `fix`): `{site_id, file, symbol, auditor_kind, resolution, claims[{sid, kinds}], not_needed, status, surface_other}`. Claims count only from subtasks with `change_kind: "fix"`. `status`: `claimed` (some claimed kind is in the audit kind's class, or either side is `other`), `mismatch` (claimed, every kind outside the class), `not_needed` (unclaimed, with a non-empty `sites_not_needed` reason), `unclaimed`. A claim wins over a `not_needed` entry for the same site. An unknown or missing kind reads as `other`. |
+| `_check_site_claims(result, defect_scope)` | The planner-loop check: `SITE_UNCLAIMED: D<n> — …` and `SITE_KIND_MISMATCH: D<n> — …` issue strings (gating labels) carrying the site's file/symbol, the audit's kind and `resolution`, and what to do. `[]` for a `blocked` plan and when the audit is inapplicable or has no sites. Wired into `phase_plan`'s `_check_planner` for the `bug-fixing` domain only — the domain the audit belongs to — so the residual rides `planner_check_rounds` and is logged, never fatal. |
+| `_site_claim_record(plans, defect_scope)` | `{domain, sites[rows]}` for the `bug-fixing` plan, or `None` when there is none or the audit is inapplicable. `phase_plan` writes it to `state.data["site_claims"]` from the first-pass plans (before recursive decomposition re-homes subtask ids) and logs the count still `unclaimed`/`mismatch`. An unclaimed site becomes work only through a validated held-out set that fails. |
+
+**Blocked domains (D4, shrunk).** The planner returns a top-level
+`blocker_kind` (`PLANNER_BLOCKER_KINDS`: `none` / `external_precondition`
+/ `evidence_gap`) and, for `external_precondition`, `external_resource`.
+The kind names mirror the implementer's typed blocker (B1) so the two
+read the same; reconcile with B1's `blocker_kind` when that lands.
+
+| Function | Purpose |
+|----------|---------|
+| `_blocked_domain_rows(plans)` | `[{domain, blocker_kind, external_resource, gap}]` for every plan with `status: "blocked"`; `blocker_kind` is `""` when the plan did not type it (a pre-feature checkpoint), `gap` is `_format_blocked_gap(confidence)`. |
+| `_settle_blocked_domains(st, plans)` | Writes `state.data["domain_blocked"]` (always — `[]` when nothing is blocked) and `die()`s, before any subtask executes, when a row is `external_precondition`, naming each domain and `external_resource`. Called in `_run_phases` after the `plans_after_plan` checkpoint (fresh and resumed) and again immediately before `_schedule()` (a re-plan can block a domain). No re-plan. |
+
+**Forbidden commands (D5).** The classifier returns
+`process_constraints = {forbidden_commands[], evidence}`; `phase_classify`
+persists `_process_constraints(result, prescribed)` to
+`state.data["process_constraints"]`.
+
+| Function | Purpose |
+|----------|---------|
+| `_process_constraints(result, prescribed)` | Whitespace-normalised, de-duplicated, non-empty `forbidden_commands` plus `evidence`. A command that `_forbidden_command_hit` matches against a prescribed command (`_prescribed_commands`) is dropped and logged — the prescription is the more specific instruction. |
+| `_forbidden_commands(data)` | The list from `data["process_constraints"]`; `[]` when absent or malformed. |
+| `_forbidden_argvs(cmd)` | Every normalised argv a command string runs: `_shell_subcommands` splits it (substitutions are their own subcommands); per subcommand, leading `NAME=value` words, wrappers (`timeout`, `nice`, `nohup`, `stdbuf`, `time`, `command`, `builtin`, `exec`, `sudo`, `xargs`, `ionice`, `setsid`, `chronic`, `unbuffer`, `noglob`, `env`, `then`/`do`/`else`/`!`, with their option values), runner proxies (`npx`, `pnpx`, `bunx`, `corepack`; `-c`/`--call` analysed as a command), shells with `-c`, `eval`, and interpreter eval flags (`node -e/-p/--eval/--print`, `python -c`, `perl -e`, `ruby -e`, `deno eval`, `bun -e`: the code and each string literal in it are analysed as commands) are unwrapped, recursing at most 5 levels; a binary path reduces to its basename; for `npm`/`pnpm`/`yarn`/`bun` global options are dropped, `exec`/`dlx`/`x` recurse into the executed command, and `test`/`t`/`tst`/`start`/`stop`/`restart`/`run-script` normalise to `run <script>`. |
+| `_forbidden_command_hit(command, forbidden)` | The first forbidden command whose normalised argv is a prefix of one of `command`'s; two package-manager `run` argvs compare from the subcommand on, so `npm test` matches a forbidden `pnpm run test`. `None` when nothing matches; never raises. |
+| `_forbidden_command_rule_patterns(forbidden)` / `_forbidden_command_denials(forbidden)` | For each forbidden command, every spelling `_full_suite_runners` gives (a command carrying `,()&|;<>`$*` gives none — the hook still covers it), as `<form>` and `<form> *`; `_forbidden_command_denials` joins them as `Bash(...)` rules for `claude_p`'s `deny_extra`. Generic: any list of command strings. |
+| `FORBIDDEN_COMMANDS_NOTICE` / `_forbidden_commands_notice(forbidden)` | The paired `NOTE FROM ORCHESTRATOR:` body: the task forbids these commands, every spelling and wrapper is denied, do not look for another, record a criterion that needs one `met: false, not_applicable: true` with evidence "the task forbids this command". `claude_p` appends it when the worker's tools reach Bash (bare `Bash`, or a `Bash(<head>…)` grant for a forbidden command's first word). When the repo's canonical test command is itself forbidden, the whole-suite notice is not sent (it would say the orchestrator runs it). |
+| `_forbidden_command_hook_settings(forbidden)` | The `--settings` JSON for `claude_p`: one `PreToolUse` hook, matcher `Bash`, command `<sys.executable> -I <ROOT>/scripts/forbidden-command-hook.py <base64 JSON list>` — the list rides in the command itself, so no file is shared with the worker and no ownership question arises on any runtime. `None` when the list is empty (no `--settings` flag at all). |
+| `_forbidden_command_hook_main(argv, stdin, stdout)` | The hook process (`scripts/forbidden-command-hook.py` imports leerie from its sibling `orchestrator/` and calls this): reads the PreToolUse event, and on a hit prints `{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": "forbidden command: <cmd> — the task forbids it"}}`. Returns 0 always; any error allows the call (fail-open — the deny rules still stand). |
+| `_strip_forbidden_commands(plans, forbidden)` | Removes `runs_commands` entries `_forbidden_command_hit` matches, so the declared-command check never requires one. Called in `_run_phases` next to `_strip_canonical_suite_commands`; returns the affected sids; never raises. |
+| `_measure_axes` (forbidden skip) | An axis whose command `_forbidden_command_hit` matches is not run: `{ran: false, measured: false, passed: null, command, summary, skip_kind: "forbidden_by_task"}`, logged, never memoised. |
+
+The planner ctx carries `process_constraints` when it is non-empty.
 
 ### Cap resolvers
 
@@ -8160,6 +8220,9 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. |
 | `requirement_coverage` | dict | the requirement-coverage gate's record, written by `phase_classify` (DESIGN §8 *Requirement coverage*): `{spans[{id, parent}], sections[{id, source}], reports[], closure[], holes{}}`. `spans`/`sections` are the IDs `_d1_split_spans`/`_d1_split_sections` assigned (no text); `parent` is the mechanical nesting link `_d1_judge_packs` groups by; `reports` the inlined report paths; `closure` the S/R ids `_d1_closure` derives; `holes` the residual `_d1_coverage_holes` findings after the check rounds (`{}` when none). |
 | `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`). The `source` key lets later producers append their own entries. |
+| `site_claims` | dict \| null | the site-claims record (DESIGN §5 *Every `fix` site is claimed*), written by `phase_plan` from the first-pass `bug-fixing` plan: `{domain, sites[{site_id, file, symbol, auditor_kind, resolution, claims[{sid, kinds[]}], not_needed, status, surface_other}]}`, `status` one of `claimed`/`mismatch`/`not_needed`/`unclaimed` (`_site_claim_rows`); `surface_other` marks a site resting on an `other` kind, for the PR. Not written when there is no `bug-fixing` plan or the audit is inapplicable. Never gates. |
+| `domain_blocked` | list[dict] | every planner domain that exited `blocked`, `[{domain, blocker_kind, external_resource, gap}]` (`_settle_blocked_domains`; DESIGN §8 *A partially blocked plan is recorded*). Written after planning and again before scheduling; `[]` when none. A row typed `external_precondition` stops the run before execution. |
+| `process_constraints` | dict | the classifier's typed process constraints (DESIGN §9 *A command the task forbids*): `{forbidden_commands[], evidence}` from `_process_constraints`; `{"forbidden_commands": [], "evidence": ""}` when the task forbids nothing. Read by `claude_p` (deny rules, notice, hook), `_measure_axes`, the plan strip and the planner ctx. |
 
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
@@ -8219,7 +8282,9 @@ Required fields, current shape:
   default `{}`), `likely_already_satisfied` (bool) + `likely_already_satisfied_evidence`
   (required non-empty when true — DESIGN §8; OR-preserved across
   `phase_classification_gate` re-classify rounds so a silent round never
-  clears an earlier true finding).
+  clears an earlier true finding). `process_constraints` (optional, via
+  `$defs`) is `{forbidden_commands: string[], evidence}` — commands the task
+  forbids running; persisted by `_process_constraints`.
 - **planner** — required: `domain`, `subtasks`, `status` (`ready` / `blocked`
   — DESIGN §8 planner gate; a `ready` plan may carry empty `subtasks`, the
   cleared-but-empty terminal state). `confidence` keys when present:
@@ -8256,6 +8321,22 @@ Required fields, current shape:
   `runs_commands`, emitting `PRESCRIBED_CMD_UNRUN: ...`; short-circuits to
   `[]` with no prescribed procedure). Tested in
   `tests/test_prescribed_cmd_coverage.py`; wired into `phase_adherence_gate`.
+  Also required: top-level `blocker_kind` (`none` / `external_precondition` /
+  `evidence_gap`) and per subtask `change_kind` (`fix` / `test` / `docs` /
+  `other`). Optional: top-level `external_resource` (string) and
+  `sites_not_needed` (`{site_id, reason}[]`); per subtask `claims`
+  (`{sites: {site_id, resolution_kinds: string[] (minItems 1)}[]}`). These
+  four live in the planner schema's `$defs` and are referenced with `$ref`
+  (the CLI resolves and validates `$ref`, probed live on 2.1.310: a value
+  outside a referenced enum was rejected).
+- **defect_scope_auditor** — required: `applicable`, `sites`. Each site:
+  required `{file, symbol, role, disposition, resolution_kind}`, optional
+  `{line_hint, note, resolution}`; `resolution_kind` (a `$ref` into the
+  schema's `$defs`) is one of `rerun_flow` / `reraise` / `relink` / `guard`
+  / `recompute` / `propagate` / `other` (`other` with an empty `resolution`
+  on a `ruled_out` site). Optional `defect_shape`, `chokepoint`,
+  `ground_truth`, `rationale`. `site_id` is assigned by code, never by the
+  worker.
 - **implementer** — required: `subtask_id`, `status` (`complete` /
   `incomplete-handoff` / `blocked` / `failed` / `needs-clarification`).
   `confidence`: `root_cause`, `solution` (1–10), `basis`. Optional: `branch`,

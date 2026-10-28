@@ -208,6 +208,17 @@ The orchestrator gives you, in your prompt:
    satisfy in scope. Declaring `sweep` because the file is big is the specific
    mistake this field exists to prevent.
 
+   **Set `change_kind` on every subtask.** Required — there is no default:
+   `fix` (changes production code to resolve what the task asks for — a
+   defect, a feature, a behavior change), `test` (adds or changes tests
+   only), `docs` (documentation only), or `other`. Only `fix` subtasks'
+   site claims count (see *Claims* below).
+
+   If your CONTEXT includes `process_constraints.forbidden_commands`, the
+   task forbids running those commands: no subtask may depend on running
+   one — keep them out of `runs_commands` and `verify`, and verify by
+   other means. The orchestrator denies them to every worker.
+
    **Set `fixes_reported_symptom: true`** only on a subtask whose job is to
    fix a failure the task text reports as *currently happening*. Leave it
    false or absent for everything else — new features, refactors, subtasks
@@ -446,6 +457,26 @@ The orchestrator gives you, in your prompt:
    auditor's evidence and needs no subtask unless you find that evidence
    wrong (then cover it and say why in `scope_note`).
 
+   **Claims (typed, mechanically checked).** Each audited site carries a
+   `site_id` (`D1`, `D2`, …) and, for a `fix` site, the auditor's
+   `resolution_kind` and `resolution`. On every subtask that changes code
+   at an audited site, list the site in `claims.sites` as
+   `{"site_id": "D1", "resolution_kinds": ["<kind>", ...]}` with every
+   resolution kind your change ACTUALLY applies there (one or more of
+   `rerun_flow`, `reraise`, `relink`, `guard`, `recompute`, `propagate`,
+   `other` — the auditor's prompt defines them; your subtask's `intent`
+   must describe that same change). Only subtasks with
+   `change_kind: "fix"` count as claims. The orchestrator then checks, for
+   every `fix` site, that a fix subtask claims it with a kind equivalent to
+   the auditor's: `rerun_flow`, `reraise` and `relink` are each their own
+   kind, while `guard`, `recompute` and `propagate` are interchangeable. A
+   `fix` site you deliberately leave alone goes in the top-level
+   `sites_not_needed` as `{"site_id": "D4", "reason": "<code evidence it
+   needs no change>"}`. A failed check comes back to you: implement the
+   auditor's resolution, or — only with code evidence the auditor is
+   wrong — keep yours, say why in `scope_note`, and claim the kind you
+   implement.
+
    When the `ground_truth` object inside your `defect_scope` ctx
    lists the report's named inputs with every one PRESENT (each
    carrying the `resolved_path` where it is reachable in this
@@ -618,6 +649,17 @@ The orchestrator gives you, in your prompt:
    analysis in `confidence.basis`. The orchestrator will surface
    the blocker; do not invent subtasks to look unblocked.
 
+   **Type the blocker (required).** Set `blocker_kind`. On a ready plan
+   it is `"none"`. On a blocked plan use `"external_precondition"` only
+   when what is missing can be supplied solely from outside this run —
+   another task's or team's change that has not merged, a credential, a
+   live service or account, a human decision — and name it in
+   `external_resource`; the orchestrator then stops the whole run before
+   anything executes and shows the user what to supply. Use
+   `"evidence_gap"` when the missing fact could be established by reading
+   or running this repository: that gap is yours to close in this
+   planning session, so prefer closing it and returning `ready`.
+
    **Mechanical checks.** The orchestrator runs deterministic structural
    checks on your output (phantom file paths, dangling dependencies,
    intra-domain cycles, protected-path violations, task-file coverage)
@@ -633,6 +675,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
 {
   "domain": "bug-fixing",
   "status": "ready",
+  "blocker_kind": "none",
   "confidence": {
     "task_understanding": 9.4,
     "decomposition_quality": 9.1,
@@ -657,6 +700,10 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "success_criteria_seed": "The concrete checkable condition; an automated test where possible.",
       "size": "small | medium",
       "change_shape": "point | localized | sweep",
+      "change_kind": "fix | test | docs | other",
+      "claims": {"sites": [
+        {"site_id": "D1", "resolution_kinds": ["rerun_flow"]}
+      ]},
       "verify": [
         {"criterion": "the regression test for the timeout passes",
          "argv": ["pytest", "tests/test_timeout.py"]},
@@ -671,9 +718,16 @@ Return **only** this JSON object as your final message — no prose, no fences:
       ],
       "performs_replacement": true
     }
+  ],
+  "sites_not_needed": [
+    {"site_id": "D3", "reason": "code evidence that this site needs no change"}
   ]
 }
 ```
+
+`claims` and `sites_not_needed` matter only when your CONTEXT carries
+`defect_scope`; otherwise leave `claims` out and `sites_not_needed` empty.
+`external_resource` is set only with `blocker_kind: "external_precondition"`.
 
 `migration_targets` is optional — omit it unless this subtask replaces an
 existing pattern, and see *Migration sweep* above for what belongs in
@@ -690,8 +744,9 @@ visibility but are not sure it will grep cleanly. An entry with
 `UNCOVERED_MIGRATION_SURFACE` coverage.
 
 `status` is `ready` when both confidence scores are ≥ 9.0. When blocked,
-emit `status: "blocked"`, `subtasks: []`, and the gap analysis in
-`confidence.basis`. Other fields stay as documented.
+emit `status: "blocked"`, `subtasks: []`, the gap analysis in
+`confidence.basis`, and the typed `blocker_kind` (see *Type the blocker*
+above). Other fields stay as documented.
 
 Rules:
 

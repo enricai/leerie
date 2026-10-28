@@ -484,7 +484,9 @@ def test_not_applicable_needs_three_agreeing_samples(
         "t", st, dict(leerie.DEFAULT_CAPS), MODELS, EFFORTS))
     assert scope["applicable"] is applicable and len(calls) == n
     if applicable:
-        assert scope["sites"] == [SITE]
+        # The audit stamps a code-assigned site_id (DESIGN §5 *Every `fix`
+        # site is claimed*).
+        assert scope["sites"] == [{**SITE, "site_id": "D1"}]
 
 
 def test_a_crashed_sample_is_no_vote(leerie, tmp_path, monkeypatch):

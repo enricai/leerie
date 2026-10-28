@@ -112,6 +112,24 @@ Do this extraction yourself, from the task prose — never leave it for a
 downstream regex or string match. If the task prescribes nothing beyond
 "do the work," leave `is_prescribed` false and `commands` empty.
 
+## Forbidden commands
+
+Some tasks forbid running a command outright ("do not run `pnpm test`, it
+hangs the machine"; "never run `prisma db push` against the shared
+database"). Extract each as structured data in `process_constraints`:
+
+- `forbidden_commands` (array of strings): every command the task says
+  must NOT be run, copied as the runnable command it names (`pnpm test`,
+  `prisma db push`), one per entry. Only a prohibition on RUNNING a
+  command belongs here — not a file to leave untouched, and not a command
+  the task merely does not mention. Empty when the task forbids nothing.
+- `evidence` (string): the phrase(s) in the task that forbid them; empty
+  when there are none.
+
+The orchestrator denies every way of running these commands to every
+worker, and does not run them itself. Do this extraction yourself, from
+the task prose — never leave it for a downstream string match.
+
 ## Required items (anchored on task spans and report sections)
 
 The orchestrator has split the input mechanically:
@@ -294,6 +312,10 @@ Return **only** this JSON object as your final message — no prose, no fences:
     "is_prescribed": false,
     "commands": [],
     "forbid_manual": false,
+    "evidence": ""
+  },
+  "process_constraints": {
+    "forbidden_commands": [],
     "evidence": ""
   },
   "span_dispositions": [
