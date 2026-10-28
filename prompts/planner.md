@@ -94,9 +94,9 @@ The orchestrator gives you, in your prompt:
    partition.
 
    **What triggers that split is `change_shape`, not the file's size** (see
-   below). Only a `sweep` is tiled; a `point` or `localized` change stays one
-   subtask however large its file is. Declare it in `change_shape` — that is the
-   field the orchestrator reads. Describing the density in `investigation_notes`
+   below). Only a `sweep` with `independent_sites: true` is tiled; a `point`
+   or `localized` change stays one subtask however large its file is. Declare
+   it in `change_shape` — that is the field the orchestrator reads. Describing the density in `investigation_notes`
    is useful detail for the implementer, but prose is not a signal the
    orchestrator can act on, so it never substitutes for the declaration.
 
@@ -207,6 +207,26 @@ The orchestrator gives you, in your prompt:
    that to a `point` change hands a dozen workers a mandate only one of them can
    satisfy in scope. Declaring `sweep` because the file is big is the specific
    mistake this field exists to prevent.
+
+   **Set `independent_sites` on every subtask** (boolean, required). `true`
+   only when each edit site can be changed correctly by someone who sees ONLY
+   that site's surrounding lines: no new shared helper, type or constant has
+   to be created first, no site's change depends on another site's change,
+   and no new file (test or source) is part of the deliverable. A rename, a
+   call-site migration to an API that ALREADY exists, or a per-row
+   re-verification are `true`. "Route every site through one new shared
+   helper", "add a baseline at one site and consume it at others", or "write
+   unit tests for these behaviours" are `false`. The orchestrator tiles a
+   large file across parallel region workers only for `change_shape:
+   "sweep"` with `independent_sites: true`; any other combination stays one
+   subtask.
+
+   **For such a sweep, list `sweep_sites`**: the identifiers every edit site
+   contains, verbatim from this repository (the symbol being renamed, the
+   call being migrated) — strings you could paste into `grep -w`, one per
+   entry, no spaces. The orchestrator finds them in the file and gives a
+   region worker only to the regions that hold one; a sweep whose identifiers
+   it cannot find is not split.
 
    **Set `change_kind` on every subtask.** Required — there is no default:
    `fix` (changes production code to resolve what the task asks for — a
@@ -711,6 +731,8 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "claims": {"sites": [
         {"site_id": "D1", "resolution_kinds": ["rerun_flow"]}
       ]},
+      "independent_sites": false,
+      "sweep_sites": [],
       "verify": [
         {"criterion": "the regression test for the timeout passes",
          "argv": ["pytest", "tests/test_timeout.py"]},

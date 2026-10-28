@@ -561,6 +561,46 @@ Return **only** this JSON object as your final message — no prose, no fences:
 - `incomplete-handoff` requires `checkpoint_path` set.
 - `blocked` requires `blocker` set with the precise missing evidence/input.
 - `failed` requires a diagnosis in `summary`.
+- `blocker_kind` is required whenever `status` is `blocked` or `failed` —
+  see "Blocker kind" below. Omit it, and `external_resource`, on any other
+  status (neither field accepts null).
+
+### Blocker kind (required whenever status is `blocked` or `failed`)
+
+When you return `blocked` or `failed`, set `blocker_kind` to exactly one
+value. The orchestrator routes on it, not on your `blocker` text:
+
+- `nothing_to_change` — the requested change is already present in the
+  tree (or your owned scope contains nothing to change); no edit is needed.
+  The subtask is driven again with your blocker as input, so say exactly
+  what you checked.
+- `external_precondition` — the work needs something that only a human
+  outside this run can supply: credentials or secrets, a live third-party
+  service or account, a human decision or approval, physical hardware. Set
+  `external_resource` to name it. This is the **only** kind that is
+  accepted without more work, and it is listed for human verification. A
+  command that fails or is killed because of this container's own resources
+  is NOT `external_precondition` — use `environment_limit`.
+- `environment_limit` — a command could not complete because of this
+  container's resources: killed (exit 137 / OOM), cannot spawn threads or
+  processes (EAGAIN), a dependency install or test run that hung or timed
+  out, a missing tool or `node_modules`. Name the command and the symptom in
+  `blocker`. The orchestrator owns the container's limits and retries once.
+- `upstream_missing` — another subtask's output that this one depends on is
+  not in your tree yet.
+- `cannot_reproduce` — you could not reproduce the defect you were meant to
+  fix. The orchestrator then runs the subtask's verify commands itself; it
+  settles the subtask only if they pass on your unchanged tree, so commit
+  nothing for this kind.
+- `regression_unresolved` — you made changes or wrote tests, but tests still
+  fail or criteria remain unmet and more work in this repository could
+  address them.
+- `other` — anything else; explain in `blocker`.
+
+Every kind other than `external_precondition`, `environment_limit` and
+`cannot_reproduce` is driven again: another round receives your blocker as
+input. A missing kind, or `external_precondition` without
+`external_resource`, is treated as `other`.
 - `needs-clarification` requires both `checkpoint_path` set AND
   `clarification_question` set to `{id, question, why_underivable}` (all
   three string fields non-empty). See §6b for the gate.

@@ -1472,6 +1472,37 @@ split mechanism therefore separates by structural type:
   `investigation_notes` would be exactly the regex-over-prose this design
   forbids.
 
+  **A sweep is tiled only when its sites are independent, and only where its
+  sites are.** `sweep` alone was not enough: a sweep that routes every site
+  through one new shared helper, or whose deliverable includes a new file,
+  cannot be finished by a worker that sees one region. The planner therefore
+  also types `independent_sites` (each site can be changed correctly from its
+  own surrounding lines alone: no new shared helper, type or constant first, no
+  site depending on another, no new file) and `sweep_sites` (the identifiers
+  every site contains). The gate is `change_shape == "sweep"` **and**
+  `independent_sites` true; a **missing** field means **no split**. That
+  reverses the earlier absence-means-split default, which existed so that
+  reconciler- and splitter-made subtasks (whose schemas lack the field) could
+  still be tiled — and that default was the main way harmful tilings happened:
+  across 8 executed tilings, region children ended blocked 66 of 86 times, and
+  in the fresh data the main path was a splitter or peel child carrying no
+  `change_shape` at all. Splitter and peel children now inherit the parent's
+  `change_shape`, `independent_sites` and `sweep_sites`, so a child is gated
+  exactly as its parent was. Tiling is then site-limited: each `sweep_sites`
+  identifier is located in the file with `git grep -w -F` (a fixed-string,
+  whole-word match — the planner names the identifier, code finds the lines),
+  and only regions containing at least one site get a child; a sweep none of
+  whose identifiers is found in the file, or whose sites fall in one region, is
+  a leaf. Benched as Q5/E1 with the gate frozen before scoring: on 6 fresh
+  genuine sweeps the gate split 12 of 12 samples (site-only tiling kept 6/25,
+  1/25, 7/25, 2/2, 2/2 and 1/9 regions); on 28 historical subtasks today's rule
+  would tile it tiled 0 (none was a genuine independent sweep, hand-labelled);
+  on 17 fresh re-plans with the frozen planner it tiled 1 subtask, a benign
+  one-site call migration, and 0 harmful ones, where today's rule tiled 2.
+  On the three development sweeps (P11) the gate permitted the split in 6 of 6
+  samples, site-limiting cut the regions 25→9, 26→10 and 25→8, and 0 of 2
+  harmful-split rechecks tiled.
+
   **Region ownership constrains paths, not only lines.** A region child owns a
   line range *and* owns no other path: the parent's criteria may demand a new
   file, and "do not edit outside lines X-Y" does not constrain creating one. In
@@ -7001,6 +7032,40 @@ planner is not sent after a contract the set itself got wrong. The filter
 is applied when the residual is read, so a set typed after its run
 finished is excluded all the same.
 
+**A task that points at a report is bounded by the report's own
+scenarios.** A writer told to break the fix writes variants — a later
+retry, the last step instead of a middle one, a delay outside the range
+the report states — and every variant left failing used to be unfinished
+work, so a chain re-ran until the variants ran out. The user's rule (option
+a): a report-pointer task — one naming a report file the repository does
+not track (`_d1_report_sources`) — is finished once the report's own
+scenarios pass. An independent `scope_judge` reads, per defect file with a
+case failing at the own start, the task, the report, the test source and
+each case's own-start outcome, and reports typed facts only: the numeric
+ranges the report states (`{param, min, max, unit, span_quote}`) and, per
+case, its `origin` (`report_example`, `report_regression_test`,
+`report_symptom` or `other_scenario`), the values it sets for those ranges
+and the report passage it comes from. Code decides: a case **counts** when
+it failed at the own start, its origin is not `other_scenario`, every value
+it sets lies inside its range (milliseconds and seconds compared in one
+unit; overlapping verified ranges for one unit merge), and its
+`span_quote` — like every range's — is a substring of the task or report
+after NFC and whitespace normalisation. A set with no counted case is a
+**variant set**: it is still repaired in the same pass, but it never
+creates a run — the no-work settle, the already-fixed check, the
+satisfied-probe protection and the run outcome read only failing files
+that hold a counted case, and the next run's residual leaves variant sets
+out like broken ones. A judge that fails leaves the set unbounded (every
+failing file counts, as before). A set whose defect cases all pass at the
+own start even after the writer's one retry is recorded with the reason
+`fixed_on_head_by_execution` — assigned by code from the runner's
+per-case report, never by a worker. Benched as P2 (v3b, frozen; 15 sets
+from the C1/D1 corpora, three samples each, every failing case hand-labelled
+under option a): 242 of 246 in-scope failing cases counted and 102 of 102
+out-of-scope ones dropped; per set-sample, 15 of 15 with an in-scope case
+kept and 30 of 30 without one dropped; and the late runs of the two replayed
+chains (12 and 4) all converged, in every sample.
+
 **Scoped runners for every runner leerie can read.** A set runs only
 through a scoped test template — the canonical command over the set's own
 files — so a repo with no template got no sets at all, silently. The
@@ -7989,7 +8054,14 @@ unchanged — only the inputs (cwd, `DIFF_BASE`, and the absence of a
 subtask spec / criteria file) differ. The pass's structured output
 lands at `st.data["conformance"]["_final"]` and is threaded into the
 `pr_writer` payload so its residuals surface as an advisory section
-in the PR body alongside the wave-by-wave summary.
+in the PR body alongside the wave-by-wave summary. That record is also the
+pass's resume sentinel, but only for a pass that **cleared**: `resume`
+skips the pass when `_final` is recorded with `blocked` false, and runs it
+again when `blocked` is true. A blocked final pass stops the run with
+"fix and resume"; skipping it on that resume would let the very run the
+operator resumed to finish the gap ship without the pass ever looking at
+the gap again (in the attribution of 32 traced chains, one needed exactly
+this fix).
 
 **Base-tree health baseline.** Before this existed, the conformer was the
 first place the repo's build/lint/test suite ran at all, so a red base tree
@@ -8967,6 +9039,40 @@ wave therefore ends terminal and `completed_waves` advances. Benched as the
 P7 replay (90 historical runs, 2000 trials each): the 95th-percentile
 re-drive time fit the budget in 90 of 90 runs, no subtask exceeded 2 rounds,
 and every wave's subtasks ended terminal.
+
+### A blocked implementer says why, as a type
+
+An implementer that ends `blocked` or `failed` types the cause as
+`blocker_kind`, and code routes on the type alone — never on the `blocker`
+prose:
+
+| `blocker_kind` | Routing |
+|---|---|
+| `nothing_to_change` | re-driven |
+| `external_precondition` (+ `external_resource`) | the only kind that may be accepted: settled `accepted_external` and listed under "Needs human verification" |
+| `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
+| `upstream_missing` | re-driven |
+| `cannot_reproduce` | settled by execution (§8 *Settled by execution*); a claim execution cannot back is re-driven |
+| `regression_unresolved` | re-driven |
+| `other` | re-driven |
+
+Re-driven means the wave-end re-drive from the shared budget above; a spent
+budget settles `unconverged`. An `external_precondition` that names no
+resource, and a result with no kind at all, are typed `other`: acceptance is
+the one outcome that ends work without code, so it needs the resource named.
+`accepted_external` is settled (resume skips it), its branch is not
+integrated, it does not make the run `unconverged`, and the State list
+`needs_human_verification` gains `{source: "blocker", subtask, resource,
+blocker}` beside the classifier's external items. Before this, every
+`blocked` subtask was auto-accepted: of 246 auto-accepted subtasks over seven
+days, a classifier over the implementers' own evidence typed only 10
+`external_precondition`. Benched as D3/B1 on 47 hand-labelled blocked
+subtasks (4 external, 12 environment, 22 no-op, 9 real work), two samples of
+the typed prompt: 4 of 4 externals typed external in both samples, 0 of 86
+non-external results typed external (an earlier wording without the
+`environment_limit` kind and its exclusion sentence typed 23 of 86 external),
+and the routing agreed with the hand label on 36 and 37 of 47, 38 of 47 once
+`cannot_reproduce` is settled by execution.
 
 ### Budget feasibility — fail fast at the cheapest moment
 

@@ -659,6 +659,14 @@ def _write_lines(path: Path, n: int) -> None:
     path.write_text("\n".join(f"line {i}" for i in range(1, n + 1)))
 
 
+# The typed split gate (DESIGN §5½ (P1) *Sub-file*): only an independent-site
+# sweep is tiled, and only the regions holding one of its `sweep_sites` —
+# `line` is on every line `_write_lines` writes, so these parents tile the
+# whole file. A parent without these fields is no longer tiled at all.
+_SWEEP = {"change_shape": "sweep", "independent_sites": True,
+          "sweep_sites": ["line"]}
+
+
 def test_subfile_oversized_single_file_region_splits(leerie, tmp_path):
     """A low-fit single-file subtask over the span cap is region-split into
     children that each own the same file, tile it exactly, and pass as leaves —
@@ -666,6 +674,7 @@ def test_subfile_oversized_single_file_region_splits(leerie, tmp_path):
     f = tmp_path / "big.ts"
     _write_lines(f, 2000)
     parent = {
+        **_SWEEP,
         "id": "feat-005",
         "title": "Route everything through the guard",
         "success_criteria_seed": "all sites routed",
@@ -724,6 +733,7 @@ def test_subfile_region_children_have_distinct_intents(leerie, tmp_path):
     parent_intent = ("Add all token-management machinery: probe functions, "
                       "ranking logic, failover hook.")
     parent = {
+        **_SWEEP,
         "id": "feat-005",
         "title": "Route everything through the guard",
         "intent": parent_intent,
@@ -771,7 +781,7 @@ def test_subfile_ids_carry_domain_prefix(leerie, tmp_path):
     f = tmp_path / "big.ts"
     _write_lines(f, 2000)
     parent = {"id": "feat-005", "title": "t", "success_criteria_seed": "c",
-              "files_likely_touched": ["big.ts"]}
+              "files_likely_touched": ["big.ts"], **_SWEEP}
     caps = _make_caps(leerie, subfile_split_max_span=700)
     st = _make_state(leerie, caps)
     models = {"fit_judge": "opus", "splitter": "opus"}
@@ -796,7 +806,7 @@ def test_subfile_no_ranges_uses_line_window_fallback(leerie, tmp_path):
     f = tmp_path / "big.ts"
     _write_lines(f, 2000)
     parent = {"id": "feat-005", "title": "t", "success_criteria_seed": "c",
-              "files_likely_touched": ["big.ts"]}
+              "files_likely_touched": ["big.ts"], **_SWEEP}
     caps = _make_caps(leerie, subfile_split_max_span=700)
     st = _make_state(leerie, caps)
     models = {"fit_judge": "opus", "splitter": "opus"}
@@ -878,7 +888,7 @@ def test_subfile_bump_workers_not_called_for_region_children(leerie, tmp_path):
     f = tmp_path / "big.ts"
     _write_lines(f, 2000)
     parent = {"id": "feat-005", "title": "t", "success_criteria_seed": "c",
-              "files_likely_touched": ["big.ts"]}
+              "files_likely_touched": ["big.ts"], **_SWEEP}
     caps = _make_caps(leerie, subfile_split_max_span=700)
     st = _make_state(leerie, caps)
     models = {"fit_judge": "opus", "splitter": "opus"}
@@ -910,6 +920,7 @@ def test_peel_unit_two_file_impl_test(leerie, tmp_path):
     _write_lines(tmp_path / "flow-runner.ts", 2000)     # oversized
     _write_lines(tmp_path / "flow-runner.test.ts", 50)  # small
     parent = {
+        **_SWEEP,
         "id": "feat-005", "title": "Thread FrameTarget",
         "success_criteria_seed": "all sites routed",
         "files_likely_touched": ["flow-runner.ts", "flow-runner.test.ts"],
@@ -962,6 +973,7 @@ def test_peel_end_to_end_dense_file_tiles(leerie, tmp_path):
     _write_lines(tmp_path / "flow-runner.ts", 2000)
     _write_lines(tmp_path / "flow-runner.test.ts", 50)
     parent = {
+        **_SWEEP,
         "id": "feat-005", "title": "Thread FrameTarget",
         "success_criteria_seed": "all sites routed",
         "files_likely_touched": ["flow-runner.ts", "flow-runner.test.ts"],
@@ -1014,6 +1026,7 @@ def _peel_leaves(leerie, tmp_path, *, downstream=None):
     _write_lines(tmp_path / "flow-runner.ts", 2000)
     _write_lines(tmp_path / "flow-runner.test.ts", 50)
     parent = {
+        **_SWEEP,
         "id": "feat-005", "title": "Thread FrameTarget",
         "success_criteria_seed": "all sites routed",
         "files_likely_touched": ["flow-runner.ts", "flow-runner.test.ts"],
@@ -1430,7 +1443,7 @@ def test_subfile_split_backstop_failure_returns_no_children(leerie, tmp_path, ca
     rather than shipping a broken partition."""
     f = tmp_path / "big.ts"
     _write_lines(f, 2000)
-    subtask = {"id": "feat-031", "files_likely_touched": ["big.ts"]}
+    subtask = {"id": "feat-031", "files_likely_touched": ["big.ts"], **_SWEEP}
 
     with patch.object(leerie, "_extract_symbol_ranges",
                        return_value=[("a", 1, 900), ("b", 901, 2000)]), \
@@ -1457,3 +1470,46 @@ def test_subfile_split_reentry_degenerate_max_span_yields_no_gain(leerie):
     children = leerie._subfile_split(subtask, Path("/tmp"), max_span=0)
 
     assert children == []
+
+
+def test_splitter_children_inherit_the_split_gate(leerie, tmp_path):
+    """A child the LLM splitter returns carries no `change_shape` of its own
+    (the splitter schema has none). It must be gated as its parent was: the
+    sweep parent's single-file child tiles; the same child under a `point`
+    parent stays a leaf (DESIGN §5½ (P1) *Sub-file*, Q5/E1)."""
+    _write_lines(tmp_path / "big.ts", 2000)
+    _write_lines(tmp_path / "other.ts", 50)
+
+    def run(parent_fields):
+        parent = {"id": "feat-007", "title": "t", "success_criteria_seed": "c",
+                  "files_likely_touched": ["big.ts", "other.ts", "x.ts"],
+                  **parent_fields}
+        caps = _make_caps(leerie, subfile_split_max_span=700)
+        st = _make_state(leerie, caps)
+
+        async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+            if schema_key == "fit_judge":
+                return _fit_response(0.90 if "feat-007-2" in sid else 0.30)
+            if schema_key == "splitter":
+                return {"children": [
+                    {"id": "feat-007-1", "title": "a",
+                     "success_criteria_seed": "a",
+                     "files_likely_touched": ["big.ts"]},
+                    {"id": "feat-007-2", "title": "b",
+                     "success_criteria_seed": "b",
+                     "files_likely_touched": ["other.ts", "x.ts"]}]}
+            pytest.fail(f"unexpected worker {schema_key!r}")
+
+        with patch.object(leerie, "_extract_symbol_ranges", return_value=[]), \
+             patch.object(leerie, "_peel_oversized_file", return_value=[]), \
+             patch.object(leerie, "claude_p", new=fake_claude_p):
+            return _run(leerie._recursive_decompose(
+                parent, 0, st, caps, {}, {}, tmp_path))
+
+    swept = run(_SWEEP)
+    assert [l["id"] for l in swept if l.get("owned_region")], \
+        "the sweep parent's child must tile"
+    assert all(l["change_shape"] == "sweep" for l in swept)
+    pointed = run({"change_shape": "point", "independent_sites": False})
+    assert not [l for l in pointed if l.get("owned_region")]
+    assert {l["id"] for l in pointed} == {"feat-007-1", "feat-007-2"}

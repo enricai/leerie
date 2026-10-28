@@ -31,7 +31,7 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "task_coverage_judge", "artifact_registry", "integration_judge",
            "no_work_judge", "delivery_judge", "defect_scope_auditor",
            "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer",
-           "ci_checks")
+           "ci_checks", "scope_judge")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -67,6 +67,9 @@ DEFAULTS = {
     # The repository's own merge checks (DESIGN §9 *The repository's own
     # merge checks run too*): sonnet through the MODEL_DEFAULT fallback.
     "ci_checks": "sonnet",
+    # The report-bounded scope judge (DESIGN §8 *A task that points at a
+    # report is bounded by the report's own scenarios*): MODEL_DEFAULT.
+    "scope_judge": "sonnet",
 }
 
 

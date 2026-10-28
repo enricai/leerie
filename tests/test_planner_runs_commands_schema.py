@@ -54,6 +54,7 @@ def test_subtask_with_runs_commands_validates(leerie):
         "runs_commands": ["recon:browser", "recon:generate"],
         "change_shape": "point",
         "change_kind": "fix",
+        "independent_sites": False,
     }
     _validate_subtask_item(leerie, instance)
 
@@ -65,6 +66,7 @@ def test_subtask_without_runs_commands_validates(leerie):
         "success_criteria_seed": "POST /volumes returns 201",
         "change_shape": "point",
         "change_kind": "fix",
+        "independent_sites": False,
     }
     _validate_subtask_item(leerie, instance)
 
@@ -77,6 +79,7 @@ def test_subtask_with_empty_runs_commands_validates(leerie):
         "runs_commands": [],
         "change_shape": "point",
         "change_kind": "fix",
+        "independent_sites": False,
     }
     _validate_subtask_item(leerie, instance)
 
@@ -90,6 +93,7 @@ def test_runs_commands_rejects_non_string_items(leerie):
         "runs_commands": [123],
         "change_shape": "point",
         "change_kind": "fix",
+        "independent_sites": False,
     }
     with pytest.raises(jsonschema.exceptions.ValidationError):
         jsonschema.validate(instance, _subtask_item_schema(leerie))

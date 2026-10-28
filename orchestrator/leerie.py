@@ -51,6 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -792,6 +793,10 @@ STATE_FIELDS = (
     # CI parity (DESIGN §9 *The repository's own merge checks run too*): the
     # discovered checks, their baseline and final runs, and the red ones.
     "ci_parity",
+    # Typed blocker kinds (DESIGN §13 *A blocked implementer says why, as a
+    # type*): per-sid `{kind, resource?, status}` of the latest blocked or
+    # failed implementer attempt, as `_route_blocker_kind` routed it.
+    "blocker_kinds",
     # The base-health baseline's measured build peak, the build-semaphore
     # slot count sized from it, and the caps it raised (DESIGN §6 *The
     # repo's own build peak*). Re-applied on resume.
@@ -1744,6 +1749,10 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # Enumerates the repository's own merge checks (DESIGN §9 *The
     # repository's own merge checks run too*); benched at medium (N6).
     "ci_checks": "medium",
+    # The report-bounded scope judge (DESIGN §8 *A task that points at a
+    # report is bounded by the report's own scenarios*), benched at medium
+    # (P2). Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
+    "scope_judge": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1875,7 +1884,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "no_work_judge", "delivery_judge",
                 "defect_scope_auditor", "rebaser", "acceptance_writer",
-                "set_auditor", "surrogate_fixer", "ci_checks")
+                "set_auditor", "surrogate_fixer", "ci_checks",
+                "scope_judge")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1902,6 +1912,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
     "delivery_judge", "defect_scope_auditor", "set_auditor", "ci_checks",
+    "scope_judge",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2221,6 +2232,18 @@ def _subtask_item_schema(
             "enum": ["point", "localized", "sweep"],
         }
         required.append("change_shape")
+        # The other half of the split gate (DESIGN §5½ (P1) *Sub-file*): a
+        # sweep is tiled only when each site can be changed from its own
+        # surrounding lines alone. Required on the same reasoning as
+        # `change_shape` — and a missing value refuses the split.
+        properties["independent_sites"] = {"type": "boolean"}
+        required.append("independent_sites")
+        # The identifiers every site of a sweep contains. Code locates them
+        # (`_sweep_site_lines`, `git grep -w -F`) and tiles only the regions
+        # holding one; optional, and absence means no site-limited tiling,
+        # so no split.
+        properties["sweep_sites"] = {
+            "type": "array", "items": {"type": "string"}}
     if include_claims:
         # Site claims (DESIGN §5 *Every `fix` site is claimed*). Both are
         # `$ref`s into the planner schema's `$defs` (`_planner_defs`), so
@@ -2405,6 +2428,19 @@ def _self_reported_risks_schema() -> dict:
 D1_SPAN_KINDS = ("heading", "background", "restatement", "process_note")
 D1_SECTION_ROLES = ("requirement", "evidence", "suggestion", "context")
 
+# Typed implementer blocker kinds (DESIGN §13 *A blocked implementer says
+# why, as a type*). Only `external_precondition` may be accepted; every other
+# kind is re-driven, retried or settled by execution (`_route_blocker_kind`).
+BLOCKER_KINDS = ("nothing_to_change", "external_precondition",
+                 "environment_limit", "upstream_missing", "cannot_reproduce",
+                 "regression_unresolved", "other")
+
+# The scope judge's vocabularies (DESIGN §8 *A task that points at a report is
+# bounded by the report's own scenarios*), bench P2 v3b.
+SCOPE_ORIGINS = ("report_example", "report_regression_test", "report_symptom",
+                 "other_scenario")
+SCOPE_UNITS = ("ms", "s", "count", "bytes", "percent", "other")
+
 # Site claims (DESIGN §5 *Every `fix` site is claimed, with how it is
 # resolved*). The auditor types how each `fix` site must be resolved; the
 # planner types, per site a `fix` subtask changes, every kind its change
@@ -2427,8 +2463,10 @@ SITE_KIND_CLASS: dict[str, str] = {
 }
 CHANGE_KINDS = ("fix", "test", "docs", "other")
 # The planner's typed blocker (DESIGN §8 *A partially blocked plan is
-# recorded*). Names follow the implementer's typed blocker so both read the
-# same; only `external_precondition` stops the run.
+# recorded*). Its external kind IS the implementer's (BLOCKER_KINDS, above):
+# `external_precondition` is the one kind either worker may type that ends
+# work without code, and it names its resource in `external_resource` on
+# both. Only it stops the run.
 PLANNER_BLOCKER_KINDS = ("none", "external_precondition", "evidence_gap")
 
 
@@ -2737,6 +2775,10 @@ SCHEMAS: dict[str, dict] = {
     "implementer": {
         "type": "object",
         "required": ["subtask_id", "status"],
+        "$defs": {
+            "blocker_kind": {"type": "string", "enum": list(BLOCKER_KINDS)},
+            "external_resource": {"type": "string"},
+        },
         "properties": {
             "subtask_id": {"type": "string"},
             "status": {
@@ -2806,6 +2848,13 @@ SCHEMAS: dict[str, dict] = {
             },
             "checkpoint_path": {"type": ["string", "null"]},
             "blocker": {"type": ["string", "null"]},
+            # DESIGN §13 *A blocked implementer says why, as a type*. Set on
+            # a non-`complete` status; `_route_blocker_kind` routes on it
+            # (never on `blocker` prose). Optional in the schema — a missing
+            # kind is typed `other` by `_blocker_kind` — and kept in `$defs`
+            # so the property table stays small.
+            "blocker_kind": {"$ref": "#/$defs/blocker_kind"},
+            "external_resource": {"$ref": "#/$defs/external_resource"},
             "summary": {"type": "string"},
             # DESIGN §11 mid-execution clarification exception. An
             # implementer that hits a genuine intent-question it cannot
@@ -2974,6 +3023,65 @@ SCHEMAS: dict[str, dict] = {
                                            "quote": {"type": "string"}}},
                         "task_quote": {"type": "string"},
                         "failure_quote": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+    "scope_judge": {
+        # Report-bounded has-work (DESIGN §8 *A task that points at a report
+        # is bounded by the report's own scenarios*): typed facts only —
+        # the report's stated ranges and, per case, its origin, the values it
+        # sets and the passage it comes from. `_scope_judge_counted` decides.
+        # Benched shape: bench P2 v3b, unchanged.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["report_ranges", "cases"],
+        "properties": {
+            "report_ranges": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["param", "min", "max", "unit",
+                                 "span_quote"],
+                    "properties": {
+                        "param": {"type": "string"},
+                        "min": {"type": "number"},
+                        "max": {"type": "number"},
+                        "unit": {"type": "string",
+                                 "enum": list(SCOPE_UNITS)},
+                        "span_quote": {"type": "string"},
+                    },
+                },
+            },
+            "cases": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["case_index", "origin", "params",
+                                 "span_quote", "reason"],
+                    "properties": {
+                        "case_index": {"type": "integer"},
+                        "origin": {"type": "string",
+                                   "enum": list(SCOPE_ORIGINS)},
+                        "params": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["range_ref", "value", "unit"],
+                                "properties": {
+                                    "range_ref": {"type": "integer"},
+                                    "value": {"type": "number"},
+                                    "unit": {"type": "string",
+                                             "enum": list(SCOPE_UNITS)},
+                                },
+                            },
+                        },
+                        "span_quote": {"type": "string"},
                         "reason": {"type": "string"},
                     },
                 },
@@ -10009,7 +10117,23 @@ def _inherited_subtask_fields(subtask: dict) -> dict:
         # Dropping it here routes the dominant dense-file shape (a file
         # bundled with its test file) straight past the gate.
         "change_shape": subtask.get("change_shape"),
+        # The rest of the split gate travels with it (DESIGN §5½ (P1)
+        # *Sub-file*): a child is gated, and site-limited, as its parent was.
+        "independent_sites": subtask.get("independent_sites"),
+        "sweep_sites": list(subtask.get("sweep_sites") or []),
     }
+
+
+def _inherit_split_fields(parent: dict, children: list[dict]) -> None:
+    """In-place: give LLM-splitter children the parent's split-gate fields.
+    The splitter schema does not carry them, and a child without them would
+    never be tiled however its parent was declared — or, before the gate
+    refused absence, always be (DESIGN §5½ (P1) *Sub-file*)."""
+    for child in children:
+        if isinstance(child, dict):
+            child["change_shape"] = parent.get("change_shape")
+            child["independent_sites"] = parent.get("independent_sites")
+            child["sweep_sites"] = list(parent.get("sweep_sites") or [])
 
 
 def _migration_child(subtask: dict, chunk: list[str], cid: str,
@@ -10285,6 +10409,52 @@ async def _label_migration_chunks(
 _NON_SWEEP_CHANGE_SHAPES = frozenset({"point", "localized"})
 
 
+def _subfile_split_gate(subtask: dict) -> str | None:
+    """None when `subtask` may be tiled intra-file, else why not (DESIGN
+    §5½ (P1) *Sub-file* *Gating condition*): only a typed `change_shape:
+    "sweep"` with `independent_sites: true`. A missing field refuses — the
+    reversed default (Q5/E1: the absence-means-split default was the main
+    path of harmful tilings)."""
+    shape = subtask.get("change_shape")
+    if shape != "sweep":
+        return (f"change_shape={shape!r}" if shape is not None
+                else "no change_shape declared")
+    if subtask.get("independent_sites") is not True:
+        return ("independent_sites not declared true"
+                if subtask.get("independent_sites") is not None
+                else "no independent_sites declared")
+    return None
+
+
+def _sweep_site_lines(subtask: dict, repo_root: Path, file: str) -> set[int]:
+    """The 1-based lines of `file` holding one of the subtask's typed
+    `sweep_sites`, located with `git grep --no-index -n -w -F` — a fixed,
+    whole-word string the planner named, never a pattern derived from prose.
+    An identifier with whitespace or a path separator is skipped; a grep that
+    fails finds nothing."""
+    lines: set[int] = set()
+    for site in subtask.get("sweep_sites") or []:
+        if (not isinstance(site, str) or not site.strip()
+                or any(c.isspace() for c in site) or "/" in site):
+            continue
+        try:
+            r = subprocess.run(
+                ["git", "grep", "--no-index", "-n", "-w", "-F", "-e", site,
+                 "--", file], cwd=str(repo_root), capture_output=True,
+                text=True, check=False, timeout=60)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode not in (0, 1):
+            continue
+        for row in r.stdout.splitlines():
+            # `<file>:<line>:<text>` — the file is the one we named.
+            rest = row[len(file) + 1:] if row.startswith(file + ":") else ""
+            num = rest.split(":", 1)[0]
+            if num.isdigit():
+                lines.add(int(num))
+    return lines
+
+
 def _subfile_split(subtask: dict, repo_root: Path,
                    max_span: int) -> list[dict]:
     """Split a single-file subtask *within* the file into region-owning children
@@ -10339,15 +10509,16 @@ def _subfile_split(subtask: dict, repo_root: Path,
         # region and 7 of 12 edited lines outside their range; exactly one
         # complied.
         #
-        # Absence is NOT treated as a refusal: `reconciler.added_subtasks` and
-        # `splitter.children` do not carry the field, and defaulting those to
-        # "don't split" would silently disable the mechanism for them. Only an
-        # explicit non-sweep declaration gates.
-        if subtask.get("change_shape") in _NON_SWEEP_CHANGE_SHAPES:
-            log(f"_recursive_decompose: {subtask.get('id', '?')} declares "
-                f"change_shape={subtask['change_shape']!r} — not tiling "
-                f"{file!r} intra-file (sub-file split is for sweeps; see "
-                f"DESIGN §5½ (P1) *Sub-file*)")
+        # Absence IS a refusal (DESIGN §5½ (P1) *Sub-file*): the earlier
+        # absence-means-split default let splitter and peel children with no
+        # declared shape be tiled, the main path of harmful tilings on fresh
+        # data (Q5/E1: region children ended blocked 66 of 86 times). Only a
+        # typed independent sweep is tiled; children inherit the fields.
+        refusal = _subfile_split_gate(subtask)
+        if refusal is not None:
+            log(f"_recursive_decompose: {subtask.get('id', '?')}: {refusal} "
+                f"— not tiling {file!r} intra-file (sub-file split is for "
+                "independent-site sweeps; see DESIGN §5½ (P1) *Sub-file*)")
             return []
         abs_path = repo_root / file
         try:
@@ -10373,6 +10544,19 @@ def _subfile_split(subtask: dict, repo_root: Path,
         log(f"_recursive_decompose: intra-file partition of {file!r} failed its "
             f"coverage backstop ({issues}); accepting as leaf")
         return []
+    # Site-limited tiling (DESIGN §5½ (P1) *Sub-file*): a region holding none
+    # of the sweep's located sites has nothing to change, and a child for it
+    # would only invent work. The full tiling passed the backstop above; the
+    # children are the regions that hold a site.
+    sites = _sweep_site_lines(subtask, repo_root, file)
+    keep = [i for i, (lo, hi) in enumerate(regions)
+            if any(lo <= n <= hi for n in sites)]
+    if len(keep) < len(regions):
+        log(f"_recursive_decompose: {base_id}: {len(keep)} of {len(regions)} "
+            f"region(s) of {file!r} hold a typed sweep site — tiling only "
+            "those")
+    regions = [regions[i] for i in keep]
+    symbols_per = [symbols_per[i] for i in keep]
     if len(regions) <= 1:
         return []  # nothing gained — leaf
 
@@ -10724,6 +10908,7 @@ async def _recursive_decompose(
                 f"{subtask.get('id', '?')}; accepting as leaf")
             return [subtask]
         children = split_result.get("children") or []
+        _inherit_split_fields(subtask, children)
         if not children:
             # Splitter produced no children; accept the subtask as a leaf.
             log(
@@ -23993,7 +24178,12 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
         "closure": _d1_closure(result, units),
         "holes": residual,
     }
-    st.data["needs_human_verification"] = _d1_needs_human_verification(items)
+    # Only this producer's own entries are rewritten: a blocker accepted as
+    # external (`_settle_accepted_external`) must survive a re-classify.
+    st.data["needs_human_verification"] = [
+        e for e in (st.data.get("needs_human_verification") or [])
+        if isinstance(e, dict) and e.get("source") != "required_item"
+    ] + _d1_needs_human_verification(items)
     if residual:
         log(f"  requirement coverage: {len(residual)} hole(s) left after "
             "the check rounds — proceeding with the items as returned: "
@@ -31190,13 +31380,16 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     if isinstance(gate, dict):
         # A set the set audit typed broken is not unfinished work (DESIGN §8
         # *A set that keeps failing is audited, and rewritten once*).
+        # Nor is a variant set of a report-pointer task (DESIGN §8 *A task
+        # that points at a report is bounded by the report's own scenarios*).
         sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
-        broken = {s_.get("index") for s_ in sets
-                  if _acceptance_set_broken(s_)}
+        by_index = {s_.get("index"): s_ for s_ in sets}
         final = gate.get("final")
         failing = (sum(1 for r in final if isinstance(r, dict)
                        and r.get("passed") is False and not r.get("unmeasured")
-                       and r.get("index") not in broken)
+                       and _acceptance_result_has_work(
+                           by_index.get(r.get("index")) or {},
+                           r.get("failing_files") or []))
                    if isinstance(final, list) else 0)
         residual = _acceptance_residual_unbroken(
             gate.get("residual") or {}, sets) or {}
@@ -37077,18 +37270,70 @@ def _acceptance_set_broken(set_: dict) -> bool:
     return set_.get("broken") is True
 
 
+def _acceptance_counted_files(set_: dict) -> set[str] | None:
+    """The defect files of `set_` holding a case the scope judge counted as
+    the report's own scenario (DESIGN §8 *A task that points at a report is
+    bounded by the report's own scenarios*), or None when the set is not
+    bounded — not a report-pointer task, or the judge could not type it —
+    and every failing file counts."""
+    scope = set_.get("scope")
+    if not isinstance(scope, dict) or scope.get("bounded") is not True:
+        return None
+    counted = scope.get("counted_cases")
+    if not isinstance(counted, dict):
+        return set()
+    return {rel for rel, ids in counted.items() if ids}
+
+
+def _acceptance_result_has_work(set_: dict, failing_files: Iterable[str]
+                                ) -> bool:
+    """Whether a failing verdict on `set_` is unfinished work: the set is
+    not typed broken, and — when the scope judge bounded it — one of the
+    failing files holds a counted case. A variant set is repaired in the
+    same pass but never creates a run."""
+    if _acceptance_set_broken(set_):
+        return False
+    counted = _acceptance_counted_files(set_)
+    if counted is None:
+        return True
+    return bool(counted & set(failing_files))
+
+
+def _acceptance_work_fails(results: list[dict], sets: list[dict]) -> bool:
+    """`_acceptance_any_fails` for the has-work readers: True when a MEASURED
+    set failed AND that failure is work (`_acceptance_result_has_work`). The
+    repair rounds and the audit keep reading `_acceptance_any_fails`, so a
+    variant set is still repaired."""
+    by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
+    return any(_acceptance_result_has_work(by_index.get(r["index"]) or {},
+                                           r.get("failing_files") or [])
+               for r in _acceptance_measured(results) if not r["passed"])
+
+
 def _acceptance_residual_unbroken(residual: dict | None,
                                   sets: list[dict]) -> dict | None:
     """A run's held-out residual with every set typed broken left out
-    (DESIGN §8 *A set typed broken is not handed on*), applied when the
-    residual is READ, so a set typed after its run finished is excluded
-    too. None when nothing is left to hand on; a residual recorded before
-    per-set indices existed (no `sets`) is returned unchanged."""
+    (DESIGN §8 *A set typed broken is not handed on*), and every variant set
+    — one whose recorded failing files hold no counted case (DESIGN §8 *A
+    task that points at a report is bounded by the report's own scenarios*)
+    — applied when the residual is READ, so a set typed after its run
+    finished is excluded too. None when nothing is left to hand on; a
+    residual recorded before per-set indices existed (no `sets`) is
+    returned unchanged."""
     if not residual or not isinstance(residual.get("sets"), list):
         return residual
     by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
-    keep = [i for i in residual["sets"]
-            if not _acceptance_set_broken(by_index.get(i) or {})]
+    files_by_set = residual.get("files_by_set") or {}
+
+    def _work(i: int) -> bool:
+        set_ = by_index.get(i) or {}
+        files = files_by_set.get(str(i))
+        if not isinstance(files, list):
+            # Recorded before failing files were: the set's own bound (an
+            # unbounded set counts whatever the files).
+            files = list(_acceptance_counted_files(set_) or [])
+        return _acceptance_result_has_work(set_, files)
+    keep = [i for i in residual["sets"] if _work(i)]
     if len(keep) == len(residual["sets"]):
         return residual
     if not keep and not residual.get("rollback_failed"):
@@ -39854,6 +40099,11 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                 k, st, caps, wt, base, res, refs, pre_untracked, log_path,
                 name, env_extra, dest_name)
             got["own_start_rewrite"] = True
+            if got.get("no_defect_fails"):
+                # The report's defect no longer reproduces here even after
+                # the writer was shown its passing cases — code's verdict,
+                # from the runner's per-case report, never a worker's.
+                got["reason"] = "fixed_on_head_by_execution"
         got.pop("no_defect_fails", None)
         out.update(got)
         return out
@@ -39947,6 +40197,8 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     # are the note of the writer's one own-start retry.
     passed_defects: dict[str, dict] = {}
     base_failing: dict[str, list[str]] = {}
+    case_status: dict[str, dict] = {}
+    failure_messages: dict[str, dict] = {}
     for f in (res.get("files") or []):
         rel = _acceptance_declared_rel(f)
         # Relative, inside the worktree, a real file, not the report.
@@ -40007,6 +40259,13 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
                 defect.append(rel)
                 if observed.get("failing_cases"):
                     base_failing[rel] = observed["failing_cases"]
+                # The scope judge's inputs (DESIGN §8 *A task that points at
+                # a report is bounded by the report's own scenarios*): every
+                # case's own-start status and the failing ones' messages.
+                if observed.get("case_status"):
+                    case_status[rel] = dict(observed["case_status"])
+                if observed.get("failure_messages"):
+                    failure_messages[rel] = dict(observed["failure_messages"])
                 # "import" only when the base run showed the file failing
                 # to load; a declared import defect that loaded and failed
                 # an assertion is an ordinary failure.
@@ -40054,7 +40313,9 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
         shutil.copy2(wt / rel, dest / rel)
     out.update(valid=True, dir=str(dest), defect_files=defect,
                control_files=control, support_files=support, cases=cases,
-               modes=modes, base_failing_cases=base_failing)
+               modes=modes, base_failing_cases=base_failing,
+               base_case_status=case_status,
+               base_failure_messages=failure_messages)
     return out
 
 
@@ -40154,6 +40415,7 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
             log(f"  acceptance set {r['index']} discarded: "
                 f"{r.get('reason', 'invalid')}")
     log(f"  acceptance: {len(sets)} of {n} set(s) valid")
+    await _acceptance_scope_judge_sets(task, st, caps, models, efforts, sets)
     report_base = _acceptance_report_base(st)
     await _record_report_reproduced(st, caps, sets, base, report_base)
     return {"validity_base": base, "report_base": report_base,
@@ -40388,6 +40650,198 @@ def _acceptance_any_fails(results: list[dict]) -> bool:
     never as a pass. A set's failure was already confirmed under B* by the
     evaluation that produced it."""
     return any(not r["passed"] for r in _acceptance_measured(results))
+
+
+# --- Report-bounded has-work (DESIGN §8 *A task that points at a report is
+# bounded by the report's own scenarios*), bench P2 v3b ---------------------
+
+# Time units the scope judge's ranges and params compare in one unit.
+_SCOPE_TO_MS = {"ms": 1.0, "s": 1000.0}
+# What one scope-judge prompt carries of a test file and a failure message.
+_SCOPE_SRC_CHARS = 60000
+_SCOPE_MSG_CHARS = 600
+
+
+def _scope_norm(text: str | None) -> str:
+    """NFC, whitespace runs collapsed to one space, stripped — the form a
+    `span_quote` is matched in (a mechanical normalisation, not parsing)."""
+    return " ".join(unicodedata.normalize("NFC", text or "").split())
+
+
+def _scope_conv(value: object, unit: object) -> tuple[float, str] | None:
+    """`(value, unit)` with ms/s in milliseconds; None when not a number."""
+    try:
+        num = float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    if num != num or num in (float("inf"), float("-inf")):
+        return None
+    u = str(unit)
+    if u in _SCOPE_TO_MS:
+        return num * _SCOPE_TO_MS[u], "ms"
+    return num, u
+
+
+def _scope_quote_ok(quote: object, haystack: str) -> bool:
+    q = _scope_norm(quote if isinstance(quote, str) else "")
+    return bool(q) and q in haystack
+
+
+def _scope_judge_counted(out: dict, haystack: str, names: list[str],
+                         failing: set[str]) -> dict[str, dict]:
+    """Decide, in code, which cases of one defect file count as the report's
+    own scenarios (the bench P2 v3b decision). `haystack` is the normalised
+    task + reports; `names` the case ids in the order the judge saw them
+    numbered; `failing` those that failed at the own start. A range is
+    verified when its `span_quote` is in the haystack; a verified range is
+    widened to the hull of the verified ranges of its unit it overlaps. A
+    case counts when it failed, its origin is not `other_scenario`, its own
+    `span_quote` verifies, and every param naming a verified range of the
+    same unit lies inside that hull (any other param is neutral). Returns
+    `{case id: {origin, in_range, quote_ok, counted}}` for the cases the
+    judge typed."""
+    ranges: list[dict] = []
+    for r in out.get("report_ranges") or []:
+        if not isinstance(r, dict):
+            ranges.append({"ok": False})
+            continue
+        lo = _scope_conv(r.get("min"), r.get("unit"))
+        hi = _scope_conv(r.get("max"), r.get("unit"))
+        if lo is None or hi is None:
+            ranges.append({"ok": False})
+            continue
+        ranges.append({"ok": _scope_quote_ok(r.get("span_quote"), haystack),
+                       "lo": min(lo[0], hi[0]), "hi": max(lo[0], hi[0]),
+                       "unit": lo[1]})
+    hull: dict[int, tuple[float, float]] = {}
+    for i, rg in enumerate(ranges):
+        if not rg["ok"]:
+            continue
+        grp = [o for o in ranges if o["ok"] and o["unit"] == rg["unit"]
+               and o["lo"] <= rg["hi"] and rg["lo"] <= o["hi"]]
+        hull[i] = (min(o["lo"] for o in grp), max(o["hi"] for o in grp))
+    verdicts: dict[str, dict] = {}
+    for v in out.get("cases") or []:
+        if not isinstance(v, dict):
+            continue
+        idx = v.get("case_index")
+        if not isinstance(idx, int) or isinstance(idx, bool) \
+                or not 0 <= idx < len(names):
+            continue
+        in_range = True
+        for p_ in v.get("params") or []:
+            if not isinstance(p_, dict):
+                continue
+            ref = p_.get("range_ref")
+            if not isinstance(ref, int) or ref not in hull:
+                continue                     # unverified or unknown: neutral
+            val = _scope_conv(p_.get("value"), p_.get("unit"))
+            if val is None or val[1] != ranges[ref]["unit"]:
+                continue
+            lo, hi = hull[ref]
+            in_range = in_range and lo <= val[0] <= hi
+        quote_ok = _scope_quote_ok(v.get("span_quote"), haystack)
+        origin = v.get("origin")
+        name = names[idx]
+        verdicts[name] = {
+            "origin": origin, "in_range": in_range, "quote_ok": quote_ok,
+            "counted": (name in failing and origin in SCOPE_ORIGINS
+                        and origin != "other_scenario" and in_range
+                        and quote_ok)}
+    return verdicts
+
+
+async def _acceptance_scope_judge_sets(task: str, st: "State", caps: dict,
+                                       models: dict, efforts: dict,
+                                       sets: list[dict]) -> None:
+    """On a report-pointer task, type each valid set's own-start-failing
+    defect cases with the independent `scope_judge` and record on the set
+    which count as the report's own scenarios (`scope`, DESIGN §8 *A task
+    that points at a report is bounded by the report's own scenarios*). One
+    judge call per defect file with a failing case. A file whose judge
+    fails (anything but budget exhaustion, which propagates) leaves the set
+    unbounded, so every failing file counts, as before. No-op on any other
+    task."""
+    reports = _d1_report_sources(task, st.repo_root)
+    if not reports or not sets:
+        return
+    haystack = _scope_norm(task + "\n" + "\n".join(reports.values()))
+    report_text = "\n\n".join(f"REPORT `{rel}` (the file the task points "
+                               f"at):\n{body}" for rel, body in
+                               reports.items())
+    empty = st.run_dir / "scope-judge"
+    empty.mkdir(parents=True, exist_ok=True)
+    sem = asyncio.Semaphore(max(1, int(caps.get("max_parallel", 1))))
+
+    async def _judge(set_: dict, rel: str) -> tuple[str, dict | None, str]:
+        status = (set_.get("base_case_status") or {}).get(rel) or {}
+        failing = list((set_.get("base_failing_cases") or {}).get(rel) or [])
+        names = list(status) or failing
+        msgs = (set_.get("base_failure_messages") or {}).get(rel) or {}
+        obs = []
+        for i, n in enumerate(names):
+            st_ = status.get(n) or ("failed" if n in failing else "passed")
+            line = f"[{i}] ({st_}) {n}"
+            if n in failing and msgs.get(n):
+                line += ("\n    failure: "
+                         + _scope_norm(str(msgs[n]))[:_SCOPE_MSG_CHARS])
+            obs.append(line)
+        try:
+            src = (Path(set_["dir"]) / rel).read_text(errors="replace")
+        except (OSError, KeyError) as e:
+            return rel, None, f"test source unreadable: {e}"
+        user = ("TASK:\n" + task + "\n\n" + report_text + "\n\n"
+                f"DEFECT TEST FILE `{rel}`:\n```\n"
+                + src[:_SCOPE_SRC_CHARS] + "\n```\n\n"
+                "OBSERVED OUTCOME OF EACH CASE ON THE UNFIXED TREE:\n"
+                + "\n".join(obs) + "\n\nReturn report_ranges, then one "
+                "entry per case, identified by its [index].")
+        async with sem:
+            # Outside the try: budget exhaustion stops the run.
+            st.bump_workers(caps)
+            try:
+                out = await claude_p(
+                    user_prompt=user,
+                    system_prompt=_load_prompt("scope_judge"),
+                    schema_key="scope_judge", cwd=str(empty),
+                    allowed_tools="Read", max_turns=3, autonomous=False,
+                    caps=caps, st=st,
+                    model=models.get("scope_judge", MODEL_DEFAULT),
+                    effort=efforts.get("scope_judge"),
+                    sid=f"scope-judge-{set_['index']}-"
+                        f"{hashlib.sha256(rel.encode()).hexdigest()[:8]}")
+            except (WorkerError, subprocess.TimeoutExpired) as e:
+                return rel, None, _brief_worker_exc(e)
+        if not isinstance(out, dict) or not out.get("cases"):
+            return rel, None, "the judge typed no case"
+        return rel, _scope_judge_counted(out, haystack, names,
+                                         set(failing)), ""
+
+    for set_ in sets:
+        files = [rel for rel in set_.get("defect_files") or []
+                 if (set_.get("base_failing_cases") or {}).get(rel)]
+        if not files:
+            # Validated with no recorded failing case IDs (exit-code only):
+            # nothing to type, so the set stays unbounded.
+            set_["scope"] = {"bounded": False,
+                             "error": "no failing case IDs recorded"}
+            continue
+        got = await _gather_or_cancel(*(_judge(set_, rel) for rel in files))
+        errors = [f"{rel}: {why}" for rel, v, why in got if v is None]
+        if errors:
+            set_["scope"] = {"bounded": False, "error": "; ".join(errors)}
+            log(f"  acceptance set {set_['index']}: scope judge did not type "
+                f"it ({'; '.join(errors)[:200]}) — every failing file counts")
+            continue
+        judged = {rel: v for rel, v, _ in got}
+        counted = {rel: [n for n, d in v.items() if d["counted"]]
+                   for rel, v in judged.items()}
+        set_["scope"] = {"bounded": True, "counted_cases": counted,
+                         "judged": judged}
+        n = sum(len(v) for v in counted.values())
+        log(f"  acceptance set {set_['index']}: {n} own-start-failing "
+            "case(s) count as the report's own scenarios"
+            + ("" if n else " — a variant set: repaired, never work"))
 
 
 def _acceptance_shown_indices(sets: list[dict]) -> set[int]:
@@ -40895,7 +41349,8 @@ def _rewrite_note(triggers: list[dict]) -> str:
 
 
 _SET_FIELDS = ("dir", "defect_files", "control_files", "support_files",
-               "cases", "modes", "base_failing_cases")
+               "cases", "modes", "base_failing_cases", "base_case_status",
+               "base_failure_messages")
 
 
 async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
@@ -40995,6 +41450,10 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
                 rw["original"] = {k: s_.get(k) for k in _SET_FIELDS}
                 for k in _SET_FIELDS:
                     s_[k] = new.get(k)
+                # A replaced set is a new set: its scope is typed afresh.
+                rw["original"]["scope"] = s_.pop("scope", None)
+                await _acceptance_scope_judge_sets(
+                    task, st, caps, models, efforts, [s_])
                 _save()
                 (res,) = await _evaluate_acceptance_sets(
                     st, caps, staging, [s_], f"gate-rewrite-{idx}", rev=rev)
@@ -41335,7 +41794,11 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             # Which sets, so a set typed broken later can be left out of
             # the next run's residual (`_acceptance_residual_unbroken`).
             "sets": [r["index"] for r in measured if not r["passed"]],
-            "cases_by_set": cases_by_set}
+            "cases_by_set": cases_by_set,
+            # Which files failed, so a variant set (no counted case among
+            # them) can be left out when the residual is read.
+            "files_by_set": {str(r["index"]): list(r["failing_files"])
+                             for r in measured if not r["passed"]}}
         if unmeasured_final:
             gate["residual"]["unmeasured_final"] = True
         log(f"  WARNING: held-out acceptance residual — "
@@ -41445,9 +41908,12 @@ async def _acceptance_results_on_head(st: "State", caps: dict
 
 
 async def _acceptance_passes_on_head(st: "State", caps: dict) -> bool:
+    """The held-out sets pass on HEAD as far as work goes: measured, and no
+    failure that is work (a variant set failing is not)."""
     res = await _acceptance_results_on_head(st, caps)
+    sets = (st.data.get("acceptance") or {}).get("sets") or []
     return (res is not None and bool(_acceptance_measured(res))
-            and not _acceptance_any_fails(res))
+            and not _acceptance_work_fails(res, sets))
 
 
 def _prior_acceptance_dispute_record(st: "State") -> dict | None:
@@ -41518,12 +41984,17 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
     try:
         acc = st.data.get("acceptance") or {}
         base = acc.get("validity_base")
-        if acc.get("sets") and base:
+        sets = acc.get("sets") or []
+        if sets and base:
             # Sets validated on this very commit each have a defect file that
             # failed here: the answer is known without running them again.
-            # The caller has just ensured the planning worktree.
+            # The caller has just ensured the planning worktree. Only a set
+            # whose failure is work protects (a variant set does not).
             if await _branch_head_sha(str(_judgment_cwd(st))) == base:
-                return set(fix_ids)
+                return set(fix_ids) if any(
+                    _acceptance_result_has_work(
+                        s_, s_.get("defect_files") or [])
+                    for s_ in sets) else set()
         res = await _acceptance_results_on_head(st, caps)
     except Exception as e:
         log(f"acceptance: the pre-sweep check raised {type(e).__name__}: "
@@ -41531,7 +42002,7 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
         return set()
     if res is None or not _acceptance_measured(res):
         return set()
-    return set(fix_ids) if _acceptance_any_fails(res) else set()
+    return set(fix_ids) if _acceptance_work_fails(res, sets) else set()
 
 
 async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
@@ -41578,7 +42049,10 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence})
         return True
-    if not _acceptance_any_fails(res):
+    if not _acceptance_work_fails(
+            res, (st.data.get("acceptance") or {}).get("sets") or []):
+        # A variant set failing is not work (DESIGN §8 *A task that points
+        # at a report is bounded by the report's own scenarios*).
         st.data["no_work_acceptance"] = {"verdict": "pass", "results": res}
         _finish_no_work_run(st, {"<confirmed already-satisfied>":
                                  judge_evidence + " — and the held-out "
@@ -41982,11 +42456,18 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # but the final pass leaves no per-round sentinel of its own. On
     # `resume` after this pass already recorded a result, re-running
     # would burn worker budget and could overwrite a clean result with
-    # a different one. The presence of `_final` in `st.data["conformance"]`
-    # is the completion sentinel.
-    if (st.data.get("conformance") or {}).get("_final") is not None:
+    # a different one. `_final` in `st.data["conformance"]` is the
+    # completion sentinel — but only for a pass that CLEARED (DESIGN §9,
+    # final-tree pass): a `blocked` pass stopped the run with "fix and
+    # resume", and skipping it on that resume would ship the gap unexamined.
+    final_block = (st.data.get("conformance") or {}).get("_final")
+    if final_block is not None and not (isinstance(final_block, dict)
+                                        and final_block.get("blocked")):
         log("phase 5: final conformance already complete — skipping (resume)")
         return
+    if final_block is not None:
+        log("phase 5: final conformance blocked on the previous attempt — "
+            "running it again (resume)")
 
     log("phase 5: final-tree conformance on staging")
     st.data["current_phase"] = "phase 5: final conformance"
@@ -42728,6 +43209,101 @@ def _block_unbacked_claim(st: "State", sid: str, blocker: str) -> dict:
     st.save()
     return {"subtask_id": sid, "status": "blocked", "blocker": blocker,
             "summary": first}
+
+
+def _blocker_kind(res: dict) -> tuple[str, str]:
+    """`(kind, resource)` of an implementer result's typed `blocker_kind`
+    (DESIGN §13 *A blocked implementer says why, as a type*). A missing or
+    unknown kind is `other`, and so is an `external_precondition` that names
+    no resource: acceptance ends work without code, so it needs the resource
+    named."""
+    kind = res.get("blocker_kind")
+    raw = res.get("external_resource")
+    resource = raw.strip() if isinstance(raw, str) else ""
+    if kind not in BLOCKER_KINDS:
+        return "other", resource
+    if kind == "external_precondition" and not resource:
+        return "other", ""
+    return kind, resource
+
+
+def _settle_accepted_external(st: "State", sid: str, resource: str,
+                              blocker: str) -> dict:
+    """Settle `sid` `accepted_external`: its work needs `resource`, which only
+    a human outside this run can supply. Terminal (`_SETTLED_STATUSES`), not
+    integrated, not `unconverged`; listed under "Needs human verification"
+    beside the classifier's external items (DESIGN §13)."""
+    st.data.setdefault("subtask_status", {})[sid] = "accepted_external"
+    entries = [e for e in (st.data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict) and e.get("source") == "blocker"
+                       and e.get("subtask") == sid)]
+    entries.append({"source": "blocker", "subtask": sid,
+                    "resource": resource, "blocker": blocker})
+    st.data["needs_human_verification"] = entries
+    reg = st.data.get("blocked")
+    if isinstance(reg, dict):
+        reg.pop(sid, None)
+        if not reg:
+            st.data.pop("blocked", None)
+    st.save()
+    log(f"  {sid}: accepted_external — needs {resource}; listed for human "
+        "verification")
+    return {"subtask_id": sid, "status": "accepted_external",
+            "blocker": blocker, "summary": f"needs {resource}: {blocker}"}
+
+
+async def _route_blocker_kind(sid: str, res: dict, subtask: dict,
+                              worktree: str, st: "State", caps: dict,
+                              env_hits: int) -> dict | None:
+    """Route a `blocked`/`failed` implementer result by its typed
+    `blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*).
+    Returns the subtask's result for this attempt, or None for the one
+    in-place retry of an `environment_limit` (`env_hits` is the count
+    including this one). Never reads the `blocker` prose."""
+    kind, resource = _blocker_kind(res)
+    blocker = str(res.get("blocker") or res.get("summary") or "")
+    record = {"kind": kind, "status": res.get("status")}
+    if resource:
+        record["resource"] = resource
+    st.data.setdefault("blocker_kinds", {})[sid] = record
+    st.save()
+    if kind == "external_precondition":
+        return _settle_accepted_external(st, sid, resource, blocker)
+    if kind == "environment_limit":
+        return _environment_limit_hit(st, sid, blocker, env_hits)
+    if kind == "cannot_reproduce":
+        has_commits = await _branch_has_commits_ahead(
+            worktree, _compute_run_branch(st.run_id))
+        if not has_commits:
+            ex = await _settle_by_execution(subtask, worktree, st, caps,
+                                            sid=sid)
+            if ex["verdict"] == "pass":
+                log(f"  {sid}: could not reproduce, and its verify commands "
+                    "pass when the orchestrator runs them; settling complete")
+                return _settle_already_satisfied(
+                    sid, {"reason": "settled_by_execution",
+                          "evidence": ex["why"],
+                          "checked": [shlex.join(c["argv"])
+                                      for c in ex["commands"]]},
+                    st, summary=res.get("summary"),
+                    criteria_results=res.get("criteria_results"))
+            if ex["verdict"] == "environment_limit":
+                return _settle_unconverged(
+                    st, sid, "environment_limit: " + ex["why"],
+                    previous_status="blocked", kind="environment_limit")
+            blocker = (f"{blocker}\n" if blocker else "") \
+                + _execution_blocker(ex)
+        else:
+            blocker = (f"{blocker}\n" if blocker else "") + (
+                "could not reproduce, but the branch carries commits — "
+                "finish the subtask's criteria or remove the work")
+    st.data.setdefault("subtask_status", {})[sid] = "blocked"
+    st.save()
+    log(f"  {sid}: blocked ({kind}) — "
+        + ("held for `leerie accept-blocked`" if st.data.get("stop_on_blocked")
+           else "re-driven from the shared budget at wave end"))
+    return {**res, "subtask_id": sid, "status": "blocked",
+            "blocker": f"[{kind}] {blocker}".strip()}
 
 
 async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
@@ -43498,22 +44074,26 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             continuation, note = True, ""
             continue
 
-        if status == "failed":
-            # A worker that reported failure itself — terminal by default.
-            # The worker (not an orchestrator-side check) decided to fail,
-            # so there is no producer-tagged structured kind. "broken" is
-            # the right default: a worker that ran to completion and then
-            # self-reported `failed` is broken-worker territory unless we
-            # have evidence otherwise. Matches the row in IMPLEMENTATION.md's
-            # "Per-subtask checks" table in §5 ("Deterministic enforcement
-            # points").
-            done = await fail(
-                "broken", res.get("summary") or "worker reported failure")
-            if done is not None:
-                return done
+        if status in ("blocked", "failed"):
+            # DESIGN §13 *A blocked implementer says why, as a type*: the
+            # typed kind decides — accepted only when external, retried in
+            # place once for an environment limit, settled by execution when
+            # it could not reproduce, re-driven from the shared budget
+            # otherwise (a self-reported `failed` included).
+            if res.get("blocker_kind") == "environment_limit":
+                environment_limit_hits += 1
+            routed = await _route_blocker_kind(
+                sid, res, subtask, worktree, st, caps,
+                environment_limit_hits)
+            if routed is not None:
+                return routed
+            continuation = True
+            note = ("Previous attempt ended on an environment limit: "
+                    f"{res.get('blocker') or res.get('summary') or ''} — "
+                    "retry it.")
             continue
 
-        # blocked, or anything unexpected
+        # anything unexpected
         return res
 
 

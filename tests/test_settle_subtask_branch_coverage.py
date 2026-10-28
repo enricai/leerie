@@ -131,21 +131,29 @@ def test_generic_worker_error_is_routed_through_fail(env, monkeypatch):  # noqa:
 
 # --- worker self-reported "failed" status ---------------------------------
 
-def test_worker_reported_failed_status_is_routed_through_fail(env, monkeypatch):  # noqa: F811
-    """A worker that returns status='failed' itself (not raised, not an
-    invariant violation) is routed through `fail("broken", ...)` with the
-    worker's own summary as the reason."""
+def test_worker_reported_failed_status_is_routed_by_its_kind(env, monkeypatch):  # noqa: F811
+    """REWRITTEN (DESIGN §13 *A blocked implementer says why, as a type*). A
+    worker that returns status='failed' itself used to be routed through
+    `fail("broken", ...)` — terminal. It is now routed by its typed
+    `blocker_kind`; with none, it is typed `other` and ends `blocked`, so
+    the wave-end re-drive takes it from the shared budget. The worker's own
+    summary stays the blocker text."""
     leerie_mod = env["leerie"]
+    calls = []
 
     async def _stub(sid_, leerie_dir, caps, st, models, efforts,
                     continuation=False, note=""):
+        calls.append(sid_)
         return {"subtask_id": sid_, "status": "failed",
                 "summary": "could not reproduce the reported symptom"}
     monkeypatch.setattr(leerie_mod, "_run_implementer", _stub)
 
     res = _settle(leerie_mod, env, caps_overrides={"failed_retries": 0})
 
-    assert res["status"] == "failed"
+    assert len(calls) == 1
+    assert res["status"] == "blocked"
+    assert res["blocker"] == ("[other] could not reproduce the reported "
+                              "symptom")
     assert res["summary"] == "could not reproduce the reported symptom"
 
 

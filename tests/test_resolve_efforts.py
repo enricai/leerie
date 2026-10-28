@@ -294,6 +294,8 @@ def test_judgment_workers_pinned_set(leerie):
         # Enumerates the repository's own merge checks (DESIGN §9), benched
         # at medium (N6).
         "ci_checks",
+        # The report-bounded scope judge (DESIGN §8), benched at medium (P2).
+        "scope_judge",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

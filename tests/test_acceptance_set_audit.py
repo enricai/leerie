@@ -225,6 +225,42 @@ def test_a_still_passing_retry_discards_the_set(leerie, tmp_path,
     res = asyncio.run(leerie._write_acceptance_set(
         1, st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS, head))
     assert len(calls) == 2 and res["valid"] is False
+    # Code's own verdict, from the runner's per-case report (DESIGN §8 *A
+    # task that points at a report is bounded by the report's own
+    # scenarios*): the defect no longer reproduces here.
+    assert res["reason"] == "fixed_on_head_by_execution"
+
+
+def test_a_first_pass_with_no_failing_defect_is_not_fixed_on_head(
+        leerie, tmp_path, monkeypatch):
+    """Anti-vacuity: without the retry (cap 0) nothing has been shown to the
+    writer, so code does not claim the defect is fixed on HEAD."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    writer, calls = _two_round_writer([NONDISCRIMINATING])
+    monkeypatch.setattr(leerie, "claude_p", writer)
+    caps = _caps(leerie, 1)
+    caps["acceptance_rewrite_rounds"] = 0
+    res = asyncio.run(leerie._write_acceptance_set(
+        1, st.data["task"], st, caps, MODELS, EFFORTS, head))
+    assert res["reason"] == "no defect file fails on the validity base"
+
+
+def test_a_valid_set_carries_the_scope_judge_inputs(leerie, tmp_path,
+                                                    monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    writer, _calls = _two_round_writer([DEFECT_TEST])
+    monkeypatch.setattr(leerie, "claude_p", writer)
+    res = asyncio.run(leerie._write_acceptance_set(
+        1, st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS, head))
+    assert res["valid"] is True
+    rel = "acc/test_defect_1.py"
+    status = res["base_case_status"][rel]
+    assert set(res["base_failing_cases"][rel]) <= set(status)
+    assert all(status[c] == "failed" for c in res["base_failing_cases"][rel])
+    assert set(res["base_failure_messages"][rel]) <= set(
+        res["base_failing_cases"][rel])
 
 
 # --- quote verification ------------------------------------------------------

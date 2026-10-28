@@ -782,6 +782,7 @@ leerie/
 │   ├── set_auditor.md             types a still-failing held-out set's failing cases (DESIGN §8 "A set that keeps failing is audited, and rewritten once")
 │   ├── surrogate_fixer.md         test-blind independent fix, the surrogate witness (same section)
 │   ├── ci_checks.md               enumerates the repository's own merge checks (DESIGN §9 "The repository's own merge checks run too")
+│   ├── scope_judge.md             types each own-start-failing defect case of a report-pointer task (DESIGN §8 "A task that points at a report is bounded by the report's own scenarios")
 │   ├── rebaser.md                 finalize-time rebase-onto-base worker (DESIGN §6 "Rebase-onto-base before push"; scoped, fully-agentic §12 exception)
 │   ├── pr_writer.md               Phase 6 PR title + body author worker
 │   ├── patch_generator.md         post-run self-heal worker — proposes minimal system-prompt patches against failing call_types
@@ -2097,6 +2098,7 @@ judgment/workhorse split once existed and why it no longer applies.
 | set_auditor | sonnet | types each failing case of a held-out set still failing after the repair rounds `implementation_gap` or a quote-backed `set_defect` (DESIGN §8 *A set that keeps failing is audited, and rewritten once*) — read-only judgment, `medium` effort |
 | surrogate_fixer | sonnet | fixes the report in a ref-less clone of the own start without ever seeing a held-out set — the surrogate witness (same section) — acting, `medium` effort |
 | ci_checks | sonnet | enumerates the repository's own merge-gating checks from its CI files and blocking hooks as typed checks (DESIGN §9 *The repository's own merge checks run too*) — read-only judgment, `medium` effort |
+| scope_judge | sonnet | on a report-pointer task, types each own-start-failing defect case of a valid held-out set (`origin`, typed params, `span_quote`) and the report's stated ranges; code decides which cases count as work (DESIGN §8 *A task that points at a report is bounded by the report's own scenarios*) — read-only judgment, `medium` effort |
 
 `MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
 lists `implementer`, `conformer`, `heal`, `pr_writer`, and `satisfied_probe`
@@ -2106,7 +2108,7 @@ diverge again later). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`,
 `artifact_registry`, `task_coverage_judge`, `integration_judge`,
 `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`,
-`acceptance_writer`, `set_auditor`, `surrogate_fixer` and `ci_checks` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
+`acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks` and `scope_judge` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
 defaults come from the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
@@ -2127,7 +2129,7 @@ reconciler, plan_overlap_judge, satisfied_probe, provision, implementer,
 integrator, conformer, fit_judge, splitter, adherence_judge,
 classification_judge, wiring_judge, provision_judge, task_coverage_judge,
 integration_judge, no_work_judge, delivery_judge, defect_scope_auditor,
-artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks. Global override: `LEERIE_MODEL` / `--model` / `model`.
+artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge. Global override: `LEERIE_MODEL` / `--model` / `model`.
 
 `judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
 workers invoked outside the main orchestrate loop, so they don't follow that
@@ -2189,7 +2191,7 @@ differs:
 
 | Worker       | Default | Notes (where it diverges from the model-table rationale) |
 |--------------|---------|-----|
-| classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge, splitter, adherence_judge, classification_judge, wiring_judge, provision_judge, task_coverage_judge, integration_judge, no_work_judge, delivery_judge, defect_scope_auditor, artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks | medium | judgment/finalize workers; `medium` is the reproducibility dial, not a cost one |
+| classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge, splitter, adherence_judge, classification_judge, wiring_judge, provision_judge, task_coverage_judge, integration_judge, no_work_judge, delivery_judge, defect_scope_auditor, artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge | medium | judgment/finalize workers; `medium` is the reproducibility dial, not a cost one |
 | implementer, conformer | low | code-writing workers; pinned low for cost/latency — a deliberate override of the prior "bounded by §8 evidence gate" unset default, since the conformer/confidence-gate loops downstream absorb the quality tradeoff |
 | satisfied_probe | unset | per-subtask advisory prune; base-tree-only tool scope + conservative default carry correctness, not pinned depth |
 | judge, heal  | unset   | post-run scoring/patching; no need to pin |
@@ -2201,8 +2203,8 @@ before reintroducing a blanket tier split if a gate regresses under `medium`.
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it per the table above — `"medium"`
-for the twenty-five judgment/finalize/writer workers (including `acceptance_writer`,
-`set_auditor`, `surrogate_fixer` and `ci_checks`),
+for the twenty-six judgment/finalize/writer workers (including `acceptance_writer`,
+`set_auditor`, `surrogate_fixer`, `ci_checks` and `scope_judge`),
 `"low"` for `implementer` and `conformer` (a distinct, cost-motivated pin
 rather than a judgment-reproducibility one). One fixed exception sits
 outside this resolution: the held-out acceptance gate's repair rounds call
@@ -2224,7 +2226,7 @@ model selection:
 8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
 
 Same mechanical pattern as model selection: `LEERIE_EFFORT_<WORKER>` (env) /
-`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same twenty-six
+`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same twenty-seven
 worker names listed above under model selection. Global override:
 `LEERIE_EFFORT` / `--effort` / `effort`.
 
@@ -2910,7 +2912,7 @@ validation contract.
 
 ### Worker types
 
-Leerie spawns the twenty-six `claude -p` worker types in `WORKER_TYPES`.
+Leerie spawns the twenty-seven `claude -p` worker types in `WORKER_TYPES`.
 Each is a separate subprocess; there is no in-session agent nesting. (The
 table predates `task_coverage_judge`, `integration_judge` and `rebaser`,
 which are specified in their own sections.)
@@ -2934,6 +2936,7 @@ which are specified in their own sections.)
 | `conformer` | `prompts/conformer.md` | sonnet | one per subtask, only on the implementer's success path; plus 0–`caps["acceptance_repair_rounds"]` held-out acceptance repair rounds at `high` effort | advisory `conformance_warnings` on the subtask result; doc/test/rule-fix commits prefixed `conformer:` on the same branch (DESIGN §9 *Post-work conformance*) |
 | `acceptance_writer` | `prompts/acceptance_writer.md` | sonnet | 0 or `caps["acceptance_sets"]` (default 5; phase 2, after the defect-scope audit, whenever the audit ran — categories include `bug-fixing` — whatever it returned, and a scoped test template exists) | `{files[{path, kind, cases[], failure_mode: "assertion" | "import"}], notes}` — held-out test files written in a disposable ref-less clone at the run's own start, the validity base (DESIGN §8 *Held-out acceptance tests*) |
 | `set_auditor` | `prompts/set_auditor.md` | sonnet | 0 or `caps["set_audit_samples"]` (default 3) per held-out set still failing after the repair rounds (phase 5, `_acceptance_audit_and_rewrite`), and again on a rewritten set that still fails; plus the same per set the surrogate witness fails | `{cases[{case, verdict: implementation_gap \| set_defect, defect_kind: none \| harness_unreachable \| coupling \| contradicts_task \| overspecified_mechanism \| environment \| test_bug, test_quote{file, quote}, prod_quote{file, quote}, task_quote, failure_quote, reason}]}` — read-only (`SATISFIED_PROBE_TOOLS`, 60 turns), cwd a worktree of the audited tree with the set staged (DESIGN §8 *A set that keeps failing is audited, and rewritten once*) |
+| `scope_judge` | `prompts/scope_judge.md` | sonnet | 0, or one per defect file with an own-start-failing case in each valid held-out set, on a report-pointer task only (phase 2, `_acceptance_scope_judge_sets`, after the sets validate; and once more for a set the audit's rewrite replaced) | `{report_ranges[{param, min, max, unit, span_quote}], cases[{case_index, origin: report_example \| report_regression_test \| report_symptom \| other_scenario, params[{range_ref, value, unit}], span_quote, reason}]}` — read-only (`Read`, 3 turns, an empty cwd); code decides which cases count (`_scope_judge_counted`) |
 | `surrogate_fixer` | `prompts/surrogate_fixer.md` | sonnet | 0 or 1 per acceptance gate (only when a set still fails after the repair rounds and neither M1/M2 nor the set audit fired) | `{summary, files_changed[]}` — acting (`ACT_TOOLS`, 150 turns, autonomous) in a ref-less clone of the own start; never sees a set (`_acceptance_read_denials`) |
 | `ci_checks` | `prompts/ci_checks.md` | sonnet | 0 or 1 per run (phase 4, `_capture_ci_parity_baseline`; only when a file matching `CI_CONFIG_GLOBS` exists on the base, and not under `skip_base_baseline`) | `{checks[{id, kind, argv, cwd, env[{name, value}], prerequisites[{argv, cwd}], trigger[], path_filters[], requires[], strict_argv[], source{file, job, step}, coverage{summary_path, config_file, thresholds[{glob, metric, min}]}, notes}], excluded[{file, job, reason}]}` — read-only (`INSPECT_TOOLS`, 40 turns) on the staging base tree; code checks provenance and selects (see *CI parity* below) |
 | `integrator` | `prompts/integrator.md` | sonnet | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
@@ -4046,7 +4049,7 @@ above.
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path except `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented user-deliverable subtrees — never `settings.json` or a top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (touched > max(3× expected, 5), or > 15 regardless) |
 | `_validate_checkpoint()` — on `incomplete-handoff` | required section missing/empty/whitespace/placeholder-only (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing punctuation ignored); a `## Files touched` path no longer exists and isn't flagged `[deleted]` | returns `blocked` |
-| `_retryable_failure(kind)` — on `status='failed'` from the worker | worker self-report of failure | `failure_kind="broken"`; **terminal** on first occurrence |
+| `_route_blocker_kind()` — on `status` `blocked` or `failed` from the worker | worker self-report of a blocker or failure, typed `blocker_kind` | **Routed by the kind** (DESIGN §13 *A blocked implementer says why, as a type*): `external_precondition` with a named resource → `accepted_external`; `environment_limit` → one in-place retry, then `unconverged`; `cannot_reproduce` → settled by execution, else re-driven; every other kind (and a missing one) → `blocked`, re-driven at wave end from the shared budget. A self-reported `failed` is no longer terminal. |
 
 `_validate_result()` accepts `complete` regardless of what
 `criteria_results` carries — empty, missing, or `met:false` entries are all
@@ -4760,8 +4763,15 @@ and refuses to tile anything but a `sweep` (DESIGN §5½ (P1) *Sub-file*
 *Gating condition*). It cannot be derived in code — the number of sites a change
 needs is not a property of the file — and it must never be read out of
 `investigation_notes`, which is planner prose (DESIGN §*Language-to-JSON*).
-Absent on `reconciler.added_subtasks` and `splitter.children`, where absence
-means "not declared" and the gate falls through to the pre-gate behaviour.
+With it, the planner carries the **required** boolean `independent_sites`
+(each site changeable from its own surrounding lines alone) and the optional
+`sweep_sites` (`string[]`, the identifiers every site contains — located in the
+file by `git grep -w -F`, never read from prose). Absent on
+`reconciler.added_subtasks` and `splitter.children`; absence of either typed
+field means **no split** (DESIGN §5½ (P1) *Sub-file* — the reversed default).
+`_recursive_decompose` copies all three onto splitter children
+(`_inherit_split_fields`), and `_inherited_subtask_fields` onto peel, migration
+and region children, so a child is gated as its parent was.
 
 `SCHEMAS["planner"]` carries the optional per-subtask `runs_commands`
 array, the `adherence_judge` worker is fully registered (schema, prompt,
@@ -5014,8 +5024,12 @@ code constant `SITE_KIND_CLASS`:
 **Blocked domains (D4, shrunk).** The planner returns a top-level
 `blocker_kind` (`PLANNER_BLOCKER_KINDS`: `none` / `external_precondition`
 / `evidence_gap`) and, for `external_precondition`, `external_resource`.
-The kind names mirror the implementer's typed blocker (B1) so the two
-read the same; reconcile with B1's `blocker_kind` when that lands.
+Reconciled with the implementer's typed blocker (B1, `BLOCKER_KINDS`, §6
+*Typed blocker kinds*): `external_precondition` is the one value the two
+share, with the same meaning (only a human outside the run can supply it)
+and the same companion `external_resource`; the planner's other two kinds
+are plan-level and have no implementer counterpart.
+`tests/test_blocker_kind.py` pins the shared value.
 
 | Function | Purpose |
 |----------|---------|
@@ -5162,7 +5176,8 @@ accept the subtask as leaf); then splits via one of:
   falls back to a distinct deterministic label (`_deterministic_chunk_label()`).
 - **Coupled path** (≤ 8 files): `splitter` LLM worker — structural seam detection.
 - **Sub-file path** (exactly 1 file, low fit, file/region span >
-  `subfile_split_max_span`, **and `change_shape == "sweep"`**): checked
+  `subfile_split_max_span`, **`change_shape == "sweep"` and `independent_sites`
+  true**): checked
   **before** the file-count fork, since a
   single dense file falls into the coupled path today where the LLM splitter
   cannot break one file. Splits the file *intra*-file in two tiers (both
@@ -5177,16 +5192,26 @@ accept the subtask as leaf); then splits via one of:
   derived from the parent's intent plus the region's line range and symbols,
   not a byte-identical copy.
 
-  **`change_shape` gate (first entry only).** `_subfile_split()` returns `[]`
-  without tiling when the subtask declares `change_shape` of `point` or
-  `localized`; only `sweep` (or an absent field — the reconciler/splitter
-  schemas do not carry it, and absence preserves the pre-gate behaviour) is
-  tiled. Read from the parent subtask, so `_migration_child()` carries
-  `change_shape` forward for the same reason it carries `migration_targets`:
-  the peel path builds a migration child that then re-enters `_subfile_split()`,
-  and dropping the field there would route straight past this gate. The
-  re-entry (tier-2) branch is deliberately **not** gated — a child carrying
-  `owned_region` is already inside an approved sweep.
+  **Split gate (first entry only) — `_subfile_split_gate(subtask) -> str |
+  None`.** `_subfile_split()` returns `[]` without tiling unless the subtask
+  declares `change_shape == "sweep"` **and** `independent_sites is True`; a
+  missing field is a refusal (`None` from the gate means "tile"; any string
+  is the logged reason). Read from the parent subtask, so `_migration_child()`
+  carries `change_shape`, `independent_sites` and `sweep_sites` forward for the
+  same reason it carries `migration_targets`: the peel path builds a migration
+  child that then re-enters `_subfile_split()`, and dropping the fields there
+  would route straight past this gate. The re-entry (tier-2) branch is not
+  gated again — a child carrying `owned_region` is already inside an approved
+  sweep — but it is site-limited the same way.
+
+  **Site-limited tiling — `_sweep_site_lines(subtask, repo_root, file) ->
+  set[int]`.** Each `sweep_sites` identifier is located with `git grep
+  --no-index -n -w -F -e <identifier> -- <file>` (whole-word, fixed string;
+  `--no-index` so a file outside a git checkout still reads). After the
+  coverage backstop passes on the full tiling, only regions holding at least
+  one located line become children; no located line, or one region left,
+  returns `[]`. Identifiers are kept only when they are non-empty strings
+  with no whitespace or path separator.
 
   A gated subtask does **not** become a leaf here. `_subfile_split()` returning
   `[]` is its "not a candidate" signal, so `_recursive_decompose()`'s `elif`
@@ -5850,6 +5875,39 @@ of the completeness re-drive. `_SETTLED_STATUSES = {"complete",
 "unconverged", "accepted_external"}` is the resume filter;
 `_TERMINAL_STATUSES` gains `unconverged` and `accepted_external`.
 
+### Typed blocker kinds — `_route_blocker_kind`
+
+DESIGN §13 *A blocked implementer says why, as a type*. `SCHEMAS
+["implementer"]` carries `blocker_kind` and `external_resource` through a
+top-level `$defs` (`{"$ref": "#/$defs/blocker_kind"}` /
+`"#/$defs/external_resource"`); `BLOCKER_KINDS = ("nothing_to_change",
+"external_precondition", "environment_limit", "upstream_missing",
+"cannot_reproduce", "regression_unresolved", "other")`.
+`_blocker_kind(res) -> tuple[str, str]` returns `(kind, resource)`: a value
+outside `BLOCKER_KINDS`, a missing one, and an `external_precondition` with
+an empty `external_resource` are all `other`. In `_settle_subtask`, a result
+whose `status` is `blocked` or `failed` goes to `async
+_route_blocker_kind(...)` before anything else:
+- `external_precondition` → `_settle_accepted_external(st, sid, resource,
+  blocker) -> dict`: `subtask_status[sid] = "accepted_external"`, `blocked[sid]`
+  dropped, and `needs_human_verification` gains `{source: "blocker", subtask,
+  resource, blocker}` (replacing an earlier entry for the same subtask);
+  returns `{status: "accepted_external"}`. `phase_classify` rewrites only the
+  `source: "required_item"` entries of that list, so it keeps these.
+- `environment_limit` → `_environment_limit_hit` (one in-place retry, then
+  `unconverged` with `kind: "environment_limit"`), whatever the ceiling.
+- `cannot_reproduce` → `_settle_by_execution`: `pass` settles complete
+  through `_settle_already_satisfied` (reason `settled_by_execution`), an
+  `environment_limit` verdict settles `unconverged`; anything else ends
+  `blocked` with the execution record in the blocker.
+- every other kind → the result is returned `blocked` (a self-reported
+  `failed` becomes `blocked`), so the wave-end `_redrive_blocked_subtasks`
+  re-drives it from the shared budget.
+The kind is persisted as `blocker_kinds[sid] = {kind, resource?, status}`
+(the latest attempt's). `phase_execute` treats `accepted_external` like
+`unconverged` at wave end: it is not integrated, not re-driven, and not
+recorded in the `blocked` registry; `_decide_outcome` does not count it.
+
 ### Settle by execution — `_settle_by_execution`
 
 DESIGN §8 *Settled by execution*. `_subtask_verify_argvs(subtask) ->
@@ -5979,8 +6037,10 @@ any_commits: bool) -> str` is the only writer of `state.data["outcome"]`
 `state.data["outcome_reasons"]`, and mirrors `outcome` into `run.json`.
 `unconverged` when any of: a `subtask_status` value is `unconverged`;
 `test_id_diff.new` is non-empty; `acceptance.gate.final` holds a failing
-measured set that is not typed broken (`_acceptance_set_broken`), or, when
-none does, `acceptance.gate.residual` read through
+measured set that still has work (`_acceptance_result_has_work`: not typed
+broken, and — when the scope judge bounded the set — one of its
+`failing_files` holds a counted case), or, when none does,
+`acceptance.gate.residual` read through
 `_acceptance_residual_unbroken` still records a failing set
 (`failing_sets > 0`) that was not rolled back to a passing verdict; `delivery_gate.unmet_after` is non-empty (or, when no
 recheck ran, `unmet_before`); `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) is non-empty. Otherwise `no_work` when `any_commits` is
@@ -6055,6 +6115,52 @@ keeping only paths that exist under the check's cwd and dropping positions.
 `_prior_delivery_residual` hands it to the next same-task run's planners as
 `ci_unmet` (`{id, why, argv, cwd, diagnostics[≤5], thresholds[≤5]}`, at most
 5).
+
+### Report-bounded has-work — `_acceptance_scope_judge_sets`
+
+DESIGN §8 *A task that points at a report is bounded by the report's own
+scenarios*. `phase_acceptance_write` calls `async
+_acceptance_scope_judge_sets(task, st, caps, models, efforts, sets)` on its
+valid sets when `_d1_report_sources(task, repo_root)` is non-empty (a
+report-pointer task); `_acceptance_audit_and_rewrite` calls it again for a
+set its rewrite replaced. Per set, per defect file with a case in
+`base_failing_cases`, one `scope_judge` call (`allowed_tools="Read"`,
+`max_turns=3`, cwd an empty `<run_dir>/scope-judge/`, budget-counted)
+receives the task, the reports, the test file's source (first 60,000
+characters) and the file's own-start cases numbered `[i]` with status and,
+for a failing case, its runner message (first 600 characters,
+whitespace-normalised). `_scope_judge_counted(out, haystack, cases,
+failing) -> dict` is the decision, all in code: a range is verified when its
+`span_quote` is a non-empty substring of the haystack (task + reports) after
+`_scope_norm` (NFC, whitespace runs to one space, stripped); `ms`/`s` convert
+to `ms`; each verified range is widened to the hull of the verified ranges of
+its unit it overlaps; a case counts when it is in `failing`, its `origin` is
+not `other_scenario`, its own `span_quote` verifies, and every param whose
+`range_ref` names a verified range of the same (converted) unit lies inside
+that hull (a param naming an unverified or out-of-list range, or another
+unit, is neutral). The set records `scope = {bounded: true,
+counted_cases{file: [case ids]}, judged{file: {case id: {origin, in_range,
+quote_ok, counted}}}}`; a judge that raises (other than budget exhaustion) or
+returns no cases leaves that file unbounded — the set records `scope =
+{bounded: false, error}` and every failing file counts. The collected set
+also carries `base_case_status{file: {case id: status}}` and
+`base_failure_messages{file: {case id: message}}`, the judge's inputs.
+
+`_acceptance_counted_files(set_) -> set[str] | None` (None when unbounded)
+and `_acceptance_result_has_work(set_, failing_files) -> bool` (not broken,
+and unbounded or a counted file is failing) are what every has-work reader
+uses: `_decide_outcome`, `_acceptance_residual_unbroken` (drops a set whose
+recorded `files_by_set[index]` holds no counted file; a residual without
+`files_by_set` falls back to the set's own bound), `_acceptance_work_fails
+(results, sets)` (the no-work settle in `_settle_pending_no_work`,
+`_acceptance_passes_on_head` and `_fix_ids_held_out_sets_protect`). The
+repair rounds and the set audit still read `_acceptance_any_fails`, so a
+variant set is repaired in the same pass. The residual gains
+`files_by_set{index: [failing files]}`.
+
+`fixed_on_head_by_execution`: when the writer's one own-start retry still
+leaves every declared defect file passing, `_write_acceptance_set` records
+that reason on the (invalid) set — the only writer of the string.
 
 ---
 
@@ -8200,6 +8306,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |
+| `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). |
 | `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
@@ -8223,7 +8330,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `defect_scope` | dict | the defect-scope audit's result on a defect-fix task (DESIGN §5 *Defect-scope audit*): `{applicable, defect_shape?, sites[], chokepoint?, ground_truth?}` — each site `{file, symbol, role, disposition: fix|ruled_out, line_hint?, note?}`, the disposition's evidence in `note` (DESIGN §5 *Every site carries a disposition*); `_warn_defect_sites_uncovered` compares only `fix` sites (a legacy site without `disposition` counts as `fix`) — `ground_truth` is `{data_dependent, inputs[], repro_command, inline_examples[]}`, each inline example `{literal, site_identifying, trigger_tokens[], site_tokens[]}` (DESIGN §5 *The report's own example inputs are captured too*) — `{"applicable": false}` when the auditor found the audit not applicable (not a defect fix at all, or a single obvious location with no competing candidate mechanisms) on every one of `caps["applicability_samples"]` samples, `{}` alongside absent key never occurs (the checkpoint stores whatever the phase returned). Own resume checkpoint keyed on presence, mirroring `artifact_registry` — plus an extra gate the registry does not carry: skipped when `plans_after_plan` is already present (see the phase-2 row for the resume rationale). Injected into planner ctx when `applicable` with non-empty `sites`. |
 | `delivery_gate` | dict | audit record of the finalize-side required-items verification (DESIGN §8 *The delivery gate*): `{unmet_before[], samples_before, unmet_after[], samples_after, routed_before?, routed_after?}`, each unmet entry `{item_index, item, evidence}` (an unmet entry settled in code also carries `settled_by: "untouched_paths"`). `routed_*` is `{external[], untouched[{item_index, met, files[]}], packs}`: the indices `_delivery_judge_unmet` kept away from the judge and the number of judge prompts (DESIGN §8 *Grouped judging at coverage item counts*). `unmet_before` is written by `_run_delivery_prejudge` (majority-confirmed unmet items, routed into the final-conformer pass); `unmet_after` by `_run_delivery_recheck` after that pass — `[]` means remedied, non-empty is the shipping residual (fail-open, loud). Presence of `unmet_after` is the resume sentinel. |
 | `site_token_warnings` | list | advisory record from `_warn_site_token_leaks` after integration: `[{token, file}]` for each `site_tokens` entry found as a whole word in the run diff's added lines and absent from the base tree (DESIGN §5 *The report's own example inputs are captured too*). Never gates; absent when the audit carried no inline examples. |
-| `acceptance` | dict | the held-out acceptance record (DESIGN §8 *Held-out acceptance tests*): `{validity_base, report_base, written, sets[], skipped?, gate?}` — `validity_base` is the run's own start, `report_base` the earliest same-task base (informational). Each valid set `{index, valid, dir, defect_files[], control_files[], support_files[], cases{file: [names]}, modes{defect file: "assertion" | "import" (observed failing to load on the base)}, base_failing_cases{defect file: [runner case IDs that failed at the own start]}, report_reproduced: bool | null, own_start_rewrite?, rewrite_rounds?, audit?, rewrite?, broken?}`, stored under `<run_dir>/acceptance/set-<k>/` (a replacing rewrite under `set-<k>-rw/`) — `own_start_rewrite: true` when the writer's one own-start retry produced it; `rewrite_rounds` the `acceptance_rewrite_rounds` counter; `audit` the latest set audit `{findings[{case, defect_kind, test_quote, prod_quote, reason, sample}], kinds[], samples, skipped?}` (only quote-verified `set_defect` cases; `kinds` is what Stage-3 escalation reads); `rewrite` `{triggers[mechanical | set_audit | surrogate_witness], outcome: replaced | kept_original, reason?, retried_empty, original?{dir, defect_files, control_files, support_files, cases, modes, base_failing_cases}, result}` (`result` the set's verdict on the integrated tree after the rewrite, which replaces its `gate.final` entry); `broken: true` (written only by `_acceptance_audit_and_rewrite`; read only through `_acceptance_set_broken`) keeps the set out of the next run's residual and out of `_decide_outcome`'s failing count. `{"skipped": reason}` when the run is not a defect fix (no `bug-fixing` category), there is no scoped test command (also `skip_kind: "no_scoped_runner"`, `reason`, `test_command`), `--skip-acceptance-check` is set, or writing raised anything but a budget-exhaustion `WorkerError` (which stops the run). `gate` is `{initial[], initial_sha?, rounds[{round, results?, sha?, error?, retried?}], final[], before_sha?, pre_tests_passed?, residual?, rolled_back?, rollback_reason?, rollback_failed?}` (`initial` persisted before any repair; `initial_sha`/`rounds[].sha` the commit each verdict was measured on — absent from a state saved before they existed, which then always counts as moved), each result `{index, passed, unmeasured, failing_files[], resource_affected_files?[]}` (`failing_files` confirmed under B*); `residual` `{failing_sets, total_sets, cases[], sets[], cases_by_set{index: [names]}, unmeasured_final?, rollback_failed?}` — from the last MEASURED verdict when the final one measured nothing (`unmeasured_final: true`, forwarded to the planner) — feeds the next same-task run via `_prior_delivery_residual` as `acceptance_unmet`, after `_acceptance_residual_unbroken` drops the sets typed broken at read time (None when none is left and no rollback failed; a residual without `sets` is used unchanged). Presence of the key is the write half's resume checkpoint (skipped when `plans_after_plan` is present, like `defect_scope`); `gate.final` is the gate half's sentinel. |
+| `acceptance` | dict | the held-out acceptance record (DESIGN §8 *Held-out acceptance tests*): `{validity_base, report_base, written, sets[], skipped?, gate?}` — `validity_base` is the run's own start, `report_base` the earliest same-task base (informational). Each valid set `{index, valid, dir, defect_files[], control_files[], support_files[], cases{file: [names]}, modes{defect file: "assertion" | "import" (observed failing to load on the base)}, base_failing_cases{defect file: [runner case IDs that failed at the own start]}, report_reproduced: bool | null, base_case_status{defect file: {case id: status}}, base_failure_messages{defect file: {case id: message}}, scope?, own_start_rewrite?, rewrite_rounds?, audit?, rewrite?, broken?}`, stored under `<run_dir>/acceptance/set-<k>/` (a replacing rewrite under `set-<k>-rw/`) — `own_start_rewrite: true` when the writer's one own-start retry produced it; `rewrite_rounds` the `acceptance_rewrite_rounds` counter; `audit` the latest set audit `{findings[{case, defect_kind, test_quote, prod_quote, reason, sample}], kinds[], samples, skipped?}` (only quote-verified `set_defect` cases; `kinds` is what Stage-3 escalation reads); `rewrite` `{triggers[mechanical | set_audit | surrogate_witness], outcome: replaced | kept_original, reason?, retried_empty, original?{dir, defect_files, control_files, support_files, cases, modes, base_failing_cases, base_case_status, base_failure_messages, scope}, result}` (`result` the set's verdict on the integrated tree after the rewrite, which replaces its `gate.final` entry); `broken: true` (written only by `_acceptance_audit_and_rewrite`; read only through `_acceptance_set_broken`) keeps the set out of the next run's residual and out of `_decide_outcome`'s failing count. `scope` (report-pointer tasks only, `_acceptance_scope_judge_sets`) is `{bounded: true, counted_cases{file: [case ids]}, judged{file: {case id: {origin, in_range, quote_ok, counted}}}}` or `{bounded: false, error}`; a bounded set with no counted case is a variant set — repaired, never work (`_acceptance_result_has_work`). An invalid set from the writer's own-start retry whose defect files all still pass carries `reason: "fixed_on_head_by_execution"`. `{"skipped": reason}` when the run is not a defect fix (no `bug-fixing` category), there is no scoped test command (also `skip_kind: "no_scoped_runner"`, `reason`, `test_command`), `--skip-acceptance-check` is set, or writing raised anything but a budget-exhaustion `WorkerError` (which stops the run). `gate` is `{initial[], initial_sha?, rounds[{round, results?, sha?, error?, retried?}], final[], before_sha?, pre_tests_passed?, residual?, rolled_back?, rollback_reason?, rollback_failed?}` (`initial` persisted before any repair; `initial_sha`/`rounds[].sha` the commit each verdict was measured on — absent from a state saved before they existed, which then always counts as moved), each result `{index, passed, unmeasured, failing_files[], resource_affected_files?[]}` (`failing_files` confirmed under B*); `residual` `{failing_sets, total_sets, cases[], sets[], cases_by_set{index: [names]}, files_by_set{index: [failing files]}, unmeasured_final?, rollback_failed?}` — from the last MEASURED verdict when the final one measured nothing (`unmeasured_final: true`, forwarded to the planner) — feeds the next same-task run via `_prior_delivery_residual` as `acceptance_unmet`, after `_acceptance_residual_unbroken` drops the sets typed broken, and the variant sets (no counted case among their `files_by_set` files), at read time (None when none is left and no rollback failed; a residual without `sets` is used unchanged). Presence of the key is the write half's resume checkpoint (skipped when `plans_after_plan` is present, like `defect_scope`); `gate.final` is the gate half's sentinel. |
 | `skip_acceptance_check` | bool | whether the held-out acceptance sets and gate are suppressed. Resolved from `--skip-acceptance-check` / `LEERIE_SKIP_ACCEPTANCE_CHECK` / `leerie.toml` / default `False`; seeded in both the fresh and resume branches. |
 | `no_work_pending` | bool | set by `_confirm_no_work_on_converged_gate` when the `no_work_judge` confirms and `_acceptance_can_check(st)` holds (acceptance not skipped, `bug-fixing` category, a scoped test template): the confirmation is held instead of finishing, and `_settle_pending_no_work` decides it after `phase_acceptance_write` (DESIGN §8 *No work is declared on executed evidence, and a dispute is bounded*). Cleared on a dispute. |
 | `no_work_acceptance` | dict | `_settle_pending_no_work`'s verdict: `{verdict: pass \| dispute \| accepted after dispute \| no valid sets \| not measurable \| error: <type>, results?, cases?}`; its presence is the settle step's resume sentinel. |
@@ -8260,7 +8367,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
 | `under_scope_warnings` | dict[str, dict] | `{touched, declared, reason}` per subtask that committed work but touched **none** of its `files_likely_touched`, from `check_diff_scope` (non-fatal signal log; DESIGN §9 *Scope is checked in both directions*). Comparison via `_declared_path_covers` — component-wise, absorbs a repo-root prefix on either side, and a directory-shaped declaration covers files beneath it. |
-| `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). |
+| `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). `conformance["_final"] = {result, warnings, blocked}` is the final-tree pass's record and its resume sentinel: `_run_final_conformance` skips on resume only when `_final` is present with `blocked` false (or absent — an orchestrator-exception record), and runs again when `blocked` is true (DESIGN §9, final-tree pass). |
 | `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). |
 | `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. |
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
@@ -8292,7 +8399,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `leerie_versions` | list[dict] | append-only resume history (N38), distinct from the immutable `leerie_version`/`leerie_commit` pair above. |
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. |
 | `requirement_coverage` | dict | the requirement-coverage gate's record, written by `phase_classify` (DESIGN §8 *Requirement coverage*): `{spans[{id, parent}], sections[{id, source}], reports[], closure[], holes{}}`. `spans`/`sections` are the IDs `_d1_split_spans`/`_d1_split_sections` assigned (no text); `parent` is the mechanical nesting link `_d1_judge_packs` groups by; `reports` the inlined report paths; `closure` the S/R ids `_d1_closure` derives; `holes` the residual `_d1_coverage_holes` findings after the check rounds (`{}` when none). |
-| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`). The `source` key lets later producers append their own entries. |
+| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}` — for a subtask settled `accepted_external` on an implementer's `external_precondition` (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). |
 | `site_claims` | dict \| null | the site-claims record (DESIGN §5 *Every `fix` site is claimed*), written by `phase_plan` from the first-pass `bug-fixing` plan: `{domain, sites[{site_id, file, symbol, auditor_kind, resolution, claims[{sid, kinds[]}], not_needed, status, surface_other}]}`, `status` one of `claimed`/`mismatch`/`not_needed`/`unclaimed` (`_site_claim_rows`); `surface_other` marks a site resting on an `other` kind, for the PR. Not written when there is no `bug-fixing` plan or the audit is inapplicable. Never gates. |
 | `domain_blocked` | list[dict] | every planner domain that exited `blocked`, `[{domain, blocker_kind, external_resource, gap}]` (`_settle_blocked_domains`; DESIGN §8 *A partially blocked plan is recorded*). Written after planning and again before scheduling; `[]` when none. A row typed `external_precondition` stops the run before execution. |
 | `process_constraints` | dict | the classifier's typed process constraints (DESIGN §9 *A command the task forbids*): `{forbidden_commands[], evidence}` from `_process_constraints`; `{"forbidden_commands": [], "evidence": ""}` when the task forbids nothing. Read by `claude_p` (deny rules, notice, hook), `_measure_axes`, the plan strip and the planner ctx. |
@@ -8385,6 +8492,9 @@ Required fields, current shape:
   `plan.json`'s `preconditions` (DESIGN §5 `requires.extent`). In every case
   `reason` must name the owner; the discriminating test is "is it in this
   run's graph?", not "could any code produce it?".
+  `change_shape` (required), `independent_sites` (required boolean) and
+  `sweep_sites` (optional `string[]`) gate the sub-file split (DESIGN §5½
+  (P1) *Sub-file*; `_subfile_split_gate`, `_sweep_site_lines`).
   `provides` is bare strings. `size` is `small`/`medium`/`large` — `large`
   triggers the size-resolution retry loop, `_validate_plan` OVERSIZED-dies if
   it survives. `runs_commands` (optional strings) feeds
@@ -8422,7 +8532,11 @@ Required fields, current shape:
   `{kind: unexercised_behavior|external_contract_assumption|untested_change,
   detail, where?}[]`, max 8 — routed by `_collect_subtask_risks` into the
   `risk_register` and the conformer's challenge context, never parsed from
-  prose).
+  prose), `blocker_kind` (`$ref` into the schema's `$defs`: `nothing_to_change`
+  / `external_precondition` / `environment_limit` / `upstream_missing` /
+  `cannot_reproduce` / `regression_unresolved` / `other`) and
+  `external_resource` (string, the resource an `external_precondition`
+  needs) — routed by `_route_blocker_kind` (§6 *Typed blocker kinds*).
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
   `design-conflict` / `failed`). `confidence`: `_confidence_schema(["resolution"])`.
   Optional: `resolution_summary`, `diagnosis` (fallback on non-`resolved`).
@@ -8478,6 +8592,12 @@ Required fields, current shape:
   `strict_argv` is `[]` when the tool has no strict form, and a non-coverage
   check carries `coverage: {summary_path: "", config_file: "", thresholds:
   []}`.
+- **scope_judge** — required: `report_ranges[]`, each `{param, min, max (a
+  single value has min = max), unit: ms|s|count|bytes|percent|other,
+  span_quote}`, and `cases[]`, each `{case_index, origin: report_example|
+  report_regression_test|report_symptom|other_scenario, params[{range_ref,
+  value, unit}], span_quote, reason}`. Facts only; `_scope_judge_counted`
+  decides which cases count (see *Report-bounded has-work* in §6).
 - **conformer** — required: `subtask_id`, `rules_files_read` (strings, empty
   when none found), `rule_violations` (`{status: fixed|residual, rule, fix,
   evidence, why_not_fixed}[]`), `file_updates` (`{kind: docs|tests, path,
@@ -8629,6 +8749,7 @@ ever spawned without one, and no prompt is shared between call types.
 | `set_auditor` | `prompts/set_auditor.md` | held-out set audit (DESIGN §8 *A set that keeps failing is audited, and rewritten once*) |
 | `surrogate_fixer` | `prompts/surrogate_fixer.md` | test-blind independent fix, the surrogate witness (same section) |
 | `ci_checks` | `prompts/ci_checks.md` | the repository's own merge checks (DESIGN §9 *The repository's own merge checks run too*) |
+| `scope_judge` | `prompts/scope_judge.md` | report-bounded has-work typing (DESIGN §8 *A task that points at a report is bounded by the report's own scenarios*) |
 | `pr_writer`      | `prompts/pr_writer.md` | invoked by `phase_finalize` when `push_will_happen` is true |
 | `dep_capture`    | `prompts/dep_capture.md` | post-run dependency-capture worker (DESIGN §6½) |
 | `judge`          | `prompts/judge.md` | post-run skill |

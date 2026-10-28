@@ -219,7 +219,8 @@ def test_planner_schema_accepts_claims_and_rejects_bad_kinds(leerie):
     jsonschema = pytest.importorskip("jsonschema")
     schema = leerie.SCHEMAS["planner"]
     sub = {"id": "bugfix-001", "title": "t", "success_criteria_seed": "c",
-           "change_shape": "point", "change_kind": "fix",
+           "change_shape": "point", "independent_sites": False,
+           "change_kind": "fix",
            "claims": {"sites": [{"site_id": "D1",
                                  "resolution_kinds": ["rerun_flow"]}]}}
     good = {"domain": "bug-fixing", "status": "ready", "blocker_kind": "none",

@@ -36,7 +36,7 @@ def test_both_branches_call_the_shared_helper():
     # calls, not just aggregate presence anywhere in the function.
     handoff_idx = src.index('if status == "incomplete-handoff"')
     clarify_idx = src.index('if status == "needs-clarification"')
-    failed_idx = src.index('if status == "failed"')
+    failed_idx = src.index('if status in ("blocked", "failed")')
 
     handoff_body = src[handoff_idx:clarify_idx]
     clarify_body = src[clarify_idx:failed_idx]
@@ -53,7 +53,7 @@ def test_both_branches_call_the_shared_helper():
 def test_clarification_side_trip_is_untouched_and_branch_specific():
     src = _settle_subtask_source()
     clarify_idx = src.index('if status == "needs-clarification"')
-    failed_idx = src.index('if status == "failed"')
+    failed_idx = src.index('if status in ("blocked", "failed")')
     clarify_body = src[clarify_idx:failed_idx]
 
     handoff_idx = src.index('if status == "incomplete-handoff"')

@@ -875,3 +875,40 @@ def test_run_final_conformance_called_between_execute_and_finalize(leerie):
     assert exec_idx < final_idx < finalize_idx, (
         "ordering broken: final conformance must run between execute "
         "and finalize")
+
+
+def test_rerun_on_resume_when_the_recorded_pass_was_blocked(env):
+    """B3: `_final` is the resume sentinel only for a pass that cleared. A
+    `blocked: true` record (the run stopped with "fix and resume") must not
+    short-circuit the resumed run — the pass runs again and its new result
+    replaces the blocked one."""
+    c = env["leerie"]
+    env["st"].data["conformance"] = {
+        "_final": {"result": None, "warnings": ["old"], "blocked": True},
+    }
+    env["st"].save()
+    state = _stub_claude_p(c, [_clean_result()])
+
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+
+    assert state["i"] == 1, "a blocked final pass must run again on resume"
+    block = env["st"].data["conformance"]["_final"]
+    assert block["blocked"] is False
+    assert block["warnings"] != ["old"]
+
+
+def test_cleared_record_with_blocked_false_still_skips(env):
+    """The other side of the same rule, with the key present and false."""
+    c = env["leerie"]
+    env["st"].data["conformance"] = {
+        "_final": {"result": _clean_result(), "warnings": [],
+                   "blocked": False},
+    }
+    env["st"].save()
+    state = _stub_claude_p(c, [_clean_result()])
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+    assert state["i"] == 0
