@@ -1857,6 +1857,32 @@ integrated with the wave and counted in what the wave must integrate; the
 wave-already-settled shortcut does not apply while one exists. Re-merging is
 safe by construction: a branch already merged is a no-op merge.
 
+**Integrated means the settled commit is on the run branch, not that the
+merge exited 0.** A merge of a branch already contained in the run branch
+exits 0 ("Already up to date"), so a subtask branch that does not point at
+the work its subtask settled on is "integrated" with nothing merged. In a
+replayed run (barnacle 45fa4253, pass 1) a test-only subtask's implementer
+checked out the base commit detached to compare behaviour, never switched
+back, and committed its three commits on the detached HEAD. Its conformer
+read them (`git diff <run-branch>..HEAD`), the subtask settled `complete`,
+its branch still pointed at the run branch, the merge was a no-op, the
+wave reported "integrated 1 of 1", and the 232-line test file never
+reached the PR; the delivery judges found it absent. Two rules close it:
+
+- *At settle, the branch is put where the work is.* When a subtask settles
+  `complete`, the orchestrator reads its worktree's HEAD. A HEAD that is
+  detached, or on another branch, while the subtask branch is an ancestor
+  of it, is a worker that left the branch — the subtask branch is moved to
+  that HEAD and checked out again (no file changes: same commit). That
+  HEAD is recorded as the subtask's **settled head**.
+- *After its merge, the settled head must be an ancestor of the run
+  branch.* When it is not, the subtask branch is pointed at the settled
+  head and the subtask is integrated once more (a conflict goes to the
+  integrator as any other). When it still is not, the subtask is backed
+  out (§6 *When integration cannot succeed*) and settled `unconverged`
+  with the settled head named — the work is never silently dropped. A
+  resumed wave finds what is still unintegrated by the same settled head.
+
 **A re-drive interrupted mid-round is undone, never integrated.** That rule
 alone integrated half-done work: a coverage re-drive keeps its subtask
 `complete` for the whole implementer session, so a crash after the session
@@ -9314,7 +9340,10 @@ everything that converged and names what did not. So every `die()`
 reachable from execution, integration, the final passes and finalize is
 either a state the run cannot safely continue from — the operator's
 checkout moved (§12 L4), a `git reset` that did not land, conflict markers
-committed to the run branch, staging or a subtask branch missing, a run
+committed to the run branch, staging or a subtask branch missing, a wave
+whose completed subtasks are neither on the run branch nor backed out (an
+invariant the per-subtask settled-head check, §6 *Integrated means the
+settled commit is on the run branch*, makes unreachable), a run
 branch gone after cleanup, `finalize.sh` failing, an integrator that
 crashed every round mid-merge (a fact about the machine, its resolution
 rescued to a ref that `resume` retries from) — or an operator's own

@@ -848,6 +848,9 @@ STATE_FIELDS = (
     # (DESIGN §6 *A re-drive interrupted mid-round is undone, never
     # integrated*): per-sid {kind, pre_sha, round, status}.
     "redrive_in_flight",
+    # Settled heads (DESIGN §6 *Integrated means the settled commit is on the
+    # run branch*): per-sid worktree HEAD at the moment it settled complete.
+    "settled_heads",
     # Delivery re-drive (DESIGN §8 *Delivery re-drive*): rounds, groups,
     # pending control notes, trade pairs, conflict and contradictions.
     "delivery_redrive",
@@ -50292,6 +50295,13 @@ async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
             statuses[sid] = m["status"]
         elif not ok:
             statuses[sid] = "in_progress"
+        # The settled head follows the rollback: a head the round recorded
+        # would read as work integration must still merge (DESIGN §6).
+        heads = st.data.setdefault("settled_heads", {})
+        if ok and pre:
+            heads[sid] = pre
+        else:
+            heads.pop(sid, None)
         if m.get("kind") == "coverage":
             rec = (st.data.get("coverage_redrive") or {}).get(sid)
             if isinstance(rec, dict):
@@ -53191,13 +53201,84 @@ def _incoming_subtask_view(leerie_dir: Path, sid: str,
     return view
 
 
+async def _record_settled_head(st: "State", leerie_dir: Path,
+                               sid: str) -> str | None:
+    """Record the commit `sid` settled `complete` on — its worktree's HEAD —
+    as `settled_heads[sid]`, putting the subtask branch there first when a
+    worker left it (DESIGN §6 *Integrated means the settled commit is on the
+    run branch*). A detached HEAD, or one on another branch, that descends
+    from the subtask branch is a worker that checked something else out and
+    committed there: the branch is moved to it and checked out again, the
+    same commit, so no file changes. In the replayed run (barnacle 45fa4253)
+    an implementer ran `git checkout <base>~0` to compare behaviour and
+    committed three times on the detached HEAD; the branch never moved, and
+    its merge was a no-op. None when there is no worktree or no HEAD."""
+    wt = _subtask_worktree_path(leerie_dir, sid)
+    if not wt.is_dir():
+        return None
+    head = (await _git_text(wt, "rev-parse", "HEAD") or "").strip()
+    if not head:
+        return None
+    ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
+    cur = (await _git_text(wt, "symbolic-ref", "-q", "HEAD") or "").strip()
+    if cur != ref:
+        tip = (await _git_text(wt, "rev-parse", "--verify", "-q", ref)
+               or "").strip()
+        follows = bool(tip) and (tip == head or (await run_proc(
+            ["git", "merge-base", "--is-ancestor", tip, head],
+            cwd=str(wt))).returncode == 0)
+        where = f"on {cur}" if cur else "detached"
+        if follows:
+            moved = await run_proc(["git", "update-ref", ref, head, tip],
+                                   cwd=str(wt))
+            back = (await run_proc(
+                ["git", "checkout", "-q", ref.removeprefix("refs/heads/")],
+                cwd=str(wt)) if moved.returncode == 0 else moved)
+            log(f"  {sid}: worktree HEAD {head[:12]} was {where}, ahead of "
+                f"its branch at {tip[:12]} — "
+                + ("branch moved to it and checked out"
+                   if moved.returncode == 0 and back.returncode == 0 else
+                   "could not move the branch "
+                   f"({(back.stderr or moved.stderr or '').strip()[:160]})"))
+        else:
+            log(f"  {sid}: worktree HEAD {head[:12]} is {where} and does not "
+                f"descend from its branch ({tip[:12] or 'missing'}); "
+                "integration checks the settled head")
+    st.data.setdefault("settled_heads", {})[sid] = head
+    st.save()
+    return head
+
+
+async def _settled_head_integrated(staging: Path, st: "State",
+                                   sid: str) -> bool:
+    """True when `sid`'s settled head is an ancestor of staging's HEAD, or
+    when none is recorded (nothing to check). `merge-base --is-ancestor`
+    exit 1 — or a head git cannot read — is False: the work is not there."""
+    head = (st.data.get("settled_heads") or {}).get(sid)
+    if not head:
+        return True
+    r = await run_proc(["git", "merge-base", "--is-ancestor", head, "HEAD"],
+                       cwd=str(staging))
+    return r.returncode == 0
+
+
+def _integration_ref(run_id: str, sid: str, heads: dict | None) -> str:
+    """What a resumed wave tests for `sid`'s integration: its settled head
+    when one is recorded, else its branch."""
+    head = (heads or {}).get(sid)
+    return head or f"refs/heads/leerie/subtasks/{run_id}/{sid}"
+
+
 async def _wave_sids_integrated_before(staging: Path, run_id: str,
-                                       sids: list[str], rev: str) -> list[str]:
-    """The `sids` whose subtask branch is already merged into `rev` — the
-    already-integrated list a resumed gate would otherwise see empty."""
+                                       sids: list[str], rev: str,
+                                       heads: dict | None = None
+                                       ) -> list[str]:
+    """The `sids` whose subtask branch (settled head, when recorded) is
+    already merged into `rev` — the already-integrated list a resumed gate
+    would otherwise see empty."""
     out: list[str] = []
     for s in sids:
-        branch = f"refs/heads/leerie/subtasks/{run_id}/{s}"
+        branch = _integration_ref(run_id, s, heads)
         try:
             r = await run_proc(["git", "merge-base", "--is-ancestor", branch,
                                 rev], cwd=str(staging))
@@ -53209,16 +53290,19 @@ async def _wave_sids_integrated_before(staging: Path, run_id: str,
 
 
 async def _wave_sids_not_integrated(staging: Path, run_id: str,
-                                    sids: list[str]) -> list[str]:
+                                    sids: list[str],
+                                    heads: dict | None = None) -> list[str]:
     """The `sids` whose subtask branch exists and is NOT yet merged into
     staging's HEAD — `complete` work a resumed wave must still integrate
     (DESIGN §6 *Skipping a settled subtask never skips its integration*).
     Only `merge-base --is-ancestor`'s exit 1 counts: a missing branch, an
     unreadable staging or any other git error is no evidence, and
-    integrating on it would die on `integrate.sh`'s precondition."""
+    integrating on it would die on `integrate.sh`'s precondition. A
+    recorded settled head is tested instead of the branch (DESIGN §6
+    *Integrated means the settled commit is on the run branch*)."""
     out: list[str] = []
     for s in sids:
-        branch = f"refs/heads/leerie/subtasks/{run_id}/{s}"
+        branch = _integration_ref(run_id, s, heads)
         try:
             r = await run_proc(["git", "merge-base", "--is-ancestor", branch,
                                 "HEAD"], cwd=str(staging))
@@ -53938,6 +54022,31 @@ async def _abandon_interrupted_merge(staging: Path, st: "State"
     return sid
 
 
+async def _reintegrate_settled_head(staging: Path, st: "State", sid: str,
+                                    pre_sha: str
+                                    ) -> subprocess.CompletedProcess:
+    """The one re-integration of a subtask whose settled head a merge left
+    out: staging back to `pre_sha` (whatever that merge brought is not
+    kept), the subtask branch pointed at the settled head, `integrate.sh`
+    again. Its result goes through the same exit-code handling as the
+    first."""
+    head = (st.data.get("settled_heads") or {}).get(sid) or ""
+    log(f"  {sid}: the merge left its settled head {head[:12]} off the run "
+        "branch — integrating once more from that head")
+    await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
+    await run_proc(["git", "update-ref",
+                    f"refs/heads/leerie/subtasks/{st.run_id}/{sid}", head],
+                   cwd=str(staging))
+    return await _run_script("integrate.sh", sid, st.run_id)
+
+
+def _settled_head_missing_reason(st: "State", sid: str) -> str:
+    head = (st.data.get("settled_heads") or {}).get(sid) or "?"
+    return (f"settled head {head} is not on the run branch after integrating "
+            f"leerie/subtasks/{st.run_id}/{sid} — the subtask's settled work "
+            "never merged")
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -53974,7 +54083,8 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     integrated_so_far: list[str] = await _wave_sids_integrated_before(
         staging, st.run_id,
         [s for s in wave if s not in results
-         and statuses.get(s) == "complete"], "HEAD")
+         and statuses.get(s) == "complete"], "HEAD",
+        st.data.get("settled_heads"))
 
     async def _gate(sid: str) -> bool:
         ok = await _run_integration_judge_gate(
@@ -54011,7 +54121,21 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
         # may still have committed something.
         pre_sha = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
         proc = await _run_script("integrate.sh", sid, st.run_id)
+        if (proc.returncode == 0
+                and not await _settled_head_integrated(staging, st, sid)):
+            # Exit 0 is not integration (DESIGN §6 *Integrated means the
+            # settled commit is on the run branch*): a branch that does not
+            # point at the settled work merges as "Already up to date".
+            # Re-integrate once, from the settled head.
+            proc = await _reintegrate_settled_head(staging, st, sid, pre_sha)
         if proc.returncode == 0:
+            if not await _settled_head_integrated(staging, st, sid):
+                await _back_out_unmerged(
+                    st, staging, sid, pre_sha,
+                    _settled_head_missing_reason(st, sid))
+                results[sid] = {"subtask_id": sid, "status": "unconverged",
+                                "summary": "integration backed out"}
+                continue
             integrated.append(sid)
             integrated_so_far.append(sid)
             continue
@@ -54143,6 +54267,14 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # Persists to `state.data["integration_gate"][sid]` and resumes
             # via the gate check at the top of this loop.
             if await _gate(sid):
+                if not await _settled_head_integrated(staging, st, sid):
+                    await _back_out_unmerged(
+                        st, staging, sid, pre_sha,
+                        _settled_head_missing_reason(st, sid))
+                    results[sid] = {"subtask_id": sid,
+                                    "status": "unconverged",
+                                    "summary": "integration backed out"}
+                    continue
                 integrated.append(sid)
                 integrated_so_far.append(sid)
         else:
@@ -54272,6 +54404,8 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                     elapsed = _close_redrive_clock(st, sid)
                     if note is None:
                         inner_redrive_sec[sid] = elapsed
+                if r.get("status") == "complete":
+                    await _record_settled_head(st, leerie_dir, sid)
                 log(f"  {sid}: {r.get('status')}")
                 return sid, r
 
@@ -54329,7 +54463,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             [sid for sid in wave if sid not in remaining
              and prior.get(sid) == "complete" and not gate.get(sid)
              # Never a branch a re-drive left mid-round (review round 2 M2).
-             and sid not in in_flight])
+             and sid not in in_flight], st.data.get("settled_heads"))
         if unintegrated_sids:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"{', '.join(unintegrated_sids)} settled complete but not "

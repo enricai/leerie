@@ -206,9 +206,9 @@ def test_the_unintegrated_path_refuses_a_marked_sid(leerie, tmp_path,
     seen: list[list[str]] = []
     real = leerie._wave_sids_not_integrated
 
-    async def spy(staging, run_id, sids):
+    async def spy(staging, run_id, sids, heads=None):
         seen.append(list(sids))
-        return await real(staging, run_id, sids)
+        return await real(staging, run_id, sids, heads)
     monkeypatch.setattr(leerie, "_wave_sids_not_integrated", spy)
     try:
         _run(leerie, st2, None, [])
