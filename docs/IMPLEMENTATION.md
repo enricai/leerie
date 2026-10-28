@@ -295,7 +295,10 @@ Base layers (top-down):
 
 - `debian:13-slim` — minimal, predictable, glibc-based.
 - `apt-get install`: `ca-certificates`, `curl`, `git`, `openssh-client`,
-  `python3`, `python3-pip`, `build-essential`, plus dev libraries
+  `python3`, `python3-pip`, `python-is-python3` (a system `python`, which
+  an unpinned mise `python` shim falls through to; without it a bare
+  `python` fails with "No version is set for shim: python"),
+  `build-essential`, plus dev libraries
   (`zlib1g-dev`, `libyaml-dev`, `libreadline-dev`, `libffi-dev`,
   `libssl-dev`, `libpq-dev`, `libsqlite3-dev`, `libgdbm-dev`,
   `default-libmysqlclient-dev`) covering native-extension compilation:

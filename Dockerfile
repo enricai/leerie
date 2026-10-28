@@ -31,9 +31,14 @@ FROM debian:13-slim
 # rsync is the receiver for the dirty-delta phase of seed-repo.sh
 # (`seed_repo_dirty` rsync's uncommitted edits + untracked files + the
 # repo-local `.claude/` directory after the bundle clone completes).
+# python-is-python3 gives the system a `python`. mise puts a `python` shim
+# first on PATH, and with no version pinned a shim falls through to the
+# system binary of the same name. Debian ships `python3` only, so without
+# this every bare `python` (a planner's verify argv, a worker's command)
+# died with "No version is set for shim: python" while `python3` worked.
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates curl git openssh-client \
-      python3 python3-pip \
+      python3 python3-pip python-is-python3 \
       procps \
       build-essential \
       rsync \
