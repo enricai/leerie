@@ -819,6 +819,13 @@ STATE_FIELDS = (
     # popped once a re-invoked judge comes back clean. Absent when no sid
     # has ever had a gating defect.
     "integration_defects",
+    # integration_unjudged: per-sid write-ahead marker {sid: pre_sha} of an
+    # integrator merge whose integration gate has not decided yet (DESIGN §6
+    # *A committed resolution is not a judged one*) — set before the
+    # integrator is spawned, dropped once the integration is decided. A
+    # resume that finds it with the sid merged and no `integration_gate`
+    # record runs the gate on the committed merge. Absent on most runs.
+    "integration_unjudged",
     # provision_recipe_gate: audit record from phase_provision_gate (DESIGN §8,
     # §6½) — the final provision_judge output. Absent when no recipe was
     # detected (kind:none) or the judge crashed every round.
@@ -54893,6 +54900,28 @@ def _record_integration_loss(st: State, sid: str, detail: str,
     reg[sid] = entries
 
 
+def _mark_integration_unjudged(st: "State", sid: str, pre_sha: str) -> None:
+    """Write ahead that `sid`'s integration will be an integrator merge the
+    integration gate must judge (DESIGN §6 *A committed resolution is not a
+    judged one*): the merge commits before the gate's verdict is saved, and
+    a kill between left a merged, unrecorded subtask a resume counted
+    integrated. `pre_sha` is the merge's first parent."""
+    st.data.setdefault("integration_unjudged", {})[sid] = pre_sha
+    st.save()
+
+
+def _clear_integration_unjudged(st: "State", sid: str) -> None:
+    """Drop `sid`'s marker once its integration is decided (a verdict
+    recorded, a back-out, the gate skipped); the key goes when it empties."""
+    marks = st.data.get("integration_unjudged")
+    if not isinstance(marks, dict) or sid not in marks:
+        return
+    marks.pop(sid, None)
+    if not marks:
+        st.data.pop("integration_unjudged", None)
+    st.save()
+
+
 async def _back_out_unmerged(st: State, staging: Path, sid: str,
                              pre_sha: str, reason: str) -> None:
     """The integration fallback for a merge no integrator produced (DESIGN
@@ -54925,6 +54954,9 @@ async def _back_out_unmerged(st: State, staging: Path, sid: str,
     _settle_unconverged(st, sid, f"integration backed out: {reason}",
                         previous_status="complete",
                         kind="integration_backed_out")
+    # After the record: a kill before this leaves `backed_out`, which a
+    # resume skips, so the marker is never read alone.
+    _clear_integration_unjudged(st, sid)
 
 
 async def _run_integration_judge_gate(
@@ -55586,11 +55618,54 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                             "summary": "integration backed out"}
         return ok
 
+    async def _finish_integrator_merge(sid: str, pre_sha: str) -> bool:
+        """What follows an integrator's committed merge, on the first pass
+        and on a resume that finds the merge unjudged (DESIGN §6 *A
+        committed resolution is not a judged one*): its subject, the commit
+        check, the integration gate, the settled-head check. True when the
+        merge stands."""
+        # The subject is code's to set: routing and sibling-delivery
+        # settlement find a subtask's merge by it (review r1).
+        await _set_integration_subject(staging, sid, pre_sha)
+        commit_err = await check_integrator_commit(staging)
+        if commit_err:
+            # non-fatal: log and record, but don't undo the integration
+            log(f"  ⚠  integrator commit warning for {sid}: {commit_err}")
+            st.data.setdefault("integrator_warnings", {})[sid] = commit_err
+            st.save()
+
+        # Independent behavioral verification of the merged result (DESIGN
+        # §8 *Independent adversarial verification*). The mechanical checks
+        # (conflict markers, merge committed) passed; this gate attacks for
+        # behavioral breakage they cannot see — e.g. a merge that silently
+        # drops one side's change, or keeps side A's signature but side B's
+        # call sites — and repairs it, or backs the subtask out as
+        # `unconverged` (DESIGN §6 *When integration cannot succeed*).
+        # Persists to `state.data["integration_gate"][sid]` and resumes
+        # via the gate check at the top of this loop.
+        ok = await _gate(sid)
+        # Decided: a verdict is recorded (or the gate was skipped, or its
+        # judge crashed and the merge was kept), so the write-ahead marker
+        # has done its job.
+        _clear_integration_unjudged(st, sid)
+        if not ok:
+            return False
+        if not await _settled_head_integrated(staging, st, sid):
+            await _back_out_unmerged(
+                st, staging, sid, pre_sha,
+                _settled_head_missing_reason(st, sid))
+            results[sid] = {"subtask_id": sid, "status": "unconverged",
+                            "summary": "integration backed out"}
+            return False
+        return True
+
     for sid in wave:
         if results.get(sid, {}).get("status") != "complete":
             continue
         gate = st.data.get("integration_gate", {}).get(sid)
         if gate is not None:
+            # A kill between the verdict's save and the marker's leaves both.
+            _clear_integration_unjudged(st, sid)
             # A prior invocation already ran integrate.sh/the integrator for
             # this sid and the merge is already committed to staging — the
             # judge only ever runs post-merge-commit, so a present entry
@@ -55605,6 +55680,22 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 # already-committed merge (DESIGN §6).
                 integrated.append(sid)
                 integrated_so_far.append(sid)
+            continue
+        unjudged = (st.data.get("integration_unjudged") or {}).get(sid)
+        if unjudged and await _wave_sids_integrated_before(
+                staging, st.run_id, [sid], "HEAD",
+                st.data.get("settled_heads")):
+            # A prior invocation's integrator committed this merge and was
+            # killed before the gate recorded a verdict: the merge is judged
+            # now, never counted integrated on its presence (DESIGN §6 *A
+            # committed resolution is not a judged one*). Without a marker
+            # the merge was clean or merged by key, which is never judged.
+            log(f"  {sid}: its integrator merge was committed but never "
+                "judged (interrupted); running the integration gate on it")
+            if await _finish_integrator_merge(sid, str(unjudged)):
+                integrated.append(sid)
+                if sid not in integrated_so_far:
+                    integrated_so_far.append(sid)
             continue
         # The merge's first parent, for the fallback: a failing integrator
         # may still have committed something.
@@ -55652,6 +55743,10 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             integrated_so_far.append(sid)
             continue
         log(f"  conflict integrating {sid}; spawning integrator")
+        # Before the integrator can commit: its merge is on staging before
+        # the gate's verdict is saved (DESIGN §6 *A committed resolution is
+        # not a judged one*).
+        _mark_integration_unjudged(st, sid, pre_sha)
         sys_prompt = _load_prompt("integrator")
         up_parts: list[str] = [
             f"Resolve the in-progress merge conflict in this worktree.\n"
@@ -55764,34 +55859,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 results[sid] = {"subtask_id": sid, "status": "unconverged",
                                 "summary": "integration backed out"}
                 continue
-            # The subject is code's to set: routing and sibling-delivery
-            # settlement find a subtask's merge by it (review r1).
-            await _set_integration_subject(staging, sid, pre_sha)
-            commit_err = await check_integrator_commit(staging)
-            if commit_err:
-                # non-fatal: log and record, but don't undo the integration
-                log(f"  ⚠  integrator commit warning for {sid}: {commit_err}")
-                st.data.setdefault("integrator_warnings", {})[sid] = commit_err
-                st.save()
-
-            # Independent behavioral verification of the merged result (DESIGN
-            # §8 *Independent adversarial verification*). The mechanical checks
-            # (conflict markers, merge committed) passed; this gate attacks for
-            # behavioral breakage they cannot see — e.g. a merge that silently
-            # drops one side's change, or keeps side A's signature but side B's
-            # call sites — and repairs it, or backs the subtask out as
-            # `unconverged` (DESIGN §6 *When integration cannot succeed*).
-            # Persists to `state.data["integration_gate"][sid]` and resumes
-            # via the gate check at the top of this loop.
-            if await _gate(sid):
-                if not await _settled_head_integrated(staging, st, sid):
-                    await _back_out_unmerged(
-                        st, staging, sid, pre_sha,
-                        _settled_head_missing_reason(st, sid))
-                    results[sid] = {"subtask_id": sid,
-                                    "status": "unconverged",
-                                    "summary": "integration backed out"}
-                    continue
+            if await _finish_integrator_merge(sid, pre_sha):
                 integrated.append(sid)
                 integrated_so_far.append(sid)
         else:
@@ -55985,7 +56053,25 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"{', '.join(unintegrated_sids)} settled complete but not "
                 "yet integrated; integrating with the wave")
-        if not remaining and not pending_gate_sids and not unintegrated_sids:
+        # An integrator merge committed before an interruption, with no
+        # verdict recorded: merged, so not in `unintegrated_sids`, and
+        # without a record, so not in `pending_gate_sids` — but never judged
+        # (DESIGN §6 *A committed resolution is not a judged one*).
+        unjudged = st.data.get("integration_unjudged") or {}
+        for sid in [s for s in wave if s in unjudged and gate.get(s)]:
+            # Its verdict is recorded; a kill came before the marker's clear.
+            _clear_integration_unjudged(st, sid)
+        unjudged_sids = [sid for sid in wave
+                         if sid in unjudged and sid not in remaining
+                         and prior.get(sid) == "complete"
+                         and not gate.get(sid)
+                         and sid not in unintegrated_sids]
+        if unjudged_sids:
+            log(f"phase 5: wave {wi + 1} of {len(waves)} — "
+                f"{', '.join(unjudged_sids)} merged by an integrator but "
+                "never judged; judging with the wave")
+        if (not remaining and not pending_gate_sids and not unintegrated_sids
+                and not unjudged_sids):
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"all {len(wave)} subtask(s) already settled, skipping")
             st.data["completed_waves"] = wi + 1
@@ -56031,7 +56117,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # at all. The gate reads the subtask's intent and criteria from its
         # own spec (`_incoming_subtask_view`), so the stand-in needs only
         # the status.
-        for sid in pending_gate_sids + unintegrated_sids:
+        for sid in pending_gate_sids + unintegrated_sids + unjudged_sids:
             results.setdefault(sid, {"status": "complete"})
 
         blocked = [s for s, r in results.items()

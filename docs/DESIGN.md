@@ -1900,6 +1900,28 @@ reached the PR; the delivery judges found it absent. Two rules close it:
   commits never reached the PR.) Re-pointing the branch at the settled
   head is refused unless the branch is an ancestor of it.
 
+**A committed resolution is not a judged one.** An integrator's merge
+reaches the run branch before the integration judge reviews it (§6 *When
+integration cannot succeed*): the commit lands, then the judge runs, then
+its verdict is recorded. A kill between the commit and the verdict left a
+`complete` subtask whose settled head *is* on the run branch and which has
+no gate record — so the rule above read it as integrated, the
+wave-already-settled shortcut applied, and the merge reached the PR having
+never been judged; a resolution that dropped one side's change shipped
+with the drop. This is the non-crash path, not only the integrator-crash
+retry: any integrator merge passes through the window. So the gate is
+written ahead: before an integrator is spawned for a conflict, the merge's
+first parent is saved for the subtask, and the marker is cleared only once
+the integration is decided — a verdict recorded, the subtask backed out,
+the gate skipped by the operator, or the merge kept because its judge
+crashed every round. A resume that finds the marker with no
+gate record runs the gate on the committed merge (its subject set first, a
+dying integrator may not have reached it), and the wave is not settled
+until it has; a marker whose merge is not on the run branch is an
+integration that never committed, merged again in its own turn. A conflict
+merged mechanically (JSON by key) and a clean merge are never judged on the
+first pass and carry no marker, so a resume does not judge them either.
+
 **A re-drive interrupted mid-round is undone, never integrated.** That rule
 alone integrated half-done work: a coverage re-drive keeps its subtask
 `complete` for the whole implementer session, so a crash after the session

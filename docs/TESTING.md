@@ -1992,6 +1992,23 @@ unchanged, the retry is bounded at exactly `max_rounds`, and a crash must
 clear `last_res` so a stale earlier result is never returned as the crashed
 round's output.
 
+## Unjudged integrator merge on resume
+
+DESIGN §6 *A committed resolution is not a judged one*:
+`tests/test_resume_unjudged_integration.py` drives the real `phase_execute`,
+`integrate_wave`, `setup-run.sh` / `new-worktree.sh` / `integrate.sh` and the
+real integration gate on a wave whose second subtask conflicts, with an
+integrator that commits a resolution dropping one side under its own message.
+The process is killed inside the integrator before and after its commit, and
+after each save until the verdict is recorded and the `integration_unjudged`
+marker cleared; every resume must judge the merge, repair the drop, give the
+merge its `leerie: integrate <sid>` subject, leave the clean sibling unjudged
+and advance the wave. Before the fix the kill after the commit and the kill
+after the first save in the window both resumed onto an unjudged merge
+("all 2 subtask(s) already settled, skipping"); removing the marker, the
+`integrate_wave` resume branch or the `phase_execute` shortcut exclusion each
+fails the suite again.
+
 ## Integrator-crash salvage path
 
 The integrator-crash salvage path (DESIGN §12 *salvage if there is something

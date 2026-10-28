@@ -38,14 +38,22 @@ class TestWiring:
     def test_invokes_integration_judge_after_merge_committed(self, leerie):
         """The gate (via the shared `_gate` closure around
         `_run_integration_judge_gate`) runs after check_merge_committed
-        passes, before appending to integrated."""
+        passes, before appending to integrated. Since the unjudged-merge
+        resume (DESIGN §6 *A committed resolution is not a judged one*) the
+        post-commit sequence is the `_finish_integrator_merge` closure,
+        shared with the resume path; executed in
+        tests/test_resume_unjudged_integration.py."""
         src = inspect.getsource(leerie.integrate_wave)
         verdict_src = inspect.getsource(leerie._integration_judge_verdict)
         assert 'schema_key="integration_judge"' in verdict_src
         assert "await _run_integration_judge_gate(" in src
+        i_finish_def = src.index("async def _finish_integrator_merge(")
+        i_gate = src.index("await _gate(sid)", i_finish_def)
         i_merge_check = src.index("check_merge_committed(staging)")
-        i_helper_call = src.index("await _gate(sid)", i_merge_check)
+        i_helper_call = src.index(
+            "await _finish_integrator_merge(sid, pre_sha)", i_merge_check)
         i_append = src.rindex("integrated.append(sid)")
+        assert i_finish_def < i_gate < i_merge_check
         assert i_merge_check < i_helper_call < i_append
 
     def test_uses_run_checked_loop(self, leerie):
