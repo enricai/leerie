@@ -1892,6 +1892,27 @@ The completeness re-drive inside a subtask's own attempt is not on the
 list: it sets the status back to `in_progress` before it loops, so a
 resume re-runs the attempt and every gate after it.
 
+A merge a hard kill interrupted is not resumed; it is abandoned. A
+SIGKILL, an OOM or a container death while an integrator is resolving
+leaves the staging worktree mid-merge (`MERGE_HEAD`), with no rescue and
+no abort, since neither had a chance to run. On resume, the first sid
+`integrate_wave` reaches need not be the one whose merge is in progress:
+a sibling that was blocked before the kill and is complete after its
+retry comes earlier in wave order. Its `git merge` then refuses, which
+`integrate.sh` reported as a conflict. That sibling's integrator resolved
+and committed the other sid's half-resolved merge, unchecked, under the
+sibling's subject. The sibling's own branch was never merged, but it was
+counted integrated (driven end to end on the real scripts and the real
+`integrate_wave`). The interrupted integration was never recorded, so
+there is nothing in it to keep: `integrate_wave` checks staging on entry
+and, if it is mid-merge, rescues the work in progress to a ref (as the
+crash path does) and aborts the merge. Its sid is then integrated again
+in its own turn. This runs in the orchestrator, which holds the run
+directory's lock, so no other process is merging into staging.
+`integrate.sh` also refuses to start while staging is mid-merge
+(precondition exit 2, not a conflict), so the state can never again
+read as one sid's conflict.
+
 This places one hard requirement on the design: **a run branch, once
 created, is never reset.** Setup creates it only if it does not already
 exist (a `run_id` collision against an existing branch is a preflight

@@ -53289,6 +53289,38 @@ async def _set_integration_subject(staging: Path, sid: str,
     return True
 
 
+async def _abandon_interrupted_merge(staging: Path, st: "State"
+                                     ) -> str | None:
+    """Abandon a merge a hard kill left in progress in `staging` (DESIGN §6
+    *Skipping a settled subtask never skips its integration*): its sid —
+    the subtask branch whose tip is `MERGE_HEAD`, else "unknown" — is
+    returned after the work in progress is rescued to a ref and the merge
+    aborted. None when staging is not mid-merge. The integration was never
+    recorded, so nothing of it is kept; its sid is merged again in its own
+    turn. Without this, the first sid `integrate.sh` reached read the
+    refusal as its own conflict, and its integrator committed the other
+    sid's half-resolved merge under its name (review r2 L4)."""
+    head = await run_proc(["git", "rev-parse", "--verify", "--quiet",
+                           "MERGE_HEAD"], cwd=str(staging))
+    if head.returncode != 0 or not head.stdout.strip():
+        return None
+    refs = await run_proc(
+        ["git", "for-each-ref", "--format=%(refname)", "--points-at",
+         head.stdout.strip(), f"refs/heads/leerie/subtasks/{st.run_id}/"],
+        cwd=str(staging))
+    names = [r.rsplit("/", 1)[-1] for r in refs.stdout.split()
+             if refs.returncode == 0]
+    sid = names[0] if names else "unknown"
+    rescue = await _rescue_integrator_work(staging, sid, st.run_id)
+    abort = await run_proc(["git", "merge", "--abort"], cwd=str(staging))
+    log(f"  staging was mid-merge of {sid} (interrupted before it was "
+        f"recorded); merge aborted"
+        + (f", work in progress rescued to {rescue}" if rescue else "")
+        + ("" if abort.returncode == 0 else
+           f" — abort failed: {abort.stderr.strip()[:200]}"))
+    return sid
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -53317,6 +53349,7 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
       `resume` retries the integration."""
     integrated: list[str] = []
     staging = (leerie_dir / "worktrees" / "staging").resolve()
+    await _abandon_interrupted_merge(staging, st)
     # Sids of this wave a PRIOR invocation already merged (a resumed wave
     # only carries results for what it re-ran): without them a resumed gate
     # and integrator would be told nothing was integrated before.

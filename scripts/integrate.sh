@@ -26,6 +26,16 @@ fi
 
 cd "$STAGING"
 
+# A merge already in progress is another integration a hard kill left
+# behind: `git merge` would refuse it, and reading that as THIS sid's
+# conflict hands the other sid's half-resolved merge to this sid's
+# integrator. The orchestrator abandons it on entry (integrate_wave); this
+# is the backstop.
+if git rev-parse --verify --quiet MERGE_HEAD >/dev/null; then
+  echo "error: run-branch worktree is mid-merge (MERGE_HEAD exists) — not integrating ${ID} on top of it" >&2
+  exit 2
+fi
+
 if git merge --no-ff -m "leerie: integrate ${ID}" "$BRANCH"; then
   echo "integrated: ${ID}"
   exit 0
