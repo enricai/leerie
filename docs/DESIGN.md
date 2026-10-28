@@ -9096,7 +9096,40 @@ Three layers follow, each derived from that one list:
   flags or test roots (the hook payload carries the roots); for pytest an
   option's value is part of the flag, read from pytest's own option table,
   so `pytest -p no:cacheprovider` is still a whole-suite run, not a run of
-  a file named `no:cacheprovider`. Hooks fire
+  a file named `no:cacheprovider`.
+
+  *One runner, every spelling.* Since every orchestrator-side launch
+  (CI parity, the provision recipe, coverage, settle-by-execution) is
+  checked by this matcher alone, a spelling it misses runs the forbidden
+  suite. The common CI spellings were missed (round-3 review M3): `vitest
+  run` read `run` as a test filter, and `python -m pytest`, `uv run
+  pytest`, `poetry run pytest` were not `pytest` at all. So the matcher
+  also unwraps `python[3[.x]] [opts] -m <module>` to the module, the
+  Python run-wrappers `uv run` (and `uv run -m`, `uv tool run`, `uvx`),
+  `poetry run`, `pipenv run`, `hatch run [ENV:]`, `pdm run`, `rye run`,
+  Ruby's `bundle exec`, `node <…>/node_modules/<pkg>/…` to the package's
+  binary, and `pnpm`/`yarn`/`bun <bin>` (a script of that name, else the
+  binary: both readings are checked); npm and yarn drop one `--` before
+  the binary's arguments, pnpm and npx do not. And every runner gets a
+  table of what is not a test-file operand, taken from its real CLI
+  (`--help`, or its own option metadata) and checked by running the real
+  runner: vitest, jest, mocha, pytest, `go test`, `cargo test` (and its
+  test binary's options behind `--`), rspec, `rails test`. A table names
+  the options whose next word is their value; the subcommands that run the
+  suite (`vitest run`/`watch`/`dev` — `vitest related <files>` stays a
+  scoped run); the options that themselves select files or targets (jest
+  `--testPathPatterns`/`--onlyChanged`, cargo `--test`/`-p`, rspec
+  `--pattern`); the operands that name the whole suite (`go test ./...`);
+  and two parser quirks the real runners showed — vitest and jest read a
+  `true`/`false` after a flag as its value (`jest --ci false` is a
+  whole-suite run; mocha does not), and vitest takes nothing after `--` as
+  a filter. A name filter (`-k`, `-t`, `--grep`, `-run`) is a value
+  option, not selection: the runner still loads every test file, which is
+  what a whole-suite forbid is about. What it still cannot see: a run that
+  lists every package or file by name (`go test ./a ./b`), and a selecting
+  option that happens to select everything (`cargo test -p` in a
+  one-package workspace, `rspec --only-failures` with no failure record).
+  Hooks fire
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not
   block every Bash call of a run.

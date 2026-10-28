@@ -22476,6 +22476,22 @@ def _forbidden_normalize(argv: list[str], depth: int,
             break
         if head == "eval":
             return _forbidden_argvs(" ".join(a[1:]), depth + 1, keep_xargs)
+        if head in _FORBID_RUN_WRAPPERS:
+            inner = _forbidden_run_wrapper(a)
+            if inner is None:
+                break
+            a = inner
+            continue
+        if _forbidden_interp_head(a[0]) == "python3":
+            inner = _forbidden_python_module(a[1:])
+            if inner is not None:
+                a = inner
+                continue
+        if head == "node":
+            inner = _forbidden_node_script(a[1:])
+            if inner is not None:
+                a = inner
+                continue
         flags = _FORBID_INTERP_EVAL.get(_forbidden_interp_head(a[0]))
         if flags:
             for i, w in enumerate(a[1:], 1):
@@ -22516,18 +22532,39 @@ def _forbidden_normalize(argv: list[str], depth: int,
             sub = a[1]
             if sub in ("exec", "dlx", "x"):
                 r = a[2:]
+                ended = False
                 while r and r[0].startswith("-"):
                     if r[0] in ("-c", "--call") and len(r) > 1:
                         return _forbidden_argvs(r[1], depth + 1, keep_xargs)
+                    ended = ended or r[0] == "--"
                     r = r[1:]
-                return _forbidden_normalize(r, depth + 1, keep_xargs)
+                return _forbidden_normalize(
+                    r if ended else _forbidden_pm_passthrough(a[0], r),
+                    depth + 1, keep_xargs)
             if sub in ("run", "run-script"):
                 a = [a[0], "run"] + _opts(a[2:])
             elif sub in _FORBID_PM_SCRIPT_ALIASES:
                 a = [a[0], "run", _FORBID_PM_SCRIPT_ALIASES[sub]] + a[2:]
             elif sub in _FORBID_PM_BUILTIN_SCRIPTS:
                 a = [a[0], "run"] + a[1:]
+            elif a[0] != "npm" and not sub.startswith("-"):
+                # `pnpm vitest run`: pnpm, yarn and bun run a script of that
+                # name, else the package binary — both readings are argvs.
+                return [a] + _forbidden_normalize(_forbidden_pm_passthrough(
+                    a[0], a[1:]), depth + 1, keep_xargs)
     return [a]
+
+
+def _forbidden_pm_passthrough(pm: str, r: list[str]) -> list[str]:
+    """The argv a package manager hands the binary `r[0]`: npm and yarn
+    drop the first `--` after it (`npm exec vitest -- run` runs `vitest
+    run`) unless a `--` before the binary already ended their options;
+    pnpm, bun and npx pass it through. Measured with the real managers
+    (`tests/test_forbidden_runner_spellings.py`)."""
+    if pm in ("npm", "yarn") and "--" in r[1:]:
+        i = r.index("--", 1)
+        return r[:i] + r[i + 1:]
+    return r
 
 
 def _forbidden_prefix_match(cand: list[str], forb: list[str]) -> bool:
@@ -22616,35 +22653,409 @@ _PYTEST_LONG_FLAGS = frozenset({
     "--trace-config", "--traceconfig", "--verbose", "--version", "--xfail-tb"})
 
 
-def _forbidden_value_opts(forb: list[str]) -> frozenset[str]:
-    """The value-taking options of the runner a forbidden argv names: only
-    pytest's are known (`pytest`, `py.test`, `python -m pytest`)."""
-    words = [os.path.basename(w) for w in forb[:3]]
-    if words[:1] in (["pytest"], ["py.test"]) or (
-            len(words) == 3 and words[1:] == ["-m", "pytest"]):
-        return _PYTEST_VALUE_OPTS
-    return frozenset()
+# Every other runner's and run-wrapper's value-taking options, derived the
+# same way from the tool's real `--help` — never hand-written (round-3
+# review M3): vitest 5.0, jest 30.5 (yargs type tags), mocha 12.0 (its
+# `run-option-metadata`), go 1.25 `go help testflag` + `go help build`,
+# cargo 1.99 `cargo test --help` and libtest's `--help`, rspec-core 3.13,
+# railties 8.1 (`Rails::TestUnit::Runner` + minitest's options), CPython
+# 3.14, node 26, uv 0.13, poetry 2.5, pipenv 2026.10, hatch 1.18, pdm
+# 2.29, rye 0.44, bundler. Pinned against
+# `tests/fixtures/forbid_runner_options.json` by
+# `tests/test_forbidden_runner_spellings.py`. A value is one word: an
+# array option in yargs (jest, mocha) is not greedy by default.
+_VITEST_VALUE_OPTS = frozenset({
+    "--api", "--api.host", "--api.port", "--attachmentsDir", "--bail",
+    "--browser", "--browser.connectTimeout", "--browser.detailsPanelPosition",
+    "--browser.locators", "--browser.name", "--browser.trace", "--changed",
+    "--config", "--configLoader", "--coverage.changed",
+    "--coverage.customProviderModule", "--coverage.exclude",
+    "--coverage.htmlDir", "--coverage.ignoreClassMethods",
+    "--coverage.include", "--coverage.processingConcurrency",
+    "--coverage.provider", "--coverage.reporter",
+    "--coverage.reportsDirectory", "--coverage.thresholds.autoUpdate",
+    "--coverage.thresholds.branches", "--coverage.thresholds.functions",
+    "--coverage.thresholds.lines", "--coverage.thresholds.perFile",
+    "--coverage.thresholds.statements", "--coverage.watermarks.branches",
+    "--coverage.watermarks.functions", "--coverage.watermarks.lines",
+    "--coverage.watermarks.statements", "--diff", "--diff.aAnnotation",
+    "--diff.aIndicator", "--diff.bAnnotation", "--diff.bIndicator",
+    "--diff.commonIndicator", "--diff.contextLines",
+    "--diff.emptyFirstOrLastLinePlaceholder", "--diff.maxDepth",
+    "--diff.truncateAnnotation", "--diff.truncateThreshold", "--dir",
+    "--environment", "--exclude", "--execArgv", "--expect.poll.interval",
+    "--expect.poll.timeout", "--experimental",
+    "--experimental.importDurations.limit",
+    "--experimental.importDurations.print",
+    "--experimental.importDurations.thresholds.danger",
+    "--experimental.importDurations.thresholds.warn",
+    "--experimental.vcsProvider", "--fsModuleCachePath", "--hookTimeout",
+    "--inspect", "--inspectBrk", "--listTags", "--maxConcurrency",
+    "--maxWorkers", "--mergeReports", "--mode", "--outputFile", "--pool",
+    "--project", "--repeats", "--reporter", "--retry", "--retry.condition",
+    "--retry.count", "--retry.delay", "--root", "--sequence",
+    "--sequence.hooks", "--sequence.seed", "--sequence.setupFiles", "--shard",
+    "--silent", "--slowTestThreshold", "--tagsFilter", "--teardownTimeout",
+    "--testNamePattern", "--testTimeout", "--typecheck.checker",
+    "--typecheck.spawnTimeout", "--typecheck.tsconfig", "--update",
+    "--vmMemoryLimit", "-c", "-p", "-r", "-t", "-u"})
+_JEST_VALUE_OPTS = frozenset({
+    "--cacheDirectory", "--changedSince", "--collectCoverageFrom", "--config",
+    "--coverageDirectory", "--coveragePathIgnorePatterns",
+    "--coverageProvider", "--coverageReporters", "--coverageThreshold",
+    "--env", "--filter", "--globalSetup", "--globalTeardown", "--globals",
+    "--haste", "--ignoreProjects", "--maxConcurrency", "--maxWorkers",
+    "--moduleDirectories", "--moduleFileExtensions", "--moduleNameMapper",
+    "--modulePathIgnorePatterns", "--modulePaths", "--notifyMode",
+    "--openHandlesTimeout", "--outputFile", "--preset", "--prettierPath",
+    "--projects", "--reporters", "--resolver", "--rootDir", "--roots",
+    "--runner", "--seed", "--selectProjects", "--setupFiles",
+    "--setupFilesAfterEnv", "--shard", "--snapshotSerializers",
+    "--testEnvironment", "--testEnvironmentOptions", "--testFailureExitCode",
+    "--testMatch", "--testNamePattern", "--testPathIgnorePatterns",
+    "--testPathPatterns", "--testRegex", "--testResultsProcessor",
+    "--testRunner", "--testSequencer", "--testTimeout", "--transform",
+    "--transformIgnorePatterns", "--unmockedModulePathPatterns",
+    "--watchPathIgnorePatterns", "--workerGracefulExitTimeout", "-c", "-t",
+    "-w"})
+_MOCHA_VALUE_OPTS = frozenset({
+    "--config", "--exclude", "--extension", "--fgrep", "--file", "--global",
+    "--globals", "--grep", "--ignore", "--jobs", "--node-option", "--package",
+    "--reporter", "--reporter-option", "--reporter-options", "--require",
+    "--retries", "--slow", "--spec", "--timeout", "--timeouts", "--ui",
+    "--watch-files", "--watch-ignore", "-O", "-R", "-f", "-g", "-j", "-n",
+    "-r", "-s", "-t", "-u"})
+_GO_TEST_VALUE_OPTS = frozenset({
+    "-C", "-asmflags", "-bench", "-benchtime", "-blockprofile",
+    "-blockprofilerate", "-buildmode", "-buildvcs", "-compiler", "-count",
+    "-covermode", "-coverpkg", "-coverprofile", "-cpu", "-cpuprofile",
+    "-fuzz", "-fuzzminimizetime", "-fuzztime", "-gccgoflags", "-gcflags",
+    "-installsuffix", "-ldflags", "-list", "-memprofile", "-memprofilerate",
+    "-mod", "-modfile", "-mutexprofile", "-mutexprofilefraction",
+    "-outputdir", "-overlay", "-p", "-parallel", "-pgo", "-pkgdir", "-run",
+    "-shuffle", "-skip", "-tags", "-timeout", "-toolexec", "-trace", "-vet"})
+_CARGO_TEST_VALUE_OPTS = frozenset({
+    "--bench", "--bin", "--color", "--config", "--example", "--exclude",
+    "--features", "--jobs", "--manifest-path", "--message-format",
+    "--package", "--profile", "--target", "--target-dir", "--test", "-F",
+    "-Z", "-j", "-m", "-p"})
+_LIBTEST_VALUE_OPTS = frozenset({
+    "--color", "--format", "--logfile", "--shuffle-seed", "--skip",
+    "--test-threads", "-Z"})
+_RSPEC_VALUE_OPTS = frozenset({
+    "--default-path", "--deprecation-out", "--drb-port", "--error-exit-code",
+    "--example", "--example-matches", "--exclude-pattern",
+    "--failure-exit-code", "--format", "--no-profile", "--options", "--order",
+    "--out", "--pattern", "--profile", "--require", "--seed", "--tag", "-E",
+    "-I", "-O", "-P", "-e", "-f", "-o", "-p", "-r", "-t"})
+_RAILS_TEST_VALUE_OPTS = frozenset({
+    "--environment", "--exclude", "--include", "--name", "--profile",
+    "--seed", "--skip", "-S", "-e", "-i", "-n", "-s"})
+_PYTHON_VALUE_OPTS = frozenset({
+    "--check-hash-based-pycs", "-W", "-X", "-c", "-m"})
+_NODE_VALUE_OPTS = frozenset({
+    "--allow-fs-read", "--allow-fs-write", "--build-sea",
+    "--build-snapshot-config", "--conditions", "--cpu-prof-dir",
+    "--cpu-prof-interval", "--cpu-prof-name", "--debug-port",
+    "--diagnostic-dir", "--disable-proto", "--disable-warning",
+    "--disable-wasm-trap-handler", "--dns-result-order", "--env-file",
+    "--env-file-if-exists", "--eval", "--experimental-config-file",
+    "--experimental-default-config-file", "--experimental-loader",
+    "--experimental-package-map", "--experimental-sea-config",
+    "--experimental-test-isolation", "--experimental-test-tag-filter",
+    "--heap-prof-dir", "--heap-prof-interval", "--heap-prof-name",
+    "--heap-prof.", "--heapsnapshot-near-heap-limit", "--heapsnapshot-signal",
+    "--icu-data-dir", "--import", "--input-type", "--inspect-port",
+    "--inspect-publish-uid", "--loader", "--localstorage-file",
+    "--max-http-header-size", "--max-old-space-size-percentage",
+    "--network-family-autoselection-attempt-timeout",
+    "--no-experimental-websocket", "--openssl-config", "--print",
+    "--redirect-warnings", "--report-dir", "--report-directory",
+    "--report-filename", "--report-signal", "--report-uncaught-exception",
+    "--require", "--require-module", "--run", "--secure-heap",
+    "--secure-heap-min", "--snapshot-blob", "--test-concurrency",
+    "--test-coverage-branches", "--test-coverage-exclude",
+    "--test-coverage-functions", "--test-coverage-include",
+    "--test-coverage-lines", "--test-global-setup", "--test-isolation",
+    "--test-name-pattern", "--test-random-seed", "--test-reporter",
+    "--test-reporter-destination", "--test-rerun-failures", "--test-shard",
+    "--test-skip-pattern", "--test-timeout", "--title", "--tls-cipher-list",
+    "--tls-keylog", "--trace-event-categories", "--trace-event-file-pattern",
+    "--trace-require-module", "--unhandled-rejections", "--use-largepages",
+    "--v8-pool-size", "--watch-kill-signal", "--watch-path", "-C", "-e", "-p",
+    "-r"})
+_UV_VALUE_OPTS = frozenset({
+    "--allow-insecure-host", "--cache-dir", "--color", "--config-file",
+    "--directory", "--project"})
+_UV_RUN_VALUE_OPTS = frozenset({
+    "--allow-insecure-host", "--cache-dir", "--color", "--config-file",
+    "--config-setting", "--config-settings-package", "--default-index",
+    "--directory", "--env-file", "--exclude-newer", "--exclude-newer-package",
+    "--extra", "--extra-index-url", "--find-links", "--fork-strategy",
+    "--group", "--index", "--index-strategy", "--index-url",
+    "--keyring-provider", "--link-mode", "--no-binary-package",
+    "--no-build-isolation-package", "--no-build-package",
+    "--no-editable-package", "--no-extra", "--no-group",
+    "--no-sources-package", "--only-group", "--package", "--prerelease",
+    "--prerelease-package", "--project", "--python", "--python-platform",
+    "--refresh-package", "--reinstall-package", "--resolution",
+    "--upgrade-group", "--upgrade-package", "--with", "--with-editable",
+    "--with-requirements", "-C", "-P", "-f", "-i", "-p", "-w"})
+_UVX_VALUE_OPTS = frozenset({
+    "--allow-insecure-host", "--build-constraints", "--cache-dir", "--color",
+    "--config-file", "--config-setting", "--config-settings-package",
+    "--constraints", "--default-index", "--directory", "--env-file",
+    "--exclude-newer", "--exclude-newer-package", "--extra-index-url",
+    "--find-links", "--fork-strategy", "--from", "--index",
+    "--index-strategy", "--index-url", "--keyring-provider", "--link-mode",
+    "--no-binary-package", "--no-build-isolation-package",
+    "--no-build-package", "--no-sources-package", "--overrides",
+    "--prerelease", "--prerelease-package", "--project", "--python",
+    "--python-platform", "--refresh-package", "--reinstall-package",
+    "--resolution", "--torch-backend", "--upgrade-group", "--upgrade-package",
+    "--with", "--with-editable", "--with-requirements", "-C", "-P", "-b",
+    "-c", "-f", "-i", "-p", "-w"})
+_POETRY_VALUE_OPTS = frozenset({
+    "--directory", "--project", "-C", "-P"})
+_PIPENV_VALUE_OPTS = frozenset({
+    "--pypi-mirror", "--python"})
+_PIPENV_RUN_VALUE_OPTS: frozenset[str] = frozenset()
+_HATCH_VALUE_OPTS = frozenset({
+    "--cache-dir", "--config", "--data-dir", "--env", "--project", "-e", "-p"})
+_HATCH_RUN_VALUE_OPTS: frozenset[str] = frozenset()
+_PDM_VALUE_OPTS = frozenset({
+    "--config", "--pep582", "-c"})
+_PDM_RUN_VALUE_OPTS = frozenset({
+    "--env", "--env-file", "--project", "--skip", "--venv", "--working-dir",
+    "-k", "-p"})
+_RYE_RUN_VALUE_OPTS = frozenset({
+    "--pyproject"})
+_BUNDLE_EXEC_VALUE_OPTS = frozenset({
+    "--gemfile"})
+
+# Run-wrappers that execute their command in a managed environment:
+# head → (the subcommand word sequences that run a command, value options
+# before that subcommand, value options after it). `uv run -m X` runs
+# module X; `hatch run [ENV:]cmd` targets an environment, after optional
+# `+var=…`/`-var=…` matrix selectors.
+_FORBID_RUN_WRAPPERS: dict[str, tuple[tuple[tuple[str, ...], ...],
+                                      frozenset[str], frozenset[str]]] = {
+    "uv": ((("run",), ("tool", "run")),
+           _UV_VALUE_OPTS | _UV_RUN_VALUE_OPTS | _UVX_VALUE_OPTS,
+           _UV_RUN_VALUE_OPTS | _UVX_VALUE_OPTS),
+    "uvx": (((),), _UVX_VALUE_OPTS, _UVX_VALUE_OPTS),
+    "poetry": ((("run",),), _POETRY_VALUE_OPTS, _POETRY_VALUE_OPTS),
+    "pipenv": ((("run",),), _PIPENV_VALUE_OPTS, _PIPENV_RUN_VALUE_OPTS),
+    "hatch": ((("run",),), _HATCH_VALUE_OPTS, _HATCH_RUN_VALUE_OPTS),
+    "pdm": ((("run",),), _PDM_VALUE_OPTS, _PDM_RUN_VALUE_OPTS),
+    "rye": ((("run",),), frozenset(), _RYE_RUN_VALUE_OPTS),
+    "bundle": ((("exec",),), frozenset(), _BUNDLE_EXEC_VALUE_OPTS),
+}
+# CPython's single-letter options that take nothing (`python3 --help`):
+# they may cluster before `m` (`-Bm pytest`).
+_PYTHON_FLAG_LETTERS = frozenset("bBdEhiIOPqsSuvVx")
+# `node [opts] <script>` running a package's own binary: the `.bin` link's
+# name, or the package directory's (a mechanical path).
+_FORBID_NODE_MODULES_BIN = re.compile(
+    r"(?:^|/)node_modules/(?:\.bin/([^/]+)$|(?:@[^/]+/)?([^/.][^/]*)/)")
+
+# What, after a matched runner, is not a test-file operand (DESIGN §9 *A
+# command the task forbids*): `subs` are subcommands that run the suite
+# (`vitest run`/`watch`/`dev`; `related <files>` is a scoped run and stays
+# an operand); `value` the options whose next word is their value;
+# `select` the options that themselves narrow the run to some files or
+# targets (a scoped run whatever else is said); `suite` the operands that
+# name the whole suite (`go test ./...`); `after_dashdash` the value
+# options of the test binary behind `--` (cargo's libtest); `bool_words`
+# the words a flag takes as its value (`jest --ci false`, vitest's
+# `--globals false`: yargs and cac read them, mocha does not); `dashdash`
+# set when words after `--` are not filters (cac hands them to vitest as
+# `options['--']`). Name filters (`-k`, `-t`, `-run`, `-e`, `-n`) are value
+# options, not selection: like a flags-only run they still load the whole
+# suite. Each of these was measured with the real runner
+# (`tests/test_forbidden_runner_spellings.py`).
+_FORBID_RUNNERS: dict[tuple[str, ...], dict[str, frozenset[str]]] = {
+    ("pytest",): {"value": _PYTEST_VALUE_OPTS},
+    ("vitest",): {
+        "subs": frozenset({"run", "watch", "dev"}),
+        "value": _VITEST_VALUE_OPTS,
+        "select": frozenset({"--changed", "--project"}),
+        "bool_words": frozenset({"true", "false"}),
+        "dashdash": frozenset({"ends_operands"})},
+    ("jest",): {
+        "value": _JEST_VALUE_OPTS,
+        "bool_words": frozenset({"true", "false"}),
+        "select": frozenset({
+            "--testPathPatterns", "--testMatch", "--testRegex",
+            "--onlyChanged", "-o", "--changedSince", "--lastCommit",
+            "--changedFilesWithAncestor", "--onlyFailures", "-f",
+            "--findRelatedTests", "--selectProjects", "--runTestsByPath"})},
+    ("mocha",): {"value": _MOCHA_VALUE_OPTS,
+                 "select": frozenset({"--spec"})},
+    ("go", "test"): {"value": _GO_TEST_VALUE_OPTS,
+                     "suite": frozenset({"./...", "...", "all"})},
+    ("cargo", "test"): {
+        "value": _CARGO_TEST_VALUE_OPTS,
+        "select": frozenset({"--test", "--bin", "--example", "--bench",
+                             "--lib", "--doc", "-p", "--package"}),
+        "after_dashdash": _LIBTEST_VALUE_OPTS},
+    ("rspec",): {
+        "value": _RSPEC_VALUE_OPTS,
+        "select": frozenset({"-P", "--pattern", "--only-failures", "-n",
+                             "--next-failure"})},
+    ("rails", "test"): {"value": _RAILS_TEST_VALUE_OPTS},
+}
+
+
+def _forbidden_runner(forb: list[str]) -> dict[str, frozenset[str]]:
+    """The `_FORBID_RUNNERS` entry of the runner a canonical forbidden argv
+    names (`_forbidden_runner_canon`), `{}` for any other command."""
+    return (_FORBID_RUNNERS.get(tuple(forb[:2]))
+            or _FORBID_RUNNERS.get(tuple(forb[:1])) or {})
+
+
+def _forbidden_runner_canon(argv: list[str]) -> list[str]:
+    """One spelling per runner invocation: `py.test` is `pytest`; `cargo t`
+    is `cargo test`; `rails t` and `rails test:all` are `rails test`; a
+    vitest suite subcommand (`run`, `watch`, `dev`) — its first positional,
+    after options and their values — is dropped, so `vitest run` and
+    `vitest` match each other."""
+    a = list(argv)
+    if a[:1] == ["py.test"]:
+        a[0] = "pytest"
+    if a[:2] == ["cargo", "t"]:
+        a[1] = "test"
+    if a[:1] == ["rails"] and a[1:2] in (["t"], ["test:all"]):
+        a[1] = "test"
+    spec = _FORBID_RUNNERS.get(tuple(a[:1])) or {}
+    subs = spec.get("subs")
+    if subs:
+        i = 1
+        while i < len(a) and a[i].startswith("-") and a[i] != "--":
+            i += 2 if a[i] in spec["value"] else 1
+        if i < len(a) and a[i] in subs:
+            a = a[:i] + a[i + 1:]
+    return a
+
+
+def _forbidden_python_module(args: list[str]) -> list[str] | None:
+    """`[module, *args]` when `python [opts] -m module args` (the words after
+    the interpreter) runs a module, else None. CPython's own option
+    surface: `-W`/`-X`/`--check-hash-based-pycs` take a value, the
+    `_PYTHON_FLAG_LETTERS` cluster, `-m` and `-c` end the options."""
+    i = 0
+    while i < len(args):
+        w = args[i]
+        if w in ("-", "--") or not w.startswith("-"):
+            return None
+        if w.startswith("--"):
+            i += 2 if w in _PYTHON_VALUE_OPTS else 1
+            continue
+        step = 1
+        for j, ch in enumerate(w[1:], 1):
+            if ch == "m":
+                mod, rest = ((w[j + 1:], args[i + 1:]) if w[j + 1:]
+                             else (args[i + 1] if i + 1 < len(args) else "",
+                                   args[i + 2:]))
+                return [mod, *rest] if mod else None
+            if ch in "WX":
+                step = 1 if w[j + 1:] else 2
+                break
+            if ch not in _PYTHON_FLAG_LETTERS:
+                return None
+        i += step
+    return None
+
+
+def _forbidden_run_wrapper(a: list[str]) -> list[str] | None:
+    """The command a `_FORBID_RUN_WRAPPERS` invocation runs (`uv run --with
+    x pytest -q` → `pytest -q`), or None when it runs none (`uv sync`)."""
+    head = os.path.basename(a[0])
+    subs, pre, post = _FORBID_RUN_WRAPPERS[head]
+    r = a[1:]
+    while r and r[0].startswith("-") and r[0] != "--":
+        r = r[2:] if r[0] in pre else r[1:]
+    for sub in subs:
+        if tuple(r[:len(sub)]) == sub:
+            r = r[len(sub):]
+            break
+    else:
+        return None
+    module = False
+    while r and r[0].startswith(("-", "+")):
+        if r[0] == "--":
+            r = r[1:]
+            break
+        if head == "uv" and r[0] in ("-m", "--module"):
+            module = True
+        r = r[2:] if r[0] in post else r[1:]
+    if head == "hatch" and r and re.fullmatch(r"[\w.-]+:\S+", r[0]):
+        r = [r[0].split(":", 1)[1]] + r[1:]
+    if module and r:
+        return ["python3", "-m"] + r
+    return r or None
+
+
+def _forbidden_node_script(args: list[str]) -> list[str] | None:
+    """`[bin, *args]` when `node [opts] <path>/node_modules/…` (the words
+    after `node`) runs a package's binary, else None."""
+    i = 0
+    while i < len(args):
+        w = args[i]
+        if w == "--":
+            i += 1
+            break
+        if not w.startswith("-"):
+            break
+        if w in _FORBID_INTERP_EVAL["node"]:
+            return None
+        i += 2 if w in _NODE_VALUE_OPTS else 1
+    if i >= len(args):
+        return None
+    m = _FORBID_NODE_MODULES_BIN.search(args[i])
+    if not m:
+        return None
+    return [m.group(1) or m.group(2), *args[i + 1:]]
 
 
 def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
-                                value_opts: frozenset[str] = frozenset()
-                                ) -> bool:
+                                value_opts: frozenset[str] = frozenset(),
+                                *, runner: dict[str, frozenset[str]]
+                                | None = None) -> bool:
     """True when the words after a matched runner still run the whole suite
     — the whole-suite deny's semantics (`_suite_rule_bodies`: the bare
     runner, or one aimed at a test root), plus a flags-only runner, which
     the hook can see though a CLI rule cannot. A run naming any other
     operand (a test file) is not a whole-suite run. The word after one of
-    the runner's `value_opts` is that option's value, not an operand."""
+    the runner's `value_opts` is that option's value, not an operand.
+    `runner` (a `_FORBID_RUNNERS` entry) adds its value options, its
+    selecting options (a hit is a scoped run), its whole-suite operands
+    and, after `--`, its test binary's value options."""
+    spec = runner or {}
+    value_opts = value_opts | spec.get("value", frozenset())
+    select = spec.get("select", frozenset())
+    bools = spec.get("bool_words", frozenset())
     norm = {r.strip("/") for r in roots}
+    norm |= {w.strip("/") for w in spec.get("suite", frozenset())}
     pos: list[str] = []
-    skip = False
+    skip = after_flag = False
     for w in rest:
         if skip:
             skip = False
+        elif w == "--":
+            if "dashdash" in spec:
+                break
+            if "after_dashdash" in spec:
+                value_opts = spec["after_dashdash"]
         elif w.startswith("-"):
+            if w.split("=", 1)[0] in select:
+                return False
             skip = w in value_opts
-        elif w != "--":
+            after_flag = not skip and "=" not in w
+            continue
+        elif not (after_flag and w in bools):
             pos.append(w.removeprefix("./").rstrip("/"))
+        after_flag = False
     return not pos or any(w in norm for w in pos)
 
 
@@ -22664,12 +23075,14 @@ def _forbidden_command_hit(command: str,
                 continue
             cmd, scope, roots = spec
             for forb in _forbidden_argvs(cmd):
+                forb = _forbidden_runner_canon(forb)
                 for c in cands:
+                    c = _forbidden_runner_canon(c)
                     if not _forbidden_prefix_match(c, forb):
                         continue
                     if (scope == "any" or _forbidden_whole_suite_rest(
                             c[len(forb):], roots,
-                            _forbidden_value_opts(forb))):
+                            runner=_forbidden_runner(forb))):
                         return cmd
     except Exception:
         return None
