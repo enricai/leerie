@@ -13,10 +13,14 @@ exhausted, and the wave dies — a deterministic loop that repeats on `resume`.
 The first fix re-ran the `satisfied_probe` on the run-branch HEAD and settled
 `complete` when it judged the criteria met. Settle-by-execution replaced that
 override (DESIGN §8 *Settled by execution*): a verification-only subtask is
-settled by running its `verify` commands, every other no-commits claim is
-re-driven from the shared budget. `_probe_criteria_satisfied_on_head` now
-serves only the pre-spawn provider-subset check, whose contract the helper
-tests below still pin.
+settled by running its `verify` commands. Re-driving every other no-commits
+claim brought the loop back, so a no-op a sibling already delivered is now
+settled on evidence (DESIGN §8 *A no-op a sibling already delivered is
+settled on evidence*): a sibling's integration on its surface, its verify
+commands passing, and this probe, all three. The probe never settles a claim
+alone. The behavioural tests for that live in
+tests/test_nothing_to_change_settle.py; the helper tests below pin the
+probe's own contract.
 
 These tests pin the helper's contract (stubbed `claude_p`, mirroring
 test_filter_satisfied_subtasks.py) and source-couple the settle wiring
@@ -179,10 +183,12 @@ def test_budget_exhaustion_propagates(leerie, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 class TestSettleWiring:
-    """The post-execution no-commits settle is decided by EXECUTION now,
-    not by this probe (DESIGN §8 *Settled by execution*): the probe helper
-    above serves only the pre-spawn provider-subset check. The behavioural
-    half lives in tests/test_settle_subtask_branch_coverage.py and
+    """The post-execution no-commits settle never asks the probe directly:
+    a verification-only subtask is decided by EXECUTION, and any other
+    claim goes through `_settle_nothing_to_change`. That helper asks the
+    probe only after the sibling precondition and the execution. The
+    behavioural half lives in tests/test_nothing_to_change_settle.py,
+    tests/test_settle_subtask_branch_coverage.py and
     tests/test_settle_by_execution.py; these guards pin where each call
     sits."""
 
@@ -198,6 +204,25 @@ class TestSettleWiring:
         region = self._no_commits_region(
             inspect.getsource(leerie._settle_subtask))
         assert "_probe_criteria_satisfied_on_head(" not in region
+
+    def test_no_commits_branch_routes_the_rest_through_the_evidence_settle(
+            self, leerie):
+        region = self._no_commits_region(
+            inspect.getsource(leerie._settle_subtask))
+        gate = region.find("if _verification_only(subtask):")
+        settle = region.find("_settle_nothing_to_change(")
+        block = region.find("return _block_unbacked_claim(", settle)
+        assert -1 < gate < settle < block
+
+    def test_the_evidence_settle_checks_in_order(self, leerie):
+        """Sibling precondition first (free, mechanical), execution next,
+        the probe last: the probe is never asked when either fails."""
+        src = inspect.getsource(leerie._settle_nothing_to_change)
+        order = [src.find(s) for s in ("_sibling_deliveries(",
+                                       "_settle_by_execution(",
+                                       "_probe_criteria_satisfied_on_head(",
+                                       "_settle_already_satisfied(")]
+        assert -1 not in order and order == sorted(order)
 
     def test_no_commits_branch_executes_only_verification_only(self, leerie):
         region = self._no_commits_region(

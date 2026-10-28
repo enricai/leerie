@@ -6649,11 +6649,12 @@ The settle needs every command to pass and the worktree's tracked files
 to be unchanged afterwards (a command that rewrites tracked files has not
 verified the tree it ran on; the change is reverted). Command output is
 data — it is logged, and only a tail ever reaches a worker, fenced as
-untrusted output in a re-drive note, never as instructions. Every other
-unbacked claim — a no-commit subtask that is not verification-only, a
-failed execution, an unrun declared command with no `verify` argv — is
-re-driven from the shared budget (§13) and settles `unconverged` when the
-budget is spent. A command killed by its cgroup at the measured ceiling is
+untrusted output in a re-drive note, never as instructions. A no-commit
+claim on a subtask whose planned surface a sibling already changed this
+run is settled on evidence (below). Every other unbacked claim — a
+no-commit subtask that is not verification-only, a failed execution, an
+unrun declared command with no `verify` argv — is re-driven from the
+shared budget (§13) and settles `unconverged` when the budget is spent. A command killed by its cgroup at the measured ceiling is
 `environment_limit` and settles `unconverged` without a re-drive (§6).
 
 Benched (E4/d4, the same 22 cases): execution with the verification-only
@@ -6667,7 +6668,56 @@ once and passes on rerun) is exactly what the re-check absorbs. On rootful
 the five rerun cases settled identically to rootless (bench P5, 5/5).
 The pre-spawn probe of a provider-subset subtask (below) is unchanged: it
 spends a read-only probe to avoid an implementer, and never overrides a
-worker's claim.
+worker's claim. After execution the probe never settles a claim alone:
+it is one of the three checks a sibling-delivered no-op must pass (below).
+
+**A no-op a sibling already delivered is settled on evidence.** The
+rule above re-drove every no-commit claim that was not verification-only,
+which turned the mid-run sibling case (above) back into a failure: in a
+two-wave smoke run, the first wave's conformer wrote the regression test
+that a second-wave subtask was planned to add. The second subtask reported
+`nothing_to_change` three times (the first try and both re-drives) and
+the run ended `unconverged`, on a task whose whole deliverable was on the
+branch. Re-driving a worker whose work is already done cannot converge, so
+the re-drive is the wrong arm for this shape. The implementer's word still
+settles nothing, so the claim is settled by evidence the orchestrator
+gathers itself (§12: prompts are advisory, code enforces). This applies to
+a `nothing_to_change` blocker and to a `complete` claim with nothing
+committed, including one whose declared commands went unrun. A claim
+settles `complete` only when all of these hold:
+
+1. **A sibling changed this subtask's surface this run.** This check is
+   mechanical. Code walks the first-parent `leerie: integrate <sid>`
+   merges on the subtask's HEAD and keeps those whose diff touches a file
+   in this subtask's `files_likely_touched`. These merges are the
+   `satisfied_by` evidence: the sibling's sid and its integration commit.
+   With none, the claim is the `e33` shape and is re-driven. In `e33` a
+   wave-1 test subtask whose test was never written reported its run of
+   the file's existing tests as done. Nothing had landed on its surface,
+   so nothing else could have done its work.
+2. **Its `verify` commands pass on HEAD**, when it has any. They run
+   exactly as settle-by-execution runs them, on the subtask's worktree,
+   which is the run branch plus nothing.
+3. **The `satisfied_probe` finds its criteria met on HEAD.** This is the
+   base-tree-only probe the pre-spawn check already uses. It is given the
+   `success_criteria_seed` and each `verify` criterion, and it defaults to
+   not satisfied.
+
+Each check covers a gap in the others. The probe alone once settled `e33`
+on a reading of the tree. Execution alone settled `e33` too (bench E4/d4,
+`exec_v1`), because running a test file passes whether or not the new
+case was written. A criterion with no command is decided only by the
+probe. The sibling precondition holds the rest to the one case where an
+earlier wave can have done the work. A settle records `dropped_subtasks
+[sid]` with reason `satisfied_by_sibling`, the `satisfied_by` merges, the
+probe's evidence and the executed commands. It goes through the same
+helper and branch rules as every no-commit settle, so its zero-commit
+branch integrates as a no-op. Anything short of all three keeps the
+re-drive, and the reason it was not settled joins the blocker. A
+re-driven attempt that reports the same claim is checked again, with the
+same evidence and against the same budget. A verify command killed at the
+measured ceiling settles `unconverged` as `environment_limit`, as the
+other execution arms do.
 
 **Probing a flagged subtask before it spends.** Settling a no-op only after
 its implementer has run is wasteful in ordering: `_warn_provider_subset_subtasks` (§5
@@ -9509,7 +9559,7 @@ prose:
 
 | `blocker_kind` | Routing |
 |---|---|
-| `nothing_to_change` | re-driven |
+| `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
 | `external_precondition` (+ `external_resource`) | the only kind that may be accepted: settled `accepted_external` and listed under "Needs human verification" |
 | `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
 | `upstream_missing` | re-driven |

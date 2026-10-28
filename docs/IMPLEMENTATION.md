@@ -4059,7 +4059,7 @@ above.
 |-------|---------|-----------|
 | `_validate_result()` — `incomplete-handoff` with missing checkpoint file | session-limit no-op; `--max-turns` with no checkpoint written; **worker reaped mid-turn** (e.g. an OOM-killed backgrounded build before the checkpoint was written) | **Rescued when the worktree holds commits, else Retryable** (`failure_kind="empty_handoff"`). `_settle_subtask` calls `_branch_has_commits_ahead` (True only when the worktree exists, git succeeds, and there are commits ahead of the run branch — distinct from `check_branch_has_commits`'s indeterminate `None`); if there are commits ahead, the worker produced a real deliverable and is settled `complete` (advisory conformance records whatever step didn't finish) instead of discarded — `fail()` would `_reset_subtask_worktree` and destroy the committed diff. Only a genuine no-op (no commits) stays retryable; a gone worktree / git failure is never mistaken for a real deliverable. Confidence gate and dirty-worktree fail are skipped for a rescued result. See DESIGN §9. |
 | `_validate_result()` — other cross-field invariants | `handoff` with null `checkpoint_path`; `blocked` with no blocker; `failed` with no summary; `needs-clarification` with no `clarification_question` / invalid `checkpoint_path` | **Terminal** (`failure_kind="broken"`) |
-| `check_branch_has_commits()` | `complete` claim, nothing committed *and* no `artifacts` returned. A non-empty `artifacts` array (DESIGN §5 *Artifact passing*) is a substitute deliverable — research-style subtasks pass without commits. | **Settled by execution when verification-only, else re-driven (DESIGN §8 *Settled by execution*).** A no-commits `complete` on a subtask `_verification_only(subtask)` holds for is settled by `_settle_by_execution`: a `pass` settles it `complete` through `_settle_already_satisfied` (`dropped_subtasks` reason `"settled_by_execution"`, the `conformance[sid]` sentinel); an `environment_limit` settles it `unconverged` (`_settle_unconverged(..., kind="environment_limit")`). Any other outcome — not verification-only, or the execution failed — returns `status: "blocked"` with a typed blocker (`_execution_blocker`), which the wave-end re-drive takes from the shared budget (§6 *Shared re-drive budget*). The post-execution HEAD satisfied-probe no longer runs here. |
+| `check_branch_has_commits()` | `complete` claim, nothing committed *and* no `artifacts` returned. A non-empty `artifacts` array (DESIGN §5 *Artifact passing*) is a substitute deliverable — research-style subtasks pass without commits. | **Settled by execution when verification-only, else re-driven (DESIGN §8 *Settled by execution*).** A no-commits `complete` on a subtask `_verification_only(subtask)` holds for is settled by `_settle_by_execution`: a `pass` settles it `complete` through `_settle_already_satisfied` (`dropped_subtasks` reason `"settled_by_execution"`, the `conformance[sid]` sentinel); an `environment_limit` settles it `unconverged` (`_settle_unconverged(..., kind="environment_limit")`). A claim that is not verification-only is settled `complete` by `_settle_nothing_to_change` only on all three of its pieces of evidence: a sibling's integration merge on its `files_likely_touched`, its verify commands passing, and the HEAD satisfied-probe (`dropped_subtasks` reason `"satisfied_by_sibling"`). The probe never settles a claim alone. Any other outcome returns `status: "blocked"` with a typed blocker (`_execution_blocker`, or the unmet check), which the wave-end re-drive takes from the shared budget (§6 *Shared re-drive budget*). |
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path except `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented user-deliverable subtrees — never `settings.json` or a top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (touched > max(3× expected, 5), or > 15 regardless) |
 | `_validate_checkpoint()` — on `incomplete-handoff` | required section missing/empty/whitespace/placeholder-only (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing punctuation ignored); a `## Files touched` path no longer exists and isn't flagged `[deleted]` | returns `blocked` |
@@ -6048,6 +6048,9 @@ _route_blocker_kind(...)` before anything else:
   through `_settle_already_satisfied` (reason `settled_by_execution`), an
   `environment_limit` verdict settles `unconverged`; anything else ends
   `blocked` with the execution record in the blocker.
+- `nothing_to_change` → `_settle_nothing_to_change` (below): a settle
+  returns its result; otherwise the result is returned `blocked` with the
+  unmet check appended to the blocker.
 - every other kind → the result is returned `blocked` (a self-reported
   `failed` becomes `blocked`), so the wave-end `_redrive_blocked_subtasks`
   re-drives it from the shared budget.
@@ -6104,14 +6107,53 @@ local `executed` carries a passing verdict to the second):
 - the no-commits arm: `_verification_only` → execute; `pass` →
   `_settle_already_satisfied` with `dropped_subtasks[sid].reason =
   "settled_by_execution"`; `environment_limit` → `_settle_unconverged(...,
-  kind="environment_limit")`; else, and for every non-verification-only
-  subtask, `_block_unbacked_claim`.
+  kind="environment_limit")`; else `_block_unbacked_claim`. A
+  non-verification-only subtask goes to `_settle_nothing_to_change` (below,
+  passing `executed`), and `_block_unbacked_claim` when that does not
+  settle.
 - the declared-command terminal arms (confidence retries spent, or an
   `empty_handoff` rescue, whose tracked debris is discarded first): with
   `_verification_only` or `_branch_has_commits_ahead`, execute; `pass` drops
   the `DECLARED_CMD_UNRUN` issues and the settle continues as `complete`;
   `environment_limit` → `unconverged`; anything else → `_block_unbacked_claim`
-  with the `declared runs_commands never executed …` blocker.
+  with the `declared runs_commands never executed …` blocker. With neither
+  (no commits, not verification-only), `_settle_nothing_to_change` first,
+  then `_block_unbacked_claim`.
+
+### Sibling-delivered no-op — `_settle_nothing_to_change`
+
+DESIGN §8 *A no-op a sibling already delivered is settled on evidence*.
+`async _settle_nothing_to_change(sid, subtask, worktree, st, caps, models,
+efforts, *, res, executed=None) -> tuple[dict | None, str]` is called for a
+`nothing_to_change` blocker (`_route_blocker_kind`, which now takes
+`models, efforts`) and for a `complete` claim with nothing committed that is
+not verification-only (both no-commit arms above). It returns `(result,
+"")` when it settles and `(None, why)` otherwise; `why` joins the
+re-drive blocker. The checks run in order, and each one stops the rest:
+
+1. `_branch_has_commits_ahead` → not this path.
+2. `async _sibling_deliveries(worktree, sid, planned) -> list[{sid,
+   commit, files}]`, newest first. It walks `git log --first-parent
+   --merges --format=%H%x09%P%x09%s HEAD` in the worktree, and for each
+   subject `leerie: integrate <other>` (`_INTEGRATE_SUBJECT_PREFIX`;
+   `<other>` ≠ `sid`) it takes `git diff --name-only <first parent>
+   <merge>`. It keeps the paths `_on_planned_surface(path, planned)`
+   matches: equal to a planned entry, or under a planned directory, with a
+   leading `./` ignored. `planned` is the subtask's `files_likely_touched`.
+   An empty result means not settled.
+3. With `_subtask_verify_argvs(subtask)` non-empty: `executed` or
+   `_settle_by_execution`. `environment_limit` returns `_settle_unconverged
+   (..., kind="environment_limit")`; any other non-`pass` verdict means not
+   settled, with `_execution_blocker`.
+4. `_probe_criteria_satisfied_on_head(..., label="settle")` (worker log
+   `satisfied_probe-settle-<sid>`). Its payload now carries `criteria`, the
+   subtask's `verify[].criterion` strings, whenever any exist (this applies
+   to the pre-spawn probe too). None means not settled.
+
+A settle goes through `_settle_already_satisfied` with `dropped_subtasks
+[sid] = {reason: "satisfied_by_sibling", satisfied_by: [{sid, commit,
+files}], evidence, checked, executed?}`. Its summary names the siblings.
+The subtask's zero-commit branch integrates as a no-op.
 
 ### Spawn-held enrollment and measured sizing
 
@@ -8675,7 +8717,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
-| `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. |
+| `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |
 | `provider_subset_sids` | list[str] | sids flagged at plan time by `_warn_provider_subset_subtasks()` — every file in the subtask's `files_likely_touched` is already owned by an ordered predecessor it depends on (DESIGN §5 *Provider-subset subtasks*). |
 | `conditional_drops` | dict[str, dict] | planner-emitted consumer subtasks dropped by the reconciler's `conditional_drop` resolution op (DESIGN §5) — i.e. the planner authored the subtask as "no-op if X" and X turned out to be unresolvable. |
 | `external_twin_demotions` | list[dict] | `unresolvable` entries rescued by `_demote_unresolvable_with_external_twin` (DESIGN §5 *The external twin*) — a consumer declared a tag `in_plan` while another subtask declared the same capability `extent: external`. |

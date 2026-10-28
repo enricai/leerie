@@ -15149,11 +15149,20 @@ async def _probe_criteria_satisfied_on_head(
         "files_likely_touched": list(
             subtask.get("files_likely_touched", []) or []),
     }
+    # The subtask's own per-criterion list, when the planner typed one:
+    # each must be met too, not only the seed's summary of them.
+    criteria = [v["criterion"] for v in (subtask.get("verify") or [])
+                if isinstance(v, dict) and isinstance(v.get("criterion"), str)
+                and v["criterion"].strip()]
+    if criteria:
+        payload["criteria"] = criteria
     user_prompt = (
         "SUBTASK:\n" + json.dumps(payload, indent=2) +
         "\n\nReturn only the JSON object per your schema. Judge the "
         "CURRENT working tree / HEAD only — never other branches or "
         "history. Default satisfied=false on any uncertainty."
+        + (" `satisfied` means the seed AND every entry of `criteria` are "
+           "met." if criteria else "")
     )
     # bump_workers OUTSIDE the try, same as _filter_satisfied_subtasks: a
     # budget-exhaustion WorkerError must propagate to abort the run, not be
@@ -46564,6 +46573,117 @@ def _block_unbacked_claim(st: "State", sid: str, blocker: str) -> dict:
             "summary": first}
 
 
+_INTEGRATE_SUBJECT_PREFIX = "leerie: integrate "
+
+
+def _on_planned_surface(path: str, planned: list[str]) -> bool:
+    """Whether a changed repo path is one of `planned` (a subtask's
+    `files_likely_touched`), or lies under a planned directory."""
+    for p in planned:
+        p = p.strip().removeprefix("./") if isinstance(p, str) else ""
+        if p and (path == p or path.startswith(p.rstrip("/") + "/")):
+            return True
+    return False
+
+
+async def _sibling_deliveries(worktree: str, sid: str,
+                              planned: list[str]) -> list[dict]:
+    """`[{sid, commit, files}]`, newest first: each first-parent `leerie:
+    integrate <sid>` merge on `worktree`'s HEAD, for a sibling other than
+    `sid`, whose diff against its first parent changed a path on `planned`.
+    This is the run's own record of work that already landed on this
+    subtask's surface. Only mechanical strings are read: commit subjects
+    `integrate.sh` wrote and `git diff --name-only` output."""
+    if not planned or not Path(worktree).exists():
+        return []
+    log_p = await run_proc(["git", "log", "--first-parent", "--merges",
+                            "--format=%H%x09%P%x09%s", "HEAD"], cwd=worktree)
+    if log_p.returncode != 0:
+        return []
+    out: list[dict] = []
+    for line in log_p.stdout.splitlines():
+        sha, _, rest = line.partition("\t")
+        parents, _, subject = rest.partition("\t")
+        if not subject.startswith(_INTEGRATE_SUBJECT_PREFIX):
+            continue
+        other = subject[len(_INTEGRATE_SUBJECT_PREFIX):].strip()
+        first_parent = parents.split()[0] if parents.split() else ""
+        if not other or other == sid or not first_parent:
+            continue
+        diff = await run_proc(["git", "diff", "--name-only", first_parent,
+                               sha], cwd=worktree)
+        if diff.returncode != 0:
+            continue
+        hit = [f for f in diff.stdout.splitlines()
+               if f and _on_planned_surface(f, planned)]
+        if hit:
+            out.append({"sid": other, "commit": sha, "files": hit})
+    return out
+
+
+async def _settle_nothing_to_change(
+        sid: str, subtask: dict, worktree: str, st: "State", caps: dict,
+        models: dict[str, str], efforts: dict[str, str | None], *,
+        res: dict, executed: dict | None = None) -> tuple[dict | None, str]:
+    """Settle a claim that there is nothing to change: a `nothing_to_change`
+    blocker, or a `complete` with nothing committed. It settles only on the
+    orchestrator's own evidence, never on the implementer's word (DESIGN §8
+    *A no-op a sibling already delivered is settled on evidence*). Returns
+    `(result, why)`. `result` is the terminal result when the claim settles
+    (`complete`, or `unconverged` on an `environment_limit` execution);
+    otherwise it is None, and `why` says which check failed, for the
+    re-drive blocker.
+
+    Three checks, all required: a sibling integrated this run changed a
+    file on this subtask's `files_likely_touched` (`_sibling_deliveries`);
+    its `verify` argvs pass on HEAD (`_settle_by_execution`; `executed`
+    reuses a pass this settle already made); and the base-tree-only
+    `satisfied_probe` finds its criteria met on HEAD."""
+    if await _branch_has_commits_ahead(worktree,
+                                       _compute_run_branch(st.run_id)):
+        return None, "the subtask branch carries commits"
+    planned = [f for f in (subtask.get("files_likely_touched") or [])
+               if isinstance(f, str)]
+    landed = await _sibling_deliveries(worktree, sid, planned)
+    if not landed:
+        return None, ("not settled on evidence: no sibling integrated this "
+                      "run changed a file this subtask plans to touch")
+    ex = None
+    if _subtask_verify_argvs(subtask):
+        ex = executed or await _settle_by_execution(subtask, worktree, st,
+                                                    caps, sid=sid)
+        if ex["verdict"] == "environment_limit":
+            return _settle_unconverged(
+                st, sid, "environment_limit: " + ex["why"],
+                previous_status="blocked", kind="environment_limit"), ""
+        if ex["verdict"] != "pass":
+            return None, ("not settled on evidence: a sibling changed its "
+                          "surface, but " + _execution_blocker(ex))
+    drop = await _probe_criteria_satisfied_on_head(
+        subtask, worktree, st, caps, models, efforts, label="settle")
+    if drop is None:
+        return None, ("not settled on evidence: a sibling changed its "
+                      "surface, but the satisfied-probe did not find its "
+                      "criteria met on HEAD")
+    by = ", ".join(f"{d['sid']} ({d['commit'][:12]})" for d in landed)
+    log(f"  {sid}: nothing to change, and the run shows why — {by} changed "
+        "its surface"
+        + (", its verify commands pass," if ex is not None else ",")
+        + " and the satisfied-probe finds its criteria met on HEAD; "
+        "settling complete")
+    record = {"reason": "satisfied_by_sibling",
+              "satisfied_by": landed,
+              "evidence": drop.get("evidence", ""),
+              "checked": list(drop.get("checked") or [])}
+    if ex is not None:
+        record["executed"] = [shlex.join(c["argv"]) for c in ex["commands"]]
+    return _settle_already_satisfied(
+        sid, record, st,
+        summary=(f"nothing to change: {by} already delivered this "
+                 "subtask's criteria, confirmed on HEAD by the orchestrator"),
+        criteria_results=res.get("criteria_results")), ""
+
+
 def _blocker_kind(res: dict) -> tuple[str, str]:
     """`(kind, resource)` of an implementer result's typed `blocker_kind`
     (DESIGN §13 *A blocked implementer says why, as a type*). A missing or
@@ -46607,7 +46727,8 @@ def _settle_accepted_external(st: "State", sid: str, resource: str,
 
 async def _route_blocker_kind(sid: str, res: dict, subtask: dict,
                               worktree: str, st: "State", caps: dict,
-                              env_hits: int) -> dict | None:
+                              env_hits: int, models: dict[str, str],
+                              efforts: dict[str, str | None]) -> dict | None:
     """Route a `blocked`/`failed` implementer result by its typed
     `blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*).
     Returns the subtask's result for this attempt, or None for the one
@@ -46624,6 +46745,12 @@ async def _route_blocker_kind(sid: str, res: dict, subtask: dict,
         return _settle_accepted_external(st, sid, resource, blocker)
     if kind == "environment_limit":
         return _environment_limit_hit(st, sid, blocker, env_hits)
+    if kind == "nothing_to_change":
+        settled, why = await _settle_nothing_to_change(
+            sid, subtask, worktree, st, caps, models, efforts, res=res)
+        if settled is not None:
+            return settled
+        blocker = (f"{blocker}\n" if blocker else "") + why
     if kind == "cannot_reproduce":
         has_commits = await _branch_has_commits_ahead(
             worktree, _compute_run_branch(st.run_id))
@@ -47074,7 +47201,12 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                     "its verify commands pass when the orchestrator runs "
                     "them — the claim stands on that execution")
             else:
-                return _block_unbacked_claim(st, sid, blocker)
+                settled, why = await _settle_nothing_to_change(
+                    sid, subtask, worktree, st, caps, models, efforts,
+                    res=res)
+                if settled is not None:
+                    return settled
+                return _block_unbacked_claim(st, sid, f"{blocker}\n{why}")
 
         # DESIGN §9 *A stale finding is not a bug*. Advisory: surfaced on the
         # result and in the log, never routed into `check_implementer_output`
@@ -47127,11 +47259,13 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 # (DESIGN §8 *Settled by execution*). A verification-only
                 # subtask has nothing to commit by definition — its claim is
                 # decided by running its typed `verify` commands, here, by
-                # the orchestrator. Every other no-commit claim (including a
-                # deliverable a sibling may already have committed) is
-                # re-driven from the shared budget rather than accepted on a
-                # reader's judgement, and settles `unconverged` when that is
-                # spent. The HEAD satisfied-probe no longer decides this.
+                # the orchestrator. Any other no-commit claim settles only
+                # on evidence that a sibling already delivered it: the run's
+                # own integration merges, the verify commands executed, and
+                # the HEAD satisfied-probe, all three
+                # (`_settle_nothing_to_change`). Otherwise it is re-driven
+                # from the shared budget and settles `unconverged` when that
+                # is spent.
                 if _verification_only(subtask):
                     ex = executed or await _settle_by_execution(
                         subtask, worktree, st, caps, sid=sid)
@@ -47153,10 +47287,14 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                             kind="environment_limit")
                     return _block_unbacked_claim(
                         st, sid, f"{message} — " + _execution_blocker(ex))
+                settled, why = await _settle_nothing_to_change(
+                    sid, subtask, worktree, st, caps, models, efforts,
+                    res=res, executed=executed)
+                if settled is not None:
+                    return settled
                 return _block_unbacked_claim(
-                    st, sid, f"{message} — not verification-only, so the "
-                    "claim cannot be settled by execution; finish and commit "
-                    "the subtask's work")
+                    st, sid, f"{message} — not verification-only, and "
+                    f"{why}; finish and commit the subtask's work")
             # uncommitted changes — retryable for a normal `complete`. For a
             # result rescued from `empty_handoff`, tracked uncommitted changes
             # are debris a reaped worker left mid-edit; the deliverable is the
@@ -47438,7 +47576,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                 environment_limit_hits += 1
             routed = await _route_blocker_kind(
                 sid, res, subtask, worktree, st, caps,
-                environment_limit_hits)
+                environment_limit_hits, models, efforts)
             if routed is not None:
                 return routed
             continuation = True
