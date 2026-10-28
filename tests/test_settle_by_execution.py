@@ -337,3 +337,22 @@ def test_untracked_output_of_a_verify_command_is_removed(harness):
     status = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt),
                             capture_output=True, text=True).stdout
     assert status == "?? mine.txt\n"
+
+
+def test_a_non_utf8_file_name_is_removed_not_raised(harness):
+    """Review r2 L2: `_untracked_files` decoded `git ls-files -z` strictly,
+    so a verify command that left a non-UTF-8 file name raised
+    UnicodeDecodeError out of the settle and killed the wave. The name is
+    now read as the filesystem does, and the file it names is removed."""
+    import os
+    wt = harness["worktree"]
+    mine = bytes(wt) + b"/mine-\xff.txt"
+    with open(mine, "wb") as f:
+        f.write(b"the worker's\n")
+    res = _settle(harness, _sub(_py(
+        "open(b'caf\\xe9.txt', 'wb').write(b'x')")))
+    assert res["verdict"] == "pass", res
+    assert res["removed_untracked"] == ["caf\udce9.txt"]
+    assert b"caf\xe9.txt" not in os.listdir(bytes(wt))
+    assert os.path.exists(mine)
+    json.dumps(harness["st"].data)      # the record persisted cleanly

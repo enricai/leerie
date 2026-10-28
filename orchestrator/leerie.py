@@ -15462,16 +15462,29 @@ _NODE_LOCKFILE_INSTALL = {
 _NESTED_NODE_ROOTS_MAX = 16
 
 
+def _git_z_output(argv: list[str], *, timeout: float | None = None
+                  ) -> subprocess.CompletedProcess:
+    """`argv` (a git command with `-z` path output) run in bytes, `stdout`
+    decoded as the filesystem does (`os.fsdecode`, surrogateescape) so a
+    non-UTF-8 file name neither raises nor stops naming its file; `text=True`
+    decoded strictly and raised `UnicodeDecodeError` (review r2 L2)."""
+    r = subprocess.run(argv, capture_output=True, check=False,
+                       timeout=timeout)
+    err = r.stderr or b""
+    return subprocess.CompletedProcess(
+        r.args, r.returncode, os.fsdecode(r.stdout or b""),
+        err.decode(errors="replace") if isinstance(err, bytes) else err)
+
+
 def _node_lockfile_paths(repo_root: Path) -> list[str]:
     """Repo-relative POSIX paths of every Node lockfile below the root:
     the tracked ones when `repo_root` is a git work tree (an untracked
     lockfile is not part of the project), else a walk that skips
     `node_modules` and dot-directories."""
     try:
-        r = subprocess.run(
+        r = _git_z_output(
             ["git", "-C", str(repo_root), "ls-files", "-z", "--",
-             *[f":(glob)**/{lf}" for lf in _NODE_LOCKFILES]],
-            capture_output=True, text=True, timeout=30, check=False)
+             *[f":(glob)**/{lf}" for lf in _NODE_LOCKFILES]], timeout=30)
         if r.returncode == 0:
             return sorted(p for p in r.stdout.split("\0") if p)
     except (OSError, subprocess.TimeoutExpired):
@@ -40361,8 +40374,7 @@ def _git_tree_sources(repo: str | Path, rev: str,
     (JS/TS by default), and every path there — read with git plumbing
     (`ls-tree`, `cat-file --batch`), so no checkout is needed and nothing is
     written."""
-    ls = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "-z", rev],
-                        capture_output=True, text=True, check=False)
+    ls = _git_z_output(["git", "-C", str(repo), "ls-tree", "-r", "-z", rev])
     if ls.returncode != 0:
         return {}, set()
     ents: list[tuple[str, str]] = []
@@ -40809,9 +40821,8 @@ def _prisma_project(repo_root: str | Path) -> dict | None:
     or `@prisma/client` (dependencies or devDependencies). Mechanical: git's
     file list and two config files."""
     root = Path(str(repo_root))
-    ls = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--",
-                         ":(glob)**/schema.prisma"],
-                        capture_output=True, text=True, check=False)
+    ls = _git_z_output(["git", "-C", str(root), "ls-files", "-z", "--",
+                        ":(glob)**/schema.prisma"])
     if ls.returncode != 0:
         return None
     for schema in sorted(p for p in ls.stdout.split("\0")
@@ -42645,9 +42656,8 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         user = "\n".join(lines)
         # What existed before the writer (the dependency install's
         # output) is never the writer's file.
-        pre = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
-                              "-z"], capture_output=True, text=True,
-                             check=False)
+        pre = _git_z_output(["git", "-C", str(wt), "ls-files", "--others",
+                             "-z"])
         if pre.returncode != 0:
             out["reason"] = "could not read the writer's worktree status"
             return out
@@ -42759,8 +42769,8 @@ def _acceptance_new_files(wt: Path, pre_untracked: set[str],
                           refs: list[str]) -> list[str]:
     """Untracked files the writer left (ignored ones included), minus the
     install's output, the report copies and runner caches."""
-    post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
-                           "-z"], capture_output=True, text=True, check=False)
+    post = _git_z_output(["git", "-C", str(wt), "ls-files", "--others",
+                          "-z"])
     return sorted(p for p in post.stdout.split("\0")
                   if p and p not in refs and p not in pre_untracked
                   and not _acceptance_is_cache_path(p))
@@ -42784,18 +42794,15 @@ async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
     # and every undeclared new file (a fixture module, a helper) becomes
     # a support file copied with the set — without it a correct fix
     # fails the set elsewhere.
-    porcelain = subprocess.run(
+    porcelain = _git_z_output(
         ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
-         "--untracked-files=no"],
-        capture_output=True, text=True, check=False)
+         "--untracked-files=no"])
     # Untracked files INCLUDING ignored ones (no --exclude-standard): a
     # helper the repo's .gitignore happens to match is still needed.
-    post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
-                           "-z"], capture_output=True, text=True,
-                          check=False)
-    visible = subprocess.run(["git", "-C", str(wt), "ls-files",
-                              "--others", "--exclude-standard", "-z"],
-                             capture_output=True, text=True, check=False)
+    post = _git_z_output(["git", "-C", str(wt), "ls-files", "--others",
+                          "-z"])
+    visible = _git_z_output(["git", "-C", str(wt), "ls-files",
+                             "--others", "--exclude-standard", "-z"])
     if (porcelain.returncode != 0 or post.returncode != 0
             or visible.returncode != 0):
         out["reason"] = "could not read the writer's worktree status"
@@ -46318,9 +46325,8 @@ _PATHS_AT: dict[tuple[str, str], set[str]] = {}
 def _git_paths_at(repo: str | Path, sha: str) -> set[str]:
     key = (str(repo), sha)
     if key not in _PATHS_AT:
-        r = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r",
-                            "--name-only", "-z", sha],
-                           capture_output=True, text=True, check=False)
+        r = _git_z_output(["git", "-C", str(repo), "ls-tree", "-r",
+                           "--name-only", "-z", sha])
         _PATHS_AT[key] = ({p for p in r.stdout.split("\0") if p}
                           if r.returncode == 0 else set())
     return _PATHS_AT[key]
@@ -50605,9 +50611,11 @@ def _untracked_files(worktree: str | Path) -> set[str] | None:
     """The worktree's untracked, not-ignored files (`git ls-files --others
     --exclude-standard -z`, mechanical output), or None when git cannot
     say."""
-    r = subprocess.run(["git", "-C", str(worktree), "ls-files", "--others",
-                        "--exclude-standard", "-z"], capture_output=True,
-                       text=True, check=False)
+    try:
+        r = _git_z_output(["git", "-C", str(worktree), "ls-files",
+                           "--others", "--exclude-standard", "-z"])
+    except OSError:
+        return None
     if r.returncode != 0:
         return None
     return {p for p in r.stdout.split("\0") if p}

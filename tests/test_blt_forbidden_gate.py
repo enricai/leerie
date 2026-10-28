@@ -106,6 +106,7 @@ EXEMPT = {
     "_stop_test_db_cluster": "postgres binaries for leerie's test database",
     "_drop_test_db": "postgres binaries for leerie's test database",
     "_sleep_then_reexec": "re-execs the orchestrator itself",
+    "_git_z_output": "git commands with `-z` path output, read as bytes",
 }
 
 
