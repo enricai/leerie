@@ -47296,9 +47296,11 @@ def _redrive_broken_cases(before: dict, after: dict) -> list[str]:
     same unit as progress (DESIGN §8 *Delivery re-drive* rule 4): every case
     of a file failing only after (its key when it has no per-case record),
     and — in a file failing on both sides, each with a per-case record —
-    every case that joined its failing list. A file that loses its per-case
-    record is not counted on its own: an unnamed whole-file failure says
-    nothing about which cases passed before."""
+    every case that joined its failing list. A file that failed with named
+    cases before and fails with none after (an import or collection error)
+    counts as its key: every case of it that passed before now fails, and
+    reading the lost names as no evidence kept a round that traded a fixed
+    case for an unimportable file (review round 2 M4)."""
     out: list[str] = []
     for k, v in after.items():
         now = list(v.get("failing_cases") or [])
@@ -47308,6 +47310,8 @@ def _redrive_broken_cases(before: dict, after: dict) -> list[str]:
         was = list(before[k].get("failing_cases") or [])
         if was and now:
             out += [f"{k}::{c}" for c in sorted(set(now) - set(was))]
+        elif was:
+            out.append(k)
     return sorted(out)
 
 

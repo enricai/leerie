@@ -6638,7 +6638,8 @@ sets measured on both sides, counted by `_redrive_fixed_cases`; None when no
 such set failed before — and `[]` sets `rollback_reason: "fixed no failing
 case"`. Otherwise `broken_cases = _acceptance_broken_cases(prev, results)`
 (the same keys, counted by `_redrive_broken_cases`; a set passing before
-contributes every case it now fails) is recorded, and a non-empty list sets
+contributes every case it now fails, and a file that failed with named
+cases before and fails as a whole after contributes its key) is recorded, and a non-empty list sets
 `rollback_reason: "broke previously passing held-out case(s)"` (DESIGN §8:
 worse is counted in cases). The entry is saved, then `_undo_round` resets
 (`_redrive_rollback(staging, pre_sha)`: `reset --hard`, confirmed, `clean
@@ -6805,7 +6806,9 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   case newly fails (`broke_cases`, from `_redrive_broken_cases(before,
   after)`: every case of a key failing only after — the key itself when it
   has no per-case record — plus, for a key failing on both sides with
-  per-case records, the IDs that joined its list), a control file newly
+  per-case records, the IDs that joined its list, plus the key itself for
+  a key that failed with a per-case record before and fails with none
+  after: a whole-file failure, an import or collection error), a control file newly
   fails, or a test is confirmed newly failing — in a held-back round also
   when a held-back case newly fails (`held_broke_cases`), a held-back
   control newly fails, or none is fixed; a set or held-back

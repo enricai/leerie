@@ -6621,9 +6621,14 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    counted in cases, not files — fixing one of a file's three failing cases
    is progress — wherever the runner's report names the cases; a file
    without that record counts as one case, and a newly failing case is
-   counted only where both sides name their cases (a file that turns from
-   named cases to an unnamed whole-file failure is not, on its own, a
-   counted regression). In a
+   counted by name where both sides name their cases. A set file that
+   passed, or failed with named cases, and now fails as a whole — an
+   import or collection error, no case list — is worse, counted as one
+   case (the file): every case it had that passed is now failing, and
+   reading the lost names as "no evidence" let a round that fixed one case
+   elsewhere by making a file unimportable stand as progress (review round
+   2 M4). A file failing as a whole on both sides, or turning from a whole
+   failure to named cases, is not on its own worse. In a
    replayed run (barnacle 7cc87f9a, pass 1) two repair rounds that fixed no
    failing case each added a defensive fallback the task explicitly
    forbade, and both shipped. A run that produces no verdict (a missing

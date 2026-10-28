@@ -3433,6 +3433,69 @@ def test_acceptance_broken_cases_counts_a_passing_set_that_fails(leerie):
     assert leerie._acceptance_broken_cases(before, before) == []
 
 
+def test_acceptance_broken_cases_counts_a_file_that_fails_as_a_whole(
+        leerie):
+    """Review round 2 M4 (the reviewer's probe): set 1's case is fixed and
+    set 2's file, failing before with a named case, fails after with no
+    case list — a collection error. Every case of it that passed now
+    fails: worse, counted as the file's key."""
+    before = [{"index": 1, "passed": False, "unmeasured": False,
+               "failing_files": ["a.py"], "failing_cases": {"a.py": ["c1"]}},
+              {"index": 2, "passed": False, "unmeasured": False,
+               "failing_files": ["b.py"], "failing_cases": {"b.py": ["d1"]}}]
+    after = [{"index": 1, "passed": True, "unmeasured": False,
+              "failing_files": []},
+             {"index": 2, "passed": False, "unmeasured": False,
+              "failing_files": ["b.py"]}]
+    assert leerie._acceptance_fixed_cases(before, after) == ["1:a.py::c1"]
+    assert leerie._acceptance_broken_cases(before, after) == ["2:b.py"]
+    # Whole-file on both sides, or whole-file to named: not on its own worse.
+    whole = [dict(after[1])]
+    assert leerie._acceptance_broken_cases(whole, whole) == []
+    assert leerie._acceptance_broken_cases(whole, [before[1]]) == []
+
+
+HELPER_BUGGY = "def mul(a, b):\n    return a + b\n"
+HELPER_TEST = ("from helper import mul\n\n"
+               "def test_mul():\n    assert mul(2, 3) == 6\n\n"
+               "def test_mul_zero():\n    assert mul(0, 0) == 0\n")
+
+
+def test_a_round_that_fixes_a_case_by_making_a_set_file_unimportable_is_reset(
+        leerie, tmp_path, monkeypatch):
+    """Review round 2 M4, end to end: the round fixes one case of set 1 and
+    deletes the module set 2 imports, so set 2's file — failing one named
+    case and passing another before — now fails to collect. Counted only
+    by name, nothing newly failed and the round stood."""
+    repo, head = _repo(tmp_path)
+    (repo / "helper.py").write_text(HELPER_BUGGY)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "helper")
+    head = _git(repo, "rev-parse", "HEAD")
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    sets = _make_sets(leerie, st, 2)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(TWO_CASES)
+    (Path(sets[1]["dir"]) / "acc" / "test_defect_2.py").write_text(
+        HELPER_TEST)
+    st.data["acceptance"] = {"sets": sets}
+
+    def half_and_break(p):
+        (p / "calc.py").write_text(HALF_FIX)
+        (p / "helper.py").unlink()
+        _git(p, "commit", "-qam", "conformer: half, drop helper")
+    fixers = [half_and_break, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert any("test_two_and_three" in c for c in r1["fixed_cases"])
+    assert r1["broken_cases"] == ["2:acc/test_defect_2.py"]
+    assert r1["rollback_reason"] == "broke previously passing held-out case(s)"
+    assert r1["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == start
+    assert (staging / "helper.py").read_text() == HELPER_BUGGY
+
+
 def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
                                                     monkeypatch):
     repo, head = _repo(tmp_path)

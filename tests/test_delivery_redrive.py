@@ -273,9 +273,17 @@ class TestVerdict:
         # A partial fix with nothing newly failing is not worse.
         v = leerie._redrive_verdict(f(a=["x", "y"]), f(a=["y"]), [])
         assert v["broke_cases"] == [] and not v["worse"]
-        # Losing the per-case record alone is no counted regression.
+        # Review round 2 M4: a file that failed with named cases and now
+        # fails as a whole (an import or collection error) is worse, counted
+        # as its key — even when another file's case was fixed.
         v = leerie._redrive_verdict(f(a=["x"]), f(a=[]), [])
-        assert v["broke_cases"] == [] and not v["worse"]
+        assert v["broke_cases"] == ["a"] and v["worse"]
+        v = leerie._redrive_verdict(f(a=["c1"], b=["d1"]), f(b=[]), [])
+        assert v["fixed_cases"] == ["a::c1"]
+        assert v["broke_cases"] == ["b"] and v["worse"]
+        # Whole-file on both sides, or whole-file to named: not worse.
+        assert not leerie._redrive_verdict(f(a=[]), f(a=[]), [])["worse"]
+        assert not leerie._redrive_verdict(f(a=[]), f(a=["x"]), [])["worse"]
         # Held-back: a newly failing held-back case is worse even when
         # another held-back case was fixed.
         v = leerie._redrive_verdict({}, {}, [], held=f(h=["p"]),
