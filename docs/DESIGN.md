@@ -10604,7 +10604,7 @@ worker-specific: planners proceed with the best result + warnings, the
 classifier dies, the integrator aborts the merge. (That last is the
 *check-exhaustion* path — the integrator kept returning output the
 mechanical checks rejected, a verdict about the work. A worker **crash**
-mid-resolution takes the salvage path in §12 instead.)
+mid-resolution takes the salvage path in §7 instead.)
 
 The multi-sample cap (`planner_samples`) controls independent parallel
 invocations. Selection among samples is mechanical (fewest issues, most

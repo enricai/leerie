@@ -139,7 +139,7 @@ def test_loop_crash_breaks(leerie):
     assert "crashed" in warnings[0]
 
 
-# --- WorkerError crash retry (DESIGN §12 *salvage if there is something to
+# --- WorkerError crash retry (DESIGN §7 *salvage if there is something to
 # salvage*) -------------------------------------------------------------------
 # A PID-exhausted / OOM-killed worker is an infrastructure failure, not a
 # verdict about the work. `_read_stream`'s own PID-cap message promises "a

@@ -2022,7 +2022,7 @@ first resumed past the gate onto the unrepaired snapshot.
 
 ## Integrator-crash salvage path
 
-The integrator-crash salvage path (DESIGN §12 *salvage if there is something
+The integrator-crash salvage path (DESIGN §7 *salvage if there is something
 to salvage*) is tested in `tests/test_rescue_integrator_work.py` against real
 temp git repos left mid-merge. `_rescue_integrator_work` captures a crashed
 integrator's in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>/<n>`

@@ -55580,8 +55580,9 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
 
     An integrator that does not produce a resolved merge never lets an
     unresolved conflict proceed onto a corrupt staging tree, but *how* it
-    ends depends on whether it reached a verdict or died (DESIGN §12; a
-    verdict is a fact about the work, a crash is a fact about the machine):
+    ends depends on whether it reached a verdict or died (DESIGN §7 *The
+    integrator*; a verdict is a fact about the work, a crash is a fact
+    about the machine):
 
     - **Verdict** (`design-conflict` / `failed`, or a `resolved` claim with
       the merge not committed): the integrator judged the merge unfit, or

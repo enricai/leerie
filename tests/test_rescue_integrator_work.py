@@ -1,4 +1,4 @@
-"""Tests for `_rescue_integrator_work` (DESIGN §12 *salvage if there is
+"""Tests for `_rescue_integrator_work` (DESIGN §7 *salvage if there is
 something to salvage*).
 
 Run 879defae's wave-2 integrator resolved six conflict hunks correctly, then
