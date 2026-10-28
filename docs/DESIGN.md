@@ -6735,7 +6735,25 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    reading the lost names as "no evidence" let a round that fixed one case
    elsewhere by making a file unimportable stand as progress (review round
    2 M4). A file failing as a whole on both sides, or turning from a whole
-   failure to named cases, is not on its own worse. In a
+   failure to named cases, is not on its own worse. The cases a failing
+   file names come from every run of its vote, never the first alone. A
+   run with a resource signature contributes no case evidence: one that
+   timed out, one killed by a signal with no report, or one whose every
+   failing case's message carries a resource signature
+   (`_RESOURCE_FAILURE_RE`, as in *A held case that fails again*). Every
+   other failing run contributes the cases its report names, none when it
+   names none (a collection error is evidence of a whole-file failure).
+   The file names the cases every such run named, or all of them when no
+   case was named by every run; it fails as a whole only when no such run
+   named any case; and a file whose every run carried a resource signature
+   has no case evidence at all. Such a file is failing but never a
+   whole-file collapse, so it is not worse on that count. A file settled
+   by a held case failing with no resource signature names that run's
+   cases, and an intermittent file its held cases. Reading the first run
+   alone, a first run that timed out followed by a confirming rerun that
+   failed in the ordinary way, naming the same case as before, read as a
+   collapse, and a round that fixed another set was rolled back as worse
+   (review round 3 L1). In a
    replayed run (barnacle 7cc87f9a, pass 1) two repair rounds that fixed no
    failing case each added a defensive fallback the task explicitly
    forbade, and both shipped. A run that produces no verdict (a missing

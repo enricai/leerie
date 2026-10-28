@@ -42668,6 +42668,9 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     has-work decides per case on (DESIGN §8 *A task that points at a report
     is bounded by the report's own scenarios*). No readable report, or one
     that ran nothing, records nothing: the file then counts as a whole.
+    A run that timed out, or died of a signal with no report, also sets
+    `cases_out["resource"]`: it gives no case evidence
+    (`_acceptance_run_case_evidence`).
 
     Not `_measure_blt`: its "could not measure" test reads the whole output
     for `No such file or directory`, which is also what a test of a missing-
@@ -42715,14 +42718,22 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                 log_path=log_path, label=f"{label}-tests: {run_cmd}",
                 verbosity="quiet")
         except subprocess.TimeoutExpired:
+            # A timeout is a resource signature: the run is failing but
+            # names no case evidence (DESIGN §8 *Delivery re-drive* rule 4).
+            if cases_out is not None:
+                cases_out["resource"] = True
             return False
         except Exception:
             return None
     if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
         return None
     if not validating:
-        if cases_out is not None and spec is not None:
-            got = _parse_runner_report(spec[2], report)
+        if cases_out is not None:
+            got = (_parse_runner_report(spec[2], report)
+                   if spec is not None else None)
+            if got is None and _rc_is_resource_signal(rc):
+                # Killed (an OOM kill, a signal) before writing a report.
+                cases_out["resource"] = True
             if (got is not None and not got["collection_error"]
                     and got["executed"]):
                 cases_out["failing_cases"] = sorted(
@@ -43375,15 +43386,21 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         resource_affected: list[str] = []
         unmeasured = False
         case_ids: dict[str, list[str]] = {}
-        # Held cases seen failing per file (any signature), and the files a
-        # held case failing with no resource signature settled as failing.
+        # Every failing run of each file, the first and each vote rerun:
+        # its cases come from all of them (`_acceptance_vote_cases`).
+        runs: dict[str, list[dict]] = {}
+        no_case_evidence: list[str] = []
+        # Held cases seen failing per file (any signature), the files a held
+        # case failing with no resource signature settled as failing, and
+        # the cases of the run that settled each.
         seen: dict[str, set[str]] = {}
         asserted: set[str] = set()
+        asserted_ids: dict[str, list[str]] = {}
         intermittent: dict[str, list[str]] = {}
         discovery: dict | None = None
 
         def _note(rel: str, obs: dict, _s=s_, _seen=seen,
-                  _asserted=asserted, _ids=case_ids) -> bool:
+                  _asserted=asserted, _ids=asserted_ids) -> bool:
             hit, saw = _acceptance_held_signals(_s, rel, obs)
             if saw:
                 _seen.setdefault(rel, set()).update(saw)
@@ -43416,15 +43433,14 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                     unmeasured = True
                 elif verdict is False:
                     failing.append(rel)
-                    if obs.get("failing_cases"):
-                        case_ids[rel] = list(obs["failing_cases"])
+                    runs.setdefault(rel, []).append(obs)
                     _note(rel, obs)
             vote = [r for r in failing if r not in asserted]
             if vote and confirm:
                 n_rerun = {"i": 0}
 
                 async def _rerun(_left: float, _files=tuple(vote),
-                                 _n=n_rerun, _nt=_note
+                                 _n=n_rerun, _nt=_note, _runs=runs
                                  ) -> set[str] | None:
                     _n["i"] += 1
                     still: set[str] = set()
@@ -43438,6 +43454,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                             return None
                         if v is False:
                             still.add(rel)
+                            _runs.setdefault(rel, []).append(o)
                             _nt(rel, o)
                     return still
                 verdict_ = await _confirm_still_failing(
@@ -43466,6 +43483,17 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                                      if r not in failing]
                 if resource_affected and not failing:
                     unmeasured = True
+            for rel in failing:
+                if rel in intermittent:
+                    continue
+                if rel in asserted_ids:
+                    case_ids[rel] = asserted_ids[rel]
+                    continue
+                got = _acceptance_vote_cases(runs.get(rel) or [])
+                if got is None:
+                    no_case_evidence.append(rel)
+                elif got:
+                    case_ids[rel] = got
         except Exception as e:
             # A copy that fails (a full disk) is no verdict on this set —
             # and must not escape: a repair's rollback check runs after.
@@ -43484,6 +43512,10 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 "failing_files": failing}
         if resource_affected:
             res_["resource_affected_files"] = resource_affected
+        if no_case_evidence:
+            # Failing, but no run gave case evidence: never read as a
+            # whole-file collapse (DESIGN §8 *Delivery re-drive* rule 4).
+            res_["no_case_evidence_files"] = no_case_evidence
         # Per-case verdict where the runner's report gave one, for every
         # confirmed failing file; a file without one counts as a whole.
         if any(rel in case_ids for rel in failing):
@@ -43500,6 +43532,56 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
             res_["discovery"] = discovery
         results.append(res_)
     return results
+
+
+# The exit signals `_RESOURCE_FAILURE_RE` names, as a process exit status.
+_RESOURCE_EXIT_SIGNALS = frozenset(
+    int(getattr(signal, n)) for n in
+    ("SIGKILL", "SIGTERM", "SIGSEGV", "SIGABRT", "SIGBUS", "SIGHUP"))
+
+
+def _rc_is_resource_signal(rc: int) -> bool:
+    """Whether a return code says the process died of a signal — negative
+    (killed directly) or 128 + one of `_RESOURCE_EXIT_SIGNALS` (the shell
+    that ran it reporting the kill)."""
+    return rc < 0 or (rc - 128) in _RESOURCE_EXIT_SIGNALS
+
+
+def _acceptance_run_case_evidence(obs: dict) -> list[str] | None:
+    """The case evidence one failing run of a set file gives (DESIGN §8
+    *Delivery re-drive* rule 4): None for a run with a resource signature —
+    it timed out or died of a signal with no report (`obs["resource"]`), or
+    every failing case's message matches `_RESOURCE_FAILURE_RE` — else the
+    cases its report named, `[]` when it named none (a collection error: a
+    whole-file failure)."""
+    if obs.get("resource"):
+        return None
+    cases = [str(c) for c in obs.get("failing_cases") or []]
+    msgs = obs.get("failing_messages") or {}
+    if cases and all(str(msgs.get(c) or "").strip()
+                     and _RESOURCE_FAILURE_RE.search(str(msgs[c]))
+                     for c in cases):
+        return None
+    return cases
+
+
+def _acceptance_vote_cases(runs: list[dict]) -> list[str] | None:
+    """A failing set file's cases from every failing run of its vote, the
+    first and each rerun (DESIGN §8 *Delivery re-drive* rule 4): the cases
+    every run with case evidence named, or all of them when no case was
+    named by every one; `[]` when such runs exist but none named a case (a
+    whole-file failure); None when every run carried a resource signature
+    (no case evidence at all). Reading the first run alone made a first-run
+    timeout followed by an ordinary failure a whole-file collapse (review
+    round 3 L1)."""
+    ev = [e for e in map(_acceptance_run_case_evidence, runs)
+          if e is not None]
+    if not ev:
+        return None
+    named = [set(e) for e in ev if e]
+    if not named:
+        return []
+    return sorted(set.intersection(*named) or set.union(*named))
 
 
 def _acceptance_held_cases(set_: dict, rel: str) -> set[str]:
@@ -45114,9 +45196,11 @@ def _acceptance_failing_keys(results: list[dict], indices: set
             continue
         cases = r.get("failing_cases") if isinstance(
             r.get("failing_cases"), dict) else {}
+        blind = set(r.get("no_case_evidence_files") or [])
         for rel in r.get("failing_files") or []:
             out[f"{r['index']}:{rel}"] = {
-                "failing_cases": list(cases.get(rel) or [])}
+                "failing_cases": list(cases.get(rel) or []),
+                **({"no_case_evidence": True} if rel in blind else {})}
     return out
 
 
@@ -47754,8 +47838,11 @@ def _redrive_failing(results: list[dict], sets: list[dict],
             if (kind == "defect" and bounded
                     and not _acceptance_file_has_work(s_, rel, cases)):
                 continue
-            out[f"{i}:{rel}"] = {"set_index": i, "file": rel, "kind": kind,
-                                 "failing_cases": list(cases.get(rel) or [])}
+            out[f"{i}:{rel}"] = {
+                "set_index": i, "file": rel, "kind": kind,
+                "failing_cases": list(cases.get(rel) or []),
+                **({"no_case_evidence": True}
+                   if rel in (r.get("no_case_evidence_files") or []) else {})}
     return out, unmeasured
 
 
@@ -47799,7 +47886,9 @@ def _redrive_broken_cases(before: dict, after: dict) -> list[str]:
     cases before and fails with none after (an import or collection error)
     counts as its key: every case of it that passed before now fails, and
     reading the lost names as no evidence kept a round that traded a fixed
-    case for an unimportable file (review round 2 M4)."""
+    case for an unimportable file (review round 2 M4). Not when the after
+    entry is marked `no_case_evidence`: every run of it carried a resource
+    signature, which is no evidence of a collapse (review round 3 L1)."""
     out: list[str] = []
     for k, v in after.items():
         now = list(v.get("failing_cases") or [])
@@ -47809,7 +47898,9 @@ def _redrive_broken_cases(before: dict, after: dict) -> list[str]:
         was = list(before[k].get("failing_cases") or [])
         if was and now:
             out += [f"{k}::{c}" for c in sorted(set(now) - set(was))]
-        elif was:
+        elif was and not v.get("no_case_evidence"):
+            # Not when every run after carried a resource signature: that
+            # is no case evidence, not a collapse (review round 3 L1).
             out.append(k)
     return sorted(out)
 

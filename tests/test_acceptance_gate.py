@@ -3505,6 +3505,175 @@ def test_a_round_that_fixes_a_case_by_making_a_set_file_unimportable_is_reset(
     assert (staging / "helper.py").read_text() == HELPER_BUGGY
 
 
+def _timeout_first_after_run(leerie, monkeypatch, rel: str, nth: int,
+                             seen: list):
+    """Make the `nth` first-run (not a confirm or discovery rerun) of `rel`
+    time out; every other run is real. `seen` collects the labels."""
+    real = leerie._run_streaming
+    count = {"n": 0}
+
+    async def spy(argv, **kw):
+        label = kw.get("label") or ""
+        if rel in label and "confirm" not in label and "discover" not in label:
+            count["n"] += 1
+            seen.append(label)
+            if count["n"] == nth:
+                raise subprocess.TimeoutExpired(argv, 1.0)
+        return await real(argv, **kw)
+    monkeypatch.setattr(leerie, "_run_streaming", spy)
+
+
+def test_a_first_run_timeout_then_an_ordinary_failure_does_not_roll_back(
+        leerie, tmp_path, monkeypatch):
+    """Review round 3 L1, end to end with real pytest: the round fixes one
+    case of set 1 and leaves set 2's file failing the same named case it
+    failed before. On the repaired tree set 2's first run times out and the
+    confirming rerun fails in the ordinary way, naming that case. The
+    file's cases come from every run of the vote, so nothing newly fails:
+    the good round is kept. Read from the first run alone, the file was a
+    whole-file collapse and the round was rolled back as worse."""
+    repo, head = _repo(tmp_path)
+    (repo / "helper.py").write_text(HELPER_BUGGY)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "helper")
+    head = _git(repo, "rev-parse", "HEAD")
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 2)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(TWO_CASES)
+    (Path(sets[1]["dir"]) / "acc" / "test_defect_2.py").write_text(
+        HELPER_TEST)
+    st.data["acceptance"] = {"sets": sets}
+    labels: list = []
+    reruns: list = []
+
+    async def confirm_by_one_real_rerun(candidates, run_final, caps, *,
+                                        label, **_kw):
+        # B* with one real rerun (the autouse stub confirms with none, and
+        # this defect needs the confirming rerun to happen).
+        cand = sorted(set(candidates))
+        still = await run_final(600.0)
+        reruns.append((label, cand, sorted(still or [])))
+        ok = [c for c in cand if still is not None and c in still]
+        return {"candidates": cand, "confirmed": ok,
+                "resource_affected": [c for c in cand if c not in ok],
+                "reruns_required": 1, "reruns_run": 1,
+                "budget_exhausted": False, "gate": None}
+    monkeypatch.setattr(leerie, "_confirm_still_failing",
+                        confirm_by_one_real_rerun)
+    # Call 1 is the start's evaluation; call 2 the repaired tree's.
+    _timeout_first_after_run(leerie, monkeypatch, "acc/test_defect_2.py", 2,
+                             labels)
+
+    def half(p):
+        (p / "calc.py").write_text(HALF_FIX)
+        _git(p, "commit", "-qam", "conformer: half")
+    fixers = [half, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    assert len(labels) >= 2                 # the timeout really fired
+    # ... and the confirming rerun on the repaired tree failed set 2's file
+    # in the ordinary way.
+    assert any(c == ["acc/test_defect_2.py"] == s for _l, c, s in reruns[2:])
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert any("test_two_and_three" in c for c in r1["fixed_cases"])
+    assert r1["broken_cases"] == []
+    assert "rollback_reason" not in r1
+    assert not r1.get("rolled_back")
+    assert _git(staging, "rev-parse", "HEAD") != _git(repo, "rev-parse",
+                                                      "main")
+    assert (staging / "calc.py").read_text() == HALF_FIX
+    # Round 1's own verdict on set 2's file names the case the confirming
+    # rerun saw failing (round 2's evaluation ran with no timeout).
+    assert labels[1].startswith("acceptance-gate-r1-")
+    after = {r["index"]: r for r in r1["results"]}
+    (case,) = after[2]["failing_cases"]["acc/test_defect_2.py"]
+    assert case.endswith("test_mul")
+    assert "no_case_evidence_files" not in after[2]
+
+
+def test_run_acceptance_file_marks_a_timeout_as_a_resource_run(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "acc").mkdir()
+    (repo / "acc" / "test_x.py").write_text(DEFECT_TEST)
+
+    async def boom(argv, **kw):
+        raise subprocess.TimeoutExpired(argv, 1.0)
+    monkeypatch.setattr(leerie, "_run_streaming", boom)
+    obs: dict = {}
+    assert asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 5), str(repo), "acc/test_x.py",
+        st.run_dir / "logs" / "x.log", "t", cases_out=obs)) is False
+    assert obs == {"resource": True}
+    assert leerie._acceptance_run_case_evidence(obs) is None
+
+
+def test_rc_is_resource_signal(leerie):
+    assert leerie._rc_is_resource_signal(-9)
+    assert leerie._rc_is_resource_signal(137)       # 128 + SIGKILL
+    assert leerie._rc_is_resource_signal(139)       # 128 + SIGSEGV
+    assert not leerie._rc_is_resource_signal(1)
+    assert not leerie._rc_is_resource_signal(2)
+    assert not leerie._rc_is_resource_signal(0)
+
+
+def test_acceptance_vote_cases_reads_every_run(leerie):
+    """Review round 3 L1: the cases come from every failing run of the
+    vote, and a run with a resource signature gives no case evidence."""
+    timeout = {"resource": True}
+    named = {"failing_cases": ["t::a"],
+             "failing_messages": {"t::a": "AssertionError: 1 != 2"}}
+    signed = {"failing_cases": ["t::b"],
+              "failing_messages": {"t::b": "Failed: Timeout >5.0s"}}
+    collection = {}
+    # The first run timed out: the rerun's cases, not a whole-file failure.
+    assert leerie._acceptance_vote_cases([timeout, named]) == ["t::a"]
+    assert leerie._acceptance_vote_cases([named, timeout]) == ["t::a"]
+    # A run whose every failing case carries a resource signature is none.
+    assert leerie._acceptance_vote_cases([signed, named]) == ["t::a"]
+    # Every run resource-signed: no case evidence at all.
+    assert leerie._acceptance_vote_cases([timeout, signed]) is None
+    assert leerie._acceptance_vote_cases([]) is None
+    # An ordinary failure naming no case is a whole-file failure ...
+    assert leerie._acceptance_vote_cases([timeout, collection]) == []
+    # ... unless another run named cases.
+    assert leerie._acceptance_vote_cases([collection, named]) == ["t::a"]
+    # A case named by every run; all of them when none is.
+    ab = {"failing_cases": ["t::a", "t::c"]}
+    assert leerie._acceptance_vote_cases([named, ab]) == ["t::a"]
+    assert leerie._acceptance_vote_cases(
+        [{"failing_cases": ["t::c"]}, named]) == ["t::a", "t::c"]
+    # A case with no message is named evidence, never a signature.
+    assert leerie._acceptance_vote_cases(
+        [{"failing_cases": ["t::d"]}]) == ["t::d"]
+
+
+def test_a_file_with_no_case_evidence_is_not_a_collapse(leerie):
+    """Every run after carried a resource signature: failing, but no
+    evidence it lost its named cases — not worse. A collection error (an
+    ordinary failure naming nothing) still is (review round 2 M4)."""
+    before = [{"index": 2, "passed": False, "unmeasured": False,
+               "failing_files": ["b.py"], "failing_cases": {"b.py": ["d1"]}}]
+    blind = [{"index": 2, "passed": False, "unmeasured": False,
+              "failing_files": ["b.py"], "no_case_evidence_files": ["b.py"]}]
+    whole = [{"index": 2, "passed": False, "unmeasured": False,
+              "failing_files": ["b.py"]}]
+    assert leerie._acceptance_broken_cases(before, blind) == []
+    assert leerie._acceptance_broken_cases(before, whole) == ["2:b.py"]
+    # A file that passed before and fails after is still worse, blind or not.
+    passed = [{"index": 2, "passed": True, "unmeasured": False,
+               "failing_files": []}]
+    assert leerie._acceptance_broken_cases(passed, blind) == ["2:b.py"]
+    # The delivery re-drive's keys carry the mark too.
+    keys, _ = leerie._redrive_failing(
+        blind, [{"index": 2, "defect_files": ["b.py"],
+                 "control_files": []}], {2})
+    assert keys["2:b.py"]["no_case_evidence"] is True
+    assert leerie._redrive_broken_cases(
+        {"2:b.py": {"failing_cases": ["d1"]}}, keys) == []
+
+
 def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
                                                     monkeypatch):
     repo, head = _repo(tmp_path)

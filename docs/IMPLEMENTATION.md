@@ -6732,7 +6732,8 @@ such set failed before — and `[]` sets `rollback_reason: "fixed no failing
 case"`. Otherwise `broken_cases = _acceptance_broken_cases(prev, results)`
 (the same keys, counted by `_redrive_broken_cases`; a set passing before
 contributes every case it now fails, and a file that failed with named
-cases before and fails as a whole after contributes its key) is recorded, and a non-empty list sets
+cases before and fails as a whole after contributes its key, unless its
+entry carries `no_case_evidence`) is recorded, and a non-empty list sets
 `rollback_reason: "broke previously passing held-out case(s)"` (DESIGN §8:
 worse is counted in cases). The entry is saved, then `_undo_round` resets
 (`_redrive_rollback(staging, pre_sha)`: `reset --hard`, confirmed, `clean
@@ -6904,7 +6905,8 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   has no per-case record — plus, for a key failing on both sides with
   per-case records, the IDs that joined its list, plus the key itself for
   a key that failed with a per-case record before and fails with none
-  after: a whole-file failure, an import or collection error), a control file newly
+  after: a whole-file failure, an import or collection error — never for
+  an after entry marked `no_case_evidence`), a control file newly
   fails, or a test is confirmed newly failing — in a held-back round also
   when a held-back case newly fails (`held_broke_cases`), a held-back
   control newly fails, or none is fixed; a set or held-back
@@ -7028,8 +7030,26 @@ from evaluation: `_acceptance_run_placed` calls `_run_acceptance_file(...,
 cases_out=obs)`, which requests the runner's report as validation does
 (`_acceptance_report_spec`) but keeps the exit-code verdict, and stores
 `obs["failing_cases"]` (the report's `failed` case IDs; nothing on no report,
-a collection error or zero executed cases); a confirmed failing file with
-IDs lands in the result's `failing_cases{file: [ids]}`.
+a collection error or zero executed cases), and `obs["resource"] = True`
+when the run timed out, or exited by a signal (`_rc_is_resource_signal`:
+a negative return code, or 128 + SIGKILL/TERM/SEGV/ABRT/BUS/HUP) with no
+readable report. Each failing run of a file — the first and every vote
+rerun — is kept, and `_acceptance_vote_cases(runs) -> list[str] | None`
+derives the file's cases (DESIGN §8 *Delivery re-drive* rule 4):
+`_acceptance_run_case_evidence(obs)` is None for a run with a resource
+signature (`obs["resource"]`, or every failing case's non-blank message
+matching `_RESOURCE_FAILURE_RE`), else the run's `failing_cases` (`[]`
+for a collection error); the file's cases are the intersection over the
+runs naming cases, their union when that is empty, `[]` when evidence
+runs exist but none named a case, and None when no run gave evidence. A
+confirmed failing file with IDs lands in the result's
+`failing_cases{file: [ids]}`; one with None is listed in the result's
+`no_case_evidence_files` (absent when empty). A file settled by an
+`asserted` held case takes the asserting run's IDs instead, and an
+intermittent file its held cases. `_acceptance_failing_keys` and
+`_redrive_failing` carry `no_case_evidence: True` on such a file's entry
+(the key absent otherwise), and `_redrive_broken_cases` then does not
+count it as a whole-file collapse.
 
 **Held cases (DESIGN §8 *A held case that fails again is a failure, not a
 flake*).** `_acceptance_held_cases(set_, rel) -> set[str]` is the defect
