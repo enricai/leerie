@@ -6162,8 +6162,12 @@ outside `BLOCKER_KINDS`, a missing one, and an `external_precondition` with
 an empty `external_resource` are all `other`. In `_settle_subtask`, a result
 whose `status` is `blocked` or `failed` goes to `async
 _route_blocker_kind(...)` before anything else:
-- `external_precondition` → `_settle_accepted_external(st, sid, resource,
-  blocker) -> dict`: `subtask_status[sid] = "accepted_external"`, `blocked[sid]`
+- `external_precondition` → `await _verify_external_claim(sid, res, subtask,
+  worktree, st, caps)` first (below); only a `verified` claim goes on to
+  `_settle_accepted_external(st, sid, resource, blocker) -> dict`, any other
+  verdict types the result `other` (falls through to the last bullet) with
+  `external_precondition not accepted (<verdict>): <why>` appended to its
+  blocker. `_settle_accepted_external`: `subtask_status[sid] = "accepted_external"`, `blocked[sid]`
   dropped, and `needs_human_verification` gains `{source: "blocker", subtask,
   resource, blocker}` (replacing an earlier entry for the same subtask);
   returns `{status: "accepted_external"}`. `phase_classify` rewrites only the
@@ -6180,8 +6184,72 @@ _route_blocker_kind(...)` before anything else:
 - every other kind → the result is returned `blocked` (a self-reported
   `failed` becomes `blocked`), so the wave-end `_redrive_blocked_subtasks`
   re-drives it from the shared budget.
-The kind is persisted as `blocker_kinds[sid] = {kind, resource?, status}`
-(the latest attempt's). `phase_execute` treats `accepted_external` like
+The kind is persisted as `blocker_kinds[sid] = {kind, resource?, status,
+claimed?, external_check?}` (the latest attempt's); an external claim adds
+`external_check = {verdict, why, claim}`, and a rejected one is recorded
+`kind: "other"` with `claimed: "external_precondition"`.
+
+External claim check (DESIGN §13 *An external claim is checked, not taken on
+the word*). `EXTERNAL_RESOURCE_KINDS = ("env_var", "network", "file",
+"binary", "service_credential", "human_action")`; `SCHEMAS["implementer"]`
+carries `external_resource_claim` as `{"$ref":
+"#/$defs/external_resource_claim"}` — a flat object, required `kind` (that
+enum), optional `name`, `host`, `port` (integer), `path`, `description`,
+`quote`. `_EXTERNAL_RESOURCE_KEY` maps each kind to the field holding its
+key (`name` / `host` / `path` / `name` / `name` / `quote`).
+- `_external_claim(res) -> dict | None` — `{kind, key, port?, description?}`,
+  None when the kind is unknown, the key field is empty, or a `network`
+  claim's port is not an integer in 1–65535.
+- `async _verify_external_claim(sid, res, subtask, worktree, st, caps) ->
+  dict` — `{verdict: "verified" | "refuted" | "unverified", why, claim}`,
+  checks in this order, the first non-`verified` one deciding: the typed
+  claim (absent → `unverified`); the per-kind probe; grounding; consistency;
+  the network probe; execution.
+  - per kind: `env_var` refuted when `os.environ[name]` is non-empty;
+    `file` refuted when `path` (expanded, relative to the worktree) exists;
+    `binary` refuted when `shutil.which(name)` or
+    `_binary_install_source(name, worktree, st) -> str` finds it (the
+    worktree's `node_modules/.bin`, `.venv/bin`, `venv/bin`; a
+    `package-lock.json` `packages[*].bin` key; a `package.json`
+    dependency key; a `requirements*.txt` or `pyproject.toml` requirement
+    name; a `.tool-versions` / `mise.toml` / `.mise.toml` tool; an argv
+    element of `provision.recipe`); `service_credential` refuted when
+    `_service_credential_source(name, environ, home) -> str` finds an
+    environment variable equal to the name's upper-snake form or prefixed
+    by it plus `_`, or a file of `_CREDENTIAL_FILES` under `$HOME` whose
+    path or text contains it; `human_action` refuted unless
+    `_audit_quote_in` finds its `quote` in `st.data["task"]` or any text of
+    `_declared_external_texts`.
+  - grounding (every kind but `human_action`): the key (and, for `file`,
+    its basename) appears case-insensitively in the task, the subtask spec,
+    a declared external text, or `git grep -F -i -q` at
+    `_compute_run_branch(run_id)` in the worktree; else `refuted`. A
+    `git grep` error or timeout with no other hit is `unverified`.
+  - consistency: `_declared_external_texts(st, subtask, sid) -> tuple[list,
+    list]` returns `(scoped, every)` — `scoped` is the planner's
+    `external_preconditions` entries whose `originating_subtasks` hold
+    `sid` (tag and reasons), `domain_blocked` rows typed
+    `external_precondition` (their `external_resource`), and the
+    `required_items` typed `verifiability: external` that this subtask
+    claims in `claims.items`; `every` is the same over all subtasks and
+    all external items. When `scoped` is non-empty the key must appear in
+    one entry, else `refuted`.
+  - network: `_network_reach(host, port) -> str` (`reachable` /
+    `unreachable` / `unknown`) runs `_NETWORK_PROBE_SCRIPT` as `python3 -I`
+    under `run_proc(timeout=_NETWORK_PROBE_HARD_SEC)` (8 s, kills the
+    process group) with a `_NETWORK_PROBE_CONNECT_SEC` (3 s) socket
+    timeout; `EAI_NONAME`/`EAI_NODATA` or a failed connect is
+    `unreachable`, any other resolver error, a hard timeout or unexpected
+    output `unknown`. The control `_network_control()` (the host and port of
+    `ANTHROPIC_BASE_URL` when set, else `_NETWORK_PROBE_CONTROL =
+    ("api.anthropic.com", 443)`) is probed first: not `reachable` →
+    `unverified`. Then the claimed host: `reachable` → `refuted`,
+    `unknown` → `unverified`, `unreachable` → backed.
+  - execution: with `_subtask_verify_argvs(subtask)` non-empty,
+    `_settle_by_execution(...)`; `pass` → `refuted`; `none` /
+    `environment_limit` → `unverified`; `fail` is backed only when, for
+    every kind but `human_action`, the output tail of a failed command
+    contains the key (case-insensitive), else `refuted`. `phase_execute` treats `accepted_external` like
 `unconverged` at wave end: it is not integrated, not re-driven, and not
 recorded in the `blocked` registry; `_decide_outcome` does not count it.
 
@@ -9105,7 +9173,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |
-| `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). |
+| `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status, claimed?, external_check?}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). An `external_precondition` claim adds `external_check: {verdict, why, claim}` (`_verify_external_claim`); one not `verified` is recorded `kind: "other"`, `claimed: "external_precondition"`. |
 | `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
@@ -9342,9 +9410,12 @@ Required fields, current shape:
   `risk_register` and the conformer's challenge context, never parsed from
   prose), `blocker_kind` (`$ref` into the schema's `$defs`: `nothing_to_change`
   / `external_precondition` / `environment_limit` / `upstream_missing` /
-  `cannot_reproduce` / `regression_unresolved` / `other`) and
+  `cannot_reproduce` / `regression_unresolved` / `other`),
   `external_resource` (string, the resource an `external_precondition`
-  needs) — routed by `_route_blocker_kind` (§6 *Typed blocker kinds*).
+  needs) and `external_resource_claim` (`$ref` into `$defs`: `{kind:
+  env_var|network|file|binary|service_credential|human_action, name?,
+  host?, port?, path?, description?, quote?}`, the typed resource
+  `_verify_external_claim` checks) — routed by `_route_blocker_kind` (§6 *Typed blocker kinds*).
 - **integrator** — required: `incoming_subtask`, `status` (`resolved` /
   `design-conflict` / `failed`). `confidence`: `_confidence_schema(["resolution"])`.
   Optional: `resolution_summary`, `diagnosis` (fallback on non-`resolved`).

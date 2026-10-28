@@ -10111,7 +10111,7 @@ prose:
 | `blocker_kind` | Routing |
 |---|---|
 | `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
-| `external_precondition` (+ `external_resource`) | the only kind that may be accepted: settled `accepted_external` and listed under "Needs human verification" |
+| `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other` |
 | `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
 | `upstream_missing` | re-driven |
 | `cannot_reproduce` | settled by execution (§8 *Settled by execution*); a claim execution cannot back is re-driven |
@@ -10126,6 +10126,68 @@ the one outcome that ends work without code, so it needs the resource named.
 integrated, it does not make the run `unconverged`, and the State list
 `needs_human_verification` gains `{source: "blocker", subtask, resource,
 blocker}` beside the classifier's external items.
+
+**An external claim is checked, not taken on the word.** Acceptance ends
+work without code, so it is the one outcome a worker's word must not
+decide (§12): until this check, a resource the implementer made up — "a
+staging API key nobody named" — settled `accepted_external` like a real
+one. The implementer now types the resource as `external_resource_claim`,
+one of six kinds, and code verifies it in the worker's own environment —
+the container every worker shares, with the orchestrator's environment
+that `claude -p` inherits:
+
+| kind | the claim is backed when |
+|---|---|
+| `env_var{name}` | the variable is unset or empty |
+| `network{host, port}` | DNS or a TCP connect to it fails within a short timeout, through the container's network |
+| `file{path}` | the path is absent (relative to the worktree) |
+| `binary{name}` | `shutil.which` finds nothing, and the repository's own lockfiles, local tool directories, tool-version files and provision recipe do not install it |
+| `service_credential{name}` | no environment variable and no well-known credential file matches it |
+| `human_action{description, quote}` | its `quote` — a step only a person can take, such as an approval in a dashboard — appears verbatim (whitespace aside) in the task text or in one of the run's typed external items: the planner's `external_preconditions`, the D4 `domain_blocked` rows, the classifier's `verifiability: external` items |
+
+Three cross-checks follow, all mechanical substrings of the claim's typed
+key (the name, host, path or quote), never a reading of prose:
+
+- *Grounded.* The key appears in the task, the subtask's own spec, a typed
+  external item, or the repository at the run branch's tip (`git grep -F`)
+  — so a resource named nowhere is not accepted, whatever the probe says,
+  since a probe for absence always backs something invented.
+- *Consistent.* When the planner declared external preconditions for this
+  subtask, or this subtask claims a classifier item typed external, or a
+  domain is blocked on an external, the key appears in one of them.
+- *Executed.* When the subtask has `verify` argvs, they are run (§8
+  *Settled by execution*): at least one must fail, and — for every kind
+  but `human_action`, whose description is prose — its output must name
+  the key.
+
+The check returns one of three verdicts. `verified` accepts. `refuted` (the
+variable is set, the host answers, the file exists, the quote is not
+there, the verify commands pass) and `unverified` (the check could not run:
+no claim was typed, the network probe's control host is unreachable, the
+probe hit its hard timeout, `git grep` or the verify commands could not
+decide) both type the result `other` and re-drive it from the shared
+budget, with the typed reason — "claimed missing env var X, but it is set"
+— in the re-drive note. A check that cannot run never accepts: the user's
+rule is that leftover work is accepted only when its cause is an external
+resource no in-container step can supply, and an unrun check has not shown
+that.
+
+The network probe runs as a child process with a connect timeout inside a
+hard wall-clock timeout that kills it, so a resolver that never answers
+cannot stall the run; a hard timeout is `unverified`. Before probing the
+claimed host it probes a control — the API endpoint every worker already
+talks to (`ANTHROPIC_BASE_URL`'s host when set, else
+`api.anthropic.com:443`): if the control is unreachable, the container has
+no usable network and an unreachable claimed host proves nothing. The
+three runtimes differ only in the path out, not in what the probe sees:
+rootless containerd routes the container's TCP through its user-mode
+network (slirp4netns or pasta), which answers the container's SYN only
+once its own host-side connect succeeds, so a refused or unroutable host
+still fails the connect; rootful containerd (Colima on macOS) bridges and
+NATs, an ordinary connect; Fly and EC2 run the image on the machine's own
+network. DNS in each goes through the container's `resolv.conf`; a
+resolver that is down is a temporary failure (`EAI_AGAIN`), read as
+`unverified`, never as a missing host.
 
 **A dependent of accepted-external work is accepted-external too.** A
 subtask whose predecessor in the scheduler's graph — `depends_on`, or a

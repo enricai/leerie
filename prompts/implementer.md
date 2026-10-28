@@ -599,8 +599,9 @@ Return **only** this JSON object as your final message — no prose, no fences:
 - `blocked` requires `blocker` set with the precise missing evidence/input.
 - `failed` requires a diagnosis in `summary`.
 - `blocker_kind` is required whenever `status` is `blocked` or `failed` —
-  see "Blocker kind" below. Omit it, and `external_resource`, on any other
-  status (neither field accepts null).
+  see "Blocker kind" below. Omit it, `external_resource` and
+  `external_resource_claim` on any other status (none of them accepts
+  null).
 
 ### Blocker kind (required whenever status is `blocked` or `failed`)
 
@@ -614,10 +615,11 @@ value. The orchestrator routes on it, not on your `blocker` text:
 - `external_precondition` — the work needs something that only a human
   outside this run can supply: credentials or secrets, a live third-party
   service or account, a human decision or approval, physical hardware. Set
-  `external_resource` to name it. This is the **only** kind that is
-  accepted without more work, and it is listed for human verification. A
-  command that fails or is killed because of this container's own resources
-  is NOT `external_precondition` — use `environment_limit`.
+  `external_resource` to name it, and type it in `external_resource_claim`
+  (below). This is the **only** kind that is accepted without more work,
+  and it is listed for human verification. A command that fails or is
+  killed because of this container's own resources is NOT
+  `external_precondition` — use `environment_limit`.
 - `environment_limit` — a command could not complete because of this
   container's resources: killed (exit 137 / OOM), cannot spawn threads or
   processes (EAGAIN), a dependency install or test run that hung or timed
@@ -638,6 +640,30 @@ Every kind other than `external_precondition`, `environment_limit` and
 `cannot_reproduce` is driven again: another round receives your blocker as
 input. A missing kind, or `external_precondition` without
 `external_resource`, is treated as `other`.
+
+`external_resource_claim` types the resource of an `external_precondition`
+so the orchestrator can check it in this container before accepting.
+Exactly one `kind`, with its field:
+- `env_var` + `name` — an environment variable that is unset or empty;
+- `network` + `host` and `port` — a host this container cannot resolve or
+  connect to;
+- `file` + `path` — a file that does not exist (relative to your worktree,
+  or absolute);
+- `binary` + `name` — a program not on `PATH` that the repository's own
+  lockfiles and install recipe do not provide;
+- `service_credential` + `name` — a credential for a service, held in no
+  environment variable or credential file here;
+- `human_action` + `description` and `quote` — a step only a person can
+  take (an approval in a dashboard, a manual sign-off); `quote` copies,
+  verbatim, the words of the task or of the run's external items that ask
+  for it.
+
+The orchestrator checks the claim: the variable must be unset, the host
+unreachable, the file absent, the binary uninstallable, the credential
+absent, the quote present; the name must appear in the task, your
+subtask's spec or the repository; and when your subtask has verify
+commands, one must fail with output naming it. A claim that does not
+check out is driven again as `other`, with the reason.
 - `needs-clarification` requires both `checkpoint_path` set AND
   `clarification_question` set to `{id, question, why_underivable}` (all
   three string fields non-empty). See §6b for the gate.

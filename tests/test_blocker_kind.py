@@ -1,6 +1,7 @@
 """Typed implementer `blocker_kind` (DESIGN §13 *A blocked implementer says
 why, as a type*): code routes a `blocked` / `failed` result on the typed
-kind alone — `external_precondition` (with a named resource) is the only
+kind alone — `external_precondition` (with a named resource its typed claim
+backs, tests/test_external_claim_check.py) is the only
 kind accepted, `environment_limit` retries in place once, `cannot_reproduce`
 is settled by execution, every other kind is re-driven from the shared
 budget. Each test drives the real `_settle_subtask` (or the router) and
@@ -79,13 +80,20 @@ def test_schema_carries_the_kinds_through_defs(leerie):
 # --- routing, end to end through _settle_subtask ----------------------------
 
 def test_external_precondition_is_accepted_and_listed(env, monkeypatch):  # noqa: F811
+    """A typed claim the check verifies (an unset variable the task names)
+    is accepted; tests/test_external_claim_check.py covers the check."""
     c = env["leerie"]
+    monkeypatch.delenv("LEERIE_T_SMTP_PASSWORD", raising=False)
+    env["st"].data["task"] = "send mail with LEERIE_T_SMTP_PASSWORD"
     env["st"].data["needs_human_verification"] = [
         {"source": "required_item", "item_index": 0, "item": "x",
          "span": "S1", "source_ref": ""}]
     env["st"].data["blocked"] = {"t1": "older"}
-    _stub_results(c, monkeypatch, [_blocked(
-        "external_precondition", resource="live SMTP credentials")])
+    blocked = _blocked("external_precondition",
+                       resource="live SMTP credentials")
+    blocked["external_resource_claim"] = {"kind": "env_var",
+                                          "name": "LEERIE_T_SMTP_PASSWORD"}
+    _stub_results(c, monkeypatch, [blocked])
     res = _settle(env)
     assert res["status"] == "accepted_external"
     st = env["st"]
@@ -98,7 +106,12 @@ def test_external_precondition_is_accepted_and_listed(env, monkeypatch):  # noqa
                           "blocker": "stuck on it"}
     assert st.data["blocker_kinds"]["t1"] == {
         "kind": "external_precondition", "status": "blocked",
-        "resource": "live SMTP credentials"}
+        "resource": "live SMTP credentials",
+        "external_check": {
+            "verdict": "verified",
+            "why": "env_var LEERIE_T_SMTP_PASSWORD: every check backs the "
+                   "claim",
+            "claim": {"kind": "env_var", "key": "LEERIE_T_SMTP_PASSWORD"}}}
     assert "accepted_external" in c._SETTLED_STATUSES
 
 
@@ -284,6 +297,9 @@ def test_prompt_names_every_kind(leerie):
     for k in leerie.BLOCKER_KINDS:
         assert f"`{k}`" in text, k
     assert "`external_resource`" in text
+    assert "`external_resource_claim`" in text
+    for k in leerie.EXTERNAL_RESOURCE_KINDS:
+        assert f"`{k}`" in text, k
     json.dumps(leerie.SCHEMAS["implementer"])
 
 

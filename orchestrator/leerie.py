@@ -2558,6 +2558,10 @@ D1_SECTION_ROLES = ("requirement", "evidence", "suggestion", "context")
 BLOCKER_KINDS = ("nothing_to_change", "external_precondition",
                  "environment_limit", "upstream_missing", "cannot_reproduce",
                  "regression_unresolved", "other")
+# The resource an `external_precondition` claims, typed so code can check it
+# (DESIGN §13 *An external claim is checked, not taken on the word*).
+EXTERNAL_RESOURCE_KINDS = ("env_var", "network", "file", "binary",
+                           "service_credential", "human_action")
 
 # The scope judge's vocabularies (DESIGN §8 *A task that points at a report is
 # bounded by the report's own scenarios*), bench P2 v3b.
@@ -2924,6 +2928,24 @@ SCHEMAS: dict[str, dict] = {
         "$defs": {
             "blocker_kind": {"type": "string", "enum": list(BLOCKER_KINDS)},
             "external_resource": {"type": "string"},
+            # Flat, `kind` the only required field (decoder-safety, as
+            # `symptom_evidence`): `_external_claim` decides in code which
+            # field the kind needs, so a claim missing it is `unverified`
+            # rather than a whole-payload validation retry.
+            "external_resource_claim": {
+                "type": "object",
+                "required": ["kind"],
+                "properties": {
+                    "kind": {"type": "string",
+                             "enum": list(EXTERNAL_RESOURCE_KINDS)},
+                    "name": {"type": "string"},
+                    "host": {"type": "string"},
+                    "port": {"type": "integer"},
+                    "path": {"type": "string"},
+                    "description": {"type": "string"},
+                    "quote": {"type": "string"},
+                },
+            },
             "risk": _risk_item_schema(),
         },
         "properties": {
@@ -3002,6 +3024,8 @@ SCHEMAS: dict[str, dict] = {
             # so the property table stays small.
             "blocker_kind": {"$ref": "#/$defs/blocker_kind"},
             "external_resource": {"$ref": "#/$defs/external_resource"},
+            "external_resource_claim": {
+                "$ref": "#/$defs/external_resource_claim"},
             "summary": {"type": "string"},
             # DESIGN §11 mid-execution clarification exception. An
             # implementer that hits a genuine intent-question it cannot
@@ -50579,6 +50603,358 @@ def _blocker_kind(res: dict) -> tuple[str, str]:
     return kind, resource
 
 
+# --- An external claim is checked, not taken on the word (DESIGN §13) -----
+#
+# The field of `external_resource_claim` that carries each kind's key: the
+# string grounding, consistency and the verify-output check look for.
+_EXTERNAL_RESOURCE_KEY = {"env_var": "name", "network": "host",
+                          "file": "path", "binary": "name",
+                          "service_credential": "name",
+                          "human_action": "quote"}
+# The network probe: a socket timeout per connect inside a hard wall-clock
+# timeout that kills the probe process, so a resolver that never answers
+# cannot stall the run (DESIGN §13: a hard timeout is `unverified`).
+_NETWORK_PROBE_CONNECT_SEC = 3.0
+_NETWORK_PROBE_HARD_SEC = 8.0
+# The control host: the API every worker already reaches. Unreachable, the
+# container has no usable network and an unreachable claimed host proves
+# nothing.
+_NETWORK_PROBE_CONTROL = ("api.anthropic.com", 443)
+# Prints one fixed word; `_network_reach` maps it. EAI_NONAME / EAI_NODATA
+# say the name does not exist; any other resolver error (EAI_AGAIN: the
+# resolver is unreachable) says nothing about the host.
+_NETWORK_PROBE_SCRIPT = (
+    "import socket, sys\n"
+    "host, port, t = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])\n"
+    "gone = {getattr(socket, n) for n in ('EAI_NONAME', 'EAI_NODATA')\n"
+    "        if hasattr(socket, n)}\n"
+    "try:\n"
+    "    socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)\n"
+    "except socket.gaierror as e:\n"
+    "    print('dns_fail' if e.errno in gone else 'dns_unknown')\n"
+    "    sys.exit(0)\n"
+    "try:\n"
+    "    socket.create_connection((host, port), timeout=t).close()\n"
+    "except OSError:\n"
+    "    print('connect_fail')\n"
+    "    sys.exit(0)\n"
+    "print('reachable')\n")
+# Home-relative credential files a `service_credential` claim is checked
+# against: by path (`.aws/credentials` matches "aws") or by content (a
+# `.netrc` `machine` line naming the service).
+_CREDENTIAL_FILES = (".netrc", ".git-credentials", ".aws/credentials",
+                     ".aws/config", ".config/gh/hosts.yml",
+                     ".docker/config.json", ".npmrc", ".pypirc",
+                     ".kube/config",
+                     ".config/gcloud/application_default_credentials.json")
+_CREDENTIAL_FILE_READ_MAX = 65536
+# A requirement line's package name ends at the first of these (PEP 508).
+_REQUIREMENT_NAME_END_RE = re.compile(r"[\s<>=!~;\[@(,]")
+
+
+def _external_claim(res: dict) -> dict | None:
+    """The implementer's typed `external_resource_claim` as `{kind, key,
+    port?, description?}`, or None when it is absent, its kind unknown, its
+    key field empty, or a `network` claim's port not an integer in
+    1–65535."""
+    raw = res.get("external_resource_claim")
+    if not isinstance(raw, dict):
+        return None
+    kind = raw.get("kind")
+    if kind not in _EXTERNAL_RESOURCE_KEY:
+        return None
+    key = raw.get(_EXTERNAL_RESOURCE_KEY[kind])
+    key = key.strip() if isinstance(key, str) else ""
+    if not key:
+        return None
+    out: dict = {"kind": kind, "key": key}
+    if kind == "network":
+        port = raw.get("port")
+        if (not isinstance(port, int) or isinstance(port, bool)
+                or not 1 <= port <= 65535):
+            return None
+        out["port"] = port
+    if kind == "human_action":
+        out["description"] = str(raw.get("description") or "")
+    return out
+
+
+def _mentions(text: object, key: str) -> bool:
+    """`key` in `text`, whitespace-collapsed and case-insensitive."""
+    k = _audit_norm(key).lower()
+    return bool(k) and isinstance(text, str) and k in _audit_norm(text).lower()
+
+
+def _declared_external_texts(st: "State", subtask: dict,
+                             sid: str) -> tuple[list[str], list[str]]:
+    """`(scoped, every)`: the texts of the run's typed external items. Every
+    one is in `every`; `scoped` holds those tied to `sid` — the planner's
+    `external_preconditions` this subtask originates, the `domain_blocked`
+    rows typed external, and the classifier's `verifiability: external`
+    items this subtask claims."""
+    scoped: list[str] = []
+    every: list[str] = []
+    for e in st.data.get("external_preconditions") or []:
+        if not isinstance(e, dict):
+            continue
+        text = " ".join([str(e.get("tag") or "")] + [
+            str(r.get("reason") or "") for r in e.get("reasons") or []
+            if isinstance(r, dict)]).strip()
+        if not text:
+            continue
+        every.append(text)
+        if sid in (e.get("originating_subtasks") or []):
+            scoped.append(text)
+    for r in st.data.get("domain_blocked") or []:
+        if (isinstance(r, dict)
+                and r.get("blocker_kind") == "external_precondition"
+                and str(r.get("external_resource") or "").strip()):
+            every.append(str(r["external_resource"]))
+            scoped.append(str(r["external_resource"]))
+    claims = subtask.get("claims") if isinstance(subtask, dict) else None
+    claimed = {c.get("item_index")
+               for c in ((claims or {}).get("items") or []
+                         if isinstance(claims, dict) else [])
+               if isinstance(c, dict)}
+    for i, it in enumerate(st.data.get("required_items") or []):
+        if (isinstance(it, dict) and it.get("verifiability") == "external"
+                and str(it.get("item") or "").strip()):
+            every.append(str(it["item"]))
+            if i in claimed:
+                scoped.append(str(it["item"]))
+    return scoped, every
+
+
+def _binary_install_source(name: str, worktree: str, st: "State") -> str:
+    """Where the repository itself would supply binary `name` — a local tool
+    directory, a lockfile or manifest, a tool-version file, the provision
+    recipe — or `""`. Each file is mechanical (JSON, a requirement line, a
+    TOML key, an argv); none is read for meaning."""
+    wt = Path(worktree)
+    for rel in ("node_modules/.bin", ".venv/bin", "venv/bin"):
+        if (wt / rel / name).exists():
+            return f"{rel}/{name}"
+
+    def _json(rel: str) -> dict:
+        try:
+            data = json.loads((wt / rel).read_text())
+        except (OSError, ValueError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    for k, pkg in (_json("package-lock.json").get("packages") or {}).items():
+        if isinstance(pkg, dict) and isinstance(pkg.get("bin"), dict) \
+                and name in pkg["bin"]:
+            return f"package-lock.json ({k or 'the root package'})"
+    manifest = _json("package.json")
+    for field in ("dependencies", "devDependencies", "optionalDependencies"):
+        deps = manifest.get(field)
+        if isinstance(deps, dict) and name in deps:
+            return f"package.json {field}"
+
+    def _norm(pkg: str) -> str:
+        return re.sub(r"[-_.]+", "-", pkg).lower()
+
+    def _lines(rel: str) -> list[str]:
+        try:
+            return (wt / rel).read_text(errors="replace").splitlines()
+        except OSError:
+            return []
+
+    for req in sorted(wt.glob("requirements*.txt")):
+        for line in _lines(req.name):
+            tok = _REQUIREMENT_NAME_END_RE.split(line.strip(), 1)[0]
+            if tok and not tok.startswith(("#", "-")) \
+                    and _norm(tok) == _norm(name):
+                return req.name
+    quoted = re.compile(r"""["']""" + re.escape(name)
+                        + r"""(\s*[<>=!~;\[@(,][^"']*)?["']""", re.I)
+    keyed = re.compile(r"^\s*[\"']?" + re.escape(name) + r"[\"']?\s*=", re.I)
+    for line in _lines("pyproject.toml"):
+        if quoted.search(line) or keyed.search(line):
+            return "pyproject.toml"
+    for line in _lines(".tool-versions"):
+        if line.split()[:1] == [name]:
+            return ".tool-versions"
+    for rel in ("mise.toml", ".mise.toml"):
+        for line in _lines(rel):
+            if keyed.search(line):
+                return rel
+    prov = st.data.get("provision")
+    for entry in (prov.get("recipe") or [] if isinstance(prov, dict) else []):
+        argv = entry.get("command") if isinstance(entry, dict) else None
+        if isinstance(argv, list) and name in argv:
+            return "the provision recipe"
+    return ""
+
+
+def _service_credential_source(name: str, environ: dict[str, str],
+                               home: Path) -> str:
+    """Where this container already holds credential `name` — an environment
+    variable equal to its upper-snake form or prefixed by it plus `_`, or a
+    `_CREDENTIAL_FILES` entry whose path or text contains it — or `""`."""
+    token = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").upper()
+    if not token:
+        return ""
+    for k, v in environ.items():
+        if v and (k.upper() == token or k.upper().startswith(token + "_")):
+            return f"environment variable {k}"
+    squashed = token.replace("_", "").lower()
+    for rel in _CREDENTIAL_FILES:
+        p = home / rel
+        if not p.is_file():
+            continue
+        if squashed in re.sub(r"[^a-z0-9]", "", rel.lower()):
+            return f"credential file ~/{rel}"
+        try:
+            with open(p, errors="replace") as fh:
+                text = fh.read(_CREDENTIAL_FILE_READ_MAX)
+        except OSError:
+            continue
+        if _mentions(text, name):
+            return f"credential file ~/{rel}"
+    return ""
+
+
+def _network_control() -> tuple[str, int]:
+    """The control host and port: `ANTHROPIC_BASE_URL`'s when set and
+    parsable, else `_NETWORK_PROBE_CONTROL`."""
+    base = os.environ.get("ANTHROPIC_BASE_URL") or ""
+    try:
+        u = urllib.parse.urlsplit(base)
+        if u.hostname:
+            return u.hostname, u.port or (80 if u.scheme == "http" else 443)
+    except ValueError:
+        pass
+    return _NETWORK_PROBE_CONTROL
+
+
+async def _network_reach(host: str, port: int) -> str:
+    """`reachable`, `unreachable` (the name does not resolve, or a TCP
+    connect fails within `_NETWORK_PROBE_CONNECT_SEC`) or `unknown` (any
+    other resolver error, the hard timeout, a probe that could not run)."""
+    try:
+        r = await run_proc([sys.executable, "-I", "-c", _NETWORK_PROBE_SCRIPT,
+                            host, str(port), str(_NETWORK_PROBE_CONNECT_SEC)],
+                           timeout=_NETWORK_PROBE_HARD_SEC)
+    except (subprocess.TimeoutExpired, OSError):
+        return "unknown"
+    return {"reachable": "reachable", "dns_fail": "unreachable",
+            "connect_fail": "unreachable"}.get(r.stdout.strip(), "unknown")
+
+
+async def _repo_mentions(worktree: str, ref: str, keys: list[str]) -> bool | None:
+    """Whether any of `keys` occurs in the tree at `ref` (`git grep -F -i`),
+    None when git cannot say."""
+    cmd = ["git", "-C", worktree, "grep", "-q", "-F", "-i"]
+    for k in keys:
+        cmd += ["-e", k]
+    try:
+        r = await run_proc(cmd + [ref, "--"], timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return {0: True, 1: False}.get(r.returncode)
+
+
+async def _verify_external_claim(sid: str, res: dict, subtask: dict,
+                                 worktree: str, st: "State",
+                                 caps: dict) -> dict:
+    """Check an `external_precondition` against its typed resource (DESIGN
+    §13 *An external claim is checked, not taken on the word*). Returns
+    `{verdict, why, claim}`: `verified` accepts; `refuted` (the resource is
+    there, or the claim is named nowhere) and `unverified` (a check could
+    not run) both re-drive. Never reads the `blocker` prose."""
+    claim = _external_claim(res)
+    out: dict = {"verdict": "unverified", "why": "", "claim": claim}
+
+    def _end(verdict: str, why: str) -> dict:
+        out["verdict"], out["why"] = verdict, why
+        return out
+
+    if claim is None:
+        return _end("unverified", "no typed `external_resource_claim` "
+                    "names the resource (kind and its name, host and port, "
+                    "path or quote)")
+    kind, key = claim["kind"], claim["key"]
+    scoped, every = _declared_external_texts(st, subtask, sid)
+    task = str(st.data.get("task") or "")
+
+    if kind == "env_var" and os.environ.get(key):
+        return _end("refuted", f"claimed missing env var {key}, but it is "
+                    "set in the worker's environment")
+    if kind == "file":
+        p = Path(key).expanduser()
+        if not p.is_absolute():
+            p = Path(worktree) / p
+        if p.exists():
+            return _end("refuted", f"claimed missing file {key}, but it "
+                        "exists")
+    if kind == "binary":
+        found = shutil.which(key) or _binary_install_source(key, worktree, st)
+        if found:
+            return _end("refuted", f"claimed missing binary {key}, but it is "
+                        f"available or installable here: {found}")
+    if kind == "service_credential":
+        found = _service_credential_source(key, dict(os.environ),
+                                           Path.home())
+        if found:
+            return _end("refuted", f"claimed missing credential {key}, but "
+                        f"the container holds it: {found}")
+    if kind == "human_action":
+        if not any(_audit_quote_in(h, key) for h in [task, *every]):
+            return _end("refuted", "claimed a step only a person can take, "
+                        "but its quote is not in the task or in any of the "
+                        "run's typed external items")
+    else:
+        keys = [key] + ([os.path.basename(key)] if kind == "file"
+                        and os.path.basename(key) not in ("", key) else [])
+        spec = json.dumps(subtask, sort_keys=True) if subtask else ""
+        if not any(_mentions(h, k) for h in [task, spec, *every]
+                   for k in keys):
+            hit = await _repo_mentions(worktree,
+                                       _compute_run_branch(st.run_id), keys)
+            if hit is None:
+                return _end("unverified", f"could not search the "
+                            f"repository for {key}")
+            if not hit:
+                return _end("refuted", f"claimed {kind} {key}, but neither "
+                            "the task, this subtask's spec, the run's "
+                            "external items nor the repository names it")
+    if scoped and not any(_mentions(h, key) for h in scoped):
+        return _end("refuted", f"claimed {kind} {key}, but the external "
+                    "items declared for this subtask name other resources: "
+                    + "; ".join(scoped)[:300])
+    if kind == "network":
+        control = _network_control()
+        if await _network_reach(*control) != "reachable":
+            return _end("unverified", "the network probe cannot run here: "
+                        f"the control host {control[0]}:{control[1]} is not "
+                        "reachable from the container")
+        reach = await _network_reach(key, claim["port"])
+        if reach == "reachable":
+            return _end("refuted", f"claimed {key}:{claim['port']} "
+                        "unreachable, but a TCP connect from the container "
+                        "succeeds")
+        if reach != "unreachable":
+            return _end("unverified", f"the probe of {key}:{claim['port']} "
+                        "could not decide (resolver error or hard timeout)")
+    if _subtask_verify_argvs(subtask):
+        ex = await _settle_by_execution(subtask, worktree, st, caps, sid=sid)
+        if ex["verdict"] == "pass":
+            return _end("refuted", f"claimed {kind} {key} is missing, but "
+                        "this subtask's verify commands pass")
+        if ex["verdict"] != "fail":
+            return _end("unverified", "this subtask's verify commands could "
+                        f"not decide: {ex['why']}")
+        failed = [c.get("tail") or "" for c in ex["commands"]
+                  if not c.get("passed")]
+        if kind != "human_action" and not any(_mentions(t, key)
+                                              for t in failed):
+            return _end("refuted", "this subtask's verify commands fail, "
+                        f"but their output never names {key}")
+    return _end("verified", f"{kind} {key}: every check backs the claim")
+
+
 def _settle_accepted_external(st: "State", sid: str, resource: str,
                               blocker: str, *,
                               via: list[str] | None = None) -> dict:
@@ -50655,7 +51031,22 @@ async def _route_blocker_kind(sid: str, res: dict, subtask: dict,
     st.data.setdefault("blocker_kinds", {})[sid] = record
     st.save()
     if kind == "external_precondition":
-        return _settle_accepted_external(st, sid, resource, blocker)
+        # Acceptance ends work without code, so the claim is checked, not
+        # taken on the worker's word (DESIGN §13); an unbacked one is `other`.
+        check = await _verify_external_claim(sid, res, subtask, worktree, st,
+                                             caps)
+        record["external_check"] = check
+        if check["verdict"] == "verified":
+            st.save()
+            return _settle_accepted_external(st, sid, resource, blocker)
+        kind = record["kind"] = "other"
+        record["claimed"] = "external_precondition"
+        st.save()
+        log(f"  {sid}: external_precondition not accepted "
+            f"({check['verdict']}) — {check['why']}")
+        blocker = ((f"{blocker}\n" if blocker else "")
+                   + f"external_precondition not accepted "
+                   f"({check['verdict']}): {check['why']}")
     if kind == "environment_limit":
         return _environment_limit_hit(st, sid, blocker, env_hits)
     if kind == "nothing_to_change":
