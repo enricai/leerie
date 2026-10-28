@@ -9075,6 +9075,36 @@ Python never reads the task for it.
   still allowed. Measured on the same run: the prefix match denied every
   `pnpm test <file>`, so acceptance writers 1–4 could not validate their
   sets.
+- *Several draws, unioned.* One draw misses forbids. Measured: the same
+  barnacle 45fa4253 task ("don't run the full test suite unnecessarily as
+  part of any validation") was typed `forbidden_commands: []` on pass 1
+  and `pnpm run test` / `whole_suite` on pass 2; 7cc87f9a's task, which
+  asks the same, was typed empty on all three passes of its replay: 1
+  typed forbid in 5 classifier draws. A
+  missed forbid costs every whole-suite run the task asked to avoid; on
+  barnacle that is 15–19 min per run. So the list is also extracted by a
+  small judgment worker of its own, `forbidden_command_extractor`, run
+  `forbidden_command_samples` (3) times, at the same time as the
+  classifier. The kept list is the union of every draw's entries (the
+  classifier's and each sample's) that pass the quote check. The union is
+  safe against invented forbids because every entry must carry a verbatim
+  task quote, which code checks. A forbid without one is dropped, however
+  many draws typed it. If each draw types a real forbid independently with
+  probability q, k draws find it with probability 1 − (1 − q)^k: at the
+  measured q ≈ 0.2, one draw finds it 20% of the time, four (the
+  classifier plus 3 samples) 59%, and at q = 0.5, 94%.
+  A separate worker, not more classifier draws: the classifier is the most
+  expensive judgment call before planning (repo inspection, up to 60
+  turns, a 1,236 s per-worker timeout). Its output is the whole
+  classification, and redrawing it would only take one field. The
+  extractor reads the task, the reports it names and the repo's resolved
+  test command, which it needs to name a whole-suite forbid. It has
+  read-only tools and a few turns, so its samples run in parallel with the
+  classifier and add no wall time. Like the classifier it types
+  constraints from the task, so it gets no orchestrator notice
+  (`NOTICE_FREE_WORKERS`). A crashed sample is no vote and is not
+  redrawn: the union only grows with draws, so a missing one costs recall,
+  never safety.
 
 Three layers follow, each derived from that one list:
 
@@ -10822,7 +10852,7 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the thirty-two worker types in
+Every main-loop LLM call in Leerie passes through one of the thirty-three worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
@@ -10831,8 +10861,8 @@ Every main-loop LLM call in Leerie passes through one of the thirty-two worker t
 `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`,
 `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`,
 `pr_reviewer`, `contract_extractor`, `falsifier`,
-`verifiability_classifier`, or `delivery_ratchet`
-(`fit_judge`/`splitter` are the P1
+`verifiability_classifier`, `delivery_ratchet`, or
+`forbidden_command_extractor` (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
 `integration_judge`, `no_work_judge`, and `delivery_judge` are the
@@ -10847,7 +10877,9 @@ report-pointer task's sets to the report's own scenarios — see §8;
 `pr_reviewer` is the advisory whole-PR review and `contract_extractor`
 types a worker-flagged contract — see §8 and §9; `falsifier` tries to prove a
 required item undelivered, and `verifiability_classifier` and
-`delivery_ratchet` re-verify met items after a repair — see §8; `rebaser` is the
+`delivery_ratchet` re-verify met items after a repair — see §8;
+`forbidden_command_extractor` re-draws the commands the task forbids — see
+§9; `rebaser` is the
 finalize-time rebase worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per

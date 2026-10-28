@@ -283,6 +283,8 @@ def _run_classify(leerie, tmp_path, monkeypatch, answers, task=TASK,
     calls: list[dict] = []
 
     async def fake_claude_p(**kw):
+        if kw.get("schema_key") == "forbidden_command_extractor":
+            return {"forbidden_commands": []}
         calls.append(kw)
         return answers[min(len(calls), len(answers)) - 1]
 

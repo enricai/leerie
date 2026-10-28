@@ -801,6 +801,7 @@ leerie/
 │   ├── contract_extractor.md      types one worker-flagged contract risk (DESIGN §8 "Typed evidence for the delivery judge")
 │   ├── falsifier.md               tries to prove one required item undelivered with a probe test on the final tree (DESIGN §8 "Delivery detection")
 │   ├── verifiability_classifier.md types each required item in_tree or execution for the delivery ratchet (DESIGN §8 "A repair that regresses met work is rolled back")
+│   ├── forbidden_command_extractor.md re-draws the commands the task forbids running, unioned with the classifier's (DESIGN §9 "A command the task forbids")
 │   ├── delivery_ratchet.md        addendum to delivery_judge.md: re-verifying met items after a repair, with evidence_files (same section)
 │   ├── rebaser.md                 finalize-time rebase-onto-base worker (DESIGN §6 "Rebase-onto-base before push"; scoped, fully-agentic §12 exception)
 │   ├── pr_writer.md               Phase 6 PR title + body author worker
@@ -2129,6 +2130,7 @@ judgment/workhorse split once existed and why it no longer applies.
 | pr_reviewer | **opus** | the advisory whole-PR review before the final conformer (DESIGN §9 *An advisory whole-PR review feeds the final conformer*) — read-only judgment, `high` effort. **The one tier exception**: an explicit `MODEL_DEFAULT_PER_WORKER["pr_reviewer"] = "opus"` entry, documented there — bench N2f, 66 calls per arm: opus high 38 verified findings naming no required item, sonnet high 8, sonnet medium 7; 18 opus findings hand-checked, 13 real, 5 plausible, 0 false |
 | contract_extractor | sonnet | types one `external_contract_assumption` risk for the contract-literal check (DESIGN §8 *Typed evidence for the delivery judge*) — no tools needed (`Read` granted, 4 turns), `medium` effort |
 | verifiability_classifier | sonnet | types each required item `in_tree` or `execution` once per run for the delivery ratchet (DESIGN §8 *A repair that regresses met work is rolled back*) — read-only judgment from an empty directory, `medium` effort |
+| forbidden_command_extractor | sonnet | re-draws the classifier's forbidden-command extraction `forbidden_command_samples` (3) times per classify, unioned (DESIGN §9 *A command the task forbids*) — read-only judgment, `medium` effort |
 | delivery_ratchet | sonnet | after a repair that committed, re-verifies the previously met `in_tree` items with their prior evidence and the repair's diff (same section) — read-only judgment, `medium` effort |
 | falsifier | sonnet | on the final tree, tries to prove ONE required item undelivered by writing and running one probe test through a public entry point, in a disposable ref-less checkout; code confirms or discards the claim (DESIGN §8 *Delivery detection*) — acting, `medium` effort |
 
@@ -2141,7 +2143,7 @@ above). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`,
 `artifact_registry`, `task_coverage_judge`, `integration_judge`,
 `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`,
-`acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `contract_extractor`, `falsifier`, `verifiability_classifier` and `delivery_ratchet` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
+`acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `contract_extractor`, `falsifier`, `verifiability_classifier`, `delivery_ratchet` and `forbidden_command_extractor` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
 defaults come from the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
@@ -2155,14 +2157,14 @@ Resolution order for each worker type `W` (highest priority first):
 7. **Per-worker default** from `MODEL_DEFAULT_PER_WORKER`
 8. **Global default `MODEL_DEFAULT`** (`sonnet`)
 
-Thirty-two worker types (`WORKER_TYPES`, plus the global override), each
+Thirty-three worker types (`WORKER_TYPES`, plus the global override), each
 independently overridable via the mechanical pattern `LEERIE_MODEL_<WORKER>` (env) /
 `--model-<worker>` (CLI) / `model_<worker>` (TOML): classifier, planner,
 reconciler, plan_overlap_judge, satisfied_probe, provision, implementer,
 integrator, conformer, fit_judge, splitter, adherence_judge,
 classification_judge, wiring_judge, provision_judge, task_coverage_judge,
 integration_judge, no_work_judge, delivery_judge, defect_scope_auditor,
-artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, pr_reviewer, contract_extractor, falsifier, verifiability_classifier, delivery_ratchet. Global override: `LEERIE_MODEL` / `--model` / `model`.
+artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, pr_reviewer, contract_extractor, falsifier, verifiability_classifier, delivery_ratchet, forbidden_command_extractor. Global override: `LEERIE_MODEL` / `--model` / `model`.
 
 `judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
 workers invoked outside the main orchestrate loop, so they don't follow that
@@ -2228,7 +2230,7 @@ differs:
 
 | Worker       | Default | Notes (where it diverges from the model-table rationale) |
 |--------------|---------|-----|
-| classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge, splitter, adherence_judge, classification_judge, wiring_judge, provision_judge, task_coverage_judge, integration_judge, no_work_judge, delivery_judge, defect_scope_auditor, artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, contract_extractor, falsifier, verifiability_classifier, delivery_ratchet | medium | judgment/finalize workers; `medium` is the reproducibility dial, not a cost one |
+| classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge, splitter, adherence_judge, classification_judge, wiring_judge, provision_judge, task_coverage_judge, integration_judge, no_work_judge, delivery_judge, defect_scope_auditor, artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, contract_extractor, falsifier, verifiability_classifier, delivery_ratchet, forbidden_command_extractor | medium | judgment/finalize workers; `medium` is the reproducibility dial, not a cost one |
 | pr_reviewer | high | the advisory whole-PR review, as benched (bench N2f arm R1, opus high) |
 | implementer, conformer | low | code-writing workers; pinned low for cost/latency — a deliberate override of the prior "bounded by §8 evidence gate" unset default, since the conformer/confidence-gate loops downstream absorb the quality tradeoff |
 | satisfied_probe | unset | per-subtask advisory prune; base-tree-only tool scope + conservative default carry correctness, not pinned depth |
@@ -2241,10 +2243,10 @@ before reintroducing a blanket tier split if a gate regresses under `medium`.
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it per the table above — `"medium"`
-for the thirty judgment/finalize/writer workers (including `acceptance_writer`,
+for the thirty-one judgment/finalize/writer workers (including `acceptance_writer`,
 `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`,
-`contract_extractor`, `falsifier`, `verifiability_classifier` and
-`delivery_ratchet`), `"high"` for `pr_reviewer`,
+`contract_extractor`, `falsifier`, `verifiability_classifier`,
+`delivery_ratchet` and `forbidden_command_extractor`), `"high"` for `pr_reviewer`,
 `"low"` for `implementer` and `conformer` (a distinct, cost-motivated pin
 rather than a judgment-reproducibility one). One fixed exception sits
 outside this resolution: the held-out acceptance gate's repair rounds call
@@ -2270,7 +2272,7 @@ model selection:
 8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
 
 Same mechanical pattern as model selection: `LEERIE_EFFORT_<WORKER>` (env) /
-`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same thirty-two
+`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same thirty-three
 worker names listed above under model selection. Global override:
 `LEERIE_EFFORT` / `--effort` / `effort`.
 
@@ -2871,7 +2873,7 @@ a container.
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → every worker defaults to `sonnet`, except `pr_reviewer` → `opus`. |
-| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ every `WORKER_TYPES` entry: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`, `integration_judge`, `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `pr_reviewer`, `contract_extractor`, `falsifier`, `verifiability_classifier`, `delivery_ratchet`. Unset → every worker → `sonnet`, except `pr_reviewer` → `opus`. |
+| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ every `WORKER_TYPES` entry: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`, `integration_judge`, `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `pr_reviewer`, `contract_extractor`, `falsifier`, `verifiability_classifier`, `delivery_ratchet`, `forbidden_command_extractor`. Unset → every worker → `sonnet`, except `pr_reviewer` → `opus`. |
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, implementer/conformer `low`, `pr_reviewer` `high`, everything else inherits Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `medium`; `pr_reviewer` `high`; implementer/conformer `low`; `satisfied_probe` unset. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
@@ -2957,7 +2959,7 @@ validation contract.
 
 ### Worker types
 
-Leerie spawns the thirty-two `claude -p` worker types in `WORKER_TYPES`.
+Leerie spawns the thirty-three `claude -p` worker types in `WORKER_TYPES`.
 Each is a separate subprocess; there is no in-session agent nesting. (The
 table predates `task_coverage_judge`, `integration_judge` and `rebaser`,
 which are specified in their own sections.)
@@ -2986,7 +2988,7 @@ which are specified in their own sections.)
 | `contract_extractor` | `prompts/contract_extractor.md` | sonnet | 0 or 1 per `external_contract_assumption` risk on `risk_register` (phase 5, `_extract_contract_literals`, after integration; cached by `<sid>#<index>`) | `{counterpart_sid: string\|null, literal: string\|null, literal_kind: string_value\|identifier\|route_path\|other, symbol: string\|null}` — `Read`, 4 turns, never autonomous (DESIGN §8 *Typed evidence for the delivery judge*) |
 | `falsifier` | `prompts/falsifier.md` | sonnet | 0, or up to `falsifier_samples` (3) per judge-bound required item — never an `external` or `untouched_paths` item — plus at most one re-ask per sample (phase 5, `_run_delivery_detection` → `_falsify_items`, after the held-out acceptance gate; samples of one item run in order and stop at the first confirmed; 0 when there is no scoped test runner, the final tree's dependencies do not install, or `_ts_resolvable` loads no TypeScript compiler API, from the tree or the bundled copy) | `{verdict: unmet_demonstrated \| could_not_demonstrate, probe_path, case_name, assertion_quote, item_span_quote, entry_point, reason}` — acting (`ACT_TOOLS`, 80 turns, `--dangerously-skip-permissions`) in a ref-less checkout of the final commit (`falsifier-lane<n>`); facts only — `_falsifier_gates` decides |
 | `verifiability_classifier` | `prompts/verifiability_classifier.md` | sonnet | 0 or 1 per run (phase 5, `_ratchet_verifiability`, at the first delivery ratchet with a previously met item not settled in code; a failed call is not cached and is retried at the next ratchet) | `{items[{item_index, verifiability: in_tree\|execution, reason}]}` — read-only (`SATISFIED_PROBE_TOOLS`, `RATCHET_CLASSIFIER_MAX_TURNS` = 6) from an empty `<run_dir>/verifiability-classifier/`; cached in `delivery_ratchet.verifiability` |
-| `delivery_ratchet` | `prompts/delivery_judge.md` + `prompts/delivery_ratchet.md` | sonnet | per acceptance-repair round or delivery re-drive group that committed and survived its own rules, with a previously met `in_tree` item: 1 per pack (`_d1_judge_packs`), 3 when sample 1 flags an item or an item's `evidence_files` meet the diff (`_ratchet_judge`) | the delivery judge's verdicts plus `evidence_files[]`; read-only (`SATISFIED_PROBE_TOOLS`, `min(30 + 6×pack, 90)` turns) in staging |
+| `forbidden_command_extractor` | `prompts/forbidden_command_extractor.md` | sonnet | `forbidden_command_samples` (3) per `phase_classify` call, concurrent with the classifier (`asyncio.gather`); a crashed sample is no vote and is not redrawn, budget exhaustion propagates | `{forbidden_commands[{command, evidence_quote, scope: any\|whole_suite}]}` — read-only (`SATISFIED_PROBE_TOOLS`, `FORBID_EXTRACTOR_MAX_TURNS` = 8) from `_judgment_cwd`; user prompt `_forbidden_extractor_prompt(sources, units, repo_root)`: the task and each referenced report verbatim, plus `resolve_blt(repo_root)["test"]`. In `NOTICE_FREE_WORKERS`. DESIGN §9 *A command the task forbids* || `delivery_ratchet` | `prompts/delivery_judge.md` + `prompts/delivery_ratchet.md` | sonnet | per acceptance-repair round or delivery re-drive group that committed and survived its own rules, with a previously met `in_tree` item: 1 per pack (`_d1_judge_packs`), 3 when sample 1 flags an item or an item's `evidence_files` meet the diff (`_ratchet_judge`) | the delivery judge's verdicts plus `evidence_files[]`; read-only (`SATISFIED_PROBE_TOOLS`, `min(30 + 6×pack, 90)` turns) in staging |
 | `surrogate_fixer` | `prompts/surrogate_fixer.md` | sonnet | 0 or 1 per acceptance gate (only when a set still fails after the repair rounds and neither M1/M2 nor the set audit fired) | `{summary, files_changed[]}` — acting (`ACT_TOOLS`, 150 turns, autonomous) in a ref-less clone of the own start; never sees a set (`_acceptance_read_denials`) |
 | `ci_checks` | `prompts/ci_checks.md` | sonnet | 0 or 1 per run (phase 4, `_capture_ci_parity_baseline`; only when a file matching `CI_CONFIG_GLOBS` exists on the base, and not under `skip_base_baseline`) | `{checks[{id, kind, argv, cwd, env[{name, value}], prerequisites[{argv, cwd}], trigger[], path_filters[], requires[], strict_argv[], source{file, job, step}, coverage{summary_path, config_file, thresholds[{glob, metric, min}]}, notes}], excluded[{file, job, reason}]}` — read-only (`INSPECT_TOOLS`, 40 turns) on the staging base tree; code checks provenance and selects (see *CI parity* below) |
 | `integrator` | `prompts/integrator.md` | sonnet | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
@@ -5116,7 +5118,13 @@ scope}]}` (`scope` is `any` or `whole_suite`). `phase_classify` persists
 `state.data["process_constraints"]`. `sources` is the raw task text plus
 each referenced report (`units["sections"]` rejoined per report). It is
 never the classifier's prompt, so text leerie appended there cannot
-qualify. `NOTICE_FREE_WORKERS = {"classifier"}`: `claude_p` appends no
+qualify. The classifier's entries are unioned with
+`forbidden_command_samples` (3) `forbidden_command_extractor` draws taken
+beside it (`_forbidden_draw_union(result, samples) -> (union, {draws,
+crashed, votes})`, classifier first, so its entry wins a scope tie); the
+quote check alone decides what is kept, each kept entry carries `votes`
+(draws that typed it) and the record `draws{draws, crashed}`.
+`NOTICE_FREE_WORKERS = {"classifier", "forbidden_command_extractor"}`: `claude_p` appends no
 `NOTE FROM ORCHESTRATOR:` (whole-suite, forbidden-command, process-kill,
 database-reset) to such a worker. Its deny rules and hook still apply.
 The gate lives in `_worker_guard` (`worker=schema_key`), so it binds every
@@ -5264,6 +5272,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | acceptance rewrite rounds (`acceptance_rewrite_rounds`) | 1 | per-set counter (`acceptance.sets[].rewrite_rounds`): at most this many rewrites of a held-out set still failing after the repair rounds, whatever triggered it (M1/M2, the set audit, the surrogate witness); bumped and saved before the writer runs, so a resume never repeats one. Also bounds the writer's own-start retry when no defect case fails (`_write_acceptance_set`). |
 | set-audit samples (`set_audit_samples`) | 3 | independent `set_auditor` samples per audit; the verdict is the union of their quote-verified `set_defect` cases (DESIGN §8). |
 | defect-scope applicability samples (`applicability_samples`) | 3 | `phase_defect_scope_audit` honours `applicable: false` only when this many independent `defect_scope_auditor` samples all say so; the first `applicable: true` sample is used. A crashed sample is no vote, drawn again within `applicability_samples + 2` attempts in all; if the votes run out first, false stands on the votes cast (DESIGN §5). |
+| forbidden-command samples (`forbidden_command_samples`) | 3 | `forbidden_command_extractor` draws per `phase_classify`, run beside the classifier; the persisted list is the union of the classifier's and every sample's entries that pass the quote check (`_forbidden_draw_union` → `_process_constraints`). 0 leaves the classifier's draw alone. |
 | delivery-judge pack size (`d1_pack_items`) | 20 | `_d1_judge_packs` packs root-ancestor item groups into one `delivery_judge` prompt while the pack stays within this many items; a single group larger than `D1_GROUP_CHUNK` (30, a code constant) is cut into chunks of 30 and each chunk is its own prompt (DESIGN §8 *Grouped judging at coverage item counts*). Not an escalation: it sizes prompts, and every judge-bound item lands in exactly one pack. Bench Q7/D1 arm (c). |
 | falsifier samples (`falsifier_samples`) | 3 | independent `falsifier` samples per judge-bound required item in final delivery detection (DESIGN §8 *Delivery detection*); the item is unmet when any one is confirmed by `_falsifier_gates`. One item's samples run in order and stop at the first confirm; 0 disables the falsifier. |
 | integration repair rounds (`integration_repair_rounds`) | 2 | `_run_integration_judge_gate` re-drives the integrator on a committed merge the `integration_judge` rejected at most this many rounds per subtask — its own counter, `integration_gate[sid].repair_rounds`, persisted before each round; never drawn from `redrive_rounds[sid]` (DESIGN §13: a merge defect of finished work, not unfinished work) — each charging its wall time to `redrive_spent_sec` and run only while `_redrive_time_left`; spent (or the run's re-drive time spent first) → the merge is backed out (`git reset --hard <merge>^1`) and the subtask settles `unconverged` (`kind: integration_backed_out`) — DESIGN §6 *When integration cannot succeed*. Persisted as `integration_gate[sid].repair_rounds`. |
@@ -9644,7 +9653,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}`, plus `via` (the accepted-external predecessors) for a dependent settled without running — for a subtask settled `accepted_external` on an implementer's `external_precondition` or as such a dependent (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). A third source, `"regression_check"` (`{source, detail}`, at most one), comes from `_set_regression_gap`: the task forbids the test command, and its scoped replacement could not run on the latest measured tree. A fourth, `"test_outcome"` (`{source, detail}`, at most one), from `_set_test_outcome_gap`: required items decided by the failing-test-ID diff whose verdict was `unknown` at final delivery detection. |
 | `site_claims` | dict \| null | the site-claims record (DESIGN §5 *Every `fix` site is claimed*), written by `phase_plan` from the first-pass `bug-fixing` plan and rewritten over its leaves after decomposition: `{domain, sites[{site_id, file, symbol, auditor_kind, resolution, claims[{sid, kinds[]}], not_needed, status, surface_other}]}`, `status` one of `claimed`/`mismatch`/`not_needed`/`unclaimed` (`_site_claim_rows`); `surface_other` marks a site resting on an `other` kind, for the PR. Not written when there is no `bug-fixing` plan or the audit is inapplicable. Never gates. |
 | `domain_blocked` | list[dict] | every planner domain that exited `blocked`, `[{domain, blocker_kind, external_resource, gap}]` (`_settle_blocked_domains`; DESIGN §8 *A partially blocked plan is recorded*). Written after planning and again before scheduling; `[]` when none. A row typed `external_precondition` stops the run before execution. |
-| `process_constraints` | dict | the classifier's typed process constraints (DESIGN §9 *A command the task forbids*): `{forbidden_commands[], entries[{command, scope, evidence_quote, test_roots?}], dropped[{command, reason, evidence_quote}]}` from `_process_constraints`. A state written before scopes existed carries `{forbidden_commands[], evidence}`; `_forbidden_specs` reads that as `scope: "any"`. Read by `claude_p` (deny rules, notice, hook), `_measure_axes`, the plan strip and the planner ctx. |
+| `process_constraints` | dict | the classifier's typed process constraints (DESIGN §9 *A command the task forbids*): `{forbidden_commands[], entries[{command, scope, evidence_quote, test_roots?, votes}], dropped[{command, reason, evidence_quote}], draws{draws, crashed}}` from `_process_constraints` over the union of the classifier's and the `forbidden_command_extractor` samples' entries. A state written before scopes existed carries `{forbidden_commands[], evidence}`; `_forbidden_specs` reads that as `scope: "any"`. Read by `claude_p` (deny rules, notice, hook), `_measure_axes`, the plan strip and the planner ctx. |
 
 
 `pending-questions.json` (written by `gather_answers` on non-TTY exit, read by
@@ -9887,6 +9896,10 @@ Required fields, current shape:
   `could_not_demonstrate`), `probe_path`, `case_name`, `assertion_quote`,
   `item_span_quote`, `entry_point`, `reason` (strings, `""` when none).
   Facts only; `_falsifier_gates` decides.
+- **forbidden_command_extractor** — required: `forbidden_commands[]`, the
+  same `_FORBIDDEN_COMMANDS_ARRAY_SCHEMA` the classifier's
+  `process_constraints.forbidden_commands` uses (`{command, evidence_quote,
+  scope: any|whole_suite}`, all required).
 - **verifiability_classifier** — required: `items[]`, each `{item_index,
   verifiability: in_tree|execution (RATCHET_VERIFIABILITY), reason}`
   (`additionalProperties: false` at both levels).
@@ -10054,6 +10067,7 @@ ever spawned without one, and no prompt is shared between call types.
 | `contract_extractor` | `prompts/contract_extractor.md` | types a worker-flagged contract (DESIGN §8 *Typed evidence for the delivery judge*) |
 | `falsifier` | `prompts/falsifier.md` | execution-backed delivery detection (DESIGN §8 *Delivery detection*) |
 | `verifiability_classifier` | `prompts/verifiability_classifier.md` | in_tree / execution typing for the delivery ratchet (DESIGN §8 *A repair that regresses met work is rolled back*) |
+| `forbidden_command_extractor` | `prompts/forbidden_command_extractor.md` | re-draws the commands the task forbids running, for the union with the classifier's (DESIGN §9 *A command the task forbids*) |
 | `delivery_ratchet` | `prompts/delivery_ratchet.md` | appended to `prompts/delivery_judge.md`: re-verifying met items after a repair (same section) |
 | `pr_writer`      | `prompts/pr_writer.md` | invoked by `phase_finalize` when `push_will_happen` is true |
 | `dep_capture`    | `prompts/dep_capture.md` | post-run dependency-capture worker (DESIGN §6½) |

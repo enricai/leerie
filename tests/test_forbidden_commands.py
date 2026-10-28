@@ -192,6 +192,98 @@ def test_phase_classify_persists_them(leerie, tmp_path, monkeypatch, extra,
     assert [e["command"] for e in pc["entries"]] == commands
 
 
+# === several draws, unioned (DESIGN §9 "Several draws, unioned") ==========
+
+def test_draw_union_counts_votes_and_crashes(leerie):
+    res = {"process_constraints": {"forbidden_commands": [
+        _fc("pnpm  test", "q1")]}}
+    samples = [{"forbidden_commands": [_fc("pnpm test", "q1"),
+                                       _fc("prisma db push", "q2")]},
+               None,
+               {"forbidden_commands": [_fc("pnpm test", "q1"),
+                                       _fc("pnpm test", "q1")]}]
+    union, rec = leerie._forbidden_draw_union(res, samples)
+    assert [e["command"] for e in
+            union["process_constraints"]["forbidden_commands"]] == [
+        "pnpm  test", "pnpm test", "prisma db push", "pnpm test",
+        "pnpm test"]
+    # One vote per draw that typed it, however often it repeats there.
+    assert rec == {"draws": 3, "crashed": 1,
+                   "votes": {"pnpm test": 3, "prisma db push": 1}}
+
+
+FORBID_TASK = ("Fix the selector. But, don't run the full test suite "
+               "unnecessarily as part of any validation.")
+
+
+def _classify_with_samples(leerie, tmp_path, monkeypatch, samples,
+                           caps_over=None):
+    from tests.stub_helpers import _d1_covered
+    from tests.test_phase_classify_satisfied_or_preserve import (
+        EFFORTS, MODELS, _caps, _minimal_state)
+    st = _minimal_state(leerie, tmp_path)
+    calls: list[dict] = []
+    draws = iter(samples)
+
+    async def fake_claude_p(**kw):
+        calls.append(kw)
+        if kw["schema_key"] == "forbidden_command_extractor":
+            got = next(draws)
+            if isinstance(got, Exception):
+                raise got
+            return got
+        # The classifier's own draw types nothing (barnacle pass 1).
+        return {**_d1_covered(), "categories": ["bug-fixing"],
+                "process_constraints": {"forbidden_commands": []}}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    caps = {**_caps(leerie), **(caps_over or {})}
+    asyncio.run(leerie.phase_classify(FORBID_TASK, st, caps, False, MODELS,
+                                      EFFORTS))
+    return st, calls
+
+
+def test_a_forbid_one_sample_types_is_kept_and_an_invented_one_dropped(
+        leerie, tmp_path, monkeypatch):
+    """Executed through the real `phase_classify`: the classifier misses
+    the forbid, one extractor sample types it with a verbatim quote, one
+    invents a forbid quoting text the task does not contain, one crashes.
+    The union keeps the quoted one only."""
+    quote = "don't run the full test suite unnecessarily"
+    st, calls = _classify_with_samples(leerie, tmp_path, monkeypatch, [
+        {"forbidden_commands": [_fc("pnpm run test", quote,
+                                    "whole_suite")]},
+        {"forbidden_commands": [_fc("prisma db push",
+                                    "never touch the database")]},
+        leerie.WorkerError("boom")])
+    ext = [c for c in calls
+           if c["schema_key"] == "forbidden_command_extractor"]
+    assert len(ext) == 3
+    assert FORBID_TASK in ext[0]["user_prompt"]
+    assert ext[0]["autonomous"] is False
+    pc = st.data["process_constraints"]
+    assert pc["forbidden_commands"] == ["pnpm run test"]
+    (entry,) = pc["entries"]
+    assert entry["scope"] == "whole_suite" and entry["votes"] == 1
+    assert [d["command"] for d in pc["dropped"]] == ["prisma db push"]
+    assert pc["draws"] == {"draws": 3, "crashed": 1}
+
+
+def test_zero_samples_leaves_the_classifier_draw_alone(
+        leerie, tmp_path, monkeypatch):
+    st, calls = _classify_with_samples(
+        leerie, tmp_path, monkeypatch, [],
+        caps_over={"forbidden_command_samples": 0})
+    assert not [c for c in calls
+                if c["schema_key"] == "forbidden_command_extractor"]
+    assert st.data["process_constraints"]["forbidden_commands"] == []
+
+
+def test_extractor_gets_no_orchestrator_notice(leerie):
+    assert "forbidden_command_extractor" in leerie.NOTICE_FREE_WORKERS
+    assert "forbidden_command_extractor" in leerie.PLANNING_WORKER_TYPES
+
+
 # === deny rules =============================================================
 
 def test_rule_patterns_and_denials(leerie):

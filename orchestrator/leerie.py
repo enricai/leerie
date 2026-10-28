@@ -301,6 +301,12 @@ DEFAULT_CAPS = {
     # audits): one sample said false on 8, the 3/3 rule on 3; 0/5 correct
     # falses on not-needed tasks turned true.
     "applicability_samples": 3,
+    # Independent draws of the forbidden-command extraction (DESIGN §9 *A
+    # command the task forbids*, "Several draws, unioned"): one classifier
+    # draw typed the barnacle 45fa4253 forbid in 1 of 5 runs. The kept list
+    # is the union of the quote-checked entries of the classifier and these
+    # samples; 0 leaves the classifier's draw alone.
+    "forbidden_command_samples": 3,
     # Delivery-judge pack size (DESIGN §8 *Grouped judging at coverage item
     # counts*): root-ancestor item groups are packed into one prompt while
     # the pack stays within this many items. Bench Q7/D1 arm (c): real
@@ -1857,6 +1863,10 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
     "verifiability_classifier": "medium",
     "delivery_ratchet": "medium",
+    # Re-draws the classifier's forbidden-command extraction (DESIGN §9 *A
+    # command the task forbids*). Judgment tier; absent from
+    # TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
+    "forbidden_command_extractor": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1990,7 +2000,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "defect_scope_auditor", "rebaser", "acceptance_writer",
                 "set_auditor", "surrogate_fixer", "ci_checks",
                 "scope_judge", "pr_reviewer", "contract_extractor",
-                "falsifier", "verifiability_classifier", "delivery_ratchet")
+                "falsifier", "verifiability_classifier", "delivery_ratchet",
+                "forbidden_command_extractor")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -2019,6 +2030,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "delivery_judge", "defect_scope_auditor", "set_auditor", "ci_checks",
     "scope_judge", "pr_reviewer", "contract_extractor",
     "verifiability_classifier", "delivery_ratchet",
+    "forbidden_command_extractor",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2646,7 +2658,30 @@ CI_COVERAGE_METRICS = ("lines", "branches", "functions", "statements")
 # (DESIGN §8 *A test outcome is the failing-test-ID diff's to settle*).
 TEST_OUTCOME_CHECKS = ["test_id_diff"]
 
+# One forbidden-command entry list, typed by the classifier and by the
+# forbidden-command extractor alike (DESIGN §9 *A command the task forbids*).
+_FORBIDDEN_COMMANDS_ARRAY_SCHEMA: dict = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "required": ["command", "evidence_quote", "scope"],
+        "properties": {
+            "command": {"type": "string"},
+            "evidence_quote": {"type": "string"},
+            "scope": {"type": "string", "enum": ["any", "whole_suite"]},
+        },
+    },
+}
+
 SCHEMAS: dict[str, dict] = {
+    "forbidden_command_extractor": {
+        "type": "object",
+        "required": ["forbidden_commands"],
+        "properties": {
+            "forbidden_commands": copy.deepcopy(
+                _FORBIDDEN_COMMANDS_ARRAY_SCHEMA),
+        },
+    },
     "classifier": {
         "type": "object",
         "required": ["categories", "span_dispositions", "section_roles",
@@ -2661,20 +2696,8 @@ SCHEMAS: dict[str, dict] = {
                 "type": "object",
                 "required": ["forbidden_commands"],
                 "properties": {
-                    "forbidden_commands": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "required": ["command", "evidence_quote",
-                                         "scope"],
-                            "properties": {
-                                "command": {"type": "string"},
-                                "evidence_quote": {"type": "string"},
-                                "scope": {"type": "string",
-                                          "enum": ["any", "whole_suite"]},
-                            },
-                        },
-                    },
+                    "forbidden_commands": copy.deepcopy(
+                        _FORBIDDEN_COMMANDS_ARRAY_SCHEMA),
                 },
             },
         },
@@ -22332,7 +22355,7 @@ FORBIDDEN_COMMANDS_NOTICE = (
 # Workers that type constraints from the task text: no `NOTE FROM
 # ORCHESTRATOR:` is appended to their prompt, so none can come back as a
 # constraint of the task (DESIGN §9 *A command the task forbids*).
-NOTICE_FREE_WORKERS = frozenset({"classifier"})
+NOTICE_FREE_WORKERS = frozenset({"classifier", "forbidden_command_extractor"})
 
 FORBIDDEN_WHOLE_SUITE_NOTICE = (
     "this task forbids running the whole test suite ({cmds}). A whole-suite "
@@ -23176,6 +23199,45 @@ def _process_constraints(result: dict, prescribed: dict | None,
         entries.append(entry)
     return {"forbidden_commands": [x["command"] for x in entries],
             "entries": entries, "dropped": dropped}
+
+
+def _forbidden_draw_union(result: dict,
+                          samples: list[dict | None]) -> tuple[dict, dict]:
+    """The union of every draw's forbidden-command entries (DESIGN §9 *A
+    command the task forbids*, "Several draws, unioned"): the classifier's
+    `process_constraints.forbidden_commands`, then each extractor sample's
+    `forbidden_commands`, in that order — a classifier-shaped result for
+    `_process_constraints`, whose quote check alone decides what is kept —
+    and `{draws, crashed, votes{command: draws that typed it}}`. A None
+    sample crashed: no vote."""
+    pc = result.get("process_constraints") if isinstance(result, dict) else None
+    lists = [pc.get("forbidden_commands") if isinstance(pc, dict) else None]
+    crashed = 0
+    for smp in samples:
+        if isinstance(smp, dict):
+            lists.append(smp.get("forbidden_commands"))
+        else:
+            crashed += 1
+    merged: list = []
+    votes: dict[str, int] = {}
+    for ents in lists:
+        seen: set[str] = set()
+        for e in ents if isinstance(ents, list) else []:
+            if not isinstance(e, dict) or not isinstance(e.get("command"),
+                                                         str):
+                continue
+            c = " ".join(e["command"].split())
+            if c and c not in seen:
+                seen.add(c)
+                votes[c] = votes.get(c, 0) + 1
+            merged.append(e)
+    return ({"process_constraints": {"forbidden_commands": merged}},
+            {"draws": len(lists), "crashed": crashed, "votes": votes})
+
+
+# The extractor needs the task and, for a whole-suite forbid, the repo's
+# test command — a quick read, not an inspection.
+FORBID_EXTRACTOR_MAX_TURNS = 8
 
 
 def _forbidden_commands(data: object) -> list[str]:
@@ -26187,6 +26249,26 @@ def _d1_untouched_verdict(cwd: str | Path, own_start: str | None,
     return {"met": not files, "files": files}
 
 
+def _forbidden_extractor_prompt(sources: list[str], units: dict,
+                                repo_root: Path) -> str:
+    """The forbidden-command extractor's user prompt: the task and the
+    reports it references verbatim (the texts the quote check reads), and
+    the repo's resolved test command, which a whole-suite forbid names."""
+    try:
+        test_cmd = (resolve_blt(repo_root) or {}).get("test") or ""
+    except Exception:
+        test_cmd = ""
+    parts = ["TASK (verbatim):\n\n" + sources[0]]
+    for rel, text in zip(units.get("reports") or [], sources[1:]):
+        parts.append(f"REPORT REFERENCED BY THE TASK ({rel}, verbatim):"
+                     f"\n\n{text}")
+    parts.append("REPO TEST COMMAND (resolved by the orchestrator): "
+                 + (f"`{test_cmd}`" if test_cmd else "(none resolved)"))
+    parts.append("Return every command the task forbids running, per your "
+                 "schema.")
+    return "\n\n".join(parts)
+
+
 async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
                          models: dict[str, str],
                          efforts: dict[str, str | None],
@@ -26249,13 +26331,51 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
             user_prompt_parts.append(fb)
         return {}
 
-    result, gate_warnings = await _run_checked_loop(
-        invoke=_invoke,
-        check=_check,
-        name="classifier",
-        max_rounds=caps["judgment_check_rounds"],
-        make_feedback_prompt=_on_feedback,
-    )
+    # The quote check reads the task and its referenced reports only — the
+    # texts the classifier was shown under TASK, never anything leerie
+    # appended to its prompt.
+    quote_sources = [task] + ["\n".join(s_["text"] for s_ in units["sections"]
+                                        if s_["source"] == rel)
+                              for rel in units["reports"]]
+    forbid_prompt = _forbidden_extractor_prompt(quote_sources, units,
+                                                repo_root)
+
+    async def _forbid_draw(i: int) -> dict | None:
+        try:
+            st.bump_workers(caps)
+            return await claude_p(
+                user_prompt=forbid_prompt,
+                system_prompt=_load_prompt("forbidden_command_extractor"),
+                schema_key="forbidden_command_extractor",
+                cwd=_judgment_cwd(st), allowed_tools=SATISFIED_PROBE_TOOLS,
+                max_turns=FORBID_EXTRACTOR_MAX_TURNS, autonomous=False,
+                caps=caps, st=st,
+                model=models.get("forbidden_command_extractor",
+                                 MODEL_DEFAULT),
+                effort=efforts.get("forbidden_command_extractor"),
+                sid=f"forbidden_command_extractor-{i}")
+        except (WorkerError, subprocess.TimeoutExpired) as e:
+            # Budget exhaustion stops the run, as everywhere else.
+            if (isinstance(e, WorkerError)
+                    and int(st.data.get("worker_count") or 0)
+                    > int(caps["max_total_workers"])):
+                raise
+            log(f"  forbidden-command sample {i} crashed "
+                f"({_brief_worker_exc(e)}) — no vote")
+            return None
+
+    n_forbid = int(caps.get("forbidden_command_samples",
+                            DEFAULT_CAPS["forbidden_command_samples"]))
+    # The samples run beside the classifier: no wall time added.
+    (result, gate_warnings), *forbid_samples = await asyncio.gather(
+        _run_checked_loop(
+            invoke=_invoke,
+            check=_check,
+            name="classifier",
+            max_rounds=caps["judgment_check_rounds"],
+            make_feedback_prompt=_on_feedback,
+        ),
+        *(_forbid_draw(i + 1) for i in range(max(0, n_forbid))))
     # Log the check-loop warnings BEFORE any die(): they carry the only
     # record of *why* the worker failed (`_run_checked_loop` stores the
     # underlying exception text there). die() calls sys.exit(), so a
@@ -26272,15 +26392,17 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["classifier_questions"] = questions
     st.data["needs_source_of_truth"] = bool(result.get("source_of_truth_question"))
     st.data["prescribed_procedure"] = result.get("prescribed_procedure") or {}
-    # The quote check reads the task and its referenced reports only — the
-    # texts the classifier was shown under TASK, never anything leerie
-    # appended to its prompt.
-    st.data["process_constraints"] = _process_constraints(
-        result, st.data["prescribed_procedure"],
-        sources=[task] + ["\n".join(s_["text"] for s_ in units["sections"]
-                                     if s_["source"] == rel)
-                          for rel in units["reports"]],
+    # Union of the classifier's draw and the extractor samples; the quote
+    # check alone decides what is kept (DESIGN §9 *A command the task
+    # forbids*, "Several draws, unioned").
+    union, draws = _forbidden_draw_union(result, forbid_samples)
+    pc_rec = _process_constraints(
+        union, st.data["prescribed_procedure"], sources=quote_sources,
         repo_root=repo_root)
+    for e in pc_rec["entries"]:
+        e["votes"] = draws["votes"].get(e["command"], 0)
+    pc_rec["draws"] = {"draws": draws["draws"], "crashed": draws["crashed"]}
+    st.data["process_constraints"] = pc_rec
     if _forbidden_commands(st.data):
         log("  task forbids: " + ", ".join(_forbidden_commands(st.data)))
     items = [it for it in result.get("required_items") or []

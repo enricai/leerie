@@ -33,7 +33,7 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer",
            "ci_checks", "scope_judge", "pr_reviewer",
            "contract_extractor", "falsifier", "verifiability_classifier",
-           "delivery_ratchet")
+           "delivery_ratchet", "forbidden_command_extractor")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -81,6 +81,8 @@ DEFAULTS = {
     # The delivery ratchet's two workers: MODEL_DEFAULT.
     "verifiability_classifier": "sonnet",
     "delivery_ratchet": "sonnet",
+    # The forbidden-command extractor (DESIGN §9): MODEL_DEFAULT.
+    "forbidden_command_extractor": "sonnet",
 }
 
 

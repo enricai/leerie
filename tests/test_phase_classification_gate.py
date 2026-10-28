@@ -552,6 +552,8 @@ def test_judge_confirmed_prevents_same_work_risk_from_stripping_within_classify(
     calls = {"n": 0}
 
     async def stub(**kwargs):
+        if kwargs.get("schema_key") == "forbidden_command_extractor":
+            return {"forbidden_commands": []}
         calls["n"] += 1
         # Classifier keeps proposing the same pair every round — it has no
         # reason to change since it isn't given the judge's confirmation

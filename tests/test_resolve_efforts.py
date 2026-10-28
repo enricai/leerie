@@ -306,6 +306,9 @@ def test_judgment_workers_pinned_set(leerie):
         # that regresses met work is rolled back*), benched at medium (Q4).
         "verifiability_classifier",
         "delivery_ratchet",
+        # Re-draws the forbidden-command extraction (DESIGN §9 *A command
+        # the task forbids*): the judgment tier's medium.
+        "forbidden_command_extractor",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'
