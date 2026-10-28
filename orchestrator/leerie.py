@@ -34671,6 +34671,14 @@ _PYTEST_SELECTING_OPTS = frozenset({
     "-k", "-m", "--deselect", "--lf", "--last-failed", "--ff",
     "--failed-first", "--nf", "--new-first", "--sw", "--stepwise",
     "--sw-skip", "--stepwise-skip", "--pyargs", "--trace", "--pdb"})
+# pytest options that judge the whole suite, so a scoped template drops
+# them: a set is one file and is judged by exit code, so a coverage or
+# warning-count threshold set for the suite turns a passing set red, and
+# a junit report written into the tree is read by nobody (review r2 L1).
+# `--cov*` options are dropped by prefix (`_scoped_pytest_template`).
+_PYTEST_SUITE_LEVEL_OPTS = frozenset({
+    "--cov-fail-under", "--max-warnings", "--junitxml", "--junit-xml",
+    "--junitprefix", "--junit-prefix"})
 _PYTHON_BIN_RE = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)*)?")
 
 
@@ -34758,9 +34766,12 @@ def _scoped_pytest_template(head: list[str], rest: list[str]
     replace them, so the suite is never run beside them. A node id
     (`a.py::t`), a selecting option (`-k`, `--lf`, …) or a word after an
     unknown long option (which may be that option's value) leaves it not
-    bare."""
+    bare. Suite-level options are dropped (`_PYTEST_SUITE_LEVEL_OPTS`, and
+    every `--cov*` option, then one `--no-cov`): a set is judged by exit
+    code, and one file is below any threshold set for the suite."""
     vals = _PYTEST_VALUE_OPTS
     keep: list[str] = []
+    dropped_cov = False
     i = 0
     while i < len(rest):
         a = rest[i]
@@ -34772,11 +34783,17 @@ def _scoped_pytest_template(head: list[str], rest: list[str]
         if a == "--":
             return None, "no_scoped_runner:not a bare pytest command"
         if a.startswith("-"):
-            keep.append(a)
-            if a in vals and i + 1 < len(rest):
-                keep.append(rest[i + 1])
-                i += 1
-            i += 1
+            # argparse never takes an option-shaped word (other than a
+            # negative number) as a value, and `--cov` only optionally
+            # takes one.
+            took = (a in vals and i + 1 < len(rest)
+                    and not (rest[i + 1].startswith("-")
+                             and not rest[i + 1][1:2].isdigit()))
+            cov = name.startswith("--cov")
+            if not (cov or name in _PYTEST_SUITE_LEVEL_OPTS):
+                keep.extend(rest[i:i + 1 + took])
+            dropped_cov = dropped_cov or cov
+            i += 1 + took
             continue
         prev = rest[i - 1] if i else ""
         if "::" in a or (prev.startswith("--") and "=" not in prev
@@ -34784,6 +34801,10 @@ def _scoped_pytest_template(head: list[str], rest: list[str]
                          and prev not in _PYTEST_LONG_FLAGS):
             return None, "no_scoped_runner:not a bare pytest command"
         i += 1                       # a path positional: replaced
+    if dropped_cov and "--no-cov" not in keep:
+        # pytest-cov is installed (the command used it): `--no-cov` also
+        # turns off a `fail_under` its config file sets.
+        keep.append("--no-cov")
     return shlex.join([*head, *keep]) + " {test_files}", "pytest"
 
 

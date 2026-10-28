@@ -7875,7 +7875,19 @@ does; which pytest options take a value is one table derived from real
 pytest 9's parser with its common plugins, not written by hand — a
 hand-written one listed the flag `--cov-branch` as value-taking, so
 `pytest --cov=src --cov-branch tests` kept `tests` as the option's
-"value" and ran the whole suite beside every set), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
+"value" and ran the whole suite beside every set; and a suite-level
+threshold is dropped from it, because a set is judged by exit code and
+one file of tests is below any threshold set for the whole suite —
+`--cov-fail-under` and `--max-warnings`, the junit report options whose
+file nobody reads, and, when the command shows pytest-cov is installed
+(any `--cov` option), every coverage option, replaced by `--no-cov`,
+which also disables a `fail_under` the coverage config sets. Measured
+with pytest 9.2 and pytest-cov 7.1: `--cov=src --cov-fail-under=90` over
+one passing file exits 1 with every case passing, as does `--cov=src`
+under a `.coveragerc` `fail_under = 90`, and `--no-cov` over the same
+file exits 0. A threshold reached only through the repo's own `addopts`
+is not seen — the command does not say pytest-cov is there, so
+`--no-cov` could be an unknown option), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
 minitest's `rails test` take `{test_files}` as written; `rake test`, which
 takes one path, becomes a `ruby -Itest -Ilib` loader over `{test_files}`;
 `go test` takes the test files' packages (`{test_packages}`, with a
