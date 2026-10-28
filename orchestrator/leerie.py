@@ -43127,6 +43127,117 @@ def _verify_set_audit_case(case: dict, *, set_texts: dict[str, str],
     return bad
 
 
+# A test block's opening in a set file: `it("title"`, `test.only('title'`,
+# `def test_name(` — program text, a mechanical string (DESIGN §12).
+_AUDIT_JS_BLOCK_RE = re.compile(
+    r"""\b(?:it|test)(?:\.\w+)*\(\s*(["'`])((?:\\.|(?!\1).)*)\1""")
+_AUDIT_PY_BLOCK_RE = re.compile(r"^(\s*)(?:async\s+)?def\s+(\w+)\s*\(",
+                                re.MULTILINE)
+_AUDIT_ASSERT_RE = re.compile(r"\bexpect\s*\(|\bassert\b|\.assert\w*\(")
+
+
+def _audit_case_key(set_: dict, rel: str, case_id: str,
+                    graph: dict) -> dict | None:
+    """The assertion key of one failing case (DESIGN §8 *Identical
+    assertions get one verdict*): `{key, assertion, target}`, where
+    `assertion` is the case's own test block's assertion statements, each
+    whitespace-collapsed, and `target` the repository modules the set file
+    imports. The block is found by the case's title (the longest `it`/`test`
+    title the case ID ends with) or test function name. None when the file
+    is unreadable or no block or assertion is found."""
+    try:
+        text = (Path(set_["dir"]) / rel).read_text(errors="replace")
+    except (OSError, KeyError, TypeError):
+        return None
+    name = case_id.split(" :: ", 1)[-1]
+    body = ""
+    if rel.endswith(".py"):
+        fn = name.rsplit(".", 1)[-1].split("[", 1)[0]
+        ms = list(_AUDIT_PY_BLOCK_RE.finditer(text))
+        for i, m in enumerate(ms):
+            if m.group(2) != fn:
+                continue
+            ind = len(m.group(1))
+            end = next((n.start() for n in ms[i + 1:]
+                        if len(n.group(1)) <= ind), len(text))
+            body = text[m.end():end]
+            break
+    else:
+        ms = list(_AUDIT_JS_BLOCK_RE.finditer(text))
+        best = None
+        for i, m in enumerate(ms):
+            title = " ".join(m.group(2).split())
+            if title and " ".join(name.split()).endswith(title) and (
+                    best is None or len(title) > best[0]):
+                best = (len(title), i)
+        if best is not None:
+            i = best[1]
+            end = ms[i + 1].start() if i + 1 < len(ms) else len(text)
+            body = text[ms[i].end():end]
+    lines = [" ".join(ln.split()) for ln in body.splitlines()
+             if _AUDIT_ASSERT_RE.search(ln)]
+    if not lines:
+        return None
+    target: set[str] = set()
+    allf = set(graph.get("files") or ()) | set(_set_files(set_))
+    for m in _JS_IMPORT_RE.finditer(text):
+        r = _js_resolve(m.group(1), rel, allf, graph.get("aliases") or {})
+        if r and r in (graph.get("files") or ()) and not _js_is_test(r):
+            target.add(r)
+    if rel.endswith(".py"):
+        with contextlib.suppress(SyntaxError, ValueError):
+            for node in ast.walk(ast.parse(text)):
+                if isinstance(node, ast.Import):
+                    target |= {a.name for a in node.names}
+                elif isinstance(node, ast.ImportFrom) and node.module:
+                    target.add(node.module)
+    assertion = "\n".join(lines)
+    tgt = sorted(target)
+    key = hashlib.sha256(json.dumps([assertion, tgt]).encode()).hexdigest()
+    return {"key": key[:16], "assertion": assertion, "target": tgt}
+
+
+def _reconcile_audit_verdicts(audits: dict[int, dict]) -> list[dict]:
+    """One verdict per assertion key across the audited sets (DESIGN §8
+    *Identical assertions get one verdict*). `audits` maps a set index to
+    its audit (`findings`, `case_keys`, `verdicts`). A key typed both
+    `set_defect` and `implementation_gap` keeps the case: the `set_defect`
+    findings for it are withdrawn from their sets' `findings` (and `kinds`
+    recomputed), in place. Returns the conflicts, each `{key, assertion,
+    target, cases: [{set, case, verdict}], kept: "implementation_gap"}`."""
+    by_key: dict[str, list[dict]] = {}
+    meta: dict[str, dict] = {}
+    for idx, audit in sorted(audits.items()):
+        for cid, verdict in (audit.get("verdicts") or {}).items():
+            k = (audit.get("case_keys") or {}).get(cid)
+            if not k:
+                continue
+            by_key.setdefault(k["key"], []).append(
+                {"set": idx, "case": cid, "verdict": verdict})
+            meta[k["key"]] = k
+    conflicts: list[dict] = []
+    for key, rows in by_key.items():
+        kinds = {r["verdict"] for r in rows}
+        if not {"set_defect", "implementation_gap"} <= kinds:
+            continue
+        for r in rows:
+            if r["verdict"] != "set_defect":
+                continue
+            a = audits[r["set"]]
+            a["findings"] = [f for f in a.get("findings") or []
+                             if f.get("case") != r["case"]]
+            a["kinds"] = sorted({f["defect_kind"] for f in a["findings"]
+                                 if f.get("defect_kind")})
+            a.setdefault("reconciled", []).append(r["case"])
+        conflicts.append({"key": key, "assertion": meta[key]["assertion"],
+                          "target": meta[key]["target"], "cases": rows,
+                          "kept": "implementation_gap"})
+        log(f"  acceptance audit: identical assertion typed both ways in "
+            f"set(s) {sorted({r['set'] for r in rows})} — kept as "
+            "implementation_gap")
+    return conflicts
+
+
 def _place_set(set_: dict, wt: Path) -> tuple[list[Path], bool]:
     """Copy a set's files into `wt`; (copied paths, complete) — a path the
     tree already has is never overwritten, and makes the placement
@@ -43292,6 +43403,15 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
         out["findings"] = list(union.values())
         out["kinds"] = sorted({f["defect_kind"] for f in out["findings"]
                                if f.get("defect_kind")})
+        # What `_reconcile_audit_verdicts` matches across sets: each failing
+        # case's verdict and its mechanical assertion key.
+        if out["samples"]:
+            out["verdicts"] = {c["case"]: ("set_defect" if c["case"] in union
+                                           else "implementation_gap")
+                               for c in failing}
+            out["case_keys"] = {
+                c["case"]: k for c in failing
+                if (k := _audit_case_key(set_, c["file"], c["case"], g))}
         return out
     finally:
         _unplace(copied + refs_copied)
@@ -43455,6 +43575,12 @@ def _rewrite_note(triggers: list[dict]) -> str:
             + " ".join(tails) + _REWRITE_CLOSE)
 
 
+# What a set's `audit` record keeps (DESIGN §8): the counted findings, every
+# failing case's verdict and assertion key, and the cases reconciliation
+# withdrew.
+_AUDIT_RECORD_KEYS = ("findings", "kinds", "sample_kinds", "samples",
+                      "skipped", "verdicts", "case_keys", "reconciled")
+
 _SET_FIELDS = ("dir", "defect_files", "control_files", "support_files",
                "cases", "modes", "base_failing_cases", "base_case_status",
                "base_failure_messages")
@@ -43496,21 +43622,34 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
     def _save() -> None:
         st.data["acceptance"] = acc
         st.save()
+
+    def _record(audit: dict) -> dict:
+        return {k: audit.get(k) for k in _AUDIT_RECORD_KEYS
+                if audit.get(k) is not None}
+    audits: dict[int, dict] = {}
     try:
+        # Every set is audited before any audit is acted on, so identical
+        # assertions in different sets get one verdict (DESIGN §8).
         for idx in todo:
             s_ = by_index[idx]
+            audits[idx] = await _acceptance_audit_on_rev(
+                st, caps, models, efforts, rev, s_, f"audit-{idx}")
+            s_["audit"] = _record(audits[idx])
+            _save()
+        conflicts = _reconcile_audit_verdicts(audits)
+        if conflicts:
+            acc.setdefault("audit_conflicts", []).extend(conflicts)
+            for idx in audits:
+                by_index[idx]["audit"] = _record(audits[idx])
+            _save()
+        for idx in todo:
+            s_ = by_index[idx]
+            audit = audits[idx]
             triggers: list[dict] = []
             mech = (_acceptance_mechanical_findings(st.repo_root, own, s_)
                     if own else [])
             if mech:
                 triggers.append({"kind": "mechanical", "findings": mech})
-            audit = await _acceptance_audit_on_rev(
-                st, caps, models, efforts, rev, s_, f"audit-{idx}")
-            s_["audit"] = {k: audit.get(k) for k in
-                           ("findings", "kinds", "sample_kinds", "samples",
-                            "skipped")
-                           if audit.get(k) is not None}
-            _save()
             if audit["findings"]:
                 triggers.append({"kind": "set_audit",
                                  "unsatisfiable_cases": audit["findings"]})
@@ -43570,10 +43709,14 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
                     again = await _acceptance_audit_on_rev(
                         st, caps, models, efforts, rev, s_,
                         f"reaudit-{idx}")
-                    s_["audit"] = {k: again.get(k) for k in
-                                   ("findings", "kinds", "sample_kinds",
-                                    "samples", "skipped")
-                                   if again.get(k) is not None}
+                    # Reconciled against the other sets' recorded verdicts
+                    # (copies: their own records stand as acted on).
+                    more = _reconcile_audit_verdicts(
+                        {**{i: copy.deepcopy(a) for i, a in audits.items()
+                            if i != idx}, idx: again})
+                    if more:
+                        acc.setdefault("audit_conflicts", []).extend(more)
+                    s_["audit"] = _record(again)
                     broken = bool(again["findings"])
             else:
                 rw["outcome"] = "kept_original"

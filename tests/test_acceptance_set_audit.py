@@ -470,6 +470,133 @@ def test_a_resumed_rewrite_reuses_its_recorded_verdict(leerie, tmp_path,
     assert w.calls == []
 
 
+# --- identical assertions get one verdict (DESIGN §8) --------------------------
+
+# Set 2 holds set 1's assertion under another test name (barnacle 7cc87f9a:
+# "dollar signs" vs "template interpolation characters").
+OVERSPECIFIED_2 = OVERSPECIFIED.replace("test_add_sums", "test_add_totals")
+
+
+def _two_sets(leerie, tmp_path):
+    repo, head, st, staging, sha = _setup(leerie, tmp_path, OVERSPECIFIED)
+    st.data["acceptance"]["sets"].append(_set(st, 2, OVERSPECIFIED_2))
+    st.save()
+    return st, staging, sha
+
+
+@pytest.mark.parametrize("set2_typed", [False, True])
+def test_identical_assertions_across_sets_get_one_verdict(
+        leerie, tmp_path, monkeypatch, set2_typed):
+    """Set 1's audit types the assertion `set_defect`, set 2's (the same
+    assertion, another test name) `implementation_gap`: the case is kept —
+    set 1 is not rewritten or marked broken — and the conflict is recorded.
+    When set 2's audit agrees, set 1 is rewritten as before."""
+    st, staging, sha = _two_sets(leerie, tmp_path)
+
+    def audit(kw, n):
+        if "acc/test_defect_2.py" in kw["user_prompt"] and not set2_typed:
+            return {"cases": []}
+        f = ("acc/test_defect_2.py" if "acc/test_defect_2.py"
+             in kw["user_prompt"] else "acc/test_defect_1.py")
+        return _typed(kw, file=f)
+    w = Workers(audit=audit, rewrite=_good_rewrite,
+                surrogate=lambda kw: {"summary": "", "files_changed": []})
+    _run(leerie, st, staging, sha, w, monkeypatch,
+         final=_failing(1) + _failing(2))
+    s1, s2 = st.data["acceptance"]["sets"]
+    # Both sets are audited before either is acted on.
+    first_writer = next((i for i, c in enumerate(w.calls)
+                         if c["schema_key"] == "acceptance_writer"), None)
+    audited = [i for i, c in enumerate(w.calls)
+               if c["schema_key"] == "set_auditor"]
+    assert len(audited) >= 6
+    if first_writer is not None:
+        assert audited[5] < first_writer
+    k1 = next(iter(s1["audit"]["case_keys"].values()))
+    k2 = next(iter(s2["audit"]["case_keys"].values()))
+    assert k1["key"] == k2["key"]
+    assert "add.__name__ == 'plus_impl'" in k1["assertion"]
+    if set2_typed:
+        assert [c["sid"] for c in w.of("acceptance_writer")][0] == \
+            "acceptance-rewrite-1"
+        assert not st.data["acceptance"].get("audit_conflicts")
+        return
+    assert w.of("acceptance_writer") == []
+    assert "rewrite" not in s1 and not s1.get("broken")
+    assert s1["audit"]["findings"] == []
+    assert len(s1["audit"]["reconciled"]) == 1
+    (conflict,) = st.data["acceptance"]["audit_conflicts"]
+    assert conflict["kept"] == "implementation_gap"
+    assert sorted((r["set"], r["verdict"]) for r in conflict["cases"]) == [
+        (1, "set_defect"), (2, "implementation_gap")]
+
+
+def test_the_assertion_key_reads_the_case_block_and_its_target(leerie,
+                                                               tmp_path):
+    """JS: the case is found by the longest `it` title its ID ends with;
+    the key is its assertions plus the modules the file imports — the same
+    assertion against another module is another key."""
+    graph = {"files": {"src/lib/random.ts", "src/lib/other.ts"},
+             "aliases": {"@/": "src/"}}
+
+    def set_with(name, title, module):
+        d = tmp_path / name
+        (d / "src").mkdir(parents=True)
+        (d / "src" / "p.test.ts").write_text(
+            f'import {{ gen }} from "@/lib/{module}";\n'
+            'describe("policy", () => {\n'
+            '  it("every value has 8 characters", () => {\n'
+            '    expect(samples().filter((p) => p.length < 8)).toEqual([]);\n'
+            '  });\n'
+            f'  it("{title}", () => {{\n'
+            '    expect(samples().filter((p) => /[\\s$]/.test(p)))'
+            '.toEqual([]);\n'
+            '  });\n});\n')
+        return {"dir": str(d), "defect_files": ["src/p.test.ts"]}
+    a = leerie._audit_case_key(
+        set_with("a", "no value contains whitespace or dollar signs",
+                 "random"), "src/p.test.ts",
+        "src/p.test.ts :: policy no value contains whitespace or dollar "
+        "signs", graph)
+    b = leerie._audit_case_key(
+        set_with("b", "no value contains template interpolation", "random"),
+        "src/p.test.ts",
+        "src/p.test.ts :: policy no value contains template interpolation",
+        graph)
+    c = leerie._audit_case_key(
+        set_with("c", "no value contains template interpolation", "other"),
+        "src/p.test.ts",
+        "src/p.test.ts :: policy no value contains template interpolation",
+        graph)
+    assert a["key"] == b["key"] and a["target"] == ["src/lib/random.ts"]
+    assert "p.length < 8" not in a["assertion"]
+    assert c["key"] != a["key"]
+    assert leerie._audit_case_key(
+        set_with("d", "x", "random"), "src/p.test.ts",
+        "src/p.test.ts :: policy nothing like it", graph) is None
+
+
+def test_reconcile_withdraws_only_a_conflicting_set_defect(leerie):
+    k = {"key": "k1", "assertion": "assert x", "target": []}
+    other = {"key": "k2", "assertion": "assert y", "target": []}
+    audits = {
+        1: {"findings": [{"case": "a", "defect_kind": "test_bug"},
+                         {"case": "b", "defect_kind": "coupling"}],
+            "verdicts": {"a": "set_defect", "b": "set_defect"},
+            "case_keys": {"a": k, "b": other}},
+        5: {"findings": [], "verdicts": {"z": "implementation_gap"},
+            "case_keys": {"z": k}}}
+    (c,) = leerie._reconcile_audit_verdicts(audits)
+    assert c["key"] == "k1" and c["kept"] == "implementation_gap"
+    assert [f["case"] for f in audits[1]["findings"]] == ["b"]
+    assert audits[1]["kinds"] == ["coupling"]
+    assert audits[1]["reconciled"] == ["a"]
+    # Agreement is not a conflict.
+    audits[5]["verdicts"]["z"] = "set_defect"
+    audits[1]["findings"].append({"case": "a", "defect_kind": "test_bug"})
+    assert leerie._reconcile_audit_verdicts(audits) == []
+
+
 # --- M1/M2 and the surrogate witness ------------------------------------------
 
 def test_mechanical_findings_trigger_a_rewrite_without_a_surrogate(

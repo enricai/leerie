@@ -7437,6 +7437,27 @@ trigger ever drops a case, a set or a residual on its own:
   almost never use the repository's own test helpers (S1: 4 of 44 writes
   imported one); the harness section is how the audit sees what they
   should have used.
+
+  *Identical assertions get one verdict.* Every still-failing set is
+  audited before any audit is acted on. Code then reconciles the verdicts
+  across sets. It matches failing cases mechanically by their **assertion
+  key**: the normalised `expect(...)` / `assert` statements of the case's
+  own test block in the set file (located by its title or function name),
+  plus its **target**, the repository modules that set file imports. When
+  one key is typed `set_defect` in one place and `implementation_gap` in
+  another, the verdict that keeps the case wins (`implementation_gap`).
+  The `set_defect` finding is withdrawn from its set, so it no longer
+  triggers a rewrite or marks the set broken, and the conflict is recorded.
+  A set rewritten later is re-audited against the other sets' recorded
+  verdicts in the same way. Measured (barnacle 7cc87f9a, pass 1): two sets
+  held the identical assertion `expect(samples().filter((p) =>
+  /[\s$]/.test(p))).toEqual([])` against `src/lib/random.ts`. Set 1's audit
+  typed it `contradicts_task` in 3 of 3 samples and the rewrite removed
+  it, while set 5's audit typed it `implementation_gap` in 3 of 3. The
+  rewrite removed the only signal the repair loop could see (set 5 was
+  held back), and the run ended `unconverged` on set 5. Case titles differ
+  between sets ("dollar signs" vs "template interpolation characters"),
+  so the titles are not the key; the assertion and its target are.
 - **The surrogate witness**, only when neither of the above fired: one
   independent `surrogate_fixer` per gate fixes the report in a ref-less
   clone of the own start (the writer's checkout) without ever seeing a set
