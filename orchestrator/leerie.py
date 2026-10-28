@@ -325,6 +325,13 @@ DEFAULT_CAPS = {
     # the subtask settles `unconverged`. Bench q4 S3: 22/22 gate passes,
     # 0/22 new test failures under B*.
     "integration_repair_rounds": 2,
+    # In-run retries of an integrator that crashed (DESIGN §7 *The
+    # integrator*): a WorkerError or a timeout is infrastructure, so the
+    # work is rescued, staging reset to the merge's first parent and the
+    # merge redone for a fresh integrator. Spent -> the subtask is backed
+    # out (`unconverged`) and the wave continues; the run never dies for a
+    # crash, so it need not be re-run.
+    "integrator_crash_retries": 2,
     # Extra waves `_schedule` may add per run to serialise same-wave
     # subtasks whose planned `files_likely_touched` intersect (DESIGN §5
     # *Planned file overlap is serialised*). q4 overlap replay: 8/15 natural
@@ -55346,6 +55353,36 @@ def _settled_head_missing_reason(st: "State", sid: str) -> str:
             "never merged")
 
 
+class _IntegratorCrash(Exception):
+    """An integrator `claude_p` that raised `WorkerError` or
+    `subprocess.TimeoutExpired`, raised on under this type so the
+    integrator's `_run_checked_loop` ends at that round (its catch-all arm)
+    instead of spending a further round on the tree the dead session left:
+    `integrate_wave` resets staging before every retry (DESIGN §7 *The
+    integrator*)."""
+
+
+async def _restart_integration_merge(staging: Path, st: "State", sid: str,
+                                     pre_sha: str) -> str | None:
+    """Start `sid`'s merge again from `pre_sha` for a retried integrator:
+    abort whatever merge is in progress, reset staging to the merge's first
+    parent (dropping a merge a dying integrator may have committed), and
+    run `integrate.sh` again. None when staging is mid-merge with the
+    conflict again; otherwise why the retry cannot proceed."""
+    await run_proc(["git", "merge", "--abort"], cwd=str(staging))
+    await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
+    head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
+    if not pre_sha or head != pre_sha:
+        return (f"the reset before a retry left staging at "
+                f"{head[:12] or 'no HEAD'}, not {pre_sha[:12] or '?'}")
+    proc = await _run_script("integrate.sh", sid, st.run_id)
+    if proc.returncode != 1:
+        msg = (proc.stderr or proc.stdout or "").strip()[:200]
+        return (f"integrate.sh exited {proc.returncode} restarting the merge"
+                + (f": {msg}" if msg else ""))
+    return None
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -55365,13 +55402,16 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
       staging to the merge's first parent, settles the subtask
       `unconverged` with its lost work recorded, and the wave continues
       (DESIGN §6 *When integration cannot succeed*).
-    - **Crash** (every round raised, so there is no status and no diagnosis):
-      infrastructure, not judgment. `_rescue_integrator_work` captures the
-      in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>/<n>` *before*
-      the abort — `git merge --abort` destroys it otherwise, and it is the
-      most expensive artifact in the run to recreate. `blocked[sid]` is
-      recorded and the die message names the ref and its recovery command;
-      `resume` retries the integration."""
+    - **Crash** (`WorkerError` or a timeout, so there is no status and no
+      diagnosis): infrastructure, not judgment (DESIGN §7 *The
+      integrator*). `_rescue_integrator_work` captures the in-progress
+      resolution to `refs/leerie/rescue/<run-id>/<sid>/<n>` *before* the
+      abort — `git merge --abort` destroys it otherwise, and it is the most
+      expensive artifact in the run to recreate. Staging is then reset to the
+      merge's first parent and the merge redone for a fresh integrator, at
+      most `integrator_crash_retries` times; spent, the subtask is backed out
+      like a verdict, with the rescue refs in its reason. Never a `die()`:
+      the run is meant to finish without a `resume`."""
     integrated: list[str] = []
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     await _abandon_interrupted_merge(staging, st)
@@ -55470,17 +55510,26 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             f"Already-integrated subtasks it may conflict with: "
             f"{', '.join(integrated_so_far) or 'none'}"]
 
+        crashes: list[BaseException] = []
+
         async def _invoke_integrator() -> dict:
             st.bump_workers(caps)
-            return await claude_p(
-                user_prompt="\n\n".join(up_parts),
-                system_prompt=sys_prompt,
-                schema_key="integrator", cwd=str(staging),
-                allowed_tools=ACT_TOOLS, max_turns=60,
-                autonomous=True, caps=caps, st=st,
-                model=models["integrator"],
-                effort=efforts["integrator"],
-                sid=f"integrator-{sid}")
+            try:
+                return await claude_p(
+                    user_prompt="\n\n".join(up_parts),
+                    system_prompt=sys_prompt,
+                    schema_key="integrator", cwd=str(staging),
+                    allowed_tools=ACT_TOOLS, max_turns=60,
+                    autonomous=True, caps=caps, st=st,
+                    model=models["integrator"],
+                    effort=efforts["integrator"],
+                    sid=f"integrator-{sid}")
+            except (WorkerError, subprocess.TimeoutExpired) as exc:
+                # Both are infrastructure — a timeout no less than a killed
+                # session or an exit with no schema-valid JSON — and both
+                # take the one retry path below.
+                crashes.append(exc)
+                raise _IntegratorCrash(_brief_worker_exc(exc)) from exc
 
         async def _on_integrator_fb(fb: str) -> dict:
             if len(up_parts) > 1:
@@ -55489,49 +55538,68 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 up_parts.append(fb)
             return {}
 
-        # The integrator's async mechanical checks (conflict markers,
-        # merge committed) run in the resolved-status path below.
-        ires, int_warnings = await _run_checked_loop(
-            invoke=_invoke_integrator,
-            check=lambda r: check_integrator_output(r),
-            name=f"integrator-{sid}",
-            max_rounds=caps["judgment_check_rounds"],
-            make_feedback_prompt=_on_integrator_fb,
-            log_path=leerie_dir / "logs" / f"integrator-{sid}.log",
-        )
-        if ires is None:
-            # The integrator crashed every round (infrastructure: PID
-            # exhaustion, OOM, a killed session) — NOT a verdict about the
-            # work. Its in-progress resolution is the most expensive artifact
-            # in the run to recreate, and `git merge --abort` destroys it
-            # unconditionally, so capture it first (DESIGN §12 *salvage if
-            # there is something to salvage*). Not gated on a merge commit:
-            # a crashed integrator typically dies mid-resolution having
-            # committed nothing, which is exactly the case worth rescuing.
+        crash_cap = int(caps.get("integrator_crash_retries",
+                                 DEFAULT_CAPS["integrator_crash_retries"]))
+        rescues: list[str] = []
+        crashed = 0
+        crash_cause = ""
+        crash_end: str | None = None
+        while True:
+            crashes.clear()
+            # The integrator's async mechanical checks (conflict markers,
+            # merge committed) run in the resolved-status path below.
+            ires, int_warnings = await _run_checked_loop(
+                invoke=_invoke_integrator,
+                check=lambda r: check_integrator_output(r),
+                name=f"integrator-{sid}",
+                max_rounds=caps["judgment_check_rounds"],
+                make_feedback_prompt=_on_integrator_fb,
+                log_path=leerie_dir / "logs" / f"integrator-{sid}.log",
+            )
             for w in int_warnings:
                 log(f"  integrator-{sid}: {w}")
-            rescue_ref = await _rescue_integrator_work(staging, sid, st.run_id)
-            await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-            # Record the block before dying (local convention — see the
-            # neighboring die() site above, which this path used to skip).
-            st.data.setdefault("blocked", {})[sid] = (
-                f"integrator crashed; resolution rescued to {rescue_ref}"
-                if rescue_ref
-                else "integrator crashed before resolving anything")
-            st.save()
-            hint = (
-                f"\nIts in-progress resolution was rescued to "
-                f"{rescue_ref} — inspect with:\n"
-                f"  git -C {staging} show {rescue_ref}\n"
-                f"and apply with:\n"
-                f"  git -C {staging} cherry-pick --no-commit {rescue_ref}"
-                if rescue_ref else
-                "\nIt crashed before resolving anything; there was "
-                "nothing to rescue.")
-            die(f"integrator for {sid} crashed; merge aborted.{hint}\n"
-                f"Re-run with resume to retry the integration.")
-        for w in int_warnings:
-            log(f"  integrator-{sid}: {w}")
+            if ires is not None and not crashes:
+                break
+            # A crash (PID exhaustion, OOM, a killed session, a timeout) is
+            # not a verdict about the work. Its in-progress resolution is the
+            # most expensive artifact in the run to recreate, and `git merge
+            # --abort` destroys it unconditionally, so capture it first
+            # (DESIGN §7 *salvage if there is something to salvage*). Not
+            # gated on a merge commit: a crashed integrator typically dies
+            # mid-resolution having committed nothing.
+            crashed += 1
+            crash_cause = (_brief_worker_exc(crashes[-1]) if crashes
+                           else "it returned no result")
+            ref = await _rescue_integrator_work(staging, sid, st.run_id)
+            if ref:
+                rescues.append(ref)
+            if crashed > crash_cap:
+                crash_end = (f"its {crash_cap} in-run "
+                             f"retr{'y' if crash_cap == 1 else 'ies'} spent")
+                break
+            log(f"  integrator for {sid} crashed ({crash_cause})"
+                + (f"; resolution rescued to {ref}" if ref else "")
+                + f"; staging reset to {pre_sha[:12]}, retrying "
+                f"({crashed}/{crash_cap})")
+            # Every attempt meets the conflict the first one did: never a
+            # dead session's half-made edits, nor a merge it committed.
+            crash_end = await _restart_integration_merge(staging, st, sid,
+                                                         pre_sha)
+            if crash_end is not None:
+                break
+            del up_parts[1:]
+        if crash_end is not None:
+            reason = (
+                f"integrator crashed {crashed} time(s), last: {crash_cause}; "
+                f"{crash_end}; "
+                + (f"its resolution(s) are rescued to {', '.join(rescues)} "
+                   f"(apply one with `git cherry-pick --no-commit <ref>`)"
+                   if rescues else "it crashed before resolving anything"))
+            log(f"  {sid}: {reason}; backing {sid} out")
+            await _back_out_unmerged(st, staging, sid, pre_sha, reason)
+            results[sid] = {"subtask_id": sid, "status": "unconverged",
+                            "summary": "integration backed out"}
+            continue
         if ires.get("status") == "resolved":
             # the integrator must have actually committed the merge — a
             # 'resolved' claim with the worktree still mid-merge is a lie,

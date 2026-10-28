@@ -736,67 +736,6 @@ def test_precondition_failure_dies_and_records_blocked(leerie, tmp_path, monkeyp
     assert "subtask branch missing" in st.data["blocked"]["feat-001"]
 
 
-def test_integrator_crash_rescues_work_aborts_and_dies(leerie, tmp_path, monkeypatch):
-    """An integrator that crashes every round (WorkerError) is infrastructure,
-    not a verdict: its in-progress resolution is rescued to a ref BEFORE the
-    merge is aborted, `blocked[sid]` names the rescue, and the run dies
-    naming the rescue ref."""
-    st = _state(leerie, tmp_path)
-    leerie_dir = tmp_path / ".leerie"
-    staging = _staging_repo(leerie_dir)
-
-    results = {"feat-001": {"status": "complete"}}
-
-    async def fake_run_script(script, sid, run_id):
-        mock = AsyncMock()
-        mock.returncode = 1  # conflict -> spawn integrator
-        mock.stderr = ""
-        mock.stdout = ""
-        return mock
-
-    async def fake_claude_p(**kwargs):
-        # Every round of the integrator's _run_checked_loop raises
-        # WorkerError, so ires ends up None.
-        raise leerie.WorkerError("session killed")
-
-    rescue_calls = []
-
-    async def fake_rescue(staging_path, sid, run_id):
-        rescue_calls.append(sid)
-        return "refs/leerie/rescue/test-int-gate-aaa/feat-001"
-
-    abort_calls = []
-
-    async def fake_run_proc(cmd, cwd=None):
-        if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
-            abort_calls.append(True)
-        mock = AsyncMock()
-        mock.returncode = 0
-        mock.stdout = ""
-        mock.stderr = ""
-        return mock
-
-    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
-    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "_rescue_integrator_work", fake_rescue)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
-
-    caps = _caps(leerie)
-    caps["judgment_check_rounds"] = 1
-
-    async def _run():
-        await leerie.integrate_wave(
-            ["feat-001"], results, leerie_dir, caps, st, MODELS, EFFORTS)
-
-    with pytest.raises(SystemExit):
-        asyncio.run(_run())
-
-    assert rescue_calls == ["feat-001"]
-    assert abort_calls, "merge must be aborted after the rescue capture"
-    assert "feat-001" in st.data.get("blocked", {})
-    assert "rescued" in st.data["blocked"]["feat-001"]
-
-
 def _conflicting_staging(leerie_dir):
     """A staging repo on `main` plus an `incoming` branch that conflicts
     with it on app.py; returns (staging, pre_sha). The fake integrate.sh
@@ -847,6 +786,195 @@ def _git_out(staging, *a):
     import subprocess
     return subprocess.run(["git", *a], cwd=str(staging), capture_output=True,
                           text=True).stdout.strip()
+
+
+def _rescue_refs(staging, run_id, sid):
+    return _git_out(staging, "for-each-ref", "--format=%(refname)",
+                    f"refs/leerie/rescue/{run_id}/{sid}/").split()
+
+
+def _half_resolve(staging, text):
+    """What a dying integrator leaves: the conflict hand-edited, nothing
+    committed."""
+    (staging / "app.py").write_text(text)
+
+
+def _resolve_and_commit(staging):
+    import subprocess
+    (staging / "app.py").write_text("x = 3\n")
+    subprocess.run(["git", "add", "app.py"], cwd=str(staging), check=True,
+                   capture_output=True)
+    subprocess.run(["git", "commit", "-q", "--no-edit"], cwd=str(staging),
+                   check=True, capture_output=True)
+    return {"status": "resolved", "resolution_summary": "kept both",
+            "confidence": {"resolution": 9.0, "basis": "clean"}}
+
+
+def _timeout():
+    import subprocess
+    return subprocess.TimeoutExpired(["claude", "-p", "SYSTEM PROMPT"], 1770)
+
+
+def test_integrator_crash_every_time_backs_out_and_the_wave_continues(
+        leerie, tmp_path, monkeypatch):
+    """Rewritten (was `..._rescues_work_aborts_and_dies`): an integrator that
+    crashes on every attempt no longer kills the run. Each crash — a
+    WorkerError and a timeout alike — is rescued to a ref of its own,
+    staging is reset to the merge's first parent and the merge redone, at
+    most `integrator_crash_retries` times; then the subtask is backed out
+    `unconverged` with every rescue ref in its reason, the loss is on the
+    risk register, and the next subtask of the wave still integrates. Real
+    git throughout."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging, pre = _conflicting_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"},
+               "feat-003": {"status": "complete"}}
+    seen: list[tuple[str, bool]] = []
+    errors = [leerie.WorkerError("session killed"), _timeout(),
+              leerie.WorkerError("no schema-valid JSON")]
+
+    async def fake_claude_p(**kwargs):
+        n = len(seen)
+        seen.append(((staging / "app.py").read_text(),
+                     (staging / ".git" / "MERGE_HEAD").exists()))
+        _half_resolve(staging, f"x = 1{n}\n")
+        raise errors[n]
+
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    caps = _caps(leerie)  # judgment_check_rounds = 3: no in-loop re-run
+    assert caps["integrator_crash_retries"] == 2
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001", "feat-003"], results, leerie_dir, caps, st, MODELS,
+        EFFORTS))
+    assert out == ["feat-003"]
+    # 1 + 2 retries, and every attempt met the original conflict — never
+    # the previous attempt's half-made edit.
+    assert len(seen) == 3
+    for text, mid_merge in seen:
+        assert mid_merge and "<<<<<<<" in text and "x = 1" in text
+    assert _git_out(staging, "rev-parse", "HEAD") == pre
+    assert not (staging / ".git" / "MERGE_HEAD").exists()
+    assert (staging / "app.py").read_text() == "x = 1\n"
+    refs = _rescue_refs(staging, st.run_id, "feat-001")
+    assert len(refs) == 3
+    assert [_git_out(staging, "show", f"{r}:app.py") for r in refs] == [
+        "x = 10", "x = 11", "x = 12"]
+    assert results["feat-001"]["status"] == "unconverged"
+    assert st.data["subtask_status"]["feat-001"] == "unconverged"
+    rec = st.data["integration_gate"]["feat-001"]
+    assert rec["outcome"] == "backed_out" and rec["reset_to"] == pre
+    for r in refs:
+        assert r in rec["fallback_reason"]
+    assert "crashed 3 time(s)" in rec["fallback_reason"]
+    # The timeout is named briefly, never with the `claude -p` argv.
+    assert "SYSTEM PROMPT" not in rec["fallback_reason"]
+    loss = st.data["risk_register"]["feat-001"]
+    assert [e["kind"] for e in loss] == ["integration_content_loss"]
+    assert refs[0] in loss[0]["detail"]
+    assert "feat-001" not in (st.data.get("blocked") or {})
+
+
+@pytest.mark.parametrize("crash", ["worker_error", "timeout"])
+def test_integrator_crash_once_retries_from_a_reset_merge_and_integrates(
+        leerie, tmp_path, monkeypatch, crash):
+    """One crash, then a clean resolution: the retry runs in the run, on a
+    merge restarted from the first parent (the dead session's edit is gone,
+    the conflict is back), and the subtask integrates. The dead session's
+    resolution stays rescued. No die, no back-out, no `blocked`."""
+    st = _state(leerie, tmp_path)
+    st.data["skip_integration_check"] = True
+    leerie_dir = tmp_path / ".leerie"
+    staging, pre = _conflicting_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"}}
+    seen: list[str] = []
+
+    async def fake_claude_p(**kwargs):
+        seen.append((staging / "app.py").read_text())
+        if len(seen) == 1:
+            _half_resolve(staging, "x = 99\n")
+            raise (leerie.WorkerError("PID table exhausted")
+                   if crash == "worker_error" else _timeout())
+        return _resolve_and_commit(staging)
+
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS,
+        EFFORTS))
+    assert out == ["feat-001"]
+    assert len(seen) == 2
+    assert "<<<<<<<" in seen[1] and "x = 99" not in seen[1]
+    head_parents = _git_out(staging, "log", "-1", "--format=%P").split()
+    assert head_parents[0] == pre and len(head_parents) == 2
+    assert (_git_out(staging, "log", "-1", "--format=%s")
+            == "leerie: integrate feat-001")
+    assert (staging / "app.py").read_text() == "x = 3\n"
+    refs = _rescue_refs(staging, st.run_id, "feat-001")
+    assert len(refs) == 1
+    assert _git_out(staging, "show", f"{refs[0]}:app.py") == "x = 99"
+    assert results["feat-001"]["status"] == "complete"
+    assert "feat-001" not in (st.data.get("integration_gate") or {})
+    assert "feat-001" not in (st.data.get("blocked") or {})
+
+
+def test_orchestrator_killed_mid_retry_resumes_and_integrates(
+        leerie, tmp_path, monkeypatch):
+    """A crash, then the orchestrator itself is killed during the retry
+    (cancellation propagates out of the integrator call, staging left
+    mid-merge with a half-made edit). `resume` rescues that edit to a NEW
+    ref — the first rescue is kept — aborts the merge, and integrates the
+    subtask afresh on the original conflict."""
+    import subprocess
+    st = _state(leerie, tmp_path)
+    st.data["skip_integration_check"] = True
+    leerie_dir = tmp_path / ".leerie"
+    staging, pre = _conflicting_staging(leerie_dir)
+    subprocess.run(["git", "branch", f"leerie/subtasks/{st.run_id}/feat-001",
+                    "incoming"], cwd=str(staging), check=True)
+    calls: list[str] = []
+
+    async def killed(**kwargs):
+        calls.append((staging / "app.py").read_text())
+        if len(calls) == 1:
+            _half_resolve(staging, "x = 41\n")
+            raise leerie.WorkerError("session killed")
+        _half_resolve(staging, "x = 42\n")
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
+    monkeypatch.setattr(leerie, "claude_p", killed)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(leerie.integrate_wave(
+            ["feat-001"], {"feat-001": {"status": "complete"}}, leerie_dir,
+            _caps(leerie), st, MODELS, EFFORTS))
+    assert len(calls) == 2 and "<<<<<<<" in calls[1]
+    assert (staging / ".git" / "MERGE_HEAD").exists()
+    first = _rescue_refs(staging, st.run_id, "feat-001")
+    assert len(first) == 1
+    first_sha = _git_out(staging, "rev-parse", first[0])
+
+    resumed: list[str] = []
+
+    async def clean(**kwargs):
+        resumed.append((staging / "app.py").read_text())
+        return _resolve_and_commit(staging)
+
+    monkeypatch.setattr(leerie, "claude_p", clean)
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001"], {"feat-001": {"status": "complete"}}, leerie_dir,
+        _caps(leerie), st, MODELS, EFFORTS))
+    assert out == ["feat-001"]
+    assert len(resumed) == 1
+    assert "<<<<<<<" in resumed[0] and "x = 42" not in resumed[0]
+    refs = _rescue_refs(staging, st.run_id, "feat-001")
+    assert len(refs) == 2 and first[0] in refs
+    assert _git_out(staging, "rev-parse", first[0]) == first_sha
+    assert sorted(_git_out(staging, "show", f"{r}:app.py") for r in refs) == [
+        "x = 41", "x = 42"]
+    assert _git_out(staging, "log", "-1", "--format=%P").split()[0] == pre
+    assert not (staging / ".git" / "MERGE_HEAD").exists()
 
 
 def test_resolved_but_merge_not_committed_backs_out(leerie, tmp_path,

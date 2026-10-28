@@ -1942,7 +1942,8 @@ ref is never overwritten. Under one fixed name per sid, a second crash on
 resume replaced the first rescue — the one the operator had been told to
 apply — and `refs/leerie/*` keeps no reflog to get it back; every merge
 whose sid could not be matched landed on the same `…/unknown` (round-3
-review L3). The die message and the `blocked` entry name the exact ref. Its sid is then integrated again
+review L3). The log line names the exact ref, and so does the back-out
+reason when an integrator's crash retries run out (§7). Its sid is then integrated again
 in its own turn. This runs in the orchestrator, which holds the run
 directory's lock, so no other process is merging into staging.
 `integrate.sh` also refuses to start while staging is mid-merge
@@ -2450,9 +2451,10 @@ Two outcomes are not failures of the integrator but facts about the work:
   `integrate.sh`'s precondition failure (the staging worktree or the subtask
   branch is missing), a failure of the back-out itself (the `git reset` to
   the merge's first parent does not land — the repository, not the merge, is
-  broken), and an integrator *crash*, which is infrastructure rather than a
-  verdict: its in-progress resolution is rescued and the run pauses for
-  `resume` to retry (§12).
+  broken). An integrator *crash* is not on this list: it is infrastructure
+  rather than a verdict, so its in-progress resolution is rescued, staging is
+  reset to the merge's first parent and the merge is retried in the run; when
+  the retries run out the subtask is backed out like a verdict (§7).
 
 **A committed merge the integration judge rejects is repaired, not died on.**
 The gate used to die on any finding (detect-and-die). That killed 3 runs in
@@ -5778,14 +5780,37 @@ exactly this). Preservation therefore cannot be conditioned on
 `check_merge_committed` — that predicate is false in precisely the case
 worth salvaging.
 
-This distinction is between a *crash* and a *verdict*, and only the first is
-new. A crash is infrastructure — PID exhaustion, OOM, a killed session — and
-says nothing about whether the resolution was any good; the run rescues the
-work and pauses for `resume`. A `design-conflict` or `failed` **verdict** is
-the integrator's considered judgment that the merge should not stand, so the
-merge is abandoned and the subtask backed out, exactly as *When integration
-cannot succeed* describes — the run continues without it: a verdict is a fact
-about the work, a crash is a fact about the machine.
+This distinction is between a *crash* and a *verdict*. A crash is
+infrastructure — PID exhaustion, OOM, a killed session, a worker killed at
+its wall-clock ceiling, an exit with no schema-valid JSON — and says nothing
+about whether the resolution was any good. A timeout is a crash in exactly
+this sense and takes exactly the same path as a `WorkerError`; neither is
+told apart from the other anywhere on it. A `design-conflict` or `failed`
+**verdict** is the integrator's considered judgment that the merge should
+not stand, so the merge is abandoned and the subtask backed out, exactly as
+*When integration cannot succeed* describes — the run continues without it:
+a verdict is a fact about the work, a crash is a fact about the machine.
+
+A crash is retried in the run, not handed to `resume`. A run is meant to
+finish in one pass, and pausing a whole run for an operator to type `resume`
+over an infrastructure blip spends the operator's attention on something a
+fresh process fixes. Each crash is handled the same way: the in-progress
+resolution is rescued to a ref of its own (never overwritten), the merge is
+aborted, staging is reset to the merge's first parent — the commit read
+before `integrate.sh` ran, the same marker a back-out resets to — and the
+merge is started again from scratch for a fresh integrator, at most
+`integrator_crash_retries` (2) times per subtask. The reset comes first so a
+retry never inherits a dead session's half-made edits or a merge it may have
+committed before it died: every attempt meets the same conflict the first
+one did. Retries are not taken inside the integrator's own check loop, which
+would re-run it on whatever tree the crash left. When the retries run out,
+the subtask is backed out exactly as a verdict is — staging at the merge's
+first parent, the subtask settled `unconverged`, the content loss on its
+risk register for the PR — with a reason naming every rescue ref, so the
+discarded resolutions can still be applied by hand; the wave continues. The
+retry count lives for one invocation: an orchestrator killed mid-retry is
+not an integrator crash, and on `resume` the interrupted merge is rescued
+and aborted on entry and the subtask integrated again in its turn.
 
 ### Forcing constrained decoding
 
@@ -9454,9 +9479,7 @@ committed to the run branch, staging or a subtask branch missing, a wave
 whose completed subtasks are neither on the run branch nor backed out (an
 invariant the per-subtask settled-head check, §6 *Integrated means the
 settled commit is on the run branch*, makes unreachable), a run
-branch gone after cleanup, `finalize.sh` failing, an integrator that
-crashed every round mid-merge (a fact about the machine, its resolution
-rescued to a ref that `resume` retries from) — or an operator's own
+branch gone after cleanup, `finalize.sh` failing — or an operator's own
 opt-in stop (`--stop-on-blocked`, `--stop-on-repo-change`,
 `--strict-conformer`). A gap in the work is never one of them: it settles
 the subtask or the run `unconverged`.
