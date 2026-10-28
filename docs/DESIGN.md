@@ -8933,8 +8933,37 @@ Three layers follow, each derived from that one list:
   follow-ups: the re-drive's test IDs and the integration gate both read
   the raw test command and would run it, past the axis's check, on a task
   that forbade it.
+  The gate takes either form a launch uses: a shell string (it builds the
+  `bash -c` argv) or an argv that is exec'd directly (checked as the shell
+  would read it, and returned unchanged). Execution review r2 found three
+  launches that exec'd repo commands as argv lists and so never reached
+  the shell-only gate: CI parity's checks and their prerequisites (by
+  construction the repo's own lint, type-check and coverage commands; a
+  task forbidding the whole suite still had it run on the base, the final
+  tree and the confirm tree), the coverage runs (vitest, `tsc`, and the
+  `settle_by: install` re-run of the recipe), and the provision recipe's
+  install and build entries that make each measured tree runnable.
+  Settle-by-execution's verify argvs, already refused before they run,
+  now also pass the gate at the launch. A CI check the task forbids is not
+  selected (`forbidden_by_task`), and a forbidden strict variant is
+  dropped, so the check is never judged on a run that did not happen.
+- *Recipe install steps fall under the forbid too.* The provision recipe
+  is derived from the repository, so its commands are repo commands, and
+  the task's words are the more specific instruction: a user who wrote
+  "never run `pnpm install`" is not overruled because leerie wanted a
+  dependency tree. A refused `install` entry counts as a failed install —
+  the tree was not made runnable, and the callers that judge by exit code
+  already treat that as no verdict — and a refused `build` entry is
+  skipped, as a failed one is. The provisioner worker's own runs are
+  covered by the worker layers above, like any worker's. The operator's
+  `.leerie-setup.sh` is not a task command and is not gated.
   Code enforces the single gate: a test fails when a shell launch appears
-  outside the helper.
+  outside the helper, or when any process launch (`subprocess`,
+  `asyncio.create_subprocess_*`, `os.exec*`, `run_proc`, `_run_streaming`,
+  `_run_contained`) runs an argv that is neither a literal led by a
+  program leerie chose (`git`, `claude`, …) nor bound from the gate in
+  the same function, outside a short reviewed list of launchers that run
+  no repository command.
 
 A forbidden command that is also a prescribed command is not forbidden
 (the prescription is the more specific instruction), and `runs_commands`

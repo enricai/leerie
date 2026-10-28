@@ -22583,19 +22583,24 @@ class ForbiddenByTask(Exception):
         self.hit = hit
 
 
-def _blt_shell_argv(cmd: str, forbidden: list[str | dict], *,
+def _blt_shell_argv(cmd: str | list, forbidden: list[str | dict], *,
                     source: str | None = None) -> list[str]:
-    """The argv for every orchestrator-side run of the repo's build, lint or
-    test command (DESIGN §9 *Every orchestrator-side run … passes one
-    gate*): `["bash", "-c", cmd]`, or `ForbiddenByTask` when `cmd` — or
-    `source`, the command it was rendered from, whose shape report flags
-    can disguise — runs what the task forbids. One helper, so a new runner
-    cannot skip the check (`tests/test_blt_forbidden_gate.py`)."""
-    for c in (cmd, source):
+    """The argv for every orchestrator-side launch of a repository command
+    (DESIGN §9 *Every orchestrator-side run … passes one gate*): a shell
+    string becomes `["bash", "-c", cmd]`; an exec argv (a list — a CI
+    check, a recipe entry, a coverage run, a verify argv) is returned as
+    `str`s, checked as the shell would read it (`shlex.join`). Either form
+    raises `ForbiddenByTask` when `cmd` — or `source`, the command it was
+    rendered from, whose shape report flags can disguise — runs what the
+    task forbids. One helper, so a new runner cannot skip the check
+    (`tests/test_blt_forbidden_gate.py`)."""
+    argv = [str(a) for a in cmd] if isinstance(cmd, (list, tuple)) else None
+    text = shlex.join(argv) if argv is not None else cmd
+    for c in (text, source):
         hit = _forbidden_command_hit(c, forbidden) if c else None
         if hit:
             raise ForbiddenByTask(hit)
-    return ["bash", "-c", cmd]
+    return argv if argv is not None else ["bash", "-c", cmd]
 
 
 def _process_constraints(result: dict, prescribed: dict | None,
@@ -36807,8 +36812,18 @@ async def _ensure_worktree_deps(tree: str, st: "State", caps: dict, *,
         # PATH etc.
         entry_env = ({**os.environ, **e["env"]} if e.get("env") else None)
         try:
+            # A recipe entry is a repo command: the task's forbid binds it
+            # too (DESIGN §9 *Recipe install steps fall under the forbid
+            # too*). A refused install is a failed install.
+            argv = _blt_shell_argv(e["command"], _forbidden_specs(st.data))
+        except ForbiddenByTask as ex:
+            ok = ok and e.get("kind") != "install"
+            log(f"  {log_prefix}: {e.get('kind')} not run — {ex}: "
+                f"{' '.join(e['command'])}")
+            continue
+        try:
             rc, _tail = await _run_streaming(
-                e["command"], cwd=str(wd), env=entry_env,
+                argv, cwd=str(wd), env=entry_env,
                 timeout=_recipe_timeout_s(e, caps.get("worker_timeout_sec")),
                 log_path=log_path,
                 label=f"{label_prefix}-install: {' '.join(e['command'])}",
@@ -38478,11 +38493,22 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
     return probs
 
 
-def _ci_select(checks: list[dict], tree: Path) -> list[dict]:
+def _ci_select(checks: list[dict], tree: Path,
+               forbidden: list[str | dict] | tuple = ()) -> list[dict]:
     """One record per discovered check, with `selected` and, when not, the
     typed `reason`: `left_to_test_axis`, `not_merge_gating`,
     `external_resource`, `db_reset` (its argv pushes to or resets a
-    database — `_ci_runs_db_reset`), `provenance` (with `problems`)."""
+    database — `_ci_runs_db_reset`), `forbidden_by_task` (its argv runs a
+    command the task forbids — never run, so never judged), `provenance`
+    (with `problems`). A forbidden `strict_argv` is dropped
+    (`strict_forbidden`) and the check judged on its plain argv."""
+    forbidden = list(forbidden)
+
+    def _hit(argv: object) -> str | None:
+        if not forbidden or not isinstance(argv, list) or not argv:
+            return None
+        return _forbidden_command_hit(shlex.join(str(a) for a in argv),
+                                      forbidden)
     out: list[dict] = []
     seen: set[str] = set()
     reset_pats = _db_reset_rule_patterns(tree)
@@ -38504,7 +38530,13 @@ def _ci_select(checks: list[dict], tree: Path) -> list[dict]:
             rec["reason"] = "external_resource"
         elif _ci_runs_db_reset(c.get("argv"), reset_pats):
             rec["reason"] = "db_reset"
+        elif _hit(c.get("argv")):
+            rec["reason"] = "forbidden_by_task"
+            rec["forbidden"] = _hit(c.get("argv"))
         else:
+            if _hit(rec.get("strict_argv")):
+                rec["strict_forbidden"] = _hit(rec["strict_argv"])
+                rec["strict_argv"] = None
             probs = _ci_check_problems(c, tree)
             if probs:
                 rec["reason"] = "provenance"
@@ -38712,9 +38744,18 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
         out["skipped"] = "db_reset"
         return out
     try:
+        argv = _blt_shell_argv(argv, _forbidden_specs(st.data))
+    except ForbiddenByTask as e:
+        # Never run, and no verdict (DESIGN §9 *A command the task
+        # forbids*): `_ci_select` already unselects such a check, so this
+        # is a prerequisite or a record read back on resume.
+        log(f"  ci parity: {label} not run — {e}")
+        out["skipped"] = "forbidden_by_task"
+        return out
+    try:
         async with _build_class_slot(st, label=f"ci {label}"):
             run = await _run_contained(
-                [str(a) for a in argv], cwd=str(cwd),
+                argv, cwd=str(cwd),
                 name=f"ci-{label}"[:60], run_id=st.run_id,
                 memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
                 pids_max=int(caps.get("worker_pids_max") or 0),
@@ -38827,7 +38868,8 @@ async def _capture_ci_parity_baseline(
         st.save()
         log(f"  ci parity: skipped — {disc['skipped']}")
         return
-    recs = _ci_select(disc.get("checks") or [], staging)
+    recs = _ci_select(disc.get("checks") or [], staging,
+                      _forbidden_specs(st.data))
     ci["checks"] = recs
     base_sha = await _branch_head_sha(str(staging))
     ci["base_sha"] = base_sha
@@ -49787,6 +49829,13 @@ async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
                     or DEFAULT_CAPS["worker_timeout_sec"])
     out: dict = {"rc": None, "timed_out": False}
     try:
+        argv = _blt_shell_argv(argv, _forbidden_specs(st.data))
+    except ForbiddenByTask as e:
+        # rc None: every caller reads it as not settled (DESIGN §9).
+        log(f"  coverage {sid} {tag}: not run — {e}")
+        out["skipped"] = "forbidden_by_task"
+        return out
+    try:
         async with _build_class_slot(st, label=f"coverage {sid} {tag}"):
             run = await _run_contained(
                 argv, cwd=str(tree), name=name, run_id=st.run_id,
@@ -50360,8 +50409,8 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     # the strip, or a subtask spec read back on resume. The orchestrator
     # never runs what the task forbids (DESIGN §9), and a criterion it
     # cannot run is not settled: the claim falls back to the re-drive.
-    refused = _forbidden_verify_argv(subtask,
-                                     _forbidden_specs(st.data))
+    forbidden = _forbidden_specs(st.data)
+    refused = _forbidden_verify_argv(subtask, forbidden)
     if refused:
         record["forbidden"] = [{"argv": a, "forbidden": f}
                                for a, f in refused]
@@ -50408,6 +50457,10 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
         nonlocal seq
         seq += 1
         label = f"settle-exec {sid}: {shlex.join(argv)}"
+        # Raises ForbiddenByTask past the loop below: the strip and the
+        # check above already refused these, so a hit here is a defect
+        # upstream, and it is still never run.
+        argv = _blt_shell_argv(argv, forbidden)
         try:
             async with (_build_class_slot(st, label=label)
                         if _is_blt_build_test_argv(argv, blt)
@@ -50435,38 +50488,42 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
             cmd["passed"] = True
 
     verdict = "pass"
-    for argv in argvs:
-        cmd: dict = {"argv": argv, "rc": None, "attempts": 0,
-                     "passed": False, "resource_affected": False,
-                     "environment_limit": False, "tail": ""}
-        record["commands"].append(cmd)
-        _take(cmd, await _once(argv, timeout))
-        if not cmd["passed"] and not cmd["environment_limit"]:
-            # B*: a failure is re-checked under the host-pressure gate.
-            async with _confirm_lock():
-                gate = await _confirm_gate(caps)
-                k = int(caps.get("confirm_pairs_escalated",
-                                 DEFAULT_CAPS["confirm_pairs_escalated"])
-                        if gate["timed_out"] else
-                        caps.get("confirm_pairs",
-                                 DEFAULT_CAPS["confirm_pairs"]))
-                budget = float(caps.get("confirm_budget_sec",
-                                        DEFAULT_CAPS["confirm_budget_sec"]))
-                t0 = time.monotonic()
-                for _ in range(k):
-                    left = budget - (time.monotonic() - t0)
-                    if left <= 0:
-                        break
-                    _take(cmd, await _once(argv, min(timeout, left)))
-                    if cmd["passed"] or cmd["environment_limit"]:
-                        break
-            cmd["resource_affected"] = cmd["passed"]
-        if cmd["environment_limit"]:
-            verdict = "environment_limit"
-            break
-        if not cmd["passed"]:
-            verdict = "fail"
-            break
+    try:
+        for argv in argvs:
+            cmd: dict = {"argv": argv, "rc": None, "attempts": 0,
+                         "passed": False, "resource_affected": False,
+                         "environment_limit": False, "tail": ""}
+            record["commands"].append(cmd)
+            _take(cmd, await _once(argv, timeout))
+            if not cmd["passed"] and not cmd["environment_limit"]:
+                # B*: a failure is re-checked under the host-pressure gate.
+                async with _confirm_lock():
+                    gate = await _confirm_gate(caps)
+                    k = int(caps.get("confirm_pairs_escalated",
+                                     DEFAULT_CAPS["confirm_pairs_escalated"])
+                            if gate["timed_out"] else
+                            caps.get("confirm_pairs",
+                                     DEFAULT_CAPS["confirm_pairs"]))
+                    budget = float(caps.get("confirm_budget_sec",
+                                            DEFAULT_CAPS["confirm_budget_sec"]))
+                    t0 = time.monotonic()
+                    for _ in range(k):
+                        left = budget - (time.monotonic() - t0)
+                        if left <= 0:
+                            break
+                        _take(cmd, await _once(argv, min(timeout, left)))
+                        if cmd["passed"] or cmd["environment_limit"]:
+                            break
+                cmd["resource_affected"] = cmd["passed"]
+            if cmd["environment_limit"]:
+                verdict = "environment_limit"
+                break
+            if not cmd["passed"]:
+                verdict = "fail"
+                break
+    except ForbiddenByTask as e:
+        verdict = "none"
+        record["why"] = f"a verify command was not run — {e}"
 
     if verdict == "pass":
         post = await run_proc(["git", "status", "--porcelain",
