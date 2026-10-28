@@ -1788,6 +1788,52 @@ def test_verdict_is_by_exit_code(leerie, tmp_path, body, want):
     assert got is want
 
 
+def test_evaluation_records_failing_cases_and_keeps_the_exit_verdict(
+        leerie, tmp_path):
+    """Evaluation asks the runner for its report only to name the failing
+    cases (has-work is decided per case, DESIGN §8); the verdict stays the
+    exit code — a file that cannot load still fails, and names nothing."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    (repo / "test_two.py").write_text(
+        "def test_counted():\n    assert True\n\n"
+        "def test_variant():\n    assert False\n")
+    (repo / "test_broken.py").write_text("import no_such_module\n")
+    obs: dict = {}
+    got = asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_two.py",
+        st.run_dir / "logs" / "p.log", "p", cases_out=obs))
+    assert got is False
+    assert len(obs["failing_cases"]) == 1
+    assert "test_variant" in obs["failing_cases"][0]
+    obs2: dict = {}
+    got2 = asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "test_broken.py",
+        st.run_dir / "logs" / "p.log", "p2", cases_out=obs2))
+    assert got2 is False and "failing_cases" not in obs2
+
+
+def test_a_failing_sets_result_names_its_failing_cases(leerie, tmp_path):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 1)
+    res = asyncio.run(leerie._evaluate_acceptance_sets(
+        st, _caps(leerie, 1), str(staging), sets, "cases"))
+    assert res[0]["failing_files"] == ["acc/test_defect_1.py"]
+    ids = res[0]["failing_cases"]["acc/test_defect_1.py"]
+    assert len(ids) == 1 and "test_add_sums" in ids[0]
+    # The id is the one validation records, so the scope judge's counted
+    # cases compare to it.
+    obs: dict = {}
+    (repo / "acc").mkdir(exist_ok=True)
+    (repo / "acc" / "test_defect_1.py").write_text(DEFECT_TEST)
+    asyncio.run(leerie._run_acceptance_file(
+        st, _caps(leerie, 1), str(repo), "acc/test_defect_1.py",
+        st.run_dir / "logs" / "v.log", "v", validating=True, observed=obs))
+    assert obs["failing_cases"] == ids
+
+
 @pytest.mark.parametrize("body", [
     "x = 1\n",                         # no test collected: pytest exit 5
     "def test_x(:\n    pass\n",        # the test file itself broken: 2
@@ -2369,6 +2415,13 @@ def _passing(n):
              "failing_files": []} for k in range(1, n + 1)]
 
 
+def _no_cases(results):
+    """A measured verdict without the runner's per-case IDs (which only
+    the evaluation knows), for comparing with `_failing`/`_passing`."""
+    return [{k: v for k, v in r.items() if k != "failing_cases"}
+            for r in results]
+
+
 def _failing(n):
     return [{"index": k, "passed": False, "unmeasured": False,
              "failing_files": [f"acc/test_defect_{k}.py"]}
@@ -2402,7 +2455,7 @@ def test_resume_after_a_passing_but_red_round_still_rolls_back(
     if with_initial:
         # What ships is the pre-repair tree, so its persisted verdict — not
         # one re-measured on the repaired tree — is the record.
-        assert gate["final"] == _failing(5)
+        assert _no_cases(gate["final"]) == _failing(5)
         assert gate["residual"]["failing_sets"] == 5
 
 
@@ -2425,7 +2478,7 @@ def test_the_pre_repair_verdict_is_on_disk_before_round_one(
         asyncio.run(leerie._run_acceptance_gate(
             st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     disk = json.loads((st.run_dir / "state.json").read_text())
-    assert disk["acceptance"]["gate"]["initial"] == _failing(5)
+    assert _no_cases(disk["acceptance"]["gate"]["initial"]) == _failing(5)
 
 
 def test_resume_after_a_passing_round_runs_no_further_round(
@@ -2471,7 +2524,7 @@ def test_every_round_is_on_disk_before_the_rollback_check(
             st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     disk = json.loads((st.run_dir / "state.json").read_text())
     assert [r["round"] for r in disk["acceptance"]["gate"]["rounds"]] == [1]
-    assert disk["acceptance"]["gate"]["initial"] == _failing(5)
+    assert _no_cases(disk["acceptance"]["gate"]["initial"]) == _failing(5)
 
 
 def test_resume_after_the_rollback_decision_finishes_the_reset(
@@ -2493,7 +2546,7 @@ def test_resume_after_the_rollback_decision_finishes_the_reset(
     gate = st.data["acceptance"]["gate"]
     assert calls == []
     assert _git(staging, "rev-parse", "HEAD") == before
-    assert gate["final"] == _failing(5) and gate["residual"]["failing_sets"] == 5
+    assert _no_cases(gate["final"]) == _failing(5) and gate["residual"]["failing_sets"] == 5
 
 
 def test_a_recorded_rollback_runs_no_further_round(leerie, tmp_path,

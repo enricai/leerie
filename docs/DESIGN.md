@@ -6509,7 +6509,10 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    or a test newly failing, each confirmed under B\* — is rolled back
    (`reset --hard` to the group's start, `clean -fd`). So is a group that
    had failing set cases and fixed **none** of them, even when nothing got
-   worse: a change that measurably fixes nothing is speculative. In a
+   worse: a change that measurably fixes nothing is speculative. Progress is
+   counted in cases, not files — fixing one of a file's three failing cases
+   is progress — wherever the runner's report names the cases; a file
+   without that record counts as one case. In a
    replayed run (barnacle 7cc87f9a, pass 1) two repair rounds that fixed no
    failing case each added a defensive fallback the task explicitly
    forbade, and both shipped. A run that produces no verdict (a missing
@@ -7522,9 +7525,17 @@ unit; overlapping verified ranges for one unit merge), and its
 after NFC and whitespace normalisation. A set with no counted case is a
 **variant set**: it is still repaired in the same pass, but it never
 creates a run — the no-work settle, the already-fixed check, the
-satisfied-probe protection and the run outcome read only failing files
-that hold a counted case, and the next run's residual leaves variant sets
-out like broken ones. A judge that fails leaves the set unbounded (every
+satisfied-probe protection, the delivery re-drive and the run outcome read
+only failing cases that are counted ones, and the next run's residual
+leaves variant sets out like broken ones. The decision is **per case, not
+per file**: the evaluation asks the runner for the same structured report
+validation reads and records which cases of each failing file failed, so a
+variant case left failing in a file whose counted case now passes is not
+work. Decided per file, it was: in a replayed run (barnacle 7cc87f9a, pass
+1) the scope judge typed the one case still failing `other_scenario`, but
+its file also held a counted case — passing by then — and the run ended
+`unconverged` on a variant. A file whose run produced no readable report
+still counts as a whole. A judge that fails leaves the set unbounded (every
 failing file counts, as before). A set whose defect cases all pass at the
 own start even after the writer's one retry is recorded with the reason
 `fixed_on_head_by_execution` — assigned by code from the runner's

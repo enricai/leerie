@@ -186,6 +186,70 @@ def test_decide_outcome_ignores_a_failing_variant_set(leerie, tmp_path,
     assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
 
 
+# --- per case, not per file (barnacle 7cc87f9a replay) ------------------------
+
+# The replay's shape: one defect file holds a counted case (the special-
+# character case, passing by the end) and a variant case the scope judge
+# typed other_scenario (the `$` case), the only one still failing.
+BOUND_MIXED = {"bounded": True,
+               "counted_cases": {"t/d.test.ts": ["special chars"]},
+               "judged": {}}
+
+
+@pytest.mark.parametrize("cases, expected", [
+    ({"t/d.test.ts": ["no $"]}, False),                 # only the variant
+    ({"t/d.test.ts": ["special chars"]}, True),          # the counted one
+    ({"t/d.test.ts": ["no $", "special chars"]}, True),
+    ({"t/d.test.ts": []}, True),        # no per-case record: whole file
+    (None, True),
+    ({"t/other.test.ts": ["no $"]}, True),   # no record for THIS file
+])
+def test_has_work_is_decided_per_failing_case(leerie, cases, expected):
+    set_ = _set(1, BOUND_MIXED)
+    assert leerie._acceptance_result_has_work(
+        set_, ["t/d.test.ts"], cases) is expected
+
+
+def test_an_unbounded_set_is_work_whatever_its_cases(leerie):
+    assert leerie._acceptance_result_has_work(
+        _set(1), ["t/d.test.ts"], {"t/d.test.ts": ["no $"]}) is True
+
+
+def test_decide_outcome_reads_failing_cases_not_files(leerie, tmp_path,
+                                                      monkeypatch):
+    """The replay ended `unconverged` on a variant: its file also held a
+    counted case. Per case, it is `done` with the variant left over — and
+    the same file failing on the counted case is still work."""
+    monkeypatch.setattr(leerie, "_write_run_json", lambda *a, **k: None)
+    variant = [{"index": 5, "passed": False, "unmeasured": False,
+                "failing_files": ["t/d.test.ts"],
+                "failing_cases": {"t/d.test.ts": ["no $"]}}]
+    st = _outcome_state(leerie, tmp_path, [_set(5, BOUND_MIXED)], variant)
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    counted = [dict(variant[0], failing_cases={
+        "t/d.test.ts": ["special chars"]})]
+    st = _outcome_state(leerie, tmp_path, [_set(5, BOUND_MIXED)], counted)
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+
+
+def test_residual_is_read_per_case(leerie):
+    res = [{"index": 5, "passed": False, "unmeasured": False,
+            "failing_files": ["t/d.test.ts"],
+            "failing_cases": {"t/d.test.ts": ["no $"]}},
+           {"index": 6, "passed": False, "unmeasured": False,
+            "failing_files": ["t/d.test.ts"],
+            "failing_cases": {"t/d.test.ts": ["special chars"]}}]
+    sets = [_set(5, BOUND_MIXED), _set(6, BOUND_MIXED)]
+    residual = leerie._acceptance_residual_of(res, sets)
+    assert residual["failing_cases_by_set"] == {
+        "5": {"t/d.test.ts": ["no $"]},
+        "6": {"t/d.test.ts": ["special chars"]}}
+    out = leerie._acceptance_residual_unbroken(residual, sets)
+    assert out["sets"] == [6] and out["failing_sets"] == 1
+    assert leerie._acceptance_work_fails(res[:1], sets) is False
+    assert leerie._acceptance_work_fails(res, sets) is True
+
+
 def test_settle_pending_no_work_accepts_variant_failures(leerie, monkeypatch):
     finished = []
     monkeypatch.setattr(leerie, "_finish_no_work_run",

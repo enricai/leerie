@@ -182,12 +182,27 @@ class TestFailing:
         got, unm = leerie._redrive_failing(res, sets + [_set(5)],
                                            {1, 2, 3, 4, 5})
         assert got == {"1:d.ts": {"set_index": 1, "file": "d.ts",
-                                  "kind": "defect"},
+                                  "kind": "defect", "failing_cases": []},
                        "1:c.ts": {"set_index": 1, "file": "c.ts",
-                                  "kind": "control"},
+                                  "kind": "control", "failing_cases": []},
                        "3:d.ts": {"set_index": 3, "file": "d.ts",
-                                  "kind": "defect"}}
+                                  "kind": "defect", "failing_cases": []}}
         assert unm == [5]
+
+    def test_a_variant_case_in_a_counted_file_is_not_work(self, leerie):
+        """Per case: the counted case passes, the one still failing in the
+        same file is a variant — nothing to re-drive. The counted case
+        failing is."""
+        s3 = _set(3, scope={"bounded": True,
+                            "counted_cases": {"d.ts": ["c1"]}})
+        res = [{"index": 3, "passed": False, "failing_files": ["d.ts"],
+                "failing_cases": {"d.ts": ["v1"]}}]
+        assert leerie._redrive_failing(res, [s3], {3}) == ({}, [])
+        res[0]["failing_cases"] = {"d.ts": ["v1", "c1"]}
+        got, _ = leerie._redrive_failing(res, [s3], {3})
+        assert got == {"3:d.ts": {"set_index": 3, "file": "d.ts",
+                                  "kind": "defect",
+                                  "failing_cases": ["v1", "c1"]}}
 
     def test_carry_keeps_unmeasured_verdicts(self, leerie):
         before = {"1:d": {"set_index": 1, "file": "d", "kind": "defect"},
@@ -211,6 +226,28 @@ class TestVerdict:
         assert v["pairs"] == [["a", "c"]]
         v = leerie._redrive_verdict(_f("a"), {}, ["t::x"])
         assert v["worse"] and v["pairs"] == [["a", "t::x"]]
+
+    def test_fixed_cases_count_cases_not_files(self, leerie):
+        def f(**cases):
+            return {k: {"set_index": 1, "file": k, "kind": "defect",
+                        "failing_cases": v} for k, v in cases.items()}
+        # One of a file's two failing cases fixed: progress, no file fixed.
+        v = leerie._redrive_verdict(f(a=["x", "y"]), f(a=["y"]), [])
+        assert v["fixed"] == [] and v["fixed_cases"] == ["a::x"]
+        # A file with no per-case record counts as one case.
+        v = leerie._redrive_verdict(f(a=[]), {}, [])
+        assert v["fixed_cases"] == ["a"]
+        v = leerie._redrive_verdict(f(a=["x"]), {}, [])
+        assert v["fixed_cases"] == ["a::x"]
+        # Nothing left the list (or no record on one side): nothing fixed.
+        assert leerie._redrive_verdict(f(a=["x"]), f(a=["x"]),
+                                       [])["fixed_cases"] == []
+        assert leerie._redrive_verdict(f(a=["x"]), f(a=[]),
+                                       [])["fixed_cases"] == []
+        # Held-back: fixing one case of a still-failing file is not worse.
+        v = leerie._redrive_verdict({}, {}, [], held=f(h=["p", "q"]),
+                                    held_after=f(h=["q"]))
+        assert not v["worse"] and v["held_fixed_cases"] == ["h::p"]
 
     def test_held_rules(self, leerie):
         h = _f("h1", "h2")
@@ -978,6 +1015,32 @@ def test_a_group_that_fixes_no_failing_case_is_rolled_back(
         assert g["zero_progress"] and not g["worse"] and g["rolled_back"]
     assert _git(w.staging, "rev-parse", "HEAD") == start
     assert "fallback" not in w.a_text("HEAD")
+
+
+def test_fixing_one_case_of_a_still_failing_file_is_progress(
+        leerie, tmp_path, monkeypatch):
+    """Zero progress counts cases: a group that fixes one of the defect
+    file's two failing cases keeps its commit although the file still
+    fails."""
+    w = World(leerie, tmp_path)
+    w.install(monkeypatch)
+    fake = leerie._evaluate_acceptance_sets
+
+    async def per_case(st, caps, tree, sets, label, **kw):
+        out = await fake(st, caps, tree, sets, label, **kw)
+        text = w.a_text(kw.get("rev", "HEAD"))
+        for r in out:
+            if DEFECT in r["failing_files"]:
+                r["failing_cases"] = {DEFECT: ["case two"] if "HALF" in text
+                                      else ["case one", "case two"]}
+        return out
+    monkeypatch.setattr(leerie, "_evaluate_acceptance_sets", per_case)
+    w.edits = [lambda w: w.write("export const a = 1; // HALF\n", "half")]
+    w.run()
+    g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
+    assert g["fixed"] == [] and g["fixed_cases"] == [f"1:{DEFECT}::case one"]
+    assert g["zero_progress"] is False and not g.get("rolled_back")
+    assert "HALF" in w.a_text("HEAD")
 
 
 def test_no_verdict_after_the_group_is_not_zero_progress(

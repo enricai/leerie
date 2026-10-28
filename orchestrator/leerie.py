@@ -32526,7 +32526,8 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                        and r.get("passed") is False and not r.get("unmeasured")
                        and _acceptance_result_has_work(
                            by_index.get(r.get("index")) or {},
-                           r.get("failing_files") or []))
+                           r.get("failing_files") or [],
+                           r.get("failing_cases")))
                    if isinstance(final, list) else 0)
         residual = _acceptance_residual_unbroken(
             gate.get("residual") or {}, sets) or {}
@@ -38443,18 +38444,43 @@ def _acceptance_counted_files(set_: dict) -> set[str] | None:
     return {rel for rel, ids in counted.items() if ids}
 
 
-def _acceptance_result_has_work(set_: dict, failing_files: Iterable[str]
-                                ) -> bool:
+def _acceptance_file_has_work(set_: dict, rel: str,
+                              failing_cases: dict | None = None) -> bool:
+    """Whether one failing file of a bounded `set_` is work: it holds a
+    counted case and — when the runner's report named the cases failing in
+    it (`failing_cases[rel]`) — one of those IS a counted case. A file with
+    no per-case record counts as a whole. Per case, not per file (DESIGN §8
+    *A task that points at a report is bounded by the report's own
+    scenarios*): in a replayed run (barnacle 7cc87f9a) a variant case left
+    failing in a file whose counted case passed made the run
+    `unconverged`."""
+    scope = set_.get("scope") if isinstance(set_.get("scope"), dict) else {}
+    counted = scope.get("counted_cases")
+    ids = list((counted or {}).get(rel) or []) if isinstance(
+        counted, dict) else []
+    if not ids:
+        return False
+    failing = (failing_cases or {}).get(rel) if isinstance(
+        failing_cases, dict) else None
+    if not isinstance(failing, list) or not failing:
+        return True
+    return bool(set(failing) & set(ids))
+
+
+def _acceptance_result_has_work(set_: dict, failing_files: Iterable[str],
+                                failing_cases: dict | None = None) -> bool:
     """Whether a failing verdict on `set_` is unfinished work: the set is
-    not typed broken, and — when the scope judge bounded it — one of the
-    failing files holds a counted case. A variant set is repaired in the
-    same pass but never creates a run."""
+    not typed broken, and — when the scope judge bounded it — a failing
+    case is a counted one (`_acceptance_file_has_work`; `failing_cases` the
+    result's `{file: [case ids]}`, absent for a file the runner reported no
+    cases of). A variant case is repaired in the same pass but never
+    creates a run."""
     if _acceptance_set_broken(set_):
         return False
-    counted = _acceptance_counted_files(set_)
-    if counted is None:
+    if _acceptance_counted_files(set_) is None:
         return True
-    return bool(counted & set(failing_files))
+    return any(_acceptance_file_has_work(set_, rel, failing_cases)
+               for rel in failing_files)
 
 
 def _acceptance_work_fails(results: list[dict], sets: list[dict]) -> bool:
@@ -38464,7 +38490,8 @@ def _acceptance_work_fails(results: list[dict], sets: list[dict]) -> bool:
     variant set is still repaired."""
     by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
     return any(_acceptance_result_has_work(by_index.get(r["index"]) or {},
-                                           r.get("failing_files") or [])
+                                           r.get("failing_files") or [],
+                                           r.get("failing_cases"))
                for r in _acceptance_measured(results) if not r["passed"])
 
 
@@ -38482,6 +38509,7 @@ def _acceptance_residual_unbroken(residual: dict | None,
         return residual
     by_index = {s_.get("index"): s_ for s_ in sets if isinstance(s_, dict)}
     files_by_set = residual.get("files_by_set") or {}
+    ids_by_set = residual.get("failing_cases_by_set") or {}
 
     def _work(i: int) -> bool:
         set_ = by_index.get(i) or {}
@@ -38490,7 +38518,8 @@ def _acceptance_residual_unbroken(residual: dict | None,
             # Recorded before failing files were: the set's own bound (an
             # unbounded set counts whatever the files).
             files = list(_acceptance_counted_files(set_) or [])
-        return _acceptance_result_has_work(set_, files)
+        return _acceptance_result_has_work(set_, files,
+                                           ids_by_set.get(str(i)))
     keep = [i for i in residual["sets"] if _work(i)]
     if len(keep) == len(residual["sets"]):
         return residual
@@ -41273,7 +41302,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                validating: bool = False,
                                failure_mode: str = "assertion",
                                observed: dict | None = None,
-                               env_extra: dict[str, str] | None = None
+                               env_extra: dict[str, str] | None = None,
+                               cases_out: dict | None = None
                                ) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
     False failed, None not measurable (no command, the shell could not run
@@ -41291,6 +41321,13 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     Without a report, a runner's ran-no-test exit (`_RUNNER_NO_VERDICT_EXITS`)
     is no verdict.
 
+    `cases_out` (evaluation, never validation): the runner is asked for the
+    same report, the verdict stays the exit code, and the IDs of the cases
+    the report shows failing go to `cases_out["failing_cases"]` — what
+    has-work decides per case on (DESIGN §8 *A task that points at a report
+    is bounded by the report's own scenarios*). No readable report, or one
+    that ran nothing, records nothing: the file then counts as a whole.
+
     Not `_measure_blt`: its "could not measure" test reads the whole output
     for `No such file or directory`, which is also what a test of a missing-
     file defect prints when it fails — exactly the failure a defect file
@@ -41304,7 +41341,7 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     # *Prisma repositories get a real database*).
     report = st.run_dir / "acceptance" / "reports" / (
         f"{label}-{hashlib.sha256(rel.encode()).hexdigest()[:12]}")
-    if validating:
+    if validating or cases_out is not None:
         spec = _acceptance_report_spec(cmd, report, [rel])
         if spec is not None:
             run_cmd, env, _kind = spec
@@ -41328,6 +41365,13 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     if rc in (126, 127) or (rc != 0 and _is_fork_exhaustion(tail or "")):
         return None
     if not validating:
+        if cases_out is not None and spec is not None:
+            got = _parse_runner_report(spec[2], report)
+            if (got is not None and not got["collection_error"]
+                    and got["executed"]):
+                cases_out["failing_cases"] = sorted(
+                    cid for cid, status in (got.get("cases") or {}).items()
+                    if status == "failed")
         return rc == 0
     parsed = _parse_runner_report(spec[2], report) if spec else None
     if parsed is None:
@@ -41963,6 +42007,7 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         failing, copied, ran = [], [], []
         resource_affected: list[str] = []
         unmeasured = False
+        case_ids: dict[str, list[str]] = {}
         try:
             for rel in ((s_.get("support_files") or [])
                         + s_["defect_files"] + s_["control_files"]):
@@ -41979,13 +42024,17 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 if rel not in (s_.get("support_files") or []):
                     ran.append(rel)
             for rel in ran:
+                obs: dict = {}
                 verdict = await _run_acceptance_file(
                     st, caps, str(wt), rel, log_path,
-                    f"acceptance-{label}", **_env_kw(env_extra))
+                    f"acceptance-{label}", cases_out=obs,
+                    **_env_kw(env_extra))
                 if verdict is None:
                     unmeasured = True
                 elif verdict is False:
                     failing.append(rel)
+                    if obs.get("failing_cases"):
+                        case_ids[rel] = list(obs["failing_cases"])
             if failing and confirm:
                 n_rerun = {"i": 0}
 
@@ -42029,6 +42078,11 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 "failing_files": failing}
         if resource_affected:
             res_["resource_affected_files"] = resource_affected
+        # Per-case verdict where the runner's report gave one, for every
+        # confirmed failing file; a file without one counts as a whole.
+        if any(rel in case_ids for rel in failing):
+            res_["failing_cases"] = {rel: case_ids[rel] for rel in failing
+                                     if rel in case_ids}
         results.append(res_)
     return results
 
@@ -43239,7 +43293,13 @@ def _acceptance_residual_of(basis: list[dict], sets: list[dict]) -> dict:
         # Which files failed, so a variant set (no counted case among them)
         # can be left out when the residual is read.
         "files_by_set": {str(r["index"]): list(r["failing_files"])
-                         for r in measured if not r["passed"]}}
+                         for r in measured if not r["passed"]},
+        # The runner's failing case IDs per file, where its report named
+        # them: has-work is decided per case when the residual is read.
+        "failing_cases_by_set": {
+            str(r["index"]): dict(r["failing_cases"])
+            for r in measured if not r["passed"]
+            and isinstance(r.get("failing_cases"), dict)}}
 
 
 def _acceptance_can_check(st: "State") -> bool:
@@ -43320,7 +43380,10 @@ async def _acceptance_results_on_head(st: "State", caps: dict
         # every set has a defect file that failed here, so the verdict is
         # known without installing and running them again.
         return [{"index": s_["index"], "passed": False, "unmeasured": False,
-                 "failing_files": list(s_.get("defect_files") or [])}
+                 "failing_files": list(s_.get("defect_files") or []),
+                 **({"failing_cases": dict(s_["base_failing_cases"])}
+                    if isinstance(s_.get("base_failing_cases"), dict)
+                    else {})}
                 for s_ in sets]
     res = await _evaluate_acceptance_sets(st, caps, tree, sets, "head",
                                           rev=sha or "HEAD")
@@ -43415,7 +43478,8 @@ async def _fix_ids_held_out_sets_protect(st: "State", caps: dict,
             if await _branch_head_sha(str(_judgment_cwd(st))) == base:
                 return set(fix_ids) if any(
                     _acceptance_result_has_work(
-                        s_, s_.get("defect_files") or [])
+                        s_, s_.get("defect_files") or [],
+                        s_.get("base_failing_cases"))
                     for s_ in sets) else set()
         res = await _acceptance_results_on_head(st, caps)
     except Exception as e:
@@ -45546,10 +45610,12 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
 
 def _redrive_failing(results: list[dict], sets: list[dict],
                      indices: set) -> tuple[dict[str, dict], list]:
-    """`"<index>:<file>"` -> `{set_index, file, kind}` for each failing file
-    of a measured set in `indices` whose failure is work
-    (`_acceptance_result_has_work`; in a bounded set only a counted defect
-    file), and the indices that produced no verdict."""
+    """`"<index>:<file>"` -> `{set_index, file, kind, failing_cases}` for
+    each failing file of a measured set in `indices` whose failure is work
+    (`_acceptance_result_has_work`; in a bounded set only a defect file
+    with a counted case failing, `_acceptance_file_has_work`), and the
+    indices that produced no verdict. `failing_cases` are the runner's
+    failing case IDs in that file, `[]` when its report named none."""
     by = {s_.get("index"): s_ for s_ in sets}
     out: dict[str, dict] = {}
     unmeasured: list = []
@@ -45562,15 +45628,20 @@ def _redrive_failing(results: list[dict], sets: list[dict],
             continue
         s_ = by.get(i) or {}
         failing = list(r.get("failing_files") or [])
-        if not failing or not _acceptance_result_has_work(s_, failing):
+        cases = r.get("failing_cases") if isinstance(
+            r.get("failing_cases"), dict) else {}
+        if not failing or not _acceptance_result_has_work(s_, failing,
+                                                          cases):
             continue
-        counted = _acceptance_counted_files(s_)
+        bounded = _acceptance_counted_files(s_) is not None
         for rel in failing:
             kind = ("control" if rel in (s_.get("control_files") or [])
                     else "defect")
-            if kind == "defect" and counted is not None and rel not in counted:
+            if (kind == "defect" and bounded
+                    and not _acceptance_file_has_work(s_, rel, cases)):
                 continue
-            out[f"{i}:{rel}"] = {"set_index": i, "file": rel, "kind": kind}
+            out[f"{i}:{rel}"] = {"set_index": i, "file": rel, "kind": kind,
+                                 "failing_cases": list(cases.get(rel) or [])}
     return out, unmeasured
 
 
@@ -45585,32 +45656,57 @@ def _redrive_carry(before: dict[str, dict], after: dict[str, dict],
     return out
 
 
+def _redrive_fixed_cases(before: dict, after: dict) -> list[str]:
+    """The failing set cases a group fixed, as `"<key>::<case id>"`: every
+    case of a file that no longer fails, and — in a file failing both before
+    and after, each with a per-case record — every case that left its
+    failing list. A file with no per-case record counts as one case (its
+    key). Progress is counted in cases, not files: a group that fixes one
+    of a file's three failing cases made progress."""
+    out: list[str] = []
+    for k, v in before.items():
+        was = list(v.get("failing_cases") or [])
+        if k not in after:
+            out += [f"{k}::{c}" for c in was] or [k]
+            continue
+        now = list(after[k].get("failing_cases") or [])
+        if was and now:
+            out += [f"{k}::{c}" for c in sorted(set(was) - set(now))]
+    return sorted(out)
+
+
 def _redrive_verdict(F: dict, F1: dict, new_ids: list[str], *,
                      held: dict | None = None,
                      held_after: dict | None = None) -> dict:
-    """Rules 5-6 (bench P8d/Q3, pure): fixed / broken set files, newly
-    failing controls, `worse` (roll back) and `trade` with its (fixed,
-    broken) pairs. The held-back rules apply only when both held-back
-    verdicts are given."""
+    """Rules 5-6 (bench P8d/Q3, pure): fixed / broken set files, the set
+    cases fixed (`fixed_cases`, `held_fixed_cases` —
+    `_redrive_fixed_cases`), newly failing controls, `worse` (roll back)
+    and `trade` with its (fixed, broken) pairs. The held-back rules apply
+    only when both held-back verdicts are given."""
     fixed = sorted(set(F) - set(F1))
     broke = sorted(set(F1) - set(F))
+    fixed_cases = _redrive_fixed_cases(F, F1)
     ctl_new = [k for k in broke if F1[k]["kind"] == "control"]
     worse = len(F1) > len(F) or bool(ctl_new) or bool(new_ids)
     hfixed: list[str] = []
     hbroke: list[str] = []
+    hfixed_cases: list[str] = []
     if held is not None and held_after is not None:
         hfixed = sorted(set(held) - set(held_after))
         hbroke = sorted(set(held_after) - set(held))
+        hfixed_cases = _redrive_fixed_cases(held, held_after)
         worse = (worse or len(held_after) > len(held)
                  or any(held_after[k]["kind"] == "control" for k in hbroke)
-                 or not hfixed)
+                 or not hfixed_cases)
     broken_side = ctl_new + sorted(new_ids) + hbroke
     trade = bool(fixed or hfixed) and bool(broken_side)
     pairs = (sorted({(f, b) for f in fixed + hfixed for b in broken_side})
              if trade else [])
     return {"fixed": fixed, "broke": broke, "ctl_new": ctl_new,
-            "held_fixed": hfixed, "held_broke": hbroke, "worse": worse,
-            "trade": trade, "pairs": [list(p) for p in pairs]}
+            "fixed_cases": fixed_cases, "held_fixed": hfixed,
+            "held_fixed_cases": hfixed_cases, "held_broke": hbroke,
+            "worse": worse, "trade": trade,
+            "pairs": [list(p) for p in pairs]}
 
 
 def _redrive_exclude_path(staging: Path) -> Path | None:
@@ -46728,16 +46824,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                      held=H if held_mode else None,
                                      held_after=H1)
                 ge.update({k: v[k] for k in ("fixed", "broke", "ctl_new",
-                                             "held_fixed", "held_broke",
+                                             "fixed_cases", "held_fixed",
+                                             "held_fixed_cases", "held_broke",
                                              "worse", "trade")})
                 void = False
                 if committed:
                     void = True   # a hidden test must never reach history
                 # Zero progress: the group had failing set cases it could be
-                # measured on, and fixed none of them. A change that
-                # measurably fixes nothing is speculative — in a replay two
-                # such rounds added defensive fallbacks the task forbade.
-                # A set with no verdict now is no evidence either way.
+                # measured on, and fixed none of them — counted in cases,
+                # not files. A change that measurably fixes nothing is
+                # speculative — in a replay two such rounds added defensive
+                # fallbacks the task forbade. A set with no verdict now is
+                # no evidence either way.
                 measured_live = [
                     n for n in live
                     if "set_index" in n and (
@@ -46745,7 +46843,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         or (not n["kind"].startswith("held_")
                             and n["set_index"] not in unm))]
                 ge["zero_progress"] = bool(
-                    measured_live and not v["fixed"] and not v["held_fixed"])
+                    measured_live and not v["fixed_cases"]
+                    and not v["held_fixed_cases"])
                 void = void or ge["zero_progress"]
                 if escalate:
                     eg = _redrive_escalation_gate(staging, pre_sha, post_sha)
