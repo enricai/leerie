@@ -22494,25 +22494,61 @@ def _forbidden_spec(f: object) -> tuple[str, str, list[str]] | None:
     return None
 
 
-# pytest options that take the NEXT word as their value, from pytest 9's
-# `--help` (every option shown with an argument), plus the common plugins'
-# (`-n`/`--dist` xdist, `--cov*`, `--timeout`, `--reruns`): the value is
-# not an operand, so `pytest -p no:cacheprovider` is still a whole-suite
-# run. Fixed CLI surface.
+# pytest's option table, derived from the parser of pytest 9.2 with the
+# common plugins (pytest-cov 7.1, pytest-xdist 3.8, pytest-timeout 2.4,
+# pytest-rerunfailures 16.7, pytest-randomly 5.0) — never hand-written: a
+# hand list carried the flag `--cov-branch` as value-taking, so `pytest
+# --cov=src --cov-branch tests` read `tests` as its value and the scoped
+# template ran the whole suite beside every set (review r2 M3).
+# `_PYTEST_VALUE_OPTS`: every option whose `nargs` is not 0 — the
+# optional-value `--cov`, `--debug` and `--cache-show` included, since
+# argparse hands them the next non-option word — so its value is not an
+# operand (`pytest -p no:cacheprovider` is still a whole-suite run).
+# `_PYTEST_LONG_FLAGS`: the `--` options that take nothing, so a word after
+# one is a positional. Pinned against `tests/fixtures/pytest_options.json`
+# (`tests/test_pytest_option_table.py`). Fixed CLI surface.
 _PYTEST_VALUE_OPTS = frozenset({
-    "-k", "-m", "-p", "-c", "-o", "-W", "-r", "--config-file",
-    "--override-ini", "--pythonwarnings", "--rootdir", "--confcutdir",
-    "--basetemp", "--maxfail", "--tb", "--capture", "--color", "--assert",
-    "--durations", "--durations-min", "--verbosity", "--import-mode",
-    "--deselect", "--ignore", "--ignore-glob", "--junitxml", "--junit-xml",
-    "--junit-prefix", "--doctest-glob", "--pastebin", "--pdbcls",
-    "--log-level", "--log-format", "--log-date-format", "--log-cli-level",
-    "--log-cli-format", "--log-cli-date-format", "--log-file",
-    "--log-file-level", "--log-file-format", "--log-file-date-format",
-    "--log-auto-indent", "--log-disable",
-    "-n", "--numprocesses", "--dist", "--cov", "--cov-report",
-    "--cov-config", "--cov-fail-under", "--timeout", "--reruns",
-    "--reruns-delay", "--randomly-seed"})
+    "--assert", "--basetemp", "--cache-show", "--capture", "--code-highlight",
+    "--color", "--confcutdir", "--config-file", "--cov", "--cov-config",
+    "--cov-context", "--cov-fail-under", "--cov-precision", "--cov-report",
+    "--debug", "--deselect", "--dist", "--doctest-glob", "--doctest-report",
+    "--durations", "--durations-min", "--force-reruns", "--ignore",
+    "--ignore-glob", "--import-mode", "--junit-prefix", "--junit-xml",
+    "--junitprefix", "--junitxml", "--last-failed-no-failures", "--lfnf",
+    "--log-auto-indent", "--log-cli-date-format", "--log-cli-format",
+    "--log-cli-level", "--log-date-format", "--log-disable", "--log-file",
+    "--log-file-date-format", "--log-file-format", "--log-file-level",
+    "--log-file-mode", "--log-format", "--log-level", "--max-suite-reruns",
+    "--max-warnings", "--max-worker-restart", "--maxfail", "--maxprocesses",
+    "--maxschedchunk", "--numprocesses", "--only-rerun", "--override-ini",
+    "--pastebin", "--pdbcls", "--px", "--pythonwarnings", "--randomly-seed",
+    "--report-chars", "--rerun-except", "--rerun-exclude-path", "--reruns",
+    "--reruns-delay", "--reruns-delay-backoff-factor", "--reruns-mode",
+    "--rootdir", "--rsyncdir", "--rsyncignore", "--session-timeout",
+    "--show-capture", "--tb", "--testrunuid", "--timeout", "--timeout-method",
+    "--timeout_method", "--tx", "--verbosity", "-W", "-c", "-k", "-m", "-n",
+    "-o", "-p", "-r"})
+_PYTEST_LONG_FLAGS = frozenset({
+    "--cache-clear", "--co", "--collect-in-virtualenv", "--collect-only",
+    "--collectonly", "--continue-on-collection-errors", "--cov-append",
+    "--cov-branch", "--cov-reset", "--disable-plugin-autoload",
+    "--disable-pytest-warnings", "--disable-warnings",
+    "--doctest-continue-on-failure", "--doctest-ignore-import-errors",
+    "--doctest-modules", "--exitfirst", "--fail-on-flaky", "--failed-first",
+    "--ff", "--fixtures", "--fixtures-per-test", "--force-short-summary",
+    "--full-trace", "--fulltrace", "--funcargs", "--help", "--keep-duplicates",
+    "--keepduplicates", "--last-failed", "--lf", "--loadscope-reorder",
+    "--looponfail", "--markers", "--new-first", "--nf", "--no-cov",
+    "--no-cov-on-fail", "--no-fold-skipped", "--no-header",
+    "--no-loadscope-reorder", "--no-showlocals", "--no-summary",
+    "--noconftest", "--pdb", "--pyargs", "--quiet",
+    "--randomly-dont-reorganize", "--randomly-dont-reset-seed",
+    "--rerun-show-tracebacks", "--runxfail", "--setup-only", "--setup-plan",
+    "--setup-show", "--setuponly", "--setupplan", "--setupshow",
+    "--showlocals", "--stepwise", "--stepwise-reset", "--stepwise-skip",
+    "--strict", "--strict-config", "--strict-markers", "--sw", "--sw-reset",
+    "--sw-skip", "--timeout-disable-debugger-detection", "--trace",
+    "--trace-config", "--traceconfig", "--verbose", "--version", "--xfail-tb"})
 
 
 def _forbidden_value_opts(forb: list[str]) -> frozenset[str]:
@@ -34606,10 +34642,7 @@ _SCOPED_RUNNER_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
 # `--tag`) are deliberately absent: they narrow the suite, so a command
 # carrying one is not bare. Fixed CLI surface.
 _SCOPED_RUNNER_VALUE_OPTS: dict[str, frozenset[str]] = {
-    "pytest": frozenset({"-p", "-n", "-c", "-W", "-o", "-r", "--maxfail",
-                         "--tb", "--durations", "--rootdir", "--basetemp",
-                         "--import-mode", "--cov", "--cov-report",
-                         "--timeout", "--dist", "--numprocesses"}),
+    "pytest": _PYTEST_VALUE_OPTS,
     "rspec": frozenset({"-f", "--format", "-r", "--require", "--order",
                         "--seed", "-o", "--out"}),
     "cargo": frozenset({"-F", "--features", "-p", "--package", "-j",
@@ -34638,19 +34671,6 @@ _PYTEST_SELECTING_OPTS = frozenset({
     "-k", "-m", "--deselect", "--lf", "--last-failed", "--ff",
     "--failed-first", "--nf", "--new-first", "--sw", "--stepwise",
     "--sw-skip", "--stepwise-skip", "--pyargs", "--trace", "--pdb"})
-# pytest long flags taking no value, so a word after one is a positional.
-_PYTEST_LONG_FLAGS = frozenset({
-    "--verbose", "--quiet", "--exitfirst", "--strict-markers",
-    "--strict-config", "--disable-warnings", "--no-header", "--no-summary",
-    "--showlocals", "--runxfail", "--cache-clear", "--doctest-modules",
-    "--full-trace", "--setup-show", "--fixtures", "--version",
-    "--continue-on-collection-errors", "--no-cov"})
-_PYTEST_EXTRA_VALUE_OPTS = frozenset({
-    "--ignore", "--ignore-glob", "--log-level", "--log-cli-level",
-    "--log-file", "--log-file-level", "--log-format", "--junitxml",
-    "--junit-xml", "--confcutdir", "--cov-config", "--cov-fail-under",
-    "--capture", "--color", "--durations-min", "--override-ini",
-    "--reruns", "--reruns-delay", "--randomly-seed", "--cov-branch"})
 _PYTHON_BIN_RE = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)*)?")
 
 
@@ -34739,7 +34759,7 @@ def _scoped_pytest_template(head: list[str], rest: list[str]
     (`a.py::t`), a selecting option (`-k`, `--lf`, …) or a word after an
     unknown long option (which may be that option's value) leaves it not
     bare."""
-    vals = _SCOPED_RUNNER_VALUE_OPTS["pytest"] | _PYTEST_EXTRA_VALUE_OPTS
+    vals = _PYTEST_VALUE_OPTS
     keep: list[str] = []
     i = 0
     while i < len(rest):

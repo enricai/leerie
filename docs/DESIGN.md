@@ -7871,7 +7871,11 @@ the wrapper's own options — which the template keeps; its path positionals,
 such as `pytest -q tests`, are replaced by the set's files rather than
 disqualifying it, while a node id, a selecting option such as `-k`/`-m`/
 `--lf`, or a word after a long option leerie cannot tell is a flag still
-does), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
+does; which pytest options take a value is one table derived from real
+pytest 9's parser with its common plugins, not written by hand — a
+hand-written one listed the flag `--cov-branch` as value-taking, so
+`pytest --cov=src --cov-branch tests` kept `tests` as the option's
+"value" and ran the whole suite beside every set), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
 minitest's `rails test` take `{test_files}` as written; `rake test`, which
 takes one path, becomes a `ruby -Itest -Ilib` loader over `{test_files}`;
 `go test` takes the test files' packages (`{test_packages}`, with a
