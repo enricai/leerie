@@ -8359,6 +8359,11 @@ also exports `leerie_repo_lock` (takes `flock` on fd 201 over
 script) and `leerie_worktree_name <run-id> <name>` (prints
 `<run-id[:12]>-<name>`; Python mirror `_worktree_dirname(run_id, name)`,
 with `_subtask_worktree_path(leerie_dir, sid)` for a subtask's path).
+Every Python site that needs a subtask's worktree takes it from
+`_subtask_worktree_path`; none joins `worktrees / <sid>` by hand, which
+names the pre-prefix layout no real run has (the coverage re-drive did, and
+found "no worktree" for every subtask — pinned by
+`tests/test_subtask_worktree_path_sites.py`).
 
 The repo is bind-mounted whole into every container, so `.git` is
 SHARED with the host and any other container. A bare prune is

@@ -49588,7 +49588,7 @@ async def _redrive_uncovered_subtasks(
     redrive_changed: dict[str, set[str]] = {}
 
     async def evaluate(sid: str) -> dict:
-        tree = Path(leerie_dir) / "worktrees" / sid
+        tree = _subtask_worktree_path(leerie_dir, sid)
         try:
             if not tree.is_dir():
                 return {"measured": False, "why": "no worktree"}
@@ -49645,7 +49645,7 @@ async def _redrive_uncovered_subtasks(
             n = _consume_redrive(st, s)
             notes[s] = _coverage_note(recs[s], n, cap, previous.get(s))
             pre[s] = await _branch_head_sha(
-                str(Path(leerie_dir) / "worktrees" / s))
+                str(_subtask_worktree_path(leerie_dir, s)))
             records[s]["rounds"].append(
                 {"round": n, "share": recs[s].get("share"),
                  "uncovered": recs[s].get("uncovered") or {},
@@ -49664,7 +49664,7 @@ async def _redrive_uncovered_subtasks(
             previous[s] = recs[s]
             if r.get("status") == "complete":
                 results[s] = r
-                tree = Path(leerie_dir) / "worktrees" / s
+                tree = _subtask_worktree_path(leerie_dir, s)
                 if pre[s]:
                     diff = await run_proc(["git", "diff", "--name-only",
                                            f"{pre[s]}..HEAD"], cwd=str(tree))
@@ -49674,7 +49674,7 @@ async def _redrive_uncovered_subtasks(
                 continue
             # Adding tests must never cost finished work: back to the
             # commit the subtask completed at, and its earlier result.
-            tree = Path(leerie_dir) / "worktrees" / s
+            tree = _subtask_worktree_path(leerie_dir, s)
             if pre[s]:
                 await run_proc(["git", "reset", "-q", "--hard", pre[s]],
                                cwd=str(tree))

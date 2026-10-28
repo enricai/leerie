@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.conftest import _run
+from tests.conftest import REPO_ROOT, _run
 
 FAKE_VITEST = r'''#!/usr/bin/env python3
 import json, os, pathlib, re, sys
@@ -119,10 +119,16 @@ def env(leerie, tmp_path, monkeypatch):
     run_dir = leerie_root / "runs" / run_id
     (run_dir / "logs").mkdir(parents=True)
     _git(repo, "branch", f"leerie/runs/{run_id}", "main")
-    tree = run_dir / "worktrees" / "feat-001"
-    _git(repo, "worktree", "add", "-q", "-b",
-         f"leerie/subtasks/{run_id}/feat-001", str(tree),
-         f"leerie/runs/{run_id}")
+    # Created by the real script, so the fixture lives where a real run puts
+    # it: a hand-built `worktrees/<sid>` (the pre-prefix layout) hid that
+    # the re-drive looked there and never measured anything on a real run.
+    made = subprocess.run(
+        ["bash", str(REPO_ROOT / "scripts" / "new-worktree.sh"), "feat-001",
+         run_id], cwd=repo, capture_output=True, text=True, check=True,
+        env={**os.environ, "LEERIE_STATE_DIR": str(leerie_root)})
+    tree = Path(made.stdout.strip().splitlines()[-1])
+    assert tree == leerie._subtask_worktree_path(run_dir, "feat-001")
+    assert tree != run_dir / "worktrees" / "feat-001"
     _install_fake(tree)
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "x", "subtask_status": {"feat-001": "complete"}}
