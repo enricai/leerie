@@ -2009,6 +2009,17 @@ after the first save in the window both resumed onto an unjudged merge
 `integrate_wave` resume branch or the `phase_execute` shortcut exclusion each
 fails the suite again.
 
+## Wiring-gate repair on resume
+
+DESIGN §5 *A wiring re-check on the fully-merged plan*:
+`tests/test_wiring_gate_repair_resume.py` drives the real `_run_phases` and
+`phase_wiring_gate` (judge scripted to a repairable `missing_requires`) and
+kills after each save from the verdict's first appearance until the repaired
+`plan_snapshot` is on disk, plus once inside the re-schedule. Disk holds both
+or neither, and every resume reaches `phase_execute` with the repaired wave
+order. With the gate saving its own verdict the window is two saves, and the
+first resumed past the gate onto the unrepaired snapshot.
+
 ## Integrator-crash salvage path
 
 The integrator-crash salvage path (DESIGN §12 *salvage if there is something

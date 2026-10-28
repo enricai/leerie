@@ -33202,7 +33202,12 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     # resume skip condition, so a run the gate killed must not carry it.
     st.data["wiring_gate"] = {**judge_result, "repairs": repairs,
                               "warnings": wiring_warnings}
-    st.save()
+    if not repairs:
+        st.save()
+    # With repairs, `_run_phases` saves the verdict in one write with the
+    # re-scheduled plan_snapshot: the verdict is the resume skip and the
+    # repairs live only in the snapshot, so a kill between two saves resumed
+    # onto the unrepaired plan (DESIGN §5).
     log("phase 3: plan-wiring gate clean"
         + (f" (after {len(repairs)} repair(s))" if repairs else ""))
     return plans
@@ -58045,7 +58050,8 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # check_plan_wiring, _validate_plan and _write_plan below all see
             # the repaired graph rather than the one the judge rejected,
             # and rewrite plan_snapshot so a later resume rehydrates the
-            # repaired _schedule (DESIGN §5).
+            # repaired _schedule (DESIGN §5). The gate left a repairing
+            # verdict unsaved: this one save carries both.
             if (st.data.get("wiring_gate") or {}).get("repairs"):
                 subtasks, waves = _schedule(
                     plans, caps.get("overlap_extra_waves",

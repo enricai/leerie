@@ -1238,7 +1238,12 @@ fallbacks).
 Because added edges change the wave partition, the scheduler is re-run and the
 plan snapshot rewritten after a repair, so everything downstream — the budget
 preflight, the deterministic wiring re-check, `_validate_plan`, `_write_plan` — sees
-the repaired graph rather than the one the judge rejected.
+the repaired graph rather than the one the judge rejected. The verdict and the
+rewritten snapshot are saved together, in one write: the verdict is what a
+resume skips the gate on, and the repairs live only in the plan the snapshot
+holds, so a kill between two writes resumed past the gate onto the unrepaired
+snapshot and executed without the edges it added. A kill before that one write
+leaves neither, and the resume runs the gate again.
 
 **Each defect declares a severity, and the severity is asked for rather than
 required.** A `live_defect` gates; a `latent_risk` is logged as a warning only.
