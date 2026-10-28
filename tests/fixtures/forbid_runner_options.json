@@ -1571,5 +1571,1013 @@
    "-t",
    "-u"
   ]
+ },
+ "whole-suite runner head": {
+  "_how": "Round-4 review M4. Each row ran through real bash with the real runner (go 1.25.3, pytest, uv, vitest 5.0.5, jest 30.5.2, mocha 12.0.3, rspec 3.13, cargo 1.99) in a project whose test files append a marker when loaded; `whole` is true when every file of the project loaded (go: packages a, b and the root package r; cargo: the lib's unit tests l and integration tests a, b). `forbid` is the whole_suite entry, test roots per project (go none, pytest/vitest/jest tests, mocha test, rspec spec, cargo tests). The matcher must refuse exactly the whole runs.",
+  "rows": [
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test -race ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test -v -count=1 ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test -coverprofile=c.out ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test -run TestA ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test ./... -race",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test -tags x -p 1 ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test ./a",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test -race ./a",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test .",
+    "ran": "r",
+    "whole": false
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test -v .",
+    "ran": "r",
+    "whole": false
+   },
+   {
+    "project": "go",
+    "forbid": "go test ./...",
+    "cmd": "go test ./a/...",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "go",
+    "forbid": "go test -race ./...",
+    "cmd": "go test ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "go",
+    "forbid": "go test -race ./...",
+    "cmd": "go test ./b",
+    "ran": "b",
+    "whole": false
+   },
+   {
+    "project": "go",
+    "forbid": "go test",
+    "cmd": "go test -v ./...",
+    "ran": "abr",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest tests",
+    "cmd": "pytest -q tests",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest tests",
+    "cmd": "pytest tests",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest tests",
+    "cmd": "pytest -x --tb short tests/",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest tests",
+    "cmd": "pytest tests/test_a.py",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest tests",
+    "cmd": "pytest -q tests/test_a.py",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest tests",
+    "cmd": "pytest .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest tests",
+    "cmd": "pytest",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "uv run pytest tests",
+    "cmd": "uv run pytest -x tests",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "uv run pytest tests",
+    "cmd": "uv run pytest -x tests/test_b.py",
+    "ran": "b",
+    "whole": false
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest",
+    "cmd": "pytest .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest",
+    "cmd": "pytest ./",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest",
+    "cmd": "pytest -q .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest",
+    "cmd": "python3 -m pytest -p no:cacheprovider .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest -q",
+    "cmd": "pytest -x",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "pytest",
+    "forbid": "pytest -q",
+    "cmd": "pytest tests/test_b.py",
+    "ran": "b",
+    "whole": false
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "vitest run .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run",
+    "cmd": "vitest .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run --coverage",
+    "cmd": "vitest run",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run --coverage",
+    "cmd": "vitest run tests/a.test.mjs",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run tests",
+    "cmd": "vitest run --reporter dot tests",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "vitest",
+    "forbid": "vitest run tests",
+    "cmd": "vitest run tests/b.test.mjs",
+    "ran": "b",
+    "whole": false
+   },
+   {
+    "project": "jest",
+    "forbid": "jest",
+    "cmd": "jest .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "jest",
+    "forbid": "jest tests",
+    "cmd": "jest --ci tests",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "jest",
+    "forbid": "jest tests",
+    "cmd": "jest tests/a.test.js",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "mocha",
+    "forbid": "mocha",
+    "cmd": "mocha .",
+    "ran": "",
+    "whole": false
+   },
+   {
+    "project": "mocha",
+    "forbid": "mocha test",
+    "cmd": "mocha --reporter dot test",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "mocha",
+    "forbid": "mocha test",
+    "cmd": "mocha test/a.spec.js",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "rspec",
+    "forbid": "rspec",
+    "cmd": "rspec .",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "rspec",
+    "forbid": "rspec spec",
+    "cmd": "rspec --format documentation spec",
+    "ran": "ab",
+    "whole": true
+   },
+   {
+    "project": "rspec",
+    "forbid": "rspec spec",
+    "cmd": "rspec spec/a_spec.rb",
+    "ran": "a",
+    "whole": false
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test",
+    "cmd": "cargo test .",
+    "ran": "",
+    "whole": false
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test --workspace",
+    "cmd": "cargo test -q",
+    "ran": "abl",
+    "whole": true
+   },
+   {
+    "project": "cargo",
+    "forbid": "cargo test --workspace",
+    "cmd": "cargo test --test a",
+    "ran": "a",
+    "whole": false
+   }
+  ]
+ },
+ "r4 reviewer matcher rows": {
+  "_how": "The round-4 execution review's 83 matcher rows (proofs4/match_probe.py): (forbidden whole_suite command, test roots, command, expected). The reviewer expected `vitest run --silent src/a.test.ts` allowed and `vitest run --project unit` refused; vitest's `--silent [value]` takes the file as its value, so the first is a whole-suite run and is refused (the review agrees). `--project` is decided in DESIGN \u00a79 (L3).",
+  "rows": [
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --reporter json --outputFile /tmp/r.json src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --reporter=json src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest src/a.test.ts --run",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest --run src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "pnpm vitest run src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "pnpm exec vitest run src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "npx vitest run src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run -c vitest.config.ts src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --config ./vitest.unit.config.ts src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --coverage.enabled false src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --pool forks src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --pool=forks --poolOptions.forks.singleFork src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --silent src/a.test.ts",
+    "refuse"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --no-color src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --environment jsdom src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --bail 1 src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --retry 2 src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --maxWorkers 1 src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --maxWorkers=1 src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --testTimeout 10000 src/a.test.ts",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run src",
+    "refuse"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run",
+    "refuse"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest run --project unit",
+    "allow"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "vitest",
+    "refuse"
+   ],
+   [
+    "vitest",
+    [
+     "src",
+     "test"
+    ],
+    "pnpm vitest",
+    "refuse"
+   ],
+   [
+    "pnpm test",
+    [
+     "src"
+    ],
+    "pnpm test src/a.test.ts",
+    "allow"
+   ],
+   [
+    "pnpm test",
+    [
+     "src"
+    ],
+    "pnpm test -- src/a.test.ts",
+    "allow"
+   ],
+   [
+    "pnpm test",
+    [
+     "src"
+    ],
+    "pnpm run test -- src/a.test.ts",
+    "allow"
+   ],
+   [
+    "pnpm test",
+    [
+     "src"
+    ],
+    "pnpm test --run src/a.test.ts",
+    "allow"
+   ],
+   [
+    "pnpm test",
+    [
+     "src"
+    ],
+    "pnpm test",
+    "refuse"
+   ],
+   [
+    "pnpm test",
+    [
+     "src"
+    ],
+    "pnpm run test",
+    "refuse"
+   ],
+   [
+    "pnpm test",
+    [
+     "src"
+    ],
+    "npm test",
+    "refuse"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest tests/test_x.py::test_a -q",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -q -p no:cacheprovider tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -x --tb=short tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --tb short tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -o addopts= tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -n 4 tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -n auto tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --timeout 60 tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --cov src --cov-report term tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -m 'not slow' tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --junitxml out.xml tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --json-report --json-report-file r.json tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --reruns 2 tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --ds myproj.settings tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest --log-level DEBUG tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "python -m pytest tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "uv run pytest tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "uv run --frozen pytest tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "poetry run pytest tests/test_x.py",
+    "allow"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest",
+    "refuse"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest tests",
+    "refuse"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest tests/",
+    "refuse"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest .",
+    "refuse"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -n 4",
+    "refuse"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "pytest -n 4 tests",
+    "refuse"
+   ],
+   [
+    "pytest",
+    [
+     "tests"
+    ],
+    "uv run pytest -q",
+    "refuse"
+   ],
+   [
+    "go test",
+    [],
+    "go test ./internal/foo",
+    "allow"
+   ],
+   [
+    "go test",
+    [],
+    "go test -run TestX ./internal/foo",
+    "allow"
+   ],
+   [
+    "go test",
+    [],
+    "go test -race -count=1 ./internal/foo/...",
+    "allow"
+   ],
+   [
+    "go test",
+    [],
+    "go test -v -timeout 30s ./internal/foo",
+    "allow"
+   ],
+   [
+    "go test",
+    [],
+    "go test -tags integration ./internal/foo",
+    "allow"
+   ],
+   [
+    "go test",
+    [],
+    "go test ./...",
+    "refuse"
+   ],
+   [
+    "go test",
+    [],
+    "go test -race ./...",
+    "refuse"
+   ],
+   [
+    "go test ./...",
+    [],
+    "go test ./internal/foo",
+    "allow"
+   ],
+   [
+    "go test ./...",
+    [],
+    "go test ./...",
+    "refuse"
+   ],
+   [
+    "go test ./...",
+    [],
+    "go test -race ./...",
+    "refuse"
+   ],
+   [
+    "go test ./...",
+    [],
+    "go test -count=1 ./...",
+    "refuse"
+   ],
+   [
+    "cargo test",
+    [],
+    "cargo test --test api",
+    "allow"
+   ],
+   [
+    "cargo test",
+    [],
+    "cargo test",
+    "refuse"
+   ],
+   [
+    "cargo test",
+    [],
+    "cargo test --workspace",
+    "refuse"
+   ],
+   [
+    "npm test",
+    [
+     "test"
+    ],
+    "npm test -- test/a.test.js",
+    "allow"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest src/a.test.ts",
+    "allow"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest --ci src/a.test.ts",
+    "allow"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest --runInBand src/a.test.ts",
+    "allow"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest -i src/a.test.ts",
+    "allow"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest --coverage=false src/a.test.ts",
+    "allow"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest --config jest.config.js src/a.test.ts",
+    "allow"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest",
+    "refuse"
+   ],
+   [
+    "jest",
+    [
+     "src"
+    ],
+    "jest --ci",
+    "refuse"
+   ]
+  ]
  }
 }

@@ -22966,7 +22966,9 @@ _FORBID_NODE_MODULES_BIN = re.compile(
 # the words a flag takes as its value (`jest --ci false`, vitest's
 # `--globals false`: yargs and cac read them, mocha does not); `dashdash`
 # set when words after `--` are not filters (cac hands them to vitest as
-# `options['--']`). Name filters (`-k`, `-t`, `-run`, `-e`, `-n`) are value
+# `options['--']`); `dot_scoped` set when the runner reads the repo root
+# `.` as one package, a name filter or a non-recursive directory (`go test
+# .`, `cargo test .`, `mocha .`) rather than the whole suite. Name filters (`-k`, `-t`, `-run`, `-e`, `-n`) are value
 # options, not selection: like a flags-only run they still load the whole
 # suite. Each of these was measured with the real runner
 # (`tests/test_forbidden_runner_spellings.py`).
@@ -22987,14 +22989,17 @@ _FORBID_RUNNERS: dict[tuple[str, ...], dict[str, frozenset[str]]] = {
             "--changedFilesWithAncestor", "--onlyFailures", "-f",
             "--findRelatedTests", "--selectProjects", "--runTestsByPath"})},
     ("mocha",): {"value": _MOCHA_VALUE_OPTS,
-                 "select": frozenset({"--spec"})},
+                 "select": frozenset({"--spec"}),
+                 "dot_scoped": frozenset({"no_recursion"})},
     ("go", "test"): {"value": _GO_TEST_VALUE_OPTS,
-                     "suite": frozenset({"./...", "...", "all"})},
+                     "suite": frozenset({"./...", "...", "all"}),
+                     "dot_scoped": frozenset({"package"})},
     ("cargo", "test"): {
         "value": _CARGO_TEST_VALUE_OPTS,
         "select": frozenset({"--test", "--bin", "--example", "--bench",
                              "--lib", "--doc", "-p", "--package"}),
-        "after_dashdash": _LIBTEST_VALUE_OPTS},
+        "after_dashdash": _LIBTEST_VALUE_OPTS,
+        "dot_scoped": frozenset({"name_filter"})},
     ("rspec",): {
         "value": _RSPEC_VALUE_OPTS,
         "select": frozenset({"-P", "--pattern", "--only-failures", "-n",
@@ -23008,6 +23013,24 @@ def _forbidden_runner(forb: list[str]) -> dict[str, frozenset[str]]:
     names (`_forbidden_runner_canon`), `{}` for any other command."""
     return (_FORBID_RUNNERS.get(tuple(forb[:2]))
             or _FORBID_RUNNERS.get(tuple(forb[:1])) or {})
+
+
+def _forbidden_suite_head(forb: list[str]) -> tuple[list[str], list[str]]:
+    """`(runner head, suite operands)` of a canonical `whole_suite` forbidden
+    argv (DESIGN §9 *A whole-suite forbid matches on the runner alone*):
+    `go test -v ./...` → `(["go", "test"], ["./..."])`. The entry's flags
+    are dropped and its operands become whole-suite operands, so a flag in
+    any position (`go test -race ./...`) still matches. A command that is
+    no `_FORBID_RUNNERS` runner, or an entry whose own words select
+    (`vitest --changed`), comes back whole with no operands: it keeps the
+    prefix match."""
+    n = (2 if tuple(forb[:2]) in _FORBID_RUNNERS
+         else 1 if tuple(forb[:1]) in _FORBID_RUNNERS else 0)
+    if not n:
+        return forb, []
+    ops = _forbidden_runner_operands(forb[n:], _FORBID_RUNNERS[
+        tuple(forb[:n])])
+    return (forb, []) if ops is None else (forb[:n], ops)
 
 
 def _forbidden_runner_canon(argv: list[str]) -> list[str]:
@@ -23114,25 +23137,25 @@ def _forbidden_node_script(args: list[str]) -> list[str] | None:
     return [m.group(1) or m.group(2), *args[i + 1:]]
 
 
-def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
-                                value_opts: frozenset[str] = frozenset(),
-                                *, runner: dict[str, frozenset[str]]
-                                | None = None) -> bool:
-    """True when the words after a matched runner still run the whole suite
-    — the whole-suite deny's semantics (`_suite_rule_bodies`: the bare
-    runner, or one aimed at a test root), plus a flags-only runner, which
-    the hook can see though a CLI rule cannot. A run naming any other
-    operand (a test file) is not a whole-suite run. The word after one of
-    the runner's `value_opts` is that option's value, not an operand.
-    `runner` (a `_FORBID_RUNNERS` entry) adds its value options, its
-    selecting options (a hit is a scoped run), its whole-suite operands
-    and, after `--`, its test binary's value options."""
-    spec = runner or {}
+def _forbidden_operand(w: str) -> str:
+    """A path operand as the suite comparison reads it: a leading `./` and
+    trailing `/` dropped, the repo root (`.`, `./`) read as `.`."""
+    return w.removeprefix("./").rstrip("/") or "."
+
+
+def _forbidden_runner_operands(rest: list[str],
+                               spec: dict[str, frozenset[str]],
+                               value_opts: frozenset[str] = frozenset()
+                               ) -> list[str] | None:
+    """The operands among the words after a matched runner, normalised by
+    `_forbidden_operand`, or None when one of the runner's selecting
+    options (`spec["select"]`) makes it a scoped run. The word after one of
+    the runner's value options is that option's value, never an operand;
+    after `--` the test binary's value options apply (`after_dashdash`), or
+    nothing more is an operand (`dashdash`)."""
     value_opts = value_opts | spec.get("value", frozenset())
     select = spec.get("select", frozenset())
     bools = spec.get("bool_words", frozenset())
-    norm = {r.strip("/") for r in roots}
-    norm |= {w.strip("/") for w in spec.get("suite", frozenset())}
     pos: list[str] = []
     skip = after_flag = False
     for w in rest:
@@ -23145,13 +23168,40 @@ def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
                 value_opts = spec["after_dashdash"]
         elif w.startswith("-"):
             if w.split("=", 1)[0] in select:
-                return False
+                return None
             skip = w in value_opts
             after_flag = not skip and "=" not in w
             continue
         elif not (after_flag and w in bools):
-            pos.append(w.removeprefix("./").rstrip("/"))
+            pos.append(_forbidden_operand(w))
         after_flag = False
+    return pos
+
+
+def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
+                                value_opts: frozenset[str] = frozenset(),
+                                *, runner: dict[str, frozenset[str]]
+                                | None = None) -> bool:
+    """True when the words after a matched runner still run the whole suite
+    — the whole-suite deny's semantics (`_suite_rule_bodies`: the bare
+    runner, or one aimed at a test root), plus a flags-only runner, which
+    the hook can see though a CLI rule cannot. A run naming any other
+    operand (a test file) is not a whole-suite run. The repo root (`.`,
+    `./`) is a whole-suite operand, except for a runner that reads it as one
+    package, a name filter or a non-recursive directory (`dot_scoped`:
+    `go test .`, `cargo test .`, `mocha .`).
+    `runner` (a `_FORBID_RUNNERS` entry) adds its value options, its
+    selecting options (a hit is a scoped run), its whole-suite operands
+    and, after `--`, its test binary's value options
+    (`_forbidden_runner_operands`)."""
+    spec = runner or {}
+    pos = _forbidden_runner_operands(rest, spec, value_opts)
+    if pos is None:
+        return False
+    norm = {_forbidden_operand(r) for r in roots}
+    norm |= {_forbidden_operand(w) for w in spec.get("suite", frozenset())}
+    if "dot_scoped" not in spec:
+        norm.add(".")
     return not pos or any(w in norm for w in pos)
 
 
@@ -23172,12 +23222,14 @@ def _forbidden_command_hit(command: str,
             cmd, scope, roots = spec
             for forb in _forbidden_argvs(cmd):
                 forb = _forbidden_runner_canon(forb)
+                head, ops = (_forbidden_suite_head(forb)
+                             if scope == "whole_suite" else (forb, []))
                 for c in cands:
                     c = _forbidden_runner_canon(c)
-                    if not _forbidden_prefix_match(c, forb):
+                    if not _forbidden_prefix_match(c, head):
                         continue
                     if (scope == "any" or _forbidden_whole_suite_rest(
-                            c[len(forb):], roots,
+                            c[len(head):], roots + ops,
                             runner=_forbidden_runner(forb))):
                         return cmd
     except Exception:

@@ -9314,6 +9314,23 @@ Three layers follow, each derived from that one list:
   lists every package or file by name (`go test ./a ./b`), and a selecting
   option that happens to select everything (`cargo test -p` in a
   one-package workspace, `rspec --only-failures` with no failure record).
+
+  *A whole-suite forbid matches on the runner alone.* The extractor is told
+  to return the repo's test command for a whole-suite forbid, and on every
+  Go repo that is `go test ./...`. A prefix match on the whole entry then
+  missed the same run with any flag before the operand: `go test -race
+  ./...` and `go test -v -count=1 ./...`, the standard CI spellings, both
+  ran past it, as did `pytest -q tests` past `pytest tests` (round-4
+  review M4). So a `whole_suite` entry that names a known runner is split
+  into the runner head and its operands. Its flags are dropped, its
+  operands join the test roots as whole-suite operands, and a candidate
+  matches on the head alone, with the runner's own flag-aware operand
+  reading deciding the rest. The repo root (`.`, `./`) is a whole-suite
+  operand too, except where the runner reads it as something smaller:
+  `go test .` tests one package, `cargo test .` is a name filter, and
+  `mocha .` loads only the files directly in the root (each measured with
+  the real runner). A run aimed at a package or a test file is still
+  scoped: `go test ./pkg/x`, `pytest tests/test_a.py`.
   Hooks fire
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not
