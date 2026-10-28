@@ -6928,6 +6928,10 @@ settles `complete` only when all of these hold:
    merges on the subtask's HEAD and keeps those whose diff touches a file
    in this subtask's `files_likely_touched`. These merges are the
    `satisfied_by` evidence: the sibling's sid and its integration commit.
+   That subject is set by code, never left to a worker: an integrator
+   that commits its conflict resolution under a message of its own has
+   the merge re-worded (tree and parents unchanged, its message kept as
+   the body), or the sibling's landed work would be invisible here.
    With none, the claim is the `e33` shape and is re-driven. In `e33` a
    wave-1 test subtask whose test was never written reported its run of
    the file's existing tests as done. Nothing had landed on its surface,

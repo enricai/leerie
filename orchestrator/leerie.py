@@ -52602,6 +52602,37 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
     return files
 
 
+async def _set_integration_subject(staging: Path, sid: str,
+                                   pre_sha: str) -> bool:
+    """Re-word an integrator's merge commit to `leerie: integrate <sid>`,
+    the subject `_integration_commit` and `_sibling_deliveries` find a
+    subtask's merge by. Only HEAD, only a two-parent merge whose first
+    parent is `pre_sha` (the run branch before this merge), and only its
+    message: tree and parents are kept, and the integrator's own message
+    becomes the body. True when HEAD carries the subject afterwards."""
+    want = f"{_INTEGRATE_SUBJECT_PREFIX}{sid}"
+    info = await run_proc(["git", "log", "-1", "--format=%P%x00%s%x00%B",
+                           "HEAD"], cwd=str(staging))
+    if info.returncode != 0:
+        return False
+    parents, subject, body = (info.stdout.split("\0") + ["", ""])[:3]
+    if subject == want:
+        return True
+    if parents.split()[:1] != [pre_sha] or len(parents.split()) != 2:
+        log(f"  {sid}: HEAD is not this integration's merge; its subject "
+            "is left as it is")
+        return False
+    r = await run_proc(["git", "commit", "--amend", "--no-verify",
+                        "--allow-empty", "-m", want, "-m",
+                        body.strip() or subject], cwd=str(staging))
+    if r.returncode != 0:
+        log(f"  {sid}: could not set the merge's subject "
+            f"({r.stderr.strip()[:200]})")
+        return False
+    log(f"  {sid}: integrator merge re-worded to {want!r}")
+    return True
+
+
 async def integrate_wave(wave: list[str], results: dict[str, dict],
                          leerie_dir: Path, caps: dict, st: State,
                          models: dict[str, str],
@@ -52786,6 +52817,9 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 results[sid] = {"subtask_id": sid, "status": "unconverged",
                                 "summary": "integration backed out"}
                 continue
+            # The subject is code's to set: routing and sibling-delivery
+            # settlement find a subtask's merge by it (review r1).
+            await _set_integration_subject(staging, sid, pre_sha)
             commit_err = await check_integrator_commit(staging)
             if commit_err:
                 # non-fatal: log and record, but don't undo the integration

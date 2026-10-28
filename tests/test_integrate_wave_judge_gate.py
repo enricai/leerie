@@ -1261,3 +1261,51 @@ def test_advisory_defect_logs_but_does_not_gate(leerie, tmp_path, monkeypatch):
     assert out == ["feat-001"]
     assert st.data["integration_gate"]["feat-001"]["accepted"] is True
     assert st.data["integration_gate"]["feat-001"]["advisories"]
+
+
+@pytest.mark.parametrize("message", [
+    "Resolve merge conflict in app.py", "leerie: integrate feat-001"])
+def test_an_integrator_merge_carries_the_integration_subject(
+        leerie, tmp_path, monkeypatch, message):
+    """Review r1 suspicion, proven: an integrator that commits its
+    resolution with a message of its own left a merge `_integration_commit`
+    (subject `leerie: integrate <sid>`) cannot find, so routing falls back to
+    `files_likely_touched` and `_sibling_deliveries` misses the sibling's
+    landed work. The subject is code's to set: the merge is re-worded,
+    tree and parents unchanged, the integrator's message kept as the
+    body."""
+    import subprocess
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging, pre = _conflicting_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"}}
+
+    async def fake_claude_p(**kwargs):
+        if kwargs.get("schema_key") == "integrator":
+            (staging / "app.py").write_text("x = 3\n")
+            subprocess.run(["git", "add", "-A"], cwd=str(staging),
+                           check=True)
+            subprocess.run(["git", "commit", "-q", "-m", message],
+                           cwd=str(staging), check=True)
+            return {"status": "resolved", "resolution_summary": "merged",
+                    "confidence": {"resolution": 9.0, "basis": "clean"}}
+        return {"merge_reviewed": True, "defects": [], "rationale": "clean"}
+
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    _no_conflict_tests(leerie, monkeypatch)
+    incoming = _git_out(staging, "rev-parse", "incoming")
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS,
+        EFFORTS))
+    assert out == ["feat-001"]
+    head = _git_out(staging, "rev-parse", "HEAD")
+    assert leerie._integration_commit(staging, "feat-001") == head
+    assert _git_out(staging, "log", "-1", "--format=%s") == \
+        "leerie: integrate feat-001"
+    assert _git_out(staging, "rev-parse", "HEAD^1", "HEAD^2").split() == [
+        pre, incoming]
+    assert (staging / "app.py").read_text() == "x = 3\n"
+    if not message.startswith("leerie:"):
+        assert message in _git_out(staging, "log", "-1", "--format=%b")
+    assert st.data["integration_gate"]["feat-001"]["merge_commit_sha"] == head
