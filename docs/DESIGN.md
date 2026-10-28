@@ -6533,7 +6533,9 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    git-excluded in the tree, with the exact command that runs them: without
    that self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against
    18 of 24 with it (every one of the 24 closed its staged sets). After each
-   group the orchestrator re-runs the sets and the repository's tests; a
+   group the orchestrator re-runs the sets and the repository's tests — a
+   test command the task forbids replaced by the scoped run of the coupled
+   tests, as at final and in the ratchet, never run raw; a
    result that is worse is rolled back (`reset --hard` to the group's
    start, `clean -fd`). Worse is counted in cases, the same unit as
    progress: any set case that passed before the group and fails after it
@@ -7381,9 +7383,21 @@ never blocks the PR; it is recorded and handed to the next same-task
 run's planner (`prior_delivery_residual`), where a full plan-and-
 implement cycle settled the generate residual 2/3 times. And a repair
 round must not trade the report for a regression: if the repo's test
-axis goes from passing to failing across the repair rounds, their
-commits are reset away and the residual is recorded instead — likewise
-if the repair turned measurable held-out sets unmeasurable (a broken
+axis goes from passing to failing across the repair rounds, and the
+failure is confirmed, their commits are reset away and the residual is
+recorded instead. Confirmed means what it means everywhere else (§9
+*Which failures are new*): the IDs failing on the repaired tree are
+confirmed under B\* against the pre-repair tree, which passed, and only a
+confirmed new failure resets; when the red run produced no per-test report
+at all (the suite could not run — a broken import or build), the axis is
+run once more, unmemoised, and a second red resets; a confirmation that
+itself fails falls back to the red run. Unconfirmed, one red
+run of one flaky test reset every round's work, the fixes included. The
+per-round ratchet does not make this rule redundant: it is the same B\*
+check per round, but it is blind exactly where the suite stops reporting
+(no IDs on one side is no verdict), and a ratchet that raises keeps its
+round; this rule, over the whole repair, is the net under both. The
+commits are likewise reset if the repair turned measurable held-out sets unmeasurable (a broken
 dependency manifest, which the staging test axis, installed long before,
 would not notice) — but only after the repaired tree is measured once
 more and the pre-repair tree measures where it does not, since every

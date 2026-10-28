@@ -2065,7 +2065,11 @@ def test_failures_section_is_names_only_and_hides_the_holdout(leerie, tmp_path):
     assert "add subtracts" in text
 
 
-def _run_gate(leerie, monkeypatch, st, fixer, measured=None):
+def _run_gate(leerie, monkeypatch, st, fixer, measured=None,
+              confirm_red=True):
+    """`measured` scripts the test axis; a red post-repair axis is then
+    confirmed (`confirm_red`) or not by a stubbed B* confirmation — its
+    real behaviour is pinned in tests/test_acceptance_red_axis_confirm.py."""
     calls = []
 
     async def fake_claude_p(**kw):
@@ -2080,6 +2084,12 @@ def _run_gate(leerie, monkeypatch, st, fixer, measured=None):
         async def fake_axes(tree, axes, st_, caps, **kw):
             return {"tests": seq.pop(0)}
         monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+
+        async def fake_confirm(*a, **kw):
+            return (("turned the test axis red", {"new": ["t::x"]})
+                    if confirm_red else ("", {"new": []}))
+        monkeypatch.setattr(leerie, "_acceptance_confirm_red_axis",
+                            fake_confirm)
     asyncio.run(leerie._run_acceptance_gate(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     return calls
@@ -2137,6 +2147,57 @@ def test_repair_that_turns_the_test_axis_red_is_rolled_back(
     assert gate["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
     assert gate["residual"]["failing_sets"] == 5
+
+
+def test_an_unconfirmed_red_test_axis_keeps_the_repair(
+        leerie, tmp_path, monkeypatch):
+    """The gate-wide rule resets only a confirmed regression: one red run
+    with no failure confirmed new under B* (a flake) keeps the repair's
+    fixes (DESIGN §8)."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    before = _git(staging, "rev-parse", "HEAD")
+    _run_gate(leerie, monkeypatch, st, _commit_fix,
+              measured=[{"passed": True, "measured": True},
+                        {"passed": False, "measured": True}],
+              confirm_red=False)
+    gate = st.data["acceptance"]["gate"]
+    assert "rolled_back" not in gate
+    assert gate["post_tests_confirm"] == {"new": []}
+    assert _git(staging, "rev-parse", "HEAD") != before
+    assert (staging / "calc.py").read_text() == FIXED
+
+
+def test_a_confirmation_that_raises_falls_back_to_the_red_run(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    before = _git(staging, "rev-parse", "HEAD")
+
+    async def boom(*a, **kw):
+        raise RuntimeError("no base worktree")
+    seq = [{"passed": True, "measured": True},
+           {"passed": False, "measured": True}]
+
+    async def fake_axes(tree, axes, st_, caps, **kw):
+        return {"tests": seq.pop(0)}
+
+    async def fake_claude_p(**kw):
+        _commit_fix(Path(kw["cwd"]))
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_measure_axes", fake_axes)
+    monkeypatch.setattr(leerie, "_acceptance_confirm_red_axis", boom)
+    asyncio.run(leerie._run_acceptance_gate(
+        st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
+    gate = st.data["acceptance"]["gate"]
+    assert gate["rolled_back"] is True
+    assert gate["post_tests_confirm"]["error"].startswith("RuntimeError")
+    assert _git(staging, "rev-parse", "HEAD") == before
 
 
 def test_resume_mid_repair_still_rolls_back_a_red_repair(

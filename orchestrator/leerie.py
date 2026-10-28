@@ -44220,8 +44220,23 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     if (post_tests.get("measured", True)
                             and not post_tests.get("passed")):
                         # A repair must not trade the report for a
-                        # regression.
-                        reason = "turned the test axis red"
+                        # regression — a confirmed one: a flaky red run
+                        # must not reset every round's fixes (DESIGN §8).
+                        try:
+                            reason, confirm = (
+                                await _acceptance_confirm_red_axis(
+                                    st, caps, staging, before_sha, test_cmd,
+                                    log_path=(leerie_dir / "logs"
+                                              / "acceptance-repair.log")))
+                        except Exception as e:
+                            # The net under the per-round ratchet: when it
+                            # cannot confirm, it falls back to the red run.
+                            reason, confirm = "turned the test axis red", {
+                                "error": f"{type(e).__name__}: {e}"[:300]}
+                            log("  acceptance: confirming the red test axis "
+                                f"raised {confirm['error']} — treated as "
+                                "red")
+                        gate["post_tests_confirm"] = confirm
                 if (not reason and _acceptance_measured(initial)
                         and not _acceptance_measured(final)):
                     # Nor make the held-out sets unmeasurable (a broken
@@ -44372,6 +44387,51 @@ def _acceptance_broken_cases(before: list[dict], after: list[dict]
               & {r["index"] for r in _acceptance_measured(after or [])})
     return _redrive_broken_cases(_acceptance_failing_keys(before, common),
                                  _acceptance_failing_keys(after, common))
+
+
+async def _acceptance_confirm_red_axis(st: "State", caps: dict,
+                                       staging: Path, before_sha: str,
+                                       test_cmd: str, *, log_path: Path
+                                       ) -> tuple[str, dict]:
+    """Whether the test axis, green before the acceptance repair and red on
+    its tree, is a regression the repair made (DESIGN §8 *Held-out
+    acceptance tests*, the gate-wide rule): `(reason, record)`, `reason`
+    empty when it is not confirmed. The repaired tree's failing IDs are
+    confirmed under B* against `before_sha`, where nothing failed
+    (`_ratchet_exec`); only a confirmed new failure counts — one red run of
+    one flaky test used to reset every round. With no per-test report (the
+    suite could not run at all) the axis is measured once more, unmemoised,
+    and a second red counts."""
+    after = await _ratchet_test_ids(st, caps, str(staging),
+                                    label="acceptance-post-ids",
+                                    log_path=log_path)
+    if after is not None:
+        ex = await _ratchet_exec(
+            st, caps, staging, before_sha,
+            {"ids": [], "files": {}, "command": after.get("command")},
+            after, label="acceptance-post", log_path=log_path)
+        rec = {"new": list(ex.get("new") or []),
+               "resource_affected": list(ex.get("resource_affected") or [])}
+        if rec["new"]:
+            return "turned the test axis red", rec
+        log("  acceptance: the test axis is red after the repair, but no "
+            "failure is confirmed new under B* (flaky or resource-affected: "
+            f"{', '.join(rec['resource_affected'][:5]) or 'none'}) — the "
+            "repair is kept")
+        return "", rec
+    again = (await _measure_axes(
+        str(staging), {"tests": test_cmd}, st, caps, log_path=log_path,
+        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+        label_prefix="acceptance-post-again", log_prefix="acceptance",
+        memo=False)).get("tests") or {}
+    reproduced = bool(again.get("measured", True)
+                      and again.get("passed") is False)
+    if not reproduced:
+        log("  acceptance: the test axis was red after the repair with no "
+            "per-test report, and green or unmeasured on a second run — the "
+            "repair is kept")
+    return ("turned the test axis red" if reproduced else "",
+            {"no_report": True, "reproduced": reproduced})
 
 
 def _acceptance_round_kept(entry: dict) -> bool:
@@ -47030,18 +47090,14 @@ async def _redrive_rollback(staging: Path, pre_sha: str) -> bool:
 async def _redrive_test_ids(st: "State", caps: dict, staging: Path,
                             label: str) -> dict | None:
     """Failing test IDs of the repo's test command on staging, or None (no
-    command, no report: no verdict)."""
-    cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"]) or "").strip()
-    if not cmd:
-        return None
-    timeout = float(caps.get("worker_timeout_sec")
-                    or DEFAULT_CAPS["worker_timeout_sec"])
-    got = await _capture_failing_test_ids(
-        str(staging), cmd, st, caps, label=label,
-        log_path=st.run_dir / "logs" / _REDRIVE_LOG, timeout=timeout)
-    if got is not None:
-        got["command"] = cmd
-    return got
+    command, nothing to run, no report: no verdict). The ratchet's own
+    measurement (`_ratchet_test_ids`): a command the task forbids is
+    replaced by its scoped run over the coupled tests, never run raw — the
+    orchestrator does not run what the task forbids (DESIGN §9 *A command
+    the task forbids*)."""
+    return await _ratchet_test_ids(st, caps, str(staging), label=label,
+                                   log_path=st.run_dir / "logs"
+                                   / _REDRIVE_LOG)
 
 
 async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
