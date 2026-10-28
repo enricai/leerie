@@ -130,6 +130,25 @@ def _writer(leerie, monkeypatch, files, probe=None):
     ("cargo test", "cargo test --no-fail-fast {test_targets}", "cargo"),
     ("cargo test --no-fail-fast",
      "cargo test --no-fail-fast {test_targets}", "cargo"),
+    # r1 L2: wrapped and argumented pytest. The path positionals are
+    # replaced by the set's files; the options and the wrapper are kept.
+    ("poetry run pytest", "poetry run pytest {test_files}", "pytest"),
+    ("pytest -q tests", "pytest -q {test_files}", "pytest"),
+    ("python -m pytest tests/", "python -m pytest {test_files}", "pytest"),
+    ("uv run --frozen pytest -q tests",
+     "uv run --frozen pytest -q {test_files}", "pytest"),
+    ("uv run --python 3.12 pytest", "uv run --python 3.12 pytest "
+     "{test_files}", "pytest"),
+    ("poetry run python -m pytest tests",
+     "poetry run python -m pytest {test_files}", "pytest"),
+    ("pipenv run pytest", "pipenv run pytest {test_files}", "pytest"),
+    ("pdm run pytest tests/unit", "pdm run pytest {test_files}", "pytest"),
+    ("python3.12 -m pytest -x tests",
+     "python3.12 -m pytest -x {test_files}", "pytest"),
+    ("pytest -n auto --log-level DEBUG tests",
+     "pytest -n auto --log-level DEBUG {test_files}", "pytest"),
+    ("pytest --strict-markers tests", "pytest --strict-markers {test_files}",
+     "pytest"),
 ])
 def test_a_bare_runner_command_infers_a_scoped_template(leerie, canonical,
                                                          template, runner):
@@ -148,6 +167,14 @@ def test_rake_test_goes_through_the_ruby_loader(leerie):
     ("npm test", "no_scoped_runner:npm"),
     ("make test", "no_scoped_runner:make"),
     ("pytest -k smoke tests/", "no_scoped_runner:not a bare pytest command"),
+    ("pytest -mslow", "no_scoped_runner:not a bare pytest command"),
+    ("poetry run pytest --lf", "no_scoped_runner:not a bare pytest command"),
+    ("pytest tests/test_a.py::test_one",
+     "no_scoped_runner:not a bare pytest command"),
+    # A word after an unknown long option may be its value: not dropped.
+    ("pytest --some-plugin-opt v tests",
+     "no_scoped_runner:not a bare pytest command"),
+    ("poetry install", "no_scoped_runner:poetry"),
     ("bundle exec rspec spec/models",
      "no_scoped_runner:not a bare rspec command"),
     ("cd sub && pytest", "no_scoped_runner:cd"),
@@ -157,6 +184,33 @@ def test_rake_test_goes_through_the_ruby_loader(leerie):
 ])
 def test_anything_else_is_a_typed_no_scoped_runner(leerie, canonical, why):
     assert leerie._infer_scoped_test_template(canonical) == (None, why)
+
+
+@pytest.mark.parametrize("canonical", [
+    "python3 -m pytest -q -p no:cacheprovider tests",
+    "python3 -m pytest -p no:cacheprovider tests/",
+])
+def test_an_argumented_pytest_template_runs_only_the_given_file(
+        leerie, tmp_path, canonical):
+    """Mechanically, on real pytest: the canonical command names the whole
+    `tests` root, where one file fails; the inferred template over the
+    passing file alone runs only that file (the root is not run beside
+    it)."""
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_ok.py").write_text(
+        "def test_ok():\n    assert True\n")
+    (tmp_path / "tests" / "test_bad.py").write_text(
+        "def test_bad():\n    assert False\n")
+    whole = subprocess.run(canonical, shell=True, cwd=str(tmp_path),
+                           capture_output=True, text=True)
+    assert whole.returncode == 1, whole.stdout
+    template, runner = leerie._infer_scoped_test_template(canonical)
+    assert runner == "pytest"
+    cmd = template.replace("{test_files}", "tests/test_ok.py")
+    one = subprocess.run(cmd, shell=True, cwd=str(tmp_path),
+                         capture_output=True, text=True)
+    assert one.returncode == 0, one.stdout
+    assert "1 passed" in one.stdout
 
 
 def test_package_and_target_placeholders_render_only_what_selects(leerie):

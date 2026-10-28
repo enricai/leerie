@@ -7778,8 +7778,14 @@ through a scoped test template — the canonical command over the set's own
 files — so a repo with no template got no sets at all, silently. The
 template is inferred, when the repo declares none, from a canonical test
 command that is a bare runner invocation (only options after the runner,
-read from its argv, never from prose): `pytest` (also `python -m pytest`,
-`uv run pytest`), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
+read from its argv, never from prose): `pytest` (also `python -m pytest`
+under any `python<version>`, and behind an environment wrapper — `uv
+run`, `poetry run`, `pipenv run`, `pdm run`, `rye run`, `hatch run`, with
+the wrapper's own options — which the template keeps; its path positionals,
+such as `pytest -q tests`, are replaced by the set's files rather than
+disqualifying it, while a node id, a selecting option such as `-k`/`-m`/
+`--lf`, or a word after a long option leerie cannot tell is a flag still
+does), `rspec` (also `bundle exec rspec`, `bin/rspec`) and
 minitest's `rails test` take `{test_files}` as written; `rake test`, which
 takes one path, becomes a `ruby -Itest -Ilib` loader over `{test_files}`;
 `go test` takes the test files' packages (`{test_packages}`, with a

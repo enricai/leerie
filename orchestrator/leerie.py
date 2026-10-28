@@ -34453,7 +34453,6 @@ _SCOPED_RUNNER_PREFIXES: tuple[tuple[tuple[str, ...], str], ...] = (
     (("pytest",), "pytest"), (("py.test",), "pytest"),
     (("python", "-m", "pytest"), "pytest"),
     (("python3", "-m", "pytest"), "pytest"),
-    (("uv", "run", "pytest"), "pytest"),
     (("rspec",), "rspec"), (("bin/rspec",), "rspec"),
     (("bundle", "exec", "rspec"), "rspec"),
     (("bin/rails", "test"), "minitest"), (("rails", "test"), "minitest"),
@@ -34475,6 +34474,60 @@ _SCOPED_RUNNER_VALUE_OPTS: dict[str, frozenset[str]] = {
     "cargo": frozenset({"-F", "--features", "-p", "--package", "-j",
                         "--jobs", "--target", "--profile", "--manifest-path"}),
 }
+# Wrappers that run a command in the project's environment (`poetry run
+# pytest`), with their own options before it: the scoped template keeps the
+# wrapper, and the command after it is read as if bare. Options that take
+# the next word, per wrapper, from each tool's `--help`. Fixed CLI surface.
+_SCOPED_ENV_WRAPPERS: dict[tuple[str, ...], frozenset[str]] = {
+    ("uv", "run"): frozenset({
+        "--with", "--with-editable", "--with-requirements", "-p",
+        "--python", "--extra", "--group", "--only-group", "--no-group",
+        "--package", "--project", "--directory", "--env-file", "--index",
+        "--default-index", "--refresh-package", "--reinstall-package"}),
+    ("poetry", "run"): frozenset({"-C", "--directory", "-P", "--project"}),
+    ("pipenv", "run"): frozenset(),
+    ("pdm", "run"): frozenset({"-p", "--project"}),
+    ("rye", "run"): frozenset({"--pyproject"}),
+    ("hatch", "run"): frozenset(),
+}
+# pytest options that select or reorder which tests run: a command carrying
+# one is narrower than the suite, so it is not bare. `--ignore` and friends
+# only take a path away and are value options instead.
+_PYTEST_SELECTING_OPTS = frozenset({
+    "-k", "-m", "--deselect", "--lf", "--last-failed", "--ff",
+    "--failed-first", "--nf", "--new-first", "--sw", "--stepwise",
+    "--sw-skip", "--stepwise-skip", "--pyargs", "--trace", "--pdb"})
+# pytest long flags taking no value, so a word after one is a positional.
+_PYTEST_LONG_FLAGS = frozenset({
+    "--verbose", "--quiet", "--exitfirst", "--strict-markers",
+    "--strict-config", "--disable-warnings", "--no-header", "--no-summary",
+    "--showlocals", "--runxfail", "--cache-clear", "--doctest-modules",
+    "--full-trace", "--setup-show", "--fixtures", "--version",
+    "--continue-on-collection-errors", "--no-cov"})
+_PYTEST_EXTRA_VALUE_OPTS = frozenset({
+    "--ignore", "--ignore-glob", "--log-level", "--log-cli-level",
+    "--log-file", "--log-file-level", "--log-format", "--junitxml",
+    "--junit-xml", "--confcutdir", "--cov-config", "--cov-fail-under",
+    "--capture", "--color", "--durations-min", "--override-ini",
+    "--reruns", "--reruns-delay", "--randomly-seed", "--cov-branch"})
+_PYTHON_BIN_RE = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)*)?")
+
+
+def _scoped_unwrap(argv: list[str]) -> int:
+    """How many leading words of `argv` are a `_SCOPED_ENV_WRAPPERS`
+    wrapper and its options (0 for none)."""
+    for prefix, vals in _SCOPED_ENV_WRAPPERS.items():
+        if tuple(argv[:len(prefix)]) != prefix:
+            continue
+        i = len(prefix)
+        while i < len(argv) and argv[i].startswith("-"):
+            if argv[i] == "--":
+                return i + 1
+            i += 2 if argv[i] in vals else 1
+        return i
+    return 0
+
+
 # `rake test` takes one path (`TEST=`), so a set's files go through a ruby
 # loader instead: each is required, then minitest's autorun runs them.
 _RUBY_TEST_LOADER = ("ruby -Itest -Ilib -e "
@@ -34495,10 +34548,18 @@ def _infer_scoped_test_template(canonical: str) -> tuple[str | None, str]:
         argv = shlex.split(canonical)
     except ValueError:
         return None, "no_scoped_runner:unparseable test command"
+    wrap = _scoped_unwrap(argv)
+    inner = argv[wrap:]
+    if (len(inner) >= 3 and _PYTHON_BIN_RE.fullmatch(inner[0])
+            and inner[1:3] == ["-m", "pytest"]):
+        # `python3.12 -m pytest` reads as the `python3 -m pytest` prefix.
+        inner = ["python3", *inner[1:]]
     for prefix, runner in _SCOPED_RUNNER_PREFIXES:
-        if tuple(argv[:len(prefix)]) != prefix:
+        if tuple(inner[:len(prefix)]) != prefix:
             continue
-        rest = argv[len(prefix):]
+        rest = argv[wrap + len(prefix):]
+        if runner == "pytest":
+            return _scoped_pytest_template(argv[:wrap + len(prefix)], rest)
         value_opts = _SCOPED_RUNNER_VALUE_OPTS.get(runner, frozenset())
         options: list[str] = []
         for i, a in enumerate(rest):
@@ -34527,6 +34588,42 @@ def _infer_scoped_test_template(canonical: str) -> tuple[str | None, str]:
         return shlex.join(argv) + " {test_files}", runner
     return None, ("no_scoped_runner:"
                   + (os.path.basename(argv[0]) if argv else "empty command"))
+
+
+def _scoped_pytest_template(head: list[str], rest: list[str]
+                            ) -> tuple[str | None, str]:
+    """A pytest command's `{test_files}` template: its options kept, its
+    path positionals (`tests`, `tests/unit`) dropped — the set's files
+    replace them, so the suite is never run beside them. A node id
+    (`a.py::t`), a selecting option (`-k`, `--lf`, …) or a word after an
+    unknown long option (which may be that option's value) leaves it not
+    bare."""
+    vals = _SCOPED_RUNNER_VALUE_OPTS["pytest"] | _PYTEST_EXTRA_VALUE_OPTS
+    keep: list[str] = []
+    i = 0
+    while i < len(rest):
+        a = rest[i]
+        name = a.split("=", 1)[0]
+        if name in _PYTEST_SELECTING_OPTS or (
+                a.startswith("-") and not a.startswith("--")
+                and a[1:2] in ("k", "m") and len(a) > 2):
+            return None, "no_scoped_runner:not a bare pytest command"
+        if a == "--":
+            return None, "no_scoped_runner:not a bare pytest command"
+        if a.startswith("-"):
+            keep.append(a)
+            if a in vals and i + 1 < len(rest):
+                keep.append(rest[i + 1])
+                i += 1
+            i += 1
+            continue
+        prev = rest[i - 1] if i else ""
+        if "::" in a or (prev.startswith("--") and "=" not in prev
+                         and prev not in vals
+                         and prev not in _PYTEST_LONG_FLAGS):
+            return None, "no_scoped_runner:not a bare pytest command"
+        i += 1                       # a path positional: replaced
+    return shlex.join([*head, *keep]) + " {test_files}", "pytest"
 
 
 def resolve_test_file_globs(repo_root: Path) -> list[str]:
