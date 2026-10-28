@@ -50,7 +50,9 @@ def test_confidence_absent_from_required_present_in_properties(leerie):
 # other required fields need (arrays required-empty unless the schema
 # itself demands non-empty items).
 _FIXTURES = {
-    "classifier": {"categories": ["bug-fixing"]},
+    # Requirement-coverage arrays are schema-required (DESIGN §8).
+    "classifier": {"categories": ["bug-fixing"], "span_dispositions": [],
+                   "section_roles": [], "required_items": []},
     "planner": {"domain": "bugfix", "subtasks": [], "status": "ready"},
     "reconciler": {
         "added_subtasks": [],

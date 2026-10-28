@@ -112,28 +112,128 @@ Do this extraction yourself, from the task prose — never leave it for a
 downstream regex or string match. If the task prescribes nothing beyond
 "do the work," leave `is_prescribed` false and `commands` empty.
 
-## Required items
+## Required items (anchored on task spans and report sections)
 
-Some tasks state explicit, enumerable requirements — a numbered checklist,
-"must include steps 1 through 5," "cover every item in the spec below."
-Extract these as structured data in `required_items`, one entry per item:
+The orchestrator has split the input mechanically:
 
-- `item` (string): the requirement itself, concise and specific enough
-  that a plan either covers it or doesn't — not a paraphrase of the whole
-  task.
-- `source_ref` (string, optional): where in the task this requirement
-  comes from (e.g. "item 3 of the checklist," "the Definition of done
-  section").
+- **The task text** into numbered spans `[S1]`, `[S2]`, ... (one per
+  heading, blank-line paragraph, and list item at any indent). A nested
+  list item is shown `[Sx < Sy]`: span Sx sits inside list item Sy.
+- **Each report file the task points at** (a markdown file not tracked
+  in the repository, inlined after the task text) into numbered sections
+  `[R1]`, `[R2]`, ... cut at every markdown heading (the text before the
+  first heading is its own section).
 
-This is deliberately narrow. Only extract items that are genuinely
-enumerable and explicit — a task that describes a goal in prose ("add
-pagination to the API") has no `required_items`; forcing a vague goal into
-a checklist item produces exactly the kind of unmovable false-positive a
-downstream mechanical check cannot resolve. When in doubt, omit the item
-rather than invent one. Most tasks have no `required_items` at all — leave
-the array empty or omit the field.
+The split is mechanical; it does not judge what matters. You do. The
+orchestrator computes coverage from your answer, so every span and every
+section must be accounted for.
 
-One class is NEVER omitted, doubt or no doubt: a **standing deliverable
+**Every task span gets a disposition** (`span_dispositions`, one entry
+per S id, in order): `"items"` when the span states something the
+delivered work must do, fix, produce, contain, preserve, or never
+contain; `"no_requirement"` when it asks for nothing. The task text is
+the user's own instruction: a task span is never discounted as a
+"suggestion". Each entry has `reason` (one short sentence).
+
+- A `no_requirement` span carries `kind`: `"heading"` (a bare heading or
+  label), `"background"` (context that asks for nothing),
+  `"restatement"` (it repeats a requirement stated elsewhere; set
+  `restates` to that S or R id, which must itself be `items` /
+  `requirement` or a restatement of one), or `"process_note"` (how to
+  work, not what to deliver, e.g. which files to read first). An `items`
+  span leaves `kind` empty.
+- A span the task orders done — including an operational step such as a
+  deploy, a PR's contents, or a negative constraint ("never X", "out of
+  scope: X") — is `items`, not `process_note`, even if a human must do
+  or approve part of it.
+
+**Nested list items.** Nested list items are their own spans. Give each
+its own disposition. A nested span that states something the delivered
+work must do, contain, preserve or never contain is `items` with its own
+required item, even when its parent is also `items`; never fold it into
+the parent's item and never mark it a `restatement` of its parent or of
+any span it sits inside. A nested span that only labels the bullets
+under it (e.g. "**Default behaviour:**") is `no_requirement` with kind
+`heading`.
+
+**Every report section gets a role** (`section_roles`, one entry per R
+id, in order), with `reason` (one short sentence):
+
+- `"requirement"`: the section reports a defect, finding, or deliverable
+  that the task adopts. "Fix the issues reported in X" adopts every
+  defect X reports. A report usually states each defect in its title
+  section or in a numbered finding section; that section is the
+  requirement. A report the task points at has at least one.
+- `"evidence"`: symptom, logs, reproduction, diagnosis, root-cause
+  analysis, verification, what was tried. It supports a requirement and
+  asks for nothing itself, even when it explains several causes of one
+  defect.
+- `"suggestion"`: a proposed way to resolve a requirement, such as a fix
+  sketch, a code diff, a "Fix" or "Suggested direction" section, or
+  suggested tests. It is `requirement` only when the task text adopts it
+  in words ("apply the suggested fixes", "add the suggested tests"); then
+  `reason` quotes those words.
+- `"context"`: a title-only heading with nothing below, background, or a
+  restatement.
+
+An `evidence`, `suggestion` or `context` section carries `supports`: the
+R id of the `requirement` section of the same report it belongs to
+(empty only for a report-wide title with nothing to support). Anchor a
+report's defect on the section that states it and link the symptom,
+diagnosis, fix and test sections to it with `supports`.
+
+**Exactly one `required_items` entry per `items` span and per
+`requirement` section** (except table rows, below), in order:
+
+- `span` (string): the S or R id it is anchored on.
+- `item` (string): the requirement as an observable outcome, concise and
+  specific enough that a plan either covers it or doesn't; keep its
+  concrete values (names, numbers, paths).
+- `parts` (array of strings): the independently checkable outcomes
+  inside it, such as several causes of one defect that must each stop
+  happening. Leave it empty when there is one.
+- `source_ref` (string, optional): a human-readable pointer
+  ("Deliverable 2").
+- `verifiability`: `"external"` when the item can only be confirmed
+  outside the repository tree — a PR body or description, a merge, a
+  deploy or CI run, watching a run, a human action, an update to memory
+  or to an artifact outside the repository. Otherwise `"tree"`. An item
+  decided by a command passing (the suite passes, the typecheck is
+  clean) is `"tree"`: the run executes those commands itself.
+- `untouched_paths` (array of strings): repo-relative paths or globs,
+  non-empty only when the item's **whole** content is that those paths
+  must not change ("leave `data/` untouched"). An item that also asks
+  for something else leaves it empty.
+
+A requirement written as prose is still a requirement: "fix the race in
+X so the second request gets the idempotent response instead of a 500"
+is an item (the defect fixed, the observable contract restored), even
+though the task contains no checklist.
+
+**Tables of findings.** When a span holds a markdown table whose rows
+are separate findings, defects or requirements that the task asks to
+address (for example "fix every row of this table"), emit ONE required
+item PER ROW instead of one item for the table: anchor each on that
+span, set `table_row` to the row's first cell copied verbatim, and state
+that row's own requirement in `item`, keeping its concrete values (names,
+numbers, file:line). Rows the task does not ask to address (already
+fixed, out of scope, header rows) get no item. Any other item leaves
+`table_row` out.
+
+The orchestrator checks coverage mechanically and sends any hole back to
+you by id:
+
+- every S span is disposed and every R section has a role;
+- every `items` span and every `requirement` section is carried by
+  exactly one item (table rows: one per row, each `table_row` copied
+  verbatim from its span);
+- no item is anchored anywhere else;
+- every `no_requirement` span has a valid `kind`, every `restates` and
+  `supports` names a requirement, and no nested span restates a span it
+  sits inside;
+- every report the task points at has a `requirement` section.
+
+One class is NEVER omitted: a **standing deliverable
 constraint** — an explicit instruction in the task text that constrains
 what the delivered code or tests may contain or must never contain
 ("never reference X anywhere in the code or examples," "always use
@@ -145,8 +245,8 @@ the items you extract, so a run whose classifier silently drops the
 constraint ships deliverables that a later gate rejects for violating it
 (measured: the same task text had its constraint extracted on one run and
 dropped on the re-run, and the re-run's deliverables violated it).
-Extract it verbatim or near-verbatim, with `source_ref` naming where in
-the task it appears.
+Its span is `items`; extract it verbatim or near-verbatim, with
+`source_ref` naming where in the task it appears.
 
 If the task includes feature work, set `source_of_truth_question` to `true`.
 The orchestrator resolves the value from a preference (`--source-of-truth`
@@ -196,7 +296,19 @@ Return **only** this JSON object as your final message — no prose, no fences:
     "forbid_manual": false,
     "evidence": ""
   },
-  "required_items": [],
+  "span_dispositions": [
+    {"span": "S1", "disposition": "items", "kind": "", "reason": "..."},
+    {"span": "S2", "disposition": "no_requirement", "kind": "restatement",
+     "restates": "S1", "reason": "..."}
+  ],
+  "section_roles": [
+    {"section": "R1", "role": "requirement", "reason": "..."},
+    {"section": "R2", "role": "evidence", "supports": "R1", "reason": "..."}
+  ],
+  "required_items": [
+    {"span": "S1", "item": "...", "parts": [], "source_ref": "...",
+     "verifiability": "tree", "untouched_paths": []}
+  ],
   "likely_already_satisfied": false,
   "likely_already_satisfied_evidence": ""
 }

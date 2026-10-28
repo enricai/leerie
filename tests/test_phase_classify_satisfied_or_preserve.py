@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import asyncio
 
+from tests.stub_helpers import _d1_covered
+
 
 def _minimal_state(leerie, tmp_path, run_id="test-classify-or-preserve"):
     leerie_root = tmp_path / ".leerie"
@@ -38,7 +40,7 @@ def test_fresh_true_with_evidence_is_persisted(leerie, tmp_path, monkeypatch):
     st = _minimal_state(leerie, tmp_path)
 
     async def fake_claude_p(**kwargs):
-        return {"categories": ["bug-fixing"],
+        return {**_d1_covered(), "categories": ["bug-fixing"],
                 "likely_already_satisfied": True,
                 "likely_already_satisfied_evidence": "commit abc123 already ships this"}
 
@@ -55,7 +57,7 @@ def test_false_on_first_round_persists_false(leerie, tmp_path, monkeypatch):
     st = _minimal_state(leerie, tmp_path)
 
     async def fake_claude_p(**kwargs):
-        return {"categories": ["bug-fixing"]}
+        return {**_d1_covered(), "categories": ["bug-fixing"]}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
@@ -78,12 +80,12 @@ def test_later_false_round_does_not_clear_earlier_true(leerie, tmp_path, monkeyp
     async def fake_claude_p(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return {"categories": ["bug-fixing", "documentation"],
+            return {**_d1_covered(), "categories": ["bug-fixing", "documentation"],
                      "likely_already_satisfied": True,
                      "likely_already_satisfied_evidence": first_evidence}
         # Round 2: a fresh classifier call that reverts to a bare category
         # guess, omitting the satisfied claim entirely.
-        return {"categories": ["bug-fixing"]}
+        return {**_d1_covered(), "categories": ["bug-fixing"]}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
@@ -107,10 +109,10 @@ def test_fresh_true_with_evidence_overrides_prior_true(leerie, tmp_path, monkeyp
     async def fake_claude_p(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return {"categories": ["bug-fixing"],
+            return {**_d1_covered(), "categories": ["bug-fixing"],
                      "likely_already_satisfied": True,
                      "likely_already_satisfied_evidence": first_evidence}
-        return {"categories": ["bug-fixing"],
+        return {**_d1_covered(), "categories": ["bug-fixing"],
                  "likely_already_satisfied": True,
                  "likely_already_satisfied_evidence": second_evidence}
 
@@ -138,10 +140,10 @@ def test_true_without_evidence_does_not_count_as_a_prior_true(leerie, tmp_path, 
     async def fake_claude_p(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return {"categories": ["bug-fixing"],
+            return {**_d1_covered(), "categories": ["bug-fixing"],
                      "likely_already_satisfied": True,
                      "likely_already_satisfied_evidence": ""}
-        return {"categories": ["bug-fixing"]}
+        return {**_d1_covered(), "categories": ["bug-fixing"]}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
@@ -169,7 +171,7 @@ def test_true_without_evidence_on_a_single_round_never_persists_as_bare_true(
     st = _minimal_state(leerie, tmp_path)
 
     async def fake_claude_p(**kwargs):
-        return {"categories": ["bug-fixing"],
+        return {**_d1_covered(), "categories": ["bug-fixing"],
                 "likely_already_satisfied": True,
                 "likely_already_satisfied_evidence": ""}
 
@@ -194,12 +196,12 @@ def test_invalid_claim_does_not_clobber_a_valid_prior_true(leerie, tmp_path, mon
     async def fake_claude_p(**kwargs):
         calls["n"] += 1
         if calls["n"] == 1:
-            return {"categories": ["bug-fixing"],
+            return {**_d1_covered(), "categories": ["bug-fixing"],
                      "likely_already_satisfied": True,
                      "likely_already_satisfied_evidence": real_evidence}
         # Round 2: True again, but with empty evidence this time — an
         # invalid claim that must not clobber round 1's valid one.
-        return {"categories": ["bug-fixing"],
+        return {**_d1_covered(), "categories": ["bug-fixing"],
                  "likely_already_satisfied": True,
                  "likely_already_satisfied_evidence": ""}
 

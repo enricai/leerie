@@ -46,6 +46,18 @@ Work the numbered REQUIRED ITEMS one by one:
 3. Record `met` per item with the evidence you actually gathered:
    file paths, symbols, matching lines.
 
+## Your slice of the items
+
+A task's required items are verified in several passes, grouped so that
+a requirement and the nested requirements under it are judged together.
+When the REQUIRED ITEMS list is followed by a note such as "(These are
+12 of the task's 40 required items…)", you hold one slice: return a
+verdict for exactly the `item_index` values in your list, no others, and
+keep each index as given (they are the task's own numbering, not
+positions in your list). Items that only a person can confirm (a PR
+description, a deploy) and items that only require some paths to stay
+unchanged are settled elsewhere and never reach you.
+
 ## Verdict bias
 
 `met: true` **only** with cited on-tree evidence. When an item is

@@ -14,6 +14,8 @@ import inspect
 
 import pytest
 
+from tests.stub_helpers import _d1_covered
+
 
 def _minimal_state(leerie, tmp_path, run_id="test-classification-gate-aaa"):
     leerie_root = tmp_path / ".leerie"
@@ -388,13 +390,13 @@ def test_exhaustion_routes_to_no_work_when_an_earlier_round_found_it_satisfied(
             if classifier_calls["n"] == 1:
                 # The first re-classify round: finds it satisfied, with
                 # evidence (mirrors the real incident's round 2).
-                return {"categories": ["documentation"],
+                return {**_d1_covered(), "categories": ["documentation"],
                         "likely_already_satisfied": True,
                         "likely_already_satisfied_evidence": first_evidence}
             # Every LATER re-classify round: reverts to a bare category
             # guess, omitting the satisfied claim entirely (mirrors the
             # real incident's final, exhausting round).
-            return {"categories": ["documentation"]}
+            return {**_d1_covered(), "categories": ["documentation"]}
         # classification_judge: a DIFFERENT miscategorization category each
         # round (never repeating a prior round's issue signature), so
         # _run_checked_loop's oscillation guard never cuts the loop short —
@@ -554,7 +556,7 @@ def test_judge_confirmed_prevents_same_work_risk_from_stripping_within_classify(
         # Classifier keeps proposing the same pair every round — it has no
         # reason to change since it isn't given the judge's confirmation
         # through any other channel in this isolated test.
-        return {"categories": ["bug-fixing", "feature-implementation"]}
+        return {**_d1_covered(), "categories": ["bug-fixing", "feature-implementation"]}
 
     monkeypatch.setattr(leerie, "claude_p", stub)
     models = dict(MODELS, classifier="sonnet")
@@ -614,8 +616,9 @@ def test_vague_spurious_category_does_not_block_implicit_confirmation(
                  ["bug-fixing", "feature-implementation", "testing"],
                  "miscategorizations": []}
 
-    async def fake_phase_classify(replan_task, s, caps, clarify, models,
-                                    efforts, judge_confirmed=frozenset()):
+    async def fake_phase_classify(task, s, caps, clarify, models,
+                                    efforts, judge_confirmed=frozenset(),
+                                    review_note=""):
         captured_confirmed["set"] = set(judge_confirmed)
         st.data["categories"] = ["bug-fixing", "feature-implementation", "testing"]
         st.save()
@@ -649,8 +652,10 @@ def test_vague_spurious_category_does_not_block_implicit_confirmation(
 # is the one the gate must act on.
 
 def _judge_rounds(leerie, monkeypatch, responses):
-    """Drive the gate with canned judge responses; return the replan_task
-    strings the re-driven phase_classify actually received."""
+    """Drive the gate with canned judge responses; return the re-classify
+    feedback the re-driven phase_classify actually received (its
+    `review_note`, shown after the cut task — DESIGN §8 *Requirement
+    coverage*)."""
     seen: list[str] = []
     calls = iter(responses)
 
@@ -658,7 +663,7 @@ def _judge_rounds(leerie, monkeypatch, responses):
         return next(calls)
 
     async def fake_phase_classify(task, st, *a, **k):
-        seen.append(task)
+        seen.append(k.get("review_note", ""))
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "phase_classify", fake_phase_classify)

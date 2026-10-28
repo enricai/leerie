@@ -5573,6 +5573,75 @@ normally that very commit: every set has a defect case that failed there,
 so the answer is already known and the sets are not run again — the
 fixes are protected and a held no-work confirmation is disputed.
 
+**Requirement coverage: every span of the task is accounted for.** The
+classifier used to extract `required_items` only when the task was
+"genuinely enumerable", with a when-in-doubt-omit posture. A requirement
+it never extracted was enforced by nothing downstream: the planners, the
+no-work judge and the delivery gate all verify the items they are
+handed. So the classifier now accounts for the WHOLE task, and code
+checks that it did, by set arithmetic over identifiers it assigned
+itself:
+
+- **Python cuts; it never reads.** The task text is cut into spans
+  `S1, S2, …` at markdown delimiters only: a heading, a blank line, a
+  list item at any indent; a fenced block stays whole
+  (`_d1_split_spans`). Each nested list item carries a `parent` link —
+  the nearest preceding list item of smaller indent in the same block —
+  computed from indentation alone. Each referenced report (a markdown
+  file the task names that is not tracked at HEAD, so a report filed
+  for this task rather than a standing repo document such as a
+  CLAUDE.md) is cut at its headings into sections `R1, R2, …`
+  (`_d1_split_sections`). Python assigns the IDs and nothing else (§12
+  *Delimiter-only cutting is not the deleted heading harvest*).
+- **All meaning comes from the classifier's JSON.** One
+  `span_dispositions` entry per span: `items` when the span states
+  something the delivered work must do, contain, preserve or never
+  contain — a negative constraint ("never X", "out of scope: X") is an
+  item — or `no_requirement` with a typed `kind` (`heading`,
+  `background`, `restatement` with the S/R id it `restates`, or
+  `process_note`). One `section_roles` entry per report section:
+  `requirement`, `evidence`, `suggestion` or `context`, the last three
+  carrying the requirement section they `supports`. Exactly one
+  `required_items` entry per `items` span and per `requirement`
+  section, anchored on it by `span`. A findings table whose rows the
+  task asks to address yields one item per row, typed by `table_row`
+  (the row's first cell, copied). Each item is typed
+  `verifiability: tree | external` and, when its whole content is that
+  some paths must not change, `untouched_paths`.
+- **The coverage gate is set arithmetic.** `_d1_coverage_holes` sends
+  back, by ID, every span without a disposition, section without a
+  role, `items` span or `requirement` section carried by no item (or by
+  more than one, unless each carries a distinct `table_row`), item
+  anchored elsewhere, `no_requirement` span without a valid `kind`,
+  `restates`/`supports` link that resolves to no requirement, nested
+  span typed a restatement of its own ancestor, and `table_row` that is
+  not found verbatim in its anchor span (a quote check after whitespace
+  normalisation, never a parse of the table). These ride the
+  classifier's existing `judgment_check_rounds` loop. A report with no
+  `requirement` section is asked about **once**; a second answer of no
+  requirement stands, since a referenced file can be pure background.
+  The closure — `items` spans, `requirement` sections, restatements
+  that resolve to one of them (directly or through a heading whose
+  block holds an `items` span), and sections supporting a requirement —
+  is persisted in `state.data["requirement_coverage"]` with any
+  residual holes. Residual holes after the rounds are logged and the
+  run proceeds: the gate improves the item list, it never stops a run.
+
+Measured (bench D1, sonnet, frozen designs). v6 (top-level list items
+only) on 22 fresh tasks, 2 samples each: deliverable-closure Jaccard
+≥ 0.8 between samples 22/22; hand-checked real requirement losses 0/22
+tasks; but of the 8 recorded instances where a lost requirement caused
+or contributed to a repeat run, v6 surfaced 6 as their own item and
+missed a causal one — a nested sub-bullet folded into its parent's
+coarse item. v6.1 (list items at any indent are delimiters, with the
+parent link) surfaced the replayed targets as their own item in 12/12
+sample-instances (4 targets × 3), bringing the 8 to 8/8 (causal 3/3),
+and held Jaccard ≥ 0.8 on 12/12 tasks with changed spans, at 2.9× the items
+(446 → 1,293 over those 12 tasks). v6.2 (one item may carry several
+sibling spans) was rejected: still 2× the items and its coverage loop
+did not converge. The item count is paid on the verification side
+instead (*Grouped judging*, below).
+
 **The delivery gate: required items are verified on the tree that
 ships.** The no-work judge above enforces `required_items` against the
 tree — but only at the START of the run AFTER the one that shipped.
@@ -5661,6 +5730,54 @@ larger cap; a pre-schedule cap-out is retried, and a double cap-out
 merely fail-safe-keeps the subtask — one wasted implementer round
 whose resulting no-op then lands on the larger-capped rescue — so
 the small cap stays acceptable there.
+
+**Grouped judging at coverage item counts.** Requirement coverage
+(above) hands the gate about three times the items, and one prompt
+does not survive that: measured on 12 recorded delivery-judge calls
+(bench Q7/D1, 9–58 items per prompt even at the old item counts), the
+single-prompt judge left 59% of all items not met — 317 of them unmet
+with no citation, "not inspected" — so its adjudicated false-unmet
+rate on labelled controls was 46% and it flagged a labelled defect for
+the right reason in 2 of 34 samples. So the gate judges in packs
+(`_d1_judge_packs`):
+
+- **Group by root ancestor.** An item's group is the root of its
+  anchor span's parent chain; items on one report section share a
+  group; an item whose anchor is unknown is its own group. Groups,
+  ordered by their smallest item index, are packed consecutively while
+  a pack stays within `d1_pack_items` (20); a single group larger than
+  30 is cut into consecutive chunks of 30, so a nested requirement and
+  its siblings are judged side by side.
+- **Each prompt knows its slice** ("these are k of the task's N
+  required items… return a verdict for exactly these item_index
+  values"), carries the global `item_index` of each item, and gets the
+  turn budget of its own pack size. Verdicts merge by `item_index`; a
+  verdict for an index outside the pack is ignored. Packs run
+  concurrently up to `max_parallel`. The dispute vote above applies per
+  pack (a pack whose first sample flags nothing costs one spawn). There
+  is **no per-item re-judge**.
+- **Code settles what code can.** An item typed
+  `verifiability: external` (a PR description, a deploy, a human
+  action) is never judged: it goes to `state.data
+  ["needs_human_verification"]`, the list the PR shows. An item whose
+  whole content is that some paths stay unchanged is settled by
+  `git diff --name-only <own start>..HEAD -- <paths>` on the integrated
+  tree (`_d1_untouched_verdict`): empty output is met, a listed file is
+  unmet with that file as evidence; an unsafe path, an unknown own
+  start or a git error sends the item to the judge.
+- **The finding-level contract** (below) is asked of the first pack
+  only, so it is judged once, not once per pack.
+
+Measured (bench Q7/D1, arm (c): routing, packs of 20, table rows typed;
+dev and fresh cases, hand-adjudicated): real false unmet 3/116 = 2.6%
+(CI 0.9–7.3; all three the "note it in the PR" half of a mixed item),
+right-reason catch 13/39 = 33% (on the dev cases 7/17 targets, equal to
+grouped judging without routing, against 1/17 for the single prompt),
+at $2.54 per pass — 7.3× the single prompt. Arm (d) — per-part typing,
+packs of 30, and the per-item re-judge — was **not** adopted: its catch
+was unchanged (2/14 against (c)'s 2/14 on the same cases), its false
+unmet rose to 7.4% (conservative), and the re-judge made a pass 8.6×
+on average and 15–32× on large tasks.
 
 **The gate judges the finding, not only the items.** Measured across
 three reports' repeat-run loops (14 of the 17 v0.32.x runs,
@@ -6179,7 +6296,9 @@ mis-wirings:
   context (only when non-empty), mirroring the instruction-adherence gate's
   `prescribed_procedure` injection, so the planner can echo a required
   item's wording into a subtask at birth instead of the omission surfacing
-  only after the fact.
+  only after the fact. The coverage judge is handed the same items,
+  numbered, and cites the `item_index` of a required item no subtask
+  addresses; it stays advisory.
 - **integrator `resolution`** → an independent `integration_judge` that did
   not perform the merge, handed the merged result plus both parent diffs and
   the conflicting subtasks' intents: did the merge actually resolve the
@@ -6892,6 +7011,13 @@ parsing over one mechanism, and the source of a real freeze incident
 backtick+MUST convention headings cannot appear verbatim in a subtask by
 construction). It is deleted; `task_coverage_judge` reads the referenced
 files itself and judges substance rather than string overlap.
+
+The classifier is the one worker handed a referenced file's text: a
+markdown report the task names that is not tracked at HEAD is inlined,
+cut at its headings, so requirement coverage (§8) can anchor items on
+its sections. That cut assigns IDs only (§12 *Delimiter-only cutting is
+not the deleted heading harvest*); the planner's section above stays a
+list of paths.
 
 ### Multi-sample planning
 
@@ -8354,6 +8480,26 @@ extraction: the task-file coverage harvest, the migration-surface signal
 (now a planner-schema field), the README section pre-filter, and
 `PHANTOM_ARTIFACT` (now reads a structured `artifact_paths` field — see §5
 *Cross-domain surface overlap*).
+
+**Delimiter-only cutting is not the deleted heading harvest.**
+Requirement coverage (§8) cuts the task text and its referenced reports
+into numbered spans and sections, and that sits next to a mechanism
+this section records as deleted, so the line between them is stated
+here. The cut uses markdown's delimiters only — a heading line, a blank
+line, a list marker (with its indent, for the parent link), a code
+fence — which are document syntax, as mechanical as a file path. It
+assigns IDs and nothing else: no span is kept or dropped, ranked,
+classified, or compared with anything by its words. Every span and
+section reaches the classifier, which says what each one means
+(disposition, kind, role, links) in typed JSON, and the gate checks
+only ID sets and ID links. The deleted heading harvest did the
+opposite at every step: it kept the headings as the requirements
+themselves, classified the harvested prose with a second regex, and
+gated on substring overlap between that prose and the plan's prose —
+the shape that froze a run for 33 identical rounds. The one string
+comparison the coverage gate makes, a `table_row` found verbatim in
+its anchor span, is a quote check on text the classifier copied, the
+same kind of check as verifying a judge's quoted line against the file.
 
 ### Opus-judgment, sonnet-workhorse (historical) — now sonnet for both
 

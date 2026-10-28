@@ -280,6 +280,11 @@ DEFAULT_CAPS = {
     # audits): one sample said false on 8, the 3/3 rule on 3; 0/5 correct
     # falses on not-needed tasks turned true.
     "applicability_samples": 3,
+    # Delivery-judge pack size (DESIGN §8 *Grouped judging at coverage item
+    # counts*): root-ancestor item groups are packed into one prompt while
+    # the pack stays within this many items. Bench Q7/D1 arm (c): real
+    # false unmet 3/116 against 23/50 for one prompt over every item.
+    "d1_pack_items": 20,
     # Longest rate-limit reset `main()` will sleep through before it stops
     # auto-resuming and pauses resumably instead (the `out_of_credits`
     # disposition). Sized to the subscription's own windows: the five-hour
@@ -468,6 +473,13 @@ STATE_FIELDS = (
     "worker_count", "decompose_worker_count", "decompose_share", "telemetry",
     "categories", "classifier_questions", "prescribed_procedure",
     "required_items", "answers",
+    # requirement_coverage: the requirement-coverage gate's record (DESIGN
+    # §8 *Requirement coverage*) — span/section IDs with their mechanical
+    # parent links, inlined report paths, the closure and residual holes.
+    # needs_human_verification: items no in-container step can verify
+    # (classifier-typed `verifiability: external`), for the PR's list;
+    # never handed to the delivery judge.
+    "requirement_coverage", "needs_human_verification",
     # likely_already_satisfied / likely_already_satisfied_evidence:
     # optional, additive classifier-schema fields (DESIGN §8). Written by
     # phase_classify on every invocation (default False / ""); consulted by
@@ -2297,10 +2309,17 @@ def _self_reported_risks_schema() -> dict:
     }
 
 
+# Requirement coverage vocabularies (DESIGN §8 *Requirement coverage*): the
+# typed meaning the classifier gives a task span or a report section.
+D1_SPAN_KINDS = ("heading", "background", "restatement", "process_note")
+D1_SECTION_ROLES = ("requirement", "evidence", "suggestion", "context")
+
+
 SCHEMAS: dict[str, dict] = {
     "classifier": {
         "type": "object",
-        "required": ["categories"],
+        "required": ["categories", "span_dispositions", "section_roles",
+                     "required_items"],
         "properties": {
             "categories": {"type": "array", "items": {"type": "string"}},
             "questions": {
@@ -2331,28 +2350,72 @@ SCHEMAS: dict[str, dict] = {
                     "evidence": {"type": "string"},
                 },
             },
-            # Language→JSON extraction, same discipline as
-            # prescribed_procedure: the task's explicit, enumerable
-            # requirements (a numbered checklist, "must include X/Y/Z"),
-            # as structured data a deterministic coverage floor can
-            # set-compare against the plan without re-reading the task's
-            # prose. This is the PRIMARY layer of the two-layer coverage
-            # gate (DESIGN §5 *Migration-surface completeness*-style
-            # composition; the SECONDARY layer is task_coverage_judge's
-            # own judgment). Deliberately narrow: only genuinely
-            # enumerable items belong here — an ambiguous or freeform goal
-            # is not a "required item," and forcing one produces the exact
-            # freeze class the old mechanical gate was deleted for
-            # (IMPLEMENTATION.md §"Freeze guard"). Empty/absent is the
-            # common, correct case.
+            # Requirement coverage (DESIGN §8 *Requirement coverage*):
+            # Python cut the task into spans S* and each referenced report
+            # into sections R* and assigned the IDs; every judgment about
+            # what a span or section means is here, typed. The gate
+            # (`_d1_coverage_holes`) is set arithmetic over these IDs and
+            # links — it never reads the prose (DESIGN §12 *Delimiter-only
+            # cutting is not the deleted heading harvest*).
+            "span_dispositions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["span", "disposition", "reason"],
+                    "properties": {
+                        "span": {"type": "string"},
+                        "disposition": {"type": "string",
+                                        "enum": ["items", "no_requirement"]},
+                        # Empty for an `items` span.
+                        "kind": {"type": "string",
+                                 "enum": [*D1_SPAN_KINDS, ""]},
+                        # The S/R id a `restatement` repeats.
+                        "restates": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+            "section_roles": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["section", "role", "reason"],
+                    "properties": {
+                        "section": {"type": "string"},
+                        "role": {"type": "string", "enum": list(D1_SECTION_ROLES)},
+                        # The `requirement` section a non-requirement
+                        # section belongs to.
+                        "supports": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
             "required_items": {
                 "type": "array",
                 "items": {
                     "type": "object",
-                    "required": ["item"],
+                    "required": ["item", "span", "verifiability"],
                     "properties": {
                         "item": {"type": "string", "minLength": 1},
+                        # The S/R id this item is anchored on.
+                        "span": {"type": "string"},
+                        "parts": {"type": "array",
+                                  "items": {"type": "string"}},
                         "source_ref": {"type": "string"},
+                        # One item per row of a findings table: the row's
+                        # first cell, copied (quote-checked against the
+                        # anchor span, never parsed).
+                        "table_row": {"type": "string"},
+                        # `external`: confirmable only outside the repo
+                        # tree; routed to needs_human_verification, never
+                        # judged.
+                        "verifiability": {"type": "string",
+                                          "enum": ["tree", "external"]},
+                        # Non-empty only when the item's whole content is
+                        # that these paths stay unchanged; settled by
+                        # `git diff` in code at the delivery gate.
+                        "untouched_paths": {"type": "array",
+                                            "items": {"type": "string"}},
                     },
                 },
             },
@@ -22762,13 +22825,441 @@ async def _run_mise_install(repo_root: Path, log_dir: Path,
 # =========================================================================
 # phases
 # =========================================================================
+# ---- Requirement coverage (DESIGN §8 *Requirement coverage*) -------------
+# Python cuts the task at markdown delimiters and assigns IDs; it never reads
+# what a span says (DESIGN §12 *Delimiter-only cutting is not the deleted
+# heading harvest*). Each regex below matches document syntax — a heading
+# marker, a list marker with its indent, a code fence — never words.
+_D1_HEADING_RE = re.compile(r"^#{1,6}\s")
+_D1_LIST_ITEM_RE = re.compile(r"^(\s*)(?:[-*+]|\d+[.)])\s")
+_D1_FENCE_RE = re.compile(r"^\s*(```|~~~)")
+# A report is inlined only when it is markdown (the cut is heading-based)
+# and not tracked at HEAD: a file filed for this task, not a standing repo
+# document such as a CLAUDE.md — the shape of the 2026-07-19 freeze.
+_D1_REPORT_SUFFIXES = frozenset({".md", ".markdown", ".mdx"})
+D1_REPORT_MAX_BYTES = 256 * 1024
+# A root-ancestor group larger than this is cut into chunks of this size
+# (bench Q7/D1, every arm); smaller groups pack up to `d1_pack_items`.
+D1_GROUP_CHUNK = 30
+# `untouched_paths` entries become git pathspecs; anything outside this
+# alphabet (or absolute, or with a `..` segment) sends the item to the judge.
+_D1_SAFE_PATH_RE = re.compile(r"^[A-Za-z0-9_./*?\[\]-]+/?$")
+
+
+def _d1_split_spans(text: str) -> list[dict]:
+    """Cut task text into spans `S1, S2, …` at markdown delimiters only:
+    a heading line, a blank line, or a list item at any indent opens a
+    span; a fenced block stays whole. A nested list item carries `parent`,
+    the nearest preceding list-item span of smaller indent in the same
+    block, from indentation alone. Each span: {id, text, parent, heading}.
+    """
+    raw: list[dict] = []
+    stack: list[tuple[int, int]] = []  # (indent, raw index) of open items
+    cur: dict | None = None
+    in_fence = False
+
+    def flush() -> None:
+        nonlocal cur
+        if cur is not None and "".join(cur["lines"]).strip():
+            raw.append(cur)
+        cur = None
+
+    for line in text.splitlines(keepends=True):
+        body = line.rstrip("\n")
+        if in_fence:
+            assert cur is not None
+            cur["lines"].append(line)
+            if _D1_FENCE_RE.match(body):
+                in_fence = False
+            continue
+        if _D1_FENCE_RE.match(body):
+            if cur is None:
+                cur = {"lines": [], "parent": None, "heading": False}
+            cur["lines"].append(line)
+            in_fence = True
+            continue
+        if not body.strip():
+            flush()
+            continue
+        if _D1_HEADING_RE.match(body):
+            flush()
+            stack = []
+            raw.append({"lines": [line], "parent": None, "heading": True})
+            continue
+        m = _D1_LIST_ITEM_RE.match(body)
+        if m:
+            flush()
+            indent = len(m.group(1).expandtabs(4))
+            while stack and stack[-1][0] >= indent:
+                stack.pop()
+            cur = {"lines": [line],
+                   "parent": stack[-1][1] if stack else None,
+                   "heading": False}
+            # The index this span will get when flushed: nothing else is
+            # appended to `raw` before then.
+            stack.append((indent, len(raw)))
+            continue
+        if cur is None:
+            cur = {"lines": [], "parent": None, "heading": False}
+            if not body.startswith((" ", "\t")):
+                stack = []
+        cur["lines"].append(line)
+    flush()
+    return [{"id": f"S{i + 1}",
+             "text": "".join(r["lines"]).rstrip("\n"),
+             "parent": None if r["parent"] is None else f"S{r['parent'] + 1}",
+             "heading": r["heading"]}
+            for i, r in enumerate(raw)]
+
+
+def _d1_split_sections(text: str, source: str, start: int) -> list[dict]:
+    """Cut a report at every markdown heading outside a code fence into
+    sections `R<start>, …`; the text before the first heading is its own
+    section. Each section: {id, source, text}."""
+    cuts, pos, fence = [0], 0, False
+    for line in text.splitlines(keepends=True):
+        if _D1_FENCE_RE.match(line):
+            fence = not fence
+        elif not fence and _D1_HEADING_RE.match(line) and pos > 0:
+            cuts.append(pos)
+        pos += len(line)
+    cuts.append(len(text))
+    out: list[dict] = []
+    for a, b in zip(cuts, cuts[1:]):
+        if text[a:b].strip():
+            out.append({"id": f"R{start + len(out)}", "source": source,
+                        "text": text[a:b].rstrip()})
+    return out
+
+
+def _d1_report_sources(task: str, repo_root: Path) -> dict[str, str]:
+    """The reports to inline for the classifier: files the task names
+    (`_glob_task_references`) with a markdown suffix that `git ls-files`
+    does not list, each at most `D1_REPORT_MAX_BYTES`. Path and git-index
+    checks only; a file too large is named in the log and left to the
+    classifier's own tools."""
+    out: dict[str, str] = {}
+    for f in _glob_task_references(task, repo_root):
+        if f.suffix.lower() not in _D1_REPORT_SUFFIXES:
+            continue
+        rel = _repo_rel(f, repo_root)
+        tracked = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "--error-unmatch",
+             "--", rel], capture_output=True, check=False).returncode == 0
+        if tracked:
+            continue
+        try:
+            if f.stat().st_size > D1_REPORT_MAX_BYTES:
+                log(f"  requirement coverage: {rel} is over "
+                    f"{D1_REPORT_MAX_BYTES} bytes — not inlined")
+                continue
+            out[rel] = f.read_text(errors="replace")
+        except OSError:
+            continue
+    return out
+
+
+def _d1_units(task: str, repo_root: Path) -> dict:
+    """The task's spans and its reports' sections, IDs assigned:
+    {spans[], sections[], reports{path: [section ids]}}."""
+    spans = _d1_split_spans(task)
+    sections: list[dict] = []
+    reports: dict[str, list[str]] = {}
+    for rel, body in _d1_report_sources(task, repo_root).items():
+        secs = _d1_split_sections(body, rel, len(sections) + 1)
+        sections += secs
+        reports[rel] = [s_["id"] for s_ in secs]
+    return {"spans": spans, "sections": sections, "reports": reports}
+
+
+def _d1_render(units: dict) -> str:
+    """The classifier's view of the cut: every span verbatim behind its ID
+    (`[Sx < Sy]` for a nested item), then each report's sections."""
+    parts = ["=== TASK TEXT (spans S*; [Sx < Sy] means Sx is a nested list "
+             "item inside Sy) ==="]
+    for s_ in units["spans"]:
+        tag = (f"[{s_['id']} < {s_['parent']}]" if s_.get("parent")
+               else f"[{s_['id']}]")
+        parts.append(f"{tag} {s_['text']}")
+    last = None
+    for s_ in units["sections"]:
+        if s_["source"] != last:
+            parts.append(f"=== REFERENCED FILE {s_['source']} (inlined "
+                         "verbatim; sections R*) ===")
+            last = s_["source"]
+        parts.append(f"[{s_['id']}]\n{s_['text']}")
+    return "\n\n".join(parts)
+
+
+def _d1_ws(text: object) -> str:
+    """Whitespace-normalised copy, for the `table_row` quote check only."""
+    return " ".join(str(text or "").split())
+
+
+def _d1_holes(result: dict, units: dict,
+              ask_report: bool = True) -> dict[str, list[str]]:
+    """The requirement-coverage gate (DESIGN §8): set arithmetic over the
+    IDs Python assigned and the links the classifier typed. Returns the
+    non-empty holes, `D1_*` label -> the IDs it names; empty when every
+    span and section is accounted for. `ask_report` gates
+    `D1_REPORT_WITHOUT_REQUIREMENT`, which `phase_classify` raises on its
+    first check only."""
+    spans, secs = units["spans"], units["sections"]
+    sids = [s_["id"] for s_ in spans]
+    rids = [s_["id"] for s_ in secs]
+    order = sids + rids
+    disp = {d.get("span"): d for d in result.get("span_dispositions") or []
+            if isinstance(d, dict)}
+    role = {d.get("section"): d for d in result.get("section_roles") or []
+            if isinstance(d, dict)}
+    items_spans = {k for k in sids
+                   if (disp.get(k) or {}).get("disposition") == "items"}
+    req_secs = {k for k in rids
+                if (role.get(k) or {}).get("role") == "requirement"}
+    anchors = items_spans | req_secs
+    items = [it for it in result.get("required_items") or []
+             if isinstance(it, dict)]
+    # Row items on one span count once: a table may carry one item per row.
+    carried: dict[str, int] = {}
+    row_spans: set[str] = set()
+    for it in items:
+        sp = it.get("span")
+        if (it.get("table_row") or "").strip():
+            if sp in row_spans:
+                continue
+            row_spans.add(sp)
+        carried[sp] = carried.get(sp, 0) + 1
+    parent = {s_["id"]: s_.get("parent") for s_ in spans}
+
+    def ancestors(sid: str) -> set[str]:
+        out: set[str] = set()
+        p = parent.get(sid)
+        while p and p not in out:
+            out.add(p)
+            p = parent.get(p)
+        return out
+
+    holes: dict[str, list[str]] = {
+        "D1_UNDISPOSED": [k for k in sids if k not in disp],
+        "D1_UNROLED": [k for k in rids if k not in role],
+        "D1_UNCOVERED": [k for k in order if k in anchors and k not in carried],
+        "D1_DUPLICATE": [k for k in order if carried.get(k, 0) > 1],
+        "D1_MISANCHORED": sorted({str(it.get("span")) for it in items
+                                  if it.get("span") not in anchors}),
+        "D1_BAD_KIND": [k for k in sids if (disp.get(k) or {}).get(
+            "disposition") == "no_requirement" and (disp[k].get("kind")
+                                                    not in D1_SPAN_KINDS)],
+        "D1_BAD_RESTATES": [k for k in sids
+                            if (disp.get(k) or {}).get("kind") == "restatement"
+                            and disp[k].get("restates") not in (
+                                set(sids) | req_secs)],
+        "D1_BAD_SUPPORTS": [k for k in rids
+                            if (role.get(k) or {}).get("role")
+                            not in (None, "requirement")
+                            and role[k].get("supports")
+                            and role[k].get("supports") not in anchors],
+        "D1_RESTATES_ANCESTOR": [k for k in sids
+                                 if (disp.get(k) or {}).get("kind")
+                                 == "restatement"
+                                 and disp[k].get("restates") in ancestors(k)],
+    }
+    text = {s_["id"]: _d1_ws(s_["text"]) for s_ in [*spans, *secs]}
+    bad_rows: list[str] = []
+    rows_by_span: dict[str, list[str]] = {}
+    for it in items:
+        row = _d1_ws(it.get("table_row"))
+        if not row:
+            continue
+        sp = str(it.get("span"))
+        rows_by_span.setdefault(sp, []).append(row)
+        if row not in text.get(sp, ""):
+            bad_rows.append(f"{sp}:{row[:40]!r} not in the span")
+    for sp, rows in rows_by_span.items():
+        for r in sorted(set(rows)):
+            if rows.count(r) > 1:
+                bad_rows.append(f"{sp}:{r[:40]!r} repeated")
+        if any(it.get("span") == sp and not _d1_ws(it.get("table_row"))
+               for it in items):
+            bad_rows.append(f"{sp}: row items mixed with a whole-table item")
+    holes["D1_BAD_TABLE_ROW"] = bad_rows
+    if ask_report:
+        holes["D1_REPORT_WITHOUT_REQUIREMENT"] = [
+            src for src, ids in units["reports"].items()
+            if ids and not any(i in req_secs for i in ids)]
+    return {label: ids for label, ids in holes.items() if ids}
+
+
+_D1_HOLE_TEXT = {
+    "D1_UNDISPOSED": "task spans with no span_dispositions entry",
+    "D1_UNROLED": "report sections with no section_roles entry",
+    "D1_UNCOVERED": "`items` spans / `requirement` sections carried by "
+                    "no required_items entry",
+    "D1_DUPLICATE": "anchors carried by more than one required_items "
+                    "entry (merge them; use `parts`)",
+    "D1_MISANCHORED": "required_items anchored on an unknown id or one "
+                      "that is not `items`/`requirement`",
+    "D1_BAD_KIND": "no_requirement spans without a valid `kind`",
+    "D1_BAD_RESTATES": "restatement spans whose `restates` is not a task "
+                       "span or a `requirement` section",
+    "D1_BAD_SUPPORTS": "sections whose `supports` is not an `items` span "
+                       "or a `requirement` section",
+    "D1_RESTATES_ANCESTOR": "nested spans marked a restatement of a list "
+                            "item they sit inside (give each its own "
+                            "disposition; `items` if it asks for "
+                            "something)",
+    "D1_BAD_TABLE_ROW": "table-row items whose `table_row` is not "
+                        "copied verbatim from their anchor span, is "
+                        "repeated, or shares its span with a "
+                        "whole-table item",
+    "D1_REPORT_WITHOUT_REQUIREMENT": "the task points at these reports "
+                                     "but none of their sections is "
+                                     "`requirement` (anchor each "
+                                     "adopted defect on the report "
+                                     "section that states it)",
+}
+
+
+def _d1_coverage_holes(result: dict, units: dict,
+                       ask_report: bool = True) -> list[str]:
+    """`_d1_holes` as `_run_checked_loop` issues: `LABEL: <ids> — what`."""
+    return [f"{label}: {', '.join(ids)} — {_D1_HOLE_TEXT[label]}"
+            for label, ids in _d1_holes(result, units, ask_report).items()]
+
+
+def _d1_closure(result: dict, units: dict) -> list[str]:
+    """The covered IDs: `items` spans, `requirement` sections, restatement
+    spans whose target resolves to one (directly, through a chain, or
+    through a heading whose block holds an `items` span), and sections
+    whose `supports` is a requirement. In cut order."""
+    spans, secs = units["spans"], units["sections"]
+    disp = {d.get("span"): d for d in result.get("span_dispositions") or []
+            if isinstance(d, dict)}
+    role = {d.get("section"): d for d in result.get("section_roles") or []
+            if isinstance(d, dict)}
+    items_spans = {k for k, d in disp.items()
+                   if d.get("disposition") == "items"}
+    req = {k for k, d in role.items() if d.get("role") == "requirement"}
+    block: dict[str, list[str]] = {}
+    cur = None
+    for s_ in spans:
+        if s_.get("heading"):
+            cur = s_["id"]
+            block[cur] = []
+        elif cur:
+            block[cur].append(s_["id"])
+
+    def resolves(t: object, seen: tuple = ()) -> bool:
+        if t in items_spans or t in req:
+            return True
+        if t in block and any(x in items_spans for x in block[t]):
+            return True
+        d = disp.get(t) or {}
+        return (d.get("kind") == "restatement" and t not in seen
+                and resolves(d.get("restates"), (*seen, t)))
+
+    covered = set(items_spans) | req
+    covered |= {k for k, d in disp.items() if d.get("kind") == "restatement"
+                and resolves(d.get("restates"), (k,))}
+    covered |= {k for k, d in role.items()
+                if d.get("role") != "requirement" and d.get("supports") in req}
+    return [x["id"] for x in [*spans, *secs] if x["id"] in covered]
+
+
+def _d1_needs_human_verification(items: list) -> list[dict]:
+    """`required_items` entries typed `verifiability: external`, in the
+    State shape the PR's "Needs human verification" list reads."""
+    return [{"source": "required_item", "item_index": i,
+             "item": str(it.get("item") or ""), "span": it.get("span"),
+             "source_ref": it.get("source_ref") or ""}
+            for i, it in enumerate(items)
+            if isinstance(it, dict) and it.get("verifiability") == "external"]
+
+
+def _d1_judge_packs(items: list[dict], indices: list[int],
+                    spans: list[dict], limit: int) -> list[list[int]]:
+    """Cut the judge-bound item indices into delivery-judge prompts
+    (DESIGN §8 *Grouped judging at coverage item counts*). An item's group
+    is the root of its anchor span's `parent` chain; items on one report
+    section share a group; any other anchor is its own group. Groups,
+    ordered by their smallest index, are packed while a pack stays within
+    `limit`; a group over `D1_GROUP_CHUNK` is cut into chunks of that size."""
+    parent = {s_["id"]: s_.get("parent") for s_ in spans
+              if isinstance(s_, dict) and s_.get("id")}
+
+    def root(sid: str) -> str:
+        seen: set[str] = set()
+        while parent.get(sid) and sid not in seen:
+            seen.add(sid)
+            sid = parent[sid]
+        return sid
+
+    groups: dict[str, list[int]] = {}
+    for i in indices:
+        sp = items[i].get("span") if isinstance(items[i], dict) else None
+        if isinstance(sp, str) and sp in parent:
+            key = "span:" + root(sp)
+        elif isinstance(sp, str) and sp.startswith("R"):
+            key = "sec:" + sp
+        else:
+            key = f"own:{i}"
+        groups.setdefault(key, []).append(i)
+    packs: list[list[int]] = []
+    cur: list[int] = []
+    for g in sorted(groups.values(), key=min):
+        if len(g) > D1_GROUP_CHUNK:
+            if cur:
+                packs.append(cur)
+                cur = []
+            packs.extend(g[k:k + D1_GROUP_CHUNK]
+                         for k in range(0, len(g), D1_GROUP_CHUNK))
+            continue
+        if cur and len(cur) + len(g) > limit:
+            packs.append(cur)
+            cur = []
+        cur = cur + g
+    if cur:
+        packs.append(cur)
+    return packs
+
+
+def _d1_untouched_verdict(cwd: str | Path, own_start: str | None,
+                          paths: list) -> dict | None:
+    """Settle an "these paths stay unchanged" item in code:
+    `git diff --name-only <own_start>..HEAD -- <pathspecs>` in `cwd`.
+    {met, files[]} — met when nothing under the paths changed. None (the
+    item goes to the judge) for an unknown own start, an empty, absolute,
+    `..`-bearing or out-of-alphabet path, or a git error."""
+    if not own_start or not paths:
+        return None
+    specs: list[str] = []
+    for p in paths:
+        p = str(p).strip()
+        if (not p or p.startswith("/") or ".." in p.split("/")
+                or not _D1_SAFE_PATH_RE.match(p)):
+            return None
+        specs.append(f":(glob){p}" if any(c in p for c in "*?[") else p)
+    r = subprocess.run(
+        ["git", "-C", str(cwd), "diff", "--name-only", f"{own_start}..HEAD",
+         "--", *specs], capture_output=True, text=True, check=False)
+    if r.returncode != 0:
+        return None
+    files = [f for f in r.stdout.splitlines() if f.strip()]
+    return {"met": not files, "files": files}
+
+
 async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
                          models: dict[str, str],
                          efforts: dict[str, str | None],
-                         judge_confirmed: frozenset[str] = frozenset()) -> dict:
+                         judge_confirmed: frozenset[str] = frozenset(),
+                         review_note: str = "") -> dict:
     """Phase 1 (classify), which also produces the Clarify sub-step's
     intent questions: classify the task and surface only genuinely
     underivable (intent-level) questions.
+
+    `review_note` (the classification gate's re-classify feedback) is
+    shown after the cut task, never cut with it: requirement coverage
+    (DESIGN §8) accounts for the user's task, not the orchestrator's
+    note about it.
 
     `judge_confirmed` (default empty — no behavior change for the initial
     classify call): see `check_classifier_output`'s docstring. Passed
@@ -22779,8 +23270,25 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.save()
     sys_prompt = _load_prompt("classifier")
     repo_root = Path(os.getcwd())
+    # Requirement coverage (DESIGN §8): the classifier sees the task cut
+    # into numbered spans (and each untracked referenced report into
+    # sections); the check below holds it to accounting for every ID.
+    units = _d1_units(task, repo_root)
     user_prompt_parts: list[str] = [
-        f"TASK:\n{task}\n\nClassify it and apply the clarification filter."]
+        "TASK (split mechanically; the text is verbatim):\n\n"
+        + _d1_render(units)
+        + (f"\n\n{review_note}" if review_note else "")
+        + "\n\nClassify it and apply the clarification filter."]
+    # A report with no requirement section is asked about once: a second
+    # "no requirement" stands, since a named file can be pure background.
+    checks_run = [0]
+
+    def _check(r: dict) -> list[str]:
+        checks_run[0] += 1
+        return (check_classifier_output(r, repo_root,
+                                        judge_confirmed=judge_confirmed)
+                + _d1_coverage_holes(r, units,
+                                     ask_report=checks_run[0] == 1))
 
     async def _invoke() -> dict:
         st.bump_workers(caps)
@@ -22803,8 +23311,7 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
 
     result, gate_warnings = await _run_checked_loop(
         invoke=_invoke,
-        check=lambda r: check_classifier_output(
-            r, repo_root, judge_confirmed=judge_confirmed),
+        check=_check,
         name="classifier",
         max_rounds=caps["judgment_check_rounds"],
         make_feedback_prompt=_on_feedback,
@@ -22825,7 +23332,24 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["classifier_questions"] = questions
     st.data["needs_source_of_truth"] = bool(result.get("source_of_truth_question"))
     st.data["prescribed_procedure"] = result.get("prescribed_procedure") or {}
-    st.data["required_items"] = result.get("required_items") or []
+    items = [it for it in result.get("required_items") or []
+             if isinstance(it, dict)]
+    st.data["required_items"] = items
+    residual = _d1_holes(result, units, ask_report=False)
+    st.data["requirement_coverage"] = {
+        "spans": [{"id": s_["id"], "parent": s_["parent"]}
+                  for s_ in units["spans"]],
+        "sections": [{"id": s_["id"], "source": s_["source"]}
+                     for s_ in units["sections"]],
+        "reports": list(units["reports"]),
+        "closure": _d1_closure(result, units),
+        "holes": residual,
+    }
+    st.data["needs_human_verification"] = _d1_needs_human_verification(items)
+    if residual:
+        log(f"  requirement coverage: {len(residual)} hole(s) left after "
+            "the check rounds — proceeding with the items as returned: "
+            + "; ".join(f"{k}: {', '.join(v)}" for k, v in residual.items()))
     # Optional, additive (DESIGN §8): persisted so phase_classification_gate
     # can consult it on exhaustion without threading the raw classifier
     # result through the gate's own re-invocation loop.
@@ -23200,8 +23724,7 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
             f"in your category set: {sorted(judge_confirmed)}."
             if judge_confirmed else ""
         )
-        replan_task = (
-            f"{task}\n\n"
+        review_note = (
             "IMPORTANT — an independent review of your previous classification "
             f"found it miscategorized the work:\n{fb}\n"
             "Re-classify so the category set covers exactly the work this task "
@@ -23209,8 +23732,9 @@ async def phase_classification_gate(task: str, st: State, caps: dict,
             "contradicts." + drop_note + confirmed_note
         )
         reclassify_rounds[0] += 1
-        await phase_classify(replan_task, st, caps, clarify, models, efforts,
-                              judge_confirmed=frozenset(judge_confirmed))
+        await phase_classify(task, st, caps, clarify, models, efforts,
+                              judge_confirmed=frozenset(judge_confirmed),
+                              review_note=review_note)
         return {}
 
     judge_result, gate_warnings = await _run_checked_loop(
@@ -28990,6 +29514,15 @@ async def phase_planning_coverage_gate(plans: list[dict], task: str, st: State,
             for s in subtasks
         ],
     }
+    # The classifier's requirement-coverage items (DESIGN §8 *Requirement
+    # coverage*), numbered so a gap can name the item it leaves unaddressed.
+    req_items = [it for it in st.data.get("required_items") or []
+                 if isinstance(it, dict)]
+    if req_items:
+        payload["required_items"] = [
+            {"item_index": i, "item": it.get("item") or "",
+             "span": it.get("span") or it.get("source_ref") or ""}
+            for i, it in enumerate(req_items)]
     # ALL-KEYWORD, matching every other claude_p caller. The first cut of
     # this call passed two positionals and omitted `allowed_tools` and
     # `max_turns` (both required), so it raised TypeError on every
@@ -35073,9 +35606,19 @@ async def _delivery_judge_unmet(
         contract_ctx: dict | None = None,
         exec_digest: str = "",
         ground_truth: dict | None = None,
+        routing: dict | None = None,
         ) -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
     (confirmed_unmet, samples_used, contract_result).
+
+    Grouped (DESIGN §8 *Grouped judging at coverage item counts*): an
+    item typed `verifiability: external` is never judged; an item with
+    `untouched_paths` is settled by `_d1_untouched_verdict` when it can
+    be (an unmet one is confirmed with `settled_by: "untouched_paths"`);
+    the rest are cut by `_d1_judge_packs` into prompts that each know
+    their slice, run concurrently, and merge by `item_index`. The
+    contract is asked of the first pack only. `routing`, when given, is
+    filled with {external[], untouched[], packs} for the gate record.
 
     `contract_ctx` (the run's applicable defect audit: defect_shape +
     sites) adds the finding-level DEFECT CONTRACT section to the
@@ -35094,8 +35637,8 @@ async def _delivery_judge_unmet(
     named input is absent is recorded as `unverifiable` (DESIGN §8;
     prompts advise, this code enforces).
 
-    Confirm-on-first-pass: one sample, and only when it flags something
-    do two more run, with an item confirmed unmet only on a 2-of-3
+    Confirm-on-first-pass, per pack: one sample, and only when it flags
+    something do two more run, with an item confirmed unmet only on a 2-of-3
     majority — single-trial LLM judging is measurably noisy, majority
     over 3 samples recovers most of the reliability, and voting on
     DISPUTES only keeps the clean-pass common case at one spawn.
@@ -35135,131 +35678,200 @@ async def _delivery_judge_unmet(
         return {**item, "item": text}
 
     normalized = [_norm_item(item) for item in items]
-    numbered = [{**item, "item_index": i}
-                for i, item in enumerate(normalized)]
-    sections = [
-        "TASK:\n" + task,
-        "REQUIRED ITEMS (verify each against the CURRENT tree — your cwd "
-        "is the integrated staging worktree, the exact tree this run is "
-        "about to ship):\n"
-        + json.dumps(numbered, indent=2),
-    ]
-    if exec_digest:
+    n_items = len(normalized)
+    # Routing (DESIGN §8 *Grouped judging at coverage item counts*): code
+    # settles what code can before any judge prompt is built.
+    own_start = _acceptance_own_start(st)
+    spans = (st.data.get("requirement_coverage") or {}).get("spans") or []
+    external: list[int] = []
+    untouched: list[dict] = []
+    confirmed: list[dict] = []
+    judge_idx: list[int] = []
+    for i, it in enumerate(normalized):
+        if it.get("verifiability") == "external":
+            external.append(i)
+            continue
+        paths = it.get("untouched_paths")
+        if isinstance(paths, list) and paths:
+            verdict = _d1_untouched_verdict(staging, own_start, paths)
+            if verdict is not None:
+                untouched.append({"item_index": i, **verdict})
+                if not verdict["met"]:
+                    confirmed.append({
+                        "item_index": i, "item": it["item"],
+                        "evidence": (
+                            "changed since the run's own start "
+                            f"({str(own_start)[:12]}): "
+                            + ", ".join(verdict["files"][:10])),
+                        "settled_by": "untouched_paths"})
+                continue
+        judge_idx.append(i)
+    packs = _d1_judge_packs(
+        normalized, judge_idx, spans,
+        int(caps.get("d1_pack_items", DEFAULT_CAPS["d1_pack_items"])))
+    if not packs and contract_ctx is not None:
+        # Every item settled without the judge, but the contract is still
+        # asked: one prompt carrying no items.
+        packs = [[]]
+    if routing is not None:
+        routing.update({"external": external, "untouched": untouched,
+                        "packs": len(packs)})
+
+    def _pack_prompt(pack: list[int], with_contract: bool) -> str:
+        entries = [{"item": normalized[i]["item"],
+                    "source_ref": (normalized[i].get("span")
+                                   or normalized[i].get("source_ref") or ""),
+                    "item_index": i} for i in pack]
+        slice_note = (
+            f"\n(These are {len(pack)} of the task's {n_items} required "
+            "items; the others are verified in separate passes. Return a "
+            "verdict for exactly these item_index values.)"
+            if len(pack) < n_items else "")
+        sections = [
+            "TASK:\n" + task,
+            "REQUIRED ITEMS (verify each against the CURRENT tree — your "
+            "cwd is the integrated staging worktree, the exact tree this "
+            "run is about to ship):\n"
+            + json.dumps(entries, indent=2) + slice_note,
+        ]
+        if exec_digest:
+            sections.append(
+                "EXECUTED COMMANDS RECORD (every build/lint/test command "
+                "this run's workers actually ran — and, when the defect "
+                "audit names a repro command, every command led by that "
+                "repro's own verbs — with verbatim result "
+                "tails, extracted from their structured logs): for any item "
+                "that requires a command to have been EXECUTED (a test "
+                "suite, a typecheck), verify it against THIS record and "
+                "cite the entry — you are read-only and cannot run suites "
+                "yourself; a command absent from this record was not run, "
+                "and such an item stays unmet.\n" + exec_digest)
+        if with_contract:
+            sections.append(
+                "DEFECT CONTRACT (the run's defect audit — DESIGN §8 *The "
+                "gate judges the finding, not only the items*): also return "
+                "the `contract` object per your schema. verdict=met only if "
+                "the audited defect_shape below HOLDS on this tree AND every "
+                "listed site is either fixed or ruled out with recorded "
+                "evidence; verdict=unmet with evidence naming the residual "
+                "otherwise; verdict=conflict — with both contracts stated in "
+                "conflicting_contracts — when satisfying this contract "
+                "demonstrably contradicts another contract this tree pins "
+                "(e.g. an existing regression guard), which needs a "
+                "discriminating design, not a fix loop; verdict=unverifiable "
+                "— with evidence naming exactly which missing input blocks "
+                "which part of the contract — when a GROUND-TRUTH "
+                "AVAILABILITY section below lists the report's named inputs "
+                "as ABSENT and the contract cannot be decided from evidence "
+                "that exists in this environment (synthetic fixtures "
+                "authored during this run do not qualify: they encode the "
+                "run's own hypothesis about what the real data contains).\n"
+                + json.dumps(contract_ctx, indent=2))
+            avail = _format_ground_truth_availability(ground_truth)
+            if avail:
+                sections.append(avail)
         sections.append(
-            "EXECUTED COMMANDS RECORD (every build/lint/test command "
-            "this run's workers actually ran — and, when the defect "
-            "audit names a repro command, every command led by that "
-            "repro's own verbs — with verbatim result "
-            "tails, extracted from their structured logs): for any item "
-            "that requires a command to have been EXECUTED (a test "
-            "suite, a typecheck), verify it against THIS record and "
-            "cite the entry — you are read-only and cannot run suites "
-            "yourself; a command absent from this record was not run, "
-            "and such an item stays unmet.\n" + exec_digest)
-    if contract_ctx is not None:
-        sections.append(
-            "DEFECT CONTRACT (the run's defect audit — DESIGN §8 *The "
-            "gate judges the finding, not only the items*): also return "
-            "the `contract` object per your schema. verdict=met only if "
-            "the audited defect_shape below HOLDS on this tree AND every "
-            "listed site is either fixed or ruled out with recorded "
-            "evidence; verdict=unmet with evidence naming the residual "
-            "otherwise; verdict=conflict — with both contracts stated in "
-            "conflicting_contracts — when satisfying this contract "
-            "demonstrably contradicts another contract this tree pins "
-            "(e.g. an existing regression guard), which needs a "
-            "discriminating design, not a fix loop; verdict=unverifiable "
-            "— with evidence naming exactly which missing input blocks "
-            "which part of the contract — when a GROUND-TRUTH "
-            "AVAILABILITY section below lists the report's named inputs "
-            "as ABSENT and the contract cannot be decided from evidence "
-            "that exists in this environment (synthetic fixtures "
-            "authored during this run do not qualify: they encode the "
-            "run's own hypothesis about what the real data contains).\n"
-            + json.dumps(contract_ctx, indent=2))
-        avail = _format_ground_truth_availability(ground_truth)
-        if avail:
-            sections.append(avail)
-    sections.append(
-        "Return one verdict per item_index per your schema. met=true "
-        "only with cited on-tree evidence; when you cannot verify, "
-        "met=false with evidence saying what you could not verify.")
-    user_prompt = "\n\n".join(sections)
+            "Return one verdict per item_index per your schema. met=true "
+            "only with cited on-tree evidence; when you cannot verify, "
+            "met=false with evidence saying what you could not verify.")
+        return "\n\n".join(sections)
 
-    # The verifier's workload scales with the item count, so a fixed cap
-    # converts a thorough judge into a crashed one: with max_turns=30, all
-    # four live attempts across the gate's first two outings (9- and
-    # 6-item lists) died at error_max_turns (turns=31) mid-list, and the
-    # gate was skipped in a run where a bench replay of the same payload
-    # flags an item unmet (DESIGN §8 *The judge's turn budget scales
-    # with the item count*). 30 is the setup base — the gate never runs
-    # on an empty list, so the smallest real budget is 36 at one item,
-    # above the old fixed 30. 6/item approximates the measured thorough
-    # pace: the live traces show ~5-6 turns per item, measured as total
-    # turns over items covered at death (setup included), so treating it
-    # as a pure per-item allowance above the base errs generous at small
-    # counts. The 90 ceiling binds from 10 items; the further past that
-    # a list runs, the further the budget falls behind the measured
-    # pace, so a long list (roughly a dozen items and beyond) can again
-    # exhaust the cap and skip the gate — an accepted, bounded residual,
-    # preferred over an uncapped budget.
-    # +12 when the finding-level contract verdict is asked for: shape
-    # + per-site disposition is measured at roughly two items' worth of
-    # verification (DESIGN §8). Ceiling unchanged.
-    judge_max_turns = min(
-        30 + 6 * len(numbered) + (12 if contract_ctx is not None else 0),
-        90)
-
-    async def _sample(k: int) -> dict:
-        st.bump_workers(caps)
-        return await claude_p(
-            user_prompt=user_prompt,
-            system_prompt=_load_prompt("delivery_judge"),
-            schema_key="delivery_judge", cwd=str(staging),
-            allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=judge_max_turns,
-            autonomous=False, caps=caps, st=st,
-            model=models.get("delivery_judge", MODEL_DEFAULT),
-            effort=efforts.get("delivery_judge"),
-            sid=f"delivery_judge-{phase_label}-s{k}",
-        )
-
-    def _contract_flagged(sample: dict) -> bool:
+    def _contract_flagged(sample: dict, with_contract: bool) -> bool:
         # On an asked call an absent/malformed contract object is a
         # flag, never a met — the fail-open direction for ESCALATION is
         # to spend two more samples, not to skip them (the final
         # resolution below still fails open to met on no-majority).
-        if contract_ctx is None:
+        if not with_contract:
             return False
         c = sample.get("contract")
         return not (isinstance(c, dict) and c.get("verdict") == "met")
 
-    samples = [await _sample(0)]
-    if (not _delivery_unmet_majority(samples, len(items))
-            and not _contract_flagged(samples[0])):
-        return [], 1, (_downgrade_ungrounded_met(
-                           {"verdict": "met", "evidence":
-                            ((samples[0].get("contract") or {}).get(
-                                "evidence") or "").strip()},
-                           ground_truth)
-                       if contract_ctx is not None else None)
-    for k in (1, 2):
-        samples.append(await _sample(k))
-    unmet_idx = _delivery_unmet_majority(samples, len(items))
-    confirmed: list[dict] = []
-    for i in unmet_idx:
-        evidence = ""
-        for s in reversed(samples):
-            for v in (s.get("verdicts") or []):
-                if v.get("item_index") == i and v.get("met") is False:
-                    evidence = (v.get("evidence") or "").strip()
+    # Packs run concurrently, bounded like a wave's workers.
+    limit = asyncio.Semaphore(max(1, int(caps.get("max_parallel") or 1)))
+
+    async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
+        with_contract = contract_ctx is not None and p == 0
+        user_prompt = _pack_prompt(pack, with_contract)
+        # The verifier's workload scales with the item count, so a fixed
+        # cap converts a thorough judge into a crashed one: with
+        # max_turns=30, all four live attempts across the gate's first two
+        # outings (9- and 6-item lists) died at error_max_turns (turns=31)
+        # mid-list (DESIGN §8 *The judge's turn budget scales with the
+        # item count*). 30 is the setup base, 6/item the measured thorough
+        # pace, 90 the ceiling. Sized per PACK: a pack is what one prompt
+        # verifies. +12 when the finding-level contract verdict is asked
+        # for: shape + per-site disposition is measured at roughly two
+        # items' worth of verification (DESIGN §8).
+        judge_max_turns = min(
+            30 + 6 * len(pack) + (12 if with_contract else 0), 90)
+        sid_base = (f"delivery_judge-{phase_label}"
+                    + (f"-p{p}" if len(packs) > 1 else ""))
+        allowed = set(pack)
+
+        async def _sample(k: int) -> dict:
+            st.bump_workers(caps)
+            smp = await claude_p(
+                user_prompt=user_prompt,
+                system_prompt=_load_prompt("delivery_judge"),
+                schema_key="delivery_judge", cwd=str(staging),
+                allowed_tools=SATISFIED_PROBE_TOOLS,
+                max_turns=judge_max_turns,
+                autonomous=False, caps=caps, st=st,
+                model=models.get("delivery_judge", MODEL_DEFAULT),
+                effort=efforts.get("delivery_judge"),
+                sid=f"{sid_base}-s{k}",
+            )
+            # Merge by item_index: a verdict for an index outside this
+            # pack is not this prompt's to give.
+            return {**smp, "verdicts": [
+                v for v in (smp.get("verdicts") or [])
+                if isinstance(v, dict) and v.get("item_index") in allowed]}
+
+        async with limit:
+            samples = [await _sample(0)]
+            if (_delivery_unmet_majority(samples, n_items)
+                    or _contract_flagged(samples[0], with_contract)):
+                for k in (1, 2):
+                    samples.append(await _sample(k))
+        return samples
+
+    tasks = [asyncio.ensure_future(_judge_pack(p, pack))
+             for p, pack in enumerate(packs)]
+    try:
+        per_pack = await asyncio.gather(*tasks)
+    except BaseException:
+        # One pack's failure ends the gate (the callers treat it as
+        # advisory); the others must not keep spawning judges after it.
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    n_samples = 0
+    for samples in per_pack:
+        n_samples += len(samples)
+        for i in _delivery_unmet_majority(samples, n_items):
+            evidence = ""
+            for s in reversed(samples):
+                for v in (s.get("verdicts") or []):
+                    if v.get("item_index") == i and v.get("met") is False:
+                        evidence = (v.get("evidence") or "").strip()
+                        break
+                if evidence:
                     break
-            if evidence:
-                break
-        confirmed.append({"item_index": i,
-                          "item": normalized[i].get("item", ""),
-                          "evidence": evidence})
+            confirmed.append({"item_index": i,
+                              "item": normalized[i].get("item", ""),
+                              "evidence": evidence})
+    confirmed.sort(key=lambda u: u["item_index"])
     contract_result: dict | None = None
-    if contract_ctx is not None:
+    if contract_ctx is not None and per_pack:
+        samples = per_pack[0]
+        if len(samples) == 1:
+            contract_result = _downgrade_ungrounded_met(
+                {"verdict": "met", "evidence":
+                 ((samples[0].get("contract") or {}).get("evidence")
+                  or "").strip()},
+                ground_truth)
+            return confirmed, n_samples, contract_result
         # Majority over the three samples' typed verdicts; an absent or
         # malformed object is a no-vote. No verdict reaching 2 (e.g. a
         # 1-1-1 split) resolves to met — fail-open, mirroring the
@@ -35291,7 +35903,7 @@ async def _delivery_judge_unmet(
                 break
         contract_result = _downgrade_ungrounded_met(
             contract_result, ground_truth)
-    return confirmed, len(samples), contract_result
+    return confirmed, n_samples, contract_result
 
 
 # --- held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*) ----
@@ -39399,6 +40011,17 @@ def _warn_site_token_leaks(st: "State", leerie_dir: Path) -> list[dict]:
     return hits
 
 
+def _log_delivery_routing(routing: dict) -> None:
+    """One line on what the delivery gate kept away from the judge."""
+    ext = routing.get("external") or []
+    unt = routing.get("untouched") or []
+    log(f"  delivery gate: {routing.get('packs', 0)} judge prompt(s); "
+        f"{len(ext)} item(s) routed to needs_human_verification "
+        f"(verifiability: external); {len(unt)} untouched-paths item(s) "
+        f"settled by git diff ({sum(1 for u in unt if not u.get('met'))} "
+        "unmet)")
+
+
 async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
                                  models: dict[str, str],
                                  efforts: dict[str, str | None],
@@ -39469,16 +40092,21 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
         log(f"  delivery gate: executed-commands digest failed "
             f"({type(e).__name__}) — judging without the record")
         exec_digest = ""
+    routing: dict = {}
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="pre", contract_ctx=contract_ctx,
-            exec_digest=exec_digest, ground_truth=ground_truth)
+            exec_digest=exec_digest, ground_truth=ground_truth,
+            routing=routing)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge crashed ({_brief_worker_exc(e)}); "
             "gate skipped (advisory)")
         return []
     gate: dict = {"unmet_before": unmet, "samples_before": n}
+    if routing:
+        gate["routed_before"] = routing
+        _log_delivery_routing(routing)
     if contract is not None:
         gate["contract_before"] = contract
     st.data["delivery_gate"] = gate
@@ -39557,17 +40185,21 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
         log(f"  delivery gate recheck: executed-commands digest failed "
             f"({type(e).__name__}) — judging without the record")
         exec_digest = ""
+    routing: dict = {}
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="recheck", contract_ctx=contract_ctx,
-            exec_digest=exec_digest, ground_truth=ground_truth)
+            exec_digest=exec_digest, ground_truth=ground_truth,
+            routing=routing)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
             "residual unrecorded (advisory)")
         return
     gate["unmet_after"] = unmet
     gate["samples_after"] = n
+    if routing:
+        gate["routed_after"] = routing
     if contract is not None:
         gate["contract_after"] = contract
     st.data["delivery_gate"] = gate

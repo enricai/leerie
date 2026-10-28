@@ -133,3 +133,21 @@ def _stub_self_cmd(tmp_path: Path) -> tuple[Path, Path]:
         """))
     stub.chmod(0o755)
     return stub, log
+
+
+def _d1_covered(n_spans: int = 1) -> dict:
+    """Classifier requirement-coverage fields that leave no hole for a task
+    that `_d1_split_spans` cuts into `n_spans` plain spans and that points
+    at no report (DESIGN §8 *Requirement coverage*): every span `items`,
+    one tree-verifiable item each. Merge into a stub classifier result so a
+    test about something else does not spend check rounds on coverage."""
+    ids = [f"S{i + 1}" for i in range(n_spans)]
+    return {
+        "span_dispositions": [{"span": i, "disposition": "items",
+                               "kind": "", "reason": "asks for work"}
+                              for i in ids],
+        "section_roles": [],
+        "required_items": [{"span": i, "item": f"requirement of {i}",
+                            "parts": [], "verifiability": "tree",
+                            "untouched_paths": []} for i in ids],
+    }
