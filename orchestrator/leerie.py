@@ -22784,6 +22784,69 @@ def _strip_canonical_suite_commands(plans: list[dict],
         return []
 
 
+def _worker_guard(allowed_tools: str, repo_root: str | Path,
+                  state_data: dict, *, worker: str | None = None) -> dict:
+    """The per-worker guard layers for a worker with `allowed_tools` on
+    `repo_root`: `{deny, notices, settings, env}` (IMPLEMENTATION, its row).
+    One owner for `claude_p` and the Fly remote integrator
+    (`scripts/worker-guard.py`), which builds its own `claude` argv in bash
+    and so lacked every layer added after it was written. `worker` is the
+    schema key: a worker in `NOTICE_FREE_WORKERS` gets every deny rule, the
+    hook and the env, but no notice."""
+    prescribed = state_data.get("prescribed_procedure")
+    # The whole-suite deny and its notice (DESIGN §9 *The whole suite is
+    # orchestrator-owned*); the notice only for a worker whose tools reach
+    # the runner — one that cannot run it has nothing to be told.
+    suite_deny = _full_suite_denials(repo_root, prescribed)
+    # Forbidden commands (DESIGN §9 *A command the task forbids*): deny
+    # rules, notice and the PreToolUse hook together.
+    # The typed specs, not the display strings: each entry's scope decides
+    # what its rules, notice and hook deny (`whole_suite` vs `any`).
+    forbidden = _forbidden_specs(state_data)
+    forbidden_deny = _forbidden_command_denials(forbidden)
+    forbidden_notice = (_forbidden_commands_notice(forbidden)
+                        if _tools_reach_forbidden(allowed_tools, forbidden)
+                        else None)
+    # Process kills by name (DESIGN §9 *A worker never kills a process by
+    # name*), for every worker whose tools reach a shell.
+    deny_kills = _tools_reach_bash(allowed_tools)
+    kill_deny = _process_kill_denials() if deny_kills else ""
+    suite_notice = (_full_suite_notice(repo_root, prescribed)
+                    if suite_deny and _tools_reach_suite_runner(
+                        allowed_tools, repo_root, prescribed) else None)
+    if suite_notice and forbidden:
+        # The suite notice says the orchestrator runs the suite; when the
+        # task forbids that command, it does not (`_measure_axes`).
+        try:
+            if _forbidden_command_hit(_canonical_test_command(repo_root),
+                                      forbidden):
+                suite_notice = None
+        except Exception:
+            pass
+    # The database push/reset deny (DESIGN §8 *Prisma repositories get a
+    # real database*).
+    db_deny = _db_reset_denials(repo_root)
+    db_notice = (DB_RESET_NOTICE if db_deny and "Bash" in [
+        x.strip() for x in allowed_tools.split(",")] else None)
+    # A worker that types constraints FROM the task never sees an
+    # orchestrator notice (DESIGN §9 *A command the task forbids*): measured,
+    # the classifier returned the whole-suite notice as a task constraint.
+    # Its deny rules, hook and env still bind it.
+    notices = [] if worker in NOTICE_FREE_WORKERS else [
+        n for n in (suite_notice, forbidden_notice,
+                    PROCESS_KILL_NOTICE if deny_kills else None,
+                    db_notice) if n]
+    return {
+        "deny": ",".join(d for d in (suite_deny, db_deny, forbidden_deny,
+                                     kill_deny) if d),
+        "notices": notices,
+        "settings": _forbidden_command_hook_settings(forbidden, deny_kills),
+        # The runtime layer: a forbidden package script refused by the
+        # package manager's own script shell, wherever the run came from.
+        "env": _forbidden_script_shell_env(forbidden) or {},
+    }
+
+
 def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
                            model: str, prompt: str | None = None,
                            deny_extra: str = "",
@@ -22951,63 +23014,21 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             allowed_tools = _widen_inspect_tools(
                 allowed_tools, Path(getattr(st, "repo_root", os.getcwd())))
 
-    # The whole-suite deny and its notice travel together, decided once here
-    # so no caller can send one without the other (DESIGN §9 *The whole
-    # suite is orchestrator-owned*): deny alone ended 2/2 replayed workers
-    # `blocked`. The notice goes only to a worker whose tools reach the
-    # runner; a worker that cannot run it has nothing to be told.
+    # The per-worker guard layers — whole-suite, database, forbidden-command
+    # and process-kill deny rules, each with its notice, plus the hook and
+    # the script-shell environment — built by the one owner the Fly remote
+    # integrator also uses (`_worker_guard`), so no caller can send a deny
+    # without its notice (#292: deny alone ended 2/2 replayed workers
+    # `blocked`) and no call site can drift from another.
     _suite_root = getattr(st, "repo_root", os.getcwd())
-    _prescribed = st.data.get("prescribed_procedure")
-    suite_deny = _full_suite_denials(_suite_root, _prescribed)
-    # Forbidden commands (DESIGN §9 *A command the task forbids*): deny rules,
-    # the paired notice and the PreToolUse hook, decided together here for
-    # the same reason as the whole-suite pair.
-    forbidden = _forbidden_specs(st.data)
-    forbidden_deny = _forbidden_command_denials(forbidden)
-    forbidden_notice = (_forbidden_commands_notice(forbidden)
-                        if _tools_reach_forbidden(allowed_tools, forbidden)
-                        else None)
-    # Process kills by name (DESIGN §9 *A worker never kills a process by
-    # name*): deny rules, notice and hook travel together the same way, for
-    # every worker whose tools reach a shell.
-    deny_kills = _tools_reach_bash(allowed_tools)
-    kill_deny = _process_kill_denials() if deny_kills else ""
-    hook_settings = _forbidden_command_hook_settings(forbidden, deny_kills)
-    # The runtime layer: a forbidden package script refused by the package
-    # manager's own script shell, wherever the run came from — another
-    # script's body included, which neither the rules nor the hook see.
-    script_guard_env = _forbidden_script_shell_env(forbidden)
-    if script_guard_env:
-        env_extra = {**script_guard_env, **(env_extra or {})}
-    suite_notice = (_full_suite_notice(_suite_root, _prescribed)
-                    if suite_deny and _tools_reach_suite_runner(
-                        allowed_tools, _suite_root, _prescribed) else None)
-    if suite_notice and forbidden:
-        # The suite notice says the orchestrator runs the suite; when the
-        # task forbids that command, it does not (`_measure_axes`).
-        try:
-            if _forbidden_command_hit(_canonical_test_command(_suite_root),
-                                      forbidden):
-                suite_notice = None
-        except Exception:
-            pass
-    # A worker that types constraints FROM the task never sees an
-    # orchestrator notice (DESIGN §9 *A command the task forbids*): measured,
-    # the classifier returned the whole-suite notice as a task constraint.
-    # Its deny rules and hook still bind it.
-    task_reader = schema_key in NOTICE_FREE_WORKERS
-    for _notice in (suite_notice, forbidden_notice,
-                    PROCESS_KILL_NOTICE if deny_kills else None):
-        if _notice and not task_reader:
-            user_prompt = (f"{user_prompt.rstrip()}\n"
-                           f"NOTE FROM ORCHESTRATOR: {_notice}")
-    # The database push/reset deny travels with its notice the same way
-    # (DESIGN §8 *Prisma repositories get a real database*).
-    db_deny = _db_reset_denials(_suite_root)
-    if (db_deny and not task_reader
-            and "Bash" in [x.strip() for x in allowed_tools.split(",")]):
+    guard = _worker_guard(allowed_tools, _suite_root, st.data,
+                          worker=schema_key)
+    hook_settings = guard["settings"]
+    if guard["env"]:
+        env_extra = {**guard["env"], **(env_extra or {})}
+    for _notice in guard["notices"]:
         user_prompt = (f"{user_prompt.rstrip()}\n"
-                       f"NOTE FROM ORCHESTRATOR: {DB_RESET_NOTICE}")
+                       f"NOTE FROM ORCHESTRATOR: {_notice}")
 
     # The appended system prompt is a second large argv element (reconciler.md
     # is ~25KB) that compounds with the user prompt toward MAX_ARG_STRLEN —
@@ -23050,7 +23071,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                     _acceptance_read_denials(schema_key, st.run_dir),
                     _sysprompt_read_denial(getattr(st, "run_dir", None),
                                            allowed_tools, autonomous),
-                    suite_deny, db_deny, forbidden_deny, kill_deny) if d),
+                    guard["deny"]) if d),
                 settings=hook_settings)
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])

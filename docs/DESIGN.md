@@ -8694,7 +8694,11 @@ install, test run or watcher. The usual motive is innocent: a worker wants to
 stop its own background command, and a pattern is the only handle it has.
 
 So the same three layers as forbidden commands, over a fixed list, for every
-worker whose tools reach a shell:
+worker whose tools reach a shell — the Fly recovery integrator included,
+which builds its own `claude` command line in bash but takes the layers from
+the same Python construction every other worker gets (`_worker_guard`,
+through `scripts/worker-guard.py`), so it cannot be the one worker that
+lacks them:
 
 - **Deny rules** `Bash(pkill)`, `Bash(killall)`, `Bash(killall5)`,
   `Bash(xargs kill)` and their ` *` forms (the CLI checks each pipeline
@@ -9537,11 +9541,15 @@ the direct-invocation/test path; the launcher always sets
 `/leerie-state`), since a blanket deny there would deny each worker its own
 worktree; `_repo_write_denials` returns `""` in that layout and logs once
 rather than staying silently confident. The remote integrator
-(`scripts/remote/collect-subtrees.sh`) cannot import the orchestrator, so
-it carries its own duplicated deny list (like its duplicated
-`SCHEMAS["integrator"]`) — its blast radius is the seeded machine and the
-branch it pushes, not the laptop, which is the argument against adding a
-third copy of a value the orchestrator owns.
+(`scripts/remote/collect-subtrees.sh`) carries no repo-write denial — its
+blast radius is the seeded machine and the branch it pushes, not the laptop
+— but it is not otherwise a second construction of the worker guard: its
+bash payload asks the orchestrator module baked into the same image
+(`scripts/worker-guard.py`) for the deny rules, notices, hook and
+environment `claude_p` would give a worker with its tools (§9 *A worker
+never kills a process by name*), and falls back to its duplicated base deny
+list (kept drift-guarded, like its duplicated `SCHEMAS["integrator"]`) only
+when that module cannot be loaded.
 
 `Task` is the live CLI's name for subagent spawning, `Agent` the retired
 one — until `Task` was added, the "no subagent spawning" constraint (§2,

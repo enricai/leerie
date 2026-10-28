@@ -986,3 +986,85 @@ def test_tsconfig_include_globs_do_not_read_as_comments(leerie, tmp_path):
                                                      "@t/": "test/"}
     assert leerie._jsonc_strip_comments('{"a": "x//y /* z */"} // c') == \
         '{"a": "x//y /* z */"} '
+
+
+# === one owner: `_worker_guard` carries every layer to both callers ========
+#
+# `claude_p` and the Fly remote integrator (`scripts/worker-guard.py`) both
+# take the guard from `_worker_guard`. The pins below execute the guard, the
+# real `claude_p` and the real script on the SAME typed state, so a guard
+# that read the display strings (`_forbidden_commands`) instead of the typed
+# specs would turn a whole-suite entry back into a prefix deny that blocks
+# every targeted `pnpm test <file>`.
+
+_SUITE_STATE = {"process_constraints": {
+    "forbidden_commands": ["pnpm run test"], "entries": SUITE}}
+
+
+def test_worker_guard_keeps_the_whole_suite_scope(leerie, monkeypatch,
+                                                  tmp_path):
+    repo = _repo(tmp_path, test="")
+    guard = leerie._worker_guard(leerie.ACT_TOOLS, repo, _SUITE_STATE,
+                                 worker="implementer")
+    rules = guard["deny"].split(",")
+    assert leerie._forbidden_command_denials(SUITE) in guard["deny"]
+    assert "Bash(pnpm run test *)" not in rules
+    assert "Bash(pnpm test *)" not in rules
+    hook = json.loads(guard["settings"])["hooks"]["PreToolUse"][0][
+        "hooks"][0]["command"]
+    assert json.loads(base64.b64decode(hook.split()[-1]))["forbidden"] == \
+        SUITE
+    (notice,) = [n for n in guard["notices"] if "whole test suite" in n]
+    assert "specific test files" in notice
+    # The real claude_p argv carries the same deny and notice.
+    argv, prompt = _spawn(leerie, monkeypatch, repo, data=_SUITE_STATE)
+    deny = argv[argv.index("--disallowedTools") + 1]
+    assert deny.endswith(guard["deny"])
+    assert f"NOTE FROM ORCHESTRATOR: {notice}" in prompt
+
+
+def test_worker_guard_notice_free_worker_keeps_every_other_layer(
+        leerie, tmp_path):
+    repo = _repo(tmp_path, test="pnpm run test")
+    tools = leerie.INSPECT_TOOLS + ",Bash(pnpm:*),Bash"
+    data = _pc("pnpm run lint")
+    told = leerie._worker_guard(tools, repo, data, worker="planner")
+    quiet = leerie._worker_guard(tools, repo, data, worker="classifier")
+    assert len(told["notices"]) >= 3, told["notices"]
+    assert quiet["notices"] == []
+    for key in ("deny", "settings", "env"):
+        assert quiet[key] == told[key], key
+    assert "Bash(pnpm run lint)" in quiet["deny"]
+
+
+def test_worker_guard_drops_the_suite_notice_when_the_suite_is_forbidden(
+        leerie, tmp_path):
+    repo = _repo(tmp_path, test="pnpm run test")
+    sent = leerie._worker_guard(leerie.ACT_TOOLS, repo, {})
+    assert [n for n in sent["notices"] if "whole test suite" in n]
+    held = leerie._worker_guard(leerie.ACT_TOOLS, repo, _pc("pnpm test"))
+    assert not [n for n in held["notices"]
+                if n == leerie._full_suite_notice(repo, None)]
+    assert _forbid_lines("\n".join(
+        f"NOTE FROM ORCHESTRATOR: {n}" for n in held["notices"]))
+
+
+def test_the_fly_guard_script_reads_the_typed_scope(leerie, tmp_path):
+    repo = _repo(tmp_path, test="")
+    state = tmp_path / "state.json"
+    state.write_text(json.dumps(_SUITE_STATE))
+    p = subprocess.run(
+        [sys.executable, "-I", str(REPO / "scripts" / "worker-guard.py"),
+         leerie.ACT_TOOLS, str(repo), str(state)],
+        capture_output=True, text=True, timeout=120)
+    assert p.returncode == 0, p.stderr
+    got = subprocess.run(
+        ["bash", "-c", p.stdout + '\nprintf "%s\\n--\\n%s" '
+         '"$guard_disallowed" "$guard_notice"'],
+        capture_output=True, text=True, timeout=60).stdout
+    disallowed, notice = got.split("\n--\n", 1)
+    guard = leerie._worker_guard(leerie.ACT_TOOLS, repo, _SUITE_STATE,
+                                 worker="integrator")
+    assert disallowed == leerie.DISALLOWED_TOOLS + "," + guard["deny"]
+    assert "Bash(pnpm run test *)" not in disallowed.split(",")
+    assert "specific test files" in notice

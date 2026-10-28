@@ -243,14 +243,38 @@ LEERIE_DIR is ${leerie_dir}.
 Incoming subtask: ${sid}
 Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
 
+    # The per-worker guard (deny rules + notices + PreToolUse hook + script
+    # shell env) from the orchestrator module baked into this image — the
+    # same `_worker_guard` every orchestrator-spawned worker gets (DESIGN §9
+    # *A worker never kills a process by name*). Falls back to the embedded
+    # base deny list alone when it cannot be loaded.
+    guard_disallowed="$integrator_disallowed_tools"
+    guard_notice=""
+    guard_settings=""
+    guard_env=()
+    guard_sh=""
+    if guard_sh=$(python3 -I "$SCRIPTS/worker-guard.py" \
+        "$integrator_allowed_tools" "$staging" "$leerie_dir/state.json" \
+        2>/dev/null) && [ -n "$guard_sh" ]; then
+      eval "$guard_sh"
+    else
+      echo "collect-subtrees: worker guard unavailable for ${sid}; using the embedded deny list" >&2
+    fi
+    guard_settings_args=()
+    if [ -n "$guard_settings" ]; then
+      guard_settings_args=(--settings "$guard_settings")
+    fi
+
     claude_out=""
     claude_rc=0
-    claude_out=$(cd "$staging" && claude -p "$user_prompt" \
+    claude_out=$(cd "$staging" && env ${guard_env[@]+"${guard_env[@]}"} \
+      claude -p "${user_prompt}${guard_notice}" \
       --append-system-prompt "$(cat "$integrator_prompt")" \
       --output-format json \
       --json-schema "$integrator_schema" \
       --allowedTools "$integrator_allowed_tools" \
-      --disallowedTools "$integrator_disallowed_tools" \
+      --disallowedTools "$guard_disallowed" \
+      ${guard_settings_args[@]+"${guard_settings_args[@]}"} \
       --max-turns 60 \
       --model sonnet \
       --effort high \

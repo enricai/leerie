@@ -377,3 +377,112 @@ def test_setup_run_creates_missing_worktree(tmp_path):
         ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:new_file.txt"],
         capture_output=True, text=True, check=False)
     assert show.returncode == 0, "new_file.txt missing from run branch"
+
+
+# --- the integrator carries the same worker guard as every other worker ------
+
+def _recording_claude(tmp_path: Path) -> tuple[Path, Path]:
+    """A stub claude that records its argv (NUL-separated) and two env
+    values, then resolves the conflict by accepting theirs."""
+    rec = tmp_path / "claude-argv"
+    stub = tmp_path / "bin" / "claude"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    stub.write_text(
+        '#!/usr/bin/env bash\n'
+        f'printf "%s\\0" "$@" > "{rec}"\n'
+        f'printf "%s" "${{LEERIE_FORBIDDEN_SCRIPTS:-}}" > "{rec}.env"\n'
+        'git checkout --theirs . >/dev/null 2>&1\n'
+        'git add -A >/dev/null 2>&1\n'
+        'git commit --no-edit >/dev/null 2>&1\n'
+        'echo \'{"type":"result","structured_output":'
+        '{"incoming_subtask":"s2","status":"resolved",'
+        '"resolution_summary":"theirs","diagnosis":null}}\'\n')
+    stub.chmod(0o755)
+    return stub, rec
+
+
+def _conflicting_run(tmp_path: Path, run_id: str, extra_state: dict):
+    repo = _make_fixture_repo(tmp_path)
+    state_dir = tmp_path / "state"
+    _make_run_branch(repo, run_id)
+    _make_state_json(state_dir, run_id, waves=[["s1", "s2"]],
+                     completed_waves=0)
+    sj = state_dir / "runs" / run_id / "state.json"
+    sj.write_text(json.dumps({**json.loads(sj.read_text()), **extra_state}))
+    _make_subtask_branch(repo, run_id, "s1", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version A\n"})
+    _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version B\n"})
+    return repo, state_dir
+
+
+def test_the_integrator_gets_the_shared_kill_deny_notice_and_hook(
+        tmp_path, leerie):
+    run_id = "test-guard-abc"
+    repo, state_dir = _conflicting_run(tmp_path, run_id, {
+        "process_constraints": {"forbidden_commands": ["npm run deploy"]}})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    _claude, rec = _recording_claude(tmp_path)
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env={"LEERIE_REPO": str(REPO_ROOT),
+             "PATH": f"{stub.parent}:{os.environ['PATH']}"})
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 2" in result.stderr.lower()
+    argv = rec.read_text().split("\0")[:-1]
+
+    def after(flag: str) -> str:
+        return argv[argv.index(flag) + 1]
+    staging = state_dir / "runs" / run_id / "worktrees" / "staging"
+    expect = leerie._worker_guard(
+        leerie.ACT_TOOLS, str(staging),
+        {"process_constraints": {"forbidden_commands": ["npm run deploy"]}})
+    # The deny list is the base list plus exactly what `claude_p` adds.
+    assert after("--disallowedTools") == (
+        leerie.DISALLOWED_TOOLS + "," + expect["deny"])
+    for rule in ("Bash(pkill)", "Bash(xargs kill *)", "Bash(npm run deploy)"):
+        assert rule in after("--disallowedTools").split(","), rule
+    assert "TaskStop" in after("--allowedTools").split(",")
+    assert "TaskStop" not in after("--disallowedTools").split(",")
+    # Every notice, on the user prompt, as claude_p appends them.
+    prompt = after("-p")
+    assert prompt.startswith("Resolve the in-progress merge conflict")
+    assert prompt.endswith("".join(f"\nNOTE FROM ORCHESTRATOR: {n}"
+                                   for n in expect["notices"]))
+    assert leerie.PROCESS_KILL_NOTICE in prompt
+    # The PreToolUse hook (kills + the forbidden command) and the script
+    # shell guard's environment.
+    hook = json.loads(after("--settings"))
+    cmd = hook["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert "forbidden-command-hook.py" in cmd
+    assert (rec.parent / "claude-argv.env").read_text() == "deploy"
+
+
+def test_the_integrator_falls_back_to_the_base_deny_list(tmp_path, leerie):
+    """Without a loadable guard the call still runs, with the embedded base
+    list — the pre-guard behaviour."""
+    run_id = "test-guard-fallback"
+    repo, state_dir = _conflicting_run(tmp_path, run_id, {})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    _claude, rec = _recording_claude(tmp_path)
+    shadow = tmp_path / "py"
+    shadow.mkdir()
+    # A python3 that fails only the guard script, so the payload's other
+    # python3 uses still work.
+    real = subprocess.run(["bash", "-c", "command -v python3"],
+                          capture_output=True, text=True).stdout.strip()
+    (shadow / "python3").write_text(
+        "#!/usr/bin/env bash\n"
+        'case "$*" in *worker-guard.py*) exit 1 ;; esac\n'
+        f'exec {real} "$@"\n')
+    (shadow / "python3").chmod(0o755)
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env={"LEERIE_REPO": str(REPO_ROOT),
+             "PATH": f"{shadow}:{stub.parent}:{os.environ['PATH']}"})
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 2" in result.stderr.lower()
+    argv = rec.read_text().split("\0")[:-1]
+    assert argv[argv.index("--disallowedTools") + 1] == \
+        leerie.DISALLOWED_TOOLS
+    assert "--settings" not in argv
