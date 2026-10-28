@@ -53166,9 +53166,13 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
                                  caps: dict) -> dict:
     """Check an `external_precondition` against its typed resource (DESIGN
     §13 *An external claim is checked, not taken on the word*). Returns
-    `{verdict, why, claim}`: `verified` accepts; `refuted` (the resource is
-    there, or the claim is named nowhere) and `unverified` (a check could
-    not run) both re-drive. Never reads the `blocker` prose."""
+    `{verdict, why, claim, reason?}` (`reason` is `local_service` or
+    `environment`): `verified` accepts; `refuted` (the resource is there,
+    or the claim is named nowhere) and `unverified` (a check could not run)
+    both re-drive, except an `unverified` for `environment` on the same
+    claim as the previous blocked attempt's, which `_route_blocker_kind`
+    settles `unconverged` (`external_unverified`). Never reads the
+    `blocker` prose."""
     claim = _external_claim(res)
     out: dict = {"verdict": "unverified", "why": "", "claim": claim}
 
@@ -53903,6 +53907,13 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
             # A resume that completes the subtask must clear the stale entry
             # so state.json doesn't carry a contradictory blocked record.
             st.data.get("blocked", {}).pop(sid, None)
+            # Nor an external check: `external_unverified` needs the same
+            # unverifiable claim on two blocked attempts in a row, and this
+            # one completed (DESIGN §13 *An environment that cannot check a
+            # claim does not burn the budget*).
+            bk = (st.data.get("blocker_kinds") or {}).get(sid)
+            if isinstance(bk, dict):
+                bk.pop("external_check", None)
         st.save()
 
         if status == "complete":

@@ -4107,7 +4107,7 @@ above.
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path except `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented user-deliverable subtrees — never `settings.json` or a top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (touched > max(3× expected, 5), or > 15 regardless) |
 | `_validate_checkpoint()` — on `incomplete-handoff` | required section missing/empty/whitespace/placeholder-only (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing punctuation ignored); a `## Files touched` path no longer exists and isn't flagged `[deleted]` | returns `blocked` |
-| `_route_blocker_kind()` — on `status` `blocked` or `failed` from the worker | worker self-report of a blocker or failure, typed `blocker_kind` | **Routed by the kind** (DESIGN §13 *A blocked implementer says why, as a type*): `external_precondition` with a named resource → `accepted_external` only when the code check verifies it (`_verify_external_claim`), otherwise retyped `other` and re-driven — except that the same claim (`check.claim`) returning `unverified` with `reason: "environment"` on the attempt after one that did settles `unconverged` (`_settle_unconverged(..., kind="external_unverified")`, reason naming the claim); `environment_limit` → one in-place retry, then `unconverged`; `cannot_reproduce` → settled by execution, else re-driven, and `unconverged` when that execution hits the environment limit; `nothing_to_change` → settled `complete` on evidence when a sibling delivered its surface, its verify commands (if any) pass and the satisfied-probe finds its criteria met (`_settle_nothing_to_change`, §6 *Sibling-delivered no-op*), else re-driven, and `unconverged` when that execution hits the environment limit; every other kind (and a missing one) → `blocked`, re-driven at wave end from the shared budget. A self-reported `failed` is no longer terminal. |
+| `_route_blocker_kind()` — on `status` `blocked` or `failed` from the worker | worker self-report of a blocker or failure, typed `blocker_kind` | **Routed by the kind** (DESIGN §13 *A blocked implementer says why, as a type*): `external_precondition` with a named resource → `accepted_external` only when the code check verifies it (`_verify_external_claim`), otherwise retyped `other` and re-driven — except that the same claim (`check.claim`) returning `unverified` with `reason: "environment"` on the blocked attempt after one that did, with no completed attempt between them, settles `unconverged` (`_settle_unconverged(..., kind="external_unverified")`, reason naming the claim); `environment_limit` → one in-place retry, then `unconverged`; `cannot_reproduce` → settled by execution, else re-driven, and `unconverged` when that execution hits the environment limit; `nothing_to_change` → settled `complete` on evidence when a sibling delivered its surface, its verify commands (if any) pass and the satisfied-probe finds its criteria met (`_settle_nothing_to_change`, §6 *Sibling-delivered no-op*), else re-driven, and `unconverged` when that execution hits the environment limit; every other kind (and a missing one) → `blocked`, re-driven at wave end from the shared budget. A self-reported `failed` is no longer terminal. |
 
 `_validate_result()` accepts `complete` regardless of what
 `criteria_results` carries — empty, missing, or `met:false` entries are all
@@ -6382,7 +6382,8 @@ _route_blocker_kind(...)` before anything else:
   `_settle_accepted_external(st, sid, resource, blocker) -> dict`, any other
   verdict types the result `other` (falls through to the last bullet) with
   `external_precondition not accepted (<verdict>): <why>` appended to its
-  blocker. `_settle_accepted_external`: `subtask_status[sid] = "accepted_external"`, `blocked[sid]`
+  blocker — except a second environmental `unverified` on the same claim,
+  settled `unconverged` (`external_unverified`, below). `_settle_accepted_external`: `subtask_status[sid] = "accepted_external"`, `blocked[sid]`
   dropped, and `needs_human_verification` gains `{source: "blocker", subtask,
   resource, blocker}` (replacing an earlier entry for the same subtask);
   returns `{status: "accepted_external"}`. `phase_classify` rewrites only the
@@ -6403,8 +6404,10 @@ The kind is persisted as `blocker_kinds[sid] = {kind, resource?, status,
 claimed?, external_check?}` (the latest attempt's); an external claim adds
 `external_check = {verdict, why, claim, reason?}`, and a rejected one is
 recorded `kind: "other"` with `claimed: "external_precondition"`.
-`_route_blocker_kind` reads the previous attempt's `external_check` before
-overwriting the record: when both it and this attempt's are `unverified`
+`_route_blocker_kind` reads the previous blocked attempt's `external_check`
+before overwriting the record (`_settle_subtask` drops `external_check` from
+the record when an attempt reports `complete`, so the comparison is with a
+blocked attempt that no completed one followed): when both it and this attempt's are `unverified`
 with `reason: "environment"` and an equal `claim`, the subtask is settled
 by `_settle_unconverged(..., kind="external_unverified")` with the reason
 "external claim could not be checked in this environment: <claim>: <why>"
@@ -9132,7 +9135,8 @@ settled `accepted_external` (`_settle_accepted_external`: not integrated,
 listed under "Needs human verification", not `unconverged`) only when
 `_verify_external_claim` returns `verified`, and is otherwise re-driven as
 `other` — unless the same claim was `unverified` with `reason:
-"environment"` on the previous attempt too, when it is settled `unconverged`
+"environment"` on the previous blocked attempt too (no completed attempt
+between them), when it is settled `unconverged`
 (`kind="external_unverified"`, DESIGN §13 *An environment that cannot check
 a claim does not burn the budget*); an `environment_limit` is retried in place once, then settled
 `unconverged` (`_environment_limit_hit`); a `nothing_to_change` is settled
@@ -9614,7 +9618,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |
-| `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status, claimed?, external_check?}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). An `external_precondition` claim adds `external_check: {verdict, why, claim}` (`_verify_external_claim`); one not `verified` is recorded `kind: "other"`, `claimed: "external_precondition"`. |
+| `blocker_kinds` | dict[str, dict] | per-sid `{kind, resource?, status, claimed?, external_check?}` — the latest implementer attempt's typed `blocker_kind` (normalised by `_blocker_kind`) on a `blocked`/`failed` result, written by `_route_blocker_kind` (DESIGN §13 *A blocked implementer says why, as a type*). An `external_precondition` claim adds `external_check: {verdict, why, claim, reason?}` (`_verify_external_claim`), dropped when a later attempt reports `complete`; one not `verified` is recorded `kind: "other"`, `claimed: "external_precondition"`. |
 | `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |

@@ -642,7 +642,8 @@ is accepted only when the orchestrator's own check backs it, and
 back them. Anything else — every other kind, and any of these the checks do
 not back — is driven again: another round receives your blocker as input,
 unless the environment itself keeps the orchestrator from running its
-check, which settles the subtask unconverged. A missing kind, or `external_precondition` without `external_resource`, is
+check on the same claim a second blocked attempt running, which settles the
+subtask unconverged (the first time, it is driven again). A missing kind, or `external_precondition` without `external_resource`, is
 treated as `other`.
 
 `external_resource_claim` types the resource of an `external_precondition`

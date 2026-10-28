@@ -688,7 +688,8 @@ integrated, listed under "Needs human verification", and not making the run
 `unconverged` — only when code verifies the typed resource it names (§13
 *An external claim is checked, not taken on the word*); an unverified claim
 is re-driven as `other`, except that the same claim unverifiable for an
-environmental reason on two attempts in a row settles `unconverged`
+environmental reason on two blocked attempts in a row (no completed
+attempt between them) settles `unconverged`
 (`external_unverified`, §13 *An environment that cannot check a claim does
 not burn the budget*). An `environment_limit` is retried in place once,
 then settled `unconverged`. A `nothing_to_change` is settled `complete` only
@@ -10714,7 +10715,7 @@ prose:
 | `blocker_kind` | Routing |
 |---|---|
 | `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
-| `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other`, except that the same claim unverified for an environmental reason on two attempts in a row settles `unconverged` (`external_unverified`, below) |
+| `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other`, except that the same claim unverified for an environmental reason on two blocked attempts in a row (no completed attempt between them) settles `unconverged` (`external_unverified`, below) |
 | `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
 | `upstream_missing` | re-driven |
 | `cannot_reproduce` | settled by execution (§8 *Settled by execution*); a claim execution cannot back is re-driven |
@@ -10791,7 +10792,9 @@ no claim was typed, the network probe's control host is unreachable, the
 probe hit its hard timeout, `git grep` or the verify commands could not
 decide) both type the result `other` and re-drive it from the shared
 budget, with the typed reason — "claimed missing env var X, but it is set"
-— in the re-drive note. A check that cannot run never accepts: the user's
+— in the re-drive note; the one exception is an `unverified` claim the
+environment cannot check twice running (*An environment that cannot check a
+claim does not burn the budget*, below), which settles `unconverged`. A check that cannot run never accepts: the user's
 rule is that leftover work is accepted only when its cause is an external
 resource no in-container step can supply, and an unrun check has not shown
 that.
@@ -10868,12 +10871,17 @@ the network probe cannot decide — the control is unreachable, the probe
 hit its hard timeout, the proxy refused to say — the claim is `unverified`
 with `reason: "environment"`: nothing the worker does next changes it. The
 first time, the subtask is re-driven as before (the worker may type a
-different, checkable claim, or finish the work). When the re-driven
+different, checkable claim, or finish the work). When the next blocked
 attempt returns the same claim and it is unverified for an environmental
 reason again, the subtask is settled `unconverged` at once, with the typed
 reason naming exactly what could not be checked — so the PR says which
 host could not be probed, and the rest of the budget is not spent
-rediscovering the environment.
+rediscovering the environment. "Again" means on two blocked attempts with
+no completed one between them: an attempt that completes clears the
+earlier check, so a subtask that finished and is later re-driven (by
+coverage or delivery) and blocks once more on the same claim is re-driven
+once before it can settle this way — the earlier blocked attempt is no
+longer the one before it.
 
 **A dependent of accepted-external work is accepted-external too.** A
 subtask whose predecessor in the scheduler's graph — `depends_on`, or a

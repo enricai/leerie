@@ -186,3 +186,27 @@ def test_a_different_claim_or_a_worker_fault_is_redriven(ext, monkeypatch):
     assert _settle_with(ext, monkeypatch, untyped)["status"] == "blocked"
     assert st.data["subtask_status"]["t1"] == "blocked"
     assert "t1" not in (st.data.get("unconverged_subtasks") or {})
+
+
+def test_a_completed_attempt_between_breaks_the_run(ext, monkeypatch):
+    """Round-4 claims review L8: "two blocked attempts in a row" compared
+    with the last *blocked* attempt's record, which nothing cleared — so
+    blocked, complete (later re-driven by coverage or delivery), blocked
+    settled `external_unverified` at once. An attempt that reports
+    `complete` now drops the earlier check: the next environmental
+    `unverified` is re-driven, and only a second one in a row settles."""
+    ext["reach"][("billing.acme-test.invalid", 8443)] = "unreachable"
+    st = ext["st"]
+    assert _settle_with(ext, monkeypatch, _env_unverified_result()
+                        )["status"] == "blocked"
+    assert "external_check" in st.data["blocker_kinds"]["t1"]
+    _settle_with(ext, monkeypatch, {"subtask_id": "t1", "status": "complete",
+                                    "summary": "done"})
+    assert "external_check" not in st.data["blocker_kinds"]["t1"]
+    res = _settle_with(ext, monkeypatch, _env_unverified_result())
+    assert res["status"] == "blocked", res
+    assert "t1" not in (st.data.get("unconverged_subtasks") or {})
+    res = _settle_with(ext, monkeypatch, _env_unverified_result())
+    assert res["status"] == "unconverged"
+    assert st.data["unconverged_subtasks"]["t1"]["kind"] == \
+        "external_unverified"
