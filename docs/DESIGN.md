@@ -9171,6 +9171,25 @@ Three layers follow, each derived from that one list:
   so `pytest -p no:cacheprovider` is still a whole-suite run, not a run of
   a file named `no:cacheprovider`.
 
+  *pnpm's binary fallback reads no option values.* pnpm reads a global
+  option's value only on the way to one of its own commands or a script.
+  When the word after the options is neither and pnpm falls back to
+  running a package binary, it reads every option as a bare flag: the
+  binary is the first word that does not start with `-` (one `--` before
+  it is dropped), and every word after it is handed on. So `pnpm --dir . vitest` runs `.`, and `pnpm -C
+  vitest x` runs `vitest x` inside `vitest/` — a value table applied there
+  read `vitest` as the directory and `x` as the binary, and let the runner
+  through. A `--filter`/`-F`/`--filter-prod` or `-r`/`--recursive`
+  selector (or `recursive`/`multi`/`m`) makes pnpm run a script only, never
+  a binary, so no binary reading is made for it; `-w`/`--workspace-root`
+  is a flag either way, and `x` is no command of pnpm's (npm's and bun's
+  `x` is `exec`; `pnpm x vitest` runs a binary named `x`). Which branch pnpm takes depends on the
+  repository's scripts, which the matcher cannot see, so it reads both:
+  the script reading with the value table, the binary reading without it.
+  Measured with the real pnpm 11.21 through real bash on argv-printing
+  binaries; the spellings are pinned in
+  `tests/fixtures/forbid_runner_options.json`.
+
   *One runner, every spelling.* Since every orchestrator-side launch
   (CI parity, the provision recipe, coverage, settle-by-execution) is
   checked by this matcher alone, a spelling it misses runs the forbidden

@@ -22415,6 +22415,12 @@ _FORBID_PM_VALUE_OPTS: dict[str, frozenset[str]] = {
         "--cwd", "-F", "--filter", "-c", "--config", "--env-file",
         "-r", "--preload", "--shell", "--elide-lines"}),
 }
+# pnpm options that make it run a script in the selected packages and never
+# fall back to a package binary (`pnpm -r vitest`: "None of the selected
+# packages has a \"vitest\" script"). Measured with the real pnpm 11.21
+# (tests/fixtures/forbid_runner_options.json, "pnpm binary fallback").
+_FORBID_PNPM_SCRIPT_ONLY_OPTS = frozenset({
+    "-r", "--recursive", "-F", "--filter", "--filter-prod"})
 # Subcommands that only select where the real one runs: `pnpm recursive
 # run test` is `pnpm -r run test`, `yarn workspace web test` runs `test` in
 # one workspace. The int is how many words they take (the name).
@@ -22550,9 +22556,13 @@ def _forbidden_normalize(argv: list[str], depth: int,
             while i < len(r) and r[i].startswith("-"):
                 i += 2 if r[i] in vals else 1
             return r[i:]
-        rest = _opts(a[1:])
+        raw = a[1:]
+        rest = _opts(raw)
+        script_only = any(w.split("=", 1)[0] in _FORBID_PNPM_SCRIPT_ONLY_OPTS
+                          for w in raw[:len(raw) - len(rest)])
         while rest:
             if rest[0] in scopes:
+                script_only = True
                 rest = _opts(rest[1 + scopes[rest[0]]:])
             elif (a[0] == "yarn" and rest[0] == "workspaces"
                     and len(rest) > 1 and rest[1] in ("run", "foreach")):
@@ -22565,7 +22575,9 @@ def _forbidden_normalize(argv: list[str], depth: int,
         a = [a[0]] + rest
         if len(a) > 1:
             sub = a[1]
-            if sub in ("exec", "dlx", "x"):
+            # `x` is exec in npm and bun; pnpm 11 has no such command and
+            # runs a binary named `x` (DESIGN §9 *pnpm's binary fallback*).
+            if sub in ("exec", "dlx") or (sub == "x" and a[0] != "pnpm"):
                 r = a[2:]
                 ended = False
                 while r and r[0].startswith("-"):
@@ -22585,9 +22597,35 @@ def _forbidden_normalize(argv: list[str], depth: int,
             elif a[0] != "npm" and not sub.startswith("-"):
                 # `pnpm vitest run`: pnpm, yarn and bun run a script of that
                 # name, else the package binary — both readings are argvs.
+                # pnpm reads its options' values only on the way to a
+                # script: its binary is read from the words as typed, every
+                # option a bare flag (DESIGN §9 *pnpm's binary fallback*).
+                if a[0] == "pnpm":
+                    binary = (None if script_only
+                              else _forbidden_pnpm_binary(raw))
+                    return [a] + (_forbidden_normalize(
+                        _forbidden_pm_passthrough("pnpm", binary),
+                        depth + 1, keep_xargs) if binary else [])
                 return [a] + _forbidden_normalize(_forbidden_pm_passthrough(
                     a[0], a[1:]), depth + 1, keep_xargs)
     return [a]
+
+
+def _forbidden_pnpm_binary(words: list[str]) -> list[str] | None:
+    """The argv pnpm runs when the word after its options is neither one of
+    its commands nor a script: it reads no option's value there, so the
+    binary is the first word that does not start with `-` (one `--` before
+    it is dropped) and every word after it is handed on — `pnpm --dir .
+    vitest` runs `.`, `pnpm -C vitest y` runs `vitest y` in `vitest/`.
+    pnpm's own fallback (its run handler) strips the leading dash words of
+    the original argv exactly so; measured with the real pnpm 11.21 through
+    real bash (`tests/test_forbidden_pm_flags.py`)."""
+    i = 0
+    while i < len(words) and words[i].startswith("-") and words[i] != "--":
+        i += 1
+    if i < len(words) and words[i] == "--":
+        i += 1
+    return words[i:] or None
 
 
 def _forbidden_pm_passthrough(pm: str, r: list[str]) -> list[str]:

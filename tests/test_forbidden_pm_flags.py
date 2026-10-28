@@ -157,3 +157,91 @@ def test_matcher_agrees_with_the_real_package_managers(leerie, tmp_path):
         if bool(leerie._forbidden_command_hit(cmd, FORBIDDEN)) is not ran:
             wrong.append((cmd, ran, (r.stdout + r.stderr)[-300:]))
     assert not wrong, wrong
+
+
+# --- pnpm's binary fallback reads no option values ---------------------------
+# (DESIGN §9 *pnpm's binary fallback reads no option values*.) The table
+# read `pnpm -C vitest x` as "directory `vitest`, binary `x`"; the real
+# pnpm 11.21 runs `vitest x` inside `vitest/`, and `pnpm --dir . vitest`
+# runs `.`. Ground truth: an argv-printing `vitest` in each package's
+# `node_modules/.bin` and in a directory named `vitest`, reached through
+# real bash. The verdicts are pinned in the fixture; the live check re-runs
+# them when pnpm is installed.
+
+PNPM_FIXTURE = json.loads((Path(__file__).parent / "fixtures"
+                           / "forbid_runner_options.json").read_text())[
+    "pnpm binary fallback"]
+
+_PNPM_STUB = ("#!/bin/sh\nprintf '%s\\037' \"${PWD#$WS_ROOT}\" vitest \"$@\""
+              " >> \"$ARGV_LOG\"\nprintf '\\n' >> \"$ARGV_LOG\"\n")
+
+
+def _pnpm_fallback_ws(root: Path) -> None:
+    def w(rel: str, text: str, mode: int | None = None) -> None:
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+        if mode:
+            (root / rel).chmod(mode)
+    w("package.json", json.dumps({"name": "root", "private": True,
+                                  "scripts": {"test": "echo RAN-TEST"}}))
+    w("pnpm-workspace.yaml", "packages:\n  - 'packages/*'\n")
+    w("packages/a/package.json", json.dumps(
+        {"name": "a", "scripts": {"test": "echo RAN-TEST"}}))
+    w("vitest/package.json", json.dumps({"name": "v"}))
+    for d in ("", "packages/a/", "vitest/"):
+        w(f"{d}node_modules/.bin/vitest", _PNPM_STUB, 0o755)
+
+
+def _pnpm_ran(root: Path, cmd: str, log: Path, env: dict) -> list[dict]:
+    log.write_text("")
+    subprocess.run(["bash", "-c", cmd], cwd=str(root), env=env,
+                   capture_output=True, text=True, timeout=120,
+                   stdin=subprocess.DEVNULL, check=False)
+    out = []
+    for line in log.read_text().splitlines():
+        cwd, *argv = line.split("\037")[:-1]
+        out.append({"cwd": cwd.lstrip("/") or ".", "argv": argv})
+    return out
+
+
+def test_pnpm_value_table_keeps_its_value_options(leerie):
+    """`-C`/`--dir`/`-F`/`--filter` do take a value on the way to a command
+    or script (`pnpm -C packages/a test` runs a's `test`); `-w`/`-r` never
+    do."""
+    t = leerie._FORBID_PM_VALUE_OPTS["pnpm"]
+    assert {"-C", "--dir", "-F", "--filter", "--filter-prod"} <= t
+    assert not t & {"-w", "--workspace-root", "-r", "--recursive"}
+    assert leerie._FORBID_PNPM_SCRIPT_ONLY_OPTS == frozenset({
+        "-r", "--recursive", "-F", "--filter", "--filter-prod"})
+
+
+@pytest.mark.parametrize("case", PNPM_FIXTURE["cases"],
+                         ids=[c["command"] for c in PNPM_FIXTURE["cases"]])
+def test_pnpm_binary_reading_matches_the_real_pnpm(leerie, case):
+    """Every argv the real pnpm ran is one the matcher reads, and the
+    matcher reads `vitest` as the binary only where pnpm ran it."""
+    reads = leerie._forbidden_argvs(case["command"])
+    for r in case["ran"]:
+        assert r["argv"] in reads, (case, reads)
+    as_binary = [r for r in reads if r[:1] == ["vitest"]]
+    assert as_binary == [r["argv"] for r in case["ran"]], (case, reads)
+    hit = bool(leerie._forbidden_command_hit(
+        case["command"], [{"command": "vitest", "scope": "any"}]))
+    assert hit is bool(case["ran"]), case
+
+
+@pytest.mark.skipif(shutil.which("pnpm") is None, reason="pnpm not installed")
+def test_pinned_pnpm_fallback_still_matches_the_real_pnpm(tmp_path):
+    """The pinned verdicts are pnpm's own: re-run them."""
+    root = tmp_path / "ws"
+    _pnpm_fallback_ws(root)
+    log = tmp_path / "argv.log"
+    env = {**os.environ, "ARGV_LOG": str(log), "WS_ROOT": str(root),
+           "npm_config_update_notifier": "false", "CI": "1",
+           "COREPACK_ENABLE_DOWNLOAD_PROMPT": "0"}
+    drift = []
+    for case in PNPM_FIXTURE["cases"]:
+        ran = _pnpm_ran(root, case["command"], log, env)
+        if ran != case["ran"]:
+            drift.append((case["command"], case["ran"], ran))
+    assert not drift, drift

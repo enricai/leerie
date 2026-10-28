@@ -10,6 +10,7 @@
   "node": "26.5.0",
   "pdm": "2.29.4",
   "pipenv": "2026.10.3",
+  "pnpm": "11.21.0",
   "poetry": "2.5.1",
   "python": "3.14",
   "railties": "8.1.4 (Rails::TestUnit::Runner + minitest's own options)",
@@ -697,6 +698,312 @@
    "-h"
   ],
   "value_opts": []
+ },
+ "pnpm binary fallback": {
+  "_how": "each command run through real bash with the real pnpm in a two-package workspace whose root, packages/a and a directory named vitest each carry an argv-printing node_modules/.bin/vitest; `ran` is every (cwd, argv) a stub received. Regenerate: tests/test_forbidden_pm_flags.py::_pnpm_fallback_ws/_pnpm_ran.",
+  "cases": [
+   {
+    "command": "pnpm vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm --dir . vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm -C . vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --dir=. vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm -C=. vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm -C vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "vitest"
+     }
+    ]
+   },
+   {
+    "command": "pnpm --dir vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "vitest"
+     }
+    ]
+   },
+   {
+    "command": "pnpm --dir vitest vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "vitest",
+       "x"
+      ],
+      "cwd": "vitest"
+     }
+    ]
+   },
+   {
+    "command": "pnpm -C vitest -C . x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "-C",
+       ".",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm --dir packages/a vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --dir=packages/a vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "packages/a"
+     }
+    ]
+   },
+   {
+    "command": "pnpm --dir . -w vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm -w --dir . vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm -w vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm --workspace-root vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm --filter a vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --filter=a vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm -F a vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm -F=a vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --filter-prod a vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm -r vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --recursive vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --dir . -r vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --dir . --filter a vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm recursive vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --reporter default vitest x",
+    "ran": []
+   },
+   {
+    "command": "pnpm --dir . vitest -- x",
+    "ran": []
+   },
+   {
+    "command": "pnpm vitest --dir . x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "--dir",
+       ".",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm -C . exec vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm -C packages/a exec vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "packages/a"
+     }
+    ]
+   },
+   {
+    "command": "pnpm -F a exec vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "packages/a"
+     }
+    ]
+   },
+   {
+    "command": "pnpm -r exec vitest x",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "x"
+      ],
+      "cwd": "packages/a"
+     }
+    ]
+   },
+   {
+    "command": "pnpm -C vitest y",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "y"
+      ],
+      "cwd": "vitest"
+     }
+    ]
+   },
+   {
+    "command": "pnpm x vitest y",
+    "ran": []
+   },
+   {
+    "command": "pnpm -- vitest y",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "y"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm -w -- vitest y",
+    "ran": [
+     {
+      "argv": [
+       "vitest",
+       "y"
+      ],
+      "cwd": "."
+     }
+    ]
+   },
+   {
+    "command": "pnpm -C . -- vitest y",
+    "ran": []
+   },
+   {
+    "command": "pnpm -C vitest exec y",
+    "ran": []
+   }
+  ]
  },
  "poetry run": {
   "flags": [
