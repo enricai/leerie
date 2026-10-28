@@ -495,3 +495,95 @@ def test_suspicion_4_driver_no_longer_accepts(ext, monkeypatch):
                                      "(unverified)")
     assert ext["st"].data["subtask_status"]["t1"] == "blocked"
     assert not ext["st"].data.get("needs_human_verification")
+
+
+# --- a local service claimed as the variable that points at it ---------------
+# Round-4 review M5: the local-service refusal was keyed on kind `network`,
+# so the same in-container Postgres claimed as `env_var DATABASE_URL` — what
+# the worker sees is "DATABASE_URL not set" — was `verified` on the strength
+# of the repository's own `.env.example` naming it. The check reads the value
+# the repository gives the variable (DESIGN §13 *A local service is not
+# external*).
+
+_NO_DB = ("import sys; print('Error: Environment variable not found: "
+          "DATABASE_URL.'); sys.exit(1)")
+
+
+@pytest.mark.parametrize("rel, text", [
+    (".env.example", "DATABASE_URL=postgres://app:app@localhost:5432/app\n"),
+    (".env.sample", 'export DATABASE_URL="postgresql://u@127.0.0.1/app"\n'),
+    ("api/.env.template", "DATABASE_URL='host=localhost port=5432 db=app'\n"),
+    (".env.test", "DATABASE_URL=10.1.2.3:5432\n"),
+    ("docker-compose.yml",
+     "services:\n  db:\n    image: postgres\n  app:\n    environment:\n"
+     "      - DATABASE_URL=postgres://u:p@db:5432/app\n"),
+    ("compose.yaml",
+     "services:\n  app:\n    environment:\n"
+     "      DATABASE_URL: postgres://u:p@192.168.1.4/app\n"),
+    ("prisma/schema.prisma",
+     'datasource db {\n  provider = "sqlite"\n'
+     '  url      = env("DATABASE_URL")\n}\n'),
+])
+@pytest.mark.parametrize("with_verify", [False, True])
+def test_env_var_pointing_at_a_local_service_is_refuted(
+        runs, monkeypatch, rel, text, with_verify):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    _commit(runs, rel, text)
+    sub = (_verify_sub(runs, _NO_DB) if with_verify else runs["subtask"])
+    out = _check(runs, {"kind": "env_var", "name": "DATABASE_URL"},
+                 subtask=sub)
+    assert out["verdict"] == "refuted", out
+    assert out.get("reason") == "local_service", out
+    assert out["why"].startswith("local service: start it in-container")
+    # The why names where the repository says so.
+    assert os.path.basename(rel) in out["why"], out["why"]
+
+
+def test_variable_shaped_service_credential_on_a_local_service_is_refuted(
+        runs, monkeypatch):
+    monkeypatch.delenv("REDIS_URL", raising=False)
+    _commit(runs, ".env.example", "REDIS_URL=redis://localhost:6379/0\n")
+    out = _check(runs, {"kind": "service_credential", "name": "REDIS_URL"})
+    assert out["verdict"] == "refuted" and out["reason"] == "local_service"
+
+
+@pytest.mark.parametrize("text", [
+    # A remote host is not evidence the variable can be supplied here.
+    "DATABASE_URL=postgres://app@db.acme-test.invalid:5432/app\n",
+    # A placeholder decides nothing.
+    "DATABASE_URL=postgres://app@${DB_HOST}:5432/app\n",
+    "DATABASE_URL=\n",
+    # Another variable's local value is not this one's.
+    "OTHER_DATABASE_URL=postgres://localhost/app\nDATABASE_URL=\n",
+])
+def test_env_var_whose_template_is_not_local_goes_on_to_the_other_checks(
+        runs, monkeypatch, text):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    _commit(runs, ".env.example", text)
+    out = _check(runs, {"kind": "env_var", "name": "DATABASE_URL"},
+                 subtask=_verify_sub(runs, _NO_DB))
+    assert out["verdict"] == "verified", out
+    assert "reason" not in out
+
+
+def test_a_postgres_prisma_datasource_is_not_read_as_local(runs, monkeypatch):
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    _commit(runs, "prisma/schema.prisma",
+            'datasource db {\n  provider = "postgresql"\n'
+            '  url      = env("DATABASE_URL")\n}\n')
+    out = _check(runs, {"kind": "env_var", "name": "DATABASE_URL"},
+                 subtask=_verify_sub(runs, _NO_DB))
+    assert out["verdict"] == "verified", out
+
+
+@pytest.mark.parametrize("value, host", [
+    ("postgres://u:p@localhost:5432/app", "localhost"),
+    ("redis://[::1]:6379", "::1"),
+    ("host=db.internal port=5432", "db.internal"),
+    ("localhost:6379", "localhost"),
+    ("postgres://u@${HOST}/x", ""),
+    ("plain-secret-value", ""),
+    ("", ""),
+])
+def test_env_value_host(ext, value, host):
+    assert ext["leerie"]._env_value_host(value) == host

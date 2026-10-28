@@ -53032,6 +53032,135 @@ async def _repo_mentions(worktree: str, ref: str, kind: str,
                for line in r.stdout.splitlines() for k in keys)
 
 
+# The repository's own statement of what a variable holds (DESIGN §13 *A
+# local service is not external*): env templates, compose files, Prisma
+# schemas. All are read as mechanical KEY=value / YAML-key lines.
+_ENV_TEMPLATE_NAMES = frozenset({".env", ".env.example", ".env.sample",
+                                 ".env.template", ".env.test"})
+_COMPOSE_FILE_NAMES = frozenset({"docker-compose.yml", "docker-compose.yaml",
+                                 "compose.yml", "compose.yaml"})
+_ENV_TEMPLATE_READ_MAX = 256 * 1024
+
+
+def _env_value_host(value: str) -> str:
+    """The host a variable's template value points at — a `scheme://`
+    URL's, a libpq DSN's `host=`, or a bare `host:port`'s — else `""`.
+    A value with an unexpanded `${…}` names no host."""
+    v = value.strip()
+    if not v or "${" in v:
+        return ""
+    if "://" in v:
+        try:
+            return urllib.parse.urlsplit(v).hostname or ""
+        except ValueError:
+            return ""
+    m = re.search(r"(?:^|\s)host=([^\s]+)", v)
+    if m:
+        return m.group(1).split(",")[0]
+    m = re.fullmatch(r"([A-Za-z0-9_.-]+):\d{1,5}", v)
+    return m.group(1) if m else ""
+
+
+def _unquote_env_value(v: str) -> str:
+    v = v.strip()
+    if len(v) >= 2 and v[0] == v[-1] and v[0] in "'\"":
+        return v[1:-1]
+    return v.split(" #", 1)[0].strip()
+
+
+def _compose_env_values(text: str, key: str) -> tuple[list[str], set[str]]:
+    """`key`'s values in a compose file's `environment:` entries (`- KEY=v`
+    or `KEY: v`) and the file's service names (two-space keys under a
+    top-level `services:`)."""
+    values: list[str] = []
+    services: set[str] = set()
+    in_services = False
+    k = re.escape(key)
+    for line in text.splitlines():
+        if re.match(r"^\S", line):
+            in_services = line.split("#", 1)[0].strip() == "services:"
+            continue
+        if in_services:
+            m = re.match(r"^  ([A-Za-z0-9][A-Za-z0-9_.-]*):\s*(?:#.*)?$",
+                         line)
+            if m:
+                services.add(m.group(1).lower())
+        m = (re.match(rf"^\s*-\s*['\"]?{k}=(.*?)['\"]?\s*$", line)
+             or re.match(rf"^\s*['\"]?{k}['\"]?:\s+(.+?)\s*$", line))
+        if m:
+            values.append(_unquote_env_value(m.group(1)))
+    return values, services
+
+
+def _prisma_sqlite_env(text: str, key: str) -> bool:
+    """True when a `schema.prisma` datasource with provider `sqlite` reads
+    its url from `env("key")`."""
+    for block in re.findall(r"datasource\s+\w+\s*\{([^}]*)\}", text):
+        if (re.search(r'provider\s*=\s*"sqlite"', block)
+                and re.search(r'url\s*=\s*env\(\s*"' + re.escape(key)
+                              + r'"\s*\)', block)):
+            return True
+    return False
+
+
+async def _env_template_local_service(worktree: str, ref: str,
+                                      key: str) -> str:
+    """`""`, or why variable `key` points at the container's own service by
+    the repository's own templates at `ref` (DESIGN §13 *A local service is
+    not external*): a local host (`_network_local_host`), a service the
+    repository's compose file defines, or a sqlite Prisma datasource."""
+    try:
+        ls = await run_proc(["git", "-C", worktree, "ls-tree", "-r",
+                             "--name-only", ref], timeout=60)
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+    if ls.returncode != 0:
+        return ""
+    paths = [p for p in ls.stdout.splitlines()
+             if os.path.basename(p) in _ENV_TEMPLATE_NAMES
+             or os.path.basename(p) in _COMPOSE_FILE_NAMES
+             or os.path.basename(p) == "schema.prisma"]
+    texts: dict[str, str] = {}
+    for p in paths:
+        try:
+            r = await run_proc(["git", "-C", worktree, "show",
+                                f"{ref}:{p}"], timeout=60)
+        except (subprocess.TimeoutExpired, OSError):
+            continue
+        if r.returncode == 0:
+            texts[p] = r.stdout[:_ENV_TEMPLATE_READ_MAX]
+    found: list[tuple[str, str]] = []
+    services: set[str] = set()
+    for p, text in texts.items():
+        name = os.path.basename(p)
+        if name == "schema.prisma":
+            if _prisma_sqlite_env(text, key):
+                return (f"`{key}` is the url of a sqlite datasource in {p}: "
+                        "a file database is the container's own")
+            continue
+        if name in _COMPOSE_FILE_NAMES:
+            vals, svc = _compose_env_values(text, key)
+            services |= svc
+            found += [(p, v) for v in vals]
+            continue
+        for line in text.splitlines():
+            m = re.match(r"^\s*(?:export\s+)?" + re.escape(key)
+                         + r"\s*=(.*)$", line)
+            if m:
+                found.append((p, _unquote_env_value(m.group(1))))
+    for p, v in found:
+        host = _env_value_host(v)
+        if not host:
+            continue
+        local = _network_local_host(host)
+        if local:
+            return f"{p} sets `{key}` to a local service — {local}"
+        if host.lower() in services:
+            return (f"{p} sets `{key}` to `{host}`, a service the "
+                    "repository's own compose file defines")
+    return ""
+
+
 async def _verify_external_claim(sid: str, res: dict, subtask: dict,
                                  worktree: str, st: "State",
                                  caps: dict) -> dict:
@@ -53055,6 +53184,12 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
     scoped, every = _declared_external_texts(st, subtask, sid)
     task = str(st.data.get("task") or "")
     local = _network_local_host(key) if kind == "network" else ""
+    if not local and (kind == "env_var" or (
+            kind == "service_credential" and _is_env_var_shaped(key))):
+        # The same local service, claimed as the variable that points at
+        # it (round-4 review M5).
+        local = await _env_template_local_service(
+            worktree, _compute_run_branch(st.run_id), key)
     if local:
         out["reason"] = "local_service"
         return _end("refuted", f"local service: start it in-container — "

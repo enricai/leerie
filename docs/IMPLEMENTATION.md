@@ -6494,6 +6494,25 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
     address the name resolves to is local, before connecting;
     `_network_reach` returns that as `"local <address>"` and the claim is
     refuted the same way.
+  - local service through a variable (checked right after, `env_var` and
+    an `_is_env_var_shaped` `service_credential` only; DESIGN §13 *A
+    local service is not external*): `await _env_template_local_service
+    (worktree, ref, key) -> str`, `ref` the run branch. It lists the tree
+    (`git ls-tree -r --name-only`) and reads with `git show <ref>:<path>`
+    (each file capped at `_ENV_TEMPLATE_READ_MAX`): files whose basename
+    is in `_ENV_TEMPLATE_NAMES` (`.env`, `.env.example`, `.env.sample`,
+    `.env.template`, `.env.test`) give `KEY=value` lines (`export `
+    prefix and matching quotes dropped); compose files
+    (`_COMPOSE_FILE_NAMES`) give `KEY=value` list items and `KEY: value`
+    map entries, plus their service names (two-space keys under
+    `services:`); `schema.prisma` files give the variable of a
+    `url = env("KEY")` in a datasource whose provider is `sqlite`.
+    `_env_value_host(value)` takes the host of a `scheme://` URL, a DSN's
+    `host=`, or a bare `host:port`; a value carrying `${` decides
+    nothing. A host that `_network_local_host` reads as local or that is
+    a compose service name, or a sqlite datasource variable, → `refuted`
+    with `reason: "local_service"`, the why naming the file and value.
+    `""` (also when git cannot list the tree) → the checks go on.
   - network: `_network_reach(host, port, *, allow_local=False) -> str`
     (`reachable` / `unreachable` / `unknown` / `local <address>`; the
     control is probed with `allow_local=True`, so a loopback API proxy

@@ -10817,6 +10817,22 @@ tries to connect. The price is a corporate service on a private address
 can supply the service; a run that wrongly accepted a local one would have
 skipped work leerie could do.
 
+The rule is about the resource, not the spelling of the claim. The same
+Postgres is as naturally claimed as a missing variable — "DATABASE_URL
+not set" is what the worker sees — so an `env_var` claim, and a
+`service_credential` claim whose name is variable-shaped, is checked
+against the value the repository itself gives that variable: a `KEY=value`
+line in an env template (`.env.example`, `.env.sample`, `.env.template`,
+`.env.test`, a committed `.env`) or a compose file's `environment:` entry,
+at the run branch's tip. A value whose host is local by the rule above —
+a URL's host, a DSN's `host=`, a bare `host:port` — or is a service the
+repository's own compose file defines, refutes the claim as a local
+service. So does a variable a Prisma schema reads as the URL of a
+`sqlite` datasource: a file database is the container's own. A value the
+templates leave as a placeholder (`${…}`, empty) decides nothing, and the
+other checks run as before; a template pointing at a remote host is not
+evidence the variable can be supplied, so it does not refute either.
+
 The network probe runs as a child process with a connect timeout inside a
 hard wall-clock timeout that kills it, so a resolver that never answers
 cannot stall the run; a hard timeout is `unverified`. When the claimed
