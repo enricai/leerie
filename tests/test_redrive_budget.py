@@ -201,6 +201,75 @@ def test_dependents_of_unconverged_settle_without_running(
     assert st.data["completed_waves"] == 3
 
 
+def test_dependents_of_accepted_external_settle_external_without_running(
+        patched, monkeypatch, tmp_path):
+    """DESIGN §13 *A dependent of accepted-external work is
+    accepted-external too*: by the graph alone — `depends_on`, a
+    `requires` tag, transitively — and citing the predecessor's resource."""
+    leerie = patched
+    (tmp_path / "plan.json").write_text(json.dumps({"subtasks": {
+        "a": {"depends_on": [], "provides": ["creds"]},
+        "g": {"depends_on": []},
+        "d": {"depends_on": []},
+        "b": {"depends_on": ["a"]},
+        "c": {"requires": [{"tag": "creds", "extent": "in_plan"}]},
+        "e": {"depends_on": ["b"]},
+        "f": {"depends_on": ["a", "g"]},
+        "h": {"depends_on": ["d"]}}}))
+    st = _mock_st([["a", "g", "d"], ["b", "c", "f", "h"], ["e"]])
+    ran: list[str] = []
+
+    async def fake(sid, leerie_dir, caps, st_, models, efforts,
+                   redrive_note=None):
+        ran.append(sid)
+        if sid == "a":
+            return leerie._settle_accepted_external(
+                st_, "a", "a production API key", "needs the key")
+        status = "blocked" if sid == "g" else "complete"
+        st_.data["subtask_status"][sid] = status
+        return {"subtask_id": sid, "status": status, "blocker": "x"}
+    monkeypatch.setattr(leerie, "_settle_subtask", fake)
+    asyncio.run(leerie.phase_execute(tmp_path, st, dict(leerie.DEFAULT_CAPS),
+                                     {}, {}))
+    # Only the independent work ran (g re-driven to its cap).
+    assert set(ran) == {"a", "g", "d", "h"}
+    status = st.data["subtask_status"]
+    assert {k: status[k] for k in "abcefh"} == {
+        "a": "accepted_external", "b": "accepted_external",
+        "c": "accepted_external", "e": "accepted_external",
+        "f": "unconverged", "h": "complete"}
+    # Unfinished work outranks human-gated work.
+    assert "g" in st.data["unconverged_subtasks"]["f"]["reason"]
+    nhv = {e["subtask"]: e for e in st.data["needs_human_verification"]}
+    assert set(nhv) == {"a", "b", "c", "e"}
+    for sid in "bce":
+        assert nhv[sid]["resource"] == "a production API key"
+        assert nhv[sid]["source"] == "blocker"
+        assert "a" in nhv[sid]["via"]
+    assert nhv["e"]["via"] == ["a", "b"]
+    # Never a re-drive round, never `unconverged`.
+    assert not set("bce") & set(st.data.get("redrive_rounds") or {})
+    assert not set("bce") & set(st.data.get("unconverged_subtasks") or {})
+    assert st.data["blocker_kinds"]["b"]["kind"] == "external_precondition"
+    assert st.data["completed_waves"] == 3
+
+
+def test_external_dependent_cites_every_predecessor_resource(leerie):
+    st = mock.Mock()
+    st.data = {"subtask_status": {}, "needs_human_verification": [
+        {"source": "blocker", "subtask": "a", "resource": "R1",
+         "blocker": "x"},
+        {"source": "blocker", "subtask": "b", "resource": "R2",
+         "blocker": "y"},
+        {"source": "blocker", "subtask": "z", "resource": "R3",
+         "blocker": "z"}]}
+    leerie._settle_external_dependent(st, "c", ["a", "b"])
+    got = [(e["subtask"], e["resource"], e.get("via"))
+           for e in st.data["needs_human_verification"]]
+    assert got[3:] == [("c", "R1", ["a", "b"]), ("c", "R2", ["a", "b"])]
+    assert st.data["subtask_status"]["c"] == "accepted_external"
+
+
 @pytest.mark.parametrize("settled", ["unconverged", "accepted_external",
                                      "complete"])
 def test_resume_treats_settled_statuses_as_done(patched, monkeypatch,

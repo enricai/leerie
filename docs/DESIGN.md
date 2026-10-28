@@ -9876,7 +9876,29 @@ the one outcome that ends work without code, so it needs the resource named.
 `accepted_external` is settled (resume skips it), its branch is not
 integrated, it does not make the run `unconverged`, and the State list
 `needs_human_verification` gains `{source: "blocker", subtask, resource,
-blocker}` beside the classifier's external items. Before this, every
+blocker}` beside the classifier's external items.
+
+**A dependent of accepted-external work is accepted-external too.** A
+subtask whose predecessor in the scheduler's graph — `depends_on`, or a
+`requires` tag that predecessor `provides`, transitively — settled
+`accepted_external` is not run. It settles `accepted_external` itself,
+citing the same resource, with its own entry under "Needs human
+verification" (`{source: "blocker", subtask, resource, blocker, via}`,
+`via` naming the predecessors). The decision is the graph's, a mechanism,
+never a reading of either subtask's prose: the edge says the dependent
+builds on the predecessor's output, and that output is exactly what never
+reaches the run branch (an accepted-external branch is not integrated). Run
+anyway, the dependent cannot succeed — it ends `blocked` on the missing
+upstream (`upstream_missing`), spends its re-drive rounds rediscovering
+that, and settles `unconverged`, turning the run `unconverged` for what is
+really the one human-only resource the run already reported. Settled this
+way it spends no implementer and no re-drive round, does not make the run
+`unconverged`, and the human sees one resource gating both subtasks. A
+subtask with an `unconverged` predecessor still settles `unconverged`
+(§13 *One re-drive budget per subtask*): unfinished work outranks
+human-gated work, since a human supplying the resource would not finish it.
+
+Before this, every
 `blocked` subtask was auto-accepted: of 246 auto-accepted subtasks over seven
 days, a classifier over the implementers' own evidence typed only 10
 `external_precondition`. Benched as D3/B1 on 47 hand-labelled blocked

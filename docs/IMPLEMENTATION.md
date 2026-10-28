@@ -6143,6 +6143,22 @@ The kind is persisted as `blocker_kinds[sid] = {kind, resource?, status}`
 `unconverged` at wave end: it is not integrated, not re-driven, and not
 recorded in the `blocked` registry; `_decide_outcome` does not count it.
 
+Dependents (DESIGN §13 *A dependent of accepted-external work is
+accepted-external too*): before a wave runs, after the `unconverged`
+predecessor check, each remaining sid with a non-empty
+`_accepted_external_predecessors(leerie_dir, st, sid)` (the transitive
+predecessors in `_build_predecessor_graph` over `plan.json` — `depends_on`
+and `requires`→`provides` edges — whose `subtask_status` is
+`accepted_external`; both helpers share `_settled_predecessors(leerie_dir,
+st, sid, status)`) is settled by `_settle_external_dependent(st, sid,
+preds)` without running: the predecessors' resources are read from their
+`source: "blocker"` entries (first-seen order, de-duplicated; `"an external
+resource"` when none), and `_settle_accepted_external(st, sid, resource,
+blocker, via=preds)` is called per resource, so `needs_human_verification`
+gains `{source: "blocker", subtask, resource, blocker, via}` per resource and
+`blocker_kinds[sid] = {kind: "external_precondition", resource, via, status:
+"not_run"}`. No implementer runs and no `redrive_rounds` entry is spent.
+
 ### Settle by execution — `_settle_by_execution`
 
 DESIGN §8 *Settled by execution*. `_subtask_verify_argvs(subtask) ->
@@ -9012,7 +9028,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `leerie_versions` | list[dict] | append-only resume history (N38), distinct from the immutable `leerie_version`/`leerie_commit` pair above. |
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. |
 | `requirement_coverage` | dict | the requirement-coverage gate's record, written by `phase_classify` (DESIGN §8 *Requirement coverage*): `{spans[{id, parent}], sections[{id, source}], reports[], closure[], holes{}}`. `spans`/`sections` are the IDs `_d1_split_spans`/`_d1_split_sections` assigned (no text); `parent` is the mechanical nesting link `_d1_judge_packs` groups by; `reports` the inlined report paths; `closure` the S/R ids `_d1_closure` derives; `holes` the residual `_d1_coverage_holes` findings after the check rounds (`{}` when none). |
-| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}` — for a subtask settled `accepted_external` on an implementer's `external_precondition` (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). A third source, `"regression_check"` (`{source, detail}`, at most one), comes from `_set_regression_gap`: the task forbids the test command, and its scoped replacement could not run on the latest measured tree. |
+| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}`, plus `via` (the accepted-external predecessors) for a dependent settled without running — for a subtask settled `accepted_external` on an implementer's `external_precondition` or as such a dependent (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). A third source, `"regression_check"` (`{source, detail}`, at most one), comes from `_set_regression_gap`: the task forbids the test command, and its scoped replacement could not run on the latest measured tree. |
 | `site_claims` | dict \| null | the site-claims record (DESIGN §5 *Every `fix` site is claimed*), written by `phase_plan` from the first-pass `bug-fixing` plan and rewritten over its leaves after decomposition: `{domain, sites[{site_id, file, symbol, auditor_kind, resolution, claims[{sid, kinds[]}], not_needed, status, surface_other}]}`, `status` one of `claimed`/`mismatch`/`not_needed`/`unclaimed` (`_site_claim_rows`); `surface_other` marks a site resting on an `other` kind, for the PR. Not written when there is no `bug-fixing` plan or the audit is inapplicable. Never gates. |
 | `domain_blocked` | list[dict] | every planner domain that exited `blocked`, `[{domain, blocker_kind, external_resource, gap}]` (`_settle_blocked_domains`; DESIGN §8 *A partially blocked plan is recorded*). Written after planning and again before scheduling; `[]` when none. A row typed `external_precondition` stops the run before execution. |
 | `process_constraints` | dict | the classifier's typed process constraints (DESIGN §9 *A command the task forbids*): `{forbidden_commands[], entries[{command, scope, evidence_quote, test_roots?}], dropped[{command, reason, evidence_quote}]}` from `_process_constraints`. A state written before scopes existed carries `{forbidden_commands[], evidence}`; `_forbidden_specs` reads that as `scope: "any"`. Read by `claude_p` (deny rules, notice, hook), `_measure_axes`, the plan strip and the planner ctx. |

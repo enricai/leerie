@@ -48473,9 +48473,26 @@ def _unconverged_predecessors(leerie_dir: Path, st: "State",
     """The transitive predecessors of `sid` (the scheduler's graph, from
     `plan.json`) that settled `unconverged`. A dependent of unfinished work
     is not run on top of it."""
+    return _settled_predecessors(leerie_dir, st, sid, "unconverged")
+
+
+def _accepted_external_predecessors(leerie_dir: Path, st: "State",
+                                    sid: str) -> list[str]:
+    """The transitive predecessors of `sid` settled `accepted_external`: their
+    output never reaches the run branch, so `sid` cannot be built on it
+    (DESIGN §13 *A dependent of accepted-external work is accepted-external
+    too*)."""
+    return _settled_predecessors(leerie_dir, st, sid, "accepted_external")
+
+
+def _settled_predecessors(leerie_dir: Path, st: "State", sid: str,
+                          status: str) -> list[str]:
+    """The transitive predecessors of `sid` (`_build_predecessor_graph` over
+    `plan.json`: `depends_on` and `requires`→`provides` edges) whose
+    `subtask_status` is `status`, sorted."""
     statuses = st.data.get("subtask_status") or {}
-    unconverged = {s for s, v in statuses.items() if v == "unconverged"}
-    if not unconverged:
+    matched = {s for s, v in statuses.items() if v == status}
+    if not matched:
         return []
     try:
         plan = json.loads((Path(leerie_dir) / "plan.json").read_text())
@@ -48486,7 +48503,7 @@ def _unconverged_predecessors(leerie_dir: Path, st: "State",
         return []
     preds, _, _ = _build_predecessor_graph(subtasks, quiet=True)
     return sorted(_transitive_predecessors(preds).get(sid, set())
-                  & unconverged)
+                  & matched)
 
 
 async def _redrive_blocked_subtasks(
@@ -49459,17 +49476,25 @@ def _blocker_kind(res: dict) -> tuple[str, str]:
 
 
 def _settle_accepted_external(st: "State", sid: str, resource: str,
-                              blocker: str) -> dict:
+                              blocker: str, *,
+                              via: list[str] | None = None) -> dict:
     """Settle `sid` `accepted_external`: its work needs `resource`, which only
     a human outside this run can supply. Terminal (`_SETTLED_STATUSES`), not
     integrated, not `unconverged`; listed under "Needs human verification"
-    beside the classifier's external items (DESIGN §13)."""
+    beside the classifier's external items (DESIGN §13). `via` — the
+    accepted-external predecessors of a dependent settled without running
+    (`_settle_external_dependent`) — keeps the dependent's entries for its
+    other resources and is recorded on the entry."""
     st.data.setdefault("subtask_status", {})[sid] = "accepted_external"
     entries = [e for e in (st.data.get("needs_human_verification") or [])
                if not (isinstance(e, dict) and e.get("source") == "blocker"
-                       and e.get("subtask") == sid)]
-    entries.append({"source": "blocker", "subtask": sid,
-                    "resource": resource, "blocker": blocker})
+                       and e.get("subtask") == sid
+                       and (via is None or e.get("resource") == resource))]
+    entry = {"source": "blocker", "subtask": sid, "resource": resource,
+             "blocker": blocker}
+    if via is not None:
+        entry["via"] = list(via)
+    entries.append(entry)
     st.data["needs_human_verification"] = entries
     reg = st.data.get("blocked")
     if isinstance(reg, dict):
@@ -49481,6 +49506,32 @@ def _settle_accepted_external(st: "State", sid: str, resource: str,
         "verification")
     return {"subtask_id": sid, "status": "accepted_external",
             "blocker": blocker, "summary": f"needs {resource}: {blocker}"}
+
+
+def _settle_external_dependent(st: "State", sid: str,
+                               preds: list[str]) -> dict:
+    """Settle `sid` `accepted_external` without running it: it builds on the
+    output of `preds`, settled `accepted_external`, which never reaches the
+    run branch (DESIGN §13 *A dependent of accepted-external work is
+    accepted-external too*). Cites each resource those predecessors wait on,
+    read from their own `source: "blocker"` entries."""
+    resources: list[str] = []
+    for e in st.data.get("needs_human_verification") or []:
+        if (isinstance(e, dict) and e.get("source") == "blocker"
+                and e.get("subtask") in preds
+                and isinstance(e.get("resource"), str)
+                and e["resource"] and e["resource"] not in resources):
+            resources.append(e["resource"])
+    resources = resources or ["an external resource"]
+    blocker = (f"not run: it builds on {', '.join(preds)}, settled "
+               "accepted_external and never integrated")
+    st.data.setdefault("blocker_kinds", {})[sid] = {
+        "kind": "external_precondition", "resource": resources[0],
+        "via": list(preds), "status": "not_run"}
+    out: dict = {}
+    for r in resources:
+        out = _settle_accepted_external(st, sid, r, blocker, via=preds)
+    return out
 
 
 async def _route_blocker_kind(sid: str, res: dict, subtask: dict,
@@ -51726,6 +51777,13 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
                     st, sid, f"not run: predecessor(s) {', '.join(preds)} "
                     "settled unconverged",
                     previous_status=prior.get(sid))
+                remaining.remove(sid)
+                continue
+            # A dependent of accepted-external work cannot succeed on top of
+            # it either; it waits on the same human (DESIGN §13).
+            ext = _accepted_external_predecessors(leerie_dir, st, sid)
+            if ext:
+                pre_settled[sid] = _settle_external_dependent(st, sid, ext)
                 remaining.remove(sid)
         # A sid whose implementer already completed but whose
         # integration_judge finding is still un-`accept`ed must not be
