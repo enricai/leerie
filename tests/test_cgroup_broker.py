@@ -1205,3 +1205,52 @@ def test_probe_reports_err_on_oserror(broker, monkeypatch):
     monkeypatch.setattr(broker.os, "fork", raising_fork)
     resp = broker._handle("probe")
     assert resp.startswith("ERR probe:")
+
+
+# ---- destroy names the PIDs it killed -------------------------------------
+# cgroup.kill kills a daemon the command started under `setsid` too (a
+# repository's test-database wrapper). It reparents to the orchestrator as a
+# zombie, and only the client can wait for it, so `destroy` names what it
+# killed (DESIGN §6 *Zombie reaping*). Found live: an unreaped postgres
+# zombie made every later `pg_ctl start` in the run fail.
+
+def test_destroy_replies_with_the_pids_it_killed(broker, monkeypatch):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-daemon"
+    d.mkdir(parents=True)
+    killed = {"done": False}
+    orig_write = broker._write
+
+    def write(path, *a, **kw):
+        if path.endswith("cgroup.kill"):
+            killed["done"] = True
+            return None
+        return orig_write(path, *a, **kw)
+
+    def read(path):
+        # Members until the kill, drained after it.
+        if path.endswith("cgroup.procs"):
+            return "" if killed["done"] else "1761\n1764\n"
+        return ""
+
+    monkeypatch.setattr(broker, "_write", write)
+    monkeypatch.setattr(broker, "_read", read)
+    assert broker._handle("destroy daemon") == "OK 1761 1764"
+    assert not d.exists()
+
+
+def test_destroy_of_an_empty_cgroup_replies_bare_ok(broker, monkeypatch):
+    broker._handle("create empty 0 0")
+    orig_write = broker._write
+    monkeypatch.setattr(
+        broker, "_write",
+        lambda path, *a, **kw: None if path.endswith("cgroup.kill")
+        else orig_write(path, *a, **kw))
+    assert broker._handle("destroy empty") == "OK"
+
+
+def test_destroy_failure_still_replies_err(broker, monkeypatch):
+    d = Path(broker.V2_ROOT) / broker.SLICE / "leerie-w-stuckd"
+    d.mkdir(parents=True)
+    monkeypatch.setattr(broker, "_write", lambda *a, **kw: None)
+    monkeypatch.setattr(broker, "_read", lambda path: "1761\n")
+    assert broker._handle("destroy stuckd").startswith("ERR ")

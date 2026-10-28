@@ -642,10 +642,16 @@ def _do(verb: str, args: list[str]) -> str:
         sid = args[0]
         if not _valid_sid(sid):
             return "ERR bad sid"
+        # The PIDs cgroup.kill is about to kill. They reparent to the
+        # orchestrator as zombies, and only the client can wait for them, so
+        # name them in the reply (DESIGN §6 *Zombie reaping*). v1 migrates
+        # survivors alive instead of killing them: nothing to name.
+        killed = (_read(f"{_v2_dir(sid)}/cgroup.procs").split()
+                  if _HIER == "v2" else [])
         err = destroy(sid)
         if err is not None:
             return f"ERR {err}"
-        return "OK"
+        return " ".join(["OK", *(p for p in killed if p.isdigit())])
     if verb == "stat":
         sid = args[0]
         if not _valid_sid(sid):

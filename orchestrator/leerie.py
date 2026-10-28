@@ -19515,8 +19515,15 @@ def _cgroup_destroy(sid: str | None) -> None:
         log(f"  [{sid}] cgroup destroy did not complete "
             f"({e.strerror or e}); dir may be leaked")
         return
-    if resp != "OK":
+    parts = resp.split()
+    if not parts or parts[0] != "OK":
         log(f"  [{sid}] cgroup destroy failed ({resp}); dir may be leaked")
+        return
+    # `OK <pid>…`: what cgroup.kill killed. They are zombies of ours now,
+    # and a daemon nobody tracked (a test database under `setsid`) would
+    # otherwise stay one, its PID lock file blocking every restart (DESIGN
+    # §6 *Zombie reaping*).
+    _mark_reapable({int(p) for p in parts[1:] if p.isdigit()})
 
 
 def _cgroup_stat(sid: str | None) -> tuple[int, int, int, int] | None:

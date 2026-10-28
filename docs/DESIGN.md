@@ -3998,6 +3998,30 @@ observed is not reaped, with the cgroup PID cap plus the container
 boundary as backstop. Because the subreaper reparents orphans to the
 orchestrator rather than PID 1, the mid-run `_reparented_orphans` filter
 accepts `ppid in (1, getpid())`; exit-time `stop_and_reap` is unaffected.
+
+**What a cgroup teardown kills, it also reaps.** The broker's `destroy`
+(`cgroup.kill` on v2) SIGKILLs every process still in the cgroup,
+including one that left the command's session on purpose, such as a test
+database a repository's own wrapper starts under `setsid` so it outlives
+one test run. Those killed processes reparent to the orchestrator and
+become zombies. When no tracker observed them, the allowlist never names
+them, so nobody waits for them, and a zombie still answers `kill(pid, 0)`.
+A daemon that guards its data directory with a PID lock file therefore
+refuses to start again for the rest of the run ("lock file already exists
+… Is another postmaster running?"). The build-peak measurement and the CI
+parity checks run in their own broker cgroup with no tracker, and a
+tracker that polls every 0.5 s can miss a daemon whose launcher exits
+sooner. So `destroy` on v2 reads `cgroup.procs` before it writes
+`cgroup.kill` and returns those PIDs as `OK <pid>…`, and the client adds
+them to the reaper's allowlist. This keeps the allowlist rule: every one
+of those PIDs was alive in a cgroup leerie created and is killed by
+leerie, so none of them is in the fork→`pidfd_open` window, and `_mark_reapable`
+still drops any PID asyncio manages. On v1 `destroy` migrates survivors
+instead of killing them, so it returns no PIDs. Found by the first live
+integration run on a Prisma repository: the baseline test measurement
+killed the wrapper's postgres, and every later test run in the container
+failed at `pg_ctl start`.
+
 This is chosen over inserting a real init (e.g. `nerdctl run --init` / tini
 as PID 1) because the subreaper covers both local and Fly runtimes
 (`--init` is nerdctl-local only) and is purely additive, changing nothing
