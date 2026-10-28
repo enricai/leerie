@@ -115,7 +115,9 @@ except Exception:
   # registered fresh here because the launcher process is fresh on resume.
   if declare -f decide_teardown >/dev/null 2>&1; then
     # shellcheck disable=SC2064
-    trap 'decide_teardown' EXIT INT TERM
+    # EXIT passes `exit`: only that pass runs the launcher's STAGE cleanup.
+    trap 'decide_teardown exit' EXIT
+    trap 'decide_teardown' INT TERM
   fi
 
   # Block until the machine is reachable.

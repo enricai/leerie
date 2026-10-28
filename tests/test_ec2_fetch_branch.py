@@ -34,10 +34,10 @@ EC2_LIB_SH = REPO_ROOT / "scripts" / "remote" / "ec2-lib.sh"
 def _make_stub_aws(stub_path: Path, exec_log: Path, instance_work: Path) -> None:
     """Stub `aws` decoding+executing ec2_remote_exec's SSM command
     locally against instance_work (standing in for /work on the
-    instance). See tests/ec2_stub.py::make_ssm_stub_aws for the shared
+    instance). See tests/ec2_stub.py::make_remote_exec_stub for the shared
     mechanics.
     """
-    ec2_stub.make_ssm_stub_aws(
+    ec2_stub.make_remote_exec_stub(
         stub_path,
         exec_log,
         instance_work.parent,

@@ -474,15 +474,15 @@ def test_lib_sh_exports_tail_with_optional_autofinalize():
 def test_lib_sh_helper_does_not_install_exit_trap():
     """Regression guard for the audit defect A: the helper must NOT
     install a `trap '...' EXIT`. The helper is sourced into the
-    launcher's shell, which already has `trap 'decide_teardown'
-    EXIT INT TERM` registered by provision.sh. An EXIT trap inside
+    launcher's shell, which already has the `decide_teardown`
+    EXIT/INT/TERM traps registered by provision.sh. An EXIT trap inside
     the helper would clobber decide_teardown — on every code path,
     not just inside the helper — and the Fly machine would never
     receive its post-run sync/finalize/destroy disposition.
 
     See DESIGN §6 *Detached orchestrator (remote mode)* and
-    scripts/remote/provision.sh:627 (`trap 'decide_teardown' EXIT
-    INT TERM`)."""
+    scripts/remote/provision.sh (`trap 'decide_teardown exit' EXIT`,
+    `trap 'decide_teardown' INT TERM`)."""
     libsh = LIB_SH.read_text()
     # Locate the helper body and scan only its lines.
     import re

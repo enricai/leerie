@@ -172,6 +172,21 @@ _try_fetch_state_for_ec2_teardown() {
 # Idempotent: the trap fires on every exit, including success; the
 # stop/terminate primitives no-op on an empty LEERIE_EC2_INSTANCE_ID.
 decide_ec2_teardown() {
+  local _rc=0
+  _decide_ec2_teardown_body || _rc=$?
+  # provision_instance/resume_instance replaced the launcher's EXIT trap
+  # with this function, which dropped the launcher's own duty to kill the
+  # $STAGE keepalive and remove $STAGE (staged ~/.ssh, ~/.aws, Claude
+  # credentials). Exit pass only (`decide_ec2_teardown exit`): an INT/TERM
+  # pass can be survived, and the rest of the run still needs $STAGE. The
+  # launcher defines the hook; standalone callers don't.
+  if [ "${1:-}" = "exit" ] && declare -F _remote_launcher_exit_cleanup >/dev/null 2>&1; then
+    _remote_launcher_exit_cleanup
+  fi
+  return "$_rc"
+}
+
+_decide_ec2_teardown_body() {
   # Idempotency: mirrors provision.sh:222-230's LEERIE_TEARDOWN_DONE
   # guard — skip every pass after the first so a SIGINT-then-EXIT
   # double-fire can't re-run teardown with a clobbered rc.
@@ -218,6 +233,11 @@ decide_ec2_teardown() {
           if [ -n "$_rid" ]; then
             remote_log "remote: run 'leerie finalize $_rid' to push and open a PR after the run completes"
           fi
+          terminate_instance
+        elif [ -n "$run_dir" ] && [ -d "$run_dir" ] \
+             && [ "$(remote_host_no_push "$run_dir/ec2-instance.json")" = "true" ]; then
+          remote_log "auto-finalize: --no-push was set at launch; run branch left on the host, no push or PR"
+          remote_log "remote: run 'leerie finalize $_rid' to push and open a PR later"
           terminate_instance
         elif [ -n "$run_dir" ] && [ -d "$run_dir" ]; then
           local _leerie_dir="${LEERIE_REPO:-${LEERIE_HOME:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}}"
@@ -417,12 +437,19 @@ provision_instance() {
   [ -f "$_EC2_PROVISION_DIR/ec2-ami.sh" ] && . "$_EC2_PROVISION_DIR/ec2-ami.sh"
 
   local ami instance_type key_name security_group subnet_id instance_profile
+  # Resolved here, in this shell, never inside one of the $(...) calls
+  # below: a subshell's export would not reach the ssh calls that bake,
+  # seed and fetch.
+  if [ -z "${LEERIE_EC2_SSH_KEY_FILE:-}" ] && [ -z "${LEERIE_EC2_KEY_NAME:-}" ]; then
+    LEERIE_EC2_SSH_KEY_FILE="$(ec2_default_key_file)" || LEERIE_EC2_SSH_KEY_FILE=""
+    export LEERIE_EC2_SSH_KEY_FILE
+  fi
   ami="$(ensure_ami)" || return 1
-  instance_type="$(default_instance_type)" || return 1
-  key_name="$(ensure_key_pair)" || return 1
-  subnet_id="$(default_subnet_id)" || return 1
-  security_group="$(ensure_security_group)" || return 1
-  instance_profile="$(ensure_instance_profile)" || instance_profile=""
+  instance_type="$(ec2_default_instance_type)" || return 1
+  key_name="$(ec2_default_key_name)" || return 1
+  subnet_id="$(ec2_default_subnet_id)" || return 1
+  security_group="$(ec2_default_security_group)" || return 1
+  instance_profile="$(ec2_default_instance_profile)" || instance_profile=""
 
   local _missing=0
   _need_ec2_var() {
@@ -450,22 +477,41 @@ provision_instance() {
   # default). No volume-orphan cleanup path exists here because there is
   # nothing created before the instance itself that could be orphaned by
   # a failed create.
+  # A just-created instance profile is eventually consistent: EC2 can
+  # reject it for tens of seconds after IAM reports it. Retry only on that
+  # rejection (the CLI's error code plus the parameter it names — a
+  # mechanical string), within a bounded budget.
   local create_output=""
   local instance_id=""
-  if create_output="$(aws ec2 run-instances \
-       --image-id "$ami" \
-       --instance-type "$instance_type" \
-       --key-name "$key_name" \
-       --network-interfaces "AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=$subnet_id,Groups=$security_group" \
-       ${instance_profile:+--iam-instance-profile "Name=$instance_profile"} \
-       --count 1 \
-       ${aws_args[@]+"${aws_args[@]}"} \
-       --output json \
-       2>&1)"; then
-    instance_id="$(printf '%s' "$create_output" \
-                    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
-                    2>/dev/null || true)"
-  fi
+  local _iam_waited=0
+  local _iam_step="${LEERIE_EC2_IAM_RETRY_S:-5}"
+  local _iam_budget="${LEERIE_EC2_IAM_RETRY_BUDGET_S:-120}"
+  while :; do
+    if create_output="$(aws ec2 run-instances \
+         --image-id "$ami" \
+         --instance-type "$instance_type" \
+         --key-name "$key_name" \
+         --network-interfaces "AssociatePublicIpAddress=true,DeviceIndex=0,SubnetId=$subnet_id,Groups=$security_group" \
+         ${instance_profile:+--iam-instance-profile "Name=$instance_profile"} \
+         --count 1 \
+         ${aws_args[@]+"${aws_args[@]}"} \
+         --output json \
+         2>&1)"; then
+      instance_id="$(printf '%s' "$create_output" \
+                      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["Instances"][0]["InstanceId"])' \
+                      2>/dev/null || true)"
+      break
+    fi
+    if [ -n "$instance_profile" ] && [ "$_iam_waited" -lt "$_iam_budget" ] \
+       && printf '%s' "$create_output" | grep -q '(InvalidParameterValue)' \
+       && printf '%s' "$create_output" | grep -q 'iamInstanceProfile'; then
+      remote_log "remote: instance profile $instance_profile not visible to EC2 yet; retrying (${_iam_waited}s/${_iam_budget}s)"
+      sleep "$_iam_step"
+      _iam_waited=$((_iam_waited + (_iam_step > 0 ? _iam_step : 1)))
+      continue
+    fi
+    break
+  done
 
   if [ -z "$instance_id" ]; then
     remote_log "failed to create EC2 instance — aws output:"
@@ -484,7 +530,10 @@ provision_instance() {
   # its cost). decide_ec2_teardown classifies $LEERIE_REMOTE_EXIT_RC and
   # dispatches to stop or terminate.
   # shellcheck disable=SC2064
-  trap 'decide_ec2_teardown' EXIT INT TERM
+  # EXIT passes `exit` so only that pass runs the launcher's STAGE cleanup;
+  # the launcher can survive an INT/TERM pass and still needs $STAGE.
+  trap 'decide_ec2_teardown exit' EXIT
+  trap 'decide_ec2_teardown' INT TERM
 
   # Persist ec2_instance_id to the run sidecar immediately so a launcher
   # crash before classification still leaves a recoverable pointer
@@ -514,15 +563,20 @@ provision_instance() {
     local remote_dir="$_state_base/remote"
     mkdir -p "$remote_dir" 2>/dev/null || true
     local pid_record="$remote_dir/$$.json"
-    python3 - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" <<'PY'
+    # host_no_push: the user's launch-time --no-push intent, which the
+    # fetched run.json cannot carry (fetch_state_ec2 strips no_push=true
+    # whenever a run branch exists); decide_ec2_teardown reads it here.
+    # Same field fly-machine.json records for Fly.
+    python3 - "$pid_record" "$instance_id" "${LEERIE_AWS_REGION:-${AWS_REGION:-}}" "${LEERIE_RUN_ID:-}" "$$" "${NO_PUSH:-false}" <<'PY'
 import json, sys, datetime
-path, iid, region, run_id, pid = sys.argv[1:]
+path, iid, region, run_id, pid, no_push = sys.argv[1:]
 data = {
     "ec2_instance_id": iid,
     "region": region or None,
     "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="seconds"),
     "run_id": run_id or None,
     "launcher_pid": int(pid),
+    "host_no_push": no_push in ("true", "1", "yes"),
 }
 with open(path, "w") as f:
     json.dump(data, f, indent=2)

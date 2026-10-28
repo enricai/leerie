@@ -16,7 +16,7 @@ EC2 runs, and the underlying row-collection (`_collect_run_rows` in
 This file pins the fix: `accept-blocked` now auto-detects EC2 the
 same way `stop` already does (`_auto_detect_run_runtime`), accepts an
 explicit `--runtime ec2`, and — mirroring the Fly path's wake-mutate-
-pause dance — wakes a stopped instance, mutates state.json over SSM
+pause dance — wakes a stopped instance, mutates state.json over SSH
 (`ec2_remote_exec`, DESIGN §6 "Transport substitution for `flyctl ssh
 console`"), mirrors the mutation onto the host copy if one exists, and
 re-pauses the instance only if this verb woke it. `_collect_run_rows`/
@@ -26,12 +26,10 @@ re-pauses the instance only if this verb woke it. `_collect_run_rows`/
 Fly and EC2 runs.
 
 Harness: the `accept-blocked` tests invoke the real `leerie` launcher
-binary against a stubbed `aws` that composes `tests/ec2_stub.py`'s
-stateful EC2 instance tracking with an `ssm start-session` handler
-(absent from `ec2_stub.py` itself, which only tests's the argv-level
-lifecycle) that decodes `ec2_remote_exec`'s base64-wrapped command and
-executes it with the invoking process's stdin drained through — the
-same mechanism `accept-blocked`'s EC2 branch relies on to pipe the
+binary against `tests/ec2_stub.py`'s stateful `aws` stub plus an `ssh`
+stub that plays the instance for `ec2_remote_exec`: it runs the remote
+`sudo -n bash -c <cmd>` locally with the invoking process's stdin
+attached — the path `accept-blocked`'s EC2 branch relies on to pipe the
 multi-line state-mutation Python program to the remote `python3 -`
 (mirroring `flyctl ssh console -C "python3 -"` on the Fly path).
 `list` tests exercise `orchestrator/leerie.py`'s `_list_runs()`
@@ -61,101 +59,46 @@ RUN_ID = "ec2-run-ab01"
 SID = "feat-001"
 
 
-# --- aws stub: stateful EC2 tracking + SSM exec ----------------------------
+# --- aws stub (stateful EC2 tracking) + ssh stub (remote exec) -------------
 
-_SSM_STUB_SOURCE = r'''#!/usr/bin/env python3
-import base64
-import json
+# ec2_remote_exec runs `ssh … <target> "sudo -n bash -c <cmd>"` (DESIGN §6:
+# every non-interactive EC2 command goes over SSH). This stub plays the
+# instance: it logs into the shared aws.log (one timeline with the EC2
+# lifecycle calls), drops the instance-side `sudo -n`, points /work at the
+# test fixture (the host's real /work is the live coordination mount here),
+# and runs the command with its own stdin attached, returning its real exit
+# status — as sshd does.
+_SSH_STUB_SOURCE = r'''#!/usr/bin/env python3
 import os
-import re
 import subprocess
 import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-
-
-def _handle_ssm(argv):
-    cmd = None
-    for a in argv:
-        if a.startswith("command="):
-            # aws CLI syntax: --parameters command=["<cmd>"]
-            raw = a[len("command="):]
-            if raw.startswith("[") and raw.endswith("]"):
-                raw = raw[1:-1]
-            if raw.startswith('"') and raw.endswith('"'):
-                raw = raw[1:-1]
-            cmd = raw
-    if cmd is None:
-        print("{}")
-        return 0
-    # ec2_remote_exec wraps its real command as a *local* shell pipeline
-    # string: "echo <b64> | base64 -d | bash". A literal `bash -c cmd`
-    # here would run that pipeline verbatim, but the final `bash` in a
-    # shell pipe gets its stdin from the pipe, not from this stub
-    # process's own stdin — so a naive reproduction can never forward an
-    # interactive session's stdin to the wrapped command, unlike the
-    # real SSM agent, which forwards the session's I/O directly to the
-    # remote command it execs (no local shell pipe in between). Decode
-    # the payload ourselves and exec it directly with this process's
-    # stdin attached, modeling that real behavior rather than the
-    # local-pipe artifact of the wrapper string.
-    m = re.search(r"echo (\S+) \| base64 -d \| bash", cmd)
-    decoded = base64.b64decode(m.group(1)).decode() if m else cmd
-    # The real remote path convention is /work/.leerie/runs/<id>/... (an
-    # actual EC2 instance's mounted repo root). This stub never leaves
-    # the test host, so /work would mean the *host's* real /work — the
-    # live leerie coordination mount in this sandbox, not a scratch dir.
-    # Rewrite it to a test-scoped fixture dir instead, mirroring
-    # test_ec2_seed_repo.py's stubbed-ssh /work rewrite.
-    dest = os.environ.get("LEERIE_TEST_WORK_DEST")
-    if dest:
-        decoded = decoded.replace("/work", dest)
-    proc = subprocess.run(["bash", "-c", decoded], stdin=sys.stdin)
-    return proc.returncode
-
-
-def main(argv):
-    with open(HERE / "aws.log", "a") as f:
-        f.write(" ".join(argv) + "\n")
-    if argv and argv[0] == "ssm" and len(argv) > 1 and argv[1] == "start-session":
-        return _handle_ssm(argv)
-    return None  # sentinel: fall through to the stateful EC2 stub
-
-
-if __name__ == "__main__":
-    rc = main(sys.argv[1:])
-    if rc is not None:
-        sys.exit(rc)
+with open(HERE / "aws.log", "a") as f:
+    f.write("ssh " + " ".join(sys.argv[1:]) + "\n")
+remote = sys.argv[-1]
+if remote.startswith("sudo -n "):
+    remote = remote[len("sudo -n "):]
+dest = os.environ.get("LEERIE_TEST_WORK_DEST")
+if dest:
+    remote = remote.replace("/work", dest)
+sys.exit(subprocess.run(["bash", "-c", remote], stdin=sys.stdin).returncode)
 '''
 
 
 def _stub_aws_with_ssm(dir: Path) -> Path:
-    """Stateful EC2 `aws` stub (tests/ec2_stub.py) + an `ssm
-    start-session` handler layered on top, since ec2_stub.py's own stub
-    has no SSM support (it is exercised only via argv-level lifecycle
-    tests elsewhere). Composes rather than forks: the SSM branch is
-    tried first; anything else falls through to the stateful stub's
-    `main()`, imported by relative path so both stubs share one
-    `state.json`/`aws.log`."""
+    """Stateful EC2 `aws` stub (tests/ec2_stub.py) plus, beside it, the
+    `ssh` stub above that plays the instance for ec2_remote_exec. Both
+    write the same aws.log, so call order across them is assertable."""
     dir = Path(dir)
     dir.mkdir(parents=True, exist_ok=True)
-    combined = _SSM_STUB_SOURCE + "\n\n# --- stateful EC2 stub ---\n" + _STUB_SOURCE.split(
-        "if __name__ == \"__main__\":", 1
-    )[0] + (
-        "\nif __name__ == \"__main__\":\n"
-        "    _rc = main(sys.argv[1:])\n"
-        "    if _rc is None:\n"
-        "        _rc = _stateful_main(sys.argv[1:])\n"
-        "    sys.exit(_rc)\n"
-    )
-    # The stateful stub defines its own `main`; rename it so the SSM
-    # wrapper's `main` (which falls through by returning None) doesn't
-    # collide with it.
-    combined = combined.replace("def main(argv):\n    with open(LOG_PATH", "def _stateful_main(argv):\n    with open(LOG_PATH")
     stub = dir / "aws"
-    stub.write_text(combined)
+    stub.write_text(_STUB_SOURCE)
     stub.chmod(0o755)
+    ssh = dir / "ssh"
+    ssh.write_text(_SSH_STUB_SOURCE)
+    ssh.chmod(0o755)
     (dir / "aws.log").write_text("")
     (dir / "state.json").write_text(json.dumps({"instances": {}, "volumes": {}}))
     return stub
@@ -171,7 +114,7 @@ def _seed_stopped_instance(aws_dir: Path) -> str:
 
 def _seed_remote_state(work_dest: Path, run_id: str, state: dict) -> Path:
     """Seed state.json at the rewritten '/work' fixture path — this is
-    what accept-blocked's EC2 branch actually mutates over SSM (the
+    what accept-blocked's EC2 branch actually mutates over SSH (the
     genuine remote copy; the run dir's *host-side* state.json, if any,
     is a best-effort mirror written afterward)."""
     remote_dir = work_dest / ".leerie" / "runs" / run_id
@@ -453,3 +396,64 @@ def test_list_ec2_run_detected_via_sidecar_only(leerie, tmp_path, capsys):
     leerie._list_runs(tmp_path, runtime_filter="ec2")
     out = capsys.readouterr().out
     assert RUN_ID in out
+
+
+# --- accept verbs must not fire the run-launch teardown --------------------
+#
+# Waking a stopped instance goes through resume_instance(), which arms the
+# run-launch teardown traps (`decide_ec2_teardown exit` on EXIT, the bare
+# form on INT/TERM). Left armed, the accept verb's own exit ran
+# decide_ec2_teardown with LEERIE_REMOTE_EXIT_RC unset (read as 0, a clean
+# run exit) and tried to fetch the run back. Against the instance the verb
+# had just re-stopped, that fetch failed: run.json gained sync_failed_at and
+# the operator got a "LEFT RUNNING" banner for a stopped instance. (Had the
+# fetch reached a running instance, the clean-exit branch terminates a run
+# with no finished_at.) The arms now neutralize those traps the way
+# `finalize` does.
+
+_ACCEPT_VERB_CASES = {
+    "accept-blocked": {"subtask_status": {SID: "blocked"}, "blocked": {SID: {}}},
+    "accept-integration": {"integration_gate": {SID: {"accepted": False}},
+                           "integration_defects": {SID: ["d"]}},
+}
+
+
+def _assert_accept_on_stopped_instance_skips_run_teardown(tmp_path: Path, verb: str) -> None:
+    aws_dir = tmp_path / "bin"
+    _stub_aws_with_ssm(aws_dir)
+    iid = _seed_stopped_instance(aws_dir)
+    env, state_dir, work_dest = build_ec2_launcher_env(tmp_path, aws_dir, with_work_dest=True)
+    run_dir = state_dir / "runs" / RUN_ID
+    write_ec2_sidecar(run_dir, RUN_ID, iid)
+    _seed_remote_state(work_dest, RUN_ID, _ACCEPT_VERB_CASES[verb])
+
+    result = _run([verb, RUN_ID, SID], env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "ACCEPTED:" in out, out
+
+    # The verb's own re-pause still happens — and is the LAST lifecycle call.
+    log = read_log(aws_dir)
+    lifecycle = [l.split()[1] for l in log
+                 if l.startswith("ec2 ") and l.split()[1].endswith("-instances")
+                 and not l.split()[1].startswith("describe")]
+    assert lifecycle == ["start-instances", "stop-instances"], log
+    assert read_state(aws_dir)["instances"][iid]["state"] == "stopped"
+    stop_at = max(i for i, l in enumerate(log) if l.startswith("ec2 stop-instances"))
+    assert not any(l.startswith("ssh ") for l in log[stop_at + 1:]), log[stop_at:]
+
+    run_json = json.loads((run_dir / "run.json").read_text())
+    assert run_json.get("pause_reason") == "user-requested"
+    assert run_json.get("paused_at")
+    assert "sync_failed_at" not in run_json
+    for teardown_line in ("synced to host", "LEFT RUNNING", "did not reach finalize",
+                          "auto-finalize"):
+        assert teardown_line not in out, out
+
+
+def test_accept_blocked_ec2_wake_does_not_fire_run_teardown(tmp_path: Path) -> None:
+    _assert_accept_on_stopped_instance_skips_run_teardown(tmp_path, "accept-blocked")
+
+
+def test_accept_integration_ec2_wake_does_not_fire_run_teardown(tmp_path: Path) -> None:
+    _assert_accept_on_stopped_instance_skips_run_teardown(tmp_path, "accept-integration")

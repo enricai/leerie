@@ -28,8 +28,8 @@ _seed_dirty_filter() {
 
 # --- _seed_timeout_prefix --------------------------------------------------
 # Emit the `timeout --kill-after=5 ${LEERIE_SEED_TIMEOUT_S:-600}` prefix
-# used to bound the bulk-transfer side of `flyctl ssh console` (Fly) / `aws
-# ssm start-session` (EC2). On hosts without GNU `timeout` (BSD macOS w/o
+# used to bound the bulk-transfer side of `flyctl ssh console` (Fly) / `ssh`
+# (EC2). On hosts without GNU `timeout` (BSD macOS w/o
 # coreutils) the function echoes nothing — caller falls back to an
 # unbounded pipe, matching pre-fix behavior. The fix converts a silent
 # multi-hour hang into a clean non-zero rc (124 on TERM, 137 on KILL) that
@@ -40,7 +40,7 @@ _seed_dirty_filter() {
 #
 # Usage:
 #   $(_seed_timeout_prefix) flyctl ssh console ... -C ...
-#   $(_seed_timeout_prefix) aws ssm start-session ...
+#   $(_seed_timeout_prefix) ssh ... ec2-user@<ip> ...
 _seed_timeout_prefix() {
   if ! command -v timeout >/dev/null 2>&1; then
     return 0
@@ -209,9 +209,15 @@ _render_launch_suffix() {
 extra_path = "/usr/local/share/mise/installs/node/lts-current/bin"
 if extra_path not in child_env.get("PATH", ""):
     child_env["PATH"] = extra_path + ":" + child_env.get("PATH", "")
+# --no-push goes AFTER the forwarded args (before any literal "--"), never
+# first: \`resume <run-id>\` / \`list\` are recognized only as argv[0] by the
+# orchestrator's main(), so a leading flag turned \`resume <id>\` into a task
+# string plus an unrecognized argument (seen on a real EC2 resume).
+_split = orch_args.index("--") if "--" in orch_args else len(orch_args)
+orch_argv = orch_args[:_split] + ["--no-push"] + orch_args[_split:]
 with open(log_path, "ab") as log_f:
     p = subprocess.Popen(
-        ["python3", "/opt/leerie-image/orchestrator/leerie.py", "--no-push", *orch_args],
+        ["python3", "/opt/leerie-image/orchestrator/leerie.py", *orch_argv],
         stdin=subprocess.DEVNULL,
         stdout=log_f,
         stderr=log_f,

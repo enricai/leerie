@@ -40,9 +40,9 @@ def _make_stub_aws(stub_path: Path, exec_log: Path, dest_dir: Path,
     logging no-op (rather than silently swallowed) when `chown_log` is
     given, so tests can assert the real script actually issued the
     ownership fix rather than merely grepping its source. See
-    tests/ec2_stub.py::make_ssm_stub_aws for the shared mechanics.
+    tests/ec2_stub.py::make_remote_exec_stub for the shared mechanics.
     """
-    ec2_stub.make_ssm_stub_aws(
+    ec2_stub.make_remote_exec_stub(
         stub_path,
         exec_log,
         dest_dir,

@@ -263,18 +263,29 @@ def test_ec2_launcher_side_vars_not_forwarded():
     """The AWS/EC2 launcher-only vars (instance lifecycle, mirroring the Fly
     LEERIE_FLY_APP/LEERIE_FLY_IMAGE/LEERIE_MACHINE_ID trio) must not leak into
     the container — they are consumed by launcher-side provisioning only."""
-    names = _forwarded_names(_run({
+    ec2_vars = {
         "LEERIE_EC2_INSTANCE_ID": "i-0123456789abcdef0",
         "LEERIE_EC2_AMI": "ami-0abcdef1234567890",
         "LEERIE_EC2_INSTANCE_TYPE": "t3.large",
         "LEERIE_EC2_KEY_NAME": "leerie-key",
         "LEERIE_EC2_SECURITY_GROUP": "sg-0123456789abcdef0",
         "LEERIE_EC2_SUBNET_ID": "subnet-0123456789abcdef0",
-    }))
-    assert names.isdisjoint({
-        "LEERIE_EC2_INSTANCE_ID", "LEERIE_EC2_AMI", "LEERIE_EC2_INSTANCE_TYPE",
-        "LEERIE_EC2_KEY_NAME", "LEERIE_EC2_SECURITY_GROUP", "LEERIE_EC2_SUBNET_ID",
-    })
+        "LEERIE_EC2_INSTANCE_PROFILE": "leerie-ssm",
+        "LEERIE_EC2_SSH_KEY_FILE": "/keys/leerie-ssh.pem",
+        "LEERIE_EC2_SSH_CIDR": "198.51.100.7/32",
+        "LEERIE_EC2_IAM_RETRY_S": "5",
+        "LEERIE_EC2_IAM_RETRY_BUDGET_S": "120",
+        "LEERIE_EC2_AMI_WAIT_S": "3600",
+        "LEERIE_EC2_BAKE_BASE_AMI": "ami-0123456789abcdef1",
+        "LEERIE_EC2_BAKE_SSH_RETRIES": "60",
+        "LEERIE_EC2_BAKE_POLL_S": "5",
+        "LEERIE_EC2_BAKE_WAIT_TRIES": "120",
+    }
+    names = _forwarded_names(_run(ec2_vars))
+    assert names.isdisjoint(ec2_vars)
+    # Control: the same harness does forward an ordinary orchestrator knob,
+    # so the disjointness above is not an empty forward list.
+    assert "LEERIE_MAX_WORKERS" in _forwarded_names(_run({**ec2_vars, "LEERIE_MAX_WORKERS": "3"}))
 
 
 def test_unset_var_not_forwarded():

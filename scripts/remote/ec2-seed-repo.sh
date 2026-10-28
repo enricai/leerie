@@ -13,8 +13,8 @@
 #   EC2: `ec2_tar_pipe` (plain ssh, DESIGN §6 "Transport substitution")
 #        for bulk data — SSM's AWS-StartInteractiveCommand has no stdin
 #        pipe and a ~4 KB document-parameter ceiling, so it cannot carry
-#        a bundle/tar payload — and `ec2_remote_exec` (SSM Session
-#        Manager, the default transport) for small remote commands.
+#        a bundle/tar payload — and `ec2_remote_exec` (SSH, under
+#        `sudo -n`; ec2-lib.sh) for small remote commands.
 #
 # Two-phase seeding, same split as seed-repo.sh:
 #
@@ -422,9 +422,11 @@ ec2_seed_repo_dirty() {
 
   local rsync_err
   rsync_err="$(mktemp -t leerie-reseed-err.XXXXXX)"
+  # --rsync-path: ec2-user cannot write leerie-owned /work files; the
+  # chown below restores ownership after the root-side receive.
   rsync -a -H \
     --from0 --files-from="$file_list" \
-    -e "$wrapper" \
+    -e "$wrapper" --rsync-path="sudo -n rsync" \
     "$USER_REPO/" "$LEERIE_EC2_SSH_TARGET:/work/" \
     >/dev/null 2>"$rsync_err"
   rsync_rc=$?
@@ -464,12 +466,13 @@ ec2_seed_repo_dirty() {
 _ec2_ssh_wrapper() {
   local wrapper
   wrapper="$(mktemp -t leerie-ec2-ssh-wrapper.XXXXXX)"
-  local _to="" _idstr=""
+  local _to="" _idstr="" _khstr=""
   _to="$(_seed_timeout_prefix)"
   _idstr="$(_ec2_ssh_identity_string)"
+  _khstr="$(_ec2_ssh_known_hosts_string)"
   cat > "$wrapper" <<EOF
 #!/usr/bin/env bash
-exec $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $_idstr "\$@"
+exec $_to ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new $_idstr $_khstr "\$@"
 EOF
   chmod +x "$wrapper"
   printf '%s' "$wrapper"

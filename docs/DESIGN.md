@@ -3934,8 +3934,9 @@ push an incomplete branch.
 
 `accept-blocked`'s EC2 action mirrors Fly's wake-mutate-pause dance:
 resolve AWS credentials, wake the instance via `resume_instance()` if
-stopped, mutate `state.json` over SSM (`ec2_remote_exec` — no ssh
-keypair or hallpass wait needed), mirror onto the host copy when one
+stopped, mutate `state.json` over the instance's SSH transport
+(`ec2_remote_exec`, see *Transport substitution* below), mirror onto the
+host copy when one
 exists, and re-pause only if this verb woke it. `stop`'s EC2 action
 resolves credentials, gates on `require_aws()`, resolves
 `LEERIE_EC2_INSTANCE_ID` from the sidecar, and calls `stop_instance()`
@@ -4161,17 +4162,50 @@ fresh AWS account with no operator-built artifact. Three strategies:
      `ensure_ami()` launches a temporary instance from the stock Debian
      13 AMI (using the same key pair, security group and subnet defaults
      as a run, below), SSHes in as the stock `admin` user (Debian's
-     cloud-image login; `ec2-user` does not exist yet), pipes the bake
-     script over the existing `ec2_tar_pipe` path, and runs it with
-     `sudo`. The script creates the `leerie` user and the `ec2-user`
-     login (authorized with the same key pair) that the run-time SSH bulk
-     transfer uses. It then calls `ec2:CreateImage` and waits for
-     `available`. Chosen over **user-data** (no exit status or log
-     visible to the launcher, 16 KB limit, failure only discoverable by
-     timeout) and **SSM** (needs the instance profile to exist and
-     register before the first step can run, a chicken-and-egg on a
-     fresh account; the SSH path is already required for bulk transfer
-     and so adds no new prerequisite).
+     cloud-image login; `ec2-user` does not exist yet), ships the baked-in
+     sources — the bake script among them — over the existing
+     `ec2_tar_pipe` path, and runs the script from that copy with `sudo`
+     and stdin closed (a script fed over stdin can be consumed mid-run by
+     any step that reads stdin, such as a package's maintainer script).
+     The script creates the `leerie` user and the `ec2-user`
+     login that the run-time SSH bulk transfer uses. `ec2-user` is made
+     cloud-init's *default user* (passwordless sudo, member of the leerie
+     group) rather than authorized with the bake-time key: cloud-init
+     re-runs its per-instance modules on every new instance id and installs
+     that instance's launch key pair into the default user, so an AMI baked
+     with one key keeps working when the key pair is overridden or
+     recreated. The script ends with `cloud-init clean` so the image's first
+     boot is a fresh instance. It then calls `ec2:CreateImage` and polls the
+     image state until `available` within a bounded budget sized for a
+     first snapshot (the CLI's stock waiter gives up after ten minutes,
+     which a first snapshot can exceed). Chosen over **user-data** (no
+     exit status or log visible to the launcher, 16 KB limit, failure only
+     discoverable by timeout) and **SSM** (needs the instance profile to
+     exist and register before the first step can run, a chicken-and-egg
+     on a fresh account; the SSH path is already required for bulk
+     transfer and so adds no new prerequisite).
+   - **The image carries what the container provided.** A container
+     gets the Dockerfile's `ENV` lines for free; an EC2 instance does not,
+     and `container-entry.sh` (which chowns leerie's home dirs in the
+     rootful case) never runs there. The bake therefore writes the
+     Dockerfile's `ENV` set to an env file in the image, which the EC2
+     launch wrapper merges into the orchestrator's environment, and leaves
+     leerie's home directory leerie-owned. It also keeps `/tmp` on disk:
+     Debian 13 mounts `/tmp` as a RAM-backed tmpfs by default, where the
+     seed bundles and the tool caches the container keeps under `/tmp`
+     would compete with the workers for memory and vanish on every boot.
+     And it takes over what `container-entry.sh` does as the container's
+     PID 1, since an instance has no such process: a root systemd unit
+     runs the cgroup broker (*Memory containment* — without it the
+     orchestrator's fail-closed containment gate refuses to start any
+     worker), after a boot-time step that creates `leerie.slice` with the
+     memory and pids controllers and the same aggregate memory cap the
+     container sets, and re-creates the `/tmp` cache directory the boot
+     cleans. Root on a real host is the rootful case, so the slice sits
+     at the top of the cgroup hierarchy exactly as it does in a rootful
+     container; a `Delegate=yes` unit cgroup would not do, since the
+     broker itself would occupy it and cgroup v2 forbids enabling
+     controllers on a cgroup that holds processes.
    - **Tag and rebake rule.** The AMI is tagged with the leerie version
      and a source hash (over the files baked in: orchestrator, scripts,
      prompts, plugin manifest, `requirements.txt`, the bake script).
@@ -4180,7 +4214,9 @@ fresh AWS account with no operator-built artifact. Three strategies:
      AMIs are left for `leerie prune` (below), never silently deleted.
    - **Teardown guarantee.** The bake instance is terminated on every
      exit path — success, bake-script failure, timeout, and
-     Ctrl-C/SIGTERM (EXIT/INT/TERM trap) — and the orchestrator-side
+     Ctrl-C/SIGTERM (EXIT/INT/TERM trap). It carries a per-bake nonce tag,
+     so an interrupt that lands while `RunInstances` is still in flight
+     (before the id is known) is reaped by tag — and the orchestrator-side
      container boundary does not apply here since the bake runs on the
      host launcher. A failed bake registers no AMI, so a partial image
      is never tagged as reusable.
@@ -4208,12 +4244,25 @@ CLI flag > `LEERIE_EC2_*` env var > `leerie.toml` > new default.
 - **Instance type** (`LEERIE_EC2_INSTANCE_TYPE`): a documented
   general-purpose default in IMPLEMENTATION.md §2½.
 - **Key pair** (`LEERIE_EC2_KEY_NAME`): create or reuse a
-  leerie-tagged key pair. The private key is stored under the state dir
-  with mode 600 and every `ssh`/`scp` invocation passes `-i` to it
-  explicitly (leerie passed no `-i` before).
+  leerie-tagged key pair. The private key is stored under the global
+  leerie state root, scoped the way the AWS resource is — per account and
+  region (`~/.leerie/.ec2-keys/<account>/<region>/`), not per repo — with
+  mode 600, and every `ssh`/`scp`/`rsync` invocation passes `-i` to it
+  explicitly (leerie passed no `-i` before). Every launcher process
+  derives the same path, so `resume`, `finalize` and `kill` find the key
+  without it being threaded through. A key pair created before this
+  layout (its private key in the per-repo state dir) is adopted by moving
+  that file into place rather than failing.
 - **Security group** (`LEERIE_EC2_SECURITY_GROUP`): create or reuse a
   leerie-tagged group allowing port 22 **only** from the launcher's
   egress IP as a `/32` (or an operator-supplied CIDR), never `0.0.0.0/0`.
+  The rule is additive: a launcher never revokes another launcher's CIDR
+  (that would cut a concurrent run's transport), and `resume` re-adds the
+  current egress IP, since a laptop that changed networks would otherwise
+  be locked out of its own paused instance. Resume touches only a
+  leerie-tagged group that is actually attached to that instance, never
+  creates one, and leaves an operator's group alone. `prune` reclaims the
+  group.
 - **Subnet** (`LEERIE_EC2_SUBNET_ID`): a public subnet of the default
   VPC. If the account has no default VPC the launcher fails with an
   actionable message naming the fix (create one with `aws ec2
@@ -4226,14 +4275,44 @@ CLI flag > `LEERIE_EC2_*` env var > `leerie.toml` > new default.
 profile passed as `IamInstanceProfile` to `RunInstances`. When unset,
 leerie may create a leerie-tagged role/profile carrying
 `AmazonSSMManagedInstanceCore`, so SSM works without Default Host
-Management Configuration. `RunInstances` also requests a public IP
-association, since the SSH bulk-transfer path needs one.
+Management Configuration. A freshly created profile is eventually
+consistent — EC2 can reject it for tens of seconds after IAM reports it —
+so the launch retries `RunInstances` on exactly that rejection within a
+bounded budget instead of sleeping a fixed interval. `RunInstances` also
+requests a public IP association, since the SSH bulk-transfer path needs
+one.
 
 **Finalization parity.** `decide_ec2_teardown` calls the same
 `host_finalize` flow as Fly's `decide_teardown` (see *Finalization*
 above): on a clean exit the host pushes the run branch and opens the PR
-before the instance is terminated, and a finalize failure keeps the
-instance's pause disposition rather than destroying unpushed work.
+before the instance is terminated, and a finalize failure leaves the
+instance running (as Fly leaves the machine running) rather than
+destroying unpushed work.
+
+Two rules hold for both remote runtimes' teardown (Fly's `decide_teardown`
+and EC2's `decide_ec2_teardown` alike):
+
+- **A launch-time `--no-push` is honored by auto-finalize.** The runtime
+  sidecar (`fly-machine.json` / `ec2-instance.json`) records it as
+  `host_no_push`, and teardown reads it there, because the fetched
+  `run.json` cannot carry it — the fetch strips `no_push=true` whenever a
+  run branch exists (a defense against old images that wrote the
+  mechanism flag). With it set, the run branch is left on the host for a
+  later `leerie finalize`, no push or PR is attempted, and the machine or
+  instance is destroyed (the work is already on the host).
+- **The teardown trap keeps the launcher's exit duties.** Provisioning
+  replaces the launcher's EXIT trap with the teardown function, so the
+  teardown's exit pass ends by running the launcher's own cleanup:
+  killing the `$STAGE` keepalive and removing `$STAGE`, which holds
+  copies of `~/.ssh`, `~/.aws` and the Claude credentials. Without it
+  every remote run leaked that directory, and the orphaned keepalive kept
+  it fresh enough to escape the one-day sweep. Only the exit pass runs it:
+  the same function also handles INT/TERM, which the launcher can
+  survive, and deleting `$STAGE` there would strip the credentials from
+  the rest of the run (seeding still needs them). The cleanup must also
+  tolerate a keepalive that is already gone; under the launcher's
+  `set -e` a failed `kill` would otherwise end the trap before `$STAGE`
+  is removed.
 
 **Cleanup.** `leerie prune` (dry-run by default, `--apply` to act) and
 `kill`/teardown where appropriate cover leerie-tagged AMIs and their
@@ -4252,16 +4331,18 @@ widen leerie's AWS identity:
   `ec2:RegisterImage`, `ec2:CreateKeyPair`, `ec2:DescribeKeyPairs`,
   `ec2:CreateSecurityGroup`, `ec2:DescribeSecurityGroups`,
   `ec2:AuthorizeSecurityGroupIngress`, `ec2:DescribeVpcs`,
-  `ec2:DescribeSubnets`.
+  `ec2:DescribeSubnets`, and `ssm:GetParameter` (the public Debian 13
+  AMI-id parameter the bake starts from).
 - Cleanup: `ec2:DeregisterImage`, `ec2:DeleteSnapshot`,
   `ec2:DescribeSnapshots`, `ec2:DeleteKeyPair`,
-  `ec2:DeleteSecurityGroup`.
+  `ec2:DeleteSecurityGroup`, `ec2:DescribeNetworkInterfaces`.
 - SSM: `ssm:StartSession`, `ssm:SendCommand`, `ssm:TerminateSession`,
   `ssm:DescribeSessions`, plus the instance-side
   `AmazonSSMManagedInstanceCore` on the instance profile.
 - `iam:PassRole` for the instance profile, and (only when leerie
-  creates the profile) `iam:CreateRole`, `iam:CreateInstanceProfile`,
-  `iam:AddRoleToInstanceProfile`, `iam:AttachRolePolicy`. No `ecr:*`.
+  creates the profile) `iam:GetInstanceProfile`, `iam:CreateRole`,
+  `iam:CreateInstanceProfile`, `iam:AddRoleToInstanceProfile`,
+  `iam:AttachRolePolicy`. No `ecr:*`.
 
 **Ownership and permissions across runtimes.** The EC2 private key and
 state dir are written by the host launcher as the invoking user (mode
@@ -4270,7 +4351,10 @@ state dir are written by the host launcher as the invoking user (mode
 container never sees the key). On the instance, the baked `leerie` and
 `ec2-user` accounts are real users on a stock Debian host with no
 user-namespace remap, so literal ownership (`chown leerie`) is correct
-there, unlike the rootless-container trap. Fly is unchanged.
+there, unlike the rootless-container trap — and since `container-entry.sh`
+never runs on an instance, the bake applies that ownership to leerie's
+home directory itself. No `Dockerfile` or `container-entry.sh` change is
+involved, so local rootless, local rootful and Fly are unchanged.
 
 **New `LEERIE_EC2_*` knob.** `LEERIE_EC2_INSTANCE_PROFILE` is added
 alongside the existing `LEERIE_EC2_AMI`, `_INSTANCE_TYPE`, `_KEY_NAME`,
@@ -4304,34 +4388,56 @@ EC2 shape the reap is AWS's problem, not leerie's. Three cases:
    no secondary volume exists; flagged so a future subtask doesn't
    assume EC2 is exempt from the discipline Fly needed.
 
-**Transport substitution for `flyctl ssh console`.** Two roles need
-replacing: piping the detached-orchestrator launch wrapper, and
-opening a session for `resume`/`--shell` attach and log tailing. This
-design picks SSM Session Manager over SSH:
+**Transport substitution for `flyctl ssh console`.** Three roles need
+replacing: small remote commands (wipe, chown, the flock probe, state
+edits), piping the detached-orchestrator launch wrapper, and opening a
+session for `resume`/`--shell` attach and log tailing. Every
+non-interactive role goes over **SSH**; **SSM Session Manager** serves
+only the interactive `--shell`:
 
-- **SSM Session Manager** (`aws ssm start-session`) is the interactive
-  and control-plane transport (launch wrapper, attach, log tail): it
-  needs no inbound rule of its own — the SSM Agent calls out to the SSM
-  service over HTTPS, the same "no sshd, no public exposure" property
-  Fly gets from hallpass + WireGuard — and auth flows through the AWS
-  credential chain and IAM.
 - **SSH** (`ec2-user@<PublicIpAddress>`, `ssh -i` the leerie-tagged key
-  pair, port 22 open only to the launcher's egress CIDR) carries the
-  **bulk transfer** (`ec2_tar_pipe`: seed and sync-back), which SSM
-  sessions cannot stream efficiently. It is therefore required, not a
-  fallback: the instance needs a key pair, the security-group rule and a
-  public IP (see *Zero-config defaults* above), and SSM supplements SSH
-  rather than replacing it.
+  pair, port 22 open only to the launcher's egress CIDR) carries every
+  non-interactive command, the launch wrapper, the log tail, and the
+  bulk transfer (`ec2_tar_pipe`: seed and sync-back). A non-pty SSH
+  channel is what these need: the payload arrives intact on stdin, the
+  remote exit status comes back natively (the launch wrapper's rc=75
+  smart-resume pivot depends on it), output streams as it is produced,
+  and there is no command-size ceiling. It is required, not a fallback:
+  the instance needs a key pair, the security-group rule and a public IP
+  (see *Zero-config defaults* above). Host keys are trusted on first
+  use **per instance**, in a known-hosts file keyed by instance id,
+  never the user's own `known_hosts`: EC2 recycles public IPs, so a later
+  instance on an address an earlier one used presents a different host
+  key, and a shared file would make ssh refuse it. A stopped-and-started
+  instance keeps its host key, so resume still matches.
+- **SSM Session Manager** (`aws ssm start-session`) is rejected for the
+  non-interactive roles on measured evidence, not preference. An
+  `AWS-StartInteractiveCommand` session runs its command on a pty: a
+  payload piped into it is read by an interpreter that sees a terminal
+  (`python3 -` opens its interactive prompt, `sh -s` prints a prompt),
+  the plugin ends the session at host-stdin EOF before the payload is
+  consumed, every output line arrives CRLF-terminated, and the session
+  itself always exits 0 so the remote status needs an in-band sentinel.
+  None of that is fixable from the caller. What SSM is good at — a human
+  at a terminal — is exactly the `--shell` role, and there it keeps its
+  advantages: no inbound rule, auth through IAM. The instance profile
+  (above) keeps SSM available for that and for operators who reach
+  instances through it.
+- **Neither transport lands as root.** SSH logs in as `ec2-user` and
+  Session Manager as `ssm-user` (it does not support root). Both have
+  passwordless sudo (the default-user config above; the SSM agent's
+  `ssm-agent-users` sudoers entry), so every remote command that writes
+  leerie-owned paths, changes ownership or drops to the `leerie` user
+  runs under `sudo -n`. `-n` makes a missing sudo grant fail at once
+  instead of hanging on a prompt.
 
-`aws ssm start-session --target <instance-id> --document-name
-AWS-StartInteractiveCommand --parameters command="python3 -"` is the SSM
-analog of `flyctl ssh console --pty=false -C "python3 -"` for the
-detached-launch wrapper; the same analog with `command="tail -F
-orchestrator.log"` (or a bare interactive shell for `--shell`) serves
-the attach/tail role. The detached-`Popen` pattern itself — session
-leader inside the instance, independent host-side tail process, stream
-death does not touch the orchestrator — is transport-agnostic and
-carries over unchanged from the Fly design (lines 2185-2206 above).
+`ssh … ec2-user@<ip> "sudo -n python3 -"` with the launch wrapper on
+stdin is the analog of `flyctl ssh console --pty=false -C "python3 -"`;
+the same with `sudo -n sh -s` and the tail wrapper serves the attach/tail
+role. The detached-`Popen` pattern itself — session leader inside the
+instance, independent host-side tail process, stream death does not
+touch the orchestrator — is transport-agnostic and carries over
+unchanged from the Fly design (lines 2185-2206 above).
 
 **Pause/resume semantics.** EC2 `stop`/`start` maps directly onto Fly's
 `machine stop`/`machine start`: `StopInstances` preserves the root EBS

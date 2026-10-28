@@ -326,6 +326,12 @@ def test_ec2_launcher_verb_runs_cleanly_under_bash32(verb_args, tmp_path):
     aws_dir = tmp_path / "bin"
     aws_dir.mkdir()
     _stub_aws(aws_dir)
+    # Remote commands go over ssh; the seeded instance's address is a test
+    # IP, so refuse at once the way an unreachable host does instead of
+    # waiting out a real connect timeout. Only the bash parsing is under test.
+    ssh = aws_dir / "ssh"
+    ssh.write_text("#!/bin/sh\necho 'ssh: connect to host: Connection refused' >&2\nexit 255\n")
+    ssh.chmod(0o755)
     iid = seed_running_instance(aws_dir)
 
     env, state_dir = _launcher_env(tmp_path, aws_dir)

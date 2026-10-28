@@ -84,32 +84,8 @@ except (ValueError, KeyError, IndexError):
 ' 2>/dev/null || true
 }
 
-# --- _resolve_ssh_target_from_instance ---------------------------------------
-# Reads the instance's current PublicIpAddress via describe-instances and
-# prints "ec2-user@<ip>". EC2 hands out a new public IP on every
-# stop/start cycle unless an Elastic IP is attached, so this must be
-# re-resolved on every resume rather than reused from provision time.
-_resolve_ssh_target_from_instance() {
-  local iid="$1"
-  local aws_args=() _a
-  while IFS= read -r _a; do aws_args+=("$_a"); done \
-    < <(_aws_region_profile_args)
-  local describe_out ip
-  describe_out="$(aws ec2 describe-instances --instance-ids "$iid" ${aws_args[@]+"${aws_args[@]}"} --output json 2>/dev/null || true)"
-  ip="$(printf '%s' "$describe_out" | python3 -c '
-import json, sys
-try:
-    d = json.load(sys.stdin)
-    inst = d["Reservations"][0]["Instances"][0]
-    print(inst.get("PublicIpAddress", ""))
-except (ValueError, KeyError, IndexError):
-    pass
-' 2>/dev/null || true)"
-  if [ -z "$ip" ]; then
-    return 1
-  fi
-  printf 'ec2-user@%s' "$ip"
-}
+# _resolve_ssh_target_from_instance lives in ec2-lib.sh (sourced above):
+# ec2_remote_exec needs it too, on verbs that never resume.
 
 # --- resume_instance ---------------------------------------------------------
 # Starts a stopped instance, waits for it to become ready again,
@@ -164,6 +140,16 @@ resume_instance() {
     return 1
   fi
 
+  # The launcher may have changed networks since the run paused: re-admit
+  # the current egress IP — only on a leerie group attached to this
+  # instance; an operator's group is theirs to manage.
+  if ! declare -f ec2_reauthorize_instance_sg >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$_RESUME_EC2_DIR/ec2-defaults.sh"
+  fi
+  ec2_reauthorize_instance_sg "$iid" \
+    || remote_log "warning: could not re-authorize SSH from this host; seeding may fail"
+
   local ssh_target=""
   if ssh_target="$(_resolve_ssh_target_from_instance "$iid")"; then
     LEERIE_EC2_SSH_TARGET="$ssh_target"
@@ -177,7 +163,9 @@ resume_instance() {
   # same as resume_machine.sh does for the Fly path.
   if declare -f decide_ec2_teardown >/dev/null 2>&1; then
     # shellcheck disable=SC2064
-    trap 'decide_ec2_teardown' EXIT INT TERM
+    # EXIT passes `exit`: only that pass runs the launcher's STAGE cleanup.
+    trap 'decide_ec2_teardown exit' EXIT
+    trap 'decide_ec2_teardown' INT TERM
   fi
 
   local sidecar=""

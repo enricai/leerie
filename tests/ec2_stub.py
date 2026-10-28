@@ -169,6 +169,8 @@ def instance_doc(instance_id, rec):
     }
     if rec["state"] == "running":
         doc["PublicIpAddress"] = rec.get("public_ip", "203.0.113.10")
+    if rec.get("security_group_ids"):
+        doc["SecurityGroups"] = [{"GroupId": g} for g in rec["security_group_ids"]]
     return doc
 
 
@@ -318,6 +320,19 @@ def main(argv):
             sgs = get_flag_all(argv, "--security-group-ids")
             if sgs:
                 rec["security_group_ids"] = sgs
+            # --network-interfaces shorthand carries subnet, groups and the
+            # public-IP flag in one value; Groups= is last, so it takes the
+            # rest of the string (it may list several ids).
+            nic = get_flag(argv, "--network-interfaces")
+            if nic is not None:
+                head, _, groups = nic.partition("Groups=")
+                fields = dict(kv.split("=", 1) for kv in head.strip(",").split(",") if "=" in kv)
+                if "SubnetId" in fields:
+                    rec["subnet_id"] = fields["SubnetId"]
+                if "AssociatePublicIpAddress" in fields:
+                    rec["associate_public_ip"] = fields["AssociatePublicIpAddress"] == "true"
+                if groups:
+                    rec["security_group_ids"] = groups.split(",")
             tags = parse_tags(get_flag(argv, "--tag-specifications"))
             if tags:
                 rec["tags"] = tags
@@ -331,10 +346,11 @@ def main(argv):
 
     if action == "describe-instances":
         ids = get_flag_all(argv, "--instance-ids") or list(state["instances"].keys())
+        filters = parse_filters(argv)
         reservations = []
         for iid in ids:
             rec = state["instances"].get(iid)
-            if rec is None:
+            if rec is None or not matches_filters(rec, filters):
                 continue
             reservations.append({"Instances": [instance_doc(iid, rec)]})
         print(json.dumps({"Reservations": reservations}))
@@ -668,6 +684,21 @@ def make_sts_only_stub_aws(
     return stub
 
 
+def write_sudo_shim(dir: Path) -> Path:
+    """A `sudo` that runs its command unprivileged. The transports wrap
+    instance-side commands in `sudo -n` (neither SSM nor SSH lands as root);
+    stubs that execute those commands locally put this ahead of the host's
+    real sudo, which would prompt or fail."""
+    shim = dir / "sudo"
+    shim.write_text(
+        "#!/usr/bin/env bash\n"
+        'while [ $# -gt 0 ]; do case "$1" in -n|-E|-H) shift ;; *) break ;; esac; done\n'
+        'exec "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim
+
+
 def _stub_aws(dir: Path) -> Path:
     """Write the stateful `aws` stub binary into `dir`.
 
@@ -680,6 +711,13 @@ def _stub_aws(dir: Path) -> Path:
     stub = dir / "aws"
     stub.write_text(_STUB_SOURCE)
     stub.chmod(0o755)
+    # Remote commands go over ssh to the instances this stub tracks, whose
+    # addresses are test IPs. Unless the test brings its own, refuse at once
+    # like an unreachable host instead of letting real ssh wait it out.
+    ssh = dir / "ssh"
+    if not ssh.exists():
+        ssh.write_text("#!/bin/sh\necho 'ssh: connect to host: Connection refused' >&2\nexit 255\n")
+        ssh.chmod(0o755)
     (dir / LOG_FILENAME).write_text("")
     (dir / STATE_FILENAME).write_text(json.dumps(_EMPTY_STATE))
     return stub
@@ -913,7 +951,7 @@ def _bash_rewrite_lines(var: str, rewrites: dict[str, str]) -> str:
     return "\n".join(lines)
 
 
-def make_ssm_stub_aws(
+def make_remote_exec_stub(
     stub_path: Path,
     exec_log: Path,
     dest_dir: Path,
@@ -923,27 +961,23 @@ def make_ssm_stub_aws(
     chown_log: Path | None = None,
     swallow_runuser: bool = False,
 ) -> None:
-    """Write a stub `aws` that decodes+executes ec2_remote_exec's
-    base64-wrapped SSM command locally, rewriting absolute instance-side
-    path prefixes (per `rewrites`, applied in order to the decoded
-    command text) so it operates against `dest_dir` instead of the real
-    instance filesystem — then re-encodes the (possibly nonzero) real
-    exit code as the rc sentinel ec2_remote_exec expects, while itself
-    always exiting 0 (mirroring the real SSM session-manager-plugin's
-    documented always-exit-0 behavior, which is exactly what
-    ec2_remote_exec's sentinel-recovery logic is designed to work
-    around).
+    """Write the instance side of ec2_remote_exec for tests: a stub `aws`
+    at `stub_path` (logs and exits 0 — ec2_remote_exec makes no aws call,
+    but require_aws still probes `sts`) and, beside it, an
+    `ec2-remote-exec` helper that make_ssm_stub_ssh hands every
+    `sudo -n bash -c <cmd>` command to. The helper runs <cmd> locally with
+    the caller's stdin and returns its real exit status, as SSH does,
+    after rewriting absolute instance-side path prefixes (per `rewrites`,
+    applied in order) so it operates against `dest_dir`.
 
     `rewrites` maps an unescaped instance-side path prefix (e.g.
     `"/work"`) to its bash replacement expression (e.g. `"$DEST/work"` —
-    `DEST` is bound to `dest_dir.resolve()` inside the stub).
-    `mkdir_subdir`, when given, pre-creates `$DEST/<mkdir_subdir>` before
-    the command runs, matching a directory the real AMI/image bakes in
-    ahead of any seed. `chown -R leerie: ` / `chown leerie: ` calls are
-    always replaced with a logging no-op (no leerie user exists in the
-    test sandbox); pass `chown_log` to make that log assertable,
-    otherwise it is discarded to /dev/null. `swallow_runuser`
-    additionally drops a `runuser -u leerie -- ` prefix.
+    `DEST` is bound to `dest_dir.resolve()`). `mkdir_subdir`, when given,
+    pre-creates `$DEST/<mkdir_subdir>`, matching a directory the real image
+    bakes in ahead of any seed. `chown -R leerie: ` / `chown leerie: `
+    calls are replaced with a logging no-op (no leerie user exists in the
+    test sandbox); pass `chown_log` to make that log assertable.
+    `swallow_runuser` additionally drops a `runuser -u leerie -- ` prefix.
     """
     dest = str(dest_dir.resolve())
     chown_sink = str(chown_log.resolve()) if chown_log else "/dev/null"
@@ -952,52 +986,27 @@ def make_ssm_stub_aws(
     runuser_line = (
         'decoded="${decoded//runuser -u leerie -- /}"' if swallow_runuser else ""
     )
-    stub_path.write_text(
+    stub_path.write_text(f'#!/usr/bin/env bash\necho "aws $*" >> {exec_log}\nexit 0\n')
+    stub_path.chmod(0o755)
+    helper = stub_path.parent / "ec2-remote-exec"
+    helper.write_text(
         f"""#!/usr/bin/env bash
-echo "aws $*" >> {exec_log}
-
+echo "remote-exec $1" >> {exec_log}
 DEST={dest!r}
 CHOWN_LOG={chown_sink!r}
 {mkdir_line}
-
-# Find the --parameters "command=[...]" argument.
-param=""
-prev=""
-for arg in "$@"; do
-  if [ "$prev" = "--parameters" ]; then
-    param="$arg"
-  fi
-  prev="$arg"
-done
-
-if [ -z "$param" ]; then
-  exit 0
-fi
-
-# param looks like: command=["echo <b64> | base64 -d | bash"]
-inner="${{param#command=[\\"}}"
-inner="${{inner%\\"]}}"
-# inner is: echo <b64> | base64 -d | bash
-b64="${{inner#echo }}"
-b64="${{b64%% | base64*}}"
-decoded="$(printf '%s' "$b64" | base64 -d)"
-
+decoded="$1"
 # Rewrite absolute instance-side paths to land inside DEST.
 {rewrite_lines}
 {runuser_line}
 # No leerie user in the test sandbox — swallow chown, logging it when
 # a caller wants to assert the ownership fix actually happened.
-decoded="${{decoded//chown -R leerie: /echo chown-R >> \\"\\$CHOWN_LOG\\"; true }}"
-decoded="${{decoded//chown leerie: /echo chown >> \\"\\$CHOWN_LOG\\"; true }}"
-
-CHOWN_LOG="$CHOWN_LOG" bash -c "$decoded"
-# SSM's own process always exits 0 regardless of the wrapped command's
-# real exit status; the sentinel inside `decoded` already carried the
-# real rc back over stdout, which ec2_remote_exec parses.
-exit 0
+decoded="${{decoded//chown -R leerie: /echo chown-R >> \"\$CHOWN_LOG\"; true }}"
+decoded="${{decoded//chown leerie: /echo chown >> \"\$CHOWN_LOG\"; true }}"
+CHOWN_LOG="$CHOWN_LOG" exec bash -c "$decoded"
 """
     )
-    stub_path.chmod(0o755)
+    helper.chmod(0o755)
 
 
 def make_ssm_stub_ssh(
@@ -1102,6 +1111,14 @@ while [ $i -lt ${{#args[@]}} ]; do
 done
 target="${{args[$i]}}"
 rest=("${{args[@]:$((i+1))}}")
+# The transports elevate on the instance (`sudo -n <cmd>` as one string,
+# or rsync's --rsync-path splitting into `sudo -n rsync ...`); this stub
+# has no instance, so it runs the command itself.
+if [ "${{rest[0]:-}}" = "sudo" ] && [ "${{rest[1]:-}}" = "-n" ]; then
+  rest=("${{rest[@]:2}}")
+elif [ "${{rest[0]#sudo -n }}" != "${{rest[0]:-}}" ]; then
+  rest=("${{rest[0]#sudo -n }}" "${{rest[@]:1}}")
+fi
 
 if [ "${{#rest[@]}}" -eq 0 ]; then
   # No remote command — this is ec2_tar_pipe's bare-target invocation
@@ -1112,6 +1129,19 @@ if [ "${{#rest[@]}}" -eq 0 ]; then
 fi
 
 case "${{rest[0]}}" in
+  "bash -c "*)
+    # ec2_remote_exec: `sudo -n bash -c <printf %q of cmd>` as one argv
+    # element (sudo already stripped above). Unquote it the way the
+    # remote login shell would, then run it with this stub's stdin.
+    eval "set -- ${{rest[0]#bash -c }}"
+    here="$(cd "$(dirname "$0")" && pwd)"
+    if [ -x "$here/ec2-remote-exec" ]; then
+      exec "$here/ec2-remote-exec" "$1"
+    fi
+    remote_cmd="$1"
+    {sh_rewrite_lines}
+    exec bash -c "$remote_cmd"
+    ;;
   sh*)
     # ec2_tar_pipe passes its whole receiver as ONE argv element:
     # "sh -c 'mkdir -p '\\''<dir>'\\'' && tar -xzC '\\''<dir>'\\'''"

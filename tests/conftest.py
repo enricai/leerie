@@ -297,11 +297,21 @@ def _default_aws_region(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _ec2_tests_isolated_home(request, tmp_path_factory, monkeypatch):
+    """EC2 tests get a throwaway HOME. `run_bash` merges os.environ, and
+    ec2_default_key_file writes leerie's key under $HOME/.leerie/.ec2-keys:
+    any test that leaves LEERIE_EC2_KEY_NAME blank would otherwise drop a
+    stub key into the developer's real home (it did, once)."""
+    if "ec2" in request.module.__name__:
+        monkeypatch.setenv("HOME", str(tmp_path_factory.mktemp("home")))
+
+
+@pytest.fixture(autouse=True)
 def _no_iam_propagation_wait(monkeypatch):
-    """`ensure_instance_profile` sleeps 10s after creating the IAM profile
-    so AWS can propagate it; every provision against the aws stub creates
-    one, and that sleep alone pushed the CI job past its 20-minute cap."""
-    monkeypatch.setenv("LEERIE_EC2_IAM_PROPAGATION_S", "0")
+    """`provision_instance` sleeps between run-instances retries while a new
+    IAM profile propagates; a test that exercises the retry would otherwise
+    spend real seconds per attempt, and the sleeps add up across the suite."""
+    monkeypatch.setenv("LEERIE_EC2_IAM_RETRY_S", "0")
 
 
 @pytest.fixture(autouse=True)

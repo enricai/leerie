@@ -202,7 +202,7 @@ def test_no_default_vpc_names_create_default_vpc_and_subnet_override(tmp_path):
     aws_dir.mkdir()
     _no_vpc_aws(aws_dir)
 
-    result = _run_defaults("default_subnet_id", aws_dir, {})
+    result = _run_defaults("ec2_default_subnet_id", aws_dir, {})
 
     assert result.returncode != 0
     assert "aws ec2 create-default-vpc" in result.stderr
@@ -242,7 +242,7 @@ def test_each_preflight_failure_names_a_distinct_fix_command(tmp_path):
     aws_dir.mkdir()
     _no_vpc_aws(aws_dir)
     _no_ip_curl(aws_dir)
-    vpc = _run_defaults("default_subnet_id", aws_dir, {}).stderr
+    vpc = _run_defaults("ec2_default_subnet_id", aws_dir, {}).stderr
     cidr = _run_defaults("ec2_egress_cidr", aws_dir, {}).stderr
 
     assert vpc != cidr

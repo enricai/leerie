@@ -1,7 +1,7 @@
 """Guards the single-owner `run_launcher` invoke helper in tests/ec2_stub.py.
 
 tests/ec2_stub.py, not tests/conftest.py, is the established convention for
-EC2-launcher-test scaffolding (see its own docstring on `make_ssm_stub_aws`
+EC2-launcher-test scaffolding (see its own docstring on `make_remote_exec_stub`
 et al.: "Single-owner discipline (same precedent as the state-machine stub
 above and tests/launcher_blocks.py)"). `run_launcher` there already
 replaced the near-identical `_run_launcher` previously redefined in

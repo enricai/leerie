@@ -39,6 +39,11 @@ def _run_decide_teardown(
     host_finalize_sh_exists: bool = True,
     run_finished_at: str | None = "2026-06-02T10:30:00Z",
     tmp_path: Path,
+    sidecar_no_push: bool | None = None,
+    no_push_env: str = "",
+    launcher_hook: bool = False,
+    fetch_rc: int = 0,
+    exit_pass: bool = True,
 ) -> subprocess.CompletedProcess:
     """Invoke decide_teardown with stubs for fetch_branch + host_finalize
     + destroy_machine; return the completed process so callers can
@@ -59,6 +64,9 @@ def _run_decide_teardown(
             else "{}"
         )
         (run_dir / "run.json").write_text(run_json_data)
+        if sidecar_no_push is not None:
+            (run_dir / "fly-machine.json").write_text(
+                f'{{"fly_machine_id": "test-mid-001", "host_no_push": {str(sidecar_no_push).lower()}}}')
 
     # Synthesize a fake LEERIE_REPO that holds a stub host-finalize.sh.
     leerie_repo = tmp_path / "leerie_repo"
@@ -73,7 +81,7 @@ def _run_decide_teardown(
     script = f"""
 source {PROVISION_SH}
 # Override the things that would make real system calls.
-_try_fetch_branch_for_teardown() {{ return 0; }}
+_try_fetch_branch_for_teardown() {{ echo "[stub] fetch called"; return {fetch_rc}; }}
 destroy_machine() {{ echo "[stub] destroy_machine called"; LEERIE_MACHINE_ID=''; }}
 stop_machine() {{ echo "[stub] stop_machine called"; LEERIE_MACHINE_ID=''; }}
 update_run_json() {{ :; }}
@@ -83,7 +91,12 @@ export LEERIE_REMOTE_RUN_ID=rid-001
 export LEERIE_RUN_ID=rid-001
 export USER_REPO={user_repo}
 export LEERIE_REPO={leerie_repo}
+NO_PUSH={no_push_env}
+{'_remote_launcher_exit_cleanup() { echo "[stub] launcher cleanup called"; }' if launcher_hook else ''}
+# The INT/TERM registration (no arg), then the EXIT one — the order a
+# Ctrl-C followed by the launcher's own exit produces.
 decide_teardown
+{'decide_teardown exit' if exit_pass else ''}
 """
     return subprocess.run(
         ["bash", "-c", script],
@@ -253,3 +266,66 @@ decide_teardown
     assert f"leerie attach {chain_id}" in combined
     assert f"leerie stop   {chain_id}" in combined
     assert f"leerie kill   {chain_id}" in combined
+
+
+def _events(result: subprocess.CompletedProcess) -> list[str]:
+    """The ordered stub calls: fetch / finalize / destroy / stop / cleanup."""
+    names = {"[stub] fetch called": "fetch", "[stub-host-finalize]": "finalize",
+             "[stub] destroy_machine called": "destroy", "[stub] stop_machine called": "stop",
+             "[stub] launcher cleanup called": "cleanup"}
+    out = []
+    for line in (result.stdout + result.stderr).splitlines():
+        for prefix, name in names.items():
+            if line.startswith(prefix):
+                out.append(name)
+    return out
+
+
+def test_launch_time_no_push_skips_finalize_and_destroys(tmp_path):
+    # The fetch strips run.json.no_push when a branch exists, so the
+    # fly-machine.json intent is what must stop the push.
+    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
+                                  tmp_path=tmp_path, sidecar_no_push=True)
+    assert result.returncode == 0, result.stderr
+    assert _events(result) == ["fetch", "destroy"]
+    assert "--no-push was set at launch" in result.stdout + result.stderr
+
+
+def test_no_push_on_the_tearing_down_launcher_also_skips_finalize(tmp_path):
+    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
+                                  tmp_path=tmp_path, no_push_env="true")
+    assert _events(result) == ["fetch", "destroy"]
+
+
+def test_recorded_push_intent_still_finalizes(tmp_path):
+    # Control: the same sidecar with host_no_push false keeps auto-finalize.
+    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
+                                  tmp_path=tmp_path, sidecar_no_push=False)
+    assert _events(result) == ["fetch", "finalize", "destroy"]
+
+
+def test_launcher_cleanup_runs_once_on_the_exit_pass(tmp_path):
+    # The replacement EXIT trap keeps the launcher's STAGE cleanup: after the
+    # teardown, once, on the `exit` pass (the INT pass before it skips it).
+    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
+                                  tmp_path=tmp_path, launcher_hook=True)
+    assert result.returncode == 0, result.stderr
+    assert _events(result) == ["fetch", "finalize", "destroy", "cleanup"]
+
+
+def test_an_int_pass_alone_keeps_stage(tmp_path):
+    # A Ctrl-C the launcher survives must not delete the staged credentials
+    # the rest of the run (seeding) still needs.
+    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
+                                  tmp_path=tmp_path, launcher_hook=True,
+                                  exit_pass=False)
+    assert "cleanup" not in _events(result)
+    assert _events(result) == ["fetch", "finalize", "destroy"]
+
+
+def test_launcher_cleanup_runs_when_the_machine_is_left_running(tmp_path):
+    result = _run_decide_teardown(host_finalize_rc=0, run_dir_exists=True,
+                                  tmp_path=tmp_path, launcher_hook=True, fetch_rc=1)
+    events = _events(result)
+    assert events[0] == "fetch" and events[-1] == "cleanup"
+    assert "destroy" not in events and "finalize" not in events

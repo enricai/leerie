@@ -43,9 +43,9 @@ def _make_stub_aws(stub_path: Path, exec_log: Path, dest_dir: Path) -> None:
     rewrite produces (ec2_tar_pipe extracts into /tmp preserving each
     payload's basename, e.g. /tmp/leerie-seed.bundle,
     /tmp/leerie-subs/<bn>.bundle) — these are NOT renamed on the way in.
-    See tests/ec2_stub.py::make_ssm_stub_aws for the shared mechanics.
+    See tests/ec2_stub.py::make_remote_exec_stub for the shared mechanics.
     """
-    ec2_stub.make_ssm_stub_aws(
+    ec2_stub.make_remote_exec_stub(
         stub_path,
         exec_log,
         dest_dir,

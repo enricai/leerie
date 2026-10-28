@@ -461,3 +461,130 @@ def test_wait_for_instance_ready_returns_early_on_terminal_state(tmp_path):
     assert result.returncode != 0
     assert "cannot proceed" in result.stderr.lower()
     assert "timed out" not in result.stderr.lower()
+
+
+# --- provision_instance: leerie's key reaches the caller's ssh calls --------
+
+def test_provision_exports_leeries_key_file_to_the_calling_shell(tmp_path, monkeypatch):
+    """The key pair is resolved inside $(...), whose exports die with the
+    subshell; the seed/fetch ssh calls run later in the caller's shell and
+    must still carry -i <leerie's key>. Pinned by running them there."""
+    home = tmp_path / "home"
+    monkeypatch.setenv("HOME", str(home))
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    env = _stub_env(aws_dir, {"LEERIE_EC2_KEY_NAME": "", "AWS_REGION": "us-east-1"})
+    env.pop("LEERIE_EC2_SSH_KEY_FILE", None)
+    monkeypatch.delenv("LEERIE_EC2_SSH_KEY_FILE", raising=False)
+
+    result = run_bash(
+        f"source {EC2_PROVISION_SH}; provision_instance >/dev/null && "
+        "echo \"file=$LEERIE_EC2_SSH_KEY_FILE\"; ec2_ssh_identity_args",
+        env=env,
+    )
+
+    assert result.returncode == 0, result.stderr
+    pem = home / ".leerie" / ".ec2-keys" / "123456789012" / "us-east-1" / "leerie-ssh.pem"
+    lines = result.stdout.splitlines()
+    assert lines[0] == f"file={pem}"
+    assert lines[1:5] == ["-i", str(pem), "-o", "IdentitiesOnly=yes"]
+    assert "--key-name leerie-ssh" in _run_instances_line(aws_dir)
+
+
+# --- provision_instance: instance-profile propagation retry ----------------
+
+_IAM_FLAKY_WRAPPER = """#!/usr/bin/env bash
+here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+if [ -n "${DENY_IAM:-}" ] && [ "$1" = "iam" ]; then
+  echo "An error occurred (AccessDenied) when calling the $2 operation" >&2
+  exit 254
+fi
+if [ "$1 $2" = "ec2 run-instances" ]; then
+  echo "$*" >> "$here/attempts.log"
+  n=$(wc -l < "$here/attempts.log")
+  if [ "$n" -le "${FAIL_TIMES:-0}" ]; then
+    echo "${FAIL_MSG}" >&2
+    exit 254
+  fi
+fi
+exec "$here/aws.real" "$@"
+"""
+
+_IAM_NOT_READY = ("An error occurred (InvalidParameterValue) when calling the RunInstances "
+                  "operation: Value (leerie-ssm) for parameter iamInstanceProfile.name is "
+                  "invalid. Invalid IAM Instance Profile name")
+
+
+def _flaky_aws(tmp_path: Path) -> Path:
+    aws_dir = tmp_path / "bin"
+    stub = _stub_aws(aws_dir)
+    stub.rename(aws_dir / "aws.real")
+    wrapper = aws_dir / "aws"
+    wrapper.write_text(_IAM_FLAKY_WRAPPER)
+    wrapper.chmod(0o755)
+    return aws_dir
+
+
+def _attempts(aws_dir: Path) -> int:
+    p = aws_dir / "attempts.log"
+    return len(p.read_text().splitlines()) if p.exists() else 0
+
+
+def test_run_instances_retries_while_the_profile_propagates(tmp_path):
+    aws_dir = _flaky_aws(tmp_path)
+    env = _stub_env(aws_dir, {"LEERIE_EC2_INSTANCE_PROFILE": "leerie-ssm",
+                              "FAIL_TIMES": "2", "FAIL_MSG": _IAM_NOT_READY})
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    assert result.returncode == 0, result.stderr
+    assert _attempts(aws_dir) == 3
+    assert len(read_state(aws_dir)["instances"]) == 1
+
+
+def test_other_run_instances_errors_are_not_retried(tmp_path):
+    aws_dir = _flaky_aws(tmp_path)
+    env = _stub_env(aws_dir, {
+        "LEERIE_EC2_INSTANCE_PROFILE": "leerie-ssm", "FAIL_TIMES": "5",
+        "FAIL_MSG": "An error occurred (InsufficientInstanceCapacity) when calling the RunInstances operation"})
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    assert result.returncode != 0
+    assert _attempts(aws_dir) == 1
+    assert "InsufficientInstanceCapacity" in result.stderr
+
+
+def test_profile_retry_gives_up_within_its_budget(tmp_path):
+    aws_dir = _flaky_aws(tmp_path)
+    env = _stub_env(aws_dir, {"LEERIE_EC2_INSTANCE_PROFILE": "leerie-ssm",
+                              "FAIL_TIMES": "100", "FAIL_MSG": _IAM_NOT_READY,
+                              "LEERIE_EC2_IAM_RETRY_BUDGET_S": "3"})
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    assert result.returncode != 0
+    # step 0 under test counts as 1s per attempt: 3 retries + the first try.
+    assert _attempts(aws_dir) == 4
+    assert read_state(aws_dir)["instances"] == {}
+
+
+def test_no_profile_means_no_profile_retry(tmp_path):
+    # IAM denied: no profile is passed, so the same error text cannot be a
+    # propagation delay and must fail on the first attempt.
+    aws_dir = _flaky_aws(tmp_path)
+    env = _stub_env(aws_dir, {"FAIL_TIMES": "5", "FAIL_MSG": _IAM_NOT_READY, "DENY_IAM": "1"})
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    assert result.returncode != 0
+    assert _attempts(aws_dir) == 1
+    assert "--iam-instance-profile" not in (aws_dir / "attempts.log").read_text()
+
+
+@pytest.mark.parametrize("no_push,expected", [("true", True), ("false", False), ("", False)])
+def test_sidecar_records_the_launch_time_no_push_intent(tmp_path, no_push, expected):
+    # decide_ec2_teardown reads this; the fetched run.json cannot carry it.
+    aws_dir = tmp_path / "bin"
+    _stub_aws(aws_dir)
+    state_host_dir = tmp_path / "state"
+    run_dir = state_host_dir / "runs" / "run-np1"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text("{}")
+    env = _stub_env(aws_dir, {"LEERIE_STATE_HOST_DIR": str(state_host_dir),
+                              "LEERIE_RUN_ID": "run-np1", "NO_PUSH": no_push})
+    result = run_bash(f"source {EC2_PROVISION_SH}; provision_instance", env=env)
+    assert result.returncode == 0, result.stderr
+    assert json.loads((run_dir / "ec2-instance.json").read_text())["host_no_push"] is expected
