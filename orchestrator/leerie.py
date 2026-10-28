@@ -52633,6 +52633,38 @@ async def _run_integration_judge_gate(
                             "--untracked-files=no")
     if dirty and dirty.strip():
         await run_proc(["git", "reset", "--hard", "HEAD"], cwd=str(staging))
+    flight = rec.get("in_round")
+    if isinstance(flight, dict) and flight.get("pre") \
+            and not rec.get("backing_out"):
+        # A repair round a crash interrupted reached no verdict: whatever
+        # its integrator left (an amended merge included) is undone and the
+        # round redone, its count handed back with it — kept spent, a crash
+        # in the last round would back the subtask out for a failure of the
+        # machine, not the merge (review round 2 M1).
+        log(f"  integration gate for {sid}: redoing repair round "
+            f"{flight.get('round')} a crash interrupted (reset to "
+            f"{str(flight['pre'])[:12]})")
+        await run_proc(["git", "reset", "--hard", str(flight["pre"])],
+                       cwd=str(staging))
+        rec["repair_rounds"] = max(0, int(flight.get("round") or 1) - 1)
+        rounds = rec.get("rounds") or []
+        if rounds and not rounds[-1].get("verdict"):
+            rounds[-1]["verdict"] = "interrupted"
+        rec.pop("in_round", None)
+        gates[sid] = rec
+        st.save()
+    elif rec.get("merge_commit_sha") and not rec.get("backing_out"):
+        # The recorded merge is off the branch with neither marker: never
+        # read as a back-out (an amended merge looks the same, review round
+        # 2 M1). Restored, the tree matches the record and is judged again.
+        rec_merge = str(rec["merge_commit_sha"])
+        anc = await run_proc(["git", "merge-base", "--is-ancestor",
+                              rec_merge, "HEAD"], cwd=str(staging))
+        if anc.returncode == 1:
+            log(f"  integration gate for {sid}: the recorded merge "
+                f"{rec_merge[:12]} is not on staging; restoring it")
+            await run_proc(["git", "reset", "--hard", rec_merge],
+                           cwd=str(staging))
     head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
     merge_sha = rec.get("merge_commit_sha") or head
     parents = (await _git_text(staging, "rev-list", "--parents", "-n", "1",
@@ -52674,16 +52706,9 @@ async def _run_integration_judge_gate(
                             kind="integration_backed_out")
         return False
 
-    # A back-out a crash interrupted is finished, never re-judged: by its
-    # marker, or — for one interrupted before the marker existed — by the
-    # recorded merge no longer being on staging at all.
+    # A back-out a crash interrupted is finished, never re-judged — only by
+    # its explicit marker.
     pending = rec.get("backing_out")
-    if not pending and rec.get("merge_commit_sha") and p1:
-        anc = await run_proc(["git", "merge-base", "--is-ancestor",
-                              merge_sha, "HEAD"], cwd=str(staging))
-        if anc.returncode == 1:
-            pending = ("the merge is no longer on staging (an interrupted "
-                       "back-out)")
     if pending:
         log(f"  integration gate for {sid}: finishing an interrupted "
             f"back-out ({pending})")
@@ -52736,11 +52761,16 @@ async def _run_integration_judge_gate(
         # subtask's work is finished and the defect is the merge's, so
         # rounds an earlier re-drive spent must not leave it none — a
         # back-out takes every line of the subtask out of the PR. Persisted
-        # before the round, so a resume cannot hand it back.
+        # before the round with the round's starting commit (`in_round`), so
+        # a resume redoes an interrupted round from where it started.
         done = int(rec.get("repair_rounds") or 0)
         if done >= cap or not _redrive_time_left(st, caps):
             return await _back_out(f"not repaired within {done} round(s)")
         rec["repair_rounds"] = done + 1
+        rec["in_round"] = {
+            "round": done + 1,
+            "pre": (await _git_text(staging, "rev-parse", "HEAD")
+                    or "").strip()}
         _persist()
         t0 = time.monotonic()
         try:
@@ -52751,6 +52781,7 @@ async def _run_integration_judge_gate(
                 parent_cache=parent_cache)
         finally:
             _charge_redrive_time(st, time.monotonic() - t0)
+        rec.pop("in_round", None)
         _persist()
         if outcome["verdict"] in ("design-conflict", "failed"):
             return await _back_out(

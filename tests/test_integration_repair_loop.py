@@ -657,9 +657,19 @@ def test_a_crash_between_the_back_out_reset_and_its_save_finishes_it(
     assert st2.load()
     assert st2.data["integration_gate"][SID].get("backing_out")
     if not marker:
-        # A state written before the marker existed: the merge's absence
-        # from staging is what tells the resume.
+        # Review round 2 M1: with no marker, the merge's absence from
+        # staging is never read as a back-out (an amended merge looks the
+        # same). The recorded merge is restored and judged again, so the
+        # tree and the record agree whatever the verdict.
         st2.data["integration_gate"][SID].pop("backing_out")
+        w2 = _Workers(staging, [[]])
+        assert _run(leerie, st2, staging, monkeypatch, w2) is True
+        assert w2.kinds() == ["integration_judge"]
+        assert _git(staging, "rev-parse", "HEAD").strip() == merge
+        rec = st2.data["integration_gate"][SID]
+        assert rec["accepted"] is True and rec.get("outcome") != "backed_out"
+        assert st2.data["subtask_status"][SID] == "complete"
+        return
     w2 = _Workers(staging, [[]])
     assert _run(leerie, st2, staging, monkeypatch, w2) is False
     assert w2.kinds() == []               # nothing re-judged
@@ -667,3 +677,157 @@ def test_a_crash_between_the_back_out_reset_and_its_save_finishes_it(
     assert rec["outcome"] == "backed_out" and rec["reset_to"] == p1
     assert st2.data["subtask_status"][SID] == "unconverged"
     assert _git(staging, "rev-parse", "HEAD").strip() == p1
+
+
+class _Crash(BaseException):
+    """A SIGTERM, OOM or resumable pause: nothing after it runs."""
+
+
+class _AmendOnce(_Workers):
+    """Round 1's integrator amends the merge itself (a mistake the round's
+    `descends_from_merge` check catches and resets); later rounds repair
+    with a new commit."""
+
+    async def __call__(self, **kw):
+        if kw["schema_key"] == "integrator" and not any(
+                c["schema_key"] == "integrator" for c in self.calls):
+            self.calls.append(kw)
+            (self.staging / "app.py").write_text(THEIRS)
+            _git(self.staging, "commit", "-q", "-a", "--amend", "--no-edit")
+            return {"incoming_subtask": SID, "status": "resolved",
+                    "diagnosis": None, "superseded": []}
+        return await super().__call__(**kw)
+
+
+class _TruthfulJudge(_Workers):
+    """A judge that reads the tree it is shown: a finding exactly when the
+    judged commit lacks the incoming side's function. A scripted verdict
+    list cannot stand in on resume — which verdict comes first depends on
+    where the crash fell."""
+
+    async def __call__(self, **kw):
+        if kw["schema_key"] != "integration_judge":
+            return await super().__call__(**kw)
+        self.calls.append(kw)
+        sha = kw["user_prompt"].split("Commit: ", 1)[1].split("\n", 1)[0]
+        text = _git(self.staging, "show", f"{sha.strip()}:app.py")
+        ok = "def incoming_helper_function" in text
+        return {"merge_reviewed": True, "defects": [] if ok else [DEFECT],
+                "rationale": "r"}
+
+
+def _crash_run_workers(kind: str, staging: Path) -> _Workers:
+    if kind == "amend":
+        # Judge: a finding; round 1 amends (reset, no re-judge); round 2
+        # repairs and its re-judge passes.
+        return _AmendOnce(staging, [[DEFECT], []])
+    return _Workers(staging, [[DEFECT], []])
+
+
+def _saves_in_a_full_run(leerie, tmp_path, monkeypatch, kind) -> int:
+    st, staging, _p1, _merge = _setup(leerie, tmp_path / "count")
+    n = {"saves": 0}
+    real = st.save
+
+    def counting():
+        n["saves"] += 1
+        real()
+    monkeypatch.setattr(st, "save", counting)
+    assert _run(leerie, st, staging, monkeypatch,
+                _crash_run_workers(kind, staging)) is True
+    monkeypatch.undo()
+    return n["saves"]
+
+
+def test_amend_then_crash_is_redone_not_backed_out(leerie, tmp_path,
+                                                   monkeypatch):
+    """Review round 2 M1, the reviewer's driver: the repair integrator
+    amends the merge and the process dies mid-session. The resume read the
+    merge's absence from staging as an interrupted back-out and backed the
+    whole subtask out without a judge call."""
+    st, staging, p1, merge = _setup(leerie, tmp_path)
+
+    class AmendThenCrash(_Workers):
+        async def __call__(self, **kw):
+            self.calls.append(kw)
+            if kw["schema_key"] == "integration_judge":
+                return {"merge_reviewed": True,
+                        "defects": self.verdicts.pop(0) if self.verdicts
+                        else [], "rationale": "r"}
+            (self.staging / "app.py").write_text(THEIRS)
+            _git(self.staging, "commit", "-q", "-a", "--amend", "--no-edit")
+            raise _Crash()
+
+    with pytest.raises(_Crash):
+        _run(leerie, st, staging, monkeypatch,
+             AmendThenCrash(staging, [[DEFECT]]))
+    # The amended merge is on staging, the recorded one is not.
+    assert subprocess.run(["git", "merge-base", "--is-ancestor", merge,
+                           "HEAD"], cwd=str(staging)).returncode == 1
+    st.release_lock()
+    st2 = leerie.State(st.run_dir.parent.parent, st.run_id)
+    assert st2.load()
+    rec = st2.data["integration_gate"][SID]
+    assert rec["in_round"]["round"] == 1 and rec["in_round"]["pre"] == merge
+    assert not rec.get("backing_out")
+    w2 = _Workers(staging, [[]])          # a judge that would now pass
+    assert _run(leerie, st2, staging, monkeypatch, w2) is True
+    assert w2.kinds() == ["integration_judge"]
+    rec = st2.data["integration_gate"][SID]
+    assert rec.get("outcome") != "backed_out" and rec["accepted"] is True
+    assert "in_round" not in rec
+    # The interrupted round is handed back and marked, not counted spent.
+    assert rec["repair_rounds"] == 0
+    assert rec["rounds"][-1]["verdict"] == "interrupted"
+    assert st2.data["subtask_status"][SID] == "complete"
+    assert _git(staging, "rev-parse", "HEAD").strip() == merge
+
+
+@pytest.mark.parametrize("kind", ["commit", "amend"])
+def test_a_crash_at_every_save_point_never_backs_the_subtask_out(
+        leerie, tmp_path, monkeypatch, kind):
+    """Review round 2 M1: crash after each `st.save()` of a gate run that
+    repairs its finding (with round 1 amending the merge, in `amend`), then
+    resume the way `integrate_wave` does — skip a backed-out or accepted
+    record, else re-enter the gate. At every point the merge survives on
+    staging, repaired or clean, and the subtask stays `complete`."""
+    total = _saves_in_a_full_run(leerie, tmp_path, monkeypatch, kind)
+    assert total >= 4
+    for k in range(1, total + 1):
+        st, staging, _p1, merge = _setup(leerie, tmp_path / f"k{k}")
+        real = st.save
+        n = {"saves": 0}
+
+        def crashing():
+            real()
+            n["saves"] += 1
+            if n["saves"] == k:
+                raise _Crash()
+        monkeypatch.setattr(st, "save", crashing)
+        try:
+            _run(leerie, st, staging, monkeypatch,
+                 _crash_run_workers(kind, staging))
+        except _Crash:
+            pass
+        monkeypatch.undo()
+        st.release_lock()
+        st2 = leerie.State(st.run_dir.parent.parent, st.run_id)
+        assert st2.load()
+        rec = (st2.data.get("integration_gate") or {}).get(SID) or {}
+        assert rec.get("outcome") != "backed_out", (k, rec)
+        if not rec.get("accepted"):
+            ok = _run(leerie, st2, staging, monkeypatch,
+                      _TruthfulJudge(staging, []))
+            assert ok is True, (k, st2.data["integration_gate"][SID])
+            monkeypatch.undo()
+        rec = st2.data["integration_gate"][SID]
+        assert rec["accepted"] is True, (k, rec)
+        assert rec.get("outcome") in ("clean", "repaired"), (k, rec)
+        assert "in_round" not in rec and "backing_out" not in rec, (k, rec)
+        assert st2.data["subtask_status"][SID] == "complete", k
+        assert subprocess.run(
+            ["git", "merge-base", "--is-ancestor", merge, "HEAD"],
+            cwd=str(staging)).returncode == 0, k
+        assert "def incoming_helper_function" in (
+            staging / "app.py").read_text() or rec["outcome"] == "clean", k
+        st2.release_lock()

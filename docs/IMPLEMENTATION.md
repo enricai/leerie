@@ -5702,14 +5702,22 @@ integrated_so_far, caps, st, models, efforts) -> bool`, a **repair loop**
    identity, on no ref). Pass = no gating finding and no confirmed test
    failure of either kind. Otherwise the next round gets the re-judge's
    findings plus a `test_failure` defect per confirmed failure, and the
-   stale list.
+   stale list. Each round is written ahead: `repair_rounds` and
+   `in_round: {round, pre}` (`pre` = staging HEAD) are saved in one
+   `_persist()` before `_integration_repair_round`, and `in_round` is
+   dropped in the save that follows it. On entry, before HEAD is read:
+   `backing_out` → finish the back-out (3); else `in_round` → `git reset
+   --hard <pre>`, `repair_rounds = round - 1`, the round's audit entry
+   gets `verdict: "interrupted"` when it has none, and the gate continues
+   (judge, then the loop redoes the round); else a `merge_commit_sha` that
+   is not an ancestor of HEAD (`git merge-base --is-ancestor` exit 1) →
+   `git reset --hard <merge_commit_sha>` and the gate continues.
 3. Back out (`False`) on a gating `intent_conflict`, an integrator
    `design-conflict`/`failed` during repair, or spent rounds: `backing_out:
    <reason>` saved first, then `git reset --hard <merge>^1`, then
-   `backing_out` dropped and `outcome: "backed_out"` saved (on entry, a
-   record carrying `backing_out`, or whose `merge_commit_sha` is no longer
-   an ancestor of HEAD — `git merge-base --is-ancestor` exit 1 — finishes
-   the back-out without a judge call), a `risk_register[sid]` entry
+   `backing_out` dropped and `outcome: "backed_out"` saved (on entry, only
+   a record carrying `backing_out` finishes the back-out without a judge
+   call), a `risk_register[sid]` entry
    `{kind: "integration_content_loss"}`, and `_settle_unconverged(...,
    kind="integration_backed_out")`; `integrate_wave` then records the sid
    `unconverged` in `results` and continues the wave. A repaired merge
@@ -5733,7 +5741,8 @@ bool}` (`accepted` is `not defects` on a fresh judge verdict), plus, once the
 repair loop runs, `repair_rounds`, `rounds` (one audit entry per round),
 `superseded`, `outcome` (`clean` / `repaired` / `backed_out`) and, as they
 apply, `fallback_reason`, `reset_to`, `residual_lines` / `residual_total`,
-and `backing_out` (only between a back-out's decision and its reset). A non-empty
+`backing_out` (only between a back-out's decision and its reset) and
+`in_round` (only while a repair round runs). A non-empty
 `defects` entry is mirrored to the flatter `state.data["integration_defects"][sid]`
 (a plain `list[str]`), which is what `accept-integration` clears. Both keys
 let a resume distinguish "never reviewed" (both keys absent) from "reviewed

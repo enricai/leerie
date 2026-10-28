@@ -2327,9 +2327,18 @@ Two outcomes are not failures of the integrator but facts about the work:
   the reset, so a crash between the two is finished on resume rather than
   re-judged. Re-judging it passed a synthetic merge of the reset tree and
   reported "the merge stands" for a merge no longer on the branch, with the
-  subtask still `complete` and its work silently out of the PR. A record
-  from before the marker is recognised by its merge no longer being an
-  ancestor of the run branch.
+  subtask still `complete` and its work silently out of the PR. Only that
+  marker finishes a back-out on resume. A repair round is written ahead
+  too: its starting commit is saved before the integrator runs, and a
+  resume that finds a round in flight resets the run branch to that commit
+  and redoes the round — never backs the subtask out. Inferring an
+  interrupted back-out from the merge no longer being an ancestor of the
+  run branch (review round 1) misread a round whose integrator had amended
+  the merge and then died — a mistake the round's own check would have
+  reset — and took every line of the subtask out of the PR without the
+  round it still had (review round 2 M1). A record whose merge is off the
+  branch with neither marker is restored to that merge and judged again:
+  the tree then matches the record, whatever the verdict.
 - **What still stops the run** is a state no fallback can step back from:
   `integrate.sh`'s precondition failure (the staging worktree or the subtask
   branch is missing), a failure of the back-out itself (the `git reset` to
@@ -2354,8 +2363,11 @@ re-drive and a blocked re-drive, or two advisory coverage rounds) had none
 left, so the first gating finding backed the subtask out with no repair at
 all, taking every line of its finished work out of the PR — adding tests
 could cost the feature. The bound is unchanged in kind: the counter is
-persisted before each round, so a resume cannot hand a round back, and the
-loop ends at its cap or when the run's re-drive time is spent:
+persisted before each round, and the loop ends at its cap or when the run's
+re-drive time is spent. A round a crash interrupted reached no verdict, so
+the resume that redoes it from its starting commit takes its count back
+with it; kept spent, a crash in the last round would back the subtask out
+for a failure of the machine, not of the merge:
 
 1. **The integrator is re-driven with typed findings,** never prose: the
    judge's gating `defects[]`; the lines the merge dropped; failing tests,
