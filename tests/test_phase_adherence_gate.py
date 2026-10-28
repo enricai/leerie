@@ -222,7 +222,7 @@ class TestWiringPrecedesScheduleAndValidatePlan:
         src = inspect.getsource(leerie._run_phases)
         gate_idx = src.find("phase_adherence_gate(")
         assert gate_idx != -1
-        schedule_idx = src.find("_schedule(plans)", gate_idx)
+        schedule_idx = src.find("_schedule(\n                plans", gate_idx)
         assert schedule_idx != -1, (
             "phase_adherence_gate must be called BEFORE _schedule(plans) "
             "in _run_phases's source order — a re-plan must never rebuild "

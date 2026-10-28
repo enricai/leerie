@@ -285,6 +285,20 @@ DEFAULT_CAPS = {
     # the pack stays within this many items. Bench Q7/D1 arm (c): real
     # false unmet 3/116 against 23/50 for one prompt over every item.
     "d1_pack_items": 20,
+    # Repair rounds of a committed merge the integration judge rejected
+    # (DESIGN §6 *When integration cannot succeed*): the integrator is
+    # re-driven with typed findings, then code re-checks and re-judges.
+    # Each round also draws from the subtask's shared re-drive counter
+    # (`subtask_redrive_rounds`). Exhausted -> the merge is backed out and
+    # the subtask settles `unconverged`. Bench q4 S3: 22/22 gate passes,
+    # 0/22 new test failures under B*.
+    "integration_repair_rounds": 2,
+    # Extra waves `_schedule` may add per run to serialise same-wave
+    # subtasks whose planned `files_likely_touched` intersect (DESIGN §5
+    # *Planned file overlap is serialised*). q4 overlap replay: 8/15 natural
+    # integration conflicts avoided at cap 3 (12/15 uncapped, 163 extra
+    # waves over 77 runs).
+    "overlap_extra_waves": 3,
     # Longest rate-limit reset `main()` will sleep through before it stops
     # auto-resuming and pauses resumably instead (the `out_of_credits`
     # disposition). Sized to the subscription's own windows: the five-hour
@@ -2709,6 +2723,26 @@ SCHEMAS: dict[str, dict] = {
             "resolution_summary": {"type": "string"},
             "diagnosis": {"type": ["string", "null"]},
             "confidence": _confidence_schema(["resolution"]),
+            # Integration repair only (DESIGN §6 *When integration cannot
+            # succeed*): each listed dropped line the repair did not restore,
+            # with the line now carrying its content. Recorded, never
+            # mechanically checked (the S4 re-insert was benched and dropped).
+            "superseded": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "required": ["file", "line", "by_line", "reason"],
+                    "properties": {
+                        "file": {"type": "string"},
+                        "line": {"type": "string"},
+                        "by_line": {"type": "string"},
+                        "reason": {"type": "string",
+                                   "enum": ["other_side_rewrite",
+                                            "duplicate", "moved",
+                                            "obsolete_by_merged_intent"]},
+                    },
+                },
+            },
         },
     },
     # DESIGN §6 *Finalization* "Rebase-onto-base before push" — a scoped,
@@ -3840,11 +3874,17 @@ SCHEMAS: dict[str, dict] = {
                                  "why_broken"],
                     "properties": {
                         "kind": {"type": "string",
+                                 # `intent_conflict`: the two sides' stated
+                                 # intents cannot both hold in any merged
+                                 # tree. Not repaired — the incoming
+                                 # subtask is backed out (DESIGN §6 *When
+                                 # integration cannot succeed*).
                                  "enum": ["dropped_change",
                                           "reintroduced_conflict",
                                           "call_site_mismatch",
                                           "semantic_regression",
-                                          "incomplete_resolution"]},
+                                          "incomplete_resolution",
+                                          "intent_conflict"]},
                         "concrete_scenario": {"type": "string"},
                         "location": {"type": "string"},
                         "why_broken": {"type": "string"},
@@ -11198,7 +11238,7 @@ def _partition_integration_defects(
     **Pure, and it must stay pure.** Its adapter inside `integrate_wave`
     (`_check_integration`) is invoked TWICE per judge result: once by
     `_run_checked_loop` as its `check=`, and again after the loop to decide the
-    `die()`. Any side effect on this path therefore fires at least twice per
+    repair. Any side effect on this path therefore fires at least twice per
     defect, and up to `judgment_check_rounds` + 1 times when a `WorkerError`
     retry re-invokes the judge. So the advisory text is *returned*, and the
     caller logs it exactly once.
@@ -11207,30 +11247,41 @@ def _partition_integration_defects(
     the pre-existing anti-gaming rule (a defect gates only with a concrete
     scenario and a location named) and the DESIGN §8 *Location is not coverage*
     citation downgrade."""
-    gating: list[str] = []
+    gating, advisory = _integration_defect_records(judge_result, repo_root)
+    return [_integration_defect_label(d) for d in gating], advisory
+
+
+def _integration_defect_records(judge_result: dict, repo_root: Path
+                                ) -> tuple[list[dict], list[str]]:
+    """`(gating_defects, advisory_notes)` of an `integration_judge` result —
+    the typed form `_partition_integration_defects` labels. The same two
+    filters: a defect gates only with a concrete scenario and a location
+    named, and a cited equivalent coverage downgrades it to advisory."""
+    gating: list[dict] = []
     advisory: list[str] = []
     for d in judge_result.get("defects") or []:
         if not isinstance(d, dict):
             continue
         scenario = (d.get("concrete_scenario") or "").strip()
         location = (d.get("location") or "").strip()
-        # Anti-gaming: a defect gates only with concrete scenario and location
-        # named.
         if not scenario or not location:
             continue
-        # DESIGN §8 "Location is not coverage": a dropped DUPLICATE is not
-        # behavioral breakage. Downgrade to advisory only on a citation naming
-        # a file that really exists in the merged tree; absence gates.
         cleared = _coverage_citation_clears(d, repo_root)
         if cleared:
             advisory.append(
                 f"({d.get('kind')}) {location}: {scenario} — "
                 f"equivalent coverage cited at {cleared}")
             continue
-        gating.append(
-            f"INTEGRATION_DEFECT ({d.get('kind', 'behavioral_defect')}) "
-            f"{location}: {scenario} — {d.get('why_broken', '')}")
+        gating.append({"kind": d.get("kind", "behavioral_defect"),
+                       "location": location, "concrete_scenario": scenario,
+                       "why_broken": d.get("why_broken", "")})
     return gating, advisory
+
+
+def _integration_defect_label(d: dict) -> str:
+    return (f"INTEGRATION_DEFECT ({d.get('kind', 'behavioral_defect')}) "
+            f"{d.get('location', '')}: {d.get('concrete_scenario', '')} — "
+            f"{d.get('why_broken', '')}")
 
 
 def check_overlap_judge_output(
@@ -28713,10 +28764,30 @@ def _filter_defects_already_ordered(
 
 def _repair_missing_requires(
     plans: list[dict], defects: list[dict],
+    warnings: list[dict] | None = None,
 ) -> tuple[list[dict], list[dict]]:
-    """Add the `requires` edges a `wiring_judge` defect names, where doing
-    so is unambiguous. Mutates *plans* in place. Returns
-    ``(repairs_applied, unrepaired_defects)``.
+    """Add the edges `wiring_judge` defects name. Mutates *plans* in place.
+    Returns ``(repairs_applied, unrepaired_defects)``; the only defect left
+    unrepaired is one naming a sid that is not in the plan. Typed warnings
+    for the shapes no edge can fix are appended to *warnings* when given
+    (DESIGN §5 *What is left after that is ordered, not refused*).
+
+    The unambiguous channels (`_repair_wiring_channels`) run first,
+    unchanged; the residual they leave goes through `_fanin_and_fallback`."""
+    repairs, unrepaired = _repair_wiring_channels(plans, defects)
+    if unrepaired:
+        extra, unrepaired, warns = _fanin_and_fallback(plans, unrepaired)
+        repairs.extend(extra)
+        if warnings is not None:
+            warnings.extend(warns)
+    return repairs, unrepaired
+
+
+def _repair_wiring_channels(
+    plans: list[dict], defects: list[dict],
+) -> tuple[list[dict], list[dict]]:
+    """The unambiguous repair channels of `_repair_missing_requires`.
+    Mutates *plans* in place. Returns ``(repairs_applied, residual)``.
 
     DESIGN §5 *A wiring re-check on the fully-merged plan*. The commonest
     defect this judge finds is one no planner could have avoided: planners
@@ -28750,10 +28821,10 @@ def _repair_missing_requires(
         which is exactly the intent. The ambiguity is an artifact of
         counting split siblings as rival providers.
 
-    Everything else is returned unrepaired for the caller to die() on: a
-    value that is neither a surviving id nor a provided tag means the plan
-    genuinely lacks the capability rather than the edge, and providers
-    spanning DIFFERENT clusters is an ambiguity only a human can resolve.
+    Everything else — providers spanning DIFFERENT clusters, an id edge
+    refused for a cycle, a value nothing provides — is the residual handed
+    to `_fanin_and_fallback`, which orders what it can and warns on the
+    rest.
 
     Reading only channel (a) was this function's original shape, and it
     was the dominant reason a repairable run still died. Measured across
@@ -28869,6 +28940,92 @@ def _repair_missing_requires(
         log(f"  wiring-gate: {len(already)} defect(s) named an edge the "
             f"subtask already declares — ignored ({', '.join(already)})")
     return repairs, unrepaired
+
+
+def _fanin_and_fallback(
+    plans: list[dict], residual: list[dict],
+) -> tuple[list[dict], list[dict], list[dict]]:
+    """Order each residual wiring defect's sid behind the capability it
+    names, as far as the graph allows. Mutates *plans* in place, each trial
+    cumulative against the edges already added. Returns ``(repairs,
+    unrepaired, warnings)``; only a defect whose sid is not in the plan is
+    unrepaired — the judge is then describing a plan this is not.
+
+    Frozen as q4 W (DESIGN §5): fan-in first — an in-plan `requires` on a
+    tag with at least one other provider orders the sid behind ALL of
+    them — then, when that would cycle (or the value is a surviving id
+    whose edge was refused for one), a `depends_on` per provider in sorted
+    order, skipping any provider whose edge would cycle: it is a
+    descendant of the sid, and nothing orders a subtask behind its own
+    descendant. No provider at all, every provider a descendant, or a
+    `missing_provides` (which names no edge) is a warning, never a death.
+    Bench: 0 deaths and 0 cycles on 52 replayed judge passes, where the
+    previous gate died on 15, and on 119 synthetic residuals."""
+    repairs: list[dict] = []
+    unrepaired: list[dict] = []
+    warnings: list[dict] = []
+    for d in residual:
+        by_id = {s["id"]: s for plan in plans
+                 for s in plan.get("subtasks", []) or []}
+        providers: dict[str, list[str]] = {}
+        for psid, ps in by_id.items():
+            for t in ps.get("provides", []) or []:
+                providers.setdefault(t, []).append(psid)
+        sid = d.get("sid")
+        value = (d.get("tag_or_dep") or "").strip()
+        if sid not in by_id:
+            unrepaired.append(d)
+            continue
+        if d.get("kind") == "missing_provides":
+            warnings.append({"sid": sid, "value": value,
+                             "kind": d.get("kind"),
+                             "why": "missing_provides_not_an_edge"})
+            continue
+        cands = [c for c in providers.get(value, []) if c != sid] \
+            if value else []
+        id_mode = False
+        if not cands and value in by_id and value != sid:
+            # An id the id channel refused (it would cycle): fall back
+            # straight to the per-provider edges below.
+            cands, id_mode = [value], True
+        if not cands:
+            warnings.append({"sid": sid, "value": value,
+                             "kind": d.get("kind"),
+                             "why": "no_in_plan_provider"})
+            continue
+        declared = {e.get("tag") for e in (by_id[sid].get("requires") or [])
+                    if isinstance(e, dict)}
+        if not id_mode and value not in declared:
+            fn = (lambda tr, _s=sid, _t=value: _add_requires_edge(tr, _s, _t))
+            if not _would_cycle_after(plans, fn):
+                fn(plans)
+                repairs.append({"sid": sid, "tag": value,
+                                "provider": sorted(cands)[0],
+                                "providers": sorted(cands),
+                                "channel": "fanin"})
+                continue
+        added: list[str] = []
+        skipped: list[str] = []
+        for prov in sorted(cands):
+            if prov in (by_id[sid].get("depends_on") or []):
+                added.append(prov)
+                continue
+            fn = (lambda tr, _s=sid, _p=prov: _add_depends_on_edge(tr, _s, _p))
+            if _would_cycle_after(plans, fn):
+                skipped.append(prov)
+                continue
+            fn(plans)
+            added.append(prov)
+        if added:
+            repairs.append({"sid": sid, "tag": value, "provider": added[0],
+                            "deps_added": added, "skipped_cyclic": skipped,
+                            "channel": "depends_on_fallback"})
+        else:
+            warnings.append({"sid": sid, "value": value,
+                             "kind": d.get("kind"),
+                             "why": "every_provider_is_a_descendant",
+                             "skipped": skipped})
+    return repairs, unrepaired, warnings
 
 
 def _apply_overlap_collisions(plans: list[dict],
@@ -29609,20 +29766,19 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
     The `wiring_judge` attacks the merged plan for them and gates on a
     NON-EMPTY `wiring_defects` array.
 
-    DETECT-AND-DIE, single pass. The reconciler cannot mechanically act on
-    "subtask X should also *require* Y" — its mandate is resolving already-
-    declared `requires` tags, not inventing missing edges from a semantic
-    argument — so re-driving `phase_reconcile` would re-derive the identical
-    plan, the judge would re-attack it, and after N rounds we'd `die()` anyway
-    having burned N expensive reconciliations. So this gate runs the judge ONCE
-    (a `WorkerError` gets a bounded fresh-session retry, not a re-plan) and, on
-    a found defect, `die()`s immediately with the concrete defect named — the
-    actionable outcome. A `WorkerError` that exhausts the retry degrades: the
-    plan is preserved (the deterministic `check_plan_wiring` already guarded the
-    structural channel).
+    REPAIR, single pass. The reconciler cannot mechanically act on
+    "subtask X should also *require* Y", so re-driving `phase_reconcile`
+    would re-derive the identical plan. The judge runs ONCE (a
+    `WorkerError` gets a bounded fresh-session retry, not a re-plan); its
+    findings are dismissed when the plan contradicts them, repaired by an
+    added edge (`_repair_missing_requires`: the unambiguous channels, then
+    fan-in and the `depends_on` fallback), or recorded as typed warnings.
+    It `die()`s only on a finding naming a sid not in the plan. A
+    `WorkerError` that exhausts the retry degrades: the plan is preserved
+    (the deterministic `check_plan_wiring` already guarded the structural
+    channel).
 
-    Returns `plans` unchanged (the gate does not mutate the plan; it either
-    passes it through or `die()`s)."""
+    Returns `plans`, mutated in place by any repair."""
     sys_prompt = _load_prompt("wiring_judge")
 
     payload = {
@@ -29721,7 +29877,9 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
         plans, _live, st.data.get("dropped_subtasks") or {})
     for _n in _false:
         log(f"  wiring-gate: discarded provably-false finding — {_n}")
-    repairs, unrepaired = _repair_missing_requires(plans, _live)
+    wiring_warnings: list[dict] = []
+    repairs, unrepaired = _repair_missing_requires(plans, _live,
+                                                   wiring_warnings)
     for r in repairs:
         if r.get("channel") == "id":
             log(f"  wiring-gate: repaired {r['sid']} -> depends_on "
@@ -29729,45 +29887,52 @@ async def phase_wiring_gate(plans: list[dict], task: str, st: State,
         elif r.get("channel") == "cofile_cluster":
             log(f"  wiring-gate: repaired {r['sid']} -> requires "
                 f"{r['tag']!r} (sub-file cluster of {r['provider']})")
+        elif r.get("channel") == "fanin":
+            log(f"  wiring-gate: repaired {r['sid']} -> requires "
+                f"{r['tag']!r} (fan-in behind every provider: "
+                f"{', '.join(r['providers'])})")
+        elif r.get("channel") == "depends_on_fallback":
+            log(f"  wiring-gate: repaired {r['sid']} -> depends_on "
+                f"{', '.join(r['deps_added'])} for {r['tag']!r} (fan-in "
+                "would cycle"
+                + (f"; skipped descendant(s) {', '.join(r['skipped_cyclic'])}"
+                   if r.get("skipped_cyclic") else "") + ")")
         else:
             log(f"  wiring-gate: repaired {r['sid']} -> requires "
                 f"{r['tag']!r} (sole in-plan provider: {r['provider']})")
+    for w in wiring_warnings:
+        log(f"  wiring-gate: WARNING {w['sid']} / {w['value']!r} "
+            f"({w.get('kind')}): {w['why']} — no edge can order it")
     if repairs:
         log(f"phase 3: plan-wiring gate added {len(repairs)} missing "
-            f"edge(s); {len(unrepaired)} defect(s) not auto-repairable")
+            f"edge(s); {len(wiring_warnings)} warning(s)")
 
+    # The one shape that still dies (DESIGN §5): a defect naming a subtask
+    # the plan does not contain, so no edge can be about this plan.
     remaining = [f"WIRING_DEFECT {_wiring_defect_label(d)}"
                  for d in unrepaired]
     if remaining:
         die(
-            "plan-wiring gate found unresolved semantic wiring defect(s):\n" +
+            "plan-wiring gate found wiring defect(s) naming a subtask that "
+            "is not in the plan:\n" +
             "\n".join(f"  • {i}" for i in remaining) +
-            "\nAn independent review found the plan's declared dependency "
-            "edges do not match the work the subtasks actually need (a subtask "
-            "that should require a capability it never declares, or a merge/"
-            "drop that severed a real dependency). The gate already dismissed "
-            "every finding the plan provably contradicts and added every edge "
-            "it could resolve unambiguously — on the tag channel, the "
-            "subtask-id channel, and single-sub-file-cluster fan-outs. Each "
-            "line above carries the judge's own concrete_reason for that "
-            "finding; act on those rather than on this paragraph, which cannot "
-            "know which of them applies. "
-            "This is a correctness gate "
-            "with no bypass flag: add the missing requires/provides/depends_on "
-            "to the plan, or refine the task so the cross-subtask dependencies "
-            "are unambiguous, then re-run. The plan this gate rejected is in "
-            "state.json's `plan_snapshot` — a run that dies in planning never "
-            "writes plan.json, so there is no plan file to edit. "
-            "(Note: --skip-overlap-judge does NOT "
-            "bypass this gate — it only skips the phase 2¾ overlap judge, which "
-            "runs earlier and independently. `resume` does not bypass it "
-            "either: the gate re-runs until it passes, since its skip is keyed "
-            "on a verdict this run never reached.)"
+            "\nEvery other finding was repaired by an added edge or recorded "
+            "as a warning; these cannot be, because the subtask they name "
+            "does not exist in the merged plan. Each line above carries the "
+            "judge's own concrete_reason. Refine the task so the cross-subtask "
+            "dependencies are unambiguous, then re-run. The plan this gate "
+            "rejected is in state.json's `plan_snapshot` — a run that dies in "
+            "planning never writes plan.json, so there is no plan file to "
+            "edit. This is a correctness gate with no bypass flag "
+            "(--skip-overlap-judge only skips the earlier, independent phase "
+            "2¾ overlap judge), and `resume` does not bypass it either: its "
+            "skip is keyed on a verdict this run never reached."
         )
 
     # Written ONLY on a clean pass (repairs included) — this key is the
     # resume skip condition, so a run the gate killed must not carry it.
-    st.data["wiring_gate"] = {**judge_result, "repairs": repairs}
+    st.data["wiring_gate"] = {**judge_result, "repairs": repairs,
+                              "warnings": wiring_warnings}
     st.save()
     log("phase 3: plan-wiring gate clean"
         + (f" (after {len(repairs)} repair(s))" if repairs else ""))
@@ -30391,9 +30556,76 @@ def _finish_no_work_run(st: State, no_work_map: dict[str, str],
     _log_run_weight(st.data.get("telemetry"), st)
 
 
-def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
+def _overlap_first_fit(wave: list[str],
+                       pairs: set[frozenset[str]]) -> list[list[str]]:
+    """Pack `wave` (in id order) first-fit into sub-waves so no two members
+    of a pair in `pairs` share one."""
+    out: list[list[str]] = []
+    for sid in sorted(wave):
+        for sub in out:
+            if not any(frozenset((sid, o)) in pairs for o in sub):
+                sub.append(sid)
+                break
+        else:
+            out.append([sid])
+    return out
+
+
+def _serialize_planned_overlap(
+    subtasks: dict, waves: list[list[str]], cap: int,
+) -> tuple[list[list[str]], list[list[str]]]:
+    """Split waves so same-wave subtasks whose planned
+    `files_likely_touched` intersect run in different sub-waves, adding at
+    most `cap` waves to the whole plan (DESIGN §5 *Planned file overlap is
+    serialised*). Returns ``(waves, serialised_pairs)``.
+
+    Pairs are taken largest overlap first (then wave, then ids — the order
+    is deterministic) and a pair is kept only while the plan's extra waves
+    stay within `cap`. A sub-wave still follows every predecessor of its
+    members, since it replaces its wave in place: only parallelism is
+    spent. Replayed on 77 corpus runs: 8 of 15 natural integration
+    conflicts avoided at cap 3, for 90 extra waves (q4 overlap replay)."""
+    if cap <= 0:
+        return [list(w) for w in waves], []
+
+    def _files(sid: str) -> set[str]:
+        return {str(f).strip().removeprefix("./")
+                for f in subtasks.get(sid, {}).get("files_likely_touched")
+                or [] if str(f).strip()}
+
+    cand: list[tuple[int, int, str, str]] = []
+    for wi, wave in enumerate(waves):
+        ws = sorted(wave)
+        for i in range(len(ws)):
+            for j in range(i + 1, len(ws)):
+                shared = _files(ws[i]) & _files(ws[j])
+                if shared:
+                    cand.append((-len(shared), wi, ws[i], ws[j]))
+    cand.sort()
+
+    def _extra(sel: dict[int, set[frozenset[str]]]) -> int:
+        return sum(len(_overlap_first_fit(w, sel.get(wi, set()))) - 1
+                   for wi, w in enumerate(waves))
+
+    chosen: dict[int, set[frozenset[str]]] = {}
+    kept: list[list[str]] = []
+    for _neg, wi, a, b in cand:
+        trial = {k: set(v) for k, v in chosen.items()}
+        trial.setdefault(wi, set()).add(frozenset((a, b)))
+        if _extra(trial) <= cap:
+            chosen = trial
+            kept.append([a, b])
+    out: list[list[str]] = []
+    for wi, wave in enumerate(waves):
+        out.extend(_overlap_first_fit(wave, chosen.get(wi, set())))
+    return out, kept
+
+
+def _schedule(plans: list[dict], overlap_extra_waves: int = 0
+              ) -> tuple[dict, list[list[str]]]:
     """Phase 3 (pure Python): merge plans, resolve intra- and cross-domain
-    dependencies, topologically sort into waves. Deterministic."""
+    dependencies, topologically sort into waves, then serialise planned
+    file overlap within `overlap_extra_waves` extra waves. Deterministic."""
     log("phase 3: scheduling")
     subtasks = _flatten_plans_to_subtasks(plans)
     blocked_domains: list[str] = []
@@ -30437,6 +30669,14 @@ def _schedule(plans: list[dict]) -> tuple[dict, list[list[str]]]:
         done |= set(wave)
         remaining -= set(wave)
 
+    kahn_waves = len(waves)
+    waves, serialised = _serialize_planned_overlap(
+        subtasks, waves, int(overlap_extra_waves))
+    if serialised:
+        log(f"  serialised {len(serialised)} same-wave pair(s) with "
+            f"overlapping planned files (+{len(waves) - kahn_waves} "
+            f"wave(s), cap {overlap_extra_waves}): "
+            + ", ".join(f"{a}/{b}" for a, b in serialised))
     log(f"  {len(subtasks)} subtasks across {len(waves)} wave(s)")
     return subtasks, waves
 
@@ -41868,66 +42108,482 @@ async def _rescue_integrator_work(staging: Path, sid: str,
         rescue_index.unlink(missing_ok=True)
 
 
-async def _run_integration_judge_gate(
-        sid: str, staging: Path, incoming_subtask: dict,
+# --- Integration repair (DESIGN §6 *When integration cannot succeed*) -------
+#
+# Side lines shorter than this (closers like `});`) carry no content of their
+# own and would flood the dropped-line list (q4 T2).
+_INTEGRATION_LINE_MIN = 8
+# Dropped lines shown to the repair integrator per round, sorted by file.
+_INTEGRATION_DROPPED_CAP = 80
+# Characters of one dropped line shown (and matched by `superseded.line`).
+_INTEGRATION_LINE_SHOWN = 200
+# Source extensions whose one-hop importers are found by an import-path grep.
+_INTEGRATION_JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
+# Synthetic merge objects carry a fixed identity: they are never on a ref, so
+# the operator's own identity does not belong on them and must not be needed.
+_SYNTHETIC_GIT_ENV = {"GIT_AUTHOR_NAME": "leerie",
+                      "GIT_AUTHOR_EMAIL": "leerie@localhost",
+                      "GIT_COMMITTER_NAME": "leerie",
+                      "GIT_COMMITTER_EMAIL": "leerie@localhost"}
+
+
+async def _git_text(cwd: str | Path, *args: str) -> str | None:
+    """stdout of `git <args>` in `cwd`, or None when it exits non-zero."""
+    try:
+        r = await run_proc(["git", *args], cwd=str(cwd))
+    except OSError:
+        return None
+    return r.stdout if r.returncode == 0 else None
+
+
+async def _diff_side_lines(cwd: str | Path, base: str, tip: str,
+                           path: str) -> tuple[set[str], set[str]]:
+    """`(added, removed)` stripped lines of `git diff -U0 base tip -- path`;
+    added lines shorter than `_INTEGRATION_LINE_MIN` are left out."""
+    out = await _git_text(cwd, "diff", "-U0", base, tip, "--", path) or ""
+    added: set[str] = set()
+    removed: set[str] = set()
+    for line in out.splitlines():
+        if line.startswith("+") and not line.startswith("+++"):
+            text = line[1:].strip()
+            if len(text) >= _INTEGRATION_LINE_MIN:
+                added.add(text)
+        elif line.startswith("-") and not line.startswith("---"):
+            removed.add(line[1:].strip())
+    return added, removed
+
+
+async def _integration_dropped_lines(cwd: str | Path, p1: str, p2: str,
+                                     head: str,
+                                     cap: int | None = _INTEGRATION_DROPPED_CAP
+                                     ) -> dict:
+    """The lines a merge dropped, found mechanically (DESIGN §6, bench S3).
+
+    In every file both parents changed against their merge base: each line
+    (stripped, at least `_INTEGRATION_LINE_MIN` characters) one parent added
+    that is absent from `head`'s copy of the file. A line is left off only
+    when the OTHER side's own diff deleted or rewrote that exact line — drops
+    inside conflict hunks stay on the list. Returns `{lines: [{file, side,
+    line}], total, excluded_rewritten}`; `side` is `integrated` (first
+    parent) or `incoming` (second); `lines` is capped at `cap` (None: all),
+    sorted by file."""
+    base = (await _git_text(cwd, "merge-base", p1, p2) or "").strip()
+    if not base:
+        return {"lines": [], "total": 0, "excluded_rewritten": 0}
+    changed: list[set[str]] = []
+    for tip in (p1, p2):
+        names = await _git_text(cwd, "diff", "--name-only", base, tip) or ""
+        changed.append({n for n in names.splitlines() if n})
+    lines: list[dict] = []
+    excluded = 0
+    for path in sorted(changed[0] & changed[1]):
+        shown = await _git_text(cwd, "show", f"{head}:{path}")
+        have = {ln.strip() for ln in (shown or "").splitlines()}
+        diffs = {"integrated": await _diff_side_lines(cwd, base, p1, path),
+                 "incoming": await _diff_side_lines(cwd, base, p2, path)}
+        for side, other in (("integrated", "incoming"),
+                            ("incoming", "integrated")):
+            for text in sorted(diffs[side][0] - have):
+                if text in diffs[other][1]:
+                    excluded += 1
+                    continue
+                lines.append({"file": path, "side": side,
+                              "line": text[:_INTEGRATION_LINE_SHOWN]})
+    return {"lines": lines if cap is None else lines[:cap],
+            "total": len(lines), "excluded_rewritten": excluded}
+
+
+def _uncovered_dropped_lines(dropped: list[dict], superseded: list[dict],
+                             head_files: dict[str, set[str]]) -> list[dict]:
+    """The dropped lines no `superseded` entry covers: an entry covers a line
+    when it names the same file and line and its `by_line` is a line of
+    HEAD's copy of that file (`head_files`, stripped lines per file)."""
+    covered = {(str(e.get("file") or ""), str(e.get("line") or "").strip())
+               for e in superseded if isinstance(e, dict)
+               and str(e.get("by_line") or "").strip()
+               in head_files.get(str(e.get("file") or ""), set())}
+    return [d for d in dropped if (d["file"], d["line"]) not in covered]
+
+
+def _ere_escape(text: str) -> str:
+    """Escape `text` for a POSIX extended regex (`git grep -E`)."""
+    return "".join("\\" + c if c in ".[]()*+?{}|^$\\" else c for c in text)
+
+
+async def _conflicted_area_tests(tree: str | Path, files: list[str],
+                                 globs: list[str] | None) -> list[str]:
+    """The tests of a merge's conflicted area (DESIGN §6, q4 T3): the test
+    files among `files`, plus test files that import a non-test member of
+    `files` one hop away (an import-path `git grep` on its module name — a
+    mechanical string). Only files present in `tree` are returned."""
+    tests = {f for f in files if _is_test_file(f, globs)}
+    for path in files:
+        if path in tests:
+            continue
+        name = os.path.basename(path)
+        stem = os.path.splitext(name)[0]
+        if path.endswith(".py"):
+            pattern = (r"(import|from) +([A-Za-z0-9_.]*\.)?"
+                       + _ere_escape(stem) + r"([^A-Za-z0-9_]|$)")
+            spec = ["*.py"]
+        elif path.endswith(_INTEGRATION_JS_EXTS):
+            pattern = ("[/'\"]" + _ere_escape(stem)
+                       + "(\\.(js|ts|tsx|jsx|mjs|cjs))?['\"]")
+            spec = [f"*{e}" for e in _INTEGRATION_JS_EXTS]
+        elif path.endswith(".json"):
+            pattern, spec = _ere_escape(name), [
+                f"*{e}" for e in _INTEGRATION_JS_EXTS] + ["*.py"]
+        else:
+            continue
+        hits = await _git_text(tree, "grep", "-l", "-E", pattern, "--",
+                               *spec) or ""
+        tests.update(h for h in hits.splitlines()
+                     if h and _is_test_file(h, globs))
+    return sorted(t for t in tests if (Path(tree) / t).is_file())
+
+
+async def _integration_tree(st: "State", sid: str, name: str, rev: str,
+                            caps: dict, log_path: Path) -> Path | None:
+    """A detached worktree at `rev` with the repo's deps installed, for the
+    conflicted-area tests; None when it cannot be created."""
+    wt = st.run_dir / "worktrees" / f"integ-{sid}-{name}"
+    _integration_tree_remove(st, wt)
+    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
+                          "--detach", str(wt), rev],
+                         capture_output=True, text=True, check=False)
+    if add.returncode != 0:
+        log(f"  integration-tests {sid}: could not create the {name} tree "
+            f"at {rev[:12]}: {add.stderr.strip()[:200]}")
+        return None
+    await _ensure_worktree_deps(
+        str(wt), st, caps, log_path=log_path,
+        verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+        label_prefix=f"integ-{sid}-{name}", log_prefix="integration")
+    return wt
+
+
+def _integration_tree_remove(st: "State", wt: Path) -> None:
+    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                    "--force", str(wt)], capture_output=True, check=False)
+    shutil.rmtree(wt, ignore_errors=True)
+    _DEPS_INSTALLED.discard(os.path.realpath(wt))
+
+
+async def _overlay_other_side(tree: Path, other: str, base: str,
+                              globs: list[str] | None) -> None:
+    """Apply `other`'s production files (every non-test file it changed
+    against `base`, at its version, or deleted) onto `tree` — the home
+    side's tree as it would be if only the other side's behaviour change
+    had landed (q4 S stale-test routing)."""
+    status = await _git_text(tree, "diff", "--name-status", "--no-renames",
+                             base, other) or ""
+    for row in status.splitlines():
+        code, _, path = row.partition("\t")
+        if not path or _is_test_file(path, globs):
+            continue
+        target = tree / path
+        if code.startswith("D"):
+            target.unlink(missing_ok=True)
+            continue
+        content = await run_proc(["git", "show", f"{other}:{path}"],
+                                 cwd=str(tree))
+        if content.returncode == 0:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(content.stdout)
+
+
+async def _integration_test_failures(
+        st: "State", sid: str, staging: Path, p1: str, p2: str,
+        merge_sha: str, caps: dict, *, log_path: Path,
+        parent_cache: dict) -> dict:
+    """Run the conflicted area's tests (DESIGN §6) on both parents and the
+    repaired HEAD, and type each confirmed failure.
+
+    A test failing on HEAD and on neither parent that ran it is a
+    candidate. A candidate is confirmed under B* against the parent it
+    passed on (`_confirm_new_failures`), or, when no parent has its file,
+    by `_confirm_still_failing` on HEAD. A confirmed failure is
+    `stale_by_other_side` when it also fails on every rerun of its home
+    parent's tree with the other side's production files applied (the other
+    side's deliberate change broke it: update the test, never the code),
+    else `test_failure` (fix the code). Returns `{test_failure: [...],
+    stale_by_other_side: [...], scope: [...], skipped: str | None}`.
+    `parent_cache` keeps each parent's failing IDs across rounds."""
+    out: dict = {"test_failure": [], "stale_by_other_side": [], "scope": [],
+                 "skipped": None}
+    cmd = (resolve_blt(st.repo_root).get("test") or "").strip()
+    if not cmd:
+        out["skipped"] = "no test command"
+        return out
+    globs = resolve_test_file_globs(st.repo_root)
+    changed = await _git_text(staging, "diff", "--name-only", p1,
+                              "HEAD") or ""
+    scope = await _conflicted_area_tests(
+        staging, sorted({n for n in changed.splitlines() if n}), globs)
+    out["scope"] = scope
+    if not scope:
+        out["skipped"] = "no test in the conflicted area"
+        return out
+    if _acceptance_cmd(st, scope, str(staging)) is None:
+        out["skipped"] = "no scoped runner for the conflicted area's tests"
+        return out
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
+    trees: dict[str, Path] = {}
+    id_files: dict[str, str] = parent_cache.setdefault("_id_files", {})
+    try:
+        async def _ids(tree: Path, label: str, files: list[str],
+                       limit: float = timeout) -> set[str] | None:
+            present = [f for f in files if (tree / f).is_file()]
+            if not present:
+                return set()
+            got = await _capture_failing_test_ids(
+                str(tree), cmd, st, caps, label=label, log_path=log_path,
+                timeout=limit, serial=True, files=present)
+            if got is None:
+                return None
+            id_files.update({k: v for k, v in (got.get("files") or {})
+                             .items() if v})
+            return set(got["ids"])
+
+        head_ids = await _ids(staging, f"integ-{sid}-head", scope)
+        if head_ids is None:
+            out["skipped"] = "the runner wrote no report on HEAD"
+            return out
+        parent_ids: dict[str, set[str] | None] = {}
+        parent_files: dict[str, set[str]] = {}
+        for side, rev in (("integrated", p1), ("incoming", p2)):
+            key = (rev, tuple(scope))
+            if key not in parent_cache:
+                tree = await _integration_tree(st, sid, side, rev, caps,
+                                               log_path)
+                if tree is None:
+                    parent_cache[key] = (None, set())
+                else:
+                    trees[side] = tree
+                    parent_cache[key] = (
+                        await _ids(tree, f"integ-{sid}-{side}", scope),
+                        {f for f in scope if (tree / f).is_file()})
+            parent_ids[side], parent_files[side] = parent_cache[key]
+        cand = sorted(i for i in head_ids
+                      if not any(ids is not None and i in ids
+                                 for ids in parent_ids.values()))
+        if not cand:
+            return out
+
+        async def _tree_for(side: str) -> Path | None:
+            if side not in trees:
+                tree = await _integration_tree(
+                    st, sid, side, p1 if side == "integrated" else p2,
+                    caps, log_path)
+                if tree is None:
+                    return None
+                trees[side] = tree
+            return trees[side]
+
+        def _home(cid: str) -> str | None:
+            # The parent whose run had the test's file and did not fail it.
+            f = id_files.get(cid)
+            for side in ("integrated", "incoming"):
+                ids = parent_ids.get(side)
+                has_file = f is None or f in parent_files.get(side, set())
+                if ids is not None and cid not in ids and has_file:
+                    return side
+            return None
+
+        def _file(cid: str) -> list[str]:
+            f = id_files.get(cid)
+            return [f] if f in scope else scope
+
+        confirmed: list[tuple[str, str | None]] = []
+        by_home: dict[str | None, list[str]] = {}
+        for cid in cand:
+            by_home.setdefault(_home(cid), []).append(cid)
+        for home, ids in by_home.items():
+            files = sorted({f for c in ids for f in _file(c)})
+
+            async def _final(left: float, _f=files) -> set[str] | None:
+                return await _ids(staging, f"integ-{sid}-confirm-head", _f,
+                                  left)
+            if home is None:
+                verdict = await _confirm_still_failing(
+                    ids, _final, caps, label=f"integration {sid}")
+                confirmed += [(c, None) for c in verdict["confirmed"]]
+                continue
+            tree = await _tree_for(home)
+            if tree is None:
+                continue
+
+            async def _base(left: float, _t=tree, _f=files,
+                            _h=home) -> set[str] | None:
+                return await _ids(_t, f"integ-{sid}-confirm-{_h}", _f, left)
+            verdict = await _confirm_new_failures(
+                ids, _base, _final, caps, label=f"integration {sid}")
+            confirmed += [(c, home) for c in verdict["new"]]
+        if not confirmed:
+            return out
+        base = (await _git_text(staging, "merge-base", p1, p2) or "").strip()
+        for home in sorted({h for _c, h in confirmed if h is not None}):
+            ids = [c for c, h in confirmed if h == home]
+            other = p2 if home == "integrated" else p1
+            overlay = await _integration_tree(
+                st, sid, f"overlay-{home}", p1 if home == "integrated"
+                else p2, caps, log_path)
+            stale: list[str] = []
+            if overlay is not None and base:
+                trees[f"overlay-{home}"] = overlay
+                await _overlay_other_side(overlay, other, base, globs)
+                files = sorted({f for c in ids for f in _file(c)})
+
+                async def _ov(left: float, _t=overlay,
+                              _f=files) -> set[str] | None:
+                    return await _ids(_t, f"integ-{sid}-overlay", _f, left)
+                stale = (await _confirm_still_failing(
+                    ids, _ov, caps,
+                    label=f"integration {sid} overlay"))["confirmed"]
+            for cid in ids:
+                if cid in stale:
+                    out["stale_by_other_side"].append({
+                        "test_id": cid, "home_side": home,
+                        "other_side": ("incoming" if home == "integrated"
+                                       else "integrated")})
+                else:
+                    out["test_failure"].append(cid)
+        out["test_failure"] += [c for c, h in confirmed if h is None]
+        return out
+    finally:
+        for tree in trees.values():
+            _integration_tree_remove(st, tree)
+
+
+def _integration_test_defect(test_id: str) -> dict:
+    return {"kind": "test_failure", "location": test_id,
+            "concrete_scenario": ("passes on a parent, fails on every rerun "
+                                  "of the merged tree (confirmed under B*); "
+                                  "not explained by the other side's "
+                                  "production change alone"),
+            "why_broken": "the merge broke behaviour this test checks"}
+
+
+def _incoming_subtask_view(leerie_dir: Path, sid: str,
+                           result: dict | None) -> dict:
+    """The incoming subtask as the integration gate sees it: its intent
+    from its own spec (`subtasks/<sid>.json` — an implementer result carries
+    none), and its criteria from the settle result, else the spec."""
+    view = dict(result or {})
+    try:
+        spec = json.loads((leerie_dir / "subtasks" / f"{sid}.json")
+                          .read_text())
+    except (OSError, ValueError):
+        spec = {}
+    if not isinstance(spec, dict):
+        spec = {}
+    if not view.get("intent"):
+        view["intent"] = spec.get("intent", "")
+    if not view.get("criteria_results"):
+        view["criteria_results"] = spec.get("criteria") or []
+    return view
+
+
+async def _wave_sids_integrated_before(staging: Path, run_id: str,
+                                       sids: list[str], rev: str) -> list[str]:
+    """The `sids` whose subtask branch is already merged into `rev` — the
+    already-integrated list a resumed gate would otherwise see empty."""
+    out: list[str] = []
+    for s in sids:
+        branch = f"refs/heads/leerie/subtasks/{run_id}/{s}"
+        try:
+            r = await run_proc(["git", "merge-base", "--is-ancestor", branch,
+                                rev], cwd=str(staging))
+        except OSError:
+            continue
+        if r.returncode == 0:
+            out.append(s)
+    return out
+
+
+def _integration_repair_prompt(leerie_dir: Path, sid: str,
+                               integrated: list[str], merge_sha: str,
+                               head: str, findings: list[dict],
+                               dropped: list[dict], stale: list[dict]) -> str:
+    """The repair integrator's user prompt: every input typed JSON, never a
+    judge's prose re-worded (DESIGN §12)."""
+    return (
+        "INTEGRATION REPAIR (re-drive after the integration gate rejected a "
+        "committed merge).\n"
+        f"LEERIE_DIR is {leerie_dir}.\n"
+        f"Incoming subtask: {sid}\n"
+        "Already-integrated subtasks it may conflict with: "
+        f"{', '.join(integrated) or 'none'}\n"
+        f"Merge commit under repair: {merge_sha} (committed to this staging "
+        f"worktree; HEAD is {head})\n\n"
+        "This is NOT a mid-merge conflict: the merge is committed and "
+        "textually clean. The gate found the problems below in the merged "
+        "result. Each finding is typed JSON (`test_failure` findings are "
+        "tests that pass on a parent and fail on the merged tree — fix the "
+        "code):\n\n"
+        + json.dumps(findings, indent=2) + "\n\n"
+        "LINES DROPPED BY THE MERGE (found mechanically): each line below was "
+        "added by one side, relative to the two sides' merge base, in a file "
+        "both sides changed, and is absent from the current tree. For EACH "
+        "line: restore it, or — only when the merged result deliberately "
+        "replaces it — list it in `superseded` as {file, line (exactly as "
+        "shown), by_line (the exact line now in the file that carries its "
+        "content), reason}. This list may be empty.\n\n"
+        + json.dumps(dropped, indent=1) + "\n\n"
+        "STALE TESTS (`stale_by_other_side`, found mechanically): each test "
+        "below passes on its own side but ALSO fails when only the other "
+        "side's production changes are applied to that side, so the other "
+        "side's deliberate behaviour change is what breaks it. Update each "
+        "such test to assert the behaviour the other side's change "
+        "established. Never change production code to make a stale test "
+        "pass, and never revert either side's change. This list may be "
+        "empty.\n\n"
+        + json.dumps(stale, indent=1) + "\n\n"
+        "Your job, in this worktree:\n"
+        "1. Read the incoming subtask's and each named already-integrated "
+        "subtask's spec and criteria (LEERIE_DIR/subtasks/<id>.json, "
+        "LEERIE_DIR/criteria/<id>.md) so the fix preserves every side's "
+        "intent.\n"
+        "2. Fix the findings, restore the dropped lines above, and update "
+        "the stale tests as instructed, on the merged tree. Do not revert "
+        "either side's change wholesale, and do not touch unrelated files.\n"
+        "3. Commit the fix as ONE new commit on top of HEAD (do not amend, "
+        f"reset or rebase). Subject: `leerie: integration repair {sid}`.\n"
+        "4. If a finding or a list above names a test, run that test file "
+        "only (never the full suite, never run_in_background).\n\n"
+        "Return the integrator JSON object, with `superseded` for every "
+        "listed line you did not restore: status `resolved` once the fix "
+        "is committed; `design-conflict` if the two intents cannot both be "
+        "preserved (explain in `diagnosis`); `failed` otherwise."
+    )
+
+
+async def _integration_judge_verdict(
+        sid: str, staging: Path, rev: str, incoming: dict,
         integrated_so_far: list[str], caps: dict, st: State,
-        models: dict[str, str], efforts: dict[str, str | None]) -> None:
-    """Invoke `integration_judge` against the merge already committed to
-    `staging` for `sid`, persist the verdict to
-    `state.data["integration_gate"][sid]` (and `["integration_defects"][sid]`
-    on a gating finding) BEFORE `die()`ing, and `die()` on an unresolved
-    (not-yet-`accepted`) defect.
-
-    Called from two places in `integrate_wave`: right after an integrator
-    commits a conflict resolution (the normal path), and — on `resume` —
-    directly against a merge a *prior* invocation already committed and the
-    judge already rejected (`accept-integration` not yet run for this sid).
-    Both call sites need the identical invoke/partition/persist/die
-    sequence; unifying them is what lets a resume re-invoke the judge
-    without re-driving `integrate.sh`/the integrator, which would just see
-    the branch already merged and short-circuit past the judge entirely.
-
-    Skipped entirely when `st.data["skip_integration_check"]` is set —
-    a full-phase bypass, independent of the accept-integration/audit-key
-    mechanism (DESIGN §8).
-    """
-    if st.data.get("skip_integration_check"):
-        log(f"  integration gate skipped for {sid} (--skip-integration-check "
-            f"/ {SKIP_INTEGRATION_CHECK_ENV} / skip_integration_check=true)")
-        return
-    sys_prompt_judge = _load_prompt("integration_judge")
+        models: dict[str, str], efforts: dict[str, str | None]
+        ) -> tuple[list[dict], list[str]] | None:
+    """One `integration_judge` review of the merge commit `rev` (a synthetic
+    merge of a repaired tree over both parents re-judges it whole, with no
+    prior findings shown). `(gating, advisories)`, or None when the judge
+    crashed every round."""
     repo_root = Path(os.getcwd())
-
-    # Build context: the merged diff, both parent subtask intents, and
-    # the list of already-integrated subtasks that were potential
-    # conflict sources.
-    merge_head_sha = (await run_proc(
-        ["git", "rev-parse", "HEAD"], cwd=str(staging)
-    )).stdout.strip()
-    merge_diff = (await run_proc(
-        ["git", "show", "--format=%B", merge_head_sha],
-        cwd=str(staging)
-    )).stdout
-
-    payload_judge = {
-        "sid": sid,
-        "incoming_intent": incoming_subtask.get("intent", ""),
-        "incoming_criteria": incoming_subtask.get("criteria_results", []),
-        "integrated_so_far": list(integrated_so_far),
-        "merge_commit_sha": merge_head_sha,
-        "merge_diff": merge_diff,
-    }
+    sys_prompt_judge = _load_prompt("integration_judge")
+    merge_diff = (await run_proc(["git", "show", "--format=%B", rev],
+                                 cwd=str(staging))).stdout
+    intent = incoming.get("intent", "")
 
     async def _invoke_integration_judge() -> dict:
         st.bump_workers(caps)
         user_prompt = (
             f"CONFLICT RESOLUTION TO REVIEW:\n"
             f"Incoming subtask: {sid}\n"
-            f"Intent: {payload_judge['incoming_intent']}\n\n"
+            f"Intent: {intent}\n\n"
             f"Already-integrated subtasks: "
-            f"{', '.join(payload_judge['integrated_so_far']) or 'none'}\n\n"
+            f"{', '.join(integrated_so_far) or 'none'}\n\n"
             f"MERGED RESULT:\n"
-            f"Commit: {merge_head_sha}\n\n"
+            f"Commit: {rev}\n\n"
             f"{merge_diff}\n\n"
             f"Attack the merged result for behavioral breakage. "
             f"Return only the JSON object per your schema."
@@ -41944,16 +42600,10 @@ async def _run_integration_judge_gate(
         )
 
     def _check_integration(judge_result: dict) -> list[str]:
-        # Thin adapter for `_run_checked_loop`'s `check=` contract.
-        # Deliberately side-effect free: this runs once per round
-        # inside the loop AND again after it, so logging here would
-        # emit each advisory 2-4 times. The post-loop call site logs
-        # the advisory list once.
+        # Side-effect free: `_run_checked_loop` calls it per round and the
+        # caller partitions again after; advisories are logged once there.
         return _partition_integration_defects(judge_result, repo_root)[0]
 
-    # No make_feedback_prompt: detect-and-die, single pass. The
-    # integrator cannot mechanically fix a semantic finding without
-    # re-resolving the conflict from scratch.
     judge_result, judge_warnings = await _run_checked_loop(
         invoke=_invoke_integration_judge,
         check=_check_integration,
@@ -41962,58 +42612,420 @@ async def _run_integration_judge_gate(
     )
     for w in judge_warnings:
         log(f"  integration-judge-{sid}: {w}")
-
     if judge_result is None:
-        # The judge crashed every round (infrastructure). The merge is
-        # already committed and passed the mechanical checks, so degrade
-        # rather than undo it. Nothing is persisted — a WorkerError
-        # degrade never reached a verdict, so a resume should re-attempt
-        # the gate rather than inherit one.
-        log(f"  ⚠  integration-judge for {sid} crashed every round; "
-            "degrading (merge preserved, check_merge_committed already ran)")
-        return
-
-    # The single place advisories are logged — see
-    # `_partition_integration_defects`' docstring for why this is
-    # not done inside `_check_integration`.
-    remaining_defects, advisories = _partition_integration_defects(
-        judge_result, repo_root)
+        return None
+    gating, advisories = _integration_defect_records(judge_result, repo_root)
     for a in advisories:
         log(f"  ⚠  integration-judge-{sid}: advisory {a}")
+    return gating, advisories
 
-    # Persisted BEFORE die()ing (unlike wiring_gate, which is written only
-    # on a clean pass) — the point is a resume must be able to tell "not
-    # yet reviewed" from "reviewed and rejected" so it knows to re-invoke
-    # the judge rather than silently skip past a rejected merge.
-    st.data.setdefault("integration_gate", {})[sid] = {
-        "defects": remaining_defects,
-        "advisories": advisories,
-        "merge_commit_sha": merge_head_sha,
-        "accepted": not remaining_defects,
-    }
-    if remaining_defects:
-        st.data.setdefault("integration_defects", {})[sid] = remaining_defects
-    else:
-        st.data.get("integration_defects", {}).pop(sid, None)
-    st.save()
 
-    if remaining_defects:
-        # Found behavioral breakage. Unlike the wiring gate (pre-merge),
-        # we already have a committed merge, so the abort instruction
-        # differs.
-        die(
-            f"integration gate found behavioral defect(s) in the merge "
-            f"for {sid}:\n" +
-            "\n".join(f"  • {d}" for d in remaining_defects) +
-            f"\n\nAn independent review found the merge is textually "
-            f"clean (no conflict markers, committed) but behaviorally "
-            f"broken. The merge has been committed to staging. Either "
-            f"revert it manually and resolve the conflict differently "
-            f"then re-run with resume, revise one of the conflicting "
-            f"subtasks' approaches then re-run with resume, or accept "
-            f"the finding with `leerie accept-integration "
-            f"{st.run_id} {sid}` and re-run with resume."
-        )
+async def _synthetic_merge(staging: Path, head: str, p1: str, p2: str,
+                           message_of: str) -> str | None:
+    """A merge object of `head`'s tree over both parents, on no ref, so the
+    repaired result is judged as one whole merge."""
+    msg = await _git_text(staging, "log", "-1", "--format=%B", message_of)
+    r = await run_proc(["git", "commit-tree", f"{head}^{{tree}}", "-p", p1,
+                        "-p", p2, "-m", (msg or "").strip() or "merge"],
+                       cwd=str(staging),
+                       env={**os.environ, **_SYNTHETIC_GIT_ENV})
+    sha = r.stdout.strip()
+    return sha if r.returncode == 0 and sha else None
+
+
+def _record_integration_loss(st: State, sid: str, detail: str,
+                             where: list[str]) -> None:
+    """Put residual integration content loss on the subtask's risk-register
+    entries, which both PR-body renderers already show."""
+    reg = st.data.setdefault("risk_register", {})
+    entries = reg.get(sid)
+    if not isinstance(entries, list):
+        entries = []
+    entries.append({"kind": "integration_content_loss", "detail": detail,
+                    "where": ", ".join(sorted(set(where))[:5])})
+    reg[sid] = entries
+
+
+async def _run_integration_judge_gate(
+        sid: str, staging: Path, incoming_subtask: dict,
+        integrated_so_far: list[str], caps: dict, st: State,
+        models: dict[str, str], efforts: dict[str, str | None]) -> bool:
+    """Review the merge committed to `staging` for `sid` with
+    `integration_judge` and repair what it finds (DESIGN §6 *When
+    integration cannot succeed*). True when the merge stands, False when
+    it was backed out (staging reset to the merge's first parent, `sid`
+    settled `unconverged`).
+
+    Each verdict is persisted to `state.data["integration_gate"][sid]`
+    before anything else happens. A gating finding re-drives the
+    integrator on the committed merge with typed `defects[]`, the dropped
+    side lines (`_integration_dropped_lines`) and routed test failures, at
+    most `integration_repair_rounds` rounds, each drawn from the subtask's
+    shared re-drive counter. Code then checks the round, in order: a new
+    commit descending from the merge, a clean tracked tree with no
+    conflict marker; a full re-judge of a synthetic merge of the repaired
+    tree; the conflicted area's tests on both parents and HEAD under B*
+    (`_integration_test_failures`). A typed `intent_conflict`, an
+    integrator `design-conflict`/`failed`, or spent rounds back the subtask
+    out instead of killing the run.
+
+    Called from two places in `integrate_wave`: right after an integrator
+    commits a conflict resolution, and on `resume` against a merge a prior
+    invocation already committed whose record is neither accepted nor
+    backed out. Skipped entirely under `skip_integration_check`."""
+    if st.data.get("skip_integration_check"):
+        log(f"  integration gate skipped for {sid} (--skip-integration-check "
+            f"/ {SKIP_INTEGRATION_CHECK_ENV} / skip_integration_check=true)")
+        return True
+    leerie_dir = staging.parent.parent
+    log_path = leerie_dir / "logs" / f"integration-{sid}.log"
+    gates = st.data.setdefault("integration_gate", {})
+    rec = dict(gates.get(sid) or {})
+    # A resumed gate can find a round's uncommitted edits: staging is
+    # orchestrator-owned, so they are discarded.
+    dirty = await _git_text(staging, "status", "--porcelain",
+                            "--untracked-files=no")
+    if dirty and dirty.strip():
+        await run_proc(["git", "reset", "--hard", "HEAD"], cwd=str(staging))
+    head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
+    merge_sha = rec.get("merge_commit_sha") or head
+    parents = (await _git_text(staging, "rev-list", "--parents", "-n", "1",
+                               merge_sha) or "").split()
+    p1, p2 = (parents[1], parents[2]) if len(parents) == 3 else ("", "")
+    judged = head
+    if p1 and head != merge_sha:
+        judged = await _synthetic_merge(staging, head, p1, p2,
+                                        merge_sha) or head
+    verdict = await _integration_judge_verdict(
+        sid, staging, judged, incoming_subtask, integrated_so_far, caps, st,
+        models, efforts)
+    if verdict is None:
+        # Infrastructure, not a verdict: the merge passed the mechanical
+        # checks, so degrade rather than undo it. Nothing new is persisted.
+        log(f"  ⚠  integration-judge for {sid} crashed every round; "
+            "degrading (merge preserved, check_merge_committed already ran)")
+        return True
+    gating, advisories = verdict
+
+    def _persist() -> None:
+        gates[sid] = rec
+        if rec.get("accepted") or rec.get("outcome") == "backed_out":
+            st.data.get("integration_defects", {}).pop(sid, None)
+        else:
+            st.data.setdefault("integration_defects", {})[sid] = list(
+                rec.get("defects") or [])
+        if not st.data.get("integration_defects"):
+            st.data.pop("integration_defects", None)
+        st.save()
+
+    rec.update({"defects": [_integration_defect_label(d) for d in gating],
+                "advisories": advisories, "merge_commit_sha": merge_sha,
+                "accepted": not gating})
+    _persist()
+
+    async def _back_out(reason: str) -> bool:
+        await run_proc(["git", "reset", "--hard", f"{merge_sha}^1"],
+                       cwd=str(staging))
+        rec.update({"accepted": False, "outcome": "backed_out",
+                    "fallback_reason": reason,
+                    "reset_to": (await _git_text(staging, "rev-parse",
+                                                 "HEAD") or "").strip()})
+        _persist()
+        _record_integration_loss(
+            st, sid, f"backed out of the run branch ({reason}); none of "
+            f"{sid}'s work is in this PR", [])
+        _settle_unconverged(st, sid, f"integration backed out: {reason}",
+                            previous_status="complete",
+                            kind="integration_backed_out")
+        return False
+
+    if not gating:
+        if rec.get("repair_rounds"):
+            await _finish_repaired(st, sid, staging, p1, p2, rec)
+            rec["outcome"] = "repaired"
+        else:
+            rec.setdefault("outcome", "clean")
+        _persist()
+        return True
+    if not p1:
+        # Not a two-parent merge (cannot happen after an integrator commit):
+        # there is nothing to back out to, so keep the old verdict.
+        log(f"  ⚠  integration gate for {sid}: {merge_sha[:12]} is not a "
+            "merge commit; the finding is recorded, not repaired")
+        return True
+
+    findings = list(gating)
+    stale: list[dict] = []
+    parent_cache: dict = {}
+    cap = int(caps.get("integration_repair_rounds",
+                       DEFAULT_CAPS["integration_repair_rounds"]))
+    while True:
+        if any(d.get("kind") == "intent_conflict" for d in findings):
+            return await _back_out("intent_conflict: the two sides' intents "
+                                   "cannot both hold")
+        done = int(rec.get("repair_rounds") or 0)
+        if done >= cap or not _redrive_allowed(st, caps, sid):
+            return await _back_out(f"not repaired within {done} round(s)")
+        _consume_redrive(st, sid)
+        rec["repair_rounds"] = done + 1
+        _persist()
+        t0 = time.monotonic()
+        try:
+            outcome = await _integration_repair_round(
+                sid, staging, merge_sha, p1, p2, findings, stale,
+                incoming_subtask, integrated_so_far, caps, st, models,
+                efforts, rec=rec, log_path=log_path,
+                parent_cache=parent_cache)
+        finally:
+            _charge_redrive_time(st, time.monotonic() - t0)
+        _persist()
+        if outcome["verdict"] in ("design-conflict", "failed"):
+            return await _back_out(
+                f"integrator {outcome['verdict']} during repair: "
+                f"{outcome.get('diagnosis') or 'no diagnosis'}")
+        if outcome["verdict"] == "pass":
+            rec.update({"accepted": True, "outcome": "repaired",
+                        "defects": []})
+            await _finish_repaired(st, sid, staging, p1, p2, rec)
+            _persist()
+            log(f"  integration gate for {sid}: repaired in "
+                f"{rec['repair_rounds']} round(s)")
+            return True
+        if outcome["verdict"] == "checked":
+            findings = outcome["findings"]
+            stale = outcome["stale"]
+            rec["defects"] = [_integration_defect_label(d) for d in findings]
+
+
+async def _integration_repair_round(
+        sid: str, staging: Path, merge_sha: str, p1: str, p2: str,
+        findings: list[dict], stale: list[dict], incoming: dict,
+        integrated_so_far: list[str], caps: dict, st: State,
+        models: dict[str, str], efforts: dict[str, str | None], *,
+        rec: dict, log_path: Path, parent_cache: dict) -> dict:
+    """One integration repair round. `verdict` is `pass`, `checked` (with
+    the next round's `findings` / `stale`), `mech_fail` / `crashed` (the
+    round is spent, staging reset to where it started, findings unchanged)
+    or the integrator's `design-conflict` / `failed`."""
+    leerie_dir = staging.parent.parent
+    pre = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
+    dropped = await _integration_dropped_lines(staging, p1, p2, pre)
+    entry: dict = {"round": int(rec.get("repair_rounds") or 0), "pre": pre,
+                   "dropped_listed": len(dropped["lines"]),
+                   "dropped_total": dropped["total"],
+                   "dropped_excluded_rewritten": dropped["excluded_rewritten"],
+                   "findings_in": len(findings), "stale_in": len(stale)}
+    rec.setdefault("rounds", []).append(entry)
+    prompt = _integration_repair_prompt(
+        leerie_dir, sid, integrated_so_far, merge_sha, pre, findings,
+        dropped["lines"], stale)
+    sys_prompt = _load_prompt("integrator")
+
+    async def _invoke_repair() -> dict:
+        st.bump_workers(caps)
+        return await claude_p(
+            user_prompt=prompt, system_prompt=sys_prompt,
+            schema_key="integrator", cwd=str(staging),
+            allowed_tools=ACT_TOOLS, max_turns=60,
+            autonomous=True, caps=caps, st=st,
+            model=models["integrator"], effort=efforts["integrator"],
+            sid=f"integrator-repair-{sid}")
+
+    ires, warnings = await _run_checked_loop(
+        invoke=_invoke_repair, check=lambda r: check_integrator_output(r),
+        name=f"integrator-repair-{sid}",
+        max_rounds=caps["judgment_check_rounds"], log_path=log_path)
+    for w in warnings:
+        log(f"  integrator-repair-{sid}: {w}")
+
+    async def _reset(verdict: str) -> dict:
+        await run_proc(["git", "reset", "--hard", pre], cwd=str(staging))
+        entry["verdict"] = verdict
+        return {"verdict": verdict}
+
+    if ires is None:
+        return await _reset("crashed")
+    status = ires.get("status")
+    entry["integrator_status"] = status
+    sup = [e for e in (ires.get("superseded") or []) if isinstance(e, dict)]
+    if sup:
+        rec.setdefault("superseded", []).extend(sup)
+    if status in ("design-conflict", "failed"):
+        await _reset(status)
+        return {"verdict": status, "diagnosis": ires.get("diagnosis")
+                or ires.get("resolution_summary")}
+    head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
+    descends = (await run_proc(["git", "merge-base", "--is-ancestor",
+                                merge_sha, head], cwd=str(staging))
+                ).returncode == 0
+    clean = not (await _git_text(staging, "status", "--porcelain",
+                                 "--untracked-files=no") or "").strip()
+    markers = await _scan_conflict_markers(staging)
+    mech = {"new_commit": bool(head) and head != pre,
+            "descends_from_merge": descends, "clean": clean,
+            "no_markers": markers is None}
+    entry["mech"] = mech
+    entry["head"] = head
+    if status != "resolved" or not all(mech.values()):
+        log(f"  integration repair {sid}: round {entry['round']} failed its "
+            f"mechanical checks ({', '.join(k for k, v in mech.items() if not v) or status}); "
+            "reset")
+        return await _reset("mech_fail")
+    tests = await _integration_test_failures(
+        st, sid, staging, p1, p2, merge_sha, caps, log_path=log_path,
+        parent_cache=parent_cache)
+    entry["tests"] = {k: tests[k] for k in ("test_failure",
+                                            "stale_by_other_side", "skipped")}
+    entry["tests"]["scope"] = len(tests["scope"])
+    if tests["skipped"]:
+        log(f"  integration repair {sid}: conflicted-area tests skipped "
+            f"({tests['skipped']})")
+    synthetic = await _synthetic_merge(staging, head, p1, p2, merge_sha)
+    verdict = await _integration_judge_verdict(
+        sid, staging, synthetic or head, incoming, integrated_so_far, caps,
+        st, models, efforts)
+    if verdict is None:
+        # The re-judge crashed: the round reached no verdict on the repair.
+        entry["verdict"] = "rejudge_crashed"
+        return {"verdict": "checked", "findings": findings, "stale": stale}
+    gating, _adv = verdict
+    entry["judge_gating"] = [_integration_defect_label(d) for d in gating]
+    if not gating and not tests["test_failure"] \
+            and not tests["stale_by_other_side"]:
+        entry["verdict"] = "pass"
+        return {"verdict": "pass"}
+    entry["verdict"] = "checked"
+    return {"verdict": "checked",
+            "findings": gating + [_integration_test_defect(t)
+                                  for t in tests["test_failure"]],
+            "stale": tests["stale_by_other_side"]}
+
+
+async def _finish_repaired(st: State, sid: str, staging: Path, p1: str,
+                           p2: str, rec: dict) -> None:
+    """Record the dropped lines a repaired merge still lacks and no
+    `superseded` entry covers, as residual content loss the PR reports."""
+    if not p1:
+        return
+    dropped = await _integration_dropped_lines(staging, p1, p2, "HEAD",
+                                               cap=None)
+    head_files: dict[str, set[str]] = {}
+    for f in {e.get("file") for e in rec.get("superseded") or []
+              if isinstance(e, dict) and e.get("file")}:
+        shown = await _git_text(staging, "show", f"HEAD:{f}")
+        head_files[str(f)] = {ln.strip() for ln in (shown or "").splitlines()}
+    residual = _uncovered_dropped_lines(dropped["lines"],
+                                        rec.get("superseded") or [],
+                                        head_files)
+    rec["residual_lines"] = residual[:_INTEGRATION_DROPPED_CAP]
+    rec["residual_total"] = len(residual)
+    if residual:
+        _record_integration_loss(
+            st, sid, f"{len(residual)} line(s) one side added are absent "
+            "after the repaired merge and were not marked superseded (state."
+            f"json integration_gate.{sid}.residual_lines)",
+            [d["file"] for d in residual])
+
+
+_JSON_MISSING = object()
+
+
+def _json_key_merge3(base: object, ours: object, theirs: object,
+                     path: str = "") -> tuple[object, list[str]]:
+    """Three-way merge of parsed JSON at key level (DESIGN §6 *A conflict
+    confined to JSON files is merged by key*). Returns `(merged,
+    conflicts)`: a key only one side changed takes that side (a side that
+    deleted it deletes it), objects both sides changed recurse, and a key
+    both sides set to different values is a conflict (ours is kept in
+    `merged`; the caller must not use it). Key order is ours, then the keys
+    only theirs has. Frozen from the q4 overlap replay's registry merge."""
+    if not all(isinstance(x, dict) for x in (base, ours, theirs)):
+        if ours == theirs or theirs == base:
+            return ours, []
+        if ours == base:
+            return theirs, []
+        return ours, [path or "/"]
+    assert isinstance(base, dict) and isinstance(ours, dict) \
+        and isinstance(theirs, dict)
+    out: dict = {}
+    conflicts: list[str] = []
+    for key in [*ours, *(k for k in theirs if k not in ours)]:
+        bv = base.get(key, _JSON_MISSING)
+        ov = ours.get(key, _JSON_MISSING)
+        tv = theirs.get(key, _JSON_MISSING)
+        if ov == tv:
+            value = ov
+        elif ov == bv:
+            value = tv
+        elif tv == bv:
+            value = ov
+        elif isinstance(ov, dict) and isinstance(tv, dict):
+            value, sub = _json_key_merge3(bv if isinstance(bv, dict) else {},
+                                          ov, tv, f"{path}/{key}")
+            conflicts += sub
+        else:
+            conflicts.append(f"{path}/{key}")
+            value = ov
+        if value is not _JSON_MISSING:
+            out[key] = value
+    return out, conflicts
+
+
+def _json_indent(text: str) -> str | int:
+    """The indent a JSON file uses (its first indented line), so a merged
+    file keeps the repo's formatting."""
+    for line in text.splitlines()[1:]:
+        lead = line[:len(line) - len(line.lstrip())]
+        if lead:
+            return "\t" if lead.startswith("\t") else len(lead)
+    return 2
+
+
+async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
+    """Commit the in-progress merge in `staging` by a key-level JSON merge
+    when every conflicted file is `.json` and each merges with no key
+    conflict. Returns the merged files, or None — the merge is then left
+    exactly as it was, for the integrator."""
+    names = await _git_text(staging, "diff", "--name-only",
+                            "--diff-filter=U")
+    files = sorted({n for n in (names or "").splitlines() if n})
+    if not files or not all(f.endswith(".json") for f in files):
+        return None
+    merged: dict[str, str] = {}
+    for f in files:
+        texts: list[str | None] = []
+        for stage in (1, 2, 3):
+            texts.append(await _git_text(staging, "show", f":{stage}:{f}"))
+        base_t, ours_t, theirs_t = texts
+        if ours_t is None or theirs_t is None:
+            return None              # a delete/modify conflict: not keys
+        try:
+            base = json.loads(base_t) if base_t is not None else {}
+            ours, theirs = json.loads(ours_t), json.loads(theirs_t)
+        except ValueError:
+            return None
+        value, conflicts = _json_key_merge3(base, ours, theirs)
+        if conflicts:
+            log(f"  {sid}: JSON key merge of {f} refused — key conflict(s) "
+                f"{', '.join(conflicts[:5])}")
+            return None
+        merged[f] = (json.dumps(value, ensure_ascii=False,
+                                indent=_json_indent(ours_t))
+                     + ("\n" if ours_t.endswith("\n") else ""))
+    for f, text in merged.items():
+        (staging / f).write_text(text)
+    add = await run_proc(["git", "add", "--", *files], cwd=str(staging))
+    commit = (await run_proc(["git", "commit", "--no-edit"],
+                             cwd=str(staging))
+              if add.returncode == 0 else add)
+    if commit.returncode != 0 or await check_merge_committed(staging):
+        # Put the conflict back exactly as git left it for the integrator.
+        await run_proc(["git", "checkout", "-m", "--", *files],
+                       cwd=str(staging))
+        log(f"  {sid}: JSON key merge could not commit "
+            f"({commit.stderr.strip()[:200]}); leaving it to the integrator")
+        return None
+    return files
 
 
 async def integrate_wave(wave: list[str], results: dict[str, dict],
@@ -42041,8 +43053,28 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
       most expensive artifact in the run to recreate. `blocked[sid]` is
       recorded and the die message names the ref and its recovery command;
       `resume` retries the integration."""
-    integrated, integrated_so_far = [], []
+    integrated: list[str] = []
     staging = (leerie_dir / "worktrees" / "staging").resolve()
+    # Sids of this wave a PRIOR invocation already merged (a resumed wave
+    # only carries results for what it re-ran): without them a resumed gate
+    # and integrator would be told nothing was integrated before.
+    statuses = st.data.get("subtask_status") or {}
+    integrated_so_far: list[str] = await _wave_sids_integrated_before(
+        staging, st.run_id,
+        [s for s in wave if s not in results
+         and statuses.get(s) == "complete"], "HEAD")
+
+    async def _gate(sid: str) -> bool:
+        ok = await _run_integration_judge_gate(
+            sid, staging, _incoming_subtask_view(leerie_dir, sid,
+                                                 results.get(sid)),
+            [s for s in integrated_so_far if s != sid],
+            caps, st, models, efforts)
+        if not ok:
+            results[sid] = {"subtask_id": sid, "status": "unconverged",
+                            "summary": "integration backed out"}
+        return ok
+
     for sid in wave:
         if results.get(sid, {}).get("status") != "complete":
             continue
@@ -42055,17 +43087,11 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # see the branch already merged, short-circuit at rc 0, and
             # skip straight past the judge, silently readvancing the wave
             # onto a merge the gate never cleared).
-            if gate.get("accepted"):
-                integrated.append(sid)
-                integrated_so_far.append(sid)
-            else:
-                # Not yet accepted via `accept-integration` — re-invoke the
-                # judge directly against the already-committed merge. This
-                # is the resume path for the incident this gate exists to
-                # let an operator recover from.
-                await _run_integration_judge_gate(
-                    sid, staging, results.get(sid, {}), integrated_so_far,
-                    caps, st, models, efforts)
+            if gate.get("outcome") == "backed_out":
+                continue
+            if gate.get("accepted") or await _gate(sid):
+                # Not yet accepted: the repair loop resumes against the
+                # already-committed merge (DESIGN §6).
                 integrated.append(sid)
                 integrated_so_far.append(sid)
             continue
@@ -42087,7 +43113,16 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             st.save()
             die(f"integrate.sh precondition failure for {sid}: "
                 f"{proc.stderr.strip() or proc.stdout.strip() or 'no message'}")
-        # exit 1 (conflict): staging worktree is mid-merge — hand to an integrator
+        # exit 1 (conflict): staging worktree is mid-merge. A conflict
+        # confined to JSON files is merged by key, mechanically (DESIGN §6);
+        # anything else goes to an integrator.
+        json_files = await _try_json_key_merge(staging, sid)
+        if json_files:
+            log(f"  conflict integrating {sid} confined to JSON; merged by "
+                f"key ({', '.join(json_files)})")
+            integrated.append(sid)
+            integrated_so_far.append(sid)
+            continue
         log(f"  conflict integrating {sid}; spawning integrator")
         sys_prompt = _load_prompt("integrator")
         up_parts: list[str] = [
@@ -42181,19 +43216,13 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # (conflict markers, merge committed) passed; this gate attacks for
             # behavioral breakage they cannot see — e.g. a merge that silently
             # drops one side's change, or keeps side A's signature but side B's
-            # call sites. Detect-and-die, single pass: an integrator cannot
-            # mechanically fix a semantic finding from an independent judge
-            # without a fresh conflict-resolution attempt, so re-driving would
-            # reproduce the same merge. Persists to
-            # `state.data["integration_gate"][sid]` and re-runs on `resume`
-            # via the gate check at the top of this loop — see
-            # `_run_integration_judge_gate`.
-            await _run_integration_judge_gate(
-                sid, staging, results.get(sid, {}), integrated_so_far,
-                caps, st, models, efforts)
-
-            integrated.append(sid)
-            integrated_so_far.append(sid)
+            # call sites — and repairs it, or backs the subtask out as
+            # `unconverged` (DESIGN §6 *When integration cannot succeed*).
+            # Persists to `state.data["integration_gate"][sid]` and resumes
+            # via the gate check at the top of this loop.
+            if await _gate(sid):
+                integrated.append(sid)
+                integrated_so_far.append(sid)
         else:
             # design-conflict or failed: the integrator could not produce a
             # correct merge. Abort the in-progress merge so staging is left
@@ -42344,7 +43373,8 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # `completed_waves` past a merge the gate rejected.
         gate = st.data.get("integration_gate", {})
         pending_gate_sids = [sid for sid in wave
-                              if gate.get(sid) and not gate[sid].get("accepted")]
+                             if gate.get(sid) and not gate[sid].get("accepted")
+                             and gate[sid].get("outcome") != "backed_out"]
         if not remaining and not pending_gate_sids:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"all {len(wave)} subtask(s) already settled, skipping")
@@ -42378,9 +43408,9 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # integration_gate finding (see `pending_gate_sids` above) — they
         # are not in `remaining`/`results` this round, and `integrate_wave`
         # requires `results[sid]["status"] == "complete"` to process a sid
-        # at all. The gate re-invocation itself only needs `sid`'s status;
-        # `intent`/`criteria_results` are unavailable this far removed from
-        # the original settle and are omitted rather than fabricated.
+        # at all. The gate reads the subtask's intent and criteria from its
+        # own spec (`_incoming_subtask_view`), so the stand-in needs only
+        # the status.
         for sid in pending_gate_sids:
             results.setdefault(sid, {"status": "complete"})
 
@@ -42399,10 +43429,12 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # change addresses) left no observable trace in state.json.
         st.data["current_phase"] = f"phase 5: integrating wave {wi + 1}"
         st.save()
-        expected = sum(1 for r in results.values()
-                       if r.get("status") == "complete")
         integrated = await integrate_wave(
             wave, results, leerie_dir, caps, st, models, efforts)
+        # Counted after integrating: a subtask the integration gate backed
+        # out is now `unconverged`, not a complete one integration skipped.
+        expected = sum(1 for r in results.values()
+                       if r.get("status") == "complete")
         # Surface the integrated count against what was eligible. A
         # divergence (integrated < expected with no die() above) is the
         # visible signature of a silent integration skip.
@@ -44227,7 +45259,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         if "plan_snapshot" not in st.data:
             st.data["current_phase"] = "phase 3: scheduling"
             st.save()
-            subtasks, waves = _schedule(plans)
+            subtasks, waves = _schedule(
+                plans, caps.get("overlap_extra_waves",
+                                DEFAULT_CAPS["overlap_extra_waves"]))
             # Diagnostic snapshot BEFORE the two gates that can die()
             # below. Both are terminal, and the planner/fit_judge/splitter
             # spend that produced this plan is the most expensive thing in
@@ -44291,7 +45325,9 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             # and rewrite plan_snapshot so a later resume rehydrates the
             # repaired _schedule (DESIGN §5).
             if (st.data.get("wiring_gate") or {}).get("repairs"):
-                subtasks, waves = _schedule(plans)
+                subtasks, waves = _schedule(
+                    plans, caps.get("overlap_extra_waves",
+                                    DEFAULT_CAPS["overlap_extra_waves"]))
                 st.data["plan_snapshot"] = {
                     "subtasks": subtasks, "waves": waves}
                 st.save()

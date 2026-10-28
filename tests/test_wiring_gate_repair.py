@@ -125,7 +125,7 @@ def test_zero_providers_declines(leerie):
     means the plan is missing the WORK, not the edge. Inventing a dependency
     on nothing would be worse than dying."""
     plans = _incident_plan()
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("refactor-005", "nobody-provides-this")])
     assert not repairs and len(unrepaired) == 1
 
@@ -138,7 +138,7 @@ def test_multiple_providers_in_different_clusters_declines(leerie):
         ("testing", [_sub("test-001", provides=["shared"]),
                      _sub("test-002", provides=["shared"])]),
     )
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("refactor-001", "shared")])
     assert not repairs and len(unrepaired) == 1
 
@@ -174,7 +174,7 @@ def test_id_channel_orders_the_producer_first(leerie):
 
 def test_id_channel_self_reference_declines(leerie):
     plans = _plans(("testing", [_sub("test-001")]))
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("test-001", "test-001")])
     assert not repairs and len(unrepaired) == 1
 
@@ -194,7 +194,7 @@ def test_id_channel_respects_the_cycle_guard(leerie):
     a cycle and must be refused exactly like the tag channel's."""
     plans = _plans(("testing", [_sub("test-001"),
                                 _sub("feat-001", depends_on=["test-001"])]))
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("test-001", "feat-001")])
     assert not repairs and len(unrepaired) == 1
     by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
@@ -271,7 +271,7 @@ def test_providers_spanning_two_clusters_still_decline(leerie):
             _sub("feat-002-r1", provides=["baked"], cluster="feat-002"),
         ]),
     )
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("test-001", "baked")])
     assert not repairs and len(unrepaired) == 1
 
@@ -284,7 +284,7 @@ def test_providers_with_no_cluster_marker_still_decline(leerie):
         ("feature-implementation", [_sub("feat-001", provides=["baked"]),
                                     _sub("feat-002", provides=["baked"])]),
     )
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("test-001", "baked")])
     assert not repairs and len(unrepaired) == 1
 
@@ -295,7 +295,7 @@ def test_cluster_channel_declines_when_sid_is_itself_a_member(leerie):
         _sub("feat-001-r1", provides=["baked"], cluster="feat-001"),
         _sub("feat-001-r2", provides=["baked"], cluster="feat-001"),
     ]))
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("feat-001-r1", "baked")])
     assert not repairs and len(unrepaired) == 1
 
@@ -304,7 +304,7 @@ def test_empty_tag_or_dep_declines(leerie):
     """`SCHEMAS["wiring_judge"]` puts no `minLength` on `tag_or_dep`, so `""`
     is schema-valid and reaches this function."""
     plans = _incident_plan()
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("refactor-005", "")])
     assert not repairs and len(unrepaired) == 1
 
@@ -318,7 +318,7 @@ def test_empty_tag_never_matches_an_empty_provides_entry(leerie):
         _sub("refactor-001"),
         _sub("refactor-002", provides=[""]),
     ]))
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("refactor-001", "")])
     assert not repairs and len(unrepaired) == 1
     by_id = {s["id"]: s for p in plans for s in p["subtasks"]}
@@ -327,7 +327,7 @@ def test_empty_tag_never_matches_an_empty_provides_entry(leerie):
 
 def test_non_missing_requires_kind_declines(leerie):
     plans = _incident_plan()
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("refactor-005", "tests-a", kind="broken_by_drop")])
     assert not repairs and len(unrepaired) == 1
 
@@ -344,7 +344,7 @@ def test_self_provider_declines(leerie):
     self-loop, not a dependency."""
     plans = _plans(("refactoring", [_sub("refactor-001", provides=["own"]),
                                     _sub("refactor-002")]))
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("refactor-001", "own")])
     assert not repairs and len(unrepaired) == 1
 
@@ -373,7 +373,7 @@ def _cycle_plan():
 
 def test_cycling_edge_is_skipped_not_applied(leerie):
     plans = _cycle_plan()
-    repairs, unrepaired = leerie._repair_missing_requires(
+    repairs, unrepaired = leerie._repair_wiring_channels(
         plans, [_defect("a-001", "from-b")])
     assert not repairs, "a cycle-closing edge must never be applied"
     assert len(unrepaired) == 1, "it must fall through to the gate's die()"
@@ -465,12 +465,36 @@ def test_gate_repairs_then_passes_and_records(leerie, monkeypatch, tmp_path):
     assert pos["test-002"] < pos["refactor-005"]
 
 
-def test_gate_still_dies_on_unrepairable(leerie, monkeypatch):
+def test_gate_records_a_warning_for_what_no_edge_can_fix(leerie, monkeypatch):
+    """Rewritten for N3 (DESIGN §5 *What is left after that is ordered, not
+    refused*): a value nothing provides used to die here; it is now a typed
+    warning persisted on `wiring_gate`, and the run continues."""
     import asyncio
 
     async def fake_claude_p(**kw):
         return {"plan_reviewed": True, "rationale": "r",
                 "wiring_defects": [_defect("refactor-005", "nobody")]}
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+
+    class _St:
+        def __init__(self):
+            self.data = {"planning_worktree": "/tmp/leerie-test-wt"}
+        def save(self): pass
+        def bump_workers(self, caps): pass
+
+    st = _St()
+    asyncio.run(leerie.phase_wiring_gate(
+        _incident_plan(), "task", st, dict(leerie.DEFAULT_CAPS), {}, {}))
+    assert [w["why"] for w in st.data["wiring_gate"]["warnings"]] == [
+        "no_in_plan_provider"]
+
+
+def test_gate_still_dies_on_an_unknown_sid(leerie, monkeypatch):
+    import asyncio
+
+    async def fake_claude_p(**kw):
+        return {"plan_reviewed": True, "rationale": "r",
+                "wiring_defects": [_defect("refactor-999", "nobody")]}
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
     class _St:
@@ -599,7 +623,8 @@ def test_caller_reschedules_when_repairs_land(leerie):
     tail = src[gate:gate + 1200]
     assert '"repairs"' in tail, (
         "_run_phases must branch on the gate's repairs list")
-    assert "_schedule(plans)" in tail, "it must re-run _schedule() after a repair"
+    assert "_schedule(\n                    plans" in tail, (
+        "it must re-run _schedule() after a repair")
     assert 'st.data["plan_snapshot"]' in tail, (
         "and rewrite plan_snapshot so a later resume rehydrates the repaired "
         "wave partition")
@@ -610,7 +635,7 @@ def test_gate_audit_key_written_only_on_a_clean_pass(leerie):
     must not carry it."""
     import inspect
     src = inspect.getsource(leerie.phase_wiring_gate)
-    die_at = src.index("plan-wiring gate found unresolved")
+    die_at = src.index("plan-wiring gate found wiring defect(s) naming")
     write_at = src.index('st.data["wiring_gate"] =')
     assert die_at < write_at, (
         "the die() must precede the audit write, so a failing gate leaves "
@@ -781,7 +806,7 @@ class TestItStillGatesGenuineDefects:
         defects = [{"kind": "missing_requires", "sid": "docs-001",
                     "tag_or_dep": "nonexistent-capability",
                     "concrete_reason": ""}]
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["docs-001"]
 
     def test_depends_on_a_NON_provider_still_gates(self, leerie):
@@ -795,7 +820,7 @@ class TestItStillGatesGenuineDefects:
         ])
         defects = [{"kind": "missing_requires", "sid": "t",
                     "tag_or_dep": "cap-y", "concrete_reason": ""}]
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["t"], (
             "depends_on=['unrelated'] does not order t behind a provider of "
             "cap-y, so the defect is still live")
@@ -825,12 +850,12 @@ class TestItStillGatesGenuineDefects:
         all. The re-check is scoped to `missing_requires` for that reason.
         """
         plans, defects = self._drop_shape("broken_by_drop")
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["t"]
 
     def test_broken_by_merge_is_not_dismissed_on_ordering(self, leerie):
         plans, defects = self._drop_shape("broken_by_merge")
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["t"]
 
     def test_the_same_shape_as_missing_requires_IS_dismissed(self, leerie):
@@ -859,7 +884,7 @@ class TestItStillGatesGenuineDefects:
         ])
         defects = [{"kind": "missing_requires", "sid": "t",
                     "tag_or_dep": "cap", "concrete_reason": ""}]
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["t"], (
             "t precedes p1 but NOT p2, so the race against p2 is real")
 
@@ -878,7 +903,7 @@ class TestItStillGatesGenuineDefects:
         defects = [{"kind": "missing_requires", "sid": "t",
                     "tag_or_dep": "nobody-provides-this",
                     "concrete_reason": ""}]
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["t"]
 
     def test_requires_with_a_NON_in_plan_extent_still_gates(self, leerie):
@@ -903,7 +928,7 @@ class TestItStillGatesGenuineDefects:
         ])
         defects = [{"kind": "missing_requires", "sid": "t",
                     "tag_or_dep": "shared-tag", "concrete_reason": ""}]
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["t"], (
             "an external requires entry creates no scheduling edge, so t is "
             "NOT ordered behind p1 and the defect is still live")
@@ -929,7 +954,7 @@ class TestItStillGatesGenuineDefects:
         ])
         defects = [{"kind": "missing_requires", "sid": "t",
                     "tag_or_dep": "cap-x", "concrete_reason": ""}]
-        _, unrepaired = leerie._repair_missing_requires(plans, defects)
+        _, unrepaired = leerie._repair_wiring_channels(plans, defects)
         assert [u["sid"] for u in unrepaired] == ["t"]
 
     def test_unknown_sid_fails_closed(self, leerie):

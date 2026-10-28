@@ -231,18 +231,24 @@ class TestWiring:
         `_run_integration_judge_gate` (the shared judge-invocation helper —
         see the "Integration gate resume" refactor) must reach on both its
         call paths."""
+        # N3: the filters live in `_integration_defect_records`; the
+        # partition labels its records, and the judge-invocation helper
+        # `_integration_judge_verdict` uses both (adapter + post-loop).
+        recs = inspect.getsource(leerie._integration_defect_records)
+        assert "_coverage_citation_clears(" in recs, (
+            "the downgrade is a no-op unless the records helper calls it")
         part = inspect.getsource(leerie._partition_integration_defects)
-        assert "_coverage_citation_clears(" in part, (
-            "the downgrade is a no-op unless the partition calls it")
-        gate = inspect.getsource(leerie._run_integration_judge_gate)
-        assert gate.count("_partition_integration_defects(") >= 2, (
-            "both the `check=` adapter and the post-loop site must use it, or "
-            "the two paths can disagree")
+        assert "_integration_defect_records(" in part
+        gate = inspect.getsource(leerie._integration_judge_verdict)
+        assert "_partition_integration_defects(" in gate
+        assert "_integration_defect_records(" in gate, (
+            "both the `check=` adapter and the post-loop site must use the "
+            "same filters, or the two paths can disagree")
 
     def test_downgrade_short_circuits_before_the_issue_is_appended(self, leerie):
         """A cleared defect must `continue`, not fall through and gate
         anyway — the fix would be inert but look present."""
-        src = inspect.getsource(leerie._partition_integration_defects)
+        src = inspect.getsource(leerie._integration_defect_records)
         i = src.index("_coverage_citation_clears(")
         window = src[i:i + 500]
         assert "continue" in window
@@ -256,13 +262,16 @@ class TestWiring:
     def test_anti_gaming_scenario_location_filter_survives(self, leerie):
         """The pre-existing filter must not have been displaced by the new
         clause when the logic moved into the partition helper."""
-        src = inspect.getsource(leerie._partition_integration_defects)
+        src = inspect.getsource(leerie._integration_defect_records)
         assert "if not scenario or not location:" in src
 
-    def test_gate_still_dies_on_remaining_defects(self, leerie):
-        """The downgrade narrows the gate; it must not have removed it."""
+    def test_gate_still_acts_on_remaining_defects(self, leerie):
+        """The downgrade narrows the gate; it must not have removed it. Since
+        N3 a remaining defect is repaired or backed out, not died on —
+        executed in tests/test_integration_repair_loop.py."""
         src = inspect.getsource(leerie._run_integration_judge_gate)
-        assert "integration gate found behavioral defect(s)" in src
+        assert "_integration_repair_round(" in src
+        assert "_back_out(" in src
 
 
 class TestPromptAsksForIt:
@@ -305,13 +314,13 @@ class TestGateExecutes:
     @staticmethod
     def _extract(leerie, repo_root, sid="feat-014"):
         fn = ast.parse(textwrap.dedent(
-            inspect.getsource(leerie._run_integration_judge_gate))).body[0]
+            inspect.getsource(leerie._integration_judge_verdict))).body[0]
         found = [n for n in ast.walk(fn)
                  if isinstance(n, ast.FunctionDef)
                  and n.name == "_check_integration"]
         assert found, (
             "ANTI-VACUITY: _check_integration not found inside "
-            "_run_integration_judge_gate — the harness would silently test "
+            "_integration_judge_verdict — the harness would silently test "
             "nothing")
         mod = ast.Module(body=[found[0]], type_ignores=[])
         ast.fix_missing_locations(mod)
@@ -457,8 +466,8 @@ class TestAdvisoryIsLoggedExactlyOnce:
     advisories, or the downgrade becomes silent."""
 
     def test_post_loop_site_logs_the_advisories(self, leerie):
-        src = inspect.getsource(leerie._run_integration_judge_gate)
-        i = src.index("remaining_defects, advisories = ")
+        src = inspect.getsource(leerie._integration_judge_verdict)
+        i = src.index("gating, advisories = ")
         window = src[i:i + 400]
         assert "for a in advisories:" in window and "log(" in window, (
             "advisories must be logged at the single post-loop site")
@@ -467,7 +476,7 @@ class TestAdvisoryIsLoggedExactlyOnce:
         """Source-coupled twin of `test_the_adapter_is_pure`: catches a `log()`
         reintroduced on a branch the behavioural test happens not to hit."""
         fn = ast.parse(textwrap.dedent(
-            inspect.getsource(leerie._run_integration_judge_gate))).body[0]
+            inspect.getsource(leerie._integration_judge_verdict))).body[0]
         ci = [n for n in ast.walk(fn) if isinstance(n, ast.FunctionDef)
               and n.name == "_check_integration"][0]
         calls = [n.func.id for n in ast.walk(ci)

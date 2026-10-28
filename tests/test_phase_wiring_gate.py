@@ -96,7 +96,7 @@ class TestWiring:
         src = inspect.getsource(leerie._run_phases)
         i_offtree = src.index("_filter_offtree_subtasks(")
         i_satisfied = src.index("await _filter_satisfied_subtasks(")
-        i_schedule = src.index("_schedule(plans)")
+        i_schedule = src.index("_schedule(\n                plans")
         i_gate = src.index("await phase_wiring_gate(")
         i_validate = src.index("_validate_plan(subtasks)")
         # Both drop filters + _schedule() precede the gate; the gate precedes
@@ -160,14 +160,31 @@ def test_clean_wiring_passes(leerie, tmp_path, monkeypatch):
 
 
 def test_defect_dies(leerie, tmp_path, monkeypatch):
-    """A concrete, live wiring defect the gate CANNOT auto-repair die()s
-    immediately (single pass, no re-drive).
+    """A live wiring defect naming a subtask NOT in the plan die()s (single
+    pass, no re-drive) — since N3 the only shape that still does (DESIGN
+    §5). Every other finding is repaired or warned on: see
+    `tests/test_wiring_fanin_fallback.py` and `test_defect_on_a_real_sid_warns`
+    below."""
+    st = _state(leerie, tmp_path)
 
-    The tag names no in-plan provider, which is the principled refusal case:
-    the plan is missing the work, not just the edge, so inventing a
-    dependency on nothing would be worse than dying. A defect whose tag has
-    exactly one provider is repaired instead — see
-    `tests/test_wiring_gate_repair.py`."""
+    async def fake_claude_p(**kwargs):
+        return {"plan_reviewed": True, "wiring_defects": [{
+            "kind": "missing_requires", "sid": "feat-999",
+            "tag_or_dep": "nothing-provides-this",
+            "concrete_reason": "reads the schema but declares no requires",
+            "severity": "live_defect",
+        }], "rationale": "missing edge"}
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    with pytest.raises(SystemExit):
+        asyncio.run(leerie.phase_wiring_gate(
+            _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+
+
+def test_defect_on_a_real_sid_warns(leerie, tmp_path, monkeypatch):
+    """Rewritten for N3: the same finding on a subtask that IS in the plan,
+    naming a capability nothing provides, used to die; it is now a typed
+    warning on `wiring_gate` and the plan passes through."""
     st = _state(leerie, tmp_path)
 
     async def fake_claude_p(**kwargs):
@@ -179,9 +196,11 @@ def test_defect_dies(leerie, tmp_path, monkeypatch):
         }], "rationale": "missing edge"}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    with pytest.raises(SystemExit):
-        asyncio.run(leerie.phase_wiring_gate(
-            _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+    asyncio.run(leerie.phase_wiring_gate(
+        _PLANS, "task", st, _caps(leerie), MODELS, EFFORTS))
+    assert st.data["wiring_gate"]["warnings"] == [{
+        "sid": "feat-002", "value": "nothing-provides-this",
+        "kind": "missing_requires", "why": "no_in_plan_provider"}]
 
 
 def test_latent_risk_defect_does_not_gate(leerie, tmp_path, monkeypatch):
@@ -228,7 +247,7 @@ def test_mixed_severity_still_dies_on_the_live_defect(leerie, tmp_path,
                 "severity": "latent_risk",
             },
             {
-                "kind": "missing_requires", "sid": "feat-002",
+                "kind": "missing_requires", "sid": "feat-999",
                 "tag_or_dep": "nothing-provides-this",
                 "concrete_reason": "reads the schema, no requires at all",
                 "severity": "live_defect",
@@ -312,7 +331,7 @@ def test_unlabelled_defect_still_gates(leerie, tmp_path, monkeypatch):
 
     async def fake_claude_p(**kwargs):
         return {"plan_reviewed": True, "wiring_defects": [{
-            "kind": "missing_requires", "sid": "feat-002",
+            "kind": "missing_requires", "sid": "feat-999",
             "tag_or_dep": "nothing-provides-this",
             "concrete_reason": "reads the schema but declares no requires",
         }], "rationale": "missing edge"}

@@ -5497,3 +5497,50 @@ pytest command, `claude_p` stubbed and the host PSI pinned quiet:
   in the payload), none when no audit ran; no scoped runner is a loud typed
   skip; `applicable: false` needs three agreeing samples, a crashed sample
   being no vote.
+
+## N3: wiring fan-in, the integration repair loop and overlap prevention
+
+`tests/test_wiring_fanin_fallback.py` covers `_fanin_and_fallback` through
+`_repair_missing_requires` (DESIGN §5 *What is left after that is ordered,
+not refused*): providers in two clusters get a fan-in `requires` and
+`_schedule` then orders the subtask behind both; a descendant provider is
+skipped by the `depends_on` fallback with the graph still acyclic; every
+provider a descendant, nothing providing the value, and `missing_provides`
+are typed warnings; and `phase_wiring_gate` persists the warnings and dies
+only on a sid not in the plan. The channel tests in
+`tests/test_wiring_gate_repair.py` (each "declines" case and the
+already-ordered re-check) now target `_repair_wiring_channels`, the stage they
+pin; the gate-level die tests there and in `tests/test_phase_wiring_gate.py`
+were rewritten to the warning, keeping a die on an unknown sid so the
+severity pins still have a gate to observe.
+
+`tests/test_integration_repair_loop.py` executes `_run_integration_judge_gate`
+against a real two-parent merge in a real git staging tree, only `claude_p` and
+the conflicted-area test run stubbed (DESIGN §6 *When integration cannot
+succeed*): a clean verdict keeps the merge; a finding is repaired in the order
+judge → integrator → re-judge, the re-judge reviewing a synthetic merge of the
+repaired tree over both parents, drawing one round from `redrive_rounds`; an
+`intent_conflict`, a spent shared budget, a `design-conflict` during repair and
+exhausted rounds each reset staging to the merge's first parent and settle the
+subtask `unconverged`; a round with no new commit is reset and spent; a
+confirmed test failure blocks the pass and reaches the next round typed, with
+the stale list; residual content loss is recorded unless a `superseded`
+entry's `by_line` is at HEAD. `_integration_dropped_lines` is run on real
+diffs (S3: a conflict-hunk drop stays listed), `_conflicted_area_tests` on a
+real repo (one-hop importers), and `_integration_test_failures` with the
+runner stubbed per tree (a parent failure is no candidate; a B\*-unconfirmed
+candidate is no failure; routing by the overlay). The detect-and-die tests in
+`tests/test_integrate_wave_judge_gate.py` were rewritten on a real merge: the
+wave continues past a backed-out subtask, the verdict is on disk before the
+repair integrator spawns, and a resume re-enters the loop without
+`integrate.sh`. `tests/test_integration_judge_coverage.py`'s source pins
+follow the filters into `_integration_defect_records` /
+`_integration_judge_verdict`.
+
+`tests/test_schedule_overlap.py` covers `_serialize_planned_overlap` through
+`_schedule` (split, cap 0, the cap counted over the whole plan, largest overlap
+first, predecessor order kept, `./` normalised, both `_run_phases` call sites
+passing the cap). `tests/test_json_key_merge.py` covers `_json_key_merge3` and
+`_try_json_key_merge` on real git conflicts: an i18n conflict is committed as
+the merge with both sides' keys and the file's formatting; a key conflict or a
+non-JSON file in the conflict leaves the merge exactly as git left it.

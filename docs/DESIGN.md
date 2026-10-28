@@ -630,19 +630,18 @@ subtasks` once the re-drives are spent, and `accept-blocked <run-id>
 `complete` so `resume` skips it, keeping external preconditions a human
 concern.
 
-**The integration gate needs the same escape hatch, for a sharper
-reason:** `integrate_wave` dies on a behavioral defect from
-`integration_judge`, an LLM whose false positive would otherwise
-permanently kill a run after full spend, since the merge is already
-committed to staging and a naive resume re-reaches the same verdict.
-`integrate_wave` persists the verdict to `integration_gate[sid]` *before*
-dying, so resume distinguishes "rejected" from "accepted" rather than
-seeing an already-merged branch and skipping past a rejected verdict.
-`accept-integration <run-id> <subtask-id>` flips the record's `accepted`
-flag; an unaccepted finding re-invokes the judge on resume, so a verdict
-that no longer reproduces resolves itself. `--skip-integration-check`
-disables the gate wholesale, matching the five other gates that carry a
-bypass.
+**The integration gate no longer dies on a finding** (§6 *When
+integration cannot succeed*): a behavioral defect from `integration_judge`
+re-drives the integrator against the committed merge, and a merge that does
+not converge is backed out and its subtask settled `unconverged`, so the
+wave continues. The verdict is still persisted to `integration_gate[sid]`
+before anything else happens, so a resume distinguishes "rejected" from
+"accepted" rather than seeing an already-merged branch and skipping past a
+rejected verdict. `accept-integration <run-id> <subtask-id>` still flips the
+record's `accepted` flag — the manual path for a run recorded by a release
+whose gate died; an unaccepted, un-backed-out record re-enters the repair
+loop on resume. `--skip-integration-check` disables the gate wholesale,
+matching the five other gates that carry a bypass.
 
 The result is a single global dependency graph spanning all domains. A
 topological sort turns it into waves: subtasks within a wave are mutually
@@ -1032,7 +1031,7 @@ semantic dangles the structural check is blind to: the deterministic check owns
 "does every declared edge resolve," the judge owns "is the set of declared
 edges the right one."
 
-**The judge repairs what is unambiguously repairable, and dies on the rest.**
+**The judge's findings are repaired, not died on.**
 Detecting-and-dying alone was wrong: the commonest defect this judge finds is one
 *no planner could have avoided*. Planners run blind and in parallel — a planner's
 context carries the task, the repo map, and the shared artifact registry, never a
@@ -1094,8 +1093,9 @@ properties matter:
   the canonical *true* finding.
 - **Direct edges only, not the transitive closure.** A further 127 corpus
   orderings hold only transitively. Those would refute the finding just as
-  soundly, but dismissing on them is a much broader claim to make on a die-only
-  gate, so the check stays 1:1 with the graph's own edge definition.
+  soundly, but dismissing on them is a much broader claim to make on a
+  correctness gate, so the check stays 1:1 with the graph's own edge
+  definition.
 
 It applies to `missing_requires` alone. The repair loop routes *every*
 non-repairable defect to the same residual, so `broken_by_drop` and
@@ -1107,13 +1107,9 @@ It runs after the repairs rather than before them because a defect can be
 mooted by an edge a *sibling* defect's repair added, and the judge's
 emission order is arbitrary. Each dismissal is logged naming the responsible
 edges, so a judge degrading over time stays visible rather than being
-silently absorbed. Anything else is refused and the gate dies as before: a
-value that is neither a subtask id nor a provided tag means the plan
-genuinely lacks the capability, and several providers spanning *different*
-clusters is an ambiguity only a human can resolve. The cycle trial is
-load-bearing rather than defensive — a well-formed but wrong edge can close
-a cycle spanning the entire plan, so skipping it would convert a survivable
-planning defect into a dead run.
+silently absorbed. The cycle trial is load-bearing rather than defensive — a
+well-formed but wrong edge can close a cycle spanning the entire plan, so
+skipping it would convert a survivable planning defect into a dead run.
 
 Reading only the tag channel was the original shape of this repair, and was
 the dominant reason a repairable run still died: measured across the
@@ -1122,6 +1118,37 @@ surviving subtask id** (one run died with 22 defects, all this shape);
 counting split siblings as rival providers accounted for the rest in a
 second run. Closing both channels takes the corpus from 19/27 runs clearing
 the gate to 21/27, with the residual defects then all genuine missing work.
+
+**What is left after that is ordered, not refused.** The gate used to die on
+the residual: several providers spanning *different* clusters, an id edge
+refused for a cycle. Neither is an ambiguity that needs a human — "order the
+subtask behind the capability" has one safe reading when every provider is a
+legitimate predecessor. So the residual is worked once more, cumulatively
+against the already-repaired plan:
+
+- **Fan-in.** The value names a tag with at least one provider other than
+  the subtask, and the subtask does not already require it → append an
+  in-plan `requires` on the tag, which orders the subtask behind *all* of its
+  providers. Applied when the cycle trial passes. This covers
+  `missing_requires` and the edge requests `broken_by_merge`,
+  `broken_by_drop` and `orphaned_dependent` carry.
+- **`depends_on` fallback.** When the fan-in would cycle (or the value is a
+  surviving id whose edge was refused for a cycle), add a `depends_on` to
+  each provider individually in sorted order, skipping any whose edge would
+  cycle — that provider is a descendant of the subtask, and nothing can order
+  a subtask behind its own descendant. One added edge is a repair; the
+  skipped providers are recorded.
+- **Warn, don't die,** when no provider is left: no in-plan provider at all,
+  every provider a descendant, or a `missing_provides` (which names no edge).
+  Each is logged and persisted as a typed warning on `wiring_gate`.
+
+The only shape that still dies is a defect naming a subtask id that is not
+in the plan: the judge is then talking about a plan this is not. Every trial
+keeps the graph acyclic. Benched as q4 W on the gate's real helpers: across
+26 replayed cases (52 judge passes) today's gate died on 15 passes (19
+defects) and the fan-in/fallback gate on none, with no cycle; on 119
+synthetic residuals, 0 deaths and 0 cycles (86 warnings, 32 `depends_on`
+fallbacks).
 
 Because added edges change the wave partition, the scheduler is re-run and the
 plan snapshot rewritten after a repair, so everything downstream — the budget
@@ -1265,6 +1292,22 @@ waves. A subtask therefore always sees the complete, validated output of
 everything it depends on — never a half-finished intermediate state. Sequential
 waves are what make "this subtask depends on that one" mean something concrete:
 the dependency is satisfied in the filesystem the dependent subtask starts from.
+
+**Planned file overlap is serialised, within a cap.** Two subtasks in one wave
+whose planned `files_likely_touched` intersect are the commonest source of an
+integration conflict: of 15 natural integrator conflicts in the run corpus, 12
+were between same-wave subtasks that both planned the conflicting file (q4
+overlap replay). Serialising every such pair avoided those 12 but cost 163
+extra waves across 77 runs. So `_schedule` splits a wave only as far as
+`overlap_extra_waves` (3) extra waves per run allows: overlapping pairs are
+taken largest overlap first, a pair is kept only while the whole plan's extra
+waves stay within the cap, and each wave is then packed first-fit in id order
+so a kept pair lands in different sub-waves. Every sub-wave still follows all
+of its predecessors, so the graph's order is untouched; only parallelism is
+spent. Replayed on the same 77 runs, the capped rule avoids 8 of the 15
+conflicts for 90 extra waves (at most 3 in any run, 40 runs affected); the
+bench's own capped arm reached 10/15 by ranking pairs on historical per-file
+conflict risk, which a run does not have.
 
 ---
 
@@ -1993,6 +2036,20 @@ purely textual merge can satisfy git while silently breaking behavior one
 side was validated against, and only a worker that understands intent can
 avoid that.
 
+**A conflict confined to JSON files is merged by key, mechanically.** Registry
+files — i18n message bundles above all — conflict whenever two subtasks each
+add keys at the same place, and no intent is in play: both sides' keys belong
+in the result. When every conflicted file of a merge is `.json`, the
+orchestrator three-way merges each one at key level (base, ours, theirs; a key
+changed on one side only takes that side, nested objects recurse, a key both
+sides changed differently is a conflict) and commits the merge itself when
+every file merges with no key conflict and keeps both sides' keys. Anything
+else — a non-JSON conflicted file, a file that does not parse, a key
+conflict — goes to the integrator unchanged. Of the two JSON-only natural
+conflicts in the q4 corpus, one merged cleanly this way; the other was a real
+key conflict (the same message key changed on both sides) and stays the
+integrator's.
+
 The mechanical re-check that *catches* a merge that broke the tree runs
 immediately after: once the integrator commits, the orchestrator scans the
 integrated worktree for unresolved conflict markers (`<<<<<<<`); a merge
@@ -2036,10 +2093,73 @@ Two outcomes are not failures of the integrator but facts about the work:
   nothing is.
 - **Genuinely irreconcilable intents are a design conflict.** If two subtasks
   want contradictory things, no merge can satisfy both — that is a problem with
-  the decomposition or the task, not a merge to be papered over. The
-  orchestrator stops the run, leaves the run branch intact at the last
-  fully-integrated wave, and reports the conflict for a human to resolve. An
-  unresolved conflict never proceeds silently onto a corrupt run-branch state.
+  the decomposition or the task, not a merge to be papered over. An integrator
+  that says so while resolving the conflict stops the run, leaving the run
+  branch intact at the last fully-integrated wave, so the conflict reaches a
+  human. An unresolved conflict never proceeds silently onto a corrupt
+  run-branch state.
+
+**A committed merge the integration judge rejects is repaired, not died on.**
+The gate used to die on any finding (detect-and-die). That killed 3 runs in
+the corpus at a mean of 24 completed subtasks discarded each — 73 subtasks,
+$79 and 16 hours of work — on findings an integrator could fix once told what
+was wrong. Now the gate is a repair loop on the committed merge, at most
+`integration_repair_rounds` (2) rounds, each drawn from the subtask's shared
+re-drive budget (§13), so integration cannot multiply re-drives either:
+
+1. **The integrator is re-driven with typed findings,** never prose: the
+   judge's gating `defects[]`; the lines the merge dropped; failing tests,
+   typed as code to fix or as stale.
+   - *Dropped lines* are computed mechanically: in every file both parents
+     changed, the lines (stripped, at least 8 characters) one parent added
+     against the merge base that are absent from the current tree. A line
+     is left off the list only when the *other* side's own diff deleted or
+     rewrote that exact line (S3); drops inside conflict hunks stay on it.
+     For each listed line the integrator restores it or marks it
+     `superseded {file, line, by_line, reason}` with the line that now
+     carries it. Superseded entries are recorded, not checked: a code
+     re-insert (S4) was benched and dropped.
+   - *Failing tests* are routed: a failure that also appears on the home
+     side's tree once the *other* side's production files are applied over
+     it is `stale_by_other_side` — the other side's deliberate behaviour
+     change broke the test, so the integrator updates the test and never the
+     production code. Any other failure is code to fix.
+2. **Code checks the round, in order:** the new commit descends from the
+   merge, the tracked tree is clean and carries no conflict marker (else the
+   round is spent and reset); then a **full re-judge** — the same judge on a
+   synthetic merge of the repaired tree over both parents, so the repaired
+   result is reviewed as one whole merge with no prior findings shown; then
+   **the tests of the conflicted area**: the test files the merge or the
+   repair changed plus one-hop importers of the changed sources, run on both
+   parents and the repaired HEAD. A test failing on HEAD and on neither
+   parent is a candidate, confirmed under B\* (§9 *Which failures are new*)
+   against the parent it passed on; only a confirmed one counts.
+3. A round passes when the re-judge has no gating defect and no test
+   failure is confirmed. The merge then stands, and any listed line still
+   absent and not superseded is recorded as residual content loss.
+
+**The fallback is a backed-out subtask, never a dead run.** A typed
+`intent_conflict` from the judge (the two sides' stated intents cannot both
+hold — the judge quotes both), an integrator verdict of `design-conflict` or
+`failed` during repair, or exhausted rounds reset the run branch to the
+merge's first parent, settle the subtask `unconverged` (§5; its dependents
+settle `unconverged` without running) and continue the wave. The outcome
+becomes `unconverged`, so the PR opens as a draft, and the backed-out work is
+recorded as residual content loss on the subtask, which the PR reports.
+
+Benched (q4 S3, 11 cases × 2 samples, sonnet): 22/22 gate passes, 0/22 new
+test failures under B\*. Lost content by diff read on 9/22 samples (7 clear,
+2 only under the strict rule that an equivalent must be shown). Of the 469
+lines the 11 merges dropped, S2's hunk-overlap filter listed 43 for the
+integrator; S3 lists 464 — the other 5 were lines the other side itself
+rewrote. The earlier design-I bench gave 27/28 gate passes, with one fallback
+on exhausted rounds.
+
+**Resume reads the subtask's own spec.** The judge and the repair integrator
+are given the incoming subtask's intent and criteria from `subtasks/<sid>.json`,
+and the already-integrated subtasks are read from the run branch's history,
+so a resumed gate sees what a fresh one does instead of an empty intent and
+an empty integrated list.
 
 ### Finalization
 
@@ -6308,11 +6428,13 @@ mis-wirings:
   one side's behavior — e.g. a merge that keeps side A's function signature
   but side B's call sites, compiling but breaking at runtime. Gates on a
   non-empty array of
-  concretely-named behavioral defects in the merged result. An integrator
-  cannot always mechanically fix a semantic finding it didn't itself reason
-  through the same way a planner can add a subtask, so this gate is
-  **detect-and-die, single pass**, mirroring `wiring_judge` /
-  `provision_judge`.
+  concretely-named behavioral defects in the merged result. A finding is
+  handed back to the integrator as typed data and the repaired tree is
+  re-judged whole, up to `integration_repair_rounds`; a typed
+  `intent_conflict` (both sides' intents quoted, no merged tree can keep
+  both) or a merge that does not converge backs the subtask out as
+  `unconverged` instead of killing the run (§6 *When integration cannot
+  succeed*).
 
   **Location is not coverage.** A merge that drops a *duplicate* is textually
   indistinguishable from one that drops the only copy — both remove content
@@ -8623,8 +8745,9 @@ multiplied: a completeness re-drive inside one settle, then a fresh settle on
 `blocked`. One measured run spent 15,017 s. Every re-drive now draws from
 **one persisted counter per subtask**, `redrive_rounds[sid]`, capped by
 `subtask_redrive_rounds` (2): the completeness gate's re-drive and the
-wave-end re-drive of a `blocked` subtask take from the same counter, as will
-every later re-drive kind. An unbacked claim settle-by-execution cannot
+wave-end re-drive of a `blocked` subtask take from the same counter, and so
+does each integration repair round (§6 *When integration cannot succeed*), as
+will every later re-drive kind. An unbacked claim settle-by-execution cannot
 settle (§8 *Settled by execution*) ends its attempt `blocked` and so enters
 through the wave-end re-drive. The per-attempt budgets (`failed_retries`,
 `implementer_confidence_retries`, `subtask_continuations`) still bound one

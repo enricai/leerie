@@ -1,8 +1,9 @@
 """Tests for the integration_judge gate in integrate_wave (DESIGN §8
 *Independent adversarial verification*): after a successful integrator merge
 commit (post check_merge_committed), invoke integration_judge to attack for
-behavioral breakage. Detect-and-die single pass: an integrator cannot
-mechanically fix a semantic finding without re-resolving the conflict.
+behavioral breakage. Since N3 a finding is repaired by re-driving the
+integrator, or the subtask is backed out (DESIGN §6 *When integration cannot
+succeed*); the loop itself is executed in tests/test_integration_repair_loop.py.
 """
 from __future__ import annotations
 
@@ -35,77 +36,59 @@ EFFORTS = {"integrator": "low", "integration_judge": "medium"}
 
 class TestWiring:
     def test_invokes_integration_judge_after_merge_committed(self, leerie):
-        """The judge (via the shared `_run_integration_judge_gate` helper —
-        see the "Integration gate resume" refactor) is invoked after
-        check_merge_committed passes, before appending to integrated."""
+        """The gate (via the shared `_gate` closure around
+        `_run_integration_judge_gate`) runs after check_merge_committed
+        passes, before appending to integrated."""
         src = inspect.getsource(leerie.integrate_wave)
-        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
-        assert 'schema_key="integration_judge"' in gate_src
-        # The helper call must sit between check_merge_committed and the
-        # LAST integrated.append(sid) line (after the judge block) in
-        # integrate_wave's own source.
+        verdict_src = inspect.getsource(leerie._integration_judge_verdict)
+        assert 'schema_key="integration_judge"' in verdict_src
+        assert "await _run_integration_judge_gate(" in src
         i_merge_check = src.index("check_merge_committed(staging)")
-        i_helper_call = src.index("await _run_integration_judge_gate(",
-                                   i_merge_check)
+        i_helper_call = src.index("await _gate(sid)", i_merge_check)
         i_append = src.rindex("integrated.append(sid)")
         assert i_merge_check < i_helper_call < i_append
 
     def test_uses_run_checked_loop(self, leerie):
         """integration_judge is invoked via _run_checked_loop for bounded
         fresh-session retry on WorkerError."""
-        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
+        gate_src = inspect.getsource(leerie._integration_judge_verdict)
         judge_idx = gate_src.index('schema_key="integration_judge"')
         assert "_run_checked_loop(" in gate_src
-        # The loop should be nearby the judge invocation
         loop_idx = gate_src.index("_run_checked_loop(", judge_idx)
         assert loop_idx > judge_idx
 
-    def test_is_detect_and_die_no_re_drive(self, leerie):
-        """The integration gate is detect-and-die, single pass — it does NOT
-        re-drive the integrator (cannot mechanically fix a semantic finding),
-        i.e. it passes no make_feedback_prompt to _run_checked_loop for the
-        judge invocation."""
-        gate_src = inspect.getsource(leerie._run_integration_judge_gate)
-        # There is exactly one _run_checked_loop call in this helper (the
-        # judge's — the integrator's own loop lives in integrate_wave, which
-        # DOES pass make_feedback_prompt).
+    def test_judge_call_passes_no_feedback_prompt(self, leerie):
+        """Rewritten for N3. The JUDGE call stays single-pass — it passes no
+        make_feedback_prompt (re-asking a judge cannot act on its finding);
+        the repair is a separate integrator re-drive followed by a fresh,
+        whole re-judge (DESIGN §6 *When integration cannot succeed*)."""
+        gate_src = inspect.getsource(leerie._integration_judge_verdict)
         judge_def_idx = gate_src.index("def _check_integration(judge_result: dict)")
         judge_loop_idx = gate_src.index("_run_checked_loop(", judge_def_idx)
-        # Find the end of that _run_checked_loop call
-        loop_end = gate_src.index(")", judge_loop_idx + 500)
-        judge_loop_block = gate_src[judge_loop_idx:loop_end]
-        # This loop should NOT have make_feedback_prompt
-        assert "make_feedback_prompt=" not in judge_loop_block
+        loop_end = gate_src.index(")", judge_loop_idx + 150)
+        assert "make_feedback_prompt=" not in gate_src[judge_loop_idx:loop_end]
+        round_src = inspect.getsource(leerie._integration_repair_round)
+        assert 'schema_key="integrator"' in round_src
 
-    def test_dies_on_concrete_defect(self, leerie):
-        """A non-empty concrete-defect result die()s with the defect named."""
+    def test_backs_out_on_an_unrepaired_defect(self, leerie):
+        """Rewritten for N3: an unrepaired defect no longer die()s — the
+        merge is reset to its first parent and the subtask settles
+        unconverged. Executed in tests/test_integration_repair_loop.py."""
         gate_src = inspect.getsource(leerie._run_integration_judge_gate)
-        # After the judge invocation, there must be a die() on defects
-        judge_idx = gate_src.index('schema_key="integration_judge"')
-        after_judge = gate_src[judge_idx:]
-        assert "die(" in after_judge
-        assert "integration gate found behavioral defect" in after_judge
+        assert "die(" not in gate_src
+        assert '"reset", "--hard", f"{merge_sha}^1"' in gate_src
+        assert "_settle_unconverged(" in gate_src
 
     def test_degrades_on_worker_error(self, leerie):
         """A WorkerError on every round degrades: merge preserved (no revert),
         since check_merge_committed already ran."""
+        verdict_src = inspect.getsource(leerie._integration_judge_verdict)
+        assert "if judge_result is None:" in verdict_src
         gate_src = inspect.getsource(leerie._run_integration_judge_gate)
-        judge_idx = gate_src.index('schema_key="integration_judge"')
-        after_judge = gate_src[judge_idx:]
-        # Must check for judge_result is None and degrade
-        assert "if judge_result is None:" in after_judge
-        assert "degrading" in after_judge
-        # Must NOT revert/abort the merge on None. The None branch is a
-        # single `if` block that returns immediately — bound it precisely
-        # by that `return`, not by the next `else:`/`die(` text (both of
-        # which appear later, in this helper's clean/gating-defect path,
-        # and a prose comment mentioning `die()ing` also falls inside a
-        # loosely-bounded window).
-        none_branch_start = after_judge.index("if judge_result is None:")
-        none_branch_end = after_judge.index("return", none_branch_start)
-        none_branch = after_judge[none_branch_start:none_branch_end]
-        assert "merge --abort" not in none_branch
-        assert "die(" not in none_branch
+        start = gate_src.index("if verdict is None:")
+        branch = gate_src[start:gate_src.index("return True", start)]
+        assert "degrading" in branch
+        assert "reset" not in branch and "merge --abort" not in branch
 
     def test_self_gate_removed_from_check_integrator_output(self, leerie):
         """check_integrator_output no longer calls _confidence_issues.
@@ -212,83 +195,104 @@ def test_clean_integration_passes(leerie, tmp_path, monkeypatch):
     assert "feat-001" in out, "clean integration should succeed"
 
 
-def test_concrete_defect_dies(leerie, tmp_path, monkeypatch):
-    """A non-empty concrete defect result die()s with the defect named."""
-    st = _state(leerie, tmp_path)
-    leerie_dir = tmp_path / ".leerie"
+SRC_BASE = "def compute():\n    return 1\n"
+SRC_OURS = SRC_BASE + "\ndef integrated_helper_function():\n    return 1\n"
+SRC_THEIRS = SRC_BASE + "\ndef incoming_helper_function():\n    return 2\n"
+
+
+def _real_merge_staging(leerie_dir):
+    """A staging repo whose HEAD is a real two-parent merge of `incoming`
+    that dropped the incoming side's function."""
+    import subprocess
+
+    def g(*a):
+        return subprocess.run(["git", *a], cwd=str(staging), check=True,
+                              capture_output=True, text=True).stdout
     staging = leerie_dir / "worktrees" / "staging"
     staging.mkdir(parents=True)
-
-    # Create a minimal git repo
-    import subprocess
-    subprocess.run(["git", "init"], cwd=str(staging), check=True,
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@x")
+    g("config", "user.name", "t")
+    (staging / "app.py").write_text(SRC_BASE)
+    g("add", "-A")
+    g("commit", "-q", "-m", "base")
+    g("checkout", "-q", "-b", "incoming")
+    (staging / "app.py").write_text(SRC_THEIRS)
+    g("commit", "-q", "-am", "incoming")
+    g("checkout", "-q", "main")
+    (staging / "app.py").write_text(SRC_OURS)
+    g("commit", "-q", "-am", "integrated")
+    p1 = g("rev-parse", "HEAD").strip()
+    subprocess.run(["git", "merge", "--no-ff", "-m", "leerie: integrate "
+                    "feat-001", "incoming"], cwd=str(staging),
                    capture_output=True)
-    subprocess.run(["git", "config", "user.email", "test@test.com"],
-                   cwd=str(staging), check=True, capture_output=True)
-    subprocess.run(["git", "config", "user.name", "Test"],
-                   cwd=str(staging), check=True, capture_output=True)
-    (staging / "file.txt").write_text("content\n")
-    subprocess.run(["git", "add", "."], cwd=str(staging), check=True,
-                   capture_output=True)
-    subprocess.run(["git", "commit", "-m", "init"], cwd=str(staging),
-                   check=True, capture_output=True)
+    (staging / "app.py").write_text(SRC_OURS)
+    g("add", "-A")
+    g("commit", "-q", "--no-edit")
+    return staging, p1, g("rev-parse", "HEAD").strip()
 
-    results = {"feat-001": {"status": "complete", "intent": "add feature",
-                           "criteria_results": []}}
+
+DROPPED = {"kind": "dropped_change",
+           "concrete_scenario": "the incoming helper was silently dropped",
+           "location": "app.py", "why_broken": "its callers fail"}
+
+
+def _no_conflict_tests(leerie, monkeypatch):
+    async def none(*a, **kw):
+        return {"test_failure": [], "stale_by_other_side": [], "scope": [],
+                "skipped": "no test command"}
+    monkeypatch.setattr(leerie, "_integration_test_failures", none)
+
+
+def test_concrete_defect_backs_out_and_the_wave_continues(leerie, tmp_path, monkeypatch):
+    """Rewritten for N3 (DESIGN §6 *When integration cannot succeed*): a
+    concrete defect no longer kills the run. Here the repair integrator
+    reports `design-conflict`, so the merge is backed out to its first
+    parent, the subtask settles `unconverged`, and the wave CONTINUES —
+    the next subtask still integrates."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging, p1, merge = _real_merge_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"},
+               "feat-003": {"status": "complete"}}
+    calls: list[str] = []
 
     async def fake_claude_p(**kwargs):
-        if kwargs.get("schema_key") == "integrator":
-            return {"status": "resolved", "resolution_summary": "merged",
-                    "confidence": {"resolution": 9.0, "basis": "clean"}}
-        elif kwargs.get("schema_key") == "integration_judge":
-            return {"merge_reviewed": True, "defects": [{
-                "kind": "dropped_change",
-                "concrete_scenario": "side A's validation was silently dropped",
-                "location": "src/auth.py:42",
-                "why_broken": "input no longer validated, security hole"
-            }], "rationale": "found breakage"}
-        return {}
+        calls.append(kwargs["sid"])
+        if kwargs.get("schema_key") == "integration_judge":
+            return {"merge_reviewed": True, "defects": [DROPPED],
+                    "rationale": "found breakage"}
+        if kwargs["sid"].startswith("integrator-repair-"):
+            return {"incoming_subtask": "feat-001",
+                    "status": "design-conflict", "diagnosis": "both cannot hold"}
+        return {"status": "resolved", "resolution_summary": "merged"}
 
     async def fake_run_script(script, sid, run_id):
         mock = AsyncMock()
-        mock.returncode = 1
-        mock.stderr = ""
-        mock.stdout = ""
+        mock.returncode = 1 if sid == "feat-001" else 0
+        mock.stderr = mock.stdout = ""
         return mock
-
-    async def fake_run_proc(cmd, cwd=None):
-        mock = AsyncMock()
-        mock.returncode = 0
-        if "rev-parse" in cmd:
-            mock.stdout = "abc123\n"
-        elif "show" in cmd:
-            mock.stdout = "Merge commit\n\ndiff\n"
-        else:
-            mock.stdout = ""
-        mock.stderr = ""
-        return mock
-
-    async def fake_check_merge_committed(staging_path):
-        # Simulate successful merge commit check (no MERGE_HEAD)
-        return None
-
-    async def fake_check_integrator_commit(staging_path):
-        # Simulate no commit warnings
-        return None
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "_run_script", fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
-    monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
-    monkeypatch.setattr(leerie, "check_integrator_commit", fake_check_integrator_commit)
-
-    async def _run():
-        await leerie.integrate_wave(
-            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
-
-    with pytest.raises(SystemExit):
-        asyncio.run(_run())
-
+    monkeypatch.setattr(leerie, "check_merge_committed",
+                        AsyncMock(return_value=None))
+    monkeypatch.setattr(leerie, "check_integrator_commit",
+                        AsyncMock(return_value=None))
+    _no_conflict_tests(leerie, monkeypatch)
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001", "feat-003"], results, leerie_dir, _caps(leerie), st,
+        MODELS, EFFORTS))
+    assert out == ["feat-003"]
+    assert calls == ["integrator-feat-001", "integration_judge-feat-001",
+                     "integrator-repair-feat-001"]
+    import subprocess
+    head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(staging),
+                          capture_output=True, text=True).stdout.strip()
+    assert head == p1
+    assert results["feat-001"]["status"] == "unconverged"
+    assert st.data["subtask_status"]["feat-001"] == "unconverged"
+    assert st.data["integration_gate"]["feat-001"]["outcome"] == "backed_out"
 
 def test_worker_error_degrades_preserves_merge(leerie, tmp_path, monkeypatch):
     """A WorkerError on every round degrades: merge preserved, no die()."""
@@ -470,67 +474,51 @@ def _staging_repo(leerie_dir):
     return staging
 
 
-def test_defect_persisted_to_state_before_die(leerie, tmp_path, monkeypatch):
-    """(a) integrate_wave writes integration_gate/integration_defects[sid]
-    BEFORE die()ing — the incident shape: a committed merge, a behavioral
-    defect, and a state.json that must survive the die() so a resume can
-    read it back."""
+def test_defect_persisted_to_state_before_the_repair(leerie, tmp_path, monkeypatch):
+    """(a) The verdict reaches integration_gate/integration_defects[sid] on
+    DISK before anything else happens — checked at the moment the repair
+    integrator is spawned, so a crash there leaves a record a resume reads."""
+    import json as _json
     st = _state(leerie, tmp_path)
     leerie_dir = tmp_path / ".leerie"
-    _staging_repo(leerie_dir)
-
-    results = {"feat-001": {"status": "complete", "intent": "add feature",
-                           "criteria_results": []}}
+    staging, _p1, merge = _real_merge_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"}}
+    on_disk: list[dict] = []
 
     async def fake_claude_p(**kwargs):
-        if kwargs.get("schema_key") == "integrator":
-            return {"status": "resolved", "resolution_summary": "merged",
-                    "confidence": {"resolution": 9.0, "basis": "clean"}}
-        elif kwargs.get("schema_key") == "integration_judge":
-            return {"merge_reviewed": True, "defects": [{
-                "kind": "dropped_change",
-                "concrete_scenario": "side A's validation was silently dropped",
-                "location": "src/auth.py:42",
-                "why_broken": "input no longer validated"
-            }], "rationale": "found breakage"}
-        return {}
+        if kwargs.get("schema_key") == "integration_judge":
+            return {"merge_reviewed": True, "defects": [DROPPED],
+                    "rationale": "found breakage"}
+        if kwargs["sid"].startswith("integrator-repair-"):
+            on_disk.append(_json.loads(st.path.read_text()))
+            return {"incoming_subtask": "feat-001", "status": "failed",
+                    "diagnosis": "x"}
+        return {"status": "resolved", "resolution_summary": "merged"}
 
     async def fake_run_script(script, sid, run_id):
         mock = AsyncMock()
         mock.returncode = 1
-        mock.stderr = ""
-        mock.stdout = ""
-        return mock
-
-    async def fake_run_proc(cmd, cwd=None):
-        mock = AsyncMock()
-        mock.returncode = 0
-        mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
-        mock.stderr = ""
+        mock.stderr = mock.stdout = ""
         return mock
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     monkeypatch.setattr(leerie, "_run_script", fake_run_script)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
     monkeypatch.setattr(leerie, "check_merge_committed",
                         AsyncMock(return_value=None))
     monkeypatch.setattr(leerie, "check_integrator_commit",
                         AsyncMock(return_value=None))
-
-    async def _run():
-        await leerie.integrate_wave(
-            ["feat-001"], results, tmp_path / ".leerie", _caps(leerie),
-            st, MODELS, EFFORTS)
-
-    with pytest.raises(SystemExit):
-        asyncio.run(_run())
-
-    # The state was persisted BEFORE the die() fired.
-    entry = st.data["integration_gate"]["feat-001"]
+    _no_conflict_tests(leerie, monkeypatch)
+    asyncio.run(leerie.integrate_wave(
+        ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS,
+        EFFORTS))
+    entry = on_disk[0]["integration_gate"]["feat-001"]
     assert entry["accepted"] is False
+    assert entry["merge_commit_sha"] == merge
     assert any("dropped_change" in d for d in entry["defects"])
-    assert st.data["integration_defects"]["feat-001"] == entry["defects"]
-
+    assert on_disk[0]["integration_defects"]["feat-001"] == entry["defects"]
+    # Backed out afterwards: the mirror is cleared, the record says why.
+    assert "feat-001" not in (st.data.get("integration_defects") or {})
+    assert st.data["integration_gate"]["feat-001"]["outcome"] == "backed_out"
 
 def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
         leerie, tmp_path, monkeypatch):
@@ -600,50 +588,71 @@ def test_resume_reinvokes_the_judge_without_redriving_integrate_sh(
     assert "feat-001" not in st.data.get("integration_defects", {})
 
 
-def test_resume_still_dies_when_defect_not_accepted(
+def test_resume_reenters_the_repair_loop(
         leerie, tmp_path, monkeypatch):
-    """A resume that re-invokes the judge and gets the SAME defect back
-    must still die() — accept-integration is the only way past it."""
+    """Rewritten for N3: a resume whose judge returns the SAME defect no
+    longer dies — it re-enters the repair loop against the recorded merge
+    (no integrate.sh), and a repair that clears the re-judge integrates."""
+    import subprocess
     st = _state(leerie, tmp_path)
     leerie_dir = tmp_path / ".leerie"
-    _staging_repo(leerie_dir)
-
+    staging, _p1, merge = _real_merge_staging(leerie_dir)
     st.data["integration_gate"] = {
         "feat-001": {"defects": ["INTEGRATION_DEFECT (dropped_change) x"],
-                     "advisories": [], "merge_commit_sha": "abc123",
+                     "advisories": [], "merge_commit_sha": merge,
                      "accepted": False}}
     st.save()
-
     results = {"feat-001": {"status": "complete"}}
+    (leerie_dir / "subtasks").mkdir(parents=True, exist_ok=True)
+    (leerie_dir / "subtasks" / "feat-001.json").write_text(
+        '{"id": "feat-001", "intent": "resumed intent"}')
+    verdicts = [[DROPPED], []]
+    sids: list[str] = []
 
     async def fake_claude_p(**kwargs):
+        sids.append(kwargs["sid"])
         if kwargs.get("schema_key") == "integration_judge":
-            return {"merge_reviewed": True, "defects": [{
-                "kind": "dropped_change",
-                "concrete_scenario": "still broken",
-                "location": "src/auth.py:42",
-                "why_broken": "still not validated"
-            }], "rationale": "still broken"}
-        return {}
+            return {"merge_reviewed": True, "defects": verdicts.pop(0),
+                    "rationale": "r"}
+        (staging / "app.py").write_text(SRC_THEIRS + SRC_OURS[len(SRC_BASE):])
+        subprocess.run(["git", "commit", "-q", "-am", "repair"],
+                       cwd=str(staging), check=True)
+        return {"incoming_subtask": "feat-001", "status": "resolved"}
 
-    async def fake_run_proc(cmd, cwd=None):
-        mock = AsyncMock()
-        mock.returncode = 0
-        mock.stdout = "abc123\n" if "rev-parse" in cmd else "Merge\n\ndiff\n"
-        mock.stderr = ""
-        return mock
+    async def no_script(*a):
+        raise AssertionError("resume must not re-drive integrate.sh")
 
-    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    # A sibling a PRIOR invocation already merged (complete, not in this
+    # invocation's results): the resumed judge must be told about it.
+    subprocess.run(["git", "branch",
+                    f"leerie/subtasks/{st.run_id}/feat-000", f"{merge}^1"],
+                   cwd=str(staging), check=True)
+    st.data["subtask_status"] = {"feat-000": "complete",
+                                 "feat-001": "complete"}
+    prompts: list[str] = []
+    real_fake = fake_claude_p
 
-    async def _run():
-        await leerie.integrate_wave(
-            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+    async def recording(**kwargs):
+        prompts.append(kwargs["user_prompt"])
+        return await real_fake(**kwargs)
 
-    with pytest.raises(SystemExit):
-        asyncio.run(_run())
-    assert st.data["integration_gate"]["feat-001"]["accepted"] is False
-
+    monkeypatch.setattr(leerie, "claude_p", recording)
+    monkeypatch.setattr(leerie, "_run_script", no_script)
+    _no_conflict_tests(leerie, monkeypatch)
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-000", "feat-001"], results, leerie_dir, _caps(leerie), st,
+        MODELS, EFFORTS))
+    assert out == ["feat-001"]
+    assert "Already-integrated subtasks: feat-000\n" in prompts[0]
+    assert "Already-integrated subtasks it may conflict with: feat-000\n" \
+        in prompts[1]
+    # The intent is read from the spec when the stand-in result has none.
+    assert "Intent: resumed intent\n" in prompts[0]
+    assert sids == ["integration_judge-feat-001",
+                    "integrator-repair-feat-001",
+                    "integration_judge-feat-001"]
+    rec = st.data["integration_gate"]["feat-001"]
+    assert rec["accepted"] is True and rec["outcome"] == "repaired"
 
 def test_accepted_finding_skips_the_judge_entirely(leerie, tmp_path, monkeypatch):
     """(d) After `accept-integration` flips `accepted` to True, a subsequent

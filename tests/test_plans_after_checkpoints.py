@@ -177,7 +177,7 @@ class TestCheckpointsFollowTheirPhaseCall:
     def test_filters_checkpoint_precedes_schedule(self, leerie):
         src = _phases_src(leerie)
         key = src.find('st.data["plans_after_filters"]')
-        sched = src.find("subtasks, waves = _schedule(plans)")
+        sched = src.find("subtasks, waves = _schedule(\n                plans")
         assert key != -1
         assert sched != -1, "_run_phases must call _schedule(plans)"
         assert key < sched

@@ -218,13 +218,14 @@ def test_integration_gate_is_declared_per_sid_keyed_by_sid(leerie):
     """The producing domain decides per-sid vs per-run granularity; this
     reads STATE_FIELDS and the real write site rather than assuming.
     `integration_gate` is a dict keyed by subtask id (verified against
-    `_run_integration_judge_gate`'s own write:
-    `st.data.setdefault("integration_gate", {})[sid] = {...}`), matching
-    what `_run_accept`/`_make_state` above already assume."""
+    `_run_integration_judge_gate`'s own write, `gates[sid] = rec` with
+    `gates = st.data.setdefault("integration_gate", {})`), matching what
+    `_run_accept`/`_make_state` above already assume."""
     assert "integration_gate" in leerie.STATE_FIELDS
     import inspect
     src = inspect.getsource(leerie._run_integration_judge_gate)
-    assert 'st.data.setdefault("integration_gate", {})[sid] = {' in src
+    assert 'gates = st.data.setdefault("integration_gate", {})' in src
+    assert "gates[sid] = rec" in src
 
 
 # --- end-to-end composition: real launcher write -> real integrate_wave read #
