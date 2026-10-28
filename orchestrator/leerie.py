@@ -5612,6 +5612,14 @@ def _worktree_add_detached(st: "State", wt: Path, rev: str
             os.close(lock_fd)
 
 
+async def _worktree_add_detached_async(st: "State", wt: Path, rev: str
+                                       ) -> subprocess.CompletedProcess:
+    """`_worktree_add_detached` off the event loop: its lock wait (up to
+    `_WORKTREE_ADD_LOCK_WAIT_SEC`) and the checkout would otherwise stall
+    every worker's watchdog and stream reader (review r2 L3)."""
+    return await asyncio.to_thread(_worktree_add_detached, st, wt, rev)
+
+
 def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     """Scoped replacement for a bare `git worktree prune`. Python port of
     `scripts/worktree-lib.sh`'s `prune_leerie_worktrees`, for the orchestrator's
@@ -37956,7 +37964,8 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
     _teardown()
-    add = _worktree_add_detached(st, wt, base_sha) if base_sha else None
+    add = (await _worktree_add_detached_async(st, wt, base_sha)
+           if base_sha else None)
     if add is None or add.returncode != 0:
         log("  B*: could not create the base worktree for the confirm — "
             "every candidate is resource_affected")
@@ -38725,7 +38734,7 @@ def _ci_parity_unmet_from(data: dict) -> list[dict]:
 async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
     wt = _helper_worktree_path(st, name)
     _ci_teardown(st, wt)
-    r = _worktree_add_detached(st, wt, sha)
+    r = await _worktree_add_detached_async(st, wt, sha)
     if r.returncode != 0:
         log(f"  ci parity: could not create the {name} worktree at "
             f"{sha[:12]}: {r.stderr.strip()[:200]}")
@@ -42608,7 +42617,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     # invalid set (the same discipline as the no_work_judge call).
     st.bump_workers(caps)
     _remove_acceptance_checkout(st, wt)
-    made = _acceptance_writer_checkout(st, wt, base)
+    made = await asyncio.to_thread(_acceptance_writer_checkout, st, wt, base)
     if made.startswith("failed"):
         out["reason"] = made
         return out
@@ -43137,7 +43146,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
     if head.returncode != 0:
         return unmeasured_all
     _teardown()                     # what a crashed evaluation left
-    add = _worktree_add_detached(st, wt, head.stdout.strip())
+    add = await _worktree_add_detached_async(st, wt, head.stdout.strip())
     if add.returncode != 0:
         log(f"  acceptance: could not create the evaluation worktree: "
             f"{add.stderr.strip()[:200]} — no evidence either way")
@@ -43993,7 +44002,7 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
     _teardown()
     url = None
     try:
-        add = _worktree_add_detached(st, wt, rev)
+        add = await _worktree_add_detached_async(st, wt, rev)
         if add.returncode != 0 or not await _ensure_worktree_deps(
                 str(wt), st, caps, log_path=log_path,
                 verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
@@ -44036,7 +44045,8 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
     wt = _helper_worktree_path(st, "acceptance-surrogate")
     log_path = st.run_dir / "logs" / "acceptance-surrogate.log"
     _remove_acceptance_checkout(st, wt)
-    if _acceptance_writer_checkout(st, wt, own).startswith("failed"):
+    if (await asyncio.to_thread(_acceptance_writer_checkout, st, wt, own)
+            ).startswith("failed"):
         return None
     task = st.data.get("task") or ""
     copied: list[Path] = []
@@ -46835,7 +46845,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     trees: list[Path] = []
     confirm_db: str | None = None
-    confirm_tree = _falsifier_checkout(st, "falsifier-confirm", sha)
+    confirm_tree = await asyncio.to_thread(
+        _falsifier_checkout, st, "falsifier-confirm", sha)
     try:
         if confirm_tree is None:
             return {"enabled": False, "skipped": "no checkout of the final "
@@ -46867,7 +46878,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         n_lanes = max(1, min(int(caps.get("max_parallel") or 1), len(todo)))
         lanes: asyncio.Queue = asyncio.Queue()
         for n in range(n_lanes):
-            lane = _falsifier_checkout(st, f"falsifier-lane{n}", sha)
+            lane = await asyncio.to_thread(
+                _falsifier_checkout, st, f"falsifier-lane{n}", sha)
             if lane is None:
                 continue
             trees.append(lane)
@@ -47601,7 +47613,7 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
     _teardown()
-    add = _worktree_add_detached(st, wt, pre_sha)
+    add = await _worktree_add_detached_async(st, wt, pre_sha)
     try:
         if add.returncode != 0:
             verdict = await _confirm_new_failures(cand, _no_rerun, _no_rerun,
@@ -52312,7 +52324,7 @@ async def _integration_tree(st: "State", sid: str, name: str, rev: str,
     conflicted-area tests; None when it cannot be created."""
     wt = _helper_worktree_path(st, f"integ-{sid}-{name}")
     _integration_tree_remove(st, wt)
-    add = _worktree_add_detached(st, wt, rev)
+    add = await _worktree_add_detached_async(st, wt, rev)
     if add.returncode != 0:
         log(f"  integration-tests {sid}: could not create the {name} tree "
             f"at {rev[:12]}: {add.stderr.strip()[:200]}")

@@ -8529,7 +8529,12 @@ at `_helper_worktree_path(st, name)` (`<run-dir>/worktrees/<run-id[:12]>-
 <name>`), and every Python `git worktree add` is `_worktree_add_detached(st,
 wt, rev)`: the add under the same `leerie-worktree.lock` (non-blocking
 retries for at most `_WORKTREE_ADD_LOCK_WAIT_SEC` = 120 s, then unlocked,
-logged). `_acceptance_read_denials` names the prefixed evaluation tree.
+logged). It blocks, so a coroutine calls `await
+_worktree_add_detached_async(st, wt, rev)` (the same call in
+`asyncio.to_thread`), and reaches the sync checkout helpers that call it
+(`_acceptance_writer_checkout`, `_falsifier_checkout`) through
+`asyncio.to_thread` too; `tests/test_helper_worktree_lock.py` fails on any
+coroutine that calls one of them directly. `_acceptance_read_denials` names the prefixed evaluation tree.
 
 The repo is bind-mounted whole into every container, so `.git` is
 SHARED with the host and any other container. A bare prune is

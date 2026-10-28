@@ -2184,6 +2184,12 @@ run deaths across 4 chains. Four rules close it:
   and names the directory `<run-id[:12]>-<name>`. It waits a bounded time
   for the lock and then adds without it, logged: these trees are
   fail-open evidence, and a stuck lock holder must not stall the run.
+  Nor may the wait stall the event loop: every caller is a coroutine, and
+  a lock wait (up to that bound) plus the checkout run on the loop froze
+  every worker's watchdog and stream reader while another run's script
+  held the lock. A coroutine reaches the add only through a worker thread
+  (`asyncio.to_thread`), enforced by a test over every coroutine that
+  calls the add or a sync helper that reaches it.
 
 The planning worktree also pruned *after* its orphan check, the order
 `new-worktree.sh` had already learned is wrong (a prune is what orphans a
