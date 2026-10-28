@@ -469,7 +469,11 @@ subtask it tests). Three mechanisms reconcile that coupling:
   site is recorded as resting on an untyped resolution, for the PR. A
   `fix` site that no fix subtask claims needs either a claim or a typed
   `sites_not_needed` entry (`{site_id, reason}`); one claimed only with
-  kinds outside the audit's class is a mismatch. Both are fed back to
+  kinds outside the audit's class is a mismatch. Recursive decomposition
+  (§5½) re-homes a split subtask into children; every child — code-built
+  or written by the splitter, whose schema has no claims — carries its
+  parent's `change_kind` and claims, stamped by code, and the record is
+  re-derived over the leaves so a claim names a subtask that exists. Both are fed back to
   the bug-fixing planner through its mechanical-check loop — the
   planner either implements the audit's resolution or, only with code
   evidence the audit is wrong, keeps its own and says so. What is left
@@ -7970,9 +7974,21 @@ it. Three layers follow, each derived from that one list:
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not
   block every Bash call of a run.
+- **A runtime guard for a forbidden package script.** When a forbidden
+  command is exactly a package script (`pnpm test`, `npm run lint`), the
+  worker's environment points npm's and pnpm's `script-shell` at a small
+  guard that refuses that script by its lifecycle name and runs every
+  other one with `/bin/sh`. It sees every run the package manager makes,
+  so it covers the one the command-line layers cannot: a script reached
+  through another script (`pnpm run ci` whose body is `pnpm test`), a
+  Makefile target, any spelling the matcher misses.
 - **The orchestrator's own measurement skips it.** `_measure_axes` does
   not run a build/lint/test command the task forbids; that axis is
-  recorded unmeasured with `skip_kind: forbidden_by_task`.
+  recorded unmeasured with `skip_kind: forbidden_by_task`. Nor does
+  settle-by-execution (§8 *Settled by execution*): a planner `verify`
+  argv that runs a forbidden command is emptied before scheduling and
+  refused if one reaches the settle anyway, so that criterion is one no
+  command decides and the claim falls back to the re-drive.
 
 A forbidden command that is also a prescribed command is not forbidden
 (the prescription is the more specific instruction), and `runs_commands`
@@ -7984,9 +8000,17 @@ test`); with the hook, 0 of 30 offline attack forms escaped the matcher
 and 0 of 12 live attempts by workers told to keep trying escaped, while
 0 of 13 offline and 0 of 10 live legitimate commands (`node -e
 "console.log(1)"`, `bash -c 'echo test'`, `grep 'pnpm run test'`, other
-scripts) were blocked. Not covered, deliberately: running the script's
-body directly (`node scripts/t.js`) — that is a different command, and
-the benched runtime script-shell guard that caught it was not adopted.
+scripts) were blocked. The runtime guard alone (no hook) refused 29 of
+32 offline forms (P10's runtime layer); the three it let run were two
+that override the script shell itself (`pnpm
+--config.script-shell=/bin/sh run test`, `pnpm_config_script_shell=
+pnpm test`), which the hook denies, and `node scripts/t.js`. So it added
+no catch on that bench; it is kept because it is the only layer that sees
+a nested run — measured here, `npm run ci` and `pnpm run ci` with `ci`
+running `pnpm test` were both refused, and `npm run lint` ran. Not
+covered by any layer, deliberately: running the script's body directly
+(`node scripts/t.js`) — that is a different command, and no package
+manager is involved.
 
 The derivation reads the target repo's files on every worker spawn, so it is
 total: an unreadable or odd ini file (`testpaths` from `pytest.ini`,

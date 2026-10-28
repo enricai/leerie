@@ -279,3 +279,35 @@ def test_execution_blocker_fences_the_output(leerie):
 def test_settle_record_is_json_serialisable(harness):
     _settle(harness, _sub(_py("pass")))
     json.dumps(harness["st"].data["settled_by_execution"])
+
+
+# ---- a command the task forbids is never run (stage 4c) ---------------------
+
+def test_a_forbidden_verify_argv_is_refused_and_nothing_runs(harness):
+    """The real settle: an argv that runs a forbidden command (here through
+    `sh -c`, which the hook's matcher unwraps) is refused before anything
+    runs — the harmless command ahead of it included — and the verdict is
+    `none`, whose callers re-drive the claim."""
+    wt = harness["worktree"]
+    harness["st"].data["process_constraints"] = {
+        "forbidden_commands": ["pnpm run test"], "evidence": "e"}
+    first = _py("open('FIRST_RAN', 'w').write('x')")
+    res = _settle(harness, _sub(first, ["sh", "-c",
+                                        "touch RAN; pnpm test"]))
+    assert res["verdict"] == "none"
+    assert res["commands"] == []
+    assert res["forbidden"] == [{"argv": ["sh", "-c", "touch RAN; pnpm test"],
+                                 "forbidden": "pnpm run test"}]
+    assert "pnpm run test" in res["why"]
+    assert not (wt / "RAN").exists() and not (wt / "FIRST_RAN").exists()
+    stored = harness["st"].data["settled_by_execution"][harness["sid"]]
+    assert stored["verdict"] == "none"
+    blocker = harness["leerie"]._execution_blocker(res)
+    assert "forbids" in blocker and "pnpm run test" in blocker
+
+
+def test_an_unrelated_forbidden_command_does_not_stop_execution(harness):
+    harness["st"].data["process_constraints"] = {
+        "forbidden_commands": ["prisma db push"], "evidence": "e"}
+    res = _settle(harness, _sub(_py("pass")))
+    assert res["verdict"] == "pass" and "forbidden" not in res

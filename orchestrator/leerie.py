@@ -10121,6 +10121,7 @@ def _inherited_subtask_fields(subtask: dict) -> dict:
         # *Sub-file*): a child is gated, and site-limited, as its parent was.
         "independent_sites": subtask.get("independent_sites"),
         "sweep_sites": list(subtask.get("sweep_sites") or []),
+        **_site_claim_fields(subtask),
     }
 
 
@@ -10134,6 +10135,23 @@ def _inherit_split_fields(parent: dict, children: list[dict]) -> None:
             child["change_shape"] = parent.get("change_shape")
             child["independent_sites"] = parent.get("independent_sites")
             child["sweep_sites"] = list(parent.get("sweep_sites") or [])
+
+
+def _site_claim_fields(subtask: dict) -> dict:
+    """The parent's `change_kind` and `claims`, for every child a split
+    makes (DESIGN §5 *Every `fix` site is claimed*). Claims are recorded on
+    the first-pass plan; a split re-homes the subtask, so a child that lost
+    them would leave its parent's sites claimed by an id no longer in the
+    plan. Every child carries the parent's claims — which child edits a site
+    is not known when the split is made, and a claim duplicated across
+    siblings still says the site is claimed. Absent keys stay absent (a
+    non-bug-fixing plan's subtask has none)."""
+    out: dict = {}
+    if "change_kind" in subtask:
+        out["change_kind"] = subtask["change_kind"]
+    if "claims" in subtask:
+        out["claims"] = copy.deepcopy(subtask["claims"])
+    return out
 
 
 def _migration_child(subtask: dict, chunk: list[str], cid: str,
@@ -10909,6 +10927,12 @@ async def _recursive_decompose(
             return [subtask]
         children = split_result.get("children") or []
         _inherit_split_fields(subtask, children)
+        # The splitter's schema carries no claims; the code stamps the
+        # parent's, as `_inherited_subtask_fields` does for code-built
+        # children.
+        for child in children:
+            if isinstance(child, dict):
+                child.update(_site_claim_fields(subtask))
         if not children:
             # Splitter produced no children; accept the subtask as a leaf.
             log(
@@ -21429,10 +21453,70 @@ def _forbidden_command_hook_main(argv: list[str], stdin: TextIO,
     return 0
 
 
+FORBIDDEN_SCRIPT_SHELL = ROOT / "scripts" / "forbidden-script-shell.sh"
+# A package-script name the guard's space-separated list can carry verbatim
+# (a mechanical string: npm script names).
+_FORBID_SCRIPT_NAME_RE = re.compile(r"[A-Za-z0-9:._-]+")
+
+
+def _forbidden_script_names(forbidden: list[str]) -> list[str]:
+    """Package scripts the task forbids outright: a forbidden command that
+    normalises to exactly `<pm> run <script>` (`pnpm test`, `npm run lint`).
+    One with further arguments (`pnpm test --watch`) forbids only that
+    spelling, so it names no script — blocking the whole script would deny
+    more than the task did."""
+    names: list[str] = []
+    for c in forbidden or []:
+        try:
+            argvs = _forbidden_argvs(c)
+        except Exception:
+            continue
+        for a in argvs:
+            if (len(a) == 3 and a[0] in _FORBID_PMS and a[1] == "run"
+                    and _FORBID_SCRIPT_NAME_RE.fullmatch(a[2])
+                    and a[2] not in names):
+                names.append(a[2])
+    return names
+
+
+def _forbidden_script_shell_env(forbidden: list[str]) -> dict[str, str]:
+    """The worker env that routes every npm/pnpm/yarn-classic script through
+    `scripts/forbidden-script-shell.sh` (DESIGN §9 *A command the task
+    forbids*, the runtime layer), or {} when no package script is forbidden.
+    The guard refuses a script whose lifecycle name is listed and runs every
+    other one with `/bin/sh` — the package managers' own default."""
+    names = _forbidden_script_names(forbidden)
+    if not names:
+        return {}
+    shell = str(FORBIDDEN_SCRIPT_SHELL)
+    return {"LEERIE_FORBIDDEN_SCRIPTS": " ".join(names),
+            "npm_config_script_shell": shell,
+            "pnpm_config_script_shell": shell}
+
+
+def _forbidden_verify_argv(subtask: dict,
+                           forbidden: list[str]) -> list[tuple[list[str], str]]:
+    """`(argv, forbidden command)` for each of `subtask`'s `verify` argvs
+    that runs a command the task forbids — same matcher as the hook, over
+    the argv as the shell would read it."""
+    if not forbidden:
+        return []
+    out: list[tuple[list[str], str]] = []
+    for argv in _subtask_verify_argvs(subtask):
+        hit = _forbidden_command_hit(shlex.join(argv), forbidden)
+        if hit:
+            out.append((argv, hit))
+    return out
+
+
 def _strip_forbidden_commands(plans: list[dict],
                               forbidden: list[str]) -> list[str]:
     """Remove `runs_commands` entries that run a forbidden command, so the
-    declared-command check never requires one. Returns the affected sids;
+    declared-command check never requires one, and empty the `argv` of each
+    `verify` entry that runs one, so settle-by-execution never runs it and
+    that criterion falls back to the re-drive (DESIGN §8 *Settled by
+    execution*: an entry with no argv is a criterion no command decides,
+    which also clears `verification_only`). Returns the affected sids;
     mutates in place; never raises."""
     if not forbidden:
         return []
@@ -21444,6 +21528,15 @@ def _strip_forbidden_commands(plans: list[dict],
             for sub in plan.get("subtasks") or []:
                 if not isinstance(sub, dict):
                     continue
+                for v in sub.get("verify") or []:
+                    argv = v.get("argv") if isinstance(v, dict) else None
+                    if (isinstance(argv, list) and argv
+                            and all(isinstance(a, str) for a in argv)
+                            and _forbidden_command_hit(shlex.join(argv),
+                                                       forbidden)):
+                        v["argv"] = []
+                        if str(sub.get("id")) not in touched:
+                            touched.append(str(sub.get("id")))
                 rc = sub.get("runs_commands")
                 if not isinstance(rc, list) or not rc:
                     continue
@@ -21451,7 +21544,8 @@ def _strip_forbidden_commands(plans: list[dict],
                         if not _forbidden_command_hit(c, forbidden)]
                 if len(kept) != len(rc):
                     sub["runs_commands"] = kept
-                    touched.append(str(sub.get("id")))
+                    if str(sub.get("id")) not in touched:
+                        touched.append(str(sub.get("id")))
     except Exception as e:
         log(f"  forbidden-command strip stopped early "
             f"({type(e).__name__}: {e})")
@@ -21678,6 +21772,12 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                         if _tools_reach_forbidden(allowed_tools, forbidden)
                         else None)
     hook_settings = _forbidden_command_hook_settings(forbidden)
+    # The runtime layer: a forbidden package script refused by the package
+    # manager's own script shell, wherever the run came from — another
+    # script's body included, which neither the rules nor the hook see.
+    script_guard_env = _forbidden_script_shell_env(forbidden)
+    if script_guard_env:
+        env_extra = {**script_guard_env, **(env_extra or {})}
     suite_notice = (_full_suite_notice(_suite_root, _prescribed)
                     if suite_deny and _tools_reach_suite_runner(
                         allowed_tools, _suite_root, _prescribed) else None)
@@ -26103,6 +26203,17 @@ async def phase_plan(task: str, st: State, caps: dict,
         plan["subtasks"] = leaves
     for plan in plans:
         _remap_vanished_deps(plan.get("subtasks", []), expansion)
+    # Re-recorded over the leaves: split children carry their parent's
+    # claims (`_site_claim_fields`), so the verdicts are unchanged and the
+    # claiming sids are now ids that exist in the plan.
+    for category, plan in zip(cats, plans):
+        if category != "bug-fixing":
+            continue
+        record = _site_claim_record(plan, defect_scope)
+        if record is not None:
+            st.data["site_claims"] = record
+            st.save()
+        break
 
     _warn_decomposition_share(st, caps)
 
@@ -43049,6 +43160,21 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     if not argvs:
         record["why"] = "the plan gives this subtask no verify argv"
         return _done()
+    # The plan strip already emptied these (`_strip_forbidden_commands`);
+    # this refuses one that reached here anyway — a plan persisted before
+    # the strip, or a subtask spec read back on resume. The orchestrator
+    # never runs what the task forbids (DESIGN §9), and a criterion it
+    # cannot run is not settled: the claim falls back to the re-drive.
+    refused = _forbidden_verify_argv(subtask,
+                                     _forbidden_commands(st.data))
+    if refused:
+        record["forbidden"] = [{"argv": a, "forbidden": f}
+                               for a, f in refused]
+        record["why"] = (
+            "verify command(s) the task forbids were not run: "
+            + "; ".join(f"`{shlex.join(a)}` runs `{f}`" for a, f in refused))
+        log(f"  {sid}: settle by execution — none: {record['why']}")
+        return _done()
     pre = await run_proc(["git", "status", "--porcelain",
                           "--untracked-files=no"], cwd=worktree)
     if pre.returncode != 0 or pre.stdout.strip():
@@ -47355,11 +47481,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
             log(f"  {_sid}: dropped its whole-suite runs_commands entry — "
                 f"the orchestrator's whole-tree pass runs the suite")
         # A forbidden command must never be REQUIRED by the declared-command
-        # check (DESIGN §9 *A command the task forbids*). Prescribed commands
-        # were already removed from the forbidden list at classify time.
+        # check, nor run by settle-by-execution (DESIGN §9 *A command the
+        # task forbids*). Prescribed commands were already removed from the
+        # forbidden list at classify time.
         for _sid in _strip_forbidden_commands(
                 plans, _forbidden_commands(st.data)):
-            log(f"  {_sid}: dropped a runs_commands entry the task forbids")
+            log(f"  {_sid}: dropped a runs_commands entry or verify argv the "
+                "task forbids")
         # A planner paraphrase of a prescribed command (`… -q`, "run …
         # to verify") covers it for the adherence floor but is not
         # immune, so the strip can remove the only entry carrying the

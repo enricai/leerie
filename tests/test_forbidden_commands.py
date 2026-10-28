@@ -26,6 +26,7 @@ import types
 
 import pytest
 
+REPO = pathlib.Path(__file__).resolve().parent.parent
 FORBID = ["pnpm run test"]
 
 # bench P10 (f2/tools/hook_offline.py ATT) + C7 shapes + npx -c.
@@ -235,6 +236,9 @@ def test_the_real_hook_script_runs_the_same_matcher(leerie):
 
 # === claude_p wiring (the real claude_p, only _invoke stubbed) =============
 
+_SPAWN_KW: dict = {}
+
+
 def _spawn(leerie, monkeypatch, repo_root, *, data=None,
            allowed_tools=None, schema_key="implementer"):
     captured: dict = {}
@@ -243,6 +247,8 @@ def _spawn(leerie, monkeypatch, repo_root, *, data=None,
                           stdin_data=None, **_kw):
         captured["cmd"] = list(cmd)
         captured["stdin"] = stdin_data
+        _SPAWN_KW.clear()
+        _SPAWN_KW.update(_kw)
         return {"type": "result", "subtype": "success", "is_error": False,
                 "result": "{}", "structured_output": {"categories": []}}
 
@@ -433,3 +439,164 @@ def test_classifier_schema_types_the_constraint(leerie):
     text = (leerie.ROOT / "prompts" / "classifier.md").read_text()
     assert "`process_constraints`" in text
     assert "`forbidden_commands`" in text
+
+
+# === stage 4c: a forbidden verify argv is never run ==========================
+
+def test_strip_empties_a_forbidden_verify_argv(leerie):
+    sub = {"id": "test-004", "verification_only": True,
+           "verify": [{"criterion": "suite", "argv": ["pnpm", "test"]},
+                      {"criterion": "lint", "argv": ["pnpm", "run", "lint"]},
+                      {"criterion": "wrapped",
+                       "argv": ["bash", "-c", "npx pnpm run test"]}]}
+    keep = {"id": "test-005",
+            "verify": [{"criterion": "lint", "argv": ["pnpm", "run", "lint"]}]}
+    assert leerie._verification_only(sub)
+    plans = [{"subtasks": [sub, keep]}]
+    assert leerie._strip_forbidden_commands(plans, ["pnpm run test"]) == [
+        "test-004"]
+    assert [v["argv"] for v in sub["verify"]] == [
+        [], ["pnpm", "run", "lint"], []]
+    # The criteria stay; no command decides them now, so the subtask is no
+    # longer verification-only and its claim falls back to the re-drive.
+    assert [v["criterion"] for v in sub["verify"]] == [
+        "suite", "lint", "wrapped"]
+    assert not leerie._verification_only(sub)
+    assert leerie._subtask_verify_argvs(sub) == [["pnpm", "run", "lint"]]
+    assert keep["verify"][0]["argv"] == ["pnpm", "run", "lint"]
+
+
+def test_forbidden_verify_argv_names_each_hit(leerie):
+    sub = {"verify": [{"criterion": "a", "argv": ["npm", "test"]},
+                      {"criterion": "b", "argv": ["make", "lint"]}]}
+    assert leerie._forbidden_verify_argv(sub, ["pnpm run test"]) == [
+        (["npm", "test"], "pnpm run test")]
+    assert leerie._forbidden_verify_argv(sub, []) == []
+
+
+def test_run_phases_strips_a_forbidden_verify_argv(leerie, monkeypatch,
+                                                   tmp_path):
+    from tests.test_resume_planning_reentry import (
+        _StopAtExecute, _args, _caps, _plan, _stub_common, EFFORTS, MODELS)
+    root = tmp_path / ".leerie-state"
+    run_id = "forbid-verify-bbb222"
+    run_dir = root / "runs" / run_id
+    (run_dir / "subtasks").mkdir(parents=True)
+    sub = {"id": "test-006", "depends_on": [], "requires": [],
+           "provides": [], "verification_only": True,
+           "verify": [{"criterion": "c", "argv": ["pnpm", "test"]}]}
+    plans = [_plan("testing", sub)]
+    _stub_common(leerie, monkeypatch, {})
+    st = leerie.State(root, run_id)
+    st.data = {"task": "t", "worker_count": 3, "categories": ["testing"],
+               "plans_after_classify": [], **_pc("pnpm run test"),
+               **{k: plans for k in (
+                   "plans_after_plan", "plans_after_reconcile",
+                   "plans_after_overlap_judge", "plans_after_adherence_gate",
+                   "plans_after_coverage_gate", "plans_after_filters")}}
+    st.save()
+    with pytest.raises(_StopAtExecute):
+        asyncio.run(leerie._run_phases(
+            _args(), _caps(leerie), run_dir, st, "codebase", "normal",
+            MODELS, EFFORTS))
+    snap = st.data["plan_snapshot"]["subtasks"]["test-006"]
+    assert snap["verify"] == [{"criterion": "c", "argv": []}]
+
+
+# === stage 4c: the runtime script-shell guard ================================
+
+@pytest.mark.parametrize("forbidden,names", [
+    (["pnpm test"], ["test"]),
+    (["npm run lint", "yarn test", "npx pnpm run test"], ["lint", "test"]),
+    # one spelling with arguments forbids only that spelling
+    (["pnpm test --watch"], []),
+    (["prisma db push"], []),
+    ([], []),
+])
+def test_forbidden_script_names(leerie, forbidden, names):
+    assert leerie._forbidden_script_names(forbidden) == names
+
+
+def test_script_shell_env_reaches_the_worker(leerie, monkeypatch, tmp_path):
+    _spawn(leerie, monkeypatch, _repo(tmp_path, test=""),
+           data=_pc("pnpm run test", "prisma db push"))
+    env = _SPAWN_KW["env_extra"]
+    assert env["LEERIE_FORBIDDEN_SCRIPTS"] == "test"
+    guard = str(leerie.FORBIDDEN_SCRIPT_SHELL)
+    assert env["npm_config_script_shell"] == guard
+    assert env["pnpm_config_script_shell"] == guard
+    assert pathlib.Path(guard).is_file()
+
+
+def test_no_forbidden_script_means_no_guard_env(leerie, monkeypatch,
+                                                tmp_path):
+    _spawn(leerie, monkeypatch, _repo(tmp_path, test=""),
+           data=_pc("prisma db push"))
+    assert "env_extra" not in _SPAWN_KW
+
+
+def _guard(event, *, scripts="test lint-x"):
+    import os
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("npm_", "LEERIE_FORBIDDEN"))}
+    env.update(LEERIE_FORBIDDEN_SCRIPTS=scripts)
+    if event is not None:
+        env["npm_lifecycle_event"] = event
+    script = REPO / "scripts" / "forbidden-script-shell.sh"
+    return subprocess.run([str(script), "-c", "echo ran"], env=env,
+                          capture_output=True, text=True, timeout=30)
+
+
+@pytest.mark.parametrize("event,refused", [
+    ("test", True), ("lint-x", True), ("lint", False), ("pretest", False),
+    ("", False), (None, False)])
+def test_guard_script_refuses_only_a_listed_script(event, refused):
+    p = _guard(event)
+    if refused:
+        assert p.returncode == 97 and p.stdout == ""
+        assert f"script '{event}' is forbidden" in p.stderr
+    else:
+        assert p.returncode == 0 and p.stdout == "ran\n", p.stderr
+
+
+def test_guard_script_with_an_empty_list_refuses_nothing():
+    p = _guard("", scripts="")
+    assert p.returncode == 0 and p.stdout == "ran\n"
+
+
+def test_guard_script_is_executable_in_git():
+    out = subprocess.run(
+        ["git", "-C", str(REPO), "ls-files", "-s",
+         "scripts/forbidden-script-shell.sh"],
+        capture_output=True, text=True).stdout
+    assert out.startswith("100755 "), out
+
+
+def test_guard_refuses_a_nested_run_under_npm(leerie, tmp_path):
+    """Live with npm: the run the command-line layers cannot see — a script
+    whose body runs the forbidden one — is refused, and the forbidden script
+    never executes; another script still runs."""
+    import os
+    import shutil
+    if not shutil.which("npm"):
+        pytest.skip("npm not on PATH")
+    (tmp_path / "scripts").mkdir()
+    (tmp_path / "package.json").write_text(json.dumps({
+        "name": "g", "version": "1.0.0", "private": True,
+        "scripts": {"test": "node scripts/t.js", "ci": "npm test",
+                    "lint": "node scripts/t.js"}}))
+    (tmp_path / "scripts" / "t.js").write_text(
+        "require('fs').appendFileSync(__dirname + '/../MARK', "
+        "process.env.npm_lifecycle_event + '\\n')\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith("npm_")}
+    env.update(leerie._forbidden_script_shell_env(["pnpm test"]))
+    mark = tmp_path / "MARK"
+    assert leerie._forbidden_command_hit("npm run ci", ["pnpm test"]) is None
+    for cmd, ok in ((["npm", "test"], False), (["npm", "run", "ci"], False),
+                    (["npm", "run", "lint"], True)):
+        mark.unlink(missing_ok=True)
+        p = subprocess.run(cmd, cwd=tmp_path, env=env, capture_output=True,
+                           text=True, timeout=120)
+        assert (p.returncode == 0) is ok, (cmd, p.stderr)
+        ran = mark.read_text().split() if mark.exists() else []
+        assert ran == (["lint"] if ok else []), cmd

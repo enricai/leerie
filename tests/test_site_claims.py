@@ -382,3 +382,110 @@ def test_planner_prompt_documents_the_fields(leerie):
     for kind in leerie.SITE_RESOLUTION_KINDS:
         assert f"`{kind}`" in aud, kind
     assert json.dumps("resolution_kind") in aud
+
+
+# === split children keep their parent's claims (stage 4c) ==================
+#
+# Claims are recorded on the first-pass plan; recursive decomposition then
+# re-homes a split subtask into children. Before this, no child carried the
+# parent's `change_kind`/`claims`, so a site the parent claimed was claimed
+# by no leaf of the plan that actually executes.
+
+def _claimed_parent(**extra) -> dict:
+    p = _sub("bugfix-001", "fix", ("D1", ["rerun_flow"]),
+             ("D2", ["guard", "propagate"]))
+    p.update({"files_likely_touched": ["a.py", "b.py"], "intent": "i"})
+    p.update(extra)
+    return p
+
+
+def test_every_code_built_child_carries_the_parents_claims(leerie):
+    parent = _claimed_parent()
+    chunk = leerie._migration_child(parent, ["a.py"], "bugfix-001-a", "t",
+                                    "c")
+    region = leerie._subfile_child(parent, "a.py", (1, 40), ["f"],
+                                   "bugfix-001-r1", "cl", 0, 2,
+                                   "bugfix-001-r1", True)
+    for child in (chunk, region):
+        assert child["change_kind"] == "fix"
+        assert child["claims"] == parent["claims"]
+        # A copy: one child's edit must not reach its siblings.
+        assert child["claims"] is not parent["claims"]
+        child["claims"]["sites"].append({"site_id": "D9",
+                                         "resolution_kinds": ["other"]})
+        assert len(parent["claims"]["sites"]) == 2
+    # A subtask with no claims (another domain) gains none.
+    bare = leerie._migration_child({"id": "test-001"}, ["a.py"], "t-a", "t",
+                                   "c")
+    assert "change_kind" not in bare and "claims" not in bare
+
+
+def test_splitter_children_are_stamped_and_the_site_stays_claimed(leerie):
+    from pathlib import Path
+    from unittest.mock import patch
+
+    from tests.conftest import _fit_response, _run, _split_response
+    from tests.test_decompose_budget_share import _caps as dcaps
+    from tests.test_decompose_budget_share import _make_real_state
+
+    parent = _claimed_parent(title="P", success_criteria_seed="crit")
+
+    async def fake_claude_p(*args, schema_key, sid="", **kwargs):
+        if schema_key == "fit_judge":
+            return _fit_response(0.10 if sid.endswith("-d0") else 0.9)
+        if schema_key == "splitter":
+            # The splitter's schema has no claims; one child even carries
+            # a stray change_kind, which the parent's must replace.
+            out = _split_response("bugfix-001", 2)
+            out["children"][1]["change_kind"] = "test"
+            return out
+        pytest.fail(f"unexpected {schema_key}")
+
+    with patch.object(leerie, "claude_p", new=fake_claude_p):
+        leaves = _run(leerie._recursive_decompose(
+            parent, 0, _make_real_state(leerie), dcaps(leerie, 200),
+            {"fit_judge": "sonnet", "splitter": "sonnet"},
+            {"fit_judge": "medium", "splitter": "medium"}, Path("/tmp")))
+
+    assert [s["id"] for s in leaves] == ["bugfix-001-1", "bugfix-001-2"]
+    assert all(s["change_kind"] == "fix" for s in leaves)
+    assert all(s["claims"] == parent["claims"] for s in leaves)
+    scope = _scope(_site("a", "rerun_flow"), _site("b", "recompute"))
+    rows = leerie._site_claim_rows(_plan(*leaves), scope)
+    assert [(r["site_id"], r["status"]) for r in rows] == [
+        ("D1", "claimed"), ("D2", "claimed")]
+    assert [c["sid"] for c in rows[0]["claims"]] == [
+        "bugfix-001-1", "bugfix-001-2"]
+
+
+def test_phase_plan_rerecords_the_claims_over_the_leaves(
+        leerie, tmp_path, monkeypatch):
+    """The real phase_plan: the record written after decomposition names
+    the leaves, with the first-pass verdicts."""
+    st = _state(leerie, tmp_path, defect_scope=SCOPE)
+    reply = _planner_reply(
+        _sub_full("bugfix-001", "fix", ("D1", ["rerun_flow"]),
+                  ("D2", ["guard"])))
+
+    async def fake_claude_p(**kw):
+        assert kw["schema_key"] == "planner"
+        return reply
+
+    async def split_in_two(subtask, *a, **k):
+        return [leerie._migration_child(subtask, [f], f"{subtask['id']}-{n}",
+                                        "t", "c")
+                for n, f in enumerate(("a.py", "b.py"), 1)]
+
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "_recursive_decompose", split_in_two)
+    caps = dict(leerie.DEFAULT_CAPS)
+    caps["planner_samples"] = 1
+    plans = asyncio.run(leerie.phase_plan("t", st, caps, MODELS, EFFORTS))
+
+    assert [s["id"] for s in plans[0]["subtasks"]] == [
+        "bugfix-001-1", "bugfix-001-2"]
+    rows = st.data["site_claims"]["sites"]
+    assert [(r["site_id"], r["status"]) for r in rows] == [
+        ("D1", "claimed"), ("D2", "claimed")]
+    assert [c["sid"] for c in rows[0]["claims"]] == [
+        "bugfix-001-1", "bugfix-001-2"]
