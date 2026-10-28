@@ -223,9 +223,19 @@ diagnosis, fix and test sections to it with `supports`.
 - `verifiability`: `"external"` when the item can only be confirmed
   outside the repository tree — a PR body or description, a merge, a
   deploy or CI run, watching a run, a human action, an update to memory
-  or to an artifact outside the repository. Otherwise `"tree"`. An item
-  decided by a command passing (the suite passes, the typecheck is
-  clean) is `"tree"`: the run executes those commands itself.
+  or to an artifact outside the repository. `"execution"`, with
+  `"check": "test_id_diff"`, when the item's whole content is that the
+  repository's existing tests do not newly fail ("no regressions",
+  "existing tests still pass", "don't break the X tests"): the run
+  settles that from the failing-test-ID diff between the base and the
+  final tree, never by reading. Otherwise `"tree"`. An item decided by
+  any other command passing (the typecheck is clean, the build passes)
+  is `"tree"`: the run executes those commands itself.
+- `part_checks` (array, optional): for an item that is NOT wholly such a
+  test outcome but has a part that is, one entry per such part:
+  `{"part": <that entry of parts, copied verbatim>, "verifiability":
+  "execution", "check": "test_id_diff"}`. Such a part must also be in
+  `parts`. Leave it empty otherwise.
 - `untouched_paths` (array of strings): repo-relative paths or globs,
   non-empty only when the item's **whole** content is that those paths
   must not change ("leave `data/` untouched"). An item that also asks

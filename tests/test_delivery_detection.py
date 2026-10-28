@@ -1147,3 +1147,43 @@ def test_outcome_prefers_unmet_final_over_unmet_after(leerie, tmp_path):
     st.data = {"delivery_gate": {"unmet_after": [], "unmet_final": [
         {"item": "x", "by": ["falsifier"]}]}}
     assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+
+
+def test_a_test_outcome_item_is_settled_in_code_never_re_driven(
+        leerie, tmp_path, monkeypatch):
+    """DESIGN §8 *A test outcome is the failing-test-ID diff's to settle*
+    (replay barnacle 45fa4253 pass 1): an item typed `execution` /
+    `check: test_id_diff` gets its row from the diff, is never judged or
+    falsified, never reaches `unmet_final` (the delivery re-drive's only
+    source of item notes), and an unknown verdict goes to the PR."""
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                          judged=False, k=0)
+    item = {"item": "No regressions: the full suite shows no new failures",
+            "span": "S9", "verifiability": "execution",
+            "check": "test_id_diff"}
+    st.data["required_items"] = [item]
+    st.save()
+    calls = _falsifier_stub(leerie, monkeypatch, st, lambda kw, n: {})
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    gate = st.data["delivery_gate"]
+    assert calls == []
+    assert gate["items"][0]["verdict"] == "unknown"
+    assert gate["items"][0]["by"] == ["test_id_diff"]
+    assert gate["unmet_final"] == []
+    assert [e["source"] for e in st.data["needs_human_verification"]] == [
+        "test_outcome"]
+    # With B* confirming a new failure the row is unmet — still not a
+    # re-drive note; the run is unconverged on the diff itself.
+    st.data["test_id_diff"] = {"new": ["t.py::test_x"], "tree_sha": "z"}
+    st.data.pop("delivery_gate")
+    st.save()
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    gate = st.data["delivery_gate"]
+    assert gate["items"][0]["verdict"] == "unmet"
+    assert gate["unmet_final"] == []
+    assert not [e for e in st.data["needs_human_verification"]
+                if e["source"] == "test_outcome"]
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert any("newly failing" in r for r in st.data["outcome_reasons"])

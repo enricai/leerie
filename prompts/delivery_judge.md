@@ -84,9 +84,16 @@ Per item:
   names two locales has a part per locale. For each part:
   - `status`: `"met"`, `"unmet"`, or `"not_inspected"` (you did not
     open the artifact that decides it — say so here, not in prose).
-  - `kind`: `"behavioral"` when the part is a runtime behaviour or a
-    number (a timeout, a delay, a count, a threshold, "keeps X as
-    today", "returns 4xx when …"); `"static"` otherwise.
+  - `kind`: `"test_outcome"` when the part is only that the
+    repository's existing tests do not newly fail ("no regressions",
+    "existing tests still pass", "don't break the X tests") — an item's
+    `test_outcome_parts` names such parts when the task classifier found
+    them. The orchestrator settles a `"test_outcome"` part from its own
+    failing-test-ID diff between the base and this tree and ignores your
+    status for it, so do not spend turns on it. `"behavioral"` when the
+    part is a runtime behaviour or a number (a timeout, a delay, a
+    count, a threshold, "keeps X as today", "returns 4xx when …");
+    `"static"` otherwise.
   - `cites`: `{path, line_start, line_end, quote}` — `path` relative to
     the repo root, 1-based line numbers of the file **as it is on this
     tree**, and `quote` copied **verbatim** from exactly those lines

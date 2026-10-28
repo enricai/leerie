@@ -383,7 +383,8 @@ class TestSchema:
         item = sch["properties"]["required_items"]["items"]
         assert set(item["required"]) == {"item", "span", "verifiability"}
         assert item["properties"]["verifiability"]["enum"] == [
-            "tree", "external"]
+            "tree", "external", "execution"]
+        assert item["properties"]["check"]["enum"] == ["test_id_diff"]
 
     def test_helper_output_has_no_holes(self, leerie):
         u = {"spans": leerie._d1_split_spans("task"), "sections": [],

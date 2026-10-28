@@ -6232,8 +6232,13 @@ itself:
   section, anchored on it by `span`. A findings table whose rows the
   task asks to address yields one item per row, typed by `table_row`
   (the row's first cell, copied). Each item is typed
-  `verifiability: tree | external` and, when its whole content is that
-  some paths must not change, `untouched_paths`.
+  `verifiability: tree | external | execution` and, when its whole
+  content is that some paths must not change, `untouched_paths`. An item
+  or part decided by whether the repository's existing tests newly fail
+  ("no regressions", "existing tests still pass", "don't break the X
+  tests") is typed `execution` with `check: test_id_diff` — the whole
+  item, or, inside a mixed item, the part (`part_checks`, each naming one
+  of the item's `parts` verbatim).
 - **The coverage gate is set arithmetic.** `_d1_coverage_holes` sends
   back, by ID, every span without a disposition, section without a
   role, `items` span or `requirement` section carried by no item (or by
@@ -6391,6 +6396,27 @@ the right reason in 2 of 34 samples. So the gate judges in packs
   tree (`_d1_untouched_verdict`): empty output is met, a listed file is
   unmet with that file as evidence; an unsafe path, an unknown own
   start or a git error sends the item to the judge.
+- **A test outcome is the failing-test-ID diff's to settle, never prose.**
+  An item typed `execution` / `check: test_id_diff` is never judged, never
+  falsified and never sent to an implementer: code reads the final tree's
+  failing-test-ID diff (§9 *Which failures are new*) — **met** when B\*
+  confirmed no new failing ID on the tree being judged, **unmet** when it
+  confirmed new ones, **unknown** when there is no diff for this tree (no
+  IDs on either side, no measurement, or a tree that moved since). Unmet
+  needs nothing more: the confirmed new IDs already make the run
+  `unconverged` (§6) and already drive the final conformance's next round.
+  Unknown goes to the PR's "Needs human verification" list. Inside a
+  mixed item the judge types such a part `kind: test_outcome` (the
+  payload names the classifier's `part_checks` for it), and code drops
+  that part from the verdict before it is checked or voted: the item is
+  met or unmet on its other parts. In a replayed run (barnacle 45fa4253,
+  pass 1) the judges held an item unmet on its "no regressions: the
+  final-tree full test run must not show new failures" part, read from a
+  record that said only "red", and the delivery re-drive spent its whole
+  budget — four implementer sessions, about 25 minutes — on an unmet item
+  no implementer could change: each ran its own base-vs-tree comparison,
+  reported "33 failed on both", committed nothing, and the item stayed
+  unmet.
 - **The finding-level contract** (below) is asked of the first pack
   only, so it is judged once, not once per pack.
 
@@ -7782,6 +7808,9 @@ route:
 
 - An item that only says paths stay untouched is settled in code, as
   everywhere else.
+- An item the coverage classifier typed `execution` / `check:
+  test_id_diff` is `execution` here without asking; a judge part typed
+  `test_outcome` is dropped from the ratchet judge's verdict, as at final.
 - A verifiability classifier types every other item, once per run, by its
   own text: `in_tree` (a reader of the repository can cite whether it holds)
   or `execution` (only running something shows it: "no regressions", "the

@@ -2637,6 +2637,9 @@ CI_REQUIRES = ("database", "browser", "network", "secrets",
 CI_EXTERNAL_REQUIRES = frozenset({"browser", "network", "secrets",
                                   "cloud_credentials", "gpu"})
 CI_COVERAGE_METRICS = ("lines", "branches", "functions", "statements")
+# What code can settle an `execution`-typed required item or part by
+# (DESIGN §8 *A test outcome is the failing-test-ID diff's to settle*).
+TEST_OUTCOME_CHECKS = ["test_id_diff"]
 
 SCHEMAS: dict[str, dict] = {
     "classifier": {
@@ -2760,8 +2763,34 @@ SCHEMAS: dict[str, dict] = {
                         # `external`: confirmable only outside the repo
                         # tree; routed to needs_human_verification, never
                         # judged.
+                        # `execution` (with `check: test_id_diff`): the
+                        # item is decided by whether existing tests newly
+                        # fail — settled from the failing-test-ID diff in
+                        # code, never judged (DESIGN §8 *A test outcome is
+                        # the failing-test-ID diff's to settle*).
                         "verifiability": {"type": "string",
-                                          "enum": ["tree", "external"]},
+                                          "enum": ["tree", "external",
+                                                   "execution"]},
+                        "check": {"type": "string",
+                                  "enum": TEST_OUTCOME_CHECKS},
+                        # The parts of a mixed item so decided, each
+                        # copied verbatim from `parts`.
+                        "part_checks": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "required": ["part", "verifiability",
+                                             "check"],
+                                "properties": {
+                                    "part": {"type": "string"},
+                                    "verifiability": {
+                                        "type": "string",
+                                        "enum": ["execution"]},
+                                    "check": {"type": "string",
+                                              "enum": TEST_OUTCOME_CHECKS},
+                                },
+                            },
+                        },
                         # Non-empty only when the item's whole content is
                         # that these paths stay unchanged; settled by
                         # `git diff` in code at the delivery gate.
@@ -4073,8 +4102,12 @@ SCHEMAS: dict[str, dict] = {
                 "required": ["requirement", "kind", "status", "cites"],
                 "properties": {
                     "requirement": {"type": "string"},
+                    # `test_outcome`: a part about whether existing
+                    # tests newly fail — dropped by code before the vote
+                    # and settled from the failing-test-ID diff.
                     "kind": {"type": "string",
-                             "enum": ["static", "behavioral"]},
+                             "enum": ["static", "behavioral",
+                                      "test_outcome"]},
                     "status": {"type": "string",
                                "enum": ["met", "unmet", "not_inspected"]},
                     "cites": {"type": "array",
@@ -6291,7 +6324,8 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             continue
         if e.get("source") == "required_item" and _pr_entry(e.get("item")):
             add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
-        elif (e.get("source") == REGRESSION_GAP_SOURCE
+        elif (e.get("source") in (REGRESSION_GAP_SOURCE,
+                                  TEST_OUTCOME_GAP_SOURCE)
               and _pr_entry(e.get("detail"))):
             add("Regression checks the run could not settle",
                 f"- [ ] {_pr_entry(e.get('detail'))}")
@@ -40068,6 +40102,10 @@ def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
     for v in sample.get("verdicts") or []:
         if not isinstance(v, dict):
             continue
+        v = _drop_test_outcome_parts(v)
+        if v.get("settled_by") == "test_id_diff":
+            out.append(v)
+            continue
         status, why = _delivery_verdict_check(v, tree, record, cache)
         if status == "unverified":
             v = {**v, "met": False, "rejected": why}
@@ -40141,6 +40179,92 @@ def _delivery_record(leerie_dir: Path, st: "State",
         workers = ""
     own = _orchestrator_results_digest(st)
     return "\n".join(x for x in (workers, own) if x)
+
+
+def _test_id_diff_item(it: object) -> bool:
+    """A required item whose whole content is decided by the failing-test-ID
+    diff (classifier-typed `verifiability: execution`, `check:
+    test_id_diff`) — settled in code, never judged, falsified or re-driven
+    (DESIGN §8 *A test outcome is the failing-test-ID diff's to settle*)."""
+    return (isinstance(it, dict) and it.get("verifiability") == "execution"
+            and it.get("check") == "test_id_diff")
+
+
+def _test_outcome_parts(it: object) -> list[str]:
+    """The parts of a mixed item the classifier typed as decided by the
+    failing-test-ID diff: each `part_checks` entry whose `part` is one of the
+    item's `parts`, compared as strings."""
+    if not isinstance(it, dict):
+        return []
+    parts = {p for p in it.get("parts") or [] if isinstance(p, str)}
+    return [c["part"] for c in it.get("part_checks") or []
+            if isinstance(c, dict) and c.get("check") == "test_id_diff"
+            and c.get("verifiability") == "execution"
+            and c.get("part") in parts]
+
+
+def _test_outcome_verdict(st: "State", tree_sha: str | None) -> dict:
+    """`{verdict, new}` of "no existing test newly fails" on the tree whose
+    content sha is `tree_sha`, from the B* failing-test-ID diff
+    (`test_id_diff`): `unmet` when it confirmed new failing IDs, `met` when
+    it confirmed none on this tree, `unknown` when there is no diff for this
+    tree — none recorded, one side's IDs unknown, or the tree moved since."""
+    diff = st.data.get("test_id_diff")
+    if not isinstance(diff, dict):
+        return {"verdict": "unknown", "new": []}
+    new = [str(x) for x in diff.get("new") or []]
+    if new:
+        return {"verdict": "unmet", "new": new}
+    if diff.get("ids_unknown") or not tree_sha \
+            or diff.get("tree_sha") != tree_sha:
+        return {"verdict": "unknown", "new": []}
+    return {"verdict": "met", "new": []}
+
+
+def _drop_test_outcome_parts(v: dict) -> dict:
+    """A judge verdict without its parts typed `test_outcome` — the failing-
+    test-ID diff settles those, not the judge (DESIGN §8). When any was
+    dropped and the judge said unmet, the verdict is met if every remaining
+    part is met (still citation-checked downstream), or if none remains
+    (`settled_by: test_id_diff`)."""
+    parts = v.get("parts")
+    if not isinstance(parts, list):
+        return v
+    rest = [p for p in parts
+            if not (isinstance(p, dict) and p.get("kind") == "test_outcome")]
+    if len(rest) == len(parts):
+        return v
+    out = {**v, "parts": rest,
+           "test_outcome_parts_dropped": len(parts) - len(rest)}
+    if v.get("met") is False:
+        if not rest:
+            out.update(met=True, settled_by="test_id_diff")
+        elif all(isinstance(p, dict) and p.get("status") == "met"
+                 for p in rest):
+            out["met"] = True
+    return out
+
+
+TEST_OUTCOME_GAP_SOURCE = "test_outcome"
+
+
+def _set_test_outcome_gap(st: "State", items: list[str]) -> None:
+    """Keep at most one "Needs human verification" entry naming the required
+    items the failing-test-ID diff could not settle (verdict `unknown`);
+    cleared when there are none."""
+    entries = [e for e in (st.data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict)
+                       and e.get("source") == TEST_OUTCOME_GAP_SOURCE)]
+    if items:
+        entries.append({
+            "source": TEST_OUTCOME_GAP_SOURCE,
+            "detail": ("no failing-test-ID diff on the final tree, so the "
+                       "run could not check that no existing test newly "
+                       "fails, as required by: " + "; ".join(
+                           x[:200] for x in items))})
+    if entries != (st.data.get("needs_human_verification") or []):
+        st.data["needs_human_verification"] = entries
+        st.save()
 
 
 def _delivery_norm_item(item: object) -> dict:
@@ -40245,11 +40369,19 @@ async def _delivery_judge_unmet(
     spans = (st.data.get("requirement_coverage") or {}).get("spans") or []
     external: list[int] = []
     untouched: list[dict] = []
+    test_outcome: list[dict] = []
     confirmed: list[dict] = []
     judge_idx: list[int] = []
+    tid = (_test_outcome_verdict(st, await _worktree_tree_sha(str(staging)))
+           if any(_test_id_diff_item(it) for it in normalized) else None)
     for i, it in enumerate(normalized):
         if it.get("verifiability") == "external":
             external.append(i)
+            continue
+        if tid is not None and _test_id_diff_item(it):
+            # Settled from the diff; never confirmed here, so never handed
+            # to a fixer as prose (DESIGN §8).
+            test_outcome.append({"item_index": i, **tid})
             continue
         paths = it.get("untouched_paths")
         if isinstance(paths, list) and paths:
@@ -40276,12 +40408,18 @@ async def _delivery_judge_unmet(
     if routing is not None:
         routing.update({"external": external, "untouched": untouched,
                         "packs": len(packs)})
+        if test_outcome:
+            routing["test_outcome"] = test_outcome
 
     def _pack_prompt(pack: list[int], with_contract: bool) -> str:
         entries = [{"item": normalized[i]["item"],
                     "source_ref": (normalized[i].get("span")
                                    or normalized[i].get("source_ref") or ""),
-                    "item_index": i} for i in pack]
+                    "item_index": i,
+                    **({"test_outcome_parts":
+                        _test_outcome_parts(normalized[i])}
+                       if _test_outcome_parts(normalized[i]) else {})}
+                   for i in pack]
         slice_note = (
             f"\n(These are {len(pack)} of the task's {n_items} required "
             "items; the others are verified in separate passes. Return a "
@@ -45854,7 +45992,10 @@ def _log_delivery_routing(routing: dict) -> None:
         f"{len(ext)} item(s) routed to needs_human_verification "
         f"(verifiability: external); {len(unt)} untouched-paths item(s) "
         f"settled by git diff ({sum(1 for u in unt if not u.get('met'))} "
-        "unmet)")
+        "unmet)"
+        + (f"; {len(tou)} test-outcome item(s) settled by the failing-test-ID "
+           "diff (" + ", ".join(str(t.get("verdict")) for t in tou) + ")"
+           if (tou := routing.get("test_outcome") or []) else ""))
 
 
 async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
@@ -47562,6 +47703,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     # human verification", an untouched-paths item to code.
     f_idx = [i for i, it in enumerate(normalized)
              if it.get("verifiability") != "external"
+             and not _test_id_diff_item(it)
              and not (isinstance(it.get("untouched_paths"), list)
                       and it["untouched_paths"])]
     try:
@@ -47584,12 +47726,30 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     fitems = progress.get("items") or {}
     rows: list[dict] = []
     unmet_final: list[dict] = []
+    tid = (_test_outcome_verdict(st, await _worktree_tree_sha(str(staging)))
+           if any(_test_id_diff_item(it) for it in normalized) else None)
+    unknown_tests: list[str] = []
     for i, it in enumerate(normalized):
         row: dict = {"item_index": i, "item": it.get("item", "")[:500]}
         if it.get("verifiability") == "external":
             row.update(verdict="external", by=[])
             rows.append(row)
             continue
+        if tid is not None and _test_id_diff_item(it):
+            # Never in unmet_final: confirmed new IDs already make the run
+            # unconverged, and no implementer is sent a test outcome.
+            row.update(verdict=tid["verdict"], by=["test_id_diff"],
+                       new=tid["new"])
+            rows.append(row)
+            if tid["verdict"] == "unknown":
+                unknown_tests.append(it.get("item", ""))
+            continue
+        if tid is None and _test_outcome_parts(it):
+            tid = _test_outcome_verdict(
+                st, await _worktree_tree_sha(str(staging)))
+        if (tid is not None and tid["verdict"] == "unknown"
+                and _test_outcome_parts(it)):
+            unknown_tests.append(it.get("item", ""))
         by: list[str] = []
         evidence: list[str] = []
         ju = judge_unmet.get(i)
@@ -47613,6 +47773,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             unmet_final.append({"item_index": i, "item": it.get("item", ""),
                                 "evidence": " | ".join(evidence)[:1200],
                                 "by": by})
+    _set_test_outcome_gap(st, unknown_tests)
     gate = dict(st.data.get("delivery_gate") or {})
     gate.pop("final_progress", None)
     gate.update(items=rows, unmet_final=unmet_final, final_sha=sha,
@@ -48334,7 +48495,8 @@ async def _ratchet_judge(st: "State", caps: dict, models: dict,
                 model=models.get("delivery_ratchet", MODEL_DEFAULT),
                 effort=efforts.get("delivery_ratchet"),
                 sid=f"delivery_ratchet-{label}-p{p}-s{k}")
-            return {v["item_index"]: v for v in (smp or {}).get("verdicts")
+            return {v["item_index"]: _drop_test_outcome_parts(v)
+                    for v in (smp or {}).get("verdicts")
                     or [] if isinstance(v, dict)
                     and v.get("item_index") in allowed}
 
@@ -48487,8 +48649,11 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
         out["untouched"].append({"item_index": i, **v})
         if not v["met"]:
             regressed.add(i)
+    typed = {i for i in rest if _test_id_diff_item(normalized[i])}
     kinds = (await _ratchet_verifiability(st, caps, models, efforts)
-             if rest else {})
+             if set(rest) - typed else {})
+    if kinds is not None:
+        kinds = {**kinds, **{i: "execution" for i in typed}}
     if kinds is None:
         out["judge"] = {"skipped": "verifiability classifier failed"}
     else:
