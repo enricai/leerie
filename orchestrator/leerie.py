@@ -54546,7 +54546,11 @@ async def _record_settled_head(st: "State", leerie_dir: Path,
     same commit, so no file changes. In the replayed run (barnacle 45fa4253)
     an implementer ran `git checkout <base>~0` to compare behaviour and
     committed three times on the detached HEAD; the branch never moved, and
-    its merge was a no-op. None when there is no worktree or no HEAD."""
+    its merge was a no-op. A HEAD the branch is NOT an ancestor of (a
+    worker that checked out the base and never committed there) is not
+    recorded: the branch tip is the settled head, so a resumed wave never
+    reads the unmerged branch as integrated through a base-commit head.
+    None when there is no worktree, no HEAD, or no branch to fall back to."""
     wt = _subtask_worktree_path(leerie_dir, sid)
     if not wt.is_dir():
         return None
@@ -54577,7 +54581,11 @@ async def _record_settled_head(st: "State", leerie_dir: Path,
         else:
             log(f"  {sid}: worktree HEAD {head[:12]} is {where} and does not "
                 f"descend from its branch ({tip[:12] or 'missing'}); "
-                "integration checks the settled head")
+                + ("the branch tip is the settled head" if tip else
+                   "no settled head recorded"))
+            if not tip:
+                return None
+            head = tip
     st.data.setdefault("settled_heads", {})[sid] = head
     st.save()
     return head
@@ -54596,29 +54604,46 @@ async def _settled_head_integrated(staging: Path, st: "State",
     return r.returncode == 0
 
 
-def _integration_ref(run_id: str, sid: str, heads: dict | None) -> str:
-    """What a resumed wave tests for `sid`'s integration: its settled head
-    when one is recorded, else its branch."""
+def _integration_refs(run_id: str, sid: str,
+                      heads: dict | None) -> list[str]:
+    """What a resumed wave tests for `sid`'s integration: its branch AND its
+    settled head when one is recorded. Both must be on staging — a head
+    alone could be a commit the branch's work is not under (DESIGN §6
+    *Integrated means the settled commit is on the run branch*)."""
+    refs = [f"refs/heads/leerie/subtasks/{run_id}/{sid}"]
     head = (heads or {}).get(sid)
-    return head or f"refs/heads/leerie/subtasks/{run_id}/{sid}"
+    if head:
+        refs.append(head)
+    return refs
+
+
+async def _ancestor_codes(staging: Path, refs: list[str],
+                          rev: str) -> list[int] | None:
+    """`merge-base --is-ancestor` exit codes of each ref against `rev`;
+    None when git could not be run."""
+    codes: list[int] = []
+    for ref in refs:
+        try:
+            r = await run_proc(["git", "merge-base", "--is-ancestor", ref,
+                                rev], cwd=str(staging))
+        except OSError:
+            return None
+        codes.append(r.returncode)
+    return codes
 
 
 async def _wave_sids_integrated_before(staging: Path, run_id: str,
                                        sids: list[str], rev: str,
                                        heads: dict | None = None
                                        ) -> list[str]:
-    """The `sids` whose subtask branch (settled head, when recorded) is
-    already merged into `rev` — the already-integrated list a resumed gate
+    """The `sids` whose subtask branch and settled head (when recorded) are
+    both already merged into `rev` — the already-integrated list a resumed gate
     would otherwise see empty."""
     out: list[str] = []
     for s in sids:
-        branch = _integration_ref(run_id, s, heads)
-        try:
-            r = await run_proc(["git", "merge-base", "--is-ancestor", branch,
-                                rev], cwd=str(staging))
-        except OSError:
-            continue
-        if r.returncode == 0:
+        codes = await _ancestor_codes(
+            staging, _integration_refs(run_id, s, heads), rev)
+        if codes and all(c == 0 for c in codes):
             out.append(s)
     return out
 
@@ -54632,17 +54657,14 @@ async def _wave_sids_not_integrated(staging: Path, run_id: str,
     Only `merge-base --is-ancestor`'s exit 1 counts: a missing branch, an
     unreadable staging or any other git error is no evidence, and
     integrating on it would die on `integrate.sh`'s precondition. A
-    recorded settled head is tested instead of the branch (DESIGN §6
-    *Integrated means the settled commit is on the run branch*)."""
+    recorded settled head is tested as well as the branch: either one off
+    staging is unintegrated work (DESIGN §6 *Integrated means the settled
+    commit is on the run branch*)."""
     out: list[str] = []
     for s in sids:
-        branch = _integration_ref(run_id, s, heads)
-        try:
-            r = await run_proc(["git", "merge-base", "--is-ancestor", branch,
-                                "HEAD"], cwd=str(staging))
-        except OSError:
-            continue
-        if r.returncode == 1:
+        codes = await _ancestor_codes(
+            staging, _integration_refs(run_id, s, heads), "HEAD")
+        if codes and all(c in (0, 1) for c in codes) and 1 in codes:
             out.append(s)
     return out
 
@@ -55378,9 +55400,19 @@ async def _reintegrate_settled_head(staging: Path, st: "State", sid: str,
     log(f"  {sid}: the merge left its settled head {head[:12]} off the run "
         "branch — integrating once more from that head")
     await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
-    await run_proc(["git", "update-ref",
-                    f"refs/heads/leerie/subtasks/{st.run_id}/{sid}", head],
-                   cwd=str(staging))
+    ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
+    tip = (await _git_text(staging, "rev-parse", "--verify", "-q", ref)
+           or "").strip()
+    # Only ever forward: a head the branch is not under would merge some
+    # other commit under this sid and orphan the branch's own work.
+    if tip and head and (tip == head or (await run_proc(
+            ["git", "merge-base", "--is-ancestor", tip, head],
+            cwd=str(staging))).returncode == 0):
+        await run_proc(["git", "update-ref", ref, head, tip],
+                       cwd=str(staging))
+    else:
+        log(f"  {sid}: settled head {head[:12] or '?'} does not descend from "
+            f"its branch ({tip[:12] or 'missing'}) — branch left where it is")
     return await _run_script("integrate.sh", sid, st.run_id)
 
 

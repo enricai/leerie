@@ -5830,8 +5830,10 @@ never skips its integration*). Such sids get the same `{"status":
 subtasks) **after** `integrate_wave`, so a backed-out subtask is not an
 integration shortfall. Both `_wave_sids_integrated_before` and
 `_wave_sids_not_integrated` take an optional `heads` map (`settled_heads`)
-and test a sid's settled head instead of its branch ref when one is
-recorded.
+and test a sid's branch ref **and**, when one is recorded, its settled
+head (`_integration_refs`): integrated only when every ref is an ancestor
+of staging, not integrated when any is not (`--is-ancestor` exit 1), and
+no evidence (skipped) when git cannot read any of them.
 
 Settled heads (DESIGN §6 *Integrated means the settled commit is on the
 run branch*). `phase_execute`'s `settle_one` calls `_record_settled_head
@@ -5839,9 +5841,11 @@ run branch*). `phase_execute`'s `settle_one` calls `_record_settled_head
 the subtask worktree present it reads `HEAD`; when `git symbolic-ref -q
 HEAD` is not `refs/heads/leerie/subtasks/<run-id>/<sid>` and that branch
 is HEAD or an ancestor of it, it `git update-ref`s the branch to HEAD
-(old value checked) and `git checkout -q`s it (logged); otherwise it logs
-the divergence and leaves the ref. HEAD is saved to
-`state.data["settled_heads"][sid]`. `_undo_interrupted_redrives` sets it
+(old value checked) and `git checkout -q`s it (logged), and HEAD is the
+settled head; otherwise (the branch is not an ancestor of HEAD) it logs
+the divergence, leaves the ref, and the **branch tip** is the settled head
+— nothing is recorded when the branch is missing. The settled head is
+saved to `state.data["settled_heads"][sid]`. `_undo_interrupted_redrives` sets it
 to the round's `pre_sha` when it rolls a round back (and drops it when the
 rollback failed). In `integrate_wave`, after a merge reports success —
 `integrate.sh` exit 0, or the integrator's committed merge that the
@@ -5850,7 +5854,9 @@ integration gate kept — `_settled_head_integrated(staging, st, sid)` runs
 no head is recorded). On False after `integrate.sh` exit 0: staging is
 reset to the merge's first parent (`git reset --hard <pre_sha>`, so a
 merge of the wrong commits is not kept), the branch is pointed at the
-settled head (`git update-ref`) and `integrate.sh` runs once more; exit 0
+settled head (`git update-ref <ref> <head> <tip>`, refused — logged, ref
+left — unless the tip is an ancestor of the head) and `integrate.sh` runs
+once more; exit 0
 is checked again, any other exit takes the ordinary conflict /
 precondition path. Still False after that second merge (or after an
 integrator merge, which is not re-run): `_back_out_unmerged(..., "settled head <sha>
@@ -9627,7 +9633,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
 | `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier typed `unverified_external`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` (or `simulated_interleaving`) to the PR's "Needs human verification"; `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
-| `settled_heads` | dict[str, str] | per-sid worktree HEAD sha at the moment the subtask settled `complete` (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
+| `settled_heads` | dict[str, str] | per-sid worktree HEAD sha at the moment the subtask settled `complete` — or the branch tip when that HEAD does not descend from it (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[]}` — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
 | `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |

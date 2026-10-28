@@ -1880,14 +1880,25 @@ reached the PR; the delivery judges found it absent. Two rules close it:
   detached, or on another branch, while the subtask branch is an ancestor
   of it, is a worker that left the branch — the subtask branch is moved to
   that HEAD and checked out again (no file changes: same commit). That
-  HEAD is recorded as the subtask's **settled head**.
+  HEAD is recorded as the subtask's **settled head**. A HEAD the branch is
+  *not* an ancestor of is a worker that checked out some other commit (the
+  base, to compare behaviour) without committing there: the branch tip is
+  the settled head, and the divergence is logged. A settled head is always
+  the branch tip or a descendant of it — never a commit that would make an
+  unmerged branch look integrated.
 - *After its merge, the settled head must be an ancestor of the run
   branch.* When it is not, the subtask branch is pointed at the settled
   head and the subtask is integrated once more (a conflict goes to the
   integrator as any other). When it still is not, the subtask is backed
   out (§6 *When integration cannot succeed*) and settled `unconverged`
   with the settled head named — the work is never silently dropped. A
-  resumed wave finds what is still unintegrated by the same settled head.
+  resumed wave counts a subtask integrated only when **both** its branch
+  tip and its settled head are ancestors of the run branch; either one
+  missing is work still to integrate. (Testing the head alone read an
+  unmerged branch as integrated when the recorded head was the base the
+  worker had checked out: the wave skipped the merge and the branch's
+  commits never reached the PR.) Re-pointing the branch at the settled
+  head is refused unless the branch is an ancestor of it.
 
 **A re-drive interrupted mid-round is undone, never integrated.** That rule
 alone integrated half-done work: a coverage re-drive keeps its subtask
