@@ -237,7 +237,9 @@ The orchestrator gives you, in your prompt:
    If your CONTEXT includes `process_constraints.forbidden_commands`, the
    task forbids running those commands: no subtask may depend on running
    one — keep them out of `runs_commands` and `verify`, and verify by
-   other means. The orchestrator denies them to every worker.
+   other means. The orchestrator denies them to every worker. An entry
+   with `scope: "whole_suite"` forbids only running the whole suite: a
+   command that names specific test files is still allowed.
 
    **Set `fixes_reported_symptom: true`** only on a subtask whose job is to
    fix a failure the task text reports as *currently happening*. Leave it

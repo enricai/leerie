@@ -412,10 +412,19 @@ def test_a_worker_that_cannot_reach_the_runner_gets_no_notice(
 
 def test_a_widened_runner_grant_does_get_the_notice(leerie, monkeypatch,
                                                     tmp_path):
+    repo = _repo(tmp_path)
     _deny, prompt = _spawn(
-        leerie, monkeypatch, _repo(tmp_path), schema_key="classifier",
+        leerie, monkeypatch, repo, schema_key="planner",
         allowed_tools=leerie.INSPECT_TOOLS + ",Bash(pytest:*)")
     assert len(_notice_lines(prompt)) == 1
+    # The classifier is the exception: it types constraints from the task,
+    # so it never receives an orchestrator notice (DESIGN §9 *A command the
+    # task forbids*); its deny rules still apply.
+    deny, prompt = _spawn(
+        leerie, monkeypatch, repo, schema_key="classifier",
+        allowed_tools=leerie.INSPECT_TOOLS + ",Bash(pytest:*)")
+    assert _notice_lines(prompt) == []
+    assert "Bash(pytest tests)" in deny
 
 
 def test_no_deny_means_no_notice(leerie, monkeypatch, tmp_path):

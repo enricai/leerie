@@ -23,6 +23,7 @@ Run it from the root of the target git repository.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import base64
 import codecs
@@ -2612,15 +2613,28 @@ SCHEMAS: dict[str, dict] = {
                      "required_items"],
         # Forbidden commands (DESIGN §9 *A command the task forbids is
         # denied in every spelling*): language→JSON, like
-        # prescribed_procedure — Python never reads the task for them.
+        # prescribed_procedure — Python never reads the task for them. Each
+        # entry carries its own quote, which code checks against the task
+        # and its reports (`_process_constraints`), and a typed scope.
         "$defs": {
             "process_constraints": {
                 "type": "object",
                 "required": ["forbidden_commands"],
                 "properties": {
                     "forbidden_commands": {
-                        "type": "array", "items": {"type": "string"}},
-                    "evidence": {"type": "string"},
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["command", "evidence_quote",
+                                         "scope"],
+                            "properties": {
+                                "command": {"type": "string"},
+                                "evidence_quote": {"type": "string"},
+                                "scope": {"type": "string",
+                                          "enum": ["any", "whole_suite"]},
+                            },
+                        },
+                    },
                 },
             },
         },
@@ -6113,6 +6127,10 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             continue
         if e.get("source") == "required_item" and _pr_entry(e.get("item")):
             add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
+        elif (e.get("source") == REGRESSION_GAP_SOURCE
+              and _pr_entry(e.get("detail"))):
+            add("Regression checks the run could not settle",
+                f"- [ ] {_pr_entry(e.get('detail'))}")
         elif e.get("source") == "blocker" and isinstance(e.get("subtask"),
                                                           str):
             add(_pr_entry(e.get("resource")) or "Unnamed resource",
@@ -21762,13 +21780,7 @@ def _full_suite_rule_patterns(repo_root: str | Path,
         # element, and past ~165 roots it would exceed Linux's per-argument
         # limit (MAX_ARG_STRLEN) and fail every worker spawn. Roots beyond
         # the cap are simply not denied; the notice still covers them.
-        roots = _test_roots(repo_root)[:_SUITE_MAX_ROOTS]
-        pats: list[str] = []
-        for r in runners:
-            pats.append(r)
-            for t in roots:
-                pats += [f"{r} {t}", f"{r} {t}/", f"{r} {t} *",
-                         f"{r} {t}/ *", f"{r} * {t}", f"{r} * {t}/"]
+        pats = _suite_rule_bodies(runners, _test_roots(repo_root))
         # Anchored: a prescribed command lifts the deny only if it IS a
         # whole-suite run, not if a runner word merely appears in it (`pip
         # install pytest`, `-k pytest`) -- an over-match here would switch
@@ -21780,6 +21792,25 @@ def _full_suite_rule_patterns(repo_root: str | Path,
     except Exception as e:
         _warn_full_suite_deny_skipped_once(e)
         return []
+
+
+def _suite_rule_bodies(runners: list[str], roots: list[str]) -> list[str]:
+    """The whole-suite rule bodies for `runners` over test `roots`: `R`,
+    then `R T`, `R T/`, `R T *`, `R T/ *`, `R * T`, `R * T/` per root —
+    the bare runner or one aimed at a test root. Shared by the
+    orchestrator-owned suite deny and a task's `whole_suite` forbid."""
+    # Bounded: every root adds rules to ONE `--disallowedTools` argv
+    # element, and past ~165 roots it would exceed Linux's per-argument
+    # limit (MAX_ARG_STRLEN) and fail every worker spawn. Roots beyond
+    # the cap are simply not denied; the notice still covers them.
+    roots = list(roots)[:_SUITE_MAX_ROOTS]
+    pats: list[str] = []
+    for r in runners:
+        pats.append(r)
+        for t in roots:
+            pats += [f"{r} {t}", f"{r} {t}/", f"{r} {t} *",
+                     f"{r} {t}/ *", f"{r} * {t}", f"{r} * {t}/"]
+    return pats
 
 
 _full_suite_deny_skip_warned: bool = False
@@ -22064,6 +22095,20 @@ FORBIDDEN_COMMANDS_NOTICE = (
     "`met: false, not_applicable: true` with evidence \"the task forbids "
     "this command\"; continue with the rest of the work.")
 
+# Workers that type constraints from the task text: no `NOTE FROM
+# ORCHESTRATOR:` is appended to their prompt, so none can come back as a
+# constraint of the task (DESIGN §9 *A command the task forbids*).
+NOTICE_FREE_WORKERS = frozenset({"classifier"})
+
+FORBIDDEN_WHOLE_SUITE_NOTICE = (
+    "this task forbids running the whole test suite ({cmds}). A whole-suite "
+    "run — the bare command, flags only, or aimed at a test directory, in "
+    "any spelling — is denied to you; running it on the specific test files "
+    "your change touches is allowed. A criterion or repo rule that needs the "
+    "whole suite is recorded `met: false, not_applicable: true` with "
+    "evidence \"the task forbids this command\"; the orchestrator runs the "
+    "tests coupled to the run's changes itself.")
+
 _FORBID_MAX_DEPTH = 5
 _FORBID_WRAPPERS = frozenset({
     "timeout", "nice", "nohup", "stdbuf", "time", "command", "builtin",
@@ -22224,91 +22269,198 @@ def _forbidden_prefix_match(cand: list[str], forb: list[str]) -> bool:
     return cand[:len(forb)] == forb
 
 
-def _forbidden_command_hit(command: str, forbidden: list[str]) -> str | None:
+FORBID_SCOPES = ("any", "whole_suite")
+
+
+def _forbidden_spec(f: object) -> tuple[str, str, list[str]] | None:
+    """`(command, scope, test roots)` of one forbidden entry: a bare string
+    (the pre-scope shape, and every non-task caller such as the kill rules)
+    is `scope: "any"`; a dict is a persisted `_process_constraints` entry.
+    None for anything else."""
+    if isinstance(f, str):
+        return (f, "any", []) if f.strip() else None
+    if isinstance(f, dict) and isinstance(f.get("command"), str) \
+            and f["command"].strip():
+        scope = f.get("scope") if f.get("scope") in FORBID_SCOPES else "any"
+        roots = [r for r in (f.get("test_roots") or [])
+                 if isinstance(r, str) and r.strip("/")]
+        return f["command"], scope, roots
+    return None
+
+
+def _forbidden_whole_suite_rest(rest: list[str], roots: list[str]) -> bool:
+    """True when the words after a matched runner still run the whole suite
+    — the whole-suite deny's semantics (`_suite_rule_bodies`: the bare
+    runner, or one aimed at a test root), plus a flags-only runner, which
+    the hook can see though a CLI rule cannot. A run naming any other
+    operand (a test file) is not a whole-suite run."""
+    norm = {r.strip("/") for r in roots}
+    pos = [w.removeprefix("./").rstrip("/") for w in rest
+           if w != "--" and not w.startswith("-")]
+    return not pos or any(w in norm for w in pos)
+
+
+def _forbidden_command_hit(command: str,
+                           forbidden: list[str | dict]) -> str | None:
     """The first forbidden command one of `command`'s normalised argvs starts
-    with, or None. Never raises: a matcher error reads as no hit (the deny
-    rules still stand) rather than failing a caller."""
+    with, or None. A `whole_suite` entry hits only a whole-suite run of it
+    (`_forbidden_whole_suite_rest`). Never raises: a matcher error reads as
+    no hit (the deny rules still stand) rather than failing a caller."""
     try:
         if not forbidden or not isinstance(command, str) or not command.strip():
             return None
         cands = _forbidden_argvs(command)
         for f in forbidden:
-            for forb in _forbidden_argvs(f):
-                if any(_forbidden_prefix_match(c, forb) for c in cands):
-                    return f
+            spec = _forbidden_spec(f)
+            if spec is None:
+                continue
+            cmd, scope, roots = spec
+            for forb in _forbidden_argvs(cmd):
+                for c in cands:
+                    if not _forbidden_prefix_match(c, forb):
+                        continue
+                    if (scope == "any" or _forbidden_whole_suite_rest(
+                            c[len(forb):], roots)):
+                        return cmd
     except Exception:
         return None
     return None
 
 
-def _process_constraints(result: dict, prescribed: dict | None) -> dict:
-    """`state.data["process_constraints"]` from the classifier's typed field:
-    forbidden commands whitespace-normalised and de-duplicated. A command the
-    task also PRESCRIBES is dropped (logged) — the prescription is the more
-    specific instruction, and keeping both would make the prescribed command
-    impossible to run while the declared-command check demands it."""
+def _process_constraints(result: dict, prescribed: dict | None,
+                         sources: list[str] | None = None,
+                         repo_root: str | Path | None = None) -> dict:
+    """`state.data["process_constraints"]` from the classifier's typed field.
+
+    An entry counts only when its `evidence_quote` (`_scope_norm`) is a
+    non-empty substring of one of `sources` — the task text and the reports
+    it references, never text leerie injected (DESIGN §9 *A command the task
+    forbids*). Commands are whitespace-normalised and de-duplicated; a
+    `whole_suite` entry carries the repo's test roots so every matcher —
+    the hook process included — reads the same scope. A command the task
+    also PRESCRIBES is dropped (logged): the prescription is the more
+    specific instruction, and keeping both would make the prescribed
+    command impossible to run while the declared-command check demands it.
+    Every dropped entry is recorded with its reason."""
     pc = result.get("process_constraints") if isinstance(result, dict) else None
     pc = pc if isinstance(pc, dict) else {}
     keep = sorted(_prescribed_commands(prescribed))
-    seen: list[str] = []
-    for c in pc.get("forbidden_commands") or []:
-        if not isinstance(c, str):
+    hay = [_scope_norm(x) for x in (sources or []) if isinstance(x, str)]
+    try:
+        roots = _test_roots(repo_root) if repo_root is not None else []
+    except Exception:
+        roots = []
+    entries: list[dict] = []
+    dropped: list[dict] = []
+    for e in pc.get("forbidden_commands") or []:
+        if not isinstance(e, dict) or not isinstance(e.get("command"), str):
             continue
-        c = " ".join(c.split())
-        if not c or c in seen:
+        c = " ".join(e["command"].split())
+        if not c:
+            continue
+        scope = e.get("scope") if e.get("scope") in FORBID_SCOPES else "any"
+        quote = _scope_norm(e.get("evidence_quote")
+                            if isinstance(e.get("evidence_quote"), str)
+                            else "")
+        if not quote or not any(quote in h for h in hay):
+            log(f"  forbidden command {c!r} dropped — its evidence quote is "
+                "not in the task or a report it references")
+            dropped.append({"command": c, "reason": "evidence_not_in_task",
+                            "evidence_quote": quote})
             continue
         if any(_forbidden_command_hit(p, [c]) for p in keep):
             log(f"  forbidden command {c!r} is also a prescribed command — "
                 "not forbidden")
+            dropped.append({"command": c, "reason": "prescribed",
+                            "evidence_quote": quote})
             continue
-        seen.append(c)
-    ev = pc.get("evidence")
-    return {"forbidden_commands": seen,
-            "evidence": ev if isinstance(ev, str) else ""}
+        if any(x["command"] == c for x in entries):
+            continue
+        entry = {"command": c, "scope": scope, "evidence_quote": quote}
+        if scope == "whole_suite":
+            entry["test_roots"] = list(roots)
+        entries.append(entry)
+    return {"forbidden_commands": [x["command"] for x in entries],
+            "entries": entries, "dropped": dropped}
 
 
 def _forbidden_commands(data: object) -> list[str]:
+    """The forbidden command strings, for display; matchers read
+    `_forbidden_specs`, which carries each one's scope."""
+    return [spec[0] for spec in
+            (_forbidden_spec(f) for f in _forbidden_specs(data)) if spec]
+
+
+def _forbidden_specs(data: object) -> list[str | dict]:
+    """The forbidden entries from `data["process_constraints"]`: the typed
+    `entries` when present, else the pre-scope string list (scope `any`).
+    `[]` when absent or malformed."""
     pc = data.get("process_constraints") if isinstance(data, dict) else None
-    cmds = pc.get("forbidden_commands") if isinstance(pc, dict) else None
+    if not isinstance(pc, dict):
+        return []
+    ents = pc.get("entries")
+    if isinstance(ents, list):
+        return [e for e in ents if _forbidden_spec(e) is not None]
+    cmds = pc.get("forbidden_commands")
     if not isinstance(cmds, list):
         return []
     return [c for c in cmds if isinstance(c, str) and c.strip()]
 
 
-def _forbidden_command_rule_patterns(forbidden: list[str]) -> list[str]:
+def _forbidden_command_rule_patterns(forbidden: list[str | dict]
+                                     ) -> list[str]:
     """Bodies of the deny rules for a list of commands: every spelling
     `_full_suite_runners` gives each one (a command it cannot express as one
     rule gives none — the hook still covers it), as `<form>` and
-    `<form> *`. Generic over any command list, so another deny (the N8 kill
-    rules) can reuse it."""
+    `<form> *` — or, for a `whole_suite` entry, the whole-suite rule set
+    over its test roots (`_suite_rule_bodies`), so a run naming test files
+    is not denied. Generic over any command list, so another deny (the N8
+    kill rules) can reuse it."""
     pats: list[str] = []
-    for c in forbidden:
-        for form in _full_suite_runners(c):
-            for p in (form, f"{form} *"):
-                if p not in pats:
-                    pats.append(p)
+    for f in forbidden:
+        spec = _forbidden_spec(f)
+        if spec is None:
+            continue
+        c, scope, roots = spec
+        forms = _full_suite_runners(c)
+        bodies = (_suite_rule_bodies(forms, roots) if scope == "whole_suite"
+                  else [p for form in forms for p in (form, f"{form} *")])
+        for p in bodies:
+            if p not in pats:
+                pats.append(p)
     return pats
 
 
-def _forbidden_command_denials(forbidden: list[str]) -> str:
+def _forbidden_command_denials(forbidden: list[str | dict]) -> str:
     return ",".join(f"Bash({p})"
                     for p in _forbidden_command_rule_patterns(forbidden))
 
 
-def _forbidden_commands_notice(forbidden: list[str]) -> str | None:
-    if not forbidden:
+def _forbidden_commands_notice(forbidden: list[str | dict]) -> str | None:
+    specs = [x for x in (_forbidden_spec(f) for f in forbidden or []) if x]
+    if not specs:
         return None
-    return FORBIDDEN_COMMANDS_NOTICE.format(
-        cmds=", ".join(f"`{c}`" for c in forbidden))
+    anys = [c for c, scope, _r in specs if scope == "any"]
+    suites = [c for c, scope, _r in specs if scope == "whole_suite"]
+    parts = []
+    if anys:
+        parts.append(FORBIDDEN_COMMANDS_NOTICE.format(
+            cmds=", ".join(f"`{c}`" for c in anys)))
+    if suites:
+        parts.append(FORBIDDEN_WHOLE_SUITE_NOTICE.format(
+            cmds=", ".join(f"`{c}`" for c in suites)))
+    return " ".join(parts)
 
 
-def _tools_reach_forbidden(allowed_tools: str, forbidden: list[str]) -> bool:
+def _tools_reach_forbidden(allowed_tools: str,
+                           forbidden: list[str | dict]) -> bool:
     """True when a worker with `allowed_tools` could type a forbidden
     command: bare `Bash`, or a `Bash(<head>…)` grant for one's first word."""
     tools = [t.strip() for t in (allowed_tools or "").split(",")]
     if "Bash" in tools:
         return True
-    heads = {c.split()[0] for c in forbidden if c.split()}
+    heads = {spec[0].split()[0] for spec in
+             (_forbidden_spec(f) for f in forbidden) if spec}
     return any(t.startswith(f"Bash({h}") for t in tools for h in heads)
 
 
@@ -22401,7 +22553,7 @@ def _tools_reach_bash(allowed_tools: str) -> bool:
 FORBIDDEN_COMMAND_HOOK = ROOT / "scripts" / "forbidden-command-hook.py"
 
 
-def _forbidden_command_hook_settings(forbidden: list[str],
+def _forbidden_command_hook_settings(forbidden: list[str | dict],
                                      deny_kills: bool = False) -> str | None:
     """The `--settings` JSON carrying the PreToolUse hook, or None when the
     task forbids nothing and kills are not denied. The payload travels
@@ -22411,8 +22563,13 @@ def _forbidden_command_hook_settings(forbidden: list[str],
     leerie the orchestrator is running."""
     if not forbidden and not deny_kills:
         return None
+    # Only what the matcher reads travels: a string, or a scoped entry's
+    # command, scope and test roots (never its evidence quote).
+    entries = [f if isinstance(f, str) else
+               {k: f[k] for k in ("command", "scope", "test_roots") if k in f}
+               for f in forbidden if _forbidden_spec(f) is not None]
     payload = base64.b64encode(json.dumps(
-        {"forbidden": list(forbidden), "kills": bool(deny_kills)}
+        {"forbidden": entries, "kills": bool(deny_kills)}
     ).encode("utf-8")).decode("ascii")
     command = " ".join(shlex.quote(w) for w in (
         sys.executable, "-I", str(FORBIDDEN_COMMAND_HOOK), payload))
@@ -22422,14 +22579,15 @@ def _forbidden_command_hook_settings(forbidden: list[str],
     }]}}, separators=(",", ":"))
 
 
-def _hook_payload(raw: object) -> tuple[list[str], bool]:
-    """(forbidden commands, deny kills) from the hook's decoded payload. A
-    bare list is the forbidden-commands-only shape."""
+def _hook_payload(raw: object) -> tuple[list[str | dict], bool]:
+    """(forbidden entries, deny kills) from the hook's decoded payload. A
+    bare list is the forbidden-commands-only shape; an entry is a command
+    string or a scoped `_process_constraints` entry."""
     if isinstance(raw, list):
-        return [c for c in raw if isinstance(c, str)], False
+        return [c for c in raw if _forbidden_spec(c) is not None], False
     if isinstance(raw, dict):
         f = raw.get("forbidden")
-        return ([c for c in f if isinstance(c, str)]
+        return ([c for c in f if _forbidden_spec(c) is not None]
                 if isinstance(f, list) else [],
                 raw.get("kills") is True)
     return [], False
@@ -22470,14 +22628,20 @@ FORBIDDEN_SCRIPT_SHELL = ROOT / "scripts" / "forbidden-script-shell.sh"
 _FORBID_SCRIPT_NAME_RE = re.compile(r"[A-Za-z0-9:._-]+")
 
 
-def _forbidden_script_names(forbidden: list[str]) -> list[str]:
-    """Package scripts the task forbids outright: a forbidden command that
-    normalises to exactly `<pm> run <script>` (`pnpm test`, `npm run lint`).
-    One with further arguments (`pnpm test --watch`) forbids only that
-    spelling, so it names no script — blocking the whole script would deny
-    more than the task did."""
+def _forbidden_script_names(forbidden: list[str | dict]) -> list[str]:
+    """Package scripts the task forbids outright: a forbidden `scope: "any"`
+    command that normalises to exactly `<pm> run <script>` (`pnpm test`,
+    `npm run lint`). One with further arguments (`pnpm test --watch`)
+    forbids only that spelling, and a `whole_suite` entry forbids only the
+    whole-suite run, so neither names a script — the guard sees the script
+    name, not its arguments, and blocking the whole script would deny more
+    than the task did."""
     names: list[str] = []
-    for c in forbidden or []:
+    for f in forbidden or []:
+        spec = _forbidden_spec(f)
+        if spec is None or spec[1] != "any":
+            continue
+        c = spec[0]
         try:
             argvs = _forbidden_argvs(c)
         except Exception:
@@ -22490,7 +22654,8 @@ def _forbidden_script_names(forbidden: list[str]) -> list[str]:
     return names
 
 
-def _forbidden_script_shell_env(forbidden: list[str]) -> dict[str, str]:
+def _forbidden_script_shell_env(forbidden: list[str | dict]
+                                ) -> dict[str, str]:
     """The worker env that routes every npm/pnpm/yarn-classic script through
     `scripts/forbidden-script-shell.sh` (DESIGN §9 *A command the task
     forbids*, the runtime layer), or {} when no package script is forbidden.
@@ -22505,8 +22670,8 @@ def _forbidden_script_shell_env(forbidden: list[str]) -> dict[str, str]:
             "pnpm_config_script_shell": shell}
 
 
-def _forbidden_verify_argv(subtask: dict,
-                           forbidden: list[str]) -> list[tuple[list[str], str]]:
+def _forbidden_verify_argv(subtask: dict, forbidden: list[str | dict]
+                           ) -> list[tuple[list[str], str]]:
     """`(argv, forbidden command)` for each of `subtask`'s `verify` argvs
     that runs a command the task forbids — same matcher as the hook, over
     the argv as the shell would read it."""
@@ -22521,7 +22686,7 @@ def _forbidden_verify_argv(subtask: dict,
 
 
 def _strip_forbidden_commands(plans: list[dict],
-                              forbidden: list[str]) -> list[str]:
+                              forbidden: list[str | dict]) -> list[str]:
     """Remove `runs_commands` entries that run a forbidden command, so the
     declared-command check never requires one, and empty the `argv` of each
     `verify` entry that runs one, so settle-by-execution never runs it and
@@ -22785,7 +22950,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     # Forbidden commands (DESIGN §9 *A command the task forbids*): deny rules,
     # the paired notice and the PreToolUse hook, decided together here for
     # the same reason as the whole-suite pair.
-    forbidden = _forbidden_commands(st.data)
+    forbidden = _forbidden_specs(st.data)
     forbidden_deny = _forbidden_command_denials(forbidden)
     forbidden_notice = (_forbidden_commands_notice(forbidden)
                         if _tools_reach_forbidden(allowed_tools, forbidden)
@@ -22814,15 +22979,21 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 suite_notice = None
         except Exception:
             pass
+    # A worker that types constraints FROM the task never sees an
+    # orchestrator notice (DESIGN §9 *A command the task forbids*): measured,
+    # the classifier returned the whole-suite notice as a task constraint.
+    # Its deny rules and hook still bind it.
+    task_reader = schema_key in NOTICE_FREE_WORKERS
     for _notice in (suite_notice, forbidden_notice,
                     PROCESS_KILL_NOTICE if deny_kills else None):
-        if _notice:
+        if _notice and not task_reader:
             user_prompt = (f"{user_prompt.rstrip()}\n"
                            f"NOTE FROM ORCHESTRATOR: {_notice}")
     # The database push/reset deny travels with its notice the same way
     # (DESIGN §8 *Prisma repositories get a real database*).
     db_deny = _db_reset_denials(_suite_root)
-    if db_deny and "Bash" in [x.strip() for x in allowed_tools.split(",")]:
+    if (db_deny and not task_reader
+            and "Bash" in [x.strip() for x in allowed_tools.split(",")]):
         user_prompt = (f"{user_prompt.rstrip()}\n"
                        f"NOTE FROM ORCHESTRATOR: {DB_RESET_NOTICE}")
 
@@ -25286,11 +25457,17 @@ async def phase_classify(task: str, st: State, caps: dict, clarify: bool,
     st.data["classifier_questions"] = questions
     st.data["needs_source_of_truth"] = bool(result.get("source_of_truth_question"))
     st.data["prescribed_procedure"] = result.get("prescribed_procedure") or {}
+    # The quote check reads the task and its referenced reports only — the
+    # texts the classifier was shown under TASK, never anything leerie
+    # appended to its prompt.
     st.data["process_constraints"] = _process_constraints(
-        result, st.data["prescribed_procedure"])
-    if st.data["process_constraints"]["forbidden_commands"]:
-        log("  task forbids: " + ", ".join(
-            st.data["process_constraints"]["forbidden_commands"]))
+        result, st.data["prescribed_procedure"],
+        sources=[task] + ["\n".join(s_["text"] for s_ in units["sections"]
+                                     if s_["source"] == rel)
+                          for rel in units["reports"]],
+        repo_root=repo_root)
+    if _forbidden_commands(st.data):
+        log("  task forbids: " + ", ".join(_forbidden_commands(st.data)))
     items = [it for it in result.get("required_items") or []
              if isinstance(it, dict)]
     st.data["required_items"] = items
@@ -27022,7 +27199,10 @@ async def phase_plan(task: str, st: State, caps: dict,
         ctx_dict["defect_scope"] = {**defect_scope,
                                     "sites": _scope_sites(defect_scope)}
     # Forbidden commands (DESIGN §9): a plan must not depend on running one.
-    _forbidden_ctx = _forbidden_commands(st.data)
+    _forbidden_ctx = [
+        {"command": sp[0], "scope": sp[1]}
+        for sp in (_forbidden_spec(f) for f in _forbidden_specs(st.data))
+        if sp]
     if _forbidden_ctx:
         ctx_dict["process_constraints"] = {"forbidden_commands": _forbidden_ctx}
     # Shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*).
@@ -36713,7 +36893,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
     installed = False
     dirty = False
 
-    forbidden = _forbidden_commands(getattr(st, "data", None))
+    forbidden = _forbidden_specs(getattr(st, "data", None))
     for axis, cmd in axes.items():
         cmd = (cmd or "").strip()
         if not cmd:
@@ -36722,6 +36902,19 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                 verbosity=verbosity, label_prefix=label_prefix)
             continue
         hit = _forbidden_command_hit(cmd, forbidden)
+        replacement: dict | None = None
+        if hit and axis == "tests":
+            # The run's only regression check is replaced, never dropped
+            # (DESIGN §9 *A command the task forbids*): the scoped runner
+            # over the tests coupled to the run's changes.
+            rep = await _scoped_test_replacement(tree, st, cmd, hit,
+                                                 forbidden,
+                                                 log_prefix=log_prefix)
+            if "scoped_replacement" not in rep:
+                results[axis] = rep
+                continue
+            cmd, replacement = rep["command"], rep["scoped_replacement"]
+            hit = None
         if hit:
             # The task forbids it (DESIGN §9): the orchestrator does not run
             # it either. Unmeasured, like an axis with no command, and never
@@ -36736,6 +36929,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         key = _blt_memo_key(axis, cmd, tree_sha) if tree_sha else None
         if key and key in store:
             results[axis] = dict(store[key])
+            if replacement is not None:
+                results[axis]["scoped_replacement"] = replacement
             log(f"  {log_prefix}: {axis} unchanged since last measurement "
                 f"— reusing recorded result")
             if (axis in failing_ids_axes
@@ -36779,6 +36974,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
             await _attach_failing_ids(res, tree, cmd, st, caps,
                                       log_path=log_path,
                                       label=f"{label_prefix}-{axis}")
+        if replacement is not None:
+            res["scoped_replacement"] = replacement
         results[axis] = res
 
         if not (memo and tree_sha):
@@ -36791,6 +36988,91 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         st.save()
 
     return results
+
+
+REGRESSION_GAP_SOURCE = "regression_check"
+
+
+def _set_regression_gap(st: "State", detail: str | None) -> None:
+    """Record (`detail`) or clear (None) the "Needs human verification"
+    entry saying the orchestrator's own regression check could not run on
+    the latest measured tree. One entry, the latest tree's: a later tree
+    the scoped run did measure clears it."""
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    entries = [e for e in (data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict)
+                       and e.get("source") == REGRESSION_GAP_SOURCE)]
+    if detail:
+        entries.append({"source": REGRESSION_GAP_SOURCE, "detail": detail})
+    if entries != (data.get("needs_human_verification") or []):
+        data["needs_human_verification"] = entries
+        with contextlib.suppress(Exception):
+            st.save()
+
+
+async def _scoped_test_replacement(tree: str, st: "State", canonical: str,
+                                   hit: str, forbidden: list[str | dict], *,
+                                   log_prefix: str) -> dict:
+    """The test axis's replacement when the task forbids its command
+    (DESIGN §9 *A command the task forbids*): `{command, scoped_replacement:
+    {replaces, forbidden, files, coupled}}` — the scoped runner rendered
+    over the tests coupled to the run's changes on `tree` — or, when there
+    is nothing to run, the unmeasured axis record. Before the baseline is
+    recorded there is no change to couple to (`skip_kind:
+    scoped_at_final`); after it, an empty coupling, no scoped runner, or a
+    scoped command the task also forbids is a gap — logged as a WARNING and
+    listed under "Needs human verification", never silent."""
+    def _unmeasured(kind: str, summary: str) -> dict:
+        return {"ran": False, "measured": False, "passed": None,
+                "command": canonical, "skip_kind": kind, "summary": summary}
+
+    data = getattr(st, "data", None) or {}
+    base = (((data.get("conformance") or {}).get("_baseline") or {})
+            .get("sha") or "")
+    if not base:
+        log(f"  {log_prefix}: tests not run here — the task forbids `{hit}`; "
+            "replaced on later trees by the tests coupled to the run's "
+            "changes")
+        return _unmeasured(
+            "scoped_at_final",
+            f"not run: the task forbids `{hit}`; replaced on later trees by "
+            "a scoped run of the tests coupled to the run's changes")
+
+    def _gap(kind: str, why: str) -> dict:
+        detail = (f"The task forbids `{hit}`, and the orchestrator could not "
+                  f"run its scoped replacement on the final tree: {why}. "
+                  "Check for regressions by hand.")
+        log(f"  WARNING {log_prefix}: regression check not run — {why}")
+        _set_regression_gap(st, detail)
+        return _unmeasured(kind, f"not run: the task forbids `{hit}` and "
+                                 f"{why}")
+
+    head = await _branch_head_sha(tree)
+    changed = await _changed_files(tree, base)
+    globs = resolve_test_file_globs(st.repo_root)
+    coupled = (_coupled_test_files(st.repo_root, head, changed, globs)
+               if head else {})
+    tests = [t for t in coupled if (Path(tree) / t).is_file()]
+    if not tests:
+        return _gap("forbidden_no_coupled_tests",
+                    "no test file is coupled to the run's changes")
+    scoped = _acceptance_cmd(st, tests, tree)
+    if not scoped:
+        return _gap("forbidden_no_scoped_runner",
+                    "the repo has no scoped test runner leerie can render")
+    also = _forbidden_command_hit(scoped, forbidden)
+    if also:
+        return _gap("forbidden_scoped_runner",
+                    f"the scoped runner is forbidden too (`{also}`)")
+    _set_regression_gap(st, None)
+    log(f"  {log_prefix}: tests replaced — the task forbids `{hit}`; running "
+        f"the {len(tests)} test file(s) coupled to the run's changes")
+    return {"command": scoped,
+            "scoped_replacement": {"replaces": canonical, "forbidden": hit,
+                                   "files": tests,
+                                   "coupled": {t: coupled[t] for t in tests}}}
 
 
 # --- B*: flake-robust failure verdicts (DESIGN §9 *Which failures are new*) -
@@ -37123,6 +37405,11 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     verdict (`test_id_diff`)."""
     base_ids = st.data.get("baseline_failing_ids")
     tests = (post or {}).get("tests") or {}
+    if tests.get("scoped_replacement"):
+        # The base never ran this scoped command (DESIGN §9 *A command the
+        # task forbids*): every final failure is a candidate, and B*'s base
+        # reruns keep one the base already had from being called new.
+        base_ids = []
     if base_ids is None or not tests.get("measured"):
         return None
     final_ids = tests.get("failing_ids")
@@ -39346,11 +39633,13 @@ def _js_is_test(path: str) -> bool:
     return bool(_JS_TEST_PATH_RE.search(path))
 
 
-def _git_tree_sources(repo: str | Path, rev: str) -> tuple[dict[str, str],
-                                                           set[str]]:
-    """{path: text} for the JS/TS source files at `rev`, and every path
-    there — read with git plumbing (`ls-tree`, `cat-file --batch`), so no
-    checkout is needed and nothing is written."""
+def _git_tree_sources(repo: str | Path, rev: str,
+                      exts: tuple[str, ...] = _JS_SRC_EXT
+                      ) -> tuple[dict[str, str], set[str]]:
+    """{path: text} for the source files at `rev` with a suffix in `exts`
+    (JS/TS by default), and every path there — read with git plumbing
+    (`ls-tree`, `cat-file --batch`), so no checkout is needed and nothing is
+    written."""
     ls = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "-z", rev],
                         capture_output=True, text=True, check=False)
     if ls.returncode != 0:
@@ -39364,7 +39653,7 @@ def _git_tree_sources(repo: str | Path, rev: str) -> tuple[dict[str, str],
         parts = meta.split()
         allp.add(path)
         if (len(parts) == 3 and parts[1] == "blob"
-                and path.endswith(_JS_SRC_EXT)
+                and path.endswith(exts)
                 and "node_modules/" not in path):
             ents.append((path, parts[2]))
     if not ents:
@@ -39475,6 +39764,121 @@ def _js_source_graph(repo: str | Path, rev: str) -> dict:
         _SOURCE_GRAPHS.clear()
     _SOURCE_GRAPHS[key] = g
     return g
+
+
+def _py_module_index(files: Iterable[str]) -> dict[str, set[str]]:
+    """Dotted module name -> the `.py` paths it can name, for every suffix
+    of each path's package parts (`src/pkg/mod.py` is `src.pkg.mod`,
+    `pkg.mod` and `mod`), so a module is found whichever directory the
+    repo puts on `sys.path`. Over-inclusive on purpose: a missed edge drops
+    a coupled test, the costly direction."""
+    idx: dict[str, set[str]] = {}
+    for f in files:
+        parts = f[:-3].split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        for i in range(len(parts)):
+            if parts[i:]:
+                idx.setdefault(".".join(parts[i:]), set()).add(f)
+    return idx
+
+
+def _py_imports(path: str, text: str, idx: dict[str, set[str]],
+                files: set[str]) -> set[str]:
+    """The repo `.py` files `text` (the module at `path`) imports, read with
+    `ast` (program text, a mechanical string — DESIGN §12). `from a import
+    b` names `a.b` when that is a module, else `a`; a relative import
+    resolves against the importer's own package."""
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError):
+        return set()
+    pkg = path.split("/")[:-1]
+    out: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                out |= idx.get(a.name, set())
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:
+                base = pkg[:max(0, len(pkg) - (node.level - 1))]
+                stem = "/".join(base + (node.module.split(".")
+                                        if node.module else []))
+                for a in node.names:
+                    for cand in (f"{stem}/{a.name}.py",
+                                 f"{stem}/{a.name}/__init__.py",
+                                 f"{stem}.py", f"{stem}/__init__.py"):
+                        if cand.lstrip("/") in files:
+                            out.add(cand.lstrip("/"))
+                            break
+                continue
+            mod = node.module or ""
+            for a in node.names:
+                hit = idx.get(f"{mod}.{a.name}")
+                out |= hit if hit else idx.get(mod, set())
+    out.discard(path)
+    return out
+
+
+def _py_source_graph(repo: str | Path, rev: str) -> dict:
+    """The Python import graph at `rev`, in `_js_source_graph`'s shape
+    (`files`, `imp`, `importers`)."""
+    key = (str(repo), f"py:{rev}")
+    if key in _SOURCE_GRAPHS:
+        return _SOURCE_GRAPHS[key]
+    src, _allp = _git_tree_sources(repo, rev, (".py",))
+    idx = _py_module_index(src)
+    files = set(src)
+    imp = {p: _py_imports(p, t, idx, files) for p, t in src.items()}
+    importers: dict[str, set[str]] = {}
+    for p, deps in imp.items():
+        for q in deps:
+            importers.setdefault(q, set()).add(p)
+    g = {"files": files, "imp": imp, "importers": importers}
+    if len(_SOURCE_GRAPHS) > 8:
+        _SOURCE_GRAPHS.clear()
+    _SOURCE_GRAPHS[key] = g
+    return g
+
+
+def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
+                        globs: list[str] | None = None
+                        ) -> dict[str, list[str]]:
+    """The tests coupled to a change (DESIGN §9): test file -> the changed
+    production files its import closure reaches, over the JS/TS and Python
+    import graphs at `rev`. A changed test file is coupled by itself (its
+    list may be empty). Never raises: a graph that cannot be read couples
+    nothing through it."""
+    changed = [c for c in changed if isinstance(c, str) and c]
+    out: dict[str, set[str]] = {c: set() for c in changed
+                                if _is_test_case_file(c, globs)}
+    prods = [c for c in changed if not _is_test_file(c, globs)]
+    if not prods:
+        return {t: sorted(v) for t, v in sorted(out.items())}
+    graphs = []
+    for build in (_js_source_graph, _py_source_graph):
+        try:
+            graphs.append(build(repo, rev))
+        except Exception as e:
+            log(f"  coupled tests: import graph unreadable "
+                f"({type(e).__name__}: {e})")
+    for g in graphs:
+        importers = g.get("importers") or {}
+        for prod in prods:
+            if prod not in g.get("files", ()):
+                continue
+            seen, stack = {prod}, [prod]
+            while stack:
+                cur = stack.pop()
+                for b in importers.get(cur, ()):
+                    if b in seen:
+                        continue
+                    seen.add(b)
+                    if _is_test_case_file(b, globs):
+                        out.setdefault(b, set()).add(prod)
+                    else:
+                        stack.append(b)
+    return {t: sorted(v) for t, v in sorted(out.items())}
 
 
 def _git_recency(repo: str | Path, rev: str,
@@ -48282,7 +48686,7 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
     # never runs what the task forbids (DESIGN §9), and a criterion it
     # cannot run is not settled: the claim falls back to the re-drive.
     refused = _forbidden_verify_argv(subtask,
-                                     _forbidden_commands(st.data))
+                                     _forbidden_specs(st.data))
     if refused:
         record["forbidden"] = [{"argv": a, "forbidden": f}
                                for a, f in refused]
@@ -52739,7 +53143,7 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         # task forbids*). Prescribed commands were already removed from the
         # forbidden list at classify time.
         for _sid in _strip_forbidden_commands(
-                plans, _forbidden_commands(st.data)):
+                plans, _forbidden_specs(st.data)):
             log(f"  {_sid}: dropped a runs_commands entry or verify argv the "
                 "task forbids")
         # A planner paraphrase of a prescribed command (`… -q`, "run …

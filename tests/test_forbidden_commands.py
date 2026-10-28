@@ -108,37 +108,72 @@ def test_matcher_never_raises(leerie, monkeypatch):
 
 # === classifier output -> state ============================================
 
+def _fc(command, quote, scope="any"):
+    return {"command": command, "evidence_quote": quote, "scope": scope}
+
+
+TASK_TEXT = ("Do not run the tests, they hang. Never run  prisma db push. "
+             "Ship it.")
+
+
 def test_process_constraints_normalises_and_drops_prescribed(leerie):
-    result = {"process_constraints": {
-        "forbidden_commands": ["pnpm   test", "pnpm test", "", 7,
-                               "prisma db push", "make deploy"],
-        "evidence": "do not run the tests"}}
+    result = {"process_constraints": {"forbidden_commands": [
+        _fc("pnpm   test", "Do not run the tests"),
+        _fc("pnpm test", "Do not run the tests"),
+        _fc("", "Ship it"), 7, "bare string",
+        _fc("prisma db push", "never run prisma db push"),
+        _fc("make deploy", "Ship it.")]}}
     prescribed = {"is_prescribed": True, "commands": ["make deploy"]}
-    assert leerie._process_constraints(result, prescribed) == {
-        "forbidden_commands": ["pnpm test", "prisma db push"],
-        "evidence": "do not run the tests"}
-    # Not prescribed (flag off) -> nothing is dropped.
+    got = leerie._process_constraints(result, prescribed, [TASK_TEXT])
+    assert got["forbidden_commands"] == ["pnpm test"]
+    # The quote check is case-sensitive: "never" is not in the task, "Never"
+    # is (whitespace normalised on both sides).
+    assert [(d["command"], d["reason"]) for d in got["dropped"]] == [
+        ("prisma db push", "evidence_not_in_task"),
+        ("make deploy", "prescribed")]
+    # Not prescribed (flag off) -> the prescription does not drop it.
+    result["process_constraints"]["forbidden_commands"][5] = _fc(
+        "prisma db push", "Never run prisma db push")
     assert leerie._process_constraints(
-        result, {"commands": ["make deploy"]})["forbidden_commands"] == [
+        result, {"commands": ["make deploy"]},
+        [TASK_TEXT])["forbidden_commands"] == [
         "pnpm test", "prisma db push", "make deploy"]
+
+
+def test_evidence_must_come_from_the_task_or_a_report(leerie):
+    """An entry whose quote is leerie's own notice (the barnacle 7cc87f9a
+    shape) is dropped; the same entry quoting a referenced report is kept."""
+    notice = leerie.FULL_SUITE_NOTICE.format(cmd="pnpm run test")
+    report = "## Constraints\nDo not run `pnpm run test` on the shared box."
+    result = {"process_constraints": {"forbidden_commands": [_fc(
+        "pnpm run test", notice[:80], "whole_suite")]}}
+    got = leerie._process_constraints(result, None, [TASK_TEXT, report])
+    assert got["forbidden_commands"] == [] and got["entries"] == []
+    assert got["dropped"][0]["reason"] == "evidence_not_in_task"
+    result = {"process_constraints": {"forbidden_commands": [_fc(
+        "pnpm run test", "Do not run `pnpm run test`", "whole_suite")]}}
+    got = leerie._process_constraints(result, None, [TASK_TEXT, report])
+    assert got["forbidden_commands"] == ["pnpm run test"]
+    assert got["entries"][0]["scope"] == "whole_suite"
 
 
 @pytest.mark.parametrize("result", [{}, {"process_constraints": None},
                                     {"process_constraints": "x"}])
 def test_absent_constraints_forbid_nothing(leerie, result):
-    assert leerie._process_constraints(result, None) == {
-        "forbidden_commands": [], "evidence": ""}
+    assert leerie._process_constraints(result, None, [TASK_TEXT]) == {
+        "forbidden_commands": [], "entries": [], "dropped": []}
 
 
-@pytest.mark.parametrize("extra,expected", [
-    ({"process_constraints": {"forbidden_commands": ["pnpm  test"],
-                              "evidence": "never run pnpm test"}},
-     {"forbidden_commands": ["pnpm test"],
-      "evidence": "never run pnpm test"}),
-    ({}, {"forbidden_commands": [], "evidence": ""}),
+@pytest.mark.parametrize("extra,commands", [
+    ({"process_constraints": {"forbidden_commands": [
+        _fc("pnpm  test", "never run pnpm test")]}}, ["pnpm test"]),
+    # The quote is not in the task: dropped, so nothing is forbidden.
+    ({"process_constraints": {"forbidden_commands": [
+        _fc("pnpm test", "running it is denied to you")]}}, []),
+    ({}, []),
 ])
 def test_phase_classify_persists_them(leerie, tmp_path, monkeypatch, extra,
-                                      expected):
+                                      commands):
     """Executed through the real `phase_classify` (only `claude_p`
     stubbed); a classifier that omits the field forbids nothing."""
     from tests.stub_helpers import _d1_covered
@@ -150,9 +185,11 @@ def test_phase_classify_persists_them(leerie, tmp_path, monkeypatch, extra,
         return {**_d1_covered(), "categories": ["bug-fixing"], **extra}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    asyncio.run(leerie.phase_classify("task", st, _caps(leerie), False,
-                                      MODELS, EFFORTS))
-    assert st.data["process_constraints"] == expected
+    asyncio.run(leerie.phase_classify("fix it; never run pnpm test", st,
+                                      _caps(leerie), False, MODELS, EFFORTS))
+    pc = st.data["process_constraints"]
+    assert pc["forbidden_commands"] == commands
+    assert [e["command"] for e in pc["entries"]] == commands
 
 
 # === deny rules =============================================================
@@ -345,15 +382,35 @@ def test_an_inspect_only_worker_gets_the_hook_but_no_notice(
         leerie, monkeypatch, tmp_path):
     repo = _repo(tmp_path, test="")
     argv, prompt = _spawn(leerie, monkeypatch, repo,
-                          data=_pc("pnpm test"), schema_key="classifier",
+                          data=_pc("pnpm test"), schema_key="planner",
                           allowed_tools=leerie.INSPECT_TOOLS)
     assert "--settings" in argv
     assert _forbid_lines(prompt) == []
     _argv, prompt = _spawn(leerie, monkeypatch, repo,
-                           data=_pc("pnpm test"), schema_key="classifier",
+                           data=_pc("pnpm test"), schema_key="planner",
                            allowed_tools=leerie.INSPECT_TOOLS
                            + ",Bash(pnpm:*)")
     assert len(_forbid_lines(prompt)) == 1
+
+
+def test_the_classifier_never_gets_an_orchestrator_notice(
+        leerie, monkeypatch, tmp_path):
+    """The classifier types constraints from the task; a notice in its
+    prompt came back as one (barnacle 7cc87f9a). The same spawn for another
+    worker carries both notices, so the absence is the classifier's rule,
+    not a missing deny. Its deny rules and hook still apply."""
+    repo = _repo(tmp_path, test="pnpm run test")
+    tools = leerie.INSPECT_TOOLS + ",Bash(pnpm:*)"
+    data = _pc("pnpm run lint")
+    _argv, prompt = _spawn(leerie, monkeypatch, repo, data=data,
+                           schema_key="planner", allowed_tools=tools)
+    assert len(_suite_lines(prompt)) == 1 and len(_forbid_lines(prompt)) == 1
+    argv, prompt = _spawn(leerie, monkeypatch, repo, data=data,
+                          schema_key="classifier", allowed_tools=tools)
+    assert "NOTE FROM ORCHESTRATOR" not in prompt
+    deny = argv[argv.index("--disallowedTools") + 1]
+    assert "Bash(pnpm run lint)" in deny and "Bash(pnpm run test)" in deny
+    assert "--settings" in argv
 
 
 def test_a_forbidden_canonical_suite_drops_the_suite_notice(
@@ -390,19 +447,24 @@ def test_measure_axes_does_not_run_a_forbidden_command(leerie, tmp_path,
 
     monkeypatch.setattr(leerie, "_measure_blt", fake_measure_blt)
     monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
-    st = types.SimpleNamespace(data={**_pc("pnpm test")}, save=lambda: None,
-                               run_id="r1")
+    st = types.SimpleNamespace(data={**_pc("pnpm test", "pnpm run lint")},
+                               save=lambda: None, run_id="r1")
     res = asyncio.run(leerie._measure_axes(
         str(tmp_path), {"build": "pnpm run build",
+                        "lint": "timeout 600 pnpm run lint",
                         "tests": "timeout 600 pnpm run test"},
         st, dict(leerie.DEFAULT_CAPS), log_path=tmp_path / "l.log",
         verbosity="quiet", memo=False))
     assert ran == ["pnpm run build"]
-    assert res["tests"] == {
+    assert res["lint"] == {
         "ran": False, "measured": False, "passed": None,
-        "command": "timeout 600 pnpm run test",
+        "command": "timeout 600 pnpm run lint",
         "skip_kind": "forbidden_by_task",
-        "summary": "not run: the task forbids `pnpm test`"}
+        "summary": "not run: the task forbids `pnpm run lint`"}
+    # The test axis is replaced, not skipped; with no baseline yet there is
+    # no change to couple to, so the deferral is typed.
+    assert res["tests"]["skip_kind"] == "scoped_at_final"
+    assert res["tests"]["measured"] is False
     assert res["build"]["ran"] is True
 
 
@@ -455,13 +517,18 @@ def test_classifier_schema_types_the_constraint(leerie):
     base = {"categories": ["bug-fixing"], "span_dispositions": [],
             "section_roles": [], "required_items": []}
     jsonschema.validate({**base, "process_constraints": {
-        "forbidden_commands": ["pnpm test"], "evidence": "e"}}, schema)
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate({**base, "process_constraints": {
-            "forbidden_commands": "pnpm test"}}, schema)
+        "forbidden_commands": [_fc("pnpm test", "e", "whole_suite")]}},
+        schema)
+    for bad in ("pnpm test", ["pnpm test"],
+                [{"command": "pnpm test", "scope": "any"}],
+                [_fc("pnpm test", "e", "some")]):
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate({**base, "process_constraints": {
+                "forbidden_commands": bad}}, schema)
     text = (leerie.ROOT / "prompts" / "classifier.md").read_text()
     assert "`process_constraints`" in text
     assert "`forbidden_commands`" in text
+    assert "`evidence_quote`" in text and "`whole_suite`" in text
 
 
 # === stage 4c: a forbidden verify argv is never run ==========================
@@ -623,3 +690,266 @@ def test_guard_refuses_a_nested_run_under_npm(leerie, tmp_path):
         assert (p.returncode == 0) is ok, (cmd, p.stderr)
         ran = mark.read_text().split() if mark.exists() else []
         assert ran == (["lint"] if ok else []), cmd
+
+
+# === scope: a forbidden whole suite denies only whole-suite runs ============
+
+SUITE = [{"command": "pnpm run test", "scope": "whole_suite",
+          "test_roots": ["tests"]}]
+
+
+@pytest.mark.parametrize("cmd,hit", [
+    ("pnpm run test", True), ("pnpm test", True), ("npm test", True),
+    ("pnpm test -- --run", True), ("pnpm test tests/", True),
+    ("pnpm test ./tests", True), ("npx pnpm run test", True),
+    ("bash -c 'pnpm test'", True),
+    # a scoped run names test files: allowed (it was denied by the prefix
+    # match before, so acceptance writers could not validate their sets)
+    ("pnpm test src/lib/random.test.ts", False),
+    ("pnpm run test -- src/a.test.ts src/b.test.ts", False),
+    ("bash -c 'pnpm test src/a.test.ts'", False),
+    ("pnpm run lint", False)])
+def test_whole_suite_scope_hits_only_whole_suite_runs(leerie, cmd, hit):
+    got = leerie._forbidden_command_hit(cmd, SUITE)
+    assert (got == "pnpm run test") is hit
+    # The same command forbidden outright still hits every spelling.
+    assert leerie._forbidden_command_hit(cmd, ["pnpm run test"]) == (
+        None if cmd == "pnpm run lint" else "pnpm run test")
+
+
+def test_whole_suite_rules_read_with_the_cli_glob(leerie):
+    pats = leerie._forbidden_command_rule_patterns(SUITE)
+    assert "pnpm run test *" not in pats and "pnpm test *" not in pats
+    for cmd, denied in (("pnpm test", True), ("pnpm test tests/", True),
+                        ("pnpm test -x tests", True),
+                        ("pnpm test src/a.test.ts", False)):
+        assert any(leerie._rule_matches(cmd, p) for p in pats) is denied, cmd
+
+
+def test_whole_suite_scope_names_no_script(leerie):
+    assert leerie._forbidden_script_names(SUITE) == []
+    assert leerie._forbidden_script_names(
+        SUITE + [{"command": "npm run lint", "scope": "any"}]) == ["lint"]
+
+
+def test_whole_suite_notice_allows_targeted_runs(leerie):
+    text = leerie._forbidden_commands_notice(SUITE)
+    assert "whole test suite" in text and "specific test files" in text
+    assert "do not look for another way" not in text
+
+
+def test_the_real_hook_reads_the_scope(leerie):
+    s = json.loads(leerie._forbidden_command_hook_settings(
+        [{**SUITE[0], "evidence_quote": "quote stays home"}]))
+    hook = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    payload = hook.split()[-1]
+    assert json.loads(base64.b64decode(payload))["forbidden"] == SUITE
+    for cmd, denied in (("corepack pnpm test", True),
+                        ("pnpm test src/a.test.ts", False)):
+        p = subprocess.run(
+            [sys.executable, "-I", str(leerie.FORBIDDEN_COMMAND_HOOK),
+             payload], input=_event(cmd), capture_output=True, text=True,
+            timeout=60)
+        assert p.returncode == 0, p.stderr
+        assert ('"permissionDecision": "deny"' in p.stdout) is denied, cmd
+
+
+def test_process_constraints_records_test_roots(leerie, tmp_path):
+    repo = _repo(tmp_path)
+    result = {"process_constraints": {"forbidden_commands": [
+        _fc("pnpm run test", "Do not run the tests", "whole_suite")]}}
+    got = leerie._process_constraints(result, None, [TASK_TEXT], repo)
+    assert got["entries"] == [{"command": "pnpm run test",
+                               "scope": "whole_suite",
+                               "evidence_quote": "Do not run the tests",
+                               "test_roots": ["tests"]}]
+    st_data = {"process_constraints": got}
+    assert leerie._forbidden_specs(st_data) == got["entries"]
+    assert leerie._forbidden_command_hit(
+        "pnpm test tests/", leerie._forbidden_specs(st_data))
+    assert not leerie._forbidden_command_hit(
+        "pnpm test tests/a.test.ts", leerie._forbidden_specs(st_data))
+
+
+def test_legacy_state_reads_as_scope_any(leerie):
+    assert leerie._forbidden_specs(_pc("pnpm test")) == ["pnpm test"]
+    assert leerie._forbidden_commands(_pc("pnpm test")) == ["pnpm test"]
+
+
+# === the coupled tests, and the scoped replacement of a forbidden suite =====
+
+def _git(cwd, *args):
+    subprocess.run(["git", "-C", str(cwd), *args], check=True,
+                   capture_output=True, text=True)
+
+
+def _coupled_repo(tmp_path):
+    """A vitest repo: `src/lib/rand.ts` is imported directly by
+    `src/lib/rand.test.ts` and through `src/app/loader.ts` by
+    `src/app/loader.e2e.test.ts`; `src/other.test.ts` imports neither. A
+    Python half: `pkg/core.py` imported by `tests/test_core.py` via
+    `pkg/api.py`."""
+    root = tmp_path / "repo"
+    files = {
+        ".leerie/config.toml": 'test = "pnpm run test"\n',
+        "vitest.config.ts": "export default {};\n",
+        "tsconfig.json": '{"compilerOptions": {"paths": {"@/*": ["./src/*"]}}}',
+        "src/lib/rand.ts": "export const rand = () => 4;\n",
+        "src/lib/rand.test.ts": 'import { rand } from "./rand";\n',
+        "src/app/loader.ts": 'import { rand } from "@/lib/rand";\n',
+        "src/app/loader.e2e.test.ts": 'import { load } from "./loader";\n',
+        "src/other.ts": "export const o = 1;\n",
+        "src/other.test.ts": 'import { o } from "./other";\n',
+        "pkg/__init__.py": "",
+        "pkg/core.py": "X = 1\n",
+        "pkg/api.py": "from .core import X\n",
+        "tests/test_core.py": "from pkg import api\n",
+        "tests/test_other.py": "import json\n",
+    }
+    for rel, text in files.items():
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text(text)
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm",
+         "base")
+    base = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    (root / "src/lib/rand.ts").write_text("export const rand = () => 5;\n")
+    (root / "pkg/core.py").write_text("X = 2\n")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qam",
+         "change")
+    head = subprocess.run(["git", "-C", str(root), "rev-parse", "HEAD"],
+                          capture_output=True, text=True).stdout.strip()
+    return root, base, head
+
+
+def test_coupled_test_files_follow_the_import_closure(leerie, tmp_path):
+    root, _base, head = _coupled_repo(tmp_path)
+    leerie._SOURCE_GRAPHS.clear()
+    got = leerie._coupled_test_files(
+        root, head, ["src/lib/rand.ts", "pkg/core.py", "src/new.test.ts"])
+    assert got["src/lib/rand.test.ts"] == ["src/lib/rand.ts"]
+    assert got["src/app/loader.e2e.test.ts"] == ["src/lib/rand.ts"]
+    assert got["tests/test_core.py"] == ["pkg/core.py"]
+    assert got["src/new.test.ts"] == []
+    assert "src/other.test.ts" not in got and "tests/test_other.py" not in got
+
+
+def _measure_st(leerie, root, base, data=None):
+    saved = []
+    st = types.SimpleNamespace(
+        data={"verbosity": "quiet",
+              "conformance": {"_baseline": {"sha": base}} if base else {},
+              **(data or {})},
+        save=lambda: saved.append(1), run_id="r1", repo_root=root,
+        run_dir=root / ".run")
+    return st
+
+
+def _stub_measure(leerie, monkeypatch):
+    ran: list[str] = []
+
+    async def fake_measure_blt(axis, cmd, tree, **kw):
+        ran.append(cmd)
+        return {"ran": True, "measured": True, "passed": True,
+                "summary": "", "command": cmd}
+
+    async def no_deps(*a, **k):
+        return None
+
+    monkeypatch.setattr(leerie, "_measure_blt", fake_measure_blt)
+    monkeypatch.setattr(leerie, "_ensure_worktree_deps", no_deps)
+    return ran
+
+
+def test_measure_axes_replaces_a_forbidden_suite_with_the_coupled_tests(
+        leerie, tmp_path, monkeypatch):
+    root, base, _head = _coupled_repo(tmp_path)
+    leerie._SOURCE_GRAPHS.clear()
+    ran = _stub_measure(leerie, monkeypatch)
+    st = _measure_st(leerie, root, base, {"process_constraints": {
+        "entries": SUITE}})
+    res = asyncio.run(leerie._measure_axes(
+        str(root), {"tests": "pnpm run test"}, st,
+        dict(leerie.DEFAULT_CAPS), log_path=tmp_path / "l.log",
+        verbosity="quiet", memo=False))
+    (cmd,) = ran
+    assert cmd.startswith("npx vitest related --run ")
+    assert "src/lib/rand.test.ts" in cmd
+    assert "src/app/loader.e2e.test.ts" in cmd
+    assert "src/other.test.ts" not in cmd
+    assert res["tests"]["measured"] is True
+    rep = res["tests"]["scoped_replacement"]
+    assert rep["replaces"] == "pnpm run test"
+    assert rep["forbidden"] == "pnpm run test"
+    assert "src/app/loader.e2e.test.ts" in rep["files"]
+    assert not st.data.get("needs_human_verification")
+
+
+def test_measure_axes_defers_at_the_baseline_and_flags_a_gap(
+        leerie, tmp_path, monkeypatch):
+    root, base, _head = _coupled_repo(tmp_path)
+    leerie._SOURCE_GRAPHS.clear()
+    ran = _stub_measure(leerie, monkeypatch)
+    # Baseline: no recorded base sha yet -> nothing runs, typed deferral.
+    st = _measure_st(leerie, root, None, {"process_constraints": {
+        "entries": SUITE}})
+    res = asyncio.run(leerie._measure_axes(
+        str(root), {"tests": "pnpm run test"}, st,
+        dict(leerie.DEFAULT_CAPS), log_path=tmp_path / "l.log",
+        verbosity="quiet", memo=False))
+    assert ran == [] and res["tests"]["skip_kind"] == "scoped_at_final"
+    assert not st.data.get("needs_human_verification")
+    # A later tree whose change couples to no test: unmeasured, and listed.
+    st = _measure_st(leerie, root, "HEAD", {"process_constraints": {
+        "entries": SUITE}})
+    res = asyncio.run(leerie._measure_axes(
+        str(root), {"tests": "pnpm run test"}, st,
+        dict(leerie.DEFAULT_CAPS), log_path=tmp_path / "l.log",
+        verbosity="quiet", memo=False))
+    assert ran == []
+    assert res["tests"]["skip_kind"] == "forbidden_no_coupled_tests"
+    (entry,) = st.data["needs_human_verification"]
+    assert entry["source"] == "regression_check"
+    lines = leerie._pr_needs_human(st.data, lambda _s: True)
+    assert any("pnpm run test" in ln for ln in
+               lines["Regression checks the run could not settle"])
+    # The same state on a tree the replacement does measure clears it.
+    st.data["conformance"] = {"_baseline": {"sha": base}}
+    asyncio.run(leerie._measure_axes(
+        str(root), {"tests": "pnpm run test"}, st,
+        dict(leerie.DEFAULT_CAPS), log_path=tmp_path / "l.log",
+        verbosity="quiet", memo=False))
+    assert len(ran) == 1
+    assert st.data["needs_human_verification"] == []
+
+
+def test_final_id_diff_uses_an_empty_base_for_a_scoped_replacement(
+        leerie, tmp_path, monkeypatch):
+    """No baseline IDs exist for the scoped command; the final failure is
+    still a candidate (B* reruns it on the base), not dropped."""
+    seen = {}
+
+    async def fake_confirm(cand, run_base, run_final, caps, *, label, **k):
+        seen["cand"] = list(cand)
+        return {"candidates": list(cand), "new": [], "resource_affected":
+                list(cand), "per_id": {}}
+
+    monkeypatch.setattr(leerie, "_confirm_new_failures", fake_confirm)
+    st = types.SimpleNamespace(
+        data={"baseline_failing_ids": None}, save=lambda: None,
+        run_dir=tmp_path, repo_root=tmp_path)
+    post = {"tests": {"measured": True, "failing_ids": ["a :: x"],
+                      "failing_id_files": {"a :: x": "a.test.ts"},
+                      "command": "npx vitest related --run a.test.ts",
+                      "scoped_replacement": {"replaces": "pnpm run test"}}}
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, dict(leerie.DEFAULT_CAPS), str(tmp_path), post,
+        log_path=tmp_path / "l.log", label="final"))
+    assert seen["cand"] == ["a :: x"] and v["candidates"] == ["a :: x"]
+    # Without the replacement, unknown base IDs keep the axis verdict.
+    del post["tests"]["scoped_replacement"]
+    assert asyncio.run(leerie._confirm_final_test_failures(
+        st, dict(leerie.DEFAULT_CAPS), str(tmp_path), post,
+        log_path=tmp_path / "l.log", label="final")) is None

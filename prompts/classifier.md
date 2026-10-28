@@ -118,16 +118,24 @@ Some tasks forbid running a command outright ("do not run `pnpm test`, it
 hangs the machine"; "never run `prisma db push` against the shared
 database"). Extract each as structured data in `process_constraints`:
 
-- `forbidden_commands` (array of strings): every command the task says
-  must NOT be run, copied as the runnable command it names (`pnpm test`,
-  `prisma db push`), one per entry. Only a prohibition on RUNNING a
-  command belongs here — not a file to leave untouched, and not a command
-  the task merely does not mention. Empty when the task forbids nothing.
-- `evidence` (string): the phrase(s) in the task that forbid them; empty
-  when there are none.
+- `forbidden_commands` (array of objects), one per command the task says
+  must NOT be run. Only a prohibition on RUNNING a command belongs here —
+  not a file to leave untouched, and not a command the task merely does not
+  mention. Empty when the task forbids nothing. Each entry has:
+  - `command`: the runnable command it names (`pnpm test`, `prisma db
+    push`). For a prohibition on running the whole test suite, the repo's
+    canonical test command.
+  - `evidence_quote`: the task's own words that forbid it, copied verbatim
+    from the task text or a referenced report. The orchestrator checks the
+    quote against those texts and drops an entry whose quote is not found
+    there.
+  - `scope`: `whole_suite` when the task forbids running the whole test
+    suite (running specific test files is still allowed); `any` when it
+    forbids the command outright.
 
 The orchestrator denies every way of running these commands to every
-worker, and does not run them itself. Do this extraction yourself, from
+worker, and does not run them itself (in place of a forbidden whole suite,
+it runs the tests coupled to the run's changes). Do this extraction yourself, from
 the task prose — never leave it for a downstream string match.
 
 ## Required items (anchored on task spans and report sections)
@@ -315,8 +323,7 @@ Return **only** this JSON object as your final message — no prose, no fences:
     "evidence": ""
   },
   "process_constraints": {
-    "forbidden_commands": [],
-    "evidence": ""
+    "forbidden_commands": []
   },
   "span_dispositions": [
     {"span": "S1", "disposition": "items", "kind": "", "reason": "..."},

@@ -8516,12 +8516,38 @@ planner's `pytest tests/ tests/test_a.py`, which the CLI denies.
 **A command the task forbids is denied in every spelling, and the
 orchestrator does not run it either.** A task sometimes forbids a command
 outright ("do not run `pnpm test`; it hangs the box"). The classifier
-returns it as typed data — `process_constraints.forbidden_commands` (with
-the task's own phrase in `evidence`) — and Python never reads the task for
-it. Three layers follow, each derived from that one list:
+returns it as typed data — `process_constraints.forbidden_commands`, one
+entry per command: the `command`, an `evidence_quote` and a `scope` — and
+Python never reads the task for it.
 
-- **Deny rules with a paired notice.** Each forbidden command becomes
-  `Bash(<cmd>)` / `Bash(<cmd> *)` rules in `--disallowedTools` (for a
+- *Evidence is the task's own words, checked by code.* An entry counts only
+  when its `evidence_quote` (NFC, whitespace collapsed) is a substring of
+  the task text or of a report the task references. Text leerie injects
+  never qualifies. Measured (barnacle 7cc87f9a, pass 1): a re-classify call
+  received the orchestrator's own whole-suite notice ("running it is denied
+  to you") in its prompt and returned `pnpm run test` as forbidden, citing
+  that notice. The next call then saw the forbidden-command notice built
+  from its own output and re-sourced the entry from the task. So the
+  classifier also never receives an orchestrator notice: it is the worker
+  that types constraints from the task, and anything else in its prompt
+  can become a constraint. The deny rules still bind it.
+- *Scope.* `scope: "any"` forbids every invocation of the command.
+  `scope: "whole_suite"` is for a task that forbids running the whole test
+  suite ("don't run the full test suite unnecessarily"). It forbids only a
+  whole-suite invocation, with the semantics of the whole-suite deny below
+  (*The whole suite is orchestrator-owned*): the bare runner, a flags-only
+  runner, or a runner aimed at a test root. A run that names test files is
+  still allowed. Measured on the same run: the prefix match denied every
+  `pnpm test <file>`, so acceptance writers 1–4 could not validate their
+  sets.
+
+Three layers follow, each derived from that one list:
+
+- **Deny rules with a paired notice.** Each forbidden `scope: "any"`
+  command becomes `Bash(<cmd>)` / `Bash(<cmd> *)` rules in
+  `--disallowedTools`. A `whole_suite` entry becomes the whole-suite rule
+  set instead (`R`, `R T`, `R T/`, `R T *`, `R T/ *`, `R * T`, `R * T/`
+  for each spelling R and test root T) (for a
   package-manager test script also its `X test` / `X run test` twin), via
   the same `deny_extra` path as the whole-suite deny, and `claude_p`
   appends a `NOTE FROM ORCHESTRATOR:` naming the forbidden commands to
@@ -8539,21 +8565,43 @@ it. Three layers follow, each derived from that one list:
   rules, unwraps wrappers, shells, `eval`, runner proxies and
   interpreter eval flags (each string literal in the code is read as a
   command too), normalises package-manager spellings, and denies a
-  command whose normalised argv starts with a forbidden one. Hooks fire
+  command whose normalised argv starts with a forbidden one. For a
+  `whole_suite` entry, it also requires the words that follow to be only
+  flags or test roots (the hook payload carries the roots). Hooks fire
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not
   block every Bash call of a run.
 - **A runtime guard for a forbidden package script.** When a forbidden
-  command is exactly a package script (`pnpm test`, `npm run lint`), the
+  `scope: "any"` command is exactly a package script (`pnpm test`, `npm run
+  lint`), the
   worker's environment points npm's and pnpm's `script-shell` at a small
   guard that refuses that script by its lifecycle name and runs every
   other one with `/bin/sh`. It sees every run the package manager makes,
   so it covers the one the command-line layers cannot: a script reached
   through another script (`pnpm run ci` whose body is `pnpm test`), a
   Makefile target, any spelling the matcher misses.
-- **The orchestrator's own measurement skips it.** `_measure_axes` does
-  not run a build/lint/test command the task forbids; that axis is
-  recorded unmeasured with `skip_kind: forbidden_by_task`. Nor does
+- **The orchestrator's own measurement skips it, except for the test
+  axis, which it replaces.** `_measure_axes` does not run a build or lint
+  command the task forbids. That axis is recorded unmeasured with
+  `skip_kind: forbidden_by_task`. A forbidden test command is *replaced*,
+  not skipped, because it is the run's only regression check. The
+  replacement is the repo's scoped test runner (the `{test_files}` /
+  `{files}` template the held-out sets use, §8 *Scoped runners*), run over
+  the test files coupled to the run's changes. Those are the changed test
+  files plus every test file whose import closure reaches a changed
+  production file. The closure comes from the mechanical import graph:
+  JS/TS import specifiers, and Python `import` statements read with
+  `ast`. These are *the coupled tests*.
+  The baseline has no changes to couple to, so its test axis is recorded
+  `skip_kind: scoped_at_final`. For the ID diff, a scoped final result
+  starts from an empty base list, and B\* reruns each candidate on the
+  base, so a failure the base already had is still not counted. When no
+  scoped runner exists, or no test file is coupled, the axis stays
+  unmeasured. That is logged as a WARNING and listed under "Needs human
+  verification", never dropped silently. Measured (barnacle 7cc87f9a, pass
+  1): the skip removed the final test axis, the run's only regression
+  measurement, on a task that also said "NEVER INTRODUCE REGRESSIONS". A
+  flaky test the run introduced never ran on the final tree. Nor does
   settle-by-execution (§8 *Settled by execution*): a planner `verify`
   argv that runs a forbidden command is emptied before scheduling and
   refused if one reaches the settle anyway, so that criterion is one no
