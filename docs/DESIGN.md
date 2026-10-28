@@ -6434,7 +6434,9 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   `untouched_paths` item — code and the PR's "needs human
   verification" own those) gets up to `falsifier_samples` (3)
   independent `falsifier` samples. Each runs in a disposable checkout
-  of the final commit with dependencies installed, and gets the item,
+  of the final commit with dependencies installed (and, on a Prisma
+  repository, a fresh throwaway database — §8 *Prisma repositories get
+  a real database*), and gets the item,
   the run's own diff (start commit and stat), the run's valid
   held-out acceptance files (read-only, git-excluded, leads only), the
   judge's typed unmet parts for that item (hypotheses, never expected
@@ -7519,8 +7521,21 @@ database. The orchestrator starts a private PostgreSQL cluster of its own
 on a free localhost port, TCP only, from the server binaries the image
 provides (the repository's own provisioning installs them), and gives
 each worktree that needs one — a writer checkout, an evaluation worktree,
-the audit worktree, the surrogate's clone — a database of its own named
-`leerie_<hash>_test`, with that tree's schema pushed. The set runs still
+the audit worktree, the surrogate's clone, a delivery-detection falsifier
+checkout (§8 *Delivery detection*), a CI-parity worktree whose checks
+`require` a database (§9 *The repository's own merge checks run too*) — a
+database of its own named `leerie_<hash>_test`, with that tree's schema
+pushed. A falsifier and a CI check are the same case as a set run: a
+probe or a database-backed check that runs against no database fails for
+the missing database, not the defect, so without one the falsifier could
+not demonstrate a persistence-layer item and every database-backed CI
+check went red at the baseline and dropped out of the gate. A falsifier
+lane is reset between samples, and so is its database (dropped and pushed
+again), so one sample's rows never reach the next; the confirm checkout
+the probe is re-run in has its own. A CI check's prerequisites that would
+themselves push to or reset a database (matched by the same rule list the
+worker deny reads) are not run: the orchestrator's guarded push is the
+only push. The set runs still
 go through the repository's own test command; a test-database wrapper
 script there (one that starts its own cluster when DATABASE_URL is unset)
 defers to the database it is handed. **Before every push, code checks the
@@ -8967,8 +8982,10 @@ on the final tree:
 2. *Selection is code.* A check runs only when one of its triggers is a pull
    request or a blocking hook (pre-push / pre-commit) and `requires` names no
    external resource (`browser`, `network`, `secrets`, `cloud_credentials`,
-   `gpu`; a `database` is not external — a check without one goes red at the
-   baseline and drops out). Test-kind checks are left to the test axis (§9
+   `gpu`; a `database` is not external — on a Prisma repository with a
+   PostgreSQL datasource such a check runs against a throwaway database of
+   its own (§8 *Prisma repositories get a real database*); elsewhere a check
+   without one goes red at the baseline and drops out). Test-kind checks are left to the test axis (§9
    *Which failures are new*), which already runs the suite with failing-ID
    diffs.
 3. *The baseline decides what gates.* Each selected check runs at the

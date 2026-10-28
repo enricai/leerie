@@ -37351,7 +37351,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                                     caps: dict, *, label: str,
                                     log_path: Path, timeout: float,
                                     serial: bool = False,
-                                    files: list[str] | None = None
+                                    files: list[str] | None = None,
+                                    env_extra: dict[str, str] | None = None
                                     ) -> dict | None:
     """Run `cmd` (its scoped form over `files` when given and renderable)
     once in `tree` with a structured report requested, and return
@@ -37360,7 +37361,9 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
     `_measure_blt` records is never measured with altered flags. With
     `serial`, the runner's `_SERIAL_RUNNER_FLAGS` are appended first; a
     serial form that yields no report (a repo whose config insists on a
-    flag the serial one contradicts) is retried once as written."""
+    flag the serial one contradicts) is retried once as written.
+    `env_extra` (a throwaway test database's URL) is laid over the run's
+    environment."""
     run_files = list(files or [])
     if run_files:
         scoped = _acceptance_cmd(st, run_files, tree)
@@ -37385,6 +37388,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
         if spec is None:
             continue
         run_cmd, env, kind = spec
+        if env_extra:
+            env = {**(env if env is not None else os.environ), **env_extra}
         try:
             report.parent.mkdir(parents=True, exist_ok=True)
             async with _blt_semaphore(caps), \
@@ -38081,9 +38086,11 @@ def _ci_check_problems(check: dict, tree: Path) -> list[str]:
 def _ci_select(checks: list[dict], tree: Path) -> list[dict]:
     """One record per discovered check, with `selected` and, when not, the
     typed `reason`: `left_to_test_axis`, `not_merge_gating`,
-    `external_resource`, `provenance` (with `problems`)."""
+    `external_resource`, `db_reset` (its argv pushes to or resets a
+    database — `_ci_runs_db_reset`), `provenance` (with `problems`)."""
     out: list[dict] = []
     seen: set[str] = set()
+    reset_pats = _db_reset_rule_patterns(tree)
     for i, c in enumerate(checks):
         rec = {k: c.get(k) for k in (
             "kind", "argv", "cwd", "env", "prerequisites", "trigger",
@@ -38100,6 +38107,8 @@ def _ci_select(checks: list[dict], tree: Path) -> list[dict]:
             rec["reason"] = "not_merge_gating"
         elif set(c.get("requires") or []) & CI_EXTERNAL_REQUIRES:
             rec["reason"] = "external_resource"
+        elif _ci_runs_db_reset(c.get("argv"), reset_pats):
+            rec["reason"] = "db_reset"
         else:
             probs = _ci_check_problems(c, tree)
             if probs:
@@ -38245,11 +38254,38 @@ async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
     return wt
 
 
+# The throwaway test database each CI tree's database-backed checks run
+# against (DESIGN §8 *Prisma repositories get a real database*), by the
+# tree's real path; set by `_ci_prepare`, dropped by `_ci_teardown`.
+_CI_DB_URLS: dict[str, str] = {}
+
+
+def _ci_runs_db_reset(argv: Iterable | None, patterns: list[str]) -> bool:
+    """True when `argv`, joined, matches one of the workers' database
+    push/reset deny rules (`_db_reset_rule_patterns`): the orchestrator's
+    own guarded push is the only one a run makes. Shell-command match on a
+    mechanical string."""
+    joined = " ".join(" ".join(str(a) for a in (argv or [])).split())
+    return bool(joined) and any(_rule_matches(joined, p) for p in patterns)
+
+
+def _ci_requires_db(rec: dict) -> bool:
+    return "database" in (rec.get("requires") or [])
+
+
+def _ci_db_session(st: "State", recs: list[dict]
+                   ) -> contextlib.AbstractAsyncContextManager:
+    """The throwaway cluster, held only when a check needs a database."""
+    return (_test_db_session(st) if any(_ci_requires_db(r) for r in recs)
+            else contextlib.nullcontext())
+
+
 def _ci_teardown(st: "State", wt: Path) -> None:
     subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
                     "--force", str(wt)], capture_output=True, check=False)
     shutil.rmtree(wt, ignore_errors=True)
     _DEPS_INSTALLED.discard(os.path.realpath(wt))
+    _drop_test_db(_CI_DB_URLS.pop(os.path.realpath(wt), None))
 
 
 async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
@@ -38260,10 +38296,16 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
     diagnostic ratchet). Returns `{rc, passed, timed_out, dirty, log}`; a
     run that changed tracked files is reset."""
     cwd = tree / (rec.get("cwd") or ".")
-    env = dict(os.environ)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("PRISMA_USER_CONSENT")}
     for e in rec.get("env") or []:
         if e.get("name"):
             env[str(e["name"])] = str(e.get("value") or "")
+    db_url = _CI_DB_URLS.get(os.path.realpath(tree))
+    if db_url and _ci_requires_db(rec):
+        # Over the check's own env: a CI file's DATABASE_URL names the CI
+        # service, not this run's throwaway database.
+        env.update(_test_db_env(db_url))
     log_path = st.run_dir / "logs" / "ci" / f"{label}.log"
     with contextlib.suppress(OSError):
         log_path.unlink()
@@ -38271,6 +38313,11 @@ async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
                     or DEFAULT_CAPS["worker_timeout_sec"])
     out = {"rc": None, "passed": False, "timed_out": False, "dirty": False,
            "log": str(log_path)}
+    if _ci_runs_db_reset(argv, _db_reset_rule_patterns(st.repo_root)):
+        log(f"  ci parity: {label} not run — it pushes to or resets a "
+            f"database: {shlex.join(str(a) for a in argv)[:200]}")
+        out["skipped"] = "db_reset"
+        return out
     try:
         async with _build_class_slot(st, label=f"ci {label}"):
             run = await _run_contained(
@@ -38307,16 +38354,23 @@ async def _ci_prepare(tree: Path, recs: list[dict], st: "State", caps: dict,
     await _ensure_worktree_deps(
         str(tree), st, caps, log_path=st.run_dir / "logs" / "ci-parity.log",
         verbosity="quiet", label_prefix=f"ci-{side}", log_prefix="ci parity")
+    if any(_ci_requires_db(r) for r in recs):
+        # After the install: the push runs the tree's own prisma CLI.
+        url = await _create_test_db(st, tree, f"ci-{side}")
+        if url:
+            _CI_DB_URLS[os.path.realpath(tree)] = url
     done: set[str] = set()
     for rec in recs:
         for j, pre in enumerate(rec.get("prerequisites") or []):
-            key = json.dumps([pre.get("cwd") or ".", pre.get("argv") or []])
+            key = json.dumps([pre.get("cwd") or ".", pre.get("argv") or [],
+                              _ci_requires_db(rec)])
             if key in done or not pre.get("argv"):
                 continue
             done.add(key)
             await _ci_run(pre["argv"], tree=tree,
                           rec={"cwd": pre.get("cwd") or ".",
-                               "env": rec.get("env")},
+                               "env": rec.get("env"),
+                               "requires": rec.get("requires")},
                           st=st, caps=caps,
                           label=f"{side}-{rec['id']}-pre{j}")
 
@@ -38390,57 +38444,60 @@ async def _capture_ci_parity_baseline(
             log(f"  ci parity: {r['id']} not run — {r['reason']}"
                 + (f" ({'; '.join(r.get('problems') or [])[:200]})"
                    if r.get("problems") else ""))
-    wt = await _ci_worktree(st, "ci-base", base_sha) if sel else None
-    if sel and wt is None:
-        for r in sel:
-            r.update({"selected": False, "reason": "no_base_worktree"})
-        sel = []
-    try:
-        if wt is not None:
-            await _ci_prepare(wt, sel, st, caps, "base")
-        for r in sel:
-            base: dict = {}
-            run = await _ci_run(r["argv"], tree=wt, rec=r, st=st, caps=caps,
-                                label=f"base-{r['id']}")
-            base.update({"rc": run["rc"], "dirty": run["dirty"]})
-            if r.get("kind") == "coverage":
-                cov = r.get("coverage") or {}
-                base["coverage"] = _ci_coverage_pcts(
-                    wt / (r.get("cwd") or ".") / cov.get("summary_path", ""),
-                    wt, r.get("cwd") or ".", cov.get("thresholds") or [])
-                if any(v is not None for v in base["coverage"].values()):
-                    r["ratchet"] = "coverage"
+    async with _ci_db_session(st, sel):
+        wt = await _ci_worktree(st, "ci-base", base_sha) if sel else None
+        if sel and wt is None:
+            for r in sel:
+                r.update({"selected": False, "reason": "no_base_worktree"})
+            sel = []
+        try:
+            if wt is not None:
+                await _ci_prepare(wt, sel, st, caps, "base")
+            for r in sel:
+                base: dict = {}
+                run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
+                                    caps=caps, label=f"base-{r['id']}")
+                base.update({"rc": run["rc"], "dirty": run["dirty"]})
+                if r.get("kind") == "coverage":
+                    cov = r.get("coverage") or {}
+                    base["coverage"] = _ci_coverage_pcts(
+                        wt / (r.get("cwd") or ".")
+                        / cov.get("summary_path", ""),
+                        wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+                    if any(v is not None for v in base["coverage"].values()):
+                        r["ratchet"] = "coverage"
+                    else:
+                        r["reason"] = "coverage_unmeasured"
+                elif run["dirty"]:
+                    r.update({"selected": False,
+                              "reason": "writes_tracked_files"})
                 else:
-                    r["reason"] = "coverage_unmeasured"
-            elif run["dirty"]:
-                r.update({"selected": False,
-                          "reason": "writes_tracked_files"})
-            else:
-                if r.get("strict_argv"):
-                    srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
-                                         st=st, caps=caps,
-                                         label=f"base-{r['id']}-strict")
-                    base["strict_rc"] = srun["rc"]
-                    if srun["passed"] and not srun["dirty"]:
-                        r["gate"] = "strict"
-                    elif not srun["dirty"] and srun["rc"] is not None:
-                        r["ratchet"] = "diagnostic"
-                        keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
-                                                   r.get("cwd") or ".")
-                        base["diagnostics"] = keys
-                if not r.get("gate") and run["passed"]:
-                    r["gate"] = "plain"
-                if not r.get("gate") and not r.get("ratchet"):
-                    r["reason"] = "red_at_baseline"
-            r["base"] = base
-            log(f"  ci parity: {r['id']} at the baseline: rc {run['rc']}"
-                + (f", strict rc {base.get('strict_rc')}"
-                   if "strict_rc" in base else "")
-                + f" -> gate {r.get('gate') or 'none'}"
-                + (f", ratchet {r['ratchet']}" if r.get("ratchet") else ""))
-    finally:
-        if wt is not None:
-            _ci_teardown(st, wt)
+                    if r.get("strict_argv"):
+                        srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
+                                             st=st, caps=caps,
+                                             label=f"base-{r['id']}-strict")
+                        base["strict_rc"] = srun["rc"]
+                        if srun["passed"] and not srun["dirty"]:
+                            r["gate"] = "strict"
+                        elif not srun["dirty"] and srun["rc"] is not None:
+                            r["ratchet"] = "diagnostic"
+                            keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
+                                                       r.get("cwd") or ".")
+                            base["diagnostics"] = keys
+                    if not r.get("gate") and run["passed"]:
+                        r["gate"] = "plain"
+                    if not r.get("gate") and not r.get("ratchet"):
+                        r["reason"] = "red_at_baseline"
+                r["base"] = base
+                log(f"  ci parity: {r['id']} at the baseline: rc {run['rc']}"
+                    + (f", strict rc {base.get('strict_rc')}"
+                       if "strict_rc" in base else "")
+                    + f" -> gate {r.get('gate') or 'none'}"
+                    + (f", ratchet {r['ratchet']}" if r.get("ratchet")
+                       else ""))
+        finally:
+            if wt is not None:
+                _ci_teardown(st, wt)
     st.data["ci_parity"] = ci
     st.save()
 
@@ -38481,77 +38538,82 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
                          DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
     final: dict = {"sha": sha, "results": {}, "unmet": [],
                    "resource_affected": []}
-    wt = await _ci_worktree(st, "ci-final", sha)
-    if wt is None:
-        final["skipped"] = "no final worktree"
-        ci["final"] = final
-        st.save()
-        return []
-    red: list[str] = []
-    try:
-        await _ci_prepare(wt, recs, st, caps, "final")
-        for r in recs:
-            res: dict = {}
-            if r.get("gate"):
-                run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r, st=st,
-                                    caps=caps, label=f"final-{r['id']}")
-                res.update({"rc": run["rc"], "dirty": run["dirty"]})
-                if not run["passed"]:
-                    red.append(r["id"])
-            if r.get("ratchet") == "diagnostic":
-                srun = await _ci_run(r["strict_argv"], tree=wt, rec=r, st=st,
-                                     caps=caps,
-                                     label=f"final-{r['id']}-strict")
-                keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
-                                           r.get("cwd") or ".")
-                base = (r.get("base") or {}).get("diagnostics") or {}
-                cwd = (r.get("cwd") or ".").strip().rstrip("/")
-                pre = "" if cwd in ("", ".") else cwd.removeprefix("./") + "/"
-                rel_touched = {t[len(pre):] for t in touched
-                               if t.startswith(pre)}
-                new = sorted(k for k, n in keys.items()
-                             if n > base.get(k, 0)
-                             and k.split("\t", 1)[0] in rel_touched)
-                res["strict_rc"] = srun["rc"]
-                res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
-                if new:
+    async with _ci_db_session(st, recs):
+        wt = await _ci_worktree(st, "ci-final", sha)
+        if wt is None:
+            final["skipped"] = "no final worktree"
+            ci["final"] = final
+            st.save()
+            return []
+        red: list[str] = []
+        try:
+            await _ci_prepare(wt, recs, st, caps, "final")
+            for r in recs:
+                res: dict = {}
+                if r.get("gate"):
+                    run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r,
+                                        st=st,
+                                        caps=caps, label=f"final-{r['id']}")
+                    res.update({"rc": run["rc"], "dirty": run["dirty"]})
+                    if not run["passed"]:
+                        red.append(r["id"])
+                if r.get("ratchet") == "diagnostic":
+                    srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
+                                         st=st,
+                                         caps=caps,
+                                         label=f"final-{r['id']}-strict")
+                    keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
+                                               r.get("cwd") or ".")
+                    base = (r.get("base") or {}).get("diagnostics") or {}
+                    cwd = (r.get("cwd") or ".").strip().rstrip("/")
+                    pre = ("" if cwd in ("", ".")
+                           else cwd.removeprefix("./") + "/")
+                    rel_touched = {t[len(pre):] for t in touched
+                                   if t.startswith(pre)}
+                    new = sorted(k for k, n in keys.items()
+                                 if n > base.get(k, 0)
+                                 and k.split("\t", 1)[0] in rel_touched)
+                    res["strict_rc"] = srun["rc"]
+                    res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
+                    if new:
+                        final["unmet"].append({
+                            "id": r["id"], "kind": r.get("kind"),
+                            "why": "new_diagnostics",
+                            "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
+                            "diagnostics": new[:_CI_DIAG_LIMIT]})
+                if r.get("ratchet") == "coverage":
+                    run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
+                                        caps=caps, label=f"final-{r['id']}")
+                    cov = r.get("coverage") or {}
+                    pcts = _ci_coverage_pcts(
+                        wt / (r.get("cwd") or ".")
+                        / cov.get("summary_path", ""),
+                        wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+                    fired = _ci_coverage_fired(r, pcts, touched, eps)
+                    res.update({"rc": run["rc"], "coverage": pcts,
+                                "fired": fired})
+                    if fired:
+                        final["unmet"].append({
+                            "id": r["id"], "kind": "coverage",
+                            "why": "coverage_ratchet", "argv": r.get("argv"),
+                            "cwd": r.get("cwd"), "thresholds": fired})
+                final["results"][r["id"]] = res
+            if red:
+                verdict = await _ci_confirm_red(st, caps, base_sha, wt,
+                                                [x for x in recs
+                                                 if x["id"] in red])
+                final["b_star"] = verdict
+                final["resource_affected"] = list(
+                    verdict.get("resource_affected") or [])
+                by_id = {x["id"]: x for x in recs}
+                for cid in verdict.get("new") or []:
+                    rr = by_id[cid]
                     final["unmet"].append({
-                        "id": r["id"], "kind": r.get("kind"),
-                        "why": "new_diagnostics",
-                        "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
-                        "diagnostics": new[:_CI_DIAG_LIMIT]})
-            if r.get("ratchet") == "coverage":
-                run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
-                                    caps=caps, label=f"final-{r['id']}")
-                cov = r.get("coverage") or {}
-                pcts = _ci_coverage_pcts(
-                    wt / (r.get("cwd") or ".") / cov.get("summary_path", ""),
-                    wt, r.get("cwd") or ".", cov.get("thresholds") or [])
-                fired = _ci_coverage_fired(r, pcts, touched, eps)
-                res.update({"rc": run["rc"], "coverage": pcts,
-                            "fired": fired})
-                if fired:
-                    final["unmet"].append({
-                        "id": r["id"], "kind": "coverage",
-                        "why": "coverage_ratchet", "argv": r.get("argv"),
-                        "cwd": r.get("cwd"), "thresholds": fired})
-            final["results"][r["id"]] = res
-        if red:
-            verdict = await _ci_confirm_red(st, caps, base_sha, wt,
-                                            [x for x in recs
-                                             if x["id"] in red])
-            final["b_star"] = verdict
-            final["resource_affected"] = list(
-                verdict.get("resource_affected") or [])
-            by_id = {x["id"]: x for x in recs}
-            for cid in verdict.get("new") or []:
-                rr = by_id[cid]
-                final["unmet"].append({
-                    "id": cid, "kind": rr.get("kind"), "why": "red",
-                    "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
-                    "rc": final["results"][cid].get("rc")})
-    finally:
-        _ci_teardown(st, wt)
+                        "id": cid, "kind": rr.get("kind"), "why": "red",
+                        "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
+                        "rc": final["results"][cid].get("rc")})
+        finally:
+            _ci_teardown(st, wt)
     ci["final"] = final
     st.save()
     if final["unmet"]:
@@ -45925,12 +45987,14 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
 async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
                            lane: Path, confirm_tree: Path, sha: str,
                            item_text: str, acc_paths: set[str],
-                           label: str) -> dict:
+                           label: str,
+                           env_extra: dict[str, str] | None = None) -> dict:
     """Code decides whether a sample demonstrated anything (bench Q2 F+
     G1–G5): `{gates{...}, confirmed, case_id?, coupling?}`. The probe is
     copied into the pristine installed checkout of the final commit, run
     there with the runner's serial flags, confirmed under B*
-    (`_confirm_still_failing`), read by the AST facts script, and removed."""
+    (`_confirm_still_failing`), read by the AST facts script, and removed.
+    `env_extra` is the confirm checkout's test database, when it has one."""
     g: dict = {}
     out: dict = {"gates": g, "confirmed": False}
     if res.get("verdict") != "unmet_demonstrated":
@@ -45974,7 +46038,7 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
             got = await _capture_failing_test_ids(
                 str(confirm_tree), cmd, st, caps, label=f"falsifier-{label}",
                 log_path=log_path, timeout=min(left, timeout), serial=True,
-                files=[rel])
+                files=[rel], env_extra=env_extra)
             return set(got["ids"]) if got is not None else None
         first = await _run(timeout)
         cid = _falsifier_case_id(first or (), str(res.get("case_name") or ""))
@@ -46064,6 +46128,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
     log_path = st.run_dir / "logs" / "falsifier-setup.log"
     verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
     trees: list[Path] = []
+    confirm_db: str | None = None
     confirm_tree = _falsifier_checkout(st, "falsifier-confirm", sha)
     try:
         if confirm_tree is None:
@@ -46080,6 +46145,11 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             # no sample could ever be confirmed, so none is spawned.
             return {"enabled": False, "skipped": "AST coupling check "
                     "unavailable (no typescript resolvable from the tree)"}
+        # A Prisma repo's probe re-runs against a database of its own
+        # (DESIGN §8 *Prisma repositories get a real database*); None
+        # elsewhere, or without a cluster.
+        confirm_db = await _create_test_db(st, confirm_tree,
+                                           "falsifier-confirm")
         sets = [s_ for s_ in ((st.data.get("acceptance") or {}).get("sets")
                               or []) if isinstance(s_, dict)]
         acc_paths = {rel for s_ in sets
@@ -46115,6 +46185,18 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         async def _sample(i: int, n: int, lane: Path) -> dict:
             item = normalized[i]
             _falsifier_reset(lane, sha)
+            # Reset with the tree: a fresh database per sample, so one
+            # sample's rows never reach the next.
+            db_url = await _create_test_db(st, lane, "falsifier-lane")
+            try:
+                return await _sample_in(i, n, lane, item,
+                                        _test_db_env(db_url) if db_url
+                                        else None)
+            finally:
+                _drop_test_db(db_url)
+
+        async def _sample_in(i: int, n: int, lane: Path, item: dict,
+                             env: dict[str, str] | None) -> dict:
             ctx, refs = _falsifier_place_leads(st, lane, sets, task)
             user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
                                           parts_by_idx.get(i) or [], record)
@@ -46125,7 +46207,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                           max_turns=FALSIFIER_MAX_TURNS, autonomous=True,
                           caps=caps, st=st,
                           model=models.get("falsifier", MODEL_DEFAULT),
-                          effort=efforts.get("falsifier"))
+                          effort=efforts.get("falsifier"), **_env_kw(env))
             st.bump_workers(caps)
             res = await claude_p(user_prompt=user, sid=sid, **common)
             rec: dict = {"sample": n, "reasked": False}
@@ -46147,7 +46229,9 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                 rec.update(await _falsifier_gates(
                     st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
                     sha=sha, item_text=item.get("item", ""),
-                    acc_paths=acc_paths, label=f"i{i}-s{n}"))
+                    acc_paths=acc_paths, label=f"i{i}-s{n}",
+                    env_extra=(_test_db_env(confirm_db) if confirm_db
+                               else None)))
             if rec.get("confirmed"):
                 saved = _falsifier_save_probe(st, lane, i, res)
                 if saved:
@@ -46189,6 +46273,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
         await _gather_or_cancel(*[_item(i) for i in todo])
         return {"enabled": True, "lanes": n_lanes}
     finally:
+        _drop_test_db(confirm_db)
         for wt in trees:
             leads = wt / FALSIFIER_LEADS_DIR
             if leads.exists():
@@ -46278,12 +46363,13 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
              and not (isinstance(it.get("untouched_paths"), list)
                       and it["untouched_paths"])]
     try:
-        fmeta = await _falsify_items(
-            st, caps, models, efforts, sha=sha, normalized=normalized,
-            indices=f_idx,
-            parts_by_idx={i: (details_by_idx.get(i) or {}).get("unmet_parts")
-                          or [] for i in f_idx},
-            record=record, progress=progress)
+        async with _test_db_session(st):
+            fmeta = await _falsify_items(
+                st, caps, models, efforts, sha=sha, normalized=normalized,
+                indices=f_idx,
+                parts_by_idx={i: (details_by_idx.get(i) or {}).get(
+                    "unmet_parts") or [] for i in f_idx},
+                record=record, progress=progress)
     except Exception as e:
         # Advisory: a broken falsifier setup leaves the judge's verdict.
         log(f"  delivery detection: falsifier raised {type(e).__name__}: "

@@ -35,7 +35,20 @@ jobs:
       - run: python3 flaky.py
       - run: python3 deploy.py
       - run: python3 -m pytest
+      - run: python3 db.py
+        env:
+          DATABASE_URL: postgresql://ci@localhost:5432/ci
+      - run: sh -c prisma db push
 """
+
+# Green only against the database this run handed it: the check stands for
+# a database-backed CI step (DESIGN §8 *Prisma repositories get a real
+# database*).
+DBCHECK = (
+    "import os, sys\n"
+    "sys.exit(0 if os.environ.get('DATABASE_URL', '').endswith('_test')"
+    " and os.environ.get('DIRECT_URL') == os.environ['DATABASE_URL']"
+    " else 1)\n")
 
 # A toy linter with fixed output: an error line per `ERROR` marker (exit 1),
 # and, under --strict, a warning line per `WARN` marker (exit 1 when any).
@@ -440,3 +453,77 @@ def test_ci_checks_is_a_registered_judgment_worker(leerie):
     assert len(json.dumps(leerie.SCHEMAS["ci_checks"])) < 6100
     assert Path(leerie.__file__).parent.parent.joinpath(
         "prompts", "ci_checks.md").is_file()
+
+
+# ---- database-backed checks run against the throwaway test database --------
+
+def _fake_test_db(leerie, monkeypatch):
+    made: list[tuple[str, str]] = []
+    dropped: list[str] = []
+
+    async def fake_create(st, tree, key):
+        url = f"postgresql://u@127.0.0.1:5999/leerie_{len(made)}_test"
+        made.append((str(tree), url))
+        return url
+    monkeypatch.setattr(leerie, "_create_test_db", fake_create)
+    monkeypatch.setattr(leerie, "_drop_test_db",
+                        lambda url: url and dropped.append(url))
+    return made, dropped
+
+
+def test_a_database_check_runs_against_its_own_test_database(
+        leerie, env, monkeypatch):
+    made, dropped = _fake_test_db(leerie, monkeypatch)
+    (env["staging"] / "db.py").write_text(DBCHECK)
+    _git(env["staging"], "add", "-A")
+    _git(env["staging"], "commit", "-qm", "db check")
+    env["checks"][:] = [
+        _check("db", [PY, "db.py"], kind="build", requires=("database",),
+               env=[("DATABASE_URL", "postgresql://ci@localhost:5432/ci")]),
+        _check("build", [PY, "build.py"], kind="build")]
+    recs = _baseline(env)
+    # Green only with the run's database laid over the CI file's own URL.
+    assert recs["db"]["gate"] == "plain", recs["db"]
+    assert recs["build"]["gate"] == "plain"
+    # One database for the base tree, dropped with it.
+    assert [t.endswith("ci-base") for t, _u in made] == [True]
+    assert dropped == [made[0][1]]
+    _commit(env, {"src/new.txt": "fine\n"})
+    assert _final(env) == []
+    assert [Path(t).name for t, _u in made] == ["ci-base", "ci-final"]
+    assert sorted(dropped) == sorted(u for _t, u in made)
+
+
+def test_no_database_is_made_when_no_check_needs_one(leerie, env,
+                                                     monkeypatch):
+    made, _dropped = _fake_test_db(leerie, monkeypatch)
+    env["checks"][:] = [_check("build", [PY, "build.py"], kind="build")]
+    _baseline(env)
+    assert made == []
+
+
+def test_a_db_reset_check_or_prerequisite_never_runs(leerie, env, tmp_path):
+    repo = env["staging"]
+    (repo / "package.json").write_text(json.dumps(
+        {"dependencies": {"@prisma/client": "7"}}))
+    (repo / "prisma").mkdir()
+    (repo / "prisma" / "schema.prisma").write_text(
+        'datasource db {\n  provider = "postgresql"\n}\n')
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-qm", "prisma")
+    pushes = _check("push", ["sh", "-c", "prisma db push"], kind="other")
+    recs = {r["id"]: r for r in leerie._ci_select([pushes], repo)}
+    assert recs["push"]["reason"] == "db_reset"
+    st = env["st"]
+    st.repo_root = repo
+    marker = tmp_path / "RAN"
+    out = _run(leerie._ci_run(
+        ["sh", "-c", f"touch {marker}; prisma db push"], tree=repo,
+        rec={"cwd": "."}, st=st, caps=env["caps"], label="t"))
+    assert out["skipped"] == "db_reset" and out["rc"] is None
+    assert not marker.exists()
+    # An ordinary command in the same repo still runs.
+    out = _run(leerie._ci_run(["touch", str(marker)], tree=repo,
+                              rec={"cwd": "."}, st=st, caps=env["caps"],
+                              label="t2"))
+    assert out["rc"] == 0 and marker.exists()

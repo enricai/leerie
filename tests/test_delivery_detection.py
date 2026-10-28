@@ -917,6 +917,65 @@ class TestRunDeliveryDetection:
                 st.data["delivery_gate"]["unmet_final"]] == [0]
 
 
+# A database-backed probe: it can only show the defect against a database
+# (DESIGN §8 *Prisma repositories get a real database*) — without one it
+# passes, as a repository's DB-backed test skips.
+DB_PROBE_SRC = ("import os\n\nfrom calc import add\n\n\n"
+                "def test_add_returns_the_sum():\n"
+                "    if not os.environ.get('DATABASE_URL', '').endswith("
+                "'_test'):\n"
+                "        return\n"
+                "    assert add(2, 3) == 5\n")
+
+
+def test_falsifier_samples_and_confirm_runs_get_a_fresh_test_database(
+        leerie, tmp_path, monkeypatch):
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                          k=2)
+    made: list[tuple[str, str]] = []
+    dropped: list[str] = []
+    sessions: list[str] = []
+
+    async def fake_create(st_, tree, key):
+        url = f"postgresql://u@127.0.0.1:5999/leerie_{len(made)}_test"
+        made.append((Path(tree).name, url))
+        return url
+    monkeypatch.setattr(leerie, "_create_test_db", fake_create)
+    monkeypatch.setattr(leerie, "_drop_test_db",
+                        lambda url: url and dropped.append(url))
+    real_session = leerie._test_db_session
+
+    def session(st_):
+        sessions.append("enter")
+        return real_session(st_)
+    monkeypatch.setattr(leerie, "_test_db_session", session)
+
+    def behave(kw, n):
+        if "add(2, 3)" in kw["user_prompt"]:
+            return _demonstrate(kw, n, src=DB_PROBE_SRC)
+        return _claim(verdict="could_not_demonstrate", probe_path="")
+    calls = _falsifier_stub(leerie, monkeypatch, st, behave)
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    assert sessions == ["enter"]
+    fc = [c for c in calls if c["schema_key"] == "falsifier"]
+    # Every sample's worker got its lane's database, made fresh for that
+    # sample (item 0 confirmed at s0; item 3 ran two samples).
+    by_url = dict((u, t) for t, u in made)
+    assert [by_url[c["env_extra"]["DATABASE_URL"]] for c in fc] == [
+        "falsifier-lane0"] * 3
+    assert len({c["env_extra"]["DATABASE_URL"] for c in fc}) == 3
+    assert all(c["env_extra"]["DIRECT_URL"] == c["env_extra"]["DATABASE_URL"]
+               and not any(k.startswith("PRISMA_USER_CONSENT")
+                           for k in c["env_extra"]) for c in fc)
+    assert [t for t, _u in made][0] == "falsifier-confirm"
+    # The probe only fails against a database: confirmed means the confirm
+    # checkout's re-runs carried one.
+    gate = st.data["delivery_gate"]
+    assert [u["item_index"] for u in gate["unmet_final"]] == [0]
+    assert sorted(dropped) == sorted(u for _t, u in made)
+
+
 def test_next_run_residual_reads_unmet_final(leerie, tmp_path):
     root = tmp_path / ".leerie"
     cur = root / "runs" / "current"
