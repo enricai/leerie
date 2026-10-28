@@ -992,3 +992,72 @@ def test_a_real_cluster_starts_on_its_own_port_and_is_removed(leerie,
     finally:
         leerie._stop_test_db_cluster(c)
     assert not Path(c["data"]).exists()
+
+
+def test_a_no_work_decided_by_execution_is_recorded_as_executed(
+        leerie, tmp_path, monkeypatch):
+    """Replay shape (barnacle 7cc87f9a, early replay, pass 3): every writer's
+    set passed at the own start twice and was discarded as
+    `fixed_on_head_by_execution`, yet the run recorded `no valid sets` — a
+    judge-only basis. The discards are now kept with their reasons, and the
+    settle records the executed basis."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    n = {"i": 0}
+
+    async def writer(**kw):
+        n["i"] += 1
+        wt = Path(kw["cwd"])
+        (wt / "acc").mkdir(exist_ok=True)
+        (wt / "acc" / "test_defect_1.py").write_text(NONDISCRIMINATING)
+        (wt / "acc" / "test_control_1.py").write_text(CONTROL_TEST)
+        return {"files": [
+            {"path": "acc/test_defect_1.py", "kind": "defect",
+             "cases": ["sums"], "failure_mode": "assertion"},
+            {"path": "acc/test_control_1.py", "kind": "control",
+             "cases": ["zero"], "failure_mode": "assertion"}]}
+    monkeypatch.setattr(leerie, "claude_p", writer)
+    acc = asyncio.run(leerie.phase_acceptance_write(
+        st.data["task"], st, _caps(leerie, 2), MODELS, EFFORTS))
+    assert n["i"] == 4                      # writer + its retry, per set
+    assert acc["sets"] == [] and acc["written"] == 2
+    assert acc["discarded"] == [
+        {"index": 1, "reason": "fixed_on_head_by_execution"},
+        {"index": 2, "reason": "fixed_on_head_by_execution"}]
+    finished = []
+    monkeypatch.setattr(leerie, "_finish_no_work_run",
+                        lambda st_, m, **k: finished.append(m))
+    st.data.update(acceptance=acc, no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    assert asyncio.run(leerie._settle_pending_no_work(
+        st, _caps(leerie, 2))) is True
+    rec = st.data["no_work_acceptance"]
+    assert rec["verdict"] == "fixed_on_head_by_execution"
+    assert rec["discarded"] == acc["discarded"]
+    assert "fixed_on_head_by_execution" in finished[0][
+        "<confirmed already-satisfied>"]
+
+
+@pytest.mark.parametrize("discarded,written,want", [
+    # One set discarded for another reason: not every set was executed away.
+    ([{"index": 1, "reason": "fixed_on_head_by_execution"},
+      {"index": 2, "reason": "no control file passes on the validity base"}],
+     2, "no valid sets"),
+    # A writer that produced nothing recorded at all.
+    ([{"index": 1, "reason": "fixed_on_head_by_execution"}], 2,
+     "no valid sets"),
+    ([], 0, "no valid sets"),
+    ([{"index": 1, "reason": "fixed_on_head_by_execution"}], 1,
+     "fixed_on_head_by_execution")])
+def test_only_an_all_executed_discard_is_an_executed_basis(
+        leerie, tmp_path, monkeypatch, discarded, written, want):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head)
+    monkeypatch.setattr(leerie, "_finish_no_work_run",
+                        lambda st_, m, **k: None)
+    st.data.update(acceptance={"sets": [], "written": written,
+                               "discarded": discarded},
+                   no_work_pending=True,
+                   no_work_confirmation={"judge_evidence": "j"})
+    asyncio.run(leerie._settle_pending_no_work(st, _caps(leerie, 2)))
+    assert st.data["no_work_acceptance"]["verdict"] == want

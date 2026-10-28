@@ -6123,7 +6123,18 @@ already disputed on acceptance evidence, a
 still-failing set ends the run as no work with a loud warning and the
 residual recorded. The cost of a wrong dispute is bounded to one extra run
 (two when the first dispute goes unacted, below).
-With no valid sets the judge's confirmation stands, as before.
+With no valid sets the judge's confirmation stands, as before — except
+when every set written was discarded because its defect cases all pass on
+this HEAD after the writer's retry (`fixed_on_head_by_execution`, below).
+That is executed evidence, not the judge's reading: the runner ran the
+report-shaped cases on HEAD and they passed. So the run records it as such
+(`no_work_acceptance.verdict = "fixed_on_head_by_execution"`, with each
+discarded set's index and reason kept on `acceptance.discarded`) rather
+than as "no valid sets", which cannot tell it from "no writer produced
+anything". Measured (barnacle 7cc87f9a, early replay, pass 3): all five
+writers' sets passed at the own start twice and were discarded on that
+reason, yet the run recorded `no valid sets` and its `no_work` read as
+judge-only.
 
 A dispute counts only once it is acted on. The run that disputed could
 still end as no work by another exit — its planners return nothing, or

@@ -43213,16 +43213,20 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
     for r in results:
         r.pop("declared_defect", None)
     sets = [r for r in results if r.get("valid")]
-    for r in results:
-        if not r.get("valid"):
-            log(f"  acceptance set {r['index']} discarded: "
-                f"{r.get('reason', 'invalid')}")
+    # Kept, not only logged: a discard on executed evidence is what the
+    # no-work settle records as its basis (DESIGN §8 *No work is declared
+    # on executed evidence*).
+    discarded = [{"index": r["index"],
+                  "reason": str(r.get("reason") or "invalid")}
+                 for r in results if not r.get("valid")]
+    for d in discarded:
+        log(f"  acceptance set {d['index']} discarded: {d['reason']}")
     log(f"  acceptance: {len(sets)} of {n} set(s) valid")
     await _acceptance_scope_judge_sets(task, st, caps, models, efforts, sets)
     report_base = _acceptance_report_base(st)
     await _record_report_reproduced(st, caps, sets, base, report_base)
     return {"validity_base": base, "report_base": report_base,
-            "sets": sets, "written": n}
+            "sets": sets, "written": n, "discarded": discarded}
 
 
 def _acceptance_own_start(st: "State") -> str | None:
@@ -45447,6 +45451,23 @@ async def _finish_if_every_fix_already_on_head(st: "State", caps: dict,
     return True
 
 
+def _acceptance_all_fixed_by_execution(acc: dict) -> bool:
+    """Whether every held-out set written was discarded as
+    `fixed_on_head_by_execution` — no valid set, at least one written, and
+    each of the `written` indices in `discarded` with that reason."""
+    if acc.get("sets"):
+        return False
+    try:
+        written = int(acc.get("written") or 0)
+    except (TypeError, ValueError):
+        return False
+    reasons = {d.get("index"): d.get("reason")
+               for d in acc.get("discarded") or [] if isinstance(d, dict)}
+    return written >= 1 and all(
+        reasons.get(k) == "fixed_on_head_by_execution"
+        for k in range(1, written + 1))
+
+
 async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     """Decide a held no-work confirmation on executed evidence (DESIGN §8
     *No work is declared on executed evidence, and a dispute is
@@ -45454,6 +45475,19 @@ async def _settle_pending_no_work(st: "State", caps: dict) -> bool:
     conf = st.data.get("no_work_confirmation") or {}
     judge_evidence = conf.get("judge_evidence") or ""
     res = await _acceptance_results_on_head(st, caps)
+    if res is None and _acceptance_all_fixed_by_execution(
+            st.data.get("acceptance") or {}):
+        # Every set written was discarded because its defect cases pass on
+        # this HEAD: executed evidence, not the judge's reading.
+        acc = st.data.get("acceptance") or {}
+        st.data["no_work_acceptance"] = {
+            "verdict": "fixed_on_head_by_execution",
+            "discarded": list(acc.get("discarded") or [])}
+        _finish_no_work_run(st, {"<confirmed already-satisfied>":
+                                 judge_evidence + " — and every held-out "
+                                 "acceptance set's defect cases pass on HEAD "
+                                 "(fixed_on_head_by_execution)"})
+        return True
     if res is None or not _acceptance_measured(res):
         # No valid sets, or none could be run on HEAD: no evidence either
         # way, so the judge's confirmation stands (as before this check).
