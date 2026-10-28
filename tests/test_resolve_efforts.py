@@ -286,6 +286,11 @@ def test_judgment_workers_pinned_set(leerie):
         # Held-out acceptance test writer (DESIGN §8 *Held-out acceptance
         # tests*) — measured at medium (40/40 page verdicts correct).
         "acceptance_writer",
+        # The held-out set audit and the surrogate witness (DESIGN §8 *A
+        # set that keeps failing is audited, and rewritten once*), both
+        # benched at medium (Q6).
+        "set_auditor",
+        "surrogate_fixer",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

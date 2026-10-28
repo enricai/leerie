@@ -2482,7 +2482,8 @@ finalize path. The rule, benched as the P7 outcome simulation (90 historical
 runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
-fails, or when a required item is still unmet after the delivery recheck —
+fails (a set typed `broken` by the set audit does not count — §8 *A set
+that keeps failing is audited, and rewritten once*), or when a required item is still unmet after the delivery recheck —
 consulted *before* the no-work check, so an empty branch that left work
 unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
@@ -6265,8 +6266,13 @@ rather than internal helpers whose signatures a fix may change. Python
 validates each set mechanically, **per case** — from the runner's
 structured report of what ran (below), and by exit code only where the
 runner can write none, never by reading runner prose: a set is valid when
-every control case passes and at least one defect case fails; a defect
-file none of whose cases fails cannot discriminate and is dropped.
+it has at least one control case, every control case passes, and at least
+one defect case fails; a defect file none of whose cases fails cannot
+discriminate and is dropped. A set with no control cannot show an
+over-broad fix, so it is not valid however its defect cases fail — the rule
+the C1 bench validated with (every one of its 11 own-start-valid sets
+carried passing controls, and ground truth called 9 of the 10 it could
+resolve valid).
 
 **The validity tree is the run's own start, not the report's.** It used
 to be the tree the report was filed against — the earliest same-task
@@ -6528,10 +6534,147 @@ on the finished task with wrong held-out tests: the repair conformer
 changed code in 3/3 trials, but 0 of the task's 247 regression tests
 and 0 attributable scraper tests (of 1,605) regressed.
 
+**A set that keeps failing is audited, and rewritten once.** A held-out
+set can be wrong in ways validity at the own start cannot see: it fails
+there for the reported reason, and then fails every correct fix too,
+because it was built on how the code happens to work rather than on what
+the report asks for. Measured on Q6's 58 own-start-valid sets: 33 still
+failed on a tree where the run's original sets passed, and a blind
+second labeller (hand-checked where it disagreed) found 19 of those 33
+were sets no correct fix could pass. Leaving such a set as a residual sends
+the next run after a contract the set itself got wrong. So after the
+repair rounds, each measured set that still fails goes through three
+triggers, in order, and **any trigger leads to exactly one rewrite at the
+run's own start** (`acceptance_rewrite_rounds`, a per-set counter); no
+trigger ever drops a case, a set or a residual on its own:
+
+- **Mechanical checks M1 and M2**, on code identifiers only (Q6/R5): M1,
+  a set file reads a recorded mock call by position (`.mock.calls[0]`,
+  `toHaveBeenNthCalledWith`), so it depends on which calls the test's own
+  setup or the implementation makes; M2, a set file imports a named symbol
+  from a production module that no other production module uses at the
+  own start, an internal helper whose place a fix may change. Measured on
+  the 58 fresh sets before the rule was frozen, M1 flagged a set later
+  labelled broken 3 times of 9 and M2 8 of 16 — too imprecise to type a
+  set broken, enough to buy one rewrite, whose harm was then measured:
+  on the 6 fairly-failing sets M1/M2 trigger, every rewrite was valid at
+  the own start and still failed the run's tree (Q6/R6, first sample) —
+  the real gap stayed caught.
+- **The c+ set audit**: a judgment worker, `set_auditor`, reads the set
+  staged in a fresh worktree of the integrated tree, the report, the
+  audited contract and every failing case with its runner failure message,
+  and types each failing case `implementation_gap` (the default) or
+  `set_defect` with a `defect_kind` (`harness_unreachable`, `coupling`,
+  `contradicts_task`, `overspecified_mechanism`, `environment`,
+  `test_bug`). Its payload carries a REPOSITORY TEST HARNESS section built
+  by code from the import graph and `git log`: the newest existing tests
+  that drive the production modules the set imports, the test-helper
+  modules they import with their exported names, and the five newest as
+  exemplars. Its rule for them: a set fake that does not answer a request
+  production makes on this tree — so production takes an error or
+  fallback path before reaching the reported behaviour — is `coupling`.
+  Every typed `set_defect` must quote the set file (`test_quote`) and, by
+  kind, the production line, the task or the failure message; code checks
+  each quote is a verbatim substring of the file it names, and a case
+  whose quotes do not check counts as `implementation_gap`. The audit is
+  run `set_audit_samples` (3) times independently and the union of the
+  counted cases is the verdict — one sample is unstable (Q6 R2: one set
+  typed 9/9 cases broken in one run and 0/9 on the re-run). On the 33
+  labelled sets (Q6 R3, the first three runs per set) one sample flagged
+  13, all correctly, but found only 13 of the 19 broken sets; the union of
+  three flagged 18, 16 of them correctly (recall 16/19). The writers
+  almost never use the repository's own test helpers (S1: 4 of 44 writes
+  imported one); the harness section is how the audit sees what they
+  should have used.
+- **The surrogate witness**, only when neither of the above fired: one
+  independent `surrogate_fixer` per gate fixes the report in a ref-less
+  clone of the own start (the writer's checkout) without ever seeing a set
+  — its `Read` denies cover them as they cover the fixers — and each
+  remaining failing set is run on its tree, confirmed under B*. A set that
+  still fails on an independent fix is a trigger and nothing more: the
+  surrogate is one fix, not the contract, so a failure there never drops a
+  case, never types a set broken and never stops the residual. The set is
+  then audited on the surrogate's tree, and its typed cases (if any) go
+  into the note. Q6/R7 ran the witness on 11 failing sets: all 6
+  broken ones failed on the independent fix (both held-out sets the other
+  triggers missed among them), and so did 4 of the 5 sets that were
+  failing fairly — which is why a surrogate failure buys a rewrite, whose
+  no-harm R6 measured, and nothing else.
+
+The rewrite is the `acceptance_writer` again, at the own start, in the
+same ref-less clone, with its original payload, its set's files put back
+where it wrote them, and a typed note: every trigger that fired with its
+evidence (the counted cases and their quotes, the M1 lines, the M2 symbol
+and module, the cases failing on the independent fix), and the closing
+instruction benched for each kind — check the report's contract through
+the public entry point, model the world the code talks to rather than the
+implementation's private protocol, keep cases the note does not name. It
+is validated exactly like a first write. Two guards keep a bad rewrite
+from costing the set: **a rewrite that declares no defect file is asked
+once more with the identical prompt** (Q6/R8: of the 5 surrogate-triggered
+rewrites, 2 came back with no defect file; one retry recovered one of
+them), **and the original set is kept whenever the rewrite is not valid**
+(no defect file after the retry, none failing at the own start, a failing
+control, an edited tracked file). A replaced set is judged again on the
+same integrated tree, under B*. A set still failing after its rewrite is
+audited once more; **a set the audit still types broken after its rewrite
+is marked `broken: true`** — so is a set the audit typed broken whose
+rewrite was not kept. A broken set is not chased again: no further
+rewrite, it does not count as unfinished work in the run outcome (§6 *The
+run outcome is decided once*), and it is kept out of the next run's
+residual (below). Only the audit types a set broken; M1/M2 and the
+surrogate are triggers only.
+
+**The writer gets one more try when nothing fails at the own start.**
+When every declared defect file ran and passed on the own start — the set
+cannot discriminate as written — the writer is asked once more in the
+same checkout, its files still there, with the runner's per-case result
+for its defect files: rewrite them to fail for the reported reason if the
+defect still reproduces here, or say in `notes` that it does not and
+return the files unchanged (C1's writer, Fix A.3). Still nothing failing
+discards the set, as before; a done task still yields no sets. The note
+carries only what the runner reported of the writer's own tests.
+
+**Prisma repositories get a real database.** On a repository whose
+schema lives in Prisma (a tracked `schema.prisma` whose nearest
+`package.json` declares `prisma` or `@prisma/client`, with a PostgreSQL
+datasource — read mechanically), a writer working from fakes hand-rolls
+the persistence layer, and a hand-rolled fake that does not answer a query
+a correct fix makes fails that fix (the `coupling` kind above; 10 of Q6's
+broken sets were on such a repository). So the writer, the rewrite and
+every set run use the repository's real Prisma client against a throwaway
+database. The orchestrator starts a private PostgreSQL cluster of its own
+on a free localhost port, TCP only, from the server binaries the image
+provides (the repository's own provisioning installs them), and gives
+each worktree that needs one — a writer checkout, an evaluation worktree,
+the audit worktree, the surrogate's clone — a database of its own named
+`leerie_<hash>_test`, with that tree's schema pushed. The set runs still
+go through the repository's own test command; a test-database wrapper
+script there (one that starts its own cluster when DATABASE_URL is unset)
+defers to the database it is handed. **Before every push, code checks the
+target**: a postgres URL on `localhost`/`127.0.0.1`, at the cluster's own
+port, a database name starting `leerie_` and ending `_test`, and
+DIRECT_URL equal to DATABASE_URL (Prisma configs commonly push to
+`DIRECT_URL ?? DATABASE_URL`); anything else is refused. Prisma's AI-agent
+consent variable is set on that push subprocess alone — never in a
+worker's environment, which is scrubbed of it — and the user's consent
+covers exactly this: pushes to throwaway test databases. The writer's
+payload gets a REAL DATABASE section (the client module, the five newest
+database-backed tests that import it unmocked, the helpers they import:
+all from the import graph), and a set file that mocks the client module
+earns one fix-up call (Q6/R4). Every worker in such a repository carries
+Bash deny rules for the commands that push to or reset a database
+(`prisma db push`, `prisma migrate reset`, `prisma migrate dev`, the
+package scripts that run them, and setting the consent variable), paired
+with an orchestrator notice, as the whole-suite deny is (#292: deny alone
+ended 2/2 replayed workers `blocked`). Without server binaries, as root,
+or when a step fails, the sets run as before, without a database, logged
+once. Q6/R4 measured 0 database-path errors across the 22 database
+rewrites and their evaluations.
+
 **A set typed broken is not handed on.** The residual records which sets
-still failed, by index. A set that a later check types `broken` (its
-`broken` field — a test no correct fix could pass, which the set audit
-decides) is left out of the next run's `prior_delivery_residual`: the next
+still failed, by index. A set the set audit types `broken` after its rewrite
+(its `broken` field — a test no correct fix could pass) is left out of the next run's `prior_delivery_residual`: the next
 planner is not sent after a contract the set itself got wrong. The filter
 is applied when the residual is read, so a set typed after its run
 finished is excluded all the same.

@@ -34,10 +34,12 @@ import errno
 import fcntl
 import fnmatch
 import functools
+import glob
 import hashlib
 import json
 import math
 import os
+import pwd
 import re
 import shlex
 import shutil
@@ -46,8 +48,10 @@ import socket
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 import weakref
@@ -259,6 +263,16 @@ DEFAULT_CAPS = {
     # Repair rounds when any held-out set fails on the integrated tree
     # (confirmed under B*); the residual then ships and feeds the next run.
     "acceptance_repair_rounds": 2,
+    # Rewrites of one held-out set still failing after the repair rounds
+    # (DESIGN §8 *A set that keeps failing is audited, and rewritten once*):
+    # a per-set counter, whatever triggered it (M1/M2, the set audit, the
+    # surrogate witness). Also bounds the writer's own-start retry when no
+    # defect case fails.
+    "acceptance_rewrite_rounds": 1,
+    # Independent set_auditor samples per audit; the union of their
+    # quote-verified set_defect cases is the verdict. Q6 R3 (33 labelled
+    # sets): one sample flagged 13/19 broken sets, the union of three 16/19.
+    "set_audit_samples": 3,
     # Independent defect_scope_auditor samples drawn when the first says
     # `applicable: false` (DESIGN §5 *`applicable: false` is honoured only
     # when three samples agree*): the first true is used, false stands only
@@ -1678,6 +1692,12 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # Writes the held-out tests from the report alone; measured at medium
     # (DESIGN §8 *Held-out acceptance tests*: 40/40 page verdicts correct).
     "acceptance_writer": "medium",
+    # The held-out set audit and the surrogate witness (DESIGN §8 *A set
+    # that keeps failing is audited, and rewritten once*), both benched at
+    # medium (Q6). Absent from TIMEOUT_DEFAULT_PER_WORKER: no measured
+    # duration corpus yet.
+    "set_auditor": "medium",
+    "surrogate_fixer": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1808,7 +1828,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "classification_judge", "wiring_judge", "provision_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "no_work_judge", "delivery_judge",
-                "defect_scope_auditor", "rebaser", "acceptance_writer")
+                "defect_scope_auditor", "rebaser", "acceptance_writer",
+                "set_auditor", "surrogate_fixer")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1834,12 +1855,13 @@ PLANNING_WORKER_TYPES = frozenset({
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
-    "delivery_judge", "defect_scope_auditor",
+    "delivery_judge", "defect_scope_auditor", "set_auditor",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
 ACTING_WORKER_TYPES = frozenset({
     "implementer", "integrator", "conformer", "rebaser", "acceptance_writer",
+    "surrogate_fixer",
 })
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main _orchestrate loop, but they do get dedicated model resolution via
@@ -2666,6 +2688,64 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "notes": {"type": "string"},
+        },
+    },
+    "set_auditor": {
+        # The c+ held-out set audit (DESIGN §8 *A set that keeps failing is
+        # audited, and rewritten once*). One entry per failing case; a
+        # `set_defect` counts only when code finds every quote its kind
+        # requires (`_verify_set_audit_case`), so the quotes are required
+        # fields — empty when they do not apply.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["cases"],
+        "properties": {
+            "cases": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["case", "verdict", "defect_kind",
+                                 "test_quote", "prod_quote", "task_quote",
+                                 "failure_quote", "reason"],
+                    "properties": {
+                        "case": {"type": "string"},
+                        "verdict": {"type": "string",
+                                    "enum": ["implementation_gap",
+                                             "set_defect"]},
+                        "defect_kind": {"type": "string",
+                                        "enum": ["none", "harness_unreachable",
+                                                 "coupling",
+                                                 "contradicts_task",
+                                                 "overspecified_mechanism",
+                                                 "environment", "test_bug"]},
+                        "test_quote": {"type": "object", "additionalProperties": False,
+                                       "required": ["file", "quote"],
+                                       "properties": {
+                                           "file": {"type": "string"},
+                                           "quote": {"type": "string"}}},
+                        "prod_quote": {"type": "object", "additionalProperties": False,
+                                       "required": ["file", "quote"],
+                                       "properties": {
+                                           "file": {"type": "string"},
+                                           "quote": {"type": "string"}}},
+                        "task_quote": {"type": "string"},
+                        "failure_quote": {"type": "string"},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+    "surrogate_fixer": {
+        # The test-blind independent fix (the surrogate witness, same
+        # section). Its tree, not this report, is what the sets run on.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["summary", "files_changed"],
+        "properties": {
+            "summary": {"type": "string"},
+            "files_changed": {"type": "array", "items": {"type": "string"}},
         },
     },
     "rebaser": {
@@ -18634,7 +18714,8 @@ async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
                            run_id: str | None = None,
                            active_token: str | None = None,
                            max_parallel: int | None = None,
-                           worker_demand_estimate_bytes: int | None = None) -> dict:
+                           worker_demand_estimate_bytes: int | None = None,
+                           env_extra: dict[str, str] | None = None) -> dict:
     """Admission-gated wrapper around `_invoke`.
 
     This exists as a separate function purely so the memory reservation is
@@ -18665,7 +18746,8 @@ async def _invoke_admitted(cmd: list[str], cwd: str, timeout: int,
             progress=progress, idle_warn_sec=idle_warn_sec,
             worker_memory_max_bytes=worker_memory_max_bytes,
             worker_pids_max=worker_pids_max, stdin_data=stdin_data,
-            run_id=run_id, active_token=active_token)
+            run_id=run_id, active_token=active_token,
+            **({"env_extra": env_extra} if env_extra else {}))
     finally:
         _release_worker_memory_admission(admission_token)
 
@@ -18679,7 +18761,8 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
                   worker_pids_max: int | None = None,
                   stdin_data: str | None = None,
                   run_id: str | None = None,
-                  active_token: str | None = None) -> dict:
+                  active_token: str | None = None,
+                  env_extra: dict[str, str] | None = None) -> dict:
     """Run a `claude -p` command, streaming events as they arrive.
 
     `stdin_data`, when given, is written to a temp file that becomes the
@@ -18775,6 +18858,18 @@ async def _invoke(cmd: list[str], cwd: str, timeout: int,
         if worker_env is None:
             worker_env = os.environ.copy()
         worker_env["ANTHROPIC_BASE_URL"] = f"http://127.0.0.1:{_STRICT_PROXY.port}"
+    # A throwaway test database's URL (DESIGN §8 *Prisma repositories get a
+    # real database*) — and never Prisma's AI-agent consent, which the user
+    # granted for the orchestrator's own pushes alone.
+    if env_extra:
+        if worker_env is None:
+            worker_env = os.environ.copy()
+        worker_env.update(env_extra)
+    if any(k.startswith("PRISMA_USER_CONSENT")
+           for k in (worker_env if worker_env is not None else os.environ)):
+        worker_env = {k: v for k, v in (worker_env if worker_env is not None
+                                        else os.environ).items()
+                      if not k.startswith("PRISMA_USER_CONSENT")}
     # Node/V8 derives its default heap ceiling (~4.2 GiB) from *host* memory,
     # not the worker's cgroup memory.max — so on a Node repo, a build can
     # abort with a V8 heap OOM while most of leerie's (larger) per-worker
@@ -19988,8 +20083,8 @@ def _warn_denial_skipped_once(root: Path) -> None:
 
 def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
     """Keep the held-out acceptance sets out of the fixers' reach (DESIGN §8
-    *Held-out acceptance tests*): `Read` denies for implementer and
-    conformer on every run-directory file that records a set — the sets
+    *Held-out acceptance tests*): `Read` denies for implementer, conformer
+    and the surrogate witness's `surrogate_fixer` on every run-directory file that records a set — the sets
     themselves, the evaluation worktree, every log (the writers' stream
     transcripts carry the test source), `orchestrator.log` (where streamed
     output is echoed), `calls.ndjson` (the writers' responses) and
@@ -19998,7 +20093,7 @@ def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
     `checkpoints/` there. Joined with `_repo_write_denials`' rules at the
     call site. A shell `cat` is not covered; hiding reduces the
     special-casing incentive, it does not guarantee it."""
-    if schema_key not in ("implementer", "conformer"):
+    if schema_key not in ("implementer", "conformer", "surrogate_fixer"):
         return ""
     rd = Path(run_dir)
     # `//` anchors an absolute path for the CLI, as in _repo_write_denials.
@@ -20589,6 +20684,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    caps: dict, st: "State", model: str, sid: str,
                    add_dirs: list[str] | None = None,
                    effort: str | None = None,
+                   env_extra: dict[str, str] | None = None,
                    _suppress_capture: bool = False) -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
@@ -20708,6 +20804,12 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     if suite_notice:
         user_prompt = (f"{user_prompt.rstrip()}\n"
                        f"NOTE FROM ORCHESTRATOR: {suite_notice}")
+    # The database push/reset deny travels with its notice the same way
+    # (DESIGN §8 *Prisma repositories get a real database*).
+    db_deny = _db_reset_denials(_suite_root)
+    if db_deny and "Bash" in [x.strip() for x in allowed_tools.split(",")]:
+        user_prompt = (f"{user_prompt.rstrip()}\n"
+                       f"NOTE FROM ORCHESTRATOR: {DB_RESET_NOTICE}")
 
     # The appended system prompt is a second large argv element (reconciler.md
     # is ~25KB) that compounds with the user prompt toward MAX_ARG_STRLEN —
@@ -20751,7 +20853,7 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 deny_extra=",".join(d for d in (
                     _repo_write_denials(st.repo_root, st.run_dir),
                     _acceptance_read_denials(schema_key, st.run_dir),
-                    suite_deny) if d))
+                    suite_deny, db_deny) if d))
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
             else:
@@ -20817,7 +20919,9 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                                          "active_oauth_token"),
                                      max_parallel=caps.get("max_parallel"),
                                      worker_demand_estimate_bytes=caps.get(
-                                         "worker_demand_estimate_bytes"))
+                                         "worker_demand_estimate_bytes"),
+                                     **({"env_extra": env_extra}
+                                        if env_extra else {}))
             _latency_ms = int((time.monotonic() - _t0) * 1000)
 
             # record run-weight telemetry
@@ -29627,13 +29731,21 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
     if isinstance(diff, dict) and diff.get("new"):
         reasons.append(f"{len(diff['new'])} test(s) newly failing on the "
                        "final tree, confirmed against the base")
-    gate = ((st.data.get("acceptance") or {}).get("gate") or {})
+    acc = st.data.get("acceptance") or {}
+    gate = (acc.get("gate") or {}) if isinstance(acc, dict) else {}
     if isinstance(gate, dict):
+        # A set the set audit typed broken is not unfinished work (DESIGN §8
+        # *A set that keeps failing is audited, and rewritten once*).
+        sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
+        broken = {s_.get("index") for s_ in sets
+                  if _acceptance_set_broken(s_)}
         final = gate.get("final")
         failing = (sum(1 for r in final if isinstance(r, dict)
-                       and r.get("passed") is False and not r.get("unmeasured"))
+                       and r.get("passed") is False and not r.get("unmeasured")
+                       and r.get("index") not in broken)
                    if isinstance(final, list) else 0)
-        residual = gate.get("residual") or {}
+        residual = _acceptance_residual_unbroken(
+            gate.get("residual") or {}, sets) or {}
         if not failing and isinstance(residual, dict):
             failing = int(residual.get("failing_sets") or 0)
         if failing:
@@ -35184,6 +35296,723 @@ async def _delivery_judge_unmet(
 
 # --- held-out acceptance tests (DESIGN §8 *Held-out acceptance tests*) ----
 
+# --- Held-out set audit: the repository's own test harness, read mechanically
+# (DESIGN §8 *A set that keeps failing is audited, and rewritten once*). Every
+# pattern below reads source code, paths or config — mechanical strings, never
+# prose (DESIGN §12). JS/TS only, as benched (Q6); for any other language the
+# graph is empty, so the harness section says so and M1/M2 never fire.
+_JS_SRC_EXT = (".ts", ".tsx", ".js", ".jsx", ".mts", ".cts", ".mjs", ".cjs")
+_JS_IMPORT_RE = re.compile(
+    r"""(?:\bfrom\s*|\bimport\s*\(\s*|\bimport\s+|\brequire\s*\(\s*)"""
+    r"""["']([^"']+)["']""")
+_JS_MOCK_RE = re.compile(
+    r"""\b(?:vi|jest)\.(?:mock|doMock|unstable_mockModule)\(\s*"""
+    r"""["']([^"']+)["']""")
+_JS_TEST_PATH_RE = re.compile(r"(\.(test|spec)\.[cm]?[jt]sx?$)|(/__tests__/)")
+_JS_SUPPORT_PATH_RE = re.compile(
+    r"(test-helper|harness|fixture|__mocks__|/testing/|(^|/)tests?/|fake|stub"
+    r"|mock|test-utils|testutils|setup-tests|vitest\.setup|jest\.setup)",
+    re.IGNORECASE)
+_JS_EXPORT_RE = re.compile(
+    r"^export\s+(?:async\s+)?(?:function\*?|const|let|class|interface|type"
+    r"|enum)\s+([A-Za-z_$][\w$]*)", re.MULTILINE)
+_JS_NAMED_IMPORT_RE = re.compile(
+    r"""import\s*\{([^}]*)\}\s*from\s*["']([^"']+)["']""")
+# M1: a case reads a recorded mock call by position — order-coupled to calls
+# the test's own setup or the implementation makes (Q6/R5).
+_M1_POSITIONAL_MOCK_READ_RE = re.compile(
+    r"\.mock\.calls\[\s*\d+\s*\]|\.mock\.lastCall|toHaveBeenNthCalledWith"
+    r"|\.mock\.calls\.at\(")
+_HARNESS_MAX_NEIGHBOURS = 40
+_HARNESS_MAX_HELPERS = 8
+_HARNESS_MAX_EXEMPLARS = 5
+
+# (repo, rev) -> the source graph; revs are commit shas, so a cached graph
+# never goes stale.
+_SOURCE_GRAPHS: dict[tuple[str, str], dict] = {}
+
+
+def _js_is_test(path: str) -> bool:
+    return bool(_JS_TEST_PATH_RE.search(path))
+
+
+def _git_tree_sources(repo: str | Path, rev: str) -> tuple[dict[str, str],
+                                                           set[str]]:
+    """{path: text} for the JS/TS source files at `rev`, and every path
+    there — read with git plumbing (`ls-tree`, `cat-file --batch`), so no
+    checkout is needed and nothing is written."""
+    ls = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r", "-z", rev],
+                        capture_output=True, text=True, check=False)
+    if ls.returncode != 0:
+        return {}, set()
+    ents: list[tuple[str, str]] = []
+    allp: set[str] = set()
+    for line in ls.stdout.split("\0"):
+        if "\t" not in line:
+            continue
+        meta, path = line.split("\t", 1)
+        parts = meta.split()
+        allp.add(path)
+        if (len(parts) == 3 and parts[1] == "blob"
+                and path.endswith(_JS_SRC_EXT)
+                and "node_modules/" not in path):
+            ents.append((path, parts[2]))
+    if not ents:
+        return {}, allp
+    got = subprocess.run(["git", "-C", str(repo), "cat-file", "--batch"],
+                         input="".join(o + "\n" for _, o in ents).encode(),
+                         capture_output=True, check=False)
+    if got.returncode != 0:
+        return {}, allp
+    out, i, buf = {}, 0, got.stdout
+    for path, _oid in ents:
+        nl = buf.index(b"\n", i)
+        head = buf[i:nl].split()
+        if len(head) < 3 or head[1] == b"missing":
+            i = nl + 1
+            continue
+        size = int(head[2])
+        out[path] = buf[nl + 1:nl + 1 + size].decode("utf-8", "replace")
+        i = nl + 1 + size + 1
+    return out, allp
+
+
+def _ts_path_aliases(repo: str | Path, rev: str) -> dict[str, str]:
+    """Import-specifier prefix -> repo-relative directory, from
+    `tsconfig.json`'s `compilerOptions.paths` at `rev` (`"@/*": ["./src/*"]`
+    gives `"@/" -> "src/"`). Config text, read mechanically; `{}` when there
+    is none or it does not parse once comments and trailing commas are
+    removed."""
+    got = subprocess.run(["git", "-C", str(repo), "show",
+                          f"{rev}:tsconfig.json"],
+                         capture_output=True, text=True, check=False)
+    if got.returncode != 0:
+        return {}
+    text = re.sub(r"/\*.*?\*/", "", got.stdout, flags=re.DOTALL)
+    text = re.sub(r'(?m)^\s*//.*$|(?<=[,{\[\s])//[^\n"]*$', "", text)
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    try:
+        opts = (json.loads(text).get("compilerOptions") or {})
+    except (ValueError, AttributeError):
+        return {}
+    base = str(opts.get("baseUrl") or ".")
+    out: dict[str, str] = {}
+    for key, targets in (opts.get("paths") or {}).items():
+        if (not isinstance(key, str) or not key.endswith("*")
+                or not isinstance(targets, list) or not targets
+                or not isinstance(targets[0], str)
+                or not targets[0].endswith("*")):
+            continue
+        d = os.path.normpath(os.path.join(base, targets[0][:-1]))
+        out[key[:-1]] = "" if d == "." else d + "/"
+    return out
+
+
+def _js_resolve(spec: str, importer: str, files: set[str],
+                aliases: dict[str, str]) -> str | None:
+    """The repo file an import specifier names, or None (a package)."""
+    cand = None
+    for prefix, d in aliases.items():
+        if prefix and spec.startswith(prefix):
+            cand = d + spec[len(prefix):]
+            break
+    if cand is None:
+        if not spec.startswith("."):
+            return None
+        cand = os.path.normpath(str(Path(importer).parent / spec))
+    for ext in ("",) + _JS_SRC_EXT + tuple("/index" + e
+                                           for e in _JS_SRC_EXT):
+        if cand + ext in files:
+            return cand + ext
+    # A `.js` specifier naming `.ts` source (ESM TypeScript).
+    stem = re.sub(r"\.[cm]?js$", "", cand)
+    for ext in _JS_SRC_EXT:
+        if stem + ext in files:
+            return stem + ext
+    return None
+
+
+def _js_source_graph(repo: str | Path, rev: str) -> dict:
+    """The JS/TS import graph at `rev`: `src` {path: text}, `files`,
+    `imp` {path: imported repo paths}, `importers` (the reverse), `support`
+    (test-support modules: non-test files on a support-shaped path imported
+    only by tests or other support modules), `aliases`, `all` (every path)."""
+    key = (str(repo), rev)
+    if key in _SOURCE_GRAPHS:
+        return _SOURCE_GRAPHS[key]
+    src, allp = _git_tree_sources(repo, rev)
+    files = set(src)
+    aliases = _ts_path_aliases(repo, rev) if files else {}
+    imp = {p: {r for r in (_js_resolve(m.group(1), p, files, aliases)
+                           for m in _JS_IMPORT_RE.finditer(t)) if r}
+           for p, t in src.items()}
+    importers: dict[str, set[str]] = {}
+    for p, deps in imp.items():
+        for q in deps:
+            importers.setdefault(q, set()).add(p)
+    support: set[str] = set()
+    for _ in range(4):   # helpers of helpers
+        for p in files:
+            if p in support or _js_is_test(p):
+                continue
+            by = importers.get(p, set())
+            if (by and _JS_SUPPORT_PATH_RE.search(p)
+                    and all(_js_is_test(b) or b in support for b in by)):
+                support.add(p)
+    g = {"src": src, "files": files, "imp": imp, "importers": importers,
+         "support": support, "aliases": aliases, "all": allp}
+    if len(_SOURCE_GRAPHS) > 8:
+        _SOURCE_GRAPHS.clear()
+    _SOURCE_GRAPHS[key] = g
+    return g
+
+
+def _git_recency(repo: str | Path, rev: str,
+                 paths: Iterable[str]) -> dict[str, int]:
+    """path -> rank among `paths` by last commit at `rev` (0 = newest), from
+    one `git log --name-only` pass (mechanical CLI output)."""
+    want = set(paths)
+    order: dict[str, int] = {}
+    if not want:
+        return order
+    got = subprocess.run(["git", "-C", str(repo), "log", "--format=",
+                          "--name-only", rev], capture_output=True,
+                         text=True, check=False)
+    for line in got.stdout.splitlines():
+        f = line.strip()
+        if f in want and f not in order:
+            order[f] = len(order)
+            if len(order) == len(want):
+                break
+    return order
+
+
+def _repo_test_harness(repo: str | Path, rev: str,
+                       seeds: Iterable[str]) -> str:
+    """The REPOSITORY TEST HARNESS payload section (Q6 arm H / c+): the
+    newest existing tests that drive `seeds` (tests importing one directly,
+    else tests of a module that imports one), the test-helper modules they
+    import with their exported names, and the five newest as exemplars.
+    Derived from the import graph and git history only."""
+    g = _js_source_graph(repo, rev)
+    sites = [s for s in seeds if s in g["files"]]
+    neigh: set[str] = set()
+    for s in sites:
+        neigh |= {b for b in g["importers"].get(s, ()) if _js_is_test(b)}
+    if not neigh:
+        for s in sites:
+            for mid in g["importers"].get(s, ()):
+                if not _js_is_test(mid):
+                    neigh |= {b for b in g["importers"].get(mid, ())
+                              if _js_is_test(b)}
+    rank = _git_recency(repo, rev, neigh)
+    recent = sorted(neigh, key=lambda p: (rank.get(p, 10 ** 9), p)
+                    )[:_HARNESS_MAX_NEIGHBOURS]
+    count: dict[str, int] = {}
+    for n in recent:
+        for q in g["imp"].get(n, ()):
+            if q in g["support"]:
+                count[q] = count.get(q, 0) + 1
+    helpers = sorted(count, key=lambda q: (-count[q], q)
+                     )[:_HARNESS_MAX_HELPERS]
+    exemplars = recent[:_HARNESS_MAX_EXEMPLARS]
+    if not helpers and not exemplars:
+        return "REPOSITORY TEST HARNESS: (none found)"
+    lines = ["REPOSITORY TEST HARNESS for the code under repair (derived from "
+             "this checkout's imports and git history):",
+             "Newest existing tests that drive the defect sites (exemplars):"]
+    for e in exemplars:
+        used = sorted(q for q in g["imp"].get(e, ()) if q in g["support"])
+        lines.append(f"- {e}" + (f"  (uses {', '.join(used)})"
+                                 if used else ""))
+    if helpers:
+        lines.append("Test-helper modules those tests import (count among "
+                     "the newest tests; exported names):")
+        for h in helpers:
+            names = _JS_EXPORT_RE.findall(g["src"].get(h, ""))[:15]
+            lines.append(f"- {h} [{count[h]}]: "
+                         f"{', '.join(names) or '(no named exports)'}")
+    return "\n".join(lines)
+
+
+def _set_files(set_: dict) -> list[str]:
+    return sorted(set((set_.get("defect_files") or [])
+                      + (set_.get("control_files") or [])
+                      + (set_.get("support_files") or [])))
+
+
+def _set_production_imports(g: dict, set_: dict) -> list[str]:
+    """The repo modules a set's files import directly — not tests, not test
+    support, not the set's own files: the seeds of its harness section."""
+    files = set(_set_files(set_))
+    allf = g["files"] | files
+    out: set[str] = set()
+    for f in files:
+        if not f.endswith(_JS_SRC_EXT):
+            continue
+        try:
+            text = (Path(set_["dir"]) / f).read_text(errors="replace")
+        except OSError:
+            continue
+        for m in _JS_IMPORT_RE.finditer(text):
+            r = _js_resolve(m.group(1), f, allf, g["aliases"])
+            if (r and r not in files and r in g["files"]
+                    and not _js_is_test(r) and r not in g["support"]):
+                out.add(r)
+    return sorted(out)
+
+
+def _acceptance_mechanical_findings(repo: str | Path, rev: str,
+                                    set_: dict) -> list[dict]:
+    """M1 and M2 (DESIGN §8; benched as Q6/R5), on code identifiers only:
+    M1 — a set file reads a recorded mock call by position; M2 — a set file
+    imports a named symbol from a production module that no other
+    production module uses (an internal helper). `rev` is the own start, the
+    tree the set was written against."""
+    g = _js_source_graph(repo, rev)
+    files = _set_files(set_)
+    allf = g["files"] | set(files)
+    out: list[dict] = []
+    for f in files:
+        if not f.endswith(_JS_SRC_EXT):
+            continue
+        try:
+            text = (Path(set_["dir"]) / f).read_text(errors="replace")
+        except OSError:
+            continue
+        lines = [f"{i + 1}: {ln.strip()}"
+                 for i, ln in enumerate(text.splitlines())
+                 if _M1_POSITIONAL_MOCK_READ_RE.search(ln)]
+        if lines:
+            out.append({"check": "M1", "file": f, "lines": lines[:8]})
+        for m in _JS_NAMED_IMPORT_RE.finditer(text):
+            target = _js_resolve(m.group(2), f, allf, g["aliases"])
+            if (not target or target in files or _js_is_test(target)
+                    or target in g["support"]):
+                continue
+            users = [q for q in g["importers"].get(target, ())
+                     if not _js_is_test(q) and q not in g["support"]]
+            for raw in m.group(1).split(","):
+                name = raw.strip()
+                if name.startswith("type "):
+                    name = name[5:].strip()
+                name = name.split(" as ")[0].strip()
+                if not name:
+                    continue
+                word = re.compile(r"\b" + re.escape(name) + r"\b")
+                if not any(word.search(g["src"].get(q, "")) for q in users):
+                    out.append({"check": "M2", "file": f, "symbol": name,
+                                "module": target})
+    return out
+
+
+# --- Prisma repos: a real throwaway database for the held-out sets (DESIGN §8
+# *Prisma repositories get a real database*). The user consented to `prisma
+# db push` against throwaway test databases only; code checks the target
+# before every push (`_test_db_url_refusal`).
+_PRISMA_CONSENT_ENV = "PRISMA_USER_CONSENT_FOR_DANGEROUS_AI_ACTION"
+_PRISMA_CONSENT_TEXT = "yes, allow prisma db push on throwaway test databases"
+_TEST_DB_PREFIX = "leerie_"
+_TEST_DB_SUFFIX = "_test"
+_PRISMA_PACKAGES = ("prisma", "@prisma/client")
+_PRISMA_PROVIDER_RE = re.compile(
+    r"datasource\s+\w+\s*\{[^}]*?\bprovider\s*=\s*\"([^\"]+)\"", re.DOTALL)
+_PRISMA_CLIENT_CTOR = "new PrismaClient"
+# Commands that push a schema to, or reset, a database. Denied to every
+# worker in a Prisma repo (`_db_reset_denials`), paired with
+# `DB_RESET_NOTICE`, and recognised inside package.json scripts so a script
+# alias is denied too.
+_DB_RESET_COMMANDS = ("prisma db push", "prisma migrate reset",
+                      "prisma migrate dev")
+DB_RESET_NOTICE = (
+    "this repository uses Prisma, and commands that push a schema to or "
+    "reset a database (`prisma db push`, `prisma migrate reset`, `prisma "
+    "migrate dev`, and the package scripts that run them) are denied to you: "
+    "the orchestrator alone prepares databases, and only throwaway test "
+    "databases. Run tests with the repository's own test command; write a "
+    "schema migration as a file rather than applying it.")
+
+
+def _prisma_project(repo_root: str | Path) -> dict | None:
+    """`{dir, schema, provider}` for the repo's Prisma project, or None — a
+    tracked `schema.prisma` whose nearest `package.json` declares `prisma`
+    or `@prisma/client` (dependencies or devDependencies). Mechanical: git's
+    file list and two config files."""
+    root = Path(str(repo_root))
+    ls = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--",
+                         ":(glob)**/schema.prisma"],
+                        capture_output=True, text=True, check=False)
+    if ls.returncode != 0:
+        return None
+    for schema in sorted(p for p in ls.stdout.split("\0")
+                         if p and "node_modules/" not in p):
+        d = Path(schema).parent
+        while True:
+            pkg = root / d / "package.json"
+            if pkg.is_file():
+                try:
+                    data = json.loads(pkg.read_text())
+                except (OSError, ValueError):
+                    data = {}
+                deps = {**(data.get("dependencies") or {}),
+                        **(data.get("devDependencies") or {})} \
+                    if isinstance(data, dict) else {}
+                if any(p in deps for p in _PRISMA_PACKAGES):
+                    try:
+                        text = (root / schema).read_text(errors="replace")
+                    except OSError:
+                        text = ""
+                    m = _PRISMA_PROVIDER_RE.search(text)
+                    rel = "" if str(d) == "." else str(d)
+                    return {"dir": rel, "schema": schema,
+                            "provider": m.group(1) if m else ""}
+                break
+            if str(d) in ("", "."):
+                break
+            d = d.parent
+    return None
+
+
+def _prisma_reset_scripts(repo_root: str | Path, project: dict) -> list[str]:
+    """Names of the project's package.json scripts whose body runs a
+    `_DB_RESET_COMMANDS` command (a script body is a shell command — a
+    mechanical string). Names carrying a permission-rule metacharacter are
+    left out: they cannot be written as a rule."""
+    pkg = Path(str(repo_root)) / project["dir"] / "package.json"
+    try:
+        scripts = (json.loads(pkg.read_text()).get("scripts") or {})
+    except (OSError, ValueError, AttributeError):
+        return []
+    out = []
+    for name, body in scripts.items():
+        if (isinstance(name, str) and isinstance(body, str)
+                and not any(ch in name for ch in ",()* ")
+                and any(c in " ".join(body.split())
+                        for c in _DB_RESET_COMMANDS)):
+            out.append(name)
+    return sorted(out)
+
+
+def _db_reset_rule_patterns(repo_root: str | Path) -> list[str]:
+    """Bodies of the database push/reset deny rules for a Prisma repo, or
+    `[]`. Total, like `_full_suite_rule_patterns`: read inside every
+    `claude_p` call, so any failure degrades to `[]`."""
+    try:
+        project = _prisma_project(repo_root)
+        if project is None:
+            return []
+        pats = [f"*{c}*" for c in _DB_RESET_COMMANDS]
+        pats.append(f"*{_PRISMA_CONSENT_ENV}*")
+        for name in _prisma_reset_scripts(repo_root, project):
+            for pm in ("npm run", "pnpm run", "pnpm", "yarn run", "yarn",
+                       "bun run", "bun"):
+                pats.append(f"*{pm} {name}*")
+        return list(dict.fromkeys(pats))
+    except Exception:
+        return []
+
+
+def _db_reset_denials(repo_root: str | Path) -> str:
+    """`_db_reset_rule_patterns` as `Bash(...)` deny rules for `deny_extra`;
+    `""` outside a Prisma repo. Paired with `DB_RESET_NOTICE` in `claude_p`
+    (#292: a deny without a notice ended 2/2 replayed workers `blocked`)."""
+    return ",".join(f"Bash({p})" for p in _db_reset_rule_patterns(repo_root))
+
+
+def _test_db_url_refusal(url: str, direct_url: str, port: int) -> str | None:
+    """Why `url` is NOT a database leerie may push to, or None when it is:
+    a postgres URL on localhost, at the port of leerie's own cluster, whose
+    database name starts `leerie_` and ends `_test`, with DIRECT_URL equal
+    to it (prisma.config.ts commonly resolves `DIRECT_URL ?? DATABASE_URL`,
+    so a different DIRECT_URL would be the push's real target). Checked
+    before every push; mechanical URL parsing only."""
+    try:
+        u = urllib.parse.urlparse(url)
+        u_port = u.port
+    except ValueError as e:
+        return f"unparseable URL ({e})"
+    name = u.path.lstrip("/")
+    if u.scheme not in ("postgres", "postgresql"):
+        return f"scheme {u.scheme!r} is not postgres"
+    if u.hostname not in ("localhost", "127.0.0.1"):
+        return f"host {u.hostname!r} is not localhost"
+    if u_port != port:
+        return f"port {u_port} is not leerie's own cluster port {port}"
+    if not (name.startswith(_TEST_DB_PREFIX)
+            and name.endswith(_TEST_DB_SUFFIX)):
+        return (f"database {name!r} is not named "
+                f"{_TEST_DB_PREFIX}*{_TEST_DB_SUFFIX}")
+    if direct_url != url:
+        return "DIRECT_URL differs from DATABASE_URL"
+    return None
+
+
+def _pg_server_bin() -> str | None:
+    """A directory holding a complete PostgreSQL server install (`initdb`,
+    `pg_ctl`, `pg_isready`, `createdb`, `dropdb`): the newest
+    `/usr/lib/postgresql/<major>/bin`, else the one on PATH."""
+    need = ("initdb", "pg_ctl", "pg_isready", "createdb", "dropdb")
+
+    def _complete(d: str) -> bool:
+        return all(os.access(os.path.join(d, t), os.X_OK) for t in need)
+    best, best_major = None, -1
+    for cand in glob.glob("/usr/lib/postgresql/*/bin"):
+        if not _complete(cand):
+            continue
+        major = os.path.basename(os.path.dirname(cand))
+        rank = int(major) if major.isdigit() else -1
+        if best is None or rank > best_major:
+            best, best_major = cand, rank
+    if best is None and shutil.which("initdb"):
+        d = os.path.dirname(shutil.which("initdb") or "")
+        if _complete(d):
+            best = d
+    return best
+
+
+# The active throwaway cluster, shared by every consumer in this process and
+# stopped when the last `_test_db_session` exits.
+_TEST_DB: dict = {"cluster": None, "refs": 0, "warned": False}
+
+
+def _free_local_port() -> int:
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return int(s.getsockname()[1])
+
+
+def _start_test_db_cluster(st: "State") -> dict | None:
+    """initdb a private cluster under the temp dir and start it on a free
+    localhost port, TCP only (no unix socket, so no path-length limit).
+    None (logged once) when no server is installed, leerie runs as root
+    (postgres refuses), or a step fails — the sets then run as before,
+    without a database."""
+    def _skip(why: str) -> None:
+        if not _TEST_DB["warned"]:
+            _TEST_DB["warned"] = True
+            log(f"  acceptance: no throwaway test database ({why}) — the "
+                "held-out sets run without one")
+    pgbin = _pg_server_bin()
+    if pgbin is None:
+        _skip("no PostgreSQL server binaries installed")
+        return None
+    if os.geteuid() == 0:
+        _skip("running as root, which postgres refuses")
+        return None
+    user = pwd.getpwuid(os.getuid()).pw_name
+    data = Path(tempfile.gettempdir()) / f"leerie-pg-{st.run_id}"
+    shutil.rmtree(data, ignore_errors=True)
+    init = subprocess.run([os.path.join(pgbin, "initdb"), "-D", str(data),
+                           "-U", user, "--auth-local=trust",
+                           "--auth-host=trust"],
+                          capture_output=True, text=True, check=False)
+    if init.returncode != 0:
+        _skip(f"initdb failed: {init.stderr.strip()[-200:]}")
+        shutil.rmtree(data, ignore_errors=True)
+        return None
+    port = _free_local_port()
+    start = subprocess.run(
+        [os.path.join(pgbin, "pg_ctl"), "-D", str(data), "-l",
+         str(data) + ".log", "-w", "-o",
+         f"-p {port} -c listen_addresses=127.0.0.1 "
+         "-c unix_socket_directories='' -c fsync=off", "start"],
+        capture_output=True, text=True, check=False,
+        start_new_session=True)
+    if start.returncode != 0:
+        _skip(f"postgres did not start: {start.stderr.strip()[-200:]}")
+        shutil.rmtree(data, ignore_errors=True)
+        return None
+    log(f"  acceptance: throwaway test database cluster on 127.0.0.1:{port}")
+    return {"bin": pgbin, "port": port, "data": str(data), "user": user}
+
+
+def _stop_test_db_cluster(cluster: dict) -> None:
+    subprocess.run([os.path.join(cluster["bin"], "pg_ctl"), "-D",
+                    cluster["data"], "-m", "fast", "-w", "stop"],
+                   capture_output=True, check=False)
+    shutil.rmtree(cluster["data"], ignore_errors=True)
+    with contextlib.suppress(OSError):
+        os.unlink(cluster["data"] + ".log")
+
+
+@contextlib.asynccontextmanager
+async def _test_db_session(st: "State") -> AsyncIterator[dict | None]:
+    """Hold the throwaway cluster for a Prisma repo whose datasource is
+    PostgreSQL; yields it, or None (not such a repo, or no cluster could be
+    started). Re-entrant: nested sessions share one cluster, stopped when
+    the outermost exits."""
+    project = _prisma_project(st.repo_root)
+    if (project is None
+            or project.get("provider") not in ("postgresql", "postgres")):
+        yield None
+        return
+    # Counted before the start is awaited, so a session entered while the
+    # cluster is starting never starts a second one (it sees no cluster
+    # until the first start returns, and its sets run without a database).
+    _TEST_DB["refs"] += 1
+    try:
+        if _TEST_DB["refs"] == 1:
+            _TEST_DB["cluster"] = await asyncio.to_thread(
+                _start_test_db_cluster, st)
+        yield _TEST_DB["cluster"]
+    finally:
+        _TEST_DB["refs"] -= 1
+        if _TEST_DB["refs"] == 0 and _TEST_DB["cluster"] is not None:
+            cluster, _TEST_DB["cluster"] = _TEST_DB["cluster"], None
+            await asyncio.to_thread(_stop_test_db_cluster, cluster)
+
+
+def _test_db_name(key: str) -> str:
+    return (_TEST_DB_PREFIX + hashlib.sha256(key.encode()).hexdigest()[:16]
+            + _TEST_DB_SUFFIX)
+
+
+def _test_db_env(url: str) -> dict[str, str]:
+    """What a worker or a set run gets: the URL, never the consent."""
+    return {"DATABASE_URL": url, "DIRECT_URL": url}
+
+
+async def _create_test_db(st: "State", tree: str | Path,
+                          key: str) -> str | None:
+    """A fresh database for `tree` on the active cluster with `tree`'s own
+    Prisma schema pushed, its URL, or None (no active cluster, or a step
+    failed — logged). The URL is checked by `_test_db_url_refusal` before
+    the push, and Prisma's AI-agent consent variable is set on the push
+    subprocess alone."""
+    cluster = _TEST_DB.get("cluster")
+    project = _prisma_project(st.repo_root)
+    if cluster is None or project is None:
+        return None
+    name = _test_db_name(f"{st.run_id}:{key}:{tree}")
+    url = f"postgresql://{cluster['user']}@127.0.0.1:{cluster['port']}/{name}"
+    refused = _test_db_url_refusal(url, url, cluster["port"])
+    if refused:
+        log(f"  acceptance: REFUSED to push to {url}: {refused}")
+        return None
+    pg = ["-h", "127.0.0.1", "-p", str(cluster["port"]),
+          "-U", cluster["user"]]
+    await asyncio.to_thread(
+        subprocess.run, [os.path.join(cluster["bin"], "dropdb"), *pg,
+                         "--if-exists", name],
+        capture_output=True, check=False)
+    made = await asyncio.to_thread(
+        subprocess.run, [os.path.join(cluster["bin"], "createdb"), *pg, name],
+        capture_output=True, text=True, check=False)
+    if made.returncode != 0:
+        log(f"  acceptance: createdb {name} failed: "
+            f"{made.stderr.strip()[-200:]}")
+        return None
+    pkg_dir = Path(str(tree)) / project["dir"]
+    prisma = pkg_dir / "node_modules" / ".bin" / "prisma"
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith("PRISMA_USER_CONSENT")}
+    env.update(_test_db_env(url))
+    # Checked again on the exact environment the push will see.
+    refused = _test_db_url_refusal(env["DATABASE_URL"], env["DIRECT_URL"],
+                                   cluster["port"])
+    if refused or not prisma.exists():
+        log(f"  acceptance: no schema push for {name}: "
+            f"{refused or 'no installed prisma CLI'}")
+        _drop_test_db(url)
+        return None
+    env[_PRISMA_CONSENT_ENV] = _PRISMA_CONSENT_TEXT
+    try:
+        push = await asyncio.to_thread(
+            subprocess.run, [str(prisma), "db", "push", "--accept-data-loss"],
+            cwd=str(pkg_dir), env=env, capture_output=True, text=True,
+            check=False, timeout=600)
+    except subprocess.TimeoutExpired:
+        push = None
+    if push is None or push.returncode != 0:
+        tail = ((push.stdout + push.stderr) if push else "timed out")
+        log(f"  acceptance: prisma db push to {name} failed: "
+            f"{tail.strip()[-300:]}")
+        _drop_test_db(url)
+        return None
+    return url
+
+
+def _drop_test_db(url: str | None) -> None:
+    """Drop a database `_create_test_db` made; never anything else."""
+    cluster = _TEST_DB.get("cluster")
+    if not url or cluster is None:
+        return
+    if _test_db_url_refusal(url, url, cluster["port"]):
+        return
+    name = urllib.parse.urlparse(url).path.lstrip("/")
+    subprocess.run([os.path.join(cluster["bin"], "dropdb"), "-h",
+                    "127.0.0.1", "-p", str(cluster["port"]), "-U",
+                    cluster["user"], "--if-exists", "--force", name],
+                   capture_output=True, check=False)
+
+
+def _prisma_db_context(repo: str | Path, rev: str) -> dict:
+    """What the REAL DATABASE section names, from the import graph at `rev`:
+    `client` — the modules that construct the Prisma client; `exemplars` —
+    the five newest tests that import one without mocking it; `helpers` —
+    the test-support modules those tests import."""
+    g = _js_source_graph(repo, rev)
+    client = sorted(p for p, t in g["src"].items()
+                    if not _js_is_test(p) and p not in g["support"]
+                    and _PRISMA_CLIENT_CTOR in t)
+    users = set()
+    for c in client:
+        for b in g["importers"].get(c, ()):
+            if _js_is_test(b) and not any(
+                    _js_resolve(m.group(1), b, g["files"], g["aliases"]) == c
+                    for m in _JS_MOCK_RE.finditer(g["src"].get(b, ""))):
+                users.add(b)
+    rank = _git_recency(repo, rev, users)
+    ex = sorted(users, key=lambda p: (rank.get(p, 10 ** 9), p))[:5]
+    helpers = sorted({q for e in ex for q in g["imp"].get(e, ())
+                      if q in g["support"] and q not in client})
+    return {"client": client, "exemplars": ex, "helpers": helpers}
+
+
+def _prisma_real_db_section(ctx: dict, test_cmd: str) -> str:
+    """The writer's REAL DATABASE payload section (Q6/R4)."""
+    return (
+        "REAL DATABASE: DATABASE_URL and DIRECT_URL in your environment "
+        "point at a real, empty PostgreSQL test database with this "
+        "checkout's Prisma schema already pushed. Build the cases on the "
+        "repository's real Prisma client (constructed in "
+        f"{json.dumps(ctx['client'])}) against that database instead of "
+        "fakes: do not mock the client module or any Prisma model. Create "
+        "the rows each case needs with unique ids (schema-valid, every "
+        "required field) and remove them afterwards. Prefer the "
+        "repository's own seed/factory helpers and copy the setup of its "
+        f"newest database-backed tests: {json.dumps(ctx['exemplars'])}"
+        + (f" (helpers they import: {json.dumps(ctx['helpers'])})"
+           if ctx["helpers"] else "")
+        + ". Mock only true externals (payment provider, email, network). "
+        f"Run each file with the repository's test command ({test_cmd}); "
+        "never push or migrate a schema and never set DATABASE_URL "
+        "yourself. The harness rejects a set file that mocks the Prisma "
+        "client module.")
+
+
+def _prisma_mock_hits(repo: str | Path, rev: str, wt: Path,
+                      files: Iterable[str], client: list[str]) -> list[str]:
+    """Set files that `vi.mock`/`jest.mock` the module constructing the
+    Prisma client, or the Prisma client package itself (code identifiers
+    only)."""
+    g = _js_source_graph(repo, rev)
+    files = list(files)
+    allf = g["files"] | set(files)
+    hits = []
+    for f in files:
+        p = wt / f
+        if not f.endswith(_JS_SRC_EXT) or not p.is_file():
+            continue
+        for m in _JS_MOCK_RE.finditer(p.read_text(errors="replace")):
+            spec = m.group(1)
+            if (_js_resolve(spec, f, allf, g["aliases"]) in client
+                    or spec == "@prisma/client"
+                    or spec.endswith("generated/prisma/client")):
+                hits.append(f"{f}: mocks {spec}")
+    return hits
+
+
 def _acceptance_report_base(st: "State") -> str | None:
     """The tree the report was filed against: the earliest COMPLETED-or-not
     same-task sibling run's starting HEAD when one exists and is still
@@ -36106,7 +36935,14 @@ def _parse_runner_report(kind: str, path: Path) -> dict | None:
                             if c["status"] in ("passed", "failed")),
             "collection_error": any(c["status"] == "load_error"
                                     for c in cases),
-            "cases": {c["id"]: c["status"] for c in cases}}
+            "cases": {c["id"]: c["status"] for c in cases},
+            # The runner's own failure text per failing case, where its
+            # report carries one (JUnit, jest JSON) — read by the set audit
+            # only, never shown to a fixer (DESIGN §8). Present only when
+            # there is some.
+            **({"messages": msgs} if (msgs := {
+                c["id"]: c["message"] for c in cases if c.get("message")})
+               else {})}
 
 
 def _runner_report_cases(kind: str, path: Path,
@@ -36128,8 +36964,12 @@ def _runner_report_cases(kind: str, path: Path,
 
     out: list[dict] = []
 
-    def _add(cid: str, file: str | None, status: str) -> None:
-        out.append({"id": cid, "file": file, "status": status})
+    def _add(cid: str, file: str | None, status: str,
+             message: str = "") -> None:
+        row = {"id": cid, "file": file, "status": status}
+        if message:
+            row["message"] = message[:4000]
+        out.append(row)
 
     def _json_lines() -> list[dict]:
         events = []
@@ -36172,7 +37012,12 @@ def _runner_report_cases(kind: str, path: Path,
                           else "failed" if ("failure" in tags
                                             or "error" in tags)
                           else "passed")
-                _add(f"{rel or classname} :: {classname}.{name}", rel, status)
+                msg = "\n".join(
+                    " ".join(x for x in ((child.get("message") or ""),
+                                         (child.text or "").strip()) if x)
+                    for child in case if child.tag in ("failure", "error"))
+                _add(f"{rel or classname} :: {classname}.{name}", rel, status,
+                     msg)
         elif kind == "jest-json":
             data = json.loads(Path(path).read_text())
             for suite in data.get("testResults") or []:
@@ -36186,7 +37031,9 @@ def _runner_report_cases(kind: str, path: Path,
                     title = r.get("fullName") or r.get("title") or ""
                     st_ = r.get("status")
                     _add(f"{rel} :: {title}", rel,
-                         st_ if st_ in ("passed", "failed") else "skipped")
+                         st_ if st_ in ("passed", "failed") else "skipped",
+                         "\n".join(str(m) for m in
+                                   (r.get("failureMessages") or [])))
         elif kind == "rspec-json":
             data = json.loads(Path(path).read_text())
             for ex in data.get("examples") or []:
@@ -36444,7 +37291,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                                label: str, *,
                                validating: bool = False,
                                failure_mode: str = "assertion",
-                               observed: dict | None = None
+                               observed: dict | None = None,
+                               env_extra: dict[str, str] | None = None
                                ) -> bool | None:
     """Exit-code verdict for one acceptance file in `tree`: True passed,
     False failed, None not measurable (no command, the shell could not run
@@ -36471,6 +37319,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     if cmd is None:
         return None
     run_cmd, env, spec = cmd, None, None
+    # `env_extra` carries a throwaway test database's URL (DESIGN §8
+    # *Prisma repositories get a real database*).
     report = st.run_dir / "acceptance" / "reports" / (
         f"{label}-{hashlib.sha256(rel.encode()).hexdigest()[:12]}")
     if validating:
@@ -36480,6 +37330,8 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             report.parent.mkdir(parents=True, exist_ok=True)
             with contextlib.suppress(OSError):
                 report.unlink()
+    if env_extra:
+        env = {**(env if env is not None else os.environ), **env_extra}
     async with _blt_semaphore(caps):
         try:
             rc, tail = await _run_streaming(
@@ -36518,19 +37370,34 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                if status == "failed"]
     if observed is not None:
         observed["failing_cases"] = failing[:20]
+        observed["failure_messages"] = {
+            cid: m for cid, m in (parsed.get("messages") or {}).items()
+            if cid in failing[:20]}
+        observed["case_status"] = dict(parsed.get("cases") or {})
     return not failing
 
 
 async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
                                 models: dict, efforts: dict,
-                                base: str) -> dict:
+                                base: str, *, rewrite_of: dict | None = None,
+                                note: str = "", attempt: int = 1) -> dict:
     """One acceptance_writer in a disposable checkout of `base` (the run's
     own start, `_acceptance_writer_checkout`); returns the validated set
-    (`valid` False when nothing discriminates)."""
+    (`valid` False when nothing discriminates). `declared_defect` says
+    whether the writer declared any defect file at all.
+
+    With `rewrite_of`, this is the set's one rewrite (DESIGN §8 *A set that
+    keeps failing is audited, and rewritten once*): the set's files are put
+    back where the writer wrote them and `note` is appended to its payload.
+    Otherwise, when every declared defect file ran and passed, the writer
+    is asked once more with the runner's per-case result (C1's Fix A.3)."""
     leerie_dir = st.run_dir
-    wt = leerie_dir / "worktrees" / f"acceptance-{k}"
-    log_path = leerie_dir / "logs" / f"acceptance-{k}.log"
-    out = {"index": k, "valid": False}
+    name = (f"acceptance-{k}" if rewrite_of is None
+            else f"acceptance-rewrite-{k}")
+    sid = name if attempt == 1 else f"{name}-a{attempt}"
+    wt = leerie_dir / "worktrees" / name
+    log_path = leerie_dir / "logs" / f"{name}.log"
+    out = {"index": k, "valid": False, "declared_defect": False}
     # Outside every try: budget exhaustion must propagate, not read as an
     # invalid set (the same discipline as the no_work_judge call).
     st.bump_workers(caps)
@@ -36539,6 +37406,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     if made.startswith("failed"):
         out["reason"] = made
         return out
+    db_url = None
     try:
         # The report is usually an untracked file in the user's checkout,
         # absent from a fresh worktree: copy what the task names.
@@ -36553,14 +37421,16 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         if not await _ensure_worktree_deps(
                 str(wt), st, caps, log_path=log_path,
                 verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-                label_prefix=f"acceptance-{k}", log_prefix="acceptance"):
+                label_prefix=name, log_prefix="acceptance"):
             # Validated without its dependencies, a defect file "fails" on
             # the base for the wrong reason and could never pass anywhere.
             out["reason"] = "dependency install failed in the writer worktree"
             return out
+        db_url = await _create_test_db(st, wt, name)
+        env_extra = _test_db_env(db_url) if db_url else None
         scope = st.data.get("defect_scope") or {}
         gt = scope.get("ground_truth") or {}
-        user = "\n".join([
+        lines = [
             "TASK:", task, "",
             "Files the task references (read them; they are the report):",
             *[f"- {r}" for r in refs], "",
@@ -36571,7 +37441,13 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             "Your current working directory is a disposable checkout of the "
             "UNFIXED tree. Write the held-out tests per your rules, run them "
             "here, and return the JSON object per your schema.",
-        ])
+        ]
+        db_ctx = None
+        if db_url:
+            db_ctx = _prisma_db_context(st.repo_root, base)
+            lines += ["", _prisma_real_db_section(
+                db_ctx, resolve_blt_scoped(st.repo_root).get("test") or "")]
+        user = "\n".join(lines)
         # What existed before the writer (the dependency install's
         # output) is never the writer's file.
         pre = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
@@ -36581,147 +37457,74 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
             out["reason"] = "could not read the writer's worktree status"
             return out
         pre_untracked = {p for p in pre.stdout.split("\0") if p}
-        res = await claude_p(
-            user_prompt=user,
-            system_prompt=_load_prompt("acceptance_writer"),
-            schema_key="acceptance_writer", cwd=str(wt),
-            allowed_tools=ACT_TOOLS, max_turns=100, autonomous=True,
-            caps=caps, st=st,
-            model=models.get("acceptance_writer", MODEL_DEFAULT),
-            effort=efforts.get("acceptance_writer"),
-            sid=f"acceptance-{k}")
-        # What the writer actually left in the tree (git porcelain —
-        # mechanical CLI output). Validation runs on THIS tree, so the set
-        # must carry exactly it: an edited tracked file invalidates the set,
-        # and every undeclared new file (a fixture module, a helper) becomes
-        # a support file copied with the set — without it a correct fix
-        # fails the set elsewhere.
-        porcelain = subprocess.run(
-            ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
-             "--untracked-files=no"],
-            capture_output=True, text=True, check=False)
-        # Untracked files INCLUDING ignored ones (no --exclude-standard): a
-        # helper the repo's .gitignore happens to match is still needed.
-        post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
-                               "-z"], capture_output=True, text=True,
-                              check=False)
-        visible = subprocess.run(["git", "-C", str(wt), "ls-files",
-                                  "--others", "--exclude-standard", "-z"],
-                                 capture_output=True, text=True, check=False)
-        if (porcelain.returncode != 0 or post.returncode != 0
-                or visible.returncode != 0):
-            out["reason"] = "could not read the writer's worktree status"
-            return out
-        for entry in porcelain.stdout.split("\0"):
-            if len(entry) >= 4:
-                out["reason"] = f"writer modified a tracked file: {entry[3:]}"
-                return out
-        new_files = sorted(
-            p for p in post.stdout.split("\0")
-            if p and p not in refs and p not in pre_untracked
-            and not _acceptance_is_cache_path(p))
-        defect, control, cases, modes = [], [], {}, {}
-        base_failing: dict[str, list[str]] = {}
-        for f in (res.get("files") or []):
-            rel = _acceptance_declared_rel(f)
-            # Relative, inside the worktree, a real file, not the report.
-            if (not rel or os.path.isabs(rel) or ".." in Path(rel).parts
-                    or rel in refs):
-                continue
-            p_ = (wt / rel).resolve()
-            if not str(p_).startswith(str(wt.resolve()) + os.sep) \
-                    or not p_.is_file():
-                continue
-            # New files only (code, not the prompt, enforces it): an edited
-            # existing test would collide with the target tree's own copy at
-            # evaluation and could never be run there.
-            if subprocess.run(["git", "-C", str(wt), "cat-file", "-e",
-                               f"{base}:{rel}"], capture_output=True,
-                              check=False).returncode == 0:
-                continue
-            mode = ("import" if f.get("kind") == "defect"
-                    and f.get("failure_mode") == "import" else "assertion")
-            if mode == "import" and not rel.endswith(".py"):
-                # The declaration cannot be honoured (no reliable parse
-                # check outside Python), and an unloadable file would
-                # otherwise discard the whole set: drop just this file, and
-                # say why — the writer was told so.
-                log(f"  acceptance set {k}: {rel} declared an import defect, "
-                    "honoured only for Python test files — file dropped")
-                continue
-            if mode == "import":
-                parses, why = await _acceptance_parse_probe(
-                    st, caps, str(wt), rel,
-                    [rel] + [n for n in new_files
-                             if n.endswith(".py") and n != rel],
-                    log_path, f"acceptance-{k}-base")
-                if parses is not True:
-                    # A file — or another Python file the writer wrote — that
-                    # does not parse under the project's interpreter fails to
-                    # load by the writer's own fault; and a probe that never
-                    # reached its check cannot show otherwise. Validate it as
-                    # an ordinary file, so a load failure is no verdict and
-                    # discards the set. The log says which it was.
-                    log(f"  acceptance set {k}: {rel} declared an import "
-                        f"defect, but {why} — declaration not honoured")
-                    mode = "assertion"
-            observed: dict = {}
-            verdict = await _run_acceptance_file(
-                st, caps, str(wt), rel, log_path, f"acceptance-{k}-base",
-                validating=True, failure_mode=mode, observed=observed)
-            if verdict is None:
-                # Not measurable (no test command for this file, the runner
-                # is missing, or it ran no test) — never mistaken for pass
-                # or fail.
-                out["reason"] = f"could not run {rel} on the validity base"
-                return out
-            if f.get("kind") == "defect":
-                # Must FAIL on the unfixed tree, or it cannot discriminate.
-                if verdict is False:
-                    defect.append(rel)
-                    if observed.get("failing_cases"):
-                        base_failing[rel] = observed["failing_cases"]
-                    # "import" only when the base run showed the file failing
-                    # to load; a declared import defect that loaded and failed
-                    # an assertion is an ordinary failure.
-                    modes[rel] = ("import" if observed.get("load_failure")
-                                  else "assertion")
-                    cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
-            elif verdict is True:
-                control.append(rel)
-                cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
-            elif f.get("kind") == "control":
-                out["reason"] = f"control file {rel} does not pass on base"
-                return out
-        if not defect:
-            out["reason"] = "no defect file fails on the validity base"
-            return out
-        # Every undeclared new file travels — a conftest or helper beside the
-        # tests is test-shaped by path and still needed. Declared files that
-        # were dropped (a defect file that passes on base) are not carried.
-        declared_any = {_acceptance_declared_rel(f) for f in
-                        (res.get("files") or [])}
-        not_ignored = {p for p in visible.stdout.split("\0") if p}
-        test_dirs = {os.path.dirname(f) for f in defect + control}
+        if rewrite_of is not None:
+            # Back where the writer wrote them — after `pre`, so they are
+            # the writer's files again, collected like any it writes now.
+            _place_set(rewrite_of, wt)
+            user += "\n\n" + note
+        kw = {"env_extra": env_extra} if env_extra else {}
 
-        def _beside_a_test(f: str) -> bool:
-            d = os.path.dirname(f)
-            return any(d == t or (t and d.startswith(t + "/"))
-                       for t in test_dirs)
-        # An ignored file travels only beside a kept test file (fixture
-        # data): elsewhere it is likely build output from the UNFIXED tree
-        # (dist/, target/), which would shadow a correct fix.
-        support = sorted(f for f in new_files if f not in declared_any
-                         and (f in not_ignored or _beside_a_test(f)))
-        dest = leerie_dir / "acceptance" / f"set-{k}"
-        shutil.rmtree(dest, ignore_errors=True)
-        for rel in defect + control + support:
-            (dest / rel).parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(wt / rel, dest / rel)
-        out.update(valid=True, dir=str(dest), defect_files=defect,
-                   control_files=control, support_files=support, cases=cases,
-                   modes=modes, base_failing_cases=base_failing)
+        async def _call(prompt: str, suffix: str = "") -> dict:
+            return await claude_p(
+                user_prompt=prompt,
+                system_prompt=_load_prompt("acceptance_writer"),
+                schema_key="acceptance_writer", cwd=str(wt),
+                allowed_tools=ACT_TOOLS, max_turns=100, autonomous=True,
+                caps=caps, st=st,
+                model=models.get("acceptance_writer", MODEL_DEFAULT),
+                effort=efforts.get("acceptance_writer"),
+                sid=sid + suffix, **kw)
+        res = await _call(user)
+        if db_ctx is not None:
+            hits = _prisma_mock_hits(st.repo_root, base, wt,
+                                     _acceptance_new_files(wt, pre_untracked,
+                                                           refs),
+                                     db_ctx["client"])
+            if hits:
+                # One fix-up call (Q6/R4): a set that mocks the client is
+                # the hand-rolled fake the real database exists to replace.
+                _bump_or_stop(st, caps)
+                fix = await _call(
+                    user + "\n\nNOTE FROM ORCHESTRATOR (typed): "
+                    + json.dumps({"files_mocking_the_prisma_client": hits})
+                    + "\nThese set files mock the repository's Prisma client. "
+                    "Use the real client against the real test database "
+                    "named in DATABASE_URL instead, re-run the files and "
+                    "return the JSON object per your schema listing the "
+                    "final files.", "-fix")
+                if fix.get("files"):
+                    res = fix
+        out["declared_defect"] = any(
+            f.get("kind") == "defect" for f in (res.get("files") or []))
+        dest_name = f"set-{k}" if rewrite_of is None else f"set-{k}-rw"
+        got = await _collect_acceptance_set(k, st, caps, wt, base, res, refs,
+                                            pre_untracked, log_path, name,
+                                            env_extra, dest_name)
+        rounds = int(caps.get("acceptance_rewrite_rounds",
+                              DEFAULT_CAPS["acceptance_rewrite_rounds"]))
+        if (rewrite_of is None and got.get("no_defect_fails")
+                and rounds >= 1):
+            log(f"  acceptance set {k}: no defect case fails at the own "
+                "start — asking the writer once more")
+            _bump_or_stop(st, caps)
+            summary = "\n".join(
+                f"- {rel}: " + (", ".join(f"{c} {s}" for c, s in cs.items())
+                                or "(no case reported)")
+                for rel, cs in got["no_defect_fails"].items())
+            res = await _call(user + "\n\nNOTE FROM ORCHESTRATOR: "
+                              + _NO_DEFECT_FAILS_NOTE.format(summary=summary),
+                              "-r1")
+            out["declared_defect"] = any(
+                f.get("kind") == "defect" for f in (res.get("files") or []))
+            got = await _collect_acceptance_set(
+                k, st, caps, wt, base, res, refs, pre_untracked, log_path,
+                name, env_extra, dest_name)
+            got["own_start_rewrite"] = True
+        got.pop("no_defect_fails", None)
+        out.update(got)
         return out
+    except _BudgetStop as e:
+        raise e.err from None
     except (WorkerError, subprocess.TimeoutExpired) as e:
         out["reason"] = _brief_worker_exc(e)
         return out
@@ -36730,7 +37533,195 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
         out["reason"] = f"{type(e).__name__}: {e}"[:200]
         return out
     finally:
+        _drop_test_db(db_url)
         _remove_acceptance_checkout(st, wt)
+
+
+
+class _BudgetStop(Exception):
+    """Carries a worker-budget `WorkerError` past a writer's own
+    `except WorkerError` (which reads a worker failure as an invalid set):
+    budget exhaustion must stop the run."""
+
+    def __init__(self, err: WorkerError) -> None:
+        super().__init__(str(err))
+        self.err = err
+
+
+def _bump_or_stop(st: "State", caps: dict) -> None:
+    try:
+        st.bump_workers(caps)
+    except WorkerError as e:
+        raise _BudgetStop(e) from e
+
+
+def _acceptance_new_files(wt: Path, pre_untracked: set[str],
+                          refs: list[str]) -> list[str]:
+    """Untracked files the writer left (ignored ones included), minus the
+    install's output, the report copies and runner caches."""
+    post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
+                           "-z"], capture_output=True, text=True, check=False)
+    return sorted(p for p in post.stdout.split("\0")
+                  if p and p not in refs and p not in pre_untracked
+                  and not _acceptance_is_cache_path(p))
+
+
+async def _collect_acceptance_set(k: int, st: "State", caps: dict, wt: Path,
+                                  base: str, res: dict, refs: list[str],
+                                  pre_untracked: set[str], log_path: Path,
+                                  label: str, env_extra: dict | None,
+                                  dest_name: str) -> dict:
+    """Collect and validate, per case at `base`, what a writer left in `wt`
+    (DESIGN §8): `{valid, reason?, dir, defect_files, control_files,
+    support_files, cases, modes, base_failing_cases}`. Valid only with at
+    least one discriminating defect file and at least one passing control
+    file. When every declared defect file ran and passed, `no_defect_fails`
+    carries their per-case statuses (the writer's one retry reads them)."""
+    out: dict = {"valid": False}
+    # What the writer actually left in the tree (git porcelain —
+    # mechanical CLI output). Validation runs on THIS tree, so the set
+    # must carry exactly it: an edited tracked file invalidates the set,
+    # and every undeclared new file (a fixture module, a helper) becomes
+    # a support file copied with the set — without it a correct fix
+    # fails the set elsewhere.
+    porcelain = subprocess.run(
+        ["git", "-C", str(wt), "status", "--porcelain=v1", "-z",
+         "--untracked-files=no"],
+        capture_output=True, text=True, check=False)
+    # Untracked files INCLUDING ignored ones (no --exclude-standard): a
+    # helper the repo's .gitignore happens to match is still needed.
+    post = subprocess.run(["git", "-C", str(wt), "ls-files", "--others",
+                           "-z"], capture_output=True, text=True,
+                          check=False)
+    visible = subprocess.run(["git", "-C", str(wt), "ls-files",
+                              "--others", "--exclude-standard", "-z"],
+                             capture_output=True, text=True, check=False)
+    if (porcelain.returncode != 0 or post.returncode != 0
+            or visible.returncode != 0):
+        out["reason"] = "could not read the writer's worktree status"
+        return out
+    for entry in porcelain.stdout.split("\0"):
+        if len(entry) >= 4:
+            out["reason"] = f"writer modified a tracked file: {entry[3:]}"
+            return out
+    new_files = sorted(
+        p for p in post.stdout.split("\0")
+        if p and p not in refs and p not in pre_untracked
+        and not _acceptance_is_cache_path(p))
+    defect, control, cases, modes = [], [], {}, {}
+    # Declared defect files that ran and passed: their per-case statuses
+    # are the note of the writer's one own-start retry.
+    passed_defects: dict[str, dict] = {}
+    base_failing: dict[str, list[str]] = {}
+    for f in (res.get("files") or []):
+        rel = _acceptance_declared_rel(f)
+        # Relative, inside the worktree, a real file, not the report.
+        if (not rel or os.path.isabs(rel) or ".." in Path(rel).parts
+                or rel in refs):
+            continue
+        p_ = (wt / rel).resolve()
+        if not str(p_).startswith(str(wt.resolve()) + os.sep) \
+                or not p_.is_file():
+            continue
+        # New files only (code, not the prompt, enforces it): an edited
+        # existing test would collide with the target tree's own copy at
+        # evaluation and could never be run there.
+        if subprocess.run(["git", "-C", str(wt), "cat-file", "-e",
+                           f"{base}:{rel}"], capture_output=True,
+                          check=False).returncode == 0:
+            continue
+        mode = ("import" if f.get("kind") == "defect"
+                and f.get("failure_mode") == "import" else "assertion")
+        if mode == "import" and not rel.endswith(".py"):
+            # The declaration cannot be honoured (no reliable parse
+            # check outside Python), and an unloadable file would
+            # otherwise discard the whole set: drop just this file, and
+            # say why — the writer was told so.
+            log(f"  acceptance set {k}: {rel} declared an import defect, "
+                "honoured only for Python test files — file dropped")
+            continue
+        if mode == "import":
+            parses, why = await _acceptance_parse_probe(
+                st, caps, str(wt), rel,
+                [rel] + [n for n in new_files
+                         if n.endswith(".py") and n != rel],
+                log_path, f"{label}-base")
+            if parses is not True:
+                # A file — or another Python file the writer wrote — that
+                # does not parse under the project's interpreter fails to
+                # load by the writer's own fault; and a probe that never
+                # reached its check cannot show otherwise. Validate it as
+                # an ordinary file, so a load failure is no verdict and
+                # discards the set. The log says which it was.
+                log(f"  acceptance set {k}: {rel} declared an import "
+                    f"defect, but {why} — declaration not honoured")
+                mode = "assertion"
+        observed: dict = {}
+        verdict = await _run_acceptance_file(
+            st, caps, str(wt), rel, log_path, f"{label}-base",
+            validating=True, failure_mode=mode, observed=observed,
+            **_env_kw(env_extra))
+        if verdict is None:
+            # Not measurable (no test command for this file, the runner
+            # is missing, or it ran no test) — never mistaken for pass
+            # or fail.
+            out["reason"] = f"could not run {rel} on the validity base"
+            return out
+        if f.get("kind") == "defect":
+            # Must FAIL on the unfixed tree, or it cannot discriminate.
+            if verdict is False:
+                defect.append(rel)
+                if observed.get("failing_cases"):
+                    base_failing[rel] = observed["failing_cases"]
+                # "import" only when the base run showed the file failing
+                # to load; a declared import defect that loaded and failed
+                # an assertion is an ordinary failure.
+                modes[rel] = ("import" if observed.get("load_failure")
+                              else "assertion")
+                cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
+            else:
+                passed_defects[rel] = observed.get("case_status") or {}
+        elif verdict is True:
+            control.append(rel)
+            cases[rel] = [str(c) for c in (f.get("cases") or [])][:20]
+        elif f.get("kind") == "control":
+            out["reason"] = f"control file {rel} does not pass on base"
+            return out
+    if not defect:
+        out["reason"] = "no defect file fails on the validity base"
+        if passed_defects:
+            out["no_defect_fails"] = passed_defects
+        return out
+    if not control:
+        # A set with no control cannot show an over-broad fix (DESIGN §8).
+        out["reason"] = "no control file passes on the validity base"
+        return out
+    # Every undeclared new file travels — a conftest or helper beside the
+    # tests is test-shaped by path and still needed. Declared files that
+    # were dropped (a defect file that passes on base) are not carried.
+    declared_any = {_acceptance_declared_rel(f) for f in
+                    (res.get("files") or [])}
+    not_ignored = {p for p in visible.stdout.split("\0") if p}
+    test_dirs = {os.path.dirname(f) for f in defect + control}
+
+    def _beside_a_test(f: str) -> bool:
+        d = os.path.dirname(f)
+        return any(d == t or (t and d.startswith(t + "/"))
+                   for t in test_dirs)
+    # An ignored file travels only beside a kept test file (fixture
+    # data): elsewhere it is likely build output from the UNFIXED tree
+    # (dist/, target/), which would shadow a correct fix.
+    support = sorted(f for f in new_files if f not in declared_any
+                     and (f in not_ignored or _beside_a_test(f)))
+    dest = st.run_dir / "acceptance" / dest_name
+    shutil.rmtree(dest, ignore_errors=True)
+    for rel in defect + control + support:
+        (dest / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(wt / rel, dest / rel)
+    out.update(valid=True, dir=str(dest), defect_files=defect,
+               control_files=control, support_files=support, cases=cases,
+               modes=modes, base_failing_cases=base_failing)
+    return out
 
 
 def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
@@ -36818,7 +37809,11 @@ async def phase_acceptance_write(task: str, st: "State", caps: dict,
         async with sem:
             return await _write_acceptance_set(k, task, st, caps, models,
                                                efforts, base)
-    results = await _gather_or_cancel(*[_one(k) for k in range(1, n + 1)])
+    async with _test_db_session(st):
+        results = await _gather_or_cancel(*[_one(k)
+                                            for k in range(1, n + 1)])
+    for r in results:
+        r.pop("declared_defect", None)
     sets = [r for r in results if r.get("valid")]
     for r in results:
         if not r.get("valid"):
@@ -36879,9 +37874,9 @@ async def _evaluate_acceptance_sets(st: "State", caps: dict, tree: str,
     disk) is no evidence from any set — never an exception that would skip
     a repair's rollback check."""
     try:
-        return await _evaluate_acceptance_sets_inner(st, caps, tree, sets,
-                                                     label, rev=rev,
-                                                     confirm=confirm)
+        async with _test_db_session(st):
+            return await _evaluate_acceptance_sets_inner(
+                st, caps, tree, sets, label, rev=rev, confirm=confirm)
     except Exception as e:
         log(f"  acceptance: evaluation failed ({type(e).__name__}: {e}) — "
             "no evidence either way")
@@ -36942,80 +37937,109 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
             log("  acceptance: dependency install failed in the evaluation "
                 "worktree — no evidence either way")
             return unmeasured_all
-        for s_ in sets:
-            failing, copied, ran = [], [], []
-            resource_affected: list[str] = []
-            unmeasured = False
-            try:
-                for rel in ((s_.get("support_files") or [])
-                            + s_["defect_files"] + s_["control_files"]):
-                    dst = wt / rel
-                    if dst.exists():
-                        # Never overwrite (or run in its place) a file the
-                        # tree already has — and never count the set as
-                        # passing on a file it could not run.
-                        unmeasured = True
-                        continue
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(Path(s_["dir"]) / rel, dst)
-                    copied.append(dst)
-                    if rel not in (s_.get("support_files") or []):
-                        ran.append(rel)
-                for rel in ran:
-                    verdict = await _run_acceptance_file(
-                        st, caps, str(wt), rel, log_path,
-                        f"acceptance-{label}")
-                    if verdict is None:
-                        unmeasured = True
-                    elif verdict is False:
-                        failing.append(rel)
-                if failing and confirm:
-                    n_rerun = {"i": 0}
-
-                    async def _rerun(_left: float, _files=tuple(failing)
-                                     ) -> set[str] | None:
-                        n_rerun["i"] += 1
-                        still: set[str] = set()
-                        for rel in _files:
-                            v = await _run_acceptance_file(
-                                st, caps, str(wt), rel, log_path,
-                                f"acceptance-{label}-confirm{n_rerun['i']}")
-                            if v is None:
-                                return None
-                            if v is False:
-                                still.add(rel)
-                        return still
-                    verdict_ = await _confirm_still_failing(
-                        failing, _rerun, caps,
-                        label=f"acceptance {label} set {s_['index']}")
-                    resource_affected = list(verdict_["resource_affected"])
-                    failing = [r for r in failing
-                               if r in verdict_["confirmed"]]
-                    if resource_affected and not failing:
-                        unmeasured = True
-            except Exception as e:
-                # A copy that fails (a full disk) is no verdict on this set —
-                # and must not escape: a repair's rollback check runs after.
-                log(f"  acceptance: set {s_['index']} could not be placed "
-                    f"({type(e).__name__}) — no evidence from it")
-                unmeasured = True
-            finally:
-                # Sets are isolated from one another: one set's files are
-                # gone before the next set's go in.
-                for dst in copied:
-                    with contextlib.suppress(OSError):
-                        dst.unlink()
-            res_ = {"index": s_["index"],
-                    "passed": not failing and not unmeasured,
-                    "unmeasured": unmeasured and not failing,
-                    "failing_files": failing}
-            if resource_affected:
-                res_["resource_affected_files"] = resource_affected
-            results.append(res_)
+        url = await _create_test_db(st, wt, f"acceptance-eval-{label}")
+        try:
+            results = await _acceptance_run_placed(
+                st, caps, wt, sets, label, confirm=confirm,
+                env_extra=_test_db_env(url) if url else None)
+        finally:
+            _drop_test_db(url)
     finally:
         _teardown()
     return results
 
+
+async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
+                                 sets: list[dict], label: str, *,
+                                 confirm: bool = True,
+                                 env_extra: dict | None = None
+                                 ) -> list[dict]:
+    """Run each set in the prepared tree `wt`, one at a time: place its
+    files (never over a path the tree has — that makes the set
+    unmeasured), run them, confirm a failing file under B* when `confirm`,
+    and remove the copies before the next set. The evaluation worktree and
+    the surrogate witness's tree both go through here (DESIGN §8)."""
+    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    results: list[dict] = []
+    for s_ in sets:
+        failing, copied, ran = [], [], []
+        resource_affected: list[str] = []
+        unmeasured = False
+        try:
+            for rel in ((s_.get("support_files") or [])
+                        + s_["defect_files"] + s_["control_files"]):
+                dst = wt / rel
+                if dst.exists():
+                    # Never overwrite (or run in its place) a file the
+                    # tree already has — and never count the set as
+                    # passing on a file it could not run.
+                    unmeasured = True
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(Path(s_["dir"]) / rel, dst)
+                copied.append(dst)
+                if rel not in (s_.get("support_files") or []):
+                    ran.append(rel)
+            for rel in ran:
+                verdict = await _run_acceptance_file(
+                    st, caps, str(wt), rel, log_path,
+                    f"acceptance-{label}", **_env_kw(env_extra))
+                if verdict is None:
+                    unmeasured = True
+                elif verdict is False:
+                    failing.append(rel)
+            if failing and confirm:
+                n_rerun = {"i": 0}
+
+                async def _rerun(_left: float, _files=tuple(failing)
+                                 ) -> set[str] | None:
+                    n_rerun["i"] += 1
+                    still: set[str] = set()
+                    for rel in _files:
+                        v = await _run_acceptance_file(
+                            st, caps, str(wt), rel, log_path,
+                            f"acceptance-{label}-confirm{n_rerun['i']}",
+                            **_env_kw(env_extra))
+                        if v is None:
+                            return None
+                        if v is False:
+                            still.add(rel)
+                    return still
+                verdict_ = await _confirm_still_failing(
+                    failing, _rerun, caps,
+                    label=f"acceptance {label} set {s_['index']}")
+                resource_affected = list(verdict_["resource_affected"])
+                failing = [r for r in failing
+                           if r in verdict_["confirmed"]]
+                if resource_affected and not failing:
+                    unmeasured = True
+        except Exception as e:
+            # A copy that fails (a full disk) is no verdict on this set —
+            # and must not escape: a repair's rollback check runs after.
+            log(f"  acceptance: set {s_['index']} could not be placed "
+                f"({type(e).__name__}) — no evidence from it")
+            unmeasured = True
+        finally:
+            # Sets are isolated from one another: one set's files are
+            # gone before the next set's go in.
+            for dst in copied:
+                with contextlib.suppress(OSError):
+                    dst.unlink()
+        res_ = {"index": s_["index"],
+                "passed": not failing and not unmeasured,
+                "unmeasured": unmeasured and not failing,
+                "failing_files": failing}
+        if resource_affected:
+            res_["resource_affected_files"] = resource_affected
+        results.append(res_)
+    return results
+
+
+
+def _env_kw(env_extra: dict | None) -> dict:
+    """`env_extra` as a keyword only when set, so an environment-free call
+    keeps the exact signature it always had."""
+    return {"env_extra": env_extra} if env_extra else {}
 
 def _acceptance_measured(results: list[dict]) -> list[dict]:
     """Sets that produced a verdict: one whose files could not all be run
@@ -37113,11 +38137,579 @@ def _format_acceptance_failures_section(results: list[dict],
     return "\n".join(lines)
 
 
+# --- Held-out set audit and the one rewrite (DESIGN §8 *A set that keeps
+# failing is audited, and rewritten once*).
+_SET_AUDIT_KINDS = ("harness_unreachable", "coupling", "contradicts_task",
+                    "overspecified_mechanism", "environment", "test_bug")
+# Which quotes each `defect_kind` must carry for its set_defect to count
+# (Q6 c+, as benched): every kind quotes the set file.
+_SET_AUDIT_QUOTES = {
+    "harness_unreachable": ("test", "prod"), "coupling": ("test", "prod"),
+    "contradicts_task": ("test", "task"),
+    "overspecified_mechanism": ("test", "task"),
+    "environment": ("test", "failure"), "test_bug": ("test",)}
+_AUDIT_QUOTE_MIN = 12
+_AUDIT_FAILURE_MSG_MAX = 1500
+# The rewrite note's closing instructions, as benched: Q6 round 2 (an
+# audit's typed cases) and round 6 (M1/M2 findings).
+_REWRITE_TAIL_TYPED = (
+    "Your held-out set (its files are in this checkout at the paths above) "
+    "was audited after the run: the cases listed in the note can NOT pass "
+    "against any correct fix of the report, for the typed reason given (the "
+    "quoted lines are where). Rewrite the set so that every defect case "
+    "checks the report's contract through the repository's public entry "
+    "point and fails on this tree only for the reported reason: model the "
+    "world the code talks to (a real DOM/engine, an in-memory store that "
+    "serves every query, schema-conformant rows), never the "
+    "implementation's private protocol (which browser expression, helper, "
+    "query member or call order it uses). Keep cases the note does not name "
+    "unless they share the defect.")
+_REWRITE_TAIL_MECHANICAL = (
+    "The mechanical findings are code facts. A case that reads a recorded "
+    "call by position depends on which calls the test's own setup or the "
+    "implementation makes, and a case that drives an internal helper "
+    "depends on where a fix puts the behaviour. Rewrite only what these "
+    "findings name so each case asserts the report's observable outcome "
+    "through the entry point production callers use; keep every other case "
+    "and its intent.")
+_REWRITE_TAIL_SURROGATE = (
+    "An independent engineer fixed the report in a separate checkout "
+    "without ever seeing your set, and the cases listed under "
+    "`failing_on_an_independent_fix` still fail on that fix. Check each "
+    "against the report's contract: where a case depends on how a fix is "
+    "built rather than on the report's observable outcome, rewrite it to "
+    "assert the outcome through the public entry point; keep a case that "
+    "checks the contract as it is.")
+_REWRITE_CLOSE = (" Run them here, then return the JSON object per your "
+                  "schema, listing the final files.")
+# The one-time own-start rewrite when no defect case fails (benched in C1 as
+# the writer's Fix A.3 rewrite round).
+_NO_DEFECT_FAILS_NOTE = (
+    "Your set was run on this tree (the run's own starting HEAD). No defect "
+    "case failed, so as written it cannot discriminate and would not be "
+    "kept. Runner result per case:\n{summary}\n\nIf the reported defect "
+    "genuinely still reproduces on this tree, rewrite the defect tests so "
+    "they fail here for that reason (keep the controls passing). If it no "
+    "longer reproduces here, say so in `notes` and return your files "
+    "unchanged. Return the JSON object per your schema.")
+
+
+def _audit_norm(text: str | None) -> str:
+    return " ".join((text or "").split())
+
+
+def _audit_quote_in(haystack: str, quote: str | None) -> bool:
+    """A quote counts only when it is at least `_AUDIT_QUOTE_MIN`
+    characters and appears verbatim (whitespace aside) in `haystack`."""
+    q = _audit_norm(quote)
+    return len(q) >= _AUDIT_QUOTE_MIN and q in _audit_norm(haystack)
+
+
+def _verify_set_audit_case(case: dict, *, set_texts: dict[str, str],
+                           tree: Path, task_text: str,
+                           messages: dict[str, str]) -> list[str]:
+    """The quotes a typed `set_defect` failed to back, `[]` when every quote
+    its kind requires is a verbatim substring of the file it names: the set
+    file for `test_quote` (never a repository file), a repository file for
+    `prod_quote` (never a set file), the task for `task_quote`, the case's
+    failure message for `failure_quote`."""
+    need = _SET_AUDIT_QUOTES.get(case.get("defect_kind"), ("test",))
+    bad: list[str] = []
+    if "test" in need:
+        tq = case.get("test_quote") or {}
+        if not _audit_quote_in(set_texts.get(str(tq.get("file") or ""), ""),
+                               tq.get("quote")):
+            bad.append("test_quote")
+    if "prod" in need:
+        pq = case.get("prod_quote") or {}
+        rel = os.path.normpath(str(pq.get("file") or "_"))
+        path = (tree / rel).resolve()
+        text = ""
+        if (rel not in set_texts and not os.path.isabs(rel)
+                and ".." not in Path(rel).parts and path.is_file()):
+            with contextlib.suppress(OSError):
+                text = path.read_text(errors="replace")
+        if not _audit_quote_in(text, pq.get("quote")):
+            bad.append("prod_quote")
+    if "task" in need and not _audit_quote_in(task_text,
+                                              case.get("task_quote")):
+        bad.append("task_quote")
+    if "failure" in need and not _audit_quote_in(
+            messages.get(str(case.get("case") or ""), ""),
+            case.get("failure_quote")):
+        bad.append("failure_quote")
+    return bad
+
+
+def _place_set(set_: dict, wt: Path) -> tuple[list[Path], bool]:
+    """Copy a set's files into `wt`; (copied paths, complete) — a path the
+    tree already has is never overwritten, and makes the placement
+    incomplete."""
+    copied: list[Path] = []
+    complete = True
+    for rel in _set_files(set_):
+        dst = wt / rel
+        if dst.exists():
+            complete = False
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(set_["dir"]) / rel, dst)
+        copied.append(dst)
+    return copied, complete
+
+
+def _unplace(copied: Iterable[Path]) -> None:
+    for dst in copied:
+        with contextlib.suppress(OSError):
+            dst.unlink()
+
+
+async def _acceptance_case_failures(st: "State", caps: dict, wt: Path,
+                                    set_: dict, log_path: Path, label: str,
+                                    env_extra: dict | None
+                                    ) -> list[dict]:
+    """Every failing case of a placed set on `wt`, from the runner's report:
+    `{case, file, kind, failure_message}` (the message capped)."""
+    out: list[dict] = []
+    for kind, files in (("defect", set_.get("defect_files") or []),
+                        ("control", set_.get("control_files") or [])):
+        for rel in files:
+            observed: dict = {}
+            verdict = await _run_acceptance_file(
+                st, caps, str(wt), rel, log_path, label, validating=True,
+                failure_mode=(set_.get("modes") or {}).get(rel, "assertion"),
+                observed=observed, **_env_kw(env_extra))
+            if verdict is not False:
+                continue
+            msgs = observed.get("failure_messages") or {}
+            ids = observed.get("failing_cases") or []
+            if not ids and observed.get("load_failure"):
+                ids = [f"{rel} :: (file failed to load)"]
+            for cid in ids:
+                out.append({"case": cid, "file": rel, "kind": kind,
+                            "failure_message": str(msgs.get(cid) or "")[
+                                :_AUDIT_FAILURE_MSG_MAX]})
+    return out
+
+
+async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
+                               efforts: dict, wt: Path, set_: dict, *,
+                               label: str, harness_rev: str,
+                               tree_note: str,
+                               env_extra: dict | None) -> dict:
+    """The c+ set audit of one set in a prepared tree `wt` (DESIGN §8):
+    place the set, read its failing cases from the runner's report, then
+    `set_audit_samples` independent `set_auditor` samples, each told the
+    repository's own test harness. A typed `set_defect` counts only when
+    code finds every quote its kind requires (`_verify_set_audit_case`); the
+    verdict is the UNION of the samples' counted cases. Returns
+    `{failing_cases, findings, kinds, samples}`. Budget exhaustion
+    propagates; a sample that fails otherwise is no finding."""
+    out: dict = {"failing_cases": [], "findings": [], "kinds": [],
+                 "samples": 0}
+    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+    copied, complete = _place_set(set_, wt)
+    refs_copied: list[Path] = []
+    try:
+        if not complete:
+            out["skipped"] = "a set path already exists in the audited tree"
+            return out
+        failing = await _acceptance_case_failures(
+            st, caps, wt, set_, log_path, f"acceptance-{label}", env_extra)
+        out["failing_cases"] = [{k: c[k] for k in ("case", "file", "kind")}
+                                for c in failing]
+        if not failing:
+            return out
+        task = st.data.get("task") or ""
+        refs = []
+        for f in _glob_task_references(task, st.repo_root):
+            rel = _repo_rel(f, st.repo_root)
+            dst = wt / rel
+            if not dst.exists():
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(f, dst)
+                refs_copied.append(dst)
+            refs.append(rel)
+        g = _js_source_graph(st.repo_root, harness_rev)
+        harness = _repo_test_harness(st.repo_root, harness_rev,
+                                     _set_production_imports(g, set_))
+        shape = (st.data.get("defect_scope") or {}).get("defect_shape")
+        user = "\n\n".join([
+            harness,
+            "TASK:\n" + task[:20000],
+            "Files the task references (the report; read them): "
+            + json.dumps(refs),
+            "AUDITED DEFECT CONTRACT: " + (shape or "(none)"),
+            "HELD-OUT SET FILES (staged at these paths in your cwd): "
+            + json.dumps({"defect": set_.get("defect_files") or [],
+                          "control": set_.get("control_files") or [],
+                          "support": set_.get("support_files") or []}),
+            f"FAILING CASES on this tree ({tree_note}; `kind` says whether "
+            "the case is a defect or a control case; a failing control means "
+            "existing behaviour the set expects to keep):\n"
+            + json.dumps(failing, indent=1),
+            "Classify every failing case per your rules and return the JSON "
+            "object per your schema."])
+        set_texts = {}
+        for rel in _set_files(set_):
+            with contextlib.suppress(OSError):
+                set_texts[rel] = (Path(set_["dir"]) / rel).read_text(
+                    errors="replace")
+        task_text = task + "\n" + "\n".join(
+            (wt / r).read_text(errors="replace") for r in refs
+            if (wt / r).is_file())
+        messages = {c["case"]: c["failure_message"] for c in failing}
+        names = {c["case"] for c in failing}
+        union: dict[str, dict] = {}
+        n = max(1, int(caps.get("set_audit_samples",
+                                DEFAULT_CAPS["set_audit_samples"])))
+        for i in range(1, n + 1):
+            st.bump_workers(caps)       # budget exhaustion propagates
+            try:
+                res = await claude_p(
+                    user_prompt=user,
+                    system_prompt=_load_prompt("set_auditor"),
+                    schema_key="set_auditor", cwd=str(wt),
+                    allowed_tools=SATISFIED_PROBE_TOOLS, max_turns=60,
+                    autonomous=False, caps=caps, st=st,
+                    model=models.get("set_auditor", MODEL_DEFAULT),
+                    effort=efforts.get("set_auditor"),
+                    sid=f"set-auditor-{label}-s{i}")
+            except (WorkerError, subprocess.TimeoutExpired) as e:
+                log(f"  acceptance: set audit sample {i} for {label} "
+                    f"failed ({_brief_worker_exc(e)}) — no finding")
+                continue
+            out["samples"] += 1
+            for c in (res.get("cases") or []):
+                cid = str(c.get("case") or "")
+                if (c.get("verdict") != "set_defect" or cid not in names
+                        or cid in union):
+                    continue
+                if _verify_set_audit_case(c, set_texts=set_texts, tree=wt,
+                                          task_text=task_text,
+                                          messages=messages):
+                    continue
+                union[cid] = {
+                    "case": cid, "defect_kind": c.get("defect_kind"),
+                    "test_quote": c.get("test_quote"),
+                    "prod_quote": c.get("prod_quote"),
+                    "reason": str(c.get("reason") or "")[:600],
+                    "sample": i}
+        out["findings"] = list(union.values())
+        out["kinds"] = sorted({f["defect_kind"] for f in out["findings"]
+                               if f.get("defect_kind")})
+        return out
+    finally:
+        _unplace(copied + refs_copied)
+
+
+@contextlib.asynccontextmanager
+async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
+                           label: str
+                           ) -> AsyncIterator[tuple[Path, dict | None] | None]:
+    """A disposable worktree of `rev` under the run dir with dependencies
+    installed and, in a Prisma repo, its own throwaway database: yields
+    `(wt, env_extra)` or None when it cannot be set up (no evidence)."""
+    wt = st.run_dir / "worktrees" / name
+    log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
+
+    def _teardown() -> None:
+        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+        _DEPS_INSTALLED.discard(os.path.realpath(wt))
+    _teardown()
+    url = None
+    try:
+        add = subprocess.run(["git", "-C", str(st.repo_root), "worktree",
+                              "add", "--detach", str(wt), rev],
+                             capture_output=True, text=True, check=False)
+        if add.returncode != 0 or not await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"acceptance-{label}", log_prefix="acceptance"):
+            yield None
+            return
+        url = await _create_test_db(st, wt, name)
+        yield wt, (_test_db_env(url) if url else None)
+    finally:
+        _drop_test_db(url)
+        _teardown()
+
+
+async def _acceptance_audit_on_rev(st: "State", caps: dict, models: dict,
+                                   efforts: dict, rev: str, set_: dict,
+                                   label: str) -> dict:
+    """`_acceptance_audit_in` on a fresh worktree of `rev` (the integrated
+    tree): none of the set lands in staging."""
+    async with _acceptance_tree(st, caps, rev, "acceptance-audit",
+                                label) as tree:
+        if tree is None:
+            return {"failing_cases": [], "findings": [], "kinds": [],
+                    "samples": 0, "skipped": "audit tree not set up"}
+        wt, env = tree
+        return await _acceptance_audit_in(
+            st, caps, models, efforts, wt, set_, label=label,
+            harness_rev=rev,
+            tree_note="after the run's implementation and repair rounds",
+            env_extra=env)
+
+
+async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
+                                efforts: dict, own: str) -> dict | None:
+    """One test-blind `surrogate_fixer` at the run's own start (Q6/R7): a
+    ref-less clone like the writer's, the report copied in, a full fix of
+    the report's contract left uncommitted in the tree. It never sees a set
+    (its `Read` denies cover them). `{dir, env}` or None when it could not
+    run or changed nothing — then it witnesses nothing."""
+    wt = st.run_dir / "worktrees" / "acceptance-surrogate"
+    log_path = st.run_dir / "logs" / "acceptance-surrogate.log"
+    _remove_acceptance_checkout(st, wt)
+    if _acceptance_writer_checkout(st, wt, own).startswith("failed"):
+        return None
+    task = st.data.get("task") or ""
+    copied: list[Path] = []
+    refs = []
+    for f in _glob_task_references(task, st.repo_root):
+        rel = _repo_rel(f, st.repo_root)
+        dst = wt / rel
+        if not dst.exists():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dst)
+            copied.append(dst)
+        refs.append(rel)
+    if not await _ensure_worktree_deps(
+            str(wt), st, caps, log_path=log_path,
+            verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+            label_prefix="acceptance-surrogate", log_prefix="acceptance"):
+        return {"dir": wt, "env": None, "abstained": "dependency install "
+                "failed"}
+    url = await _create_test_db(st, wt, "acceptance-surrogate")
+    env = _test_db_env(url) if url else None
+    scope = st.data.get("defect_scope") or {}
+    gt = scope.get("ground_truth") or {}
+    user = "\n".join([
+        "TASK:", task, "",
+        "Files the task references (read them; they are the report):",
+        *[f"- {r}" for r in refs], "",
+        "DEFECT CONTRACT (from the defect-scope audit): "
+        + (scope.get("defect_shape") or "(none)"), "",
+        "REPORT EXAMPLE INPUTS (verbatim from the report):",
+        json.dumps(gt.get("inline_examples") or [], indent=1), "",
+        "Your current working directory is a checkout of the UNFIXED tree. "
+        "Fix the report per your rules and return the JSON object per your "
+        "schema."])
+    st.bump_workers(caps)
+    kw = {"env_extra": env} if env else {}
+    try:
+        await claude_p(
+            user_prompt=user, system_prompt=_load_prompt("surrogate_fixer"),
+            schema_key="surrogate_fixer", cwd=str(wt),
+            allowed_tools=ACT_TOOLS, max_turns=150, autonomous=True,
+            caps=caps, st=st,
+            model=models.get("surrogate_fixer", MODEL_DEFAULT),
+            effort=efforts.get("surrogate_fixer"),
+            sid="acceptance-surrogate", **kw)
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        return {"dir": wt, "env": env, "url": url,
+                "abstained": _brief_worker_exc(e)}
+    # Only the report copies made above go; never a tracked file.
+    _unplace(copied)
+    changed = subprocess.run(["git", "-C", str(wt), "status",
+                              "--porcelain"], capture_output=True, text=True,
+                             check=False)
+    if changed.returncode != 0 or not changed.stdout.strip():
+        return {"dir": wt, "env": env, "url": url,
+                "abstained": "the independent fix changed nothing"}
+    return {"dir": wt, "env": env, "url": url}
+
+
+async def _acceptance_rewrite_set(k: int, task: str, st: "State", caps: dict,
+                                  models: dict, efforts: dict, base: str,
+                                  set_: dict, note: str) -> dict:
+    """The one rewrite of a set at the run's own start: the writer, given
+    its set's files back and the typed note. A rewrite that declares no
+    defect file is asked once more with the identical prompt (Q6/R8); the
+    caller keeps the original set unless the result is valid."""
+    res = await _write_acceptance_set(k, task, st, caps, models, efforts,
+                                      base, rewrite_of=set_, note=note)
+    if not res.get("declared_defect"):
+        log(f"  acceptance set {k}: the rewrite declared no defect file — "
+            "asking once more")
+        res = await _write_acceptance_set(k, task, st, caps, models, efforts,
+                                          base, rewrite_of=set_, note=note,
+                                          attempt=2)
+        res["retried_empty"] = True
+    return res
+
+
+def _rewrite_note(triggers: list[dict]) -> str:
+    """The typed note a rewrite gets: every trigger that fired, then the
+    benched closing instruction for each kind present."""
+    kinds = {t["kind"] for t in triggers}
+    tails = []
+    if kinds & {"set_audit", "surrogate_witness"} and any(
+            t.get("unsatisfiable_cases") for t in triggers):
+        tails.append(_REWRITE_TAIL_TYPED)
+    if "surrogate_witness" in kinds:
+        tails.append(_REWRITE_TAIL_SURROGATE)
+    if "mechanical" in kinds:
+        tails.append(_REWRITE_TAIL_MECHANICAL)
+    return ("NOTE FROM ORCHESTRATOR (typed): "
+            + json.dumps({"triggers": triggers}, indent=1) + "\n"
+            + " ".join(tails) + _REWRITE_CLOSE)
+
+
+_SET_FIELDS = ("dir", "defect_files", "control_files", "support_files",
+               "cases", "modes", "base_failing_cases")
+
+
+async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
+                                        models: dict, efforts: dict,
+                                        staging: str, final: list[dict],
+                                        final_sha: str) -> list[dict]:
+    """After the repair rounds (DESIGN §8 *A set that keeps failing is
+    audited, and rewritten once*): every measured set still failing is
+    checked by M1/M2, then the c+ audit on the integrated tree, then — only
+    when neither fired — the surrogate witness. Any trigger leads to exactly
+    one rewrite at the run's own start (`acceptance_rewrite_rounds`); no
+    trigger drops a case. The rewritten set is re-judged on the same tree;
+    a set still typed broken (by the audit) after its rewrite is marked
+    `broken`. Returns `final` with each rewritten set's new verdict. State
+    is saved after every step, so a resume never repeats a rewrite."""
+    acc = st.data.get("acceptance") or {}
+    sets = acc.get("sets") or []
+    by_index = {s_["index"]: s_ for s_ in sets}
+    results = {r["index"]: r for r in final}
+    for s_ in sets:
+        done = (s_.get("rewrite") or {}).get("result")
+        if isinstance(done, dict):
+            results[s_["index"]] = done
+    cap = int(caps.get("acceptance_rewrite_rounds",
+                       DEFAULT_CAPS["acceptance_rewrite_rounds"]))
+    own = acc.get("validity_base") or _acceptance_own_start(st)
+    task = st.data.get("task") or ""
+    rev = final_sha or "HEAD"
+    sur: dict = {}
+    todo = [i for i in sorted(results)
+            if i in by_index and not results[i].get("passed")
+            and not results[i].get("unmeasured")
+            and not _acceptance_set_broken(by_index[i])
+            and int(by_index[i].get("rewrite_rounds") or 0) < cap]
+
+    def _save() -> None:
+        st.data["acceptance"] = acc
+        st.save()
+    try:
+        for idx in todo:
+            s_ = by_index[idx]
+            triggers: list[dict] = []
+            mech = (_acceptance_mechanical_findings(st.repo_root, own, s_)
+                    if own else [])
+            if mech:
+                triggers.append({"kind": "mechanical", "findings": mech})
+            audit = await _acceptance_audit_on_rev(
+                st, caps, models, efforts, rev, s_, f"audit-{idx}")
+            s_["audit"] = {k: audit.get(k) for k in
+                           ("findings", "kinds", "samples", "skipped")
+                           if audit.get(k) is not None}
+            _save()
+            if audit["findings"]:
+                triggers.append({"kind": "set_audit",
+                                 "unsatisfiable_cases": audit["findings"]})
+            if not triggers and own:
+                if not sur:
+                    sur.update(await _acceptance_surrogate(
+                        st, caps, models, efforts, own) or {"abstained":
+                                                            "not set up"})
+                    if sur.get("abstained"):
+                        log(f"  acceptance: surrogate witness abstained "
+                            f"({sur['abstained']})")
+                if sur.get("dir") and not sur.get("abstained"):
+                    witness = await _acceptance_run_placed(
+                        st, caps, Path(sur["dir"]), [s_],
+                        f"surrogate-{idx}", confirm=True,
+                        env_extra=sur.get("env"))
+                    if witness and witness[0]["failing_files"]:
+                        sur_audit = await _acceptance_audit_in(
+                            st, caps, models, efforts, Path(sur["dir"]), s_,
+                            label=f"surrogate-audit-{idx}", harness_rev=own,
+                            tree_note="an independent fix of the report, "
+                            "made without seeing this set",
+                            env_extra=sur.get("env"))
+                        triggers.append({
+                            "kind": "surrogate_witness",
+                            "failing_on_an_independent_fix": [
+                                c["case"] for c in sur_audit["failing_cases"]
+                            ] or witness[0]["failing_files"],
+                            "unsatisfiable_cases": sur_audit["findings"]})
+            if not triggers:
+                continue
+            s_["rewrite_rounds"] = int(s_.get("rewrite_rounds") or 0) + 1
+            s_["rewrite"] = {"triggers": [t["kind"] for t in triggers]}
+            _save()
+            log(f"  acceptance set {idx}: still failing after repair; "
+                f"rewriting once at the own start "
+                f"({', '.join(t['kind'] for t in triggers)})")
+            new = await _acceptance_rewrite_set(
+                idx, task, st, caps, models, efforts, own, s_,
+                _rewrite_note(triggers))
+            rw = s_["rewrite"]
+            rw["retried_empty"] = bool(new.get("retried_empty"))
+            if new.get("valid"):
+                rw["outcome"] = "replaced"
+                rw["original"] = {k: s_.get(k) for k in _SET_FIELDS}
+                for k in _SET_FIELDS:
+                    s_[k] = new.get(k)
+                _save()
+                (res,) = await _evaluate_acceptance_sets(
+                    st, caps, staging, [s_], f"gate-rewrite-{idx}", rev=rev)
+                broken = False
+                if not res.get("passed") and not res.get("unmeasured"):
+                    again = await _acceptance_audit_on_rev(
+                        st, caps, models, efforts, rev, s_,
+                        f"reaudit-{idx}")
+                    s_["audit"] = {k: again.get(k) for k in
+                                   ("findings", "kinds", "samples",
+                                    "skipped")
+                                   if again.get(k) is not None}
+                    broken = bool(again["findings"])
+            else:
+                rw["outcome"] = "kept_original"
+                rw["reason"] = str(new.get("reason") or "")[:200]
+                res = results[idx]
+                broken = bool(audit["findings"])
+            if broken:
+                s_["broken"] = True
+                log(f"  acceptance set {idx}: still typed broken after its "
+                    "rewrite — not chased again, kept out of the next run's "
+                    "residual")
+            rw["result"] = res
+            results[idx] = res
+            _save()
+    finally:
+        if sur.get("dir"):
+            _drop_test_db(sur.get("url"))
+            _remove_acceptance_checkout(st, Path(sur["dir"]))
+    return [results.get(r["index"], r) for r in final]
+
+
 async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                                models: dict, efforts: dict) -> None:
     """Post-integration held-out acceptance gate (DESIGN §8 *Held-out
     acceptance tests*): at most two high-effort repair rounds, non-blocking,
-    with a mechanical rollback if the repair turns the test axis red."""
+    with a mechanical rollback if the repair turns the test axis red; then
+    the set audit and one rewrite of a set still failing. One throwaway
+    test-database session spans it (Prisma repos only)."""
+    async with _test_db_session(st):
+        await _run_acceptance_gate_inner(leerie_dir, st, caps, models,
+                                         efforts)
+
+
+async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
+                                     caps: dict, models: dict,
+                                     efforts: dict) -> None:
+    """`_run_acceptance_gate`'s body."""
     acc = st.data.get("acceptance") or {}
     sets = acc.get("sets") or []
     if not sets or (acc.get("gate") or {}).get("final") is not None:
@@ -37368,6 +38960,21 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                     "repair's commits remain on the branch")
                 # `final` keeps describing the repair's tree: it is what
                 # ships.
+    if (not gate.get("audited") and _acceptance_measured(final)
+            and _acceptance_any_fails(final)):
+        # A set still failing after the repair rounds is audited and, on any
+        # trigger, rewritten once at the own start (DESIGN §8 *A set that
+        # keeps failing is audited, and rewritten once*). Advisory: a
+        # failure leaves the verdict as it was.
+        try:
+            audit_sha = await _branch_head_sha(str(staging))
+            final = await _acceptance_audit_and_rewrite(
+                st, caps, models, efforts, str(staging), final,
+                audit_sha or final_sha)
+        except Exception as e:
+            log(f"  acceptance: set audit stopped ({type(e).__name__}: {e})"
+                " — verdicts kept as measured")
+        gate["audited"] = True
     gate["final"] = final
     # A repair that left nothing measurable (it broke the dependency
     # manifest, say) must not erase a failing verdict: the last measured

@@ -42,6 +42,32 @@ EFFORTS = {"acceptance_writer": "medium", "conformer": "low"}
 
 
 @pytest.fixture(autouse=True)
+def _confirm_at_once(leerie, monkeypatch):
+    """A failing set file is confirmed without B*'s reruns here: each rerun
+    re-ran real pytest files, and the file grew from 6m22s (fae7d99) to
+    about thirteen minutes; with this stub it is back to about six and a
+    half. B* itself is pinned with real reruns in
+    tests/test_acceptance_own_start.py (a flaky set file is resource-affected,
+    a consistent one confirmed) and tests/test_bstar_confirm.py."""
+    async def confirm_all(candidates, run_final, caps, *, label, **_kw):
+        cand = sorted(set(candidates))
+        return {"candidates": cand, "confirmed": cand,
+                "resource_affected": [], "reruns_required": 0,
+                "reruns_run": 0, "budget_exhausted": False, "gate": None}
+    monkeypatch.setattr(leerie, "_confirm_still_failing", confirm_all)
+
+
+@pytest.fixture(autouse=True)
+def _no_set_audit(leerie, monkeypatch):
+    """The post-repair set audit and rewrite has its own file
+    (tests/test_acceptance_set_audit.py); the gate tests here pin the repair
+    rounds, whose fakes answer only the conformer."""
+    async def unchanged(st, caps, models, efforts, staging, final, sha):
+        return final
+    monkeypatch.setattr(leerie, "_acceptance_audit_and_rewrite", unchanged)
+
+
+@pytest.fixture(autouse=True)
 def _clear_deps_memo(leerie):
     leerie._DEPS_INSTALLED.clear()
     yield
@@ -82,6 +108,19 @@ def _st(leerie, tmp_path, repo, head, **data):
     st.data.update(data)
     st.save()
     return st
+
+
+def _plus_control(wt, out: dict, rel: str = "acc/test_control_zero.py"
+                  ) -> dict:
+    """A valid set needs at least one passing control (DESIGN §8): a writer
+    stub that declares only defect files adds this one."""
+    p = Path(wt) / rel
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(CONTROL_TEST)
+    out["files"].append({"path": rel, "kind": "control",
+                         "cases": ["zero stays zero"],
+                         "failure_mode": "assertion"})
+    return out
 
 
 def _writer_stub(leerie, monkeypatch, files_by_set):
@@ -474,8 +513,9 @@ def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
         # What running the test leaves behind.
         subprocess.run([sys.executable, "-m", "pytest", "-q",
                         "tests/test_defect_h.py"], cwd=wt, capture_output=True)
-        return {"files": [{"path": "tests/test_defect_h.py", "kind": "defect",
-                           "cases": ["sums via helper"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "tests/test_defect_h.py", "kind": "defect",
+             "cases": ["sums via helper"]}]}, "tests/test_control_zero.py")
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
@@ -1130,7 +1170,10 @@ def _import_writer(leerie, monkeypatch, files):
             if mode:
                 decl.append({"path": rel, "kind": "defect",
                              "cases": ["mul exists"], "failure_mode": mode})
-        return {"files": decl}
+        control = ("acc/control_zero_test.py"
+                   if any(r.endswith("_test.py") for r in files)
+                   else "acc/test_control_zero.py")
+        return _plus_control(wt, {"files": decl}, control)
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
 
 
@@ -1543,8 +1586,9 @@ def test_undeclared_helper_travels_with_the_set(leerie, tmp_path,
         (wt / "acc" / "__init__.py").write_text("")
         (wt / "acc" / "helper_vals.py").write_text("EXPECTED = 5\n")
         (wt / "acc" / "test_defect_h.py").write_text(helper_test)
-        return {"files": [{"path": "acc/test_defect_h.py", "kind": "defect",
-                           "cases": ["sums via helper"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "acc/test_defect_h.py", "kind": "defect",
+             "cases": ["sums via helper"]}]})
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
@@ -1619,14 +1663,15 @@ def test_absolute_path_is_rejected_and_one_writer_cannot_sink_the_rest(
         if k == 1:
             q = Path(kw["cwd"]) / "acc" / "test_defect_1b.py"
             q.write_text(DEFECT_TEST)
-            return {"files": [
+            return _plus_control(kw["cwd"], {"files": [
                 {"path": str(p), "kind": "defect", "cases": ["a"]},
                 {"path": "acc/test_defect_1b.py", "kind": "defect",
-                 "cases": ["b"]}]}
+                 "cases": ["b"]}]})
         if k == 2:
             raise OSError("writer 2 blew up")
-        return {"files": [{"path": f"acc/test_defect_{k}.py", "kind": "defect",
-                           "cases": ["c"]}]}
+        return _plus_control(kw["cwd"], {"files": [
+            {"path": f"acc/test_defect_{k}.py", "kind": "defect",
+             "cases": ["c"]}]})
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
@@ -1683,8 +1728,9 @@ def test_ignored_build_output_elsewhere_does_not_travel(leerie, tmp_path,
         (wt / "dist" / "calc_built.py").write_text(BUGGY)
         (wt / "acc").mkdir()
         (wt / "acc" / "test_defect_x.py").write_text(DEFECT_TEST)
-        return {"files": [{"path": "acc/test_defect_x.py", "kind": "defect",
-                           "cases": ["sums"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "acc/test_defect_x.py", "kind": "defect",
+             "cases": ["sums"]}]})
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
         st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))
@@ -1711,8 +1757,9 @@ def test_a_gitignored_helper_still_travels(leerie, tmp_path, monkeypatch):
         (wt / "acc").mkdir()
         (wt / "acc" / "cases.json").write_text('{"want": 5}')
         (wt / "acc" / "test_defect_j.py").write_text(reader)
-        return {"files": [{"path": "acc/test_defect_j.py", "kind": "defect",
-                           "cases": ["sums per cases.json"]}]}
+        return _plus_control(wt, {"files": [
+            {"path": "acc/test_defect_j.py", "kind": "defect",
+             "cases": ["sums per cases.json"]}]})
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     acc = asyncio.run(leerie.phase_acceptance_write(
         st.data["task"], st, _caps(leerie, 1), MODELS, EFFORTS))

@@ -42,7 +42,8 @@ report is among the files the task references; read it in full first.
    holds. The harness re-checks this case by case from the runner's
    report of which tests ran and how each ended (by exit code only where
    the runner can write no report); it drops a defect file none of whose
-   cases fails here, and discards the set if any control case fails. A
+   cases fails here, and discards the set if any control case fails or
+   it has no control file at all. A
    file that runs no test at all, or that cannot be loaded, discards your
    WHOLE set — every file in it — unless rule 7 applies.
 7. **Import defects.** When the report's defect IS that loading fails —

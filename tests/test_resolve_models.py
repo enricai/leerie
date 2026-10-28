@@ -30,7 +30,7 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "classification_judge", "wiring_judge", "provision_judge",
            "task_coverage_judge", "artifact_registry", "integration_judge",
            "no_work_judge", "delivery_judge", "defect_scope_auditor",
-           "rebaser", "acceptance_writer")
+           "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -58,6 +58,11 @@ DEFAULTS = {
     "defect_scope_auditor": "sonnet",
     "rebaser": "sonnet",
     "acceptance_writer": "sonnet",
+    # The held-out set audit and the surrogate witness (DESIGN §8 *A set
+    # that keeps failing is audited, and rewritten once*): sonnet through
+    # the MODEL_DEFAULT fallback.
+    "set_auditor": "sonnet",
+    "surrogate_fixer": "sonnet",
 }
 
 

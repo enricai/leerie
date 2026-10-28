@@ -105,6 +105,14 @@ def _writer(leerie, monkeypatch, files, probe=None):
             p.write_text(text)
             decl.append({"path": rel, "kind": kind, "cases": cases,
                          "failure_mode": "assertion"})
+        if not any(d["kind"] == "control" for d in decl):
+            # A valid set needs a passing control (DESIGN §8).
+            p = Path(kw["cwd"]) / "acc" / "test_control_auto.py"
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(CONTROL_TEST)
+            decl.append({"path": "acc/test_control_auto.py",
+                         "kind": "control", "cases": ["zero"],
+                         "failure_mode": "assertion"})
         return {"files": decl}
     monkeypatch.setattr(leerie, "claude_p", fake)
     return seen
