@@ -797,54 +797,93 @@ def test_integrator_crash_rescues_work_aborts_and_dies(leerie, tmp_path, monkeyp
     assert "rescued" in st.data["blocked"]["feat-001"]
 
 
-def test_resolved_but_merge_not_committed_aborts_and_dies(leerie, tmp_path, monkeypatch):
-    """An integrator claiming 'resolved' while the worktree is still
-    mid-merge is a lie (the integrator-side analogue of
-    check_branch_has_commits) — the merge is aborted and the run dies."""
-    st = _state(leerie, tmp_path)
-    leerie_dir = tmp_path / ".leerie"
-    staging = _staging_repo(leerie_dir)
+def _conflicting_staging(leerie_dir):
+    """A staging repo on `main` plus an `incoming` branch that conflicts
+    with it on app.py; returns (staging, pre_sha). The fake integrate.sh
+    below starts the real merge, so the integrator meets a real
+    mid-merge tree."""
+    import subprocess
 
-    results = {"feat-001": {"status": "complete"}}
+    def g(*a):
+        return subprocess.run(["git", *a], cwd=str(staging), check=True,
+                              capture_output=True, text=True).stdout
+    staging = leerie_dir / "worktrees" / "staging"
+    staging.mkdir(parents=True)
+    g("init", "-q", "-b", "main")
+    g("config", "user.email", "t@x")
+    g("config", "user.name", "t")
+    (staging / "app.py").write_text("x = 0\n")
+    g("add", "-A")
+    g("commit", "-q", "-m", "base")
+    g("checkout", "-q", "-b", "incoming")
+    (staging / "app.py").write_text("x = 2\n")
+    g("commit", "-q", "-am", "incoming")
+    g("checkout", "-q", "main")
+    (staging / "app.py").write_text("x = 1\n")
+    g("commit", "-q", "-am", "integrated")
+    return staging, g("rev-parse", "HEAD").strip()
+
+
+def _real_conflict_script(staging):
+    """integrate.sh stand-in: feat-001 starts a real conflicting merge
+    (rc 1); any other sid merges clean (rc 0)."""
+    import subprocess
 
     async def fake_run_script(script, sid, run_id):
         mock = AsyncMock()
-        mock.returncode = 1
-        mock.stderr = ""
-        mock.stdout = ""
+        mock.stderr = mock.stdout = ""
+        if sid == "feat-001":
+            r = subprocess.run(["git", "merge", "--no-ff", "-m", "leerie: "
+                                "integrate feat-001", "incoming"],
+                               cwd=str(staging), capture_output=True)
+            mock.returncode = 1 if r.returncode else 0
+        else:
+            mock.returncode = 0
         return mock
+    return fake_run_script
+
+
+def _git_out(staging, *a):
+    import subprocess
+    return subprocess.run(["git", *a], cwd=str(staging), capture_output=True,
+                          text=True).stdout.strip()
+
+
+def test_resolved_but_merge_not_committed_backs_out(leerie, tmp_path,
+                                                     monkeypatch):
+    """Rewritten for N3 (DESIGN §6 *When integration cannot succeed*): an
+    integrator claiming 'resolved' while the worktree is still mid-merge is
+    a lie (the integrator-side analogue of check_branch_has_commits). The
+    merge is abandoned and the subtask backed out — the run no longer
+    dies, and the next subtask of the wave still integrates. Real git:
+    the real check_merge_committed sees the real MERGE_HEAD."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging, pre = _conflicting_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"},
+               "feat-003": {"status": "complete"}}
 
     async def fake_claude_p(**kwargs):
         return {"status": "resolved", "resolution_summary": "merged",
                 "confidence": {"resolution": 9.0, "basis": "clean"}}
 
-    async def fake_check_merge_committed(staging_path):
-        return "MERGE_HEAD still present — merge was never committed"
-
-    abort_calls = []
-
-    async def fake_run_proc(cmd, cwd=None):
-        if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
-            abort_calls.append(True)
-        mock = AsyncMock()
-        mock.returncode = 0
-        mock.stdout = ""
-        mock.stderr = ""
-        return mock
-
-    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "check_merge_committed", fake_check_merge_committed)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
-
-    async def _run():
-        await leerie.integrate_wave(
-            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
-
-    with pytest.raises(SystemExit):
-        asyncio.run(_run())
-
-    assert abort_calls
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001", "feat-003"], results, leerie_dir, _caps(leerie), st,
+        MODELS, EFFORTS))
+    assert out == ["feat-003"]
+    assert _git_out(staging, "rev-parse", "HEAD") == pre
+    assert not (staging / ".git" / "MERGE_HEAD").exists()
+    assert _git_out(staging, "status", "--porcelain") == ""
+    assert results["feat-001"]["status"] == "unconverged"
+    assert st.data["subtask_status"]["feat-001"] == "unconverged"
+    rec = st.data["integration_gate"]["feat-001"]
+    assert rec["outcome"] == "backed_out" and rec["accepted"] is False
+    assert rec["reset_to"] == pre
+    assert "claimed resolved" in rec["fallback_reason"]
+    assert (st.data["unconverged_subtasks"]["feat-001"]["kind"]
+            == "integration_backed_out")
 
 
 def test_integrator_commit_warning_is_non_fatal_and_recorded(leerie, tmp_path, monkeypatch):
@@ -909,50 +948,105 @@ def test_integrator_commit_warning_is_non_fatal_and_recorded(leerie, tmp_path, m
     assert "resolved conflict" in st.data["integrator_warnings"]["feat-001"]
 
 
-def test_design_conflict_verdict_aborts_and_dies(leerie, tmp_path, monkeypatch):
-    """An integrator verdict of 'design-conflict' (could not produce a
-    correct merge) aborts the in-progress merge and terminates, naming the
-    diagnosis."""
+@pytest.mark.parametrize("status,commits", [
+    ("design-conflict", False), ("failed", False),
+    # A failing integrator that committed a merge anyway: the fallback
+    # resets to the merge's first parent, not to whatever it left.
+    ("design-conflict", True)])
+def test_first_resolution_verdict_backs_out_and_the_wave_continues(
+        leerie, tmp_path, monkeypatch, status, commits):
+    """Rewritten for N3 (DESIGN §6 *When integration cannot succeed*): an
+    integrator verdict of `design-conflict`/`failed` on the FIRST conflict
+    resolution takes the repair loop's fallback instead of killing the run —
+    staging reset to the merge's first parent, the subtask settled
+    `unconverged`, the loss recorded, the wave continued, and a resume
+    skipping the record. Real git merges throughout."""
     st = _state(leerie, tmp_path)
     leerie_dir = tmp_path / ".leerie"
-    staging = _staging_repo(leerie_dir)
-
-    results = {"feat-001": {"status": "complete"}}
-
-    async def fake_run_script(script, sid, run_id):
-        mock = AsyncMock()
-        mock.returncode = 1
-        mock.stderr = ""
-        mock.stdout = ""
-        return mock
+    staging, pre = _conflicting_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"},
+               "feat-003": {"status": "complete"}}
+    calls: list[str] = []
 
     async def fake_claude_p(**kwargs):
-        return {"status": "design-conflict",
+        calls.append(kwargs["sid"])
+        if commits:
+            import subprocess
+            (staging / "app.py").write_text("x = 3\n")
+            subprocess.run(["git", "commit", "-qam", "half"], cwd=str(staging),
+                           capture_output=True, check=True)
+        return {"status": status,
                 "diagnosis": "the two subtasks disagree on the API shape"}
 
-    abort_calls = []
-
-    async def fake_run_proc(cmd, cwd=None):
-        if cmd[:2] == ["git", "merge"] and "--abort" in cmd:
-            abort_calls.append(True)
-        mock = AsyncMock()
-        mock.returncode = 0
-        mock.stdout = ""
-        mock.stderr = ""
-        return mock
-
-    monkeypatch.setattr(leerie, "_run_script", fake_run_script)
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
-    monkeypatch.setattr(leerie, "run_proc", fake_run_proc)
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001", "feat-003"], results, leerie_dir, _caps(leerie), st,
+        MODELS, EFFORTS))
+    # The wave continued: feat-003 still integrated, after the back-out.
+    assert out == ["feat-003"]
+    assert calls == ["integrator-feat-001"]
+    assert _git_out(staging, "rev-parse", "HEAD") == pre
+    assert not (staging / ".git" / "MERGE_HEAD").exists()
+    assert (staging / "app.py").read_text() == "x = 1\n"
+    assert results["feat-001"]["status"] == "unconverged"
+    assert st.data["subtask_status"]["feat-001"] == "unconverged"
+    rec = st.data["integration_gate"]["feat-001"]
+    assert rec["outcome"] == "backed_out" and rec["reset_to"] == pre
+    assert status in rec["fallback_reason"]
+    assert "disagree on the API shape" in rec["fallback_reason"]
+    loss = st.data["risk_register"]["feat-001"]
+    assert [e["kind"] for e in loss] == ["integration_content_loss"]
+    assert "none of feat-001's work is in this PR" in loss[0]["detail"]
+    assert "blocked" not in st.data or "feat-001" not in st.data["blocked"]
+    # Resume: the backed-out record is skipped — no integrate.sh, no worker.
+    calls.clear()
+    scripts: list[str] = []
 
-    async def _run():
-        await leerie.integrate_wave(
-            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS, EFFORTS)
+    async def no_script(script, sid, run_id):
+        scripts.append(sid)
+        raise AssertionError("a backed-out sid must not be re-integrated")
+    monkeypatch.setattr(leerie, "_run_script", no_script)
+    again = asyncio.run(leerie.integrate_wave(
+        ["feat-001"], {"feat-001": {"status": "complete"}}, leerie_dir,
+        _caps(leerie), st, MODELS, EFFORTS))
+    assert again == [] and calls == [] and scripts == []
 
+
+def test_first_resolution_back_out_dies_only_when_the_reset_fails(
+        leerie, tmp_path, monkeypatch):
+    """The one state the fallback cannot step back from: the reset to the
+    merge's first parent does not land (a broken repository). That still
+    die()s, with the sid recorded blocked."""
+    st = _state(leerie, tmp_path)
+    leerie_dir = tmp_path / ".leerie"
+    staging, pre = _conflicting_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"}}
+    real_run_proc = leerie.run_proc
+
+    async def broken_reset(cmd, cwd=None, **kw):
+        if cmd[:3] == ["git", "reset", "--hard"]:
+            mock = AsyncMock()
+            mock.returncode, mock.stdout, mock.stderr = 128, "", "corrupt"
+            return mock
+        return await real_run_proc(cmd, cwd=cwd, **kw)
+
+    async def fake_claude_p(**kwargs):
+        import subprocess
+        (staging / "app.py").write_text("x = 3\n")
+        subprocess.run(["git", "commit", "-qam", "half"], cwd=str(staging),
+                       capture_output=True, check=True)
+        return {"status": "failed", "diagnosis": "gave up"}
+
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    monkeypatch.setattr(leerie, "run_proc", broken_reset)
     with pytest.raises(SystemExit):
-        asyncio.run(_run())
-
-    assert abort_calls
+        asyncio.run(leerie.integrate_wave(
+            ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS,
+            EFFORTS))
+    assert "back-out failed" in st.data["blocked"]["feat-001"]
+    assert st.data.get("subtask_status", {}).get("feat-001") != "unconverged"
 
 
 def test_clean_merge_no_conflict_appends_without_integrator(leerie, tmp_path, monkeypatch):

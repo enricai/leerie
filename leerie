@@ -2528,6 +2528,15 @@ entry = gate.get(sid)
 if entry is None:
     print(f"ERROR: subtask {sid!r} not found in integration_gate", file=sys.stderr)
     sys.exit(1)
+if entry.get("outcome") == "backed_out":
+    # Nothing is integrated: the subtask was reset off the run branch and
+    # settled unconverged, so flipping `accepted` would claim a merge that
+    # is not there. Changes nothing.
+    _why = entry.get("fallback_reason") or "no reason recorded"
+    print(f"NOOP: subtask {sid!r} was backed out of the run branch ({_why}); "
+          "none of its work is integrated, so there is no finding to accept. "
+          "It is settled unconverged; a later run redoes its work")
+    sys.exit(0)
 if entry.get("accepted"):
     print(f"NOOP: subtask {sid!r} integration finding is already accepted")
     sys.exit(0)

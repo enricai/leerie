@@ -30,7 +30,8 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "classification_judge", "wiring_judge", "provision_judge",
            "task_coverage_judge", "artifact_registry", "integration_judge",
            "no_work_judge", "delivery_judge", "defect_scope_auditor",
-           "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer")
+           "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer",
+           "ci_checks")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -63,6 +64,9 @@ DEFAULTS = {
     # the MODEL_DEFAULT fallback.
     "set_auditor": "sonnet",
     "surrogate_fixer": "sonnet",
+    # The repository's own merge checks (DESIGN §9 *The repository's own
+    # merge checks run too*): sonnet through the MODEL_DEFAULT fallback.
+    "ci_checks": "sonnet",
 }
 
 

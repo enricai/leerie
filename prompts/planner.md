@@ -579,7 +579,14 @@ The orchestrator gives you, in your prompt:
    than another hypothesis-scoped fix; if they are still absent, say
    so in `confidence.basis` and keep the plan minimal — stacking more
    unverifiable fixes on an unverifiable pile is how the same task
-   loops. An `acceptance_unmet` entry names held-out acceptance cases —
+   loops. A `ci_unmet` entry names one of the repository's own merge
+   checks (the CI's lint, typecheck, build or coverage command, with its
+   `argv` and `cwd`) that run left red on its final tree: `why` is `red`
+   (the command failed), `new_diagnostics` (the strict lint reported the
+   listed `diagnostics` the base did not, in files that run changed) or
+   `coverage_ratchet` (the listed `thresholds` fell below their minimum
+   and below the base). Plan the change that makes each check pass the way
+   the CI runs it. An `acceptance_unmet` entry names held-out acceptance cases —
    tests written from the report alone, which that run's fix still
    failed after its repair rounds: plan the root-cause change that makes
    the report's contract hold for those cases in general, not a change

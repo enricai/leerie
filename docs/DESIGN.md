@@ -681,7 +681,9 @@ before anything else happens, so a resume distinguishes "rejected" from
 rejected verdict. `accept-integration <run-id> <subtask-id>` still flips the
 record's `accepted` flag — the manual path for a run recorded by a release
 whose gate died; an unaccepted, un-backed-out record re-enters the repair
-loop on resume. `--skip-integration-check` disables the gate wholesale,
+loop on resume. A backed-out record has nothing integrated to accept: the
+verb says so and changes nothing, since its subtask's work is not on the run
+branch. `--skip-integration-check` disables the gate wholesale,
 matching the five other gates that carry a bypass.
 
 The result is a single global dependency graph spanning all domains. A
@@ -2135,10 +2137,22 @@ Two outcomes are not failures of the integrator but facts about the work:
 - **Genuinely irreconcilable intents are a design conflict.** If two subtasks
   want contradictory things, no merge can satisfy both — that is a problem with
   the decomposition or the task, not a merge to be papered over. An integrator
-  that says so while resolving the conflict stops the run, leaving the run
-  branch intact at the last fully-integrated wave, so the conflict reaches a
-  human. An unresolved conflict never proceeds silently onto a corrupt
-  run-branch state.
+  that says so — `design-conflict`, or `failed` — while first resolving the
+  conflict takes the same fallback as a failed repair round (below): the
+  merge is abandoned, the run branch is reset to the merge's first parent,
+  the subtask settles `unconverged` and the wave continues, with the lost work
+  recorded and the PR opened as a draft so the conflict reaches a human. So
+  does an unverified `resolved` claim. An unresolved conflict never proceeds
+  silently onto a corrupt run-branch state, and neither verdict kills the
+  run: it used to, discarding every completed subtask of the run over one
+  subtask's merge.
+- **What still stops the run** is a state no fallback can step back from:
+  `integrate.sh`'s precondition failure (the staging worktree or the subtask
+  branch is missing), a failure of the back-out itself (the `git reset` to
+  the merge's first parent does not land — the repository, not the merge, is
+  broken), and an integrator *crash*, which is infrastructure rather than a
+  verdict: its in-progress resolution is rescued and the run pauses for
+  `resume` to retry (§12).
 
 **A committed merge the integration judge rejects is repaired, not died on.**
 The gate used to die on any finding (detect-and-die). That killed 3 runs in
@@ -2644,7 +2658,7 @@ runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
-that keeps failing is audited, and rewritten once*), or when a required item is still unmet after the delivery recheck —
+that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck, or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*) —
 consulted *before* the no-work check, so an empty branch that left work
 unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
@@ -5336,10 +5350,10 @@ This distinction is between a *crash* and a *verdict*, and only the first is
 new. A crash is infrastructure — PID exhaustion, OOM, a killed session — and
 says nothing about whether the resolution was any good; the run rescues the
 work and pauses for `resume`. A `design-conflict` or `failed` **verdict** is
-the integrator's considered judgment that the merge should not stand, and
-still aborts and discards, exactly as *When integration cannot succeed*
-describes: a verdict is a fact about the work, a crash is a fact about the
-machine.
+the integrator's considered judgment that the merge should not stand, so the
+merge is abandoned and the subtask backed out, exactly as *When integration
+cannot succeed* describes — the run continues without it: a verdict is a fact
+about the work, a crash is a fact about the machine.
 
 ### Forcing constrained decoding
 
@@ -8067,6 +8081,80 @@ run `unconverged`. On a green base the same rule applies, so a final-tree
 failure that B\* types `resource_affected` no longer spends conformer rounds.
 Where the runner has no structured report, nothing changes — the axis
 verdict stands.
+
+**The repository's own merge checks run too (CI parity).** The base-health
+axes run the build, lint and test commands leerie resolved for the repo, which
+is not what the repo's CI runs before a merge. On the benched repos those
+three commands covered 4 of the 22 merge-gating checks (barnacle 2/5,
+funeralworks 1/10, api 1/4, leerie 0/3); a PR that broke a typecheck, a
+second package's lint, a translations check or a coverage threshold shipped
+green. So leerie also runs the repo's own merge checks, at the baseline and
+on the final tree:
+
+1. *Discovery is a worker; trust is code.* A read-only judgment worker,
+   `ci_checks`, reads the CI configuration (workflows, CI files, blocking git
+   hooks, and the manifests that resolve what a step calls) and emits typed
+   checks: `kind`, the `argv` exactly as the step runs it, `cwd`, literal
+   `env`, prerequisites, `trigger`s, `requires` (external resources), a
+   `strict_argv` (the warnings-as-errors form) and, for a coverage check,
+   its typed thresholds. It runs only when such a file exists. Code then
+   checks **provenance**: every argv token, prerequisite token and env value
+   must appear verbatim (whitespace-collapsed) in the CI file the check
+   cites; a strict form's non-flag tokens must appear in that file or a
+   manifest beside it; a coverage threshold's glob, metric and minimum must
+   appear in the config file it cites. A check that fails provenance, or
+   still carries a CI expression placeholder, never runs.
+2. *Selection is code.* A check runs only when one of its triggers is a pull
+   request or a blocking hook (pre-push / pre-commit) and `requires` names no
+   external resource (`browser`, `network`, `secrets`, `cloud_credentials`,
+   `gpu`; a `database` is not external — a check without one goes red at the
+   baseline and drops out). Test-kind checks are left to the test axis (§9
+   *Which failures are new*), which already runs the suite with failing-ID
+   diffs.
+3. *The baseline decides what gates.* Each selected check runs at the
+   baseline in its own detached worktree of the base. A check red there is
+   not a gate (the repo was already red; leerie cannot attribute it). The
+   strict variant is used **only if it is green at the baseline**; then it
+   replaces the plain one — the CI's own lint exits 0 on a warning the
+   strict form catches. A check that changes tracked files is not a check
+   and is dropped.
+4. *Ratchets, where a binary gate is blind.*
+   - A strict lint red at the baseline ratchets **per diagnostic**: the
+     strict output's diagnostics (file plus message, positions dropped —
+     fixed tool output, parsed mechanically) are compared base to final, and
+     a diagnostic new on the final tree in a file the run changed is red.
+   - A coverage check ratchets **per glob and metric**: a threshold fires
+     only when the final percentage is below its minimum, below the base's
+     by more than `ci_coverage_epsilon_pct`, and the glob covers a file the
+     run changed. The coverage command's own exit code is not a gate: the
+     benched repo's coverage job was red at the baseline on 13 of 15 PRs, so
+     the binary gate dropped out and missed the regression the ratchet
+     caught.
+5. *Final.* The same checks run on the final tree in a fresh worktree; a
+   gate red there is confirmed under B\* (interleaved base/final reruns) and
+   only a confirmed one counts — anything else is `resource_affected`,
+   reported, never red. Every check run is spawn-held in a capped broker
+   cgroup at the worker caps and holds a host build slot (§6 *Enrollment
+   holds the spawn*, *A host-wide build semaphore*).
+
+A red final check makes delivery unmet: the run's outcome is `unconverged`
+(§6 *The run outcome is decided once*) and the next same-task run's planners
+are handed the red checks as part of the prior delivery residual. Re-driving
+the subtasks that broke a check is the delivery re-drive's job, not this
+section's; the record it reads is `ci_parity.final.unmet`.
+
+Benched (N6, N6b). Discovery: 12 worker runs (4 repos × 3 samples) found
+92/92 checks with the right kind, requirements and gate selection (78/78
+gate-eligible), 0 provenance failures, 0 harmful extras. Gate runs on 39
+clean merged PRs (barnacle 22, api 10, funeralworks 7; 203 gate checks):
+0 false gates (Wilson 95% upper bound 9.0%), and 5 true catches — four by
+the strict lint (warnings the CI's own lint exits 0 on), one by the plain
+lint. Coverage: the ratchet fired
+0 times on the 7 clean funeralworks pairs, and once on the replayed PR that
+dropped a 95% branch threshold (91.62% → 91.53%, fixed by the next PR);
+the base against a rerun of the base fired 0 times.
+The same check runs gave identical exit codes under rootless and rootful
+containers, with no file left unowned or unwritable.
 
 ---
 

@@ -291,6 +291,9 @@ def test_judgment_workers_pinned_set(leerie):
         # benched at medium (Q6).
         "set_auditor",
         "surrogate_fixer",
+        # Enumerates the repository's own merge checks (DESIGN §9), benched
+        # at medium (N6).
+        "ci_checks",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

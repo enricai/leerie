@@ -110,6 +110,30 @@ def test_noop_on_already_accepted(tmp_path):
     assert "already accepted" in r.stdout
 
 
+def test_backed_out_record_reports_nothing_integrated_and_changes_nothing(
+        tmp_path):
+    """A record the integration fallback backed out has no merge on the run
+    branch: the verb must not print ACCEPTED (it used to, flipping
+    `accepted` on a merge that is not there). It says what happened and
+    leaves state.json byte-identical."""
+    sf = _make_state(
+        tmp_path,
+        {"feat-001": {"defects": [], "advisories": [], "merge_commit_sha": "",
+                      "accepted": False, "outcome": "backed_out",
+                      "fallback_reason": "integrator design-conflict on the "
+                                         "first resolution: shapes differ",
+                      "reset_to": "abc123"}})
+    before = sf.read_bytes()
+    r = _run_accept(sf, "feat-001")
+    assert r.returncode == 0, r.stderr
+    assert "ACCEPTED" not in r.stdout
+    assert "NOOP:" in r.stdout
+    assert "backed out of the run branch" in r.stdout
+    assert "shapes differ" in r.stdout
+    assert "none of its work is integrated" in r.stdout
+    assert sf.read_bytes() == before
+
+
 def test_errors_on_unknown_subtask(tmp_path):
     sf = _make_state(
         tmp_path,

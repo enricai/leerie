@@ -300,6 +300,13 @@ DEFAULT_CAPS = {
     # integration conflicts avoided at cap 3 (12/15 uncapped, 163 extra
     # waves over 77 runs).
     "overlap_extra_waves": 3,
+    # CI-parity coverage ratchet (DESIGN §9 *The repository's own merge
+    # checks run too*): a threshold fires only when the final percentage is
+    # below its minimum AND below the base's by more than this many points
+    # (and the glob covers a file the run changed). A hundredth of a point
+    # absorbs two-decimal summary rounding; the one benched regression
+    # dropped 0.09 points (91.62 -> 91.53).
+    "ci_coverage_epsilon_pct": 0.01,
     # Longest rate-limit reset `main()` will sleep through before it stops
     # auto-resuming and pauses resumably instead (the `out_of_credits`
     # disposition). Sized to the subscription's own windows: the five-hour
@@ -782,6 +789,9 @@ STATE_FIELDS = (
     # Settle by execution (DESIGN §8): per-sid record of every execution of
     # a subtask's `verify` argvs, whatever the verdict.
     "settled_by_execution",
+    # CI parity (DESIGN §9 *The repository's own merge checks run too*): the
+    # discovered checks, their baseline and final runs, and the red ones.
+    "ci_parity",
     # The base-health baseline's measured build peak, the build-semaphore
     # slot count sized from it, and the caps it raised (DESIGN §6 *The
     # repo's own build peak*). Re-applied on resume.
@@ -1731,6 +1741,9 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # duration corpus yet.
     "set_auditor": "medium",
     "surrogate_fixer": "medium",
+    # Enumerates the repository's own merge checks (DESIGN §9 *The
+    # repository's own merge checks run too*); benched at medium (N6).
+    "ci_checks": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1862,7 +1875,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "task_coverage_judge", "artifact_registry",
                 "integration_judge", "no_work_judge", "delivery_judge",
                 "defect_scope_auditor", "rebaser", "acceptance_writer",
-                "set_auditor", "surrogate_fixer")
+                "set_auditor", "surrogate_fixer", "ci_checks")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1888,7 +1901,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "artifact_registry", "planner", "fit_judge", "splitter", "reconciler",
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
-    "delivery_judge", "defect_scope_auditor", "set_auditor",
+    "delivery_judge", "defect_scope_auditor", "set_auditor", "ci_checks",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2418,6 +2431,24 @@ CHANGE_KINDS = ("fix", "test", "docs", "other")
 # same; only `external_precondition` stops the run.
 PLANNER_BLOCKER_KINDS = ("none", "external_precondition", "evidence_gap")
 
+
+# The `ci_checks` worker's typed vocabulary (DESIGN §9 *The repository's own
+# merge checks run too*). Selection is code: a check runs only when one of its
+# triggers is in CI_GATING_TRIGGERS and none of its `requires` is in
+# CI_EXTERNAL_REQUIRES. `database` is not external — bench n6 scored a
+# database-backed coverage check gate-eligible; without one it is red at the
+# baseline and drops out on its own.
+CI_CHECK_KINDS = ("build", "lint", "format", "typecheck", "test", "coverage",
+                  "other")
+CI_TRIGGERS = ("pull_request", "push_default_branch", "push_other",
+               "pre_push_hook", "pre_commit_hook", "schedule", "manual", "tag")
+CI_GATING_TRIGGERS = frozenset({"pull_request", "pre_push_hook",
+                                "pre_commit_hook"})
+CI_REQUIRES = ("database", "browser", "network", "secrets",
+               "cloud_credentials", "gpu")
+CI_EXTERNAL_REQUIRES = frozenset({"browser", "network", "secrets",
+                                  "cloud_credentials", "gpu"})
+CI_COVERAGE_METRICS = ("lines", "branches", "functions", "statements")
 
 SCHEMAS: dict[str, dict] = {
     "classifier": {
@@ -2958,6 +2989,87 @@ SCHEMAS: dict[str, dict] = {
         "properties": {
             "summary": {"type": "string"},
             "files_changed": {"type": "array", "items": {"type": "string"}},
+        },
+    },
+    "ci_checks": {
+        # The repository's own merge checks (DESIGN §9 *The repository's own
+        # merge checks run too*). Typed only: code checks every argv token's
+        # provenance against the cited file (`_ci_check_problems`), selects
+        # by trigger and requires (`_ci_select`), and decides by execution
+        # which checks gate. Benched as bench n6 `draft/schema.json`, with
+        # `env` as a list and `strict_argv` as a possibly empty list (strict
+        # output has no maps and no nullable arrays), plus the typed
+        # coverage thresholds the bench hand-supplied (an empty
+        # `summary_path` / `thresholds` when the check is not coverage).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["checks", "excluded"],
+        "properties": {
+            "checks": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["id", "kind", "argv", "cwd", "env",
+                             "prerequisites", "trigger", "path_filters",
+                             "requires", "strict_argv", "source",
+                             "coverage", "notes"],
+                "properties": {
+                    "id": {"type": "string"},
+                    "kind": {"type": "string", "enum": list(CI_CHECK_KINDS)},
+                    "argv": {"type": "array", "items": {"type": "string"},
+                             "minItems": 1},
+                    "cwd": {"type": "string"},
+                    "env": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["name", "value"],
+                        "properties": {"name": {"type": "string"},
+                                       "value": {"type": "string"}}}},
+                    "prerequisites": {"type": "array", "items": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["argv", "cwd"],
+                        "properties": {"argv": {"type": "array", "items":
+                                                {"type": "string"}},
+                                       "cwd": {"type": "string"}}}},
+                    "trigger": {"type": "array", "items": {
+                        "type": "string", "enum": list(CI_TRIGGERS)}},
+                    "path_filters": {"type": "array",
+                                     "items": {"type": "string"}},
+                    "requires": {"type": "array", "items": {
+                        "type": "string", "enum": list(CI_REQUIRES)}},
+                    "strict_argv": {"type": "array",
+                                    "items": {"type": "string"}},
+                    "source": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["file", "job", "step"],
+                        "properties": {"file": {"type": "string"},
+                                       "job": {"type": "string"},
+                                       "step": {"type": "string"}}},
+                    "coverage": {
+                        "type": "object", "additionalProperties": False,
+                        "required": ["summary_path", "config_file",
+                                     "thresholds"],
+                        "properties": {
+                            "summary_path": {"type": "string"},
+                            "config_file": {"type": "string"},
+                            "thresholds": {"type": "array", "items": {
+                                "type": "object",
+                                "additionalProperties": False,
+                                "required": ["glob", "metric", "min"],
+                                "properties": {
+                                    "glob": {"type": "string"},
+                                    "metric": {"type": "string", "enum":
+                                               list(CI_COVERAGE_METRICS)},
+                                    "min": {"type": "number"}}}}}},
+                    "notes": {"type": "string"},
+                }}},
+            "excluded": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["file", "job", "reason"],
+                "properties": {
+                    "file": {"type": "string"},
+                    "job": {"type": "string"},
+                    "reason": {"type": "string", "enum": [
+                        "deploy", "release", "schedule_only", "manual_only",
+                        "push_only", "reporting_only", "duplicate",
+                        "external_action", "other"]}}}},
         },
     },
     "rebaser": {
@@ -31098,6 +31210,11 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                  else delivery.get("unmet_before"))
         if unmet:
             reasons.append(f"{len(unmet)} required item(s) still unmet")
+    ci_unmet = _ci_parity_unmet(st)
+    if ci_unmet:
+        reasons.append(f"{len(ci_unmet)} of the repository's own merge "
+                       "check(s) red on the final tree: "
+                       + ", ".join(str(u.get("id")) for u in ci_unmet))
     if reasons:
         outcome = "unconverged"
     elif not any_commits:
@@ -36022,6 +36139,657 @@ async def _capture_conformance_baseline(
                                                "red_axes": []}})
 
 
+# --- CI parity (DESIGN §9 *The repository's own merge checks run too*) -----
+
+# Files the repo's merge automation lives in. The worker is spawned only when
+# one exists (a mechanical glob — nothing to read otherwise).
+CI_CONFIG_GLOBS = (
+    ".github/workflows/*.yml", ".github/workflows/*.yaml", ".gitlab-ci.yml",
+    ".circleci/config.yml", "azure-pipelines.yml", "bitbucket-pipelines.yml",
+    ".buildkite/*.yml", ".buildkite/*.yaml", "Jenkinsfile", ".husky/*",
+    ".pre-commit-config.yaml", "lefthook.yml", ".lefthook.yml",
+    ".git-hooks/*")
+# Manifests a strict variant may resolve its tool through (`pnpm run lint`
+# -> `pnpm exec <tool> ...`): its non-flag tokens must appear in the CI file
+# or in one of these, beside the check or at the repo root.
+CI_STRICT_MANIFESTS = ("package.json", "Makefile", "pyproject.toml",
+                       "tox.ini", "setup.cfg", "noxfile.py", "justfile",
+                       "Taskfile.yml")
+# A CI expression placeholder (`${{ matrix.x }}`) cannot be run as written.
+_CI_PLACEHOLDER = "${{"
+_CI_DIAG_LIMIT = 20
+# Fixed tool output: `path:line[:col]<sep>rest` (biome, ruff, eslint
+# unix/compact, tsc-style lint) or, under a path header line, an indented
+# `line:col  rest` (eslint stylish). Mechanical strings only.
+_CI_DIAG_PATH_LINE_RE = re.compile(r"^\s*(\S+?):(\d+)(?::(\d+))?[:\s]\s*(.*)$")
+_CI_DIAG_POS_LINE_RE = re.compile(r"^\s+(\d+):(\d+)\s+(.*)$")
+_CI_ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+def _ci_flat(text: str) -> str:
+    return " ".join(text.split())
+
+
+def _ci_safe_rel(tree: Path, rel: str) -> Path | None:
+    """`tree/rel` when `rel` is a relative path staying inside `tree`."""
+    rel = (rel or ".").strip()
+    if rel.startswith("/") or ".." in rel.split("/"):
+        return None
+    p = (tree / rel).resolve()
+    root = tree.resolve()
+    if p != root and root not in p.parents:
+        return None
+    return p
+
+
+def _ci_config_files(tree: Path) -> list[str]:
+    out: set[str] = set()
+    for pat in CI_CONFIG_GLOBS:
+        for f in glob.glob(str(tree / pat)):
+            if os.path.isfile(f):
+                out.add(os.path.relpath(f, tree))
+    return sorted(out)
+
+
+def _ci_check_problems(check: dict, tree: Path) -> list[str]:
+    """Provenance and shape, checked in code (DESIGN §9): every argv,
+    prerequisite and env token must appear verbatim (whitespace-collapsed)
+    in the CI file the check cites; a strict variant's non-flag tokens in
+    that file or a manifest beside the check / at the root; a coverage
+    threshold's glob, metric and minimum in the config file it cites. Empty
+    list = the check may run."""
+    probs: list[str] = []
+    src = _ci_safe_rel(tree, ((check.get("source") or {}).get("file") or ""))
+    if src is None or not src.is_file():
+        return ["source file missing or outside the repo"]
+    try:
+        flat = _ci_flat(src.read_text(errors="replace"))
+    except OSError:
+        return ["source file unreadable"]
+    cwd = _ci_safe_rel(tree, check.get("cwd") or ".")
+    if cwd is None or not cwd.is_dir():
+        probs.append(f"cwd {check.get('cwd')!r} is not a directory in the "
+                     "repo")
+    argv = [str(a) for a in (check.get("argv") or [])]
+    if not argv:
+        probs.append("empty argv")
+    tokens = list(argv)
+    for pre in check.get("prerequisites") or []:
+        tokens += [str(a) for a in (pre.get("argv") or [])]
+        if _ci_safe_rel(tree, pre.get("cwd") or ".") is None:
+            probs.append(f"prerequisite cwd {pre.get('cwd')!r} escapes the "
+                         "repo")
+    for e in check.get("env") or []:
+        tokens += [str(e.get("name") or ""), str(e.get("value") or "")]
+    for t in tokens:
+        ft = _ci_flat(t)
+        if ft and ft not in flat:
+            probs.append(f"token {t!r} does not appear in {src.name}")
+        if _CI_PLACEHOLDER in t:
+            probs.append(f"token {t!r} is an unresolved CI placeholder")
+    strict = [str(a) for a in (check.get("strict_argv") or [])]
+    if strict:
+        texts = [flat]
+        for base in {cwd or tree, tree}:
+            for m in CI_STRICT_MANIFESTS:
+                with contextlib.suppress(OSError):
+                    texts.append(_ci_flat((base / m).read_text(
+                        errors="replace")))
+        for t in strict:
+            ft = _ci_flat(t)
+            if ft and not t.startswith("-") and not any(
+                    ft in x for x in texts):
+                probs.append(f"strict token {t!r} appears in neither the "
+                             "CI file nor a manifest")
+    if check.get("kind") == "coverage":
+        cov = check.get("coverage") or {}
+        cfg = _ci_safe_rel(tree, cov.get("config_file") or "")
+        summ = (cov.get("summary_path") or "").strip()
+        ths = cov.get("thresholds") or []
+        if cfg is None or not cfg.is_file() or not summ or not ths or (
+                _ci_safe_rel(cwd or tree, summ) is None):
+            probs.append("coverage check without a readable config file, a "
+                         "summary path or thresholds")
+        else:
+            try:
+                ctext = _ci_flat(cfg.read_text(errors="replace"))
+            except OSError:
+                ctext = ""
+            for th in ths:
+                g = str(th.get("glob") or "")
+                num = th.get("min")
+                nums = {str(num)}
+                if isinstance(num, float) and num.is_integer():
+                    nums.add(str(int(num)))
+                if ((g != "**" and g not in ctext)
+                        or str(th.get("metric")) not in ctext
+                        or not any(n in ctext for n in nums)):
+                    probs.append(f"threshold {g} {th.get('metric')} "
+                                 f">= {num} not found in {cfg.name}")
+    return probs
+
+
+def _ci_select(checks: list[dict], tree: Path) -> list[dict]:
+    """One record per discovered check, with `selected` and, when not, the
+    typed `reason`: `left_to_test_axis`, `not_merge_gating`,
+    `external_resource`, `provenance` (with `problems`)."""
+    out: list[dict] = []
+    seen: set[str] = set()
+    for i, c in enumerate(checks):
+        rec = {k: c.get(k) for k in (
+            "kind", "argv", "cwd", "env", "prerequisites", "trigger",
+            "requires", "strict_argv", "source", "coverage")}
+        cid = _CGROUP_NAME_UNSAFE_RE.sub("_", str(c.get("id") or f"check{i}"))
+        while cid in seen:
+            cid += "_"
+        seen.add(cid)
+        rec["id"] = cid
+        rec["selected"] = False
+        if c.get("kind") == "test":
+            rec["reason"] = "left_to_test_axis"
+        elif not set(c.get("trigger") or []) & CI_GATING_TRIGGERS:
+            rec["reason"] = "not_merge_gating"
+        elif set(c.get("requires") or []) & CI_EXTERNAL_REQUIRES:
+            rec["reason"] = "external_resource"
+        else:
+            probs = _ci_check_problems(c, tree)
+            if probs:
+                rec["reason"] = "provenance"
+                rec["problems"] = probs[:10]
+            else:
+                rec["selected"] = True
+        out.append(rec)
+    return out
+
+
+def _ci_rel(path: str, tree: Path, cwd: str) -> str:
+    """A tool-printed path, made relative to the check's cwd."""
+    path = path.strip()
+    base = (tree / (cwd or ".")).resolve()
+    if path.startswith("/"):
+        with contextlib.suppress(ValueError):
+            return str(Path(path).resolve().relative_to(base))
+        return path
+    return path[2:] if path.startswith("./") else path
+
+
+def _ci_diagnostic_keys(output: str, tree: Path, cwd: str) -> dict[str, int]:
+    """Count of each diagnostic in a lint run's output, keyed `file\\ttext`
+    with positions dropped, so the same warning moved by an edit is the same
+    key. Fixed tool output, parsed mechanically; a line naming no file that
+    exists under the check's cwd is not a diagnostic."""
+    base = (tree / (cwd or ".")).resolve()
+    counts: dict[str, int] = {}
+    current = ""
+    for raw in output.splitlines():
+        line = _CI_ANSI_RE.sub("", raw).rstrip()
+        m = _CI_DIAG_PATH_LINE_RE.match(line)
+        if m:
+            rel = _ci_rel(m.group(1), tree, cwd)
+            if (base / rel).is_file():
+                current = rel
+                text = _ci_flat(m.group(4)).rstrip("━─ ").strip()
+                if text:
+                    k = f"{rel}\t{text}"
+                    counts[k] = counts.get(k, 0) + 1
+                continue
+        stripped = line.strip()
+        if stripped and " " not in stripped:
+            rel = _ci_rel(stripped, tree, cwd)
+            if (base / rel).is_file():
+                current = rel
+                continue
+        m = _CI_DIAG_POS_LINE_RE.match(line)
+        if m and current:
+            k = f"{current}\t{_ci_flat(m.group(3))}"
+            counts[k] = counts.get(k, 0) + 1
+    return counts
+
+
+def _ci_glob_match(rel: str, pattern: str) -> bool:
+    return (pattern in ("**", "**/*", "*") or fnmatch.fnmatch(rel, pattern)
+            or fnmatch.fnmatch(rel, pattern.replace("/**/", "/*")))
+
+
+def _ci_coverage_pcts(summary: Path, tree: Path, cwd: str,
+                      thresholds: list[dict]) -> dict[str, float | None]:
+    """Per `glob|metric`, the percentage over the files of an istanbul
+    `json-summary` (mechanical JSON) matching the glob, from covered/total
+    (never the rounded `pct`). None when the summary is unreadable or no
+    file matches."""
+    out: dict[str, float | None] = {}
+    try:
+        data = json.loads(summary.read_text())
+    except (OSError, ValueError):
+        data = None
+    for th in thresholds:
+        key = f"{th.get('glob')}|{th.get('metric')}"
+        if not isinstance(data, dict):
+            out[key] = None
+            continue
+        cov = tot = 0
+        for f, v in data.items():
+            if f == "total" or not isinstance(v, dict):
+                continue
+            m = v.get(th.get("metric")) or {}
+            if not _ci_glob_match(_ci_rel(f, tree, cwd), str(th.get("glob"))):
+                continue
+            with contextlib.suppress(TypeError, ValueError):
+                cov += int(m.get("covered") or 0)
+                tot += int(m.get("total") or 0)
+        out[key] = round(100.0 * cov / tot, 4) if tot else None
+    return out
+
+
+def _ci_coverage_fired(rec: dict, final_pcts: dict, touched: list[str],
+                       eps: float) -> list[dict]:
+    """The coverage ratchet: a threshold fires when final < min, final <
+    base - eps, and the glob covers a file the run changed (relative to the
+    check's cwd)."""
+    cwd = (rec.get("cwd") or ".").strip().rstrip("/")
+    pre = "" if cwd in ("", ".") else cwd.removeprefix("./") + "/"
+    rel_touched = [t[len(pre):] for t in touched if t.startswith(pre)]
+    base = (rec.get("base") or {}).get("coverage") or {}
+    fired: list[dict] = []
+    for th in ((rec.get("coverage") or {}).get("thresholds") or []):
+        key = f"{th.get('glob')}|{th.get('metric')}"
+        b, f = base.get(key), final_pcts.get(key)
+        if b is None or f is None:
+            continue
+        try:
+            mn = float(th.get("min"))
+        except (TypeError, ValueError):
+            continue
+        if (f < mn and f < b - eps and any(
+                _ci_glob_match(t, str(th.get("glob"))) for t in rel_touched)):
+            fired.append({"glob": th.get("glob"), "metric": th.get("metric"),
+                          "min": mn, "base": b, "final": f})
+    return fired
+
+
+def _ci_parity_unmet(st: "State") -> list[dict]:
+    """The final tree's confirmed-red merge checks — the record a delivery
+    re-drive reads (DESIGN §9). Empty when CI parity did not run."""
+    ci = st.data.get("ci_parity")
+    final = (ci or {}).get("final") if isinstance(ci, dict) else None
+    unmet = (final or {}).get("unmet") if isinstance(final, dict) else None
+    return list(unmet) if isinstance(unmet, list) else []
+
+
+async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
+    wt = st.run_dir / "worktrees" / name
+    _ci_teardown(st, wt)
+    r = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
+                        "--detach", str(wt), sha], capture_output=True,
+                       text=True, check=False)
+    if r.returncode != 0:
+        log(f"  ci parity: could not create the {name} worktree at "
+            f"{sha[:12]}: {r.stderr.strip()[:200]}")
+        return None
+    return wt
+
+
+def _ci_teardown(st: "State", wt: Path) -> None:
+    subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                    "--force", str(wt)], capture_output=True, check=False)
+    shutil.rmtree(wt, ignore_errors=True)
+    _DEPS_INSTALLED.discard(os.path.realpath(wt))
+
+
+async def _ci_run(argv: list[str], *, tree: Path, rec: dict, st: "State",
+                  caps: dict, label: str) -> dict:
+    """Run one check argv in `tree` — exec'd directly, spawn-held in a broker
+    cgroup at the worker caps, holding a host build slot (DESIGN §6). Its
+    whole output lands in a log file of its own (read back for the
+    diagnostic ratchet). Returns `{rc, passed, timed_out, dirty, log}`; a
+    run that changed tracked files is reset."""
+    cwd = tree / (rec.get("cwd") or ".")
+    env = dict(os.environ)
+    for e in rec.get("env") or []:
+        if e.get("name"):
+            env[str(e["name"])] = str(e.get("value") or "")
+    log_path = st.run_dir / "logs" / "ci" / f"{label}.log"
+    with contextlib.suppress(OSError):
+        log_path.unlink()
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
+    out = {"rc": None, "passed": False, "timed_out": False, "dirty": False,
+           "log": str(log_path)}
+    try:
+        async with _build_class_slot(st, label=f"ci {label}"):
+            run = await _run_contained(
+                [str(a) for a in argv], cwd=str(cwd),
+                name=f"ci-{label}"[:60], run_id=st.run_id,
+                memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
+                pids_max=int(caps.get("worker_pids_max") or 0),
+                timeout=max(1.0, timeout), log_path=log_path,
+                label=f"ci {label}: {shlex.join(argv)}", env=env)
+        out["rc"], out["timed_out"] = run["rc"], run["timed_out"]
+    except OSError as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    out["passed"] = out["rc"] == 0
+    st_ = await run_proc(["git", "status", "--porcelain",
+                          "--untracked-files=no"], cwd=str(tree))
+    if st_.returncode != 0 or st_.stdout.strip():
+        out["dirty"] = True
+        await run_proc(["git", "checkout", "--", "."], cwd=str(tree))
+    return out
+
+
+def _ci_log_text(run: dict) -> str:
+    try:
+        return Path(run.get("log") or "").read_text(errors="replace")
+    except OSError:
+        return ""
+
+
+async def _ci_prepare(tree: Path, recs: list[dict], st: "State", caps: dict,
+                      side: str) -> None:
+    """Install deps (the provision recipe) and run every selected check's
+    prerequisites, each once, in order. Failures are recorded by the
+    checks that then go red, not here."""
+    await _ensure_worktree_deps(
+        str(tree), st, caps, log_path=st.run_dir / "logs" / "ci-parity.log",
+        verbosity="quiet", label_prefix=f"ci-{side}", log_prefix="ci parity")
+    done: set[str] = set()
+    for rec in recs:
+        for j, pre in enumerate(rec.get("prerequisites") or []):
+            key = json.dumps([pre.get("cwd") or ".", pre.get("argv") or []])
+            if key in done or not pre.get("argv"):
+                continue
+            done.add(key)
+            await _ci_run(pre["argv"], tree=tree,
+                          rec={"cwd": pre.get("cwd") or ".",
+                               "env": rec.get("env")},
+                          st=st, caps=caps,
+                          label=f"{side}-{rec['id']}-pre{j}")
+
+
+async def _ci_discover(staging: Path, st: "State", caps: dict,
+                       models: dict[str, str],
+                       efforts: dict[str, str | None]) -> dict:
+    """Spawn `ci_checks` once on the base tree. `{config_files, checks,
+    excluded}` or `{skipped}`."""
+    files = _ci_config_files(staging)
+    if not files:
+        return {"skipped": "no CI configuration or blocking hook file"}
+    st.bump_workers(caps)
+    try:
+        res = await claude_p(
+            user_prompt=(
+                "Repository root: the current working directory. CI and "
+                "hook files found there:\n"
+                + "\n".join(f"- {f}" for f in files)
+                + "\n\nList every merge-gating check this repository's CI "
+                "and blocking git hooks run, per the system prompt, and "
+                "return the JSON object per your schema."),
+            system_prompt=_load_prompt("ci_checks"),
+            schema_key="ci_checks", cwd=str(staging),
+            allowed_tools=INSPECT_TOOLS, max_turns=40, autonomous=False,
+            caps=caps, st=st, model=models.get("ci_checks", MODEL_DEFAULT),
+            effort=efforts.get("ci_checks"), sid="ci-checks")
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        log(f"  ci parity: ci_checks failed ({_brief_worker_exc(e)}) — "
+            "skipped (advisory)")
+        return {"skipped": f"ci_checks failed: {_brief_worker_exc(e)}",
+                "config_files": files}
+    return {"config_files": files, "checks": list(res.get("checks") or []),
+            "excluded": list(res.get("excluded") or [])}
+
+
+async def _capture_ci_parity_baseline(
+        leerie_dir: Path, st: State, caps: dict, models: dict[str, str],
+        efforts: dict[str, str | None]) -> None:
+    """Discover the repository's own merge checks and run them on the base
+    (DESIGN §9 *The repository's own merge checks run too*). Decides, by
+    execution, which gate: a check red at the baseline is not a gate; a
+    strict variant replaces the plain one only when green here, and when
+    red ratchets per diagnostic; a coverage check ratchets per threshold;
+    a check that writes tracked files is dropped. Advisory and idempotent
+    (`ci_parity.baseline_done`)."""
+    ci = st.data.get("ci_parity")
+    if isinstance(ci, dict) and ci.get("baseline_done"):
+        return
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        return
+    log("phase 4: CI parity — discovering the repository's own merge checks")
+    disc = await _ci_discover(staging, st, caps, models, efforts)
+    ci = {"baseline_done": True, "config_files": disc.get("config_files")
+          or [], "excluded_by_worker": disc.get("excluded") or []}
+    if disc.get("skipped"):
+        ci["skipped"] = disc["skipped"]
+        ci["checks"] = []
+        st.data["ci_parity"] = ci
+        st.save()
+        log(f"  ci parity: skipped — {disc['skipped']}")
+        return
+    recs = _ci_select(disc.get("checks") or [], staging)
+    ci["checks"] = recs
+    base_sha = await _branch_head_sha(str(staging))
+    ci["base_sha"] = base_sha
+    sel = [r for r in recs if r["selected"]]
+    for r in recs:
+        if not r["selected"]:
+            log(f"  ci parity: {r['id']} not run — {r['reason']}"
+                + (f" ({'; '.join(r.get('problems') or [])[:200]})"
+                   if r.get("problems") else ""))
+    wt = await _ci_worktree(st, "ci-base", base_sha) if sel else None
+    if sel and wt is None:
+        for r in sel:
+            r.update({"selected": False, "reason": "no_base_worktree"})
+        sel = []
+    try:
+        if wt is not None:
+            await _ci_prepare(wt, sel, st, caps, "base")
+        for r in sel:
+            base: dict = {}
+            run = await _ci_run(r["argv"], tree=wt, rec=r, st=st, caps=caps,
+                                label=f"base-{r['id']}")
+            base.update({"rc": run["rc"], "dirty": run["dirty"]})
+            if r.get("kind") == "coverage":
+                cov = r.get("coverage") or {}
+                base["coverage"] = _ci_coverage_pcts(
+                    wt / (r.get("cwd") or ".") / cov.get("summary_path", ""),
+                    wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+                if any(v is not None for v in base["coverage"].values()):
+                    r["ratchet"] = "coverage"
+                else:
+                    r["reason"] = "coverage_unmeasured"
+            elif run["dirty"]:
+                r.update({"selected": False,
+                          "reason": "writes_tracked_files"})
+            else:
+                if r.get("strict_argv"):
+                    srun = await _ci_run(r["strict_argv"], tree=wt, rec=r,
+                                         st=st, caps=caps,
+                                         label=f"base-{r['id']}-strict")
+                    base["strict_rc"] = srun["rc"]
+                    if srun["passed"] and not srun["dirty"]:
+                        r["gate"] = "strict"
+                    elif not srun["dirty"] and srun["rc"] is not None:
+                        r["ratchet"] = "diagnostic"
+                        keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
+                                                   r.get("cwd") or ".")
+                        base["diagnostics"] = keys
+                if not r.get("gate") and run["passed"]:
+                    r["gate"] = "plain"
+                if not r.get("gate") and not r.get("ratchet"):
+                    r["reason"] = "red_at_baseline"
+            r["base"] = base
+            log(f"  ci parity: {r['id']} at the baseline: rc {run['rc']}"
+                + (f", strict rc {base.get('strict_rc')}"
+                   if "strict_rc" in base else "")
+                + f" -> gate {r.get('gate') or 'none'}"
+                + (f", ratchet {r['ratchet']}" if r.get("ratchet") else ""))
+    finally:
+        if wt is not None:
+            _ci_teardown(st, wt)
+    st.data["ci_parity"] = ci
+    st.save()
+
+
+def _ci_gate_argv(rec: dict) -> list[str]:
+    return list(rec.get("strict_argv") if rec.get("gate") == "strict"
+                else rec.get("argv") or [])
+
+
+async def _run_ci_parity_final(leerie_dir: Path, st: State,
+                               caps: dict) -> list[dict]:
+    """Run the gating checks and ratchets on the final tree (DESIGN §9).
+    A gate red here is confirmed under B* against the base (interleaved
+    reruns, `_confirm_new_failures`); only a confirmed one, a new
+    diagnostic in a file the run changed, or a fired coverage threshold is
+    `unmet`. Persists `ci_parity.final` and returns the unmet list.
+    Advisory; idempotent per final commit."""
+    ci = st.data.get("ci_parity")
+    if not isinstance(ci, dict) or not ci.get("checks"):
+        return []
+    recs = [r for r in ci["checks"]
+            if r.get("selected") and (r.get("gate") or r.get("ratchet"))]
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not recs or not staging.is_dir():
+        return []
+    sha = await _branch_head_sha(str(staging))
+    prior = ci.get("final")
+    if isinstance(prior, dict) and prior.get("sha") == sha:
+        return list(prior.get("unmet") or [])
+    log(f"phase 5: CI parity — {len(recs)} merge check(s) on the final tree")
+    base_sha = ci.get("base_sha") or ""
+    touched: list[str] = []
+    if base_sha and sha:
+        d = await run_proc(["git", "diff", "--name-only",
+                            f"{base_sha}..{sha}"], cwd=str(staging))
+        touched = [x for x in d.stdout.splitlines() if x.strip()]
+    eps = float(caps.get("ci_coverage_epsilon_pct",
+                         DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
+    final: dict = {"sha": sha, "results": {}, "unmet": [],
+                   "resource_affected": []}
+    wt = await _ci_worktree(st, "ci-final", sha)
+    if wt is None:
+        final["skipped"] = "no final worktree"
+        ci["final"] = final
+        st.save()
+        return []
+    red: list[str] = []
+    try:
+        await _ci_prepare(wt, recs, st, caps, "final")
+        for r in recs:
+            res: dict = {}
+            if r.get("gate"):
+                run = await _ci_run(_ci_gate_argv(r), tree=wt, rec=r, st=st,
+                                    caps=caps, label=f"final-{r['id']}")
+                res.update({"rc": run["rc"], "dirty": run["dirty"]})
+                if not run["passed"]:
+                    red.append(r["id"])
+            if r.get("ratchet") == "diagnostic":
+                srun = await _ci_run(r["strict_argv"], tree=wt, rec=r, st=st,
+                                     caps=caps,
+                                     label=f"final-{r['id']}-strict")
+                keys = _ci_diagnostic_keys(_ci_log_text(srun), wt,
+                                           r.get("cwd") or ".")
+                base = (r.get("base") or {}).get("diagnostics") or {}
+                cwd = (r.get("cwd") or ".").strip().rstrip("/")
+                pre = "" if cwd in ("", ".") else cwd.removeprefix("./") + "/"
+                rel_touched = {t[len(pre):] for t in touched
+                               if t.startswith(pre)}
+                new = sorted(k for k, n in keys.items()
+                             if n > base.get(k, 0)
+                             and k.split("\t", 1)[0] in rel_touched)
+                res["strict_rc"] = srun["rc"]
+                res["new_diagnostics"] = new[:_CI_DIAG_LIMIT]
+                if new:
+                    final["unmet"].append({
+                        "id": r["id"], "kind": r.get("kind"),
+                        "why": "new_diagnostics",
+                        "argv": r.get("strict_argv"), "cwd": r.get("cwd"),
+                        "diagnostics": new[:_CI_DIAG_LIMIT]})
+            if r.get("ratchet") == "coverage":
+                run = await _ci_run(r["argv"], tree=wt, rec=r, st=st,
+                                    caps=caps, label=f"final-{r['id']}")
+                cov = r.get("coverage") or {}
+                pcts = _ci_coverage_pcts(
+                    wt / (r.get("cwd") or ".") / cov.get("summary_path", ""),
+                    wt, r.get("cwd") or ".", cov.get("thresholds") or [])
+                fired = _ci_coverage_fired(r, pcts, touched, eps)
+                res.update({"rc": run["rc"], "coverage": pcts,
+                            "fired": fired})
+                if fired:
+                    final["unmet"].append({
+                        "id": r["id"], "kind": "coverage",
+                        "why": "coverage_ratchet", "argv": r.get("argv"),
+                        "cwd": r.get("cwd"), "thresholds": fired})
+            final["results"][r["id"]] = res
+        if red:
+            verdict = await _ci_confirm_red(st, caps, base_sha, wt,
+                                            [x for x in recs
+                                             if x["id"] in red])
+            final["b_star"] = verdict
+            final["resource_affected"] = list(
+                verdict.get("resource_affected") or [])
+            by_id = {x["id"]: x for x in recs}
+            for cid in verdict.get("new") or []:
+                rr = by_id[cid]
+                final["unmet"].append({
+                    "id": cid, "kind": rr.get("kind"), "why": "red",
+                    "argv": _ci_gate_argv(rr), "cwd": rr.get("cwd"),
+                    "rc": final["results"][cid].get("rc")})
+    finally:
+        _ci_teardown(st, wt)
+    ci["final"] = final
+    st.save()
+    if final["unmet"]:
+        log(f"  ci parity: {len(final['unmet'])} merge check(s) red on the "
+            "final tree: " + "; ".join(
+                f"{u['id']} ({u['why']})" for u in final["unmet"]))
+    else:
+        log("  ci parity: every gating merge check holds on the final tree"
+            + (f" ({len(final['resource_affected'])} red run(s) typed "
+               "resource_affected)" if final["resource_affected"] else ""))
+    return list(final["unmet"])
+
+
+async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
+                          final_tree: Path, recs: list[dict]) -> dict:
+    """B* for gates red on the final tree: interleaved base/final reruns of
+    just those checks; a check is red only if it failed every final rerun
+    and passed every base rerun."""
+    cand = [r["id"] for r in recs]
+    base_wt = (await _ci_worktree(st, "ci-confirm-base", base_sha)
+               if base_sha else None)
+
+    async def _none(_t: float) -> set[str] | None:
+        return None
+
+    if base_wt is None:
+        return await _confirm_new_failures(cand, _none, _none, caps,
+                                           label="ci parity")
+    n = {"i": 0}
+
+    def _runner(tree: Path, side: str):
+        async def _run(_timeout: float) -> set[str] | None:
+            n["i"] += 1
+            failing: set[str] = set()
+            for r in recs:
+                run = await _ci_run(_ci_gate_argv(r), tree=tree, rec=r,
+                                    st=st, caps=caps,
+                                    label=f"confirm-{side}{n['i']}-{r['id']}")
+                if run["timed_out"]:
+                    return None
+                if not run["passed"]:
+                    failing.add(r["id"])
+            return failing
+        return _run
+
+    try:
+        await _ci_prepare(base_wt, recs, st, caps, "confirm-base")
+        return await _confirm_new_failures(
+            cand, _runner(base_wt, "base"), _runner(final_tree, "final"),
+            caps, label="ci parity")
+    finally:
+        _ci_teardown(st, base_wt)
+
+
 def _format_unmet_required_items_section(
         unmet: list[dict], contract_unmet: dict | None = None) -> str:
     """The final-conformer prompt section that routes confirmed-unmet
@@ -36414,6 +37182,20 @@ def _prior_delivery_residual(st: "State") -> dict | None:
                 {"item": (u.get("item") or "")[:200],
                  "evidence": (u.get("evidence") or "")[:400]}
                 for u in unmet_after[:3]]
+        # The repository's own merge checks that run left red (DESIGN §9
+        # *The repository's own merge checks run too*): typed, never output.
+        ci_final = (data.get("ci_parity") or {}).get("final") or {}
+        ci_unmet = [u for u in (ci_final.get("unmet") or [])
+                    if isinstance(u, dict)]
+        if ci_unmet:
+            residual["ci_unmet"] = [
+                {"id": str(u.get("id"))[:80], "why": u.get("why"),
+                 "argv": [str(a)[:120] for a in (u.get("argv") or [])][:20],
+                 "cwd": str(u.get("cwd") or ".")[:120],
+                 "diagnostics": [str(d)[:200] for d in
+                                 (u.get("diagnostics") or [])][:5],
+                 "thresholds": list(u.get("thresholds") or [])[:5]}
+                for u in ci_unmet[:5]]
         # The recheck's verdict outranks the pre-pass one wherever it
         # exists (it saw the remediated tree): an after-verdict of met
         # supersedes a pre-pass conflict, and the recheck can DISCOVER
@@ -43346,6 +44128,40 @@ def _record_integration_loss(st: State, sid: str, detail: str,
     reg[sid] = entries
 
 
+async def _back_out_unmerged(st: State, staging: Path, sid: str,
+                             pre_sha: str, reason: str) -> None:
+    """The integration fallback for a merge no integrator produced (DESIGN
+    §6 *When integration cannot succeed*): abandon the in-progress merge,
+    reset staging to `pre_sha` (the merge's first parent, read before
+    `integrate.sh` ran — a failing integrator may have committed anyway),
+    and settle `sid` `unconverged` with its lost work recorded, so the wave
+    continues. The record carries `outcome: "backed_out"`, which a resume
+    skips. A reset that does not land is the one state left to `die()` on:
+    the repository, not the merge, is then broken."""
+    await run_proc(["git", "merge", "--abort"], cwd=str(staging))
+    await run_proc(["git", "reset", "--hard", pre_sha], cwd=str(staging))
+    head = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
+    if not pre_sha or head != pre_sha:
+        st.data.setdefault("blocked", {})[sid] = (
+            f"integration back-out failed: staging is at {head or '?'}, "
+            f"not {pre_sha or '?'}")
+        st.save()
+        die(f"could not back {sid} out of the run branch: `git reset --hard "
+            f"{pre_sha or '<unknown>'}` left staging at {head or 'no HEAD'} "
+            f"({reason}). The staging worktree needs a manual look before "
+            "`resume`.")
+    st.data.setdefault("integration_gate", {})[sid] = {
+        "defects": [], "advisories": [], "merge_commit_sha": "",
+        "accepted": False, "outcome": "backed_out",
+        "fallback_reason": reason, "reset_to": head}
+    _record_integration_loss(
+        st, sid, f"backed out of the run branch ({reason}); none of "
+        f"{sid}'s work is in this PR", [])
+    _settle_unconverged(st, sid, f"integration backed out: {reason}",
+                        previous_status="complete",
+                        kind="integration_backed_out")
+
+
 async def _run_integration_judge_gate(
         sid: str, staging: Path, incoming_subtask: dict,
         integrated_so_far: list[str], caps: dict, st: State,
@@ -43736,16 +44552,17 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
     cherry-pick); resolve conflicts with an integrator worker. Returns the
     list of integrated ids.
 
-    An integrator that does not produce a resolved merge ends the run either
-    way — an unresolved conflict must not silently proceed onto a corrupt
-    staging tree — but *how* depends on whether it reached a verdict or died
-    (DESIGN §12; a verdict is a fact about the work, a crash is a fact about
-    the machine):
+    An integrator that does not produce a resolved merge never lets an
+    unresolved conflict proceed onto a corrupt staging tree, but *how* it
+    ends depends on whether it reached a verdict or died (DESIGN §12; a
+    verdict is a fact about the work, a crash is a fact about the machine):
 
-    - **Verdict** (`design-conflict` / `failed`): the integrator judged the
-      merge unfit. The in-progress merge is aborted, leaving the staging
-      worktree clean, and the run terminates with its diagnosis. Its partial
-      work is deliberately discarded — it said so itself.
+    - **Verdict** (`design-conflict` / `failed`, or a `resolved` claim with
+      the merge not committed): the integrator judged the merge unfit, or
+      did not finish it. `_back_out_unmerged` abandons the merge, resets
+      staging to the merge's first parent, settles the subtask
+      `unconverged` with its lost work recorded, and the wave continues
+      (DESIGN §6 *When integration cannot succeed*).
     - **Crash** (every round raised, so there is no status and no diagnosis):
       infrastructure, not judgment. `_rescue_integrator_work` captures the
       in-progress resolution to `refs/leerie/rescue/<run-id>/<sid>` *before*
@@ -43795,6 +44612,9 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 integrated.append(sid)
                 integrated_so_far.append(sid)
             continue
+        # The merge's first parent, for the fallback: a failing integrator
+        # may still have committed something.
+        pre_sha = (await _git_text(staging, "rev-parse", "HEAD") or "").strip()
         proc = await _run_script("integrate.sh", sid, st.run_id)
         if proc.returncode == 0:
             integrated.append(sid)
@@ -43900,10 +44720,14 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
             # the integrator-side analogue of check_branch_has_commits.
             merge_err = await check_merge_committed(staging)
             if merge_err:
-                await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-                die(f"integrator for {sid} returned 'resolved' but {merge_err}. "
-                    f"The merge was aborted; {_compute_run_branch(st.run_id)} "
-                    "is clean. Resolve and re-run with resume.")
+                log(f"  integrator for {sid} returned 'resolved' but "
+                    f"{merge_err}; backing {sid} out")
+                await _back_out_unmerged(
+                    st, staging, sid, pre_sha,
+                    f"integrator claimed resolved but {merge_err}")
+                results[sid] = {"subtask_id": sid, "status": "unconverged",
+                                "summary": "integration backed out"}
+                continue
             commit_err = await check_integrator_commit(staging)
             if commit_err:
                 # non-fatal: log and record, but don't undo the integration
@@ -43925,21 +44749,19 @@ async def integrate_wave(wave: list[str], results: dict[str, dict],
                 integrated_so_far.append(sid)
         else:
             # design-conflict or failed: the integrator could not produce a
-            # correct merge. Abort the in-progress merge so staging is left
-            # clean, then terminate — this must not proceed silently.
+            # correct merge. The same fallback as a repair round's verdict:
+            # back the subtask out and continue the wave (DESIGN §6).
             diagnosis = (ires.get("diagnosis")
                          or ires.get("resolution_summary")
                          or "no diagnosis provided")
             log(f"  integrator could not resolve {sid}: "
-                f"{ires.get('status')} — {diagnosis}")
-            await run_proc(["git", "merge", "--abort"], cwd=str(staging))
-            die(f"integrator could not integrate {sid} "
-                f"({ires.get('status')}): {diagnosis}\n"
-                f"The in-progress merge was aborted; "
-                f"{_compute_run_branch(st.run_id)} is intact at the last "
-                f"good wave. Resolve the conflict between {sid} and "
-                f"the already-integrated subtasks manually, then re-run with "
-                f"resume.")
+                f"{ires.get('status')} — {diagnosis}; backing {sid} out")
+            await _back_out_unmerged(
+                st, staging, sid, pre_sha,
+                f"integrator {ires.get('status')} on the first resolution: "
+                f"{diagnosis}")
+            results[sid] = {"subtask_id": sid, "status": "unconverged",
+                            "summary": "integration backed out"}
     return integrated
 
 
@@ -43992,6 +44814,17 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
             # to never raise, but a bug in its glue must not block the run.
             log(f"phase 4: base-health baseline errored "
                 f"({type(e).__name__}: {e}); proceeding with no baseline")
+        # The repository's own merge checks, on the same untouched base
+        # (DESIGN §9 *The repository's own merge checks run too*). Same
+        # opt-out: it is the same kind of whole-repo run. Advisory.
+        try:
+            await _capture_ci_parity_baseline(leerie_dir, st, caps, models,
+                                              efforts)
+        except WorkerError:
+            raise
+        except Exception as e:
+            log(f"phase 4: CI parity baseline errored "
+                f"({type(e).__name__}: {e}); proceeding without it")
 
     waves = st.data["waves"]
     start = st.data.get("completed_waves", 0)
@@ -46134,6 +46967,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         await _run_acceptance_gate(leerie_dir, st, caps, models, efforts)
     except Exception as e:
         log(f"acceptance gate raised {type(e).__name__}: {e} — surfaced as "
+            "advisory, finalize proceeds")
+    # The repository's own merge checks on the final tree (DESIGN §9 *The
+    # repository's own merge checks run too*): after the last step that can
+    # change it. A red check makes delivery unmet (`_decide_outcome`); its
+    # re-drive reads `_ci_parity_unmet`.
+    try:
+        await _run_ci_parity_final(leerie_dir, st, caps)
+    except Exception as e:
+        log(f"CI parity (final) raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
