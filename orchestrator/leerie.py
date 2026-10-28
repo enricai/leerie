@@ -978,6 +978,15 @@ def _is_protected_path(path: str) -> bool:
     return False
 
 _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
+# Judgment workers get no blanket Read/Grep/Glob grant. The CLI allows those
+# tools inside the working directories (cwd plus `--add-dir`) and refuses them
+# outside, the boundary it already holds every allowlisted shell read to.
+# Measured live (claude 2.1.310, a scratch run dir): with a bare `Read`
+# granted, a judgment worker read `<run-dir>/state.json` and a staged system
+# prompt; without it, both were refused while a file in its cwd still read.
+# The boundary is what keeps them out of the run directory, so they need no
+# `Read()` deny rule, and must not carry one (`_reads_beyond_cwd`).
+_JUDGE_READ_BASE = "WebSearch,WebFetch"
 # INSPECT_TOOLS is the read-only-with-shell bucket for every judgment worker
 # (PLANNING_WORKER_TYPES). Those workers run in a disposable detached worktree
 # (`_judgment_cwd`), never the user's checkout, and never carry
@@ -1006,7 +1015,7 @@ _READ_BASE = "Read,Grep,Glob,WebSearch,WebFetch"
 #       model's context; survives --dangerously-skip-permissions, so it is
 #       the layer that still holds for `autonomous` acting workers.
 INSPECT_TOOLS = (
-    f"{_READ_BASE},"
+    f"{_JUDGE_READ_BASE},"
     "Bash(ls:*),Bash(find:*),Bash(cat:*),Bash(head:*),Bash(tail:*),"
     "Bash(wc:*),Bash(grep:*),Bash(rg:*),Bash(file:*),Bash(stat:*),"
     "Bash(tree:*),Bash(pwd),Bash(echo:*),"
@@ -1054,7 +1063,7 @@ ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit,TaskStop"
 # denied by design — the pattern is prefix-anchored and each subcommand of a
 # compound must match independently.)
 SATISFIED_PROBE_TOOLS = (
-    f"{_READ_BASE},"
+    f"{_JUDGE_READ_BASE},"
     "Bash(ls:*),Bash(cat:*),Bash(head:*),Bash(wc:*),Bash(grep:*),"
     "Bash(rg:*),Bash(file:*),Bash(stat:*),Bash(pwd),Bash(echo:*),"
     "Bash(git show HEAD:*),Bash(git diff:*),Bash(git status:*)"
@@ -21464,10 +21473,24 @@ def _write_system_prompt_file(run_dir: str | Path | None, text: str) -> str:
         return f.name
 
 
-def _sysprompt_read_denial(run_dir: str | Path | None) -> str:
-    """`Read` deny on the staged system prompts, for every worker: another
-    worker's instructions are not input to this one."""
-    if run_dir is None:
+def _reads_beyond_cwd(allowed_tools: str, autonomous: bool) -> bool:
+    """Whether a worker can read outside its working directories: an
+    acting worker (its boundary is erased), or one granted a bare `Read`,
+    `Grep` or `Glob`, which the CLI then allows on any path."""
+    tools = {t.strip() for t in (allowed_tools or "").split(",")}
+    return autonomous or bool(tools & {"Read", "Grep", "Glob"})
+
+
+def _sysprompt_read_denial(run_dir: str | Path | None, allowed_tools: str,
+                           autonomous: bool) -> str:
+    """`Read` deny on the staged system prompts, for every worker that can
+    read beyond its working directories: another worker's instructions are
+    not input to this one (DESIGN §7 *The system prompt is staged in the
+    run directory*). A worker held to the boundary gets none. Any `Read()`
+    deny makes the CLI refuse `cd <dir>; <read> <relative path>` compounds
+    it cannot resolve statically, and the boundary already keeps such a
+    worker out of the run directory."""
+    if run_dir is None or not _reads_beyond_cwd(allowed_tools, autonomous):
         return ""
     return f"Read(/{Path(run_dir) / SYSPROMPT_DIRNAME}/**)"
 
@@ -22807,7 +22830,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 deny_extra=",".join(d for d in (
                     _repo_write_denials(st.repo_root, st.run_dir),
                     _acceptance_read_denials(schema_key, st.run_dir),
-                    _sysprompt_read_denial(getattr(st, "run_dir", None)),
+                    _sysprompt_read_denial(getattr(st, "run_dir", None),
+                                           allowed_tools, autonomous),
                     suite_deny, db_deny, forbidden_deny, kill_deny) if d),
                 settings=hook_settings)
             if system_prompt_file is not None:

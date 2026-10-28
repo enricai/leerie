@@ -109,13 +109,17 @@ def test_inspect_tools_verbs_all_carry_wildcard(leerie):
     )
 
 
-def test_inspect_tools_includes_read_tools(leerie):
-    """Read/Grep/Glob still need to be in the bucket — they're the
-    primary tools and the Bash patterns are a fallback for cross-cwd
-    inspection."""
+def test_inspect_tools_grants_no_blanket_read_tools(leerie):
+    """Read/Grep/Glob stay the primary tools, but they are NOT granted.
+    The CLI allows them inside the working directories with no grant, and a
+    bare grant would let them read any path, including the run directory
+    (DESIGN §7 *The system prompt is staged in the run directory*; measured
+    live on claude 2.1.310). The boundary is what keeps a judgment worker
+    out of the run directory, so the bucket must not carry them."""
     entries = set(_entries(leerie.INSPECT_TOOLS))
     for name in ("Read", "Grep", "Glob"):
-        assert name in entries, f"INSPECT_TOOLS must include {name}"
+        assert name not in entries, f"INSPECT_TOOLS must not grant {name}"
+    assert {"WebSearch", "WebFetch"} <= entries
 
 
 def test_classifier_call_site_uses_inspect_tools():

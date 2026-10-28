@@ -5522,10 +5522,27 @@ reads that file at every spawn of the call — a call that can last a
 nothing guarantees: anything that clears /tmp under a live run (a host
 cleanup, a lost overlay) took every in-flight worker's file with it, and 5
 runs died at their next spawn. It now lives under `<run-dir>/sysprompt/`,
-the state the run already depends on, deleted when its call ends. Workers'
-`Read` is denied there — another worker's instructions are not input to this
-one. The system temp dir remains the fallback only when the run directory
-cannot hold the file.
+the state the run already depends on, deleted when its call ends. Another
+worker's instructions are not input to this one, so no worker may read
+there. How that holds depends on the worker:
+
+- **Acting workers** run with the boundary erased (§12 L1), so they get a
+  `Read` deny rule on the directory.
+- **Judgment workers** hold no blanket `Read`/`Grep`/`Glob` grant. The CLI
+  allows those tools inside the working directories and refuses them
+  outside, as it already refuses every allowlisted shell read outside. The
+  run directory lies outside every judgment cwd, so it is unreadable to
+  them with no rule at all.
+
+They must not carry the deny rule as well. While any `Read()` deny is
+configured, the CLI refuses a compound `cd <dir>; <read> <relative path>`
+whenever it cannot resolve the paths statically, and a grep pattern or a
+`--include=*.ts` is enough to prevent that. When this branch first gave
+every worker the deny, that refusal hit a satisfied-probe, a delivery
+judge and the PR reviewer in one smoke run, each in its own tree. Code
+decides by the worker's actual grant: any worker that is autonomous, or
+holds a bare `Read`, `Grep` or `Glob`, gets the deny. The system temp dir
+remains the fallback only when the run directory cannot hold the file.
 
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a
