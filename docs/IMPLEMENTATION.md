@@ -5755,8 +5755,18 @@ silently advancing `completed_waves` past a rejected merge. Such sids get a
 intent and criteria from the subtask's spec (`_incoming_subtask_view`) and
 the already-integrated list from the run branch
 (`_wave_sids_integrated_before`), so a resumed gate sees what a fresh one
-does. `phase_execute` counts `expected` (completed subtasks) **after**
-`integrate_wave`, so a backed-out subtask is not an integration shortfall.
+does. The shortcut likewise checks for a wave sid whose `subtask_status`
+is already `complete` with no `integration_gate` record whose subtask
+branch is not an ancestor of staging's HEAD
+(`_wave_sids_not_integrated(staging, run_id, sids)`: `git merge-base
+--is-ancestor` exit 1 only — a missing branch or an unreadable staging is
+not evidence) — a sibling that settled before an interruption in the
+wave-end re-drives, never merged (DESIGN §6 *Skipping a settled subtask
+never skips its integration*). Such sids get the same `{"status":
+"complete"}` stand-in, so `integrate_wave` merges them (`integrate.sh`) and
+`expected` counts them. `phase_execute` counts `expected` (completed
+subtasks) **after** `integrate_wave`, so a backed-out subtask is not an
+integration shortfall.
 
 `leerie accept-integration <run-id> <subtask-id> [--runtime fly|ec2|local]`
 mirrors `accept-blocked`'s shape and local/Fly/EC2 state-mutation machinery

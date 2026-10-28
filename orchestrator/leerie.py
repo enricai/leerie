@@ -51466,6 +51466,27 @@ async def _wave_sids_integrated_before(staging: Path, run_id: str,
     return out
 
 
+async def _wave_sids_not_integrated(staging: Path, run_id: str,
+                                    sids: list[str]) -> list[str]:
+    """The `sids` whose subtask branch exists and is NOT yet merged into
+    staging's HEAD — `complete` work a resumed wave must still integrate
+    (DESIGN §6 *Skipping a settled subtask never skips its integration*).
+    Only `merge-base --is-ancestor`'s exit 1 counts: a missing branch, an
+    unreadable staging or any other git error is no evidence, and
+    integrating on it would die on `integrate.sh`'s precondition."""
+    out: list[str] = []
+    for s in sids:
+        branch = f"refs/heads/leerie/subtasks/{run_id}/{s}"
+        try:
+            r = await run_proc(["git", "merge-base", "--is-ancestor", branch,
+                                "HEAD"], cwd=str(staging))
+        except OSError:
+            continue
+        if r.returncode == 1:
+            out.append(s)
+    return out
+
+
 def _integration_repair_prompt(leerie_dir: Path, sid: str,
                                integrated: list[str], merge_sha: str,
                                head: str, findings: list[dict],
@@ -52397,7 +52418,22 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         pending_gate_sids = [sid for sid in wave
                              if gate.get(sid) and not gate[sid].get("accepted")
                              and gate[sid].get("outcome") != "backed_out"]
-        if not remaining and not pending_gate_sids:
+        # A sid that settled `complete` before an interruption in the
+        # wave-end re-drives below was never merged: `complete` is the
+        # subtask's own verdict, not proof it reached the run branch. Without
+        # this it is skipped as settled, left out of `results`, so neither
+        # integrated nor counted in `expected`, and the wave advances with
+        # its work only on its subtask branch (DESIGN §6 *Skipping a settled
+        # subtask never skips its integration*).
+        unintegrated_sids = await _wave_sids_not_integrated(
+            leerie_dir / "worktrees" / "staging", st.run_id,
+            [sid for sid in wave if sid not in remaining
+             and prior.get(sid) == "complete" and not gate.get(sid)])
+        if unintegrated_sids:
+            log(f"phase 5: wave {wi + 1} of {len(waves)} — "
+                f"{', '.join(unintegrated_sids)} settled complete but not "
+                "yet integrated; integrating with the wave")
+        if not remaining and not pending_gate_sids and not unintegrated_sids:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"all {len(wave)} subtask(s) already settled, skipping")
             st.data["completed_waves"] = wi + 1
@@ -52438,7 +52474,7 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # at all. The gate reads the subtask's intent and criteria from its
         # own spec (`_incoming_subtask_view`), so the stand-in needs only
         # the status.
-        for sid in pending_gate_sids:
+        for sid in pending_gate_sids + unintegrated_sids:
             results.setdefault(sid, {"status": "complete"})
 
         blocked = [s for s, r in results.items()

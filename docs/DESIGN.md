@@ -1831,6 +1831,22 @@ resume contract. Within a wave, `phase_execute` skips subtasks whose
 already complete, the wave is skipped entirely and `completed_waves` is
 advanced.
 
+**Skipping a settled subtask never skips its integration.** `complete` says
+the subtask's own work is done, not that it reached the run branch. Between
+the moment a wave's subtasks settle and the moment it integrates, the wave
+re-drives what ended blocked and what no test executes (§13, §9) — full
+implementer sessions, hours of them — and an interruption there (Ctrl-C,
+SIGTERM, an OOM, the resumable disk-headroom pause) used to leave a finished
+sibling `complete` but unmerged. The resumed wave then ran only what was
+unsettled, integrated only that, counted only that in the integrity check,
+and advanced: the finished work stayed on its subtask branch and the PR
+shipped without it. So on resume, a `complete` subtask of the wave whose
+branch is not yet an ancestor of the run branch, and which has no
+integration-gate record (a sid with one is the gate's to resume), is
+integrated with the wave and counted in what the wave must integrate; the
+wave-already-settled shortcut does not apply while one exists. Re-merging is
+safe by construction: a branch already merged is a no-op merge.
+
 This places one hard requirement on the design: **a run branch, once
 created, is never reset.** Setup creates it only if it does not already
 exist (a `run_id` collision against an existing branch is a preflight
