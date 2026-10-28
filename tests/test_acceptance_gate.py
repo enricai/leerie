@@ -3332,3 +3332,44 @@ def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
     assert gate["rounds"][0]["rolled_back"] is True
     assert len(calls) == 1                       # round 2 only
     assert _git(staging, "rev-parse", "HEAD") == start
+
+
+# --- repair rounds see the task and its required items (lane A 3d item 3) --
+
+def test_repair_rounds_get_the_task_and_required_items_not_held_data(
+        leerie, tmp_path, monkeypatch):
+    """Not blind: the task text and every required item, with its typed
+    parts, come before the failure names — and the held-out discipline
+    stands (no held-back names, no test source)."""
+    repo, head = _repo(tmp_path)
+    items = [{"item": "add returns the sum", "span": "S1",
+              "verifiability": "tree",
+              "parts": ["Root-cause fix with no defensive code",
+                        "No regressions in existing functionality"]},
+             "a plain-string item"]
+    st = _st(leerie, tmp_path, repo, head, working_branch="main",
+             required_items=items)
+    _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    calls = _run_gate(leerie, monkeypatch, st, _commit_fix)
+    up = calls[0]["user_prompt"]
+    i_task = up.index("TASK (")
+    i_items = up.index("REQUIRED ITEMS (")
+    i_fail = up.index("ACCEPTANCE FAILURES")
+    assert i_task < i_items < i_fail
+    assert "fix the bug in report.md" in up[i_task:i_items]
+    block = up[i_items:i_fail]
+    entries = json.loads(block[block.index("["):block.rindex("]") + 1])
+    assert entries == [
+        {"item_index": 0, "item": "add returns the sum",
+         "parts": ["Root-cause fix with no defensive code",
+                   "No regressions in existing functionality"]},
+        {"item_index": 1, "item": "a plain-string item"}]
+    assert "case from set 4" not in up and "case from set 5" not in up
+    assert "assert add(2, 3) == 5" not in up
+
+
+def test_task_section_without_items_names_the_task_only(leerie):
+    text = leerie._format_acceptance_task_section("do the thing", [])
+    assert text.startswith("TASK (") and "do the thing" in text
+    assert "REQUIRED ITEMS" not in text

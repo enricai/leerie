@@ -7281,6 +7281,11 @@ rerun that produced a verdict; anything else is `resource_affected`, and a
 set whose only failures were resource-affected is no evidence either way —
 so a load flake never forces a repair round, nor a residual. A failing
 set triggers **at most two repair rounds**: the conformer is
+given the task text and its typed required items, with each item's
+classifier-typed parts verbatim — neither is held-out data, and a round
+shown neither repairs blind: in the replayed barnacle 7cc87f9a pass 1 both
+rounds, never told that the task forbade defensive code, guessed that the
+hidden tests stub the crypto source and added a fallback for it — and is
 told which declared cases failed and the defect contract — cases whose
 file was SEEN failing to load against the unfixed tree (declared an
 import defect by the writer and confirmed by the runner's report) listed

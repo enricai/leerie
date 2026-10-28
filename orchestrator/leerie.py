@@ -42309,6 +42309,32 @@ def _acceptance_shown_indices(sets: list[dict]) -> set[int]:
     return set(ordered[:-2]) if len(ordered) >= 4 else set(ordered)
 
 
+def _format_acceptance_task_section(task: str, items: list) -> str:
+    """The task and its typed required items for a repair round (DESIGN §8
+    *Held-out acceptance tests*): neither is held-out data, and a round
+    shown neither repaired blind — in a replayed run (barnacle 7cc87f9a)
+    both rounds guessed that the hidden tests stub the crypto source and
+    added the defensive fallback the task forbade. Each item goes with its
+    classifier-typed `parts`, verbatim; the delivery judge stays the
+    enforcer."""
+    entries = []
+    for i, it in enumerate(items or []):
+        n = _delivery_norm_item(it)
+        e: dict = {"item_index": i, "item": n.get("item", "")}
+        parts = n.get("parts")
+        if isinstance(parts, list) and parts:
+            e["parts"] = [str(x) for x in parts]
+        entries.append(e)
+    out = ["TASK (what this run must deliver; the held-out tests check the "
+           "defect it names, and every constraint it states still binds "
+           "your fix):\n" + (task or "(none recorded)")]
+    if entries:
+        out.append("REQUIRED ITEMS (typed from the task; each must still "
+                   "hold on the tree you leave — a fix that breaks one is "
+                   "not a fix):\n" + json.dumps(entries, indent=1))
+    return "\n\n".join(out)
+
+
 def _format_acceptance_failures_section(results: list[dict],
                                         sets: list[dict], shown: set[int],
                                         rnd: int, defect_shape: str,
@@ -43137,6 +43163,9 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 "subject must start with `conformer:`.",
                 f"DIFF_BASE: {st.data.get('working_branch')} (compare with "
                 f"`git diff {st.data.get('working_branch')}..HEAD`)",
+                _format_acceptance_task_section(
+                    st.data.get("task", ""),
+                    st.data.get("required_items") or []),
                 _format_acceptance_failures_section(
                     final, sets, shown, rnd, shape, rounds,
                     held_back=bool(hidden)),
