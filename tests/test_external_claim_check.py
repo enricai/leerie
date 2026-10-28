@@ -42,7 +42,7 @@ def ext(env, monkeypatch, tmp_path):  # noqa: F811
         "Wire the billing export. It reads LEERIE_T_BILLING_TOKEN, calls "
         "billing.acme-test.invalid on port 8443, loads "
         "config/acme-billing.pem, shells out to acmectl-leerie-t and uses "
-        "the Acme Billing service credential. Then an admin must approve "
+        "the ACME_BILLING service credential. Then an admin must approve "
         "the export in the Acme billing dashboard.")
     env["st"].save()
     env["home"] = home
@@ -178,7 +178,7 @@ def test_binary_in_the_provision_recipe_is_refuted(ext):
 
 
 def test_service_credential(ext, monkeypatch):
-    claim = {"kind": "service_credential", "name": "Acme Billing"}
+    claim = {"kind": "service_credential", "name": "ACME_BILLING"}
     for k in list(os.environ):
         if k.upper().startswith("ACME_BILLING"):
             monkeypatch.delenv(k)
@@ -192,15 +192,15 @@ def test_service_credential(ext, monkeypatch):
 def test_service_credential_held_in_a_credential_file(ext):
     c = ext["leerie"]
     (ext["home"] / ".netrc").write_text(
-        "machine acme billing login u password p\n")
+        "machine acme_billing login u password p\n")
     assert c._service_credential_source(
-        "Acme Billing", {}, ext["home"]) == "credential file ~/.netrc"
+        "ACME_BILLING", {}, ext["home"]) == "credential file ~/.netrc"
     assert c._service_credential_source("aws", {}, ext["home"]) == ""
     (ext["home"] / ".aws").mkdir()
     (ext["home"] / ".aws" / "credentials").write_text("[default]\n")
     assert c._service_credential_source(
         "aws", {}, ext["home"]) == "credential file ~/.aws/credentials"
-    assert _check(ext, {"kind": "service_credential", "name": "Acme Billing"}
+    assert _check(ext, {"kind": "service_credential", "name": "ACME_BILLING"}
                   )["verdict"] == "refuted"
 
 
@@ -239,14 +239,23 @@ def test_network_control_follows_anthropic_base_url(leerie, monkeypatch):
 
 
 def test_human_action(ext):
+    """The quote must come from a typed external item; the task names the
+    same step, but the task alone never backs a human_action (round-3
+    review M1)."""
     claim = {"kind": "human_action", "description": "dashboard approval",
              "quote": "an admin must approve the export in the Acme billing "
                       "dashboard"}
+    out = _check(ext, claim)
+    assert out["verdict"] == "refuted"
+    assert "the task text alone does not declare a human step" in out["why"]
+    ext["st"].data["required_items"] = [
+        {"item": "Then an admin must approve the export in the Acme billing "
+                 "dashboard.", "span": "S3", "verifiability": "external"}]
     assert _check(ext, claim)["verdict"] == "verified"
     out = _check(ext, {**claim, "quote": "someone has to sign the release "
                                          "form"})
     assert out["verdict"] == "refuted"
-    assert "quote is not in the task" in out["why"]
+    assert "quote is in none of the run's typed external items" in out["why"]
     # too short to be a quote at all
     assert _check(ext, {**claim, "quote": "approve"})["verdict"] == "refuted"
 
@@ -302,7 +311,7 @@ def test_made_up_resource_is_not_accepted(ext, monkeypatch):
     monkeypatch.delenv("LEERIE_T_NOBODY_NAMED", raising=False)
     for claim in ({"kind": "env_var", "name": "LEERIE_T_NOBODY_NAMED"},
                   {"kind": "service_credential",
-                   "name": "a staging API key nobody named"},
+                   "name": "LEERIE_T_STAGING_KEY_NOBODY_NAMED"},
                   {"kind": "file", "path": "/opt/nobody-named.key"},
                   {"kind": "binary", "name": "nobody-named-ctl"}):
         out = _check(ext, claim)

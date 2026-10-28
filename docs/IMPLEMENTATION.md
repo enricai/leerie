@@ -6323,8 +6323,31 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
 - `async _verify_external_claim(sid, res, subtask, worktree, st, caps) ->
   dict` — `{verdict: "verified" | "refuted" | "unverified", why, claim}`,
   checks in this order, the first non-`verified` one deciding: the typed
-  claim (absent → `unverified`); the per-kind probe; grounding; consistency;
-  the network probe; execution.
+  claim (absent → `unverified`); the key's shape; the per-kind probe;
+  grounding; consistency; the network probe; execution.
+  - shape: `_claim_key_shape(kind, key) -> str` — `""` when the key has its
+    kind's shape, else the refutation reason. `env_var`: fullmatch of
+    `_ENV_VAR_NAME_RE` (`[A-Z_][A-Z0-9_]{2,}`) and not in
+    `_CLAIM_KEY_STOPWORDS` (a fixed frozenset of upper-case English and
+    shell words: `THE`, `EXPORT`, `FAILED`, `ERROR`, …); `binary`:
+    fullmatch of `_BINARY_NAME_RE` (`[A-Za-z0-9][A-Za-z0-9._+-]+`, no
+    `/`) and its upper-case form not a stop-word; `file`:
+    `_is_path_shaped(key)` (no whitespace or control character, no `://`,
+    a `/` or a `.` in its last component, that component at least two
+    characters and not all dots); `network`: an IP literal
+    (`ipaddress.ip_address`) or a dotted host of `_HOST_LABEL_RE` labels;
+    `service_credential`: env-var-shaped or path-shaped; `human_action`:
+    no shape (its quote is checked by `_audit_quote_in`).
+  - matching: `_claim_key_in(text, kind, key) -> bool` — whole-token, never
+    a substring. `_claim_token_re(kind, key)` builds the pattern: env-var
+    names (and env-var-shaped credentials) bounded by
+    `(?<![A-Za-z0-9_])`/`(?![A-Za-z0-9_])`, exact case; paths (and
+    path-shaped credentials, `./` and a trailing `/` stripped) bounded on
+    path components — no path character (`[A-Za-z0-9_.~+@%-]`) before, and
+    after neither a path character nor a `.` that continues the name —
+    exact case; binaries the same with `/` allowed before (a command word
+    may sit at the end of a directory); hosts bounded by host-label
+    characters, case-folded; `human_action` is `_audit_quote_in`.
   - per kind: `env_var` refuted when `os.environ[name]` is non-empty;
     `file` refuted when `path` (expanded, relative to the worktree) exists;
     `binary` refuted when `shutil.which(name)` or
@@ -6338,13 +6361,16 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
     environment variable equal to the name's upper-snake form or prefixed
     by it plus `_`, or a file of `_CREDENTIAL_FILES` under `$HOME` whose
     path or text contains it; `human_action` refuted unless
-    `_audit_quote_in` finds its `quote` in `st.data["task"]` or any text of
-    `_declared_external_texts`.
-  - grounding (every kind but `human_action`): the key (and, for `file`,
-    its basename) appears case-insensitively in the task, the subtask spec,
-    a declared external text, or `git grep -F -i -q` at
-    `_compute_run_branch(run_id)` in the worktree; else `refuted`. A
-    `git grep` error or timeout with no other hit is `unverified`.
+    `_audit_quote_in` finds its `quote` in a text of
+    `_declared_external_texts` (`every`) — never in `st.data["task"]`.
+  - grounding (every kind but `human_action`): `_claim_key_in` finds the
+    key (and, for `file`, its basename when that is itself path-shaped) in
+    the task, the subtask spec, a declared external text, or the tree:
+    `_repo_mentions(worktree, ref, kind, keys) -> bool | None` runs
+    `git grep -I -h -F -e <key>…` (`-i` for `network` only) at
+    `_compute_run_branch(run_id)` and token-matches each hit line; else
+    `refuted`. A `git grep` error or timeout with no other hit is
+    `unverified`.
   - consistency: `_declared_external_texts(st, subtask, sid) -> tuple[list,
     list]` returns `(scoped, every)` — `scoped` is the planner's
     `external_preconditions` entries whose `originating_subtasks` hold
@@ -6352,8 +6378,8 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
     `external_precondition` (their `external_resource`), and the
     `required_items` typed `verifiability: external` that this subtask
     claims in `claims.items`; `every` is the same over all subtasks and
-    all external items. When `scoped` is non-empty the key must appear in
-    one entry, else `refuted`.
+    all external items. When `scoped` is non-empty `_claim_key_in` must
+    find the key in one entry, else `refuted`.
   - network: `_network_reach(host, port) -> str` (`reachable` /
     `unreachable` / `unknown`) runs `_NETWORK_PROBE_SCRIPT` as `python3 -I`
     under `run_proc(timeout=_NETWORK_PROBE_HARD_SEC)` (8 s, kills the
@@ -6368,8 +6394,8 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
   - execution: with `_subtask_verify_argvs(subtask)` non-empty,
     `_settle_by_execution(...)`; `pass` → `refuted`; `none` /
     `environment_limit` → `unverified`; `fail` is backed only when, for
-    every kind but `human_action`, the output tail of a failed command
-    contains the key (case-insensitive), else `refuted`. `phase_execute` treats `accepted_external` like
+    every kind but `human_action`, `_claim_key_in` finds the key in the
+    output tail of a failed command, else `refuted`. `phase_execute` treats `accepted_external` like
 `unconverged` at wave end: it is not integrated, not re-driven, and not
 recorded in the `blocked` registry; `_decide_outcome` does not count it.
 

@@ -39,6 +39,7 @@ import fnmatch
 import functools
 import glob
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -51680,6 +51681,125 @@ def _mentions(text: object, key: str) -> bool:
     return bool(k) and isinstance(text, str) and k in _audit_norm(text).lower()
 
 
+# The key of an external claim has the shape of its kind (DESIGN §13 *The key
+# has the shape of its kind*). A one-letter or common-word key occurs in any
+# task, any repository and any undone subtask's failure output (`FAILED`,
+# `assert`), so without a shape it passed grounding and the execution check
+# by construction (round-3 review M1).
+_ENV_VAR_NAME_RE = re.compile(r"[A-Z_][A-Z0-9_]{2,}")
+_BINARY_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]+")
+_HOST_LABEL_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?")
+# Upper-case English and shell words, and test-runner status words, that an
+# env-var or binary claim may not name: each appears in ordinary prose or
+# failure output, so it grounds anywhere.
+_CLAIM_KEY_STOPWORDS = frozenset({
+    "THE", "AND", "FOR", "NOT", "BUT", "ARE", "WAS", "YOU", "ALL", "ANY",
+    "CAN", "HAS", "HAD", "ITS", "OUT", "USE", "NEW", "NOW", "ONE", "TWO",
+    "OFF", "YES", "NONE", "TRUE", "FALSE", "NULL", "NIL", "EXPORT", "UNSET",
+    "SET", "ENV", "ECHO", "EXIT", "EVAL", "EXEC", "SOURCE", "LOCAL",
+    "DECLARE", "READONLY", "RETURN", "THEN", "ELSE", "ELIF", "DONE",
+    "CASE", "ESAC", "WHILE", "UNTIL", "FUNCTION", "SELECT", "TIME", "TEST",
+    "TESTS", "ERROR", "ERRORS", "ERR", "FAIL", "FAILS", "FAILED",
+    "FAILURE", "FAILURES", "PASS", "PASSED", "PASSES", "SKIP", "SKIPPED",
+    "XFAIL", "XPASS", "WARN", "WARNING", "WARNINGS", "INFO", "DEBUG",
+    "TRACE", "FATAL", "PANIC", "ABORT", "ABORTED", "ASSERT", "ASSERTION",
+    "EXCEPTION", "TRACEBACK", "TIMEOUT", "KILLED", "MISSING", "UNDEFINED",
+    "UNKNOWN", "INVALID", "DENIED", "REFUSED", "TODO", "FIXME", "NOTE",
+    "XXX", "KEY", "TOKEN", "SECRET", "PASSWORD", "API", "URL", "HTTP",
+    "HTTPS", "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "EXPECTED",
+    "RECEIVED", "ACTUAL", "SUCCESS", "OK", "NO", "IS", "IN", "IT", "TO",
+    "OF", "ON", "OR", "BE", "AT", "BY", "IF", "DO", "FI", "AS",
+})
+# Path-component boundaries (DESIGN §13): a path or binary key is not
+# preceded by a character that continues a component (a `/` may precede it),
+# nor followed by one or by a `.` that continues the name (a sentence's full
+# stop may follow it).
+_PATH_BEFORE = r"(?<![A-Za-z0-9_.~+@%-])"
+_PATH_AFTER = r"(?![A-Za-z0-9_~+@%-]|\.[A-Za-z0-9])"
+
+
+def _is_path_shaped(key: str) -> bool:
+    """A path: no whitespace or control character, not a URL, and a `/` or
+    an extension in its last component, which is at least two characters
+    and not all dots."""
+    if (not key or "://" in key
+            or any(ch.isspace() or ord(ch) < 32 for ch in key)):
+        return False
+    last = key.rstrip("/").rsplit("/", 1)[-1]
+    if len(last) < 2 or set(last) == {"."}:
+        return False
+    return "/" in key or "." in last
+
+
+def _is_env_var_shaped(key: str) -> bool:
+    return (bool(_ENV_VAR_NAME_RE.fullmatch(key))
+            and key not in _CLAIM_KEY_STOPWORDS)
+
+
+def _claim_key_shape(kind: str, key: str) -> str:
+    """`""` when `key` has the shape of an external claim of `kind`, else
+    why it does not (DESIGN §13 *The key has the shape of its kind*)."""
+    if kind == "env_var":
+        if not _is_env_var_shaped(key):
+            return (f"`{key}` is not an environment variable name "
+                    "([A-Z_][A-Z0-9_]{2,}, not a common word)")
+    elif kind == "binary":
+        if (not _BINARY_NAME_RE.fullmatch(key)
+                or key.upper() in _CLAIM_KEY_STOPWORDS):
+            return (f"`{key}` is not an executable name (no `/`, no "
+                    "whitespace, not a common word)")
+    elif kind == "file":
+        if not _is_path_shaped(key):
+            return (f"`{key}` is not a path (a `/` or an extension, no "
+                    "whitespace, not a URL)")
+    elif kind == "network":
+        try:
+            ipaddress.ip_address(key)
+            return ""
+        except ValueError:
+            pass
+        labels = key.rstrip(".").split(".")
+        if (len(key) > 253 or len(labels) < 2
+                or not all(_HOST_LABEL_RE.fullmatch(lb) for lb in labels)):
+            return (f"`{key}` is not a host name (dotted labels) or an IP "
+                    "address")
+    elif kind == "service_credential":
+        if not (_is_env_var_shaped(key) or _is_path_shaped(key)):
+            return (f"`{key}` names no credential: not an environment "
+                    "variable name and not a path")
+    return ""
+
+
+def _claim_token_re(kind: str, key: str) -> re.Pattern | None:
+    """The whole-token pattern `_claim_key_in` matches `key` with, or None
+    for `human_action` (a verbatim quote)."""
+    if kind == "human_action":
+        return None
+    if kind == "env_var" or (kind == "service_credential"
+                             and _is_env_var_shaped(key)):
+        return re.compile(r"(?<![A-Za-z0-9_])" + re.escape(key)
+                          + r"(?![A-Za-z0-9_])")
+    if kind == "network":
+        return re.compile(r"(?<![A-Za-z0-9.-])" + re.escape(key.rstrip("."))
+                          + r"(?![A-Za-z0-9-]|\.[A-Za-z0-9])", re.I)
+    if kind != "binary":
+        key = key[2:] if key.startswith("./") else key
+        key = key.rstrip("/") or key
+    return re.compile(_PATH_BEFORE + re.escape(key) + _PATH_AFTER)
+
+
+def _claim_key_in(text: object, kind: str, key: str) -> bool:
+    """`key` occurs in `text` as a whole token of its kind — never as a
+    substring (DESIGN §13: a `FAILED` key inside any failure output, a
+    `config` key inside `myconfig/`, are not mentions)."""
+    if not isinstance(text, str) or not key:
+        return False
+    pat = _claim_token_re(kind, key)
+    if pat is None:
+        return _audit_quote_in(text, key)
+    return bool(pat.search(text))
+
+
 def _declared_external_texts(st: "State", subtask: dict,
                              sid: str) -> tuple[list[str], list[str]]:
     """`(scoped, every)`: the texts of the run's typed external items. Every
@@ -51838,17 +51958,24 @@ async def _network_reach(host: str, port: int) -> str:
             "connect_fail": "unreachable"}.get(r.stdout.strip(), "unknown")
 
 
-async def _repo_mentions(worktree: str, ref: str, keys: list[str]) -> bool | None:
-    """Whether any of `keys` occurs in the tree at `ref` (`git grep -F -i`),
-    None when git cannot say."""
-    cmd = ["git", "-C", worktree, "grep", "-q", "-F", "-i"]
+async def _repo_mentions(worktree: str, ref: str, kind: str,
+                         keys: list[str]) -> bool | None:
+    """Whether any of `keys` occurs as a whole token of `kind` in the tree at
+    `ref` (`git grep -F` finds the candidate lines, `_claim_key_in` decides
+    each), None when git cannot say."""
+    cmd = ["git", "-C", worktree, "grep", "-I", "-h", "-F"]
+    if kind == "network":
+        cmd.append("-i")
     for k in keys:
         cmd += ["-e", k]
     try:
         r = await run_proc(cmd + [ref, "--"], timeout=60)
     except (subprocess.TimeoutExpired, OSError):
         return None
-    return {0: True, 1: False}.get(r.returncode)
+    if r.returncode not in (0, 1):
+        return None
+    return any(_claim_key_in(line, kind, k)
+               for line in r.stdout.splitlines() for k in keys)
 
 
 async def _verify_external_claim(sid: str, res: dict, subtask: dict,
@@ -51873,6 +52000,9 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
     kind, key = claim["kind"], claim["key"]
     scoped, every = _declared_external_texts(st, subtask, sid)
     task = str(st.data.get("task") or "")
+    bad_shape = _claim_key_shape(kind, key)
+    if bad_shape:
+        return _end("refuted", f"claimed {kind}, but {bad_shape}")
 
     if kind == "env_var" and os.environ.get(key):
         return _end("refuted", f"claimed missing env var {key}, but it is "
@@ -51892,22 +52022,31 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
     if kind == "service_credential":
         found = _service_credential_source(key, dict(os.environ),
                                            Path.home())
+        if not found and not _is_env_var_shaped(key):
+            p = Path(key).expanduser()
+            if (p if p.is_absolute() else Path(worktree) / p).exists():
+                found = f"the file {key}"
         if found:
             return _end("refuted", f"claimed missing credential {key}, but "
                         f"the container holds it: {found}")
     if kind == "human_action":
-        if not any(_audit_quote_in(h, key) for h in [task, *every]):
+        # Never the task alone: the task describes the work, so any span of
+        # it would do as a quote (round-3 review M1).
+        if not any(_audit_quote_in(h, key) for h in every):
             return _end("refuted", "claimed a step only a person can take, "
-                        "but its quote is not in the task or in any of the "
-                        "run's typed external items")
+                        "but its quote is in none of the run's typed "
+                        "external items (the task text alone does not "
+                        "declare a human step)")
     else:
-        keys = [key] + ([os.path.basename(key)] if kind == "file"
-                        and os.path.basename(key) not in ("", key) else [])
+        base = os.path.basename(key.rstrip("/"))
+        keys = [key] + ([base] if kind == "file" and base != key
+                        and _is_path_shaped(base) else [])
         spec = json.dumps(subtask, sort_keys=True) if subtask else ""
-        if not any(_mentions(h, k) for h in [task, spec, *every]
+        if not any(_claim_key_in(h, kind, k) for h in [task, spec, *every]
                    for k in keys):
             hit = await _repo_mentions(worktree,
-                                       _compute_run_branch(st.run_id), keys)
+                                       _compute_run_branch(st.run_id), kind,
+                                       keys)
             if hit is None:
                 return _end("unverified", f"could not search the "
                             f"repository for {key}")
@@ -51915,7 +52054,7 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
                 return _end("refuted", f"claimed {kind} {key}, but neither "
                             "the task, this subtask's spec, the run's "
                             "external items nor the repository names it")
-    if scoped and not any(_mentions(h, key) for h in scoped):
+    if scoped and not any(_claim_key_in(h, kind, key) for h in scoped):
         return _end("refuted", f"claimed {kind} {key}, but the external "
                     "items declared for this subtask name other resources: "
                     + "; ".join(scoped)[:300])
@@ -51943,7 +52082,7 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
                         f"not decide: {ex['why']}")
         failed = [c.get("tail") or "" for c in ex["commands"]
                   if not c.get("passed")]
-        if kind != "human_action" and not any(_mentions(t, key)
+        if kind != "human_action" and not any(_claim_key_in(t, kind, key)
                                               for t in failed):
             return _end("refuted", "this subtask's verify commands fail, "
                         f"but their output never names {key}")

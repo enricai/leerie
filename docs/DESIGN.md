@@ -10516,13 +10516,33 @@ that `claude -p` inherits:
 | `file{path}` | the path is absent (relative to the worktree) |
 | `binary{name}` | `shutil.which` finds nothing, and the repository's own lockfiles, local tool directories, tool-version files and provision recipe do not install it |
 | `service_credential{name}` | no environment variable and no well-known credential file matches it |
-| `human_action{description, quote}` | its `quote` — a step only a person can take, such as an approval in a dashboard — appears verbatim (whitespace aside) in the task text or in one of the run's typed external items: the planner's `external_preconditions`, the D4 `domain_blocked` rows, the classifier's `verifiability: external` items |
+| `human_action{description, quote}` | its `quote` — a step only a person can take, such as an approval in a dashboard — appears verbatim (whitespace aside) in one of the run's typed external items: the planner's `external_preconditions`, the D4 `domain_blocked` rows, the classifier's `verifiability: external` items. Never in the task text alone: the task is where the work is described, so any span of it would do, and a quote lifted from it names no human step anyone declared |
 
-Three cross-checks follow, all mechanical substrings of the claim's typed
-key (the name, host, path or quote), never a reading of prose:
+*The key has the shape of its kind.* Before any probe, the key must look
+like what it claims to be, or the claim is refuted: an `env_var` name
+matches `[A-Z_][A-Z0-9_]{2,}` and is not on a small fixed list of common
+English and shell words (`EXPORT`, `THE`, `FAILED`, `ERROR`, …); a
+`binary` name is a valid executable name (no `/`, no whitespace, not one
+of those words); a `file` is a path (a `/` or an extension, no
+whitespace, not a URL); a `network` host is a dotted host name or an IP
+literal; a `service_credential` name is env-var-shaped or path-shaped.
+Without this a one-letter or common-word key passes every check below:
+it occurs in any task and repository, and in the failure output of any
+undone subtask (`FAILED`, `assert`), so a claim of "env var `FAILED`"
+settled an undone subtask `accepted_external` (round-3 review M1).
+
+Three cross-checks follow, all mechanical whole-token matches of the
+claim's typed key (the name, host, path or quote), never a substring and
+never a reading of prose. An env var or credential name matches at
+identifier boundaries in its exact case; a path matches on path-component
+boundaries (`config/x.pem` inside `/srv/app/config/x.pem`, never inside
+`myconfig/x.pem`); a host matches at host-label boundaries, case-folded;
+a binary name at command-word boundaries; a `human_action` quote
+verbatim:
 
 - *Grounded.* The key appears in the task, the subtask's own spec, a typed
-  external item, or the repository at the run branch's tip (`git grep -F`)
+  external item, or the repository at the run branch's tip (`git grep -F`,
+  each hit line then token-matched)
   — so a resource named nowhere is not accepted, whatever the probe says,
   since a probe for absence always backs something invented.
 - *Consistent.* When the planner declared external preconditions for this
@@ -10534,8 +10554,9 @@ key (the name, host, path or quote), never a reading of prose:
   the key.
 
 The check returns one of three verdicts. `verified` accepts. `refuted` (the
-variable is set, the host answers, the file exists, the quote is not
-there, the verify commands pass) and `unverified` (the check could not run:
+variable is set, the key does not have its kind's shape, the host
+answers, the file exists, the quote is not there, the verify commands
+pass) and `unverified` (the check could not run:
 no claim was typed, the network probe's control host is unreachable, the
 probe hit its hard timeout, `git grep` or the verify commands could not
 decide) both type the result `other` and re-drive it from the shared

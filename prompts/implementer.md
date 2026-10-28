@@ -645,22 +645,30 @@ input. A missing kind, or `external_precondition` without
 so the orchestrator can check it in this container before accepting.
 Exactly one `kind`, with its field:
 - `env_var` + `name` — an environment variable that is unset or empty;
+  the name itself, upper-case letters, digits and underscores, at least
+  three characters (a common word such as EXPORT or ERROR is refused);
 - `network` + `host` and `port` — a host this container cannot resolve or
   connect to;
 - `file` + `path` — a file that does not exist (relative to your worktree,
-  or absolute);
+  or absolute), written as a path;
 - `binary` + `name` — a program not on `PATH` that the repository's own
   lockfiles and install recipe do not provide;
 - `service_credential` + `name` — a credential for a service, held in no
-  environment variable or credential file here;
+  environment variable or credential file here, named as the environment
+  variable or the file path that would hold it;
 - `human_action` + `description` and `quote` — a step only a person can
   take (an approval in a dashboard, a manual sign-off); `quote` copies,
-  verbatim, the words of the task or of the run's external items that ask
-  for it.
+  verbatim, the words of one of the run's declared external items that ask
+  for it. A quote from the task text alone is refused.
+
+Name the resource exactly, and only as it is written in the task, your
+subtask's spec or the repository: the name is matched as a whole word or
+path, never as part of a longer one.
 
 The orchestrator checks the claim: the variable must be unset, the host
 unreachable, the file absent, the binary uninstallable, the credential
-absent, the quote present; the name must appear in the task, your
+absent, the quote present; the name must have its kind's shape and
+appear in the task, your
 subtask's spec or the repository; and when your subtask has verify
 commands, one must fail with output naming it. A claim that does not
 check out is driven again as `other`, with the reason.
