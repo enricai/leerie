@@ -6884,7 +6884,11 @@ command passes on exit 0; a command that fails is re-checked under B\*
 `confirm_pairs` reruns, any exit 0 passing it as `resource_affected`).
 The settle needs every command to pass and the worktree's tracked files
 to be unchanged afterwards (a command that rewrites tracked files has not
-verified the tree it ran on; the change is reverted). Command output is
+verified the tree it ran on; the change is reverted). Untracked files the
+commands create — build output, reports — are removed afterwards, whatever
+the verdict, so none waits in the worktree for a later worker's `git add
+-A`; files that were already there and ignored files (installed
+dependencies) stay. Command output is
 data — it is logged, and only a tail ever reaches a worker, fenced as
 untrusted output in a re-drive note, never as instructions. A no-commit
 claim on a subtask whose planned surface a sibling already changed this

@@ -6201,7 +6201,7 @@ non-empty, every entry's argv non-empty); `_at_measured_ceiling(st) -> bool`
 (`blt_peak` recorded). `async _settle_by_execution(subtask, worktree, st,
 caps, *, sid) -> dict` returns and persists `settled_by_execution[sid] =
 {verdict, why, commands: [{argv, rc, attempts, passed, resource_affected,
-environment_limit, tail}], dirty}`:
+environment_limit, tail}], dirty, removed_untracked?}`:
 
 - `none` without running when there is no argv; when an argv runs a
   command the task forbids (`_forbidden_verify_argv` over
@@ -6227,6 +6227,11 @@ environment_limit, tail}], dirty}`:
 - `pass` additionally needs the tracked tree unchanged afterwards; otherwise
   `fail`, the changes listed in `dirty` and reverted with `git checkout --
   .`.
+- Whatever the verdict, untracked not-ignored files that were not there
+  before the commands ran (`_untracked_files`: `git ls-files --others
+  --exclude-standard -z`, before and after) are deleted, with the
+  directories they leave empty, and listed in `removed_untracked` (first
+  20).
 
 `_execution_blocker(record) -> str` is the re-drive blocker: the `why`, then
 the last command's tail (`_EXEC_TAIL_CHARS` = 1200) between `--- command

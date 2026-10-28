@@ -311,3 +311,29 @@ def test_an_unrelated_forbidden_command_does_not_stop_execution(harness):
         "forbidden_commands": ["prisma db push"], "evidence": "e"}
     res = _settle(harness, _sub(_py("pass")))
     assert res["verdict"] == "pass" and "forbidden" not in res
+
+
+def test_untracked_output_of_a_verify_command_is_removed(harness):
+    """Review r1 suspicion, proven: the clean-tree check reads tracked files
+    only (`--untracked-files=no`), so a verify command's build output stayed
+    in the worktree, untracked, for a later worker's `git add -A`. What the
+    commands create is removed; what was there before, and ignored files,
+    stay."""
+    wt = harness["worktree"]
+    (wt / "mine.txt").write_text("the worker's\n")
+    (wt / ".gitignore").write_text("deps/\n")
+    subprocess.run(["git", "add", ".gitignore"], cwd=str(wt), check=True)
+    subprocess.run(["git", "commit", "-qm", "ignore"], cwd=str(wt),
+                   check=True)
+    res = _settle(harness, _sub(_py(
+        "import os; os.makedirs('out/sub', exist_ok=True); "
+        "open('out/sub/build.txt','w').write('x'); "
+        "open('report.xml','w').write('x'); os.makedirs('deps', "
+        "exist_ok=True); open('deps/lib.js','w').write('x')")))
+    assert res["verdict"] == "pass", res
+    assert res["removed_untracked"] == ["out/sub/build.txt", "report.xml"]
+    assert not (wt / "out").exists() and not (wt / "report.xml").exists()
+    assert (wt / "mine.txt").is_file() and (wt / "deps" / "lib.js").is_file()
+    status = subprocess.run(["git", "status", "--porcelain"], cwd=str(wt),
+                            capture_output=True, text=True).stdout
+    assert status == "?? mine.txt\n"

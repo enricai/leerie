@@ -50276,6 +50276,11 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                                 verbosity="quiet",
                                 label_prefix=f"settle-exec-{sid}",
                                 log_prefix=f"settle-exec {sid}")
+    # Untracked files the commands create (build output a verify command
+    # leaves) are removed afterwards, so nothing of this execution waits in
+    # the worktree for a later worker's `git add -A`. Ignored files are not
+    # listed, so installed dependencies stay.
+    untracked_before = _untracked_files(worktree)
     try:
         blt = resolve_blt(st.repo_root)
     except Exception:
@@ -50362,6 +50367,18 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
             record["why"] = ("the commands changed tracked files, so they "
                              "did not verify the committed tree")
             await run_proc(["git", "checkout", "--", "."], cwd=worktree)
+    if untracked_before is not None:
+        made = sorted((_untracked_files(worktree) or set())
+                      - untracked_before)
+        for rel in made:
+            with contextlib.suppress(OSError):
+                (Path(worktree) / rel).unlink()
+        for d in sorted({os.path.dirname(r) for r in made if "/" in r},
+                        key=lambda x: -len(x)):
+            with contextlib.suppress(OSError):
+                os.removedirs(Path(worktree) / d)
+        if made:
+            record["removed_untracked"] = made[:20]
     record["verdict"] = verdict
     if not record["why"]:
         last = record["commands"][-1]
@@ -50373,6 +50390,18 @@ async def _settle_by_execution(subtask: dict, worktree: str, st: "State",
                f"exited {last['rc']} on {last['attempts']} run(s)"))
     log(f"  {sid}: settle by execution — {verdict}: {record['why']}")
     return _done()
+
+
+def _untracked_files(worktree: str | Path) -> set[str] | None:
+    """The worktree's untracked, not-ignored files (`git ls-files --others
+    --exclude-standard -z`, mechanical output), or None when git cannot
+    say."""
+    r = subprocess.run(["git", "-C", str(worktree), "ls-files", "--others",
+                        "--exclude-standard", "-z"], capture_output=True,
+                       text=True, check=False)
+    if r.returncode != 0:
+        return None
+    return {p for p in r.stdout.split("\0") if p}
 
 
 def _execution_blocker(record: dict) -> str:
