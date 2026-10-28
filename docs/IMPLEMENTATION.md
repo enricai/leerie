@@ -6542,7 +6542,11 @@ included: when the round has a verdict on a commit other than `pre_sha`,
 `_acceptance_failing_keys` (`"<index>:<file>"` → `{failing_cases}`) over the
 sets measured on both sides, counted by `_redrive_fixed_cases`; None when no
 such set failed before — and `[]` sets `rollback_reason: "fixed no failing
-case"`. The entry is saved, then `_undo_round` resets
+case"`. Otherwise `broken_cases = _acceptance_broken_cases(prev, results)`
+(the same keys, counted by `_redrive_broken_cases`; a set passing before
+contributes every case it now fails) is recorded, and a non-empty list sets
+`rollback_reason: "broke previously passing held-out case(s)"` (DESIGN §8:
+worse is counted in cases). The entry is saved, then `_undo_round` resets
 (`_redrive_rollback(staging, pre_sha)`: `reset --hard`, confirmed, `clean
 -fd`) and `final`/`final_sha` return to the verdict before the round. A
 failed reset sets `rollback_failed` on the entry and the gate and ends the
@@ -6698,10 +6702,14 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   against a `redrive-base` worktree at `pre_sha` by `_confirm_new_failures`
   (`_redrive_new_failures`, through `_ratchet_exec`, which first runs the
   intermittent discovery and types `intermittent_regression` rows, recorded
-  on the group). `_redrive_verdict` (pure): `worse` when more
-  set files fail, a control file newly fails, or a test is confirmed newly
-  failing — in a held-back round also when more held-back files fail, a
-  held-back control newly fails, or none is fixed; a set or held-back
+  on the group). `_redrive_verdict` (pure): `worse` when any set
+  case newly fails (`broke_cases`, from `_redrive_broken_cases(before,
+  after)`: every case of a key failing only after — the key itself when it
+  has no per-case record — plus, for a key failing on both sides with
+  per-case records, the IDs that joined its list), a control file newly
+  fails, or a test is confirmed newly failing — in a held-back round also
+  when a held-back case newly fails (`held_broke_cases`), a held-back
+  control newly fails, or none is fixed; a set or held-back
   measurement that produced nothing carries the earlier verdict
   (`resource_affected`), and the held-back rules then do not apply. A group
   is `zero_progress` when a set note it drove names a set that produced a

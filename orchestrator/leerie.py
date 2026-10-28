@@ -44037,17 +44037,25 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
         async def _settle_round(entry: dict, prev: list[dict],
                                 prev_sha: str) -> None:
             """Record a round and, when it committed and fixed no failing
-            case, roll it back to its own start (DESIGN §8 *Held-out
-            acceptance tests*: a repair that measurably fixes nothing is
-            speculative). The decision is on disk before the reset."""
+            case or made a passing case fail, roll it back to its own start
+            (DESIGN §8 *Held-out acceptance tests*: a repair that measurably
+            fixes nothing is speculative, and worse is counted in cases).
+            The decision is on disk before the reset."""
             nonlocal final, final_sha
             pre = entry.get("pre_sha") or ""
             moved = bool(entry.get("results")) and entry.get("sha") != pre
             if moved and pre:
                 fixed = _acceptance_fixed_cases(prev, entry["results"])
                 entry["fixed_cases"] = fixed
+                broken = _acceptance_broken_cases(prev, entry["results"])
+                entry["broken_cases"] = broken
                 if fixed == []:
                     entry["rollback_reason"] = "fixed no failing case"
+                elif broken:
+                    # Worse, counted in cases: a round that fixed one case by
+                    # breaking a passing one is not progress (DESIGN §8).
+                    entry["rollback_reason"] = (
+                        "broke previously passing held-out case(s)")
             if (moved and pre and entry.get("sha")
                     and not entry.get("rollback_reason")):
                 # The delivery ratchet (DESIGN §8 *A repair that regresses
@@ -44352,6 +44360,18 @@ def _acceptance_fixed_cases(before: list[dict], after: list[dict]
     if not was:
         return None
     return _redrive_fixed_cases(was, _acceptance_failing_keys(after, common))
+
+
+def _acceptance_broken_cases(before: list[dict], after: list[dict]
+                             ) -> list[str]:
+    """The held-out cases a repair round made fail that passed before it —
+    in a set already failing or in one that passed — over the sets measured
+    on both sides (`_redrive_broken_cases`, so worse is counted in cases,
+    like progress; DESIGN §8)."""
+    common = ({r["index"] for r in _acceptance_measured(before or [])}
+              & {r["index"] for r in _acceptance_measured(after or [])})
+    return _redrive_broken_cases(_acceptance_failing_keys(before, common),
+                                 _acceptance_failing_keys(after, common))
 
 
 def _acceptance_round_kept(entry: dict) -> bool:
@@ -46833,27 +46853,56 @@ def _redrive_fixed_cases(before: dict, after: dict) -> list[str]:
     return sorted(out)
 
 
+def _redrive_broken_cases(before: dict, after: dict) -> list[str]:
+    """The set cases that passed before and fail after, as `"<key>::<case
+    id>"` — `_redrive_fixed_cases`'s mirror, so "worse" is counted in the
+    same unit as progress (DESIGN §8 *Delivery re-drive* rule 4): every case
+    of a file failing only after (its key when it has no per-case record),
+    and — in a file failing on both sides, each with a per-case record —
+    every case that joined its failing list. A file that loses its per-case
+    record is not counted on its own: an unnamed whole-file failure says
+    nothing about which cases passed before."""
+    out: list[str] = []
+    for k, v in after.items():
+        now = list(v.get("failing_cases") or [])
+        if k not in before:
+            out += [f"{k}::{c}" for c in now] or [k]
+            continue
+        was = list(before[k].get("failing_cases") or [])
+        if was and now:
+            out += [f"{k}::{c}" for c in sorted(set(now) - set(was))]
+    return sorted(out)
+
+
 def _redrive_verdict(F: dict, F1: dict, new_ids: list[str], *,
                      held: dict | None = None,
                      held_after: dict | None = None) -> dict:
-    """Rules 5-6 (bench P8d/Q3, pure): fixed / broken set files, the set
+    """Rules 4-6 (bench P8d/Q3, pure): fixed / broken set files, the set
     cases fixed (`fixed_cases`, `held_fixed_cases` —
-    `_redrive_fixed_cases`), newly failing controls, `worse` (roll back)
+    `_redrive_fixed_cases`) and newly failing (`broke_cases`,
+    `held_broke_cases` — `_redrive_broken_cases`), newly failing controls,
+    `worse` (roll back: any newly failing case, control or test)
     and `trade` with its (fixed, broken) pairs. The held-back rules apply
     only when both held-back verdicts are given."""
     fixed = sorted(set(F) - set(F1))
     broke = sorted(set(F1) - set(F))
     fixed_cases = _redrive_fixed_cases(F, F1)
+    # Worse is counted in cases, like progress: in files, a group that
+    # fixed one case and broke three in the same file, or fixed one file by
+    # breaking another, was not worse (review round 1 M4).
+    broke_cases = _redrive_broken_cases(F, F1)
     ctl_new = [k for k in broke if F1[k]["kind"] == "control"]
-    worse = len(F1) > len(F) or bool(ctl_new) or bool(new_ids)
+    worse = bool(broke_cases) or bool(ctl_new) or bool(new_ids)
     hfixed: list[str] = []
     hbroke: list[str] = []
     hfixed_cases: list[str] = []
+    hbroke_cases: list[str] = []
     if held is not None and held_after is not None:
         hfixed = sorted(set(held) - set(held_after))
         hbroke = sorted(set(held_after) - set(held))
         hfixed_cases = _redrive_fixed_cases(held, held_after)
-        worse = (worse or len(held_after) > len(held)
+        hbroke_cases = _redrive_broken_cases(held, held_after)
+        worse = (worse or bool(hbroke_cases)
                  or any(held_after[k]["kind"] == "control" for k in hbroke)
                  or not hfixed_cases)
     broken_side = ctl_new + sorted(new_ids) + hbroke
@@ -46861,8 +46910,9 @@ def _redrive_verdict(F: dict, F1: dict, new_ids: list[str], *,
     pairs = (sorted({(f, b) for f in fixed + hfixed for b in broken_side})
              if trade else [])
     return {"fixed": fixed, "broke": broke, "ctl_new": ctl_new,
-            "fixed_cases": fixed_cases, "held_fixed": hfixed,
-            "held_fixed_cases": hfixed_cases, "held_broke": hbroke,
+            "fixed_cases": fixed_cases, "broke_cases": broke_cases,
+            "held_fixed": hfixed, "held_fixed_cases": hfixed_cases,
+            "held_broke": hbroke, "held_broke_cases": hbroke_cases,
             "worse": worse, "trade": trade,
             "pairs": [list(p) for p in pairs]}
 
@@ -48395,8 +48445,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                      held=H if held_mode else None,
                                      held_after=H1)
                 ge.update({k: v[k] for k in ("fixed", "broke", "ctl_new",
-                                             "fixed_cases", "held_fixed",
+                                             "fixed_cases", "broke_cases",
+                                             "held_fixed",
                                              "held_fixed_cases", "held_broke",
+                                             "held_broke_cases",
                                              "worse", "trade")})
                 void = False
                 if committed:

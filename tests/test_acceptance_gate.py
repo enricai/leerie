@@ -3312,6 +3312,65 @@ def test_a_round_that_fixes_one_case_of_a_failing_file_is_kept(
     assert (staging / "calc.py").read_text() == HALF_FIX
 
 
+MIXED_CASES = ("from calc import add\n\n"
+               "def test_two_and_three():\n    assert add(2, 3) == 5\n\n"
+               "def test_three_and_zero():\n    assert add(3, 0) == 3\n\n"
+               "def test_four_and_zero():\n    assert add(4, 0) == 4\n")
+# Fixes add(2, 3) and breaks add(3, 0) and add(4, 0), which passed before.
+TRADE_FIX = ("def add(a, b):\n"
+             "    return a + b if a == 2 else a * b\n")
+
+
+def test_a_round_that_fixes_one_case_by_breaking_passing_ones_is_reset(
+        leerie, tmp_path, monkeypatch):
+    """Review round 1 M4: worse is counted in cases, like progress. The round
+    fixes one failing case and makes two passing cases of the same set fail;
+    counted in files nothing changed (one failing file before and after),
+    and the round stood with the held-out verdict strictly worse."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    sets = _make_sets(leerie, st, 1)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(
+        MIXED_CASES)
+    st.data["acceptance"] = {"sets": sets}
+
+    def trade(p):
+        (p / "calc.py").write_text(TRADE_FIX)
+        _git(p, "commit", "-qam", "conformer: trade")
+    fixers = [trade, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert len(r1["fixed_cases"]) == 1
+    assert "test_two_and_three" in r1["fixed_cases"][0]
+    assert len(r1["broken_cases"]) == 2
+    assert all("zero" in c for c in r1["broken_cases"])
+    assert r1["rollback_reason"] == "broke previously passing held-out case(s)"
+    assert r1["rolled_back"] is True
+    assert _git(staging, "rev-parse", "HEAD") == start
+    assert (staging / "calc.py").read_text() == BUGGY
+
+
+def test_acceptance_broken_cases_counts_a_passing_set_that_fails(leerie):
+    """The reviewer's case: set 1 trades c1 for c2/c3 and set 2, passing
+    before, fails after — every newly failing case is counted, the fixed one
+    is still reported as fixed."""
+    before = [{"index": 1, "passed": False, "failing_files": ["a.test.ts"],
+               "failing_cases": {"a.test.ts": ["c1"]}},
+              {"index": 2, "passed": True, "failing_files": []}]
+    after = [{"index": 1, "passed": False, "failing_files": ["a.test.ts"],
+              "failing_cases": {"a.test.ts": ["c2", "c3"]}},
+             {"index": 2, "passed": False, "failing_files": ["b.test.ts"],
+              "failing_cases": {"b.test.ts": ["x"]}}]
+    assert leerie._acceptance_fixed_cases(before, after) == [
+        "1:a.test.ts::c1"]
+    assert leerie._acceptance_broken_cases(before, after) == [
+        "1:a.test.ts::c2", "1:a.test.ts::c3", "2:b.test.ts::x"]
+    # Nothing newly failing: an honest partial fix.
+    assert leerie._acceptance_broken_cases(before, before) == []
+
+
 def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
                                                     monkeypatch):
     repo, head = _repo(tmp_path)

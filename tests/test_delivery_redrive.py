@@ -252,6 +252,37 @@ class TestVerdict:
                                     held_after=f(h=["q"]))
         assert not v["worse"] and v["held_fixed_cases"] == ["h::p"]
 
+    def test_worse_is_counted_in_cases(self, leerie):
+        """Review round 1 M4 (the reviewer's probe): one case fixed, three
+        newly failing in the same file — counted in files nothing changed,
+        and the group was kept."""
+        def f(**cases):
+            return {k: {"set_index": 1, "file": k, "kind": "defect",
+                        "failing_cases": v} for k, v in cases.items()}
+        v = leerie._redrive_verdict(f(a=["c1"]), f(a=["c2", "c3", "c4"]), [])
+        assert v["fixed_cases"] == ["a::c1"]
+        assert v["broke_cases"] == ["a::c2", "a::c3", "a::c4"]
+        assert v["worse"]
+        # A set file traded for another: equal file counts, still worse.
+        v = leerie._redrive_verdict(f(a=["x"]), f(b=["y"]), [])
+        assert v["fixed_cases"] == ["a::x"] and v["broke_cases"] == ["b::y"]
+        assert v["worse"]
+        # A newly failing file with no per-case record counts as one case.
+        v = leerie._redrive_verdict(f(a=["x"]), f(a=["x"], b=[]), [])
+        assert v["broke_cases"] == ["b"] and v["worse"]
+        # A partial fix with nothing newly failing is not worse.
+        v = leerie._redrive_verdict(f(a=["x", "y"]), f(a=["y"]), [])
+        assert v["broke_cases"] == [] and not v["worse"]
+        # Losing the per-case record alone is no counted regression.
+        v = leerie._redrive_verdict(f(a=["x"]), f(a=[]), [])
+        assert v["broke_cases"] == [] and not v["worse"]
+        # Held-back: a newly failing held-back case is worse even when
+        # another held-back case was fixed.
+        v = leerie._redrive_verdict({}, {}, [], held=f(h=["p"]),
+                                    held_after=f(h=["q"]))
+        assert v["held_fixed_cases"] == ["h::p"]
+        assert v["held_broke_cases"] == ["h::q"] and v["worse"]
+
     def test_held_rules(self, leerie):
         h = _f("h1", "h2")
         v = leerie._redrive_verdict({}, {}, [], held=h, held_after=_f("h2"))

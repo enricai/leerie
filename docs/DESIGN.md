@@ -6534,14 +6534,24 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    that self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against
    18 of 24 with it (every one of the 24 closed its staged sets). After each
    group the orchestrator re-runs the sets and the repository's tests; a
-   result that is worse — more failing set files, a control newly failing,
-   or a test newly failing, each confirmed under B\* — is rolled back
-   (`reset --hard` to the group's start, `clean -fd`). So is a group that
+   result that is worse is rolled back (`reset --hard` to the group's
+   start, `clean -fd`). Worse is counted in cases, the same unit as
+   progress: any set case that passed before the group and fails after it
+   — a newly failing case in a file that was already failing, or any case
+   of a set file that passed before — or a control newly failing, or a
+   test newly failing, each confirmed under B\*. Counted in files, a group
+   that fixed one case of a failing file and broke three others in it read
+   as progress and stood (review round 1 M4); and a group that fixed one
+   set file by breaking another read as not worse, the file counts being
+   equal. So is a group that
    had failing set cases and fixed **none** of them, even when nothing got
    worse: a change that measurably fixes nothing is speculative. Progress is
    counted in cases, not files — fixing one of a file's three failing cases
    is progress — wherever the runner's report names the cases; a file
-   without that record counts as one case. In a
+   without that record counts as one case, and a newly failing case is
+   counted only where both sides name their cases (a file that turns from
+   named cases to an unnamed whole-file failure is not, on its own, a
+   counted regression). In a
    replayed run (barnacle 7cc87f9a, pass 1) two repair rounds that fixed no
    failing case each added a defensive fallback the task explicitly
    forbade, and both shipped. A run that produces no verdict (a missing
@@ -7398,13 +7408,19 @@ on the finished task with wrong held-out tests: the repair conformer
 changed code in 3/3 trials, but 0 of the task's 247 regression tests
 and 0 attributable scraper tests (of 1,605) regressed.
 
-**A repair round that fixes nothing is rolled back.** Each round is also
+**A repair round that fixes nothing, or makes the verdict worse, is rolled
+back.** Each round is also
 judged on its own, against the verdict before it: a round that committed
 and fixed **none** of the failing held-out cases — counted per case where
 the runner's report names them, over the sets measured on both sides,
 variant sets included since the rounds repair them too — is reset to that
 round's own start (recorded before its worker runs), whatever the test
-axis says. A blind change that measurably fixes nothing is speculative by
+axis says. So is a round that made any held-out case that passed before it
+fail — in a set that was already failing or in one that passed — by the
+same per-case count as the delivery re-drive's rule 4 (*Delivery
+re-drive*). Without it a round that fixed one case of a failing set and
+broke a passing set kept its commits: the held-out verdict got strictly
+worse and the round stood. A blind change that measurably fixes nothing is speculative by
 construction. In the replayed barnacle 7cc87f9a pass 1 both repair rounds
 left every failing set failing, and each added code the task forbade (the
 second a defensive `Math.random` fallback); both shipped, because the only
