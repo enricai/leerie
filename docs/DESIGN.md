@@ -7502,13 +7502,86 @@ majority fails. Under the old majority rule a minority of failing sets
 was shipped as a residual with no repair round at all (G1: a failing
 validated set left unrepaired because the majority passed). A set
 failure is a verdict like a new test failure and is confirmed the same
-way (§9 *Which failures are new*): a set file that fails on the tree is
-rerun serially behind the host-pressure gate, `confirm_pairs` times (or
-`confirm_pairs_escalated` after a gate timeout) inside
-`confirm_budget_sec`, and it stays failing only if it failed on every
-rerun that produced a verdict; anything else is `resource_affected`, and a
-set whose only failures were resource-affected is no evidence either way —
-so a load flake never forces a repair round, nor a residual. A failing
+way (§9 *Which failures are new*) — with one asymmetry, below: a set file
+that fails on the tree is rerun serially behind the host-pressure gate,
+`confirm_pairs` times (or `confirm_pairs_escalated` after a gate timeout)
+inside `confirm_budget_sec`, and it stays failing only if it failed on
+every rerun that produced a verdict; anything else is `resource_affected`,
+and a set whose only failures were resource-affected and touched no held
+case is no evidence either way — so a load flake never forces a repair
+round, nor a residual.
+
+**A held case that fails again is a failure, not a flake.** A set's
+*held* cases are the defect cases validation saw fail at the run's own
+start (`base_failing_cases`; in a set the scope judge bounded, only its
+counted cases). Each failed there by construction, so on the tree under
+test the vote is the wrong question for them: the rerun vote exists to
+tell a load flake from a regression, and a held case failing again for a
+non-resource reason is the reported defect showing, however rarely. So:
+
+1. *No vote for the defect showing.* A held case failing on the tree,
+   whose runner-report message carries no resource signature — a timeout,
+   a worker crash or exit signal, an out-of-memory kill
+   (`_RESOURCE_FAILURE_RE`, the same mechanical match on fixed runner
+   output as §9's intermittent typing) — makes its file failing outright.
+   Only the rest goes to the vote: a held case failing with a resource
+   signature or with no message to read, a failure whose report names no
+   case, a control. A vote rerun that shows a held case failing with no
+   resource signature also settles its file as failing.
+2. *Discovery.* Every set measured with confirmation whose defect files
+   did not end failing — it passed, or the vote typed its failures
+   `resource_affected` — has those files rerun up to
+   `acceptance_intermittent_repeats` (10, never more than 10) more times,
+   serially behind the gate and inside `confirm_budget_sec`, stopping at
+   the first rerun that shows a held case failing with no resource
+   signature, which makes the file failing.
+3. *A held case that failed is never unmeasured.* A set whose held case
+   failed at least once, but only with resource signatures (or none
+   readable), and that neither rule settled, is not "no evidence": it is
+   typed **intermittent** (`intermittent_cases`) and counts as a failing
+   set — the repair rounds and the delivery re-drive take it like any
+   failing set, the gate's residual names it (`residual.intermittent`),
+   and left unresolved it makes the run `unconverged`. A set unmeasured
+   with no held-case failure stays no evidence either way, but the gate
+   never logs that the held-out sets pass while any set is unmeasured: it
+   logs how many were.
+
+Measured (barnacle 7cc87f9a, early replay, pass 1): the shipped generator
+drew its one guaranteed special from an alphabet that included `-` and
+`_`, which the report's sites do not count. Two sets' counted case ("every
+sample contains a special other than `-`/`_`", 2000 samples) failed per
+run with p = 0.546; the vote confirmed it only when all four runs failed,
+0.546⁴ = 8.9%. In 45.7% of first passes it was seen failing on an
+`AssertionError`, typed `resource_affected`, the set went unmeasured and
+the gate logged that the held-out sets pass — about 91% of first passes
+shipped the defect with a green verdict, and the chain took three passes.
+Rule 1 catches it whenever the first run fails (54.6%); with discovery's
+ten reruns a set misses it with probability 0.454¹¹ < 0.02%.
+
+The asymmetry is deliberately confined to held cases. Elsewhere a B\*
+verdict has no own-start failure to lean on, and each place keeps its
+symmetric rule:
+
+- *The final ID diff (E3) and the delivery ratchet's execution route
+  (N5's `_ratchet_exec`).* A candidate there passed on the base: it is an
+  expected-to-pass case, and an expected-to-pass case failing now and then
+  is exactly what a pre-existing flaky test looks like, which a few base
+  reruns bound but cannot exclude. So a non-resource intermittent failure
+  stays typed `intermittent_regression` — evidence, not a trigger (§9 *An
+  intermittent failure the run introduced is evidence*). What these routes
+  must not do is go silent: the ratchet records the execution-shaped items
+  it could not check (`exec_unchecked`) when its ID diff measured nothing,
+  rather than keeping the round as if they had held.
+- *The delivery re-drive (B2's `_redrive_verdict`).* Its set verdicts come
+  from the same evaluation, so rules 1–3 reach it unchanged; a set with no
+  verdict keeps its earlier one (`_redrive_carry`), never a pass.
+- *The falsifier's confirm.* A probe is written against the final tree and
+  never failed at an own start; an unconfirmed probe leaves the item at the
+  judge's verdict and is recorded in the sample's gates. It stays a vote:
+  a probe that fails one run in four may be the probe's own nondeterminism,
+  and a confirmed probe drives a re-drive.
+
+A failing
 set triggers **at most two repair rounds**: the conformer is
 given the task text and its typed required items, with each item's
 classifier-typed parts verbatim — neither is held-out data, and a round

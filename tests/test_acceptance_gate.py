@@ -56,6 +56,15 @@ def _confirm_at_once(leerie, monkeypatch):
                 "reruns_run": 0, "budget_exhausted": False, "gate": None}
     monkeypatch.setattr(leerie, "_confirm_still_failing", confirm_all)
 
+    # Held-case discovery reruns every passing defect file up to ten times
+    # (DESIGN §8 *A held case that fails again*); these fixtures are
+    # deterministic, so it would find nothing and only cost time. Pinned
+    # with real reruns in tests/test_acceptance_held_case_intermittent.py.
+    async def discover_nothing(st, caps, wt, rels, *a, **_kw):
+        return {"files": list(rels), "repeats_required": 0,
+                "repeats_run": 0, "budget_exhausted": False, "found": []}
+    monkeypatch.setattr(leerie, "_acceptance_discover", discover_nothing)
+
 
 @pytest.fixture(autouse=True)
 def _no_set_audit(leerie, monkeypatch):

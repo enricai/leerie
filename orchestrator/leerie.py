@@ -257,6 +257,12 @@ DEFAULT_CAPS = {
     # §9 *An intermittent failure the run introduced is evidence*): at a
     # 10.5% per-run failure rate, 20 repeats find it with p = 0.89.
     "confirm_intermittent_repeats": 20,
+    # Discovery reruns of a held-out set's defect files that did not end
+    # failing (DESIGN §8 *A held case that fails again is a failure, not a
+    # flake*), clamped to `_ACCEPTANCE_INTERMITTENT_MAX`: at the replayed
+    # barnacle 7cc87f9a p = 0.546 per run, a set misses the defect with
+    # probability 0.454**11 < 0.02%.
+    "acceptance_intermittent_repeats": 10,
     # CRITIC-pattern mechanical-feedback re-invocation caps. Each worker
     # type gets code-enforced structural checks (file existence, graph
     # cycles, lockfile consistency, etc.) and the orchestrator re-invokes
@@ -42562,6 +42568,12 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                 cases_out["failing_cases"] = sorted(
                     cid for cid, status in (got.get("cases") or {}).items()
                     if status == "failed")
+                # The runner's own message per failing case: whether a held
+                # case's failure carries a resource signature is read from
+                # it (DESIGN §8 *A held case that fails again*).
+                cases_out["failing_messages"] = {
+                    cid: m for cid, m in (got.get("messages") or {}).items()
+                    if cid in cases_out["failing_cases"]}
         return rc == 0
     parsed = _parse_runner_report(spec[2], report) if spec else None
     if parsed is None:
@@ -43181,9 +43193,17 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                                  ) -> list[dict]:
     """Run each set in the prepared tree `wt`, one at a time: place its
     files (never over a path the tree has — that makes the set
-    unmeasured), run them, confirm a failing file under B* when `confirm`,
-    and remove the copies before the next set. The evaluation worktree and
-    the surrogate witness's tree both go through here (DESIGN §8)."""
+    unmeasured), run them, confirm a failing file when `confirm`, and
+    remove the copies before the next set. The evaluation worktree and the
+    surrogate witness's tree both go through here (DESIGN §8).
+
+    Confirming is asymmetric for held cases (DESIGN §8 *A held case that
+    fails again is a failure, not a flake*): a file whose held case fails
+    with no resource signature is failing without a vote; the rest go to
+    B* (`_confirm_still_failing`); a defect file with held cases that did
+    not end failing is rerun by `_acceptance_discover`; and a file whose
+    held case was seen failing, but only with resource signatures, is
+    failing and typed `intermittent_cases` — never unmeasured."""
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
     results: list[dict] = []
     for s_ in sets:
@@ -43191,6 +43211,22 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         resource_affected: list[str] = []
         unmeasured = False
         case_ids: dict[str, list[str]] = {}
+        # Held cases seen failing per file (any signature), and the files a
+        # held case failing with no resource signature settled as failing.
+        seen: dict[str, set[str]] = {}
+        asserted: set[str] = set()
+        intermittent: dict[str, list[str]] = {}
+        discovery: dict | None = None
+
+        def _note(rel: str, obs: dict, _s=s_, _seen=seen,
+                  _asserted=asserted, _ids=case_ids) -> bool:
+            hit, saw = _acceptance_held_signals(_s, rel, obs)
+            if saw:
+                _seen.setdefault(rel, set()).update(saw)
+            if hit:
+                _asserted.add(rel)
+                _ids.setdefault(rel, list(obs.get("failing_cases") or []))
+            return bool(hit)
         try:
             for rel in ((s_.get("support_files") or [])
                         + s_["defect_files"] + s_["control_files"]):
@@ -43218,29 +43254,52 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                     failing.append(rel)
                     if obs.get("failing_cases"):
                         case_ids[rel] = list(obs["failing_cases"])
-            if failing and confirm:
+                    _note(rel, obs)
+            vote = [r for r in failing if r not in asserted]
+            if vote and confirm:
                 n_rerun = {"i": 0}
 
-                async def _rerun(_left: float, _files=tuple(failing)
+                async def _rerun(_left: float, _files=tuple(vote),
+                                 _n=n_rerun, _nt=_note
                                  ) -> set[str] | None:
-                    n_rerun["i"] += 1
+                    _n["i"] += 1
                     still: set[str] = set()
                     for rel in _files:
+                        o: dict = {}
                         v = await _run_acceptance_file(
                             st, caps, str(wt), rel, log_path,
-                            f"acceptance-{label}-confirm{n_rerun['i']}",
-                            **_env_kw(env_extra))
+                            f"acceptance-{label}-confirm{_n['i']}",
+                            cases_out=o, **_env_kw(env_extra))
                         if v is None:
                             return None
                         if v is False:
                             still.add(rel)
+                            _nt(rel, o)
                     return still
                 verdict_ = await _confirm_still_failing(
-                    failing, _rerun, caps,
+                    vote, _rerun, caps,
                     label=f"acceptance {label} set {s_['index']}")
                 resource_affected = list(verdict_["resource_affected"])
                 failing = [r for r in failing
-                           if r in verdict_["confirmed"]]
+                           if r in asserted or r in verdict_["confirmed"]]
+            if confirm:
+                pending = [r for r in ran if r not in failing
+                           and _acceptance_held_cases(s_, r)]
+                if pending:
+                    discovery = await _acceptance_discover(
+                        st, caps, wt, pending, log_path, label,
+                        env_extra, _note, index=s_["index"])
+                    failing += [r for r in pending if r in asserted]
+                for rel in ran:
+                    if rel not in failing and seen.get(rel):
+                        # Rule 3: a held case that failed is never
+                        # unmeasured, whatever its signature said.
+                        intermittent[rel] = sorted(seen[rel])
+                        case_ids[rel] = sorted(seen[rel])
+                        failing.append(rel)
+                failing = [r for r in ran if r in failing]
+                resource_affected = [r for r in resource_affected
+                                     if r not in failing]
                 if resource_affected and not failing:
                     unmeasured = True
         except Exception as e:
@@ -43266,9 +43325,109 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
         if any(rel in case_ids for rel in failing):
             res_["failing_cases"] = {rel: case_ids[rel] for rel in failing
                                      if rel in case_ids}
+        if intermittent:
+            res_["intermittent_cases"] = intermittent
+            log(f"  acceptance {label} set {s_['index']}: held case(s) "
+                "failed only with resource signatures — typed intermittent, "
+                "a failing set (never unmeasured)")
+        if discovery is not None and discovery["found"]:
+            # Only when it changed the verdict: a pass stays the shape
+            # every reader already compares.
+            res_["discovery"] = discovery
         results.append(res_)
     return results
 
+
+def _acceptance_held_cases(set_: dict, rel: str) -> set[str]:
+    """The held cases of one set file (DESIGN §8 *A held case that fails
+    again is a failure, not a flake*): the defect file's cases validation
+    saw fail at the own start (`base_failing_cases`), only the counted ones
+    when the scope judge bounded the set. Empty for a control, or a set
+    recorded without per-case validation."""
+    if rel not in (set_.get("defect_files") or []):
+        return set()
+    base = (set_.get("base_failing_cases") or {}).get(rel)
+    if not isinstance(base, list):
+        return set()
+    held = {str(c) for c in base}
+    if _acceptance_counted_files(set_) is not None:
+        counted = ((set_.get("scope") or {}).get("counted_cases")
+                   or {}).get(rel) or []
+        held &= {str(c) for c in counted}
+    return held
+
+
+def _acceptance_held_signals(set_: dict, rel: str, obs: dict
+                             ) -> tuple[set[str], set[str]]:
+    """`(asserted, seen)` for one run of a set file: `seen` its held cases
+    the runner's report shows failing, `asserted` those whose report message
+    carries no resource signature (`_RESOURCE_FAILURE_RE` — fixed runner
+    output, DESIGN §12). A case with no message cannot show its signature,
+    so it is seen but never asserted."""
+    seen = _acceptance_held_cases(set_, rel) & {
+        str(c) for c in obs.get("failing_cases") or []}
+    msgs = obs.get("failing_messages") or {}
+    asserted = {c for c in seen
+                if str(msgs.get(c) or "").strip()
+                and not _RESOURCE_FAILURE_RE.search(str(msgs[c]))}
+    return asserted, seen
+
+
+# The most discovery reruns a held-out set file gets per evaluation.
+_ACCEPTANCE_INTERMITTENT_MAX = 10
+
+
+async def _acceptance_discover(st: "State", caps: dict, wt: Path,
+                               rels: list[str], log_path: Path, label: str,
+                               env_extra: dict | None,
+                               note: Callable[[str, dict], bool], *,
+                               index: object = None) -> dict:
+    """Discovery for held cases (DESIGN §8 *A held case that fails again*,
+    rule 2): rerun each of `rels` — defect files with held cases that did
+    not end failing — serially, up to `acceptance_intermittent_repeats`
+    rounds (at most `_ACCEPTANCE_INTERMITTENT_MAX`), behind the
+    host-pressure gate and inside `confirm_budget_sec`. `note(rel, obs)`
+    records each failing run and is True when a held case failed with no
+    resource signature; such a file is not rerun again. Returns `{files,
+    repeats_required, repeats_run, budget_exhausted, found[]}`."""
+    reps = max(0, min(int(caps.get(
+        "acceptance_intermittent_repeats",
+        DEFAULT_CAPS["acceptance_intermittent_repeats"])),
+        _ACCEPTANCE_INTERMITTENT_MAX))
+    out: dict = {"files": list(rels), "repeats_required": reps,
+                 "repeats_run": 0, "budget_exhausted": False, "found": []}
+    if reps == 0 or not rels:
+        return out
+    pending = list(rels)
+    clock = time.monotonic
+    async with _confirm_lock():
+        budget = float(caps.get("confirm_budget_sec",
+                                DEFAULT_CAPS["confirm_budget_sec"]))
+        t0 = clock()
+        await _confirm_gate(caps)
+        for i in range(reps):
+            if not pending:
+                break
+            for rel in list(pending):
+                if budget - (clock() - t0) <= 0:
+                    out["budget_exhausted"] = True
+                    break
+                obs: dict = {}
+                v = await _run_acceptance_file(
+                    st, caps, str(wt), rel, log_path,
+                    f"acceptance-{label}-discover{i + 1}", cases_out=obs,
+                    **_env_kw(env_extra))
+                if v is False and note(rel, obs):
+                    pending.remove(rel)
+                    out["found"].append(rel)
+            out["repeats_run"] = i + 1
+            if out["budget_exhausted"]:
+                break
+    if out["found"]:
+        log(f"  acceptance {label} set {index}: discovery found a held case "
+            f"failing in {len(out['found'])} file(s) after "
+            f"{out['repeats_run']} rerun round(s)")
+    return out
 
 
 def _env_kw(env_extra: dict | None) -> dict:
@@ -44757,8 +44916,17 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             f"{gate['residual']['total_sets']} measured set(s) still "
             "fail; shipping anyway (non-blocking), recorded for the next run")
     elif _acceptance_measured(final):
-        log("phase 5: acceptance gate — held-out sets pass on the "
-            "integrated tree")
+        unm = len(final) - len(_acceptance_measured(final))
+        if unm:
+            # Never "pass" while a set produced no verdict (DESIGN §8 *A
+            # held case that fails again*).
+            log(f"phase 5: acceptance gate — "
+                f"{len(_acceptance_measured(final))} of {len(final)} "
+                f"held-out set(s) pass, {unm} unmeasured (no evidence "
+                "either way)")
+        else:
+            log("phase 5: acceptance gate — held-out sets pass on the "
+                "integrated tree")
     if gate.get("rollback_failed"):
         # The repair the gate decided to revert ships anyway: the next run
         # must hear of it even when its sets pass (a red test axis).
@@ -44877,7 +45045,12 @@ def _acceptance_residual_of(basis: list[dict], sets: list[dict]) -> dict:
                               "cases", {}).get(rel, [])][:20]
         for r in measured if not r["passed"]}
     names = [c for v in cases_by_set.values() for c in v]
+    # A failing set whose held case failed only with resource signatures
+    # (DESIGN §8 *A held case that fails again*, rule 3), typed as such.
+    intermittent = [r["index"] for r in measured if not r["passed"]
+                    and r.get("intermittent_cases")]
     return {
+        **({"intermittent": intermittent} if intermittent else {}),
         "failing_sets": sum(1 for r in measured if not r["passed"]),
         "total_sets": len(measured), "cases": names[:20],
         # Which sets, so a set typed broken later can be left out of the
@@ -47998,7 +48171,7 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
     ex = exec_result or {}
     out: dict = {"pre_sha": pre_sha, "post_sha": post_sha, "prior_met": [],
                  "untouched": [], "execution": [], "exec_flagged": [],
-                 "judge": None, "regressed": [],
+                 "exec_unchecked": [], "judge": None, "regressed": [],
                  "new_failures": list(ex.get("new") or []),
                  "intermittent_regression": list(
                      ex.get("intermittent_regression") or [])}
@@ -48031,6 +48204,14 @@ async def _delivery_ratchet(st: "State", caps: dict, models: dict,
         if out["new_failures"]:
             out["exec_flagged"] = list(out["execution"])
             regressed |= set(out["execution"])
+        elif ex.get("unmeasured") and out["execution"]:
+            # No ID diff on either side: these items were not checked, and
+            # the record says so rather than reading as held (DESIGN §8 *A
+            # held case that fails again*).
+            out["exec_unchecked"] = list(out["execution"])
+            log(f"  delivery ratchet {label}: {len(out['execution'])} "
+                "execution-shaped item(s) unchecked — the failing-test-ID "
+                "diff measured nothing")
         judged = [i for i in rest if kinds.get(i) != "execution"]
         if judged:
             sec = _intermittent_regression_evidence_section(

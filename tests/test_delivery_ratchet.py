@@ -440,3 +440,30 @@ def test_intermittent_rows_of_kept_ratchets_reach_the_evidence(leerie):
     assert leerie._intermittent_regression_rows(state) == [
         {"id": "t::a", "file": "t"}, {"id": "t::b", "file": "t"}]
     assert leerie._intermittent_regression_rows({}) == []
+
+
+@pytest.mark.parametrize("unmeasured", [True, False])
+def test_an_unmeasured_id_diff_leaves_execution_items_unchecked_not_held(
+        leerie, tmp_path, monkeypatch, unmeasured):
+    """DESIGN §8 *A held case that fails again*: with no ID diff on either
+    side the execution route checked nothing. The ratchet says so
+    (`exec_unchecked`) instead of reading the items as held; a measured
+    diff with no new failure leaves the list empty."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main",
+             required_items=ITEMS)
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    st.data["delivery_gate"] = {"judged_before": _judged_before(start, [])}
+    w = Workers([])
+    monkeypatch.setattr(leerie, "claude_p", w)
+    ex = ({"new": [], "resource_affected": [], "unmeasured": True,
+           "intermittent_regression": []} if unmeasured else
+          {"new": [], "resource_affected": [], "unmeasured": False,
+           "intermittent_regression": []})
+    rat = asyncio.run(leerie._delivery_ratchet(
+        st, _caps(leerie, 5), MODELS, EFFORTS, staging, start, start,
+        exec_result=ex, label="t"))
+    assert rat["execution"] == [2]
+    assert rat["exec_unchecked"] == ([2] if unmeasured else [])
+    assert rat["regressed"] == [] and 2 not in rat["judge"]["judged"]
