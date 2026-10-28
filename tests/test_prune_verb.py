@@ -413,3 +413,65 @@ def test_dry_run_and_apply_agree(tmp_path):
     assert (kept_dry is None) == (kept_app is None)
     if kept_dry:
         assert kept_dry.group(1) == kept_app.group(1)
+
+
+# --- the worktrees of idle resumable runs (N7b; DESIGN §6 *Idle runs'
+# worktrees are reaped at preflight*) ---------------------------------------
+
+def _resumable_with_worktree(root: Path, repo: Path, rid: str, *,
+                             old: bool) -> Path:
+    d = _run_dir(root, rid, old=False)      # no finished_at: resumable
+    wt = d / "worktrees" / f"{rid}-feat-001"
+    wt.parent.mkdir()
+    assert _git(repo, "worktree", "add", "-q", "-b",
+                f"leerie/subtasks/{rid}/feat-001", str(wt),
+                "HEAD").returncode == 0
+    (wt / "blob.bin").write_bytes(b"z" * (3 * 1048576))
+    if old:
+        for dirpath, dirnames, filenames in os.walk(d, topdown=False):
+            for n in filenames + dirnames:
+                os.utime(os.path.join(dirpath, n), (OLD, OLD),
+                         follow_symlinks=False)
+        os.utime(d, (OLD, OLD))
+    return d
+
+
+def test_idle_resumable_runs_lose_their_worktrees_and_keep_the_rest(
+        tmp_path):
+    root = tmp_path / "state"
+    repo = _repo(tmp_path)
+    idle = _resumable_with_worktree(root, repo, "idle-run", old=True)
+    fresh = _resumable_with_worktree(root, repo, "fresh-run", old=False)
+
+    dry = _prune(root, repo)
+    assert dry.returncode == 0, dry.stderr
+    assert "would remove the worktrees of 1 idle resumable run(s)" in \
+        dry.stdout
+    assert (idle / "worktrees").is_dir(), "dry-run deleted something"
+    mib = float(re.search(r"would remove ~([\d.]+) MiB", dry.stdout)[1])
+    assert mib >= 3.0
+
+    r = _prune(root, repo, "--apply")
+    assert r.returncode == 0, r.stderr
+    assert "removed the worktrees of 1 idle resumable run(s)" in r.stdout
+    assert not (idle / "worktrees").exists()
+    assert (idle / "run.json").exists() and (idle / "state.json").exists()
+    assert (fresh / "worktrees" / "fresh-run-feat-001" / "blob.bin").exists()
+    # The run stays resumable, so its branch stays.
+    out = _git(repo, "branch", "--list", "leerie/subtasks/*").stdout
+    assert "leerie/subtasks/idle-run/feat-001" in out
+
+
+def test_a_live_idle_run_keeps_its_worktrees(tmp_path):
+    import fcntl
+    root = tmp_path / "state"
+    repo = _repo(tmp_path)
+    idle = _resumable_with_worktree(root, repo, "held-run", old=True)
+    fd = os.open(str(idle), os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        r = _prune(root, repo, "--apply")
+    finally:
+        os.close(fd)
+    assert r.returncode == 0, r.stderr
+    assert (idle / "worktrees").is_dir()

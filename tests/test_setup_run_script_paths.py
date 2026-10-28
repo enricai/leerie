@@ -163,7 +163,8 @@ def test_new_worktree_takes_run_id_arg():
 def test_new_worktree_uses_per_run_paths():
     src = _script("new-worktree.sh")
     assert 'LEERIE_ROOT="${LEERIE_STATE_DIR:-.leerie}"' in src
-    assert 'WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/${ID}"' in src
+    assert ('WT="${LEERIE_ROOT}/runs/${RUN_ID}/worktrees/'
+            '$(leerie_worktree_name "$RUN_ID" "$ID")"') in src
 
 
 def test_new_worktree_branch_uses_subtasks_namespace():

@@ -47,7 +47,7 @@ def test_noop_when_neither_worktree_nor_branch_exists(leerie, tmp_path, monkeypa
     asyncio.run(leerie._reset_subtask_worktree("sid-x", leerie_dir, "run-id"))
 
     # No worktree dir was created; no branch was created.
-    assert not (leerie_dir / "worktrees" / "sid-x").exists()
+    assert not (leerie_dir / "worktrees" / "run-id-sid-x").exists()
     branches = _git("branch", "--list", "leerie/subtasks/run-id/sid-x", cwd=repo)
     assert branches.stdout.strip() == ""
 
@@ -58,7 +58,7 @@ def test_removes_existing_worktree_and_branch(leerie, tmp_path, monkeypatch):
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
-    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.parent.mkdir(parents=True)
 
     # Set up the run branch (parent of the subtask branch) and the subtask
@@ -89,7 +89,7 @@ def test_reset_falls_back_to_rmtree_when_git_leaves_dir_behind(
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
-    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.mkdir(parents=True)
     (wt_dir / "leftover.txt").write_text("stray\n")
     r = _git_noraise("worktree", "remove", "--force", str(wt_dir), cwd=repo)
@@ -152,7 +152,7 @@ def test_resets_so_worktree_add_b_succeeds_on_retry(leerie, tmp_path, monkeypatc
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
-    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.parent.mkdir(parents=True)
     _git("branch", "leerie/runs/run-id", "main", cwd=repo)
 

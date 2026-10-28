@@ -76,7 +76,7 @@ class TestEnsurePlanningWorktree:
     def test_creates_the_worktree_and_records_the_path(self, leerie, env):
         repo, state, st = env
         path = _run(leerie, st)
-        assert (state / "runs" / "r1" / "worktrees" / "planning").is_dir()
+        assert (state / "runs" / "r1" / "worktrees" / "r1-planning").is_dir()
         assert st.data["planning_worktree"] == path
         assert st.saves >= 1, "the path must be persisted, not just returned"
 
@@ -158,7 +158,7 @@ class TestEnsurePlanningWorktree:
         (repo / "brief.md").write_text("the spec\n")     # untracked
         st.data["task"] = "implement what brief.md says"
         _run(leerie, st)
-        wt = state / "runs" / "r1" / "worktrees" / "planning"
+        wt = state / "runs" / "r1" / "worktrees" / "r1-planning"
         assert (wt / "brief.md").exists()
         _run(leerie, st)
         assert (wt / "brief.md").exists(), (

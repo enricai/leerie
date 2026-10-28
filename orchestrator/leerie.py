@@ -1005,7 +1005,10 @@ INSPECT_TOOLS = (
 # a deny would not deliver the read-only property it appears to buy.
 # Listing it here also keeps it inside KNOWN_TOOLS, so the observed-surface
 # partition stays complete.
-ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit"
+#
+# TaskStop: an acting worker stops its OWN `run_in_background` command with it
+# (session-scoped; see DISALLOWED_TOOLS) instead of a pattern kill.
+ACT_TOOLS = f"{_READ_BASE},Bash,Write,Edit,NotebookEdit,TaskStop"
 
 # SATISFIED_PROBE_TOOLS — a deliberately narrow, BASE-TREE-ONLY subset of
 # INSPECT_TOOLS for the phase-3 satisfied-probe (DESIGN §8 *Already-
@@ -1048,14 +1051,20 @@ SATISFIED_PROBE_TOOLS = (
 # the injected StructuredOutput tool), Skill (loads arbitrary skill
 # instructions outside leerie's own prompts), Monitor (backgrounds
 # untracked long-running watches), the Task* family (TaskCreate, TaskGet,
-# TaskList, TaskUpdate, TaskOutput, TaskStop — untracked parallel work
-# items; the Create/Get/List/Update names are retired from current CLI
-# builds but kept for defense-in-depth), ListAgents (enumerates/targets
+# TaskList, TaskUpdate, TaskOutput — untracked parallel work items; the
+# Create/Get/List/Update names are retired from current CLI builds but kept
+# for defense-in-depth), ListAgents (enumerates/targets
 # other sessions), EnterWorktree/ExitWorktree (git worktree mechanics
 # reserved to the orchestrator's own scripts), DesignSync (writes to an
 # external claude.ai project outside worktree/git tracking), and
 # ToolSearch (denied for consistency with the rest of this set even
 # though it only searches for MCP tool schemas, not a distinct bypass).
+#
+# `TaskStop` is deliberately NOT here (DESIGN §9 *A worker never kills a
+# process by name*): it stops one of the CALLING session's own background
+# tasks — a foreign task ID gets "No task found" — so it is the safe way for a
+# worker to stop its own background command, and it is what the process-kill
+# notice points workers at instead of `pkill`. It is granted in ACT_TOOLS.
 #
 # `Task` is the live CLI's name for subagent spawning; `Agent` above is the
 # retired one, so until it was added here CLAUDE.md's "No subagent spawning"
@@ -1080,7 +1089,7 @@ DISALLOWED_TOOLS = (
     "CronCreate,CronDelete,CronList,"
     "RemoteTrigger,PushNotification,"
     "Workflow,ReportFindings,Skill,Monitor,"
-    "TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,TaskStop,"
+    "TaskCreate,TaskGet,TaskList,TaskUpdate,TaskOutput,"
     "ListAgents,EnterWorktree,ExitWorktree,DesignSync,ToolSearch,"
     "ListMcpResourcesTool,ReadMcpResourceTool,ReadMcpResourceDirTool"
 )
@@ -5138,6 +5147,23 @@ async def _terminate_proc_tree(proc: asyncio.subprocess.Process) -> None:
                 pass
 
 
+def _worktree_dirname(run_id: str, name: str) -> str:
+    """The directory name of a run's subtask or planning worktree: the run
+    id's first 12 characters, a dash, then `name`. git names a worktree's
+    admin entry (`.git/worktrees/<basename>`) after the directory, so without
+    the prefix every run's `bugfix-001` competed for one admin name in the
+    shared `.git` (DESIGN §6 *Never a repository-global git operation*).
+    Mirror of `scripts/worktree-lib.sh`'s `leerie_worktree_name`."""
+    return f"{str(run_id)[:12]}-{name}"
+
+
+def _subtask_worktree_path(leerie_dir: Path, sid: str) -> Path:
+    """`<run-dir>/worktrees/<prefix>-<sid>` — where `new-worktree.sh` puts a
+    subtask's worktree. The run directory's own name is the run id."""
+    leerie_dir = Path(leerie_dir)
+    return leerie_dir / "worktrees" / _worktree_dirname(leerie_dir.name, sid)
+
+
 def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
     """Clean up after an abnormal exit (signal, exception, WorkerError).
 
@@ -5272,6 +5298,11 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
         shutil.rmtree(st.run_dir, ignore_errors=True)
 
 
+# How long the Python prune waits for the repository-wide worktree lock
+# before skipping (a prune is housekeeping; skipping deletes nothing).
+_WORKTREE_LOCK_WAIT_SEC = 30.0
+
+
 def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     """Scoped replacement for a bare `git worktree prune`. Python port of
     `scripts/worktree-lib.sh`'s `prune_leerie_worktrees`, for the orchestrator's
@@ -5315,9 +5346,39 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
         # nothing -- a silent no-op indistinguishable from "nothing was
         # stale". (The shell helper achieves this with `2>&1`; here it is the
         # concatenation of `r.stdout` and `r.stderr`.)
+    except (OSError, subprocess.TimeoutExpired):
+        return
+    # The repository-wide worktree lock the scripts take (`leerie_repo_lock`):
+    # without it this prune races a script's `worktree add` exactly as the
+    # scripts' own prunes did. Bounded: a prune is housekeeping, so one that
+    # cannot get the lock within `_WORKTREE_LOCK_WAIT_SEC` is skipped
+    # (nothing deleted).
+    try:
+        lock_fd = os.open(str(git_dir / "leerie-worktree.lock"),
+                          os.O_WRONLY | os.O_CREAT, 0o644)
+    except OSError:
+        return
+    try:
+        deadline = time.monotonic() + _WORKTREE_LOCK_WAIT_SEC
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() >= deadline:
+                    return
+                time.sleep(0.1)
+        _prune_leerie_worktrees_locked(git_dir, root, _env)
+    finally:
+        os.close(lock_fd)
+
+
+def _prune_leerie_worktrees_locked(git_dir: Path, root: str,
+                                   env: dict[str, str]) -> None:
+    try:
         r = subprocess.run(["git", "worktree", "prune", "-n", "-v"],
                            capture_output=True, text=True, check=False,
-                           timeout=10, env=_env)
+                           timeout=10, env=env)
     except (OSError, subprocess.TimeoutExpired):
         return
     for line in (r.stdout + "\n" + r.stderr).splitlines():
@@ -5349,6 +5410,10 @@ def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
         except OSError:
             continue
         if resolved != root and not resolved.startswith(root + os.sep):
+            continue
+        # Re-check right before deleting (as the shell helper does): only an
+        # entry whose worktree `.git` link is really gone is stale.
+        if os.path.lexists(os.path.join(resolved, ".git")):
             continue
         shutil.rmtree(entry, ignore_errors=True)
 
@@ -5385,7 +5450,7 @@ async def _reset_subtask_worktree(sid: str, leerie_dir: Path, run_id: str) -> No
     and that is the expected idempotent case. Mirrors the rmtree
     fallback in `_cleanup_on_abnormal_exit` for the case where git
     administratively succeeded but left the directory behind."""
-    worktree = leerie_dir / "worktrees" / sid
+    worktree = _subtask_worktree_path(leerie_dir, sid)
     branch = f"leerie/subtasks/{run_id}/{sid}"
     try:
         await run_proc(["git", "worktree", "remove", "--force", str(worktree)], timeout=240)
@@ -5407,7 +5472,7 @@ async def _prune_subtask_worktree(sid: str, leerie_dir: Path) -> None:
     --force` returns nonzero when its target is missing, which is the
     expected idempotent case. Never raises — a failed prune is disk
     pressure deferred to run-end cleanup, not a reason to fail the wave."""
-    worktree = leerie_dir / "worktrees" / sid
+    worktree = _subtask_worktree_path(leerie_dir, sid)
     try:
         await run_proc(["git", "worktree", "remove", "--force", str(worktree)], timeout=240)
     except subprocess.TimeoutExpired:
@@ -9362,7 +9427,8 @@ def _judgment_cwd(st: "State") -> str:
         raise RuntimeError(
             "cannot derive a judgment-worker cwd: state has neither "
             "`planning_worktree` nor `run_dir`")
-    return str(Path(run_dir) / "worktrees" / "planning")
+    return str(Path(run_dir) / "worktrees"
+               / _worktree_dirname(Path(run_dir).name, "planning"))
 
 
 # =========================================================================
@@ -9477,6 +9543,116 @@ async def _preflight_repo() -> None:
             "  git branch -D leerie               # delete (if fully merged)")
 
 
+# --- Reaping idle runs' worktrees (DESIGN §6 *Idle runs' worktrees are
+# reaped at preflight*) ------------------------------------------------------
+
+# A run nobody has touched for this long is not about to resume; its
+# worktrees are rebuilt from its branches if it ever does.
+WORKTREE_REAP_IDLE_DAYS = 7
+# Files whose mtime says a run is still being worked (besides its directory,
+# `logs/` and `worktrees/` entries).
+_RUN_ACTIVITY_FILES = ("state.json", "run.json", "orchestrator.log",
+                       "calls.ndjson", "memory.ndjson",
+                       "orchestrator.exit_code")
+_REAP_TRASH_PREFIX = ".worktrees.reap-"
+
+
+def _run_last_activity(run_dir: Path) -> float:
+    ts = [run_dir.stat().st_mtime]
+    for f in _RUN_ACTIVITY_FILES:
+        with contextlib.suppress(OSError):
+            ts.append((run_dir / f).stat().st_mtime)
+    for sub in ("logs", "worktrees"):
+        p = run_dir / sub
+        with contextlib.suppress(OSError):
+            ts.append(p.stat().st_mtime)
+            with os.scandir(p) as it:
+                for e in it:
+                    with contextlib.suppress(OSError):
+                        ts.append(e.stat(follow_symlinks=False).st_mtime)
+    return max(ts)
+
+
+def _tree_bytes(root: Path) -> int:
+    """Bytes under `root`, each inode once (pnpm hard-links one file into
+    many worktrees), symlinks not followed."""
+    seen: set[tuple[int, int]] = set()
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            try:
+                st_ = os.lstat(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            key = (st_.st_dev, st_.st_ino)
+            if key in seen:
+                continue
+            seen.add(key)
+            total += st_.st_size
+    return total
+
+
+def _reap_idle_worktrees(runs_dir: Path, self_id: str,
+                         idle_days: float = WORKTREE_REAP_IDLE_DAYS,
+                         now: float | None = None) -> dict:
+    """Delete `<run>/worktrees/` of every run that is neither this one, nor
+    live, nor touched within `idle_days`. Only `worktrees/` is touched —
+    state, logs and branches stay, so the run can still resume (its scripts
+    rebuild every worktree from its branches; uncommitted edits are lost, as
+    on any abnormal exit).
+
+    The directory is renamed to `<run>/.worktrees.reap-<pid>` while holding
+    the run's flock, then deleted after releasing it: a resume taking the
+    lock a moment later never sees a half-deleted tree. A run whose flock
+    cannot be taken is live and skipped (fail closed). Leftover
+    `.worktrees.reap-*` from an interrupted reap are deleted too. Never
+    raises; errors are counted in the report."""
+    cutoff = (time.time() if now is None else now) - idle_days * 86400
+    report: dict = {"reaped": [], "skipped_live": [], "skipped_recent": [],
+                    "bytes": 0, "errors": 0}
+    try:
+        entries = sorted(runs_dir.iterdir())
+    except OSError:
+        return report
+    for d in entries:
+        try:
+            if not d.is_dir() or d.is_symlink() or d.name == self_id:
+                continue
+            for trash in d.glob(_REAP_TRASH_PREFIX + "*"):
+                if trash.is_dir() and not trash.is_symlink():
+                    report["bytes"] += _tree_bytes(trash)
+                    shutil.rmtree(trash, ignore_errors=True)
+            wt = d / "worktrees"
+            if (not wt.is_dir() or wt.is_symlink()
+                    or not any(wt.iterdir())):
+                continue
+            if _run_last_activity(d) >= cutoff:
+                report["skipped_recent"].append(d.name)
+                continue
+            fd = os.open(str(d), os.O_RDONLY)
+            try:
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    report["skipped_live"].append(d.name)
+                    continue
+                trash = d / f"{_REAP_TRASH_PREFIX}{os.getpid()}"
+                os.rename(wt, trash)
+            finally:
+                os.close(fd)
+            report["bytes"] += _tree_bytes(trash)
+            errs: list[str] = []
+            shutil.rmtree(trash, onerror=lambda *a: errs.append(str(a[1])))
+            report["errors"] += len(errs)
+            # The deleted worktrees' admin entries in the shared `.git`,
+            # scoped to this run directory.
+            _prune_leerie_worktrees(d)
+            report["reaped"].append(d.name)
+        except OSError:
+            report["errors"] += 1
+    return report
+
+
 async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
                     skip_smoke: bool = False, no_push: bool = False,
                     model: str = MODEL_DEFAULT) -> None:
@@ -9493,6 +9669,24 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
             "Every subprocess would report a bogus failure. This is an "
             "environment problem, not a leerie configuration problem.")
 
+    # 0.4. reap idle runs' worktrees (DESIGN §6 *Idle runs' worktrees are
+    # reaped at preflight*), before the headroom check reads free space.
+    # Nothing else reaps them: a paused or died run keeps a full checkout
+    # plus node_modules per subtask for as long as its directory exists.
+    try:
+        reap = await asyncio.to_thread(
+            _reap_idle_worktrees, leerie_dir.parent, leerie_dir.name)
+        if reap["reaped"] or reap["bytes"]:
+            log(f"preflight: reaped the worktrees of {len(reap['reaped'])} "
+                f"run(s) idle >= {WORKTREE_REAP_IDLE_DAYS}d, freed "
+                f"{reap['bytes'] / 1048576:.1f} MiB (skipped "
+                f"{len(reap['skipped_live'])} live, "
+                f"{len(reap['skipped_recent'])} recent"
+                + (f"; {reap['errors']} delete error(s)"
+                   if reap["errors"] else "") + ")")
+    except Exception as e:  # housekeeping must never stop a run
+        log(f"preflight: worktree reap skipped ({type(e).__name__}: {e})")
+
     # 0.5. disk headroom (N30) — a run writes state.json/logs/calls.ndjson/
     # worktrees continuously, and the first failing write under a full disk
     # was previously an unhandled `OSError: [Errno 28] No space left on
@@ -9504,9 +9698,8 @@ async def preflight(leerie_dir: Path, verbosity: str = VERBOSITY_DEFAULT,
     if ratio < DISK_MIN_FREE_RATIO:
         die(f"insufficient disk space to start a run: "
             f"{_disk_headroom_message(leerie_dir, ratio)}. "
-            "Free up space (`leerie list` to see past runs, then prune old "
-            "ones under the state root by hand — nothing reaps them "
-            "automatically) and retry.")
+            "Free up space (`leerie prune` lists what old run state it "
+            "would reclaim; `leerie prune --apply` deletes it) and retry.")
 
     # 4. claude CLI version is recent enough for `--json-schema` in -p mode.
     #    Runs even when --skip-smoke is set: --skip-smoke is for skipping the
@@ -14659,6 +14852,129 @@ _PROVISION_ARGV0_ALLOW = frozenset({
 _PROVISION_SHELL_METACHARS = frozenset(set("|&;$`><\n\r"))
 
 
+_NODE_LOCKFILES = ("pnpm-lock.yaml", "yarn.lock", "package-lock.json")
+_NODE_LOCKFILE_INSTALL = {
+    "pnpm-lock.yaml": ["pnpm", "install", "--frozen-lockfile"],
+    "yarn.lock": ["yarn", "install", "--frozen-lockfile"],
+    "package-lock.json": ["npm", "ci"],
+}
+# A repo with more nested roots than this is not a shape the table should
+# guess at; the extra roots are left to the worker's own install.
+_NESTED_NODE_ROOTS_MAX = 16
+
+
+def _node_lockfile_paths(repo_root: Path) -> list[str]:
+    """Repo-relative POSIX paths of every Node lockfile below the root:
+    the tracked ones when `repo_root` is a git work tree (an untracked
+    lockfile is not part of the project), else a walk that skips
+    `node_modules` and dot-directories."""
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(repo_root), "ls-files", "-z", "--",
+             *[f":(glob)**/{lf}" for lf in _NODE_LOCKFILES]],
+            capture_output=True, text=True, timeout=30, check=False)
+        if r.returncode == 0:
+            return sorted(p for p in r.stdout.split("\0") if p)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(repo_root):
+        dirnames[:] = sorted(d for d in dirnames
+                             if d != "node_modules" and not d.startswith("."))
+        for lf in _NODE_LOCKFILES:
+            if lf in filenames:
+                out.append(Path(dirpath, lf).relative_to(repo_root).as_posix())
+    return sorted(out)
+
+
+def _workspace_globs(repo_root: Path) -> list[str]:
+    """The root's workspace member globs: `packages:` in pnpm-workspace.yaml
+    and `workspaces` in package.json (a list, or npm/yarn's
+    `{"packages": [...]}`). Both are mechanical config files; a `!` glob is
+    an exclusion and is kept with its `!`."""
+    globs: list[str] = []
+    ws = repo_root / "pnpm-workspace.yaml"
+    if ws.is_file():
+        try:
+            in_packages = False
+            for line in ws.read_text(encoding="utf-8").splitlines():
+                bare = line.split("#", 1)[0].rstrip()
+                if not bare.strip():
+                    continue
+                if not bare[0].isspace():
+                    in_packages = bare.strip() == "packages:"
+                    continue
+                item = bare.strip()
+                if in_packages and item.startswith("-"):
+                    g = item[1:].strip().strip("'\"")
+                    if g:
+                        globs.append(g)
+        except (OSError, UnicodeDecodeError):
+            pass
+    try:
+        pkg = json.loads((repo_root / "package.json").read_text(
+            encoding="utf-8"))
+        w = pkg.get("workspaces") if isinstance(pkg, dict) else None
+        if isinstance(w, dict):
+            w = w.get("packages")
+        if isinstance(w, list):
+            globs += [g for g in w if isinstance(g, str) and g]
+    except (OSError, ValueError, UnicodeDecodeError):
+        pass
+    return globs
+
+
+def _workspace_glob_matches(path: str, glob: str) -> bool:
+    """A workspace glob against a repo-relative directory: `*` stays within
+    one path segment, `**` spans segments."""
+    g = glob.strip().rstrip("/")
+    while g.startswith("./"):
+        g = g[2:]
+    rx = ""
+    i = 0
+    while i < len(g):
+        if g.startswith("**", i):
+            rx += ".*"
+            i += 2
+            if g.startswith("/", i):
+                rx += "/?"
+                i += 1
+        elif g[i] == "*":
+            rx += "[^/]*"
+            i += 1
+        elif g[i] == "?":
+            rx += "[^/]"
+            i += 1
+        else:
+            rx += re.escape(g[i])
+            i += 1
+    return re.fullmatch(rx, path) is not None
+
+
+def _nested_node_roots(repo_root: Path) -> list[tuple[str, str]]:
+    """(directory, lockfile) for every Node project root below the repo root
+    that is not a member of the root's workspace: a directory holding its
+    own lockfile (DESIGN §6½ *One install per independent package root*).
+    pnpm > yarn > npm within one directory, as at the root."""
+    by_dir: dict[str, list[str]] = {}
+    for rel in _node_lockfile_paths(repo_root):
+        d, _, name = rel.rpartition("/")
+        if not d or "node_modules" in d.split("/"):
+            continue
+        by_dir.setdefault(d, []).append(name)
+    globs = _workspace_globs(repo_root)
+    include = [g for g in globs if not g.startswith("!")]
+    exclude = [g[1:] for g in globs if g.startswith("!")]
+    out: list[tuple[str, str]] = []
+    for d in sorted(by_dir):
+        if (any(_workspace_glob_matches(d, g) for g in include)
+                and not any(_workspace_glob_matches(d, g) for g in exclude)):
+            continue
+        lf = next(f for f in _NODE_LOCKFILES if f in by_dir[d])
+        out.append((d, lf))
+    return out[:_NESTED_NODE_ROOTS_MAX]
+
+
 def _lockfile_table_entries(repo_root: Path) -> list[dict]:
     """The deterministic lockfile → install-command table. Returns a list of
     recipe entries (possibly empty) — polyglot repos like Rails-with-frontend
@@ -14698,6 +15014,18 @@ def _lockfile_table_entries(repo_root: Path) -> list[dict]:
             "kind": "install",
             "command": ["npm", "ci"],
             "working_dir": ".",
+            "timeout_s": 1800,
+        })
+    # One entry per independent Node root below the top (a `worker/` or
+    # `infra/` with its own lockfile, outside the root's workspace). A root
+    # install never reaches them, and the provision judge rejected the
+    # one-entry recipe as missing their dependencies: 7 run deaths across 5
+    # chains (`_nested_node_roots`).
+    for d, lf in _nested_node_roots(repo_root):
+        entries.append({
+            "kind": "install",
+            "command": list(_NODE_LOCKFILE_INSTALL[lf]),
+            "working_dir": d,
             "timeout_s": 1800,
         })
 
@@ -20715,6 +21043,42 @@ def _warn_denial_skipped_once(root: Path) -> None:
         "applies. Set LEERIE_STATE_DIR outside the repo to restore it.")
 
 
+SYSPROMPT_DIRNAME = "sysprompt"
+
+
+def _write_system_prompt_file(run_dir: str | Path | None, text: str) -> str:
+    """Stage `--append-system-prompt-file`'s file under `<run-dir>/sysprompt/`
+    (DESIGN §7 *The system prompt is staged in the run directory*), not /tmp.
+    The CLI reads it at each spawn of a `claude_p` call, which can span a
+    90-minute worker and its retries, and anything that clears /tmp under a
+    live run (a host cleanup, a lost overlay) takes every in-flight file
+    with it: 5 runs died that way at their next spawn. The run directory is
+    the state the run already depends on, and the directory is read-denied
+    to workers (`_sysprompt_read_denial`). Falls back to the system temp dir
+    only when the run directory cannot hold it."""
+    import tempfile  # noqa: PLC0415
+    d: str | None = None
+    if run_dir is not None:
+        try:
+            p = Path(run_dir) / SYSPROMPT_DIRNAME
+            p.mkdir(parents=True, exist_ok=True)
+            d = str(p)
+        except OSError:
+            d = None
+    with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".txt", delete=False, dir=d) as f:
+        f.write(text)
+        return f.name
+
+
+def _sysprompt_read_denial(run_dir: str | Path | None) -> str:
+    """`Read` deny on the staged system prompts, for every worker: another
+    worker's instructions are not input to this one."""
+    if run_dir is None:
+        return ""
+    return f"Read(/{Path(run_dir) / SYSPROMPT_DIRNAME}/**)"
+
+
 def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
     """Keep the held-out acceptance sets out of the fixers' reach (DESIGN §8
     *Held-out acceptance tests*): `Read` denies for implementer, conformer
@@ -21285,16 +21649,19 @@ _FORBID_STR_LIT = re.compile(
 _FORBID_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 
-def _forbidden_argvs(cmd: str, depth: int = 0) -> list[list[str]]:
+def _forbidden_argvs(cmd: str, depth: int = 0,
+                     keep_xargs: bool = False) -> list[list[str]]:
     """Every normalised argv `cmd` runs (IMPLEMENTATION §5½ *Forbidden
     commands*): split with the whole-suite matcher's quote-aware scan, then
-    each subcommand unwrapped by `_forbidden_normalize`."""
+    each subcommand unwrapped by `_forbidden_normalize`. `keep_xargs` keeps
+    an `xargs` head as a leading `"xargs"` word instead of unwrapping it
+    away, so the process-kill matcher can tell `xargs kill` from `kill`."""
     if depth > _FORBID_MAX_DEPTH or not isinstance(cmd, str):
         return []
     out: list[list[str]] = []
     for seg in _shell_subcommands(cmd):
         argv = [w.replace(_QUOTED_SPACE, " ") for w in seg.split()]
-        out.extend(_forbidden_normalize(argv, depth))
+        out.extend(_forbidden_normalize(argv, depth, keep_xargs))
     return out
 
 
@@ -21305,7 +21672,8 @@ def _forbidden_interp_head(word: str) -> str:
     return "python3" if re.fullmatch(r"python[0-9.]*", head) else head
 
 
-def _forbidden_normalize(argv: list[str], depth: int) -> list[list[str]]:
+def _forbidden_normalize(argv: list[str], depth: int,
+                         keep_xargs: bool = False) -> list[list[str]]:
     a = list(argv)
     while a:
         head = os.path.basename(a[0])
@@ -21313,13 +21681,21 @@ def _forbidden_normalize(argv: list[str], depth: int) -> list[list[str]]:
             a = a[1:]
             continue
         if head in _FORBID_WRAPPERS:
+            if keep_xargs and head == "xargs":
+                rest = a[1:]
+                vals = _FORBID_WRAPPER_VALUE_OPTS["xargs"]
+                while rest and rest[0].startswith("-"):
+                    rest = rest[2:] if rest[0] in vals else rest[1:]
+                return [["xargs"] + r for r in
+                        (_forbidden_normalize(rest, depth, keep_xargs)
+                         if rest else [[]])]
             vals = _FORBID_WRAPPER_VALUE_OPTS.get(head, frozenset())
             a = a[1:]
             while a:
                 opt = a[0]
                 if head == "env" and opt in ("-S", "--split-string") \
                         and len(a) > 1:
-                    return _forbidden_argvs(a[1], depth + 1)
+                    return _forbidden_argvs(a[1], depth + 1, keep_xargs)
                 if opt in vals:
                     a = a[2:]
                 elif opt.startswith("-") or _FORBID_ASSIGN.match(opt) or (
@@ -21332,26 +21708,26 @@ def _forbidden_normalize(argv: list[str], depth: int) -> list[list[str]]:
             a = a[1:]
             while a and a[0].startswith("-"):
                 if a[0] in ("-c", "--call") and len(a) > 1:
-                    return _forbidden_argvs(a[1], depth + 1)
+                    return _forbidden_argvs(a[1], depth + 1, keep_xargs)
                 a = a[2:] if a[0] in ("-p", "--package") else a[1:]
             continue
         if head in _FORBID_SHELLS:
             for i, w in enumerate(a[1:], 1):
                 if w.startswith("-") and not w.startswith("--") and "c" in w:
-                    return (_forbidden_argvs(a[i + 1], depth + 1)
+                    return (_forbidden_argvs(a[i + 1], depth + 1, keep_xargs)
                             if i + 1 < len(a) else [])
             break
         if head == "eval":
-            return _forbidden_argvs(" ".join(a[1:]), depth + 1)
+            return _forbidden_argvs(" ".join(a[1:]), depth + 1, keep_xargs)
         flags = _FORBID_INTERP_EVAL.get(_forbidden_interp_head(a[0]))
         if flags:
             for i, w in enumerate(a[1:], 1):
                 if w in flags and i + 1 < len(a):
                     code = a[i + 1]
-                    out = _forbidden_argvs(code, depth + 1)
+                    out = _forbidden_argvs(code, depth + 1, keep_xargs)
                     for m in _FORBID_STR_LIT.finditer(code):
                         lit = next(g for g in m.groups() if g is not None)
-                        out.extend(_forbidden_argvs(lit, depth + 1))
+                        out.extend(_forbidden_argvs(lit, depth + 1, keep_xargs))
                     return out
         break
     if not a:
@@ -21368,9 +21744,9 @@ def _forbidden_normalize(argv: list[str], depth: int) -> list[list[str]]:
                 r = a[2:]
                 while r and r[0].startswith("-"):
                     if r[0] in ("-c", "--call") and len(r) > 1:
-                        return _forbidden_argvs(r[1], depth + 1)
+                        return _forbidden_argvs(r[1], depth + 1, keep_xargs)
                     r = r[1:]
-                return _forbidden_normalize(r, depth + 1)
+                return _forbidden_normalize(r, depth + 1, keep_xargs)
             if sub in ("run", "run-script"):
                 r = [w for w in a[2:]]
                 while r and r[0].startswith("-"):
@@ -21481,19 +21857,108 @@ def _tools_reach_forbidden(allowed_tools: str, forbidden: list[str]) -> bool:
     return any(t.startswith(f"Bash({h}") for t in tools for h in heads)
 
 
+# --- Process kills (DESIGN §9 *A worker never kills a process by name*) ---
+#
+# Workers share one PID namespace (the run's container), so a pattern kill
+# reaches siblings: of 48 `pkill -f` calls on record, 15 killed another
+# worker's (or the orchestrator's) install, test run or watcher. Same three
+# layers as the forbidden commands above, over a fixed list: deny rules for
+# the literal prefixes, the PreToolUse hook (same matcher) for every other
+# spelling, and a paired notice pointing at `TaskStop`, which is scoped to
+# the calling session and so can only stop the worker's own background work.
+
+PROCESS_KILL_NOTICE = (
+    "killing processes by name or pattern is denied to you: `pkill`, "
+    "`killall`, `fuser -k`, and `kill` fed by `pgrep`, `pidof` or `xargs` — "
+    "directly or through `sh -c`, `eval` or an interpreter. Other workers run "
+    "in the same process table, so a pattern also matches their installs, "
+    "test runs and servers. To stop a command you started with "
+    "`run_in_background`, call the TaskStop tool with its task ID; to stop a "
+    "process you started with `&`, `kill` the PID you saved from `$!`.")
+# Deny-rule heads. The CLI matches a rule against each subcommand of a
+# pipeline, so `pgrep -f x | xargs kill` meets `xargs kill`.
+PROCESS_KILL_DENY_COMMANDS = ("pkill", "killall", "killall5", "xargs kill")
+_KILL_BY_NAME = frozenset({"pkill", "killall", "killall5"})
+_PID_FINDERS = frozenset({"pgrep", "pidof"})
+
+
+def _kill_signal_is_zero(argv: list[str]) -> bool:
+    """`kill -0` / `kill -s 0` / `kill -l` signal nothing (a liveness probe
+    or a signal listing), so they are never a kill."""
+    rest = argv[1:]
+    for i, w in enumerate(rest):
+        if w in ("-0", "-l", "-L", "--list"):
+            return True
+        if w in ("-s", "-n") and i + 1 < len(rest) and rest[i + 1] == "0":
+            return True
+    return False
+
+
+def _process_kill_hit(command: str) -> str | None:
+    """The kill form `command` runs, or None: a by-name killer (`pkill`,
+    `killall`), `fuser -k`, `kill` behind `xargs`, or `kill` in the same
+    command as a pid finder (`kill $(pgrep -f x)`, a `pgrep … | while read`
+    loop). Reads only normalised argv heads — a commit message or a grep
+    pattern that merely contains the word is not a kill. Never raises."""
+    try:
+        if not isinstance(command, str) or not command.strip():
+            return None
+        argvs = [a for a in _forbidden_argvs(command, keep_xargs=True) if a]
+        finder = False
+        kills: list[list[str]] = []
+        for a in argvs:
+            via_xargs = False
+            while a and a[0] == "xargs":
+                via_xargs, a = True, a[1:]
+            if not a:
+                continue
+            head = a[0]
+            if head in _KILL_BY_NAME:
+                return head
+            if head == "fuser" and any(
+                    w == "--kill" or (w.startswith("-") and not
+                                      w.startswith("--") and "k" in w)
+                    for w in a[1:]):
+                return "fuser -k"
+            if head in _PID_FINDERS:
+                finder = True
+            if head == "kill" and not _kill_signal_is_zero(a):
+                if via_xargs:
+                    return "xargs kill"
+                kills.append(a)
+        if kills and finder:
+            return "kill fed by a pid finder"
+    except Exception:
+        return None
+    return None
+
+
+def _process_kill_denials() -> str:
+    return _forbidden_command_denials(list(PROCESS_KILL_DENY_COMMANDS))
+
+
+def _tools_reach_bash(allowed_tools: str) -> bool:
+    """Unrestricted `Bash` — the only grant under which a worker can type a
+    kill (no `Bash(<verb>…)` allow pattern leerie issues names one)."""
+    return "Bash" in [t.strip() for t in (allowed_tools or "").split(",")]
+
+
 FORBIDDEN_COMMAND_HOOK = ROOT / "scripts" / "forbidden-command-hook.py"
 
 
-def _forbidden_command_hook_settings(forbidden: list[str]) -> str | None:
+def _forbidden_command_hook_settings(forbidden: list[str],
+                                     deny_kills: bool = False) -> str | None:
     """The `--settings` JSON carrying the PreToolUse hook, or None when the
-    task forbids nothing. The list travels base64-encoded in the hook's own
-    argv — no file is shared with the worker, so no ownership question
-    arises on any runtime. The orchestrator's own interpreter runs it, so
-    the hook imports exactly the leerie the orchestrator is running."""
-    if not forbidden:
+    task forbids nothing and kills are not denied. The payload travels
+    base64-encoded in the hook's own argv — no file is shared with the
+    worker, so no ownership question arises on any runtime. The
+    orchestrator's own interpreter runs it, so the hook imports exactly the
+    leerie the orchestrator is running."""
+    if not forbidden and not deny_kills:
         return None
-    payload = base64.b64encode(
-        json.dumps(forbidden).encode("utf-8")).decode("ascii")
+    payload = base64.b64encode(json.dumps(
+        {"forbidden": list(forbidden), "kills": bool(deny_kills)}
+    ).encode("utf-8")).decode("ascii")
     command = " ".join(shlex.quote(w) for w in (
         sys.executable, "-I", str(FORBIDDEN_COMMAND_HOOK), payload))
     return json.dumps({"hooks": {"PreToolUse": [{
@@ -21502,27 +21967,45 @@ def _forbidden_command_hook_settings(forbidden: list[str]) -> str | None:
     }]}}, separators=(",", ":"))
 
 
+def _hook_payload(raw: object) -> tuple[list[str], bool]:
+    """(forbidden commands, deny kills) from the hook's decoded payload. A
+    bare list is the forbidden-commands-only shape."""
+    if isinstance(raw, list):
+        return [c for c in raw if isinstance(c, str)], False
+    if isinstance(raw, dict):
+        f = raw.get("forbidden")
+        return ([c for c in f if isinstance(c, str)]
+                if isinstance(f, list) else [],
+                raw.get("kills") is True)
+    return [], False
+
+
 def _forbidden_command_hook_main(argv: list[str], stdin: TextIO,
                                  stdout: TextIO) -> int:
-    """The hook process: deny a Bash call that runs a forbidden command.
-    Always returns 0 and fails open — a matcher error, a malformed event or
-    payload allows the call (the deny rules still stand); a crash here must
-    not block every Bash call of a run."""
+    """The hook process: deny a Bash call that runs a forbidden command or
+    kills processes by name. Always returns 0 and fails open — a matcher
+    error, a malformed event or payload allows the call (the deny rules
+    still stand); a crash here must not block every Bash call of a run."""
     try:
-        forbidden = json.loads(base64.b64decode(argv[1]).decode("utf-8"))
+        forbidden, deny_kills = _hook_payload(
+            json.loads(base64.b64decode(argv[1]).decode("utf-8")))
         event = json.load(stdin)
         command = ((event.get("tool_input") or {}).get("command")
                    if isinstance(event, dict) else None)
-        hit = _forbidden_command_hit(command, [
-            c for c in forbidden if isinstance(c, str)])
+        hit = _forbidden_command_hit(command, forbidden)
+        kill = (_process_kill_hit(command)
+                if deny_kills and not hit else None)
     except Exception:
         return 0
-    if hit:
+    reason = (f"forbidden command: {hit} — the task forbids it" if hit else
+              f"process kill by name or pattern ({kill}) — other workers "
+              "share this process table; stop your own background task "
+              "with TaskStop, or `kill` a PID you saved" if kill else None)
+    if reason:
         stdout.write(json.dumps({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
             "permissionDecision": "deny",
-            "permissionDecisionReason":
-                f"forbidden command: {hit} — the task forbids it"}}))
+            "permissionDecisionReason": reason}}))
     return 0
 
 
@@ -21711,8 +22194,9 @@ def _contained_claude_argv(*, schema: str, allowed_tools: str, max_turns: int,
         "--strict-mcp-config",
     ])
     if settings is not None:
-        # The forbidden-command PreToolUse hook (DESIGN §9). Absent unless the
-        # task forbids a command, so every other argv is unchanged.
+        # The PreToolUse hook (DESIGN §9): forbidden commands, and process
+        # kills by name for every worker whose tools reach a shell. Absent
+        # for a shell-less worker on a task that forbids nothing.
         cmd.extend(["--settings", settings])
     return cmd
 
@@ -21844,7 +22328,12 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     forbidden_notice = (_forbidden_commands_notice(forbidden)
                         if _tools_reach_forbidden(allowed_tools, forbidden)
                         else None)
-    hook_settings = _forbidden_command_hook_settings(forbidden)
+    # Process kills by name (DESIGN §9 *A worker never kills a process by
+    # name*): deny rules, notice and hook travel together the same way, for
+    # every worker whose tools reach a shell.
+    deny_kills = _tools_reach_bash(allowed_tools)
+    kill_deny = _process_kill_denials() if deny_kills else ""
+    hook_settings = _forbidden_command_hook_settings(forbidden, deny_kills)
     # The runtime layer: a forbidden package script refused by the package
     # manager's own script shell, wherever the run came from — another
     # script's body included, which neither the rules nor the hook see.
@@ -21863,7 +22352,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 suite_notice = None
         except Exception:
             pass
-    for _notice in (suite_notice, forbidden_notice):
+    for _notice in (suite_notice, forbidden_notice,
+                    PROCESS_KILL_NOTICE if deny_kills else None):
         if _notice:
             user_prompt = (f"{user_prompt.rstrip()}\n"
                            f"NOTE FROM ORCHESTRATOR: {_notice}")
@@ -21885,11 +22375,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
     use_file_flag = _append_system_prompt_file_supported()
     system_prompt_file: str | None = None
     if use_file_flag:
-        import tempfile  # noqa: PLC0415
-        with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".txt", delete=False) as f:
-            f.write(system_prompt)
-            system_prompt_file = f.name
+        system_prompt_file = _write_system_prompt_file(
+            getattr(st, "run_dir", None), system_prompt)
 
     try:
         def build(extra_user: str = "") -> list[str]:
@@ -21916,7 +22403,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                 deny_extra=",".join(d for d in (
                     _repo_write_denials(st.repo_root, st.run_dir),
                     _acceptance_read_denials(schema_key, st.run_dir),
-                    suite_deny, db_deny, forbidden_deny) if d),
+                    _sysprompt_read_denial(getattr(st, "run_dir", None)),
+                    suite_deny, db_deny, forbidden_deny, kill_deny) if d),
                 settings=hook_settings)
             if system_prompt_file is not None:
                 cmd.extend(["--append-system-prompt-file", system_prompt_file])
@@ -44236,7 +44724,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
     executed: dict | None = None
     note = redrive_note or ""
     continuation = redrive_note is not None
-    worktree = str(leerie_dir / "worktrees" / sid)
+    worktree = str(_subtask_worktree_path(leerie_dir, sid))
     subtask_path = leerie_dir / "subtasks" / f"{sid}.json"
     subtask = json.loads(subtask_path.read_text()) if subtask_path.exists() else {}
 
@@ -44248,7 +44736,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
         caller should proceed (continuations has already been incremented
         here on the success path)."""
         nonlocal continuations
-        wt_root = leerie_dir / "worktrees" / sid
+        wt_root = _subtask_worktree_path(leerie_dir, sid)
         cp_err = _validate_checkpoint(res.get("checkpoint_path") or "",
                                      worktree_root=wt_root)
         if cp_err:

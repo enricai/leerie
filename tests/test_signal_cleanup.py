@@ -110,6 +110,9 @@ def test_cleanup_removes_worktrees_dir(leerie, tmp_path, monkeypatch):
     run_dir = tmp_path / "runs" / run_id
     (run_dir / "worktrees" / "staging").mkdir(parents=True)
     (run_dir / "worktrees" / "feat-001").mkdir(parents=True)
+    # The git common dir the stub reports: the prune takes its repository
+    # lock file there, so it must exist.
+    (tmp_path / ".git").mkdir()
     st = _FakeState(run_id, run_dir)
 
     calls: list[list[str]] = []

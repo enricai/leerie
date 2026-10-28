@@ -126,8 +126,8 @@ def env(leerie, tmp_path):
     _run(["git", "checkout", "-q", "-b", run_branch], cwd=repo)
 
     # Set up .leerie coordination state first so the subtask worktree
-    # can live under run_dir/worktrees/<sid> — the canonical location
-    # _settle_subtask uses (`worktree = str(leerie_dir / "worktrees" / sid)`).
+    # can live where _settle_subtask looks for it
+    # (`_subtask_worktree_path(leerie_dir, sid)`).
     sid = "t1"
     subtask_branch = f"leerie/subtasks/{run_id}/{sid}"
     leerie_root = repo / ".leerie"
@@ -136,7 +136,7 @@ def env(leerie, tmp_path):
     (run_dir / "criteria").mkdir()
     (run_dir / "logs").mkdir()
     (run_dir / "worktrees").mkdir()
-    worktree = run_dir / "worktrees" / sid
+    worktree = leerie._subtask_worktree_path(run_dir, sid)
     _run(["git", "worktree", "add", "-q", "-b", subtask_branch,
           str(worktree), run_branch], cwd=repo)
 

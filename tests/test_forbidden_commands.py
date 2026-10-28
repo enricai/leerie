@@ -196,7 +196,13 @@ def test_hook_settings_shape(leerie):
     words = hook["command"].split()
     assert words[:3] == [sys.executable, "-I",
                          str(leerie.FORBIDDEN_COMMAND_HOOK)]
-    assert json.loads(base64.b64decode(words[3])) == FORBID
+    assert json.loads(base64.b64decode(words[3])) == {
+        "forbidden": FORBID, "kills": False}
+    # The process-kill deny alone is enough for a hook (N8).
+    s = json.loads(leerie._forbidden_command_hook_settings([], True))
+    cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert json.loads(base64.b64decode(cmd.split()[-1])) == {
+        "forbidden": [], "kills": True}
 
 
 def _run_hook_main(leerie, cmd, payload):
@@ -302,19 +308,36 @@ def test_deny_notice_and_hook_reach_the_argv_together(leerie, monkeypatch,
     assert deny.startswith("Agent,Task,")
     settings = json.loads(argv[argv.index("--settings") + 1])
     hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-    assert json.loads(base64.b64decode(hook.split()[-1])) == [
-        "prisma db push"]
+    assert json.loads(base64.b64decode(hook.split()[-1])) == {
+        "forbidden": ["prisma db push"], "kills": True}
     (line,) = _forbid_lines(prompt)
     assert "`prisma db push`" in line
     assert "do not look for another way" in line
     assert "not_applicable: true" in line
 
 
-def test_nothing_forbidden_means_no_settings_no_rule_no_notice(
+def test_nothing_forbidden_means_no_forbidden_rule_or_notice(
         leerie, monkeypatch, tmp_path):
-    argv, prompt = _spawn(leerie, monkeypatch, _repo(tmp_path, test=""))
+    repo = _repo(tmp_path, test="")
+    argv, prompt = _spawn(leerie, monkeypatch, repo)
+    # An acting worker still carries the process-kill hook and rules (N8),
+    # with an empty forbidden list.
+    settings = json.loads(argv[argv.index("--settings") + 1])
+    hook = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+    assert json.loads(base64.b64decode(hook.split()[-1])) == {
+        "forbidden": [], "kills": True}
+    deny = argv[argv.index("--disallowedTools") + 1]
+    bash_rules = [r for r in deny.split(",") if r.startswith("Bash(")]
+    assert bash_rules == [f"Bash({p})" for p in
+                          leerie._forbidden_command_rule_patterns(
+                              list(leerie.PROCESS_KILL_DENY_COMMANDS))]
+    assert _forbid_lines(prompt) == []
+    # A shell-less worker on a task that forbids nothing: no hook at all.
+    argv, prompt = _spawn(leerie, monkeypatch, repo, schema_key="classifier",
+                          allowed_tools=leerie.INSPECT_TOOLS)
     assert "--settings" not in argv
-    assert "Bash(" not in argv[argv.index("--disallowedTools") + 1]
+    assert not [r for r in argv[argv.index("--disallowedTools") + 1]
+                .split(",") if r.startswith("Bash(")]
     assert _forbid_lines(prompt) == []
 
 

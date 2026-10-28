@@ -1501,9 +1501,10 @@ PY
         --apply) _prune_apply=true; shift ;;
         -h|--help)
           echo "Usage: leerie prune [--older-than DAYS] [--apply]" >&2
-          echo "  Removes terminal run dirs and stale repo-map cache entries" >&2
-          echo "  older than DAYS (default 14), and subtask branches whose run" >&2
-          echo "  dir is gone. Dry-run unless --apply is given." >&2
+          echo "  Removes terminal run dirs, the worktrees of idle resumable" >&2
+          echo "  runs, and stale repo-map cache entries older than DAYS" >&2
+          echo "  (default 14), and subtask branches whose run dir is gone," >&2
+          echo "  reporting the space freed. Dry-run unless --apply is given." >&2
           echo "  With AWS credentials resolvable, also lists (--apply: deletes)" >&2
           echo "  leerie-tagged EC2 AMIs older than DAYS (current version kept)," >&2
           echo "  snapshots, key pairs, security groups and the IAM role." >&2
@@ -1688,8 +1689,76 @@ def _deregister_orphaned_worktrees(reaped: set) -> None:
             shutil.rmtree(entry, ignore_errors=True)
 
 
+def _last_activity(d) -> float:
+    """Newest mtime among the run dir, the files a live run keeps writing,
+    and the entries of `logs/` and `worktrees/` -- the same signal the
+    orchestrator's preflight reap reads (`_run_last_activity`)."""
+    ts = [d.stat().st_mtime]
+    for f in ("state.json", "run.json", "orchestrator.log", "calls.ndjson",
+              "memory.ndjson", "orchestrator.exit_code"):
+        try:
+            ts.append((d / f).stat().st_mtime)
+        except OSError:
+            pass
+    for sub in ("logs", "worktrees"):
+        try:
+            ts.append((d / sub).stat().st_mtime)
+            for e in os.scandir(d / sub):
+                try:
+                    ts.append(e.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    pass
+        except OSError:
+            pass
+    return max(ts)
+
+
+def _reap_worktrees(d) -> int:
+    """Delete an idle, non-live run's `worktrees/` only (its state, logs and
+    branches stay, so it can still resume -- its scripts rebuild every
+    worktree from its branches). Renamed under the run-directory flock, then
+    deleted, as the orchestrator's preflight reap does (DESIGN §6 *Idle
+    runs' worktrees are reaped at preflight*). Returns the bytes it frees
+    (each inode once); 0 when it did nothing."""
+    wt = d / "worktrees"
+    if not wt.is_dir() or wt.is_symlink() or not any(wt.iterdir()):
+        return 0
+    seen = set()
+    nbytes = 0
+    for dirpath, _dirnames, filenames in os.walk(wt):
+        for f in filenames:
+            try:
+                st_ = os.lstat(os.path.join(dirpath, f))
+            except OSError:
+                continue
+            if (st_.st_dev, st_.st_ino) in seen:
+                continue
+            seen.add((st_.st_dev, st_.st_ino))
+            nbytes += st_.st_size
+    if not apply:
+        return nbytes
+    try:
+        fd = os.open(d, os.O_RDONLY)
+    except OSError:
+        return 0
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0
+        trash = d / (".worktrees.reap-%d" % os.getpid())
+        os.rename(wt, trash)
+    except OSError:
+        return 0
+    finally:
+        os.close(fd)
+    shutil.rmtree(trash, ignore_errors=True)
+    return nbytes
+
+
 runs = root / "runs"
 live = set()
+worktrees_reaped = 0
 if runs.is_dir():
     for d in sorted(runs.iterdir()):
         if not d.is_dir():
@@ -1718,6 +1787,18 @@ if runs.is_dir():
                 shutil.rmtree(d, ignore_errors=True)
         else:
             live.add(d.name)
+            # A resumable run keeps its directory, but not an old idle
+            # run's worktrees -- a full checkout plus node_modules per
+            # subtask -- which a resume rebuilds anyway.
+            if _last_activity(d) < cutoff and not _is_live(d, d.name):
+                _freed = _reap_worktrees(d)
+                if _freed:
+                    freed += _freed
+                    worktrees_reaped += 1
+                    try:
+                        reaped_dirs.add(str((d / "worktrees").resolve()))
+                    except OSError:
+                        pass
 
 # Deregister BEFORE reaping branches, and after the removal loop so the sweep
 # sees the directories it just deleted as gone.
@@ -1806,6 +1887,7 @@ for ref in out.splitlines():
 verb = "removed" if apply else "would remove"
 print(f"leerie prune ({'apply' if apply else 'dry-run'}, older than {days}d)")
 print(f"  {verb} {len(runs_removed)} terminal run dir(s)")
+print(f"  {verb} the worktrees of {worktrees_reaped} idle resumable run(s)")
 print(f"  {verb} {cache_removed} repo-map cache entr(y/ies)")
 print(f"  {verb} {len(branches_removed)} orphaned subtask branch(es)")
 if branches_kept:
@@ -7506,7 +7588,6 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE"; rm -f "${_cidfi
 # pip's pattern (warm once serially in phase_provision, hit cached
 # wheels in parallel from worktree replays) is documented in DESIGN §6½.
 mkdir -p "$HOME/.cache/leerie/mise-data" \
-         "$HOME/.cache/leerie/pnpm-store" \
          "$HOME/.cache/leerie/pip" \
          "$HOME/.cache/leerie/go-mod" \
          "$HOME/.cache/leerie/cargo" \
@@ -7517,7 +7598,6 @@ mkdir -p "$HOME/.cache/leerie/mise-data" \
 
 CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
-  -v "$HOME/.cache/leerie/pnpm-store:/home/leerie/.cache/leerie/pnpm-store"
   -v "$HOME/.cache/leerie/pip:/home/leerie/.cache/leerie/pip"
   -v "$HOME/.cache/leerie/go-mod:/home/leerie/.cache/leerie/go-mod"
   -v "$HOME/.cache/leerie/cargo:/home/leerie/.cache/leerie/cargo"
@@ -7527,7 +7607,15 @@ CACHE_MOUNTS=(
   # prior version of this file set that and pnpm silently ignored it,
   # falling back to ~/.local/share/pnpm/store inside the container —
   # which is NOT bind-mounted, so every run paid full registry cost.
-  -e "npm_config_store_dir=/home/leerie/.cache/leerie/pnpm-store"
+  #
+  # The store lives IN THE STATE MOUNT, next to the worktrees (DESIGN §6½
+  # *The pnpm store shares the worktrees' mount*). pnpm hard-links packages
+  # from the store into node_modules, and a hard link cannot cross a mount:
+  # with the store on its own cache mount every install fell back to
+  # copying, and concurrent installs ran past their timeouts (3 chains).
+  # Same mount, so the same ownership as the worktrees on every runtime:
+  # measured rootful, store and worktrees share inodes with no chown.
+  -e "npm_config_store_dir=/leerie-state/.pnpm-store"
   -e "PIP_CACHE_DIR=/home/leerie/.cache/leerie/pip"
   -e "GOMODCACHE=/home/leerie/.cache/leerie/go-mod"
   -e "CARGO_HOME=/home/leerie/.cache/leerie/cargo"
@@ -8218,6 +8306,10 @@ child_env["LOGNAME"] = "leerie"
 child_env["USER_REPO"] = "$(basename "$USER_REPO")"
 child_env["TZ"] = ${_host_tz_json}
 child_env["LEERIE_COMMIT"] = ${_leerie_commit_json}
+# The pnpm store shares the state volume with the worktrees, so installs
+# hard-link instead of copying (DESIGN 6.5, the pnpm store shares the
+# worktrees mount): the state root here is /work/.leerie.
+child_env["npm_config_store_dir"] = "/work/.leerie/.pnpm-store"
 if "${_BEDROCK_BEARER_ACTIVE}" == "true":
     child_env["AWS_BEARER_TOKEN_BEDROCK"] = ${_bedrock_bearer_token_json}
     child_env["CLAUDE_CODE_USE_BEDROCK"] = ${_bedrock_use_bedrock_json}

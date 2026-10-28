@@ -51,6 +51,11 @@ _INTENTIONALLY_UNCALLED = {
     # asserts the Python and bash forms agree. Deleting it would remove the
     # anchor that test checks against.
     "_compute_subtask_branch",
+    # The PreToolUse hook process's entry point: its only caller is
+    # `scripts/forbidden-command-hook.py`, a separate process that imports
+    # leerie (DESIGN §9). `tests/test_forbidden_commands.py` and
+    # `tests/test_process_kill_deny.py` run that script for real.
+    "_forbidden_command_hook_main",
 }
 
 

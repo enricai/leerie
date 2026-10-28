@@ -79,7 +79,7 @@ def env(leerie, tmp_path):
     (run_dir / "criteria").mkdir()
     (run_dir / "logs").mkdir()
     (run_dir / "worktrees").mkdir()
-    worktree = run_dir / "worktrees" / sid
+    worktree = leerie._subtask_worktree_path(run_dir, sid)
     _run(["git", "worktree", "add", "-q", "-b", subtask_branch,
           str(worktree), run_branch], cwd=repo)
 

@@ -320,7 +320,7 @@ def settle_env(leerie, tmp_path):
     run_dir = leerie_root / "runs" / run_id
     for d in ("subtasks", "criteria", "logs", "worktrees"):
         (run_dir / d).mkdir(parents=True, exist_ok=True)
-    worktree = run_dir / "worktrees" / sid
+    worktree = leerie._subtask_worktree_path(run_dir, sid)
     run_git_cwd_kw("worktree", "add", "-q", "-b",
           f"leerie/subtasks/{run_id}/{sid}", str(worktree), run_branch, cwd=repo)
     # The implementer's committed work, so check_branch_has_commits passes.

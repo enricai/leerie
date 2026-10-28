@@ -63,6 +63,17 @@ because there are no subagents, only independent OS processes. Control-flow
 drift is impossible because the orchestrator is real loops and
 conditionals, not a model interpreting instructions.
 
+The workers themselves are headless CLI sessions whose tool surface code
+fixes: `--disallowedTools` removes every tool that would start work the
+orchestrator cannot see (subagents under both the live `Task` and the
+retired `Agent` name, messages, timers, workflows, task lists and output
+readers). One task tool stays: `TaskStop`. It acts only on the calling
+session's own background commands — a foreign task ID gets "No task found"
+— so it gives a worker no reach beyond itself, and it is the sanctioned way
+for a worker to stop its own `run_in_background` command instead of a
+pattern kill that reaches its siblings (§9 *A worker never kills a process
+by name*).
+
 **Why a headless CLI process, not an API library.** The CLI binary runs on
 the interactive Claude Code subscription with only the CLI as a
 dependency; an agent library returning typed objects would be less brittle
@@ -2048,6 +2059,73 @@ The rule generalises: any git verb that acts on the whole repository rather
 than on this run's own refs and worktrees is out of bounds from inside a
 container.
 
+**Even leerie's own scope is one run, not the state root.** A prune scoped to
+the whole state root still reached sibling runs: racing a sibling's
+`worktree add` (admin entry written, the worktree's `.git` link not yet), it
+dropped a live registration, and the sibling died on "already exists" — 4
+run deaths across 4 chains. Four rules close it:
+
+- **Every in-container prune names its own run directory.** A stale entry of
+  another run is that run's to clean (on resume) or the reaper's (below).
+- **One repository-wide lock.** Every script that adds a worktree
+  (`setup-run.sh`, `new-worktree.sh`, `planning-worktree.sh`), `cleanup.sh`'s
+  prune and the Python prune take `flock` on
+  `<git-common-dir>/leerie-worktree.lock` around the prune → orphan check →
+  add sequence. The per-run lock it replaces serialised one run's siblings
+  but not two runs, nor a run's planning worktree against its subtasks. The
+  lock file sits where git writes its own worktree admin entries, so it is
+  writable wherever `worktree add` is, on every runtime.
+- **Re-check before deleting.** git's "prunable" verdict is read before the
+  loop reaches an entry; an entry is deleted only if its worktree's `.git`
+  link is still gone at that moment.
+- **Run-id-prefixed worktree names.** git names a worktree's admin entry
+  after the directory's basename, so every run's `bugfix-001` competed for
+  one admin name; subtask and planning worktrees are now
+  `worktrees/<run-id[:12]>-<sid>`. A run started before the change has its
+  subtask worktree moved (`git worktree move`, uncommitted work included) on
+  resume, since its branch is checked out at the old path.
+
+The planning worktree also pruned *after* its orphan check, the order
+`new-worktree.sh` had already learned is wrong (a prune is what orphans a
+directory); it now prunes first. And every registration check captures `git
+worktree list --porcelain` before grep reads it: piped into `grep -q` under
+`pipefail`, grep exits at the first match, git takes SIGPIPE once its output
+passes the 4 KiB pipe buffer, and a registered worktree reads as absent —
+300/300 false negatives for an entry in the first 4 KiB of a 9 KiB list, and
+19 of 35 worktrees of a live repository read absent at least once in 10
+checks. All seven such checks were rewritten. Measured together (6
+concurrent runs × 200 iterations of planning + 3 subtask worktrees with
+random removal and simulated SIGKILL leftovers, once with no other worktrees
+and once with 40 live ones): 0 failed iterations of 2,400, against 4 of
+1,200 (no other worktrees) and 8 of 300 (40 live ones) before.
+
+### Idle runs' worktrees are reaped at preflight
+
+A paused or died run keeps a full checkout — node_modules included — per
+subtask for as long as its directory exists, and nothing reaped them: the
+disk preflight then refused new runs. `preflight` now deletes the
+`worktrees/` of every other run that is neither live nor touched for
+`WORKTREE_REAP_IDLE_DAYS` (7) days — touched meaning the newest mtime of the
+run directory, its state/log files and the entries of `logs/` and
+`worktrees/`. Only `worktrees/` goes: state, logs and branches stay, and a
+resume rebuilds every worktree from its branches (uncommitted edits are
+lost, exactly as on an abnormal exit). Liveness is the run-directory flock
+(§6 *Single owner per run dir*), and it fails closed: the directory is
+renamed to `.worktrees.reap-<pid>` while holding that flock — a run whose
+flock is held is skipped — and deleted after releasing it, so a resume that
+takes the lock a moment later never sees a half-deleted tree. The run's own
+registrations are then pruned (scoped to its directory). Housekeeping never
+stops a run: any error is counted and logged.
+
+`leerie prune` does the same for an idle resumable run older than its
+`--older-than` cutoff (it already removed terminal runs whole), and reports
+the space each kind frees. Measured on a copy of one repository's 440 run
+directories (16 with worktrees): 8 reaped, 3 live (flock held) and 5 recent
+skipped, 0 errors, no file outside `worktrees/` changed, identically on
+rootless and rootful containerd. A resume after the reap recreated all four worktrees at
+their branch tips with committed work intact and left no stale
+registration.
+
 ### One task, one run
 
 The flock above makes a *run directory* single-owner. It says nothing about
@@ -3025,12 +3103,28 @@ content-addressed and normally *hardlink* from a shared store into each
 almost nothing when store and tree share a mount (measured once, on one
 host: 92.6% of `node_modules` bytes shared, private remainder 102 MiB
 against a 1.35 GiB tree — illustrative, not a verified general quantity).
-But leerie bind-mounts the package-manager store and the state directory
-as *separate* mounts, and Linux refuses `link()` across different mounts
-even when both resolve to the same filesystem (`do_linkat`'s `EXDEV`) — so
-the store cannot hardlink into a worktree, pnpm falls back to copying, and
-each worktree pays full freight. That is the multiplier behind the 51 GB,
-and the mid-run prune bounds coexistence to one wave's worth of trees.
+But leerie used to bind-mount the package-manager store and the state
+directory as *separate* mounts, and Linux refuses `link()` across different
+mounts even when both resolve to the same filesystem (`do_linkat`'s
+`EXDEV`) — so the store could not hardlink into a worktree, pnpm fell back
+to copying, and each worktree paid full freight. That is the multiplier
+behind the 51 GB, and the mid-run prune bounds coexistence to one wave's
+worth of trees.
+
+**The pnpm store shares the worktrees' mount.** The store now lives in the
+state mount itself — `/leerie-state/.pnpm-store` locally,
+`/work/.leerie/.pnpm-store` on Fly (the state root there is
+`/work/.leerie`) — through `npm_config_store_dir`, so installs hard-link.
+Copying was not only a disk cost: concurrent installs copying whole trees
+ran past their timeouts, and three chains lost work to it (an install that
+"did not finish within 600 s", held-out sets discarded on install timeouts).
+The store is one per state root, i.e. per repository, shared by its runs;
+pnpm's store is content-addressed with atomic writes, so concurrent
+installs into it are safe. Ownership follows the worktrees on every
+runtime, because it is the same mount: measured rootful (real uid switch),
+five worktrees installed into one store with 0 EACCES, the worker owning
+every new store file, one package file carrying 6 links (the store's and
+one per worktree), and no chown. EC2 keeps its image-default store.
 
 This explains *why* worktrees are expensive; it deliberately does not
 drive a gate. A per-worktree measured bound was attempted and withdrawn
@@ -3039,10 +3133,8 @@ worktree depends on mount topology leerie does not control and a peak
 count that depends on scheduling. The disk guardrail is instead a
 proportional free-space floor plus a resumable pause; see
 IMPLEMENTATION.md's "Disk headroom (N30)". Colocating the store with the
-worktrees on one mount would collapse the per-worktree cost and is the
-more fundamental fix, but it changes runtime behaviour across the local,
-Fly and EC2 runtimes and both privilege models, so it is held as a
-separate change rather than folded into the guardrail.
+worktrees (above) collapses the per-worktree cost; the guardrail stays,
+since mount topology on a given host is still not leerie's to assume.
 
 **Worktree-only cleanup, always.** Whether triggered by Ctrl-C,
 SIGTERM, SIGHUP, WorkerError, or any other exception:
@@ -4765,6 +4857,18 @@ classification and planning, layered top-to-bottom by determinism:
    the first match — silently dropping a frontend install would leave
    half the workers broken. When the table returns a non-empty result
    the orchestrator uses it; no model in this path either.
+
+   **One install per independent package root.** A Node lockfile in a
+   subdirectory (`worker/`, `infra/`) that is not a member of the root's
+   workspace (`pnpm-workspace.yaml` `packages:`, or `package.json`
+   `workspaces`) is a separate project a root install never reaches, so
+   the table emits one entry per such directory, with that directory as
+   `working_dir`, pnpm > yarn > npm within it as at the root. Tracked
+   lockfiles only, `node_modules` excluded, at most 16 roots. The
+   one-entry recipe was rejected by the provision judge as missing those
+   roots' dependencies, killing 7 runs across 5 chains at the provision
+   gate — two after the no-work judge had already confirmed the task
+   done.
 4. **LLM provision worker — fallback.** When the table returns empty
    (Java with Gradle, a bare `pyproject.toml` without lockfile, a
    polyglot Makefile-driven setup), the orchestrator invokes a
@@ -5358,6 +5462,19 @@ cause). Adding `[1m]` cleared both paths, with the proxy's
 rewritten/passed-through/fell-back counters identical under either alias —
 the window is bought back without giving up the constrained decoding the
 flag exists for.
+
+**The system prompt is staged in the run directory.** A worker's appended
+system prompt travels as a file (`--append-system-prompt-file`; inline it
+would compound the user prompt toward the per-argument limit), and the CLI
+reads that file at every spawn of the call — a call that can last a
+90-minute worker plus its retries. The file used to live in /tmp, which
+nothing guarantees: anything that clears /tmp under a live run (a host
+cleanup, a lost overlay) took every in-flight worker's file with it, and 5
+runs died at their next spawn. It now lives under `<run-dir>/sysprompt/`,
+the state the run already depends on, deleted when its call ends. Workers'
+`Read` is denied there — another worker's instructions are not input to this
+one. The system temp dir remains the fallback only when the run directory
+cannot hold the file.
 
 What happens after a hard worker error depends on whether partial progress can
 be salvaged. An **implementer** has a worktree branch and possibly a
@@ -8084,6 +8201,52 @@ canonical command containing `*` is declined outright, since the CLI would
 read it as a wildcard. None appeared among the full-suite invocations
 leerie's own workers ran on record, which is the honest extent of the claim;
 the notice, not the deny, is what such a worker is left with.
+
+**A worker never kills a process by name.** Every worker of a run shares
+one process table (the run's container), so `pkill -f vitest` stops every
+sibling's vitest too, and an install or test run killed mid-way surfaces as a
+sibling's mysterious failure. Of 48 pattern kills on record (all `pkill
+-f …`), 15 killed another worker's (or the orchestrator's own)
+install, test run or watcher. The usual motive is innocent: a worker wants to
+stop its own background command, and a pattern is the only handle it has.
+
+So the same three layers as forbidden commands, over a fixed list, for every
+worker whose tools reach a shell:
+
+- **Deny rules** `Bash(pkill)`, `Bash(killall)`, `Bash(killall5)`,
+  `Bash(xargs kill)` and their ` *` forms (the CLI checks each pipeline
+  segment, so `pgrep -f x | xargs kill` meets `xargs kill`).
+- **The PreToolUse hook**, the same process and matcher as above, also
+  denies `kill` behind `xargs`, `kill` in the same command as a pid finder
+  (`kill $(pgrep -f x)`, a `pgrep … | while read` loop, `pidof`), `fuser -k`,
+  and all of these inside `sh -c`, `eval`, wrappers or interpreter strings.
+  It reads normalised argv heads only — a commit message, a grep pattern or
+  `echo "kill $(pgrep x)"` is not a kill — and `kill -0` / `kill -l` signal
+  nothing and pass. `kill <pid>` of a PID the worker saved stays allowed.
+  Because the hook now runs before every Bash call of every acting worker,
+  the hook script allows a call whose text contains neither `kill` nor
+  `fuser` without importing leerie (an import costs ~1.7 s where no
+  bytecode cache can be written).
+- **A paired notice**: kills by name are denied because other workers share
+  the process table; stop your own background command with `TaskStop`, or
+  `kill` a PID you saved from `$!`. `TaskStop` is therefore no longer
+  denied (§2).
+
+Measured: the matcher denies all 48 recorded kill commands and the wrapped
+forms above, and none of the legitimate controls. In a replay of 12 recorded
+kill-motive implementer cases × 2 samples × 2 arms (47 rows scored), workers
+made 0 bypass attempts (`sh -c`, `xargs`, `os.kill`, `fuser -k`) in either
+arm; with `TaskStop` allowed, workers used it 4 times, each successfully,
+and 24/24 completed (23/23 without it). The bench's own wide glob
+(`Bash(*pgrep*|*kill*)`) denied one `git commit` whose message mentioned
+`pkill`; matching normalised argv heads instead is why no glob of that shape
+ships. The arm with `TaskStop` still denied made no kill attempt at all, so
+the replay did not reproduce the motive; that the deny stops the harm rests
+on the matcher covering the 48 recorded commands, not on the replay. A
+per-worker PID namespace, which would make the kill harmless rather than
+denied, needs seccomp, AppArmor and systempaths unconfined on both rootless
+and rootful containerd and is deferred. The Fly remote integrator builds its
+own argv and carries neither this deny nor its notice.
 
 **The round signal is a regression, not a verdict.** Because a scoped
 result and a full baseline are not comparable, the base-health baseline

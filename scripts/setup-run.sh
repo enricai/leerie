@@ -122,23 +122,31 @@ fi
 # simply exists. Removing the directory is the only remedy, and it is safe —
 # the run branch (and every integration commit on it) is untouched, so the
 # resume re-attaches to the waves already completed.
-if ! git worktree list --porcelain | grep -qxF "worktree $STAGING_WT" && [ -d "$STAGING_WT" ]; then
+#
+# Under the repository-wide worktree lock (`leerie_repo_lock`), like every
+# other script that adds a worktree. `git worktree list` is captured before
+# grep reads it: piped into `grep -q` under `pipefail`, git takes SIGPIPE
+# past 4 KiB and the check reads "not registered" (new-worktree.sh).
+leerie_repo_lock
+if ! grep -qxF "worktree $STAGING_WT" <<<"$(git worktree list --porcelain)" \
+    && [ -d "$STAGING_WT" ]; then
   rm -rf "$STAGING_WT"
 fi
 # Clear stale admin entries whose directory is gone, so the reuse check below
 # sees post-cleanup truth.
-# Scoped prune: leerie's OWN registrations only. A bare
+# Scoped prune: THIS run's registrations only. A bare
 # `git worktree prune` is repository-global with no grace period, so
 # inside a container sharing the host's .git it destroys host-side
 # worktrees whose paths the container cannot see (scripts/worktree-lib.sh;
-# docs/POSTMORTEM-2026-08-14.md, F19).
-prune_leerie_worktrees "${LEERIE_ROOT}"
+# docs/POSTMORTEM-2026-08-14.md, F19); a state-root-wide one reaches
+# sibling runs' live worktrees.
+prune_leerie_worktrees "${RUN_DIR}"
 
 # Add the run-branch worktree if it is not already present. The check must use
 # -xF (fixed-string, whole-line): the old `grep -q "worktree .*/${STAGING_WT}$"`
 # expanded to a double slash for an absolute $STAGING_WT (`/leerie-state` in the
 # container), so it never matched and this add ran unconditionally.
-if ! git worktree list --porcelain | grep -qxF "worktree $STAGING_WT"; then
+if ! grep -qxF "worktree $STAGING_WT" <<<"$(git worktree list --porcelain)"; then
   git worktree add "${STAGING_WT}" "${BRANCH}" >/dev/null
 fi
 

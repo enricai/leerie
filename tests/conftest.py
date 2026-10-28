@@ -352,8 +352,9 @@ def _no_real_planning_worktree(request, monkeypatch):
     leerie = request.getfixturevalue("leerie")
 
     async def _stub(st):
-        path = str(Path(getattr(st, "run_dir", ".")) / "worktrees"
-                   / "planning")
+        run_dir = Path(getattr(st, "run_dir", "."))
+        path = str(run_dir / "worktrees"
+                   / leerie._worktree_dirname(run_dir.name, "planning"))
         try:
             st.data["planning_worktree"] = path
             st.save()

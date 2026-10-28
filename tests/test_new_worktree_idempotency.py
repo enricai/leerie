@@ -91,7 +91,7 @@ def test_orphaned_dir_without_registration_is_reclaimed(tmp_path: Path) -> None:
     assert tip, "precondition: the subtask branch should carry a commit"
 
     # Partial cleanup: git's admin entry is gone, the directory survives.
-    admin = repo / ".git" / "worktrees" / "sub-001"
+    admin = repo / ".git" / "worktrees" / "run-42-sub-001"
     assert admin.is_dir(), "precondition: worktree admin entry should exist"
     shutil.rmtree(admin)
     assert wt.is_dir(), "precondition: the orphaned dir must still be present"
@@ -194,7 +194,7 @@ def test_prune_must_not_orphan_the_dir_it_then_fails_on(tmp_path: Path) -> None:
     # the script starts is handled by either ordering (the pre-existing
     # `test_orphaned_dir_without_registration_is_reclaimed` covers it). Only
     # an orphan that prune CREATES mid-script escapes a guard that ran first.
-    admin = repo / ".git" / "worktrees" / "sub-001"
+    admin = repo / ".git" / "worktrees" / "run-42-sub-001"
     assert admin.is_dir(), "expected a registration"
     (wt / ".git").unlink()
     assert wt.is_dir(), "the directory must remain — that is the orphan state"
@@ -271,7 +271,7 @@ def test_mode_M1_path_exists_unregistered_is_repaired(tmp_path: Path) -> None:
 
     # Deregister but leave the populated directory: the M1 state, however it
     # arises (prune, partial cleanup, or a race the evidence cannot name).
-    shutil.rmtree(repo / ".git" / "worktrees" / "sub-001")
+    shutil.rmtree(repo / ".git" / "worktrees" / "run-42-sub-001")
     assert wt.is_dir()
 
     r2 = _run_new_worktree(repo, "sub-001", "run-42")
@@ -289,7 +289,7 @@ def test_mode_M3_registered_but_directory_gone_is_repaired(
     r1 = _run_new_worktree(repo, "sub-001", "run-42")
     wt = Path(r1.stdout.strip().splitlines()[-1])
     shutil.rmtree(wt)          # directory gone, admin entry left behind
-    assert (repo / ".git" / "worktrees" / "sub-001").is_dir()
+    assert (repo / ".git" / "worktrees" / "run-42-sub-001").is_dir()
 
     r2 = _run_new_worktree(repo, "sub-001", "run-42")
     assert r2.returncode == 0, f"M3 not repaired: {r2.stderr.strip()}"

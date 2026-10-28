@@ -359,10 +359,19 @@ def test_the_deny_reaches_the_argv(leerie, monkeypatch, tmp_path):
     assert deny.startswith("Agent,Task,"), "base denials must be preserved"
 
 
+def _suite_rules(leerie, deny):
+    """The `Bash(...)` rules in `deny` other than the process-kill rules
+    every shell-capable worker carries (DESIGN §9)."""
+    kill = {f"Bash({p})" for p in leerie._forbidden_command_rule_patterns(
+        list(leerie.PROCESS_KILL_DENY_COMMANDS))}
+    return [r for r in deny.split(",") if r.startswith("Bash(")
+            and r not in kill]
+
+
 def test_no_deny_when_the_repo_has_no_test_command(leerie, monkeypatch,
                                                    tmp_path):
     deny = _argv_for(leerie, monkeypatch, _repo(tmp_path, test=""))
-    assert "Bash(" not in deny
+    assert _suite_rules(leerie, deny) == []
 
 
 def _notice_lines(prompt):
@@ -411,7 +420,7 @@ def test_a_widened_runner_grant_does_get_the_notice(leerie, monkeypatch,
 
 def test_no_deny_means_no_notice(leerie, monkeypatch, tmp_path):
     deny, prompt = _spawn(leerie, monkeypatch, _repo(tmp_path, test=""))
-    assert "Bash(" not in deny
+    assert _suite_rules(leerie, deny) == []
     assert _notice_lines(prompt) == []
 
 
@@ -447,7 +456,7 @@ def test_docs_only_subtask_defers_tests_end_to_end(leerie, monkeypatch,
     for d in ("subtasks", "criteria", "logs", "worktrees"):
         (run_dir / d).mkdir(parents=True)
     sid = "docs-002"
-    wt = run_dir / "worktrees" / sid
+    wt = leerie._subtask_worktree_path(run_dir, sid)
     run_git_repo_first(repo, "worktree", "add", "-q", "-b",
                        f"leerie/subtasks/{run_id}/{sid}", str(wt), run_branch)
     (wt / "docs" / "DESIGN.md").write_text("# design\n\nnew section\n")

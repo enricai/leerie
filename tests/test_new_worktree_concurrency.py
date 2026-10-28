@@ -77,25 +77,24 @@ def _instrumented_script(tmp_path: Path, name: str, log: Path,
     src = SCRIPT.read_text()
     lines = src.splitlines(keepends=True)
     out = []
-    lock_markers = ("LOCK_DIR=", 'mkdir -p "$LOCK_DIR"',
-                     "exec 200>", "flock 200")
     enter_snippet = (
-        f'echo "enter $ID $(date +%s.%N)" >> "{log}"\n'
+        f'echo "enter ${{RUN_ID}}/$ID $(date +%s.%N)" >> "{log}"\n'
         f'sleep {INJECTED_DELAY_SEC}\n'
     )
+    placed = False
     for line in lines:
         stripped = line.strip()
-        if strip_lock and any(stripped.startswith(m) for m in lock_markers):
-            if stripped.startswith("LOCK_DIR="):
-                # Same instrumentation point in source order, minus the lock
-                # itself: the enter-marker must still land here so both
-                # copies log "enter" at the same point relative to the
-                # prune -> ... -> add sequence that follows.
-                out.append(enter_snippet)
+        if stripped == "leerie_repo_lock":
+            # The lock is taken here; the enter-marker lands at the same
+            # point in both copies, so the unlocked one differs only by the
+            # lock itself.
+            if not strip_lock:
+                out.append(line)
+            out.append(enter_snippet)
+            placed = True
             continue
         out.append(line)
-        if stripped == "flock 200" and not strip_lock:
-            out.append(enter_snippet)
+    assert placed, "harness bug: the lock call `leerie_repo_lock` not found"
     text = "".join(out)
     # Log the exit right before the final `(cd "$WT" && pwd)` — i.e. after
     # the whole prune/orphan-check/add sequence has completed.
@@ -103,7 +102,7 @@ def _instrumented_script(tmp_path: Path, name: str, log: Path,
     assert marker in text, "harness bug: exit-instrumentation point not found"
     text = text.replace(
         marker,
-        f'echo "exit $ID $(date +%s.%N)" >> "{log}"\n{marker}',
+        f'echo "exit ${{RUN_ID}}/$ID $(date +%s.%N)" >> "{log}"\n{marker}',
         1,
     )
     script = tmp_path / name
@@ -200,10 +199,40 @@ def test_locked_script_never_overlaps_the_critical_section(
         os.environ.pop("LEERIE_STATE_DIR", None)
 
     assert log.exists(), "harness bug: no instrumentation events recorded"
+    # Anti-vacuity: every invocation must have logged its critical section,
+    # or "zero overlaps" proves nothing.
+    assert log.read_text().count("enter ") == ROUNDS * WORKERS_PER_ROUND
     overlaps = _count_overlaps(log)
     assert overlaps == 0, (
         f"locked script allowed {overlaps} overlapping critical-section "
         "interval(s) between siblings — the flock did not serialize them")
+
+
+def test_the_lock_serialises_different_runs_too(tmp_path: Path) -> None:
+    """The lock is repository-wide (`leerie_repo_lock`), not per run: two
+    runs adding worktrees to one repository must not interleave either. A
+    per-run lock passes the sibling test above and fails this one."""
+    repo = _make_repo(tmp_path, "repo-cross")
+    _git("branch", "leerie/runs/run-other", "main", cwd=repo)
+    log = tmp_path / "cross.log"
+    script = _instrumented_script(tmp_path, "cross.sh", log,
+                                  strip_lock=False)
+    os.environ["LEERIE_STATE_DIR"] = str(tmp_path / "state-cross")
+    try:
+        for rnd in range(ROUNDS):
+            threads = [threading.Thread(target=_run_workers,
+                                        args=(script, repo, rid, rnd))
+                       for rid in ("run-race", "run-other")]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+            _reset_worktrees(repo)
+    finally:
+        os.environ.pop("LEERIE_STATE_DIR", None)
+    # sids repeat across the two runs; the log keys them `<run>/<sid>`.
+    assert log.read_text().count("enter ") == 2 * ROUNDS * WORKERS_PER_ROUND
+    assert _count_overlaps(log) == 0
 
 
 def test_unlocked_script_allows_overlap(tmp_path: Path) -> None:
@@ -215,7 +244,8 @@ def test_unlocked_script_allows_overlap(tmp_path: Path) -> None:
     log = tmp_path / "unlocked.log"
     script = _instrumented_script(tmp_path, "unlocked.sh", log,
                                    strip_lock=True)
-    assert "flock" not in script.read_text(), (
+    assert not [ln for ln in script.read_text().splitlines()
+                if ln.strip() == "leerie_repo_lock"], (
         "harness bug: unlocked copy still contains the lock")
     os.environ["LEERIE_STATE_DIR"] = str(tmp_path / "state-unlocked")
     try:

@@ -42,7 +42,7 @@ def test_noop_when_worktree_absent(leerie, tmp_path, monkeypatch):
 
     asyncio.run(leerie._prune_subtask_worktree("sid-x", leerie_dir))
 
-    assert not (leerie_dir / "worktrees" / "sid-x").exists()
+    assert not (leerie_dir / "worktrees" / "run-id-sid-x").exists()
 
 
 def test_removes_worktree_dir_but_keeps_branch(leerie, tmp_path, monkeypatch):
@@ -51,7 +51,7 @@ def test_removes_worktree_dir_but_keeps_branch(leerie, tmp_path, monkeypatch):
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
-    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.parent.mkdir(parents=True)
 
     _git("branch", "leerie/runs/run-id", "main", cwd=repo)
@@ -80,8 +80,8 @@ def test_prune_does_not_touch_other_sids_worktree(leerie, tmp_path, monkeypatch)
     leerie_dir.joinpath("worktrees").mkdir(parents=True)
     _git("branch", "leerie/runs/run-id", "main", cwd=repo)
 
-    wt_a = leerie_dir / "worktrees" / "sid-a"
-    wt_b = leerie_dir / "worktrees" / "sid-b"
+    wt_a = leerie_dir / "worktrees" / "run-id-sid-a"
+    wt_b = leerie_dir / "worktrees" / "run-id-sid-b"
     for sid, wt in (("sid-a", wt_a), ("sid-b", wt_b)):
         r = _git("worktree", "add", str(wt), "-b",
                  f"leerie/subtasks/run-id/{sid}", "leerie/runs/run-id", cwd=repo)
@@ -102,7 +102,7 @@ def test_prune_falls_back_to_rmtree_when_git_leaves_dir_behind(
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
-    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.mkdir(parents=True)
     (wt_dir / "leftover.txt").write_text("stray\n")
     # Never registered with git, so `git worktree remove --force` returns
@@ -151,7 +151,7 @@ def test_prune_survives_run_proc_timeout(leerie, tmp_path, monkeypatch):
     repo = _make_repo(tmp_path / "repo")
     monkeypatch.chdir(repo)
     leerie_dir = repo / ".leerie" / "runs" / "run-id"
-    wt_dir = leerie_dir / "worktrees" / "sid-x"
+    wt_dir = leerie_dir / "worktrees" / "run-id-sid-x"
     wt_dir.mkdir(parents=True)
     (wt_dir / "leftover.txt").write_text("stray\n")
 
@@ -179,8 +179,8 @@ def test_prune_then_reset_of_sibling_still_works(leerie, tmp_path, monkeypatch):
     leerie_dir.joinpath("worktrees").mkdir(parents=True)
     _git("branch", "leerie/runs/run-id", "main", cwd=repo)
 
-    wt_ok = leerie_dir / "worktrees" / "sid-ok"
-    wt_blocked = leerie_dir / "worktrees" / "sid-blocked"
+    wt_ok = leerie_dir / "worktrees" / "run-id-sid-ok"
+    wt_blocked = leerie_dir / "worktrees" / "run-id-sid-blocked"
     for sid, wt in (("sid-ok", wt_ok), ("sid-blocked", wt_blocked)):
         r = _git("worktree", "add", str(wt), "-b",
                  f"leerie/subtasks/run-id/{sid}", "leerie/runs/run-id", cwd=repo)
