@@ -44336,6 +44336,33 @@ async def _git_out(cwd: Path, *args: str) -> str:
     return p.stdout if p.returncode == 0 else ""
 
 
+def _pr_review_tools(staging: Path, repo_root: Path) -> tuple[str, list[str],
+                                                            str]:
+    """`(allowed_tools, command prefixes, canonical test command)` for the
+    pr_reviewer (DESIGN §9 *An advisory whole-PR review feeds the final
+    conformer*). The tools are INSPECT_TOOLS widened by the repo's
+    build/lint/test verbs, plus `Bash(<form>:*)` for every spelling of the
+    canonical test runner (`_full_suite_runners`), so `python -m pytest` is
+    granted wherever `pytest` is. The prefixes are what the user message
+    lists as runnable. The test command is "" when none is known, and then
+    no runner is granted. The whole-suite deny still applies: `claude_p`
+    adds it for any tools that reach the runner."""
+    tools = _widen_inspect_tools(INSPECT_TOOLS, staging)
+    have = set(tools.split(","))
+    try:
+        canonical = _canonical_test_command(repo_root)
+        forms = _full_suite_runners(canonical)
+    except Exception:
+        canonical, forms = "", []
+    extra = [f"Bash({f}:*)" for f in forms if f"Bash({f}:*)" not in have]
+    if extra:
+        tools += "," + ",".join(extra)
+    prefixes = [g[len("Bash("):-len(":*)")] for g in tools.split(",")
+                if g.startswith("Bash(") and g.endswith(":*)")
+                and g not in INSPECT_TOOLS.split(",")]
+    return tools, prefixes, canonical
+
+
 async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
                          models: dict[str, str],
                          efforts: dict[str, str | None]) -> dict | None:
@@ -44384,7 +44411,21 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
               f"FULL DIFF (`git diff {base}...HEAD`)"
               + (f" — cut at {_PR_REVIEW_DIFF_MAX} characters; read the "
                  "rest with git" if cut else "") + ":",
-              "```diff", diff[:_PR_REVIEW_DIFF_MAX].rstrip("\n"), "```", "",
+              "```diff", diff[:_PR_REVIEW_DIFF_MAX].rstrip("\n"), "```", ""]
+    tools, prefixes, canonical = _pr_review_tools(staging,
+                                                  Path(st.repo_root))
+    parts += ["COMMANDS YOU MAY RUN (besides read-only file, search and "
+              "git inspection; anything else is refused):"]
+    parts += ([f"- `{p} ...`" for p in prefixes] if prefixes else
+              ["- none: this repository has no known build, lint or test "
+               "command, so none is granted to you."])
+    parts += [f"The repository's test command is `{canonical}`; run it on "
+              "specific test files, never on the whole suite."
+              if canonical and any(canonical == p
+                                   or canonical.startswith(p + " ")
+                                   for p in prefixes) else
+              "No test runner is granted to you: do not try to run tests. "
+              "Confirm a suspicion by reading the code instead.", "",
               "Review this PR and return your findings per your schema."]
     untracked0 = set((await _git_out(
         staging, "ls-files", "--others", "--exclude-standard",
@@ -44401,7 +44442,7 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
             user_prompt="\n".join(parts),
             system_prompt=_load_prompt("pr_reviewer"),
             schema_key="pr_reviewer", cwd=str(staging),
-            allowed_tools=_widen_inspect_tools(INSPECT_TOOLS, staging),
+            allowed_tools=tools,
             max_turns=PR_REVIEW_MAX_TURNS, autonomous=False, caps=caps,
             st=st, model=record["model"], effort=record["effort"],
             sid="pr_reviewer")

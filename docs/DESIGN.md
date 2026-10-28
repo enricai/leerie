@@ -8570,7 +8570,15 @@ pass, a `pr_reviewer` worker reviews the whole PR the way that reviewer
 would: the task, its referenced reports, the required items (numbered,
 plus the audited defect contract), and the full diff from the working
 branch, in the staging tree, read-only, allowed to run the repo's build
-and test verbs to confirm a suspicion. Each finding is typed (`bug`,
+and test verbs to confirm a suspicion. Those are the verbs the repo's
+build, lint and test commands invoke, plus every spelling of the
+canonical test runner (`python -m pytest` as well as `pytest`), and the
+whole-suite deny (§9 *The whole suite is orchestrator-owned*) still
+applies. The user message names exactly what it may run, and when the
+repo has no known test command it says that no test runner is granted.
+The prompt promises nothing the tools do not grant: in a smoke run the
+reviewer twice tried `python -m pytest`, which the prompt invited and no
+grant covered. Each finding is typed (`bug`,
 `regression`, `unmet_requirement`, the item it bears on or none) and
 quotes the file at HEAD; code checks the quote verbatim against the
 file, and an item's quoted span against that item's text, and only a
