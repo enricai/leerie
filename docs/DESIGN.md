@@ -6634,9 +6634,22 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   the case reads no source or document text, evaluates no code text,
   and imports no symbol only tests use (`_falsifier_coupling`, over
   the TypeScript AST of the probe, policy in Python). The coupling
-  check is JS/TS-only, as benched: on a repository where it cannot run
-  (no `typescript` package resolvable from the installed tree) the
-  falsifier is not spawned and detection is the judge alone.
+  check is JS/TS-only, as benched. Its facts are syntax-only — a parse
+  of one file, no type checking, no program — so the repository's own
+  compiler version does not matter to them, and any TypeScript with the
+  JS compiler API reads them the same. The facts script therefore uses
+  the tree's own `typescript` when that package has the compiler API,
+  and otherwise a pinned 5.x the image ships for exactly this: a
+  repository on the TypeScript 7 native port, whose package exports a
+  version string and no compiler API, would else leave the falsifier
+  able to run but structurally unable to confirm anything. Availability
+  is tested as the compiler API being loadable, never as a package name
+  resolving; inside the image it always is. Where it is not (a host run
+  without the bundled copy and no usable tree copy) the falsifier is not
+  spawned and detection is the judge alone. A sample whose facts still
+  fail to load records that as its own gate (`facts_read: false`), an
+  infrastructure miss, never as a failed assertion or coupling check —
+  the falsifier did not lose, the check did not run.
 - **One re-ask.** A sample that answers `could_not_demonstrate`
   without having written a test-shaped file and run a command naming
   it — read mechanically from its own transcript's `tool_use` records
@@ -6751,8 +6764,12 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    production file finds no removed null-guarded throw or error return
    (D1), no new success-shaped early return on a null branch (D2), and no
    new catch swallowing an error class thrown under a null guard (D3) —
-   else rolled back. Where the AST check cannot run (no `node`, no
-   `typescript` resolvable from the tree), there is no escalation.
+   else rolled back. The AST check reads syntax only, so it loads the
+   tree's own `typescript` when that package has the JS compiler API and
+   the image's pinned 5.x otherwise (*Delivery detection* above): inside
+   the image it can always run. Only where it cannot (no `node`, no
+   compiler API from the tree or the bundled copy — a host run) is there
+   no escalation.
 8. *One budget.* Every group draws one round from each member's shared
    counter (§13 *One re-drive budget per subtask*) and its wall time from
    `redrive_budget_sec`, the hard stop.

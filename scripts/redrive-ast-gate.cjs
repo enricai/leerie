@@ -10,10 +10,11 @@
 //    error-return of the same function.
 // D3 (decided in leerie.py across files): a catch new in head that swallows
 //    an error class some changed file throws under a null guard.
-// `typescript` is resolved from the working directory — the installed tree
-// under test — so the check runs only where the repository carries the
-// compiler. A missing base file means a new file: nothing to compare.
-const ts = require(require.resolve('typescript', { paths: [process.cwd()] }));
+// `typescript` comes from load-typescript.cjs: the installed tree under
+// test's own (resolved from the working directory) when it has the compiler
+// API, else the image's pinned copy. A missing base file means a new file:
+// nothing to compare.
+const ts = require('./load-typescript.cjs').loadTypescript().ts;
 const fs = require('fs');
 const [, , baseFile, headFile, name] = process.argv;
 

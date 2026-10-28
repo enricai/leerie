@@ -46301,6 +46301,20 @@ FALSIFIER_REASK_NOTE = (
     "return the JSON object per your schema.")
 # The AST facts script the coupling check reads (JS/TS only, as benched).
 TEST_CASE_FACTS = ROOT / "scripts" / "test-case-facts.cjs"
+# Both AST scripts load `typescript` through this: the tree's own when it has
+# the JS compiler API, else BUNDLED_TYPESCRIPT. Run alone, it is the probe.
+TS_LOADER = ROOT / "scripts" / "load-typescript.cjs"
+# The pinned JS-API `typescript` the image ships (Dockerfile,
+# BUNDLED_TYPESCRIPT_VERSION). Outside /opt/leerie-image, which local runs
+# bind-mount over. The AST facts are syntax-only, so a repository whose own
+# `typescript` lacks the API (the TypeScript 7 native port) parses with this.
+BUNDLED_TYPESCRIPT = Path("/opt/leerie-vendor/node_modules/typescript")
+
+
+def _ts_script_env() -> dict[str, str]:
+    """The environment of a node run of an AST script: the caller's, plus
+    where the bundled `typescript` lives."""
+    return {**os.environ, "LEERIE_BUNDLED_TYPESCRIPT": str(BUNDLED_TYPESCRIPT)}
 # Coupling policy over those facts (bench n2d coupling.py, frozen). Every
 # pattern reads code tokens, paths or shell commands — mechanical strings
 # (DESIGN §12), never prose.
@@ -46345,12 +46359,13 @@ def _git_paths_at(repo: str | Path, sha: str) -> set[str]:
 def _probe_case_facts(tree: str | Path, probe: str | Path,
                       case: str) -> dict:
     """The AST facts of one test case (`scripts/test-case-facts.cjs`, run
-    in the installed `tree` so `typescript` resolves from it), or
-    `{"error": ...}`."""
+    in the installed `tree` so its own `typescript` is tried first), or
+    `{"error": ...}` — one starting `facts_failed` when the script itself
+    could not run (an infrastructure miss, not a fact about the probe)."""
     try:
         r = subprocess.run(["node", str(TEST_CASE_FACTS), str(probe), case],
                            cwd=str(tree), capture_output=True, text=True,
-                           timeout=120, check=False)
+                           timeout=120, check=False, env=_ts_script_env())
     except (OSError, subprocess.TimeoutExpired) as e:
         return {"error": f"facts_failed: {type(e).__name__}"}
     try:
@@ -46770,6 +46785,16 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
         title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
         facts = await asyncio.to_thread(_probe_case_facts, confirm_tree,
                                         dst, title)
+        err = str(facts.get("error") or "")
+        g["facts_read"] = not err.startswith("facts_failed")
+        if not g["facts_read"]:
+            # The check did not run: its own reason, so the miss is never
+            # read as a failed assertion or coupling gate.
+            out["facts_error"] = {k: facts[k] for k in ("error", "stderr")
+                                  if k in facts}
+            log(f"  delivery detection: falsifier {label}: AST facts "
+                f"script failed ({err}); sample not judged")
+            return out
         reach = _scope_norm(" ".join(str(x) for x in
                                      (facts.get("reach_src") or [])))
         aq = _scope_norm(str(res.get("assertion_quote") or ""))
@@ -46810,13 +46835,14 @@ def _falsifier_save_probe(st: "State", lane: Path, i: int,
 
 
 def _ts_resolvable(tree: str | Path) -> bool:
-    """True when `node` can resolve the `typescript` package from `tree` —
-    the AST facts script's one dependency."""
+    """True when the AST scripts can load a `typescript` with the compiler
+    API in `tree` — its own, or the bundled copy (`scripts/load-typescript.cjs`
+    run as the probe). A package that merely resolves is not enough: the
+    TypeScript 7 native port resolves and has no `createSourceFile`."""
     try:
-        r = subprocess.run(
-            ["node", "-e",
-             "require.resolve('typescript',{paths:[process.cwd()]})"],
-            cwd=str(tree), capture_output=True, timeout=60, check=False)
+        r = subprocess.run(["node", str(TS_LOADER)], cwd=str(tree),
+                           capture_output=True, timeout=60, check=False,
+                           env=_ts_script_env())
     except (OSError, subprocess.TimeoutExpired):
         return False
     return r.returncode == 0
@@ -46861,7 +46887,8 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
             # The AST coupling check is JS/TS-only, as benched: without it
             # no sample could ever be confirmed, so none is spawned.
             return {"enabled": False, "skipped": "AST coupling check "
-                    "unavailable (no typescript resolvable from the tree)"}
+                    "unavailable (no typescript compiler API from the tree "
+                    "or the bundled copy)"}
         # A Prisma repo's probe re-runs against a database of its own
         # (DESIGN §8 *Prisma repositories get a real database*); None
         # elsewhere, or without a cluster.
@@ -48073,8 +48100,9 @@ def _redrive_audit_blocks(set_: dict) -> bool | None:
 
 
 def _redrive_ast_available(staging: Path) -> bool:
-    """Gate (d+) can run: `node`, the script and a `typescript` resolvable
-    from the tree. Without it there is no escalation."""
+    """Gate (d+) can run: `node`, the script and a `typescript` compiler API
+    from the tree or the bundled copy (`_ts_resolvable`). Without it there is
+    no escalation."""
     return (shutil.which("node") is not None and REDRIVE_AST_GATE.is_file()
             and _ts_resolvable(staging))
 
@@ -48399,7 +48427,8 @@ def _redrive_ast_hits(staging: Path, base: str, head: str
                 q = subprocess.run(["node", str(REDRIVE_AST_GATE), bf,
                                     str(staging / f), f], cwd=str(staging),
                                    capture_output=True, text=True,
-                                   timeout=120, check=False)
+                                   timeout=120, check=False,
+                                   env=_ts_script_env())
                 got = json.loads(q.stdout)
             except (OSError, subprocess.TimeoutExpired, ValueError):
                 return None

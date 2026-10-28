@@ -512,6 +512,32 @@ class TestAstGate:
         hits = self._run(leerie, tmp_path, after)
         assert [h["rule"] for h in hits] == ["D2_early_success_return"]
 
+    def test_ts7_tree_runs_on_the_bundled_typescript(self, leerie, tmp_path,
+                                                     monkeypatch):
+        """A tree on the TypeScript 7 native port (its `typescript` exports
+        a version only): the gate is available through the bundled copy
+        and reports the same D1 hit."""
+        repo, _ = _repo(tmp_path)
+        base = _commit(repo, {"src/load.ts": self.BASE}, "b")
+        head = _commit(repo, {"src/load.ts": (
+            "export function load(x: Item | null) {\n"
+            "  return { status: 'ok', x };\n}\n")}, "h")
+        pkg = repo / "node_modules" / "typescript"
+        (pkg / "lib").mkdir(parents=True)
+        (pkg / "package.json").write_text(json.dumps({
+            "name": "typescript", "version": "7.0.2",
+            "exports": {".": "./lib/version.cjs"}}))
+        (pkg / "lib" / "version.cjs").write_text(
+            "module.exports = { version: '7.0.2' };\n")
+        monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT",
+                            tmp_path / "none")
+        assert leerie._redrive_ast_available(repo) is False
+        assert leerie._redrive_ast_hits(repo, base, head) is None
+        monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
+        assert leerie._redrive_ast_available(repo) is True
+        hits = leerie._redrive_ast_hits(repo, base, head)
+        assert [h["rule"] for h in hits] == ["D1_guard_removed"]
+
     def test_d3_swallowed_across_files(self, leerie, tmp_path):
         caller = ("import { load } from './load';\n"
                   "export function use(x: Item | null) {\n"
@@ -535,8 +561,9 @@ def test_escalation_gate_voids_on_any_hit(leerie, tmp_path, monkeypatch):
                                                "b")["void"]
 
 
-def test_ast_unavailable_without_typescript(leerie, tmp_path):
+def test_ast_unavailable_without_typescript(leerie, tmp_path, monkeypatch):
     repo, _ = _repo(tmp_path)
+    monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", tmp_path / "none")
     assert leerie._redrive_ast_available(repo) is False
 
 

@@ -5572,8 +5572,9 @@ non-JSON file in the conflict leaves the merge exactly as git left it.
 resolve.** `scripts/test-case-facts.cjs` (the falsifier's coupling facts,
 `tests/test_delivery_detection.py`) and `scripts/redrive-ast-gate.cjs` (the
 delivery re-drive's escalation gate, `tests/test_delivery_redrive.py`) load
-`typescript` from the tree they run in, and leerie installs none of its own,
-so both skip on a host where node cannot resolve it — which was every CI run.
+`typescript` from the tree they run in (else from the image's bundled copy,
+which a host test run does not have), so both skip on a host where node cannot
+resolve it — which was every CI run.
 `.github/workflows/test.yml` now installs a pinned `typescript` under
 `$RUNNER_TEMP` and exports `LEERIE_TEST_TYPESCRIPT_DIR`. A set
 `LEERIE_TEST_TYPESCRIPT_DIR` is binding: the tests use it as given, so a
@@ -5582,3 +5583,18 @@ broken install fails them instead of skipping them, and
 (`GITHUB_ACTIONS=true`) when the variable is unset or names nothing node can
 load. To run them locally: `npm install --no-save --prefix <dir> typescript`
 and point the variable at `<dir>/node_modules/typescript`.
+
+**A TypeScript 7 tree parses with the bundled compiler.** The native port's
+`typescript` package resolves but exports a version string only, so the AST
+scripts used to crash on `ts.ScriptTarget` and every falsifier sample on such
+a repo read as rejected. `scripts/load-typescript.cjs` loads the tree's own
+copy only when `typeof ts.createSourceFile === 'function'`, else the pinned
+copy at `BUNDLED_TYPESCRIPT`. `tests/test_delivery_detection.py` builds a fake
+TS7-shaped package (`_ts7_tree`): without a bundle `_ts_resolvable` is False
+and `_probe_case_facts` returns `facts_failed`; with `BUNDLED_TYPESCRIPT`
+pointed at the test's typescript the loader reports `bundled` and the facts
+come out; `tests/test_delivery_redrive.py::TestAstGate::test_ts7_tree_runs_on_the_bundled_typescript`
+does the same for gate (d+). `TestFalsifierGates::test_a_facts_script_failure_is_its_own_gate_not_a_rejection`
+pins `facts_read: false` with no `assertion_in_case` / `not_coupled`, and
+`test_the_image_ships_the_bundled_typescript_where_leerie_looks` pins the
+Dockerfile's extraction path to the constant.

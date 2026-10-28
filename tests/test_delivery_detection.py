@@ -499,7 +499,8 @@ class TestCouplingPolicy:
 
     @pytest.mark.skipif(_ts_dir() is None,
                         reason="node or the typescript package unavailable")
-    def test_facts_script_reads_the_reachable_case(self, leerie, tmp_path):
+    def test_facts_script_reads_the_reachable_case(self, leerie, tmp_path,
+                                                   monkeypatch):
         tree = tmp_path / "tree"
         (tree / "node_modules").mkdir(parents=True)
         os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
@@ -531,11 +532,96 @@ class TestCouplingPolicy:
                                                             "publicFn"}
         assert leerie._ts_resolvable(tree) is True
         (tmp_path / "probe-less").mkdir()
+        monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT",
+                            tmp_path / "no-bundle")
         assert leerie._ts_resolvable(tmp_path / "probe-less") is False
 
     def test_facts_failure_is_an_error_not_a_crash(self, leerie, tmp_path):
         assert "error" in leerie._probe_case_facts(
             tmp_path, tmp_path / "missing.test.ts", "x")
+
+
+# === the bundled typescript fallback =======================================
+
+def _ts7_tree(root: Path) -> Path:
+    """An installed tree shaped like a TypeScript 7 (native port) repo: its
+    `typescript` package resolves, and its export is a version string only —
+    no compiler API (`ts.createSourceFile` undefined)."""
+    pkg = root / "node_modules" / "typescript"
+    (pkg / "lib").mkdir(parents=True)
+    (pkg / "package.json").write_text(json.dumps({
+        "name": "typescript", "version": "7.0.2",
+        "exports": {".": "./lib/version.cjs",
+                    "./package.json": "./package.json"}}))
+    (pkg / "lib" / "version.cjs").write_text(
+        "module.exports = { version: '7.0.2' };\n")
+    probe = root / "probe" / "x.test.ts"
+    probe.parent.mkdir()
+    probe.write_text("describe('m', () => {\n"
+                     "  it('keeps the sum', () => {\n"
+                     "    expect(add(2, 3)).toBe(5);\n  });\n});\n")
+    return root
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node unavailable")
+def test_ts7_tree_without_a_bundle_is_unavailable(leerie, tmp_path,
+                                                  monkeypatch):
+    """The package resolves but has no compiler API: not available — the
+    check that used to pass on a bare `require.resolve`."""
+    tree = _ts7_tree(tmp_path / "tree")
+    monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", tmp_path / "none")
+    assert subprocess.run(["node", "-e", "require.resolve('typescript')"],
+                          cwd=tree, check=False).returncode == 0
+    assert leerie._ts_resolvable(tree) is False
+    facts = leerie._probe_case_facts(tree, tree / "probe" / "x.test.ts",
+                                     "m keeps the sum")
+    assert facts["error"] == "facts_failed"
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
+def test_ts7_tree_falls_back_to_the_bundled_typescript(leerie, tmp_path,
+                                                       monkeypatch):
+    """The tree's TypeScript 7 lacks the compiler API, so the scripts load
+    the bundled copy and the facts come out as from any JS-API tree."""
+    tree = _ts7_tree(tmp_path / "tree")
+    monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", Path(_ts_dir()))
+    assert leerie._ts_resolvable(tree) is True
+    r = subprocess.run(["node", str(leerie.TS_LOADER)], cwd=tree,
+                       env=leerie._ts_script_env(), capture_output=True,
+                       text=True, check=False)
+    assert r.stdout.strip() == "bundled", r.stderr
+    facts = leerie._probe_case_facts(tree, tree / "probe" / "x.test.ts",
+                                     "m keeps the sum")
+    assert "error" not in facts, facts
+    assert facts["title"] == "keeps the sum"
+    assert "expect(add(2, 3)).toBe(5);" in " ".join(facts["reach_src"])
+
+
+@pytest.mark.skipif(_ts_dir() is None,
+                    reason="node or the typescript package unavailable")
+def test_a_tree_with_the_compiler_api_uses_its_own(leerie, tmp_path,
+                                                   monkeypatch):
+    tree = tmp_path / "tree"
+    (tree / "node_modules").mkdir(parents=True)
+    os.symlink(_ts_dir(), tree / "node_modules" / "typescript")
+    monkeypatch.setattr(leerie, "BUNDLED_TYPESCRIPT", tmp_path / "none")
+    r = subprocess.run(["node", str(leerie.TS_LOADER)], cwd=tree,
+                       env=leerie._ts_script_env(), capture_output=True,
+                       text=True, check=False)
+    assert r.stdout.strip() == "tree", r.stderr
+
+
+def test_the_image_ships_the_bundled_typescript_where_leerie_looks(leerie):
+    """The Dockerfile extracts the pinned package exactly at
+    BUNDLED_TYPESCRIPT, outside the /opt/leerie-image bind mount, pinned by
+    version and sha512, and checks it has the compiler API."""
+    df = (Path(leerie.ROOT) / "Dockerfile").read_text()
+    assert f"dst={leerie.BUNDLED_TYPESCRIPT};" in df
+    assert not str(leerie.BUNDLED_TYPESCRIPT).startswith("/opt/leerie-image")
+    assert "ARG BUNDLED_TYPESCRIPT_VERSION=5." in df
+    assert "sha512sum -c" in df
+    assert "typeof ts.createSourceFile!=='function'" in df
 
 
 # === code gates, run for real on a pytest probe ============================
@@ -590,7 +676,8 @@ class TestFalsifierGates:
         assert out["gates"] == {
             "new_file": True, "not_a_lead": True, "runnable": True,
             "item_quote": True, "case_fails": True, "fails_under_bstar": True,
-            "assertion_in_case": True, "not_coupled": True}
+            "facts_read": True, "assertion_in_case": True,
+            "not_coupled": True}
         assert out["case_id"].endswith("test_add_returns_the_sum")
         # The probe ran in the pristine checkout and was removed after.
         assert gate_env.facts[0][0] == str(gate_env.confirm)
@@ -664,6 +751,42 @@ class TestFalsifierGates:
             confirm_tree=gate_env.confirm, sha=gate_env.head,
             item_text=ITEM, acc_paths=set(), label="t"))
         assert out["gates"]["not_a_lead"] is False and not out["confirmed"]
+
+    def test_a_facts_script_failure_is_its_own_gate_not_a_rejection(
+            self, leerie, gate_env, monkeypatch):
+        """The AST facts script could not run (TypeScript 7's compiler-less
+        package, a crash): an infrastructure miss, recorded as
+        `facts_read: false` — never as a failed assertion or coupling gate
+        the falsifier could be blamed for."""
+        monkeypatch.setattr(
+            leerie, "_probe_case_facts",
+            lambda tree, probe, case: {"error": "facts_failed",
+                                       "stderr": "TypeError: Latest"})
+        out = _gates(leerie, gate_env, _claim())
+        assert out["confirmed"] is False
+        assert out["gates"] == {
+            "new_file": True, "not_a_lead": True, "runnable": True,
+            "item_quote": True, "case_fails": True, "fails_under_bstar": True,
+            "facts_read": False}
+        assert out["facts_error"] == {"error": "facts_failed",
+                                      "stderr": "TypeError: Latest"}
+        assert "coupling" not in out
+        # The probe is still removed from the pristine checkout.
+        assert not (gate_env.confirm / PROBE_REL).exists()
+
+    def test_a_case_the_script_cannot_find_is_still_a_rejection(
+            self, leerie, gate_env, monkeypatch):
+        """`case_not_found` is a fact about the probe, not a script
+        failure: the facts were read, and the case's gates fail."""
+        monkeypatch.setattr(
+            leerie, "_probe_case_facts",
+            lambda tree, probe, case: {"error": "case_not_found",
+                                       "titles": []})
+        out = _gates(leerie, gate_env, _claim())
+        assert out["gates"]["facts_read"] is True
+        assert out["gates"]["assertion_in_case"] is False
+        assert out["gates"]["not_coupled"] is False
+        assert "facts_error" not in out and out["confirmed"] is False
 
     def test_could_not_demonstrate_runs_no_gate(self, leerie, gate_env):
         out = _gates(leerie, gate_env,

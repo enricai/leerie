@@ -5,10 +5,10 @@
 // Reachable code = the case callback + enclosing describe hooks + every
 // file-level/describe-level declaration transitively referenced from those.
 // Facts are syntactic only; the policy lives in leerie.py
-// (`_falsifier_coupling`). `typescript` is resolved from the working
-// directory — the installed tree under test — so the check runs only where
-// the repository itself carries the compiler.
-const ts = require(require.resolve('typescript', { paths: [process.cwd()] }));
+// (`_falsifier_coupling`). `typescript` comes from load-typescript.cjs: the
+// installed tree under test's own (resolved from the working directory) when
+// it has the compiler API, else the image's pinned copy.
+const ts = require('./load-typescript.cjs').loadTypescript().ts;
 const fs = require('fs');
 const [file, want] = process.argv.slice(2);
 const text = fs.readFileSync(file, 'utf8');

@@ -47,9 +47,10 @@ jobs:
 
       # The AST-script tests (scripts/test-case-facts.cjs in
       # tests/test_delivery_detection.py, scripts/redrive-ast-gate.cjs in
-      # tests/test_delivery_redrive.py) need `typescript`, which leerie never
-      # installs itself: it comes from the target repo's own install. Without
-      # this step they skip and CI never runs them. The runner image's own
+      # tests/test_delivery_redrive.py) need `typescript`: in a run it comes
+      # from the target repo's install or the image's bundled copy, neither of
+      # which a CI host has. Without this step they skip and CI never runs
+      # them; the tests also use this copy as the stand-in bundled one. The runner image's own
       # node runs the scripts; the package is pinned and kept outside the
       # checkout so no package.json enters the repo.
       - name: Install typescript for the AST-script tests
