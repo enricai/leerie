@@ -767,6 +767,14 @@ class TestRunDeliveryDetection:
         assert verdicts == [(0, "unmet"), (1, "external"), (2, "met"),
                             (3, "met")]
         assert gate["items"][0]["falsifier"]["samples"][0]["confirmed"]
+        # The confirmed probe is kept for the delivery re-drive's re-check;
+        # an unconfirmed sample's is not.
+        saved = gate["items"][0]["falsifier"]["samples"][0]["probe_saved"]
+        assert Path(saved["dir"]) == st.run_dir / "acceptance/probes/i0"
+        assert Path(saved["dir"], saved["file"]).read_text() == PROBE_SRC
+        assert not any(s_.get("probe_saved") for r in gate["items"][1:]
+                       for s_ in ((r.get("falsifier") or {}).get("samples")
+                                  or []))
         assert gate["falsifier"]["enabled"] is True
         assert "final_progress" not in gate and gate["final_sha"] == head
         # Leads: present, read-only, git-excluded; the tree is the final

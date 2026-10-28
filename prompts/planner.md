@@ -449,6 +449,14 @@ The orchestrator gives you, in your prompt:
    by comparing `required_items` against your subtasks'
    `title`/`success_criteria_seed` text, so a subtask that covers a
    required item but describes it in unrelated words reads as uncovered.
+   Also claim it: on every subtask whose work delivers a required item,
+   list it in `claims.items` as `{"item_index": 0, "kind": "deliverable"}`
+   — `item_index` is the item's 0-based position in `required_items`;
+   `kind` is `deliverable` when the item is a change the tree must
+   carry, `process` when it constrains only how the work is done (a
+   command to run, something never to do). Claim every item at least
+   once. If an item is still unmet after the run, the orchestrator hands
+   it back to exactly the subtasks that claimed it.
 
    If your CONTEXT includes `defect_scope` (present only on defect-fix
    tasks where an upstream audit found the defect implicating multiple
@@ -730,6 +738,8 @@ Return **only** this JSON object as your final message — no prose, no fences:
       "change_kind": "fix | test | docs | other",
       "claims": {"sites": [
         {"site_id": "D1", "resolution_kinds": ["rerun_flow"]}
+      ], "items": [
+        {"item_index": 0, "kind": "deliverable"}
       ]},
       "independent_sites": false,
       "sweep_sites": [],
@@ -754,8 +764,10 @@ Return **only** this JSON object as your final message — no prose, no fences:
 }
 ```
 
-`claims` and `sites_not_needed` matter only when your CONTEXT carries
-`defect_scope`; otherwise leave `claims` out and `sites_not_needed` empty.
+`claims.sites` and `sites_not_needed` matter only when your CONTEXT
+carries `defect_scope`; otherwise leave `claims.sites` and
+`sites_not_needed` empty. `claims.items` matters whenever your CONTEXT
+carries `required_items`.
 `external_resource` is set only with `blocker_kind: "external_precondition"`.
 
 `migration_targets` is optional — omit it unless this subtask replaces an

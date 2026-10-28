@@ -130,6 +130,12 @@ MIN_CLAUDE_CLI_STRICT_OUTPUT = (2, 1, 289)
 # (6/6). Only runs whose held-out sets fail pay it.
 EFFORT_ACCEPTANCE_REPAIR = "high"
 
+# Effort for the delivery re-drive's last-round escalation only (DESIGN §8
+# *Delivery re-drive*): a group on its members' last round, every failing set
+# of it written at the own start, behind the audit, test-weakening, schema
+# and AST gates. Bench Q3-FRESH2: 9 of 10 fair sets closed at high.
+EFFORT_REDRIVE_ESCALATION = "high"
+
 # --- tunable caps --------------------------------------------------------
 DEFAULT_CAPS = {
     # Runaway backstop, not a routine capacity limit (N3+N4, corpus-derived
@@ -826,6 +832,9 @@ STATE_FIELDS = (
     # re-driven*): per-sid {rounds[], last, final, uncovered, open_gaps?,
     # rolled_back?}; `final` covered / untested / rolled_back / unmeasured.
     "coverage_redrive",
+    # Delivery re-drive (DESIGN §8 *Delivery re-drive*): rounds, groups,
+    # pending control notes, trade pairs, conflict and contradictions.
+    "delivery_redrive",
     # working_branch: the user's branch at the moment phase_classify
     # runs (`git rev-parse --abbrev-ref HEAD`). Mirrored to run.json
     # and to `<state-root>/runs/<id>/working-branch` (setup-run.sh writes
@@ -2337,6 +2346,24 @@ def _planner_defs() -> dict:
             "type": "object",
             "required": ["sites"],
             "properties": {
+                # DESIGN §5 *Required items are claimed too*: the
+                # required_items indices this subtask delivers — the
+                # delivery re-drive's routing key. Optional.
+                "items": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["item_index", "kind"],
+                        "properties": {
+                            # No `minimum`: strict mode strips range
+                            # bounds; `_item_claims` drops a negative
+                            # index in code.
+                            "item_index": {"type": "integer"},
+                            "kind": {"type": "string",
+                                     "enum": list(ITEM_CLAIM_KINDS)},
+                        },
+                    },
+                },
                 "sites": {
                     "type": "array",
                     "items": {
@@ -2543,6 +2570,10 @@ SITE_KIND_CLASS: dict[str, str] = {
     "other": "other",
 }
 CHANGE_KINDS = ("fix", "test", "docs", "other")
+# What a subtask's claim on a required item says the item is (DESIGN §5
+# *Required items are claimed too*): a tree change, or a constraint on how
+# to work — which the delivery re-drive never routes.
+ITEM_CLAIM_KINDS = ("deliverable", "process")
 # The advisory whole-PR review's finding kinds (DESIGN §9) and the
 # contract extractor's literal kinds (DESIGN §8), both as benched.
 PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
@@ -32511,6 +32542,11 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
         reasons.append(f"{len(ci_unmet)} of the repository's own merge "
                        "check(s) red on the final tree: "
                        + ", ".join(str(u.get("id")) for u in ci_unmet))
+    redrive = st.data.get("delivery_redrive")
+    conflict = (redrive.get("conflict") if isinstance(redrive, dict)
+                else None)
+    if isinstance(conflict, dict) and conflict.get("reason"):
+        reasons.append(str(conflict["reason"]))
     if reasons:
         outcome = "unconverged"
     elif not any_commits:
@@ -33386,29 +33422,14 @@ def _format_provision_recipe_section(recipe: list[dict],
     return "\n".join(lines)
 
 
-async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
-                          models: dict[str, str],
-                          efforts: dict[str, str | None],
-                          continuation: bool = False, note: str = "") -> dict:
-    """Spawn one implementer for one subtask in its own worktree. Handles
-    both kinds of continuation up to the shared `subtask_continuations`
-    cap: context-exhaustion handoffs and DESIGN §11 mid-execution
-    clarifications."""
-    sys_prompt = _load_prompt("implementer")
-    proc = await _run_script("new-worktree.sh", sid, st.run_id)
-    if proc.returncode != 0:
-        raise WorktreeSetupError(
-            f"worktree creation failed for {sid}: {proc.stderr.strip()}")
-    worktree = proc.stdout.strip().splitlines()[-1]
-    # The fresh worktree has NO installed deps. The implementer runs
-    # installs itself in its own worktree against the shared
-    # package-manager caches (DESIGN §6½ "Worker-driven install"); the
-    # recipe to follow is injected into its prompt below. We don't
-    # pre-install here because (a) it would clobber the host's
-    # repo_root checkout that this worktree shares the package cache
-    # with, and (b) workers correctly skip install when their subtask
-    # is config-only / docs-only.
-
+def _implementer_base_prompt(sid: str, leerie_dir: Path, caps: dict,
+                             st: State, *, cwd_line: str) -> list[str]:
+    """The implementer's user-prompt lines up to (not including) the
+    continuation and orchestrator-note lines: the subtask spec pointer,
+    `cwd_line` (what the working directory is), the evidence-gate bound,
+    the clarification gate and the provision, artifact, convention and
+    owned-region sections. Shared by `_run_implementer` (the subtask's own
+    worktree) and the delivery re-drive (the integrated staging tree)."""
     # DESIGN §11 mid-execution clarification: the worker may exit with
     # `needs-clarification` only when --clarify is in effect. Without
     # --clarify (the default) the user has not opted into questions, so
@@ -33419,8 +33440,7 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     up = [f"Execute subtask `{sid}`.",
           f"LEERIE_DIR is {leerie_dir} (absolute).",
           f"Read your spec at {leerie_dir}/subtasks/{sid}.json.",
-          "Your current working directory IS your isolated worktree — make and "
-          "commit all code changes here.",
+          cwd_line,
           # DESIGN §8 + §13: evidence-gate bound, prompt-governed.
           f"CONFIDENCE_ROUNDS: {caps['confidence_rounds']} (the maximum "
           "number of evidence-gate iterations before you exit blocked).",
@@ -33460,6 +33480,36 @@ async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
     region_section = _format_owned_region_section(leerie_dir, sid)
     if region_section is not None:
         up.append(region_section)
+    return up
+
+
+async def _run_implementer(sid: str, leerie_dir: Path, caps: dict, st: State,
+                          models: dict[str, str],
+                          efforts: dict[str, str | None],
+                          continuation: bool = False, note: str = "") -> dict:
+    """Spawn one implementer for one subtask in its own worktree. Handles
+    both kinds of continuation up to the shared `subtask_continuations`
+    cap: context-exhaustion handoffs and DESIGN §11 mid-execution
+    clarifications."""
+    sys_prompt = _load_prompt("implementer")
+    proc = await _run_script("new-worktree.sh", sid, st.run_id)
+    if proc.returncode != 0:
+        raise WorktreeSetupError(
+            f"worktree creation failed for {sid}: {proc.stderr.strip()}")
+    worktree = proc.stdout.strip().splitlines()[-1]
+    # The fresh worktree has NO installed deps. The implementer runs
+    # installs itself in its own worktree against the shared
+    # package-manager caches (DESIGN §6½ "Worker-driven install"); the
+    # recipe to follow is injected into its prompt below. We don't
+    # pre-install here because (a) it would clobber the host's
+    # repo_root checkout that this worktree shares the package cache
+    # with, and (b) workers correctly skip install when their subtask
+    # is config-only / docs-only.
+
+    up = _implementer_base_prompt(
+        sid, leerie_dir, caps, st,
+        cwd_line="Your current working directory IS your isolated worktree "
+                 "— make and commit all code changes here.")
     if continuation:
         # Only mention the checkpoint when one exists. It is written solely on
         # `incomplete-handoff` / `needs-clarification`, so most continuations
@@ -42454,7 +42504,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
     `{failing_cases, findings, kinds, samples}`. Budget exhaustion
     propagates; a sample that fails otherwise is no finding."""
     out: dict = {"failing_cases": [], "findings": [], "kinds": [],
-                 "samples": 0}
+                 "sample_kinds": [], "samples": 0}
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
     copied, complete = _place_set(set_, wt)
     refs_copied: list[Path] = []
@@ -42528,14 +42578,21 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                     f"failed ({_brief_worker_exc(e)}) — no finding")
                 continue
             out["samples"] += 1
+            # Each sample's own verified kinds, beside the union: the
+            # delivery re-drive's escalation gate counts a majority of
+            # samples, which the union cannot say (DESIGN §8).
+            kinds_here: set[str] = set()
             for c in (res.get("cases") or []):
                 cid = str(c.get("case") or "")
-                if (c.get("verdict") != "set_defect" or cid not in names
-                        or cid in union):
+                if c.get("verdict") != "set_defect" or cid not in names:
                     continue
                 if _verify_set_audit_case(c, set_texts=set_texts, tree=wt,
                                           task_text=task_text,
                                           messages=messages):
+                    continue
+                if isinstance(c.get("defect_kind"), str):
+                    kinds_here.add(c["defect_kind"])
+                if cid in union:
                     continue
                 union[cid] = {
                     "case": cid, "defect_kind": c.get("defect_kind"),
@@ -42543,6 +42600,7 @@ async def _acceptance_audit_in(st: "State", caps: dict, models: dict,
                     "prod_quote": c.get("prod_quote"),
                     "reason": str(c.get("reason") or "")[:600],
                     "sample": i}
+            out["sample_kinds"].append(sorted(kinds_here))
         out["findings"] = list(union.values())
         out["kinds"] = sorted({f["defect_kind"] for f in out["findings"]
                                if f.get("defect_kind")})
@@ -42594,7 +42652,8 @@ async def _acceptance_audit_on_rev(st: "State", caps: dict, models: dict,
                                 label) as tree:
         if tree is None:
             return {"failing_cases": [], "findings": [], "kinds": [],
-                    "samples": 0, "skipped": "audit tree not set up"}
+                    "sample_kinds": [], "samples": 0,
+                    "skipped": "audit tree not set up"}
         wt, env = tree
         return await _acceptance_audit_in(
             st, caps, models, efforts, wt, set_, label=label,
@@ -42760,7 +42819,8 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
             audit = await _acceptance_audit_on_rev(
                 st, caps, models, efforts, rev, s_, f"audit-{idx}")
             s_["audit"] = {k: audit.get(k) for k in
-                           ("findings", "kinds", "samples", "skipped")
+                           ("findings", "kinds", "sample_kinds", "samples",
+                            "skipped")
                            if audit.get(k) is not None}
             _save()
             if audit["findings"]:
@@ -42823,8 +42883,8 @@ async def _acceptance_audit_and_rewrite(st: "State", caps: dict,
                         st, caps, models, efforts, rev, s_,
                         f"reaudit-{idx}")
                     s_["audit"] = {k: again.get(k) for k in
-                                   ("findings", "kinds", "samples",
-                                    "skipped")
+                                   ("findings", "kinds", "sample_kinds",
+                                    "samples", "skipped")
                                    if again.get(k) is not None}
                     broken = bool(again["findings"])
             else:
@@ -43129,6 +43189,9 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 " — verdicts kept as measured")
         gate["audited"] = True
     gate["final"] = final
+    # The commit `final` describes: the delivery re-drive reuses the verdict
+    # only while staging's HEAD is still that commit.
+    gate["final_sha"] = await _branch_head_sha(str(staging))
     # A repair that left nothing measurable (it broke the dependency
     # manifest, say) must not erase a failing verdict: the last measured
     # one becomes the residual, marked as such.
@@ -43140,25 +43203,7 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 basis, unmeasured_final = r, True
                 break
     if _acceptance_measured(basis) and _acceptance_any_fails(basis):
-        by_index = {s_["index"]: s_ for s_ in sets}
-        measured = _acceptance_measured(basis)
-        cases_by_set = {
-            str(r["index"]): [c for rel in r["failing_files"]
-                              for c in by_index[r["index"]]["cases"].get(
-                                  rel, [])][:20]
-            for r in measured if not r["passed"]}
-        names = [c for v in cases_by_set.values() for c in v]
-        gate["residual"] = {
-            "failing_sets": sum(1 for r in measured if not r["passed"]),
-            "total_sets": len(measured), "cases": names[:20],
-            # Which sets, so a set typed broken later can be left out of
-            # the next run's residual (`_acceptance_residual_unbroken`).
-            "sets": [r["index"] for r in measured if not r["passed"]],
-            "cases_by_set": cases_by_set,
-            # Which files failed, so a variant set (no counted case among
-            # them) can be left out when the residual is read.
-            "files_by_set": {str(r["index"]): list(r["failing_files"])
-                             for r in measured if not r["passed"]}}
+        gate["residual"] = _acceptance_residual_of(basis, sets)
         if unmeasured_final:
             gate["residual"]["unmeasured_final"] = True
         log(f"  WARNING: held-out acceptance residual — "
@@ -43178,6 +43223,31 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
     acc["gate"] = gate
     st.data["acceptance"] = acc
     st.save()
+
+
+def _acceptance_residual_of(basis: list[dict], sets: list[dict]) -> dict:
+    """The residual record of a measured verdict with at least one failing
+    set (`acceptance.gate.residual`): what the next same-task run's planner
+    is handed. Written by the gate and, after it, the delivery re-drive."""
+    by_index = {s_["index"]: s_ for s_ in sets}
+    measured = _acceptance_measured(basis)
+    cases_by_set = {
+        str(r["index"]): [c for rel in r["failing_files"]
+                          for c in (by_index.get(r["index"]) or {}).get(
+                              "cases", {}).get(rel, [])][:20]
+        for r in measured if not r["passed"]}
+    names = [c for v in cases_by_set.values() for c in v]
+    return {
+        "failing_sets": sum(1 for r in measured if not r["passed"]),
+        "total_sets": len(measured), "cases": names[:20],
+        # Which sets, so a set typed broken later can be left out of the
+        # next run's residual (`_acceptance_residual_unbroken`).
+        "sets": [r["index"] for r in measured if not r["passed"]],
+        "cases_by_set": cases_by_set,
+        # Which files failed, so a variant set (no counted case among them)
+        # can be left out when the residual is read.
+        "files_by_set": {str(r["index"]): list(r["failing_files"])
+                         for r in measured if not r["passed"]}}
 
 
 def _acceptance_can_check(st: "State") -> bool:
@@ -44967,6 +45037,26 @@ async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
     return out
 
 
+def _falsifier_save_probe(st: "State", lane: Path, i: int,
+                          res: dict) -> dict | None:
+    """Keep a confirmed sample's probe beside the held-out sets, under
+    `<run_dir>/acceptance/probes/i<k>/` (Read-denied to every fixer,
+    `_acceptance_read_denials`), so the delivery re-drive can re-run it on a
+    later tree (DESIGN §8 *Delivery re-drive*). `{dir, file}`, or None when
+    it cannot be copied."""
+    rel = _delivery_cite_rel(str(res.get("probe_path") or ""), lane)
+    if not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
+        return None
+    dst_dir = st.run_dir / "acceptance" / "probes" / f"i{i}"
+    try:
+        shutil.rmtree(dst_dir, ignore_errors=True)
+        (dst_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(lane / rel, dst_dir / rel)
+    except OSError:
+        return None
+    return {"dir": str(dst_dir), "file": rel}
+
+
 def _ts_resolvable(tree: str | Path) -> bool:
     """True when `node` can resolve the `typescript` package from `tree` —
     the AST facts script's one dependency."""
@@ -45086,6 +45176,10 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                     st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
                     sha=sha, item_text=item.get("item", ""),
                     acc_paths=acc_paths, label=f"i{i}-s{n}"))
+            if rec.get("confirmed"):
+                saved = _falsifier_save_probe(st, lane, i, res)
+                if saved:
+                    rec["probe_saved"] = saved
             return rec
 
         async def _item(i: int) -> None:
@@ -45276,6 +45370,1512 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     else:
         log("  delivery detection: no required item shown unmet on the "
             "final tree")
+
+
+# --- Delivery re-drive (DESIGN §8 *Delivery re-drive*; bench P8d, Q3 L1,
+# Q3-FRESH2 escalation gates) ---------------------------------------------
+#
+# Every pattern below reads paths, git output, import specifiers or source
+# code — mechanical strings, never prose (DESIGN §12). Routing reads typed
+# fields only (`claims.items`, set file kinds, check records).
+
+REDRIVE_AST_GATE = ROOT / "scripts" / "redrive-ast-gate.cjs"
+# Test-shaped paths for the escalation gates (b), (c), (d), as benched.
+_REDRIVE_TEST_RE = re.compile(
+    r"(\.test\.|\.spec\.|/__tests__/|(^|/)tests?/|\.test-helper\.)")
+# Production files gates (c) and (d) read: JS/TS, as benched.
+_REDRIVE_PROD_RE = re.compile(r"\.(ts|tsx|js|mjs|cjs)$")
+_REDRIVE_LOG = "delivery-redrive.log"
+_REDRIVE_EXCLUDE_TAG = "# leerie delivery re-drive staged set"
+# What a note shows of an item's evidence and a set file's case names.
+_REDRIVE_EVIDENCE_MAX = 1200
+_REDRIVE_CASES_MAX = 12
+
+
+def _item_claims(subtasks: dict | list) -> dict[int, dict]:
+    """item_index -> `{claimed_by: [sid, ...], kind}` from each subtask's
+    typed `claims.items` (DESIGN §5 *Required items are claimed too*). A
+    claimer typing `deliverable` wins over one typing `process`: a process
+    item is never routed, so a disagreement must not drop a deliverable."""
+    rows = (subtasks.items() if isinstance(subtasks, dict)
+            else [(s.get("id"), s) for s in subtasks if isinstance(s, dict)])
+    out: dict[int, dict] = {}
+    for sid, spec in rows:
+        if not isinstance(spec, dict) or not isinstance(spec.get("claims"),
+                                                        dict):
+            continue
+        for c in spec["claims"].get("items") or []:
+            if not isinstance(c, dict):
+                continue
+            i = c.get("item_index")
+            if not isinstance(i, int) or isinstance(i, bool) or i < 0:
+                continue
+            kind = (c.get("kind") if c.get("kind") in ITEM_CLAIM_KINDS
+                    else "deliverable")
+            row = out.setdefault(i, {"claimed_by": [], "kind": kind})
+            if str(sid) not in row["claimed_by"]:
+                row["claimed_by"].append(str(sid))
+            if kind == "deliverable":
+                row["kind"] = "deliverable"
+    return out
+
+
+def _redrive_subtask_files(staging: Path, sid: str, spec: dict) -> list[str]:
+    """The source files `sid` changed: those its `leerie: integrate <sid>`
+    merge brought in, else its `files_likely_touched` — never a test file."""
+    files: list[str] = []
+    merge = _integration_commit(staging, sid)
+    if merge:
+        r = subprocess.run(["git", "-C", str(staging), "diff", "--name-only",
+                            f"{merge}^1", merge], capture_output=True,
+                           text=True, check=False)
+        if r.returncode == 0:
+            files = [x for x in r.stdout.splitlines() if x.strip()]
+    if not files:
+        files = [f for f in (spec.get("files_likely_touched") or [])
+                 if isinstance(f, str)]
+    return sorted({f for f in files
+                   if _CONTRACT_CODE_FILE_RE.search(f) and not _is_test_file(f)
+                   and "node_modules/" not in f})
+
+
+def _redrive_exercised(g: dict, set_: dict, rel: str) -> list[str]:
+    """The in-repo production modules one set file imports or mocks
+    (rule 3's "files that control exercises"; JS/TS only)."""
+    if not rel.endswith(_JS_SRC_EXT) or not set_.get("dir"):
+        return []
+    try:
+        text = (Path(set_["dir"]) / rel).read_text(errors="replace")
+    except OSError:
+        return []
+    own = set(_set_files(set_))
+    allf = set(g.get("files") or ()) | own
+    out: set[str] = set()
+    for rx in (_JS_IMPORT_RE, _JS_MOCK_RE):
+        for m in rx.finditer(text):
+            r = _js_resolve(m.group(1), rel, allf, g.get("aliases") or {})
+            if (r and r not in own and r in (g.get("files") or ())
+                    and not _js_is_test(r)
+                    and r not in (g.get("support") or ())):
+                out.add(r)
+    return sorted(out)
+
+
+def _redrive_ci_files(u: dict, files: Iterable[str]) -> list[str]:
+    """Which of `files` (repo-relative) a red merge check touches: a new
+    diagnostic's file, or a file a fired coverage glob matches. A plain red
+    gate names no file."""
+    cwd = (str(u.get("cwd") or ".")).strip().rstrip("/")
+    pre = "" if cwd in ("", ".") else cwd.removeprefix("./") + "/"
+    diag = {pre + str(k).split("\t", 1)[0]
+            for k in (u.get("diagnostics") or []) if isinstance(k, str)}
+    globs = [str(t.get("glob")) for t in (u.get("thresholds") or [])
+             if isinstance(t, dict) and t.get("glob")]
+    out = []
+    for f in files:
+        if f in diag or (f.startswith(pre) and any(
+                _ci_glob_match(f[len(pre):], gl) for gl in globs)):
+            out.append(f)
+    return out
+
+
+def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
+                   fallback: list[str], pending: list[dict]) -> list[dict]:
+    """Rules 2-4 (bench P8d `route`): the groups `[{members, files, notes}]`
+    in plan order (`subfiles`' order). Defect notes go together to the
+    subtasks whose files meet any defect file's `exercised` files, else
+    `fallback`, else everyone; a control-shaped note (`control_regression`,
+    `held_control`, `ci_check`) to the subtasks its `exercised` files
+    touch, else the defect claimers, else everyone; an item to every
+    claimer in `claimed_by`, else the defect claimers, else everyone.
+    Subtasks sharing a file are one group; `pending` (X3') rides along in
+    every group."""
+    order = list(subfiles)
+    rank = {s: i for i, s in enumerate(order)}
+    targets: dict[str, list[dict]] = {}
+
+    def give(sids: Iterable[str], n: dict) -> None:
+        for sid in sids:
+            targets.setdefault(sid, []).append(n)
+
+    def touching(n: dict) -> list[str]:
+        ex = set(n.get("exercised") or ())
+        return [s for s in order if ex & set(subfiles[s])]
+
+    defects = [n for n in notes if n.get("kind") in ("defect", "held_defect")]
+    claimers: list[str] = []
+    for n in defects:
+        claimers += [s for s in touching(n) if s not in claimers]
+    if defects and not claimers:
+        claimers = [s for s in fallback if s in rank] or list(order)
+    for n in defects:
+        give(claimers, n)
+    for n in notes:
+        k = n.get("kind")
+        if k in ("control_regression", "held_control", "ci_check"):
+            give(touching(n) or claimers or order, n)
+        elif k == "unmet_item":
+            cl = [s for s in (n.get("claimed_by") or []) if s in rank]
+            give(cl or claimers or order, n)
+    ids = sorted(targets, key=lambda s: rank.get(s, len(order)))
+    parent = {s: s for s in ids}
+
+    def find(a: str) -> str:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+    for i, a in enumerate(ids):
+        for b in ids[i + 1:]:
+            if set(subfiles.get(a) or ()) & set(subfiles.get(b) or ()):
+                parent[find(b)] = find(a)
+    grouped: dict[str, list[str]] = {}
+    for s in ids:
+        grouped.setdefault(find(s), []).append(s)
+    groups = []
+    for members in sorted(grouped.values(), key=lambda m: rank[m[0]]):
+        seen: set[str] = set()
+        gnotes: list[dict] = []
+        for m in members:
+            for n in targets[m]:
+                if n["key"] not in seen:
+                    seen.add(n["key"])
+                    gnotes.append(n)
+        for n in pending:
+            if n["key"] not in seen:
+                seen.add(n["key"])
+                gnotes.append(n)
+        groups.append({"members": members,
+                       "files": sorted(set().union(*[set(subfiles[m])
+                                                     for m in members])),
+                       "notes": gnotes})
+    return groups
+
+
+def _redrive_failing(results: list[dict], sets: list[dict],
+                     indices: set) -> tuple[dict[str, dict], list]:
+    """`"<index>:<file>"` -> `{set_index, file, kind}` for each failing file
+    of a measured set in `indices` whose failure is work
+    (`_acceptance_result_has_work`; in a bounded set only a counted defect
+    file), and the indices that produced no verdict."""
+    by = {s_.get("index"): s_ for s_ in sets}
+    out: dict[str, dict] = {}
+    unmeasured: list = []
+    for r in results or []:
+        i = r.get("index")
+        if i not in indices:
+            continue
+        if r.get("unmeasured"):
+            unmeasured.append(i)
+            continue
+        s_ = by.get(i) or {}
+        failing = list(r.get("failing_files") or [])
+        if not failing or not _acceptance_result_has_work(s_, failing):
+            continue
+        counted = _acceptance_counted_files(s_)
+        for rel in failing:
+            kind = ("control" if rel in (s_.get("control_files") or [])
+                    else "defect")
+            if kind == "defect" and counted is not None and rel not in counted:
+                continue
+            out[f"{i}:{rel}"] = {"set_index": i, "file": rel, "kind": kind}
+    return out, unmeasured
+
+
+def _redrive_carry(before: dict[str, dict], after: dict[str, dict],
+                   unmeasured: list) -> dict[str, dict]:
+    """`after` with the earlier verdict kept for every set that produced no
+    verdict now: a missing report is `resource_affected`, never evidence."""
+    out = dict(after)
+    for k, v in before.items():
+        if v["set_index"] in unmeasured:
+            out[k] = v
+    return out
+
+
+def _redrive_verdict(F: dict, F1: dict, new_ids: list[str], *,
+                     held: dict | None = None,
+                     held_after: dict | None = None) -> dict:
+    """Rules 5-6 (bench P8d/Q3, pure): fixed / broken set files, newly
+    failing controls, `worse` (roll back) and `trade` with its (fixed,
+    broken) pairs. The held-back rules apply only when both held-back
+    verdicts are given."""
+    fixed = sorted(set(F) - set(F1))
+    broke = sorted(set(F1) - set(F))
+    ctl_new = [k for k in broke if F1[k]["kind"] == "control"]
+    worse = len(F1) > len(F) or bool(ctl_new) or bool(new_ids)
+    hfixed: list[str] = []
+    hbroke: list[str] = []
+    if held is not None and held_after is not None:
+        hfixed = sorted(set(held) - set(held_after))
+        hbroke = sorted(set(held_after) - set(held))
+        worse = (worse or len(held_after) > len(held)
+                 or any(held_after[k]["kind"] == "control" for k in hbroke)
+                 or not hfixed)
+    broken_side = ctl_new + sorted(new_ids) + hbroke
+    trade = bool(fixed or hfixed) and bool(broken_side)
+    pairs = (sorted({(f, b) for f in fixed + hfixed for b in broken_side})
+             if trade else [])
+    return {"fixed": fixed, "broke": broke, "ctl_new": ctl_new,
+            "held_fixed": hfixed, "held_broke": hbroke, "worse": worse,
+            "trade": trade, "pairs": [list(p) for p in pairs]}
+
+
+def _redrive_exclude_path(staging: Path) -> Path | None:
+    r = subprocess.run(["git", "-C", str(staging), "rev-parse", "--git-path",
+                        "info/exclude"], capture_output=True, text=True,
+                       check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return None
+    ex = Path(r.stdout.strip())
+    return ex if ex.is_absolute() else staging / ex
+
+
+def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
+    """Remove this run's marked block from the exclude file — a worktree's
+    `info/exclude` is the repository's shared one, so nothing of it may
+    outlive the group."""
+    ex = _redrive_exclude_path(staging)
+    if ex is None or not ex.is_file():
+        return
+    begin, end = (f"{_REDRIVE_EXCLUDE_TAG} {run_id} begin",
+                  f"{_REDRIVE_EXCLUDE_TAG} {run_id} end")
+    out, skip = [], False
+    for line in ex.read_text().splitlines():
+        if line == begin:
+            skip = True
+            continue
+        if line == end:
+            skip = False
+            continue
+        if not skip:
+            out.append(line)
+    ex.write_text("\n".join(out) + ("\n" if out else ""))
+
+
+def _redrive_stage(staging: Path, sets: list[dict], run_id: str
+                   ) -> list[dict]:
+    """X2: copy the shown sets read-only into staging and git-exclude them.
+    A set whose path the tree already has, or another staged set took, is
+    skipped (never overwritten). Returns `[{set_index, dir, files}]`."""
+    taken: set[str] = set()
+    staged: list[dict] = []
+    for s_ in sets:
+        rels = _set_files(s_)
+        if not rels or not s_.get("dir") or any(
+                (staging / r).exists() or r in taken for r in rels):
+            log(f"  delivery re-drive: set {s_.get('index')} not staged — a "
+                "path already exists in the tree")
+            continue
+        try:
+            for rel in rels:
+                dst = staging / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(Path(s_["dir"]) / rel, dst)
+                dst.chmod(0o444)
+        except OSError as e:
+            log(f"  delivery re-drive: set {s_.get('index')} not staged "
+                f"({type(e).__name__})")
+            for rel in rels:
+                with contextlib.suppress(OSError):
+                    (staging / rel).chmod(0o644)
+                    (staging / rel).unlink()
+            continue
+        taken |= set(rels)
+        staged.append({"set_index": s_.get("index"), "dir": s_["dir"],
+                       "files": rels})
+    _redrive_exclude_clear(staging, run_id)
+    ex = _redrive_exclude_path(staging)
+    if ex is not None and taken:
+        ex.parent.mkdir(parents=True, exist_ok=True)
+        with ex.open("a") as f:
+            f.write("\n".join([f"{_REDRIVE_EXCLUDE_TAG} {run_id} begin",
+                               *("/" + r for r in sorted(taken)),
+                               f"{_REDRIVE_EXCLUDE_TAG} {run_id} end"])
+                    + "\n")
+    return staged
+
+
+def _redrive_unstage(staging: Path, staged: list[dict], run_id: str
+                     ) -> list[str]:
+    """Remove the staged copies (and the directories only they needed) and
+    the exclude block; returns the staged files whose bytes changed."""
+    tampered: list[str] = []
+    for s_ in staged:
+        for rel in s_["files"]:
+            dst = staging / rel
+            if not dst.exists():
+                continue
+            try:
+                if dst.read_bytes() != (Path(s_["dir"]) / rel).read_bytes():
+                    tampered.append(rel)
+            except OSError:
+                tampered.append(rel)
+            with contextlib.suppress(OSError):
+                dst.chmod(0o644)
+                dst.unlink()
+        for d in sorted({(staging / r).parent for r in s_["files"]},
+                        key=lambda p: -len(str(p))):
+            with contextlib.suppress(OSError):
+                d.rmdir()
+    _redrive_exclude_clear(staging, run_id)
+    return tampered
+
+
+async def _redrive_rollback(staging: Path, pre_sha: str) -> bool:
+    """`reset --hard pre_sha` (confirmed) then `clean -fd` (ignored files —
+    installed dependencies — kept)."""
+    ok = await _acceptance_rollback(str(staging), pre_sha)
+    subprocess.run(["git", "-C", str(staging), "clean", "-fdq"],
+                   capture_output=True, check=False)
+    return ok
+
+
+async def _redrive_test_ids(st: "State", caps: dict, staging: Path,
+                            label: str) -> dict | None:
+    """Failing test IDs of the repo's test command on staging, or None (no
+    command, no report: no verdict)."""
+    cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"]) or "").strip()
+    if not cmd:
+        return None
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
+    got = await _capture_failing_test_ids(
+        str(staging), cmd, st, caps, label=label,
+        log_path=st.run_dir / "logs" / _REDRIVE_LOG, timeout=timeout)
+    if got is not None:
+        got["command"] = cmd
+    return got
+
+
+async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
+                                pre_sha: str, before: dict | None,
+                                after: dict | None, label: str) -> dict:
+    """B*: the IDs failing after a group and not before it, confirmed
+    against a `redrive-base` worktree at `pre_sha` (`_confirm_new_failures`).
+    `{new, resource_affected, unmeasured}`; no verdict on either side is
+    `unmeasured`, never a regression."""
+    if before is None or after is None:
+        return {"new": [], "resource_affected": [], "unmeasured": True}
+    cand = sorted(set(after["ids"]) - set(before["ids"]))
+    if not cand:
+        return {"new": [], "resource_affected": [], "unmeasured": False}
+    id_files = after.get("files") or {}
+    files = sorted({id_files.get(c) for c in cand}, key=str)
+    rerun = None if (None in files or not files) else list(files)
+    cmd = after.get("command") or ""
+    log_path = st.run_dir / "logs" / _REDRIVE_LOG
+    wt = st.run_dir / "worktrees" / "redrive-base"
+
+    def _teardown() -> None:
+        subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
+                        "--force", str(wt)], capture_output=True, check=False)
+        shutil.rmtree(wt, ignore_errors=True)
+        _DEPS_INSTALLED.discard(os.path.realpath(wt))
+
+    _teardown()
+    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
+                          "--detach", str(wt), pre_sha],
+                         capture_output=True, text=True, check=False)
+    try:
+        if add.returncode != 0:
+            verdict = await _confirm_new_failures(cand, _no_rerun, _no_rerun,
+                                                  caps, label=label)
+        else:
+            await _ensure_worktree_deps(
+                str(wt), st, caps, log_path=log_path,
+                verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
+                label_prefix=f"{label}-base", log_prefix="delivery re-drive")
+            n = {"i": 0}
+
+            def _runner(tree: str, side: str):
+                async def _run(timeout: float) -> set[str] | None:
+                    n["i"] += 1
+                    got = await _capture_failing_test_ids(
+                        tree, cmd, st, caps, label=f"{label}-{side}{n['i']}",
+                        log_path=log_path, timeout=timeout, serial=True,
+                        files=rerun)
+                    return None if got is None else set(got["ids"])
+                return _run
+            verdict = await _confirm_new_failures(
+                cand, _runner(str(wt), "base"), _runner(str(staging), "final"),
+                caps, label=label)
+    finally:
+        _teardown()
+    return {"new": list(verdict["new"]),
+            "resource_affected": list(verdict["resource_affected"]),
+            "unmeasured": False, "files": {c: id_files.get(c)
+                                           for c in verdict["new"]}}
+
+
+# --- escalation gates (Q3-FRESH2 config (ii)+(d+)) --------------------------
+
+def _redrive_audit_blocks(set_: dict) -> bool | None:
+    """Gate (a): True when a strict majority of the set audit's samples
+    typed a case `contradicts_task`; None when there is no per-sample
+    record (no audit — no escalation)."""
+    audit = set_.get("audit")
+    if not isinstance(audit, dict):
+        return None
+    kinds = audit.get("sample_kinds")
+    if not isinstance(kinds, list) or not kinds:
+        return None
+    n = max(int(audit.get("samples") or 0), len(kinds))
+    hits = sum(1 for ks in kinds
+               if isinstance(ks, list) and "contradicts_task" in ks)
+    return hits * 2 > n
+
+
+def _redrive_ast_available(staging: Path) -> bool:
+    """Gate (d+) can run: `node`, the script and a `typescript` resolvable
+    from the tree. Without it there is no escalation."""
+    return (shutil.which("node") is not None and REDRIVE_AST_GATE.is_file()
+            and _ts_resolvable(staging))
+
+
+_TG_EXPECT_RE = re.compile(r"\bexpect\s*\(|\bassert(?:\.\w+)?\s*\(")
+_TG_CASE_RE = re.compile(r"(?<![\w.])(?:it|test)\s*\(")
+_TG_SKIP_RE = re.compile(
+    r"\.(?:skip|only|todo)\s*\(|(?<![\w.])x(?:it|describe|test)\s*\(")
+
+
+def _redrive_git(repo: str | Path, *args: str) -> str:
+    return subprocess.run(["git", "-C", str(repo), *args],
+                          capture_output=True, text=True, check=False).stdout
+
+
+def _redrive_exists_at(repo: str | Path, rev: str, path: str) -> bool:
+    return subprocess.run(["git", "-C", str(repo), "cat-file", "-e",
+                           f"{rev}:{path}"], capture_output=True,
+                          check=False).returncode == 0
+
+
+def _redrive_weakened_tests(repo: str | Path, base: str, head: str
+                            ) -> list[dict]:
+    """Gate (b) (bench final/testgate.py counts, the outside-contract clause
+    dropped): every test file present at `base` that `head` deletes, or
+    leaves with fewer expect/assert call sites, fewer it/test cases, or
+    more skip/only/todo/x-prefixed calls."""
+    out = []
+    for f in _redrive_git(repo, "diff", "--name-only", base, head).split():
+        if not _REDRIVE_TEST_RE.search(f) or not _redrive_exists_at(
+                repo, base, f):
+            continue
+        b = _redrive_git(repo, "show", f"{base}:{f}")
+        if not _redrive_exists_at(repo, head, f):
+            out.append({"file": f, "why": ["deleted"]})
+            continue
+        h = _redrive_git(repo, "show", f"{head}:{f}")
+        why = []
+        for name, rx, worse in (("fewer_expect", _TG_EXPECT_RE, -1),
+                                ("fewer_cases", _TG_CASE_RE, -1),
+                                ("added_skip_only", _TG_SKIP_RE, 1)):
+            nb, nh = len(rx.findall(b)), len(rx.findall(h))
+            if (nh - nb) * worse > 0:
+                why.append(f"{name} {nb}->{nh}")
+        if why:
+            out.append({"file": f, "why": why})
+    return out
+
+
+_SG_ID = r"[A-Za-z_$][\w$]*"
+_SG_EMPTY_RE = re.compile(
+    r"(\?\?|\|\|)\s*(\[\s*\]|\{\s*\}|new\s+Map\s*\(\s*\)|new\s+Set\s*\(\s*\))")
+_SG_ERR_RE = re.compile(
+    r"throw\s|status\s*:\s*4\d\d|status\(\s*4\d\d|[,(]\s*4\d\d\s*[,)]"
+    r"|return\b.*\b(error|Error|badRequest|notFound|unauthorized|forbidden"
+    r"|invalid)")
+
+
+def _sg_strip_comments(s: str) -> str:
+    s = re.sub(r"/\*.*?\*/", "", s, flags=re.S)
+    return re.sub(r"(^|[^:\"'`])//.*$", r"\1", s, flags=re.M)
+
+
+def _sg_block(src: str, start: int) -> str:
+    """The text of the balanced `{...}` opening at `src[start]`."""
+    depth, i = 0, start
+    while i < len(src):
+        if src[i] == "{":
+            depth += 1
+        elif src[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return src[start + 1:i]
+        i += 1
+    return src[start + 1:]
+
+
+def _sg_prisma_models(repo: str | Path, base: str) -> dict:
+    """`model X { ... }` blocks of the repo's `schema.prisma` at `base`,
+    parsed mechanically: per field its type, required (no `?`) and list
+    flags, plus the scalar keys of each required relation."""
+    path = next((p for p in _redrive_git(repo, "ls-tree", "-r", "--name-only",
+                                         base).split()
+                 if p.endswith("schema.prisma")), None)
+    if not path:
+        return {}
+    src = _redrive_git(repo, "show", f"{base}:{path}")
+    models: dict = {}
+    for m in re.finditer(r"^model\s+(\w+)\s*\{", src, re.M):
+        body = _sg_block(src, m.end() - 1)
+        fields: dict = {}
+        rel_fk: set[str] = set()
+        for line in body.splitlines():
+            fm = re.match(r"\s*(\w+)\s+(\w+)(\[\])?(\?)?", line)
+            if not fm or line.strip().startswith("@@"):
+                continue
+            fname, typ, lst, opt = fm.groups()
+            fields[fname] = {"type": typ, "required": not opt,
+                             "list": bool(lst)}
+            r = re.search(r"@relation\([^)]*fields:\s*\[([^\]]*)\]", line)
+            if r and not opt:
+                rel_fk |= {x.strip() for x in r.group(1).split(",")}
+        models[m.group(1)] = {"fields": fields, "rel_fk": rel_fk}
+    for mdl in models.values():
+        for fd in mdl["fields"].values():
+            fd["relation"] = fd["type"] in models
+    return models
+
+
+def _sg_required_fields(repo: str | Path, base: str, head: str, f: str,
+                        models: dict) -> tuple[set, set, set, str]:
+    """(required fields, boolean ones, required where-keys, base source)
+    for one production file: Prisma models the file names, its base
+    `z.object` keys and interface/type members."""
+    base_src = _redrive_git(repo, "show", f"{base}:{f}")
+    head_src = _redrive_git(repo, "show", f"{head}:{f}")
+    both = base_src + "\n" + head_src
+    R: set[str] = set()
+    BOOL: set[str] = set()
+    WK: set[str] = set()
+    for mname, mdl in models.items():
+        lc = mname[0].lower() + mname[1:]
+        if re.search(r"\b(" + re.escape(mname) + "|" + re.escape(lc)
+                     + r")\b", both):
+            for fname, fd in mdl["fields"].items():
+                if fd["required"]:
+                    R.add(fname)
+                    if fd["type"] == "Boolean":
+                        BOOL.add(fname)
+                    if fd["relation"]:
+                        WK.add(fname)
+            WK |= mdl["rel_fk"]
+    src = _sg_strip_comments(base_src)
+    for m in re.finditer(r"z\.object\(\s*\{", src):
+        depth = 0
+        for line in _sg_block(src, m.end() - 1).splitlines():
+            if depth == 0:
+                km = re.match(r"\s*(" + _SG_ID + r")\s*:\s*(.*)$", line)
+                if km and not re.search(
+                        r"\.(optional|nullable|nullish|default|catch)\(",
+                        km.group(2)):
+                    R.add(km.group(1))
+                    if "z.boolean" in km.group(2):
+                        BOOL.add(km.group(1))
+            depth = max(0, depth + line.count("{") + line.count("(")
+                        - line.count("}") - line.count(")"))
+    for m in re.finditer(
+            r"(?:interface\s+" + _SG_ID + r"(?:<[^>{]*>)?(?:\s+extends\s+[^{]+)?"
+            r"|type\s+" + _SG_ID + r"(?:<[^>{]*>)?\s*=)\s*\{", src):
+        depth = 0
+        for line in _sg_block(src, m.end() - 1).splitlines():
+            if depth == 0:
+                km = re.match(r"\s*(?:readonly\s+)?(" + _SG_ID
+                              + r")(\??)\s*:\s*(.*)$", line)
+                if km and not km.group(2) and not re.search(
+                        r"\|\s*(undefined|null)\b", km.group(3)):
+                    R.add(km.group(1))
+                    if re.match(r"boolean\b", km.group(3).strip()):
+                        BOOL.add(km.group(1))
+            depth = max(0, depth + line.count("{") - line.count("}"))
+    return R, BOOL, WK, base_src
+
+
+def _sg_where_lines(src: str) -> set[int]:
+    inside: set[int] = set()
+    for m in re.finditer(r"\bwhere\s*:\s*\{", src):
+        depth, i = 1, m.end()
+        while i < len(src) and depth:
+            depth += {"{": 1, "}": -1}.get(src[i], 0)
+            i += 1
+        a = src.count("\n", 0, m.start()) + 1
+        b = src.count("\n", 0, i) + 1
+        inside |= set(range(a + 1, b))
+    return inside
+
+
+def _sg_rules_on(code: str, R: set, BOOL: set,
+                 aliases: dict[str, str]) -> list[tuple[str, str]]:
+    """(rule, field) pairs one code line matches (gate (c) v2)."""
+    out: list[tuple[str, str]] = []
+    for fld in R:
+        acc = r"(?:\.|\?\.)" + re.escape(fld) + r"\b(?:\([^()]*\))?"
+        ops = r"(\?\?|\|\|)" if fld not in BOOL else r"(\?\?)"
+        m = re.search(acc + r"\s*" + ops + r"\s*(.{0,40})", code)
+        if m and not _SG_EMPTY_RE.match(code[m.start(1):]):
+            out.append(("C1_default_read", fld))
+        if fld not in BOOL and re.search(
+                r"!\s*[\w$.?\]\[]*" + acc + r"\s*\|\|", code):
+            out.append(("C2_missing_guard", fld))
+        if re.search(acc + r"\s*[=!]==?\s*(null|undefined)\s*\|\|", code):
+            out.append(("C2_missing_guard", fld))
+        if fld not in BOOL and re.search(acc + r"\s*\?\s*[^:?.\s][^:]*:",
+                                         code):
+            out.append(("C3_ternary_default", fld))
+    for al, fld in aliases.items():
+        ae = r"(?<![\w$.])" + re.escape(al) + r"\b"
+        m = re.search(ae + r"\s*(\?\?|\|\|)", code)
+        if ((m and not _SG_EMPTY_RE.match(code[m.start(1):]))
+                or re.search(r"!\s*" + re.escape(al) + r"\b\s*\|\|", code)
+                or re.search(ae + r"\s*[=!]==?\s*(null|undefined)\s*\|\|",
+                             code)):
+            out.append(("C1C2_alias", fld))
+    return out
+
+
+def _redrive_schema_hits(repo: str | Path, base: str, head: str
+                         ) -> list[dict]:
+    """Gate (c) v2 (bench final/schema_gate2.py + the FRESH2 empty-string
+    exemption): new nullable or defaulted reads of a required field on
+    added lines of changed JS/TS production files."""
+    models = _sg_prisma_models(repo, base)
+    hits: list[dict] = []
+    files = [f for f in _redrive_git(repo, "diff", "--name-only", base,
+                                     head).split()
+             if _REDRIVE_PROD_RE.search(f) and not _REDRIVE_TEST_RE.search(f)]
+    for f in files:
+        R, BOOL, WK, base_src = _sg_required_fields(repo, base, head, f,
+                                                    models)
+        if not R:
+            continue
+        head_lines = _redrive_git(repo, "show", f"{head}:{f}").splitlines()
+        d = _redrive_git(repo, "diff", "-U0", base, head, "--", f)
+        wl = _sg_where_lines(base_src)
+        hunks: list[dict] = []
+        cur: dict | None = None
+        oln = nln = 0
+        for line in d.splitlines():
+            m = re.match(r"@@ -(\d+)(?:,\d+)? \+(\d+)", line)
+            if m:
+                oln, nln = int(m.group(1)), int(m.group(2))
+                cur = {"rem": [], "add": []}
+                hunks.append(cur)
+                continue
+            if line.startswith(("---", "+++")) or cur is None:
+                continue
+            if line.startswith("-"):
+                cur["rem"].append((oln, line[1:]))
+                oln += 1
+            elif line.startswith("+"):
+                cur["add"].append((nln, _sg_strip_comments(line[1:])))
+                nln += 1
+        all_added = [c for h in hunks for _, c in h["add"]]
+        aliases: dict[str, str] = {}
+        for code in all_added:
+            for dm in re.finditer(r"\{([^{}]*)\}\s*=", code):
+                for part in dm.group(1).split(","):
+                    pm = re.match(r"\s*(" + _SG_ID + r")\s*(?::\s*(" + _SG_ID
+                                  + r"))?\s*$", part)
+                    if pm and pm.group(1) in R:
+                        aliases[pm.group(2) or pm.group(1)] = pm.group(1)
+        for h in hunks:
+            removed = {r for _, ln in h["rem"]
+                       for r in _sg_rules_on(_sg_strip_comments(ln), R, BOOL,
+                                             aliases)}
+            for ln, code in h["add"]:
+                for rule, fld in _sg_rules_on(code, R, BOOL, aliases):
+                    if (rule, fld) in removed:
+                        continue
+                    if re.match(r"\s*(\}\s*else\s+)?if\s*\(", code) and \
+                            _SG_ERR_RE.search("\n".join(
+                                head_lines[ln: ln + 4])):
+                        continue
+                    if rule == "C1_default_read":
+                        cm = re.search(
+                            r"([\w$.?\[\]]+)\s*\?\?\s*[\w$.?]*\."
+                            + re.escape(fld)
+                            + r"\b\s*\?\?\s*(\"\"|'')", code)
+                        if cm and ("?." in cm.group(1) or re.split(
+                                r"\??\.", cm.group(1))[-1] not in R):
+                            continue
+                    hits.append({"rule": rule, "file": f, "field": fld,
+                                 "line": code.strip()[:200]})
+        rem_all = [ln for h in hunks for _, ln in h["rem"]]
+        rem_req = {mm.group(1) for mm in (
+            re.match(r"\s*(?:readonly\s+)?(" + _SG_ID + r")\s*:", ln)
+            for ln in rem_all) if mm}
+        for code in all_added:
+            om = re.match(r"\s*(?:readonly\s+)?(" + _SG_ID + r")\?\s*:", code)
+            if om and om.group(1) in R and om.group(1) in rem_req:
+                hits.append({"rule": "C4_optionalised", "file": f,
+                             "field": om.group(1), "line": code.strip()[:200]})
+            zm = re.match(r"\s*(" + _SG_ID + r")\s*:\s*.*\.optional\(", code)
+            if zm and zm.group(1) in R and zm.group(1) in rem_req:
+                hits.append({"rule": "C4_optionalised", "file": f,
+                             "field": zm.group(1), "line": code.strip()[:200]})
+        added_keys = {mm.group(1) for mm in (
+            re.match(r"\s*(" + _SG_ID + r")\s*:", c) for c in all_added) if mm}
+        for h in hunks:
+            for n, ln in h["rem"]:
+                km = re.match(r"\s*(" + _SG_ID + r")\s*:", ln)
+                if (km and n in wl and km.group(1) in WK
+                        and km.group(1) not in added_keys):
+                    hits.append({"rule": "C5_where_key_removed", "file": f,
+                                 "field": km.group(1),
+                                 "line": ln.strip()[:200]})
+    return hits
+
+
+def _redrive_ast_hits(staging: Path, base: str, head: str
+                      ) -> list[dict] | None:
+    """Gate (d+): `scripts/redrive-ast-gate.cjs` per changed JS/TS
+    production file of the working tree (D1, D2), then D3 across files: a
+    newly swallowing catch whose class some changed file throws under a null
+    guard. None when the script yields no JSON — the gate could not run."""
+    hits: list[dict] = []
+    thrown: set[str] = set()
+    swallowed: list[dict] = []
+    files = [f for f in _redrive_git(staging, "diff", "--name-only", base,
+                                     head).split()
+             if _REDRIVE_PROD_RE.search(f) and not _REDRIVE_TEST_RE.search(f)
+             and (staging / f).is_file()]
+    for f in files:
+        with tempfile.TemporaryDirectory() as td:
+            bf = ""
+            b = subprocess.run(["git", "-C", str(staging), "show",
+                                f"{base}:{f}"], capture_output=True,
+                               text=True, check=False)
+            if b.returncode == 0:
+                bf = str(Path(td) / "base.ts")
+                Path(bf).write_text(b.stdout)
+            try:
+                q = subprocess.run(["node", str(REDRIVE_AST_GATE), bf,
+                                    str(staging / f), f], cwd=str(staging),
+                                   capture_output=True, text=True,
+                                   timeout=120, check=False)
+                got = json.loads(q.stdout)
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                return None
+        if not isinstance(got, dict):
+            return None
+        hits += [{**h, "file": f} for h in got.get("hits") or []
+                 if isinstance(h, dict)]
+        thrown |= {str(x) for x in got.get("guardThrown") or []}
+        swallowed += [{**x, "file": f} for x in got.get("newSwallowed") or []
+                      if isinstance(x, dict)]
+    hits += [{"rule": "D3_guard_error_swallowed", **x} for x in swallowed
+             if x.get("cls") in thrown]
+    return hits
+
+
+def _redrive_escalation_gate(staging: Path, base: str, head: str) -> dict:
+    """Gates (b), (c), (d+) on an escalated round's diff: `void` on any
+    hit, or when the AST check could not run."""
+    weakened = _redrive_weakened_tests(staging, base, head)
+    schema = _redrive_schema_hits(staging, base, head)
+    ast = _redrive_ast_hits(staging, base, head)
+    return {"void": bool(weakened or schema or ast is None or ast),
+            "weakened": weakened, "schema": schema, "ast": ast}
+
+
+def _redrive_escalate(st: "State", caps: dict, members: list[str],
+                      set_indices: set, sets_by_index: dict,
+                      ast_ok: bool) -> bool:
+    """Whether this group's round runs at `EFFORT_REDRIVE_ESCALATION`: every
+    member is on its last round, the group names a failing set, every such
+    set is from this run's own-start writer and passes the audit gate (a),
+    and the AST gate (d+) can run."""
+    if not ast_ok or not set_indices or not members:
+        return False
+    cap = int(caps.get("subtask_redrive_rounds",
+                       DEFAULT_CAPS["subtask_redrive_rounds"]))
+    rounds = st.data.get("redrive_rounds") or {}
+    if any(int(rounds.get(m, 0)) + 1 < cap for m in members):
+        return False
+    acc = st.data.get("acceptance") or {}
+    own = _acceptance_own_start(st)
+    if not own or acc.get("validity_base") != own:
+        return False
+    return all(_redrive_audit_blocks(sets_by_index.get(i) or {}) is False
+               for i in set_indices)
+
+
+# --- notes, the drive, the item re-check ------------------------------------
+
+def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
+                  merged: list[dict], held_names: list[dict],
+                  defect_shape: str, selfcheck_files: list[str],
+                  selfcheck_cmd: str | None) -> str:
+    """The typed DELIVERY RE-DRIVE note (bench P8d / Q3 L1 wording)."""
+    shown: list[dict] = []
+    for n in notes:
+        k = n["kind"]
+        if k in ("defect", "control_regression") and n.get("file"):
+            shown.append({"kind": k, "test_file": n["file"],
+                          "cases": list(n.get("cases") or [])
+                          [:_REDRIVE_CASES_MAX]})
+        elif k == "control_regression":
+            shown.append({"kind": k, "test": n.get("test"),
+                          "detail": n.get("detail")})
+        elif k == "unmet_item":
+            shown.append({"kind": k, "item": n.get("item"),
+                          "evidence": str(n.get("evidence") or "")
+                          [:_REDRIVE_EVIDENCE_MAX]})
+        elif k == "ci_check":
+            shown.append({"kind": k, "check": n.get("id"),
+                          "why": n.get("why"), "command": n.get("command"),
+                          "diagnostics": list(n.get("diagnostics") or [])[:20]})
+    parts = [
+        f"DELIVERY RE-DRIVE (round {rnd} of {rounds}). Your work and your "
+        "siblings' work are already integrated on this tree (your cwd). The "
+        "delivery gate found work unmet. Each entry below is typed: "
+        "kind=defect means a case of a held-out acceptance set validated at "
+        "this run's start still fails here (the reported defect still "
+        "reproduces); kind=control_regression means behaviour that passed at "
+        "the run's start is now broken by this run's changes (or was broken "
+        "by an earlier re-drive attempt that was reverted) and must "
+        "stay/become passing without losing the fix; kind=unmet_item means "
+        "the delivery judge found this required item of the task unmet on "
+        "this tree, with the evidence quoted; kind=ci_check means one of the "
+        "repository's own merge checks is red on this tree, confirmed "
+        "against the run's base — make it pass without weakening it.",
+        json.dumps(shown, indent=1)]
+    if merged:
+        parts.append(
+            "MERGED RE-DRIVE: these subtasks share production files with "
+            "yours and are re-driven together in this one session; their "
+            "scope is yours for this round:\n" + "\n".join(
+                f"  - {m['id']}: {m.get('title') or ''}\n    intent: "
+                f"{str(m.get('intent') or '')[:600]}" for m in merged))
+    if held_names:
+        parts.append(
+            "HELD-BACK ACCEPTANCE FAILURES: the staged tests below now pass, "
+            "but further independent tests of the same contract, written "
+            "from the defect report alone by workers that never saw this "
+            "run's code, FAIL on this tree. You cannot see these tests or "
+            "their output; the failing cases are named below. They encode "
+            "the REPORT'S contract — fix the defect at its root so the "
+            "contract holds in general. Fitting these names will fail the "
+            "recheck. Re-derive the cause from the report itself (the task "
+            "names it).\n" + "\n".join(
+                f"  - {h['name']}" + ("  (behaviour that passed at the run's "
+                                      "start; keep it passing)"
+                                      if h.get("kind") == "control" else "")
+                for h in held_names)
+            + "\nDEFECT CONTRACT: " + (defect_shape or "(none recorded)"))
+    if selfcheck_files and selfcheck_cmd:
+        parts.append(
+            "SELF-CHECK: the " + ("already-passing part of the "
+                                  if held_names else "")
+            + "acceptance set is staged READ-ONLY in this tree at these paths "
+            "(git-ignored; do not edit, move, copy or commit them):\n"
+            + "\n".join("  - " + f for f in selfcheck_files)
+            + f"\nRun exactly this command to check your work against it:\n"
+            f"  {selfcheck_cmd}")
+    parts.append(
+        "Fix the cause in the production code. Do not special-case test "
+        "inputs or copy literals from tests into production code, and do not "
+        "weaken, delete or skip any existing test. Done means every listed "
+        "case passes" + (" with the command above"
+                         if selfcheck_files and selfcheck_cmd else "")
+        + ", every listed item is met, and no test that passes on this tree "
+        "now fails. Commit your change.")
+    return "\n".join(parts)
+
+
+async def _redrive_drive(leerie_dir: Path, st: "State", caps: dict,
+                         models: dict, staging: Path, members: list[str],
+                         note: str, *, effort: str | None,
+                         label: str) -> dict:
+    """One implementer session in staging for the group, as its first
+    member, with the note. A failure is recorded, never raised: what the
+    worker committed is measured all the same."""
+    up = _implementer_base_prompt(
+        members[0], leerie_dir, caps, st,
+        cwd_line="Your current working directory IS the integrated staging "
+                 "worktree of this run — make and commit all code changes "
+                 "here.")
+    up.append(f"NOTE FROM ORCHESTRATOR: {note}")
+    try:
+        st.bump_workers(caps)
+        res = await claude_p(
+            user_prompt="\n".join(up),
+            system_prompt=_load_prompt("implementer"),
+            schema_key="implementer", cwd=str(staging),
+            allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
+            caps=caps, st=st,
+            model=models.get("implementer", MODEL_DEFAULT),
+            effort=effort, sid=label)
+        return {"status": res.get("status"),
+                "summary": str(res.get("summary") or "")[:500]}
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        return {"error": _brief_worker_exc(e)}
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"[:300]}
+
+
+async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
+                                 models: dict, efforts: dict,
+                                 staging: Path, indices: list[int]
+                                 ) -> dict[int, dict]:
+    """item_index -> `{unmet, by[], evidence}` on staging's HEAD: judge-
+    and untouched-paths-unmet items re-judged (`_delivery_judge_unmet`),
+    falsifier-unmet items by re-running their saved probe. A check that
+    crashes or measures nothing keeps the item unmet."""
+    items = st.data.get("required_items") or []
+    gate = st.data.get("delivery_gate") or {}
+    prior = {u.get("item_index"): u for u in (gate.get("unmet_final") or [])
+             if isinstance(u, dict)}
+    rows = {r.get("item_index"): r for r in (gate.get("items") or [])
+            if isinstance(r, dict)}
+    out: dict[int, dict] = {}
+    judge_idx = [i for i in indices if i < len(items) and (
+        set((prior.get(i) or {}).get("by") or ["judge"])
+        & {"judge", "untouched_paths"})]
+    if judge_idx:
+        ds = st.data.get("defect_scope") or {}
+        record = _delivery_record(
+            leerie_dir, st, ((ds.get("ground_truth") or {}).get(
+                "repro_command") if isinstance(ds.get("ground_truth"), dict)
+                else None))
+        evidence, _c = _delivery_typed_evidence(st, leerie_dir,
+                                                refresh_tokens=True)
+        try:
+            unmet, _n, _x = await _delivery_judge_unmet(
+                st.data.get("task", ""), [items[i] for i in judge_idx],
+                staging, st, caps, models, efforts, phase_label="redrive",
+                exec_digest=record, typed_evidence=evidence)
+            hit = {judge_idx[u["item_index"]]: u for u in unmet
+                   if isinstance(u.get("item_index"), int)
+                   and 0 <= u["item_index"] < len(judge_idx)}
+            for i in judge_idx:
+                u = hit.get(i)
+                out[i] = {"unmet": u is not None,
+                          "by": [u.get("settled_by") or "judge"] if u else [],
+                          "evidence": str((u or {}).get("evidence") or "")}
+        except Exception as e:
+            log(f"  delivery re-drive: item re-judge failed "
+                f"({type(e).__name__}) — items kept unmet")
+            for i in judge_idx:
+                out[i] = {"unmet": True, "by": ["judge"],
+                          "evidence": str((prior.get(i) or {}).get(
+                              "evidence") or "")}
+    for i in indices:
+        if "falsifier" not in set((prior.get(i) or {}).get("by") or []):
+            continue
+        fi = (rows.get(i) or {}).get("falsifier") or {}
+        saved = next((s_.get("probe_saved") for s_ in fi.get("samples") or []
+                      if isinstance(s_, dict) and s_.get("probe_saved")),
+                     None)
+        still = True
+        if isinstance(saved, dict) and saved.get("file"):
+            probe = {"index": 1_000_000 + i, "dir": saved.get("dir"),
+                     "defect_files": [saved["file"]], "control_files": [],
+                     "support_files": [], "cases": {}}
+            res = await _evaluate_acceptance_sets(
+                st, caps, str(staging), [probe], f"redrive-probe-i{i}")
+            r = res[0] if res else {"unmeasured": True}
+            still = bool(r.get("unmeasured") or not r.get("passed"))
+        cur = out.setdefault(i, {"unmet": False, "by": [], "evidence": ""})
+        if still:
+            cur["unmet"] = True
+            cur["by"].append("falsifier")
+            cur["evidence"] = (cur["evidence"] + " | " if cur["evidence"]
+                               else "") + str((prior.get(i) or {}).get(
+                                   "evidence") or "")
+    return out
+
+
+def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
+                                 sha: str) -> None:
+    """Rewrite `delivery_gate.unmet_final` / `items[]` for the re-checked
+    items: a met one leaves the list, a still-unmet one keeps it with the
+    new evidence."""
+    if not verdicts:
+        return
+    gate = dict(st.data.get("delivery_gate") or {})
+    unmet = []
+    for u in gate.get("unmet_final") or []:
+        i = u.get("item_index") if isinstance(u, dict) else None
+        v = verdicts.get(i)
+        if v is None:
+            unmet.append(u)
+        elif v["unmet"]:
+            unmet.append({**u, "by": v["by"] or u.get("by") or [],
+                          "evidence": (v["evidence"] or u.get("evidence")
+                                       or "")[:1200]})
+    rows = []
+    for r in gate.get("items") or []:
+        if isinstance(r, dict) and r.get("item_index") in verdicts:
+            v = verdicts[r["item_index"]]
+            r = {**r, "verdict": "unmet" if v["unmet"] else "met",
+                 "by": v["by"] if v["unmet"] else [],
+                 "redrive_recheck": {"sha": sha}}
+        rows.append(r)
+    gate.update(unmet_final=unmet, items=rows)
+    st.data["delivery_gate"] = gate
+    st.save()
+
+
+def _redrive_key_text(key: str) -> str:
+    """A note key, readable: `3:src/a.test.ts` is a held-out set file, any
+    other key a test of the repository."""
+    if ":" in key and key.split(":", 1)[0].isdigit():
+        i, rel = key.split(":", 1)
+        return f"held-out set {i}'s {rel}"
+    return f"existing test `{key}`"
+
+
+async def _redrive_commit_leftovers(staging: Path, label: str) -> None:
+    st_ = await run_proc(["git", "status", "--porcelain"], cwd=str(staging))
+    if st_.returncode == 0 and st_.stdout.strip():
+        await run_proc(["git", "add", "-A"], cwd=str(staging))
+        await run_proc(["git", "commit", "-q", "--no-verify", "-m",
+                        f"leerie: delivery re-drive leftovers ({label})"],
+                       cwd=str(staging))
+
+
+async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
+                                models: dict[str, str],
+                                efforts: dict[str, str | None]) -> None:
+    """Hand confirmed-unmet work back to the subtasks that own it, on the
+    integrated staging tree (DESIGN §8 *Delivery re-drive*): failing held-out
+    sets, unmet required items and red merge checks, routed by typed claims
+    and the import graph, in sequential groups from the shared re-drive
+    budget, each re-checked and rolled back when worse. Advisory: never
+    stops a run."""
+    rec = dict(st.data.get("delivery_redrive") or {})
+    if rec.get("done"):
+        return
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        return
+    run_id = str(st.run_id)
+
+    def _save() -> None:
+        st.data["delivery_redrive"] = rec
+        st.save()
+
+    flight = rec.get("in_flight")
+    if isinstance(flight, dict):
+        # A crash mid-group: what it left is unknown, so it is undone.
+        _redrive_exclude_clear(staging, run_id)
+        if flight.get("pre_sha"):
+            ok = await _redrive_rollback(staging, flight["pre_sha"])
+            log(f"  delivery re-drive: resumed — the interrupted group was "
+                f"{'rolled back' if ok else 'NOT rolled back (reset failed)'}")
+        rec.pop("in_flight", None)
+        _save()
+    head = await _branch_head_sha(str(staging))
+    if not head:
+        return
+    rec.setdefault("start_sha", head)
+    rec.setdefault("rounds", [])
+    rec.setdefault("pending_controls", [])
+    rec.setdefault("trade_pairs", [])
+    rec.setdefault("contradictions", [])
+    st.data["current_phase"] = "phase 5: delivery re-drive"
+    acc = st.data.get("acceptance") or {}
+    all_sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
+    sets = [s_ for s_ in all_sets if not _acceptance_set_broken(s_)]
+    by_index = {s_.get("index"): s_ for s_ in sets}
+    shown_idx = _acceptance_shown_indices(all_sets) if all_sets else set()
+    shown = [s_ for s_ in sets if s_.get("index") in shown_idx]
+    held = [s_ for s_ in sets if s_.get("index") not in shown_idx]
+    held_idx = {s_.get("index") for s_ in held}
+    gate = acc.get("gate") or {}
+    try:
+        plan = json.loads((Path(leerie_dir) / "plan.json").read_text())
+        specs = plan.get("subtasks") or {}
+    except (OSError, ValueError):
+        specs = {}
+    if not isinstance(specs, dict):
+        specs = {}
+    statuses = st.data.get("subtask_status") or {}
+    accepted = st.data.get("accepted_blocked") or {}
+    subfiles = {sid: _redrive_subtask_files(staging, sid, spec)
+                for sid, spec in specs.items()
+                if isinstance(spec, dict)
+                and statuses.get(sid) not in ("blocked", "unconverged",
+                                              "accepted_external")
+                and sid not in accepted}
+    claims = _item_claims(specs)
+    site_claimers = [sid for sid, spec in specs.items()
+                     if isinstance(spec, dict)
+                     and spec.get("change_kind") == "fix"
+                     and ((spec.get("claims") or {}).get("sites")
+                          if isinstance(spec.get("claims"), dict) else None)]
+    items = st.data.get("required_items") or []
+    normalized = [_delivery_norm_item(it) for it in items]
+
+    def open_items() -> list[dict]:
+        out = []
+        for u in (st.data.get("delivery_gate") or {}).get("unmet_final") or []:
+            i = u.get("item_index") if isinstance(u, dict) else None
+            if not isinstance(i, int) or i >= len(normalized):
+                continue
+            cl = claims.get(i) or {}
+            if cl.get("kind") == "process":
+                continue   # rule 4: a process constraint is not routed
+            out.append({"kind": "unmet_item", "key": f"item-{i}",
+                        "item_index": i, "item": u.get("item", ""),
+                        "evidence": u.get("evidence", ""),
+                        "claimed_by": list(cl.get("claimed_by") or [])})
+        return out
+
+    def open_checks() -> list[dict]:
+        allf = sorted({f for fs in subfiles.values() for f in fs})
+        out = []
+        for u in _ci_parity_unmet(st):
+            argv = u.get("argv")
+            out.append({"kind": "ci_check", "key": f"ci-{u.get('id')}",
+                        "id": u.get("id"), "why": u.get("why"),
+                        "command": (shlex.join(str(a) for a in argv)
+                                    if isinstance(argv, list) else None),
+                        "diagnostics": list(u.get("diagnostics") or []),
+                        "exercised": _redrive_ci_files(u, allf)})
+        return out
+
+    async def measure(subset: list[dict], label: str
+                      ) -> tuple[dict[str, dict], list]:
+        if not subset:
+            return {}, []
+        sha = await _branch_head_sha(str(staging))
+        res = await _evaluate_acceptance_sets(
+            st, caps, str(staging), subset, label, rev=sha or "HEAD")
+        return _redrive_failing(res, sets, {s_["index"] for s_ in subset})
+
+    if gate.get("final_sha") and gate.get("final_sha") == head and isinstance(
+            gate.get("final"), list):
+        F, _u = _redrive_failing(gate["final"], sets, shown_idx)
+        H_known, _u = _redrive_failing(gate["final"], sets, held_idx)
+    elif shown or held:
+        F, _u = await measure(shown, "redrive-start")
+        H_known = None
+    else:
+        F, H_known = {}, {}
+    if not (F or (held and H_known is None) or H_known or open_items()
+            or open_checks()):
+        rec["done"] = True
+        _save()
+        return
+    log("phase 5: delivery re-drive — "
+        f"{len(F)} failing shown set file(s), {len(open_items())} unmet "
+        f"item(s), {len(open_checks())} red merge check(s)")
+    cap = int(caps.get("subtask_redrive_rounds",
+                       DEFAULT_CAPS["subtask_redrive_rounds"]))
+    budget = float(caps.get("redrive_budget_sec",
+                            DEFAULT_CAPS["redrive_budget_sec"]))
+    graph = _js_source_graph(st.repo_root, head) if sets else {}
+    shape = (st.data.get("defect_scope") or {}).get("defect_shape") or ""
+    ast_ok = _redrive_ast_available(staging)
+    trade_pairs = {tuple(p) for p in rec["trade_pairs"]}
+    prior_members: list[str] = []
+    ids_before = await _redrive_test_ids(st, caps, staging, "redrive-ids0")
+    rechecked_sha = rec.get("items_rechecked_sha")
+    selfcheck_cmd_files = sorted({r for s_ in shown
+                                  for r in (s_.get("defect_files") or [])
+                                  + (s_.get("control_files") or [])})
+
+    def set_note(k: str, v: dict, kind: str) -> dict:
+        s_ = by_index.get(v["set_index"]) or {}
+        return {"kind": kind, "key": k, "set_index": v["set_index"],
+                "file": v["file"],
+                "cases": list((s_.get("cases") or {}).get(v["file"], [])),
+                "exercised": _redrive_exercised(graph, s_, v["file"])}
+
+    rnd = len(rec["rounds"])
+    max_rounds = cap * max(1, len(subfiles)) + 1
+    start_items = sorted({u["item_index"] for u in open_items()})
+    while not rec.get("conflict") and not rec.get("rollback_failed"):
+        if float(st.data.get("redrive_spent_sec") or 0.0) >= budget:
+            log("  delivery re-drive: redrive_budget_sec spent — stopping")
+            break
+        rnd += 1
+        if rnd > max_rounds:
+            # Every driven round spends a member's counter, so this never
+            # binds while the budget check holds; it keeps a broken one
+            # from spinning.
+            log("  delivery re-drive: round ceiling reached — stopping")
+            break
+        held_mode = False
+        H: dict[str, dict] = {}
+        if not F and held and not rec.get("held_round_done"):
+            if H_known is None:
+                H_known, _u = await measure(held, f"redrive-r{rnd}-held")
+            H = dict(H_known)
+            if H:
+                held_mode = True
+                rec["held_round_done"] = True
+        items_open = open_items()
+        checks_open = open_checks()
+        if not held_mode and not (F or items_open or checks_open):
+            rnd -= 1
+            break
+        if held_mode:
+            notes = [set_note(k, v, "held_" + v["kind"]) for k, v in H.items()]
+            fallback = prior_members or site_claimers
+        else:
+            notes = [set_note(k, v, "defect" if v["kind"] == "defect"
+                              else "control_regression")
+                     for k, v in F.items()]
+            fallback = site_claimers
+        notes += items_open + checks_open
+        groups = _redrive_route(notes, subfiles, fallback=fallback,
+                                pending=rec["pending_controls"])
+        entry_round = {"round": rnd, "held_mode": held_mode, "groups": []}
+        rec["rounds"].append(entry_round)
+        _save()
+        drove = False
+        routed_items: set[int] = set()
+        routed_checks = False
+        for gi, g in enumerate(groups):
+            ge: dict = {"group": gi, "members": g["members"]}
+            entry_round["groups"].append(ge)
+            if held_mode and gi > 0 and drove:
+                H, _u2 = await measure(held, f"redrive-r{rnd}g{gi}-held-pre")
+                H = _redrive_carry(H_known or {}, H, _u2)
+            live = [n for n in g["notes"] if
+                    (n["kind"] in ("defect",) or (n["kind"] ==
+                                                  "control_regression"
+                                                  and n.get("file")))
+                    and n["key"] in F
+                    or n["kind"].startswith("held_") and n["key"] in H
+                    or n["kind"] in ("unmet_item", "ci_check")]
+            ge["notes"] = sorted({n["kind"] for n in live})
+            if not live:
+                ge["skipped"] = "nothing_left"
+                _save()
+                continue
+            members = [m for m in g["members"]
+                       if _redrive_allowed(st, caps, m)]
+            if not members:
+                ge["skipped"] = "budget"
+                _save()
+                continue
+            pend = [n for n in rec["pending_controls"]
+                    if n["key"] not in {x["key"] for x in live}]
+            gnotes = live + pend
+            set_idx = {n["set_index"] for n in live if "set_index" in n}
+            escalate = _redrive_escalate(st, caps, members, set_idx,
+                                         by_index, ast_ok)
+            ge["escalated"] = escalate
+            pre_sha = await _branch_head_sha(str(staging))
+            if not pre_sha:
+                ge["skipped"] = "head_unreadable"
+                break
+            ge["pre_sha"] = pre_sha
+            rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
+            for m in members:
+                _consume_redrive(st, m)
+            _save()
+            t0 = time.monotonic()
+            staged = _redrive_stage(staging, shown, run_id)
+            staged_files = sorted({f for s_ in staged for f in s_["files"]
+                                   if f in selfcheck_cmd_files})
+            cmd = (_acceptance_cmd(st, staged_files, str(staging))
+                   if staged_files else None)
+            merged = [{"id": m, "title": (specs.get(m) or {}).get("title"),
+                       "intent": (specs.get(m) or {}).get("intent")}
+                      for m in members[1:]]
+            held_names = ([{"name": c, "kind": n["kind"][5:]}
+                           for n in live if n["kind"].startswith("held_")
+                           for c in (n.get("cases") or [])[:_REDRIVE_CASES_MAX]]
+                          if held_mode else [])
+            note = _redrive_note(
+                [n for n in gnotes if not n["kind"].startswith("held_")],
+                rnd=rnd, rounds=cap, merged=merged, held_names=held_names,
+                defect_shape=shape, selfcheck_files=staged_files,
+                selfcheck_cmd=cmd)
+            effort = (EFFORT_REDRIVE_ESCALATION if escalate
+                      else efforts.get("implementer"))
+            try:
+                ge["implementer"] = await _redrive_drive(
+                    leerie_dir, st, caps, models, staging, members, note,
+                    effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
+            finally:
+                ge["tampered"] = _redrive_unstage(staging, staged, run_id)
+            await _redrive_commit_leftovers(staging, f"r{rnd} g{gi}")
+            drove = True
+            prior_members += [m for m in members if m not in prior_members]
+            routed_items |= {n["item_index"] for n in live
+                             if n["kind"] == "unmet_item"}
+            routed_checks = routed_checks or any(n["kind"] == "ci_check"
+                                                 for n in live)
+            post_sha = await _branch_head_sha(str(staging))
+            ge["post_sha"] = post_sha
+            if not post_sha or post_sha == pre_sha:
+                ge["no_change"] = True
+            else:
+                # Every commit's files, not the net diff: a staged file
+                # committed and then deleted is still in the history.
+                changed = _redrive_git(staging, "log", "--format=",
+                                       "--name-only",
+                                       f"{pre_sha}..{post_sha}").split()
+                committed = sorted(set(changed) & {
+                    f for s_ in staged for f in s_["files"]})
+                ge["committed_staged"] = committed
+                F1, unm = await measure(shown, f"redrive-r{rnd}g{gi}")
+                F1 = _redrive_carry(F, F1, unm)
+                H1 = None
+                if held_mode:
+                    H1, unm_h = await measure(held, f"redrive-r{rnd}g{gi}-held")
+                    H1 = (None if unm_h and len(unm_h) == len(held)
+                          else _redrive_carry(H, H1, unm_h))
+                ids_after = await _redrive_test_ids(
+                    st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
+                newv = await _redrive_new_failures(
+                    st, caps, staging, pre_sha, ids_before, ids_after,
+                    f"redrive-r{rnd}g{gi}")
+                ge["new_failures"] = newv["new"]
+                ge["resource_affected"] = (
+                    newv["resource_affected"] + [f"set {i}" for i in unm]
+                    + (["test ids"] if newv["unmeasured"] else []))
+                v = _redrive_verdict(F, F1, newv["new"],
+                                     held=H if held_mode else None,
+                                     held_after=H1)
+                ge.update({k: v[k] for k in ("fixed", "broke", "ctl_new",
+                                             "held_fixed", "held_broke",
+                                             "worse", "trade")})
+                void = False
+                if committed:
+                    void = True   # a hidden test must never reach history
+                # Zero progress: the group had failing set cases it could be
+                # measured on, and fixed none of them. A change that
+                # measurably fixes nothing is speculative — in a replay two
+                # such rounds added defensive fallbacks the task forbade.
+                # A set with no verdict now is no evidence either way.
+                measured_live = [
+                    n for n in live
+                    if "set_index" in n and (
+                        (n["kind"].startswith("held_") and H1 is not None)
+                        or (not n["kind"].startswith("held_")
+                            and n["set_index"] not in unm))]
+                ge["zero_progress"] = bool(
+                    measured_live and not v["fixed"] and not v["held_fixed"])
+                void = void or ge["zero_progress"]
+                if escalate:
+                    eg = _redrive_escalation_gate(staging, pre_sha, post_sha)
+                    ge["gate"] = eg
+                    void = void or eg["void"]
+                if v["worse"] or void:
+                    ok = await _redrive_rollback(staging, pre_sha)
+                    ge["rolled_back"] = ok
+                    if not ok:
+                        ge["rollback_failed"] = True
+                        log("  WARNING: delivery re-drive: rollback FAILED — "
+                            "stopping with the group's commits on staging")
+                        rec["rollback_failed"] = True
+                        rec.pop("in_flight", None)
+                        _charge_redrive_time(st, time.monotonic() - t0)
+                        _save()
+                        break
+                    have = {n["key"] for n in rec["pending_controls"]}
+                    for k in newv["new"]:
+                        if k not in have:
+                            rec["pending_controls"].append({
+                                "kind": "control_regression", "key": k,
+                                "test": k, "detail": (
+                                    "an earlier re-drive attempt broke this "
+                                    "existing test (confirmed against the tree "
+                                    "before it) and was reverted. Keep it "
+                                    "passing.")})
+                    for k in v["ctl_new"]:
+                        if k not in have:
+                            rec["pending_controls"].append(
+                                set_note(k, F1[k], "control_regression"))
+                else:
+                    F = F1
+                    if held_mode and H1 is not None:
+                        H = H1
+                        H_known = H1
+                    if ids_after is not None:
+                        ids_before = ids_after
+                if v["trade"]:
+                    pairs = {tuple(p) for p in v["pairs"]}
+                    again = sorted(pairs & trade_pairs)
+                    trade_pairs |= pairs
+                    rec["trade_pairs"] = [list(p) for p in sorted(trade_pairs)]
+                    if again:
+                        a, b = again[0]
+                        reason = (
+                            "the delivery re-drive stopped on a conflict: "
+                            f"fixing {_redrive_key_text(a)} broke "
+                            f"{_redrive_key_text(b)} again after the earlier "
+                            "attempt that broke it was rolled back — both "
+                            "cannot hold with the approaches tried")
+                        rec["conflict"] = {"pairs": [list(p) for p in again],
+                                           "round": rnd, "reason": reason}
+                        own = _acceptance_own_start(st)
+                        files = newv.get("files") or {}
+                        for fa, fb in again:
+                            f = files.get(fb)
+                            if f and own and _redrive_exists_at(
+                                    st.repo_root, own, f):
+                                rec["contradictions"].append(
+                                    {"fixed": fa, "tracked_test": fb,
+                                     "file": f, "round": rnd})
+                        log(f"  WARNING: {reason}")
+            _charge_redrive_time(st, time.monotonic() - t0)
+            rec.pop("in_flight", None)
+            _save()
+            if rec.get("conflict"):
+                break
+        if not drove:
+            break
+        now = await _branch_head_sha(str(staging))
+        if routed_items and now and now != rechecked_sha:
+            ver = await _redrive_recheck_items(
+                leerie_dir, st, caps, models, efforts, staging,
+                sorted(routed_items))
+            _redrive_apply_item_verdicts(st, ver, now)
+            rechecked_sha = rec["items_rechecked_sha"] = now
+            _save()
+        if routed_checks and now:
+            await _run_ci_parity_final(leerie_dir, st, caps)
+        if held_mode:
+            # Bench Q3 L1: the held-back round is followed by the verdict on
+            # the whole set, never by a second held-back round.
+            continue
+    final = await _branch_head_sha(str(staging))
+    if final and final != rec["start_sha"]:
+        if all_sets:
+            res = await _evaluate_acceptance_sets(
+                st, caps, str(staging), all_sets, "redrive-final",
+                rev=final)
+            if _acceptance_measured(res):
+                acc = st.data.get("acceptance") or {}
+                g = dict(acc.get("gate") or {})
+                g["final"] = res
+                g["final_sha"] = final
+                keep_rb = (g.get("residual") or {}).get("rollback_failed")
+                if _acceptance_any_fails(res):
+                    g["residual"] = _acceptance_residual_of(res, all_sets)
+                    if keep_rb:
+                        g["residual"]["rollback_failed"] = True
+                elif keep_rb:
+                    g["residual"] = {"failing_sets": 0,
+                                     "total_sets": len(
+                                         _acceptance_measured(res)),
+                                     "cases": [], "rollback_failed": True}
+                else:
+                    g.pop("residual", None)
+                acc["gate"] = g
+                st.data["acceptance"] = acc
+                st.save()
+        await _run_ci_parity_final(leerie_dir, st, caps)
+        if start_items and rechecked_sha != final:
+            ver = await _redrive_recheck_items(
+                leerie_dir, st, caps, models, efforts, staging, start_items)
+            _redrive_apply_item_verdicts(st, ver, final)
+        rec["items_rechecked_sha"] = final
+    rec["final_sha"] = final
+    rec["done"] = True
+    _save()
+    log("  delivery re-drive: done"
+        + (f" — conflict: {rec['conflict']['reason']}"
+           if rec.get("conflict") else ""))
 
 
 async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
@@ -51146,6 +52746,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
         await _run_ci_parity_final(leerie_dir, st, caps)
     except Exception as e:
         log(f"CI parity (final) raised {type(e).__name__}: {e} — surfaced as "
+            "advisory, finalize proceeds")
+    # Hand confirmed-unmet work back to the subtasks that own it (DESIGN §8
+    # *Delivery re-drive*): failing sets, unmet items, red merge checks.
+    try:
+        await _run_delivery_redrive(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"delivery re-drive raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),

@@ -2058,6 +2058,11 @@ def test_gate_repairs_at_high_effort_and_records_a_clean_final(
     assert "case from set 1" in up and "case from set 5" not in up
     gate = st.data["acceptance"]["gate"]
     assert all(r["passed"] for r in gate["final"]) and "residual" not in gate
+    # The commit `final` describes: the repaired HEAD, not the start — what
+    # the delivery re-drive compares before reusing the verdict.
+    staging = st.run_dir / "worktrees" / "staging"
+    assert gate["final_sha"] == _git(staging, "rev-parse", "HEAD")
+    assert gate["final_sha"] != gate["initial_sha"]
 
 
 def test_unfixed_tree_ships_with_a_residual_after_two_rounds(

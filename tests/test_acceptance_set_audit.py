@@ -321,6 +321,8 @@ def test_the_audit_is_the_union_of_three_verified_samples(
     (f,) = res["findings"]
     assert f["sample"] == 3 and f["defect_kind"] == "test_bug"
     assert res["kinds"] == ["test_bug"]
+    # Per sample, only verified kinds: sample 2's quote is not in the set.
+    assert res["sample_kinds"] == [[], [], ["test_bug"]]
     prompt = w.of("set_auditor")[0]["user_prompt"]
     # The payload, in order: the harness section, the task, the failing
     # case with the runner's failure message.
@@ -334,6 +336,23 @@ def test_the_audit_is_the_union_of_three_verified_samples(
     assert "acc/test_defect_1.py" in call["_files_at_call"]
     # Nothing of the set reached staging.
     assert not (staging / "acc").exists()
+
+
+def test_each_sample_keeps_its_own_kinds_beyond_the_union(
+        leerie, tmp_path, monkeypatch):
+    """The delivery re-drive's escalation gate counts a majority of
+    samples: a case the union already holds still counts in a later
+    sample's kinds."""
+    repo, head, st, staging, sha = _setup(leerie, tmp_path, OVERSPECIFIED)
+    w = Workers(audit=lambda kw, n: {"cases": []} if n == 2 else _typed(kw))
+    monkeypatch.setattr(leerie, "claude_p", w)
+    res = asyncio.run(leerie._acceptance_audit_on_rev(
+        st, _caps(leerie, 1), MODELS, EFFORTS, sha,
+        st.data["acceptance"]["sets"][0], "a1"))
+    (f,) = res["findings"]
+    assert f["sample"] == 1
+    assert res["sample_kinds"] == [["test_bug"], [], ["test_bug"]]
+    assert leerie._redrive_audit_blocks({"audit": res}) is False
 
 
 def test_the_sample_count_follows_the_cap(leerie, tmp_path, monkeypatch):

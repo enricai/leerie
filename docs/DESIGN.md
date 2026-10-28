@@ -503,6 +503,15 @@ subtask it tests). Three mechanisms reconcile that coupling:
   read on a control (4 sites, one run) were all `other` claims — which
   is why `other` is surfaced instead of contradicting.
 
+  **Required items are claimed too.** On every run, not only a defect
+  fix, each planner subtask lists in `claims.items` the required items
+  (§8 *The delivery gate*) its work delivers, each typed `deliverable`
+  (a change the tree must carry) or `process` (a constraint on how to
+  work). The claim is not checked at plan time; it is the routing key of
+  the delivery re-drive (§8 *Delivery re-drive*), which hands an unmet
+  deliverable item back to every subtask that claimed it, and never
+  routes a process item. Split children inherit it with the site claims.
+
   A top-level `already_resolved_on_tree` flag was tried alongside and
   dropped: under strict decoding, every schema variant carrying that one
   extra required boolean returned `sites: []` in 5 of 18 calls combined,
@@ -2798,7 +2807,7 @@ runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
-that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*) —
+that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides) —
 consulted *before* the no-work check, so an empty branch that left work
 unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
@@ -6462,6 +6471,101 @@ target / 148 control items, frozen labels): F+ k=3 caught 23/31 =
 77.1% and 8/144 = 5.6%; with the re-ask, 24/31 and 13/148 (adjudicated
 28/35 and 9/144). One sample alone caught 19/31.
 
+**Delivery re-drive: unmet work goes back to the subtasks that own it.**
+Detection alone ships a PR that says what is missing; the next run then
+re-plans from scratch. After the repository's merge checks have run on the
+final tree, every piece of confirmed-unmet work is handed back to the
+subtasks whose work it is, on the integrated staging tree, in the same
+pass (benched as P8b–P8d and Q3, frozen rules):
+
+1. *What is unmet.* A held-out set that fails on the final tree, confirmed
+   under B\*, forces unmet — whatever the judge said. A set typed `broken`
+   (the set audit) is settled and never chased; a variant set of a
+   report-pointer task never counts as work (*A task that points at a
+   report is bounded by the report's own scenarios*). An item in
+   `delivery_gate.unmet_final`, and a red merge check
+   (`ci_parity.final.unmet`), are unmet too.
+2. *Who owns it.* The planner types, per subtask, the required items it
+   delivers (`claims.items[] = {item_index, kind: deliverable | process}`).
+   An unmet deliverable item re-drives **every** claimer; a process item
+   (how to work, never a tree change) is not routed. A failing defect file
+   goes to the subtasks whose production diff — the files their
+   `leerie: integrate <sid>` merge changed — touches a file that test file
+   imports (the import graph, mechanical); with none, to the audited fix
+   sites' claimers; with none, to every integrated subtask. A failing
+   control file goes the same way, to the subtasks whose diff touches what
+   it exercises; a red merge check is routed like a failing control (its
+   diagnostics' files, a coverage glob's files).
+3. *Groups, in sequence.* Subtasks that share a production file re-drive
+   as one implementer session (their scopes merged), and groups run one
+   after another on the same tree. Before each group the open work is
+   re-checked, and a group with nothing left failing is skipped.
+4. *A self-check, then a re-check.* The shown sets are staged read-only and
+   git-excluded in the tree, with the exact command that runs them: without
+   that self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against
+   18 of 24 with it (every one of the 24 closed its staged sets). After each
+   group the orchestrator re-runs the sets and the repository's tests; a
+   result that is worse — more failing set files, a control newly failing,
+   or a test newly failing, each confirmed under B\* — is rolled back
+   (`reset --hard` to the group's start, `clean -fd`). So is a group that
+   had failing set cases and fixed **none** of them, even when nothing got
+   worse: a change that measurably fixes nothing is speculative. In a
+   replayed run (barnacle 7cc87f9a, pass 1) two repair rounds that fixed no
+   failing case each added a defensive fallback the task explicitly
+   forbade, and both shipped. A run that produces no verdict (a missing
+   report) is `resource_affected`, never on its own a reason to roll back,
+   and a set without a verdict cannot make a group zero-progress.
+5. *A trade is not progress.* A group that fixes a case only by breaking a
+   control or a passing test is rolled back, and the broken behaviour goes
+   as a typed `control_regression` note to every remaining group and to the
+   next round. Only when the same (fixed, broken) pair breaks again is the
+   work declared a `conflict`: the re-drive stops, the run is
+   `unconverged`, and the PR is a draft whose reason names both sides. When
+   the broken side is a test already tracked in the repository, the pair
+   is recorded as a contradiction with that test — typed PR evidence; the
+   set is never dropped for it.
+6. *Held-back names.* With four or more valid sets two are held back
+   (*Held-out acceptance tests*). Once the shown sets pass, the held-back
+   ones run; if any fail, one round names their failing cases — names
+   only, never source or output, with "fitting these names will fail the
+   recheck". It takes its round from the same counter.
+7. *The last round may think harder — behind four gates.* A group whose
+   members are on their last round and whose failing sets were all written
+   by this run's own-start writer runs at effort `high` instead of the
+   implementer's own, but only when every gate holds: (a) the set audit
+   (three samples) did not type a case `contradicts_task` in a majority of
+   them; (b) the round edits no tracked test so as to weaken it (fewer
+   `expect`/assert calls, fewer cases, an added `skip`/`only`, a deleted
+   file) — else the round is void and rolled back; (c) no new nullable or
+   defaulted read of a required field (Prisma schema, zod object,
+   interface member) appears on an added line — only patterns new in their
+   hunk, with error branches and empty-collection defaults exempt — else
+   rolled back; (d) a TypeScript-compiler AST check of every changed
+   production file finds no removed null-guarded throw or error return
+   (D1), no new success-shaped early return on a null branch (D2), and no
+   new catch swallowing an error class thrown under a null guard (D3) —
+   else rolled back. Where the AST check cannot run (no `node`, no
+   `typescript` resolvable from the tree), there is no escalation.
+8. *One budget.* Every group draws one round from each member's shared
+   counter (§13 *One re-drive budget per subtask*) and its wall time from
+   `redrive_budget_sec`, the hard stop.
+
+After the last round the sets are measured once more on the tree that
+ships, the merge checks re-run when the tree moved, and each routed item is
+re-checked: re-judged by the cited judge, and an item a falsifier proved
+unmet by re-running its saved probe on the new tree. That verdict is what
+`_decide_outcome` reads.
+
+Measured. P8d (fresh cases, rules 1–5): every rollback restored the
+pre-group tree. Q3 (frozen L1, held-back names, 9 cases × up to 3
+samples): whole-set closure 18/24 within the two rounds of the shared
+counter, 0 B\*-confirmed new failures on the closed runs, all 15 rollbacks
+correct. Escalation (Q3-FRESH2, gates (a)+(b)+(c)+(d+), fresh sets never
+escalated before): 9 of the 10 fair sets closed (no escalation is
+recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
+(b), (c) and (d), 3 did not close, and 4 closed, each hand-reviewed in the
+bench.
+
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
 classification-gate, reconciler, provision, overlap-judge, and integrator
@@ -9558,7 +9662,8 @@ multiplied: a completeness re-drive inside one settle, then a fresh settle on
 wave-end re-drive of a `blocked` subtask take from the same counter, and so
 does each integration repair round (§6 *When integration cannot succeed*) and
 each coverage re-drive round (§9 *Changed lines no test executes are
-re-driven*), as will every later re-drive kind. An unbacked claim settle-by-execution cannot
+re-driven*) and each delivery re-drive group (§8 *Delivery re-drive*),
+as will every later re-drive kind. An unbacked claim settle-by-execution cannot
 settle (§8 *Settled by execution*) ends its attempt `blocked` and so enters
 through the wave-end re-drive. The per-attempt budgets (`failed_retries`,
 `implementer_confidence_retries`, `subtask_continuations`) still bound one
