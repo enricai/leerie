@@ -838,6 +838,10 @@ STATE_FIELDS = (
     # re-driven*): per-sid {rounds[], last, final, uncovered, open_gaps?,
     # rolled_back?}; `final` covered / untested / rolled_back / unmeasured.
     "coverage_redrive",
+    # Write-ahead marker of a wave-end re-drive round on a subtask's branch
+    # (DESIGN §6 *A re-drive interrupted mid-round is undone, never
+    # integrated*): per-sid {kind, pre_sha, round, status}.
+    "redrive_in_flight",
     # Delivery re-drive (DESIGN §8 *Delivery re-drive*): rounds, groups,
     # pending control notes, trade pairs, conflict and contradictions.
     "delivery_redrive",
@@ -49523,6 +49527,68 @@ def _consume_redrive(st: "State", sid: str) -> int:
     return rounds[sid]
 
 
+def _mark_redrive_in_flight(st: "State", sid: str, kind: str, pre_sha: str,
+                            rnd: int, status: str | None) -> None:
+    """Write-ahead for a wave-end re-drive round on `sid`'s branch (DESIGN
+    §6 *A re-drive interrupted mid-round is undone, never integrated*): the
+    commit and status the round started from. The caller saves it before
+    any settle runs."""
+    st.data.setdefault("redrive_in_flight", {})[sid] = {
+        "kind": kind, "pre_sha": pre_sha or "", "round": rnd,
+        "status": status}
+
+
+def _clear_redrive_in_flight(st: "State", sid: str) -> None:
+    reg = st.data.get("redrive_in_flight")
+    if isinstance(reg, dict):
+        reg.pop(sid, None)
+        if not reg:
+            st.data.pop("redrive_in_flight", None)
+
+
+async def _undo_interrupted_redrives(st: "State", leerie_dir: Path,
+                                     wave: list[str]) -> None:
+    """Take back every re-drive round of `wave` a crash interrupted: the
+    subtask's branch reset to the round's start, its status restored, a
+    coverage record re-opened. The round's commits were never decided —
+    with the status still `complete`, the resume merged them unverified
+    (review round 2 M2). A branch that cannot be put back is not trusted
+    as finished either: its status becomes `in_progress`, so the attempt
+    re-runs with every gate."""
+    reg = st.data.get("redrive_in_flight")
+    if not isinstance(reg, dict):
+        return
+    for sid in [s for s in wave if isinstance(reg.get(s), dict)]:
+        m = reg[sid]
+        pre = str(m.get("pre_sha") or "")
+        tree = _subtask_worktree_path(leerie_dir, sid)
+        ok = False
+        if pre and tree.is_dir():
+            ok = await _redrive_rollback(tree, pre)
+        elif pre and st.repo_root:
+            ref = f"refs/heads/leerie/subtasks/{st.run_id}/{sid}"
+            ok = (await run_proc(["git", "update-ref", ref, pre],
+                                 cwd=str(st.repo_root))).returncode == 0
+        statuses = st.data.setdefault("subtask_status", {})
+        if ok and m.get("status"):
+            statuses[sid] = m["status"]
+        elif not ok:
+            statuses[sid] = "in_progress"
+        if m.get("kind") == "coverage":
+            rec = (st.data.get("coverage_redrive") or {}).get(sid)
+            if isinstance(rec, dict):
+                rec.pop("final", None)
+                if rec.get("rounds"):
+                    rec["rounds"][-1]["interrupted"] = True
+        log(f"  {sid}: {m.get('kind')} re-drive round {m.get('round')} was "
+            "interrupted — "
+            + (f"rolled back to {pre[:12]}, status {statuses.get(sid)}"
+               if ok else "its branch could not be rolled back; the "
+               "attempt re-runs"))
+        _clear_redrive_in_flight(st, sid)
+        st.save()
+
+
 def _open_redrive_clock(st: "State", sid: str) -> None:
     _REDRIVE_CLOCKS.setdefault((str(st.run_id), sid), time.monotonic())
 
@@ -49612,14 +49678,16 @@ def _settled_predecessors(leerie_dir: Path, st: "State", sid: str,
 async def _redrive_blocked_subtasks(
         results: dict[str, dict],
         settle: Callable[[str, str], Awaitable[dict]],
-        st: "State", caps: dict) -> None:
+        st: "State", caps: dict, leerie_dir: Path) -> None:
     """Re-drive this wave's `blocked` subtasks from the shared budget, in
     rounds, until none is blocked or none may be re-driven. `settle(sid,
     note)` runs one re-driven settle. Each round's wall time is charged to
     `redrive_spent_sec` (siblings re-drive in parallel, so a round costs its
     longest settle). `failed` subtasks are not re-driven: `failed_retries`
     already spent their retries, and the two-tier policy does not re-run a
-    broken worker. Mutates `results` in place."""
+    broken worker. Each round is written ahead
+    (`_mark_redrive_in_flight`), so a crash mid-round is undone on resume.
+    Mutates `results` in place."""
     while True:
         due = [s for s, r in results.items()
                if r.get("status") == "blocked" and _redrive_allowed(st, caps, s)]
@@ -49636,11 +49704,18 @@ async def _redrive_blocked_subtasks(
             log(f"  {s}: blocked — re-driving (round {n} of "
                 f"{caps.get('subtask_redrive_rounds', DEFAULT_CAPS['subtask_redrive_rounds'])}"
                 f"): {blocker}")
+            _mark_redrive_in_flight(
+                st, s, "blocked", await _branch_head_sha(
+                    str(_subtask_worktree_path(leerie_dir, s))), n,
+                (st.data.get("subtask_status") or {}).get(s) or "blocked")
+        st.save()
         t0 = time.monotonic()
         pairs = await _gather_or_cancel(*(settle(s, notes[s]) for s in due))
         _charge_redrive_time(st, time.monotonic() - t0)
         for s, r in zip(due, pairs):
             results[s] = r
+            _clear_redrive_in_flight(st, s)
+        st.save()
 
 
 # --- Coverage re-drive (DESIGN §9 *Changed lines no test executes are
@@ -50076,7 +50151,8 @@ async def _redrive_uncovered_subtasks(
     shared budget, before integration. Fires when the unexecuted share is
     at least `coverage_uncovered_share` or a typed gap is open. A re-drive
     that does not end `complete` is rolled back to the pre-re-drive commit
-    and its earlier result restored. Persists `coverage_redrive[sid]`
+    and its earlier result restored; one a crash interrupts is rolled back
+    on resume (`_mark_redrive_in_flight`). Persists `coverage_redrive[sid]`
     `{rounds[], final}`; `final` is `covered` (nothing fires),
     `untested` (still firing when the budget is spent — listed in the PR,
     never `unconverged`), `rolled_back`, or `unmeasured`. Mutates
@@ -50153,6 +50229,9 @@ async def _redrive_uncovered_subtasks(
                  "uncovered": recs[s].get("uncovered") or {},
                  "gaps_open": len(open_gaps(recs[s])),
                  "pre_sha": pre[s]})
+            # The status stays `complete` through the session: without
+            # this, a crash in it merged its commits unverified on resume.
+            _mark_redrive_in_flight(st, s, "coverage", pre[s], n, "complete")
             log(f"  {s}: coverage — re-driving (round {n} of {cap}): share "
                 f"{float(recs[s].get('share') or 0.0):.2f} of changed "
                 "executable lines unexecuted, "
@@ -50196,6 +50275,8 @@ async def _redrive_uncovered_subtasks(
             log(f"  {s}: coverage re-drive ended {r.get('status')} — "
                 f"rolled back to {pre[s][:12] or '?'}; the subtask stays "
                 "complete")
+        for s in due:
+            _clear_redrive_in_flight(st, s)
         st.save()
         pending = nxt
 
@@ -53433,6 +53514,9 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # `complete`, and the terminal `unconverged` / `accepted_external`,
         # whose re-run would be the loop the shared re-drive budget ends.
         # Failed/blocked subtasks are retried — that is the point of resume.
+        # A re-drive round a crash interrupted is taken back first: its
+        # commits were never decided, whatever the status reads.
+        await _undo_interrupted_redrives(st, leerie_dir, wave)
         prior = st.data.get("subtask_status", {})
         remaining = [sid for sid in wave
                      if prior.get(sid) not in _SETTLED_STATUSES]
@@ -53471,10 +53555,13 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # integrated nor counted in `expected`, and the wave advances with
         # its work only on its subtask branch (DESIGN §6 *Skipping a settled
         # subtask never skips its integration*).
+        in_flight = st.data.get("redrive_in_flight") or {}
         unintegrated_sids = await _wave_sids_not_integrated(
             leerie_dir / "worktrees" / "staging", st.run_id,
             [sid for sid in wave if sid not in remaining
-             and prior.get(sid) == "complete" and not gate.get(sid)])
+             and prior.get(sid) == "complete" and not gate.get(sid)
+             # Never a branch a re-drive left mid-round (review round 2 M2).
+             and sid not in in_flight])
         if unintegrated_sids:
             log(f"phase 5: wave {wi + 1} of {len(waves)} — "
                 f"{', '.join(unintegrated_sids)} settled complete but not "
@@ -53503,10 +53590,15 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
 
         pairs = await _gather_or_cancel(*(settle_one(sid) for sid in remaining))
         results: dict[str, dict] = {**pre_settled, **dict(pairs)}
+        # Before the re-drives, not after: a coverage record an interrupted
+        # round re-opened is evaluated again, so the round is not done.
+        for sid in unintegrated_sids:
+            results.setdefault(sid, {"status": "complete"})
         _charge_redrive_time(st, max(inner_redrive_sec.values(), default=0.0))
         # Re-drive what ended blocked, from the shared budget, BEFORE
         # integrating — a re-driven success integrates with its wave.
-        await _redrive_blocked_subtasks(results, redrive_one, st, caps)
+        await _redrive_blocked_subtasks(results, redrive_one, st, caps,
+                                        leerie_dir)
         # Then re-drive completed subtasks whose changed lines no test
         # executes (DESIGN §9), from the same shared budget, still before
         # integrating.

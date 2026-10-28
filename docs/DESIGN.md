@@ -1848,6 +1848,41 @@ integrated with the wave and counted in what the wave must integrate; the
 wave-already-settled shortcut does not apply while one exists. Re-merging is
 safe by construction: a branch already merged is a no-op merge.
 
+**A re-drive interrupted mid-round is undone, never integrated.** That rule
+alone integrated half-done work: a coverage re-drive keeps its subtask
+`complete` for the whole implementer session, so a crash after the session
+committed a half-written test left a `complete`, unmerged branch, and the
+resume merged commits no confidence gate, completeness check or coverage
+verdict had seen (review round 2 M2). So every re-drive that works while
+the status it started from still stands is written ahead: its starting
+commit is saved before the round, and cleared only once the round is
+decided. A resume that finds one rolls the work back to that commit,
+restores the status the round started from, and treats the round as not
+done — a coverage record is evaluated again — and the "complete but not
+yet integrated" path refuses any subtask still carrying the marker. The
+round's draw on the shared re-drive budget stays spent (§13). The
+re-drives that work under a status they did not earn, and how each is
+covered:
+
+- the *coverage re-drive* (§9) — `complete` throughout; marker on the
+  subtask, rollback of its branch;
+- the *blocked re-drive* (§13) — `blocked` until its session writes the
+  new status, which a crash before the round is decided would leave
+  unverified; marker on the subtask, rollback of its branch;
+- the *delivery re-drive* (§8) — members stay `complete` while it
+  changes the run branch; its own in-flight group marker, rollback of the
+  run branch;
+- the *integration repair* (§6 *When integration cannot succeed*) — the
+  subtask stays `complete` while the merge is repaired; its in-round
+  marker, the round redone from its start;
+- the *held-out acceptance repair* (§8) — on the run branch, after every
+  subtask settled; its saved round start, the round measured and rolled
+  back by verdict before it is kept.
+
+The completeness re-drive inside a subtask's own attempt is not on the
+list: it sets the status back to `in_progress` before it loops, so a
+resume re-runs the attempt and every gate after it.
+
 This places one hard requirement on the design: **a run branch, once
 created, is never reset.** Setup creates it only if it does not already
 exist (a `run_id` collision against an existing branch is a preflight

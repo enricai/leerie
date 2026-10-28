@@ -5796,6 +5796,25 @@ never skips its integration*). Such sids get the same `{"status":
 subtasks) **after** `integrate_wave`, so a backed-out subtask is not an
 integration shortfall.
 
+Interrupted subtask re-drives (DESIGN §6 *A re-drive interrupted mid-round
+is undone, never integrated*): `_redrive_uncovered_subtasks` and
+`_redrive_blocked_subtasks` call `_mark_redrive_in_flight(st, sid, kind,
+pre_sha, round, status)` for each due sid — `redrive_in_flight[sid] =
+{kind: "coverage" | "blocked", pre_sha, round, status}`, `pre_sha` the
+subtask worktree's HEAD and `status` its `subtask_status` before the
+round — saved before any settle runs, and `_clear_redrive_in_flight` drops
+it in the save that records the round's outcome. At the top of each wave,
+before `subtask_status` is read, `_undo_interrupted_redrives(st,
+leerie_dir, wave)` takes every marked sid of the wave back:
+`_redrive_rollback(<worktree>, pre_sha)` (or, with no worktree, `git
+update-ref refs/heads/leerie/subtasks/<run-id>/<sid> pre_sha`), the status
+restored, a coverage round entry marked `interrupted: true` and the
+record's `final` dropped so it is evaluated again, then the marker
+cleared; a rollback that does not land `die()`s with the marker kept.
+`complete` sids not yet integrated get their `{"status": "complete"}`
+stand-in **before** the wave-end re-drives, so an open coverage record is
+re-evaluated, and a sid still carrying a marker is never one of them.
+
 `leerie accept-integration <run-id> <subtask-id> [--runtime fly|ec2|local]`
 mirrors `accept-blocked`'s shape and local/Fly/EC2 state-mutation machinery
 exactly (same runtime auto-detection via `_auto_detect_run_runtime`, same
@@ -9254,6 +9273,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
 | `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier typed `unverified_external`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` (or `simulated_interleaving`) to the PR's "Needs human verification"; `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
+| `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[]}` — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
 | `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[], tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |

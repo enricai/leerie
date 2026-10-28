@@ -157,7 +157,7 @@ def test_counter_consumed_earlier_is_not_handed_back(patched, monkeypatch,
     assert st.data["subtask_status"]["a"] == "unconverged"
 
 
-def test_redrive_round_wall_time_is_charged(leerie):
+def test_redrive_round_wall_time_is_charged(leerie, tmp_path):
     st = _mock_st([["a"]], redrive_spent_sec=10.0)
 
     async def settle(sid, note):
@@ -165,7 +165,7 @@ def test_redrive_round_wall_time_is_charged(leerie):
         return {"status": "complete"}
     asyncio.run(leerie._redrive_blocked_subtasks(
         {"a": {"status": "blocked", "blocker": "x"}}, settle, st,
-        dict(leerie.DEFAULT_CAPS)))
+        dict(leerie.DEFAULT_CAPS), tmp_path))
     assert 10.3 <= st.data["redrive_spent_sec"] < 15.0
 
 
