@@ -819,6 +819,31 @@ def test_whole_suite_scope_hits_only_whole_suite_runs(leerie, cmd, hit):
         None if cmd == "pnpm run lint" else "pnpm run test")
 
 
+PYSUITE = [{"command": "pytest", "scope": "whole_suite",
+            "test_roots": ["tests"]}]
+
+
+@pytest.mark.parametrize("cmd,hit", [
+    # An option's value is not a test file (lane A's finding): each of these
+    # still runs the whole suite.
+    ("pytest -p no:cacheprovider", True),
+    ("pytest -p no:cacheprovider tests/", True),
+    ("pytest -k smoke", True),
+    ("pytest -m 'not slow'", True),
+    ("pytest -c setup.cfg -o addopts= tests", True),
+    ("pytest --rootdir . -W error", True),
+    ("pytest -n auto --dist loadfile", True),
+    ("pytest --tb short --maxfail 3", True),
+    ("pytest -p=no:cacheprovider", True),
+    ("pytest --deselect tests/test_a.py::t", True),
+    # A real operand after the option's value is still a targeted run.
+    ("pytest -p no:cacheprovider tests/test_a.py", False),
+    ("pytest -k smoke tests/test_a.py", False),
+    ("pytest tests/test_a.py", False)])
+def test_whole_suite_pytest_reads_option_values(leerie, cmd, hit):
+    assert (leerie._forbidden_command_hit(cmd, PYSUITE) == "pytest") is hit
+
+
 def test_whole_suite_rules_read_with_the_cli_glob(leerie):
     pats = leerie._forbidden_command_rule_patterns(SUITE)
     assert "pnpm run test *" not in pats and "pnpm test *" not in pats

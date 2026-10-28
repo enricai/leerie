@@ -8789,7 +8789,10 @@ Three layers follow, each derived from that one list:
   run`/`foreach`) — and denies a
   command whose normalised argv starts with a forbidden one. For a
   `whole_suite` entry, it also requires the words that follow to be only
-  flags or test roots (the hook payload carries the roots). Hooks fire
+  flags or test roots (the hook payload carries the roots); for pytest an
+  option's value is part of the flag, read from pytest's own option table,
+  so `pytest -p no:cacheprovider` is still a whole-suite run, not a run of
+  a file named `no:cacheprovider`. Hooks fire
   under `--dangerously-skip-permissions`. The hook fails open (a crash
   allows the call; the deny rules still stand) — a matcher bug must not
   block every Bash call of a run.

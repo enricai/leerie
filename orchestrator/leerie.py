@@ -22464,15 +22464,56 @@ def _forbidden_spec(f: object) -> tuple[str, str, list[str]] | None:
     return None
 
 
-def _forbidden_whole_suite_rest(rest: list[str], roots: list[str]) -> bool:
+# pytest options that take the NEXT word as their value, from pytest 9's
+# `--help` (every option shown with an argument), plus the common plugins'
+# (`-n`/`--dist` xdist, `--cov*`, `--timeout`, `--reruns`): the value is
+# not an operand, so `pytest -p no:cacheprovider` is still a whole-suite
+# run. Fixed CLI surface.
+_PYTEST_VALUE_OPTS = frozenset({
+    "-k", "-m", "-p", "-c", "-o", "-W", "-r", "--config-file",
+    "--override-ini", "--pythonwarnings", "--rootdir", "--confcutdir",
+    "--basetemp", "--maxfail", "--tb", "--capture", "--color", "--assert",
+    "--durations", "--durations-min", "--verbosity", "--import-mode",
+    "--deselect", "--ignore", "--ignore-glob", "--junitxml", "--junit-xml",
+    "--junit-prefix", "--doctest-glob", "--pastebin", "--pdbcls",
+    "--log-level", "--log-format", "--log-date-format", "--log-cli-level",
+    "--log-cli-format", "--log-cli-date-format", "--log-file",
+    "--log-file-level", "--log-file-format", "--log-file-date-format",
+    "--log-auto-indent", "--log-disable",
+    "-n", "--numprocesses", "--dist", "--cov", "--cov-report",
+    "--cov-config", "--cov-fail-under", "--timeout", "--reruns",
+    "--reruns-delay", "--randomly-seed"})
+
+
+def _forbidden_value_opts(forb: list[str]) -> frozenset[str]:
+    """The value-taking options of the runner a forbidden argv names: only
+    pytest's are known (`pytest`, `py.test`, `python -m pytest`)."""
+    words = [os.path.basename(w) for w in forb[:3]]
+    if words[:1] in (["pytest"], ["py.test"]) or (
+            len(words) == 3 and words[1:] == ["-m", "pytest"]):
+        return _PYTEST_VALUE_OPTS
+    return frozenset()
+
+
+def _forbidden_whole_suite_rest(rest: list[str], roots: list[str],
+                                value_opts: frozenset[str] = frozenset()
+                                ) -> bool:
     """True when the words after a matched runner still run the whole suite
     — the whole-suite deny's semantics (`_suite_rule_bodies`: the bare
     runner, or one aimed at a test root), plus a flags-only runner, which
     the hook can see though a CLI rule cannot. A run naming any other
-    operand (a test file) is not a whole-suite run."""
+    operand (a test file) is not a whole-suite run. The word after one of
+    the runner's `value_opts` is that option's value, not an operand."""
     norm = {r.strip("/") for r in roots}
-    pos = [w.removeprefix("./").rstrip("/") for w in rest
-           if w != "--" and not w.startswith("-")]
+    pos: list[str] = []
+    skip = False
+    for w in rest:
+        if skip:
+            skip = False
+        elif w.startswith("-"):
+            skip = w in value_opts
+        elif w != "--":
+            pos.append(w.removeprefix("./").rstrip("/"))
     return not pos or any(w in norm for w in pos)
 
 
@@ -22496,7 +22537,8 @@ def _forbidden_command_hit(command: str,
                     if not _forbidden_prefix_match(c, forb):
                         continue
                     if (scope == "any" or _forbidden_whole_suite_rest(
-                            c[len(forb):], roots)):
+                            c[len(forb):], roots,
+                            _forbidden_value_opts(forb))):
                         return cmd
     except Exception:
         return None
