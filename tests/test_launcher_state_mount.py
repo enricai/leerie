@@ -53,6 +53,7 @@ CGROUP_MOUNT_ARG=()
 ROOTLESS_SECOPT=()
 REWRITTEN_ARGS=()
 _leerie_env_args=()
+_leerie_host_dir="$HOME/.leerie/.host"
 """
     + extract_run_argv()
     + '\nnerdctl run "${_run_argv[@]}"\n'

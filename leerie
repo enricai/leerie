@@ -7587,6 +7587,25 @@ trap 'kill "$_stage_keepalive_pid" 2>/dev/null; rm -rf "$STAGE"; rm -f "${_cidfi
 # Concurrency-safety per cache is documented in IMPLEMENTATION §0.5;
 # pip's pattern (warm once serially in phase_provision, hit cached
 # wheels in parallel from worktree replays) is documented in DESIGN §6½.
+#
+# The host-wide dir (build semaphore, DESIGN §6 *A host-wide build
+# semaphore*) defaults to ~/.leerie/.host and must stay shared: the
+# semaphore bounds only the runs that mount the same dir. LEERIE_HOST_DIR
+# repoints it for an isolated run (a bench) that must never touch
+# ~/.leerie. Inside the container the same name means the mount point, set
+# after the LEERIE_* forward below, so this host value never leaks in.
+_leerie_host_dir="${LEERIE_HOST_DIR:-$HOME/.leerie/.host}"
+case "$_leerie_host_dir" in
+  "~")   _leerie_host_dir="$HOME" ;;
+  "~/"*) _leerie_host_dir="$HOME/${_leerie_host_dir#"~/"}" ;;
+esac
+case "$_leerie_host_dir" in
+  /*) ;;
+  *)
+    echo "leerie: error: LEERIE_HOST_DIR='$_leerie_host_dir' is not an absolute path" >&2
+    exit 1
+    ;;
+esac
 mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/pip" \
          "$HOME/.cache/leerie/go-mod" \
@@ -7594,7 +7613,7 @@ mkdir -p "$HOME/.cache/leerie/mise-data" \
          "$HOME/.cache/leerie/corepack" \
          "$HOME/.cache/leerie/bundle" \
          "$LEERIE_STATE_HOST_DIR" \
-         "$HOME/.leerie/.host"
+         "$_leerie_host_dir"
 
 CACHE_MOUNTS=(
   -v "$HOME/.cache/leerie/mise-data:/home/leerie/.local/share/mise"
@@ -8977,6 +8996,8 @@ else
   #     value would point at a host path meaningless inside the container.
   #   - LEERIE_HOME / LEERIE_REPO / LEERIE_STATE_HOST_DIR / LEERIE_SELF_CMD:
   #     launcher self-location + host paths.
+  #   - LEERIE_HOST_DIR: the host path of the host-wide dir; remapped
+  #     explicitly below (-e LEERIE_HOST_DIR=/leerie-host).
   #   - Fly/EC2/remote/chain/wave machinery: consumed launcher-side only.
   #   - LEERIE_NO_PUSH: the orchestrator is always invoked with --no-push and
   #     the host does the push; forwarding it would be redundant/confusing.
@@ -8985,7 +9006,8 @@ else
   _leerie_env_denylist=" \
     LEERIE_SKIP_PREPUSH_PREFLIGHT \
     LEERIE_STATE_DIR LEERIE_INSPECT_DIRS LEERIE_HOME LEERIE_REPO \
-    LEERIE_STATE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION LEERIE_TASK_ARG \
+    LEERIE_STATE_HOST_DIR LEERIE_HOST_DIR LEERIE_SELF_CMD LEERIE_VERSION \
+    LEERIE_TASK_ARG \
     LEERIE_NO_PUSH LEERIE_GENERATED_SENTINEL LEERIE_RECAPTURE_WROTE \
     LEERIE_NO_AUTO_PUBLISH LEERIE_LOCAL_BUILD LEERIE_FORCE_KILL \
     LEERIE_NO_RUNTIME_INSTALL LEERIE_INSPECT_HOST_TARGETS \
@@ -9046,7 +9068,7 @@ else
     # host-wide build semaphore*). After the LEERIE_* forward so a host value
     # of the same name cannot repoint it. Ownership: rootless sees this
     # host-user dir as its own; rootful's entry guard chowns it to leerie.
-    -v "$HOME/.leerie/.host:/leerie-host"
+    -v "$_leerie_host_dir:/leerie-host"
     -e LEERIE_HOST_DIR=/leerie-host
     ${CGROUP_MOUNT_ARG[@]+"${CGROUP_MOUNT_ARG[@]}"}
     --cgroupns=host
