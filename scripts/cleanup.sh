@@ -75,7 +75,7 @@ clean_one_run() {
       # stale worktree directory persists across cleanups and blocks
       # `resume`'s new-worktree.sh from re-creating the worktree at
       # the same path. Path is sandboxed under
-      # .leerie/runs/<run-id>/worktrees/<sid>; the leading `[ -d ]` plus
+      # .leerie/runs/<run-id>/worktrees/<run-id[:12]>-<sid>; the leading `[ -d ]` plus
       # the glob restricts scope to that directory's children.
       if [ -d "$d" ]; then
         rm -rf "$d"

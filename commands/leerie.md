@@ -70,7 +70,8 @@ dependencies on the user's behalf.
    `LEERIE_MODEL_<WORKER>`. Per-worker defaults: every worker — judgment
    (classifier, planner, reconciler, plan_overlap_judge, provision,
    integrator) and acting (implementer, conformer) alike — defaults to
-   `sonnet`.
+   `sonnet`, except `pr_reviewer` (the advisory whole-PR review), which
+   defaults to `opus`.
    Then resume:
 
    ```

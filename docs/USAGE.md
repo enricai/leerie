@@ -156,9 +156,12 @@ past run, use `--all-runs --branches`.
 
 **A subtask reports `blocked`.** The implementer hit something it cannot
 resolve (an external dependency, an ambiguous spec, a failing test it
-cannot fix). By default Leerie logs a warning, auto-accepts the subtask
-(it is marked complete and skipped), integrates the wave's successful
-subtasks and continues. Pass `--stop-on-blocked` (or set
+cannot fix). By default Leerie re-drives it with its blocker as the note,
+from one re-drive budget per subtask (`subtask_redrive_rounds`, bounded
+run-wide by `redrive_budget_sec`); once that budget is spent the subtask
+settles `unconverged`, the wave's successful subtasks are integrated and
+the run continues. A run with an unconverged subtask ends `unconverged`
+and its PR opens as a draft — never presented as done. Pass `--stop-on-blocked` (or set
 `LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked` in `leerie.toml`) to halt
 instead: the blocker reason lands in
 `<state-root>/runs/<run-id>/state.json` and Leerie exits non-zero. You
@@ -274,9 +277,14 @@ resume-after-conflict, the complete verb list) are in
 
 ## Reclaiming disk: `leerie prune`
 
-Nothing reaps run state automatically; leerie's own preflight refuses to
-start a run on low disk headroom and tells you to prune by hand:
-`leerie prune` (dry-run, default) / `leerie prune --apply`. It removes
-terminal run directories, repo-map cache entries, and orphaned subtask
+The one automatic reap is narrow: every run's preflight deletes the
+`worktrees/` of each other run in the repo that is not live and has been
+idle for 7 days (`WORKTREE_REAP_IDLE_DAYS`). Its state, logs and branches
+stay, so it can still resume — resume rebuilds the worktrees from the
+branches (uncommitted edits are lost). Everything else waits for you;
+leerie's own preflight refuses to start a run on low disk headroom and
+tells you to prune by hand: `leerie prune` (dry-run, default) /
+`leerie prune --apply`. It removes terminal run directories, the worktrees
+of idle resumable runs, repo-map cache entries, and orphaned subtask
 branches — only ever on positive evidence a piece is safe to delete. Full
 mechanics in [`IMPLEMENTATION.md`](IMPLEMENTATION.md).

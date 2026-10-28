@@ -193,12 +193,12 @@ done
 staging="${LEERIE_STATE_DIR}/runs/${run_id}/worktrees/staging"
 leerie_dir="${LEERIE_STATE_DIR}/runs/${run_id}"
 integrator_prompt="${SCRIPTS}/../prompts/integrator.md"
-# Must be kept in sync with SCHEMAS["integrator"] in orchestrator/leerie.py —
-# this script can't import Python, so there's no other guard against drift.
+# Must be kept in sync with SCHEMAS["integrator"] in orchestrator/leerie.py.
 # Embedded copies of the orchestrator's ACT_TOOLS / DISALLOWED_TOOLS. This
-# script invokes `claude -p` directly on the remote machine and cannot import
-# orchestrator/leerie.py, so the values are duplicated here — exactly like
-# integrator_schema below, and guarded the same way, by
+# script invokes `claude -p` directly on the remote machine; it loads
+# orchestrator/leerie.py only through worker-guard.py (below), for the worker
+# guard, and falls back to this deny list when that load fails. The schema
+# and both lists are duplicated here and guarded by
 # tests/test_collect_subtrees_integrator_schema.py. ANY EDIT TO EITHER LIST
 # IN leerie.py MUST BE MIRRORED HERE.
 integrator_allowed_tools='Read,Grep,Glob,WebSearch,WebFetch,Bash,Write,Edit,NotebookEdit,TaskStop'

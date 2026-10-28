@@ -1555,7 +1555,7 @@ def _host_spelling(p: str) -> str:
 
     Subtask worktrees are created INSIDE the container, where the state root
     is bind-mounted at `/leerie-state` -- so `new-worktree.sh` writes
-    `/leerie-state/runs/<id>/worktrees/<sid>/.git` into
+    `/leerie-state/runs/<id>/worktrees/<id[:12]>-<sid>/.git` into
     `.git/worktrees/<n>/gitdir`, while `prune` runs on the host and knows the
     directory as `$LEERIE_STATE_HOST_DIR/runs/<id>/...`. Comparing the two
     spellings without translating never matched, which made the whole

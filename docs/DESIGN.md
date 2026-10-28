@@ -24,8 +24,9 @@ result without further human input except where input is genuinely
 impossible to derive. Every loop is bounded, every decision is made from the
 codebase or research, and state is kept on disk so a run is observable and
 resumable. Every worker — judgment and workhorse alike — runs on Sonnet 5 (§12
-*Opus-judgment, sonnet-workhorse (historical) — now sonnet for both*); a
-many-worker graph stays cheap against a subscription instead of accumulating
+*Opus-judgment, sonnet-workhorse (historical) — now sonnet for both*), with
+one exception: `pr_reviewer`, the advisory whole-PR review that never gates,
+runs on Opus (§12); a many-worker graph stays cheap against a subscription instead of accumulating
 per-call API charges the way a fleet of Opus-tier agents would.
 
 **On the term "graph engineering."** Leerie's task graph is literal, not
@@ -6306,9 +6307,10 @@ under the same dispute vote.
   74); without it and with the provenance, the gated judge called 17 of
   17 fresh leaking PRs unmet against 6 of 17 for one sample of today's
   judge, and 30 of 30 clean PRs met. The segment-boundary rule comes
-  from the later lever round: on its no-harm stress 31 of 31 clean PRs
-  stayed met, while 6 of 7 PRs that touched a guard list were judged
-  unmet — the residual harm the guard-line exclusion only partly
+  from the later lever round: on its no-harm stress the judge kept all 29
+  clean PRs it judged met (31 calls; one of the 30 clean cases was never
+  judged), while of the 4 PRs that touched a guard list, 3 were judged
+  unmet (6 of 7 calls) — the residual harm the guard-line exclusion only partly
   removes, and the reason the hits stay evidence, never a gate.
 - **Contract literals.** An implementer's `external_contract_assumption`
   risk says its change is right only if something outside its subtask
@@ -6330,8 +6332,9 @@ under the same dispute vote.
   pair renamed) and 0 of 105 unmutated controls, where the rule set
   without the code-only and near-variant rules flagged 106 — every miss
   of that one was a literal still present in a doc or another consumer.
-  On the recorded real risks (Q5 worlds): 6 of 8 violations flagged, 0
-  of 288 false flags. The checks read JavaScript/TypeScript repos;
+  On the recorded real risks (Q5 worlds), which v7e was designed on, so
+  these are design-set numbers and not held-out evidence: 6 of 8
+  violations flagged, 0 of 288 false flags. The checks read JavaScript/TypeScript repos;
   the code-file and test-file patterns also take other languages'
   usual suffixes.
 
@@ -8669,9 +8672,10 @@ mechanism exists to remove. Four mechanisms read that list:
 
 - **Hard deny.** The rules go into `--disallowedTools` as scoped
   `Bash(...)` patterns, the only permission control that survives
-  `--dangerously-skip-permissions`, on every worker `claude_p` spawns (the
-  Fly remote integrator and the preflight smoke test build their own argv
-  and carry neither the deny nor the notice). The CLI strips
+  `--dangerously-skip-permissions`, on every worker `claude_p` spawns and on
+  the Fly remote integrator, whose bash-built argv takes the same deny and
+  notice from `_worker_guard` through `scripts/worker-guard.py` (only the
+  preflight smoke test builds its own argv and carries neither). The CLI strips
   `timeout`-style wrappers and redirections and checks every segment of a
   compound command, so anything aimed at a test root is refused, `-k`/`-m`
   selections included; file-targeted runs, loops over files and selections
@@ -8960,8 +8964,7 @@ the replay did not reproduce the motive; that the deny stops the harm rests
 on the matcher covering the 48 recorded commands, not on the replay. A
 per-worker PID namespace, which would make the kill harmless rather than
 denied, needs seccomp, AppArmor and systempaths unconfined on both rootless
-and rootful containerd and is deferred. The Fly remote integrator builds its
-own argv and carries neither this deny nor its notice.
+and rootful containerd and is deferred.
 
 **The round signal is a regression, not a verdict.** Because a scoped
 result and a full baseline are not comparable, the base-health baseline
@@ -9175,7 +9178,8 @@ in B\*'s verdict, so it never spends a conformer round or makes a run
 `unconverged`. It goes to the delivery judge as a typed evidence section,
 and to the PR under "Needs human verification". It ships as evidence because
 its false-positive rate cannot be bounded on the data available. Of the
-bench Q9 trials (48 clean, 73 with a reverted fix), the count rule alone
+bench Q9 trials that carry the B arm (48 clean — 25 dev and 23 held-out,
+of Q9's 184 clean trials — and 73 with a reverted fix), the count rule alone
 (clean base, at least one final failure) fired in 8 of 48 clean trials
 (16.7%). Of those trial hits, 18 IDs in clean and defect trials were not
 truly new: 16 synthetic wall-clock tests that import nothing, and 2 real
@@ -9255,11 +9259,12 @@ section's; the record it reads is `ci_parity.final.unmet`.
 Benched (N6, N6b). Discovery: 12 worker runs (4 repos × 3 samples) found
 92/92 checks with the right kind, requirements and gate selection (78/78
 gate-eligible), 0 provenance failures, 0 harmful extras. Gate runs on 39
-clean merged PRs (barnacle 22, api 10, funeralworks 7; 203 gate checks):
+clean merged PRs (barnacle 22, api 11, funeralworks 6; 203 gate checks):
 0 false gates (Wilson 95% upper bound 9.0%), and 5 true catches — four by
 the strict lint (warnings the CI's own lint exits 0 on), one by the plain
 lint. Coverage: the ratchet fired
-0 times on the 7 clean funeralworks pairs, and once on the replayed PR that
+0 times on the 7 funeralworks pairs (the 6 clean PRs and one whose
+lint-strict break a later PR fixed), and once on the replayed PR that
 dropped a 95% branch threshold (91.62% → 91.53%, fixed by the next PR);
 the base against a rerun of the base fired 0 times.
 The same check runs gave identical exit codes under rootless and rootful

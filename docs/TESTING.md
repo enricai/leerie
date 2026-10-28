@@ -2019,8 +2019,12 @@ empty diff.
 
 **`scripts/remote/collect-subtrees.sh` embeds a second copy of
 `SCHEMAS["integrator"]`** as a single-quoted shell string, because it invokes
-`claude -p --json-schema` directly from bash on the remote machine and
-cannot import the orchestrator. **Any edit to that schema must update both.**
+`claude -p --json-schema` directly from bash on the remote machine. Its
+payload does load the orchestrator module baked into the image, but only
+through `scripts/worker-guard.py` for the worker guard (deny rules, notices,
+hook, env); the schema is not taken from it, and the duplicated base deny
+list is used only when that load fails. **Any edit to that schema must
+update both.**
 That same direct invocation also puts the script outside the
 `--dangerously-force-strict-output` path — it runs only after the
 orchestrator (which owns the proxy) has exited, so output there is
@@ -4006,8 +4010,8 @@ a crash or a repeat warning; the fingerprint never raises (a non-UTF-8
 directory listing, an undecodable porcelain escape, any unexpected
 error all give a value); a commit during planning is warned as becoming
 part of what the run builds on and pushes, a file edit is not; the
-baseline is untouched after a warning (it feeds
-`_acceptance_validity_base`); with the flag on, a HEAD move dies under the
+baseline is untouched after a warning (it feeds `_acceptance_own_start` and
+`_acceptance_report_base`); with the flag on, a HEAD move dies under the
 execute-wave call shape (through the real `_execute_check_porcelain_only`)
 that is silent by default, and both die framings name the way to continue
 past one's own changes (resume without the flag). Plus
@@ -4489,7 +4493,7 @@ stubbed, and the stubs write files the way the workers would.
   worker.
 - **Skips** (no `bug-fixing` category, `--skip-acceptance-check`) are recorded
   with their reason.
-- **Report base** (informational since Stage 2a): the earliest same-task
+- **Report base** (informational, never a filter): the earliest same-task
   sibling's starting HEAD; a different task is ignored.
 - **Evaluation** never overwrites, or runs in place of, a file the run itself
   put at the same path, and removes what it copied.

@@ -184,18 +184,23 @@ the rest of the family stay denied.
   "medium"` — that dial is about reproducibility/determinism, not model
   tier, and is unaffected by this change.
   **Separately, `implementer` and `conformer` — the two workers that
-  write the fix — are pinned to `EFFORT_DEFAULT_PER_WORKER =
+  write the run's fix — are pinned to `EFFORT_DEFAULT_PER_WORKER =
   "low"`,** a deliberate cost/latency trade-off distinct from the
   judgment workers' `medium`: these previously inherited Claude's own
   default reasoning depth (unset, i.e. high) so their effort stayed
   bounded by their own evidence gates (DESIGN §8); that tradeoff is now
   overridden in favor of a fixed low-effort ceiling, with the downstream
-  conformer/confidence-gate loops absorbing the quality difference. Two
+  conformer/confidence-gate loops absorbing the quality difference. Four
   scoped exceptions: `acceptance_writer` writes only held-out *tests*, at
-  `medium`; and the held-out acceptance gate's repair rounds call the
-  conformer at `EFFORT_ACCEPTANCE_REPAIR = "high"` regardless of effort
-  overrides — measured as the lever on multi-mechanism defects, paid only
-  by runs whose held-out sets fail (DESIGN §8 *Held-out acceptance tests*).
+  `medium`; `surrogate_fixer` writes a fix too, but only the set audit's
+  witness fix in a throwaway worktree, also at `medium`; the held-out
+  acceptance gate's repair rounds call the conformer at
+  `EFFORT_ACCEPTANCE_REPAIR = "high"` regardless of effort overrides —
+  measured as the lever on multi-mechanism defects, paid only by runs
+  whose held-out sets fail (DESIGN §8 *Held-out acceptance tests*); and the
+  delivery re-drive's last round calls the implementer at
+  `EFFORT_REDRIVE_ESCALATION = "high"`, only for a group that passes every
+  escalation gate (DESIGN §8 *Delivery re-drive*).
   `satisfied_probe` remains an explicit `MODEL_DEFAULT_PER_WORKER` entry
   (still sonnet, matching the global default, but kept for its own
   documented reason: it runs once per subtask and throughput dominates,
@@ -318,7 +323,8 @@ One-time runtime setup (leerie runs in a container) and install steps are in
 # instead of re-reaching the same verdict forever:
 ./leerie accept-integration <run-id> <subtask-id>
 
-# Reclaim disk. Nothing reaps run state automatically; dry-run by default.
+# Reclaim disk. Only idle runs' worktrees are reaped automatically (at
+# preflight, after 7 idle days); everything else waits for prune. Dry-run by default.
 ./leerie prune                        # show what would go
 ./leerie prune --apply                # default cutoff is 14 days
 

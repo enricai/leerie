@@ -3,7 +3,8 @@
 Leerie — graph-engineered task driver for Claude Code.
 
 Runs entirely on the Claude Code CLI / subscription, every worker defaulting
-to Sonnet 5 (no opus tier) to keep subscription token usage down. Every unit
+to Sonnet 5 to keep subscription token usage down, except the advisory
+`pr_reviewer`, which defaults to Opus (DESIGN §12). Every unit
 of LLM work is a `claude -p` headless invocation. This script owns ALL control
 flow — phase sequencing, wave scheduling, caps, retries, integration — in real
 Python, so the orchestration cannot drift the way an LLM-driven controller
@@ -5463,7 +5464,8 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
             # bookkeeping pass, and the surviving directory blocked
             # `resume`'s new-worktree.sh from re-creating the
             # worktree at the same path. Safe to rm because the path
-            # is sandboxed under <state-root>/runs/<run-id>/worktrees/<sid>;
+            # is sandboxed under
+            # <state-root>/runs/<run-id>/worktrees/<run-id[:12]>-<sid>;
             # we re-check via .resolve() to make sure a symlink or
             # refactor hasn't escaped the sandbox.
             if entry.exists():
@@ -51438,7 +51440,7 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
 
         if status == "incomplete-handoff":
             # Worktree convention from scripts/new-worktree.sh:
-            # .leerie/worktrees/<subtask-id>. The freshness check on
+            # <run-dir>/worktrees/<run-id[:12]>-<subtask-id>. The freshness check on
             # `## Files touched` validates paths against this directory;
             # if it no longer exists (e.g. cleanup ran early), the check
             # is skipped gracefully.
@@ -55565,8 +55567,11 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
     ap.add_argument("--model", choices=MODEL_VALUES, metavar="ALIAS",
                     help=f"model alias for all workers "
                          f"({'|'.join(MODEL_VALUES)}); without an override, "
-                         f"every worker defaults to {MODEL_DEFAULT} "
-                         "(IMPLEMENTATION.md §2). Per-worker "
+                         f"every worker defaults to {MODEL_DEFAULT} except "
+                         + ", ".join(f"{_w} ({_m})" for _w, _m in
+                                     MODEL_DEFAULT_PER_WORKER.items()
+                                     if _m != MODEL_DEFAULT)
+                         + " (IMPLEMENTATION.md §2). Per-worker "
                          "--model-<worker> flags override this, as do "
                          "LEERIE_MODEL[_*] env vars and leerie.toml")
     for _w in WORKER_TYPES:
