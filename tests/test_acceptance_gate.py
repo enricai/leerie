@@ -2252,7 +2252,9 @@ def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
                                                       monkeypatch):
     """Round 1 commits a repair that turns the test axis red; round 2's
     `bump_workers` exhausts the budget. The rollback check must still run
-    (the budget error used to escape the gate before it)."""
+    (the budget error used to escape the gate before it). The repair fixes
+    no failing case either, so it is the per-round rule that resets it,
+    before round 2 — and nothing is left for the gate-wide one."""
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     staging = _staging(st, repo)
@@ -2280,7 +2282,8 @@ def test_budget_exhaustion_mid_repair_still_rolls_back(leerie, tmp_path,
     gate = st.data["acceptance"]["gate"]
     assert len(calls) == 1
     assert "budget exhausted" in gate["rounds"][-1]["error"]
-    assert gate["rolled_back"] is True
+    assert gate["rounds"][0]["rollback_reason"] == "fixed no failing case"
+    assert gate["rounds"][0]["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
     assert gate["final"] is not None
 
@@ -2865,7 +2868,10 @@ def test_a_fork_failure_reading_head_after_a_repair_still_rolls_back(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     assert failed == [1]
     gate = st.data["acceptance"]["gate"]
-    assert gate["rolled_back"] is True
+    # The bad commit fixed no failing case: reset by the per-round rule,
+    # through the errored-round path.
+    assert gate["rounds"][0]["rollback_reason"] == "fixed no failing case"
+    assert gate["rounds"][0]["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
@@ -2900,7 +2906,9 @@ def test_a_failure_spawning_a_later_round_still_rolls_back(
         st.run_dir, st, _caps(leerie, 5), MODELS, EFFORTS))
     gate = st.data["acceptance"]["gate"]
     assert len(calls) == 2 and "error" in gate["rounds"][1]
-    assert gate["rolled_back"] is True
+    # Round 1's red commit fixed no failing case: the per-round rule reset
+    # it before round 2's spawn failure.
+    assert gate["rounds"][0]["rolled_back"] is True
     assert _git(staging, "rev-parse", "HEAD") == before
 
 
@@ -3219,3 +3227,108 @@ def test_wiring_order_in_run_phases(leerie):
     i_gate = src.index("await _run_acceptance_gate(")
     i_final = src.index("await phase_finalize(")
     assert i_recheck < i_gate < i_final
+
+
+# --- per-round rollback: a repair round that fixes nothing (DESIGN §8 *A
+# repair round that fixes nothing is rolled back*) -----------------------
+
+def _hedge(staging: Path):
+    """What the replayed rounds did: a change that fixes no failing case."""
+    (staging / "calc.py").write_text(
+        BUGGY + "\n\ndef _fallback(a, b):\n    return a - b\n")
+    _git(staging, "commit", "-qam", "conformer: defensive fallback")
+
+
+def test_a_round_that_fixes_no_failing_case_is_reset_to_its_own_start(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    start = _git(staging, "rev-parse", "HEAD")
+    # Round 1 hedges, round 2 fixes: round 2 starts from the tree before
+    # round 1, and its fix is kept.
+    fixers = [_hedge, _commit_fix]
+    calls = _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    assert len(calls) == 2
+    gate = st.data["acceptance"]["gate"]
+    r1, r2 = gate["rounds"]
+    assert r1["pre_sha"] == start and r1["fixed_cases"] == []
+    assert r1["rollback_reason"] == "fixed no failing case"
+    assert r1["rolled_back"] is True
+    assert r2["pre_sha"] == start and r2["fixed_cases"]
+    assert not r2.get("rollback_reason")
+    log = _git(staging, "log", "--format=%s", f"{start}..HEAD")
+    assert log == "conformer: fix add"           # the hedge is gone
+    assert "_fallback" not in (staging / "calc.py").read_text()
+    assert all(r["passed"] for r in gate["final"])
+    assert "round_pre" not in gate
+
+
+def test_two_rounds_that_fix_nothing_leave_the_tree_they_started_from(
+        leerie, tmp_path, monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 5)}
+    start = _git(staging, "rev-parse", "HEAD")
+    _run_gate(leerie, monkeypatch, st, _hedge)
+    gate = st.data["acceptance"]["gate"]
+    assert [r["rollback_reason"] for r in gate["rounds"]] == [
+        "fixed no failing case"] * 2
+    assert _git(staging, "rev-parse", "HEAD") == start
+    # The residual is the measured verdict of the tree that ships.
+    assert gate["residual"]["failing_sets"] == 5
+    assert gate["final_sha"] == start
+
+
+TWO_CASES = ("from calc import add\n\n"
+             "def test_two_and_three():\n    assert add(2, 3) == 5\n\n"
+             "def test_one_and_one():\n    assert add(1, 1) == 2\n")
+HALF_FIX = ("def add(a, b):\n"
+            "    return a + b if a == 2 else a - b\n")
+
+
+def test_a_round_that_fixes_one_case_of_a_failing_file_is_kept(
+        leerie, tmp_path, monkeypatch):
+    """Counted in cases: the file still fails, but one of its two failing
+    cases passes now — progress."""
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    sets = _make_sets(leerie, st, 1)
+    (Path(sets[0]["dir"]) / "acc" / "test_defect_1.py").write_text(TWO_CASES)
+    st.data["acceptance"] = {"sets": sets}
+
+    def half(p):
+        (p / "calc.py").write_text(HALF_FIX)
+        _git(p, "commit", "-qam", "conformer: half")
+    fixers = [half, lambda p: None]
+    _run_gate(leerie, monkeypatch, st, lambda p: fixers.pop(0)(p))
+    r1 = st.data["acceptance"]["gate"]["rounds"][0]
+    assert len(r1["fixed_cases"]) == 1
+    assert "test_two_and_three" in r1["fixed_cases"][0]
+    assert not r1.get("rollback_reason")
+    assert (staging / "calc.py").read_text() == HALF_FIX
+
+
+def test_a_resume_finishes_a_decided_round_rollback(leerie, tmp_path,
+                                                    monkeypatch):
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    staging = _staging(st, repo)
+    start = _git(staging, "rev-parse", "HEAD")
+    _hedge(staging)
+    hedged = _git(staging, "rev-parse", "HEAD")
+    sets = _make_sets(leerie, st, 5)
+    st.data["acceptance"] = {"sets": sets, "gate": {
+        "before_sha": start, "initial": _failing(5), "initial_sha": start,
+        "pre_tests_passed": False,
+        "rounds": [{"round": 1, "results": _failing(5), "sha": hedged,
+                    "pre_sha": start, "fixed_cases": [],
+                    "rollback_reason": "fixed no failing case"}]}}
+    calls = _run_gate(leerie, monkeypatch, st, lambda p: None)
+    gate = st.data["acceptance"]["gate"]
+    assert gate["rounds"][0]["rolled_back"] is True
+    assert len(calls) == 1                       # round 2 only
+    assert _git(staging, "rev-parse", "HEAD") == start

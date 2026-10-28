@@ -7359,6 +7359,27 @@ on the finished task with wrong held-out tests: the repair conformer
 changed code in 3/3 trials, but 0 of the task's 247 regression tests
 and 0 attributable scraper tests (of 1,605) regressed.
 
+**A repair round that fixes nothing is rolled back.** Each round is also
+judged on its own, against the verdict before it: a round that committed
+and fixed **none** of the failing held-out cases — counted per case where
+the runner's report names them, over the sets measured on both sides,
+variant sets included since the rounds repair them too — is reset to that
+round's own start (recorded before its worker runs), whatever the test
+axis says. A blind change that measurably fixes nothing is speculative by
+construction. In the replayed barnacle 7cc87f9a pass 1 both repair rounds
+left every failing set failing, and each added code the task forbade (the
+second a defensive `Math.random` fallback); both shipped, because the only
+rollback rules were a test axis turning red (the axis was not even
+measured) and sets turning unmeasurable. The decision is on disk before
+the reset, so a resume finishes it; a rolled-back round's verdict never
+describes the tree again, and the next round starts from the tree before
+it. A failed reset is recorded and stops the rounds, like the gate's own.
+The price: when every set still failing is one no correct fix can pass (a
+set the audit below would type broken), a correct repair fixes no case and
+is reset too. With several valid sets a correct fix shows up as progress on
+the sound ones; the set audit and rewrite after the rounds then deal with
+the broken one, and its residual reaches the next run.
+
 **A set that keeps failing is audited, and rewritten once.** A held-out
 set can be wrong in ways validity at the own start cannot see: it fails
 there for the reported reason, and then fails every correct fix too,

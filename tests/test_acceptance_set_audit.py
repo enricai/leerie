@@ -559,21 +559,26 @@ def test_the_gate_audits_a_set_still_failing_after_repair(
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
+    # Set 2 is sound: the repair fixes its case, which is the progress that
+    # keeps the repair (a round fixing no failing case is reset). Set 1
+    # still fails it — overspecified — and goes to the audit.
     st.data["acceptance"] = {"validity_base": head,
-                             "sets": [_set(st, 1, OVERSPECIFIED)]}
+                             "sets": [_set(st, 1, OVERSPECIFIED),
+                                      _set(st, 2, DEFECT_TEST)]}
     st.save()
     w = Workers(audit=lambda kw, n: _typed(kw), rewrite=_good_rewrite,
                 conformer=_commit_fix)
     monkeypatch.setattr(leerie, "claude_p", w)
     asyncio.run(leerie._run_acceptance_gate(
-        st.run_dir, st, _caps(leerie, 1), MODELS, EFFORTS))
+        st.run_dir, st, _caps(leerie, 2), MODELS, EFFORTS))
     keys = [c["schema_key"] for c in w.calls]
     # Repair rounds first, then the audit, then the one rewrite.
     assert keys.index("conformer") < keys.index("set_auditor") \
         < keys.index("acceptance_writer")
     gate = st.data["acceptance"]["gate"]
+    assert not gate["rounds"][0].get("rollback_reason")
     assert gate["audited"] is True
-    assert gate["final"][0]["passed"] is True and "residual" not in gate
+    assert all(r["passed"] for r in gate["final"]) and "residual" not in gate
 
 
 def test_a_broken_set_is_not_unfinished_work(leerie, tmp_path):

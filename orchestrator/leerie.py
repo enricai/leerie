@@ -43005,7 +43005,7 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
     # verdict was measured on.
     final, final_sha = initial, gate.get("initial_sha", "")
     for r in reversed(gate["rounds"]):
-        if r.get("results"):
+        if r.get("results") and _acceptance_round_kept(r):
             final, final_sha = r["results"], r.get("sha", "")
             break
     # A recorded before_sha means a repair already started: resume it, so
@@ -43064,13 +43064,71 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             log("  acceptance: staging HEAD unreadable — no rollback target, "
                 "so no repair; residual recorded")
             rounds = 0
+        def _save_gate() -> None:
+            acc["gate"] = gate
+            st.data["acceptance"] = acc
+            st.save()
+
+        async def _settle_round(entry: dict, prev: list[dict],
+                                prev_sha: str) -> None:
+            """Record a round and, when it committed and fixed no failing
+            case, roll it back to its own start (DESIGN §8 *Held-out
+            acceptance tests*: a repair that measurably fixes nothing is
+            speculative). The decision is on disk before the reset."""
+            nonlocal final, final_sha
+            pre = entry.get("pre_sha") or ""
+            moved = bool(entry.get("results")) and entry.get("sha") != pre
+            if moved and pre:
+                fixed = _acceptance_fixed_cases(prev, entry["results"])
+                entry["fixed_cases"] = fixed
+                if fixed == []:
+                    entry["rollback_reason"] = "fixed no failing case"
+            gate["rounds"].append(entry)
+            gate.pop("round_pre", None)
+            _save_gate()
+            if entry.get("rollback_reason"):
+                await _undo_round(entry)
+                final, final_sha = prev, prev_sha
+
+        async def _undo_round(entry: dict) -> None:
+            ok = await _redrive_rollback(staging, entry["pre_sha"])
+            entry["rolled_back"] = ok
+            if ok:
+                log(f"  acceptance repair round {entry['round']} "
+                    f"{entry['rollback_reason']} — its commits were reset "
+                    "away")
+            else:
+                entry["rollback_failed"] = True
+                gate["rollback_failed"] = True
+                log(f"  WARNING: acceptance repair round {entry['round']} "
+                    f"{entry['rollback_reason']} but resetting staging to "
+                    f"{entry['pre_sha'][:12]} FAILED — its commits remain")
+            _save_gate()
+
+        # A round decided rolled back before a crash finishes its reset.
+        last = gate["rounds"][-1] if gate["rounds"] else {}
+        if (last.get("rollback_reason") and "rolled_back" not in last
+                and last.get("pre_sha")):
+            await _undo_round(last)
         # Rounds already spent before a resume count against the cap.
         for rnd in range(len(gate["rounds"]) + 1, rounds + 1):
             # At the top, not only after a round: a resume after a round
             # that already passed — or after the rollback decision — must
             # not run another.
-            if gate.get("rolled_back") or not _acceptance_any_fails(final):
+            if (gate.get("rolled_back") or gate.get("rollback_failed")
+                    or not _acceptance_any_fails(final)):
                 break
+            # Each round's own start, on disk before its worker runs: the
+            # round is rolled back to it, never to the gate's start.
+            flight = gate.get("round_pre")
+            if (isinstance(flight, dict) and flight.get("round") == rnd
+                    and flight.get("sha")):
+                round_pre = flight["sha"]
+            else:
+                round_pre = await _branch_head_sha(str(staging))
+                gate["round_pre"] = {"round": rnd, "sha": round_pre}
+                _save_gate()
+            prev, prev_sha = final, final_sha
             up = [
                 "Run the acceptance repair pass on the merged run branch.",
                 f"LEERIE_DIR is {leerie_dir} (absolute).",
@@ -43102,7 +43160,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 # an OSError spawning the worker (EAGAIN) through unchanged,
                 # and after an earlier round's commit that must not skip the
                 # rollback check below.
-                entry = {"round": rnd, "error": _brief_worker_exc(e)}
+                entry = {"round": rnd, "error": _brief_worker_exc(e),
+                         "pre_sha": round_pre}
                 # A worker can commit and then fail (a schema miss, a
                 # timeout) — or an interrupted earlier attempt at this round
                 # committed before the resume: when HEAD is not the commit
@@ -43115,17 +43174,14 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     final, final_sha = await _measure(f"gate-r{rnd}")
                     entry["results"] = final
                     entry["sha"] = final_sha
-                gate["rounds"].append(entry)
-                acc["gate"] = gate
-                st.data["acceptance"] = acc
-                st.save()
+                await _settle_round(entry, prev, prev_sha)
                 break
             # `_evaluate_acceptance_sets` turns a set it cannot place into
             # no evidence rather than raising, so the rollback check below
             # always runs on what this round committed.
-            prev = final
             final, final_sha = await _measure(f"gate-r{rnd}")
-            entry = {"round": rnd, "results": final, "sha": final_sha}
+            entry = {"round": rnd, "results": final, "sha": final_sha,
+                     "pre_sha": round_pre}
             if (not _acceptance_measured(final)
                     and _acceptance_measured(prev)):
                 # Every evaluation installs afresh, so a one-off failure (a
@@ -43139,10 +43195,9 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     entry.update(results=final, sha=final_sha)
             # Saved per round: a crash before the rollback check must not
             # lose a spent round, or a resume would run it past the cap.
-            gate["rounds"].append(entry)
-            acc["gate"] = gate
-            st.data["acceptance"] = acc
-            st.save()
+            await _settle_round(entry, prev, prev_sha)
+            if entry.get("rollback_failed"):
+                break
         reason = ""
         if not gate.get("rolled_back") and before_sha:
             after_sha = await _branch_head_sha(str(staging))
@@ -43175,14 +43230,16 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                     # tree once more; only if it still measures nothing while
                     # the pre-repair tree does is the repair to blame.
                     last = gate["rounds"][-1] if gate["rounds"] else {}
-                    if last.get("retried") and last.get("sha") == final_sha:
+                    if (last.get("retried") and last.get("sha") == final_sha
+                            and _acceptance_round_kept(last)):
                         # The round already measured this commit twice.
                         retry, retry_sha = final, final_sha
                     else:
                         retry, retry_sha = await _measure("gate-retry")
                     if _acceptance_measured(retry):
                         final, final_sha = retry, retry_sha
-                        if gate["rounds"]:
+                        if gate["rounds"] and _acceptance_round_kept(
+                                gate["rounds"][-1]):
                             gate["rounds"][-1]["results"] = retry
                             gate["rounds"][-1]["sha"] = retry_sha
                     else:
@@ -43244,7 +43301,8 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
     basis, unmeasured_final = final, False
     if not _acceptance_measured(final):
         for r in reversed([initial] + [x.get("results") or []
-                                       for x in gate["rounds"]]):
+                                       for x in gate["rounds"]
+                                       if _acceptance_round_kept(x)]):
             if _acceptance_measured(r):
                 basis, unmeasured_final = r, True
                 break
@@ -43269,6 +43327,43 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
     acc["gate"] = gate
     st.data["acceptance"] = acc
     st.save()
+
+
+def _acceptance_failing_keys(results: list[dict], indices: set
+                             ) -> dict[str, dict]:
+    """`"<index>:<file>"` -> `{failing_cases}` for each failing file of a
+    measured result in `indices` — the shape `_redrive_fixed_cases`
+    counts."""
+    out: dict[str, dict] = {}
+    for r in _acceptance_measured(results or []):
+        if r.get("passed") or r.get("index") not in indices:
+            continue
+        cases = r.get("failing_cases") if isinstance(
+            r.get("failing_cases"), dict) else {}
+        for rel in r.get("failing_files") or []:
+            out[f"{r['index']}:{rel}"] = {
+                "failing_cases": list(cases.get(rel) or [])}
+    return out
+
+
+def _acceptance_fixed_cases(before: list[dict], after: list[dict]
+                            ) -> list[str] | None:
+    """The failing held-out cases a repair round fixed, counted per case
+    (`_redrive_fixed_cases`) over the sets measured on both sides, every
+    set counted — a variant set is repaired too. None when no set measured
+    on both sides failed before: no evidence either way."""
+    common = ({r["index"] for r in _acceptance_measured(before or [])}
+              & {r["index"] for r in _acceptance_measured(after or [])})
+    was = _acceptance_failing_keys(before, common)
+    if not was:
+        return None
+    return _redrive_fixed_cases(was, _acceptance_failing_keys(after, common))
+
+
+def _acceptance_round_kept(entry: dict) -> bool:
+    """A repair round whose commits stand: none was decided rolled back
+    (`rollback_reason`) — its verdict then no longer describes the tree."""
+    return not entry.get("rollback_reason")
 
 
 def _acceptance_residual_of(basis: list[dict], sets: list[dict]) -> dict:
