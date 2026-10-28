@@ -18,6 +18,7 @@ which is what defeats both `git stash push` and `git stash create`
 from __future__ import annotations
 
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -311,3 +312,26 @@ def test_rescue_ref_is_namespaced_by_run_and_subtask(leerie, conflicted_repo):
     assert ref_a != ref_b
     assert _git("show", f"{ref_a}:f.txt", cwd=conflicted_repo).stdout == "A\n"
     assert _git("show", f"{ref_b}:f.txt", cwd=conflicted_repo).stdout == "B\n"
+
+
+def test_rescues_in_a_linked_worktree(leerie, conflicted_repo, tmp_path):
+    """Staging is a `git worktree add` checkout, where `.git` is a FILE: a
+    throwaway index under `staging/.git/` cannot be created, so the rescue
+    returned None on every real run while the plain-repo fixture above
+    passed. Same conflict, inside a linked worktree."""
+    _git("merge", "--abort", cwd=conflicted_repo)
+    wt = tmp_path / "linked-staging"
+    _git("worktree", "add", "-q", "-b", "stg", str(wt), "HEAD",
+         cwd=conflicted_repo)
+    assert (wt / ".git").is_file(), "fixture sanity: a linked worktree"
+    _git_noraise("merge", "side", cwd=wt)
+    (wt / "f.txt").write_text("RESOLVED-IN-WORKTREE\n")
+    ref = _run(leerie._rescue_integrator_work(wt, "feat-006", "run1"))
+    assert ref == "refs/leerie/rescue/run1/feat-006"
+    shown = _git("show", f"{ref}:f.txt", cwd=wt)
+    assert shown.stdout == "RESOLVED-IN-WORKTREE\n"
+    # The throwaway index is gone, and the worktree's real index untouched.
+    gd = _git("rev-parse", "--absolute-git-dir", cwd=wt).stdout.strip()
+    assert not list(Path(gd).glob("leerie-rescue-*"))
+    assert _git_noraise("rev-parse", "--verify", "--quiet", "MERGE_HEAD",
+                        cwd=wt).returncode == 0

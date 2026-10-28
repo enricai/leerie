@@ -51259,7 +51259,22 @@ async def _rescue_integrator_work(staging: Path, sid: str,
 
     Best-effort by contract: a rescue failure must never mask the underlying
     crash, so every git failure degrades to None."""
-    rescue_index = staging / ".git" / f"leerie-rescue-index-{sid}"
+    # The worktree's OWN git dir, never `staging/.git/...`: staging is a
+    # linked worktree, where `.git` is a file, so a path under it cannot be
+    # created and every rescue returned None. `--absolute-git-dir` is the
+    # per-worktree admin dir (`<common>/worktrees/<name>`), private to this
+    # checkout, not the shared repository's own files.
+    # Plain `subprocess.run`, outside the `run_proc` sequence the rescue's
+    # own steps are pinned by, and failure-tolerant like them.
+    try:
+        gd = subprocess.run(["git", "rev-parse", "--absolute-git-dir"],
+                            cwd=str(staging), capture_output=True, text=True,
+                            check=False, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if gd.returncode != 0 or not gd.stdout.strip():
+        return None
+    rescue_index = Path(gd.stdout.strip()) / f"leerie-rescue-index-{sid}"
     env = {**os.environ, "GIT_INDEX_FILE": str(rescue_index)}
     try:
         seed = await run_proc(["git", "read-tree", "HEAD"],

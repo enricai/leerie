@@ -4154,7 +4154,9 @@ only checks the outcome.
 ref, or `None` when nothing to save or the capture failed. **Not** gated on
 `check_merge_committed`: a crashed integrator typically dies mid-resolution
 with no merge commit, exactly the case worth rescuing (DESIGN §12). Stages
-into a throwaway `GIT_INDEX_FILE` seeded from HEAD (`read-tree` → `add -A` →
+into a throwaway `GIT_INDEX_FILE` — in the worktree's own git dir
+(`rev-parse --absolute-git-dir`; staging is a linked worktree whose `.git` is
+a file) — seeded from HEAD (`read-tree` → `add -A` →
 `write-tree` → `commit-tree`) because `git stash` refuses a conflicted tree;
 the real index/working tree are never touched, untracked files are
 captured. Every git failure degrades to `None` — a rescue failure must
