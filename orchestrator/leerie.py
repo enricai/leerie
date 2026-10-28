@@ -252,6 +252,10 @@ DEFAULT_CAPS = {
     "confirm_pairs": 3,
     "confirm_pairs_escalated": 5,
     "confirm_budget_sec": 1800,
+    # Discovery repeats of the import-coupled tests on the final tree (DESIGN
+    # §9 *An intermittent failure the run introduced is evidence*): at a
+    # 10.5% per-run failure rate, 20 repeats find it with p = 0.89.
+    "confirm_intermittent_repeats": 20,
     # CRITIC-pattern mechanical-feedback re-invocation caps. Each worker
     # type gets code-enforced structural checks (file existence, graph
     # cycles, lockfile consistency, etc.) and the orchestrator re-invokes
@@ -6136,6 +6140,14 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             add(_pr_entry(e.get("resource")) or "Unnamed resource",
                 f"- [ ] **{e['subtask']}** was not done, waiting on it: "
                 f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+    for row in _intermittent_regression_rows(state):
+        add("Intermittent failures the run may have introduced",
+            f"- [ ] {_pr_code(row['id'])} failed {row.get('final_failed')} "
+            f"of {row.get('final_runs')} run(s) on the final tree and "
+            f"{row.get('base_failed', 0)} of {row.get('base_runs')} on the "
+            "base; it imports "
+            + ", ".join(_pr_code(p) for p in row.get("imports_changed") or [])
+            + " (changed here). Re-run it repeatedly before merging.")
     register = state.get("risk_register")
     for sid, entries in (register.items()
                          if isinstance(register, dict) else ()):
@@ -37387,10 +37399,15 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                 report.unlink()
             return None
         ids = _runner_report_failing_ids(kind, report, str(tree))
+        messages = {c["id"]: c.get("message", "")
+                    for c in (_runner_report_cases(kind, report, str(tree))
+                              or [])
+                    if ids and c["id"] in ids}
         with contextlib.suppress(OSError):
             report.unlink()
         if ids is not None:
-            return {"ids": sorted(ids), "files": ids, "kind": kind}
+            return {"ids": sorted(ids), "files": ids, "kind": kind,
+                    "messages": messages}
     return None
 
 
@@ -37400,9 +37417,13 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                                        label: str) -> dict | None:
     """The failing-test-ID diff (E3) for one final-conformance measurement:
     final IDs not failing on the base are candidates, confirmed by B*
-    against the base commit. None when either side's IDs are unknown — the
-    axis verdict then stands, as before. Records `final_failing_ids` and the
-    verdict (`test_id_diff`)."""
+    against the base commit. Before the confirm, the import-coupled tests
+    are rerun `confirm_intermittent_repeats` times (`_intermittent_discovery`)
+    and every ID they fail joins the candidates; after it, a
+    `resource_affected` ID meeting the intermittent-regression rule is typed
+    (`_type_intermittent_regressions`) as evidence — never counted. None
+    when either side's IDs are unknown — the axis verdict then stands, as
+    before. Records `final_failing_ids` and the verdict (`test_id_diff`)."""
     base_ids = st.data.get("baseline_failing_ids")
     tests = (post or {}).get("tests") or {}
     if tests.get("scoped_replacement"):
@@ -37418,30 +37439,42 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     st.data["final_failing_ids"] = list(final_ids)
     st.save()
     cand = sorted(set(final_ids) - set(base_ids))
-    id_files = tests.get("failing_id_files") or {}
+    id_files = dict(tests.get("failing_id_files") or {})
     # The same candidates on the same tree were already confirmed (a round
     # that committed nothing): a second confirm would only re-measure noise.
     tree_sha = await _worktree_tree_sha(staging)
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
-            and prior.get("candidates") == cand):
+            and prior.get("final_candidates",
+                          prior.get("candidates")) == cand):
         return prior
-    if not cand:
-        verdict = await _confirm_new_failures([], _no_rerun, _no_rerun, caps,
-                                              label=label)
-        verdict["tree_sha"] = tree_sha
-        st.data["test_id_diff"] = verdict
-        st.save()
-        return verdict
     cmd = tests.get("command") or ""
-    files = sorted({id_files.get(c) for c in cand})
-    rerun_files = None if (None in files or not files) else list(files)
     base_sha = ((st.data.get("conformance") or {}).get("_baseline")
                 or {}).get("sha") or ""
     if not base_sha:
         base_sha = await _merge_base_sha(
             staging, st.data.get("working_branch") or "",
             await _branch_head_sha(staging))
+    disc = await _intermittent_discovery(st, caps, staging, cmd, base_sha,
+                                         log_path=log_path, label=label)
+    messages: dict[str, list[str]] = {}
+    for run in disc.pop("_runs", []):
+        for cid, msg in (run.get("messages") or {}).items():
+            messages.setdefault(cid, []).append(msg)
+    found = sorted(set(disc.get("failed_ids") or []) - set(base_ids)
+                   - set(cand))
+    id_files.update({c: disc["id_files"].get(c) for c in found})
+    all_cand = sorted(set(cand) | set(found))
+    if not all_cand:
+        verdict = await _confirm_new_failures([], _no_rerun, _no_rerun, caps,
+                                              label=label)
+        verdict.update(final_candidates=cand, tree_sha=tree_sha,
+                       discovery=disc, intermittent_regression=[])
+        st.data["test_id_diff"] = verdict
+        st.save()
+        return verdict
+    files = sorted({id_files.get(c) for c in all_cand})
+    rerun_files = None if (None in files or not files) else list(files)
     wt = st.run_dir / "worktrees" / "confirm-base"
 
     def _teardown() -> None:
@@ -37461,7 +37494,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
 
         async def _none(_t: float) -> set[str] | None:
             return None
-        verdict = await _confirm_new_failures(cand, _none, _none, caps,
+        verdict = await _confirm_new_failures(all_cand, _none, _none, caps,
                                               label=label)
     else:
         try:
@@ -37478,17 +37511,161 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
                         tree, cmd, st, caps,
                         label=f"{label}-{side}{n['i']}", log_path=log_path,
                         timeout=timeout, serial=True, files=rerun_files)
-                    return None if got is None else set(got["ids"])
+                    if got is None:
+                        return None
+                    if side == "final":
+                        for cid, msg in (got.get("messages") or {}).items():
+                            messages.setdefault(cid, []).append(msg)
+                    return set(got["ids"])
                 return _run
             verdict = await _confirm_new_failures(
-                cand, _runner_for(str(wt), "base"),
+                all_cand, _runner_for(str(wt), "base"),
                 _runner_for(staging, "final"), caps, label=label)
         finally:
             _teardown()
+    verdict["final_candidates"] = cand
     verdict["tree_sha"] = tree_sha
+    verdict["discovery"] = disc
+    verdict["intermittent_regression"] = _type_intermittent_regressions(
+        verdict, final_ids=set(final_ids), base_ids=set(base_ids),
+        discovery_counts=disc.get("fail_counts") or {},
+        repeats_run=int(disc.get("repeats_run") or 0),
+        coupled=disc.get("coupled") or {}, id_files=id_files,
+        messages=messages)
+    if verdict["intermittent_regression"]:
+        log(f"  B* {label}: {len(verdict['intermittent_regression'])} "
+            "intermittent regression(s) typed — evidence for the delivery "
+            "judge and the PR, not counted")
     st.data["test_id_diff"] = verdict
     st.save()
     return verdict
+
+
+# A failure the runner's own report attributes to the environment: a timeout,
+# a worker crash, an out-of-memory kill, an exit signal. Matched on the
+# runner's report message — fixed tool output (DESIGN §12) — never on prose.
+_RESOURCE_FAILURE_RE = re.compile(
+    r"timed out|exceeded timeout|Failed: Timeout|Timeout of \d+\s*ms"
+    r"|Worker exited unexpectedly|Worker forks emitted error"
+    r"|Worker terminated|heap out of memory|out of memory|\bENOMEM\b"
+    r"|MemoryError|\bKilled\b|\bSIG(?:KILL|TERM|SEGV|ABRT|BUS|HUP)\b",
+    re.IGNORECASE)
+
+
+async def _intermittent_discovery(st: "State", caps: dict, staging: str,
+                                  cmd: str, base_sha: str, *,
+                                  log_path: Path, label: str) -> dict:
+    """Discovery for the intermittent-regression rule (DESIGN §9 *An
+    intermittent failure the run introduced is evidence*): the import-coupled
+    tests — test files that directly import a production file changed since
+    `base_sha` — rerun serially `confirm_intermittent_repeats` times on the
+    final tree, after the host-pressure gate and inside `confirm_budget_sec`.
+    Returns `{coupled, files, repeats_required, repeats_run,
+    budget_exhausted, failed_ids, fail_counts, id_files, skipped?, _runs}`
+    (`_runs` carries each repeat's messages for the caller and is popped
+    before the verdict is stored). Never raises."""
+    out: dict = {"coupled": {}, "files": [], "repeats_required": 0,
+                 "repeats_run": 0, "budget_exhausted": False,
+                 "failed_ids": [], "fail_counts": {}, "id_files": {},
+                 "_runs": []}
+    try:
+        reps = int(caps.get("confirm_intermittent_repeats",
+                            DEFAULT_CAPS["confirm_intermittent_repeats"]))
+        if reps <= 0 or not base_sha:
+            out["skipped"] = "disabled" if reps <= 0 else "no base commit"
+            return out
+        head = await _branch_head_sha(staging)
+        changed = await _changed_files(staging, base_sha)
+        globs = resolve_test_file_globs(st.repo_root)
+        coupled = (_coupled_test_files(st.repo_root, head, changed, globs,
+                                       direct=True) if head else {})
+        files = [t for t in coupled if (Path(staging) / t).is_file()]
+        out["coupled"] = {t: coupled[t] for t in files}
+        out["files"] = files
+        if not files:
+            out["skipped"] = "no test file imports a changed production file"
+            return out
+        if not _acceptance_cmd(st, files, staging):
+            # Without a scoped runner a repeat would run the whole suite.
+            out["skipped"] = "no scoped test runner for the coupled files"
+            return out
+        out["repeats_required"] = reps
+        clock = time.monotonic
+        counts: dict[str, int] = {}
+        async with _confirm_lock():
+            budget = float(caps.get("confirm_budget_sec",
+                                    DEFAULT_CAPS["confirm_budget_sec"]))
+            t0 = clock()
+            out["gate"] = await _confirm_gate(caps)
+            for i in range(reps):
+                left = budget - (clock() - t0)
+                if left <= 0:
+                    out["budget_exhausted"] = True
+                    break
+                got = await _capture_failing_test_ids(
+                    staging, cmd, st, caps, label=f"{label}-repeat{i + 1}",
+                    log_path=log_path, timeout=left, serial=True,
+                    files=files)
+                out["repeats_run"] += 1
+                if got is None:
+                    continue
+                out["_runs"].append(got)
+                for cid in got["ids"]:
+                    counts[cid] = counts.get(cid, 0) + 1
+                    out["id_files"][cid] = (got.get("files") or {}).get(cid)
+        out["fail_counts"] = counts
+        out["failed_ids"] = sorted(counts)
+        log(f"  B* {label}: discovery reran {len(files)} import-coupled test "
+            f"file(s) {out['repeats_run']}/{reps} time(s); "
+            f"{len(counts)} ID(s) failed at least once"
+            + ("; budget exhausted" if out["budget_exhausted"] else ""))
+    except Exception as e:
+        out["skipped"] = f"discovery errored ({type(e).__name__}: {e})"
+        log(f"  B* {label}: {out['skipped']}")
+    return out
+
+
+def _type_intermittent_regressions(verdict: dict, *, final_ids: set[str],
+                                   base_ids: set[str],
+                                   discovery_counts: dict[str, int],
+                                   repeats_run: int,
+                                   coupled: dict[str, list[str]],
+                                   id_files: dict[str, str | None],
+                                   messages: dict[str, list[str]]
+                                   ) -> list[dict]:
+    """The `intermittent_regression` evidence rows (DESIGN §9): a B*
+    `resource_affected` ID whose base was clean (not in `base_ids`, no
+    failure in a complete set of base reruns), that failed at least once on
+    the final tree, whose file directly imports a changed production file
+    (`coupled`), and none of whose recorded failure messages carries a
+    resource signature (`_RESOURCE_FAILURE_RE`) — an ID with no recorded
+    message cannot show it and is not typed. Evidence only: the ID stays
+    `resource_affected`."""
+    rows: list[dict] = []
+    base_complete = (verdict.get("pairs_run") == verdict.get("pairs_required")
+                     and not verdict.get("budget_exhausted"))
+    for cid in verdict.get("resource_affected") or []:
+        per = (verdict.get("per_id") or {}).get(cid) or {}
+        f = id_files.get(cid)
+        msgs = [m for m in messages.get(cid) or [] if m and m.strip()]
+        final_failed = (int(cid in final_ids)
+                        + int(discovery_counts.get(cid) or 0)
+                        + int(per.get("final_failed") or 0))
+        if (cid in base_ids or not base_complete
+                or int(per.get("base_failed") or 0) != 0
+                or final_failed < 1 or f not in coupled or not coupled[f]
+                or not msgs
+                or any(_RESOURCE_FAILURE_RE.search(m) for m in msgs)):
+            continue
+        rows.append({
+            "id": cid, "file": f, "imports_changed": list(coupled[f]),
+            "final_failed": final_failed,
+            "final_runs": 1 + repeats_run + int(verdict.get("pairs_run")
+                                                or 0),
+            "base_failed": 0,
+            "base_runs": int(verdict.get("pairs_run") or 0),
+            "message": msgs[0][:400]})
+    return rows
 
 
 async def _no_rerun(_timeout: float) -> set[str] | None:
@@ -39676,6 +39853,40 @@ def _git_tree_sources(repo: str | Path, rev: str,
     return out, allp
 
 
+def _jsonc_strip_comments(text: str) -> str:
+    """JSON-with-comments (tsconfig) without its `//` and `/* */` comments,
+    read outside strings only: a regex over the whole text also took
+    `"src/**/*.ts"` in an `include` list for a comment, and the result no
+    longer parsed, so every path alias was lost."""
+    out: list[str] = []
+    i, n, in_str = 0, len(text), False
+    while i < n:
+        ch = text[i]
+        if in_str:
+            out.append(ch)
+            if ch == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_str = False
+            i += 1
+        elif ch == '"':
+            in_str = True
+            out.append(ch)
+            i += 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
 def _ts_path_aliases(repo: str | Path, rev: str) -> dict[str, str]:
     """Import-specifier prefix -> repo-relative directory, from
     `tsconfig.json`'s `compilerOptions.paths` at `rev` (`"@/*": ["./src/*"]`
@@ -39687,9 +39898,7 @@ def _ts_path_aliases(repo: str | Path, rev: str) -> dict[str, str]:
                          capture_output=True, text=True, check=False)
     if got.returncode != 0:
         return {}
-    text = re.sub(r"/\*.*?\*/", "", got.stdout, flags=re.DOTALL)
-    text = re.sub(r'(?m)^\s*//.*$|(?<=[,{\[\s])//[^\n"]*$', "", text)
-    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    text = re.sub(r",(\s*[}\]])", r"\1", _jsonc_strip_comments(got.stdout))
     try:
         opts = (json.loads(text).get("compilerOptions") or {})
     except (ValueError, AttributeError):
@@ -39842,16 +40051,19 @@ def _py_source_graph(repo: str | Path, rev: str) -> dict:
 
 
 def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
-                        globs: list[str] | None = None
-                        ) -> dict[str, list[str]]:
+                        globs: list[str] | None = None, *,
+                        direct: bool = False) -> dict[str, list[str]]:
     """The tests coupled to a change (DESIGN §9): test file -> the changed
     production files its import closure reaches, over the JS/TS and Python
     import graphs at `rev`. A changed test file is coupled by itself (its
-    list may be empty). Never raises: a graph that cannot be read couples
-    nothing through it."""
+    list may be empty). `direct` keeps only test files that import a changed
+    production file themselves — the import-coupled tests of the
+    intermittent-regression rule — and no changed test file on its own
+    (on barnacle one module's closure reached 864-956 of ~1,200 test files).
+    Never raises: a graph that cannot be read couples nothing through it."""
     changed = [c for c in changed if isinstance(c, str) and c]
-    out: dict[str, set[str]] = {c: set() for c in changed
-                                if _is_test_case_file(c, globs)}
+    out: dict[str, set[str]] = {} if direct else {
+        c: set() for c in changed if _is_test_case_file(c, globs)}
     prods = [c for c in changed if not _is_test_file(c, globs)]
     if not prods:
         return {t: sorted(v) for t, v in sorted(out.items())}
@@ -39876,7 +40088,7 @@ def _coupled_test_files(repo: str | Path, rev: str, changed: Iterable[str],
                     seen.add(b)
                     if _is_test_case_file(b, globs):
                         out.setdefault(b, set()).add(prod)
-                    else:
+                    elif not direct:
                         stack.append(b)
     return {t: sorted(v) for t, v in sorted(out.items())}
 
@@ -44870,6 +45082,34 @@ def _contract_literal_evidence_section(flagged: list[dict]) -> str | None:
         "evidence must cite the mismatch.\n" + json.dumps(rows, indent=2))
 
 
+def _intermittent_regression_rows(state: dict) -> list[dict]:
+    """The typed `intermittent_regression` rows of the latest final ID diff
+    (`test_id_diff`), or []."""
+    diff = state.get("test_id_diff") if isinstance(state, dict) else None
+    rows = diff.get("intermittent_regression") if isinstance(diff, dict) \
+        else None
+    return [r for r in rows if isinstance(r, dict) and r.get("id")] \
+        if isinstance(rows, list) else []
+
+
+def _intermittent_regression_evidence_section(rows: list[dict]
+                                              ) -> str | None:
+    """The delivery judge's INTERMITTENT REGRESSIONS section, or None."""
+    if not rows:
+        return None
+    return (
+        "INTERMITTENT REGRESSIONS (mechanical evidence, not a verdict): each "
+        "test below passed on every base run, failed at least once on the "
+        "final tree, imports a production file this run changed, and its "
+        "failure is not a timeout or crash in the runner's own report. It "
+        "did not fail on every rerun, so the run does not count it. Read "
+        "the test and the change it imports: if the change made it fail "
+        "some of the time and a required item (no regressions, the "
+        "reported behaviour) depends on it, that item is unmet and your "
+        "evidence must cite the test.\n"
+        + json.dumps(rows[:20], indent=2))
+
+
 def _delivery_typed_evidence(st: "State", leerie_dir: Path, *,
                              refresh_tokens: bool) -> tuple[list[str], dict]:
     """The typed evidence sections for the delivery judge (N7a, N7d) and
@@ -44891,6 +45131,11 @@ def _delivery_typed_evidence(st: "State", leerie_dir: Path, *,
     if sec:
         sections.append(sec)
         counts["contract_flags"] = len(flagged)
+    rows = _intermittent_regression_rows(st.data)
+    sec = _intermittent_regression_evidence_section(rows)
+    if sec:
+        sections.append(sec)
+        counts["intermittent_regressions"] = len(rows)
     return sections, counts
 
 

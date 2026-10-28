@@ -8872,6 +8872,55 @@ failure that B\* types `resource_affected` no longer spends conformer rounds.
 Where the runner has no structured report, nothing changes — the axis
 verdict stands.
 
+**An intermittent failure the run introduced is evidence, not a verdict.**
+B\* calls an ID new only when it fails on every final rerun, so a test the
+run made fail one time in ten is never new. Measured (barnacle 7cc87f9a):
+the run's alphabet fed a generated password to `new RegExp`, and 10.5% of
+passwords throw (Monte Carlo, 200k samples). The final run surfaces that
+test at all with p = 0.105, and B\* calls it new with p = 0.105⁴ ≈ 0.012%.
+Finding it is the binding constraint, not the verdict. So the final ID diff
+adds two steps:
+
+1. *Discovery.* The run's import-coupled tests are the test files that
+   directly import a production file the run changed. They come from the
+   mechanical import graph: JS/TS specifiers, and Python `import` read with
+   `ast`. These are rerun serially `confirm_intermittent_repeats` (20)
+   times on the final tree, under the host-pressure gate and inside
+   `confirm_budget_sec`. Every ID that failed in any run (the final run, a
+   repeat, or a B\* final rerun) and not on the base joins the B\*
+   candidates, so it gets base reruns. At p = 0.105, R = 20 finds such a
+   test with probability 1 − 0.895²⁰ ≈ 89% (R = 10: 67%; R = 30: 96%).
+   Direct imports, not the transitive closure: on barnacle one changed
+   module's closure reaches 864–956 of ~1,200 test files. That is the
+   whole suite twenty times, and it couples every flaky test in the repo.
+2. *Typing.* An ID is typed `intermittent_regression` only when all of
+   these hold. Its base was clean: it is not in the baseline's failing IDs
+   and failed none of B\*'s base reruns. It failed at least once on the
+   final tree. Its file directly imports a changed production file. And no
+   failure of it carries a resource signature in the runner's own report:
+   a timeout, a worker crash, an out-of-memory kill or an exit signal. The
+   report is fixed runner output, so this is a mechanical match; an ID with
+   no recorded message cannot show its signature and is not typed.
+
+The type is **evidence, not a trigger**. The ID stays `resource_affected`
+in B\*'s verdict, so it never spends a conformer round or makes a run
+`unconverged`. It goes to the delivery judge as a typed evidence section,
+and to the PR under "Needs human verification". It ships as evidence because
+its false-positive rate cannot be bounded on the data available. Of the
+bench Q9 trials (48 clean, 73 with a reverted fix), the count rule alone
+(clean base, at least one final failure) fired in 8 of 48 clean trials
+(16.7%). Of those trial hits, 18 IDs in clean and defect trials were not
+truly new: 16 synthetic wall-clock tests that import nothing, and 2 real
+barnacle tests. Direct coupling excludes all 18. That includes the 2 real
+ones in the counterfactual where the run changed the defect's own
+production files; the transitive closure would have coupled both. But
+only 2 real flaky IDs ever reached the filter: 0 of 2 has a 95% upper bound
+far above 2%, and 0 of 48 clean trials gives 7.4%. Q9 also stored no
+failure messages, so the signature condition was not measured at all. The
+one positive control is the barnacle test above, which imports the changed
+module directly. A trigger needs a bench that captures failure messages and
+includes reverted fixes that leave a coupled flaky test.
+
 **The repository's own merge checks run too (CI parity).** The base-health
 axes run the build, lint and test commands leerie resolved for the repo, which
 is not what the repo's CI runs before a merge. On the benched repos those

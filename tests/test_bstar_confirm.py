@@ -447,3 +447,181 @@ def test_final_loop_continues_only_on_a_confirmed_new_failure(
     warnings = st.data["conformance"]["_final"]["warnings"]
     has_new = any("passed on the base tree" in w for w in warnings)
     assert has_new is bool(new)
+
+
+# --- the intermittent-regression rule (DESIGN §9 *An intermittent failure the
+# run introduced is evidence, not a verdict*) --------------------------------
+
+_COUPLED_SUITE = """\
+import os
+
+from app import core
+
+
+def _tick(name):
+    n = int(open(name).read()) + 1 if os.path.exists(name) else 1
+    open(name, "w").write(str(n))
+    return n
+
+
+def test_intermittent():
+    # Fails one run in four, and only once the run's change is in place.
+    n = _tick("count_a")
+    assert not (core.VALUE == 2 and n % 4 == 2), "value leaked"
+
+
+def test_slow_box():
+    n = _tick("count_b")
+    if core.VALUE == 2 and n % 4 == 2:
+        raise AssertionError("Failed: Timeout >1.0s")
+"""
+
+_UNCOUPLED_SUITE = """\
+import os
+
+
+def test_wall_clock():
+    name = "count_c"
+    n = int(open(name).read()) + 1 if os.path.exists(name) else 1
+    open(name, "w").write(str(n))
+    assert n % 4 != 2
+"""
+
+
+@pytest.fixture
+def coupled_repo(leerie, tmp_path):
+    """Base: `app/core.py` VALUE=1. Final: VALUE=2. `tests/test_core.py`
+    imports `app.core` directly and fails intermittently on the final tree
+    (one assertion, one timeout-shaped message); `tests/test_clock.py`
+    imports nothing and is flaky on both sides."""
+    repo = tmp_path / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "app").mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    (repo / ".gitignore").write_text("count_*\n.leerie/\n")
+    (repo / ".leerie").mkdir()
+    (repo / ".leerie" / "config.toml").write_text(
+        'test = "python3 -m pytest -q -p no:cacheprovider"\n')
+    (repo / "app" / "__init__.py").write_text("")
+    (repo / "app" / "core.py").write_text("VALUE = 1\n")
+    (repo / "tests" / "test_core.py").write_text(_COUPLED_SUITE)
+    (repo / "tests" / "test_clock.py").write_text(_UNCOUPLED_SUITE)
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "base")
+    base = _git(repo, "rev-parse", "HEAD")
+    run_id = "fix-002-abcdef"
+    _git(repo, "checkout", "-q", "-b", f"leerie/runs/{run_id}")
+    (repo / "app" / "core.py").write_text("VALUE = 2\n")
+    _git(repo, "commit", "-q", "-am", "final")
+    _git(repo, "checkout", "-q", "main")
+    leerie_root = repo / ".leerie"
+    run_dir = leerie_root / "runs" / run_id
+    (run_dir / "logs").mkdir(parents=True)
+    (run_dir / "worktrees").mkdir(parents=True)
+    staging = run_dir / "worktrees" / "staging"
+    _git(repo, "worktree", "add", "-q", str(staging), f"leerie/runs/{run_id}")
+    st = leerie.State(leerie_root, run_id)
+    st.data = {"task": "x", "working_branch": "main",
+               "conformance": {"_baseline": {"sha": base}},
+               "baseline_failing_ids": []}
+    st.repo_root = repo
+    st.save()
+    return {"repo": repo, "staging": staging, "st": st, "base": base}
+
+
+COUPLED_CMD = "python3 -m pytest -q -p no:cacheprovider"
+INTERMITTENT = "tests/test_core.py :: tests.test_core.test_intermittent"
+TIMEOUT_SHAPED = "tests/test_core.py :: tests.test_core.test_slow_box"
+CLOCK = "tests/test_clock.py :: tests.test_clock.test_wall_clock"
+
+
+def test_intermittent_regression_is_found_typed_and_never_counted(
+        leerie, coupled_repo, monkeypatch):
+    """End to end on a real suite: the final run surfaced nothing. Discovery
+    reruns the one import-coupled file, finds both of its intermittent
+    failures, and B* confirms neither as new. Only the assertion failure is
+    typed `intermittent_regression`: the timeout-shaped one carries a
+    resource signature, and the uncoupled flake (forced into the final run)
+    imports nothing the run changed."""
+    monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
+    st, staging = coupled_repo["st"], coupled_repo["staging"]
+    post = {"tests": {"ran": True, "measured": True, "passed": False,
+                      "command": COUPLED_CMD, "failing_ids": [CLOCK],
+                      "failing_id_files": {CLOCK: "tests/test_clock.py"}}}
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, _caps(leerie, confirm_intermittent_repeats=8), str(staging),
+        post, log_path=st.run_dir / "logs" / "t.log", label="final-r0"))
+    disc = v["discovery"]
+    assert disc["files"] == ["tests/test_core.py"]
+    assert disc["coupled"] == {"tests/test_core.py": ["app/core.py"]}
+    assert disc["repeats_run"] == 8
+    assert {INTERMITTENT, TIMEOUT_SHAPED} <= set(disc["failed_ids"])
+    assert v["final_candidates"] == [CLOCK]
+    assert set(v["candidates"]) == {CLOCK, INTERMITTENT, TIMEOUT_SHAPED}
+    # Never counted: B* needs every final rerun to fail.
+    assert v["new"] == []
+    rows = v["intermittent_regression"]
+    assert [r["id"] for r in rows] == [INTERMITTENT]
+    (row,) = rows
+    assert row["imports_changed"] == ["app/core.py"]
+    assert row["base_failed"] == 0 and row["base_runs"] == 3
+    assert 1 <= row["final_failed"] < row["final_runs"]
+    assert "value leaked" in row["message"]
+    assert "_runs" not in st.data["test_id_diff"]["discovery"]
+    # Evidence reaches the delivery judge and the PR.
+    sec = leerie._intermittent_regression_evidence_section(
+        leerie._intermittent_regression_rows(st.data))
+    assert INTERMITTENT in sec and TIMEOUT_SHAPED not in sec
+    groups = leerie._pr_needs_human(st.data, lambda _s: True)
+    (line,) = groups["Intermittent failures the run may have introduced"]
+    assert "test_intermittent" in line and "`app/core.py`" in line
+
+
+def test_discovery_needs_a_scoped_runner(leerie, coupled_repo, monkeypatch):
+    """Without a scoped runner a repeat would rerun the whole suite twenty
+    times: discovery is skipped, by name."""
+    monkeypatch.setattr(leerie, "_acceptance_cmd", lambda *a, **k: None)
+    st = coupled_repo["st"]
+    d = asyncio.run(leerie._intermittent_discovery(
+        st, _caps(leerie), str(coupled_repo["staging"]), COUPLED_CMD,
+        coupled_repo["base"], log_path=st.run_dir / "logs" / "t.log",
+        label="t"))
+    assert d["repeats_run"] == 0
+    assert d["skipped"] == "no scoped test runner for the coupled files"
+
+
+@pytest.mark.parametrize("change,typed", [
+    ({}, True),
+    ({"base_ids": {"x"}}, False),            # failed on the base run
+    ({"per_id": {"base_failed": 1}}, False),  # failed a base rerun
+    ({"pairs_run": 2}, False),                # base reruns incomplete
+    ({"coupled": {}}, False),                 # imports nothing changed
+    ({"messages": {}}, False),                # no signature to read
+    ({"messages": {"x": ["Test timed out in 5000ms."]}}, False),
+    ({"messages": {"x": ["Worker exited unexpectedly"]}}, False),
+    ({"messages": {"x": ["SyntaxError: Nothing to repeat"]}}, True),
+    ({"discovery_counts": {}, "final_ids": set()}, False),  # never failed
+])
+def test_intermittent_typing_conditions(leerie, change, typed):
+    """Each condition of the rule, removed one at a time."""
+    kw = {"final_ids": set(), "base_ids": set(),
+          "discovery_counts": {"x": 2}, "repeats_run": 20,
+          "coupled": {"a.test.ts": ["src/a.ts"]},
+          "id_files": {"x": "a.test.ts"},
+          "messages": {"x": ["AssertionError: expected [] to equal ['$']"]}}
+    verdict = {"resource_affected": ["x"], "pairs_run": 3,
+               "pairs_required": 3,
+               "per_id": {"x": {"final_failed": 0, "base_failed": 0}}}
+    for k, v in change.items():
+        if k == "pairs_run":
+            verdict["pairs_run"] = v
+        elif k == "per_id":
+            verdict["per_id"]["x"].update(v)
+        else:
+            kw[k] = v
+    rows = leerie._type_intermittent_regressions(verdict, **kw)
+    assert bool(rows) is typed
+    if typed:
+        assert rows[0]["final_failed"] == 2 and rows[0]["final_runs"] == 24

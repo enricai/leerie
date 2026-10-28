@@ -5101,9 +5101,10 @@ database-reset) to such a worker. Its deny rules and hook still apply.
 | `_measure_axes` (forbidden skip) | A build or lint axis whose command `_forbidden_command_hit` matches is not run: `{ran: false, measured: false, passed: null, command, summary, skip_kind: "forbidden_by_task"}`, logged, never memoised. A matched `tests` axis goes to `_scoped_test_replacement` instead. |
 | `_scoped_test_replacement(tree, st, canonical, hit, forbidden, *, log_prefix)` | Replaces a forbidden test command. Before `conformance._baseline.sha` exists it returns the unmeasured record `skip_kind: "scoped_at_final"`. Otherwise it computes `_changed_files(tree, base)`, then `_coupled_test_files(repo, HEAD, changed, globs)`, keeps the coupled files present in `tree`, and renders them with `_acceptance_cmd`. It returns `{command, scoped_replacement: {replaces, forbidden, files, coupled}}`. `_measure_axes` measures that command like any axis (memoised under its own key) and copies `scoped_replacement` onto the result. When no file is coupled (`forbidden_no_coupled_tests`), there is no scoped runner (`forbidden_no_scoped_runner`), or the scoped command is forbidden too (`forbidden_scoped_runner`), it returns an unmeasured record, logs a WARNING and calls `_set_regression_gap`. A successful replacement clears that gap. |
 | `_set_regression_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "regression_check", detail}` (`REGRESSION_GAP_SOURCE`): set from `detail`, removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
-| `_coupled_test_files(repo, rev, changed, globs=None)` | The coupled tests: test file -> the changed production files its import closure reaches, sorted. Changed test files map to themselves (possibly `[]`). The closure is a reverse walk over `importers` of `_js_source_graph` and `_py_source_graph` at `rev`. The walk goes through non-test modules and stops at test files (`_is_test_case_file`). It never raises; an unreadable graph is logged and couples nothing. |
+| `_coupled_test_files(repo, rev, changed, globs=None, *, direct=False)` | The coupled tests: test file -> the changed production files its import closure reaches, sorted. Changed test files map to themselves (possibly `[]`). With `direct=True`, only test files that import a changed production file themselves count (no walk through other modules), and a changed test file is not coupled by itself: these are the import-coupled tests of the intermittent-regression rule. The closure is a reverse walk over `importers` of `_js_source_graph` and `_py_source_graph` at `rev`. The walk goes through non-test modules and stops at test files (`_is_test_case_file`). It never raises; an unreadable graph is logged and couples nothing. |
 | `_py_source_graph(repo, rev)` | The Python import graph at `rev` (`files`, `imp`, `importers`), cached in `_SOURCE_GRAPHS` under `(repo, "py:" + rev)`. Sources come from `_git_tree_sources(repo, rev, (".py",))`. `_py_module_index` maps every dotted suffix of a path's package parts to it. `_py_imports` reads `import` / `from … import` with `ast`: `from a import b` names `a.b` when that is a module, else `a`, and relative imports resolve against the importer's package. |
 | `_git_tree_sources(repo, rev, exts=_JS_SRC_EXT)` | `exts` selects the source suffixes read. |
+| `_jsonc_strip_comments(text)` | `tsconfig.json` text without `//` and `/* */` comments, scanned outside JSON strings only. `_ts_path_aliases` uses it, then drops trailing commas. Before, a regex strip took the `/**/` inside an `include` glob such as `"src/**/*.ts"` for a comment, the JSON stopped parsing, and every alias was lost. Measured on barnacle: no `@/` import edge was resolved, so 0 test files were coupled to `src/lib/random.ts` instead of 4 direct importers. |
 
 The planner ctx carries `process_constraints = {forbidden_commands: [{command, scope}]}` when it is non-empty.
 
@@ -5155,7 +5156,7 @@ continues.
 | `_integration_commit(staging, sid)` | The newest first-parent commit at HEAD whose subject is `leerie: integrate <sid>`, or None. |
 | `_check_contract_literals(st, leerie_dir)` | For each record with `extracted`: tree = `git ls-tree -r --name-only HEAD`, grep = `git grep -n -F -e <literal> HEAD`, owner/counterpart sides from `_integration_commit` (`_diff_added_lines([sha^1, sha])`, `git diff --name-only`). Writes `flag`, `why`; returns the flagged records; never raises. |
 | `_contract_literal_evidence_section(flagged)` | `None` or the `CONTRACT LITERAL FLAGS` section: up to 20 `{owner_sid, counterpart_sid, literal, literal_kind, why, risk}`. |
-| `_delivery_typed_evidence(st, leerie_dir, *, refresh_tokens)` | `(sections, {site_token_hits, contract_flags})` for `_delivery_judge_unmet(typed_evidence=…)`; the prejudge uses the recorded hits, the recheck recomputes them; both rerun the contract check. The counts are recorded as `delivery_gate.evidence_before` / `evidence_after`. Never raises. |
+| `_delivery_typed_evidence(st, leerie_dir, *, refresh_tokens)` | `(sections, {site_token_hits, contract_flags, intermittent_regressions?})` (the INTERMITTENT REGRESSIONS section, from `test_id_diff`, is added when rows exist) for `_delivery_judge_unmet(typed_evidence=…)`; the prejudge uses the recorded hits, the recheck recomputes them; both rerun the contract check. The counts are recorded as `delivery_gate.evidence_before` / `evidence_after`. Never raises. |
 
 `_delivery_judge_unmet(…, typed_evidence=None)` appends each section to every
 pack prompt before the closing instruction; with none the prompt is
@@ -5204,6 +5205,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | B\* base/final rerun pairs (`confirm_pairs`) | 3 | interleaved base, final, base, final … reruns per confirm (DESIGN §9 *Which failures are new*). |
 | B\* escalated pairs (`confirm_pairs_escalated`) | 5 | pairs used instead when the gate timed out. |
 | B\* confirm wall-time budget (`confirm_budget_sec`) | 1800 s | bounds one whole confirm, gate wait included; each rerun's timeout is the remaining budget. Pairs cut short type every candidate `resource_affected` (`budget_exhausted: true`). |
+| B\* intermittent discovery repeats (`confirm_intermittent_repeats`) | 20 | serial reruns of the import-coupled tests on the final tree, per final-tree ID diff (`_intermittent_discovery`), inside their own `confirm_budget_sec`; 0 disables discovery. At a 10.5% per-run failure rate, 20 repeats find the test with p ≈ 0.89. |
 | total worker invocations per run | 2000 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | the cheap, runtime backstop in `State.bump_workers()`: raises `WorkerError`, abort, state saved for `resume`. The complementary early check is `check_budget_feasibility()` at the plan/execute boundary (after `_schedule()`, before `_write_plan()`) — it estimates remaining `claude -p` calls from the planner output and `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value before any implementer spawns. See DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*. |
 | per-subtask call-estimate (for the feasibility preflight) | 3.0 (`subtask_call_estimate`) | not a runtime gate; consumed by `check_budget_feasibility()` as the per-subtask multiplier in its remaining-call estimate. Raised from 2.5 to absorb the per-subtask conformer completeness gate (DESIGN §9), whose `solution_defects` finding re-drives the implementer up to `completeness_retry_rounds` times. |
 | per-subtask re-plan estimate | 1.5 (`replan_decompose_estimate`) | not a runtime gate; consumed by `check_replan_affordable()` as the per-subtask multiplier when projecting a re-plan's cost. A re-plan re-runs the whole P1 decomposition, not just the planners — the larger half of the cost. Rounded up so the preflight errs toward refusing a marginal re-plan. |
@@ -5972,6 +5974,54 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   the round's `tests:` axis regression and treats `tests` as baseline-red
   for `_conformance_clean` — a failure B\* typed `resource_affected` is not
   this run's.
+- Intermittent regressions (DESIGN §9 *An intermittent failure the run
+  introduced is evidence, not a verdict*). Before the confirm,
+  `_confirm_final_test_failures` calls `_intermittent_discovery`. Every ID
+  that discovery failed and that is neither a baseline nor a final
+  candidate joins the candidates (its file joins the rerun files). The
+  verdict also records `final_candidates` (the final-run candidates alone;
+  the memo compares these), `discovery` and `intermittent_regression`
+  (from `_type_intermittent_regressions`). Each final-side B\* rerun also
+  keeps its report messages for the typing.
+- `async _intermittent_discovery(st, caps, staging, cmd, base_sha, *,
+  log_path, label) -> dict`. The import-coupled tests are
+  `_coupled_test_files(repo, staging HEAD, _changed_files(staging,
+  base_sha), globs, direct=True)` that exist in staging. With a scoped
+  runner (`_acceptance_cmd`), they are rerun serially
+  `confirm_intermittent_repeats` times through `_capture_failing_test_ids(...,
+  serial=True, files=coupled)`. The reruns hold `_confirm_lock` after one
+  `_confirm_gate` and stay inside `confirm_budget_sec`. Returns `{coupled,
+  files, repeats_required, repeats_run, budget_exhausted, gate,
+  failed_ids, fail_counts, id_files, skipped?}`. `skipped` is one of
+  `disabled`, `no base commit`, `no test file imports a changed production
+  file`, `no scoped test runner for the coupled files` (without one, a
+  repeat would run the whole suite), or `discovery errored (…)`. A
+  transient `_runs` key carries the messages and is popped before the
+  verdict is stored. Never raises.
+- `_type_intermittent_regressions(verdict, *, final_ids, base_ids,
+  discovery_counts, repeats_run, coupled, id_files, messages) ->
+  list[dict]`. It reads only the B\* `resource_affected` IDs. An ID is
+  typed when all of these hold: it is not in `base_ids`; the base reruns
+  are complete (`pairs_run == pairs_required`, no `budget_exhausted`) with
+  `base_failed == 0`; it failed at least once across the final run,
+  discovery and the B\* final reruns; its file is a key of `coupled` with
+  a non-empty list; and it has at least one recorded message, none of
+  which matches `_RESOURCE_FAILURE_RE` (timeouts, worker crashes,
+  out-of-memory, exit signals; matched on the runner report's message,
+  case-insensitive). Each row is `{id, file, imports_changed,
+  final_failed, final_runs, base_failed: 0, base_runs, message}`
+  (`final_runs` = 1 + repeats + B\* pairs; `message` capped at 400
+  characters). The ID stays `resource_affected`: the rows never add a
+  regression and never change `outcome`.
+- `_capture_failing_test_ids` also returns `messages: {id: message}` for
+  the failing IDs, from `_runner_report_cases`.
+- `_intermittent_regression_rows(state)` returns
+  `test_id_diff.intermittent_regression` (or []).
+  `_intermittent_regression_evidence_section(rows)` is the delivery
+  judge's INTERMITTENT REGRESSIONS section (first 20 rows), appended by
+  `_delivery_typed_evidence`, which then counts `intermittent_regressions`.
+  `_pr_needs_human` lists each row under "Intermittent failures the run may
+  have introduced".
 
 ### Shared re-drive budget
 
@@ -8850,7 +8900,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
-| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value); `new` non-empty makes the outcome `unconverged`. |
+| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only); `new` non-empty makes the outcome `unconverged`. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |

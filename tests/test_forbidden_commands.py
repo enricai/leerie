@@ -953,3 +953,36 @@ def test_final_id_diff_uses_an_empty_base_for_a_scoped_replacement(
     assert asyncio.run(leerie._confirm_final_test_failures(
         st, dict(leerie.DEFAULT_CAPS), str(tmp_path), post,
         log_path=tmp_path / "l.log", label="final")) is None
+
+
+def test_direct_coupling_keeps_only_direct_importers(leerie, tmp_path):
+    """The intermittent-regression rule's coupling (DESIGN §9): a test
+    reaching the change only through another module is not coupled, and a
+    changed test file is not coupled by itself."""
+    root, _base, head = _coupled_repo(tmp_path)
+    leerie._SOURCE_GRAPHS.clear()
+    got = leerie._coupled_test_files(
+        root, head, ["src/lib/rand.ts", "pkg/core.py", "src/new.test.ts"],
+        direct=True)
+    assert got == {"src/lib/rand.test.ts": ["src/lib/rand.ts"]}
+
+
+def test_tsconfig_include_globs_do_not_read_as_comments(leerie, tmp_path):
+    """`"src/**/*.ts"` holds `/*` … `*/`; a regex comment strip ate it, the
+    JSON no longer parsed, and every alias (so every `@/` import edge) was
+    lost — measured on barnacle: 0 test files coupled to `src/lib/random.ts`
+    against 4 direct importers."""
+    root = tmp_path / "r"
+    root.mkdir()
+    (root / "tsconfig.json").write_text(
+        '{\n  // comment\n  "compilerOptions": {\n    /* block */\n'
+        '    "paths": {"@/*": ["./src/*"], "@t/*": ["./test/*"],},\n'
+        '  },\n  "include": ["src/**/*.ts", "test/**/*.ts"]\n}\n')
+    _git(root, "init", "-q", "-b", "main")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "add", "-A")
+    _git(root, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm",
+         "c")
+    assert leerie._ts_path_aliases(root, "HEAD") == {"@/": "src/",
+                                                     "@t/": "test/"}
+    assert leerie._jsonc_strip_comments('{"a": "x//y /* z */"} // c') == \
+        '{"a": "x//y /* z */"} '
