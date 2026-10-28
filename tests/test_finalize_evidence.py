@@ -26,15 +26,6 @@ EFFORTS = {"pr_reviewer": "high", "contract_extractor": "medium",
            "delivery_judge": "medium", "conformer": "low"}
 
 
-@pytest.fixture(autouse=True)
-def _restore_claude_p(leerie):
-    """The review tests rebind `leerie.claude_p` directly (as the final-
-    conformance harness does); restore it so no stub outlives its test."""
-    original = leerie.claude_p
-    yield
-    leerie.claude_p = original
-
-
 def _git(cwd, *args):
     r = subprocess.run(["git", *args], cwd=cwd, capture_output=True,
                        text=True)
@@ -364,7 +355,7 @@ def _review_env(env, required=True):  # noqa: F811
     return env
 
 
-def _stub_reviewer(leerie, findings, *, mutate=None):
+def _stub_reviewer(leerie, monkeypatch, findings, *, mutate=None):
     calls: list[dict] = []
 
     async def fake(**kw):
@@ -374,7 +365,7 @@ def _stub_reviewer(leerie, findings, *, mutate=None):
                 mutate(Path(kw["cwd"]))
             return {"findings": findings}
         return _clean_result()
-    leerie.claude_p = fake
+    monkeypatch.setattr(leerie, "claude_p", fake)
     return calls
 
 
@@ -385,10 +376,10 @@ BAD_QUOTE = {**GOOD, "item_id": None, "kind": "bug",
              "quote": "def g(): return 2", "item_span_quote": None}
 
 
-def test_review_payload_verification_and_record(env):  # noqa: F811
+def test_review_payload_verification_and_record(env, monkeypatch):  # noqa: F811
     leerie = env["leerie"]
     _review_env(env)
-    calls = _stub_reviewer(leerie, [GOOD, BAD_QUOTE])
+    calls = _stub_reviewer(leerie, monkeypatch, [GOOD, BAD_QUOTE])
     rec = asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     (call,) = calls
@@ -408,10 +399,10 @@ def test_review_payload_verification_and_record(env):  # noqa: F811
     assert env["st"].data["pr_review"] is rec
 
 
-def test_only_verified_findings_reach_the_final_conformer(env):  # noqa: F811
+def test_only_verified_findings_reach_the_final_conformer(env, monkeypatch):  # noqa: F811
     leerie = env["leerie"]
     _review_env(env)
-    calls = _stub_reviewer(leerie, [GOOD, BAD_QUOTE])
+    calls = _stub_reviewer(leerie, monkeypatch, [GOOD, BAD_QUOTE])
     asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     asyncio.run(leerie._run_final_conformance(
@@ -426,16 +417,16 @@ def test_only_verified_findings_reach_the_final_conformer(env):  # noqa: F811
     assert [f["quote"] for f in shown] == [GOOD["quote"]]
 
 
-def test_no_verified_finding_means_no_section(env):  # noqa: F811
+def test_no_verified_finding_means_no_section(env, monkeypatch):  # noqa: F811
     leerie = env["leerie"]
     _review_env(env)
-    _stub_reviewer(leerie, [BAD_QUOTE])
+    _stub_reviewer(leerie, monkeypatch, [BAD_QUOTE])
     asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     assert leerie._format_pr_review_section(env["st"]) is None
 
 
-def test_reviewer_changes_are_reverted(env):  # noqa: F811
+def test_reviewer_changes_are_reverted(env, monkeypatch):  # noqa: F811
     leerie = env["leerie"]
     _review_env(env)
     head = _git(env["staging"], "rev-parse", "HEAD").strip()
@@ -443,7 +434,7 @@ def test_reviewer_changes_are_reverted(env):  # noqa: F811
     def mutate(cwd: Path):
         (cwd / "src.py").write_text("changed\n")
         (cwd / "coverage.out").write_text("x\n")
-    _stub_reviewer(leerie, [], mutate=mutate)
+    _stub_reviewer(leerie, monkeypatch, [], mutate=mutate)
     rec = asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     assert rec["tree_restored"] is True
@@ -458,33 +449,33 @@ def test_reviewer_changes_are_reverted(env):  # noqa: F811
     def commit(cwd: Path):
         (cwd / "src.py").write_text("committed\n")
         _git(cwd, "commit", "-qam", "reviewer")
-    _stub_reviewer(leerie, [], mutate=commit)
+    _stub_reviewer(leerie, monkeypatch, [], mutate=commit)
     asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     assert _git(st_, "rev-parse", "HEAD").strip() == head
 
 
-def test_review_runs_once_and_a_crash_is_recorded(env):  # noqa: F811
+def test_review_runs_once_and_a_crash_is_recorded(env, monkeypatch):  # noqa: F811
     leerie = env["leerie"]
     _review_env(env)
 
     async def crash(**kw):
         raise leerie.WorkerError("boom")
-    leerie.claude_p = crash
+    monkeypatch.setattr(leerie, "claude_p", crash)
     rec = asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     assert "boom" in rec["error"] and rec["findings"] == []
-    calls = _stub_reviewer(leerie, [GOOD])
+    calls = _stub_reviewer(leerie, monkeypatch, [GOOD])
     again = asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     assert calls == [] and again is env["st"].data["pr_review"]
 
 
-def test_skipped_once_the_final_conformance_ran(env):  # noqa: F811
+def test_skipped_once_the_final_conformance_ran(env, monkeypatch):  # noqa: F811
     leerie = env["leerie"]
     _review_env(env)
     env["st"].data["conformance"] = {"_final": {"result": {}}}
-    calls = _stub_reviewer(leerie, [GOOD])
+    calls = _stub_reviewer(leerie, monkeypatch, [GOOD])
     assert asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS)) is None
     assert calls == [] and "pr_review" not in env["st"].data
