@@ -161,7 +161,10 @@ cannot fix), and says why as a typed kind. A missing external resource
 `accepted_external` — not merged, listed under "Needs human verification"
 in the PR, and not making the run `unconverged` — but only after Leerie
 checks the claim itself (the variable really is unset, the host really is
-unreachable, and so on); a claim the check does not back is re-driven. A
+unreachable, and so on); a claim the check does not back is re-driven —
+unless the container itself cannot check it (the probe cannot reach the
+network to decide) twice in a row for the same claim, when it settles
+`unconverged` with a reason naming what could not be checked. A
 resource kill at the container's limit is retried once in place, then
 settles `unconverged`. A "nothing to change" claim is settled done only
 when a sibling subtask already changed the files it planned to touch, its

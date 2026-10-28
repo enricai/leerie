@@ -687,7 +687,10 @@ typed `blocker_kind` (§13 *A blocked implementer says why, as a type*). An
 integrated, listed under "Needs human verification", and not making the run
 `unconverged` — only when code verifies the typed resource it names (§13
 *An external claim is checked, not taken on the word*); an unverified claim
-is re-driven as `other`. An `environment_limit` is retried in place once,
+is re-driven as `other`, except that the same claim unverifiable for an
+environmental reason on two attempts in a row settles `unconverged`
+(`external_unverified`, §13 *An environment that cannot check a claim does
+not burn the budget*). An `environment_limit` is retried in place once,
 then settled `unconverged`. A `nothing_to_change` is settled `complete` only
 when a sibling integrated this run changed its surface, its verify commands
 (if any) pass, and the satisfied-probe finds its criteria met; a
@@ -10655,7 +10658,7 @@ prose:
 | `blocker_kind` | Routing |
 |---|---|
 | `nothing_to_change` | settled `complete` on evidence when a sibling changed its surface this run, its `verify` commands pass on HEAD and the satisfied-probe finds its criteria met there (§8 *A no-op a sibling already delivered is settled on evidence*); otherwise re-driven |
-| `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other` |
+| `external_precondition` (+ `external_resource`, `external_resource_claim`) | the only kind that may be accepted, and only when code verifies the typed resource (below): settled `accepted_external` and listed under "Needs human verification"; a claim the check does not verify is `other`, except that the same claim unverified for an environmental reason on two attempts in a row settles `unconverged` (`external_unverified`, below) |
 | `environment_limit` | retried in place once, then `unconverged` (the rule of §6 *At the measured ceiling, a resource kill is an environment limit*) |
 | `upstream_missing` | re-driven |
 | `cannot_reproduce` | settled by execution (§8 *Settled by execution*); a claim execution cannot back is re-driven |
