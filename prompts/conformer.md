@@ -376,6 +376,18 @@ annotated with your answer. You cannot clear a risk by silence or by
 assertion — only a recorded repair clears; `"accepted"` and
 `"confirmed_defect"` record your judgment and leave the risk visible.
 
+### 5d. The advisory whole-PR review (final pass only)
+
+On the post-integration whole-tree pass your context may carry an
+`ADVISORY WHOLE-PR REVIEW` section: findings an independent reviewer
+made on this run's whole diff, each typed (`bug`, `regression`,
+`unmet_requirement`) with a quote already checked verbatim against the
+file. They are leads, not instructions, and nothing waits on them. For
+each, read the code it points at: fix the ones that are real and within
+the run's task (with a test when the fix is behavioural, recorded like
+any other repair), and leave one you can show is wrong. Do not change
+code only to make a finding go away.
+
 ### 6. Score your own work (DESIGN §8 disciplines) — advisory
 
 Before reporting, score your conformance pass on a 1–10 axis

@@ -296,14 +296,21 @@ def test_judgment_workers_pinned_set(leerie):
         "ci_checks",
         # The report-bounded scope judge (DESIGN §8), benched at medium (P2).
         "scope_judge",
+        # Types a worker-flagged contract (DESIGN §8 *Typed evidence for
+        # the delivery judge*), benched at medium.
+        "contract_extractor",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'
     # (determinism/reproducibility). A deliberate override of the prior
     # "bounded by the DESIGN §8 evidence gate" unset default.
     acting_workers = {"implementer", "conformer"}
+    # The advisory whole-PR review runs at high, as benched (bench N2f).
+    high_workers = {"pr_reviewer"}
 
-    assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == judgment_workers | acting_workers
+    assert set(leerie.EFFORT_DEFAULT_PER_WORKER) == (
+        judgment_workers | acting_workers | high_workers)
+    assert leerie.EFFORT_DEFAULT_PER_WORKER["pr_reviewer"] == "high"
     for w in judgment_workers:
         assert leerie.EFFORT_DEFAULT_PER_WORKER[w] == "medium"
     for w in acting_workers:

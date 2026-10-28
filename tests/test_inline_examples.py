@@ -15,6 +15,9 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import json
+
+import pytest
 
 from tests.conftest import init_git_repo
 from tests.conftest import run_git_cwd_first_stdout as _git
@@ -111,20 +114,98 @@ def test_site_token_added_by_the_run_is_reported(leerie, tmp_path, capsys):
     st = _state(leerie, tmp_path, working_branch="main",
                 defect_scope=_scope(_SITE_EXAMPLE))
     hits = leerie._warn_site_token_leaks(st, leerie_dir)
-    assert hits == [{"token": "acmeshop", "file": "src/x.ts"}]
+    assert hits == [{"token": "acmeshop", "file": "src/x.ts",
+                     "added_line": "// e.g. an AcmeShop-style list",
+                     "report_example": _SITE_EXAMPLE["literal"]}]
     assert st.data["site_token_warnings"] == hits
-    assert "WARNING" in capsys.readouterr().out
+    assert "site token" in capsys.readouterr().out
 
 
-def test_site_token_already_in_the_base_tree_is_skipped(leerie, tmp_path):
-    """The measured false-positive source: a token the repo already uses
-    (here present in `main`) flags nothing."""
+def test_site_token_already_in_the_base_tree_is_still_reported(leerie,
+                                                               tmp_path):
+    """Rewritten (stage 6b, N7a): the base-tree skip made the check inert
+    (bench q5/n7a, 0 of 74) — a leak already merged hid every later one.
+    A token the base already carries is reported on the line THIS run
+    adds; an unchanged base line is never a hit (only added lines are
+    read)."""
     leerie_dir = _staged_run(tmp_path, "an acmewidget was here before\n",
                              {"src/y.ts": "const acmewidget = 1;\n"})
     st = _state(leerie, tmp_path, working_branch="main",
                 defect_scope=_scope({**_SITE_EXAMPLE,
                                      "site_tokens": ["acmewidget"]}))
-    assert leerie._warn_site_token_leaks(st, leerie_dir) == []
+    hits = leerie._warn_site_token_leaks(st, leerie_dir)
+    assert [(h["token"], h["file"]) for h in hits] == [
+        ("acmewidget", "src/y.ts")]
+
+
+def test_identifier_segments_are_boundaries(leerie, tmp_path):
+    """v2 rule 3': `_`, `-`, `.`, `/` separate segments, so the token is
+    found inside an identifier; a longer alphanumeric word is not."""
+    leerie_dir = _staged_run(tmp_path, "x\n", {
+        "src/a.ts": "const cls = 'AcmeShop_Forms_Field';\n"
+                    "const longer = 'acmeshopping';\n"
+                    "const host = 'api.acmewidget-fixture.example';\n"})
+    st = _state(leerie, tmp_path, working_branch="main",
+                defect_scope=_scope(_SITE_EXAMPLE))
+    hits = leerie._warn_site_token_leaks(st, leerie_dir)
+    assert [h["added_line"] for h in hits] == [
+        "const cls = 'AcmeShop_Forms_Field';",
+        "const host = 'api.acmewidget-fixture.example';"]
+
+
+@pytest.mark.parametrize("path,line,guard", [
+    # a denylist in a guard test: bare terms only
+    ("src/site-agnostic.test.ts", '  "acmeshop",', True),
+    ("src/site-agnostic.test.ts",
+     "const FORBIDDEN = ['acmeshop', 'acmewidget'];", True),
+    ("src/__tests__/agnostic.ts",
+     "export const VENDORS = [/acmeshop/i, /acmewidget/i];", True),
+    ("tests/test_agnostic.py", '    "acmeshop",', True),
+    # as benched, a bare `[` without a declaration is not stripped
+    ("src/a.test.ts", "  [/acmeshop/i, /acmewidget/i]", False),
+    # the same line outside a test file is a leak
+    ("src/denylist.ts", '  "acmeshop",', False),
+    # a fixture value is not a bare term list
+    ("src/a.test.ts", '  name: "AcmeShop",', False),
+    ("src/a.test.ts", '  "https://acmeshop.example/x",', False),
+    ("src/a.test.ts", "", False),
+])
+def test_guard_line_exclusion(leerie, path, line, guard):
+    assert leerie._site_token_guard_line(path, line) is guard
+
+
+def test_a_guard_list_line_is_not_a_hit(leerie, tmp_path):
+    leerie_dir = _staged_run(tmp_path, "x\n", {
+        "src/site-agnostic.test.ts":
+            "const FORBIDDEN = [\n  \"acmeshop\",\n];\n"
+            "it('uses the acmeshop host', () => {});\n"})
+    st = _state(leerie, tmp_path, working_branch="main",
+                defect_scope=_scope(_SITE_EXAMPLE))
+    hits = leerie._warn_site_token_leaks(st, leerie_dir)
+    assert [h["added_line"] for h in hits] == [
+        "it('uses the acmeshop host', () => {});"]
+
+
+def test_evidence_section_caps_and_states_the_total(leerie):
+    assert leerie._site_token_evidence_section([]) is None
+    hits = [{"token": "acmeshop", "file": f"src/f{i % 12}.ts",
+             "added_line": f"line {i}", "report_example": "ex"}
+            for i in range(60)]
+    sec = leerie._site_token_evidence_section(hits)
+    head, body = sec.split("\n", 1)
+    shown = json.loads(body)
+    assert len(shown) == 30
+    per = {}
+    for h in shown:
+        per[h["file"]] = per.get(h["file"], 0) + 1
+        assert h["token_source"] == {"report_example": "ex",
+                                     "audit_marked_site_identifying": True}
+    assert max(per.values()) == 3
+    assert "Showing 30 of 60 hits" in head
+    # ordered by file, then diff order
+    assert [h["file"] for h in shown] == sorted(h["file"] for h in shown)
+    assert [h["added_line"] for h in shown[:3]] == ["line 0", "line 12",
+                                                    "line 24"]
 
 
 def test_partial_word_does_not_match(leerie, tmp_path):

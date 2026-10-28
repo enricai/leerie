@@ -108,6 +108,26 @@ anywhere in this run, and such an item stays `met=false` with evidence
 saying exactly that. Do not downgrade to "could not verify" when the
 record answers the question.
 
+## Typed evidence sections
+
+Your payload may carry two sections code computed on this tree; each
+appears only when it has something to show.
+
+- `SITE-TOKEN HITS`: lines this run's diff adds that name a token from
+  the report's site-identifying examples. They bear only on an item that
+  forbids naming the sites or plugins being fixed. Decide each hit: if
+  the added text names or identifies one of them, that item is unmet
+  and your evidence cites the line; a hit that does not (a generic
+  word, a guard that forbids the name) leaves it met.
+- `CONTRACT LITERAL FLAGS`: a worker recorded that its change depends on
+  another subtask honouring one exact value, and code found no
+  counterpart code honouring it as typed. Read both sides. If they
+  disagree and a required item depends on that contract, that item is
+  unmet and your evidence cites the mismatch; if they agree after all,
+  say where.
+
+Neither section is a verdict on its own.
+
 ## Defect contract
 
 When your payload carries a DEFECT CONTRACT section (the run's defect

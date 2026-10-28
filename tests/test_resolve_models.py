@@ -31,7 +31,8 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "task_coverage_judge", "artifact_registry", "integration_judge",
            "no_work_judge", "delivery_judge", "defect_scope_auditor",
            "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer",
-           "ci_checks", "scope_judge")
+           "ci_checks", "scope_judge", "pr_reviewer",
+           "contract_extractor")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -70,6 +71,10 @@ DEFAULTS = {
     # The report-bounded scope judge (DESIGN §8 *A task that points at a
     # report is bounded by the report's own scenarios*): MODEL_DEFAULT.
     "scope_judge": "sonnet",
+    # The advisory whole-PR review: the one documented opus exception
+    # (DESIGN §12; bench N2f). The contract extractor falls through.
+    "pr_reviewer": "opus",
+    "contract_extractor": "sonnet",
 }
 
 

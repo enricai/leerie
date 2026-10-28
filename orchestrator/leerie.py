@@ -540,12 +540,17 @@ STATE_FIELDS = (
     # resume checkpoint mirroring artifact_registry; injected into
     # planner ctx when applicable with non-empty sites.
     "defect_scope",
-    # site_token_warnings: advisory [{token, file}] from
-    # _warn_site_token_leaks after integration — a report's site-identifying
-    # token found in the run's added lines and absent from the base tree
-    # (DESIGN §5 *The report's own example inputs are captured too*).
-    # Never gates.
+    # site_token_warnings: advisory [{token, file, added_line,
+    # report_example}] from _warn_site_token_leaks after integration and
+    # again at the delivery recheck — a report's site-identifying token on a
+    # line the run's diff adds (DESIGN §5 *The report's own example inputs
+    # are captured too*). Evidence for the delivery judge; never gates.
     "site_token_warnings",
+    # contract_literal_checks: per worker-flagged contract `<sid>#<i>`, the
+    # contract_extractor's typed contract and the check's flag/why (DESIGN
+    # §8 *Typed evidence for the delivery judge*). pr_review: the advisory
+    # whole-PR review and its verified findings (DESIGN §9). Never gate.
+    "contract_literal_checks", "pr_review",
     # acceptance: the held-out acceptance record (DESIGN §8 *Held-out
     # acceptance tests*): {validity_base, written, sets[], skipped?, gate?}
     # — each valid set {index, valid, dir, defect_files[], control_files[],
@@ -1663,6 +1668,14 @@ MODEL_DEFAULT_PER_WORKER = {
     # rests on the base-tree-only tool scope + conservative default, not
     # the model tier.
     "satisfied_probe": "sonnet",
+    # pr_reviewer: the one advisory whole-PR review at finalize (DESIGN §9
+    # *An advisory whole-PR review feeds the final conformer*). Benched
+    # (bench/n2f, 66 calls per arm): opus at effort high returned 38
+    # verified findings that name no required item, sonnet high 8 and
+    # sonnet medium 7 — about 5x; of 18 opus findings hand-checked, 13 were
+    # real, 5 plausible and none false. It runs once per run and never
+    # gates, so the tier is spent where it finds what nothing else does.
+    "pr_reviewer": "opus",
 }
 # NOTE: with MODEL_DEFAULT now "sonnet", every worker not listed above
 # (all judgment workers, plus the post-run `judge` worker) also resolves
@@ -1753,6 +1766,13 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # report is bounded by the report's own scenarios*), benched at medium
     # (P2). Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
     "scope_judge": "medium",
+    # The advisory whole-PR review runs at `high`, as benched (bench/n2f
+    # arm R1, opus high); see its MODEL_DEFAULT_PER_WORKER entry.
+    "pr_reviewer": "high",
+    # Types one worker-flagged contract risk for the contract-literal check
+    # (DESIGN §8 *Typed evidence for the delivery judge*); benched at
+    # medium (bench/q5 n7d, q10).
+    "contract_extractor": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1885,7 +1905,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "integration_judge", "no_work_judge", "delivery_judge",
                 "defect_scope_auditor", "rebaser", "acceptance_writer",
                 "set_auditor", "surrogate_fixer", "ci_checks",
-                "scope_judge")
+                "scope_judge", "pr_reviewer", "contract_extractor")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1912,7 +1932,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "plan_overlap_judge", "adherence_judge", "task_coverage_judge",
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
     "delivery_judge", "defect_scope_auditor", "set_auditor", "ci_checks",
-    "scope_judge",
+    "scope_judge", "pr_reviewer", "contract_extractor",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -2462,6 +2482,11 @@ SITE_KIND_CLASS: dict[str, str] = {
     "other": "other",
 }
 CHANGE_KINDS = ("fix", "test", "docs", "other")
+# The advisory whole-PR review's finding kinds (DESIGN §9) and the
+# contract extractor's literal kinds (DESIGN §8), both as benched.
+PR_REVIEW_KINDS = ("unmet_requirement", "bug", "regression")
+CONTRACT_LITERAL_KINDS = ("string_value", "identifier", "route_path",
+                          "other")
 # The planner's typed blocker (DESIGN §8 *A partially blocked plan is
 # recorded*). Its external kind IS the implementer's (BLOCKER_KINDS, above):
 # `external_precondition` is the one kind either worker may type that ends
@@ -3178,6 +3203,54 @@ SCHEMAS: dict[str, dict] = {
                         "deploy", "release", "schedule_only", "manual_only",
                         "push_only", "reporting_only", "duplicate",
                         "external_action", "other"]}}}},
+        },
+    },
+    "pr_reviewer": {
+        # The advisory whole-PR review (DESIGN §9 *An advisory whole-PR
+        # review feeds the final conformer*), as benched (bench/n2f
+        # harness/review.py SCHEMA). Every finding quotes the file at HEAD;
+        # `_verify_pr_finding` checks the quote (and an item's span) by
+        # string containment, and an unverified finding is never handed on.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["findings"],
+        "properties": {
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_id", "kind", "path", "line_start",
+                                 "line_end", "quote", "item_span_quote",
+                                 "explanation"],
+                    "properties": {
+                        "item_id": {"type": ["string", "null"]},
+                        "kind": {"type": "string",
+                                 "enum": list(PR_REVIEW_KINDS)},
+                        "path": {"type": "string"},
+                        "line_start": {"type": "integer"},
+                        "line_end": {"type": "integer"},
+                        "quote": {"type": "string"},
+                        "item_span_quote": {"type": ["string", "null"]},
+                        "explanation": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
+    "contract_extractor": {
+        # Types one `external_contract_assumption` risk (DESIGN §8 *Typed
+        # evidence for the delivery judge*), as benched (bench/q10
+        # tools/schema2.json). Code validates both ids and the literal.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["counterpart_sid", "literal", "literal_kind", "symbol"],
+        "properties": {
+            "counterpart_sid": {"type": ["string", "null"]},
+            "literal": {"type": ["string", "null"]},
+            "literal_kind": {"type": "string",
+                             "enum": list(CONTRACT_LITERAL_KINDS)},
+            "symbol": {"type": ["string", "null"]},
         },
     },
     "rebaser": {
@@ -37685,6 +37758,7 @@ async def _delivery_judge_unmet(
         exec_digest: str = "",
         ground_truth: dict | None = None,
         routing: dict | None = None,
+        typed_evidence: list[str] | None = None,
         ) -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
     (confirmed_unmet, samples_used, contract_result).
@@ -37697,6 +37771,9 @@ async def _delivery_judge_unmet(
     their slice, run concurrently, and merge by `item_index`. The
     contract is asked of the first pack only. `routing`, when given, is
     filled with {external[], untouched[], packs} for the gate record.
+    `typed_evidence` sections (site-token hits, contract-literal flags —
+    `_delivery_typed_evidence`) are appended to every pack's prompt; with
+    none the prompt is byte-identical to a run without them.
 
     `contract_ctx` (the run's applicable defect audit: defect_shape +
     sites) adds the finding-level DEFECT CONTRACT section to the
@@ -37848,6 +37925,7 @@ async def _delivery_judge_unmet(
             avail = _format_ground_truth_availability(ground_truth)
             if avail:
                 sections.append(avail)
+        sections.extend(typed_evidence or [])
         sections.append(
             "Return one verdict per item_index per your schema. met=true "
             "only with cited on-tree evidence; when you cannot verify, "
@@ -42270,25 +42348,54 @@ def _site_tokens_from_scope(defect_scope: object) -> list[str]:
     return list(seen)
 
 
-def _warn_site_token_leaks(st: "State", leerie_dir: Path) -> list[dict]:
-    """Advisory: report any site-identifying token from the report's inline
-    examples that this run's diff adds and the base tree does not already
-    contain (DESIGN §5 *The report's own example inputs are captured
-    too*). Tokens are matched as whole words, case-insensitively, against
-    `git diff` added lines — mechanical string containment on an
-    LLM-extracted typed field, never prose interpretation. A token already
-    in the base tree is skipped: measured, that exclusion is what keeps
-    generic words ("go", "cruise") from flagging nearly every commit. It
-    also hides a leak that is already merged, which is why this never
-    gates. Returns the recorded hits."""
-    tokens = _site_tokens_from_scope(st.data.get("defect_scope"))
-    base = st.data.get("working_branch")
-    staging = leerie_dir / "worktrees" / "staging"
-    if not tokens or not base or not staging.is_dir():
-        return []
+# Site-token leak check (DESIGN §5 *The report's own example inputs are
+# captured too*; bench q5/n7a FROZEN.md, v2 boundaries). Every pattern below
+# reads source lines and paths — mechanical strings, never prose.
+#
+# A test file, by path (frozen rule 4a).
+_SITE_TOKEN_TEST_FILE_RE = re.compile(
+    r"\.(test|spec)\.[cm]?[jt]sx?$|(^|/)(tests?|__tests__)/|_test\.(py|go)$"
+    r"|(^|/)test_[^/]*\.py$")
+_SITE_TOKEN_DECL_RE = re.compile(
+    r"^(export\s+)?(const|let|var)\s+\w+(\s*:\s*[^=]+)?\s*=\s*\[")
+_SITE_TOKEN_PART_RE = re.compile(
+    r"""^(?:"([^"]*)"|'([^']*)'|`([^`]*)`|/([^/]*)/[a-z]*)$""")
+_SITE_TOKEN_BARE_RE = re.compile(r"^[A-Za-z0-9_.\-]+$")
+# What the delivery judge is shown (v2 rule 5'): the full list is persisted.
+_SITE_TOKEN_PER_FILE = 3
+_SITE_TOKEN_SENT = 30
+
+
+def _site_token_guard_line(path: str, text: str) -> bool:
+    """A denylist entry in a guard test, not a leak (frozen rule 4): the
+    file is a test file AND the added line is a bare term list — after one
+    leading `const X = [` and a trailing `];`, every comma-separated part
+    is a quoted literal or a regex literal whose inner text is one bare
+    term (`"bahamas",`, `[/acme/i, /widget/i]`). A fixture value such as
+    `name: "Acme"` is not."""
+    if not _SITE_TOKEN_TEST_FILE_RE.search(path):
+        return False
+    t = _SITE_TOKEN_DECL_RE.sub("", text.strip(), count=1)
+    t = re.sub(r"\]\s*;?$", "", t).strip()
+    parts = [x.strip() for x in t.split(",") if x.strip()]
+    if not parts:
+        return False
+    for part in parts:
+        m = _SITE_TOKEN_PART_RE.match(part)
+        if not m:
+            return False
+        inner = next(g for g in m.groups() if g is not None)
+        if not _SITE_TOKEN_BARE_RE.match(inner):
+            return False
+    return True
+
+
+def _diff_added_lines(cwd: Path, rev_range: list[str]) -> list[tuple[str, str]]:
+    """`(file, line)` for every line `git diff --unified=0 <range>` adds."""
     diff = subprocess.run(
-        ["git", "-C", str(staging), "diff", "--unified=0", f"{base}..HEAD"],
-        capture_output=True, text=True, check=False).stdout
+        ["git", "-C", str(cwd), "diff", "--unified=0", *rev_range],
+        capture_output=True, text=True, errors="replace",
+        check=False).stdout
     added: list[tuple[str, str]] = []
     current = ""
     for line in diff.splitlines():
@@ -42296,26 +42403,99 @@ def _warn_site_token_leaks(st: "State", leerie_dir: Path) -> list[dict]:
             current = line[6:]
         elif line.startswith("+") and not line.startswith("+++"):
             added.append((current, line[1:]))
-    hits: list[dict] = []
-    for tok in tokens:
-        in_base = subprocess.run(
-            ["git", "-C", str(staging), "grep", "-q", "-w", "-i", "-F",
-             "-e", tok, base, "--"],
-            capture_output=True, check=False).returncode == 0
-        if in_base:
+    return added
+
+
+def _warn_site_token_leaks(st: "State", leerie_dir: Path) -> list[dict]:
+    """Advisory evidence, never a gate: every line this run's diff adds
+    that names a site token from the report's inline examples (DESIGN §5
+    *The report's own example inputs are captured too*; bench q5/n7a).
+    Tokens are the audit's typed `site_tokens`; a hit is a case-insensitive
+    match on identifier-segment boundaries (`_`, `-`, `.`, `/` are
+    boundaries, so a token hits `Token_Forms_Field`), one per added line;
+    a guard test's bare term list (`_site_token_guard_line`) is not a hit.
+    There is no base-tree skip — measured, it made the check inert (0/74):
+    a leak already merged hid every later one.
+
+    Persists every hit as `site_token_warnings` [{token, file, added_line,
+    report_example}] and returns it. The hits reach the delivery judge as a
+    typed section (`_site_token_evidence_section`); nothing re-drives on a
+    hit alone."""
+    ds = st.data.get("defect_scope")
+    tokens = _site_tokens_from_scope(ds)
+    base = st.data.get("working_branch")
+    staging = leerie_dir / "worktrees" / "staging"
+    if not tokens or not base or not staging.is_dir():
+        return []
+    # Provenance: the inline example each token came from, preferring one
+    # the audit marked site-identifying.
+    source: dict[str, str] = {}
+    examples = (((ds or {}).get("ground_truth") or {})
+                .get("inline_examples") or [])
+    for e in sorted(examples, key=lambda e: not (
+            isinstance(e, dict) and e.get("site_identifying"))):
+        if not isinstance(e, dict):
             continue
-        pat = re.compile(rf"(?<!\w){re.escape(tok)}(?!\w)", re.IGNORECASE)
-        files = sorted({f for f, text in added if pat.search(text)})
-        hits.extend({"token": tok, "file": f} for f in files)
+        for t in e.get("site_tokens") or []:
+            source.setdefault(str(t).strip().lower(),
+                              str(e.get("literal") or "")[:300])
+    pats = [(t, re.compile(rf"(?<![A-Za-z0-9]){re.escape(t)}(?![A-Za-z0-9])",
+                           re.IGNORECASE)) for t in tokens]
+    hits: list[dict] = []
+    for f, text in _diff_added_lines(staging, [f"{base}..HEAD"]):
+        if _site_token_guard_line(f, text):
+            continue
+        tok = next((t for t, p in pats if p.search(text)), None)
+        if tok is not None:
+            hits.append({"token": tok, "file": f,
+                         "added_line": text.strip()[:200],
+                         "report_example": source.get(tok, "")})
     if hits:
-        log("  WARNING: this run's diff adds site-identifying name(s) from "
-            "the report's examples (the task may require a site-agnostic "
-            "repo; advisory only):")
-        for h in hits:
+        log(f"  site tokens: {len(hits)} added line(s) name a site token "
+            "from the report's examples (evidence for the delivery judge; "
+            "advisory):")
+        for h in hits[:10]:
             log(f"    • {h['token']!r} in {h['file']}")
     st.data["site_token_warnings"] = hits
     st.save()
     return hits
+
+
+def _site_token_evidence_section(hits: list[dict]) -> str | None:
+    """The delivery judge's SITE-TOKEN HITS section (bench n6b arm C, the
+    adopted wording), or None with no hits — so a run without hits sends
+    the judge a byte-identical prompt. At most `_SITE_TOKEN_PER_FILE` per
+    file and `_SITE_TOKEN_SENT` in all, ordered by file then diff order,
+    with the total stated."""
+    if not hits:
+        return None
+    sent: list[dict] = []
+    per: dict[str, int] = {}
+    for i, h in sorted(enumerate(hits), key=lambda x: (x[1]["file"], x[0])):
+        if per.get(h["file"], 0) >= _SITE_TOKEN_PER_FILE:
+            continue
+        per[h["file"]] = per.get(h["file"], 0) + 1
+        sent.append({"token": h["token"], "file": h["file"],
+                     "added_line": h["added_line"],
+                     "token_source": {
+                         "report_example": h.get("report_example") or "",
+                         "audit_marked_site_identifying": True}})
+        if len(sent) >= _SITE_TOKEN_SENT:
+            break
+    note = (f" Showing {len(sent)} of {len(hits)} hits (truncated: at most "
+            f"{_SITE_TOKEN_PER_FILE} per file, {_SITE_TOKEN_SENT} total)."
+            if len(sent) < len(hits) else "")
+    return (
+        "SITE-TOKEN HITS (mechanical evidence for any required item that "
+        "forbids naming the sites or plugins being fixed — a negative "
+        "constraint; it bears on no other item): case-insensitive matches, "
+        "on identifier-segment boundaries, of the report's site-identifying "
+        "tokens against the lines THIS RUN'S DIFF ADDS. A hit is a lead, not "
+        "a verdict: decide for each whether the added text names or "
+        "identifies a plugin/site being fixed; if any does, that item is "
+        "unmet and your evidence must cite it. The list does not prove the "
+        "absence of other site names." + note + "\n"
+        + json.dumps(sent, indent=2))
 
 
 def _log_delivery_routing(routing: dict) -> None:
@@ -42400,17 +42580,23 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
             f"({type(e).__name__}) — judging without the record")
         exec_digest = ""
     routing: dict = {}
+    # Typed evidence (DESIGN §8 *Typed evidence for the delivery judge*):
+    # the site-token hits `_run_phases` just recorded, and the
+    # contract-literal check on this tree.
+    evidence, ev_counts = _delivery_typed_evidence(
+        st, leerie_dir, refresh_tokens=False)
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="pre", contract_ctx=contract_ctx,
             exec_digest=exec_digest, ground_truth=ground_truth,
-            routing=routing)
+            routing=routing, typed_evidence=evidence)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge crashed ({_brief_worker_exc(e)}); "
             "gate skipped (advisory)")
         return []
-    gate: dict = {"unmet_before": unmet, "samples_before": n}
+    gate: dict = {"unmet_before": unmet, "samples_before": n,
+                  "evidence_before": ev_counts}
     if routing:
         gate["routed_before"] = routing
         _log_delivery_routing(routing)
@@ -42493,18 +42679,23 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
             f"({type(e).__name__}) — judging without the record")
         exec_digest = ""
     routing: dict = {}
+    # Recomputed: the final conformer may have changed what the hits and
+    # flags were about.
+    evidence, ev_counts = _delivery_typed_evidence(
+        st, leerie_dir, refresh_tokens=True)
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="recheck", contract_ctx=contract_ctx,
             exec_digest=exec_digest, ground_truth=ground_truth,
-            routing=routing)
+            routing=routing, typed_evidence=evidence)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
             "residual unrecorded (advisory)")
         return
     gate["unmet_after"] = unmet
     gate["samples_after"] = n
+    gate["evidence_after"] = ev_counts
     if routing:
         gate["routed_after"] = routing
     if contract is not None:
@@ -42536,6 +42727,577 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     else:
         log("  delivery gate: all previously-unmet required items "
             "verified remedied")
+
+
+# --- Contract literals (DESIGN §8 *Typed evidence for the delivery judge*;
+# bench q10 FROZEN_v7.md, check7e) ------------------------------------------
+#
+# An implementer's `external_contract_assumption` risk is typed by the
+# contract_extractor worker ({counterpart_sid, literal, literal_kind,
+# symbol}); everything below compares paths and source lines — mechanical
+# strings. The benched check read JS/TS repos; the code-file and test-file
+# patterns add the common other languages' spellings.
+_CONTRACT_TEST_FILE_RE = re.compile(
+    r"(^|/)(tests?|__tests__|e2e)/|\.(test|spec)\.[jt]sx?$"
+    r"|(^|/)test_[^/]*\.py$|_test\.(py|go)$")
+_CONTRACT_CODE_FILE_RE = re.compile(
+    r"\.(ts|tsx|js|jsx|mjs|cjs|py|go|rb|rs|java|kt|php|cs|swift)$")
+# v7e rule 1: only a plain token literal is checked.
+_CONTRACT_TOKEN_RE = re.compile(r"^[A-Za-z_$][\w.:\-$]*$")
+_CONTRACT_STR_TOKEN_RE = re.compile(
+    r"""(["'`])([A-Za-z][A-Za-z0-9_.:\-]{1,60})\1""")
+_CONTRACT_ID_TOKEN_RE = re.compile(r"(?<![\w$])([A-Za-z_$][\w$]{2,60})(?![\w$])")
+_CONTRACT_ROUTER_FILE_RE = re.compile(r"(^|/)app/.*(page|route)\.(t|j)sx?$")
+_CONTRACT_ROUTE_FILE_RE = re.compile(r"/(page|route)\.(t|j)sx?$")
+_CONTRACT_CHECKED_KINDS = ("string_value", "identifier", "route_path")
+
+
+def _contract_matcher(kind: str, lit: str) -> "re.Pattern[str] | None":
+    if kind == "string_value":
+        return re.compile(r"([\"'`])" + re.escape(lit) + r"\1")
+    if kind == "identifier":
+        return re.compile(r"(?<![\w$])" + re.escape(lit) + r"(?![\w$])")
+    return None
+
+
+def _contract_route_segments(lit: str) -> list[str]:
+    parts = lit.split("?", 1)[0].strip("/").split("/")
+    return [p for p in parts if p and not p.startswith(("{", "[", ":"))]
+
+
+def _contract_path_serves(path: str, segs: list[str]) -> bool:
+    """An app-router page/route file whose trailing non-group, non-dynamic
+    directory segments equal the route's."""
+    if not segs or not _CONTRACT_ROUTE_FILE_RE.search(path):
+        return False
+    parts = [x for x in path.split("/")[:-1]
+             if not (x.startswith("(") or x.startswith("["))]
+    return parts[-len(segs):] == segs
+
+
+def _contract_near_variant(lit: str, tok: str) -> bool:
+    """v7e rule 3: equal once case and `-_.:` are dropped, a plural, or a
+    raw prefix of at least 4 chars and half the length that ends inside a
+    word (`auto`|`pay`, not `settings`|`:read`)."""
+    if tok == lit:
+        return False
+
+    def norm(x: str) -> str:
+        return re.sub(r"[-_.:]", "", x.lower())
+    a, b = norm(lit), norm(tok)
+    if a == b or a + "s" == b or b + "s" == a:
+        return True
+    short, long_ = sorted((lit, tok), key=len)
+    return (len(short) >= 4 and long_.startswith(short)
+            and len(short) / len(long_) >= 0.5
+            and long_[len(short)].isalnum())
+
+
+def _contract_literal_verdict(ext: dict, *, tree_files: list[str],
+                              grep: list[tuple[str, str]],
+                              own_files: set[str],
+                              cp_added: list[tuple[str, str]] | None
+                              ) -> tuple[bool, str]:
+    """`(flag, why)` for one typed contract (bench q10 check7e, transcribed
+    rule for rule). `tree_files` is the final tree's file list, `grep` the
+    `(path, line)` pairs of the final tree containing the literal, `own_files`
+    the owner's integration diff files, `cp_added` the counterpart's
+    integration diff added lines (None: not integrated)."""
+    cp = ext.get("counterpart_sid")
+    lit = ext.get("literal")
+    kind = ext.get("literal_kind")
+    sym = ext.get("symbol")
+    if (lit and kind in ("string_value", "identifier")
+            and not _CONTRACT_TOKEN_RE.match(lit)):
+        return False, "not a token literal"
+    if (not cp or not lit or ext.get("literal_unverified")
+            or kind not in _CONTRACT_CHECKED_KINDS):
+        return False, "no check"
+    if kind == "route_path":
+        if not any(_CONTRACT_ROUTER_FILE_RE.search(p) for p in tree_files):
+            return False, "no app router"
+        segs = _contract_route_segments(lit)
+        if any(_contract_path_serves(p, segs) for p in tree_files):
+            return False, "served in the final tree"
+        pat = re.compile(re.escape(lit.split("?")[0]) + r"(?![\w\-/])")
+        if cp_added is not None and any(
+                pat.search(t) for f, t in cp_added
+                if not _CONTRACT_TEST_FILE_RE.search(f)):
+            return False, "on a counterpart added line"
+        return True, "route not served"
+    if sym and cp_added is not None and any(
+            re.search(rf"(?<![\w$]){re.escape(sym)}(?![\w$])", t)
+            for _f, t in cp_added):
+        return False, "symbol used by the counterpart"
+    m = _contract_matcher(kind, lit)
+    if cp_added is None:
+        present = any(p not in own_files and m.search(t) for p, t in grep)
+        return (not present), ("counterpart not integrated; "
+                               + ("present" if present else "absent")
+                               + " outside the owner's files")
+    if any(m.search(t) for _f, t in cp_added):
+        return False, "on a counterpart added line"
+    # v7e rule 2: only non-test code outside the owner's files honours it.
+    honoured = any(
+        p not in own_files and not _CONTRACT_TEST_FILE_RE.search(p)
+        and _CONTRACT_CODE_FILE_RE.search(p) and m.search(t)
+        for p, t in grep)
+    if not honoured:
+        return True, "counterpart diff missing"
+    # v7e rule 3: honoured elsewhere, but the counterpart emits a variant.
+    rx = _CONTRACT_STR_TOKEN_RE if kind == "string_value" \
+        else _CONTRACT_ID_TOKEN_RE
+    for f, t in cp_added:
+        if _CONTRACT_TEST_FILE_RE.search(f):
+            continue
+        for mm in rx.finditer(t):
+            tok = mm.group(2) if kind == "string_value" else mm.group(1)
+            if _contract_near_variant(lit, tok):
+                return True, f"counterpart emits a near-variant {tok!r}"
+    return False, "honoured in non-test code"
+
+
+def _integration_commit(staging: Path, sid: str) -> str | None:
+    """The newest first-parent `leerie: integrate <sid>` merge at HEAD."""
+    out = subprocess.run(
+        ["git", "-C", str(staging), "log", "--first-parent",
+         "--format=%H%x09%s", "HEAD"],
+        capture_output=True, text=True, check=False).stdout
+    for line in out.splitlines():
+        sha, _, subject = line.partition("\t")
+        if subject == f"leerie: integrate {sid}":
+            return sha
+    return None
+
+
+def _contract_risks(st: "State") -> list[tuple[str, str, int, dict]]:
+    """`(key, owner sid, index, risk)` for every `external_contract_assumption`
+    on the risk register, in sid order."""
+    out: list[tuple[str, str, int, dict]] = []
+    reg = st.data.get("risk_register") or {}
+    for sid in sorted(reg):
+        for i, r in enumerate(reg.get(sid) or []):
+            if (isinstance(r, dict)
+                    and r.get("kind") == "external_contract_assumption"):
+                out.append((f"{sid}#{i}", sid, i, r))
+    return out
+
+
+async def _extract_contract_literals(leerie_dir: Path, st: "State",
+                                     caps: dict, models: dict[str, str],
+                                     efforts: dict[str, str | None]) -> None:
+    """Type each worker-flagged contract once (DESIGN §8 *Typed evidence
+    for the delivery judge*): the contract_extractor reads the risk and the
+    run's subtask titles. Code keeps a counterpart only when it is another
+    subtask of this run, and marks a literal not found verbatim in the
+    risk's own text `literal_unverified` (bench q10 extract10.py). Cached
+    in `contract_literal_checks` by `<sid>#<index>`, so a resume never
+    re-asks. Advisory: a worker failure records `error` and moves on."""
+    risks = _contract_risks(st)
+    if not risks:
+        return
+    records = st.data.setdefault("contract_literal_checks", {})
+    todo = [x for x in risks if x[0] not in records]
+    if not todo:
+        return
+    try:
+        plan = json.loads((Path(leerie_dir) / "plan.json").read_text())
+        specs = plan.get("subtasks") or {}
+    except (OSError, ValueError):
+        specs = {}
+    subtasks = [{"id": sid, "title": str((spec or {}).get("title") or "")[:200]}
+                for sid, spec in sorted(specs.items())
+                if isinstance(spec, dict)]
+    ids = {s["id"] for s in subtasks}
+    log(f"phase 5: contract literals — typing {len(todo)} worker-flagged "
+        "contract(s)")
+    sem = asyncio.Semaphore(max(1, int(caps.get("max_parallel") or 1)))
+
+    async def _one(key: str, sid: str, idx: int, risk: dict) -> None:
+        rec: dict = {"owner_sid": sid, "risk_index": idx,
+                     "detail": risk.get("detail") or "",
+                     "where": risk.get("where") or ""}
+        user = ("RISK:\n" + json.dumps(
+            {"sid": sid, "kind": risk.get("kind"),
+             "detail": rec["detail"], "where": rec["where"] or None},
+            indent=1) + "\n\nSUBTASKS:\n" + json.dumps(subtasks, indent=1))
+        async with sem:
+            try:
+                st.bump_workers(caps)
+                out = await claude_p(
+                    user_prompt=user,
+                    system_prompt=_load_prompt("contract_extractor"),
+                    schema_key="contract_extractor", cwd=_judgment_cwd(st),
+                    allowed_tools="Read", max_turns=4, autonomous=False,
+                    caps=caps, st=st,
+                    model=models.get("contract_extractor", MODEL_DEFAULT),
+                    effort=efforts.get("contract_extractor"),
+                    sid=f"contract_extractor-{sid}-{idx}")
+            except (WorkerError, subprocess.TimeoutExpired) as e:
+                rec["error"] = _brief_worker_exc(e)
+                records[key] = rec
+                st.save()
+                return
+        ext = {k: out.get(k) for k in ("counterpart_sid", "literal",
+                                        "literal_kind", "symbol")}
+        if ext["counterpart_sid"] not in ids or ext["counterpart_sid"] == sid:
+            ext["counterpart_sid"] = None
+        lit = ext["literal"]
+        if isinstance(lit, str) and lit and lit not in (
+                rec["detail"] + " " + rec["where"]):
+            ext["literal_unverified"] = True
+        rec["extracted"] = ext
+        records[key] = rec
+        st.save()
+
+    await _gather_or_cancel(*(_one(*x) for x in todo))
+
+
+def _check_contract_literals(st: "State", leerie_dir: Path) -> list[dict]:
+    """Run the v7e check over every typed contract against the staging tree
+    as it is now, writing `flag` / `why` onto each `contract_literal_checks`
+    record; returns the flagged records. Never raises."""
+    records = st.data.get("contract_literal_checks") or {}
+    staging = leerie_dir / "worktrees" / "staging"
+    if not records or not staging.is_dir():
+        return []
+    try:
+        tree = subprocess.run(
+            ["git", "-C", str(staging), "ls-tree", "-r", "--name-only",
+             "HEAD"], capture_output=True, text=True,
+            check=False).stdout.splitlines()
+        added: dict[str, list[tuple[str, str]] | None] = {}
+        files: dict[str, set[str]] = {}
+
+        def _side(sid: str) -> None:
+            if sid in added:
+                return
+            sha = _integration_commit(staging, sid)
+            if sha is None:
+                added[sid], files[sid] = None, set()
+                return
+            added[sid] = _diff_added_lines(staging, [f"{sha}^1", sha])
+            files[sid] = set(subprocess.run(
+                ["git", "-C", str(staging), "diff", "--name-only",
+                 f"{sha}^1", sha], capture_output=True, text=True,
+                check=False).stdout.split())
+
+        flagged: list[dict] = []
+        for key in sorted(records):
+            rec = records[key]
+            ext = rec.get("extracted")
+            if not isinstance(ext, dict):
+                continue
+            lit = ext.get("literal") or ""
+            grep: list[tuple[str, str]] = []
+            if lit:
+                out = subprocess.run(
+                    ["git", "-C", str(staging), "grep", "-n", "-F", "-e",
+                     lit, "HEAD", "--"], capture_output=True, text=True,
+                    errors="replace", check=False).stdout
+                for line in out.splitlines():
+                    parts = line.split(":", 3)
+                    if len(parts) == 4:
+                        grep.append((parts[1], parts[3]))
+            _side(rec["owner_sid"])
+            cp = ext.get("counterpart_sid")
+            if cp:
+                _side(cp)
+            flag, why = _contract_literal_verdict(
+                ext, tree_files=tree, grep=grep,
+                own_files=files[rec["owner_sid"]],
+                cp_added=added.get(cp) if cp else None)
+            rec["flag"], rec["why"] = flag, why
+            if flag:
+                flagged.append(rec)
+        st.save()
+        if flagged:
+            log(f"  contract literals: {len(flagged)} worker-flagged "
+                "contract(s) not honoured by their counterpart (evidence "
+                "for the delivery judge): " + "; ".join(
+                    f"{r['owner_sid']} -> {r['extracted']['counterpart_sid']}"
+                    f" {r['extracted']['literal']!r} ({r['why']})"
+                    for r in flagged[:5]))
+        return flagged
+    except Exception as e:
+        log(f"  contract literals: check errored ({type(e).__name__}: {e}); "
+            "no evidence sent")
+        return []
+
+
+def _contract_literal_evidence_section(flagged: list[dict]) -> str | None:
+    """The delivery judge's CONTRACT LITERAL FLAGS section, or None."""
+    if not flagged:
+        return None
+    rows = [{"owner_sid": r["owner_sid"],
+             "counterpart_sid": r["extracted"].get("counterpart_sid"),
+             "literal": r["extracted"].get("literal"),
+             "literal_kind": r["extracted"].get("literal_kind"),
+             "why": r.get("why"), "risk": r.get("detail")}
+            for r in flagged[:20]]
+    return (
+        "CONTRACT LITERAL FLAGS (mechanical evidence): a worker recorded "
+        "that its change is correct only if another subtask of this run "
+        "honours one exact value, and the integrated tree's code does not "
+        "show that subtask honouring it as typed (`why`). A flag is a lead, "
+        "not a verdict: read both sides; if they disagree and a required "
+        "item depends on that contract, that item is unmet and your "
+        "evidence must cite the mismatch.\n" + json.dumps(rows, indent=2))
+
+
+def _delivery_typed_evidence(st: "State", leerie_dir: Path, *,
+                             refresh_tokens: bool) -> tuple[list[str], dict]:
+    """The typed evidence sections for the delivery judge (N7a, N7d) and
+    their counts, recomputed on the staging tree as it is now. Never
+    raises: an error sends no section."""
+    sections: list[str] = []
+    counts = {"site_token_hits": 0, "contract_flags": 0}
+    try:
+        hits = (_warn_site_token_leaks(st, leerie_dir) if refresh_tokens
+                else (st.data.get("site_token_warnings") or []))
+        sec = _site_token_evidence_section(hits)
+        if sec:
+            sections.append(sec)
+            counts["site_token_hits"] = len(hits)
+    except Exception as e:
+        log(f"  site-token evidence errored ({type(e).__name__}: {e})")
+    flagged = _check_contract_literals(st, leerie_dir)
+    sec = _contract_literal_evidence_section(flagged)
+    if sec:
+        sections.append(sec)
+        counts["contract_flags"] = len(flagged)
+    return sections, counts
+
+
+# --- The advisory whole-PR review (DESIGN §9 *An advisory whole-PR review
+# feeds the final conformer*; bench n2f) --------------------------------------
+
+PR_REVIEW_MAX_TURNS = 150
+# Bounds the diff in the payload; a larger diff is cut and says so (the
+# reviewer can still read the tree and run git itself).
+_PR_REVIEW_DIFF_MAX = 600_000
+# Verified findings the final conformer is shown.
+_PR_REVIEW_SHOWN = 20
+_PR_ITEM_ID_RE = re.compile(r"(?:item\s*|i)?#?\s*(\d+|contract)")
+
+
+def _pr_review_items(st: "State") -> list[dict]:
+    """REQUIRED ITEMS as the reviewer sees them: `{item_id, text}` by
+    position, plus the audited defect contract as `contract`."""
+    items: list[dict] = []
+    for i, it in enumerate(st.data.get("required_items") or []):
+        text = it.get("item") if isinstance(it, dict) else it
+        if not isinstance(text, str):
+            text = json.dumps(text, sort_keys=True)
+        items.append({"item_id": str(i), "text": text})
+    ds = st.data.get("defect_scope") or {}
+    if ds.get("applicable") and ds.get("sites"):
+        items.append({"item_id": "contract", "text": json.dumps(
+            {"defect_shape": ds.get("defect_shape") or "",
+             "sites": ds.get("sites")}, indent=1, ensure_ascii=False)})
+    return items
+
+
+def _ws_norm(s: str) -> str:
+    return " ".join((s or "").split())
+
+
+def _verify_pr_finding(f: dict, staging: Path, items: list[dict]) -> dict:
+    """The bench's mechanical check (n2f review.py `verify_finding`), on
+    strings only: the quote must occur in the file at HEAD (whitespace-
+    normalised, raw or with diff markers stripped); `line_ok` whether it
+    sits within 5 lines of the claimed range; an `item_id` must name a
+    listed item and its `item_span_quote` must occur in that item's text.
+    `verified` is the quote check — an unverified finding is never handed
+    on."""
+    out: dict = {}
+    path = str(f.get("path") or "").strip()
+    if path.startswith("./"):
+        path = path[2:]
+    blob = subprocess.run(["git", "-C", str(staging), "show", f"HEAD:{path}"],
+                          capture_output=True, text=True, errors="replace",
+                          check=False)
+    content = blob.stdout if blob.returncode == 0 else None
+    q = str(f.get("quote") or "")
+    stripped = "\n".join(ln[1:] if ln[:1] in "+ " else ln
+                         for ln in q.split("\n"))
+    quote_ok, line_ok, used = False, None, q
+    if content is not None and _ws_norm(q):
+        nc = _ws_norm(content)
+        for cand in (q, stripped):
+            if _ws_norm(cand) and _ws_norm(cand) in nc:
+                quote_ok, used = True, cand
+                break
+        if quote_ok:
+            first = _ws_norm(used.strip().split("\n")[0])
+            hits = [n + 1 for n, ln in enumerate(content.split("\n"))
+                    if first and first in _ws_norm(ln)]
+            lo = int(f.get("line_start") or 0)
+            hi = max(int(f.get("line_end") or 0), lo)
+            line_ok = (any(lo - 5 <= h <= hi + 5 for h in hits)
+                       if hits else None)
+    iid = f.get("item_id")
+    norm_id = None
+    if iid is not None:
+        sid = str(iid).strip().lower()
+        m = _PR_ITEM_ID_RE.fullmatch(sid)
+        norm_id = m.group(1) if m else sid
+    item = next((it for it in items if it["item_id"] == norm_id), None) \
+        if norm_id is not None else None
+    span_ok = None
+    if norm_id is not None:
+        sq = str(f.get("item_span_quote") or "")
+        pieces = [_ws_norm(p).strip("\"'“”‘’ ").casefold()
+                  for p in re.split(r"\.\.\.|…", sq)]
+        pieces = [p for p in pieces if p]
+        span_ok = bool(item and pieces and all(
+            p in _ws_norm(item["text"]).casefold() for p in pieces))
+    out.update({"path_exists": content is not None, "quote_ok": quote_ok,
+                "line_ok": line_ok, "item_id_norm": norm_id,
+                "item_known": (item is not None) if norm_id is not None
+                else None,
+                "span_ok": span_ok, "verified": quote_ok})
+    return out
+
+
+async def _git_out(cwd: Path, *args: str) -> str:
+    p = await run_proc(["git", *args], cwd=str(cwd))
+    return p.stdout if p.returncode == 0 else ""
+
+
+async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
+                         models: dict[str, str],
+                         efforts: dict[str, str | None]) -> dict | None:
+    """One advisory review of the whole PR (DESIGN §9 *An advisory whole-PR
+    review feeds the final conformer*): the pr_reviewer reads the task, its
+    reports, the required items and the full diff from `working_branch`,
+    in the staging tree, read-only, and may run the repo's build verbs to
+    confirm a suspicion. Each finding is checked by `_verify_pr_finding`.
+    Persists `pr_review` and returns it. Never gates: nothing reads it
+    except the final conformer's prompt and the PR; a crash is recorded.
+
+    Runs once: skipped when `pr_review` exists or the final conformance
+    already ran (resume). Anything the reviewer changed in the tree is
+    reverted (`tree_restored`)."""
+    if "pr_review" in st.data:
+        return st.data["pr_review"]
+    if (st.data.get("conformance") or {}).get("_final") is not None:
+        return None
+    base = st.data.get("working_branch")
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not base or not staging.is_dir():
+        return None
+    log("phase 5: advisory whole-PR review (DESIGN §9)")
+    st.data["current_phase"] = "phase 5: pr review"
+    st.save()
+    task = st.data.get("task", "")
+    items = _pr_review_items(st)
+    diff = await _git_out(staging, "diff", f"{base}...HEAD")
+    names = await _git_out(staging, "diff", "--name-only", f"{base}...HEAD")
+    head = (await _git_out(staging, "rev-parse", "HEAD")).strip()
+    cut = len(diff) > _PR_REVIEW_DIFF_MAX
+    parts = ["TASK:", task.strip(), ""]
+    try:
+        reports = _d1_report_sources(task, Path(st.repo_root))
+    except Exception:
+        reports = {}
+    for rel, text in reports.items():
+        parts += [f"REFERENCED REPORT `{rel}` (the task points at this "
+                  "file; full contents):", text.strip(), ""]
+    parts += ["REQUIRED ITEMS (derived from the task; use these ids for "
+              "`item_id`):", json.dumps(items, indent=1, ensure_ascii=False),
+              "",
+              f"PULL REQUEST: base `{base}`, head {head} (checked out in "
+              "your cwd).",
+              "CHANGED FILES:", names.strip(), "",
+              f"FULL DIFF (`git diff {base}...HEAD`)"
+              + (f" — cut at {_PR_REVIEW_DIFF_MAX} characters; read the "
+                 "rest with git" if cut else "") + ":",
+              "```diff", diff[:_PR_REVIEW_DIFF_MAX].rstrip("\n"), "```", "",
+              "Review this PR and return your findings per your schema."]
+    untracked0 = set((await _git_out(
+        staging, "ls-files", "--others", "--exclude-standard",
+        "-z")).split("\0"))
+    dirty0 = bool((await _git_out(
+        staging, "status", "--porcelain", "--untracked-files=no")).strip())
+    record: dict = {"base": base, "head": head,
+                    "model": models.get("pr_reviewer", MODEL_DEFAULT),
+                    "effort": efforts.get("pr_reviewer"),
+                    "diff_cut": cut, "findings": []}
+    try:
+        st.bump_workers(caps)
+        out = await claude_p(
+            user_prompt="\n".join(parts),
+            system_prompt=_load_prompt("pr_reviewer"),
+            schema_key="pr_reviewer", cwd=str(staging),
+            allowed_tools=_widen_inspect_tools(INSPECT_TOOLS, staging),
+            max_turns=PR_REVIEW_MAX_TURNS, autonomous=False, caps=caps,
+            st=st, model=record["model"], effort=record["effort"],
+            sid="pr_reviewer")
+    except (WorkerError, subprocess.TimeoutExpired) as e:
+        record["error"] = _brief_worker_exc(e)
+        out = None
+    # Read-only means read-only: whatever a test run or formatter left is
+    # undone, so the final conformer starts from the integrated tree.
+    restored = False
+    if (await _git_out(staging, "rev-parse", "HEAD")).strip() != head:
+        await run_proc(["git", "reset", "-q", "--hard", head],
+                       cwd=str(staging))
+        restored = True
+    elif not dirty0 and (await _git_out(
+            staging, "status", "--porcelain",
+            "--untracked-files=no")).strip():
+        await run_proc(["git", "checkout", "--", "."], cwd=str(staging))
+        restored = True
+    for rel in set((await _git_out(
+            staging, "ls-files", "--others", "--exclude-standard",
+            "-z")).split("\0")) - untracked0:
+        if rel and (staging / rel).is_file():
+            with contextlib.suppress(OSError):
+                (staging / rel).unlink()
+                restored = True
+    record["tree_restored"] = restored
+    if out is not None:
+        for f in out.get("findings") or []:
+            if isinstance(f, dict):
+                record["findings"].append(
+                    {**f, **_verify_pr_finding(f, staging, items)})
+    record["n_findings"] = len(record["findings"])
+    record["n_verified"] = sum(1 for f in record["findings"]
+                               if f["verified"])
+    record["at"] = now()
+    st.data["pr_review"] = record
+    st.save()
+    if "error" in record:
+        log(f"  pr review: reviewer failed ({record['error']}); advisory, "
+            "continuing")
+    else:
+        log(f"  pr review: {record['n_findings']} finding(s), "
+            f"{record['n_verified']} with a verified quote — handed to the "
+            "final conformer (advisory)")
+    return record
+
+
+def _format_pr_review_section(st: "State") -> str | None:
+    """The final conformer's ADVISORY WHOLE-PR REVIEW section: the verified
+    findings only, or None."""
+    rec = st.data.get("pr_review") or {}
+    shown = [{k: f.get(k) for k in ("kind", "item_id", "path", "line_start",
+                                    "line_end", "quote", "explanation")}
+             for f in (rec.get("findings") or []) if f.get("verified")]
+    if not shown:
+        return None
+    more = len(shown) - _PR_REVIEW_SHOWN
+    shown = shown[:_PR_REVIEW_SHOWN]
+    return (
+        "ADVISORY WHOLE-PR REVIEW: an independent reviewer read this run's "
+        "whole diff before this pass; each finding's quote was checked "
+        "verbatim against the file. Advisory — nothing here is required and "
+        "nothing waits on it. For each finding, check the code: fix the "
+        "ones that are real, within the run's task, and leave any you can "
+        "show is wrong."
+        + (f" ({more} more not shown.)" if more > 0 else "") + "\n"
+        + json.dumps(shown, indent=2, ensure_ascii=False))
 
 
 async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
@@ -42682,6 +43444,10 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         if unmet_required_items or _contract_unmet is not None:
             up.append(_format_unmet_required_items_section(
                 unmet_required_items, _contract_unmet))
+        # The advisory whole-PR review (DESIGN §9): verified findings only.
+        _pr_section = _format_pr_review_section(st)
+        if _pr_section:
+            up.append(_pr_section)
         _append_conformer_context_sections(up, pre, "full", st)
         if blt_feedback is not None:
             up.append(blt_feedback)
@@ -47624,6 +48390,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         # Advisory output must never abort a run.
         log(f"site-token check errored ({type(e).__name__}: {e}); continuing")
+    # Worker-flagged contracts typed once, for the delivery judge's
+    # contract-literal evidence (DESIGN §8). Advisory.
+    try:
+        await _extract_contract_literals(leerie_dir, st, caps, models,
+                                         efforts)
+    except Exception as e:
+        log(f"contract-literal extraction raised {type(e).__name__}: {e} "
+            "— no contract evidence, continuing")
     # Delivery gate, first half (DESIGN §8 *The delivery gate*): verify
     # the integrated tree against required_items and hand any
     # confirmed-unmet items to the final-conformer pass below. Advisory
@@ -47635,6 +48409,13 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"delivery gate (pre) raised {type(e).__name__}: {e} — "
             "surfaced as advisory, continuing")
+    # The advisory whole-PR review (DESIGN §9): its findings go to the final
+    # conformer below and to the PR; they never gate or touch the outcome.
+    try:
+        await _run_pr_review(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"pr review raised {type(e).__name__}: {e} — surfaced as "
+            "advisory, continuing")
     # Final-tree conformance pass on the integrated staging worktree
     # (DESIGN §6 *Worktree and integration model*, final-tree pass).
     # Advisory — never raises; failure modes surface in

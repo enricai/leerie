@@ -194,6 +194,10 @@ for whenever the CLI renames a tool.
   documented reason: it runs once per subtask and throughput dominates,
   with correctness resting on its base-tree-only tool scope rather than
   model tier — see the comment at its `MODEL_DEFAULT_PER_WORKER` entry).
+  `pr_reviewer` is the one worker on `opus` (effort `high`): the advisory
+  whole-PR review, which never gates, measured at about 5x sonnet's
+  verified findings on code no required item names (bench N2f; the
+  reason is at its `MODEL_DEFAULT_PER_WORKER` entry and DESIGN §12).
 - **Caps are real Python counters in `DEFAULT_CAPS`**, not prompt
   instructions. Adding a new cap means adding a counter and a check, not
   asking a worker to bound itself.

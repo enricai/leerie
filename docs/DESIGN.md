@@ -421,7 +421,9 @@ subtask it tests). Three mechanisms reconcile that coupling:
   requirements; the `site_tokens` back an advisory, never gating,
   diff check after integration — measured precision 100% but recall
   only 1 of 3 leaking commits across 36 shipped commits, because a
-  leak already present in the base tree hides later ones.
+  leak already present in the base tree hid later ones. That skip is
+  gone; the hits are now evidence for the delivery judge (§8 *Typed
+  evidence for the delivery judge*).
 
   **Every site carries a disposition.** Listing a site is not deciding
   it. The dominant cause of serial narrow fixing — 5 of 11 historical
@@ -6015,6 +6017,57 @@ was unchanged (2/14 against (c)'s 2/14 on the same cases), its false
 unmet rose to 7.4% (conservative), and the re-judge made a pass 8.6×
 on average and 15–32× on large tasks.
 
+**Typed evidence for the delivery judge.** Two mechanical checks hand
+the judge evidence it would otherwise have to find by reading, each as
+a section of its prompt that is present only when there is something to
+show (a run without either sends a byte-identical prompt). Neither ever
+re-drives on its own: what happens to an item is the judge's verdict,
+under the same dispute vote.
+
+- **Site tokens.** When the report's inline examples carry
+  site-identifying tokens (§5 *The report's own example inputs are
+  captured too*), every line the run's diff adds is matched against
+  them, case-insensitively, on identifier-segment boundaries (`_`, `-`,
+  `.`, `/` separate segments, so a token is found inside
+  `Token_Forms_Field`). A guard test's bare term list — a test file
+  whose added line is nothing but quoted or regex literals of single
+  terms — is a denylist, not a leak, and is not a hit. There is no
+  base-tree skip. Hits, with the report example each token came from,
+  go to the judge for any item that forbids naming the sites (at most 3
+  per file and 30 in all, the total stated). Measured (bench Q5/N7a,
+  whole-word rules): with the base-tree skip the check was inert (0 of
+  74); without it and with the provenance, the gated judge called 17 of
+  17 fresh leaking PRs unmet against 6 of 17 for one sample of today's
+  judge, and 30 of 30 clean PRs met. The segment-boundary rule comes
+  from the later lever round: on its no-harm stress 31 of 31 clean PRs
+  stayed met, while 6 of 7 PRs that touched a guard list were judged
+  unmet — the residual harm the guard-line exclusion only partly
+  removes, and the reason the hits stay evidence, never a gate.
+- **Contract literals.** An implementer's `external_contract_assumption`
+  risk says its change is right only if something outside its subtask
+  holds. A `contract_extractor` worker types each one once: the
+  counterpart subtask of this run (or none), the exact literal, its kind
+  (`string_value`, `identifier`, `route_path`, `other`), and a carrying
+  symbol; code drops a counterpart that is not another subtask of the
+  run and marks a literal not found verbatim in the risk unverified.
+  The check (v7e) then reads the counterpart's integration diff and the
+  integrated tree: only a plain token literal is checked; a route must
+  be served by an app-router page or appear on a counterpart added line;
+  a string or identifier is honoured by a counterpart added line, else
+  only by a non-test code file outside the owner's own files — a doc,
+  an i18n file or a migration does not honour a code contract — and is
+  flagged even then when the counterpart's added lines carry a
+  near-variant of it (`autopay` for `auto`). Flags go to the judge with
+  the risk text. Measured (bench Q10, held-out half): v7e flagged 157 of
+  162 synthetic mismatches (one side of a verified real producer/consumer
+  pair renamed) and 0 of 105 unmutated controls, where the rule set
+  without the code-only and near-variant rules flagged 106 — every miss
+  of that one was a literal still present in a doc or another consumer.
+  On the recorded real risks (Q5 worlds): 6 of 8 violations flagged, 0
+  of 288 false flags. The checks read JavaScript/TypeScript repos;
+  the code-file and test-file patterns also take other languages'
+  usual suffixes.
+
 **The gate judges the finding, not only the items.** Measured across
 three reports' repeat-run loops (14 of the 17 v0.32.x runs,
 2026-09-28..30): every run that shipped a fix shipped an
@@ -8087,6 +8140,29 @@ operator resumed to finish the gap ship without the pass ever looking at
 the gap again (in the attribution of 32 traced chains, one needed exactly
 this fix).
 
+**An advisory whole-PR review feeds the final conformer.** Every check
+above is anchored to something the run already wrote down — a required
+item, a subtask's criteria, an axis. A bug in code no item names passes
+all of them, and a later human review keeps finding exactly those. So,
+once per run, after the delivery gate's first half and before this final
+pass, a `pr_reviewer` worker reviews the whole PR the way that reviewer
+would: the task, its referenced reports, the required items (numbered,
+plus the audited defect contract), and the full diff from the working
+branch, in the staging tree, read-only, allowed to run the repo's build
+and test verbs to confirm a suspicion. Each finding is typed (`bug`,
+`regression`, `unmet_requirement`, the item it bears on or none) and
+quotes the file at HEAD; code checks the quote verbatim against the
+file, and an item's quoted span against that item's text, and only a
+finding whose quote checks out reaches the final conformer, as an
+advisory section it verifies against the code before acting. The review
+never gates and never changes the run's outcome; anything it changed in
+the tree is reverted; its record (`pr_review`) is for the PR. It runs on
+`opus` at effort `high` — the one model-tier exception (§12): measured
+(bench N2f, 66 calls per arm on 33 PRs), opus high returned 38 verified
+findings that name no required item against 8 for sonnet high and 7
+for sonnet medium, and of 18 opus findings hand-checked 13 were real,
+5 plausible and none false.
+
 **Base-tree health baseline.** Before this existed, the conformer was the
 first place the repo's build/lint/test suite ran at all, so a red base tree
 (the repo's own tests red on the developer's branch, or leerie's own
@@ -8937,6 +9013,12 @@ separate, cost-motivated decision; see IMPLEMENTATION.md §2 "Effort
 selection".) If a verdict-flip-with-tier regression is ever observed again
 on a future model swap, re-run the adherence-judge incident/control pair
 before reintroducing a tier split.
+
+One worker is deliberately on `opus`: `pr_reviewer`, the advisory
+whole-PR review (§9 *An advisory whole-PR review feeds the final
+conformer*), at effort `high`. It is not a judgment the run waits on;
+it looks for what nothing else is anchored to, and there the tier
+measured about five times the verified findings (bench N2f).
 
 ---
 
