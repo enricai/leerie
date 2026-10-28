@@ -8790,7 +8790,13 @@ Three layers follow, each derived from that one list:
   lint`), the
   worker's environment points npm's and pnpm's `script-shell` at a small
   guard that refuses that script by its lifecycle name and runs every
-  other one with `/bin/sh`. It sees every run the package manager makes,
+  other one with the shell the repository configured (`script-shell` in
+  `.npmrc`, `scriptShell` in `pnpm-workspace.yaml`, read back from the
+  package manager with leerie's override removed; `/bin/sh` when none).
+  The override outranks the repository's setting, so a guard that ran
+  `/bin/sh` itself broke a repo's bash-syntax scripts (measured with npm 11
+  and pnpm 11: `[[ 1 == 1 ]] && echo BASH-OK` printed BASH-OK plainly and
+  `[[: not found` under the guard). It sees every run the package manager makes,
   so it covers the one the command-line layers cannot: a script reached
   through another script (`pnpm run ci` whose body is `pnpm test`), a
   Makefile target, any spelling the matcher misses.

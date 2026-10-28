@@ -692,6 +692,108 @@ def test_guard_refuses_a_nested_run_under_npm(leerie, tmp_path):
         assert ran == (["lint"] if ok else []), cmd
 
 
+# --- the guard chains to the repository's own script-shell (r1 L4) ---------
+#
+# The env var that routes scripts to the guard outranks the repo's setting
+# (`script-shell=bash` in .npmrc, `scriptShell` in pnpm-workspace.yaml), and
+# the guard used to run everything with /bin/sh (dash on Debian): measured
+# with npm 11 and pnpm 11, a `[[ 1 == 1 ]] && echo BASH-OK` script printed
+# BASH-OK plain and `[[: not found` under the guard.
+
+def _guard_with_pm(tmp_path, answer, *, agent="npm/11.0.0 node/v26",
+                   cached=None):
+    """Run the guard as a script of a stub package manager whose `config
+    get script-shell` prints `answer` and logs each call (and whether
+    leerie's override was still in its environment)."""
+    import os
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    log = tmp_path / "pm.log"
+    (bin_dir / "npm").write_text(
+        "#!/bin/sh\n"
+        "echo \"$*|${npm_config_script_shell-unset}|"
+        "${pnpm_config_script_shell-unset}\" >> \"$PM_LOG\"\n"
+        f"echo '{answer}'\n")
+    (bin_dir / "npm").chmod(0o755)
+    fake = tmp_path / "fake-shell"
+    fake.write_text("#!/bin/sh\necho \"fake-shell $*\"\n"
+                    "echo \"cache=$LEERIE_REPO_SCRIPT_SHELL_npm\"\n")
+    fake.chmod(0o755)
+    env = {k: v for k, v in os.environ.items()
+           if not k.startswith(("npm_", "LEERIE_"))}
+    env.update(PATH=f"{bin_dir}:{env['PATH']}", PM_LOG=str(log),
+               LEERIE_FORBIDDEN_SCRIPTS="lint", npm_lifecycle_event="test",
+               npm_config_user_agent=agent,
+               npm_config_script_shell="/the/guard",
+               pnpm_config_script_shell="/the/guard")
+    if cached is not None:
+        env["LEERIE_REPO_SCRIPT_SHELL_npm"] = cached
+    script = REPO / "scripts" / "forbidden-script-shell.sh"
+    p = subprocess.run([str(script), "-c", "echo ran"], env=env,
+                       capture_output=True, text=True, timeout=30)
+    calls = log.read_text().splitlines() if log.exists() else []
+    return p, calls, str(fake)
+
+
+def test_guard_runs_a_script_with_the_repos_configured_shell(tmp_path):
+    p, calls, fake = _guard_with_pm(tmp_path, str(tmp_path / "fake-shell"))
+    assert p.returncode == 0, p.stderr
+    assert p.stdout.splitlines() == ["fake-shell -c echo ran",
+                                     f"cache={fake}"]
+    # Asked once, with leerie's override removed from its environment.
+    assert calls == ["config get script-shell|unset|unset"]
+
+
+@pytest.mark.parametrize("answer", ["undefined", "null", ""])
+def test_guard_falls_back_to_sh_when_the_repo_sets_none(tmp_path, answer):
+    p, calls, _ = _guard_with_pm(tmp_path, answer)
+    assert p.returncode == 0 and p.stdout == "ran\n", p.stderr
+    assert len(calls) == 1
+
+
+def test_guard_uses_the_cached_answer_for_nested_scripts(tmp_path):
+    p, calls, fake = _guard_with_pm(tmp_path, "never-asked",
+                                    cached=str(tmp_path / "fake-shell"))
+    assert p.stdout.startswith("fake-shell -c echo ran")
+    assert calls == []
+
+
+def test_guard_without_a_package_manager_runs_sh(tmp_path):
+    p, calls, _ = _guard_with_pm(tmp_path, "bash", agent="")
+    assert p.stdout == "ran\n" and calls == []
+
+
+@pytest.mark.parametrize("pm,config", [
+    ("npm", (".npmrc", "script-shell=bash\n")),
+    ("pnpm", ("pnpm-workspace.yaml", "scriptShell: bash\n")),
+])
+def test_guard_keeps_a_bash_script_shell_live(leerie, tmp_path, pm, config):
+    """Live: a repo that configures bash keeps its bash-syntax scripts
+    working under the guard, and the forbidden script is still refused."""
+    import os
+    import shutil
+    if not shutil.which(pm) or not shutil.which("bash"):
+        pytest.skip(f"{pm} or bash not on PATH")
+    (tmp_path / "package.json").write_text(json.dumps({
+        "name": "g", "version": "1.0.0", "private": True,
+        "scripts": {"test": "[[ 1 == 1 ]] && echo BASH-OK",
+                    "lint": "echo LINTED"}}))
+    (tmp_path / config[0]).write_text(config[1])
+    env = {k: v for k, v in os.environ.items() if not k.startswith("npm_")}
+    env.update(leerie._forbidden_script_shell_env(["pnpm run lint"]))
+    ok = subprocess.run([pm, "test"], cwd=tmp_path, env=env,
+                        capture_output=True, text=True, timeout=120)
+    assert ok.returncode == 0 and "BASH-OK" in ok.stdout, (ok.stdout,
+                                                          ok.stderr)
+    refused = subprocess.run([pm, "run", "lint"], cwd=tmp_path, env=env,
+                             capture_output=True, text=True, timeout=120)
+    # npm echoes the script's command (`> echo LINTED`); its output would
+    # be a line of its own.
+    assert refused.returncode != 0
+    assert "LINTED" not in refused.stdout.splitlines()
+    assert "script 'lint' is forbidden" in refused.stderr + refused.stdout
+
+
 # === scope: a forbidden whole suite denies only whole-suite runs ============
 
 SUITE = [{"command": "pnpm run test", "scope": "whole_suite",
