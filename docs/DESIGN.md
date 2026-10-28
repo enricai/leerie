@@ -8661,8 +8661,9 @@ mechanism exists to remove. Four mechanisms read that list:
   each denied). Outside quotes the boundaries are the shell operators,
   newlines, a subshell's brackets and brace *groups* — brace *expansion*
   (`tests/{a,b}.py`) stays part of a word, as the CLI read it. Redirections
-  are dropped with their target, quoted or not, and a backslash-newline
-  continues the line. It then tries the match from every word of a
+  are dropped with their target, quoted or not; outside quotes an escaped
+  blank stays part of its word and a backslash-newline is removed, as bash
+  reads them (`bash -c pnpm\ test` passes `-c` the one word `pnpm test`). It then tries the match from every word of a
   subcommand, which covers the CLI's prefix stripping and errs wide on
   purpose: it also strips a paraphrase such as "run pytest tests/ to
   verify", since the declared-command check would accept only the refused
@@ -8765,7 +8766,13 @@ Three layers follow, each derived from that one list:
   splits the command with the same quote-aware scan as the whole-suite
   rules, unwraps wrappers, shells, `eval`, runner proxies and
   interpreter eval flags (each string literal in the code is read as a
-  command too), normalises package-manager spellings, and denies a
+  command too), normalises package-manager spellings — each manager's OWN global options
+  (one table for all of them listed `-w` as taking a value, which is npm's
+  `--workspace <name>` but pnpm's flag `--workspace-root`, so `pnpm -w
+  test` ran past a forbidden `pnpm test`), checked against the real pnpm,
+  npm and yarn, and the subcommands that only pick where a script runs
+  (`pnpm recursive`/`multi`/`m`, `yarn workspace <name>`, `yarn workspaces
+  run`/`foreach`) — and denies a
   command whose normalised argv starts with a forbidden one. For a
   `whole_suite` entry, it also requires the words that follow to be only
   flags or test roots (the hook payload carries the roots). Hooks fire

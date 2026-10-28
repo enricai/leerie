@@ -21973,8 +21973,9 @@ def _shell_subcommands(cmd: str) -> list[str]:
     string's edge on both sides) -- brace expansion such as `tests/{a,b}.py`
     is part of a word, which is how the CLI read it live. An unclosed
     substitution still contributes its outer command. A backslash escapes
-    the next character, which is also what makes a backslash-newline
-    continue the line. Redirections outside quotes (`> f`,
+    the next character (an escaped blank stays in its word, as
+    `_QUOTED_SPACE`), and a backslash-newline is removed, as bash removes
+    it. Redirections outside quotes (`> f`,
     `2>&1`, `<in`, `> "a b"`) are dropped with their target, unless the
     target holds a substitution, which runs and is scanned. Whitespace is
     collapsed per subcommand."""
@@ -22027,7 +22028,13 @@ def _shell_subcommands(cmd: str) -> list[str]:
             i += 1
             continue
         if ch == "\\" and i + 1 < n:
-            buf.append(s[i + 1])
+            # As bash reads it: an escaped blank is part of the word
+            # (`bash -c pnpm\ test` passes ONE argument, `pnpm test`), and
+            # backslash-newline is removed entirely (`pyt\<newline>est` is
+            # `pytest`).
+            nxt = s[i + 1]
+            if nxt != "\n":
+                buf.append(_QUOTED_SPACE if nxt.isspace() else nxt)
             i += 2
             continue
         if subst and ch == subst[-1][0]:
@@ -22190,10 +22197,37 @@ _FORBID_WRAPPER_VALUE_OPTS: dict[str, frozenset[str]] = {
 _FORBID_SHELLS = frozenset({"bash", "sh", "zsh", "dash", "ksh"})
 _FORBID_PROXIES = frozenset({"npx", "pnpx", "bunx", "corepack"})
 _FORBID_PMS = frozenset({"npm", "pnpm", "yarn", "bun"})
-# Package-manager options that consume the next word.
-_FORBID_PM_VALUE_OPTS = frozenset({
-    "-C", "--dir", "--prefix", "--filter", "-F", "--workspace", "-w",
-    "--cwd", "--loglevel", "--reporter"})
+# Package-manager options that consume the next word, per manager: one
+# table for all of them was wrong both ways — pnpm's `-w` is the flag
+# `--workspace-root`, npm's is `--workspace <name>`. From each tool's
+# `--help` (pnpm 11, npm 11, yarn 1 and 4, bun 1) and checked by running
+# the real pnpm/npm/yarn (tests/test_forbidden_pm_flags.py).
+_FORBID_PM_VALUE_OPTS: dict[str, frozenset[str]] = {
+    "pnpm": frozenset({
+        "-C", "--dir", "-F", "--filter", "--filter-prod", "--loglevel",
+        "--reporter", "--workspace-concurrency", "--resume-from",
+        "--test-pattern", "--changed-files-ignore-pattern"}),
+    "npm": frozenset({
+        "-w", "--workspace", "-C", "--prefix", "--loglevel",
+        "--script-shell", "--userconfig", "--globalconfig", "--cache",
+        "--registry", "--include", "--omit"}),
+    "yarn": frozenset({
+        "--cwd", "--modules-folder", "--cache-folder", "--mutex",
+        "--network-timeout", "--network-concurrency", "--registry",
+        "--global-folder", "--link-folder", "--use-yarnrc", "--otp",
+        # yarn 4 `workspaces foreach`
+        "--from", "--include", "--exclude", "-j", "--jobs"}),
+    "bun": frozenset({
+        "--cwd", "-F", "--filter", "-c", "--config", "--env-file",
+        "-r", "--preload", "--shell", "--elide-lines"}),
+}
+# Subcommands that only select where the real one runs: `pnpm recursive
+# run test` is `pnpm -r run test`, `yarn workspace web test` runs `test` in
+# one workspace. The int is how many words they take (the name).
+_FORBID_PM_SCOPE_SUBS: dict[str, dict[str, int]] = {
+    "pnpm": {"recursive": 0, "multi": 0, "m": 0},
+    "yarn": {"workspace": 1},
+}
 _FORBID_PM_SCRIPT_ALIASES = {"t": "test", "tst": "test"}
 _FORBID_PM_BUILTIN_SCRIPTS = frozenset({"test", "start", "stop", "restart"})
 # Interpreter flags whose next word is code to run.
@@ -22298,10 +22332,27 @@ def _forbidden_normalize(argv: list[str], depth: int,
         return []
     a[0] = os.path.basename(a[0])
     if a[0] in _FORBID_PMS:
-        rest, i = a[1:], 0
-        while i < len(rest) and rest[i].startswith("-"):
-            i += 2 if rest[i] in _FORBID_PM_VALUE_OPTS else 1
-        a = [a[0]] + rest[i:]
+        vals = _FORBID_PM_VALUE_OPTS[a[0]]
+        scopes = _FORBID_PM_SCOPE_SUBS.get(a[0], {})
+
+        def _opts(r: list[str]) -> list[str]:
+            i = 0
+            while i < len(r) and r[i].startswith("-"):
+                i += 2 if r[i] in vals else 1
+            return r[i:]
+        rest = _opts(a[1:])
+        while rest:
+            if rest[0] in scopes:
+                rest = _opts(rest[1 + scopes[rest[0]]:])
+            elif (a[0] == "yarn" and rest[0] == "workspaces"
+                    and len(rest) > 1 and rest[1] in ("run", "foreach")):
+                # yarn 1 `workspaces run <script>`; yarn 4 `workspaces
+                # foreach [opts] <script|run script>`.
+                rest = (rest[1:] if rest[1] == "run"
+                        else _opts(rest[2:]))
+            else:
+                break
+        a = [a[0]] + rest
         if len(a) > 1:
             sub = a[1]
             if sub in ("exec", "dlx", "x"):
@@ -22312,10 +22363,7 @@ def _forbidden_normalize(argv: list[str], depth: int,
                     r = r[1:]
                 return _forbidden_normalize(r, depth + 1, keep_xargs)
             if sub in ("run", "run-script"):
-                r = [w for w in a[2:]]
-                while r and r[0].startswith("-"):
-                    r = r[1:]
-                a = [a[0], "run"] + r
+                a = [a[0], "run"] + _opts(a[2:])
             elif sub in _FORBID_PM_SCRIPT_ALIASES:
                 a = [a[0], "run", _FORBID_PM_SCRIPT_ALIASES[sub]] + a[2:]
             elif sub in _FORBID_PM_BUILTIN_SCRIPTS:
