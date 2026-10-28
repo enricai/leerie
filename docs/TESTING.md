@@ -5563,3 +5563,18 @@ passing the cap). `tests/test_json_key_merge.py` covers `_json_key_merge3` and
 `_try_json_key_merge` on real git conflicts: an i18n conflict is committed as
 the merge with both sides' keys and the file's formatting; a key conflict or a
 non-JSON file in the conflict leaves the merge exactly as git left it.
+
+**The AST-script tests run on CI, not only where `typescript` happens to
+resolve.** `scripts/test-case-facts.cjs` (the falsifier's coupling facts,
+`tests/test_delivery_detection.py`) and `scripts/redrive-ast-gate.cjs` (the
+delivery re-drive's escalation gate, `tests/test_delivery_redrive.py`) load
+`typescript` from the tree they run in, and leerie installs none of its own,
+so both skip on a host where node cannot resolve it — which was every CI run.
+`.github/workflows/test.yml` now installs a pinned `typescript` under
+`$RUNNER_TEMP` and exports `LEERIE_TEST_TYPESCRIPT_DIR`. A set
+`LEERIE_TEST_TYPESCRIPT_DIR` is binding: the tests use it as given, so a
+broken install fails them instead of skipping them, and
+`test_ci_provisions_the_typescript_the_ast_tests_need` fails on CI
+(`GITHUB_ACTIONS=true`) when the variable is unset or names nothing node can
+load. To run them locally: `npm install --no-save --prefix <dir> typescript`
+and point the variable at `<dir>/node_modules/typescript`.

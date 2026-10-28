@@ -45,6 +45,19 @@ jobs:
           pip install -r requirements.txt
           pip install pytest pytest-cov jsonschema
 
+      # The AST-script tests (scripts/test-case-facts.cjs in
+      # tests/test_delivery_detection.py, scripts/redrive-ast-gate.cjs in
+      # tests/test_delivery_redrive.py) need `typescript`, which leerie never
+      # installs itself: it comes from the target repo's own install. Without
+      # this step they skip and CI never runs them. The runner image's own
+      # node runs the scripts; the package is pinned and kept outside the
+      # checkout so no package.json enters the repo.
+      - name: Install typescript for the AST-script tests
+        run: |
+          node --version
+          npm install --no-save --no-package-lock --prefix "$RUNNER_TEMP/ts" typescript@5.9.3
+          echo "LEERIE_TEST_TYPESCRIPT_DIR=$RUNNER_TEMP/ts/node_modules/typescript" >> "$GITHUB_ENV"
+
       - name: Syntax check (from CLAUDE.md task-completion checklist)
         run: python -c "import ast; ast.parse(open('orchestrator/leerie.py').read())"
 

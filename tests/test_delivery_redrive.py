@@ -40,11 +40,14 @@ def _git(cwd: Path, *args: str) -> str:
 
 
 def _ts_dir() -> str | None:
+    env = os.environ.get(TS_DIR_ENV)
+    if env:
+        # Set means required (CI sets it): returned even when unusable — no
+        # node, no package — so a broken install fails the tests instead of
+        # skipping them.
+        return env
     if shutil.which("node") is None:
         return None
-    env = os.environ.get(TS_DIR_ENV)
-    if env and Path(env, "package.json").is_file():
-        return env
     r = subprocess.run(["node", "-e", "console.log(require.resolve("
                         "'typescript/package.json'))"],
                        capture_output=True, text=True, check=False)

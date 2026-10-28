@@ -412,15 +412,30 @@ class TestReask:
 def _ts_dir() -> str | None:
     """A `typescript` package the facts script can load: the env override,
     else whatever `node` resolves from the repo root. None → skip."""
+    env = os.environ.get("LEERIE_TEST_TYPESCRIPT_DIR")
+    if env:
+        # Set means required (CI sets it): returned even when unusable — no
+        # node, no package — so a broken install fails the tests instead of
+        # skipping them.
+        return env
     if shutil.which("node") is None:
         return None
-    env = os.environ.get("LEERIE_TEST_TYPESCRIPT_DIR")
-    if env and Path(env, "package.json").is_file():
-        return env
     r = subprocess.run(["node", "-e", "console.log(require.resolve("
                         "'typescript/package.json'))"],
                        capture_output=True, text=True, check=False)
     return str(Path(r.stdout.strip()).parent) if r.returncode == 0 else None
+
+
+def test_ci_provisions_the_typescript_the_ast_tests_need():
+    """On CI the AST-script tests must run, never skip: the workflow sets
+    LEERIE_TEST_TYPESCRIPT_DIR to an installed package node can load."""
+    if os.environ.get("GITHUB_ACTIONS") != "true":
+        pytest.skip("CI-only guard")
+    ts = os.environ.get("LEERIE_TEST_TYPESCRIPT_DIR")
+    assert ts and Path(ts, "package.json").is_file(), ts
+    r = subprocess.run(["node", "-e", f"require({json.dumps(ts)})"],
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 0, r.stderr
 
 
 class TestCouplingPolicy:
