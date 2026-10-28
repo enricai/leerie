@@ -6454,6 +6454,22 @@ def _pr_advisory(state: dict) -> list[str]:
                     + f"({_pr_entry(r.get('why')) or 'flagged'})")
     block("Contract literals another subtask may not honour",
           "contract_literal_checks", rows)
+    acc = state.get("acceptance")
+    gate = acc.get("gate") if isinstance(acc, dict) else None
+    final = gate.get("final") if isinstance(gate, dict) else None
+    why = {"budget_exhausted": "the confirm budget ran out",
+           "repeats_disabled": "acceptance_intermittent_repeats is 0"}
+    block("Held-out discovery that did not finish", "acceptance.gate.final",
+          [f"- set {_pr_entry(r.get('index'))}: held cases in "
+           + ", ".join(_pr_code(f) for f in d.get("files") or [])
+           + f" rerun {d.get('repeats_run', 0)} of "
+           f"{d.get('repeats_required', 0)} time(s) — "
+           + why.get(str(d.get("reason")), "stopped early")
+           + "; an intermittent defect there may be unseen"
+           for r in (final if isinstance(final, list) else [])
+           if isinstance(r, dict) and isinstance(d := r.get("discovery"),
+                                                 dict)
+           and d.get("incomplete") is True])
     hits = state.get("site_token_warnings")
     block("Report site tokens on added lines", "site_token_warnings",
           [f"- {_pr_code(h.get('token'))} in {_pr_code(h.get('file'))}: "
@@ -44528,10 +44544,16 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
             log(f"  acceptance {label} set {s_['index']}: held case(s) "
                 "failed only with resource signatures — typed intermittent, "
                 "a failing set (never unmeasured)")
-        if discovery is not None and discovery["found"]:
-            # Only when it changed the verdict: a pass stays the shape
-            # every reader already compares.
+        if discovery is not None:
+            # Found or not: a set whose held cases were never rerun must not
+            # read like one rerun clean (DESIGN §8 *A held case that fails
+            # again*, rule 2).
             res_["discovery"] = discovery
+            if discovery.get("incomplete"):
+                log(f"  acceptance {label} set {s_['index']}: "
+                    f"discovery_incomplete — {discovery['repeats_run']} of "
+                    f"{discovery['repeats_required']} rerun round(s) "
+                    f"({discovery.get('reason') or 'unknown'})")
         results.append(res_)
     return results
 
@@ -44637,14 +44659,22 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
     host-pressure gate and inside `confirm_budget_sec`. `note(rel, obs)`
     records each failing run and is True when a held case failed with no
     resource signature; such a file is not rerun again. Returns `{files,
-    repeats_required, repeats_run, budget_exhausted, found[]}`."""
+    repeats_required, repeats_run, budget_exhausted, found[], incomplete,
+    reason}`: `incomplete` when files were still pending after fewer than
+    the required rounds, `reason` why (`budget_exhausted`,
+    `repeats_disabled`) — so a set never rerun is never read as one rerun
+    clean."""
     reps = max(0, min(int(caps.get(
         "acceptance_intermittent_repeats",
         DEFAULT_CAPS["acceptance_intermittent_repeats"])),
         _ACCEPTANCE_INTERMITTENT_MAX))
     out: dict = {"files": list(rels), "repeats_required": reps,
-                 "repeats_run": 0, "budget_exhausted": False, "found": []}
-    if reps == 0 or not rels:
+                 "repeats_run": 0, "budget_exhausted": False, "found": [],
+                 "incomplete": False, "reason": ""}
+    if not rels:
+        return out
+    if reps == 0:
+        out.update(incomplete=True, reason="repeats_disabled")
         return out
     pending = list(rels)
     clock = time.monotonic
@@ -44668,9 +44698,12 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
                 if v is False and note(rel, obs):
                     pending.remove(rel)
                     out["found"].append(rel)
-            out["repeats_run"] = i + 1
             if out["budget_exhausted"]:
+                # A round the budget cut short is not a round run.
                 break
+            out["repeats_run"] = i + 1
+        if out["budget_exhausted"] and pending:
+            out.update(incomplete=True, reason="budget_exhausted")
     if out["found"]:
         log(f"  acceptance {label} set {index}: discovery found a held case "
             f"failing in {len(out['found'])} file(s) after "

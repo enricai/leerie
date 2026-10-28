@@ -62,7 +62,8 @@ def _confirm_at_once(leerie, monkeypatch):
     # with real reruns in tests/test_acceptance_held_case_intermittent.py.
     async def discover_nothing(st, caps, wt, rels, *a, **_kw):
         return {"files": list(rels), "repeats_required": 0,
-                "repeats_run": 0, "budget_exhausted": False, "found": []}
+                "repeats_run": 0, "budget_exhausted": False, "found": [],
+                "incomplete": False, "reason": ""}
     monkeypatch.setattr(leerie, "_acceptance_discover", discover_nothing)
 
 
@@ -538,6 +539,9 @@ def test_helper_beside_the_tests_travels_with_the_set(leerie, tmp_path,
                    env={**os.environ, "PYTHONPATH": str(staging)})
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    # Discovery always leaves its record (review round 4 L1); it found
+    # nothing here.
+    assert res[0].pop("discovery")["found"] == []
     assert res == [{"index": 1, "passed": True, "unmeasured": False,
                     "failing_files": []}]
 
@@ -1608,6 +1612,9 @@ def test_undeclared_helper_travels_with_the_set(leerie, tmp_path,
     _commit_fix(staging)
     res = asyncio.run(leerie._evaluate_acceptance_sets(
         st, _caps(leerie, 1), str(staging), acc["sets"], "t"))
+    # Discovery always leaves its record (review round 4 L1); it found
+    # nothing here.
+    assert res[0].pop("discovery")["found"] == []
     assert res == [{"index": 1, "passed": True, "unmeasured": False,
                     "failing_files": []}]
 

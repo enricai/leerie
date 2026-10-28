@@ -7289,7 +7289,7 @@ settles its file failing whatever the vote says. Then discovery
 not end failing, up to `acceptance_intermittent_repeats` (clamped to
 `_ACCEPTANCE_INTERMITTENT_MAX = 10`) serial reruns under `_confirm_lock`
 and `_confirm_gate`, inside `confirm_budget_sec`, stopping at the first
-`asserted` case; a file that got one is failing, and the result then carries `discovery{files, repeats_required, repeats_run, budget_exhausted, found[]}` (absent when discovery found nothing, so a passing result keeps its shape). A held case `seen` in
+`asserted` case; a file that got one is failing. Whenever discovery had files to rerun, the result carries `discovery{files, repeats_required, repeats_run, budget_exhausted, found[], incomplete, reason}`, found or not: `repeats_run` counts only rounds every pending file finished; `incomplete` is true and `reason` is `"budget_exhausted"` (the budget ran out before every round) or `"repeats_disabled"` (`acceptance_intermittent_repeats` is 0) when fewer than the required rounds ran with files still pending, else false and `""`. An incomplete discovery logs `acceptance <label> set <i>: discovery_incomplete — <run> of <required> rerun round(s) (<reason>)`, and `_pr_advisory` lists every `acceptance.gate.final` result whose discovery is incomplete under "Held-out discovery that did not finish". A held case `seen` in
 any run of a file that ends neither failing nor passing cleanly — every
 held failure carried a resource signature or no message — makes that
 file failing with `intermittent_cases{file: [case ids]}` on the result

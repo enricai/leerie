@@ -210,8 +210,15 @@ def test_discovery_is_capped_at_ten(leerie, tmp_path):
     s_, _cid = _set(leerie, st, repo, marker, _base_for("P" * 11))
     res = _evaluate(leerie, st, repo, [s_],
                     _caps(leerie, acceptance_intermittent_repeats=50))
-    assert res["passed"] is True and "discovery" not in res
+    assert res["passed"] is True
+    # Ten clean reruns leave a record that says so.
+    assert res["discovery"]["repeats_run"] == 10
+    assert res["discovery"]["found"] == []
+    assert res["discovery"]["incomplete"] is False
     assert marker.read_text() == "11"          # the first run + 10
+    assert not any("discovery" in line.lower()
+                   for line in leerie._pr_advisory(
+                       {"acceptance": {"gate": {"final": [res]}}}))
 
 
 def test_discovery_off_keeps_a_passing_first_run(leerie, tmp_path):
@@ -222,6 +229,37 @@ def test_discovery_off_keeps_a_passing_first_run(leerie, tmp_path):
     res = _evaluate(leerie, st, repo, [s_],
                     _caps(leerie, acceptance_intermittent_repeats=0))
     assert res["passed"] is True and marker.read_text() == "1"
+    assert res["discovery"]["incomplete"] is True
+    assert res["discovery"]["reason"] == "repeats_disabled"
+    assert res["discovery"]["repeats_run"] == 0
+
+
+def test_starved_discovery_is_recorded_and_reaches_the_pr(leerie, tmp_path,
+                                                          capsys):
+    """Review round 4 L1: discovery whose budget ran out before any rerun
+    left no trace, so the set read exactly like one rerun ten times clean.
+    The pattern would be found on the second run (PF), so a record saying
+    complete here would be false."""
+    repo, own = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, own)
+    marker = tmp_path / "runs"
+    s_, _cid = _set(leerie, st, repo, marker, _base_for("PF"))
+    res = _evaluate(leerie, st, repo, [s_],
+                    _caps(leerie, confirm_budget_sec=0))
+    assert res["passed"] is True and marker.read_text() == "1"
+    d = res["discovery"]
+    assert d["budget_exhausted"] is True and d["incomplete"] is True
+    assert d["reason"] == "budget_exhausted"
+    assert d["repeats_run"] == 0 and d["repeats_required"] == 10
+    assert "discovery_incomplete — 0 of 10" in capsys.readouterr().out
+    lines = leerie._pr_advisory({"acceptance": {"gate": {"final": [res]}}})
+    assert lines[0] == "**Held-out discovery that did not finish**"
+    assert REL in lines[1] and "rerun 0 of 10" in lines[1]
+    assert "budget ran out" in lines[1]
+    body = leerie._format_pr_end_state_section(
+        {"acceptance": {"gate": {"final": [res]}}})
+    assert "Held-out discovery that did not finish" in body.split(
+        "## Advisory", 1)[1]
 
 
 # --- rule 3: resource signatures only --------------------------------------
