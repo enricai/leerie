@@ -5993,7 +5993,7 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   Records `state.data["final_failing_ids"]`; candidates are the final IDs
   not in the baseline; reruns use `_acceptance_cmd` over the candidates'
   files when every candidate has one (else the canonical `tests` command)
-  in a disposable detached worktree `worktrees/confirm-base` at the
+  in a disposable detached worktree `worktrees/<run-id[:12]>-confirm-base` at the
   baseline sha (else the `working_branch` merge-base) with deps installed,
   against staging for the final side. Persists the verdict to
   `state.data["test_id_diff"]`. In the round loop, a non-empty `new` adds
@@ -8394,6 +8394,14 @@ Every Python site that needs a subtask's worktree takes it from
 names the pre-prefix layout no real run has (the coverage re-drive did, and
 found "no worktree" for every subtask — pinned by
 `tests/test_subtask_worktree_path_sites.py`).
+The orchestrator's helper worktrees (`confirm-base`, `acceptance-eval`,
+`acceptance-audit`, `redrive-base`, `ci-<name>`, `integ-<sid>-<side>`, and
+the `acceptance-<k>`/`acceptance-surrogate`/`falsifier-*` checkouts) live
+at `_helper_worktree_path(st, name)` (`<run-dir>/worktrees/<run-id[:12]>-
+<name>`), and every Python `git worktree add` is `_worktree_add_detached(st,
+wt, rev)`: the add under the same `leerie-worktree.lock` (non-blocking
+retries for at most `_WORKTREE_ADD_LOCK_WAIT_SEC` = 120 s, then unlocked,
+logged). `_acceptance_read_denials` names the prefixed evaluation tree.
 
 The repo is bind-mounted whole into every container, so `.git` is
 SHARED with the host and any other container. A bare prune is

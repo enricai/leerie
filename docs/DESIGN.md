@@ -2131,6 +2131,14 @@ run deaths across 4 chains. Four rules close it:
   `worktrees/<run-id[:12]>-<sid>`. A run started before the change has its
   subtask worktree moved (`git worktree move`, uncommitted work included) on
   resume, since its branch is checked out at the old path.
+- **The orchestrator's own helper worktrees follow the same two rules.**
+  `confirm-base`, `acceptance-eval`, `redrive-base`, the CI and
+  integration trees and the writer/falsifier checkouts' worktree fallback
+  ran a bare `git worktree add` under an unprefixed name. Each now goes
+  through one function that takes the repository-wide lock around the add
+  and names the directory `<run-id[:12]>-<name>`. It waits a bounded time
+  for the lock and then adds without it, logged: these trees are
+  fail-open evidence, and a stuck lock holder must not stall the run.
 
 The planning worktree also pruned *after* its orphan check, the order
 `new-worktree.sh` had already learned is wrong (a prune is what orphans a

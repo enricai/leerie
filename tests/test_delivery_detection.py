@@ -979,13 +979,16 @@ def test_falsifier_samples_and_confirm_runs_get_a_fresh_test_database(
     # Every sample's worker got its lane's database, made fresh for that
     # sample (item 0 confirmed at s0; item 3 ran two samples).
     by_url = dict((u, t) for t, u in made)
+    # Checkouts are run-id-prefixed (`_helper_worktree_path`).
+    lane0 = leerie._helper_worktree_path(st, "falsifier-lane0").name
     assert [by_url[c["env_extra"]["DATABASE_URL"]] for c in fc] == [
-        "falsifier-lane0"] * 3
+        lane0] * 3
     assert len({c["env_extra"]["DATABASE_URL"] for c in fc}) == 3
     assert all(c["env_extra"]["DIRECT_URL"] == c["env_extra"]["DATABASE_URL"]
                and not any(k.startswith("PRISMA_USER_CONSENT")
                            for k in c["env_extra"]) for c in fc)
-    assert [t for t, _u in made][0] == "falsifier-confirm"
+    assert [t for t, _u in made][0] == leerie._helper_worktree_path(
+        st, "falsifier-confirm").name
     # The probe only fails against a database: confirmed means the confirm
     # checkout's re-runs carried one.
     gate = st.data["delivery_gate"]

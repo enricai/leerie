@@ -648,7 +648,8 @@ def test_the_surrogate_witness_triggers_only_when_nothing_else_fired(
     assert "failing_on_an_independent_fix" in note
     assert final[0]["passed"] is True
     # The surrogate's clone is gone afterwards.
-    assert not (st.run_dir / "worktrees" / "acceptance-surrogate").exists()
+    assert not leerie._helper_worktree_path(
+        st, "acceptance-surrogate").exists()
 
 
 def test_a_set_passing_on_the_independent_fix_is_not_rewritten(

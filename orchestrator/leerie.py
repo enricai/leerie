@@ -5521,6 +5521,67 @@ def _cleanup_on_abnormal_exit(st: "State", *, full_purge: bool) -> None:
 _WORKTREE_LOCK_WAIT_SEC = 30.0
 
 
+# How long a helper worktree's `worktree add` waits for that lock before
+# going ahead without it (logged): the scripts hold it only for a prune and
+# an add, so a longer wait means a stuck holder, and the helpers fail open.
+_WORKTREE_ADD_LOCK_WAIT_SEC = 120.0
+
+
+def _helper_worktree_path(st: "State", name: str) -> Path:
+    """`<run-dir>/worktrees/<run-id[:12]>-<name>`: a helper worktree
+    (`confirm-base`, `acceptance-eval`, `redrive-base`, a CI or integration
+    tree, a writer or falsifier checkout) named like a subtask's, so its
+    admin entry never competes with another run's for one name (DESIGN §6
+    *Never a repository-global git operation*). The run directory's own
+    name is the run id, as for `_subtask_worktree_path`."""
+    return st.run_dir / "worktrees" / _worktree_dirname(st.run_dir.name,
+                                                        name)
+
+
+def _worktree_add_detached(st: "State", wt: Path, rev: str
+                           ) -> subprocess.CompletedProcess:
+    """`git worktree add --detach <wt> <rev>` under the repository-wide
+    worktree lock every script's add and every prune takes
+    (`<git-common-dir>/leerie-worktree.lock`, `leerie_repo_lock`): without
+    it a prune of this run racing the add (admin entry written, `.git` link
+    not yet) drops the registration. Waits at most
+    `_WORKTREE_ADD_LOCK_WAIT_SEC`, then adds unlocked, logged — these
+    helpers fail open."""
+    argv = ["git", "-C", str(st.repo_root), "worktree", "add", "--detach",
+            str(wt), rev]
+    lock_fd = None
+    try:
+        gd = subprocess.run(["git", "-C", str(st.repo_root), "rev-parse",
+                             "--path-format=absolute", "--git-common-dir"],
+                            capture_output=True, text=True, check=False,
+                            timeout=30)
+        if gd.returncode == 0 and gd.stdout.strip():
+            lock_fd = os.open(str(Path(gd.stdout.strip())
+                                  / "leerie-worktree.lock"),
+                              os.O_WRONLY | os.O_CREAT, 0o644)
+    except (OSError, subprocess.TimeoutExpired):
+        lock_fd = None
+    try:
+        if lock_fd is not None:
+            deadline = time.monotonic() + _WORKTREE_ADD_LOCK_WAIT_SEC
+            while True:
+                try:
+                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        log(f"  worktree lock not acquired in "
+                            f"{_WORKTREE_ADD_LOCK_WAIT_SEC:.0f}s; adding "
+                            f"{wt.name} without it")
+                        break
+                    time.sleep(0.1)
+        return subprocess.run(argv, capture_output=True, text=True,
+                              check=False)
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+
+
 def _prune_leerie_worktrees(leerie_root: Path | str) -> None:
     """Scoped replacement for a bare `git worktree prune`. Python port of
     `scripts/worktree-lib.sh`'s `prune_leerie_worktrees`, for the orchestrator's
@@ -21627,9 +21688,12 @@ def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
                           "falsifier"):
         return ""
     rd = Path(run_dir)
+    # The evaluation worktree is run-id-prefixed (`_helper_worktree_path`);
+    # the run directory's own name is the run id.
+    eval_wt = rd / "worktrees" / _worktree_dirname(rd.name, "acceptance-eval")
     # `//` anchors an absolute path for the CLI, as in _repo_write_denials.
     return ",".join([f"Read(/{rd / 'acceptance'}/**)",
-                     f"Read(/{rd / 'worktrees' / 'acceptance-eval'}/**)",
+                     f"Read(/{eval_wt}/**)",
                      f"Read(/{rd / 'logs'}/**)",
                      f"Read(/{rd / 'orchestrator.log'})",
                      f"Read(/{rd / 'calls.ndjson'})",
@@ -37742,7 +37806,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         return verdict
     files = sorted({id_files.get(c) for c in all_cand})
     rerun_files = None if (None in files or not files) else list(files)
-    wt = st.run_dir / "worktrees" / "confirm-base"
+    wt = _helper_worktree_path(st, "confirm-base")
 
     def _teardown() -> None:
         subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
@@ -37751,10 +37815,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
     _teardown()
-    add = (subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
-                           "--detach", str(wt), base_sha],
-                          capture_output=True, text=True, check=False)
-           if base_sha else None)
+    add = _worktree_add_detached(st, wt, base_sha) if base_sha else None
     if add is None or add.returncode != 0:
         log("  B*: could not create the base worktree for the confirm — "
             "every candidate is resource_affected")
@@ -38504,11 +38565,9 @@ def _ci_parity_unmet_from(data: dict) -> list[dict]:
 
 
 async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
-    wt = st.run_dir / "worktrees" / name
+    wt = _helper_worktree_path(st, name)
     _ci_teardown(st, wt)
-    r = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
-                        "--detach", str(wt), sha], capture_output=True,
-                       text=True, check=False)
+    r = _worktree_add_detached(st, wt, sha)
     if r.returncode != 0:
         log(f"  ci parity: could not create the {name} worktree at "
             f"{sha[:12]}: {r.stderr.strip()[:200]}")
@@ -42376,7 +42435,7 @@ async def _write_acceptance_set(k: int, task: str, st: "State", caps: dict,
     name = (f"acceptance-{k}" if rewrite_of is None
             else f"acceptance-rewrite-{k}")
     sid = name if attempt == 1 else f"{name}-a{attempt}"
-    wt = leerie_dir / "worktrees" / name
+    wt = _helper_worktree_path(st, name)
     log_path = leerie_dir / "logs" / f"{name}.log"
     out = {"index": k, "valid": False, "declared_defect": False}
     # Outside every try: budget exhaustion must propagate, not read as an
@@ -42757,8 +42816,7 @@ def _acceptance_writer_checkout(st: "State", wt: Path, base: str) -> str:
     log(f"  acceptance: no ref-less writer clone ({why}) — using a "
         "detached worktree, where every ref is visible")
     shutil.rmtree(wt, ignore_errors=True)
-    add = _git("-C", str(st.repo_root), "worktree", "add", "--detach",
-               str(wt), base)
+    add = _worktree_add_detached(st, wt, base)
     if add.returncode != 0:
         return f"failed: worktree add failed: {add.stderr.strip()[:200]}"
     return "worktree"
@@ -42899,7 +42957,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
     are `resource_affected_files`, and a set whose failures were all
     resource-affected is no evidence either way (DESIGN §8)."""
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
-    wt = st.run_dir / "worktrees" / "acceptance-eval"
+    wt = _helper_worktree_path(st, "acceptance-eval")
 
     def _teardown() -> None:
         subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
@@ -42917,9 +42975,7 @@ async def _evaluate_acceptance_sets_inner(st: "State", caps: dict, tree: str,
     if head.returncode != 0:
         return unmeasured_all
     _teardown()                     # what a crashed evaluation left
-    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
-                          "--detach", str(wt), head.stdout.strip()],
-                         capture_output=True, text=True, check=False)
+    add = _worktree_add_detached(st, wt, head.stdout.strip())
     if add.returncode != 0:
         log(f"  acceptance: could not create the evaluation worktree: "
             f"{add.stderr.strip()[:200]} — no evidence either way")
@@ -43764,7 +43820,7 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
     """A disposable worktree of `rev` under the run dir with dependencies
     installed and, in a Prisma repo, its own throwaway database: yields
     `(wt, env_extra)` or None when it cannot be set up (no evidence)."""
-    wt = st.run_dir / "worktrees" / name
+    wt = _helper_worktree_path(st, name)
     log_path = st.run_dir / "logs" / f"acceptance-{label}.log"
 
     def _teardown() -> None:
@@ -43775,9 +43831,7 @@ async def _acceptance_tree(st: "State", caps: dict, rev: str, name: str,
     _teardown()
     url = None
     try:
-        add = subprocess.run(["git", "-C", str(st.repo_root), "worktree",
-                              "add", "--detach", str(wt), rev],
-                             capture_output=True, text=True, check=False)
+        add = _worktree_add_detached(st, wt, rev)
         if add.returncode != 0 or not await _ensure_worktree_deps(
                 str(wt), st, caps, log_path=log_path,
                 verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
@@ -43817,7 +43871,7 @@ async def _acceptance_surrogate(st: "State", caps: dict, models: dict,
     the report's contract left uncommitted in the tree. It never sees a set
     (its `Read` denies cover them). `{dir, env}` or None when it could not
     run or changed nothing — then it witnesses nothing."""
-    wt = st.run_dir / "worktrees" / "acceptance-surrogate"
+    wt = _helper_worktree_path(st, "acceptance-surrogate")
     log_path = st.run_dir / "logs" / "acceptance-surrogate.log"
     _remove_acceptance_checkout(st, wt)
     if _acceptance_writer_checkout(st, wt, own).startswith("failed"):
@@ -46297,7 +46351,7 @@ def _falsifier_needs_reask(result: dict | None, activity: dict) -> bool:
 def _falsifier_checkout(st: "State", name: str, sha: str) -> Path | None:
     """A ref-less checkout of `sha` (the writers' own kind, so no later fix
     on another branch is reachable), or None."""
-    wt = st.run_dir / "worktrees" / name
+    wt = _helper_worktree_path(st, name)
     _remove_acceptance_checkout(st, wt)
     kind = _acceptance_writer_checkout(st, wt, sha)
     if kind.startswith("failed"):
@@ -47373,7 +47427,7 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     rerun = None if (None in files or not files) else list(files)
     cmd = after.get("command") or ""
     log_path = st.run_dir / "logs" / _REDRIVE_LOG
-    wt = st.run_dir / "worktrees" / "redrive-base"
+    wt = _helper_worktree_path(st, "redrive-base")
 
     def _teardown() -> None:
         subprocess.run(["git", "-C", str(st.repo_root), "worktree", "remove",
@@ -47382,9 +47436,7 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
         _DEPS_INSTALLED.discard(os.path.realpath(wt))
 
     _teardown()
-    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
-                          "--detach", str(wt), pre_sha],
-                         capture_output=True, text=True, check=False)
+    add = _worktree_add_detached(st, wt, pre_sha)
     try:
         if add.returncode != 0:
             verdict = await _confirm_new_failures(cand, _no_rerun, _no_rerun,
@@ -51603,11 +51655,9 @@ async def _integration_tree(st: "State", sid: str, name: str, rev: str,
                             caps: dict, log_path: Path) -> Path | None:
     """A detached worktree at `rev` with the repo's deps installed, for the
     conflicted-area tests; None when it cannot be created."""
-    wt = st.run_dir / "worktrees" / f"integ-{sid}-{name}"
+    wt = _helper_worktree_path(st, f"integ-{sid}-{name}")
     _integration_tree_remove(st, wt)
-    add = subprocess.run(["git", "-C", str(st.repo_root), "worktree", "add",
-                          "--detach", str(wt), rev],
-                         capture_output=True, text=True, check=False)
+    add = _worktree_add_detached(st, wt, rev)
     if add.returncode != 0:
         log(f"  integration-tests {sid}: could not create the {name} tree "
             f"at {rev[:12]}: {add.stderr.strip()[:200]}")

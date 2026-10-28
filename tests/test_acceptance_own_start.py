@@ -405,7 +405,7 @@ def test_the_writer_reaches_no_ref_and_no_later_commit(leerie, tmp_path,
     assert seen["refs"] == "" and seen["remotes"] == ""
     assert seen["head"] == own and fix not in seen["all"]
     assert len(acc["sets"]) == 1
-    assert not (st.run_dir / "worktrees" / "acceptance-1").exists()
+    assert not leerie._helper_worktree_path(st, "acceptance-1").exists()
     # The user's checkout and its refs are untouched.
     assert _git(repo, "rev-parse", "leerie/runs/earlier") == fix
     assert _git(repo, "status", "--porcelain") == ""
@@ -422,7 +422,7 @@ def test_a_failed_clone_falls_back_to_a_worktree(leerie, tmp_path,
             return subprocess.CompletedProcess(argv, 128, "", "no clone")
         return real(argv, *a, **k)
     monkeypatch.setattr(leerie.subprocess, "run", run)
-    wt = st.run_dir / "worktrees" / "acceptance-9"
+    wt = leerie._helper_worktree_path(st, "acceptance-9")
     assert leerie._acceptance_writer_checkout(st, wt, own) == "worktree"
     assert "detached worktree" in capsys.readouterr().out
     assert _git(wt, "rev-parse", "HEAD") == own

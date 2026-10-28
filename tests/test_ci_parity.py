@@ -490,7 +490,10 @@ def test_a_database_check_runs_against_its_own_test_database(
     assert dropped == [made[0][1]]
     _commit(env, {"src/new.txt": "fine\n"})
     assert _final(env) == []
-    assert [Path(t).name for t, _u in made] == ["ci-base", "ci-final"]
+    # Run-id-prefixed helper worktrees (`_helper_worktree_path`).
+    prefix = env["st"].run_id[:12] + "-"
+    assert [Path(t).name for t, _u in made] == [prefix + "ci-base",
+                                               prefix + "ci-final"]
     assert sorted(dropped) == sorted(u for _t, u in made)
 
 

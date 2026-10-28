@@ -383,7 +383,7 @@ def test_e3_confirms_the_real_regression_and_types_the_flake(
     assert st.data["test_id_diff"]["new"] == [stable]
     assert stable in st.data["final_failing_ids"]
     # The base worktree is disposable.
-    assert not (st.run_dir / "worktrees" / "confirm-base").exists()
+    assert not leerie._helper_worktree_path(st, "confirm-base").exists()
 
 
 def test_e3_unknown_base_ids_leaves_the_axis_verdict(leerie, e3_repo):

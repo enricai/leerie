@@ -176,7 +176,7 @@ def test_valid_set_keeps_only_discriminating_defect_files(leerie, tmp_path,
     assert stored.read_text() == DEFECT_TEST
     assert "acceptance" in str(stored.relative_to(st.run_dir))
     # The disposable worktree is gone and the user's checkout is untouched.
-    assert not (st.run_dir / "worktrees" / "acceptance-1").exists()
+    assert not leerie._helper_worktree_path(st, "acceptance-1").exists()
     assert _git(repo, "status", "--porcelain") == ""
 
 
@@ -330,14 +330,14 @@ def test_evaluation_never_touches_the_tree_and_never_overwrites(
         (False, True), (False, False)]
     assert _tree_snapshot(staging) == before    # not a byte changed
     assert seen_trees and all(t != str(staging) for t in seen_trees)
-    assert not (st.run_dir / "worktrees" / "acceptance-eval").exists()
+    assert not leerie._helper_worktree_path(st, "acceptance-eval").exists()
 
 
 def test_a_crashed_evaluations_worktree_is_replaced(leerie, tmp_path):
     repo, head = _repo(tmp_path)
     st = _st(leerie, tmp_path, repo, head)
     staging = _staging(st, repo)
-    stale = st.run_dir / "worktrees" / "acceptance-eval"
+    stale = leerie._helper_worktree_path(st, "acceptance-eval")
     _git(repo, "worktree", "add", "-q", "--detach", str(stale), head)
     (stale / "acc").mkdir()
     (stale / "acc" / "test_defect_1.py").write_text("# left by a crash\n")
@@ -2304,7 +2304,7 @@ def test_evaluation_installs_deps_before_running(leerie, tmp_path, monkeypatch):
     _run_gate(leerie, monkeypatch, st, _commit_fix)
     # Deps are installed in the evaluation worktree before its first
     # held-out file runs there — never in staging.
-    eval_wt = str(st.run_dir / "worktrees" / "acceptance-eval")
+    eval_wt = str(leerie._helper_worktree_path(st, "acceptance-eval"))
     assert events[0] == ("deps", eval_wt)
     assert events[1] == ("run", eval_wt)
 
@@ -3261,7 +3261,8 @@ def test_fixers_cannot_read_the_sets(leerie, tmp_path):
         # calls.ndjson the writers' responses.
         assert leerie._acceptance_read_denials(w, run_dir).split(",") == [
             f"Read(/{run_dir}/acceptance/**)",
-            f"Read(/{run_dir}/worktrees/acceptance-eval/**)",
+            # run-id-prefixed: the run directory's name is the run id
+            f"Read(/{run_dir}/worktrees/r-acceptance-eval/**)",
             f"Read(/{run_dir}/logs/**)",
             f"Read(/{run_dir}/orchestrator.log)",
             f"Read(/{run_dir}/calls.ndjson)",
