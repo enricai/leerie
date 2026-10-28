@@ -51623,22 +51623,55 @@ _NETWORK_PROBE_CONTROL = ("api.anthropic.com", 443)
 # rule) prints `local <address>` before any connect (DESIGN §13 *A local
 # service is not external*).
 _NETWORK_PROBE_SCRIPT = (
-    "import ipaddress, socket, sys\n"
+    "import ipaddress, os, socket, sys\n"
     "host, port, t = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])\n"
     "allow_local = sys.argv[4:5] == ['1']\n"
+    "proxy = sys.argv[5:7]\n"
     "gone = {getattr(socket, n) for n in ('EAI_NONAME', 'EAI_NODATA')\n"
     "        if hasattr(socket, n)}\n"
     "try:\n"
     "    infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)\n"
     "except socket.gaierror as e:\n"
-    "    print('dns_fail' if e.errno in gone else 'dns_unknown')\n"
-    "    sys.exit(0)\n"
+    "    if not proxy:\n"
+    "        print('dns_fail' if e.errno in gone else 'dns_unknown')\n"
+    "        sys.exit(0)\n"
+    "    infos = []\n"
     "for info in ([] if allow_local else infos):\n"
     "    a = ipaddress.ip_address(str(info[4][0]).split('%')[0])\n"
     "    if (a.is_loopback or a.is_private or a.is_link_local\n"
     "            or a.is_unspecified):\n"
     "        print('local', a)\n"
     "        sys.exit(0)\n"
+    "if proxy:\n"
+    "    target = f'[{host}]:{port}' if ':' in host else f'{host}:{port}'\n"
+    "    auth = os.environ.get('LEERIE_PROBE_PROXY_AUTH', '')\n"
+    "    req = (f'CONNECT {target} HTTP/1.1\\r\\nHost: {target}\\r\\n'\n"
+    "           + (f'Proxy-Authorization: Basic {auth}\\r\\n'\n"
+    "              if auth else '')\n"
+    "           + '\\r\\n')\n"
+    "    data = b''\n"
+    "    try:\n"
+    "        s = socket.create_connection((proxy[0], int(proxy[1])),\n"
+    "                                     timeout=t)\n"
+    "        try:\n"
+    "            s.sendall(req.encode())\n"
+    "            while b'\\r\\n' not in data and len(data) < 4096:\n"
+    "                chunk = s.recv(1024)\n"
+    "                if not chunk:\n"
+    "                    break\n"
+    "                data += chunk\n"
+    "        finally:\n"
+    "            s.close()\n"
+    "    except OSError:\n"
+    "        print('proxy_unknown')\n"
+    "        sys.exit(0)\n"
+    "    words = data.split(b'\\r\\n', 1)[0].split()\n"
+    "    code = (words[1] if len(words) > 1\n"
+    "            and words[0].startswith(b'HTTP/') else b'')\n"
+    "    print('reachable' if len(code) == 3 and code[:1] == b'2' else\n"
+    "          'connect_fail' if code in (b'502', b'503', b'504') else\n"
+    "          'proxy_unknown')\n"
+    "    sys.exit(0)\n"
     "try:\n"
     "    socket.create_connection((host, port), timeout=t).close()\n"
     "except OSError:\n"
@@ -51990,6 +52023,41 @@ def _network_local_host(host: str) -> str:
     return ""
 
 
+_PROXY_ENV_VARS = ("https_proxy", "HTTPS_PROXY", "http_proxy", "HTTP_PROXY")
+
+
+def _egress_proxy(host: str) -> tuple[str, int, str] | None:
+    """`(proxy host, proxy port, basic credential)` a worker's tools would
+    reach `host` through, or None for a direct connect (DESIGN §13 *The
+    probe takes the worker's way out*): no proxy variable parses,
+    `NO_PROXY` exempts `host`, or `host` is the container's own."""
+    if _network_local_host(host):
+        return None
+    for var in _PROXY_ENV_VARS:
+        raw = os.environ.get(var) or ""
+        if not raw.strip():
+            continue
+        try:
+            u = urllib.parse.urlsplit(raw if "://" in raw else "http://" + raw)
+            phost, pport = u.hostname, u.port
+        except ValueError:
+            continue
+        if not phost:
+            continue
+        try:
+            if urllib.request.proxy_bypass_environment(host):
+                return None
+        except Exception:
+            pass
+        auth = ""
+        if u.username is not None:
+            auth = base64.b64encode(
+                (urllib.parse.unquote(u.username) + ":"
+                 + urllib.parse.unquote(u.password or "")).encode()).decode()
+        return phost, pport or (443 if u.scheme == "https" else 80), auth
+    return None
+
+
 async def _network_reach(host: str, port: int, *,
                          allow_local: bool = False) -> str:
     """`reachable`, `unreachable` (the name does not resolve, or a TCP
@@ -51998,12 +52066,20 @@ async def _network_reach(host: str, port: int, *,
     container's own; no connect is tried) or `unknown` (any other resolver
     error, the hard timeout, a probe that could not run). `allow_local`
     connects to a local address instead — the control, which may be a
-    loopback API proxy."""
+    loopback API proxy. Through `_egress_proxy(host)` when it names one:
+    an HTTP CONNECT whose 2xx is `reachable`, 502/503/504 `unreachable`,
+    anything else `unknown`."""
+    argv = [sys.executable, "-I", "-c", _NETWORK_PROBE_SCRIPT, host,
+            str(port), str(_NETWORK_PROBE_CONNECT_SEC),
+            "1" if allow_local else "0"]
+    env = None
+    proxy = _egress_proxy(host)
+    if proxy is not None:
+        argv += [proxy[0], str(proxy[1])]
+        # The credential goes in the environment, never argv (`ps`).
+        env = {**os.environ, "LEERIE_PROBE_PROXY_AUTH": proxy[2]}
     try:
-        r = await run_proc([sys.executable, "-I", "-c", _NETWORK_PROBE_SCRIPT,
-                            host, str(port), str(_NETWORK_PROBE_CONNECT_SEC),
-                            "1" if allow_local else "0"],
-                           timeout=_NETWORK_PROBE_HARD_SEC)
+        r = await run_proc(argv, timeout=_NETWORK_PROBE_HARD_SEC, env=env)
     except (subprocess.TimeoutExpired, OSError):
         return "unknown"
     word = r.stdout.strip()
@@ -52136,10 +52212,13 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
                         "unreachable, but a TCP connect from the container "
                         "succeeds")
         if reach != "unreachable":
+            out["reason"] = "environment"
             return _end("unverified", f"the probe of {key}:{claim['port']} "
-                        "could not decide (resolver error or hard timeout)")
+                        "could not decide (resolver error, hard timeout or "
+                        "an undecided proxy answer)")
         control = _network_control()
         if await _network_reach(*control, allow_local=True) != "reachable":
+            out["reason"] = "environment"
             return _end("unverified", "the network probe cannot run here: "
                         f"the control host {control[0]}:{control[1]} is not "
                         "reachable from the container")
@@ -52230,6 +52309,8 @@ async def _route_blocker_kind(sid: str, res: dict, subtask: dict,
     including this one). Never reads the `blocker` prose."""
     kind, resource = _blocker_kind(res)
     blocker = str(res.get("blocker") or res.get("summary") or "")
+    prev = (st.data.get("blocker_kinds") or {}).get(sid)
+    prev_check = prev.get("external_check") if isinstance(prev, dict) else None
     record = {"kind": kind, "status": res.get("status")}
     if resource:
         record["resource"] = resource
@@ -52247,6 +52328,22 @@ async def _route_blocker_kind(sid: str, res: dict, subtask: dict,
         kind = record["kind"] = "other"
         record["claimed"] = "external_precondition"
         st.save()
+        if (check["verdict"] == "unverified"
+                and check.get("reason") == "environment"
+                and isinstance(prev_check, dict)
+                and prev_check.get("reason") == "environment"
+                and prev_check.get("claim") == check["claim"]):
+            # The same claim, unverifiable for the same environmental cause
+            # after a re-drive: nothing a further session does changes it
+            # (DESIGN §13 *An environment that cannot check a claim does not
+            # burn the budget*).
+            c = check["claim"] or {}
+            what = (f"{c.get('kind')} {c.get('key')}"
+                    + (f":{c['port']}" if "port" in c else ""))
+            return _settle_unconverged(
+                st, sid, "external claim could not be checked in this "
+                f"environment: {what}: {check['why']}",
+                previous_status="blocked", kind="external_unverified")
         log(f"  {sid}: external_precondition not accepted "
             f"({check['verdict']}) — {check['why']}")
         blocker = ((f"{blocker}\n" if blocker else "")

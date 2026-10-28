@@ -6306,8 +6306,14 @@ _route_blocker_kind(...)` before anything else:
   re-drives it from the shared budget.
 The kind is persisted as `blocker_kinds[sid] = {kind, resource?, status,
 claimed?, external_check?}` (the latest attempt's); an external claim adds
-`external_check = {verdict, why, claim}`, and a rejected one is recorded
-`kind: "other"` with `claimed: "external_precondition"`.
+`external_check = {verdict, why, claim, reason?}`, and a rejected one is
+recorded `kind: "other"` with `claimed: "external_precondition"`.
+`_route_blocker_kind` reads the previous attempt's `external_check` before
+overwriting the record: when both it and this attempt's are `unverified`
+with `reason: "environment"` and an equal `claim`, the subtask is settled
+by `_settle_unconverged(..., kind="external_unverified")` with the reason
+"external claim could not be checked in this environment: <claim>: <why>"
+instead of being re-driven again.
 
 External claim check (DESIGN §13 *An external claim is checked, not taken on
 the word*). `EXTERNAL_RESOURCE_KINDS = ("env_var", "network", "file",
@@ -6323,7 +6329,7 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
 - `async _verify_external_claim(sid, res, subtask, worktree, st, caps) ->
   dict` — `{verdict: "verified" | "refuted" | "unverified", why, claim,
   reason?}` (`reason` types why a claim was not accepted when that is not
-  the worker's evidence: `local_service`),
+  the worker's evidence: `local_service`, `environment`),
   checks in this order, the first non-`verified` one deciding: the typed
   claim (absent → `unverified`); the key's shape; the per-kind probe;
   grounding; consistency; the network probe; execution.
@@ -6406,7 +6412,22 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
     `unverified`. Only an `unreachable` one needs the control
     `_network_control()` (the host and port of `ANTHROPIC_BASE_URL` when
     set, else `_NETWORK_PROBE_CONTROL = ("api.anthropic.com", 443)`): not
-    `reachable` → `unverified`, else backed.
+    `reachable` → `unverified`, else backed. A probe that cannot decide
+    (the control not `reachable`, the claimed host `unknown`) sets
+    `reason: "environment"`.
+  - proxy: `_egress_proxy(host) -> tuple[str, int, str] | None` — the
+    first of `https_proxy`, `HTTPS_PROXY`, `http_proxy`, `HTTP_PROXY`
+    that parses (`urllib.parse.urlsplit`, default port 80/443 by scheme),
+    as `(proxy_host, proxy_port, basic_auth)` (`basic_auth` the base64
+    `user:password` of its userinfo, or `""`); None when none is set,
+    when `urllib.request.proxy_bypass_environment(host)` exempts the host,
+    or when `_network_local_host(host)` is non-empty. `_network_reach`
+    passes the proxy host and port to the probe as argv and the credential
+    in the `LEERIE_PROBE_PROXY_AUTH` environment variable (never argv);
+    the probe sends `CONNECT host:port HTTP/1.1` and reads the status
+    line: 2xx `reachable`, 502/503/504 `unreachable`, anything else or a
+    proxy connect failure `unknown`. A local resolution failure is
+    ignored in proxy mode (the proxy resolves).
   - execution: with `_subtask_verify_argvs(subtask)` non-empty,
     `_settle_by_execution(...)`; `pass` → `refuted`; `none` /
     `environment_limit` → `unverified`; `fail` is backed only when, for

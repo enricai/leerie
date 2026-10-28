@@ -10604,6 +10604,31 @@ network. DNS in each goes through the container's `resolv.conf`; a
 resolver that is down is a temporary failure (`EAI_AGAIN`), read as
 `unverified`, never as a missing host.
 
+*The probe takes the worker's way out.* Where egress is only through an
+HTTP proxy (`HTTPS_PROXY` / `HTTP_PROXY`), a direct connect to the control
+fails, so every network claim read `unverified` — re-driven until the
+budget was spent, a full implementer session each time, then `blocked`
+(round-3 review L4). A worker's own tools go through that proxy, so the
+probe does too: when a proxy is set and `NO_PROXY` does not exempt the
+host, the control and the claimed host are each probed by an HTTP
+`CONNECT host:port` through the proxy (with its credentials when the proxy
+URL carries them). A 2xx is reachable; a 502, 503 or 504 — the proxy could
+not resolve or reach the host — is unreachable; any other answer (a 403
+policy refusal, a 407) or a proxy that does not answer decides nothing,
+`unverified`. A local host is never proxied.
+
+*An environment that cannot check a claim does not burn the budget.* When
+the network probe cannot decide — the control is unreachable, the probe
+hit its hard timeout, the proxy refused to say — the claim is `unverified`
+with `reason: "environment"`: nothing the worker does next changes it. The
+first time, the subtask is re-driven as before (the worker may type a
+different, checkable claim, or finish the work). When the re-driven
+attempt returns the same claim and it is unverified for an environmental
+reason again, the subtask is settled `unconverged` at once, with the typed
+reason naming exactly what could not be checked — so the PR says which
+host could not be probed, and the rest of the budget is not spent
+rediscovering the environment.
+
 **A dependent of accepted-external work is accepted-external too.** A
 subtask whose predecessor in the scheduler's graph — `depends_on`, or a
 `requires` tag that predecessor `provides`, transitively — settled
