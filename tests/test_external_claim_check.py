@@ -34,7 +34,7 @@ def ext(env, monkeypatch, tmp_path):  # noqa: F811
     monkeypatch.setenv("HOME", str(home))
     reach: dict[tuple[str, int], str] = {}
 
-    async def _reach(host, port):
+    async def _reach(host, port, allow_local=False):
         return reach.get((host, port), "unknown")
     monkeypatch.setattr(c, "_network_reach", _reach)
     monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
@@ -285,9 +285,13 @@ def test_network_probe_reaches_a_listener_and_not_a_closed_port(leerie):
     closed.close()
     try:
         assert asyncio.run(leerie._network_reach(
-            "127.0.0.1", open_port)) == "reachable"
+            "127.0.0.1", open_port, allow_local=True)) == "reachable"
         assert asyncio.run(leerie._network_reach(
-            "127.0.0.1", closed_port)) == "unreachable"
+            "127.0.0.1", closed_port, allow_local=True)) == "unreachable"
+        # without `allow_local` a loopback address is a local service,
+        # never connected to (DESIGN §13 *A local service is not external*)
+        assert asyncio.run(leerie._network_reach(
+            "127.0.0.1", open_port)) == "local 127.0.0.1"
     finally:
         srv.close()
 

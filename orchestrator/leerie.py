@@ -51619,16 +51619,26 @@ _NETWORK_PROBE_CONTROL = ("api.anthropic.com", 443)
 # Prints one fixed word; `_network_reach` maps it. EAI_NONAME / EAI_NODATA
 # say the name does not exist; any other resolver error (EAI_AGAIN: the
 # resolver is unreachable) says nothing about the host.
+# A resolved address that is the container's own (`_is_local_address`'s
+# rule) prints `local <address>` before any connect (DESIGN §13 *A local
+# service is not external*).
 _NETWORK_PROBE_SCRIPT = (
-    "import socket, sys\n"
+    "import ipaddress, socket, sys\n"
     "host, port, t = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])\n"
+    "allow_local = sys.argv[4:5] == ['1']\n"
     "gone = {getattr(socket, n) for n in ('EAI_NONAME', 'EAI_NODATA')\n"
     "        if hasattr(socket, n)}\n"
     "try:\n"
-    "    socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)\n"
+    "    infos = socket.getaddrinfo(host, port, proto=socket.IPPROTO_TCP)\n"
     "except socket.gaierror as e:\n"
     "    print('dns_fail' if e.errno in gone else 'dns_unknown')\n"
     "    sys.exit(0)\n"
+    "for info in ([] if allow_local else infos):\n"
+    "    a = ipaddress.ip_address(str(info[4][0]).split('%')[0])\n"
+    "    if (a.is_loopback or a.is_private or a.is_link_local\n"
+    "            or a.is_unspecified):\n"
+    "        print('local', a)\n"
+    "        sys.exit(0)\n"
     "try:\n"
     "    socket.create_connection((host, port), timeout=t).close()\n"
     "except OSError:\n"
@@ -51944,18 +51954,63 @@ def _network_control() -> tuple[str, int]:
     return _NETWORK_PROBE_CONTROL
 
 
-async def _network_reach(host: str, port: int) -> str:
+# The container's own host table: a name it serves is a local service.
+_ETC_HOSTS = "/etc/hosts"
+
+
+def _is_local_address(addr: str) -> bool:
+    """A loopback, private (RFC 1918, IPv6 ULA), link-local or unspecified
+    address — the probe script applies the same rule to resolved ones."""
+    try:
+        a = ipaddress.ip_address(addr.split("%")[0])
+    except ValueError:
+        return False
+    return a.is_loopback or a.is_private or a.is_link_local or a.is_unspecified
+
+
+def _network_local_host(host: str) -> str:
+    """`""`, or why `host` is the container's own and so not external
+    (DESIGN §13 *A local service is not external*): `localhost` or a
+    `.localhost` name, a local IP literal, or a name `_ETC_HOSTS` serves.
+    A name that only resolves to a local address is caught by the probe."""
+    h = host.strip().strip("[]").rstrip(".").lower()
+    if h == "localhost" or h.endswith(".localhost"):
+        return f"`{host}` is the container's own loopback name"
+    if _is_local_address(h):
+        return f"`{host}` is a loopback, private or link-local address"
+    try:
+        with open(_ETC_HOSTS, errors="replace") as fh:
+            for line in fh:
+                words = line.split("#", 1)[0].split()
+                if h in (w.lower() for w in words[1:]):
+                    return (f"`{host}` is served by the container's own "
+                            f"{_ETC_HOSTS} ({words[0]})")
+    except OSError:
+        pass
+    return ""
+
+
+async def _network_reach(host: str, port: int, *,
+                         allow_local: bool = False) -> str:
     """`reachable`, `unreachable` (the name does not resolve, or a TCP
-    connect fails within `_NETWORK_PROBE_CONNECT_SEC`) or `unknown` (any
-    other resolver error, the hard timeout, a probe that could not run)."""
+    connect fails within `_NETWORK_PROBE_CONNECT_SEC`), `local <address>`
+    (the name resolves to an address `_is_local_address` reads as the
+    container's own; no connect is tried) or `unknown` (any other resolver
+    error, the hard timeout, a probe that could not run). `allow_local`
+    connects to a local address instead — the control, which may be a
+    loopback API proxy."""
     try:
         r = await run_proc([sys.executable, "-I", "-c", _NETWORK_PROBE_SCRIPT,
-                            host, str(port), str(_NETWORK_PROBE_CONNECT_SEC)],
+                            host, str(port), str(_NETWORK_PROBE_CONNECT_SEC),
+                            "1" if allow_local else "0"],
                            timeout=_NETWORK_PROBE_HARD_SEC)
     except (subprocess.TimeoutExpired, OSError):
         return "unknown"
+    word = r.stdout.strip()
+    if word.startswith("local ") and len(word.split()) == 2:
+        return word
     return {"reachable": "reachable", "dns_fail": "unreachable",
-            "connect_fail": "unreachable"}.get(r.stdout.strip(), "unknown")
+            "connect_fail": "unreachable"}.get(word, "unknown")
 
 
 async def _repo_mentions(worktree: str, ref: str, kind: str,
@@ -52000,6 +52055,12 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
     kind, key = claim["kind"], claim["key"]
     scoped, every = _declared_external_texts(st, subtask, sid)
     task = str(st.data.get("task") or "")
+    local = _network_local_host(key) if kind == "network" else ""
+    if local:
+        out["reason"] = "local_service"
+        return _end("refuted", f"local service: start it in-container — "
+                    f"{local}; a service the container can run is not an "
+                    "external resource")
     bad_shape = _claim_key_shape(kind, key)
     if bad_shape:
         return _end("refuted", f"claimed {kind}, but {bad_shape}")
@@ -52059,12 +52120,17 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
                     "items declared for this subtask name other resources: "
                     + "; ".join(scoped)[:300])
     if kind == "network":
-        control = _network_control()
-        if await _network_reach(*control) != "reachable":
-            return _end("unverified", "the network probe cannot run here: "
-                        f"the control host {control[0]}:{control[1]} is not "
-                        "reachable from the container")
+        # The claimed host first: a local or reachable one is refuted
+        # whatever the control says; only `unreachable` needs the control
+        # to mean anything.
         reach = await _network_reach(key, claim["port"])
+        if reach.startswith("local "):
+            out["reason"] = "local_service"
+            return _end("refuted", "local service: start it in-container — "
+                        f"`{key}` resolves to {reach.split()[1]}, the "
+                        "container's own (loopback, private or link-local) "
+                        "address; a service the container can run is not "
+                        "an external resource")
         if reach == "reachable":
             return _end("refuted", f"claimed {key}:{claim['port']} "
                         "unreachable, but a TCP connect from the container "
@@ -52072,6 +52138,11 @@ async def _verify_external_claim(sid: str, res: dict, subtask: dict,
         if reach != "unreachable":
             return _end("unverified", f"the probe of {key}:{claim['port']} "
                         "could not decide (resolver error or hard timeout)")
+        control = _network_control()
+        if await _network_reach(*control, allow_local=True) != "reachable":
+            return _end("unverified", "the network probe cannot run here: "
+                        f"the control host {control[0]}:{control[1]} is not "
+                        "reachable from the container")
     if _subtask_verify_argvs(subtask):
         ex = await _settle_by_execution(subtask, worktree, st, caps, sid=sid)
         if ex["verdict"] == "pass":

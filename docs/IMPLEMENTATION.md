@@ -6321,7 +6321,9 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
   None when the kind is unknown, the key field is empty, or a `network`
   claim's port is not an integer in 1–65535.
 - `async _verify_external_claim(sid, res, subtask, worktree, st, caps) ->
-  dict` — `{verdict: "verified" | "refuted" | "unverified", why, claim}`,
+  dict` — `{verdict: "verified" | "refuted" | "unverified", why, claim,
+  reason?}` (`reason` types why a claim was not accepted when that is not
+  the worker's evidence: `local_service`),
   checks in this order, the first non-`verified` one deciding: the typed
   claim (absent → `unverified`); the key's shape; the per-kind probe;
   grounding; consistency; the network probe; execution.
@@ -6380,17 +6382,31 @@ key (`name` / `host` / `path` / `name` / `name` / `quote`).
     claims in `claims.items`; `every` is the same over all subtasks and
     all external items. When `scoped` is non-empty `_claim_key_in` must
     find the key in one entry, else `refuted`.
-  - network: `_network_reach(host, port) -> str` (`reachable` /
-    `unreachable` / `unknown`) runs `_NETWORK_PROBE_SCRIPT` as `python3 -I`
+  - local service (checked before the shape, `network` only):
+    `_network_local_host(host) -> str` — `""`, or why the host is the
+    container's own: `localhost` / `*.localhost`, an IP literal that
+    `_is_local_address` reads as loopback, private, link-local or
+    unspecified, or a name listed in `_ETC_HOSTS` (`/etc/hosts`; comments
+    dropped, every name after the address). Non-empty → `refuted` with
+    `reason: "local_service"` and why `"local service: start it
+    in-container — …"`. The probe also prints `local <address>` when any
+    address the name resolves to is local, before connecting;
+    `_network_reach` returns that as `"local <address>"` and the claim is
+    refuted the same way.
+  - network: `_network_reach(host, port, *, allow_local=False) -> str`
+    (`reachable` / `unreachable` / `unknown` / `local <address>`; the
+    control is probed with `allow_local=True`, so a loopback API proxy
+    still connects) runs `_NETWORK_PROBE_SCRIPT` as `python3 -I`
     under `run_proc(timeout=_NETWORK_PROBE_HARD_SEC)` (8 s, kills the
     process group) with a `_NETWORK_PROBE_CONNECT_SEC` (3 s) socket
     timeout; `EAI_NONAME`/`EAI_NODATA` or a failed connect is
     `unreachable`, any other resolver error, a hard timeout or unexpected
-    output `unknown`. The control `_network_control()` (the host and port of
-    `ANTHROPIC_BASE_URL` when set, else `_NETWORK_PROBE_CONTROL =
-    ("api.anthropic.com", 443)`) is probed first: not `reachable` →
-    `unverified`. Then the claimed host: `reachable` → `refuted`,
-    `unknown` → `unverified`, `unreachable` → backed.
+    output `unknown`. The claimed host is probed first: `local …` →
+    `refuted` (`local_service`), `reachable` → `refuted`, `unknown` →
+    `unverified`. Only an `unreachable` one needs the control
+    `_network_control()` (the host and port of `ANTHROPIC_BASE_URL` when
+    set, else `_NETWORK_PROBE_CONTROL = ("api.anthropic.com", 443)`): not
+    `reachable` → `unverified`, else backed.
   - execution: with `_subtask_verify_argvs(subtask)` non-empty,
     `_settle_by_execution(...)`; `pass` → `refuted`; `none` /
     `environment_limit` → `unverified`; `fail` is backed only when, for

@@ -10566,10 +10566,31 @@ rule is that leftover work is accepted only when its cause is an external
 resource no in-container step can supply, and an unrun check has not shown
 that.
 
+*A local service is not external.* A `network` claim on a host that is
+the container's own — `localhost` or a `.localhost` name, a name the
+container's `/etc/hosts` serves, or a host that resolves to a loopback,
+private (RFC 1918, IPv6 ULA), link-local or unspecified address — is never
+verified, whatever the probe sees. The user's rule accepts leftover work
+only for a resource no in-container step can supply, and a Postgres or
+Redis on localhost, or a compose service name, is exactly what an
+in-container step starts (leerie itself starts a throwaway Postgres for
+Prisma repos): "could not connect to the database" is the commonest
+blocker text, and on a closed local port the probe reads `unreachable`,
+which settled the subtask `accepted_external` with no work (round-3 review
+M2). Such a claim is refuted with the typed reason "local service: start
+it in-container", naming the address it resolved to, and re-driven. The
+check runs on the resolved address, not the spelling: the name is
+resolved by the probe itself, which reports a local address before it
+tries to connect. The price is a corporate service on a private address
+(split-horizon DNS): it cannot be accepted as external and ends
+`unconverged` with that reason, which the PR reports — a human reading it
+can supply the service; a run that wrongly accepted a local one would have
+skipped work leerie could do.
+
 The network probe runs as a child process with a connect timeout inside a
 hard wall-clock timeout that kills it, so a resolver that never answers
-cannot stall the run; a hard timeout is `unverified`. Before probing the
-claimed host it probes a control — the API endpoint every worker already
+cannot stall the run; a hard timeout is `unverified`. When the claimed
+host is unreachable, it then probes a control — the API endpoint every worker already
 talks to (`ANTHROPIC_BASE_URL`'s host when set, else
 `api.anthropic.com:443`): if the control is unreachable, the container has
 no usable network and an unreachable claimed host proves nothing. The
