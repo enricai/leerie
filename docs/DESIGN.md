@@ -2250,7 +2250,14 @@ changed on one side only takes that side, nested objects recurse, a key both
 sides changed differently is a conflict) and commits the merge itself when
 every file merges with no key conflict and keeps both sides' keys. Anything
 else — a non-JSON conflicted file, a file that does not parse, a key
-conflict — goes to the integrator unchanged. Of the two JSON-only natural
+conflict — goes to the integrator unchanged. So does a file whose
+formatting the merge cannot reproduce byte for byte: the merged value is
+rendered with the serializer settings (indent, escaping, final newline)
+that re-render OUR side exactly, so only the merged keys' lines change; a
+file in a style no such setting writes (prettier's inline arrays, CRLF,
+duplicate keys) would come back wholly reformatted — unrelated churn in
+the PR and a red formatter check caused by leerie's own merge — so it is
+not key-merged. Of the two JSON-only natural
 conflicts in the q4 corpus, one merged cleanly this way; the other was a real
 key conflict (the same message key changed on both sides) and stays the
 integrator's.

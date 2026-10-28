@@ -52259,13 +52259,36 @@ def _json_key_merge3(base: object, ours: object, theirs: object,
 
 
 def _json_indent(text: str) -> str | int:
-    """The indent a JSON file uses (its first indented line), so a merged
-    file keeps the repo's formatting."""
+    """The indent a JSON file uses (its first indented line)."""
     for line in text.splitlines()[1:]:
         lead = line[:len(line) - len(line.lstrip())]
         if lead:
             return "\t" if lead.startswith("\t") else len(lead)
     return 2
+
+
+def _json_faithful_renderer(text: str) -> Callable[[object], str] | None:
+    """A serializer that reproduces `text` byte for byte from its parsed
+    value, or None when none does (DESIGN §6 *A conflict confined to JSON
+    files is merged by key*). Rendering the merged value with it changes
+    only the merged keys' lines: everything else re-renders exactly as it
+    was. A file in a style `json.dumps` cannot write — prettier's inline
+    arrays, `\\uXXXX` beside literal non-ASCII, CRLF, duplicate keys, an
+    exponent float — has none, and is left to the integrator."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    nl = "\n" if text.endswith("\n") else ""
+    for indent in dict.fromkeys([_json_indent(text), 2, 4, "\t"]):
+        for ascii_only in (False, True):
+            def render(v: object, indent: str | int = indent,
+                       ascii_only: bool = ascii_only) -> str:
+                return json.dumps(v, ensure_ascii=ascii_only,
+                                  indent=indent) + nl
+            if render(value) == text:
+                return render
+    return None
 
 
 async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
@@ -52296,9 +52319,13 @@ async def _try_json_key_merge(staging: Path, sid: str) -> list[str] | None:
             log(f"  {sid}: JSON key merge of {f} refused — key conflict(s) "
                 f"{', '.join(conflicts[:5])}")
             return None
-        merged[f] = (json.dumps(value, ensure_ascii=False,
-                                indent=_json_indent(ours_t))
-                     + ("\n" if ours_t.endswith("\n") else ""))
+        render = _json_faithful_renderer(ours_t)
+        if render is None:
+            log(f"  {sid}: JSON key merge of {f} refused — its formatting "
+                "cannot be reproduced, so a merge would rewrite the whole "
+                "file")
+            return None
+        merged[f] = render(value)
     for f, text in merged.items():
         (staging / f).write_text(text)
     add = await run_proc(["git", "add", "--", *files], cwd=str(staging))
