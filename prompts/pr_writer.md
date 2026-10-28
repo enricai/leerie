@@ -108,11 +108,14 @@ to merge and deploy the named dependency before merging this PR. Do
 not parse or interpret the reason text — quote it as-is. Do not
 invent ordering constraints beyond what the data says.
 
-Do **not** render a residual-risks section of your own: when the run's
-risk register is non-empty, the orchestrator appends a mechanical
-`## ⚠ Residual risks` section after your body (DESIGN §6 — the append
-is code-owned so no composition step can summarize a worker's caveat
-away). Writing one yourself would render it twice.
+Do **not** write any of these sections yourself: `## Unconverged`,
+`## Needs human verification`, `## Untested after re-drive`,
+`## Integration content loss`, `## Repository merge checks still red`,
+`## Advisory (not verified by this run)` (nor a `## ⚠ Residual risks`
+section). The orchestrator renders them from the run's typed state and
+appends them after your body (DESIGN §6 — the append is code-owned so no
+composition step can summarize a caveat away). Writing one yourself would
+render it twice, so any you write is removed.
 
 ## Output
 

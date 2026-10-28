@@ -2546,25 +2546,50 @@ logged and swallowed, falling back to a deterministic body composed from
 `compose_pr_body`, the canonical reference for that shape). Generating a
 richer body must never block finalize success.
 
-**The residual-risk section is appended by code on every composition
-path.** When the run's `risk_register` (§9 *Self-reported risk is routed,
-not read*) is non-empty, a `## ⚠ Residual risks` section rendering each
-entry verbatim is appended to the PR body mechanically, on both live
-composition paths: by Python after the `pr_writer` worker's body is
-accepted, and in the launcher's LLM-less bash fallback by a `jq` renderer
-format-identical to `compose_pr_body` — the never-invoked canonical
-fallback reference the bash mirrors, which carries the same section —
-the same append-regardless-of-path discipline as the rebaser's diagnosis
-note. The `pr_writer` prompt tells the worker not to render its own risks
-section, but the guarantee is the append, not the prompt (§12): a
-worker-emitted section is stripped unconditionally — span-limited to the
-section, so surrounding legitimate content survives — whether or not the
-register has anything to append in its place. The section renders only
-subtasks whose work the PR actually contains: a sid still `blocked` at
-finalize was excluded from wave integration, and an `accept-blocked`ed
-sid's branch is likewise never merged (resume excludes it, so
-integration sees no result entry) — both are skipped, via
-`subtask_status` and the `accepted_blocked` registry.
+**The PR's end-state section is rendered by code, from typed state, on
+every composition path.** `_format_pr_end_state_section` turns what the run
+recorded into at most six short lists, each under its own heading, each
+present only when it has an entry:
+
+- `## Unconverged` — why the PR is a draft: the outcome decider's reasons
+  (§6 *The run outcome is decided once*) and every `unconverged` subtask
+  with its own reason.
+- `## Needs human verification` — one checkbox list, grouped by the
+  resource a human must supply: the task's required items the classifier
+  typed `external`, subtasks accepted on an `external_precondition`
+  blocker (§13), risks a worker typed `gap: unverified_external` (a
+  concurrency risk whose tests can only stub the interleaving is labelled
+  so — `simulated_interleaving`), and audited fix sites resolved by an
+  untyped (`other`) change (§5 *Every `fix` site is claimed*).
+- `## Untested after re-drive` — changed lines that no test executes after
+  the coverage re-drive spent its rounds (§9 *Changed lines no test
+  executes are re-driven*). Listed, never a reason to draft.
+- `## Integration content loss` — work a merge dropped (§6 *When
+  integration cannot succeed*).
+- `## Repository merge checks still red` — the CI-parity checks confirmed
+  red on the final tree (§9 *The repository's own merge checks run too*).
+- `## Advisory (not verified by this run)` — the whole-PR review's verified
+  findings, the contract-literal flags and the site-token hits (§8, §9),
+  labelled advisory because nothing waited on them.
+
+It replaces a generic dump of every worker's self-reported risk, verbatim,
+under one "Residual risks" heading — which mixed in-container gaps,
+process notes and external checks, and filed integration content loss
+under "Self-reported by workers". Benched as Q5/G (sonnet judge, two
+samples with the order swapped): on a fresh 10-PR corpus the typed lists
+were preferred for "what do I do" and as less confusing on 10 of 10 PRs
+in both samples; summed over the two samples, 92 of 92 entries were
+actionable against 1 of 485 in the dump, which carried 268 noise entries. The section is written to
+`run.json` as `pr_end_state` beside `finished_at`, so the launcher's
+LLM-less fallback appends the same text rather than re-deriving it in
+`jq`; on the `pr_writer` path it is appended to the accepted body. The
+`pr_writer` prompt tells the worker not to write these headings; the
+guarantee is the append (§12) — a worker-emitted copy of any of them is
+stripped, span-limited to that section, whether or not the run has
+anything to append. The risk-derived and untested lists render only
+subtasks whose work the PR contains (not `blocked`, `unconverged`,
+`accepted_external`, or `accept-blocked`ed); integration content loss is
+listed precisely because the work is not there.
 
 When the target repo has multiple templates inside
 `PULL_REQUEST_TEMPLATE/`, the alphabetically first `.md` wins by
@@ -2779,7 +2804,9 @@ unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
 into `run.json`, and the host launcher opens the PR as a **draft** when it
 is `unconverged` — the PR still carries everything that did converge, but it
-cannot be mistaken for finished work. Before this, no-work was decided in
+cannot be mistaken for finished work — and the body says why: the end-state
+section (§6 *Finalization*) opens with `## Unconverged`, the decider's
+reasons followed by each unconverged subtask's own. Before this, no-work was decided in
 five scattered places and a run with unfinished work shipped an ordinary PR.
 
 ### Credential strategy
@@ -7633,19 +7660,35 @@ Two further disciplines sit at the §12 axis:
   1. **A `risk_register` in run state.** `_collect_subtask_risks` folds the
      already-typed tier (`production_evidence.exercised == false`, from the
      implementer and the conformer) together with an explicit typed
-     `self_reported_risks` field on the implementer result (kind enum +
-     one-line detail), keyed by subtask, set and cleared on the same
-     settle path as `symptom_findings`. (Measured across 2,627 implementer
-     calls on three repos: the `exercised: false` tier fires on 3.2% of
-     results; on the motivating run — a fourth, separate corpus — it
-     flagged exactly the defect-bearing subtasks. A low-noise,
-     high-recall signal.)
-  2. **A Python-appended PR section.** The register renders into the PR
-     body as a `## ⚠ Residual risks` section appended by code on every
-     composition path — LLM-written, deterministic fallback, and the
-     launcher's bash fallback alike — so the reviewer sees the worker's own
-     caveats verbatim. The `pr_writer` worker never owns this section: an
-     LLM composer can summarize a caveat away; an append cannot.
+     `self_reported_risks` field on the implementer result, keyed by
+     subtask, set and cleared on the same settle path as
+     `symptom_findings`. (Measured across 2,627 implementer calls on three
+     repos: the `exercised: false` tier fires on 3.2% of results; on the
+     motivating run — a fourth, separate corpus — it flagged exactly the
+     defect-bearing subtasks. A low-noise, high-recall signal.) Each typed
+     entry says what is missing, where, and what would settle it, so code
+     can route it: `gap` — `test_missing` (changed production code no test
+     exercises), `test_weak` (a test exists but does not assert the
+     change), `unverified_external` (depends on something outside the
+     repository's own checks: a live service, real database, cloud
+     resource, real device), or `none` (informational); `where_paths` —
+     exact repository paths, which code keeps only when each is a file in
+     the subtask's worktree; `settle_by` — `test`, `typecheck`, `install`
+     or `build`; an optional `resource` naming what a human must supply,
+     and `simulated_interleaving` for a race whose tests can only stub the
+     interleaving. A note about the worker's own process ("typecheck was
+     not run") is kind `process_note` and never enters the register: the
+     orchestrator runs its own checks. (Bench Q7/G v5: of the 9 frozen
+     late-chain subtasks, 8 of 9 first emissions carried only a
+     process note.) The `exercised: false` tier is typed
+     `unverified_external` — the worker could not exercise the path here.
+  2. **Routed by type, never dumped.** `gap: unverified_external` reaches
+     the PR's "Needs human verification" list (§6 *Finalization*);
+     `test_missing` / `test_weak` feed the coverage re-drive below (*Changed
+     lines no test executes are re-driven*); `none` and every entry the
+     conformer cleared stay in `state.json` only. The PR section is code's,
+     not the `pr_writer`'s: an LLM composer can summarize a caveat away; an
+     append cannot.
   3. **Conformer challenge items, answered through a typed disposition.**
      The implementer's disclosed risks are injected into its conformer's
      context, and the conformer must answer each through a positional
@@ -7702,6 +7745,57 @@ Two further disciplines sit at the §12 axis:
      whose unrelated fix in the same pass co-occurs with a `mitigated`
      answer to a different risk — is bounded by the PR section rendering
      every entry, addressed or not, with its disposition visible.
+
+- **Changed lines no test executes are re-driven.** A worker's own risk
+  disclosure misses the commonest gap: in Q7/G v6, 15 subtasks whose test
+  was removed were re-run twice with the typed `gap` field, and a gap named
+  the seeded file in 6 of 30 emissions. So the orchestrator measures it. After a subtask settles `complete` and before
+  its wave integrates, `_measure_subtask_coverage` runs the subtask's own
+  test files — the test-shaped files its diff changed — with line coverage
+  restricted to its changed production files, and reads which changed
+  executable lines ran. Coverage counts only from a test file that passed
+  (one that fails is re-run once; failing twice, it contributes nothing).
+  For a file with lines still unexecuted, every other test file that
+  imports it (at most 30 per file, a module it mocks does not count) runs
+  the same way, and the lines it executes are settled. A test-path helper
+  module — under a test directory but not itself a test file — is never a
+  test here: in the bench one was counted as a failing test and cost a
+  closure. The subtask is re-driven when the unexecuted share of its
+  changed executable lines is at least `coverage_uncovered_share` (0.25),
+  or when one of its risks typed `test_missing` / `test_weak` is not
+  settled:
+
+  - `test_missing` settles without a re-drive when an existing test file
+    that imports one of its `where_paths` passes (under B*: a failure is
+    re-run before it counts).
+  - `settle_by: typecheck` / `build` settles only when the type-checker
+    passes and lists every `where_paths` file among the files it checked
+    (`tsc --listFiles`): an axis passing says nothing about a file outside
+    its own file list.
+  - `test_weak` has no mechanical settle before a re-drive; after one, it
+    settles when a test file the re-drive changed, in or importing its
+    `where_paths`, passes.
+
+  One note per subtask names the unexecuted `file:line`s and the unsettled
+  gaps, and the implementer continues on its own branch. Each round draws
+  from the subtask's shared re-drive counter (§13 *One re-drive budget per
+  subtask*), so there are at most two, and round 2 is told why round 1 was
+  not enough: the lines still unexecuted and the tests that failed twice.
+  A re-drive that does not end `complete` is rolled back to the subtask's
+  pre-re-drive commit — adding tests must never cost finished work. What
+  is still unexecuted after the rounds is listed in the PR's "Untested
+  after re-drive" and never drafts the PR. JS/TS with vitest's v8
+  coverage only, as benched; elsewhere the measurement is recorded
+  `unmeasured` and nothing is re-driven. Bench Q7/G v8 (funeralworks; a
+  seed deletes or reverts one test file the subtask added): detection
+  fired on 16 of 19 hard seeds (a seeded line left unexecuted); on clean
+  final trees it fired on 4 of 20 fresh subtasks and 1 of 12 more; within
+  two rounds 13 of 16 detected seeds closed (every line executed by tests
+  that pass, and a judge read the tests as addressing the lines), with 0
+  new test failures; the detector took a median 53 s per subtask. Line
+  coverage cannot see a weakened assertion: of 8 soft seeds (the test
+  kept but reverted) it fired on 1, and the typed gap on none of 16
+  emissions.
 
 - **A stale finding is not a bug.** The evidence contract above asks whether
   a fix fires; this asks whether the failure it fixes still happens. On one
@@ -9290,8 +9384,9 @@ multiplied: a completeness re-drive inside one settle, then a fresh settle on
 **one persisted counter per subtask**, `redrive_rounds[sid]`, capped by
 `subtask_redrive_rounds` (2): the completeness gate's re-drive and the
 wave-end re-drive of a `blocked` subtask take from the same counter, and so
-does each integration repair round (§6 *When integration cannot succeed*), as
-will every later re-drive kind. An unbacked claim settle-by-execution cannot
+does each integration repair round (§6 *When integration cannot succeed*) and
+each coverage re-drive round (§9 *Changed lines no test executes are
+re-driven*), as will every later re-drive kind. An unbacked claim settle-by-execution cannot
 settle (§8 *Settled by execution*) ends its attempt `blocked` and so enters
 through the wave-end re-drive. The per-attempt budgets (`failed_retries`,
 `implementer_confidence_retries`, `subtask_continuations`) still bound one
@@ -9409,13 +9504,15 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the twenty-three worker types in
+Every main-loop LLM call in Leerie passes through one of the twenty-nine worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
 `artifact_registry`, `integration_judge`, `no_work_judge`,
-`delivery_judge`, `defect_scope_auditor`, `acceptance_writer`, or `rebaser`
+`delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`,
+`set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`,
+`pr_reviewer`, or `contract_extractor`
 (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
@@ -9424,8 +9521,13 @@ independent adversarial
 verifiers — see §8; `artifact_registry` is the pre-planning
 shared-vocabulary worker and `defect_scope_auditor` the pre-planning
 defect-shape enumerator — see §5; `acceptance_writer` writes the held-out
-acceptance tests — see §8; `rebaser` is the finalize-time rebase
-worker — see §6). Each worker type is a distinct **call type** — a
+acceptance tests, `set_auditor` audits a held-out set that keeps failing,
+`surrogate_fixer` is that audit's witness fix and `scope_judge` bounds a
+report-pointer task's sets to the report's own scenarios — see §8;
+`ci_checks` reads the repository's CI configuration — see §9;
+`pr_reviewer` is the advisory whole-PR review and `contract_extractor`
+types a worker-flagged contract — see §8 and §9; `rebaser` is the
+finalize-time rebase worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per
 worker role, no overlap, no gap. Post-run skill workers — `judge`,

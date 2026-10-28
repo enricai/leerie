@@ -6,8 +6,11 @@ helpers:
   `risk_dispositions` answers and the verifiable-act co-occurrence checks.
 - `_format_self_reported_risks` — the conformer-facing challenge block
   (whose item order IS the disposition-index contract).
-- `_format_risk_register_section` — the PR-body renderer appended by code
-  on every composition path.
+- `_format_pr_end_state_section` — the PR-body renderer that replaced the
+  generic risk dump: register entries reach the PR only by their typed
+  `gap` (DESIGN §6 *The PR's end-state section is rendered by code, from
+  typed state*; the rest of that renderer is pinned in
+  tests/test_pr_end_state.py).
 
 The incident these pin: an implementer disclosed, in typed fields, that its
 new path was unexercised and keyed on an external API's message wording —
@@ -183,6 +186,7 @@ def test_conformer_own_unexercised_evidence_joins_unchallenged(leerie):
     out = leerie._collect_subtask_risks(None, conf)
     assert out == [{"kind": "unexercised_behavior",
                     "detail": "needs live API", "source": "conformer",
+                    "gap": "unverified_external", "where_paths": [],
                     "addressed": False}]
 
 
@@ -209,53 +213,67 @@ def test_challenge_block_carries_each_detail_verbatim(leerie):
 
 # --- the PR section --------------------------------------------------------
 
-def test_pr_section_renders_details_verbatim_with_status(leerie):
+def _ext(detail, addressed=False, **kw):
+    return {"kind": "external_contract_assumption", "detail": detail,
+            "source": "implementer", "gap": "unverified_external",
+            "where_paths": [], "addressed": addressed, **kw}
+
+
+def test_pr_section_routes_register_entries_by_gap(leerie):
+    """Only typed external entries (and simulated interleavings) reach the
+    PR, under "Needs human verification" grouped by resource; an addressed
+    entry, a `test_missing` gap and a `none` entry stay in state only. The
+    retired dump rendered all four verbatim."""
     state = {"risk_register": {"feat-x": [
-        {"kind": "external_contract_assumption",
-         "detail": "matches the provider's error-message wording",
-         "where": "app/services/x.rb", "source": "implementer",
-         "disposition": "accepted", "addressed": False},
-        {"kind": "unexercised_behavior", "detail": "needs live API",
-         "source": "implementer", "disposition": "mitigated",
-         "addressed": True},
-        {"kind": "untested_change", "detail": "escalated to the gate",
-         "source": "implementer", "disposition": "confirmed_defect",
+        _ext("matches the provider's error-message wording",
+             resource="the provider's live API",
+             where_paths=["app/services/x.rb"]),
+        _ext("already mitigated", addressed=True),
+        {"kind": "untested_change", "detail": "no test for the parser",
+         "source": "implementer", "gap": "test_missing",
+         "where_paths": ["app/parser.rb"], "addressed": False},
+        {"kind": "untested_change", "detail": "informational note",
+         "source": "implementer", "gap": "none", "where_paths": [],
          "addressed": False},
+        {"kind": "unexercised_behavior", "detail": "two writers race",
+         "source": "implementer", "gap": "test_weak", "where_paths": [],
+         "simulated_interleaving": True, "addressed": False},
     ]}}
-    sec = leerie._format_risk_register_section(state)
-    assert "## ⚠ Residual risks" in sec
-    assert ("- **feat-x** [external_contract_assumption] matches the "
-            "provider's error-message wording (app/services/x.rb) — "
-            "accepted, not cleared") in sec
-    assert ("- **feat-x** [unexercised_behavior] needs live API — "
-            "addressed (mitigated)") in sec
-    assert ("- **feat-x** [untested_change] escalated to the gate — "
-            "confirmed_defect, not cleared") in sec
+    sec = leerie._format_pr_end_state_section(state)
+    assert "Residual risks" not in sec
+    assert "## Needs human verification" in sec
+    assert ("**the provider's live API**\n- [ ] **feat-x**: matches the "
+            "provider's error-message wording (`app/services/x.rb`)") in sec
+    assert ("**A real concurrent engine**\n- [ ] **feat-x**: two writers "
+            "race — tests simulate the interleaving") in sec
+    for gone in ("already mitigated", "no test for the parser",
+                 "informational note"):
+        assert gone not in sec
 
 
 def test_pr_section_empty_register_renders_nothing(leerie):
-    assert leerie._format_risk_register_section({}) == ""
-    assert leerie._format_risk_register_section({"risk_register": {}}) == ""
-    assert leerie._format_risk_register_section(
+    assert leerie._format_pr_end_state_section({}) == ""
+    assert leerie._format_pr_end_state_section({"risk_register": {}}) == ""
+    assert leerie._format_pr_end_state_section(
         {"risk_register": {"s": []}}) == ""
 
 
 def test_pr_section_skips_still_blocked_subtasks(leerie):
-    """A sid still `blocked` at finalize was excluded from integration —
-    its risks describe code the PR does not contain. An accept-blocked'ed
-    sid is likewise skipped, via the `accepted_blocked` registry (its
-    status reads `complete` but its branch is never merged — see
+    """A sid still `blocked` (or settled `unconverged`) at finalize was
+    excluded from integration — its risks describe code the PR does not
+    contain. An accept-blocked'ed sid is likewise skipped, via the
+    `accepted_blocked` registry (see
     test_pr_section_skips_accept_blocked_sids)."""
-    entry = [{"kind": "untested_change", "detail": "orphan risk",
-              "source": "implementer", "addressed": False}]
-    state = {"risk_register": {"s1": entry, "s2": entry},
-             "subtask_status": {"s1": "blocked", "s2": "complete"}}
-    sec = leerie._format_risk_register_section(state)
+    entry = [_ext("orphan risk")]
+    state = {"risk_register": {"s1": entry, "s2": entry, "s3": entry},
+             "subtask_status": {"s1": "blocked", "s2": "complete",
+                                "s3": "unconverged"}}
+    sec = leerie._format_pr_end_state_section(state)
     assert "**s2**" in sec
-    assert "**s1**" not in sec
+    assert "**s1**" not in sec and "**s3**" not in sec
     only_blocked = {"risk_register": {"s1": entry},
                     "subtask_status": {"s1": "blocked"}}
-    assert leerie._format_risk_register_section(only_blocked) == ""
+    assert leerie._format_pr_end_state_section(only_blocked) == ""
 
 
 # --- schema substance ------------------------------------------------------
@@ -266,12 +284,80 @@ def test_implementer_schema_rejects_an_unknown_risk_kind(leerie):
     jsonschema = pytest.importorskip("jsonschema")
     good = {"subtask_id": "s", "status": "complete",
             "self_reported_risks": [
-                {"kind": "untested_change", "detail": "d"}]}
+                {"kind": "untested_change", "detail": "d",
+                 "gap": "test_missing", "where_paths": ["a.py"],
+                 "settle_by": "test"}]}
     jsonschema.validate(good, leerie.SCHEMAS["implementer"])
-    bad = {"subtask_id": "s", "status": "complete",
-           "self_reported_risks": [{"kind": "spooky_vibes", "detail": "d"}]}
-    with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(bad, leerie.SCHEMAS["implementer"])
+    for bad_item in ({"kind": "spooky_vibes", "detail": "d", "gap": "none",
+                      "where_paths": []},
+                     {"kind": "untested_change", "detail": "d",
+                      "gap": "vibes", "where_paths": []},
+                     {"kind": "untested_change", "detail": "d",
+                      "gap": "none", "where_paths": [],
+                      "settle_by": "prayer"},
+                     # the routed fields are required
+                     {"kind": "untested_change", "detail": "d"}):
+        bad = {"subtask_id": "s", "status": "complete",
+               "self_reported_risks": [bad_item]}
+        with pytest.raises(jsonschema.ValidationError):
+            jsonschema.validate(bad, leerie.SCHEMAS["implementer"])
+
+
+def test_risk_item_lives_in_defs_behind_a_ref(leerie):
+    sch = leerie.SCHEMAS["implementer"]
+    assert sch["properties"]["self_reported_risks"]["items"] == {
+        "$ref": "#/$defs/risk"}
+    item = sch["$defs"]["risk"]
+    assert item["properties"]["gap"]["enum"] == [
+        "test_missing", "test_weak", "unverified_external", "none"]
+    assert item["properties"]["settle_by"]["enum"] == [
+        "test", "typecheck", "install", "build"]
+    assert "process_note" in item["properties"]["kind"]["enum"]
+
+
+def test_process_note_never_enters_the_register(leerie):
+    """A note about the worker's own process is informational: dropped at
+    ingestion, so neither the register nor the conformer's challenge block
+    (whose order is the disposition index) carries it."""
+    res = {"subtask_id": "s", "status": "complete", "self_reported_risks": [
+        {"kind": "process_note", "detail": "typecheck was not run",
+         "gap": "none", "where_paths": []},
+        {"kind": "untested_change", "detail": "parser untested",
+         "gap": "test_missing", "where_paths": ["p.py"],
+         "settle_by": "typecheck", "resource": "",
+         "simulated_interleaving": True}]}
+    out = leerie._typed_risks(res, "implementer")
+    assert [e["detail"] for e in out] == ["parser untested"]
+    assert out[0]["gap"] == "test_missing"
+    assert out[0]["where_paths"] == ["p.py"]
+    assert out[0]["settle_by"] == "typecheck"
+    assert out[0]["simulated_interleaving"] is True
+    assert "resource" not in out[0]
+    block = leerie._format_self_reported_risks(res)
+    assert "typecheck was not run" not in block
+    assert "  0. [untested_change]" in block
+
+
+def test_a_result_without_gap_is_typed_none(leerie):
+    """A result from before the typed fields routes nowhere, rather than
+    being guessed into a re-drive or the human list."""
+    out = leerie._typed_risks({"self_reported_risks": [
+        {"kind": "untested_change", "detail": "d", "gap": "bogus"}]},
+        "implementer")
+    assert out[0]["gap"] == "none" and out[0]["where_paths"] == []
+
+
+def test_where_paths_are_kept_only_when_they_are_files(leerie, tmp_path):
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "a.ts").write_text("x")
+    entries = [{"where_paths": ["src/a.ts", "./src/a.ts", "src/missing.ts",
+                                "src", "../outside.ts", "/etc/passwd"]},
+               {"kind": "integration_content_loss"}]
+    out = leerie._verify_risk_paths(entries, tmp_path)
+    assert out[0]["where_paths"] == ["src/a.ts", "src/a.ts"]
+    assert out[0]["where_paths_unverified"] == [
+        "src/missing.ts", "src", "../outside.ts", "/etc/passwd"]
+    assert "where_paths" not in out[1]
 
 
 def test_conformer_schema_accepts_positional_dispositions(leerie):
@@ -492,7 +578,8 @@ def test_long_and_multiline_details_are_normalized_not_rejected(leerie):
     long_detail = "x" * 301
     payload = {"subtask_id": "s", "status": "complete",
                "self_reported_risks": [
-                   {"kind": "untested_change", "detail": long_detail}]}
+                   {"kind": "untested_change", "detail": long_detail,
+                    "gap": "none", "where_paths": []}]}
     jsonschema.validate(payload, leerie.SCHEMAS["implementer"])
     out = leerie._collect_subtask_risks(payload, None)
     assert len(out[0]["detail"]) == 300
@@ -500,7 +587,7 @@ def test_long_and_multiline_details_are_normalized_not_rejected(leerie):
     sneaky = _impl(reason="line one\n## Injected heading\nline two")
     out = leerie._collect_subtask_risks(sneaky, None)
     assert "\n" not in out[0]["detail"]
-    sec = leerie._format_risk_register_section(
+    sec = leerie._format_pr_end_state_section(
         {"risk_register": {"s": out}})
     assert "\n## Injected heading" not in sec
     assert "line one ## Injected heading line two" in sec
@@ -509,10 +596,12 @@ def test_long_and_multiline_details_are_normalized_not_rejected(leerie):
 def test_malformed_register_degrades_to_no_section(leerie):
     """A garbage register must render nothing, never raise — a raise
     inside _compose_pr_via_llm's fail-open discards the accepted body."""
-    assert leerie._format_risk_register_section(
+    assert leerie._format_pr_end_state_section(
         {"risk_register": ["not", "a", "dict"]}) == ""
-    assert leerie._format_risk_register_section(
+    assert leerie._format_pr_end_state_section(
         {"risk_register": {"s": "not-a-list"}}) == ""
+    assert leerie._format_pr_end_state_section(
+        {"risk_register": {"s": ["x", 3, None]}}) == ""
 
 
 # --- round-3 pins: rollback-neutralized repairs, accepted_blocked skip, ----
@@ -539,12 +628,11 @@ def test_pr_section_skips_accept_blocked_sids(leerie):
     the launcher mutator but its branch is NEVER merged (the verified
     chain at the completeness gate) — so a status filter alone misses
     it; the accepted_blocked registry is the discriminator."""
-    entry = [{"kind": "untested_change", "detail": "orphan risk",
-              "source": "implementer", "addressed": False}]
+    entry = [_ext("orphan risk")]
     state = {"risk_register": {"s1": entry, "s2": entry},
              "subtask_status": {"s1": "complete", "s2": "complete"},
              "accepted_blocked": {"s1": {"at": "2026-10-01"}}}
-    sec = leerie._format_risk_register_section(state)
+    sec = leerie._format_pr_end_state_section(state)
     assert "**s2**" in sec
     assert "**s1**" not in sec
 
@@ -553,11 +641,10 @@ def test_malformed_statuses_degrade_instead_of_raising(leerie):
     """subtask_status/accepted_blocked of the wrong type must degrade to
     'no filter', never raise — a raise here is swallowed fail-open and
     discards the accepted pr_writer body."""
-    entry = [{"kind": "untested_change", "detail": "d",
-              "source": "implementer", "addressed": False}]
+    entry = [_ext("d")]
     state = {"risk_register": {"s1": entry},
              "subtask_status": ["s1"], "accepted_blocked": "nope"}
-    sec = leerie._format_risk_register_section(state)
+    sec = leerie._format_pr_end_state_section(state)
     assert "**s1**" in sec  # rendered; filters degraded, no crash
 
 

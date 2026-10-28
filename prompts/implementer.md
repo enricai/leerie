@@ -424,7 +424,10 @@ entry instead:
 "self_reported_risks": [
   {"kind": "external_contract_assumption",
    "detail": "treats the provider's error-message wording as the discriminator; only `resolve_blt` -style documented fields were available for the happy path",
-   "where": "orchestrator/leerie.py:_run_checked_loop"}
+   "where": "orchestrator/leerie.py:_run_checked_loop",
+   "gap": "unverified_external",
+   "where_paths": ["orchestrator/leerie.py"],
+   "resource": "the provider's live API"}
 ]
 ```
 
@@ -433,15 +436,49 @@ executed here — pairs with `exercised: false` above),
 `"external_contract_assumption"` (behavior depends on an undocumented or
 unverified detail of an external interface — message text, implicit format,
 unstated ordering), `"untested_change"` (you committed code no new or
-existing test exercises). One line of `detail` each; `where` when it is one
-place.
+existing test exercises), and `"process_note"` (a note about your own
+process — what you did or did not run, commit, install or check, e.g.
+"typecheck was not run"). The orchestrator runs its own build, lint and
+test checks, so a `process_note` is informational and goes nowhere. One
+line of `detail` each; `where` when it is one place.
+
+Every entry also carries the typed fields code routes on:
+
+- `where_paths` — the exact repository-relative paths of the files the risk
+  is about: the production code whose behaviour is uncertain, or the weak
+  test. Each must be a file that exists in your worktree when you finish;
+  a path that does not is dropped. `[]` only if no file applies.
+- `gap` — exactly one of:
+  - `test_missing`: production code in this subtask's change has no test
+    that exercises it;
+  - `test_weak`: a test exists but does not assert the behaviour the change
+    is about (it mocks the code under test away, asserts too little, or
+    misses a case the change introduced);
+  - `unverified_external`: the behaviour depends on something outside this
+    repository's own checks (a live service, real database, cloud resource,
+    real browser or device, or a separate package the repository's root
+    type-check and test commands do not cover) and was not verified;
+  - `none`: not a gap in the code or its tests — information, a design
+    decision.
+- `settle_by` *(optional)* — what would settle it: `test` (the default),
+  `typecheck`, `install`, or `build`.
+- `resource` *(optional; give it for `unverified_external`)* — a short noun
+  phrase naming what a human needs to check it ("a live payment-provider
+  sandbox", "a Postgres server under load").
+- `simulated_interleaving` *(optional)* — `true` for a race or concurrency
+  behaviour whose tests can only stub the interleaving.
+
+Before finishing, check that each production file you changed is exercised
+by a test; report a risk for each one that is not.
 
 This field is **routed, not judged**: entries go to your conformer as
-explicit challenges and onto the run's risk register, which the PR body
-shows the human reviewer verbatim. It never gates and never costs a retry —
-honesty here is free, and silence is the only wrong answer. Do not use it
-to restate ordinary limitations of the subtask's scope; use it for the
-thing you would want the reviewer to know before merging.
+explicit challenges; a `test_missing` or `test_weak` gap the orchestrator
+cannot settle mechanically comes back to you as a re-drive, and an
+`unverified_external` one is listed in the PR for a human to check. It
+never gates and never costs a retry — honesty here is free, and silence is
+the only wrong answer. Do not use it to restate ordinary limitations of the
+subtask's scope; use it for the thing you would want the reviewer to know
+before merging.
 
 ### 6. Suspending across a worker boundary
 

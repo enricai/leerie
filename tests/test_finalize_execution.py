@@ -897,3 +897,30 @@ def test_orchestrate_strict_output_proxy_summary_on_clean_run(
         "both", "quiet", {}, {}))
 
     assert leerie._STRICT_PROXY is None
+
+
+def test_phase_finalize_writes_the_end_state_after_the_outcome(
+        leerie, monkeypatch, st):
+    """DESIGN §6 *The PR's end-state section is rendered by code, from typed
+    state*: phase_finalize renders the section AFTER `_decide_outcome`, so
+    an unconverged run's `pr_end_state` (the text the launcher's fallback
+    appends) already says why the PR is a draft."""
+    _finalize_ready_state(st)
+    st.data["subtask_status"]["feat-002"] = "unconverged"
+    st.data["unconverged_subtasks"] = {
+        "feat-002": {"reason": "re-drive budget spent on the parser"}}
+
+    async def _fake_compose(*a, **k):
+        return None
+
+    monkeypatch.setattr(leerie, "_compose_pr_via_llm", _fake_compose)
+    asyncio.run(leerie.phase_finalize(
+        st.leerie_root, st, no_push=True, no_verify=False,
+        caps=_caps(leerie), models={}, efforts={}))
+    run_json = json.loads((st.run_dir / "run.json").read_text())
+    assert run_json["outcome"] == "unconverged"
+    end = run_json["pr_end_state"]
+    assert end == leerie._format_pr_end_state_section(st.data)
+    assert end.startswith("\n## Unconverged\n\nThis PR is a draft")
+    assert "- 1 subtask(s) unconverged: feat-002" in end
+    assert "- **feat-002**: re-drive budget spent on the parser" in end

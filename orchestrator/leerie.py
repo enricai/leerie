@@ -308,6 +308,13 @@ DEFAULT_CAPS = {
     # absorbs two-decimal summary rounding; the one benched regression
     # dropped 0.09 points (91.62 -> 91.53).
     "ci_coverage_epsilon_pct": 0.01,
+    # Coverage re-drive threshold (DESIGN §9 *Changed lines no test executes
+    # are re-driven*): a completed subtask is re-driven when at least this
+    # share of its changed executable lines is executed by no test (own
+    # tests, then importing tests). Bench Q7/G v8: fired on 16/19 hard
+    # seeds and on 4/20 fresh clean subtasks; rounds come from
+    # `subtask_redrive_rounds`.
+    "coverage_uncovered_share": 0.25,
     # Longest rate-limit reset `main()` will sleep through before it stops
     # auto-resuming and pauses resumably instead (the `out_of_credits`
     # disposition). Sized to the subscription's own windows: the five-hour
@@ -806,6 +813,10 @@ STATE_FIELDS = (
     # slot count sized from it, and the caps it raised (DESIGN §6 *The
     # repo's own build peak*). Re-applied on resume.
     "blt_peak",
+    # Coverage re-drive (DESIGN §9 *Changed lines no test executes are
+    # re-driven*): per-sid {rounds[], last, final, uncovered, open_gaps?,
+    # rolled_back?}; `final` covered / untested / rolled_back / unmeasured.
+    "coverage_redrive",
     # working_branch: the user's branch at the moment phase_classify
     # runs (`git rev-parse --abbrev-ref HEAD`). Mirrored to run.json
     # and to `<state-root>/runs/<id>/working-branch` (setup-run.sh writes
@@ -2411,6 +2422,17 @@ def _risk_dispositions_schema() -> dict:
     return {"type": "array", "maxItems": 9, "items": {"type": "string"}}
 
 
+# Typed risk fields (DESIGN §9 *Self-reported risk is routed, not read*):
+# what is missing, and what would settle it. Code routes on these alone.
+RISK_GAPS = ("test_missing", "test_weak", "unverified_external", "none")
+RISK_SETTLE_BY = ("test", "typecheck", "install", "build")
+# `process_note` is a note about the worker's own process ("typecheck was
+# not run"); it never enters the register — the orchestrator runs its own
+# checks (bench Q7/G v5: 8 of 9 first emissions carried only one).
+RISK_KINDS = ("unexercised_behavior", "external_contract_assumption",
+              "untested_change", "process_note")
+
+
 def _self_reported_risks_schema() -> dict:
     """DESIGN §9 *Self-reported risk is routed, not read*.
 
@@ -2420,34 +2442,41 @@ def _self_reported_risks_schema() -> dict:
     external API's exact message wording, flagged its path unexercised —
     and the defect shipped, because the prose reached nobody. Per the
     Language-to-JSON rule the remedy is a typed field Python can route
-    (`_collect_subtask_risks` → `risk_register` → PR body), never parsing
-    the prose.
+    (`_collect_subtask_risks` → `risk_register` → coverage re-drive and the
+    PR's end-state section), never parsing the prose.
 
-    Kept small and flat (`_production_evidence_schema`'s decoder-safety
-    argument): `where` optional, `maxItems` bounds the array in place of
-    any new cap (there is no loop to cap — risks never gate or retry).
-    Optional at the top level; an absent field simply contributes nothing
-    to the register, because the `exercised: false` tier already covers
-    the undisclosed case mechanically. Deliberately NO maxLength on
-    `detail`: a length bound on the wire makes an honest 301-char
-    disclosure cost the whole payload a validation retry — honesty must
-    not cost a retry — so `_typed_risks` normalizes and trims at
-    ingestion (`_RISK_DETAIL_MAX`) instead.
+    The item lives in the implementer schema's `$defs` (`_risk_item_schema`)
+    behind a `$ref`, so the property table stays small. `maxItems` bounds
+    the array in place of any new cap. Optional at the top level; an absent
+    field simply contributes nothing to the register, because the
+    `exercised: false` tier already covers the undisclosed case
+    mechanically. Deliberately NO maxLength on `detail`: a length bound on
+    the wire makes an honest 301-char disclosure cost the whole payload a
+    validation retry — honesty must not cost a retry — so `_typed_risks`
+    normalizes and trims at ingestion (`_RISK_DETAIL_MAX`) instead.
     """
+    return {"type": "array", "maxItems": 8,
+            "items": {"$ref": "#/$defs/risk"}}
+
+
+def _risk_item_schema() -> dict:
+    """One `self_reported_risks` entry. `gap` and `where_paths` are required
+    — they are what code routes on (`gap`) and checks (`where_paths`: each
+    must be a file in the subtask's worktree, `_verify_risk_paths`).
+    `settle_by`, `resource` and `simulated_interleaving` are optional."""
     return {
-        "type": "array",
-        "maxItems": 8,
-        "items": {
-            "type": "object",
-            "required": ["kind", "detail"],
-            "properties": {
-                "kind": {"type": "string",
-                         "enum": ["unexercised_behavior",
-                                  "external_contract_assumption",
-                                  "untested_change"]},
-                "detail": {"type": "string", "minLength": 1},
-                "where": {"type": "string"},
-            },
+        "type": "object",
+        "required": ["kind", "detail", "gap", "where_paths"],
+        "properties": {
+            "kind": {"type": "string", "enum": list(RISK_KINDS)},
+            "detail": {"type": "string", "minLength": 1},
+            "where": {"type": "string"},
+            "gap": {"type": "string", "enum": list(RISK_GAPS)},
+            "where_paths": {"type": "array", "maxItems": 10,
+                            "items": {"type": "string"}},
+            "settle_by": {"type": "string", "enum": list(RISK_SETTLE_BY)},
+            "resource": {"type": "string"},
+            "simulated_interleaving": {"type": "boolean"},
         },
     }
 
@@ -2812,6 +2841,7 @@ SCHEMAS: dict[str, dict] = {
         "$defs": {
             "blocker_kind": {"type": "string", "enum": list(BLOCKER_KINDS)},
             "external_resource": {"type": "string"},
+            "risk": _risk_item_schema(),
         },
         "properties": {
             "subtask_id": {"type": "string"},
@@ -5823,23 +5853,45 @@ def _format_run_duration(started_at: str | None, finished_at: str | None) -> str
         return None
 
 
+# Code-owned PR-body headings (DESIGN §6 *The PR's end-state section is
+# rendered by code, from typed state*). `_strip_worker_risk_sections` removes
+# a worker-emitted copy of any of them. The first is the retired generic
+# dump's heading: still stripped, because a pr_writer echoing an old PR body
+# or template may emit it.
 _RISK_SECTION_HEADING = "## ⚠ Residual risks"
+_PR_END_STATE_HEADINGS: tuple[str, ...] = (
+    _RISK_SECTION_HEADING,
+    "## Unconverged",
+    "## Needs human verification",
+    "## Untested after re-drive",
+    "## Integration content loss",
+    "## Repository merge checks still red",
+    "## Advisory (not verified by this run)",
+)
+# One rendered entry's text: one line, bounded (`_normalize_risk_text`).
+_PR_ENTRY_MAX = 300
+# Advisory entries shown per source; the rest are counted, not listed.
+_PR_ADVISORY_SHOWN = 10
+# Unexecuted line numbers listed per file under "Untested after re-drive".
+_PR_LINES_SHOWN = 20
 
 
 def _strip_worker_risk_sections(body: str) -> tuple[str, bool]:
-    """Remove worker-emitted residual-risks sections from a pr_writer
-    body, preserving everything else (DESIGN §6: the section is
-    code-owned; §12: the prompt asks, this enforces).
+    """Remove worker-emitted copies of the code-owned PR sections
+    (`_PR_END_STATE_HEADINGS`) from a pr_writer body, preserving everything
+    else (DESIGN §6: the sections are code-owned; §12: the prompt asks, this
+    enforces).
 
     Line-anchored and span-limited, deliberately: a naive
     `body[:body.find(heading)]` truncated every LEGITIMATE section after
     a mid-body (or merely quoted) heading — measured, a `## Deploy
     order` section silently lost — and matched the substring inside a
     `### `-prefixed line, leaving a dangling `#`. This removes only
-    from a heading at a line start to the next `\\n## ` top-level
-    heading (or end of body), and loops in case the worker emitted the
-    section more than once. A heading quoted inside a code fence is
-    skipped — stripping it left the fence unclosed and rendered
+    from a heading at a line start — the whole line, so `## Unconverged`
+    never matches a worker's `## Unconverged-looking title` — to the next
+    `\\n## ` top-level heading (or end of body), and loops in case the
+    worker emitted a section more than once. A heading quoted inside a code
+    fence is skipped — stripping it left the fence unclosed and rendered
     everything after as a literal code block, measured. Fence state is
     tracked per fence LINE (a line opening with ``` or ~~~, closed by
     its own marker), not by substring count: an inline ``` in prose
@@ -5860,108 +5912,308 @@ def _strip_worker_risk_sections(body: str) -> tuple[str, bool]:
                 open_marker = ""
         return bool(open_marker)
 
+    def _whole_line(text: str, start: int, heading: str) -> bool:
+        rest = text[start + len(heading):].split("\n", 1)[0]
+        return rest.strip() == ""
+
     body = body.replace("⚠️", "⚠")
     stripped = False
-    search_from = 0
-    while True:
-        if search_from == 0 and body.startswith(_RISK_SECTION_HEADING):
-            start = 0
-        else:
-            marker = body.find("\n" + _RISK_SECTION_HEADING, search_from)
-            if marker == -1:
-                break
-            start = marker + 1
-        if _inside_fence(body, start):
-            # Inside an open code fence: a quote, not a section. Advance
-            # past it (loop progress is the termination guarantee).
-            search_from = start + len(_RISK_SECTION_HEADING)
-            continue
-        # The section END must be fence-aware too: a `## ` line inside a
-        # code fence WITHIN the worker's section is not a boundary —
-        # stopping there kept worker-fabricated content and left the
-        # fence's opener unclosed (the measured broken-fence incident,
-        # from the other side).
-        pos = start
-        nxt = -1
-        while True:
-            nxt = body.find("\n## ", pos + 1)
-            if nxt == -1 or not _inside_fence(body, nxt + 1):
-                break
-            pos = nxt
-        end = len(body) if nxt == -1 else nxt + 1
-        body = (body[:start].rstrip("\r\n") + "\n\n"
-                + body[end:].lstrip("\n")).strip("\n") \
-            if body[end:].strip() else body[:start].rstrip("\r\n")
+    for heading in _PR_END_STATE_HEADINGS:
         search_from = 0
-        stripped = True
+        while True:
+            if (search_from == 0 and body.startswith(heading)
+                    and _whole_line(body, 0, heading)):
+                start = 0
+            else:
+                marker = body.find("\n" + heading, search_from)
+                if marker == -1:
+                    break
+                start = marker + 1
+                if not _whole_line(body, start, heading):
+                    search_from = start + len(heading)
+                    continue
+            if _inside_fence(body, start):
+                # Inside an open code fence: a quote, not a section.
+                # Advance past it (loop progress is the termination
+                # guarantee).
+                search_from = start + len(heading)
+                continue
+            # The section END must be fence-aware too: a `## ` line inside
+            # a code fence WITHIN the worker's section is not a boundary —
+            # stopping there kept worker-fabricated content and left the
+            # fence's opener unclosed (the measured broken-fence incident,
+            # from the other side).
+            pos = start
+            nxt = -1
+            while True:
+                nxt = body.find("\n## ", pos + 1)
+                if nxt == -1 or not _inside_fence(body, nxt + 1):
+                    break
+                pos = nxt
+            end = len(body) if nxt == -1 else nxt + 1
+            body = (body[:start].rstrip("\r\n") + "\n\n"
+                    + body[end:].lstrip("\n")).strip("\n") \
+                if body[end:].strip() else body[:start].rstrip("\r\n")
+            search_from = 0
+            stripped = True
     return body, stripped
 
 
-def _format_risk_register_section(state: dict) -> str:
-    """Render `state.json.risk_register` as the PR body's residual-risks
-    section, or "" when the register is empty (DESIGN §9 *Self-reported
-    risk is routed, not read*; DESIGN §6 *The residual-risk section is
-    appended by code on every composition path*).
+def _pr_entry(value: object) -> str:
+    """One entry's text for the PR section: one line, bounded, so worker or
+    worker-derived text can never open a markdown heading there."""
+    return _normalize_risk_text(value, _PR_ENTRY_MAX)
 
-    Appended by code on both live composition paths — after the pr_writer
-    worker's accepted body in `_compose_pr_via_llm`, and in
-    `scripts/host-finalize.sh`'s LLM-less fallback by a format-identical
-    `jq` renderer (keep that mirror in sync, like the cost line) that
-    mirrors `compose_pr_body`, the never-invoked canonical fallback
-    reference, which also carries the section. Never owned by the
-    pr_writer worker: an LLM composer can summarize a caveat away; an
-    append cannot. Entries render verbatim — the worker's own words are
-    the content (one line each: `_typed_risks` normalized them at
-    ingestion, so no entry can open a new markdown heading here)."""
-    register = state.get("risk_register")
-    if not isinstance(register, dict):
-        # A malformed register must degrade to "no section": this runs
-        # inside _compose_pr_via_llm AFTER the worker's body is accepted,
-        # and an exception there is swallowed fail-open — discarding the
-        # whole accepted body over a garbage register entry.
+
+def _pr_code(value: object) -> str:
+    """`value` as inline code; a backtick inside would end the span."""
+    return "`" + _normalize_risk_text(value, _PR_ENTRY_MAX).replace(
+        "`", "'") + "`"
+
+
+def _pr_paths(paths: object) -> str:
+    """` (`a`, `b`)` for a non-empty list of path strings, else ""."""
+    if not isinstance(paths, list):
         return ""
-    # Render only sids whose work the PR actually contains. A sid still
-    # `blocked` at finalize was excluded from wave integration; an
-    # accept-blocked'ed sid is rewritten to `complete` by the launcher
-    # mutator but its branch is STILL never merged (the verified chain at
-    # the completeness gate: resume excludes it from `remaining`, so
-    # integrate_wave sees no result entry) — so both are skipped via
-    # `subtask_status` plus the `accepted_blocked` registry. Keep the jq
-    # mirror's filter identical. isinstance guards, not `or {}`: a
-    # malformed value must degrade to "no filter"/"no section", never
-    # raise — a raise here is swallowed by _compose_pr_via_llm's
-    # fail-open, which then discards the whole accepted pr_writer body.
-    statuses = state.get("subtask_status")
-    if not isinstance(statuses, dict):
-        statuses = {}
-    accepted = state.get("accepted_blocked")
-    if not isinstance(accepted, dict):
-        accepted = {}
-    lines: list[str] = []
-    for sid, entries in register.items():
-        if statuses.get(sid) == "blocked" or sid in accepted:
+    shown = [_pr_code(p) for p in paths if isinstance(p, str) and p.strip()]
+    return f" ({', '.join(shown)})" if shown else ""
+
+
+def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
+                    ) -> dict[str, list[str]]:
+    """The "Needs human verification" checkboxes, grouped by the resource a
+    human must supply, in first-seen order and de-duplicated."""
+    groups: dict[str, list[str]] = {}
+
+    def add(group: str, line: str) -> None:
+        bucket = groups.setdefault(group, [])
+        if line not in bucket:
+            bucket.append(line)
+
+    for e in state.get("needs_human_verification") or []:
+        if not isinstance(e, dict):
             continue
-        if not isinstance(entries, list):
+        if e.get("source") == "required_item" and _pr_entry(e.get("item")):
+            add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
+        elif e.get("source") == "blocker" and isinstance(e.get("subtask"),
+                                                          str):
+            add(_pr_entry(e.get("resource")) or "Unnamed resource",
+                f"- [ ] **{e['subtask']}** was not done, waiting on it: "
+                f"{_pr_entry(e.get('blocker')) or 'no reason recorded'}")
+    register = state.get("risk_register")
+    for sid, entries in (register.items()
+                         if isinstance(register, dict) else ()):
+        if not in_pr(sid) or not isinstance(entries, list):
             continue
         for e in entries:
-            if not isinstance(e, dict):
+            if not isinstance(e, dict) or e.get("addressed") is True:
                 continue
-            where = f" ({e['where']})" if e.get("where") else ""
-            if e.get("addressed") is True:
-                status = f"addressed ({e.get('disposition') or ''})"
-            elif e.get("disposition"):
-                status = f"{e['disposition']}, not cleared"
-            else:
-                status = "unaddressed"
-            lines.append(f"- **{sid}** [{e.get('kind') or 'risk'}] "
-                         f"{e.get('detail') or ''}{where} — {status}")
-    if not lines:
+            simulated = e.get("simulated_interleaving") is True
+            if e.get("gap") != "unverified_external" and not simulated:
+                continue
+            detail = _pr_entry(e.get("detail"))
+            if not detail:
+                continue
+            group = _pr_entry(e.get("resource")) or (
+                "A real concurrent engine" if simulated
+                else "Outside this repository's checks")
+            add(group, f"- [ ] **{sid}**: {detail}"
+                + _pr_paths(e.get("where_paths"))
+                + (" — tests simulate the interleaving" if simulated
+                   else ""))
+    claims = state.get("site_claims")
+    for row in ((claims.get("sites") or []) if isinstance(claims, dict)
+                else []):
+        if not isinstance(row, dict) or row.get("surface_other") is not True:
+            continue
+        where = " ".join(_pr_code(row[k]) for k in ("file", "symbol")
+                         if isinstance(row.get(k), str) and row[k].strip())
+        add("Fix sites resolved by an untyped change",
+            f"- [ ] Check {where or 'the site'} "
+            f"({_pr_entry(row.get('site_id'))}) is resolved: "
+            f"{_pr_entry(row.get('resolution')) or 'no resolution recorded'}")
+    return groups
+
+
+def _pr_advisory(state: dict) -> list[str]:
+    """The advisory lines: verified whole-PR review findings, contract
+    literal flags, site-token hits — each source capped at
+    `_PR_ADVISORY_SHOWN`, the remainder counted."""
+    out: list[str] = []
+
+    def block(title: str, key: str, lines: list[str]) -> None:
+        if not lines:
+            return
+        out.append(f"**{title}**")
+        out.extend(lines[:_PR_ADVISORY_SHOWN])
+        if len(lines) > _PR_ADVISORY_SHOWN:
+            out.append(f"- … {len(lines) - _PR_ADVISORY_SHOWN} more in "
+                       f"state.json `{key}`")
+        out.append("")
+
+    rev = state.get("pr_review")
+    findings = ((rev.get("findings") or []) if isinstance(rev, dict) else [])
+    block("Whole-PR review findings (each quote checked in the file)",
+          "pr_review",
+          [f"- {_pr_code(str(f.get('path') or '?') + ':' + str(f.get('line_start') or '?') + '-' + str(f.get('line_end') or '?'))}"
+           f" [{_pr_entry(f.get('kind')) or 'finding'}] "
+           f"{_pr_entry(f.get('explanation'))}"
+           for f in findings
+           if isinstance(f, dict) and f.get("verified") is True])
+    checks = state.get("contract_literal_checks")
+    rows = []
+    for key in sorted(checks) if isinstance(checks, dict) else []:
+        r = checks[key]
+        if not isinstance(r, dict) or r.get("flag") is not True:
+            continue
+        ext = r.get("extracted") if isinstance(r.get("extracted"),
+                                               dict) else {}
+        lit = ext.get("literal")
+        rows.append(f"- **{_pr_entry(r.get('owner_sid'))}** → "
+                    f"**{_pr_entry(ext.get('counterpart_sid')) or '?'}**: "
+                    + (f"{_pr_code(lit)} " if isinstance(lit, str) and lit
+                       else "")
+                    + f"({_pr_entry(r.get('why')) or 'flagged'})")
+    block("Contract literals another subtask may not honour",
+          "contract_literal_checks", rows)
+    hits = state.get("site_token_warnings")
+    block("Report site tokens on added lines", "site_token_warnings",
+          [f"- {_pr_code(h.get('token'))} in {_pr_code(h.get('file'))}: "
+           f"{_pr_entry(h.get('added_line'))}"
+           for h in (hits if isinstance(hits, list) else [])
+           if isinstance(h, dict)])
+    while out and out[-1] == "":
+        out.pop()
+    return out
+
+
+def _format_pr_end_state_section(state: dict) -> str:
+    """The PR body's end-state section, rendered from typed run state, or ""
+    when there is nothing to say (DESIGN §6 *The PR's end-state section is
+    rendered by code, from typed state*). Up to six headed lists, each only
+    when non-empty, in this order: `## Unconverged` (why the PR is a draft),
+    `## Needs human verification`, `## Untested after re-drive`,
+    `## Integration content loss`, `## Repository merge checks still red`,
+    `## Advisory (not verified by this run)`.
+
+    Rendered once at finalize and written to `run.json` as `pr_end_state`
+    (`phase_finalize`), so the launcher's LLM-less fallback appends the
+    same text; `_compose_pr_via_llm` appends it to the pr_writer's body and
+    `compose_pr_body` carries it. Never owned by the pr_writer: an LLM
+    composer can summarize a caveat away; an append cannot. Every shape
+    check degrades to "no entry", never raises — this runs inside
+    `_compose_pr_via_llm` after the worker's body is accepted, where an
+    exception would discard the whole body."""
+    if not isinstance(state, dict):
         return ""
-    return ("\n## ⚠ Residual risks\n\n"
-            "Self-reported by workers; entries cleared by a verifiable "
-            "act during conformance are annotated addressed. Full entries "
-            "in state.json `risk_register`.\n\n"
-            + "\n".join(lines))
+
+    def _dict(key: str) -> dict:
+        v = state.get(key)
+        return v if isinstance(v, dict) else {}
+
+    statuses = _dict("subtask_status")
+    accepted = _dict("accepted_blocked")
+
+    def in_pr(sid: str) -> bool:
+        # Work the PR does not contain: still blocked, settled unconverged
+        # or accepted_external (never integrated), or accept-blocked (its
+        # branch is never merged — resume excludes it).
+        return (statuses.get(sid) not in ("blocked", "unconverged",
+                                          "accepted_external")
+                and sid not in accepted)
+
+    sections: list[tuple[str, list[str]]] = []
+
+    lines: list[str] = []
+    unconverged = {s: r for s, r in _dict("unconverged_subtasks").items()
+                   if statuses.get(s) == "unconverged" and isinstance(r, dict)}
+    if state.get("outcome") == "unconverged":
+        lines += ["This PR is a draft: the run did not finish its work.", ""]
+        reasons = state.get("outcome_reasons")
+        lines += [f"- {_pr_entry(r)}" for r in
+                  (reasons if isinstance(reasons, list) else [])
+                  if _pr_entry(r)]
+    lines += [f"- **{sid}**: "
+              f"{_pr_entry(unconverged[sid].get('reason')) or 'no reason recorded'}"
+              for sid in sorted(unconverged)]
+    if lines and lines[-1] == "":
+        lines.pop()
+    if lines:
+        sections.append(("## Unconverged", lines))
+
+    groups = _pr_needs_human(state, in_pr)
+    if groups:
+        lines = ["Checks no step inside the run's container could make, "
+                 "grouped by what they need.", ""]
+        for group, items in groups.items():
+            lines += [f"**{group}**", *items, ""]
+        sections.append(("## Needs human verification", lines[:-1]))
+
+    lines = []
+    for sid, rec in sorted(_dict("coverage_redrive").items()):
+        if (not in_pr(sid) or not isinstance(rec, dict)
+                or rec.get("final") != "untested"):
+            continue
+        unc = rec.get("uncovered")
+        for f, ls in sorted(unc.items()) if isinstance(unc, dict) else []:
+            nums = [str(n) for n in ls if isinstance(n, int)] \
+                if isinstance(ls, list) else []
+            if not nums:
+                continue
+            more = len(nums) - _PR_LINES_SHOWN
+            lines.append(f"- **{sid}**: {_pr_code(f)} lines "
+                         + ", ".join(nums[:_PR_LINES_SHOWN])
+                         + (f" (and {more} more)" if more > 0 else ""))
+        gaps = rec.get("open_gaps")
+        for g in gaps if isinstance(gaps, list) else []:
+            if isinstance(g, dict) and _pr_entry(g.get("detail")):
+                lines.append(f"- **{sid}**: [{_pr_entry(g.get('gap'))}] "
+                             f"{_pr_entry(g.get('detail'))}"
+                             + _pr_paths(g.get("where_paths")))
+    if lines:
+        sections.append(("## Untested after re-drive", [
+            "Changed lines no test executes, and reported test gaps still "
+            "open, after the coverage re-drive spent its rounds.", "",
+            *lines]))
+
+    lines = []
+    register = _dict("risk_register")
+    for sid, entries in register.items():
+        for e in entries if isinstance(entries, list) else []:
+            if (isinstance(e, dict)
+                    and e.get("kind") == "integration_content_loss"):
+                where = (f" ({_pr_code(e['where'])})"
+                         if isinstance(e.get("where"), str)
+                         and e["where"].strip() else "")
+                lines.append(f"- **{sid}**: "
+                             f"{_pr_entry(e.get('detail'))}{where}")
+    if lines:
+        sections.append(("## Integration content loss", [
+            "Work a merge did not carry into this branch.", "", *lines]))
+
+    lines = []
+    for u in _ci_parity_unmet_from(state):
+        argv = u.get("argv")
+        cmd = (f": {_pr_code(shlex.join(str(a) for a in argv))}"
+               if isinstance(argv, list) and argv else "")
+        lines.append(f"- {_pr_code(u.get('id'))} "
+                     f"({_pr_entry(u.get('kind')) or 'check'}, "
+                     f"{_pr_entry(u.get('why')) or 'red'}){cmd}")
+    if lines:
+        sections.append(("## Repository merge checks still red", [
+            "Checks the repository's CI runs before a merge, confirmed red "
+            "on this branch and green on its base.", "", *lines]))
+
+    lines = _pr_advisory(state)
+    if lines:
+        sections.append(("## Advisory (not verified by this run)", [
+            "Leads, not verdicts: nothing waited on these. Check each one.",
+            "", *lines]))
+
+    if not sections:
+        return ""
+    return "\n" + "\n\n".join(f"{h}\n\n" + "\n".join(b)
+                               for h, b in sections)
 
 
 def compose_pr_body(state: dict, run_id: str) -> str:
@@ -6053,7 +6305,7 @@ def compose_pr_body(state: dict, run_id: str) -> str:
                 body += f"- **{tag}** — {combined}\n"
             else:
                 body += f"- **{tag}**\n"
-    body += _format_risk_register_section(state)
+    body += _format_pr_end_state_section(state)
     return body
 
 
@@ -12532,8 +12784,9 @@ def check_production_evidence(result: dict) -> list[str]:
     return issues
 
 
-_RISK_KINDS = frozenset({"unexercised_behavior", "external_contract_assumption",
-                         "untested_change"})
+# The kinds that enter the register: every `RISK_KINDS` value but
+# `process_note`, which is excluded at ingestion (DESIGN §9).
+_RISK_KINDS = frozenset(RISK_KINDS) - {"process_note"}
 _RISK_DISPOSITIONS = frozenset({"confirmed_defect", "mitigated", "accepted"})
 # Ingestion caps for worker-authored risk text. Enforced here rather than
 # by schema maxLength: a length bound on the wire makes an honest 301-char
@@ -12569,26 +12822,72 @@ def _typed_risks(result: dict | None, source: str) -> list[dict]:
     out: list[dict] = []
     ev = result.get("production_evidence")
     if isinstance(ev, dict) and ev.get("exercised") is False:
+        # The worker could not exercise the path here: typed external, so
+        # it reaches "Needs human verification" (DESIGN §9).
         out.append({
             "kind": "unexercised_behavior",
             "detail": _normalize_risk_text(
                 ev.get("unexercisable_reason"), _RISK_DETAIL_MAX)
             or "path not exercised against real repo state",
             "source": source,
+            "gap": "unverified_external",
+            "where_paths": [],
         })
     for item in result.get("self_reported_risks") or []:
         if not isinstance(item, dict):
             continue
         kind = item.get("kind")
         detail = _normalize_risk_text(item.get("detail"), _RISK_DETAIL_MAX)
+        # `process_note` (and any unknown kind) is dropped here, so neither
+        # the register nor the conformer's challenge block ever carries it.
         if kind not in _RISK_KINDS or not detail:
             continue
-        entry = {"kind": kind, "detail": detail, "source": source}
+        # A result from before the typed fields carries no gap: `none`, so
+        # it is kept in state but routes nowhere.
+        gap = item.get("gap") if item.get("gap") in RISK_GAPS else "none"
+        paths = item.get("where_paths")
+        entry = {"kind": kind, "detail": detail, "source": source,
+                 "gap": gap,
+                 "where_paths": [p for p in (
+                     _normalize_risk_text(x, _RISK_WHERE_MAX)
+                     for x in (paths if isinstance(paths, list) else [])
+                     if isinstance(x, str)) if p][:10]}
         where = _normalize_risk_text(item.get("where"), _RISK_WHERE_MAX)
         if where:
             entry["where"] = where
+        if item.get("settle_by") in RISK_SETTLE_BY:
+            entry["settle_by"] = item["settle_by"]
+        resource = _normalize_risk_text(item.get("resource"), _RISK_WHERE_MAX)
+        if resource:
+            entry["resource"] = resource
+        if item.get("simulated_interleaving") is True:
+            entry["simulated_interleaving"] = True
         out.append(entry)
     return out
+
+
+def _verify_risk_paths(entries: list[dict], worktree: str | Path
+                       ) -> list[dict]:
+    """Keep each entry's `where_paths` only where it names a file inside
+    `worktree` (relative, no `..`, an existing file); the rest move to
+    `where_paths_unverified` (DESIGN §9: exact repository paths, which code
+    verifies exist). A mechanical path check — never a guess at what a
+    path meant."""
+    root = Path(worktree)
+    for e in entries:
+        kept: list[str] = []
+        dropped: list[str] = []
+        for p in e.get("where_paths") or []:
+            rel = p.replace("\\", "/").removeprefix("./")
+            ok = (not rel.startswith("/")
+                  and ".." not in rel.split("/")
+                  and (root / rel).is_file())
+            (kept if ok else dropped).append(rel if ok else p)
+        if "where_paths" in e:
+            e["where_paths"] = kept
+        if dropped:
+            e["where_paths_unverified"] = dropped
+    return entries
 
 
 def _collect_subtask_risks(impl_res: dict | None,
@@ -37275,10 +37574,17 @@ def _ci_coverage_fired(rec: dict, final_pcts: dict, touched: list[str],
 def _ci_parity_unmet(st: "State") -> list[dict]:
     """The final tree's confirmed-red merge checks — the record a delivery
     re-drive reads (DESIGN §9). Empty when CI parity did not run."""
-    ci = st.data.get("ci_parity")
-    final = (ci or {}).get("final") if isinstance(ci, dict) else None
-    unmet = (final or {}).get("unmet") if isinstance(final, dict) else None
-    return list(unmet) if isinstance(unmet, list) else []
+    return _ci_parity_unmet_from(st.data)
+
+
+def _ci_parity_unmet_from(data: dict) -> list[dict]:
+    """`_ci_parity_unmet` over a plain state dict (the PR renderer has no
+    `State`); only dict entries."""
+    ci = data.get("ci_parity") if isinstance(data, dict) else None
+    final = ci.get("final") if isinstance(ci, dict) else None
+    unmet = final.get("unmet") if isinstance(final, dict) else None
+    return ([u for u in unmet if isinstance(u, dict)]
+            if isinstance(unmet, list) else [])
 
 
 async def _ci_worktree(st: "State", name: str, sha: str) -> Path | None:
@@ -44340,6 +44646,563 @@ async def _redrive_blocked_subtasks(
             results[s] = r
 
 
+# --- Coverage re-drive (DESIGN §9 *Changed lines no test executes are
+# re-driven*) -------------------------------------------------------------
+#
+# JS/TS with vitest's v8 coverage only, as benched (Q7/G v7, v8). Line
+# numbers and paths are read from git's diff header and coverage JSON —
+# mechanical strings and typed data, never prose (DESIGN §12).
+_COV_SRC_EXT = _JS_SRC_EXT
+# Importing test files run per production file in the settle phase (v7).
+_COV_SETTLE_TESTS_PER_FILE = 30
+# An empty test whose run reports every included file's statement map, so a
+# changed file no test loads still has executable lines (the v7 harness
+# fix: without it a subtask with no runnable test reported nothing).
+_COV_BASELINE_TEST = "leerie-coverage-baseline.test.ts"
+_COV_BASELINE_TEXT = ('import { test } from "vitest";\n'
+                      'test("leerie coverage baseline", () => {});\n')
+_DIFF_HUNK_RE = re.compile(r"^@@ -\S+ \+(\d+)(?:,(\d+))? @@")
+
+
+def _is_test_case_file(path: str, globs: list[str] | None = None) -> bool:
+    """A test file proper — its basename is test-shaped (or it matches a
+    configured `test_file_globs` entry). A helper module that merely sits
+    under a test directory is not one: in the bench such a module was
+    counted as a failing test and cost a closure."""
+    norm = path.replace("\\", "/").removeprefix("./")
+    if globs:
+        return any(fnmatch.fnmatch(norm, g) for g in globs)
+    base = norm.rsplit("/", 1)[-1]
+    return any(fnmatch.fnmatch(base, g) for g in _TEST_BASENAME_GLOBS)
+
+
+def _vitest_coverage_bin(tree: Path) -> Path | None:
+    """The worktree's own vitest, when its v8 coverage provider is installed
+    beside it; None otherwise (nothing is measured)."""
+    exe = tree / "node_modules" / ".bin" / "vitest"
+    provider = tree / "node_modules" / "@vitest" / "coverage-v8"
+    return exe if exe.exists() and provider.exists() else None
+
+
+async def _changed_line_numbers(tree: Path, base_ref: str,
+                                path: str) -> list[int]:
+    """New-side line numbers `base_ref..HEAD` changed in `path`, from the
+    `-U0` hunk headers."""
+    r = await run_proc(["git", "diff", "-U0", f"{base_ref}..HEAD", "--",
+                        path], cwd=str(tree))
+    out: set[int] = set()
+    for line in r.stdout.splitlines() if r.returncode == 0 else []:
+        m = _DIFF_HUNK_RE.match(line)
+        if m:
+            start = int(m.group(1))
+            count = int(m.group(2)) if m.group(2) is not None else 1
+            out.update(range(start, start + count))
+    return sorted(out)
+
+
+async def _cov_contained(argv: list[str], *, tree: Path, st: "State",
+                         caps: dict, sid: str, tag: str,
+                         log_path: Path | None = None) -> dict:
+    """Run one coverage/settle command in `tree`, spawn-held in a broker
+    cgroup at the worker caps, holding a host build slot (DESIGN §6). A run
+    that changed tracked files is reset. Output goes to the subtask's
+    coverage log unless `log_path` names another."""
+    name = _CGROUP_NAME_UNSAFE_RE.sub("-", f"cov-{sid}-{tag}")[:60]
+    if log_path is None:
+        log_path = st.run_dir / "logs" / f"coverage-{sid}.log"
+    env = {**os.environ, "CI": "1", "NO_COLOR": "1", "FORCE_COLOR": "0"}
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
+    out: dict = {"rc": None, "timed_out": False}
+    try:
+        async with _build_class_slot(st, label=f"coverage {sid} {tag}"):
+            run = await _run_contained(
+                argv, cwd=str(tree), name=name, run_id=st.run_id,
+                memory_max_bytes=int(caps.get("worker_memory_max_bytes") or 0),
+                pids_max=int(caps.get("worker_pids_max") or 0),
+                timeout=max(1.0, timeout), log_path=log_path,
+                label=f"coverage {sid} {tag}", env=env)
+        out.update(rc=run["rc"], timed_out=run["timed_out"],
+                   tail=run.get("tail") or "")
+    except OSError as e:
+        out["error"] = f"{type(e).__name__}: {e}"
+    dirty = await run_proc(["git", "status", "--porcelain",
+                            "--untracked-files=no"], cwd=str(tree))
+    if dirty.returncode == 0 and dirty.stdout.strip():
+        await run_proc(["git", "checkout", "--", "."], cwd=str(tree))
+    return out
+
+
+async def _vitest_run(exe: Path, tree: Path, tests: list[str],
+                      include: list[str], *, st: "State", caps: dict,
+                      sid: str, tag: str, coverage: bool = True
+                      ) -> tuple[dict[str, bool], dict[str, dict[int, int]]]:
+    """One vitest run of `tests`: `({test: passed}, {file: {line: hits}})`.
+    Pass status comes from vitest's JSON reporter, hits from the v8
+    `coverage-final.json` restricted to `include` (a statement's start line
+    carries its count; the line's count is the max over its statements)."""
+    work = st.run_dir / "coverage" / _CGROUP_NAME_UNSAFE_RE.sub("-", sid)
+    covdir = work / f"cov-{tag}"
+    report = work / f"res-{tag}.json"
+    shutil.rmtree(covdir, ignore_errors=True)
+    work.mkdir(parents=True, exist_ok=True)
+    with contextlib.suppress(OSError):
+        report.unlink()
+    argv = [str(exe), "run", "--reporter=json", f"--outputFile={report}"]
+    if coverage:
+        argv += ["--coverage.enabled=true", "--coverage.provider=v8",
+                 "--coverage.reporter=json",
+                 f"--coverage.reportsDirectory={covdir}",
+                 "--coverage.exclude=**/node_modules/**",
+                 *[f"--coverage.include={f}" for f in include]]
+    else:
+        argv.append("--coverage.enabled=false")
+    await _cov_contained([*argv, *tests], tree=tree, st=st, caps=caps,
+                         sid=sid, tag=tag)
+    real = os.path.realpath(tree)
+    status = {t: False for t in tests}
+    with contextlib.suppress(OSError, ValueError, AttributeError, TypeError):
+        for tr in json.loads(report.read_text()).get("testResults") or []:
+            rel = os.path.relpath(os.path.realpath(tr.get("name") or ""),
+                                  real)
+            if rel in status:
+                status[rel] = tr.get("status") == "passed"
+    hits: dict[str, dict[int, int]] = {}
+    cf = covdir / "coverage-final.json"
+    if coverage:
+        with contextlib.suppress(OSError, ValueError, AttributeError,
+                                 TypeError, KeyError):
+            for path, d in json.loads(cf.read_text()).items():
+                rel = os.path.relpath(os.path.realpath(path), real)
+                lh: dict[int, int] = {}
+                for k, loc in (d.get("statementMap") or {}).items():
+                    ln = int(loc["start"]["line"])
+                    lh[ln] = max(lh.get(ln, 0), int((d.get("s") or {})
+                                                    .get(k, 0)))
+                hits[rel] = lh
+    return status, hits
+
+
+async def _vitest_cover(exe: Path, tree: Path, tests: list[str],
+                        include: list[str], *, st: "State", caps: dict,
+                        sid: str, tag: str
+                        ) -> tuple[dict[str, dict[int, int]], list[str],
+                                   list[str]]:
+    """Coverage counted only from test files that pass: a failing file is
+    re-run once (B*: one failure is not yet a verdict), and a file failing
+    twice contributes nothing — the run is repeated without it. Returns
+    `(hits, passed, failed_twice)`."""
+    tests = [t for t in tests if (tree / t).is_file()]
+    if not tests or not include:
+        return {}, [], []
+    st1, hits = await _vitest_run(exe, tree, tests, include, st=st,
+                                  caps=caps, sid=sid, tag=f"{tag}-1")
+    failing = [t for t, ok in st1.items() if not ok]
+    failed_twice: list[str] = []
+    if failing:
+        st2, _ = await _vitest_run(exe, tree, failing, include, st=st,
+                                   caps=caps, sid=sid, tag=f"{tag}-2",
+                                   coverage=False)
+        failed_twice = [t for t in failing if not st2.get(t)]
+        if failed_twice:
+            keep = [t for t in tests if t not in failed_twice]
+            hits = ((await _vitest_run(exe, tree, keep, include, st=st,
+                                       caps=caps, sid=sid,
+                                       tag=f"{tag}-3"))[1]
+                    if keep else {})
+    return hits, [t for t in tests if t not in failed_twice], failed_twice
+
+
+def _js_test_importers(graph: dict, prod: str,
+                       globs: list[str] | None) -> list[str]:
+    """Tracked test files that import `prod` and do not mock it (a module a
+    test replaces with `vi.mock` / `jest.mock` is not exercised by it),
+    sorted. Helper modules under a test directory are not test files."""
+    out = []
+    for t in sorted(graph.get("importers", {}).get(prod, set())):
+        if not _is_test_case_file(t, globs):
+            continue
+        text = graph["src"].get(t, "")
+        mocked = {_js_resolve(m.group(1), t, graph["files"],
+                              graph["aliases"])
+                  for m in _JS_MOCK_RE.finditer(text)}
+        if prod not in mocked:
+            out.append(t)
+    return out
+
+
+async def _measure_subtask_coverage(sid: str, tree: Path, base_ref: str,
+                                    st: "State", caps: dict) -> dict:
+    """The coverage detector (bench Q7/G v7 + v8) for one subtask's
+    worktree: which changed executable lines of its changed production files
+    its own tests execute, then which of the rest another importing test
+    executes. Returns `{measured, why?, prods, own_tests, own_failed_twice,
+    exec_changed{file: n}, uncovered{file: [line]}, settled{file: [test]},
+    settle_failed_twice, share}`; `share` is unexecuted / executable over
+    the subtask's changed files. Never raises."""
+    rec: dict = {"measured": False}
+    exe = _vitest_coverage_bin(tree)
+    if exe is None:
+        rec["why"] = ("no vitest with @vitest/coverage-v8 in the worktree "
+                      "(coverage is measured for JS/TS with vitest only)")
+        return rec
+    globs = resolve_test_file_globs(st.repo_root)
+    changed = await _changed_files(str(tree), base_ref)
+    prods = sorted(f for f in changed
+                   if f.endswith(_COV_SRC_EXT)
+                   and not _is_test_file(f, globs) and (tree / f).is_file())
+    own = sorted(f for f in changed
+                 if f.endswith(_COV_SRC_EXT) and _is_test_case_file(f, globs)
+                 and (tree / f).is_file())
+    lines = {p: await _changed_line_numbers(tree, base_ref, p) for p in prods}
+    prods = [p for p in prods if lines[p]]
+    rec.update(measured=True, prods=prods, own_tests=own,
+               own_failed_twice=[], exec_changed={}, uncovered={},
+               settled={}, settle_failed_twice=[], share=0.0)
+    if not prods:
+        rec["why"] = "no changed JS/TS production lines"
+        return rec
+    baseline = tree / _COV_BASELINE_TEST
+    try:
+        baseline.write_text(_COV_BASELINE_TEXT)
+        _, base_hits = await _vitest_run(exe, tree, [_COV_BASELINE_TEST],
+                                         prods, st=st, caps=caps, sid=sid,
+                                         tag="baseline")
+    finally:
+        with contextlib.suppress(OSError):
+            baseline.unlink()
+    h1, _passed, ft1 = await _vitest_cover(exe, tree, own, prods, st=st,
+                                           caps=caps, sid=sid, tag="own")
+    rec["own_failed_twice"] = ft1
+    unc: dict[str, set[int]] = {}
+    for p in prods:
+        executable = set(base_hits.get(p, {})) | set(h1.get(p, {}))
+        ex = {ln for ln in lines[p] if ln in executable}
+        rec["exec_changed"][p] = len(ex)
+        unc[p] = {ln for ln in ex if not h1.get(p, {}).get(ln, 0)}
+    open_files = [p for p in prods if unc[p]]
+    if open_files:
+        head = await _branch_head_sha(str(tree))
+        graph = (await asyncio.to_thread(_js_source_graph, str(tree), head)
+                 if head else {"importers": {}, "src": {}, "files": set(),
+                               "aliases": {}})
+        per = {p: [t for t in _js_test_importers(graph, p, globs)
+                   if t not in own][:_COV_SETTLE_TESTS_PER_FILE]
+               for p in open_files}
+        settle_tests = sorted({t for ts in per.values() for t in ts})
+        h2, _p2, ft2 = await _vitest_cover(exe, tree, settle_tests,
+                                           open_files, st=st, caps=caps,
+                                           sid=sid, tag="settle")
+        rec["settle_failed_twice"] = ft2
+        for p in open_files:
+            done = {ln for ln in unc[p] if h2.get(p, {}).get(ln, 0)}
+            if done:
+                rec["settled"][p] = per[p]
+            unc[p] -= done
+    rec["uncovered"] = {p: sorted(v) for p, v in unc.items() if v}
+    total = sum(rec["exec_changed"].values())
+    rec["share"] = (round(sum(len(v) for v in rec["uncovered"].values())
+                          / total, 4) if total else 0.0)
+    return rec
+
+
+async def _tsc_lists_paths(tree: Path, paths: list[str], *, st: "State",
+                           caps: dict, sid: str) -> bool:
+    """The type-check axis clears a `settle_by: typecheck|build` gap only
+    when it passes AND its own file list holds every path (bench Q7/G v5:
+    an axis passing says nothing about a file it never compiled). `tsc
+    --noEmit --listFiles` gives both in one run."""
+    exe = tree / "node_modules" / ".bin" / "tsc"
+    if not paths or not exe.exists() or not (tree / "tsconfig.json").is_file():
+        return False
+    log_path = st.run_dir / "logs" / f"coverage-{sid}-tsc.log"
+    with contextlib.suppress(OSError):
+        log_path.unlink()
+    run = await _cov_contained([str(exe), "--noEmit", "--listFiles", "-p",
+                                "tsconfig.json"], tree=tree, st=st,
+                               caps=caps, sid=sid, tag="tsc",
+                               log_path=log_path)
+    if run.get("rc") != 0:
+        return False
+    try:
+        listed_text = log_path.read_text(errors="replace")
+    except OSError:
+        return False
+    listed = {os.path.realpath(x.strip()) for x in listed_text.splitlines()
+              if x.strip().startswith("/")}
+    return all(os.path.realpath(tree / p) in listed for p in paths)
+
+
+async def _install_settles(tree: Path, *, st: "State", caps: dict,
+                           sid: str) -> bool:
+    """A `settle_by: install` gap clears when every `install` entry of the
+    run's provision recipe exits 0 in the subtask's worktree."""
+    entries = [e for e in ((st.data.get("provision") or {}).get("recipe")
+                           or [])
+               if isinstance(e, dict) and e.get("kind") == "install"
+               and isinstance(e.get("command"), list) and e["command"]]
+    if not entries:
+        return False
+    for e in entries:
+        run = await _cov_contained([str(a) for a in e["command"]],
+                                   tree=tree / (e.get("working_dir") or "."),
+                                   st=st, caps=caps, sid=sid, tag="install")
+        if run.get("rc") != 0:
+            return False
+    return True
+
+
+async def _settle_typed_gaps(sid: str, tree: Path, st: "State", caps: dict,
+                             *, redrive_changed: set[str]) -> list[dict]:
+    """The subtask's unaddressed `test_missing` / `test_weak` risks with at
+    least one verified `where_paths`, each with `settled` and `how` (DESIGN
+    §9). A gap naming no verified file triggers nothing: no note can aim at
+    it. `redrive_changed` is what this subtask's coverage re-drives changed
+    so far — a `test_weak` gap settles only on a test one of them touched."""
+    entries = (st.data.get("risk_register") or {}).get(sid)
+    gaps = [e for e in (entries if isinstance(entries, list) else [])
+            if isinstance(e, dict) and e.get("addressed") is not True
+            and e.get("gap") in ("test_missing", "test_weak")
+            and e.get("where_paths")]
+    if not gaps:
+        return []
+    exe = _vitest_coverage_bin(tree)
+    globs = resolve_test_file_globs(st.repo_root)
+    head = await _branch_head_sha(str(tree))
+    graph = (await asyncio.to_thread(_js_source_graph, str(tree), head)
+             if head else {"importers": {}, "src": {}, "files": set(),
+                           "aliases": {}})
+    out: list[dict] = []
+    for i, e in enumerate(gaps):
+        paths = list(e["where_paths"])
+        settle_by = e.get("settle_by") or "test"
+        row = {"detail": e.get("detail") or "", "gap": e["gap"],
+               "where_paths": paths, "settle_by": settle_by,
+               "settled": False, "checkable": True, "how": ""}
+        # A gap no mechanism here can settle never fires a re-drive: two
+        # rounds with no way to tell when the work is done would only spend.
+        if settle_by in ("typecheck", "build"):
+            row["checkable"] = ((tree / "node_modules" / ".bin" / "tsc")
+                                .exists()
+                                and (tree / "tsconfig.json").is_file())
+            if row["checkable"] and await _tsc_lists_paths(
+                    tree, paths, st=st, caps=caps, sid=sid):
+                row.update(settled=True, how="tsc passed and lists every "
+                           "where_paths file")
+        elif settle_by == "install":
+            row["checkable"] = any(
+                isinstance(x, dict) and x.get("kind") == "install"
+                for x in ((st.data.get("provision") or {}).get("recipe")
+                          or []))
+            if row["checkable"] and await _install_settles(
+                    tree, st=st, caps=caps, sid=sid):
+                row.update(settled=True, how="the provision install passed")
+        else:
+            row["checkable"] = exe is not None
+            cands = sorted({p for p in paths if _is_test_case_file(p, globs)}
+                           | {t for p in paths
+                              for t in _js_test_importers(graph, p, globs)})
+            if e["gap"] == "test_weak":
+                cands = [t for t in cands if t in redrive_changed]
+            if exe is not None and cands:
+                _h, passed, _ft = await _vitest_cover(
+                    exe, tree, cands[:_COV_SETTLE_TESTS_PER_FILE], paths,
+                    st=st, caps=caps, sid=sid, tag=f"gap{i}")
+                if passed:
+                    row.update(settled=True,
+                               how=f"{passed[0]} imports it and passes")
+        out.append(row)
+    return out
+
+
+def _coverage_note(rec: dict, round_no: int, cap: int,
+                   previous: dict | None) -> str:
+    """The re-drive note: the unexecuted `file:line`s and the unsettled
+    typed gaps; from round 2 on, also why the previous round was not
+    enough — its own lines still unexecuted, its tests that failed twice,
+    its gaps still open."""
+    def lines_of(unc: dict) -> str:
+        return ", ".join(f"{f}:{ln}" for f, ls in sorted(unc.items())
+                         for ln in ls)
+
+    parts = [f"COVERAGE RE-DRIVE (round {round_no} of at most {cap}): your "
+             "subtask is complete and stays integrated as it is; the "
+             "orchestrator measured which of its changed lines its tests "
+             "execute."]
+    if rec.get("uncovered"):
+        parts.append("These changed lines are executed by no test: "
+                     + lines_of(rec["uncovered"]) + ". Write or extend a "
+                     "test that executes them through their real call path "
+                     "and asserts their behaviour; run it and commit it.")
+    open_gaps = [g for g in rec.get("gaps") or []
+                 if g.get("checkable") and not g.get("settled")]
+    if open_gaps:
+        parts.append("These risks you reported are not settled — for each, "
+                     "write or strengthen a test that exercises these files "
+                     "through their real call path, run it, and commit it:\n"
+                     + "\n".join(f"- [{g['gap']}] {g['detail']} (where: "
+                                 f"{', '.join(g['where_paths'])})"
+                                 for g in open_gaps))
+    if previous is not None:
+        why = []
+        prev_unc = previous.get("uncovered") or {}
+        still = {f: [ln for ln in ls
+                     if ln in (rec.get("uncovered") or {}).get(f, [])]
+                 for f, ls in prev_unc.items()}
+        still = {f: ls for f, ls in still.items() if ls}
+        if still:
+            why.append("lines it was asked to cover are still executed by "
+                       "no test: " + lines_of(still))
+        failed = sorted(set(rec.get("own_failed_twice") or [])
+                        | set(rec.get("settle_failed_twice") or []))
+        if failed:
+            why.append("these test files failed twice, so they count for "
+                       "nothing: " + ", ".join(failed))
+        if open_gaps:
+            why.append(f"{len(open_gaps)} reported risk(s) still unsettled")
+        if why:
+            parts.append(f"NOT ADDRESSED by round {round_no - 1}: "
+                         + "; ".join(why) + ".")
+    parts.append("If a test exposes a defect, fix the code at its root. Do "
+                 "not change behaviour a test does not show is wrong, and do "
+                 "not weaken or delete existing tests.")
+    return "\n\n".join(parts)
+
+
+async def _redrive_uncovered_subtasks(
+        results: dict[str, dict],
+        settle: Callable[[str, str], Awaitable[dict]],
+        st: "State", caps: dict, leerie_dir: Path) -> None:
+    """Re-drive this wave's `complete` subtasks whose changed lines no test
+    executes, or whose `test_missing` / `test_weak` risks are unsettled
+    (DESIGN §9 *Changed lines no test executes are re-driven*), from the
+    shared budget, before integration. Fires when the unexecuted share is
+    at least `coverage_uncovered_share` or a typed gap is open. A re-drive
+    that does not end `complete` is rolled back to the pre-re-drive commit
+    and its earlier result restored. Persists `coverage_redrive[sid]`
+    `{rounds[], final}`; `final` is `covered` (nothing fires),
+    `untested` (still firing when the budget is spent — listed in the PR,
+    never `unconverged`), `rolled_back`, or `unmeasured`. Mutates
+    `results`."""
+    records = st.data.setdefault("coverage_redrive", {})
+    run_branch = _compute_run_branch(st.run_id)
+    share_min = float(caps.get("coverage_uncovered_share",
+                               DEFAULT_CAPS["coverage_uncovered_share"]))
+    cap = int(caps.get("subtask_redrive_rounds",
+                       DEFAULT_CAPS["subtask_redrive_rounds"]))
+    redrive_changed: dict[str, set[str]] = {}
+
+    async def evaluate(sid: str) -> dict:
+        tree = Path(leerie_dir) / "worktrees" / sid
+        try:
+            if not tree.is_dir():
+                return {"measured": False, "why": "no worktree"}
+            rec = await _measure_subtask_coverage(sid, tree, run_branch, st,
+                                                  caps)
+            rec["gaps"] = await _settle_typed_gaps(
+                sid, tree, st, caps,
+                redrive_changed=redrive_changed.get(sid, set()))
+            return rec
+        except Exception as e:  # advisory measurement: never kills a wave
+            return {"measured": False,
+                    "why": f"measurement error ({type(e).__name__}: {e})"}
+
+    def open_gaps(rec: dict) -> list[dict]:
+        return [g for g in rec.get("gaps") or []
+                if g.get("checkable") and not g.get("settled")]
+
+    def fires(rec: dict) -> bool:
+        return bool((rec.get("measured") and rec.get("uncovered")
+                     and float(rec.get("share") or 0.0) >= share_min)
+                    or open_gaps(rec))
+
+    pending = sorted(s for s, r in results.items()
+                     if r.get("status") == "complete"
+                     and not (records.get(s) or {}).get("final"))
+    previous: dict[str, dict] = {}
+    while pending:
+        recs = dict(zip(pending, await _gather_or_cancel(
+            *(evaluate(s) for s in pending))))
+        due: list[str] = []
+        for s in pending:
+            rec = recs[s]
+            entry = records.setdefault(s, {"rounds": []})
+            entry["last"] = rec
+            if not fires(rec):
+                entry["final"] = ("covered" if rec.get("measured")
+                                  or rec.get("gaps") else "unmeasured")
+                entry["uncovered"] = rec.get("uncovered") or {}
+            elif _redrive_allowed(st, caps, s):
+                due.append(s)
+            else:
+                entry["final"] = "untested"
+                entry["uncovered"] = rec.get("uncovered") or {}
+                entry["open_gaps"] = open_gaps(rec)
+                log(f"  {s}: coverage — {sum(len(v) for v in (rec.get('uncovered') or {}).values())} "
+                    "changed line(s) still unexecuted and the re-drive "
+                    "budget is spent; listed in the PR as untested")
+        st.save()
+        if not due:
+            return
+        notes: dict[str, str] = {}
+        pre: dict[str, str] = {}
+        for s in due:
+            n = _consume_redrive(st, s)
+            notes[s] = _coverage_note(recs[s], n, cap, previous.get(s))
+            pre[s] = await _branch_head_sha(
+                str(Path(leerie_dir) / "worktrees" / s))
+            records[s]["rounds"].append(
+                {"round": n, "share": recs[s].get("share"),
+                 "uncovered": recs[s].get("uncovered") or {},
+                 "gaps_open": len(open_gaps(recs[s])),
+                 "pre_sha": pre[s]})
+            log(f"  {s}: coverage — re-driving (round {n} of {cap}): share "
+                f"{float(recs[s].get('share') or 0.0):.2f} of changed "
+                "executable lines unexecuted, "
+                f"{records[s]['rounds'][-1]['gaps_open']} typed gap(s) open")
+        st.save()
+        t0 = time.monotonic()
+        outs = await _gather_or_cancel(*(settle(s, notes[s]) for s in due))
+        _charge_redrive_time(st, time.monotonic() - t0)
+        nxt: list[str] = []
+        for s, r in zip(due, outs):
+            previous[s] = recs[s]
+            if r.get("status") == "complete":
+                results[s] = r
+                tree = Path(leerie_dir) / "worktrees" / s
+                if pre[s]:
+                    diff = await run_proc(["git", "diff", "--name-only",
+                                           f"{pre[s]}..HEAD"], cwd=str(tree))
+                    redrive_changed.setdefault(s, set()).update(
+                        diff.stdout.split())
+                nxt.append(s)
+                continue
+            # Adding tests must never cost finished work: back to the
+            # commit the subtask completed at, and its earlier result.
+            tree = Path(leerie_dir) / "worktrees" / s
+            if pre[s]:
+                await run_proc(["git", "reset", "-q", "--hard", pre[s]],
+                               cwd=str(tree))
+            st.data.setdefault("subtask_status", {})[s] = "complete"
+            (st.data.get("unconverged_subtasks") or {}).pop(s, None)
+            reg = st.data.get("blocked")
+            if isinstance(reg, dict):
+                reg.pop(s, None)
+                if not reg:
+                    st.data.pop("blocked", None)
+            records[s]["final"] = "rolled_back"
+            records[s]["uncovered"] = recs[s].get("uncovered") or {}
+            records[s]["rolled_back"] = {"status": r.get("status"),
+                                         "reason": _pr_entry(
+                                             r.get("blocker")
+                                             or r.get("summary"))}
+            log(f"  {s}: coverage re-drive ended {r.get('status')} — "
+                f"rolled back to {pre[s][:12] or '?'}; the subtask stays "
+                "complete")
+        st.save()
+        pending = nxt
+
+
 # --- E4: settle by execution (DESIGN §8 *Settled by execution*) ----------
 #
 # Output a settle command prints reaches a worker only as this much tail,
@@ -45327,7 +46190,8 @@ async def _settle_subtask(sid: str, leerie_dir: Path, caps: dict, st: State,
                            "gate; the risk stays on the register")
                 log(f"  {sid}: conformance: {_cd_msg}")
                 res.setdefault("conformance_warnings", []).append(_cd_msg)
-            _risks = _collect_subtask_risks(res, conf_res)
+            _risks = _verify_risk_paths(
+                _collect_subtask_risks(res, conf_res), worktree)
             if _risks:
                 st.data.setdefault("risk_register", {})[sid] = _risks
             else:
@@ -46896,6 +47760,11 @@ async def phase_execute(leerie_dir: Path, st: State, caps: dict,
         # Re-drive what ended blocked, from the shared budget, BEFORE
         # integrating — a re-driven success integrates with its wave.
         await _redrive_blocked_subtasks(results, redrive_one, st, caps)
+        # Then re-drive completed subtasks whose changed lines no test
+        # executes (DESIGN §9), from the same shared budget, still before
+        # integrating.
+        await _redrive_uncovered_subtasks(results, redrive_one, st, caps,
+                                          leerie_dir)
         # Stand-in entries for sids whose implementer completed in a prior
         # invocation but who still have a pending, un-accepted
         # integration_gate finding (see `pending_gate_sids` above) — they
@@ -47529,23 +48398,22 @@ async def _compose_pr_via_llm(st: "State",
             log("pr_writer: worker returned empty title or body; "
                 "launcher will use deterministic fallback")
             return
-        # DESIGN §6 *The residual-risk section is appended by code on every
-        # composition path*: the worker never owns this section (its prompt
+        # DESIGN §6 *The PR's end-state section is rendered by code, from
+        # typed state*: the worker never owns these sections (its prompt
         # says so, but the append is the guarantee — §12, the same
         # discipline as _strip_leerie_prefix above: a worker-emitted
-        # section would otherwise render twice, or — with an empty
-        # register — ship worker-fabricated risks unbacked by any state).
-        # Strip UNCONDITIONALLY, append only when the register has
-        # content; both before the run.json write so the handed-off
-        # pr_body is already complete and the launcher needs no risk
-        # logic on this path.
+        # section would otherwise render twice, or — with nothing to
+        # append — ship worker-fabricated entries unbacked by any state).
+        # Strip UNCONDITIONALLY, append only when there is content; both
+        # before the run.json write so the handed-off pr_body is already
+        # complete and the launcher needs no section logic on this path.
         body, stripped = _strip_worker_risk_sections(body)
         if stripped:
-            log("pr_writer: stripped a worker-emitted residual-risks "
-                "section; the orchestrator owns that section")
-        risk_section = _format_risk_register_section(st.data)
-        if risk_section:
-            body = body + "\n" + risk_section
+            log("pr_writer: stripped a worker-emitted end-state section; "
+                "the orchestrator owns those sections")
+        end_state = _format_pr_end_state_section(st.data)
+        if end_state:
+            body = body + "\n" + end_state
         used = result.get("used_template")
         _write_run_json(
             st.run_dir,
@@ -47734,6 +48602,10 @@ async def phase_finalize(leerie_dir: Path, st: State, no_push: bool,
         finished_at=st.data["finished_at"],
         no_push=not will_push,
         no_verify=no_verify,
+        # Rendered once, after the outcome: the launcher's LLM-less
+        # fallback appends this text as-is (DESIGN §6 *The PR's end-state
+        # section is rendered by code, from typed state*).
+        pr_end_state=_format_pr_end_state_section(st.data),
     )
 
     # Capture-and-bake hook (DESIGN §6½). Non-fatal: any error is

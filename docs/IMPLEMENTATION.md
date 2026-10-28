@@ -1982,18 +1982,18 @@ detail past the cut-off.
 | `PR_WRITER_DIFF_SAMPLE_MAX_LINES`| 500    | sampled `git diff` hunks (line-capped because individual diff lines can be long and breaking one mid-line would render the surrounding hunk unreadable) |
 | `PR_WRITER_FINAL_CONFORMANCE_MAX_BYTES` | 8,000 | serialized JSON length of the `final_conformance` payload field. Enforced inside `_final_conformance_payload` by trimming `warnings` (then `residuals`) from the tail; at least one of each is preserved and a `truncated: true` marker is added when trimming fired |
 
-When `state.json.risk_register` is non-empty, `_compose_pr_via_llm` appends
-`_format_risk_register_section(st.data)` to the worker's accepted body
-before writing `pr_body` to `run.json` — so the handed-off body is already
-complete — and the same section is rendered in the launcher's LLM-less
-bash fallback by a `jq` block format-identical to `compose_pr_body`, the
-canonical fallback reference it mirrors (DESIGN §6 *Finalization*, *The
-residual-risk section is appended by code on every composition path*).
-The `pr_writer` prompt tells the worker not to render its own risks
-section; the append is the guarantee, and a worker-emitted copy of the
-section is removed unconditionally (span-limited, via
-`_strip_worker_risk_sections`) even when the register is empty and
-nothing is appended in its place.
+`_compose_pr_via_llm` appends `_format_pr_end_state_section(st.data)` to
+the worker's accepted body, when it is non-empty, before writing `pr_body`
+to `run.json` — so the handed-off body is already complete. `phase_finalize`
+renders the same section once, after `_decide_outcome`, into `run.json` as
+`pr_end_state`, and the launcher's LLM-less bash fallback appends that text
+as-is (`jq -r '.pr_end_state'`): there is no second renderer to keep in
+sync (DESIGN §6 *Finalization*, *The PR's end-state section is rendered by
+code, from typed state*). The `pr_writer` prompt tells the worker not to
+write the code-owned headings (`_PR_END_STATE_HEADINGS`); the append is the
+guarantee, and a worker-emitted copy of any of them is removed
+unconditionally (span-limited and whole-line-anchored, via
+`_strip_worker_risk_sections`) even when nothing is appended in its place.
 
 These are **module constants, not `DEFAULT_CAPS` entries**, by design:
 `DEFAULT_CAPS` is the surface for user-tunable run-wide operational caps
@@ -2233,7 +2233,7 @@ model selection:
 8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
 
 Same mechanical pattern as model selection: `LEERIE_EFFORT_<WORKER>` (env) /
-`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same twenty-seven
+`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same twenty-nine
 worker names listed above under model selection. Global override:
 `LEERIE_EFFORT` / `--effort` / `effort`.
 
@@ -2919,7 +2919,7 @@ validation contract.
 
 ### Worker types
 
-Leerie spawns the twenty-seven `claude -p` worker types in `WORKER_TYPES`.
+Leerie spawns the twenty-nine `claude -p` worker types in `WORKER_TYPES`.
 Each is a separate subprocess; there is no in-session agent nesting. (The
 table predates `task_coverage_judge`, `integration_judge` and `rebaser`,
 which are specified in their own sections.)
@@ -4601,9 +4601,22 @@ entries `{kind, detail, where?, source, disposition?, addressed}`: tier 1 is
 `production_evidence.exercised == false` on either result (kind
 `unexercised_behavior`, detail = the `unexercisable_reason`); tier 2 is the
 implementer's optional `self_reported_risks` array
-(`_self_reported_risks_schema()`: `{kind:
-unexercised_behavior|external_contract_assumption|untested_change, detail,
-where?}`, max 8). Every detail/where is normalized on ingestion by
+(`_self_reported_risks_schema()`: max 8 items, each a `$ref` to the
+implementer schema's `$defs.risk` = `_risk_item_schema()`: `{kind:
+RISK_KINDS, detail, where?, gap: RISK_GAPS, where_paths[] (max 10),
+settle_by?: RISK_SETTLE_BY, resource?, simulated_interleaving?}`, `kind`,
+`detail`, `gap` and `where_paths` required). `RISK_GAPS = (test_missing,
+test_weak, unverified_external, none)`; `RISK_SETTLE_BY = (test, typecheck,
+install, build)`; `RISK_KINDS` adds `process_note` to the three register
+kinds, and `_typed_risks` drops a `process_note` (and any unknown kind) on
+ingestion, so it reaches neither the register nor the conformer's challenge
+block. An entry without a valid `gap` (a result from before the field) is
+typed `none`; the `exercised: false` tier is typed `gap:
+unverified_external` with `where_paths: []`. `_verify_risk_paths(entries,
+worktree)` then keeps a `where_paths` entry only when it is a relative path
+with no `..` naming a file in the subtask's worktree, moving the rest to
+`where_paths_unverified`; `_settle_subtask` applies it before writing the
+register. Every detail/where is normalized on ingestion by
 `_normalize_risk_text` (whitespace runs — including newlines — collapsed;
 length-capped at `_RISK_DETAIL_MAX` = 300 / `_RISK_WHERE_MAX` = 120
 characters) so a disclosure can never inject markdown structure into the
@@ -4637,19 +4650,11 @@ unrelated-repair residual class and why per-risk linkage was rejected.
 `symptom_findings`, and threads the implementer-side entries into
 `_run_conformance_phase` → `_run_conformer`, which renders them as a
 `SELF_REPORTED_RISKS` context block the conformer must answer. The register
-reaches the PR body through `_format_risk_register_section(state)` —
-which skips any sid still `blocked` at finalize AND any sid in the
-`accepted_blocked` registry (an accepted sid's status is rewritten to
-`complete` but its branch is never merged), since neither's work is in
-the PR — appended by code on both live composition paths
-(`_compose_pr_via_llm` after the worker's body is accepted — any
-worker-emitted copy of the section removed unconditionally by
-`_strip_worker_risk_sections`, span-limited so surrounding content
-survives — and a format-identical `jq` renderer in
-`scripts/host-finalize.sh`'s LLM-less fallback, mirroring
-`compose_pr_body`, the canonical fallback reference, which carries the
-same section — the `rebase_diagnosis_note` append discipline). Advisory
-end to end: risks never gate, re-drive, or block; the two *gating*
+is routed by type: `gap: unverified_external` (and any entry with
+`simulated_interleaving: true`) reaches the PR's "Needs human verification"
+list through `_format_pr_end_state_section`; `test_missing` / `test_weak`
+feed the coverage re-drive (*Coverage re-drive* below); everything else
+stays in `state.json`. Risks never gate; the two *gating*
 robustness kinds live on `solution_defects`
 (`external_contract_assumption`, `unrevalidated_precondition`) and ride
 the existing completeness channel unchanged. Pinned by
@@ -5152,8 +5157,9 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | orchestrator-level conformer rounds per subtask (`conformance_rounds`) | 3 | exit the conformance loop; any residuals become `conformance_warnings` on the subtask result — never `failed` / `blocked` (DESIGN §9 *Post-work conformance*). Backgrounding-retry (Pattern B) warnings from round N are injected as structured CRITIC-pattern feedback into round N+1. |
 | concurrent orchestrator-run build/lint/test measurements (`blt_parallel`) | 2 | not an escalation — a gate. Distinct from `max_parallel`, which bounds *workers*: a worker is admitted by `_await_worker_memory_admission` and enrolled in a cgroup, while a BLT command `_run_streaming` starts carries no `memory.max`/`pids.max` of its own (DESIGN §6 *Orchestrator-run build/lint/test is bounded, not contained*). Held around the command only — never the memo lookup (a hit must stay free) nor the install. Sized lazily on the running loop by `_blt_semaphore`, since a module-level `asyncio.Semaphore()` binds to whatever loop is current at import. 2 is a floor, not a measured optimum; it matters most under `--subtask-tests full`. |
 | implementer completeness re-drives per subtask (`completeness_retry_rounds`) | 1 | the conformer's gating `solution_defects` axis found concrete behavioral gaps in the implementer's diff (DESIGN §9 *The one gating axis: solution completeness*). Each round folds the found defects into the implementer's next attempt as mandatory criteria and re-drives it (a **separate** counter from `implementer_confidence_retries`/`failed_retries`/`subtask_continuations`). Each round **also draws from the shared per-subtask re-drive counter** (`subtask_redrive_rounds`, below): it runs only while `_redrive_allowed(st, caps, sid)` holds and consumes one `redrive_rounds[sid]` via `_consume_redrive`, so the two budgets cannot multiply. On exhaustion the subtask returns `blocked` with the residual defects named; at wave end it is re-driven only if the shared counter has room, else settled `unconverged` — never silently advisory. Independent of `--strict-conformer`, which governs only the advisory build/lint/test/residual axes. |
-| shared re-drive rounds per subtask (`subtask_redrive_rounds`) | 2 | one persisted counter per subtask, `state.data["redrive_rounds"][sid]`, drawn by every re-drive kind — today the completeness gate's in-settle re-drive and the wave-end re-drive of a `blocked` subtask (`_redrive_blocked_subtasks`). `_redrive_allowed(st, caps, sid)` is `redrive_rounds[sid] < subtask_redrive_rounds and redrive_spent_sec < redrive_budget_sec`; `_consume_redrive(st, sid)` increments and saves. Per-attempt budgets (`failed_retries`, `implementer_confidence_retries`, `subtask_continuations`) are not re-drives and do not draw from it. On exhaustion the subtask is settled `unconverged` (`_settle_unconverged`) — never left `blocked` — and its dependents settle `unconverged` without running (DESIGN §13 *One re-drive budget per subtask*). |
+| shared re-drive rounds per subtask (`subtask_redrive_rounds`) | 2 | one persisted counter per subtask, `state.data["redrive_rounds"][sid]`, drawn by every re-drive kind — the completeness gate's in-settle re-drive, the wave-end re-drive of a `blocked` subtask (`_redrive_blocked_subtasks`), each integration repair round and each coverage re-drive round (`_redrive_uncovered_subtasks`). `_redrive_allowed(st, caps, sid)` is `redrive_rounds[sid] < subtask_redrive_rounds and redrive_spent_sec < redrive_budget_sec`; `_consume_redrive(st, sid)` increments and saves. Per-attempt budgets (`failed_retries`, `implementer_confidence_retries`, `subtask_continuations`) are not re-drives and do not draw from it. On exhaustion the subtask is settled `unconverged` (`_settle_unconverged`) — never left `blocked` — and its dependents settle `unconverged` without running (DESIGN §13 *One re-drive budget per subtask*). |
 | run-level re-drive wall time (`redrive_budget_sec`) | 14400 s (4 h) | the hard stop for every re-drive in the run: `state.data["redrive_spent_sec"]` accumulates, per wave, the longest in-settle re-drive (clock opened by `_open_redrive_clock(st, sid)` at the first in-settle re-drive, closed by `_close_redrive_clock` when the settle returns) plus the wall time of each wave-end re-drive round. Once spent, `_redrive_allowed` is False for every subtask. Measured worst run: 15,017 s. |
+| coverage re-drive threshold (`coverage_uncovered_share`) | 0.25 | `_redrive_uncovered_subtasks`: a completed subtask is re-driven when at least this share of its changed executable lines is executed by no test, after the importing-test settle (DESIGN §9 *Changed lines no test executes are re-driven*). Rounds come from `subtask_redrive_rounds`. |
 | B\* host CPU-pressure gate (`confirm_psi_cpu_max`) | 40 | `_confirm_gate` waits until `_host_cpu_psi()` — `some avg10` of the **host** file `_HOST_PSI_CPU_PATH = "/proc/pressure/cpu"`, never a cgroup's `cpu.pressure` — is below this value. |
 | B\* gate wait (`confirm_gate_wait_sec`) | 300 s | the gate polls every 2 s for at most this long; a timeout (or an unreadable PSI file, which is logged and treated as a timeout) escalates the pairs below. |
 | B\* base/final rerun pairs (`confirm_pairs`) | 3 | interleaved base, final, base, final … reruns per confirm (DESIGN §9 *Which failures are new*). |
@@ -5944,6 +5950,72 @@ starts the first attempt as a continuation carrying that note, the shape
 of the completeness re-drive. `_SETTLED_STATUSES = {"complete",
 "unconverged", "accepted_external"}` is the resume filter;
 `_TERMINAL_STATUSES` gains `unconverged` and `accepted_external`.
+
+### Coverage re-drive — `_redrive_uncovered_subtasks`
+
+DESIGN §9 *Changed lines no test executes are re-driven*. `async
+_redrive_uncovered_subtasks(results, settle, st, caps, leerie_dir)` runs in
+the wave loop right after `_redrive_blocked_subtasks`, before
+`integrate_wave`, over every `complete` result whose
+`coverage_redrive[sid].final` is unset. Per subtask and round it measures,
+re-drives what fires, and loops on the re-driven ones:
+
+- `_measure_subtask_coverage(sid, tree, base_ref, st, caps) -> dict` (the
+  bench Q7/G v7 detector, v8 threshold; never raises): only when
+  `_vitest_coverage_bin(tree)` finds `node_modules/.bin/vitest` beside
+  `node_modules/@vitest/coverage-v8`, else `{measured: False, why}`.
+  Production files = the subtask's changed files (`_changed_files(tree,
+  run_branch)`) ending in `_COV_SRC_EXT` (= `_JS_SRC_EXT`) that are not
+  `_is_test_file`; own tests = changed `_is_test_case_file` files (a
+  basename-test-shaped file, or a `test_file_globs` match — a helper module
+  under a test directory is not one). Changed lines are the `-U0` hunk
+  headers of `git diff <run_branch>..HEAD` (`_changed_line_numbers`).
+  Executable lines = statement start lines of `coverage-final.json` from a
+  run of the empty `_COV_BASELINE_TEST` (written into the tree and removed
+  in a `finally`) unioned with the own-test run. `_vitest_cover` counts
+  coverage only from test files that pass: a failing file is re-run once
+  without coverage, and a file failing twice is dropped and the coverage
+  run repeated without it. For files with lines left unexecuted,
+  `_js_test_importers(graph, prod, globs)` (from `_js_source_graph` at the
+  tree's HEAD; a test that `vi.mock`s / `jest.mock`s the file does not
+  count) supplies up to `_COV_SETTLE_TESTS_PER_FILE` (30) other test files,
+  and the lines they execute are settled. Returns `{measured, prods,
+  own_tests, own_failed_twice, exec_changed{file: n}, uncovered{file:
+  [line]}, settled{file: [test]}, settle_failed_twice, share}`. Each vitest
+  run (`_vitest_run`: `--reporter=json --outputFile`, `--coverage.provider=v8
+  --coverage.reporter=json --coverage.include=<file>…`, reports under
+  `<run_dir>/coverage/<sid>/`) goes through `_cov_contained`: spawn-held
+  in a broker cgroup at the worker caps, holding a host build slot
+  (`_build_class_slot`), the tracked tree reset if the run dirtied it.
+- `_settle_typed_gaps(sid, tree, st, caps, *, redrive_changed) ->
+  list[dict]`: the subtask's unaddressed `test_missing` / `test_weak`
+  register entries with a verified `where_paths`, each `{detail, gap,
+  where_paths, settle_by, settled, checkable, how}`. `settle_by` `test`
+  (the default): `test_missing` settles when a test file among or importing
+  its paths passes under `_vitest_cover`; `test_weak` only when such a test
+  is one a coverage re-drive of this subtask changed. `typecheck` / `build`:
+  `_tsc_lists_paths` — `node_modules/.bin/tsc --noEmit --listFiles -p
+  tsconfig.json` exits 0 and its listed files hold every path. `install`:
+  `_install_settles` — every `install` entry of the provision recipe exits
+  0. A gap no mechanism can check (`checkable: false`) never fires.
+- Fires when `measured`, `uncovered` is non-empty and `share >=
+  caps["coverage_uncovered_share"]`, or a checkable gap is unsettled. A
+  firing subtask is re-driven when `_redrive_allowed`: `_consume_redrive`,
+  then `settle(sid, _coverage_note(rec, n, cap, previous))` — the note
+  names the unexecuted `file:line`s and the open gaps, and from round 2 a
+  `NOT ADDRESSED by round n-1:` line (that round's lines still unexecuted,
+  its test files that failed twice, its gaps still open). The pre-re-drive
+  HEAD is recorded; a re-drive that does not end `complete` is reset
+  (`git reset --hard <pre_sha>`), its earlier result restored,
+  `subtask_status[sid]` set back to `complete` and any `blocked` /
+  `unconverged_subtasks` entry dropped (`final: "rolled_back"`). Each
+  round's wall time is charged to `redrive_spent_sec`.
+- `coverage_redrive[sid]` = `{rounds[{round, share, uncovered, gaps_open,
+  pre_sha}], last, final, uncovered, open_gaps?, rolled_back?}`; `final`
+  is `covered` (nothing fires), `untested` (still firing with the budget
+  spent — rendered under "Untested after re-drive", never `unconverged`),
+  `rolled_back`, or `unmeasured`. A set `final` skips the subtask on
+  resume.
 
 ### Typed blocker kinds — `_route_blocker_kind`
 
@@ -6767,10 +6839,9 @@ The launcher's finalize block in `leerie` (bash) does, in order:
    deterministic body shape `compose_pr_body` produces (task, category,
    source-of-truth, run timestamps, wave + subtask + worker counts,
    when `external_preconditions` is non-empty a `⚠ Deploy-ordering`
-   section, and when `risk_register` is non-empty a `⚠ Residual risks`
-   section — each rendered via `jq`, byte-identical to the Python
-   renderer; see "Deploy-ordering notes" and the §5½ risk-routing
-   paragraph). The launcher branches on whether
+   section rendered via `jq`, byte-identical to the Python renderer —
+   see "Deploy-ordering notes" — and then run.json's `pr_end_state`,
+   the end-state section `phase_finalize` rendered, appended as-is). The launcher branches on whether
    `pr_title_llm` / `pr_body_llm` are non-empty.
 5. **Open PR.** Before calling `gh pr create`, validate that
    `working_branch` still exists on origin via `git ls-remote
@@ -8377,7 +8448,8 @@ discovery without parsing the full `state.json`):
 | `volume_id` | str \| null | Fly volume ID when the machine was provisioned with one (default on `--runtime fly`). Mounted at `/work`; destroyed with the machine. Requires `fly_machine_id` non-null. |
 | `image_tag` | str \| null | Full Fly registry image tag recorded at provision time; `resume_machine()` updates the machine's image on resume if `$FLY_IMAGE_TAG` has drifted from the stored value. |
 | `pr_title` | str \| null | LLM-written PR title from the `pr_writer` worker (omits the `leerie: ` prefix; the launcher prepends it). Null when the worker errored or was skipped (no-push); `host_finalize` falls back to a deterministic title. |
-| `pr_body` | str \| null | PR body (markdown): the `pr_writer` worker's accepted body, with any worker-emitted residual-risks section stripped and the code-appended `## ⚠ Residual risks` section attached when `risk_register` is non-empty (`_compose_pr_via_llm` — that section is deliberately never LLM-written). Null on the same conditions as `pr_title`. |
+| `pr_body` | str \| null | PR body (markdown): the `pr_writer` worker's accepted body, with any worker-emitted copy of a code-owned end-state section stripped and `_format_pr_end_state_section` appended when it is non-empty (`_compose_pr_via_llm` — those sections are deliberately never LLM-written). Null on the same conditions as `pr_title`. |
+| `pr_end_state` | str | the PR's end-state section (`_format_pr_end_state_section`, DESIGN §6 *The PR's end-state section is rendered by code, from typed state*), rendered once by `phase_finalize` after `_decide_outcome` and written with `finished_at`; `""` when there is nothing to say. `host-finalize.sh`'s LLM-less fallback appends it as-is. |
 | `pr_template_used` | str \| null | repo-relative path of the PR template the worker filled out (e.g. `.github/pull_request_template.md`). Null when the worker produced its no-template default structure. |
 | `rebase_disposition_status` | str \| null | set to `"unusable"` by the rebase fallback arm when the rebaser seam returns rc=0 but its JSON is empty, unparseable, or lacks `status`. |
 | `rebase_disposition_jq_rc` | str \| null | the `jq -e` exit code from parsing `$_rebaser_json` in that fallback arm — non-zero means the payload was unparseable JSON, not merely missing `.status`. Null under the same conditions as `rebase_disposition_status`. |
@@ -8444,7 +8516,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `active_oauth_token` | str \| None | the raw `CLAUDE_CODE_OAUTH_TOKEN` value currently selected for this run's `claude -p` spawns (DESIGN §6 *Multi-token rotation*; IMPLEMENTATION.md §3 *Multi-token rotation*). |
 | `waves` | list[list[str]] | scheduled subtask ids per wave (from `_schedule`) |
 | `completed_waves` | int | index of the next wave to run (resume cursor) |
-| `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. |
+| `outcome` | str | `done` / `no_work` / `unconverged`, written only by `_decide_outcome` (DESIGN §6 *The run outcome is decided once*); mirrored into `run.json`. `unconverged` opens a draft PR whose end-state section starts with `## Unconverged`. |
 | `outcome_reasons` | list[str] | why `_decide_outcome` chose `unconverged` (empty otherwise). |
 | `redrive_rounds` | dict[str, int] | per-subtask shared re-drive counter (`subtask_redrive_rounds`; DESIGN §13 *One re-drive budget per subtask*), persisted so `resume` cannot reset it. |
 | `redrive_spent_sec` | float | run-level re-drive wall time charged so far against `redrive_budget_sec`. |
@@ -8515,7 +8587,8 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). |
 | `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. |
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
-| `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries (`{kind, detail, where?, source, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks` plus the `production_evidence.exercised == false` tier); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`; rendered verbatim — addressed entries annotated — into the PR body's `## ⚠ Residual risks` section by code on every composition path. |
+| `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier typed `unverified_external`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` (or `simulated_interleaving`) to the PR's "Needs human verification"; `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
+| `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule. |
@@ -8673,8 +8746,11 @@ Required fields, current shape:
   `checkpoint_path`), `artifacts` (DESIGN §5: `{name, kind: "markdown"|"json"|"text",
   content, summary?}[]` — deliverables for downstream subtasks),
   `self_reported_risks` (DESIGN §9 *Self-reported risk is routed, not read*:
-  `{kind: unexercised_behavior|external_contract_assumption|untested_change,
-  detail, where?}[]`, max 8 — routed by `_collect_subtask_risks` into the
+  max 8 items, each `$ref: #/$defs/risk` — `{kind:
+  unexercised_behavior|external_contract_assumption|untested_change|process_note,
+  detail, where?, gap: test_missing|test_weak|unverified_external|none,
+  where_paths[], settle_by?: test|typecheck|install|build, resource?,
+  simulated_interleaving?}` — routed by `_collect_subtask_risks` into the
   `risk_register` and the conformer's challenge context, never parsed from
   prose), `blocker_kind` (`$ref` into the schema's `$defs`: `nothing_to_change`
   / `external_precondition` / `environment_limit` / `upstream_missing` /

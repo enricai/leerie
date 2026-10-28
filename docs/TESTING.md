@@ -4347,11 +4347,30 @@ tracked per fence line, so an inline ``` in prose does not flip it and
 the section END equally fence-aware so a fenced `## ` line inside the
 section is not a boundary (`test_strip_section_end_is_fence_aware`),
 and the U+FE0F variation-selector heading still matched), and
-`tests/test_host_finalize_sh.py` (the bash fallback's jq renderer
-byte-matches `_format_risk_register_section` on the same state —
-including the blocked-sid and `accepted_blocked` filters — with the
-expectation computed from the Python renderer, so the two cannot drift
-independently of the test).
+`tests/test_host_finalize_sh.py` (the bash fallback appends run.json's
+`pr_end_state` as-is and never re-renders state itself — the jq mirror of
+the retired risk dump is gone, so there is no second renderer to drift).
+
+**The PR's end-state section** (DESIGN §6 *The PR's end-state section is
+rendered by code, from typed state*), in `tests/test_pr_end_state.py`: the
+renderer executed on a state carrying every source, asserting each rendered
+line and the order of the six headings; integration content loss under its
+own heading, not as a worker risk; caps on the advisory lists; entry text
+that cannot open a heading; malformed state rendering nothing; and the strip
+of a worker-emitted copy of every code-owned heading, whole-line anchored.
+`tests/test_finalize_execution.py::test_phase_finalize_writes_the_end_state_after_the_outcome`
+pins that `pr_end_state` is rendered after `_decide_outcome`.
+
+**The coverage re-drive** (DESIGN §9 *Changed lines no test executes are
+re-driven*), in `tests/test_coverage_redrive.py`: real git worktrees and a
+stand-in `node_modules/.bin/vitest` that speaks vitest's JSON reporter and
+the v8 `coverage-final.json`, so the detector (pass-only counting, the
+importing-test settle with mocks excluded, helper modules excluded), the
+threshold, both re-drive rounds with round 2's "NOT ADDRESSED" line, the
+spent-budget `untested` listing, the rollback of a re-drive that does not
+complete, the resume skip and the typed-gap settles (`test_missing` by an
+importing test, `typecheck` only for a file in `tsc --listFiles`) run
+unmodified.
 
 **The gating robustness kinds**, in `tests/test_solution_defects.py`:
 `external_contract_assumption` / `unrevalidated_precondition` pass the
