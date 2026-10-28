@@ -9543,9 +9543,23 @@ failure new / does this set still fail" verdict uses:
    gate timed out. One confirm runs at a time, and the whole confirm is
    bounded by `confirm_budget_sec` (1800 s).
 3. *Verdict.* An ID is **new** only if it failed on every final rerun and
-   passed on every base rerun. Anything else — flaky, failing on both
-   sides, a rerun that produced no report, or pairs cut short by the budget
-   — is typed `resource_affected`: reported, never counted as a regression.
+   passed on every base rerun. An ID that failed on every one of the `k`
+   base reruns, each of which produced a report, is **`pre_existing`**: the
+   base already fails it deterministically, whatever the final side did.
+   An ID for which no rerun on either side produced a report is
+   **`no_verdict`**: nothing was measured. Everything else — flaky on
+   either side, failing on some base reruns and not others, pairs cut short
+   by the budget after some evidence — is `resource_affected`. None of the
+   three is counted as a regression, but they are reported apart, because
+   they mean different things to the reader: `resource_affected` is the
+   label for mixed evidence (the flake label), and it is never given to a
+   test that failed on every base rerun. Measured (barnacle 45fa4253 pass
+   2): 33 IDs with `final_failed 3, base_failed 3` were labelled
+   `resource_affected`, so the run's record showed 33 base failures as
+   flakiness. The same split holds where B\* has no base side (a held-out
+   set, a falsifier probe): `confirmed` when every rerun failed it,
+   `no_verdict` when no rerun produced a report, `resource_affected`
+   otherwise.
 
 The pairing and `k` carry the guarantee (a p≈0.5 flake goes 3/3 vs 0/3 with
 probability 4⁻³ ≈ 1.6%); the gate only reduces how often `k` must grow.

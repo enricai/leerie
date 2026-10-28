@@ -676,7 +676,8 @@ def test_new_failures_confirmed_under_bstar(leerie, tmp_path):
     # No verdict on one side is never a regression.
     v2 = asyncio.run(leerie._redrive_new_failures(st, caps, repo, pre, None,
                                                   after, "t2"))
-    assert v2 == {"new": [], "resource_affected": [], "unmeasured": True}
+    assert v2 == {"new": [], "pre_existing": [], "no_verdict": [],
+                  "resource_affected": [], "unmeasured": True}
 
 
 # === end to end =============================================================
@@ -1140,7 +1141,7 @@ def test_fixing_one_case_of_a_still_failing_file_is_progress(
 
 def test_no_verdict_after_the_group_is_not_zero_progress(
         leerie, tmp_path, monkeypatch):
-    """A missing report is resource_affected, never a rollback on its own."""
+    """A missing report is unmeasured, never a rollback on its own."""
     w = World(leerie, tmp_path)
     w.install(monkeypatch)
     measured = leerie._evaluate_acceptance_sets
@@ -1157,7 +1158,9 @@ def test_no_verdict_after_the_group_is_not_zero_progress(
     w.run()
     g = w.st.data["delivery_redrive"]["rounds"][0]["groups"][0]
     assert g["zero_progress"] is False and not g.get("rolled_back")
-    assert "set 1" in g["resource_affected"]
+    # No verdict is `unmeasured`, never the flake label.
+    assert "set 1" in g["unmeasured"] and "set 1" not in g[
+        "resource_affected"]
     assert "change" in w.a_text("HEAD")
 
 

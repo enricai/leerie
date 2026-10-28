@@ -133,7 +133,8 @@ def test_deterministic_regression_is_new_with_interleaved_pairs(leerie):
     assert v["pairs_required"] == 3 and v["pairs_run"] == 3
     # Interleaved, base first: B F B F B F.
     assert [c[0] for c in calls] == ["base", "final"] * 3
-    assert v["per_id"]["t::x"] == {"final_failed": 3, "base_failed": 0}
+    assert v["per_id"]["t::x"] == {"final_failed": 3, "base_failed": 0,
+                                   "final_runs": 3, "base_runs": 3}
 
 
 def test_flaky_final_is_resource_affected(leerie):
@@ -150,6 +151,76 @@ def test_failing_on_base_too_is_not_new(leerie):
     v = asyncio.run(leerie._confirm_new_failures(
         ["t::x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
     assert v["new"] == [] and v["resource_affected"] == ["t::x"]
+
+
+def test_failing_every_base_rerun_is_pre_existing_not_flaky(leerie):
+    """Barnacle 45fa4253 pass 2: 33 IDs failed 3/3 on both sides and were
+    labelled resource_affected — the flake label. Failing every base rerun
+    is the base's own failure (DESIGN §9 *Which failures are new*, step
+    3), whatever the final side did."""
+    calls = []
+    b, f = _runners([{"t::x", "t::y"}] * 3,
+                    [{"t::x", "t::y"}, {"t::x"}, {"t::x", "t::y"}], calls)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["t::x", "t::y"], b, f, _caps(leerie), label="t",
+        read_psi=lambda: 0.0))
+    assert v["pre_existing"] == ["t::x", "t::y"]
+    assert v["resource_affected"] == [] and v["new"] == []
+    assert v["no_verdict"] == []
+
+
+def test_base_failing_some_reruns_stays_resource_affected(leerie):
+    """2 of 3 base reruns is mixed evidence, not pre_existing; nor is a
+    base rerun with no report counted as a failure."""
+    calls = []
+    b, f = _runners([{"x", "y"}, {"x"}, {"x"}], [{"x", "y"}] * 3, calls)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x", "y"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+    assert v["pre_existing"] == ["x"] and v["resource_affected"] == ["y"]
+    calls = []
+    b, f = _runners([{"x"}, None, {"x"}], [{"x"}] * 3, calls)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 0.0))
+    assert v["pre_existing"] == [] and v["resource_affected"] == ["x"]
+
+
+def test_no_rerun_with_a_report_is_no_verdict(leerie):
+    """No report on either side measured nothing: `no_verdict`, never the
+    flake label."""
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], leerie._no_rerun, leerie._no_rerun, _caps(leerie), label="t",
+        read_psi=lambda: 0.0))
+    assert v["no_verdict"] == ["x"] and v["resource_affected"] == []
+    assert v["pre_existing"] == [] and v["new"] == []
+
+
+def test_still_failing_splits_no_verdict(leerie):
+    async def none(_t):
+        return None
+    v = asyncio.run(leerie._confirm_still_failing(
+        ["x"], none, _caps(leerie), label="t", read_psi=lambda: 0.0))
+    assert v["no_verdict"] == ["x"] and v["resource_affected"] == []
+    runs = iter([{"x"}, set(), {"x"}])
+
+    async def mixed(_t):
+        return next(runs)
+    v = asyncio.run(leerie._confirm_still_failing(
+        ["x"], mixed, _caps(leerie), label="t", read_psi=lambda: 0.0))
+    assert v["resource_affected"] == ["x"] and v["no_verdict"] == []
+
+
+def test_pre_existing_reaches_the_judge_record_apart_from_new(leerie,
+                                                              tmp_path):
+    st = leerie.State(tmp_path / "s", "r")
+    st.data = {"test_id_diff": {"candidates": ["a", "b"], "new": ["t :: a"],
+                                "pre_existing": ["t :: b"],
+                                "resource_affected": []}}
+    lines = leerie._orchestrator_results_digest(st).splitlines()
+    assert lines == [
+        "[orchestrator B* failing-test diff] tests newly failing on the "
+        "final tree, confirmed against the base: t :: a",
+        "[orchestrator B* failing-test diff] 1 test(s) failing on every "
+        "base rerun too (pre-existing, not this run's): t :: b"]
 
 
 def test_mixed_candidates_split_per_id(leerie):
@@ -624,6 +695,7 @@ def test_discovery_needs_a_scoped_runner(leerie, coupled_repo, monkeypatch):
     ({"base_ids": {"x"}}, False),            # failed on the base run
     ({"per_id": {"base_failed": 1}}, False),  # failed a base rerun
     ({"pairs_run": 2}, False),                # base reruns incomplete
+    ({"per_id": {"base_runs": 2}}, False),    # a base rerun had no report
     ({"coupled": {}}, False),                 # imports nothing changed
     ({"messages": {}}, False),                # no signature to read
     ({"messages": {"x": ["Test timed out in 5000ms."]}}, False),

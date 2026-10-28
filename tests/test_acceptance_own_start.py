@@ -629,7 +629,9 @@ def test_still_failing_needs_every_rerun(leerie):
         return None
     out = asyncio.run(leerie._confirm_still_failing(
         ["a"], none, caps, label="t", read_psi=lambda: 0.0))
-    assert out["confirmed"] == [] and out["resource_affected"] == ["a"]
+    # No rerun produced a report: no verdict, never the flake label.
+    assert out["confirmed"] == [] and out["no_verdict"] == ["a"]
+    assert out["resource_affected"] == []
     # A gate timeout escalates the reruns.
     n = {"i": 0}
 

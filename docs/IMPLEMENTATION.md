@@ -6057,12 +6057,27 @@ than re-running once.
   a time, per event loop, lazily created like `_blt_semaphore`). Runs the
   gate, then `confirm_pairs` (or `confirm_pairs_escalated` on a gate
   timeout) interleaved pairs, base first, each rerun given the remaining
-  `confirm_budget_sec`. Returns `{candidates, new, resource_affected,
-  pairs_required, pairs_run, budget_exhausted, gate, per_id: {id:
-  {final_failed, base_failed}}}`: an ID is `new` iff every required pair
-  ran, it is in every final rerun's set and in no base rerun's set, and
-  every rerun produced a verdict; every other candidate is
-  `resource_affected`. No candidates → no gate, no reruns.
+  `confirm_budget_sec`. Returns `{candidates, new, pre_existing,
+  no_verdict, resource_affected, pairs_required, pairs_run,
+  budget_exhausted, gate, per_id: {id: {final_failed, base_failed,
+  final_runs, base_runs}}}` (`*_runs`: that side's reruns that produced a
+  verdict). An ID is `new` iff every required pair ran, it is in every
+  final rerun's set and in no base rerun's set, and every rerun produced a
+  verdict; `pre_existing` iff `base_runs == base_failed == pairs_required`
+  (it failed every base rerun, each with a verdict); `no_verdict` iff no
+  rerun on either side produced a verdict (`base_runs == final_runs == 0`:
+  a missing base worktree, a budget spent before the first rerun, reports
+  never written); every other candidate is `resource_affected` — mixed
+  evidence only (DESIGN §9 *Which failures are new*, step 3). No
+  candidates → no gate, no reruns.
+- `async _confirm_still_failing(candidates, run_final, caps, *, label,
+  …) -> dict` — the same gate and budget with no base side: `{candidates,
+  confirmed, no_verdict, resource_affected, reruns_required, reruns_run,
+  budget_exhausted, gate}`. `confirmed` iff every required rerun ran,
+  produced a verdict and failed it; `no_verdict` iff no rerun produced a
+  verdict; every other candidate `resource_affected`.
+  `_acceptance_run_placed` treats `no_verdict` like `resource_affected`
+  (no evidence either way: the set is unmeasured unless it also fails).
 
 Test-ID plumbing for the failing-test-ID diff (E3):
 
@@ -6172,7 +6187,8 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   discovery_counts, repeats_run, coupled, id_files, messages) ->
   list[dict]`. It reads only the B\* `resource_affected` IDs. An ID is
   typed when all of these hold: it is not in `base_ids`; the base reruns
-  are complete (`pairs_run == pairs_required`, no `budget_exhausted`) with
+  are complete (`pairs_run == pairs_required`, no `budget_exhausted`), each
+  produced a verdict (`per_id.base_runs == pairs_run`), with
   `base_failed == 0`; it failed at least once across the final run,
   discovery and the B\* final reruns; its file is a key of `coupled` with
   a non-empty list; and it has at least one recorded message, none of
@@ -6812,7 +6828,9 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   staging HEAD. A gate (`_ci_gate_argv`) that fails is confirmed by
   `_ci_confirm_red` — `_confirm_new_failures` with base reruns in a fresh
   `ci-confirm-base` worktree and final reruns in `ci-final`; only `new` ids
-  become `unmet` (`why: red`), the rest `resource_affected`. A diagnostic
+  become `unmet` (`why: red`); `final.pre_existing` and `final.no_verdict`
+  record the B\* split of the rest, `final.resource_affected` the mixed
+  ones. A diagnostic
   ratchet is `unmet` (`why: new_diagnostics`) when a key's final count
   exceeds the base's in a file the run changed (`git diff --name-only
   <base_sha>..<final_sha>`, relative to the check's cwd). A coverage ratchet
@@ -6943,8 +6961,9 @@ nor void.
   join `after`'s IDs; `_redrive_new_failures` confirms the candidates under
   B\* against a worktree at `pre_sha` (it now also returns the whole B\*
   `verdict`); `_type_intermittent_regressions` types the evidence rows.
-  Returns `{new, resource_affected, unmeasured, files, intermittent_regression[],
-  discovery}`. The re-drive calls it in place of `_redrive_new_failures`.
+  Returns `{new, pre_existing, no_verdict, resource_affected, unmeasured,
+  files, intermittent_regression[], discovery}` (the first four as B\*
+  split them). The re-drive calls it in place of `_redrive_new_failures`.
   `_ratchet_test_ids(st, caps, tree, *, label, log_path)` is the test axis
   with IDs: `_capture_failing_test_ids` of the BLT `tests` command, or of
   its `_scoped_test_replacement` when the task forbids it; None with no
@@ -9523,7 +9542,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `acceptance_dispute` | dict | `{failing_sets, total_sets, cases[], accepted?, unacted?, redispute?}` written when held-out sets fail on HEAD — as a new dispute when the previous completed same-task run had NOT already disputed, and again with `accepted: true` when it had (the carry-forward); `_prior_acceptance_dispute` reads it from that sibling on the next run, which then accepts no work instead of disputing again. `unacted: true` is set by `_mark_dispute_unacted` when the disputing run still ended as no work by another exit (empty plans, or the satisfied-probe sweep emptying the plan); `_prior_acceptance_dispute` does not count such a dispute unless it also carries `redispute: true` — written when the dispute was raised because the previous run's dispute was unacted (`_prior_acceptance_dispute_record`), so a second unacted dispute counts and the wrong-tests loop stays bounded at two extra runs (DESIGN §8 *A dispute counts only once it is acted on*). |
 | `declared_unrun_warnings` | dict | per-sid list of `DECLARED_CMD_UNRUN` issues on an `empty_handoff`-rescued subtask that settled `complete` without running them. No longer written — such a rescue is now settled by execution or re-driven (DESIGN §8 *Settled by execution*) — but still read by `phase_finalize`, so a run recorded before the change keeps surfacing it. |
 | `settled_by_execution` | dict[str, dict] | per-sid record of `_settle_by_execution` (DESIGN §8 *Settled by execution*): `{verdict, why, commands: [{argv, rc, attempts, passed, resource_affected, environment_limit}], dirty, forbidden?}` (`forbidden[{argv, forbidden}]` only when a verify argv runs a command the task forbids — then nothing ran), written on every execution whatever the verdict. |
-| `ci_parity` | dict \| absent | CI parity (DESIGN §9 *The repository's own merge checks run too*), written by `_capture_ci_parity_baseline` and `_run_ci_parity_final`: `{baseline_done, config_files[], excluded_by_worker[], skipped?, base_sha, checks[], final?}`. Each check `{id, kind, argv, cwd, env, prerequisites, trigger, requires, strict_argv, source, coverage, selected, reason?, problems?, gate?: plain \| strict, ratchet?: diagnostic \| coverage, base?{rc, dirty, strict_rc?, diagnostics?{"file\ttext": count}, coverage?{"glob\|metric": pct}}}`; `reason` one of `left_to_test_axis`, `not_merge_gating`, `external_resource`, `provenance` (with `problems`), `no_base_worktree`, `writes_tracked_files`, `red_at_baseline`, `coverage_unmeasured`. `final` `{sha, results{id: {...}}, unmet[{id, kind, why: red \| new_diagnostics \| coverage_ratchet, argv, cwd, rc? \| diagnostics? \| thresholds?}], resource_affected[], b_star?, skipped?}`. `baseline_done` is the baseline's resume sentinel; `final.sha` equal to the staging HEAD is the final half's. |
+| `ci_parity` | dict \| absent | CI parity (DESIGN §9 *The repository's own merge checks run too*), written by `_capture_ci_parity_baseline` and `_run_ci_parity_final`: `{baseline_done, config_files[], excluded_by_worker[], skipped?, base_sha, checks[], final?}`. Each check `{id, kind, argv, cwd, env, prerequisites, trigger, requires, strict_argv, source, coverage, selected, reason?, problems?, gate?: plain \| strict, ratchet?: diagnostic \| coverage, base?{rc, dirty, strict_rc?, diagnostics?{"file\ttext": count}, coverage?{"glob\|metric": pct}}}`; `reason` one of `left_to_test_axis`, `not_merge_gating`, `external_resource`, `provenance` (with `problems`), `no_base_worktree`, `writes_tracked_files`, `red_at_baseline`, `coverage_unmeasured`. `final` `{sha, results{id: {...}}, unmet[{id, kind, why: red \| new_diagnostics \| coverage_ratchet, argv, cwd, rc? \| diagnostics? \| thresholds?}], resource_affected[], pre_existing[], no_verdict[], b_star?, skipped?}`. `baseline_done` is the baseline's resume sentinel; `final.sha` equal to the staging HEAD is the final half's. |
 | `blt_peak` | dict \| absent | the base-health baseline's measured peak (DESIGN §6 *The repo's own build peak*): `{memory_bytes, pids, axis, slots, worker_memory_max_bytes, worker_pids_max}` — the largest `memory.peak` / `pids.peak` across the measured axes, the host build-semaphore slot count sized from it, and the raised caps `_apply_blt_peak` applied. Re-applied on resume. |
 | `answers` | dict[str, str] | user answers to classifier questions (and source-of-truth) |
 | `artifact_registry` | list[dict] | shared artifact vocabulary (DESIGN §5 *Artifact-registry worker*). |
@@ -9562,7 +9581,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `settled_heads` | dict[str, str] | per-sid worktree HEAD sha at the moment the subtask settled `complete` (`_record_settled_head`, DESIGN §6 *Integrated means the settled commit is on the run branch*); `integrate_wave` requires it to be an ancestor of staging after the merge; reset to the round's `pre_sha` by `_undo_interrupted_redrives`. |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[]}` — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[], tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |

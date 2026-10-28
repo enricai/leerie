@@ -38244,15 +38244,18 @@ async def _confirm_new_failures(
     base/final pairs — `confirm_pairs`, or `confirm_pairs_escalated` when the
     gate timed out — inside `confirm_budget_sec`. An ID is new only if every
     required pair ran, every final rerun failed it, every base rerun passed
-    it, and every rerun produced a verdict; anything else is
-    `resource_affected` — reported, never a regression. `run_base` /
+    it, and every rerun produced a verdict. One that failed every base
+    rerun (each with a verdict) is `pre_existing`; one no rerun produced a
+    verdict for is `no_verdict`; anything else — mixed evidence — is
+    `resource_affected`. None is a regression. `run_base` /
     `run_final` get the remaining budget as their timeout and return one
     serial rerun's failing IDs (None: no verdict).
 
     Frozen from Q9 (held-out, 124 trials): 0/88 clean trials called new,
     36/36 reverted fixes detected."""
     cand = sorted(set(candidates))
-    out: dict = {"candidates": cand, "new": [], "resource_affected": [],
+    out: dict = {"candidates": cand, "new": [], "pre_existing": [],
+                 "no_verdict": [], "resource_affected": [],
                  "pairs_required": 0, "pairs_run": 0,
                  "budget_exhausted": False, "gate": None, "per_id": {}}
     if not cand:
@@ -38297,14 +38300,28 @@ async def _confirm_new_failures(
                                if r is not None and cid in r)
             base_failed = sum(1 for r in base_runs
                               if r is not None and cid in r)
+            base_seen = sum(1 for r in base_runs if r is not None)
+            final_seen = sum(1 for r in final_runs if r is not None)
             out["per_id"][cid] = {"final_failed": final_failed,
-                                  "base_failed": base_failed}
+                                  "base_failed": base_failed,
+                                  "final_runs": final_seen,
+                                  "base_runs": base_seen}
             if complete and final_failed == k and base_failed == 0:
                 out["new"].append(cid)
+            elif base_seen == k and base_failed == k:
+                # The base fails it every time: not a flake, and never
+                # reported as one (barnacle 45fa4253: 33 such IDs read as
+                # resource_affected).
+                out["pre_existing"].append(cid)
+            elif base_seen == 0 and final_seen == 0:
+                out["no_verdict"].append(cid)
             else:
                 out["resource_affected"].append(cid)
     log(f"  B* {label}: {len(cand)} candidate(s), {len(out['new'])} new, "
-        f"{len(out['resource_affected'])} resource_affected "
+        f"{len(out['pre_existing'])} pre_existing, "
+        f"{len(out['resource_affected'])} resource_affected"
+        + (f", {len(out['no_verdict'])} no_verdict" if out["no_verdict"]
+           else "") + " "
         f"({out['pairs_run']}/{k} pair(s); gate waited "
         f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
         f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
@@ -38324,11 +38341,13 @@ async def _confirm_still_failing(
     `confirm_pairs` serial reruns of the tree (`confirm_pairs_escalated` when
     the gate timed out) inside `confirm_budget_sec`. A candidate is
     `confirmed` only if every required rerun ran, produced a verdict and
-    failed it; anything else is `resource_affected` — so a load flake never
-    forces a repair. `run_final` gets the remaining budget and returns the
-    failing candidates of one rerun (None: no verdict)."""
+    failed it; `no_verdict` when no rerun produced a verdict; anything else
+    is `resource_affected` — so a load flake never forces a repair.
+    `run_final` gets the remaining budget and returns the failing
+    candidates of one rerun (None: no verdict)."""
     cand = sorted(set(candidates))
-    out: dict = {"candidates": cand, "confirmed": [], "resource_affected": [],
+    out: dict = {"candidates": cand, "confirmed": [], "no_verdict": [],
+                 "resource_affected": [],
                  "reruns_required": 0, "reruns_run": 0,
                  "budget_exhausted": False, "gate": None}
     if not cand:
@@ -38360,13 +38379,18 @@ async def _confirm_still_failing(
                 runs.append(None)
         out["reruns_run"] = len(runs)
         complete = len(runs) == k and all(r is not None for r in runs)
+        seen = sum(1 for r in runs if r is not None)
         for cid in cand:
             if complete and all(cid in r for r in runs if r is not None):
                 out["confirmed"].append(cid)
+            elif seen == 0:
+                out["no_verdict"].append(cid)
             else:
                 out["resource_affected"].append(cid)
     log(f"  B* {label}: {len(cand)} failing, {len(out['confirmed'])} "
-        f"confirmed, {len(out['resource_affected'])} resource_affected "
+        f"confirmed, {len(out['resource_affected'])} resource_affected"
+        + (f", {len(out['no_verdict'])} no_verdict" if out["no_verdict"]
+           else "") + " "
         f"({out['reruns_run']}/{k} rerun(s); gate waited "
         f"{gate['waited_sec']}s{', timed out' if gate['timed_out'] else ''}"
         f"{'; budget exhausted' if out['budget_exhausted'] else ''})")
@@ -38577,7 +38601,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
            if base_sha else None)
     if add is None or add.returncode != 0:
         log("  B*: could not create the base worktree for the confirm — "
-            "every candidate is resource_affected")
+            "no candidate gets a verdict (no_verdict)")
 
         async def _none(_t: float) -> set[str] | None:
             return None
@@ -38740,7 +38764,10 @@ def _type_intermittent_regressions(verdict: dict, *, final_ids: set[str],
         final_failed = (int(cid in final_ids)
                         + int(discovery_counts.get(cid) or 0)
                         + int(per.get("final_failed") or 0))
-        if (cid in base_ids or not base_complete
+        # A base rerun with no report is not a clean base run.
+        base_measured = int(per.get("base_runs", verdict.get("pairs_run"))
+                            or 0) == int(verdict.get("pairs_run") or 0)
+        if (cid in base_ids or not base_complete or not base_measured
                 or int(per.get("base_failed") or 0) != 0
                 or final_failed < 1 or f not in coupled or not coupled[f]
                 or not msgs
@@ -39646,7 +39673,8 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
     eps = float(caps.get("ci_coverage_epsilon_pct",
                          DEFAULT_CAPS["ci_coverage_epsilon_pct"]))
     final: dict = {"sha": sha, "results": {}, "unmet": [],
-                   "resource_affected": []}
+                   "resource_affected": [], "pre_existing": [],
+                   "no_verdict": []}
     async with _ci_db_session(st, recs):
         wt = await _ci_worktree(st, "ci-final", sha)
         if wt is None:
@@ -39714,6 +39742,9 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
                 final["b_star"] = verdict
                 final["resource_affected"] = list(
                     verdict.get("resource_affected") or [])
+                final["pre_existing"] = list(
+                    verdict.get("pre_existing") or [])
+                final["no_verdict"] = list(verdict.get("no_verdict") or [])
                 by_id = {x["id"]: x for x in recs}
                 for cid in verdict.get("new") or []:
                     rr = by_id[cid]
@@ -39732,7 +39763,9 @@ async def _run_ci_parity_final(leerie_dir: Path, st: State,
     else:
         log("  ci parity: every gating merge check holds on the final tree"
             + (f" ({len(final['resource_affected'])} red run(s) typed "
-               "resource_affected)" if final["resource_affected"] else ""))
+               "resource_affected)" if final["resource_affected"] else "")
+            + (f" ({len(final['pre_existing'])} red on every base rerun "
+               "too: pre_existing)" if final["pre_existing"] else ""))
     return list(final["unmet"])
 
 
@@ -40552,6 +40585,13 @@ def _orchestrator_results_digest(st: "State") -> str:
         lines.append("[orchestrator B* failing-test diff] tests newly "
                      "failing on the final tree, confirmed against the base: "
                      + ("; ".join(new[:10]) if new else "none"))
+        pre = [str(x)[:160] for x in (diff.get("pre_existing") or [])]
+        if pre:
+            lines.append(
+                f"[orchestrator B* failing-test diff] {len(pre)} test(s) "
+                "failing on every base rerun too (pre-existing, not this "
+                "run's): " + "; ".join(pre[:10])
+                + (f" (+{len(pre) - 10} more)" if len(pre) > 10 else ""))
     acc = st.data.get("acceptance") or {}
     gate = (acc.get("gate") or {}) if isinstance(acc, dict) else {}
     final_sets = gate.get("final") if isinstance(gate, dict) else None
@@ -44018,7 +44058,11 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                 verdict_ = await _confirm_still_failing(
                     vote, _rerun, caps,
                     label=f"acceptance {label} set {s_['index']}")
-                resource_affected = list(verdict_["resource_affected"])
+                # No verdict is no evidence either way, like mixed
+                # evidence: the set is unmeasured unless it also fails.
+                resource_affected = list(
+                    verdict_["resource_affected"]
+                    + (verdict_.get("no_verdict") or []))
                 failing = [r for r in failing
                            if r in asserted or r in verdict_["confirmed"]]
             if confirm:
@@ -45810,6 +45854,7 @@ async def _acceptance_confirm_red_axis(st: "State", caps: dict,
             {"ids": [], "files": {}, "command": after.get("command")},
             after, label="acceptance-post", log_path=log_path)
         rec = {"new": list(ex.get("new") or []),
+               "pre_existing": list(ex.get("pre_existing") or []),
                "resource_affected": list(ex.get("resource_affected") or [])}
         if rec["new"]:
             return "turned the test axis red", rec
@@ -48663,10 +48708,12 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     `{new, resource_affected, unmeasured}`; no verdict on either side is
     `unmeasured`, never a regression."""
     if before is None or after is None:
-        return {"new": [], "resource_affected": [], "unmeasured": True}
+        return {"new": [], "pre_existing": [], "no_verdict": [],
+                "resource_affected": [], "unmeasured": True}
     cand = sorted(set(after["ids"]) - set(before["ids"]))
     if not cand:
-        return {"new": [], "resource_affected": [], "unmeasured": False}
+        return {"new": [], "pre_existing": [], "no_verdict": [],
+                "resource_affected": [], "unmeasured": False}
     id_files = after.get("files") or {}
     files = sorted({id_files.get(c) for c in cand}, key=str)
     rerun = None if (None in files or not files) else list(files)
@@ -48708,6 +48755,8 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     finally:
         _teardown()
     return {"new": list(verdict["new"]),
+            "pre_existing": list(verdict.get("pre_existing") or []),
+            "no_verdict": list(verdict.get("no_verdict") or []),
             "resource_affected": list(verdict["resource_affected"]),
             "unmeasured": False, "files": {c: id_files.get(c)
                                            for c in verdict["new"]},
@@ -48991,7 +49040,8 @@ async def _ratchet_exec(st: "State", caps: dict, staging: Path,
     (`_type_intermittent_regressions`), never counted. `{new,
     resource_affected, unmeasured, intermittent_regression[], discovery?}`."""
     if before is None or after is None:
-        return {"new": [], "resource_affected": [], "unmeasured": True,
+        return {"new": [], "pre_existing": [], "no_verdict": [],
+                "resource_affected": [], "unmeasured": True,
                 "intermittent_regression": []}
     disc = await _intermittent_discovery(
         st, caps, str(staging), after.get("command") or "", pre_sha,
@@ -50103,8 +50153,15 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 if newv.get("intermittent_regression"):
                     ge["intermittent_regression"] = newv[
                         "intermittent_regression"]
-                ge["resource_affected"] = (
-                    newv["resource_affected"] + [f"set {i}" for i in unm]
+                # Mixed evidence only; a measurement with no verdict is
+                # `unmeasured`, a base failure `pre_existing` (DESIGN §9
+                # *Which failures are new*, step 3).
+                ge["resource_affected"] = list(
+                    newv.get("resource_affected") or [])
+                ge["pre_existing"] = list(newv.get("pre_existing") or [])
+                ge["unmeasured"] = (
+                    [f"set {i}" for i in unm]
+                    + list(newv.get("no_verdict") or [])
                     + (["test ids"] if newv["unmeasured"] else []))
                 v = _redrive_verdict(F, F1, newv["new"],
                                      held=H if held_mode else None,
