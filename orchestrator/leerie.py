@@ -46161,22 +46161,77 @@ def _falsifier_checkout(st: "State", name: str, sha: str) -> Path | None:
     return wt
 
 
-def _git_exclude(wt: Path, patterns: Iterable[str]) -> None:
-    """Append `patterns` to the checkout's own `info/exclude`."""
-    r = subprocess.run(["git", "-C", str(wt), "rev-parse", "--git-path",
-                        "info/exclude"], capture_output=True, text=True,
-                       check=False)
-    if r.returncode != 0 or not r.stdout.strip():
-        return
-    ex = Path(r.stdout.strip())
-    if not ex.is_absolute():
-        ex = wt / ex
-    ex.parent.mkdir(parents=True, exist_ok=True)
-    have = ex.read_text().splitlines() if ex.is_file() else []
-    add = [p for p in patterns if p not in have]
-    if add:
-        with ex.open("a") as f:
-            f.write("\n" + "\n".join(add) + "\n")
+# A linked worktree's `info/exclude` is the repository's SHARED one (git
+# resolves `--git-path info/exclude` to the common dir), so a file leerie
+# places in a checkout is kept out of `git status`/`git add -A` by a
+# self-ignoring `.gitignore` beside it instead — written only where the
+# directory has none, and removed with the file (DESIGN §6 *Ignores are per
+# checkout*). The tag on its first line is how a later call knows the file
+# is leerie's own.
+_CHECKOUT_IGNORE_TAG = "# leerie: placed files, this checkout only"
+
+
+def _gitignore_escape(name: str) -> str:
+    """`name` as a literal gitignore pattern (glob metacharacters and a
+    trailing space escaped)."""
+    out = "".join("\\" + c if c in "*?[\\" else c for c in name)
+    return out[:-1] + "\\ " if out.endswith(" ") else out
+
+
+def _checkout_ignorable(wt: Path, rel: str) -> bool:
+    """True when `_checkout_ignore` can ignore `rel`: its directory has no
+    `.gitignore`, or only one leerie wrote."""
+    gi = wt / os.path.dirname(rel.strip("/")) / ".gitignore"
+    if rel.endswith("/"):
+        gi = wt / rel.strip("/") / ".gitignore"
+    if not gi.exists():
+        return True
+    try:
+        return gi.read_text().splitlines()[:1] == [_CHECKOUT_IGNORE_TAG]
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def _checkout_ignore(wt: Path, rels: Iterable[str]) -> list[str]:
+    """Git-ignore the untracked paths `rels` in checkout `wt` only, through
+    a self-ignoring `.gitignore` in each one's directory (a rel ending in
+    `/` ignores that whole directory). A directory with a `.gitignore` of
+    its own — tracked, or the user's — is never edited: its rels are
+    returned, not ignored."""
+    by_dir: dict[str, list[str]] = {}
+    refused: list[str] = []
+    for rel in rels:
+        if not _checkout_ignorable(wt, rel):
+            refused.append(rel)
+        elif rel.endswith("/"):
+            by_dir.setdefault(rel.strip("/"), []).append("*")
+        else:
+            d, name = os.path.split(rel.strip("/"))
+            by_dir.setdefault(d, []).append("/" + _gitignore_escape(name))
+    for d, pats in by_dir.items():
+        gi = wt / d / ".gitignore"
+        lines = (gi.read_text().splitlines() if gi.is_file()
+                 else [_CHECKOUT_IGNORE_TAG, "/.gitignore"])
+        lines += [p_ for p_ in dict.fromkeys(pats) if p_ not in lines]
+        gi.parent.mkdir(parents=True, exist_ok=True)
+        gi.write_text("\n".join(lines) + "\n")
+    return refused
+
+
+def _checkout_unignore(wt: Path, rels: Iterable[str]) -> None:
+    """Remove the `.gitignore` files `_checkout_ignore` wrote for `rels`
+    (only leerie's own: the tag is checked)."""
+    dirs = {rel.strip("/") if rel.endswith("/")
+            else os.path.dirname(rel.strip("/")) for rel in rels}
+    for d in dirs:
+        gi = wt / d / ".gitignore"
+        try:
+            ours = gi.read_text().splitlines()[:1] == [_CHECKOUT_IGNORE_TAG]
+        except (OSError, UnicodeDecodeError):
+            continue
+        if ours:
+            with contextlib.suppress(OSError):
+                gi.unlink()
 
 
 def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
@@ -46184,15 +46239,15 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
     """Put the leads into a falsifier checkout: each valid held-out set's
     files, read-only under `FALSIFIER_LEADS_DIR/acceptance/set-<k>/`, and
     every file the task references that the checkout lacks (a report filed
-    for the task). Both git-excluded. Returns (lead files, referenced
-    files present)."""
+    for the task). Both git-ignored in this checkout only
+    (`_checkout_ignore`). Returns (lead files, referenced files present)."""
     leads = wt / FALSIFIER_LEADS_DIR
     if leads.exists():
         for p in leads.rglob("*"):
             with contextlib.suppress(OSError):
                 p.chmod(0o755 if p.is_dir() else 0o644)
         shutil.rmtree(leads, ignore_errors=True)
-    excludes = [f"/{FALSIFIER_LEADS_DIR}/"]
+    excludes = [FALSIFIER_LEADS_DIR + "/"]
     ctx: list[str] = []
     for s_ in sets:
         if not s_.get("valid") or not s_.get("dir"):
@@ -46219,10 +46274,12 @@ def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
         if not dst.exists() and Path(f).is_file():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(f, dst)
-            excludes.append("/" + rel)
+            excludes.append(rel)
         if dst.exists():
             refs.append(rel)
-    _git_exclude(wt, excludes)
+    # A referenced file whose directory has its own `.gitignore` stays
+    # visible: the checkout is disposable and nothing commits from it.
+    _checkout_ignore(wt, excludes)
     return ctx, refs
 
 
@@ -47041,16 +47098,19 @@ def _redrive_exclude_path(staging: Path) -> Path | None:
 
 
 def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
-    """Remove this run's marked block from the exclude file — a worktree's
-    `info/exclude` is the repository's shared one, so nothing of it may
-    outlive the group."""
+    """Remove a marked block an earlier leerie wrote into the shared
+    `info/exclude` (it now ignores per checkout, `_checkout_ignore`): only
+    a resumed run that crashed mid-group under that version has one."""
     ex = _redrive_exclude_path(staging)
     if ex is None or not ex.is_file():
         return
     begin, end = (f"{_REDRIVE_EXCLUDE_TAG} {run_id} begin",
                   f"{_REDRIVE_EXCLUDE_TAG} {run_id} end")
+    text = ex.read_text()
+    if begin not in text.splitlines():
+        return          # never rewrite the user's file when nothing is ours
     out, skip = [], False
-    for line in ex.read_text().splitlines():
+    for line in text.splitlines():
         if line == begin:
             skip = True
             continue
@@ -47062,11 +47122,13 @@ def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
     ex.write_text("\n".join(out) + ("\n" if out else ""))
 
 
-def _redrive_stage(staging: Path, sets: list[dict], run_id: str
-                   ) -> list[dict]:
-    """X2: copy the shown sets read-only into staging and git-exclude them.
-    A set whose path the tree already has, or another staged set took, is
-    skipped (never overwritten). Returns `[{set_index, dir, files}]`."""
+def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
+    """X2: copy the shown sets read-only into staging and git-ignore them in
+    staging only (`_checkout_ignore`). A set whose path the tree already
+    has, or another staged set took, is skipped (never overwritten); so is
+    one with a file in a directory that has its own `.gitignore` (never
+    edited, so it could not be ignored). Returns `[{set_index, dir,
+    files}]`."""
     taken: set[str] = set()
     staged: list[dict] = []
     for s_ in sets:
@@ -47075,6 +47137,10 @@ def _redrive_stage(staging: Path, sets: list[dict], run_id: str
                 (staging / r).exists() or r in taken for r in rels):
             log(f"  delivery re-drive: set {s_.get('index')} not staged — a "
                 "path already exists in the tree")
+            continue
+        if not all(_checkout_ignorable(staging, r) for r in rels):
+            log(f"  delivery re-drive: set {s_.get('index')} not staged — "
+                "its directory has a .gitignore of its own")
             continue
         try:
             for rel in rels:
@@ -47093,23 +47159,16 @@ def _redrive_stage(staging: Path, sets: list[dict], run_id: str
         taken |= set(rels)
         staged.append({"set_index": s_.get("index"), "dir": s_["dir"],
                        "files": rels})
-    _redrive_exclude_clear(staging, run_id)
-    ex = _redrive_exclude_path(staging)
-    if ex is not None and taken:
-        ex.parent.mkdir(parents=True, exist_ok=True)
-        with ex.open("a") as f:
-            f.write("\n".join([f"{_REDRIVE_EXCLUDE_TAG} {run_id} begin",
-                               *("/" + r for r in sorted(taken)),
-                               f"{_REDRIVE_EXCLUDE_TAG} {run_id} end"])
-                    + "\n")
+    _checkout_ignore(staging, sorted(taken))
     return staged
 
 
-def _redrive_unstage(staging: Path, staged: list[dict], run_id: str
-                     ) -> list[str]:
-    """Remove the staged copies (and the directories only they needed) and
-    the exclude block; returns the staged files whose bytes changed."""
+def _redrive_unstage(staging: Path, staged: list[dict]) -> list[str]:
+    """Remove the staged copies, their `.gitignore` files and the
+    directories only they needed; returns the staged files whose bytes
+    changed."""
     tampered: list[str] = []
+    _checkout_unignore(staging, [f for s_ in staged for f in s_["files"]])
     for s_ in staged:
         for rel in s_["files"]:
             dst = staging / rel
@@ -47127,7 +47186,6 @@ def _redrive_unstage(staging: Path, staged: list[dict], run_id: str
                         key=lambda p: -len(str(p))):
             with contextlib.suppress(OSError):
                 d.rmdir()
-    _redrive_exclude_clear(staging, run_id)
     return tampered
 
 
@@ -48273,7 +48331,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
 
     flight = rec.get("in_flight")
     if isinstance(flight, dict):
-        # A crash mid-group: what it left is unknown, so it is undone.
+        # A crash mid-group: what it left is unknown, so it is undone. The
+        # staged files' `.gitignore` files go first, so `clean -fd` takes
+        # the files with them.
+        _checkout_unignore(staging, flight.get("stage_files") or [])
         _redrive_exclude_clear(staging, run_id)
         if flight.get("pre_sha"):
             ok = await _redrive_rollback(staging, flight["pre_sha"])
@@ -48480,12 +48541,18 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 ge["skipped"] = "head_unreadable"
                 break
             ge["pre_sha"] = pre_sha
-            rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi}
+            # The files staging may place, saved before it does: a crash
+            # leaves them git-ignored (they survive `clean -fd`), so the
+            # resume undoes their `.gitignore` files by this list.
+            rec["in_flight"] = {"pre_sha": pre_sha, "round": rnd, "group": gi,
+                                "stage_files": sorted({
+                                    f for s_ in shown
+                                    for f in _set_files(s_)})}
             for m in members:
                 _consume_redrive(st, m)
             _save()
             t0 = time.monotonic()
-            staged = _redrive_stage(staging, shown, run_id)
+            staged = _redrive_stage(staging, shown)
             staged_files = sorted({f for s_ in staged for f in s_["files"]
                                    if f in selfcheck_cmd_files})
             cmd = (_acceptance_cmd(st, staged_files, str(staging))
@@ -48509,7 +48576,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     leerie_dir, st, caps, models, staging, members, note,
                     effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
             finally:
-                ge["tampered"] = _redrive_unstage(staging, staged, run_id)
+                ge["tampered"] = _redrive_unstage(staging, staged)
             await _redrive_commit_leftovers(staging, f"r{rnd} g{gi}")
             drove = True
             prior_members += [m for m in members if m not in prior_members]

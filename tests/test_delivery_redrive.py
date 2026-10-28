@@ -330,7 +330,7 @@ class TestStage:
         # A set whose path the tree already has is never overwritten.
         s2 = _set(2, dir=str(sdir), defect_files=["src/a.ts"],
                   control_files=[])
-        staged = leerie._redrive_stage(repo, [s1, s2], "run-x")
+        staged = leerie._redrive_stage(repo, [s1, s2])
         assert [s["set_index"] for s in staged] == [1]
         f = repo / "src" / "a.test.ts"
         assert f.is_file() and not (f.stat().st_mode & stat.S_IWUSR)
@@ -338,12 +338,16 @@ class TestStage:
         assert (repo / "src" / "a.ts").read_text().endswith("BUG\n")
         f.chmod(0o644)
         f.write_text("tampered\n")
-        tampered = leerie._redrive_unstage(repo, staged, "run-x")
+        tampered = leerie._redrive_unstage(repo, staged)
         assert tampered == ["src/a.test.ts"]
         assert not f.exists()
+        # Ignored through a `.gitignore` of its own, removed with the file;
+        # the repository's shared exclude file is never written.
+        assert not (repo / "src" / ".gitignore").exists()
+        assert _git(repo, "status", "--porcelain") == ""
         ex = Path(_git(repo, "rev-parse", "--git-path", "info/exclude"))
         ex = ex if ex.is_absolute() else repo / ex
-        assert "leerie delivery re-drive" not in ex.read_text()
+        assert "leerie" not in ex.read_text()
 
 
 # === escalation gates =======================================================
@@ -911,6 +915,28 @@ def test_resumed_in_flight_group_is_rolled_back(leerie, tmp_path,
     assert _git(w.staging, "rev-parse", "HEAD~1") == pre
     assert "FIXED" in w.a_text("HEAD")
     assert w.st.data["redrive_rounds"] == {"s1": 2}
+
+
+def test_resumed_in_flight_group_removes_staged_sets(leerie, tmp_path,
+                                                    monkeypatch):
+    """A crash after staging leaves the set files git-ignored, so `clean
+    -fd` alone would keep them; the resume removes their `.gitignore` by
+    the write-ahead `stage_files` list first, and they go with the clean."""
+    w = World(leerie, tmp_path)
+    w.install(monkeypatch)
+    pre = _git(w.staging, "rev-parse", "HEAD")
+    staged = leerie._redrive_stage(w.staging, w.sets)
+    files = sorted({f for s_ in staged for f in s_["files"]})
+    assert files and all((w.staging / f).is_file() for f in files)
+    w.st.data["delivery_redrive"] = {"in_flight": {
+        "pre_sha": pre, "round": 1, "group": 0, "stage_files": files},
+        "rounds": [{"round": 1, "groups": []}]}
+    w.st.data["redrive_rounds"] = {"s1": 2}         # no budget left
+    w.run()
+    assert not any((w.staging / f).exists() for f in files)
+    assert not (w.staging / "src" / ".gitignore").exists()
+    assert _git(w.staging, "status", "--porcelain",
+                "--untracked-files=all") == ""
 
 
 def test_last_round_escalates_and_gate_voids(leerie, tmp_path, monkeypatch):

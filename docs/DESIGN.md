@@ -2084,6 +2084,28 @@ The rule generalises: any git verb that acts on the whole repository rather
 than on this run's own refs and worktrees is out of bounds from inside a
 container.
 
+**Ignores are per checkout.** A file is part of that shared state too:
+`info/exclude` lives in the common dir, so `git rev-parse --git-path
+info/exclude` in a linked worktree names the USER's exclude file. The
+falsifier once appended its leads and the task's referenced files there and
+never removed them, so the untracked report the task pointed at vanished
+from the user's own `git status`, and `git add` of it was refused as
+ignored. A file leerie places in a checkout and must keep out of commits
+(the falsifier's leads, the delivery re-drive's staged sets) is instead
+ignored by a self-ignoring `.gitignore` beside it — `/.gitignore` and the
+file's literal name, under a leerie tag — written only in a directory that
+has no `.gitignore` of its own and removed with the file. A directory that
+has one is never edited: the re-drive does not stage that set, and the
+falsifier's (disposable, never committed) checkout leaves that file
+visible. The alternatives fail on correctness: a per-worktree
+`core.excludesFile` needs `extensions.worktreeConfig`, itself a write to
+the shared `.git/config`, and replaces the user's global excludes file;
+`--assume-unchanged` and `--skip-worktree` apply only to tracked paths
+(and git reads a skip-worktree `.gitignore` from the index, not the
+file); and staged tests outside the work tree lose their relative imports.
+The `.gitignore` is plain worktree content, so it behaves the same on
+every runtime.
+
 **Even leerie's own scope is one run, not the state root.** A prune scoped to
 the whole state root still reached sibling runs: racing a sibling's
 `worktree add` (admin entry written, the worktree's `.git` link not yet), it
@@ -6468,7 +6490,8 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   repository, a fresh throwaway database — §8 *Prisma repositories get
   a real database*), and gets the item,
   the run's own diff (start commit and stat), the run's valid
-  held-out acceptance files (read-only, git-excluded, leads only), and
+  held-out acceptance files (read-only, git-ignored in that checkout
+  only, leads only), and
   the judge's typed unmet parts for that item (hypotheses, never
   expected values). It writes ONE new probe test through a public entry
   point, asserting the item's own words, and runs it.
@@ -6552,7 +6575,8 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    after another on the same tree. Before each group the open work is
    re-checked, and a group with nothing left failing is skipped.
 4. *A self-check, then a re-check.* The shown sets are staged read-only and
-   git-excluded in the tree, with the exact command that runs them: without
+   git-ignored in that checkout only (§6 *Ignores are per checkout*),
+   with the exact command that runs them: without
    that self-check (bench Q3 arm L3) whole-set closure was 0 of 4, against
    18 of 24 with it (every one of the 24 closed its staged sets). After each
    group the orchestrator re-runs the sets and the repository's tests — a

@@ -6415,7 +6415,7 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   Per sample: `_falsifier_reset` (`reset --hard` + `clean -fd`), `_falsifier_place_leads`
   (each valid set's files read-only under
   `FALSIFIER_LEADS_DIR/acceptance/set-<k>/`, every task-referenced file the
-  checkout lacks, both added to the checkout's `info/exclude`), then
+  checkout lacks, both ignored in that checkout only by `_checkout_ignore`), then
   `claude_p(schema_key="falsifier", allowed_tools=ACT_TOOLS,
   max_turns=FALSIFIER_MAX_TURNS (80), autonomous=True,
   sid="falsifier-i<k>-s<n>")` with `_falsifier_user_prompt` (task,
@@ -6691,9 +6691,11 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   false are dropped (`skipped: budget` when none is left); each member's
   counter is consumed (`_consume_redrive`); `in_flight {pre_sha, round,
   group}` is saved; the shown sets are staged (`_redrive_stage`: copied
-  read-only, skipping a set whose path the tree already has, listed in a
-  marked block of the checkout's `info/exclude` that `_redrive_unstage`
-  removes); one implementer runs in staging (`_redrive_drive`:
+  read-only, skipping a set whose path the tree already has or whose
+  directory has a `.gitignore` of its own, ignored in staging only by
+  `_checkout_ignore`, which `_redrive_unstage` undoes; the candidate files
+  are saved as `in_flight.stage_files` first, so a resumed crash removes
+  their `.gitignore` files before the rollback's `clean -fd`); one implementer runs in staging (`_redrive_drive`:
   `_implementer_base_prompt` of the first member + `NOTE FROM
   ORCHESTRATOR:` `_redrive_note(...)`, `claude_p(schema_key="implementer",
   allowed_tools=ACT_TOOLS, max_turns=120, autonomous=True,
