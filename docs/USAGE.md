@@ -156,7 +156,18 @@ past run, use `--all-runs --branches`.
 
 **A subtask reports `blocked`.** The implementer hit something it cannot
 resolve (an external dependency, an ambiguous spec, a failing test it
-cannot fix). By default Leerie re-drives it with its blocker as the note,
+cannot fix), and says why as a typed kind. A missing external resource
+(a credential, a service, a step only a person can take) is settled
+`accepted_external` — not merged, listed under "Needs human verification"
+in the PR, and not making the run `unconverged` — but only after Leerie
+checks the claim itself (the variable really is unset, the host really is
+unreachable, and so on); a claim the check does not back is re-driven. A
+resource kill at the container's limit is retried once in place, then
+settles `unconverged`. A "nothing to change" claim is settled done only on
+the evidence of a sibling subtask that already delivered it, and a "cannot
+reproduce" claim only when Leerie runs the subtask's verify commands and
+they pass. Every other
+blocker is re-driven with its blocker as the note,
 from one re-drive budget per subtask (`subtask_redrive_rounds`, bounded
 run-wide by `redrive_budget_sec`); once that budget is spent the subtask
 settles `unconverged`, the wave's successful subtasks are integrated and

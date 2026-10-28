@@ -20122,9 +20122,9 @@ def _rank_tokens(tokens: list[str], cache_sec: int) -> list[str]:
     """Rank tokens by remaining runway, most runway first.
 
     Score: min(1 - five_hour_util, 1 - seven_day_util), accounting for the
-    seven_day_opus_util sublimit when present (leerie's judgment workers
-    default to Opus, so a token near its Opus weekly cap has less usable
-    runway than its aggregate suggests) — the effective score also
+    seven_day_opus_util sublimit when present (`pr_reviewer` defaults to
+    Opus and any worker can be overridden onto it, so a token near its Opus
+    weekly cap has less usable runway than its aggregate suggests) — the effective score also
     incorporates (1 - seven_day_opus_util) when that field is populated.
     A None seven_day_opus_util means "no Opus usage recorded" (full
     runway), not "unknown" — it does not penalize the score. Ties are

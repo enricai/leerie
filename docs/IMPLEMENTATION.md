@@ -2072,10 +2072,12 @@ instead of ignoring them, and gives `_model_arg` an argument on which to append
 first). Valid values: `sonnet` | `opus` | `haiku` (aliases — the `claude` CLI
 resolves them to the current model version).
 
-**Per-worker defaults: Sonnet 5 for both judgment and implementation.** Every
-worker — judgment (classify, decompose, reconcile cross-domain coupling,
-detect cross-planner overlap, resolve merge conflicts behaviorally, check
-criteria, score captured calls) and workhorse alike — defaults to Sonnet. See
+**Per-worker defaults: Sonnet 5 for both judgment and implementation, Opus
+for `pr_reviewer`.** Every worker — judgment (classify, decompose, reconcile
+cross-domain coupling, detect cross-planner overlap, resolve merge conflicts
+behaviorally, check criteria, score captured calls) and workhorse alike —
+defaults to Sonnet, except `pr_reviewer`, which defaults to Opus (its row
+below). See
 DESIGN §12 *Opus-judgment, sonnet-workhorse (historical)* for why a
 judgment/workhorse split once existed and why it no longer applies.
 
@@ -2734,8 +2736,8 @@ table.
 | `--inspect-dir PATH` | none | Extra directory the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded to `claude -p` as `--add-dir`. Repeatable. Also `LEERIE_INSPECT_DIRS` (colon-separated) or `inspect_dirs` in `leerie.toml` (comma-separated). |
 | `--model ALIAS` | per-worker (every worker → `sonnet`, except `pr_reviewer` → `opus`) | `sonnet` / `opus` / `haiku`. Sets every worker this run; without it the per-worker defaults apply. |
 | `--model-<worker> ALIAS` | per-worker default (every worker → `sonnet`, except `pr_reviewer` → `opus`) | Per-worker override. `<worker>` is any `WORKER_TYPES` entry (listed under `LEERIE_MODEL_<WORKER>` below). Overrides `--model`, `LEERIE_MODEL`, and `leerie.toml`. |
-| `--effort LEVEL` | per-worker (judgment: `medium`; implementer/conformer: `low`) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift); implementer/conformer are pinned to `low` for cost/latency. §2 "Effort selection". |
-| `--effort-<worker> LEVEL` | per-worker default (judgment workers → `medium`; implementer/conformer → `low`) | Per-worker override. `<worker>` is one of the orchestrator workers (same set as `--model-<worker>`). Overrides `--effort`, `LEERIE_EFFORT`, and `leerie.toml`. |
+| `--effort LEVEL` | per-worker (judgment: `medium`; implementer/conformer: `low`; `pr_reviewer`: `high`) | `low` / `medium` / `high` / `xhigh` / `max`. Reasoning-depth dial forwarded to `claude -p --effort`. Pins judgment workers to a consistent depth across runs to reduce same-job variance (e.g. planner subtask-count drift); implementer/conformer are pinned to `low` for cost/latency. §2 "Effort selection". |
+| `--effort-<worker> LEVEL` | per-worker default (judgment workers → `medium`; implementer/conformer → `low`; `pr_reviewer` → `high`) | Per-worker override. `<worker>` is one of the orchestrator workers (same set as `--model-<worker>`). Overrides `--effort`, `LEERIE_EFFORT`, and `leerie.toml`. |
 | `--judge-model ALIAS` | `sonnet` | Model alias for the post-run judge skill (absent from `MODEL_DEFAULT_PER_WORKER`, falls through to the global `MODEL_DEFAULT`). Also `LEERIE_MODEL_JUDGE` or `model_judge` in `leerie.toml`. |
 | `--heal-model ALIAS` | `sonnet` | Model alias for the post-run self-heal skill. Also `LEERIE_MODEL_HEAL` or `model_heal` in `leerie.toml`. |
 | `--heal-max-rounds N` | `10` | Maximum heal-loop iterations per `call_type`. Also `LEERIE_HEAL_MAX_ROUNDS` or `heal_max_rounds` in `leerie.toml`. |
@@ -2858,7 +2860,7 @@ a container.
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → every worker defaults to `sonnet`, except `pr_reviewer` → `opus`. |
 | `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ every `WORKER_TYPES` entry: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`, `integration_judge`, `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `pr_reviewer`, `contract_extractor`, `falsifier`, `verifiability_classifier`, `delivery_ratchet`. Unset → every worker → `sonnet`, except `pr_reviewer` → `opus`. |
-| `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, implementer/conformer `low`, everything else inherits Claude default. |
+| `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, implementer/conformer `low`, `pr_reviewer` `high`, everything else inherits Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `medium`; `pr_reviewer` `high`; implementer/conformer `low`; `satisfied_probe` unset. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
 | `LEERIE_INSPECT_DIRS` | `inspect_dirs` | Extra directories the inspect-bucket workers (classifier, planner, reconciler, plan_overlap_judge, provision, artifact_registry) may read; forwarded as `--add-dir`. Env value is colon-separated; TOML value is comma-separated. Overridden by `--inspect-dir` (repeatable). Unset → none. |
@@ -3713,8 +3715,9 @@ probed for remaining runway and the winner becomes
   (0.0–1.0 fraction, `datetime` reset). `/v1/messages/count_tokens` does
   **not** carry these headers — a real inference call is required.
 - **Ranking** (`_rank_tokens`): sorts by `min(1 − five_hour_util, 1 −
-  seven_day_util)` descending (accounting for the Opus sublimit, since
-  leerie's judgment workers default to Opus), tie-broken by furthest
+  seven_day_util)` descending (accounting for the Opus sublimit, which
+  `pr_reviewer` — leerie's one Opus-default worker — and any `--model opus`
+  override draw on), tie-broken by furthest
   `resets_at`. A token whose probe failed entirely sorts last but remains
   eligible.
 - **Cache**: each token's probe result is cached, keyed by
@@ -5603,9 +5606,8 @@ worker *is* the independent check), gate on a **non-empty array of
 concretely-named found defects**, registered in `WORKER_TYPES` and
 `EFFORT_DEFAULT_PER_WORKER` (`"medium"`), absent from
 `MODEL_DEFAULT_PER_WORKER` (sonnet via the global `MODEL_DEFAULT` fallback —
-`MODEL_DEFAULT` is currently `"sonnet"` for every worker; see CLAUDE.md
-"Every worker — judgment and acting/workhorse alike — defaults to
-`sonnet`"), invoked read-only (`INSPECT_TOOLS`, `autonomous=False`) after
+`MODEL_DEFAULT` is `"sonnet"`, the default of every worker except
+`pr_reviewer`, the one `opus` entry; see §2 *Model selection*), invoked read-only (`INSPECT_TOOLS`, `autonomous=False`) after
 `st.bump_workers(caps)`. `task_coverage_judge` is wired into
 `phase_planning_coverage_gate` (a whole-plan gate run after
 reconciliation); `integration_judge` is wired per-subtask into the
@@ -8732,9 +8734,19 @@ external` prerequisites (DESIGN §5), `resume` retries it — which
 blocks again indefinitely. The `accept-blocked` verb lets the operator
 acknowledge the external block so `resume` skips that subtask.
 
-By default the wave loop never accepts a blocked subtask: it re-drives
-it from the shared re-drive budget and settles it `unconverged` when that
-budget is spent (DESIGN §13 *One re-drive budget per subtask*), so this
+By default the wave loop never accepts a blocked subtask as `complete`;
+`_route_blocker_kind` routes it on its `blocker_kind` (DESIGN §13 *A
+blocked implementer says why, as a type*). An `external_precondition` is
+settled `accepted_external` (`_settle_accepted_external`: not integrated,
+listed under "Needs human verification", not `unconverged`) only when
+`_verify_external_claim` returns `verified`, and is otherwise re-driven as
+`other`; an `environment_limit` is retried in place once, then settled
+`unconverged` (`_environment_limit_hit`); a `nothing_to_change` is settled
+`complete` on sibling evidence (`_settle_nothing_to_change`) and a
+`cannot_reproduce` by execution, when the checks back them. Every other
+blocked subtask is re-driven from the shared re-drive budget and settled
+`unconverged` when that budget is spent (DESIGN §13 *One re-drive budget
+per subtask*), so this
 verb is the manual path used under `--stop-on-blocked`
 (`LEERIE_STOP_ON_BLOCKED` / `stop_on_blocked`), where a blocked wave
 `die()`s with `wave N has unresolved subtasks`.

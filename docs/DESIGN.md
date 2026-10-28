@@ -681,9 +681,18 @@ unsatisfied prerequisites are `extent: external`, the worker discovers
 the dependency is missing (e.g. no Postgres server in the container) and
 returns `status: blocked`; the orchestrator doesn't gate dispatch on
 external preconditions, so `resume` would block again indefinitely.
-By default the orchestrator no longer accepts a blocked subtask as
-done. Once its wave finishes, a `blocked` subtask is re-driven from the
-subtask's shared re-drive budget (§13 *One re-drive budget per subtask*);
+The orchestrator never accepts a blocked subtask as done; it routes on the
+typed `blocker_kind` (§13 *A blocked implementer says why, as a type*). An
+`external_precondition` is settled **`accepted_external`** — not
+integrated, listed under "Needs human verification", and not making the run
+`unconverged` — only when code verifies the typed resource it names (§13
+*An external claim is checked, not taken on the word*); an unverified claim
+is re-driven as `other`. An `environment_limit` is retried in place once,
+then settled `unconverged`. A `nothing_to_change` is settled `complete` on a
+sibling's evidence, and a `cannot_reproduce` by execution, when the checks
+back them. Every other blocked subtask is re-driven once its wave finishes,
+from the subtask's shared re-drive budget (§13 *One re-drive budget per
+subtask*);
 when that budget is spent — or a subtask `failed` (the two-tier retry policy
 already spent its retries) — it is settled **`unconverged`**: a terminal
 status that is never left `blocked`, whose branch is not integrated, whose
