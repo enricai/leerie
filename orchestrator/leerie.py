@@ -54425,13 +54425,21 @@ async def _run_integration_judge_gate(
         # its integrator left (an amended merge included) is undone and the
         # round redone, its count handed back with it — kept spent, a crash
         # in the last round would back the subtask out for a failure of the
-        # machine, not the merge (review round 2 M1).
-        log(f"  integration gate for {sid}: redoing repair round "
-            f"{flight.get('round')} a crash interrupted (reset to "
-            f"{str(flight['pre'])[:12]})")
+        # machine, not the merge (review round 2 M1). Handed back once per
+        # round: a crash the round causes every time (an OOM kill skips the
+        # time charge too) would otherwise redo it forever (round-3 L2).
+        n = int(flight.get("round") or 1)
+        again = bool(flight.get("refunded"))
+        log(f"  integration gate for {sid}: repair round {n} was "
+            f"interrupted{' again — counted as spent' if again else ''} "
+            f"(reset to {str(flight['pre'])[:12]})")
         await run_proc(["git", "reset", "--hard", str(flight["pre"])],
                        cwd=str(staging))
-        rec["repair_rounds"] = max(0, int(flight.get("round") or 1) - 1)
+        if again:
+            rec["repair_rounds"] = max(int(rec.get("repair_rounds") or 0), n)
+        else:
+            rec["repair_rounds"] = max(0, n - 1)
+            rec["refunded_round"] = n
         rounds = rec.get("rounds") or []
         if rounds and not rounds[-1].get("verdict"):
             rounds[-1]["verdict"] = "interrupted"
@@ -54556,6 +54564,8 @@ async def _run_integration_judge_gate(
             "round": done + 1,
             "pre": (await _git_text(staging, "rev-parse", "HEAD")
                     or "").strip()}
+        if rec.get("refunded_round") == done + 1:
+            rec["in_round"]["refunded"] = True
         _persist()
         t0 = time.monotonic()
         try:

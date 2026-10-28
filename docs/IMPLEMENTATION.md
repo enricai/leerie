@@ -5722,13 +5722,17 @@ integrated_so_far, caps, st, models, efforts) -> bool`, a **repair loop**
    failure of either kind. Otherwise the next round gets the re-judge's
    findings plus a `test_failure` defect per confirmed failure, and the
    stale list. Each round is written ahead: `repair_rounds` and
-   `in_round: {round, pre}` (`pre` = staging HEAD) are saved in one
+   `in_round: {round, pre, refunded?}` (`pre` = staging HEAD; `refunded:
+   true` when `rec["refunded_round"]` equals this round) are saved in one
    `_persist()` before `_integration_repair_round`, and `in_round` is
    dropped in the save that follows it. On entry, before HEAD is read:
    `backing_out` → finish the back-out (3); else `in_round` → `git reset
-   --hard <pre>`, `repair_rounds = round - 1`, the round's audit entry
-   gets `verdict: "interrupted"` when it has none, and the gate continues
-   (judge, then the loop redoes the round); else a `merge_commit_sha` that
+   --hard <pre>`, the round's audit entry gets `verdict: "interrupted"`
+   when it has none, and — only when `in_round` lacks `refunded` —
+   `repair_rounds = round - 1` and `refunded_round = round` (the count is
+   handed back once per round; a second interruption leaves
+   `repair_rounds` at `round`, spent); the gate continues (judge, then the
+   loop redoes or moves past the round); else a `merge_commit_sha` that
    is not an ancestor of HEAD (`git merge-base --is-ancestor` exit 1) →
    `git reset --hard <merge_commit_sha>` and the gate continues.
 3. Back out (`False`) on a gating `intent_conflict`, an integrator
@@ -5760,8 +5764,9 @@ bool}` (`accepted` is `not defects` on a fresh judge verdict), plus, once the
 repair loop runs, `repair_rounds`, `rounds` (one audit entry per round),
 `superseded`, `outcome` (`clean` / `repaired` / `backed_out`) and, as they
 apply, `fallback_reason`, `reset_to`, `residual_lines` / `residual_total`,
-`backing_out` (only between a back-out's decision and its reset) and
-`in_round` (only while a repair round runs). A non-empty
+`backing_out` (only between a back-out's decision and its reset),
+`in_round` (only while a repair round runs) and `refunded_round` (the
+last round whose interrupted count was handed back). A non-empty
 `defects` entry is mirrored to the flatter `state.data["integration_defects"][sid]`
 (a plain `list[str]`), which is what `accept-integration` clears. Both keys
 let a resume distinguish "never reviewed" (both keys absent) from "reviewed

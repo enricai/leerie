@@ -2464,7 +2464,15 @@ persisted before each round, and the loop ends at its cap or when the run's
 re-drive time is spent. A round a crash interrupted reached no verdict, so
 the resume that redoes it from its starting commit takes its count back
 with it; kept spent, a crash in the last round would back the subtask out
-for a failure of the machine, not of the merge:
+for a failure of the machine, not of the merge. It takes it back once per
+round: the redone round is marked refunded, and when that round is
+interrupted again its count stays spent. Without the bound, a crash the
+round itself causes every time (an OOM kill or SIGKILL the integrator
+session reliably triggers, which also skips the re-drive time charge) was
+redone on every resume with neither the round counter nor the time budget
+ever drawn down (round-3 review L2); with it, a deterministic crash costs
+at most two sessions per round before the loop reaches its cap and backs
+the subtask out:
 
 1. **The integrator is re-driven with typed findings,** never prose: the
    judge's gating `defects[]`; the lines the merge dropped; failing tests,
