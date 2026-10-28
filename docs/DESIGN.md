@@ -2322,7 +2322,13 @@ Two outcomes are not failures of the integrator but facts about the work:
   does an unverified `resolved` claim. An unresolved conflict never proceeds
   silently onto a corrupt run-branch state, and neither verdict kills the
   run: it used to, discarding every completed subtask of the run over one
-  subtask's merge.
+  subtask's merge. A back-out is written ahead: the decision is saved before
+  the reset, so a crash between the two is finished on resume rather than
+  re-judged. Re-judging it passed a synthetic merge of the reset tree and
+  reported "the merge stands" for a merge no longer on the branch, with the
+  subtask still `complete` and its work silently out of the PR. A record
+  from before the marker is recognised by its merge no longer being an
+  ancestor of the run branch.
 - **What still stops the run** is a state no fallback can step back from:
   `integrate.sh`'s precondition failure (the staging worktree or the subtask
   branch is missing), a failure of the back-out itself (the `git reset` to

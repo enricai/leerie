@@ -5694,8 +5694,12 @@ integrated_so_far, caps, st, models, efforts) -> bool`, a **repair loop**
    findings plus a `test_failure` defect per confirmed failure, and the
    stale list.
 3. Back out (`False`) on a gating `intent_conflict`, an integrator
-   `design-conflict`/`failed` during repair, or spent rounds: `git reset
-   --hard <merge>^1`, `outcome: "backed_out"`, a `risk_register[sid]` entry
+   `design-conflict`/`failed` during repair, or spent rounds: `backing_out:
+   <reason>` saved first, then `git reset --hard <merge>^1`, then
+   `backing_out` dropped and `outcome: "backed_out"` saved (on entry, a
+   record carrying `backing_out`, or whose `merge_commit_sha` is no longer
+   an ancestor of HEAD — `git merge-base --is-ancestor` exit 1 — finishes
+   the back-out without a judge call), a `risk_register[sid]` entry
    `{kind: "integration_content_loss"}`, and `_settle_unconverged(...,
    kind="integration_backed_out")`; `integrate_wave` then records the sid
    `unconverged` in `results` and continues the wave. A repaired merge
@@ -5718,7 +5722,8 @@ Unlike `wiring_gate`, which is written only on a clean pass,
 bool}` (`accepted` is `not defects` on a fresh judge verdict), plus, once the
 repair loop runs, `repair_rounds`, `rounds` (one audit entry per round),
 `superseded`, `outcome` (`clean` / `repaired` / `backed_out`) and, as they
-apply, `fallback_reason`, `reset_to`, `residual_lines` / `residual_total`. A non-empty
+apply, `fallback_reason`, `reset_to`, `residual_lines` / `residual_total`,
+and `backing_out` (only between a back-out's decision and its reset). A non-empty
 `defects` entry is mirrored to the flatter `state.data["integration_defects"][sid]`
 (a plain `list[str]`), which is what `accept-integration` clears. Both keys
 let a resume distinguish "never reviewed" (both keys absent) from "reviewed

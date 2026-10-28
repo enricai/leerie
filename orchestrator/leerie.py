@@ -52212,6 +52212,57 @@ async def _run_integration_judge_gate(
     parents = (await _git_text(staging, "rev-list", "--parents", "-n", "1",
                                merge_sha) or "").split()
     p1, p2 = (parents[1], parents[2]) if len(parents) == 3 else ("", "")
+
+    def _persist() -> None:
+        gates[sid] = rec
+        if rec.get("accepted") or rec.get("outcome") == "backed_out":
+            st.data.get("integration_defects", {}).pop(sid, None)
+        else:
+            st.data.setdefault("integration_defects", {})[sid] = list(
+                rec.get("defects") or [])
+        if not st.data.get("integration_defects"):
+            st.data.pop("integration_defects", None)
+        st.save()
+
+    async def _back_out(reason: str) -> bool:
+        # Write-ahead: the reset and the save are two steps, and a crash
+        # between them would leave the merge gone from staging under a
+        # record that still reads "being judged" — which a resumed gate then
+        # re-judged and could pass ("the merge stands") for a merge no
+        # longer on the branch. The marker makes the resume finish this.
+        rec["backing_out"] = reason
+        _persist()
+        await run_proc(["git", "reset", "--hard", f"{merge_sha}^1"],
+                       cwd=str(staging))
+        rec.pop("backing_out", None)
+        rec.update({"accepted": False, "outcome": "backed_out",
+                    "fallback_reason": reason,
+                    "reset_to": (await _git_text(staging, "rev-parse",
+                                                 "HEAD") or "").strip()})
+        _persist()
+        _record_integration_loss(
+            st, sid, f"backed out of the run branch ({reason}); none of "
+            f"{sid}'s work is in this PR", [])
+        _settle_unconverged(st, sid, f"integration backed out: {reason}",
+                            previous_status="complete",
+                            kind="integration_backed_out")
+        return False
+
+    # A back-out a crash interrupted is finished, never re-judged: by its
+    # marker, or — for one interrupted before the marker existed — by the
+    # recorded merge no longer being on staging at all.
+    pending = rec.get("backing_out")
+    if not pending and rec.get("merge_commit_sha") and p1:
+        anc = await run_proc(["git", "merge-base", "--is-ancestor",
+                              merge_sha, "HEAD"], cwd=str(staging))
+        if anc.returncode == 1:
+            pending = ("the merge is no longer on staging (an interrupted "
+                       "back-out)")
+    if pending:
+        log(f"  integration gate for {sid}: finishing an interrupted "
+            f"back-out ({pending})")
+        return await _back_out(pending)
+
     judged = head
     if p1 and head != merge_sha:
         judged = await _synthetic_merge(staging, head, p1, p2,
@@ -52226,38 +52277,10 @@ async def _run_integration_judge_gate(
             "degrading (merge preserved, check_merge_committed already ran)")
         return True
     gating, advisories = verdict
-
-    def _persist() -> None:
-        gates[sid] = rec
-        if rec.get("accepted") or rec.get("outcome") == "backed_out":
-            st.data.get("integration_defects", {}).pop(sid, None)
-        else:
-            st.data.setdefault("integration_defects", {})[sid] = list(
-                rec.get("defects") or [])
-        if not st.data.get("integration_defects"):
-            st.data.pop("integration_defects", None)
-        st.save()
-
     rec.update({"defects": [_integration_defect_label(d) for d in gating],
                 "advisories": advisories, "merge_commit_sha": merge_sha,
                 "accepted": not gating})
     _persist()
-
-    async def _back_out(reason: str) -> bool:
-        await run_proc(["git", "reset", "--hard", f"{merge_sha}^1"],
-                       cwd=str(staging))
-        rec.update({"accepted": False, "outcome": "backed_out",
-                    "fallback_reason": reason,
-                    "reset_to": (await _git_text(staging, "rev-parse",
-                                                 "HEAD") or "").strip()})
-        _persist()
-        _record_integration_loss(
-            st, sid, f"backed out of the run branch ({reason}); none of "
-            f"{sid}'s work is in this PR", [])
-        _settle_unconverged(st, sid, f"integration backed out: {reason}",
-                            previous_status="complete",
-                            kind="integration_backed_out")
-        return False
 
     if not gating:
         if rec.get("repair_rounds"):

@@ -615,3 +615,55 @@ def test_phase_execute_counts_expected_after_integrating(leerie):
     assert src.index("await integrate_wave(") < src.index("expected = sum(")
     i = src.index("pending_gate_sids = [")
     assert '"backed_out"' in src[i:i + 300]
+
+
+@pytest.mark.parametrize("marker", [True, False])
+def test_a_crash_between_the_back_out_reset_and_its_save_finishes_it(
+        leerie, tmp_path, monkeypatch, marker):
+    """Review r1 suspicion: `_back_out` resets staging to the merge's first
+    parent, then saves. A crash between the two leaves a record neither
+    accepted nor backed out while the merge is gone from staging; the
+    resumed gate re-judged a synthetic merge of the reset tree, and a clean
+    verdict returned True — "the merge stands" — for a merge that is not on
+    the branch, with the subtask still `complete`."""
+    st, staging, p1, merge = _setup(leerie, tmp_path)
+    conflict = dict(DEFECT, kind="intent_conflict")
+    real_save = st.save
+    reset_seen = {"n": 0}
+    real_run_proc = leerie.run_proc
+
+    async def spy_run_proc(argv, *a, **kw):
+        if argv[:3] == ["git", "reset", "--hard"]:
+            reset_seen["n"] += 1
+        return await real_run_proc(argv, *a, **kw)
+
+    class Crash(BaseException):
+        pass
+
+    def crashing_save():
+        if reset_seen["n"]:
+            raise Crash()
+        real_save()
+    monkeypatch.setattr(leerie, "run_proc", spy_run_proc)
+    monkeypatch.setattr(st, "save", crashing_save)
+    w = _Workers(staging, [[conflict]])
+    with pytest.raises(Crash):
+        _run(leerie, st, staging, monkeypatch, w)
+    assert _git(staging, "rev-parse", "HEAD").strip() == p1
+    # The resume: a fresh State read from disk, and a judge that now finds
+    # nothing on the (reset) tree.
+    st.release_lock()
+    st2 = leerie.State(st.run_dir.parent.parent, st.run_id)
+    assert st2.load()
+    assert st2.data["integration_gate"][SID].get("backing_out")
+    if not marker:
+        # A state written before the marker existed: the merge's absence
+        # from staging is what tells the resume.
+        st2.data["integration_gate"][SID].pop("backing_out")
+    w2 = _Workers(staging, [[]])
+    assert _run(leerie, st2, staging, monkeypatch, w2) is False
+    assert w2.kinds() == []               # nothing re-judged
+    rec = st2.data["integration_gate"][SID]
+    assert rec["outcome"] == "backed_out" and rec["reset_to"] == p1
+    assert st2.data["subtask_status"][SID] == "unconverged"
+    assert _git(staging, "rev-parse", "HEAD").strip() == p1
