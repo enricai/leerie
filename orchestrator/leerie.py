@@ -21673,14 +21673,18 @@ FULL_SUITE_NOTICE = (
     "owns this\" and continue with targeted test files.")
 
 
-def _canonical_test_command(repo_root: str | Path) -> str:
+def _canonical_test_command(repo_root: str | Path,
+                            declared: dict[str, str] | None = None) -> str:
     """The repo's canonical test command, with `resolve_blt`'s precedence
-    (a declared `test`, even empty, wins) but without its log line -- this
-    is read once per worker spawn."""
+    (a declared `test`, even empty, wins) but without its log lines -- this
+    is read once per worker spawn and once per acceptance file, where the
+    provenance log would repeat on every call. `declared` is the already
+    loaded `.leerie/config.toml` BLT table, when the caller has it."""
     root = Path(str(repo_root))
-    declared = _load_blt_config(root) or {}
+    if declared is None:
+        declared = _load_blt_config(root) or {}
     if "test" in declared:
-        return (declared["test"] or "").strip()
+        return (declared.get("test") or "").strip()
     return (_infer_build_lint_test(root).get("test") or "").strip()
 
 
@@ -34139,18 +34143,6 @@ _SCOPED_RUNNER_VALUE_OPTS: dict[str, frozenset[str]] = {
 _RUBY_TEST_LOADER = ("ruby -Itest -Ilib -e "
                      + shlex.quote("ARGV.dup.each { |f| require "
                                    "File.expand_path(f) }; ARGV.clear"))
-
-
-def _canonical_test_command(repo_root: Path,
-                            declared: dict[str, str] | None = None) -> str:
-    """`resolve_blt(repo_root)["test"]` without its log lines — read once
-    per acceptance file, where `resolve_blt`'s provenance log would repeat
-    on every call."""
-    if declared is None:
-        declared = _load_blt_config(repo_root) or {}
-    if "test" in declared:
-        return (declared.get("test") or "").strip()
-    return (_infer_build_lint_test(repo_root).get("test") or "").strip()
 
 
 def _infer_scoped_test_template(canonical: str) -> tuple[str | None, str]:
