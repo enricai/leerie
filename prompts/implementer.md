@@ -636,10 +636,14 @@ value. The orchestrator routes on it, not on your `blocker` text:
   address them.
 - `other` — anything else; explain in `blocker`.
 
-Every kind other than `external_precondition`, `environment_limit` and
-`cannot_reproduce` is driven again: another round receives your blocker as
-input. A missing kind, or `external_precondition` without
-`external_resource`, is treated as `other`.
+`environment_limit` is retried once, then settled. `external_precondition`
+is accepted only when the orchestrator's own check backs it, and
+`nothing_to_change` and `cannot_reproduce` settle only when its own checks
+back them. Anything else — every other kind, and any of these the checks do
+not back — is driven again: another round receives your blocker as input,
+unless the environment itself keeps the orchestrator from running its
+check, which settles the subtask unconverged. A missing kind, or `external_precondition` without `external_resource`, is
+treated as `other`.
 
 `external_resource_claim` types the resource of an `external_precondition`
 so the orchestrator can check it in this container before accepting.

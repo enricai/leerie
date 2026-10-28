@@ -163,10 +163,12 @@ in the PR, and not making the run `unconverged` — but only after Leerie
 checks the claim itself (the variable really is unset, the host really is
 unreachable, and so on); a claim the check does not back is re-driven. A
 resource kill at the container's limit is retried once in place, then
-settles `unconverged`. A "nothing to change" claim is settled done only on
-the evidence of a sibling subtask that already delivered it, and a "cannot
-reproduce" claim only when Leerie runs the subtask's verify commands and
-they pass. Every other
+settles `unconverged`. A "nothing to change" claim is settled done only
+when a sibling subtask already changed the files it planned to touch, its
+verify commands (if any) pass, and a separate check finds its criteria met; a
+"cannot reproduce" claim only when Leerie runs the subtask's verify commands
+and they pass. If running those verify commands hits the container's limit,
+either claim settles `unconverged`. Every other
 blocker is re-driven with its blocker as the note,
 from one re-drive budget per subtask (`subtask_redrive_rounds`, bounded
 run-wide by `redrive_budget_sec`); once that budget is spent the subtask

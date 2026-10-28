@@ -1731,8 +1731,9 @@ MODEL_VALUES = ("sonnet", "opus", "haiku")
 # to Opus based on measured evidence that Sonnet gave opposite verdicts
 # from Opus on identical judgment inputs; that gap has since closed for
 # Sonnet 5 (externally verified against Opus 4.8, which was already the
-# working baseline), so every worker — judgment and workhorse alike — now
-# defaults to Sonnet. Users can override globally with --model /
+# working baseline), so judgment and workhorse workers alike now default
+# to Sonnet. The one exception is `pr_reviewer`, on Opus (its
+# MODEL_DEFAULT_PER_WORKER entry gives the reason). Users can override globally with --model /
 # LEERIE_MODEL / `model =` in leerie.toml, or per-worker with
 # --model-<worker> / LEERIE_MODEL_<WORKER> / `model_<worker> =`.
 MODEL_DEFAULT = "sonnet"
@@ -47559,9 +47560,10 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
               "No test runner is granted to you: do not try to run tests. "
               "Confirm a suspicion by reading the code instead.", "",
               "Review this PR and return your findings per your schema."]
-    untracked0 = set((await _git_out(
-        staging, "ls-files", "--others", "--exclude-standard",
-        "-z")).split("\0"))
+    # Read through `_git_z_output` (`os.fsdecode`): `run_proc` decodes with
+    # replacement, so a non-UTF-8 leftover came back under a name that
+    # opens nothing and was never removed.
+    untracked0 = await asyncio.to_thread(_untracked_files, staging)
     dirty0 = bool((await _git_out(
         staging, "status", "--porcelain", "--untracked-files=no")).strip())
     record: dict = {"base": base, "head": head,
@@ -47593,10 +47595,14 @@ async def _run_pr_review(leerie_dir: Path, st: "State", caps: dict,
             "--untracked-files=no")).strip():
         await run_proc(["git", "checkout", "--", "."], cwd=str(staging))
         restored = True
-    for rel in set((await _git_out(
-            staging, "ls-files", "--others", "--exclude-standard",
-            "-z")).split("\0")) - untracked0:
-        if rel and (staging / rel).is_file():
+    untracked1 = await asyncio.to_thread(_untracked_files, staging)
+    # Without both listings nothing tells a leftover from a file that was
+    # already there, so nothing is removed.
+    leftovers = (untracked1 - untracked0
+                 if untracked0 is not None and untracked1 is not None
+                 else set())
+    for rel in leftovers:
+        if (staging / rel).is_file():
             with contextlib.suppress(OSError):
                 (staging / rel).unlink()
                 restored = True
@@ -58304,7 +58310,9 @@ See README.md "Launcher verbs" for full details and sub-flags.""")
                          f"({'|'.join(EFFORT_VALUES)}); judgment workers "
                          f"default to {EFFORT_DEFAULT_PER_WORKER['planner']}, "
                          f"implementer/conformer default to "
-                         f"{EFFORT_DEFAULT_PER_WORKER['implementer']} "
+                         f"{EFFORT_DEFAULT_PER_WORKER['implementer']}, "
+                         f"pr_reviewer to "
+                         f"{EFFORT_DEFAULT_PER_WORKER['pr_reviewer']} "
                          f"(pinned workers: {_pinned_workers}) "
                          "(IMPLEMENTATION.md §2). Per-worker --effort-<worker> "
                          "flags override this, as do LEERIE_EFFORT[_*] env vars "

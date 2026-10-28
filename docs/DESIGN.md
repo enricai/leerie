@@ -688,9 +688,12 @@ integrated, listed under "Needs human verification", and not making the run
 `unconverged` — only when code verifies the typed resource it names (§13
 *An external claim is checked, not taken on the word*); an unverified claim
 is re-driven as `other`. An `environment_limit` is retried in place once,
-then settled `unconverged`. A `nothing_to_change` is settled `complete` on a
-sibling's evidence, and a `cannot_reproduce` by execution, when the checks
-back them. Every other blocked subtask is re-driven once its wave finishes,
+then settled `unconverged`. A `nothing_to_change` is settled `complete` only
+when a sibling integrated this run changed its surface, its verify commands
+(if any) pass, and the satisfied-probe finds its criteria met; a
+`cannot_reproduce` with no commits is settled `complete` when its verify commands pass. In
+both, a verify execution that hits the environment limit settles
+`unconverged`; any other unmet check re-drives it. Every other blocked subtask is re-driven once its wave finishes,
 from the subtask's shared re-drive budget (§13 *One re-drive budget per
 subtask*);
 when that budget is spent — or a subtask `failed` (the two-tier retry policy

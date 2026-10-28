@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -453,6 +454,28 @@ def test_reviewer_changes_are_reverted(env, monkeypatch):  # noqa: F811
     asyncio.run(leerie._run_pr_review(
         env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
     assert _git(st_, "rev-parse", "HEAD").strip() == head
+
+
+def test_a_non_utf8_leftover_is_removed_and_an_earlier_one_kept(
+        env, monkeypatch):  # noqa: F811
+    # The untracked listing is read through `_git_z_output`: `run_proc`'s
+    # replacement decoding named a non-UTF-8 leftover "caf\ufffd.out",
+    # which opens nothing, so the file survived the cleanup.
+    leerie = env["leerie"]
+    _review_env(env)
+    st_ = bytes(env["staging"])
+    with open(st_ + b"/before\xe9.txt", "wb") as f:
+        f.write(b"there before the review\n")
+
+    def mutate(cwd: Path):
+        with open(bytes(cwd) + b"/caf\xe9.out", "wb") as f:
+            f.write(b"x\n")
+    _stub_reviewer(leerie, monkeypatch, [], mutate=mutate)
+    rec = asyncio.run(leerie._run_pr_review(
+        env["run_dir"], env["st"], env["caps"], MODELS, EFFORTS))
+    assert not os.path.exists(st_ + b"/caf\xe9.out")
+    assert os.path.exists(st_ + b"/before\xe9.txt")
+    assert rec["tree_restored"] is True
 
 
 def test_review_runs_once_and_a_crash_is_recorded(env, monkeypatch):  # noqa: F811

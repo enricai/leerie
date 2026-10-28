@@ -4107,7 +4107,7 @@ above.
 | dirty worktree check | uncommitted changes that vanish on integration | **Retryable** |
 | `check_diff_scope()` | `.leerie/` or `.git/` in the diff; any `.claude/` path except `.claude/agents/`, `.claude/commands/`, `.claude/skills/` (the documented user-deliverable subtrees — never `settings.json` or a top-level `.claude/` file) | **Terminal** (protected path); scope-volume warning is non-fatal (touched > max(3× expected, 5), or > 15 regardless) |
 | `_validate_checkpoint()` — on `incomplete-handoff` | required section missing/empty/whitespace/placeholder-only (`none`/`n/a`/`na`/`tbd`/`nothing`/`unknown`/`todo`/`pending`/`—`/`--`/`-`/`?`, trailing punctuation ignored); a `## Files touched` path no longer exists and isn't flagged `[deleted]` | returns `blocked` |
-| `_route_blocker_kind()` — on `status` `blocked` or `failed` from the worker | worker self-report of a blocker or failure, typed `blocker_kind` | **Routed by the kind** (DESIGN §13 *A blocked implementer says why, as a type*): `external_precondition` with a named resource → `accepted_external`; `environment_limit` → one in-place retry, then `unconverged`; `cannot_reproduce` → settled by execution, else re-driven; `nothing_to_change` → settled `complete` on evidence when a sibling delivered its surface (`_settle_nothing_to_change`, §6 *Sibling-delivered no-op*), else re-driven; every other kind (and a missing one) → `blocked`, re-driven at wave end from the shared budget. A self-reported `failed` is no longer terminal. |
+| `_route_blocker_kind()` — on `status` `blocked` or `failed` from the worker | worker self-report of a blocker or failure, typed `blocker_kind` | **Routed by the kind** (DESIGN §13 *A blocked implementer says why, as a type*): `external_precondition` with a named resource → `accepted_external` only when the code check verifies it (`_verify_external_claim`), otherwise retyped `other` and re-driven; `environment_limit` → one in-place retry, then `unconverged`; `cannot_reproduce` → settled by execution, else re-driven, and `unconverged` when that execution hits the environment limit; `nothing_to_change` → settled `complete` on evidence when a sibling delivered its surface, its verify commands (if any) pass and the satisfied-probe finds its criteria met (`_settle_nothing_to_change`, §6 *Sibling-delivered no-op*), else re-driven, and `unconverged` when that execution hits the environment limit; every other kind (and a missing one) → `blocked`, re-driven at wave end from the shared budget. A self-reported `failed` is no longer terminal. |
 
 `_validate_result()` accepts `complete` regardless of what
 `criteria_results` carries — empty, missing, or `met:false` entries are all
@@ -9075,8 +9075,12 @@ listed under "Needs human verification", not `unconverged`) only when
 `_verify_external_claim` returns `verified`, and is otherwise re-driven as
 `other`; an `environment_limit` is retried in place once, then settled
 `unconverged` (`_environment_limit_hit`); a `nothing_to_change` is settled
-`complete` on sibling evidence (`_settle_nothing_to_change`) and a
-`cannot_reproduce` by execution, when the checks back them. Every other
+`complete` (`_settle_nothing_to_change`) only when a sibling integrated this
+run changed a file it plans to touch, its verify commands (if any) pass on
+HEAD, and the satisfied-probe finds its criteria met there, and a `cannot_reproduce`
+with no commits is settled `complete` when its verify commands pass; in both,
+a verify execution that hits the environment limit settles `unconverged`,
+and any other unmet check re-drives it. Every other
 blocked subtask is re-driven from the shared re-drive budget and settled
 `unconverged` when that budget is spent (DESIGN §13 *One re-drive budget
 per subtask*), so this
