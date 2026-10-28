@@ -140,3 +140,42 @@ def test_the_guard_can_actually_fail(tree: ast.Module):
     merged = ast.Module(body=tree.body + planted.body, type_ignores=[])
     used = _referenced(merged)
     assert "_guard_probe_never_called" not in used
+
+
+def _redefined(tree: ast.Module) -> list[tuple[str, list[int]]]:
+    """`(name, [lineno, ...])` for every module-level def/class bound more
+    than once at module level."""
+    seen: dict[str, list[int]] = {}
+    for n in tree.body:
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef,
+                          ast.ClassDef)):
+            seen.setdefault(n.name, []).append(n.lineno)
+    return sorted((nm, lns) for nm, lns in seen.items() if len(lns) > 1)
+
+
+def test_no_module_level_function_is_defined_twice(tree: ast.Module):
+    """A second module-level `def` of the same name silently rebinds it:
+    every caller gets the later body and the earlier one is dead text that
+    reads as live. `_canonical_test_command` shipped this way (#292's
+    definition shadowed by a later stage's), and no guard fired: the sweep
+    above keys `defined` by name, so the two collapse into one entry that is
+    referenced, and `test_no_undefined_names.py` only asks whether a name is
+    bound — twice is bound. Public names too: a shadowed public def is the
+    same defect."""
+    dup = _redefined(tree)
+    assert not dup, (
+        "defined more than once at module level in orchestrator/leerie.py "
+        "(the last definition wins; the others are dead): "
+        + ", ".join(f"{nm} (lines {', '.join(map(str, lns))})"
+                    for nm, lns in dup)
+        + ". Merge them into one definition and check every caller against "
+          "the surviving signature.")
+
+
+def test_the_redefinition_guard_can_actually_fail(tree: ast.Module):
+    """Anti-vacuity: a planted second definition of a real function must be
+    reported."""
+    first = next(n for n in tree.body if isinstance(n, ast.FunctionDef))
+    planted = ast.parse(f"def {first.name}():\n    return 1\n")
+    merged = ast.Module(body=tree.body + planted.body, type_ignores=[])
+    assert first.name in [nm for nm, _ in _redefined(merged)]
