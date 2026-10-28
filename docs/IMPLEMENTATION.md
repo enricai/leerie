@@ -6093,6 +6093,20 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   the round's `tests:` axis regression and treats `tests` as baseline-red
   for `_conformance_clean` — a failure B\* typed `resource_affected` is not
   this run's.
+- Final-tree loop exit and residual defects (DESIGN §9, final-tree pass:
+  *An unfixed solution defect keeps the final loop going*).
+  `_run_final_conformance` breaks only when `_conformance_clean(res,
+  clean_baseline)`, no regression, **and** `_actionable_solution_defects
+  (res)` is empty (that last term is skipped under
+  `--skip-completeness-check`). Otherwise the next round's prompt carries
+  `_format_final_defects_note(defects)`. After the last round the
+  survivors are recorded as `conformance._final.residual_defects` (each
+  `{kind, where, concrete_case, why_ships_a_defect}`) with a warning per
+  defect, and the function returns — it never `die()`s on them. `blocked`
+  is `final_blocked` only (the `--strict-conformer` die, kept: an operator
+  opt-in). `_run_delivery_redrive` turns each into a `solution_defect`
+  note and `_decide_outcome` adds the reason
+  (`_residual_defects_reason`).
 - Intermittent regressions (DESIGN §9 *An intermittent failure the run
   introduced is evidence, not a verdict*). Before the confirm,
   `_confirm_final_test_failures` calls `_intermittent_discovery`. Every ID
@@ -6531,7 +6545,7 @@ broken, and — when the scope judge bounded the set — one of its
 `_acceptance_residual_unbroken` still records a failing set
 (`failing_sets > 0`) that was not rolled back to a passing verdict; `delivery_gate.unmet_final` is non-empty (final delivery detection's
 verdict; when it did not run, `unmet_after`, or, when no recheck ran,
-`unmet_before`); `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) is non-empty; `delivery_redrive.conflict` is set (its `reason` sentence is the outcome reason, verbatim). Otherwise `no_work` when `any_commits` is
+`unmet_before`); `_ci_parity_unmet(st)` (`ci_parity.final.unmet`) is non-empty; `delivery_redrive.conflict` is set (its `reason` sentence is the outcome reason, verbatim); `conformance._final.residual_defects` is non-empty (`_residual_defects_reason`: the count, whether the delivery re-drive drove them, and up to three `[kind] where: case`). Otherwise `no_work` when `any_commits` is
 False, else `done`. Callers: `_finish_no_work_run` (every planning-time
 no-work exit and finalize's empty-branch exit) with `any_commits=False` —
 it sets `no_work_required` only when the outcome is `no_work`, and logs the
@@ -6847,7 +6861,13 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   when `gate.final_sha` is the staging HEAD, else one
   `_evaluate_acceptance_sets` of the shown sets (B*-confirmed). Items:
   `delivery_gate.unmet_final`, minus items every claimer types `process`.
-  Merge checks: `_ci_parity_unmet(st)`.
+  Merge checks: `_ci_parity_unmet(st)`. Residual solution defects:
+  `conformance._final.residual_defects`, each a note `{kind:
+  "solution_defect", key: "solution-defect-<j>", defect_kind, where,
+  concrete_case, why, exercised: [_solution_defect_file(where, files)]}`
+  until its key is in `defects_driven`; `_solution_defect_file` is the
+  integrated source file that `where` names (the whole string, or its part
+  before a `:`), else none.
 - **Routing** (`_redrive_route(notes, subfiles, *, fallback, pending)`,
   pure). `subfiles` maps each integrated subtask — plan order, status not
   `blocked` / `unconverged` / `accepted_external`, not accept-blocked — to
@@ -6863,7 +6883,8 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   claimers; in a held-back round the subtasks earlier groups drove), else
   every subtask. A control note (a failing set control, a held-back
   control, a red check via `_redrive_ci_files`: its diagnostics' files
-  under its cwd, a coverage glob matched with `_ci_glob_match`) goes to the
+  under its cwd, a coverage glob matched with `_ci_glob_match`; a
+  `solution_defect` by its `where` file) goes to the
   subtasks it touches, else the defect claimers, else every subtask. An
   item goes to every claimer (`_item_claims(plan_subtasks)` over
   `claims.items`), else the defect claimers, else every subtask. Subtasks
@@ -9408,7 +9429,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `integrator_warnings` | dict[str, str] | non-fatal commit warnings from `integrate_wave` (non-fatal signal log) |
 | `scope_warnings` | dict[str, dict] | oversized-diff warnings from `check_diff_scope` (non-fatal signal log) |
 | `under_scope_warnings` | dict[str, dict] | `{touched, declared, reason}` per subtask that committed work but touched **none** of its `files_likely_touched`, from `check_diff_scope` (non-fatal signal log; DESIGN §9 *Scope is checked in both directions*). Comparison via `_declared_path_covers` — component-wise, absorbs a repo-root prefix on either side, and a directory-shaped declaration covers files beneath it. |
-| `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). `conformance["_final"] = {result, warnings, blocked}` is the final-tree pass's record and its resume sentinel: `_run_final_conformance` skips on resume only when `_final` is present with `blocked` false (or absent — an orchestrator-exception record), and runs again when `blocked` is true (DESIGN §9, final-tree pass). |
+| `conformance` | dict[str, dict] | per-subtask conformer output and `conformance_warnings` (non-fatal signal log). `conformance["_final"] = {result, warnings, blocked, residual_defects?[]}` is the final-tree pass's record (`residual_defects`: the actionable solution defects still unfixed after the last round — re-drive notes and an `unconverged` reason, never a stop) and its resume sentinel: `_run_final_conformance` skips on resume only when `_final` is present with `blocked` false (or absent — an orchestrator-exception record), and runs again when `blocked` is true (DESIGN §9, final-tree pass). |
 | `blt_results` | dict[str, dict] | Per-run memo of orchestrator-measured build/lint/test verdicts (DESIGN §9). |
 | `unreviewed_subtasks` | list[str] | subtask ids whose conformer produced no result at all (worker crash, or the 5400 s timeout), so a subtask that was never reviewed is distinguishable from one that passed. |
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
@@ -9416,7 +9437,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[]}` — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[], tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[], tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |

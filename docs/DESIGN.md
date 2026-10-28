@@ -2964,7 +2964,7 @@ runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
-that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides) —
+that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*), or when the delivery re-drive declared a `conflict` (the same fix-for-regression trade recurred — §8 *Delivery re-drive*; the reason names both sides), or when the final-tree conformance left an actionable solution defect unfixed after its last round (§9, final-tree pass; the reason names each defect's kind, location and case) —
 consulted *before* the no-work check, so an empty branch that left work
 unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
@@ -6689,7 +6689,15 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    report-pointer task never counts as work (*A task that points at a
    report is bounded by the report's own scenarios*). An item in
    `delivery_gate.unmet_final`, and a red merge check
-   (`ci_parity.final.unmet`), are unmet too.
+   (`ci_parity.final.unmet`), are unmet too. So is a solution defect the
+   final-tree conformance left unfixed after its last round
+   (`conformance._final.residual_defects`, §9 final-tree pass): it goes
+   as a typed `solution_defect` note (kind, `where`, concrete case), is
+   routed like a failing control — to the subtasks whose integrated diff
+   touches the file its `where` names, with none the same fallback a
+   control takes — and is driven once (a group that is rolled back leaves
+   it open for the next). No step re-verifies it mechanically, so it stays
+   in the outcome's reasons.
 2. *Who owns it.* The planner types, per subtask, the required items it
    delivers (`claims.items[] = {item_index, kind: deliverable | process}`).
    An unmet deliverable item re-drives **every** claimer; a process item
@@ -9267,11 +9275,52 @@ lands at `st.data["conformance"]["_final"]` and is threaded into the
 in the PR body alongside the wave-by-wave summary. That record is also the
 pass's resume sentinel, but only for a pass that **cleared**: `resume`
 skips the pass when `_final` is recorded with `blocked` false, and runs it
-again when `blocked` is true. A blocked final pass stops the run with
-"fix and resume"; skipping it on that resume would let the very run the
-operator resumed to finish the gap ship without the pass ever looking at
-the gap again (in the attribution of 32 traced chains, one needed exactly
-this fix).
+again when `blocked` is true. A blocked final pass (`--strict-conformer`
+only, below) stops the run with "fix and resume"; skipping it on that
+resume would let the very run the operator resumed to finish the gap ship
+without the pass ever looking at the gap again (in the attribution of 32
+traced chains, one needed exactly this fix).
+
+**An unfixed solution defect keeps the final loop going, and what survives
+it is unfinished work, not a stop.** The round loop ends early only when
+the axes are clean against the base, nothing regressed, **and** no
+actionable `solution_defect` is left unfixed — the one gating axis is part
+of "clean" here. While one is left and rounds remain, the next round gets
+the unfixed defects as a typed note. Before this, the loop's exit test
+looked only at the residual and axis channels: in a replayed run (barnacle
+45fa4253, pass 1) the final conformer reported one unfixed
+`unhandled_path` in round 0 against a baseline-red test axis, the loop
+read clean and exited with two of its three rounds unused, and the run
+`die()`d "fix and resume"; the resumed run's final conformer fixed the same
+defect, same tree, in one round. A defect still unfixed after the last
+round is recorded on `_final` as `residual_defects`; it is no reason to
+stop the run. Every wave has integrated, but the subtasks that own the
+code still exist for the delivery re-drive (§8 *Delivery re-drive*), which
+takes each residual defect as a typed `solution_defect` note, routed to
+the subtasks whose integrated diff touches the file the defect's `where`
+names, and drives it once from their shared budget. Nothing mechanical can
+re-verify a defect the conformer found, so a residual defect makes the run
+`unconverged` (§6 *The run outcome is decided once*), its reason naming
+each defect's kind, location and case — the PR is a draft that says what
+is open, never a run that stopped with the work on a branch nobody opens.
+`--skip-completeness-check` still demotes the defects to warnings, and
+`--strict-conformer` still stops the run on its own axes (clobbered files,
+residuals): that flag is the operator asking for exactly that stop.
+
+**A stop after execution begins is for a state no step can continue
+from.** Once the first wave starts, a `die()` throws away a run's whole
+spend and leaves nothing a reviewer can open; `unconverged` keeps
+everything that converged and names what did not. So every `die()`
+reachable from execution, integration, the final passes and finalize is
+either a state the run cannot safely continue from — the operator's
+checkout moved (§12 L4), a `git reset` that did not land, conflict markers
+committed to the run branch, staging or a subtask branch missing, a run
+branch gone after cleanup, `finalize.sh` failing, an integrator that
+crashed every round mid-merge (a fact about the machine, its resolution
+rescued to a ref that `resume` retries from) — or an operator's own
+opt-in stop (`--stop-on-blocked`, `--stop-on-repo-change`,
+`--strict-conformer`). A gap in the work is never one of them: it settles
+the subtask or the run `unconverged`.
 
 **An advisory whole-PR review feeds the final conformer.** Every check
 above is anchored to something the run already wrote down — a required

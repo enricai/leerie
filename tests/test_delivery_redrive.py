@@ -1159,3 +1159,46 @@ def test_no_verdict_after_the_group_is_not_zero_progress(
     assert g["zero_progress"] is False and not g.get("rolled_back")
     assert "set 1" in g["resource_affected"]
     assert "change" in w.a_text("HEAD")
+
+
+def test_residual_solution_defect_goes_to_its_file_owner_once(
+        leerie, tmp_path, monkeypatch):
+    """Replay shape (barnacle 45fa4253 pass 1): the final conformance left one
+    unfixed solution defect in src/b.ts after its last round. The re-drive
+    hands it, typed, to the subtask whose integrated diff touches that file
+    (s2, not s1), drives it once, and the run settles `unconverged` with the
+    defect named — never a stop."""
+    w = World(leerie, tmp_path, n_sets=0)
+    w.st.data["conformance"] = {"_final": {
+        "result": None, "warnings": [], "blocked": False,
+        "residual_defects": [{
+            "kind": "unhandled_path", "where": "src/b.ts:12",
+            "concrete_case": "results arrive after the first read",
+            "why_ships_a_defect": "Enter is sent on a partial list"}]}}
+    w.st.save()
+    w.install(monkeypatch)
+    w.edits = [None]
+    w.run()
+    rec = w.st.data["delivery_redrive"]
+    assert [c["sid"] for c in w.calls] == ["delivery-redrive-r1-g0"]
+    p = w.calls[0]["prompt"]
+    assert p.startswith("Execute subtask `s2`.")
+    assert '"kind": "solution_defect"' in p
+    assert "results arrive after the first read" in p
+    assert rec["defects_driven"] == ["solution-defect-0"]
+    assert rec["rounds"][0]["groups"][0]["no_change"] is True
+    assert rec["done"]
+    assert w.L._decide_outcome(w.st, any_commits=True) == "unconverged"
+    reason = w.st.data["outcome_reasons"][-1]
+    assert reason.startswith("1 solution defect(s) the final conformance "
+                             "left unfixed")
+    assert "(1 of them driven by the delivery re-drive" in reason
+    assert "[unhandled_path] src/b.ts:12" in reason
+
+
+def test_solution_defect_file_is_a_path_match(leerie):
+    files = ["src/a.ts", "src/b.ts"]
+    assert leerie._solution_defect_file("src/b.ts:12", files) == "src/b.ts"
+    assert leerie._solution_defect_file("./src/a.ts", files) == "src/a.ts"
+    assert leerie._solution_defect_file("handleEnter()", files) is None
+    assert leerie._solution_defect_file("src/b.tsx:3", files) is None

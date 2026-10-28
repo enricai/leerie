@@ -33092,6 +33092,9 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
                 else None)
     if isinstance(conflict, dict) and conflict.get("reason"):
         reasons.append(str(conflict["reason"]))
+    residual_defects = _residual_defects_reason(st)
+    if residual_defects:
+        reasons.append(residual_defects)
     if reasons:
         outcome = "unconverged"
     elif not any_commits:
@@ -47739,7 +47742,8 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
     in plan order (`subfiles`' order). Defect notes go together to the
     subtasks whose files meet any defect file's `exercised` files, else
     `fallback`, else everyone; a control-shaped note (`control_regression`,
-    `held_control`, `ci_check`) to the subtasks its `exercised` files
+    `held_control`, `ci_check`, `solution_defect`) to the subtasks its
+    `exercised` files
     touch, else the defect claimers, else everyone; an item to every
     claimer in `claimed_by`, else the defect claimers, else everyone.
     Subtasks sharing a file are one group; `pending` (X3') rides along in
@@ -47766,7 +47770,8 @@ def _redrive_route(notes: list[dict], subfiles: dict[str, list[str]], *,
         give(claimers, n)
     for n in notes:
         k = n.get("kind")
-        if k in ("control_regression", "held_control", "ci_check"):
+        if k in ("control_regression", "held_control", "ci_check",
+                 "solution_defect"):
             give(touching(n) or claimers or order, n)
         elif k == "unmet_item":
             cl = [s for s in (n.get("claimed_by") or []) if s in rank]
@@ -48967,6 +48972,11 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
             shown.append({"kind": k, "check": n.get("id"),
                           "why": n.get("why"), "command": n.get("command"),
                           "diagnostics": list(n.get("diagnostics") or [])[:20]})
+        elif k == "solution_defect":
+            shown.append({"kind": k, "defect_kind": n.get("defect_kind"),
+                          "where": n.get("where"),
+                          "concrete_case": n.get("concrete_case"),
+                          "why_ships_a_defect": n.get("why")})
     parts = [
         f"DELIVERY RE-DRIVE (round {rnd} of {rounds}). Your work and your "
         "siblings' work are already integrated on this tree (your cwd). The "
@@ -48980,7 +48990,10 @@ def _redrive_note(notes: list[dict], *, rnd: int, rounds: int,
         "the delivery judge found this required item of the task unmet on "
         "this tree, with the evidence quoted; kind=ci_check means one of the "
         "repository's own merge checks is red on this tree, confirmed "
-        "against the run's base — make it pass without weakening it.",
+        "against the run's base — make it pass without weakening it; "
+        "kind=solution_defect means the final whole-tree review attacked "
+        "this run's combined diff and found this concrete case unhandled at "
+        "`where` — handle it at its root.",
         json.dumps(shown, indent=1)]
     if merged:
         parts.append(
@@ -49219,6 +49232,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     rec.setdefault("pending_controls", [])
     rec.setdefault("trade_pairs", [])
     rec.setdefault("contradictions", [])
+    rec.setdefault("defects_driven", [])
     st.data["current_phase"] = "phase 5: delivery re-drive"
     acc = st.data.get("acceptance") or {}
     all_sets = [s_ for s_ in (acc.get("sets") or []) if isinstance(s_, dict)]
@@ -49281,6 +49295,26 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         "exercised": _redrive_ci_files(u, allf)})
         return out
 
+    def open_defects() -> list[dict]:
+        # The final conformance's residual solution defects (DESIGN §8
+        # *Delivery re-drive* rule 1), each until a kept group drove it.
+        fin = (st.data.get("conformance") or {}).get("_final")
+        rows = fin.get("residual_defects") if isinstance(fin, dict) else None
+        allf = sorted({f for fs in subfiles.values() for f in fs})
+        out = []
+        for j, d in enumerate(rows or []):
+            key = _solution_defect_key(j)
+            if not isinstance(d, dict) or key in rec["defects_driven"]:
+                continue
+            f = _solution_defect_file(d.get("where") or "", allf)
+            out.append({"kind": "solution_defect", "key": key,
+                        "defect_kind": d.get("kind"),
+                        "where": d.get("where"),
+                        "concrete_case": d.get("concrete_case"),
+                        "why": d.get("why_ships_a_defect"),
+                        "exercised": [f] if f else []})
+        return out
+
     async def measure(subset: list[dict], label: str
                       ) -> tuple[dict[str, dict], list]:
         if not subset:
@@ -49300,13 +49334,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     else:
         F, H_known = {}, {}
     if not (F or (held and H_known is None) or H_known or open_items()
-            or open_checks()):
+            or open_checks() or open_defects()):
         rec["done"] = True
         _save()
         return
     log("phase 5: delivery re-drive — "
         f"{len(F)} failing shown set file(s), {len(open_items())} unmet "
-        f"item(s), {len(open_checks())} red merge check(s)")
+        f"item(s), {len(open_checks())} red merge check(s), "
+        f"{len(open_defects())} unfixed solution defect(s)")
     cap = int(caps.get("subtask_redrive_rounds",
                        DEFAULT_CAPS["subtask_redrive_rounds"]))
     budget = float(caps.get("redrive_budget_sec",
@@ -49354,7 +49389,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 rec["held_round_done"] = True
         items_open = open_items()
         checks_open = open_checks()
-        if not held_mode and not (F or items_open or checks_open):
+        defects_open = open_defects()
+        if not held_mode and not (F or items_open or checks_open
+                                  or defects_open):
             rnd -= 1
             break
         if held_mode:
@@ -49365,7 +49402,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                               else "control_regression")
                      for k, v in F.items()]
             fallback = site_claimers
-        notes += items_open + checks_open
+        notes += items_open + checks_open + defects_open
         groups = _redrive_route(notes, subfiles, fallback=fallback,
                                 pending=rec["pending_controls"])
         entry_round = {"round": rnd, "held_mode": held_mode, "groups": []}
@@ -49386,7 +49423,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                                   and n.get("file")))
                     and n["key"] in F
                     or n["kind"].startswith("held_") and n["key"] in H
-                    or n["kind"] in ("unmet_item", "ci_check")]
+                    or n["kind"] in ("unmet_item", "ci_check",
+                                     "solution_defect")]
             ge["notes"] = sorted({n["kind"] for n in live})
             if not live:
                 ge["skipped"] = "nothing_left"
@@ -49608,6 +49646,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                     {"fixed": fa, "tracked_test": fb,
                                      "file": f, "round": rnd})
                         log(f"  WARNING: {reason}")
+            if not ge.get("rolled_back"):
+                rec["defects_driven"] += [
+                    n["key"] for n in live if n["kind"] == "solution_defect"
+                    and n["key"] not in rec["defects_driven"]]
             _charge_redrive_time(st, time.monotonic() - t0)
             rec.pop("in_flight", None)
             _save()
@@ -49722,6 +49764,10 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     warnings: list[str] = []
     last_res: dict | None = None
     blt_feedback: str | None = None
+    # The previous round's unfixed solution defects, handed to the next
+    # round (DESIGN §9, final-tree pass).
+    defect_feedback: str | None = None
+    skip_completeness = bool(st.data.get("skip_completeness_check"))
     # Same delta-scoping as the per-subtask loop (DESIGN §9). The final pass
     # reviews the integrated tree, but a base-tree failure is no more this
     # run's doing here than it was per-subtask, so it must not consume the
@@ -49820,6 +49866,8 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         _append_conformer_context_sections(up, pre, "full", st)
         if blt_feedback is not None:
             up.append(blt_feedback)
+        if defect_feedback is not None:
+            up.append(defect_feedback)
 
         try:
             st.bump_workers(caps)
@@ -49977,28 +50025,41 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             warnings, regressions, f"final conformer round {c_round}:",
             c_round, caps)
 
-        if _conformance_clean(res, clean_baseline) and not regressions:
+        # The one gating axis is part of "clean" here (DESIGN §9, final-tree
+        # pass): an unfixed defect is what the remaining rounds are for.
+        # `_conformance_clean` alone read a round with an unfixed defect on a
+        # baseline-red tree as clean and left two rounds unused (barnacle
+        # 45fa4253 pass 1).
+        open_defects = ([] if skip_completeness
+                        else _actionable_solution_defects(res))
+        if (_conformance_clean(res, clean_baseline) and not regressions
+                and not open_defects):
             break
+        defect_feedback = (_format_final_defects_note(open_defects)
+                           if open_defects else None)
 
     if last_res is not None:
         warnings.extend(_summarize_residuals(last_res))
 
-    # DESIGN §9 *The one gating axis: solution completeness*. On the final
-    # whole-tree pass the conformer attacked the integrated diff against the
-    # working branch; actionable solution_defects gate INDEPENDENT of
-    # --strict-conformer (the build/lint/test/clobber residuals below stay
-    # strict-only). There is no implementer to re-drive here — every wave has
-    # integrated — so a surviving gap is terminal: die() (fix + resume),
-    # matching the strict final_blocked die. --skip-completeness-check demotes
-    # this to advisory (a hallucinated defect on the integrated tree would
-    # otherwise block finalize with no escape, re-attacking on every resume).
+    # DESIGN §9 *The one gating axis: solution completeness*, final-tree
+    # pass. A defect still unfixed after the last round is unfinished work,
+    # not a stop: it is recorded as `residual_defects`, the delivery re-drive
+    # hands it to the subtasks that own its file, and `_decide_outcome` makes
+    # the run `unconverged` with it named. It used to `die()` "fix and
+    # resume", throwing away a finished run for a gap the next step could
+    # take. --skip-completeness-check demotes it to a warning.
     final_defects = _actionable_solution_defects(last_res)
-    if final_defects and st.data.get("skip_completeness_check"):
+    if final_defects and skip_completeness:
         warnings.append(
             f"completeness gate found {len(final_defects)} unhandled case(s) "
             "on the integrated tree but --skip-completeness-check is set — "
             "surfaced as advisory, run not blocked")
         final_defects = []
+    for d in final_defects:
+        warnings.append(
+            "unfixed after the last round — handed to the delivery "
+            f"re-drive: [{d.get('kind')}] {(d.get('where') or '').strip()}: "
+            f"{(d.get('concrete_case') or '').strip()}")
 
     final_blocked = bool(
         caps.get("strict_conformer")
@@ -50006,27 +50067,83 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
              or (last_res is not None
                  and not _conformance_clean(last_res, clean_baseline))))
 
-    st.data.setdefault("conformance", {})["_final"] = {
+    final_rec: dict = {
         "result": last_res,
         "warnings": warnings,
-        "blocked": bool(final_blocked or final_defects),
+        "blocked": final_blocked,
     }
+    if final_defects:
+        final_rec["residual_defects"] = [
+            {k: str(d.get(k) or "").strip()
+             for k in ("kind", "where", "concrete_case",
+                       "why_ships_a_defect")}
+            for d in final_defects]
+    st.data.setdefault("conformance", {})["_final"] = final_rec
     st.save()
     for w in warnings:
         log(f"  final conformance: {w}")
-    if final_defects:
-        summary = "; ".join(
-            f"[{d.get('kind')}] {(d.get('where') or '').strip()}: "
-            f"{(d.get('concrete_case') or '').strip()}"
-            for d in final_defects[:3])
-        die(f"completeness gate: final-tree conformance found "
-            f"{len(final_defects)} unhandled case(s) in the integrated diff: "
-            f"{summary}; run blocked. Fix and resume.")
     if final_blocked:
+        # Kept: `--strict-conformer` is the operator asking for this stop
+        # (DESIGN §9 *A stop after execution begins*).
         why = (f"conformer reverted/deleted integrated file(s): "
                f"{clobbered_files}" if clobbered_files else "has residuals")
         die(f"strict-conformer: final-tree conformance {why}; "
             "run blocked. Fix and resume.")
+
+
+def _format_final_defects_note(defects: list[dict]) -> str:
+    """The next final-conformer round's note: the previous round's
+    solution defects it reported and did not fix, typed (DESIGN §9,
+    final-tree pass)."""
+    rows = [{k: str(d.get(k) or "").strip()
+             for k in ("kind", "where", "concrete_case", "why_ships_a_defect")}
+            for d in defects]
+    return ("UNFIXED SOLUTION DEFECTS: the previous round of this pass "
+            "reported these solution_defects and did not fix them. Fix each "
+            "at its root in this round and report it with fixed: true; one "
+            "you still cannot fix stays fixed: false.\n"
+            + json.dumps(rows, indent=1))
+
+
+def _residual_defects_reason(st: "State") -> str | None:
+    """The outcome reason for the final conformance's residual solution
+    defects (DESIGN §6 *The run outcome is decided once*), or None."""
+    fin = (st.data.get("conformance") or {}).get("_final")
+    rows = fin.get("residual_defects") if isinstance(fin, dict) else None
+    rows = [d for d in rows or [] if isinstance(d, dict)]
+    if not rows:
+        return None
+    rd = st.data.get("delivery_redrive")
+    driven = set((rd or {}).get("defects_driven") or []
+                 if isinstance(rd, dict) else [])
+    n_driven = sum(1 for j in range(len(rows))
+                   if _solution_defect_key(j) in driven)
+    shown = "; ".join(f"[{d.get('kind')}] {d.get('where')}: "
+                      f"{str(d.get('concrete_case') or '')[:200]}"
+                      for d in rows[:3])
+    more = f" (+{len(rows) - 3} more)" if len(rows) > 3 else ""
+    return (f"{len(rows)} solution defect(s) the final conformance left "
+            f"unfixed after its last round ({n_driven} of them driven by the "
+            f"delivery re-drive, none re-verified): {shown}{more}")
+
+
+def _solution_defect_key(j: int) -> str:
+    return f"solution-defect-{j}"
+
+
+def _solution_defect_file(where: str, files: Iterable[str]) -> str | None:
+    """The file of `files` a solution defect's `where` (`file:line` or a
+    function, per the conformer's schema) names: the whole string, or its
+    part before the first `:` — a path, compared as a path. None when it
+    names none of them."""
+    w = str(where or "").strip()
+    while w.startswith("./"):
+        w = w[2:]
+    cands = {w, w.split(":", 1)[0].strip()}
+    for f in files:
+        if f in cands:
+            return f
+    return None
 
 
 def _format_new_failing_ids(id_diff: dict, limit: int = 10) -> str:

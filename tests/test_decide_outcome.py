@@ -158,3 +158,14 @@ def test_phase_finalize_records_the_outcome_in_run_json(
     assert json.loads((s.run_dir / "run.json").read_text())["outcome"] \
         == expected
     assert s.data["finished_at"]
+
+
+def test_residual_solution_defects_are_unconverged(leerie, st):
+    st.data["conformance"] = {"_final": {"blocked": False, "residual_defects": [
+        {"kind": "unhandled_path", "where": "src/x.ts:8",
+         "concrete_case": "late results", "why_ships_a_defect": "w"}]}}
+    assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+    assert st.data["outcome_reasons"] == [
+        "1 solution defect(s) the final conformance left unfixed after its "
+        "last round (0 of them driven by the delivery re-drive, none "
+        "re-verified): [unhandled_path] src/x.ts:8: late results"]

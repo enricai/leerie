@@ -1,15 +1,17 @@
 """Tests for the implementer completeness gate (DESIGN §9 *The one gating
 axis: solution completeness*): the conformer's gating `solution_defects` axis
 routed through _settle_subtask (per-subtask retry/block) and
-_run_final_conformance (whole-tree die), both INDEPENDENT of --strict-conformer.
+_run_final_conformance (whole-tree: the loop continues while a defect is
+unfixed, and a survivor becomes `residual_defects` — never a die), both
+INDEPENDENT of --strict-conformer.
 
 - Tier 1: source-coupling wiring pins for the _settle_subtask seam (the retry
   branch is deep inside a large function driving real implementers, so its
   wiring is pinned by source inspection, per the discipline used in
   test_dep_capture_wiring.py). The decision predicate itself
   (_actionable_solution_defects) is unit-tested in test_solution_defects.py.
-- Tier 2: behavioral tests of _run_final_conformance's independent-of-strict
-  solution_defects die, using a real staging worktree.
+- Tier 2: behavioral tests of _run_final_conformance's solution_defects
+  handling, using a real staging worktree.
 """
 from __future__ import annotations
 
@@ -97,13 +99,14 @@ class TestFinalConformanceWiring:
         src = inspect.getsource(leerie._run_final_conformance)
         assert "_actionable_solution_defects(last_res)" in src
 
-    def test_final_dies_on_defects_independent_of_strict(self, leerie):
-        """final_defects must die() outside the strict_conformer guard."""
+    def test_final_never_dies_on_defects(self, leerie):
+        """The only die() left in the final pass is the --strict-conformer
+        one (DESIGN §9 *A stop after execution begins*); the behavioural
+        pair is test_final_defects_never_die_and_are_recorded."""
         src = inspect.getsource(leerie._run_final_conformance)
-        assert "final_defects" in src
-        # The die on final_defects must not be gated on strict_conformer.
         block = src[src.index("final_defects ="):]
-        assert "if final_defects:" in block
+        assert block.count("die(") == 1
+        assert "strict-conformer" in block[block.index("die("):]
 
 
 # === Tier 2: _run_final_conformance behavioral ==============================
@@ -182,19 +185,64 @@ def _restore_claude_p(leerie):
     leerie.claude_p = original
 
 
-def test_final_defects_die_even_without_strict(env):
-    """An actionable solution_defect on the final pass dies regardless of
-    --strict-conformer (caps has strict_conformer False by default)."""
+_DEFECT = {"kind": "unhandled_input", "concrete_case": "empty list",
+           "where": "src.py:10", "why_ships_a_defect": "crashes"}
+
+
+def _stub_rounds(leerie_mod, results):
+    """claude_p returning `results` in order, recording each call's sid and
+    user prompt."""
+    calls: list[dict] = []
+
+    async def _stub(**kwargs):
+        calls.append({"sid": kwargs.get("sid"),
+                      "prompt": kwargs.get("user_prompt") or ""})
+        return results[min(len(calls), len(results)) - 1]
+    leerie_mod.claude_p = _stub
+    return calls
+
+
+def test_final_defects_never_die_and_are_recorded(env):
+    """An unfixed actionable defect keeps the loop going to the cap, and the
+    survivor is recorded for the delivery re-drive and the outcome — the run
+    is not stopped (it used to die "fix and resume")."""
     c = env["leerie"]
     assert not env["caps"].get("strict_conformer")
-    _stub_claude_p(c, _clean_final(solution_defects=[{
-        "kind": "unhandled_input", "concrete_case": "empty list",
-        "where": "src.py:10", "why_ships_a_defect": "crashes",
-    }]))
-    with pytest.raises(SystemExit):
-        asyncio.run(c._run_final_conformance(
-            env["run_dir"], env["st"], env["caps"], env["models"],
-            env["efforts"]))
+    calls = _stub_rounds(c, [_clean_final(solution_defects=[dict(_DEFECT)])])
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+    assert [x["sid"] for x in calls] == [
+        f"final-conformer-r{i}"
+        for i in range(env["caps"]["conformance_rounds"])]
+    final = env["st"].data["conformance"]["_final"]
+    assert final["blocked"] is False
+    assert final["residual_defects"] == [dict(_DEFECT)]
+    assert c._residual_defects_reason(env["st"]).startswith(
+        "1 solution defect(s) the final conformance left unfixed")
+
+
+def test_final_defect_fixed_in_the_next_round(env):
+    """Replay shape (barnacle 45fa4253 pass 1): round 0 reports an unfixed
+    defect on a tree whose axes read clean; round 1 runs, is handed the
+    defect, fixes it, and the pass ends there with nothing residual."""
+    c = env["leerie"]
+    calls = _stub_rounds(c, [
+        _clean_final(solution_defects=[dict(_DEFECT, fixed=False)]),
+        _clean_final(solution_defects=[dict(_DEFECT, fixed=True)]),
+    ])
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
+    assert [x["sid"] for x in calls] == ["final-conformer-r0",
+                                         "final-conformer-r1"]
+    assert "UNFIXED SOLUTION DEFECTS" not in calls[0]["prompt"]
+    assert "UNFIXED SOLUTION DEFECTS" in calls[1]["prompt"]
+    assert "empty list" in calls[1]["prompt"]
+    final = env["st"].data["conformance"]["_final"]
+    assert "residual_defects" not in final
+    assert final["blocked"] is False
+    assert c._residual_defects_reason(env["st"]) is None
 
 
 def test_final_clean_passes(env):
@@ -230,12 +278,15 @@ def test_skip_completeness_check_demotes_final_gate(env):
         "kind": "unhandled_input", "concrete_case": "empty list",
         "where": "src.py:10", "why_ships_a_defect": "crashes",
     }]))
-    # No SystemExit despite an actionable defect.
+    calls = _stub_rounds(c, [_clean_final(solution_defects=[dict(_DEFECT)])])
     asyncio.run(c._run_final_conformance(
         env["run_dir"], env["st"], env["caps"], env["models"], env["efforts"]))
     final = (env["st"].data.get("conformance") or {}).get("_final")
     assert final["blocked"] is False
     assert any("skip-completeness-check" in w for w in final["warnings"])
+    # Advisory: the defect neither holds the loop open nor stays residual.
+    assert len(calls) == 1
+    assert "residual_defects" not in final
 
 
 class TestSkipWiring:

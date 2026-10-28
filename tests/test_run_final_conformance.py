@@ -693,24 +693,28 @@ def test_strict_conformer_residuals_die(env):
     assert block["blocked"] is True
 
 
-# --- completeness gate: actionable solution_defects die() -------------------
+# --- completeness gate: an unfixed actionable defect is residual, no die() --
 
-def test_completeness_gate_actionable_defect_dies(env):
+def test_completeness_gate_actionable_defect_is_residual_not_a_stop(env):
+    """DESIGN §9, final-tree pass: a defect still unfixed after the last
+    round is recorded for the delivery re-drive and the outcome; the pass
+    returns instead of die()ing, and does not mark itself blocked."""
     c = env["leerie"]
 
     defective = _clean_result(solution_defects=[
         {"kind": "unhandled_case", "where": "src.py:10",
          "concrete_case": "empty input list", "actionable": True},
     ])
-    _stub_claude_p(c, [defective])
+    _stub_claude_p(c, [defective] * env["caps"]["conformance_rounds"])
 
-    with pytest.raises(SystemExit):
-        asyncio.run(c._run_final_conformance(
-            env["run_dir"], env["st"], env["caps"], env["models"],
-            env["efforts"]))
+    asyncio.run(c._run_final_conformance(
+        env["run_dir"], env["st"], env["caps"], env["models"],
+        env["efforts"]))
 
     block = env["st"].data["conformance"]["_final"]
-    assert block["blocked"] is True
+    assert block["blocked"] is False
+    assert [d["concrete_case"] for d in block["residual_defects"]] == [
+        "empty input list"]
 
 
 def test_completeness_gate_advisory_when_skip_flag_set(env):
