@@ -827,6 +827,10 @@ STATE_FIELDS = (
     # The failing-test-ID diff (DESIGN §9 *Which failures are new*): base and
     # final failing IDs, and the latest B* verdict on their difference.
     "baseline_failing_ids", "final_failing_ids", "test_id_diff",
+    # Measured per-file test durations, from every structured report read,
+    # that size intermittent discovery to its budget (DESIGN §9 *An
+    # intermittent failure the run introduced is evidence*).
+    "test_file_durations",
     # Settle by execution (DESIGN §8): per-sid record of every execution of
     # a subtask's `verify` argvs, whatever the verdict.
     "settled_by_execution",
@@ -38397,6 +38401,84 @@ async def _confirm_still_failing(
     return out
 
 
+def _runner_report_file_durations(kind: str, path: Path,
+                                  tree: str | None = None
+                                  ) -> dict[str, float]:
+    """Repo-relative test file -> seconds it took, from a runner's
+    structured report (fixed machine formats, DESIGN §12): a jest/vitest
+    suite's `endTime - startTime` (else `perfStats.runtime`, else the sum
+    of its cases' `duration`), the sum of JUnit `time` per file, the sum of
+    rspec `run_time` per file. `{}` for a format with no per-file time or
+    an unreadable report."""
+
+    def _rel(name: str) -> str:
+        if tree is not None and os.path.isabs(name):
+            return os.path.relpath(name, tree)
+        return os.path.normpath(name)
+
+    out: dict[str, float] = {}
+
+    def _num(v: object) -> float | None:
+        return (float(v) if isinstance(v, (int, float))
+                and not isinstance(v, bool) and v >= 0 else None)
+    try:
+        if kind == "jest-json":
+            data = json.loads(Path(path).read_text())
+            for suite in data.get("testResults") or []:
+                name = str(suite.get("name") or "")
+                if not name:
+                    continue
+                start, end = _num(suite.get("startTime")), _num(
+                    suite.get("endTime"))
+                perf = suite.get("perfStats") or {}
+                if start is not None and end is not None and end >= start:
+                    ms = end - start
+                elif _num(perf.get("runtime")) is not None:
+                    ms = float(perf["runtime"])
+                else:
+                    ms = sum(_num(r.get("duration")) or 0.0 for r in
+                             suite.get("assertionResults") or [])
+                out[_rel(name)] = out.get(_rel(name), 0.0) + ms / 1000.0
+        elif kind == "junit":
+            root = ElementTree.parse(path).getroot()
+            for case in root.iter("testcase"):
+                f = case.get("file")
+                if not f and tree is not None and case.get("classname"):
+                    f = _junit_class_file(case.get("classname") or "", tree)
+                try:
+                    t = float(case.get("time") or 0.0)
+                except ValueError:
+                    t = 0.0
+                if f:
+                    out[_rel(f)] = out.get(_rel(f), 0.0) + max(t, 0.0)
+        elif kind == "rspec-json":
+            data = json.loads(Path(path).read_text())
+            for ex in data.get("examples") or []:
+                f = str(ex.get("file_path") or "")
+                if f:
+                    out[_rel(f)] = (out.get(_rel(f), 0.0)
+                                    + (_num(ex.get("run_time")) or 0.0))
+    except (OSError, ValueError, ElementTree.ParseError, AttributeError,
+            TypeError, KeyError):
+        return {}
+    return {f: round(t, 3) for f, t in out.items()}
+
+
+def _record_test_durations(st: "State", durations: dict[str, float]) -> None:
+    """Merge measured per-file durations into the run-wide
+    `test_file_durations` (the newest measurement of a file wins)."""
+    data = getattr(st, "data", None)
+    if not durations or not isinstance(data, dict):
+        return
+    cur = data.get("test_file_durations")
+    cur = dict(cur) if isinstance(cur, dict) else {}
+    cur.update(durations)
+    st.data["test_file_durations"] = cur
+    save = getattr(st, "save", None)
+    if callable(save):
+        save()
+
+
 def _runner_report_failing_ids(kind: str, path: Path,
                                tree: str) -> dict[str, str | None] | None:
     """Failing test ID -> repo-relative file (None when the report does not
@@ -38503,6 +38585,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
                 report.unlink()
             return None
         ids = _runner_report_failing_ids(kind, report, str(tree))
+        durations = _runner_report_file_durations(kind, report, str(tree))
+        _record_test_durations(st, durations)
         messages = {c["id"]: c.get("message", "")
                     for c in (_runner_report_cases(kind, report, str(tree))
                               or [])
@@ -38511,7 +38595,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             report.unlink()
         if ids is not None:
             return {"ids": sorted(ids), "files": ids, "kind": kind,
-                    "messages": messages}
+                    "messages": messages, "durations": durations}
     return None
 
 
@@ -38665,22 +38749,71 @@ _RESOURCE_FAILURE_RE = re.compile(
     re.IGNORECASE)
 
 
+# A repeat's cost beyond its files' own durations (runner start-up,
+# collection) when no calibration run has measured it.
+_DISCOVERY_RUN_OVERHEAD_SEC = 10.0
+
+
+def _discovery_rank(files: list[str], coupled: dict[str, list[str]],
+                    durations: dict[str, float]) -> list[str]:
+    """Discovery files in the order they are taken (DESIGN §9 *An
+    intermittent failure the run introduced is evidence*): closeness first
+    — every one imports a changed file directly; one importing more of the
+    changed files ranks first — then the shortest measured duration (an
+    unmeasured file last), then the path."""
+    return sorted(files, key=lambda f: (-len(coupled.get(f) or []),
+                                        durations.get(f, float("inf")), f))
+
+
+def _discovery_select(ranked: list[str], durations: dict[str, float],
+                      reps: int, budget: float, overhead: float) -> dict:
+    """The files whose `reps` full repeats fit in `budget` seconds, taken in
+    `ranked` order while `(sum(duration) + overhead) * reps <= budget`.
+    Pure. `{chosen, skipped[{file, reason, duration_sec?}], planned_sec}`;
+    `reason` is `over budget` or `no measured duration`."""
+    chosen: list[str] = []
+    skipped: list[dict] = []
+    total = 0.0
+    for f in ranked:
+        d = durations.get(f)
+        if d is None:
+            skipped.append({"file": f, "reason": "no measured duration"})
+        elif (total + d + overhead) * reps <= budget:
+            chosen.append(f)
+            total += d
+        else:
+            skipped.append({"file": f, "reason": "over budget",
+                            "duration_sec": round(d, 3)})
+    return {"chosen": chosen, "skipped": skipped,
+            "planned_sec": round((total + overhead) * reps, 1)
+            if chosen else 0.0}
+
+
 async def _intermittent_discovery(st: "State", caps: dict, staging: str,
                                   cmd: str, base_sha: str, *,
-                                  log_path: Path, label: str) -> dict:
+                                  log_path: Path, label: str,
+                                  clock: Callable[[], float] | None = None
+                                  ) -> dict:
     """Discovery for the intermittent-regression rule (DESIGN §9 *An
     intermittent failure the run introduced is evidence*): the import-coupled
     tests — test files that directly import a production file changed since
     `base_sha` — rerun serially `confirm_intermittent_repeats` times on the
     final tree, after the host-pressure gate and inside `confirm_budget_sec`.
-    Returns `{coupled, files, repeats_required, repeats_run,
-    budget_exhausted, failed_ids, fail_counts, id_files, skipped?, _runs}`
-    (`_runs` carries each repeat's messages for the caller and is popped
-    before the verdict is stored). Never raises."""
+    Sized to the budget: only the files whose every repeat fits, by their
+    measured durations (`test_file_durations`; files with none are first
+    calibrated inside one repeat's share of the budget), ranked by
+    `_discovery_rank` and chosen by `_discovery_select`; the rest are
+    recorded in `skipped_files`, and with none chosen nothing is repeated
+    (`skipped: "over budget"`). Returns `{coupled, files, repeats_required,
+    repeats_run, budget_exhausted, failed_ids, fail_counts, id_files,
+    selection?, skipped_files?, skipped?, _runs}` (`_runs` carries each
+    repeat's messages for the caller and is popped before the verdict is
+    stored). Never raises."""
     out: dict = {"coupled": {}, "files": [], "repeats_required": 0,
                  "repeats_run": 0, "budget_exhausted": False,
                  "failed_ids": [], "fail_counts": {}, "id_files": {},
                  "_runs": []}
+    clock = clock or time.monotonic
     try:
         reps = int(caps.get("confirm_intermittent_repeats",
                             DEFAULT_CAPS["confirm_intermittent_repeats"]))
@@ -38694,7 +38827,6 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
                                        direct=True) if head else {})
         files = [t for t in coupled if (Path(staging) / t).is_file()]
         out["coupled"] = {t: coupled[t] for t in files}
-        out["files"] = files
         if not files:
             out["skipped"] = "no test file imports a changed production file"
             return out
@@ -38703,22 +38835,73 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
             out["skipped"] = "no scoped test runner for the coupled files"
             return out
         out["repeats_required"] = reps
-        clock = time.monotonic
         counts: dict[str, int] = {}
         async with _confirm_lock():
             budget = float(caps.get("confirm_budget_sec",
                                     DEFAULT_CAPS["confirm_budget_sec"]))
             t0 = clock()
             out["gate"] = await _confirm_gate(caps)
-            for i in range(reps):
+            known = st.data.get("test_file_durations")
+            durations = {f: float(v) for f, v in (
+                known.items() if isinstance(known, dict) else ())
+                if f in out["coupled"] and isinstance(v, (int, float))}
+            overhead = _DISCOVERY_RUN_OVERHEAD_SEC
+            # Calibrate the unmeasured files once, in rank order and in
+            # doubling chunks, inside one repeat's share of the budget: a
+            # chunk that does not finish leaves its files unmeasured.
+            unknown = [f for f in _discovery_rank(files, out["coupled"], {})
+                       if f not in durations]
+            calib: dict = {"files": len(unknown), "runs": 0, "measured": 0,
+                           "sec": 0.0}
+            c_end = (clock() - t0) + budget / reps
+            size, i = 1, 0
+            while i < len(unknown):
+                left = min(c_end, budget) - (clock() - t0)
+                if left <= 0:
+                    break
+                chunk = unknown[i:i + size]
+                c0 = clock()
+                got = await _capture_failing_test_ids(
+                    staging, cmd, st, caps,
+                    label=f"{label}-calibrate{calib['runs'] + 1}",
+                    log_path=log_path, timeout=left, serial=True,
+                    files=chunk)
+                wall = clock() - c0
+                calib["runs"] += 1
+                if got is None:
+                    break
+                rep = got.get("durations") or {}
+                got_d = {f: float(rep[f]) for f in chunk if f in rep}
+                if got_d:
+                    overhead = max(0.0, wall - sum(got_d.values()))
+                for f in chunk:
+                    # A file the report gave no time for carries its share
+                    # of the chunk's wall time, start-up included.
+                    durations[f] = got_d.get(f, wall / len(chunk))
+                calib["measured"] += len(chunk)
+                i += size
+                size *= 2
+            calib["sec"] = round(clock() - t0, 1)
+            left = budget - (clock() - t0)
+            ranked = _discovery_rank(files, out["coupled"], durations)
+            sel = _discovery_select(ranked, durations, reps, left, overhead)
+            out["files"] = sel["chosen"]
+            out["skipped_files"] = sel["skipped"]
+            out["selection"] = {"budget_sec": round(left, 1),
+                                "planned_sec": sel["planned_sec"],
+                                "overhead_sec": round(overhead, 1),
+                                "calibration": calib}
+            if not sel["chosen"]:
+                out["skipped"] = "over budget"
+            for n in range(reps if sel["chosen"] else 0):
                 left = budget - (clock() - t0)
                 if left <= 0:
                     out["budget_exhausted"] = True
                     break
                 got = await _capture_failing_test_ids(
-                    staging, cmd, st, caps, label=f"{label}-repeat{i + 1}",
+                    staging, cmd, st, caps, label=f"{label}-repeat{n + 1}",
                     log_path=log_path, timeout=left, serial=True,
-                    files=files)
+                    files=sel["chosen"])
                 out["repeats_run"] += 1
                 if got is None:
                     continue
@@ -38728,9 +38911,14 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
                     out["id_files"][cid] = (got.get("files") or {}).get(cid)
         out["fail_counts"] = counts
         out["failed_ids"] = sorted(counts)
-        log(f"  B* {label}: discovery reran {len(files)} import-coupled test "
-            f"file(s) {out['repeats_run']}/{reps} time(s); "
-            f"{len(counts)} ID(s) failed at least once"
+        over = sum(1 for x in out["skipped_files"]
+                   if x["reason"] == "over budget")
+        log(f"  B* {label}: discovery reran {len(out['files'])} of "
+            f"{len(files)} import-coupled test file(s) "
+            f"{out['repeats_run']}/{reps} time(s)"
+            + (f" ({len(out['skipped_files'])} skipped: {over} over budget)"
+               if out["skipped_files"] else "")
+            + f"; {len(counts)} ID(s) failed at least once"
             + ("; budget exhausted" if out["budget_exhausted"] else ""))
     except Exception as e:
         out["skipped"] = f"discovery errored ({type(e).__name__}: {e})"

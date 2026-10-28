@@ -5250,7 +5250,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | B\* base/final rerun pairs (`confirm_pairs`) | 3 | interleaved base, final, base, final … reruns per confirm (DESIGN §9 *Which failures are new*). |
 | B\* escalated pairs (`confirm_pairs_escalated`) | 5 | pairs used instead when the gate timed out. |
 | B\* confirm wall-time budget (`confirm_budget_sec`) | 1800 s | bounds one whole confirm, gate wait included; each rerun's timeout is the remaining budget. Pairs cut short type every candidate `resource_affected` (`budget_exhausted: true`). |
-| B\* intermittent discovery repeats (`confirm_intermittent_repeats`) | 20 | serial reruns of the import-coupled tests on the final tree, per final-tree ID diff (`_intermittent_discovery`), inside their own `confirm_budget_sec`; 0 disables discovery. At a 10.5% per-run failure rate, 20 repeats find the test with p ≈ 0.89. |
+| B\* intermittent discovery repeats (`confirm_intermittent_repeats`) | 20 | serial reruns of the import-coupled tests on the final tree, per final-tree ID diff (`_intermittent_discovery`), inside their own `confirm_budget_sec`; 0 disables discovery. Only the files whose 20 repeats all fit the budget by measured duration run; the rest are recorded skipped (never fewer repeats). At a 10.5% per-run failure rate, 20 repeats find the test with p ≈ 0.89; at p = 0.1, 2 repeats only 19%. |
 | held-out intermittent discovery repeats (`acceptance_intermittent_repeats`) | 10 | serial reruns, per confirmed set evaluation, of each defect file with held cases that did not end failing (`_acceptance_discover`), inside `confirm_budget_sec`, stopping at the first held case failing with no resource signature (DESIGN §8 *A held case that fails again is a failure, not a flake*). Clamped to 10 (`_ACCEPTANCE_INTERMITTENT_MAX`); 0 disables discovery. At the replay's p = 0.546 per run, a set misses the defect with probability 0.454¹¹ < 0.02%. |
 | total worker invocations per run | 2000 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | the cheap, runtime backstop in `State.bump_workers()`: raises `WorkerError`, abort, state saved for `resume`. The complementary early check is `check_budget_feasibility()` at the plan/execute boundary (after `_schedule()`, before `_write_plan()`) — it estimates remaining `claude -p` calls from the planner output and `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value before any implementer spawns. See DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*. |
 | per-subtask call-estimate (for the feasibility preflight) | 3.0 (`subtask_call_estimate`) | not a runtime gate; consumed by `check_budget_feasibility()` as the per-subtask multiplier in its remaining-call estimate. Raised from 2.5 to absorb the per-subtask conformer completeness gate (DESIGN §9), whose `solution_defects` finding re-drives the implementer up to `completeness_retry_rounds` times. |
@@ -6172,17 +6172,48 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   log_path, label) -> dict`. The import-coupled tests are
   `_coupled_test_files(repo, staging HEAD, _changed_files(staging,
   base_sha), globs, direct=True)` that exist in staging. With a scoped
-  runner (`_acceptance_cmd`), they are rerun serially
-  `confirm_intermittent_repeats` times through `_capture_failing_test_ids(...,
-  serial=True, files=coupled)`. The reruns hold `_confirm_lock` after one
-  `_confirm_gate` and stay inside `confirm_budget_sec`. Returns `{coupled,
-  files, repeats_required, repeats_run, budget_exhausted, gate,
-  failed_ids, fail_counts, id_files, skipped?}`. `skipped` is one of
+  runner (`_acceptance_cmd`), and holding `_confirm_lock` after one
+  `_confirm_gate`, all inside one `confirm_budget_sec` (DESIGN §9 *Sized
+  to the budget*):
+  1. *Durations.* `state.data["test_file_durations"]` for the coupled
+     files. The unmeasured ones are calibrated in `_discovery_rank` order
+     (no durations) in chunks of 1, 2, 4 … files through
+     `_capture_failing_test_ids(..., serial=True, files=chunk)`, while the
+     elapsed time is under `confirm_budget_sec / confirm_intermittent_repeats`;
+     each run's timeout is what is left of that share. A chunk that
+     returns None stops calibration. A completed chunk's files take the
+     report's durations (a file it gave none takes `wall / len(chunk)`),
+     and the per-repeat overhead becomes `max(0, wall − Σ reported)`
+     (default `_DISCOVERY_RUN_OVERHEAD_SEC` = 10 s). Calibration runs are
+     not repeats: their IDs are not counted.
+  2. *Selection.* `_discovery_rank(files, coupled, durations)`: by
+     `-len(coupled[f])`, then duration (unmeasured last), then path.
+     `_discovery_select(ranked, durations, reps, budget_left, overhead) ->
+     {chosen, skipped[{file, reason, duration_sec?}], planned_sec}` (pure)
+     takes a file while `(Σ chosen durations + overhead) × reps ≤
+     budget_left`; `reason` is `over budget` or `no measured duration`.
+  3. *Repeats.* The chosen files are rerun `confirm_intermittent_repeats`
+     times (`serial=True, files=chosen`), each with the remaining budget as
+     its timeout; with none chosen, nothing runs and `skipped` is `over
+     budget`.
+  Returns `{coupled, files (the chosen), repeats_required, repeats_run,
+  budget_exhausted, gate, failed_ids, fail_counts, id_files, selection?
+  {budget_sec, planned_sec, overhead_sec, calibration{files, runs,
+  measured, sec}}, skipped_files?, skipped?}`. `skipped` is one of
   `disabled`, `no base commit`, `no test file imports a changed production
   file`, `no scoped test runner for the coupled files` (without one, a
-  repeat would run the whole suite), or `discovery errored (…)`. A
-  transient `_runs` key carries the messages and is popped before the
-  verdict is stored. Never raises.
+  repeat would run the whole suite), `over budget`, or `discovery errored
+  (…)`. A transient `_runs` key carries the messages and is popped before
+  the verdict is stored. `clock` (default `time.monotonic`) is injectable.
+  Never raises. `_ratchet_exec` (N5) calls the same function, so each of
+  its calls is bounded the same way.
+- `_runner_report_file_durations(kind, path, tree) -> dict[str, float]` —
+  repo-relative test file → seconds, from the same structured reports:
+  jest/vitest JSON suite `endTime − startTime` (else `perfStats.runtime`,
+  else Σ case `duration`), Σ JUnit `time` per file, Σ rspec `run_time` per
+  file; `{}` otherwise. `_capture_failing_test_ids` returns it as
+  `durations` and merges it into `test_file_durations` through
+  `_record_test_durations(st, durations)` (newest wins).
 - `_type_intermittent_regressions(verdict, *, final_ids, base_ids,
   discovery_counts, repeats_run, coupled, id_files, messages) ->
   list[dict]`. It reads only the B\* `resource_affected` IDs. An ID is
@@ -9513,6 +9544,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
+| `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
 | `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed); `new` non-empty makes the outcome `unconverged`. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |

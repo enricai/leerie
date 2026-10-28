@@ -9588,7 +9588,8 @@ adds two steps:
    mechanical import graph: JS/TS specifiers, and Python `import` read with
    `ast`. These are rerun serially `confirm_intermittent_repeats` (20)
    times on the final tree, under the host-pressure gate and inside
-   `confirm_budget_sec`. Every ID that failed in any run (the final run, a
+   `confirm_budget_sec`, as many of them as that budget holds at the full
+   repeat count (*Sized to the budget*, below). Every ID that failed in any run (the final run, a
    repeat, or a B\* final rerun) and not on the base joins the B\*
    candidates, so it gets base reruns. At p = 0.105, R = 20 finds such a
    test with probability 1 − 0.895²⁰ ≈ 89% (R = 10: 67%; R = 30: 96%).
@@ -9599,6 +9600,39 @@ adds two steps:
    Direct imports, not the transitive closure: on barnacle one changed
    module's closure reaches 864–956 of ~1,200 test files. That is the
    whole suite twenty times, and it couples every flaky test in the repo.
+   *Sized to the budget.* A repeat count only buys detection when every
+   repeat runs. At per-run failure rate p, R repeats find a test with
+   probability 1 − (1 − p)^R: for p = 0.1 that is 88% at R = 20, 65% at
+   R = 10 and 19% at R = 2. So discovery never trades repeats for files:
+   it reruns the files whose `confirm_intermittent_repeats` repeats all fit
+   in `confirm_budget_sec`, and records the rest as skipped. Fewer files at
+   R = 20 beats every file at R = 2. Measured (barnacle 45fa4253 pass 2):
+   the changed `flow-runner.ts` is imported directly by 301 test files, one
+   serial repeat of them takes about 15 min, and the old rule ran 2 of 20
+   repeats in each 30-min budget, per final-conformer round. That bought a
+   19% chance per flaky test, at the full budget every round.
+
+   The files are chosen from measured per-file durations: every structured
+   report leerie reads (the axis IDs, B\* reruns, discovery repeats) also
+   yields each file's wall time (jest/vitest JSON suite start/end, the sum of
+   JUnit `time` or rspec `run_time` per file), kept run-wide. Files are
+   ranked by closeness, then duration: every discovery file already imports
+   a changed file directly (a transitive importer is never a discovery
+   file, above), and among them one importing more of the changed files
+   ranks first; then the shortest first, so the most files fit. A file is
+   taken while (Σ duration + one repeat's runner start-up) × R stays inside
+   what is left of the budget. A file with no measured duration is
+   calibrated first: the unmeasured files run once with a report, in rank
+   order and in chunks of 1, 2, 4 … files, inside one repeat's share of the
+   budget (`confirm_budget_sec` / R); a chunk that does not finish leaves
+   its files unmeasured and skipped. Calibration runs are not repeats: a
+   file is counted only over its R repeats. When not even the first file
+   fits, discovery records `skipped: "over budget"` and runs nothing. So one
+   discovery — final-tree or the delivery ratchet's (N5), which calls the
+   same function — costs at most `confirm_budget_sec`, gate wait and
+   calibration included. On barnacle's hub file (~3 s per importer) that is
+   about 26 importers, each rerun all 20 times, instead of all 301 rerun
+   twice; the other 275 are recorded as skipped, not silently dropped.
 2. *Typing.* An ID is typed `intermittent_regression` only when all of
    these hold. Its base was clean: it is not in the baseline's failing IDs
    and failed none of B\*'s base reruns. It failed at least once on the
