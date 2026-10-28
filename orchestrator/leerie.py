@@ -46238,12 +46238,14 @@ def _falsifier_reset(wt: Path, sha: str) -> None:
 
 def _falsifier_user_prompt(task: str, item: dict, own: str | None,
                            stat: str, ctx: list[str], refs: list[str],
-                           parts: list[dict], record: str) -> str:
-    """The falsifier's payload: the frozen F+ user prompt plus the
-    orchestrator's results record."""
+                           parts: list[dict]) -> str:
+    """The falsifier's payload: the frozen F+ user prompt line for line
+    (DESIGN §8 *What ships is what was measured* — the only differences
+    are an unknown start commit and the item's span as its
+    `source_ref`)."""
     lines = ["TASK:", task, "",
              "Files the task references:",
-             *([f"- {r}" for r in refs] or ["(none)"]), "",
+             *[f"- {r}" for r in refs], "",
              "THE ITEM TO CHECK:",
              json.dumps({"item": item.get("item", ""),
                          "source_ref": (item.get("span")
@@ -46260,13 +46262,10 @@ def _falsifier_user_prompt(task: str, item: dict, own: str | None,
         + "\n".join(f"- {x}" for x in ctx[:60]) if ctx
         else "HELD-OUT ACCEPTANCE FILES: none for this run.")
     lines.append("")
-    if parts:
-        lines += ["A REVIEWER'S OPEN PARTS for this item (hypotheses to test "
-                  "by execution):", json.dumps(parts, indent=1)[:6000], ""]
-    if record:
-        lines += ["EXECUTED COMMANDS RECORD (what this run's workers and the "
-                  "orchestrator itself ran on the way to this tree, with "
-                  "results; leads, not proof):", record[-12000:], ""]
+    lines.append("A REVIEWER'S OPEN PARTS for this item (hypotheses to test "
+                 "by execution):\n" + json.dumps(parts, indent=1)[:6000]
+                 if parts else "")
+    lines.append("")
     lines.append(
         "Your working directory is a disposable copy of the FINISHED tree. "
         "Try to demonstrate this item is NOT delivered per your rules, and "
@@ -46399,7 +46398,7 @@ def _ts_resolvable(tree: str | Path) -> bool:
 async def _falsify_items(st: "State", caps: dict, models: dict,
                          efforts: dict, *, sha: str, normalized: list[dict],
                          indices: list[int], parts_by_idx: dict[int, list],
-                         record: str, progress: dict) -> dict:
+                         progress: dict) -> dict:
     """Run up to `falsifier_samples` falsifier samples per item in
     `indices` on the final commit `sha`; record each item's samples into
     `progress["items"]` (saved as they finish, so a resume skips them).
@@ -46489,7 +46488,7 @@ async def _falsify_items(st: "State", caps: dict, models: dict,
                              env: dict[str, str] | None) -> dict:
             ctx, refs = _falsifier_place_leads(st, lane, sets, task)
             user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
-                                          parts_by_idx.get(i) or [], record)
+                                          parts_by_idx.get(i) or [])
             sid = f"falsifier-i{i}-s{n}"
             common = dict(system_prompt=_load_prompt("falsifier"),
                           schema_key="falsifier", cwd=str(lane),
@@ -46659,7 +46658,7 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
                 indices=f_idx,
                 parts_by_idx={i: (details_by_idx.get(i) or {}).get(
                     "unmet_parts") or [] for i in f_idx},
-                record=record, progress=progress)
+                progress=progress)
     except Exception as e:
         # Advisory: a broken falsifier setup leaves the judge's verdict.
         log(f"  delivery detection: falsifier raised {type(e).__name__}: "

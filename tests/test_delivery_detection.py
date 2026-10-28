@@ -796,12 +796,14 @@ class TestRunDeliveryDetection:
         # commit.
         assert all(s["lead"] and not s["lead_writable"] for s in seen)
         assert all(s["status"] == "" and s["head"] == head for s in seen)
-        # The payload carries the judge's open part and the orchestrator's
-        # own acceptance verdict.
+        # The payload carries the judge's open part, and — the benched F+
+        # payload, DESIGN §8 *What ships is what was measured* — not the
+        # executed-commands record the judge gets.
         p0 = next(c for c in calls if c["sid"] == "falsifier-i0-s0")
         assert "add of two positives" in p0["user_prompt"]
-        assert ("[orchestrator held-out acceptance set 1] result on the "
-                "final tree: failed" in p0["user_prompt"])
+        assert ("[orchestrator held-out acceptance set 1]"
+                not in p0["user_prompt"])
+        assert "EXECUTED COMMANDS RECORD" not in p0["user_prompt"]
         assert p0["allowed_tools"] == leerie.ACT_TOOLS and p0["autonomous"]
         # Every checkout is gone.
         assert not list((st.run_dir / "worktrees").glob("falsifier-*"))

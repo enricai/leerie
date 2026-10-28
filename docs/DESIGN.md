@@ -6468,11 +6468,30 @@ two detectors, each checked by code (bench Q2 *F+*, frozen design):
   repository, a fresh throwaway database — §8 *Prisma repositories get
   a real database*), and gets the item,
   the run's own diff (start commit and stat), the run's valid
-  held-out acceptance files (read-only, git-excluded, leads only), the
-  judge's typed unmet parts for that item (hypotheses, never expected
-  values), and the orchestrator's results record. It writes ONE new
-  probe test through a public entry point, asserting the item's own
-  words, and runs it.
+  held-out acceptance files (read-only, git-excluded, leads only), and
+  the judge's typed unmet parts for that item (hypotheses, never
+  expected values). It writes ONE new probe test through a public entry
+  point, asserting the item's own words, and runs it.
+- **What ships is what was measured.** The falsifier's system prompt
+  is the frozen F+ prompt and its leads addendum, concatenated
+  verbatim, and its input is the frozen F+ user prompt. The only
+  differences are the ones the code requires:
+  1. the leads directory `.q2ctx/` is `.leerie-falsifier/`
+     (`FALSIFIER_LEADS_DIR`), twice in the addendum;
+  2. when the run's start commit cannot be read, the input says
+     `START COMMIT of this run: unknown.` in place of the commit and its
+     diff stat (the bench always had one);
+  3. the item's `source_ref` is its typed span when it has one (the
+     bench corpus carried `source_ref` directly).
+  The first shipped prompt also told the worker what the orchestrator
+  checks and offered the executed-commands record as a lead, and its
+  input carried that record: none of it was benched, so the Q2 numbers
+  did not describe it. All three are gone. The checks were already in the
+  benched prompt's own words — one NEW file, run with the repository's
+  test runner, outside the leads; the item span copied
+  character-for-character; the failure confirmed by a second run; the
+  failing assertion copied from the probe; no source reads, code
+  evaluation or test-only imports, "discarded automatically".
 - **Code decides whether a falsifier demonstrated anything.** A
   sample is confirmed only when all of these hold: the probe is one
   new file, outside the leads and not an acceptance file, that the

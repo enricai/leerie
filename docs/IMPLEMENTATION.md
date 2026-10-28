@@ -6421,7 +6421,10 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   sid="falsifier-i<k>-s<n>")` with `_falsifier_user_prompt` (task,
   referenced files, the item and its anchor, the own start and
   `git diff --stat=160 <own>..<final>`, the lead files, the item's
-  `unmet_parts`, the record). `_falsifier_probe_activity` reads the
+  `unmet_parts`) — the frozen F+ user prompt line for line; the record
+  is not passed (DESIGN §8 *What ships is what was measured*).
+  `prompts/falsifier.md` is the frozen `falsifier_prompt.md` +
+  `fplus_addendum.md` with `.q2ctx/` → `FALSIFIER_LEADS_DIR`. `_falsifier_probe_activity` reads the
   sample's own log (`_iter_log_tool_use(kinds=("Write", "Edit",
   "MultiEdit", "Bash"))`): `created` when a written path is test-shaped
   (`_is_test_file`) and outside the leads, `ran` when a Bash command names
