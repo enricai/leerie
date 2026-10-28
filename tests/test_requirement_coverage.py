@@ -21,7 +21,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.stub_helpers import _d1_covered
+from tests.stub_helpers import _d1_covered, _delivery_tree, _judge_verdict
 
 MODELS = {"classifier": "sonnet", "delivery_judge": "sonnet",
           "task_coverage_judge": "sonnet"}
@@ -449,6 +449,9 @@ class TestGroupedDeliveryJudge:
         repo, base = _repo(tmp_path)
         (repo / "data" / "a.csv").write_text("changed\n")
         _git(repo, "commit", "-qam", "touch data")
+        # The judges' stubbed citations quote this file (DESIGN §8
+        # *Delivery detection*: a met must carry a verified citation).
+        _delivery_tree(repo)
         spans = [{"id": "S1", "parent": None}]
         spans += [{"id": f"S{i}", "parent": "S1"} for i in range(2, 26)]
         spans += [{"id": "S26", "parent": None}]
@@ -478,11 +481,9 @@ class TestGroupedDeliveryJudge:
             idx = [e["item_index"] for e in arr]
             # Item 3 always unmet; a stray verdict for item 0 sent to the
             # second pack must be ignored.
-            vs = [{"item_index": i, "met": i != 3, "evidence": f"e{i}"}
-                  for i in idx]
+            vs = [_judge_verdict(i, i != 3, f"e{i}") for i in idx]
             if 0 not in idx:
-                vs.append({"item_index": 0, "met": False,
-                           "evidence": "stray"})
+                vs.append(_judge_verdict(0, False, "stray"))
             return {"verdicts": vs}
 
         st, items, repo, calls = self._setup(leerie, tmp_path, monkeypatch,
@@ -516,8 +517,8 @@ class TestGroupedDeliveryJudge:
         def verdict_for(kw):
             payload = kw["user_prompt"]
             arr = json.loads(payload.split("):\n", 1)[1].split("\n(These")[0])
-            out = {"verdicts": [{"item_index": e["item_index"], "met": True,
-                                 "evidence": "ok"} for e in arr]}
+            out = {"verdicts": [_judge_verdict(e["item_index"], True, "ok")
+                                for e in arr]}
             if "DEFECT CONTRACT" in payload:
                 out["contract"] = {"verdict": "met", "evidence": "holds"}
             return out
@@ -542,12 +543,12 @@ class TestGroupedDeliveryJudge:
 
         async def fake_claude_p(**kw):
             calls.append(kw)
-            return {"verdicts": [{"item_index": 0, "met": True,
-                                  "evidence": "ok"}]}
+            return {"verdicts": [_judge_verdict(0, True, "ok")]}
 
         monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+        tree = _delivery_tree(tmp_path / "tree")
         asyncio.run(leerie._delivery_judge_unmet(
-            "task", [{"item": "one"}], tmp_path, st,
+            "task", [{"item": "one"}], tree, st,
             dict(leerie.DEFAULT_CAPS), MODELS, EFFORTS, phase_label="pre"))
         assert [c["sid"] for c in calls] == ["delivery_judge-pre-s0"]
         assert "(These are" not in calls[0]["user_prompt"]

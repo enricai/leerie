@@ -24,6 +24,8 @@ import json
 
 import pytest
 
+from tests.stub_helpers import _delivery_tree, _judge_verdict
+
 MODELS = {"delivery_judge": "sonnet", "conformer": "sonnet"}
 EFFORTS = {"delivery_judge": "medium", "conformer": "low"}
 
@@ -35,16 +37,17 @@ ITEMS = [
 
 
 def _verdicts(*met_flags, evidence="checked"):
-    return {"verdicts": [
-        {"item_index": i, "met": m, "evidence": f"{evidence}-{i}"}
-        for i, m in enumerate(met_flags)]}
+    # Each verdict cites a line `_state`'s staging tree carries, so a met
+    # survives the citation screen (DESIGN §8 *Delivery detection*).
+    return {"verdicts": [_judge_verdict(i, m, f"{evidence}-{i}")
+                         for i, m in enumerate(met_flags)]}
 
 
 def _state(leerie, tmp_path, **overrides):
     leerie_root = tmp_path / ".leerie"
     run_id = "test-delivery-gate"
     run_dir = leerie_root / "runs" / run_id
-    (run_dir / "worktrees" / "staging").mkdir(parents=True)
+    _delivery_tree(run_dir / "worktrees" / "staging")
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "test task", "worker_count": 0,
                # The gate mirrors _run_final_conformance's own guard: no
@@ -200,9 +203,9 @@ def test_item_supplied_index_cannot_override_position(
     poisoned = [{"item": "poisoned requirement", "item_index": 99}]
     st, run_dir = _state(leerie, tmp_path, required_items=poisoned)
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e0"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e1"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e2"}]},
+        {"verdicts": [_judge_verdict(0, False, "e0")]},
+        {"verdicts": [_judge_verdict(0, False, "e1")]},
+        {"verdicts": [_judge_verdict(0, False, "e2")]},
     ])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
@@ -223,7 +226,7 @@ def test_plain_string_items_are_coerced_not_fatal(
     st, run_dir = _state(leerie, tmp_path,
                          required_items=["a plain string requirement"])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": True, "evidence": "ok"}]}])
+        {"verdicts": [_judge_verdict(0, True, "ok")]}])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
     assert unmet == []
@@ -243,9 +246,9 @@ def test_no_item_key_serialization_excludes_stray_item_index(
     st, run_dir = _state(leerie, tmp_path, required_items=[
         {"requirement": "keyless with stray index", "item_index": 99}])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
     ])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
@@ -268,7 +271,7 @@ def test_nested_item_value_serializes_with_sorted_keys(
     st, run_dir = _state(leerie, tmp_path, required_items=[
         {"item": {"zebra": 1, "alpha": 2}}])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": True, "evidence": "ok"}]}])
+        {"verdicts": [_judge_verdict(0, True, "ok")]}])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
     assert unmet == []
@@ -309,9 +312,9 @@ def test_dict_item_without_item_key_gets_serialized_text(
     st, run_dir = _state(leerie, tmp_path, required_items=[
         {"requirement": "no item key here", "source_ref": "x"}])
     calls = _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
     ])
     unmet = asyncio.run(leerie._run_delivery_prejudge(
         run_dir, st, _caps(leerie), MODELS, EFFORTS))
@@ -338,9 +341,9 @@ def test_non_string_item_value_survives_the_recheck_residual_log(
                                                "evidence": "e"}],
                              "samples_before": 3})
     _patch_judge(leerie, monkeypatch, [
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
-        {"verdicts": [{"item_index": 0, "met": False, "evidence": "e"}]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
+        {"verdicts": [_judge_verdict(0, False, "e")]},
     ])
     lines: list[str] = []
     monkeypatch.setattr(leerie, "log", lines.append)

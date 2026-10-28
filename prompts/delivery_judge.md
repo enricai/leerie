@@ -69,17 +69,83 @@ extra run. The orchestrator applies a majority vote across independent
 samples before acting on any `false`, so do not soften a genuine finding
 to avoid noise — mechanisms downstream handle noise.
 
-## Output
+## Output and the evidence contract
 
-Return **only** a JSON object per your schema:
+Return **only** a JSON object per your schema. The orchestrator does not
+read your prose to decide anything: it decides from typed fields, and it
+**checks every citation you give against this tree's `HEAD`**.
+
+Per item:
+
+- `parts` — split the item into **every concrete thing it requires**:
+  each named site, reader, caller, string, file, page, locale, value or
+  behaviour gets its own part. An item that names "every reader" has
+  one part per reader you find (find them with `grep`); an item that
+  names two locales has a part per locale. For each part:
+  - `status`: `"met"`, `"unmet"`, or `"not_inspected"` (you did not
+    open the artifact that decides it — say so here, not in prose).
+  - `kind`: `"behavioral"` when the part is a runtime behaviour or a
+    number (a timeout, a delay, a count, a threshold, "keeps X as
+    today", "returns 4xx when …"); `"static"` otherwise.
+  - `cites`: `{path, line_start, line_end, quote}` — `path` relative to
+    the repo root, 1-based line numbers of the file **as it is on this
+    tree**, and `quote` copied **verbatim** from exactly those lines
+    (contiguous text, no `...`, no paraphrase, at least one identifier
+    or string literal, at most ~300 characters). For a part proven only
+    by a command result, use `path: "RECORD"`, `line_start: 0`,
+    `line_end: 0`, and quote the EXECUTED COMMANDS RECORD entry's
+    command line or result text verbatim. For a part whose requirement
+    is that something is **absent** ("never contain X", "remove Y"), use
+    `path: "ABSENT"`, `line_start: 0`, `line_end: 0`, and put the
+    extended regex you searched for in `quote`; the orchestrator re-runs
+    it with `git grep -E` over `HEAD` and the citation verifies only
+    when nothing matches. When the requirement covers only part of the
+    tree (e.g. "no X in `src/`"), scope the search with
+    `path: "ABSENT:<pathspec>"` (a git pathspec such as `ABSENT:src/` or
+    `ABSENT:*.ts`); the orchestrator then runs
+    `git grep -E <quote> HEAD -- <pathspec>`.
+- `met: true` **only** when every part is `"met"` and every met part
+  carries at least one citation. A `"behavioral"` met part cites the
+  production line that sets or decides the behaviour on the code path
+  the requirement names (not only a test); also cite the test line that
+  asserts it when one exists. A missing test makes a part `"unmet"` only
+  when the item itself asks for a test. If some input shape the
+  requirement covers takes a different code path with a different
+  value, that part is `"unmet"`.
+- An `"unmet"` part cites the violating line, or the line where the
+  required thing should be and is not (e.g. the filter that omits a
+  case, the string that is still hard-coded). Its parts are handed to
+  an execution-backed check as hypotheses, so name each one precisely.
+- `evidence`: one or two sentences summarising what you verified.
+
+What the code does with this: a `met` whose parts are not all `met`, or
+whose every part does not carry a citation found in that file on `HEAD`
+(after whitespace normalisation), is **rejected** and counted as an
+unmet vote. So never cite from memory: open the file (`Read` shows line
+numbers) and copy the lines.
+
+Example:
 
 ```json
 {
   "verdicts": [
     {"item_index": 0, "met": true,
-     "evidence": "src/example_module.py:42 implements the required check; tests/test_example_module.py asserts it"},
+     "parts": [
+       {"requirement": "check rejects an empty name", "kind": "behavioral",
+        "status": "met",
+        "cites": [
+          {"path": "src/example_module.py", "line_start": 42, "line_end": 43,
+           "quote": "if not name:\n        raise ValueError(\"empty name\")"},
+          {"path": "tests/test_example_module.py", "line_start": 17,
+           "line_end": 17, "quote": "with pytest.raises(ValueError):"}]}],
+     "evidence": "the check and its test"},
     {"item_index": 1, "met": false,
-     "evidence": "the constraint forbids the term; grep found 3 occurrences in tests/fixture files"}
+     "parts": [
+       {"requirement": "no occurrence of the forbidden term", "kind": "static",
+        "status": "unmet",
+        "cites": [{"path": "tests/fixtures/sample.json", "line_start": 3,
+                   "line_end": 3, "quote": "\"vendor\": \"forbidden-term\""}]}],
+     "evidence": "grep found the term in a fixture"}
   ],
   "rationale": "one short paragraph on how you verified"
 }
@@ -89,8 +155,6 @@ Return **only** a JSON object per your schema:
   payload's REQUIRED ITEMS. The orchestrator tallies votes by
   `item_index` — an index you omit counts as met, so never omit an item
   you found violated.
-- `evidence` (required per verdict): what you verified on this tree,
-  with paths; on `false`, what is missing or violating and where.
 
 ## Executed-commands record
 
@@ -100,10 +164,13 @@ payload carries an EXECUTED COMMANDS RECORD section, that is the run's
 own structured log of every build/lint/test command its workers
 actually executed — and, when the defect audit names a repro command,
 every command led by that repro's own verbs — with verbatim result
-tails. Verify any
+tails, followed by the orchestrator's OWN results (entries tagged
+`[orchestrator …]`: the final-tree build/lint/test commands it measured,
+the tests it confirmed newly failing, each held-out acceptance set's
+verdict). Verify any
 execution-shaped item (a suite must pass, a typecheck must be clean)
-against that record and cite the entry — `[sid] $ command` plus what
-its result tail shows. A command absent from the record was not run
+against that record and cite the entry with `path: "RECORD"` — the
+command line or the result text, verbatim. A command absent from the record was not run
 anywhere in this run, and such an item stays `met=false` with evidence
 saying exactly that. Do not downgrade to "could not verify" when the
 record answers the question.

@@ -151,3 +151,44 @@ def _d1_covered(n_spans: int = 1) -> dict:
                             "parts": [], "verifiability": "tree",
                             "untouched_paths": []} for i in ids],
     }
+
+
+# A delivery_judge citation code can verify (DESIGN §8 *Delivery detection*):
+# `_delivery_tree` commits this line at this path, and `_judge_verdict` cites
+# it, so a stubbed `met` is a VERIFIED met rather than one the screen
+# rejects.
+DELIVERY_CITED_FILE = "src/delivered_feature.py"
+DELIVERY_CITED_LINE = "def delivered_feature(value):"
+
+
+def _delivery_tree(path: Path) -> Path:
+    """Make `path` a git repository (or reuse it) whose HEAD carries
+    `DELIVERY_CITED_FILE`; returns `path`."""
+    import subprocess
+    path.mkdir(parents=True, exist_ok=True)
+    if not (path / ".git").exists():
+        subprocess.run(["git", "init", "-q", str(path)], check=True)
+    f = path / DELIVERY_CITED_FILE
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_text(DELIVERY_CITED_LINE + "\n    return value\n")
+    subprocess.run(["git", "-C", str(path), "add", DELIVERY_CITED_FILE],
+                   check=True)
+    subprocess.run(["git", "-C", str(path), "-c", "user.email=t@t",
+                    "-c", "user.name=t", "commit", "-q", "-m",
+                    "cited file"], check=True)
+    return path
+
+
+def _judge_parts(met: bool) -> list[dict]:
+    """One part citing the committed line — `met` or `unmet`."""
+    return [{"requirement": "the delivered feature exists",
+             "kind": "static", "status": "met" if met else "unmet",
+             "cites": [{"path": DELIVERY_CITED_FILE, "line_start": 1,
+                        "line_end": 1, "quote": DELIVERY_CITED_LINE}]}]
+
+
+def _judge_verdict(index: int, met: bool, evidence: str = "e") -> dict:
+    """A schema-shaped delivery_judge verdict whose citation verifies on a
+    `_delivery_tree`."""
+    return {"item_index": index, "met": met, "parts": _judge_parts(met),
+            "evidence": evidence}

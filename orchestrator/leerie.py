@@ -287,6 +287,11 @@ DEFAULT_CAPS = {
     # the pack stays within this many items. Bench Q7/D1 arm (c): real
     # false unmet 3/116 against 23/50 for one prompt over every item.
     "d1_pack_items": 20,
+    # Independent `falsifier` samples per judged required item on the final
+    # tree (DESIGN §8 *Delivery detection*): the item is unmet when any one
+    # is confirmed by code. Bench Q2 F+ (held-out, 31 targets / 148
+    # controls): k=3 caught 23/31 at 12/148 false unmet, k=1 19/31.
+    "falsifier_samples": 3,
     # Repair rounds of a committed merge the integration judge rejected
     # (DESIGN §6 *When integration cannot succeed*): the integrator is
     # re-driven with typed findings, then code re-checks and re-judges.
@@ -585,7 +590,11 @@ STATE_FIELDS = (
     # every confirmed-unmet item
     # was remedied by the final-conformer round it was routed into;
     # non-empty unmet_after is the persisted residual the operator (and
-    # the next run's planner, via the classifier) can see.
+    # the next run's planner, via the classifier) can see. judged_before /
+    # judged_after {sha, unmet[], details[]} record what each judge pass
+    # saw; final delivery detection (DESIGN §8 *Delivery detection*) adds
+    # items[] (per item: verdict, by[], judge, falsifier), unmet_final[],
+    # final_sha, final_judge, falsifier, and final_progress while running.
     "delivery_gate",
     # declared_unrun_warnings: per-sid record of declared runs_commands an
     # empty_handoff-rescued subtask never executed. The rescue settles
@@ -1793,6 +1802,10 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # (DESIGN §8 *Typed evidence for the delivery judge*); benched at
     # medium (bench/q5 n7d, q10).
     "contract_extractor": "medium",
+    # The delivery falsifier (DESIGN §8 *Delivery detection*), benched at
+    # medium (Q2 F+). Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration
+    # corpus yet.
+    "falsifier": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1925,7 +1938,8 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "integration_judge", "no_work_judge", "delivery_judge",
                 "defect_scope_auditor", "rebaser", "acceptance_writer",
                 "set_auditor", "surrogate_fixer", "ci_checks",
-                "scope_judge", "pr_reviewer", "contract_extractor")
+                "scope_judge", "pr_reviewer", "contract_extractor",
+                "falsifier")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1958,7 +1972,7 @@ PLANNING_WORKER_TYPES = frozenset({
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
 ACTING_WORKER_TYPES = frozenset({
     "implementer", "integrator", "conformer", "rebaser", "acceptance_writer",
-    "surrogate_fixer",
+    "surrogate_fixer", "falsifier",
 })
 # Post-run skill workers — not in WORKER_TYPES because they don't run inside
 # the main _orchestrate loop, but they do get dedicated model resolution via
@@ -3928,13 +3942,47 @@ SCHEMAS: dict[str, dict] = {
         "type": "object",
         "additionalProperties": False,
         "required": ["verdicts"],
+        # Typed per-part citations (DESIGN §8 *Delivery detection*): code
+        # verifies every quote against HEAD (`_verify_delivery_cite`) and a
+        # `met` whose parts do not all carry a verified citation counts as
+        # an unmet vote.
+        "$defs": {
+            "cite": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["path", "line_start", "line_end", "quote"],
+                "properties": {
+                    # Repo-relative path, or "RECORD" (the executed-
+                    # commands record), or "ABSENT" / "ABSENT:<pathspec>"
+                    # (an extended regex that must match nothing).
+                    "path": {"type": "string"},
+                    "line_start": {"type": "integer"},
+                    "line_end": {"type": "integer"},
+                    "quote": {"type": "string"},
+                },
+            },
+            "part": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["requirement", "kind", "status", "cites"],
+                "properties": {
+                    "requirement": {"type": "string"},
+                    "kind": {"type": "string",
+                             "enum": ["static", "behavioral"]},
+                    "status": {"type": "string",
+                               "enum": ["met", "unmet", "not_inspected"]},
+                    "cites": {"type": "array",
+                              "items": {"$ref": "#/$defs/cite"}},
+                },
+            },
+        },
         "properties": {
             "verdicts": {
                 "type": "array",
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
-                    "required": ["item_index", "met", "evidence"],
+                    "required": ["item_index", "met", "parts", "evidence"],
                     "properties": {
                         # Index into the numbered REQUIRED ITEMS list the
                         # judge was handed. Integer, not the item text —
@@ -3945,6 +3993,11 @@ SCHEMAS: dict[str, dict] = {
                         # false unmet costs one fix round; a false met
                         # ships the violation).
                         "met": {"type": "boolean"},
+                        # Every concrete thing the item requires, each with
+                        # its citations — the falsifier's probe targets
+                        # when unmet.
+                        "parts": {"type": "array",
+                                  "items": {"$ref": "#/$defs/part"}},
                         "evidence": {"type": "string"},
                     },
                 },
@@ -3980,6 +4033,31 @@ SCHEMAS: dict[str, dict] = {
                 },
             },
             "rationale": {"type": "string"},
+        },
+    },
+    "falsifier": {
+        # Execution-backed delivery detection (DESIGN §8 *Delivery
+        # detection*), as benched (Q2 F+): one probe test that tries to show
+        # ONE required item undelivered on the final tree. Facts only — code
+        # decides whether the probe demonstrated anything (`_falsifier_gates`).
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["verdict", "probe_path", "case_name", "assertion_quote",
+                     "item_span_quote", "entry_point", "reason"],
+        "properties": {
+            "verdict": {"type": "string",
+                        "enum": ["unmet_demonstrated",
+                                 "could_not_demonstrate"]},
+            # The probe file, relative to the repository root ("" if none).
+            "probe_path": {"type": "string"},
+            # The exact title of the failing case ("" if none).
+            "case_name": {"type": "string"},
+            # The failing assertion line, verbatim from the probe.
+            "assertion_quote": {"type": "string"},
+            # The span of the item text the assertion tests, verbatim.
+            "item_span_quote": {"type": "string"},
+            "entry_point": {"type": "string"},
+            "reason": {"type": "string"},
         },
     },
     "defect_scope_auditor": {
@@ -21389,8 +21467,12 @@ def _acceptance_read_denials(schema_key: str, run_dir: str | Path) -> str:
     transcripts. The fixers' prompts read only `subtasks/`, `criteria/` and
     `checkpoints/` there. Joined with `_repo_write_denials`' rules at the
     call site. A shell `cat` is not covered; hiding reduces the
-    special-casing incentive, it does not guarantee it."""
-    if schema_key not in ("implementer", "conformer", "surrogate_fixer"):
+    special-casing incentive, it does not guarantee it. The delivery
+    `falsifier` is denied the same run state (bench Q2 F+ hid it): it gets
+    its own read-only copies of the valid sets as leads (DESIGN §8
+    *Delivery detection*)."""
+    if schema_key not in ("implementer", "conformer", "surrogate_fixer",
+                          "falsifier"):
         return ""
     rd = Path(run_dir)
     # `//` anchors an absolute path for the CLI, as in _repo_write_denials.
@@ -22506,9 +22588,16 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
                    add_dirs: list[str] | None = None,
                    effort: str | None = None,
                    env_extra: dict[str, str] | None = None,
+                   resume_session: str | None = None,
                    _suppress_capture: bool = False) -> dict:
     """Run one headless Claude Code worker and return its validated
     structured output.
+
+    `resume_session`, when set, continues that CLI session (`--resume`) with
+    `user_prompt` as the next turn instead of starting a fresh one — the
+    delivery falsifier's one re-ask (DESIGN §8 *Delivery detection*). The
+    caller must pass the same `cwd` the session ran in: the CLI files its
+    sessions by working directory.
 
     The worker's result is constrained with `--json-schema` (inline — a file
     path is silently ignored by the CLI). The CLI validates the worker's final
@@ -22715,6 +22804,8 @@ async def claude_p(user_prompt: str, system_prompt: str, *, schema_key: str,
             # only workers with a resolved effort carry the flag.
             if effort is not None:
                 cmd.extend(["--effort", effort])
+            if resume_session:
+                cmd.extend(["--resume", resume_session])
             for d in (add_dirs or ()):
                 cmd.extend(["--add-dir", d])
             # Acting workers (autonomous=True) run inside an isolated worktree
@@ -32370,7 +32461,8 @@ def _decide_outcome(st: State, *, any_commits: bool) -> str:
             reasons.append(f"{failing} held-out acceptance set(s) still fail")
     delivery = st.data.get("delivery_gate")
     if isinstance(delivery, dict):
-        unmet = (delivery.get("unmet_after") if "unmet_after" in delivery
+        unmet = (delivery.get("unmet_final") if "unmet_final" in delivery
+                 else delivery.get("unmet_after") if "unmet_after" in delivery
                  else delivery.get("unmet_before"))
         if unmet:
             reasons.append(f"{len(unmet)} required item(s) still unmet")
@@ -35324,9 +35416,15 @@ _BG_RESULT_PREFIX = "Command running in background with ID:"
 _BG_ID_RE = re.compile(r"Command running in background with ID:\s*(\w+)")
 
 
+_LOG_TOOL_KINDS = ("Bash", "BashOutput", "KillBash", "Read")
+
+
 def _iter_log_tool_use(
-        log_path: Path) -> Iterator[tuple[str, dict, str]]:
-    """Yield each Bash/BashOutput/KillBash/Read `tool_use` block from a
+        log_path: Path,
+        kinds: tuple[str, ...] = _LOG_TOOL_KINDS,
+        ) -> Iterator[tuple[str, dict, str]]:
+    """Yield each Bash/BashOutput/KillBash/Read `tool_use` block (or each
+    of `kinds`) from a
     per-worker JSONL log, paired with its `tool_result` content when
     one is present. Yields tuples of (kind, input_dict, result_text)
     where `result_text` is "" if no result was paired.
@@ -35366,7 +35464,7 @@ def _iter_log_tool_use(
             t = blk.get("type")
             if t == "tool_use":
                 name = blk.get("name", "")
-                if name in ("Bash", "BashOutput", "KillBash", "Read"):
+                if name in kinds:
                     uses.append((blk.get("id", ""), name,
                                  blk.get("input") or {}))
             elif t == "tool_result":
@@ -38380,7 +38478,10 @@ def _prior_delivery_residual(st: "State") -> dict | None:
         gate = data.get("delivery_gate") or {}
         acc_residual = ((data.get("acceptance") or {}).get("gate")
                         or {}).get("residual")
-        unmet_after = gate.get("unmet_after") or []
+        # Final detection's verdict, when it ran, is the latest word on
+        # the shipped tree (DESIGN §8 *Delivery detection*).
+        unmet_after = ((gate.get("unmet_final") if "unmet_final" in gate
+                        else gate.get("unmet_after")) or [])
         contract_after = gate.get("contract_after") or {}
         contract_before = gate.get("contract_before") or {}
         residual: dict = {}
@@ -38543,6 +38644,230 @@ def _executed_commands_digest(leerie_dir: Path, repo_root: Path,
     return "\n".join(entries)
 
 
+# --- B2c: typed per-part citations, checked by code (DESIGN §8 *Delivery
+# detection*). Bench N2e verify_e, as frozen, with one stated difference: a
+# quote counts when it is anywhere in the cited file at HEAD (a mislocated
+# real quote is not a fabrication); the line window only labels the status.
+# A quote shorter than this once whitespace-normalised matches by accident.
+_DELIVERY_CITE_MIN_QUOTE = 8
+# Citation statuses that verify (`_verify_delivery_cite`).
+_DELIVERY_CITE_OK = frozenset({"ok", "drift", "record_ok", "absent_ok"})
+
+
+def _delivery_cite_rel(path: str, tree: str | Path) -> str:
+    """A judge's citation path made repo-relative: the tree's own absolute
+    prefix and a leading `./` stripped (mechanical path handling)."""
+    p = (path or "").strip()
+    root = str(tree).rstrip("/") + "/"
+    if p.startswith(root):
+        p = p[len(root):]
+    while p.startswith("./"):
+        p = p[2:]
+    return p
+
+
+def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
+                          cache: dict | None = None) -> str:
+    """One citation's status against `tree`'s HEAD: `ok` (the quote is in
+    the cited lines, 3 lines of slack), `drift` (elsewhere in that file),
+    `absent` (not in the file), `no_file`, `short`; `record_ok` /
+    `record_absent` for `path: "RECORD"` (the executed-commands record);
+    `absent_ok` / `absent_found` / `bad_regex` for `path: "ABSENT"` or
+    `"ABSENT:<pathspec>"`, whose quote is an extended regex `git grep -E`
+    must find nowhere. Substring checks after NFC/whitespace normalisation —
+    never a parse of the judge's prose."""
+    path = str(cite.get("path") or "").strip()
+    quote = cite.get("quote") if isinstance(cite.get("quote"), str) else ""
+    head = path.upper()
+    if head == "ABSENT" or head.startswith("ABSENT:"):
+        raw = quote.strip()
+        if not raw:
+            return "bad_regex"
+        spec = path.split(":", 1)[1].strip() if ":" in path else ""
+        r = subprocess.run(
+            ["git", "-C", str(tree), "grep", "-q", "-E", "-e", raw, "HEAD",
+             "--", *([spec] if spec else [])],
+            capture_output=True, check=False)
+        return {0: "absent_found", 1: "absent_ok"}.get(r.returncode,
+                                                        "bad_regex")
+    q = _scope_norm(quote)
+    if len(q) < _DELIVERY_CITE_MIN_QUOTE:
+        return "short"
+    if head == "RECORD":
+        return "record_ok" if q in _scope_norm(record) else "record_absent"
+    rel = _delivery_cite_rel(path, tree)
+    if not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
+        return "no_file"
+    memo = cache if cache is not None else {}
+    if rel not in memo:
+        got = subprocess.run(["git", "-C", str(tree), "show", f"HEAD:{rel}"],
+                             capture_output=True, check=False)
+        memo[rel] = (None if got.returncode != 0
+                     else got.stdout.decode("utf-8", "replace"))
+    text = memo[rel]
+    if text is None:
+        return "no_file"
+    lines = text.split("\n")
+    ls, le = cite.get("line_start"), cite.get("line_end")
+    if (isinstance(ls, int) and isinstance(le, int)
+            and not isinstance(ls, bool) and not isinstance(le, bool)
+            and 1 <= ls <= le):
+        window = "\n".join(lines[max(0, ls - 4):le + 3])
+        if q in _scope_norm(window):
+            return "ok"
+    return "drift" if q in _scope_norm(text) else "absent"
+
+
+def _delivery_verdict_check(v: dict, tree: str | Path, record: str,
+                            cache: dict | None = None
+                            ) -> tuple[str, str]:
+    """`met` only for a verdict claiming met whose every part is `met` and
+    carries at least one verified citation; a met claim failing that is
+    `unverified` (with the reason) — rejected, so a fabricated quote cannot
+    buy a met. A verdict not claiming met is `unmet`."""
+    if v.get("met") is not True:
+        return "unmet", ""
+    parts = [p for p in (v.get("parts") or []) if isinstance(p, dict)]
+    if not parts:
+        return "unverified", "no_parts"
+    if any(p.get("status") != "met" for p in parts):
+        return "unverified", "part_not_met"
+    for p in parts:
+        if not any(isinstance(c, dict)
+                   and _verify_delivery_cite(c, tree, record, cache)
+                   in _DELIVERY_CITE_OK
+                   for c in (p.get("cites") or [])):
+            return "unverified", "part_uncited"
+    return "met", ""
+
+
+def _delivery_unmet_parts(v: dict, tree: str | Path, record: str,
+                          cache: dict | None = None) -> list[dict]:
+    """The parts a verdict typed `unmet`, each keeping only its citations
+    that verify (a fabricated one is dropped) — the falsifier's probe
+    targets (bench Q2 F+ lead 3)."""
+    out = []
+    for p in v.get("parts") or []:
+        if not isinstance(p, dict) or p.get("status") != "unmet":
+            continue
+        cites = [c for c in (p.get("cites") or []) if isinstance(c, dict)
+                 and _verify_delivery_cite(c, tree, record, cache)
+                 in _DELIVERY_CITE_OK]
+        out.append({"requirement": str(p.get("requirement") or "")[:500],
+                    "kind": p.get("kind"),
+                    "cites": [{k: c.get(k) for k in
+                               ("path", "line_start", "line_end", "quote")}
+                              for c in cites][:5]})
+    return out
+
+
+def _delivery_screen_sample(sample: dict, tree: str | Path, record: str,
+                            cache: dict | None = None) -> dict:
+    """A judge sample with every rejected met turned into an unmet vote
+    (`met: false`, `rejected: <reason>`), the shape
+    `_delivery_unmet_majority` tallies unchanged."""
+    out = []
+    for v in sample.get("verdicts") or []:
+        if not isinstance(v, dict):
+            continue
+        status, why = _delivery_verdict_check(v, tree, record, cache)
+        if status == "unverified":
+            v = {**v, "met": False, "rejected": why}
+        out.append(v)
+    return {**sample, "verdicts": out}
+
+
+def _orchestrator_results_digest(st: "State") -> str:
+    """The orchestrator's OWN results for the executed-commands record
+    (DESIGN §8 *Execution-shaped items are judged from the run's own
+    records*): the final-tree build/lint/test axes it measured, the test IDs
+    B* confirmed newly failing, and each held-out acceptance set's final
+    verdict. Read from typed state only; "" when none of it exists yet."""
+    lines: list[str] = []
+    final = ((st.data.get("conformance") or {}).get("_final") or {})
+    res = final.get("result") if isinstance(final, dict) else None
+    for axis in ("build", "lint", "tests"):
+        a = (res or {}).get(axis) if isinstance(res, dict) else None
+        if not isinstance(a, dict) or not a.get("command"):
+            continue
+        verdict = ("not measured" if not a.get("measured", True)
+                   else "passed" if a.get("passed") else "failed")
+        summary = str(a.get("summary") or "").replace("\n", " | ")[:200]
+        lines.append(f"[orchestrator final-tree {axis}] $ "
+                     f"{str(a['command'])[:200]}\n    result: {verdict}"
+                     + (f" — {summary}" if summary else ""))
+    diff = st.data.get("test_id_diff")
+    if isinstance(diff, dict) and diff.get("candidates") is not None:
+        new = [str(x)[:160] for x in (diff.get("new") or [])]
+        lines.append("[orchestrator B* failing-test diff] tests newly "
+                     "failing on the final tree, confirmed against the base: "
+                     + ("; ".join(new[:10]) if new else "none"))
+    acc = st.data.get("acceptance") or {}
+    gate = (acc.get("gate") or {}) if isinstance(acc, dict) else {}
+    final_sets = gate.get("final") if isinstance(gate, dict) else None
+    if isinstance(final_sets, list):
+        cases = ((gate.get("residual") or {}).get("cases_by_set") or {}
+                 if isinstance(gate.get("residual"), dict) else {})
+        for r in final_sets:
+            if not isinstance(r, dict):
+                continue
+            k = r.get("index")
+            if r.get("unmeasured"):
+                verdict = "not measured"
+            elif r.get("passed"):
+                verdict = "passed"
+            else:
+                names = [str(c)[:160] for c in
+                         (cases.get(str(k)) or cases.get(k) or [])][:5]
+                verdict = ("failed: " + ", ".join(
+                    str(f) for f in (r.get("failing_files") or [])[:5])
+                    + (f" (cases: {'; '.join(names)})" if names else ""))
+            lines.append(f"[orchestrator held-out acceptance set {k}] "
+                         f"result on the final tree: {verdict}")
+    return "\n".join(lines)
+
+
+def _delivery_record(leerie_dir: Path, st: "State",
+                     repro_command: str | None) -> str:
+    """The executed-commands record a delivery pass hands its judge (and
+    the falsifier): the workers' runs from their logs, then the
+    orchestrator's own results. A torn log degrades to the orchestrator's
+    half, never takes the pass down."""
+    try:
+        workers = _executed_commands_digest(
+            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
+            repro_command=repro_command)
+    except Exception as e:
+        log(f"  delivery gate: executed-commands digest failed "
+            f"({type(e).__name__}) — judging without the workers' record")
+        workers = ""
+    own = _orchestrator_results_digest(st)
+    return "\n".join(x for x in (workers, own) if x)
+
+
+def _delivery_norm_item(item: object) -> dict:
+    """One required item in the shape every delivery pass reads (see the
+    caller's comment in `_delivery_judge_unmet`)."""
+    if not isinstance(item, dict):
+        return {"item": str(item)}
+    if "item" not in item:
+        # No text field at all: the whole entry is the only
+        # description this requirement has, so serialize it — an
+        # empty string here handed the conformer a blank
+        # requirement, unchanged from pre-normalization behavior
+        # (round 4: that made the no-item-key test
+        # non-discriminating). A stray item_index key is excluded
+        # from the text: the positional index is authoritative, and
+        # echoing a contradicting number into the judge payload
+        # invites misaligned verdicts (round 5).
+        body = {k: v for k, v in item.items() if k != "item_index"}
+        return {**item, "item": json.dumps(body, sort_keys=True)}
+    text = item["item"]
+    if not isinstance(text, str):
+        text = "" if text is None else json.dumps(text, sort_keys=True)
+    return {**item, "item": text}
+
+
 async def _delivery_judge_unmet(
         task: str, items: list[dict], staging: Path, st: "State",
         caps: dict, models: dict[str, str],
@@ -38553,9 +38878,17 @@ async def _delivery_judge_unmet(
         ground_truth: dict | None = None,
         routing: dict | None = None,
         typed_evidence: list[str] | None = None,
+        item_details: dict | None = None,
         ) -> tuple[list[dict], int, dict | None]:
     """Run the delivery_judge over the staging tree; return
     (confirmed_unmet, samples_used, contract_result).
+
+    Every sample is screened by code before the vote
+    (`_delivery_screen_sample`, DESIGN §8 *Delivery detection*): a `met`
+    whose parts do not all carry a citation verified against HEAD counts as
+    an unmet vote. `item_details`, when given, is filled per judged index
+    with {item_index, samples, unmet_votes, rejected, unmet_parts[]} — the
+    unmet parts (verified citations only) are the falsifier's probe targets.
 
     Grouped (DESIGN §8 *Grouped judging at coverage item counts*): an
     item typed `verifiability: external` is never judged; an item with
@@ -38606,27 +38939,7 @@ async def _delivery_judge_unmet(
     # printable text, and the recheck's residual log slices it — a
     # nested non-string value there raised TypeError into the advisory
     # wrapper, losing the residual line (round 2).
-    def _norm_item(item: object) -> dict:
-        if not isinstance(item, dict):
-            return {"item": str(item)}
-        if "item" not in item:
-            # No text field at all: the whole entry is the only
-            # description this requirement has, so serialize it — an
-            # empty string here handed the conformer a blank
-            # requirement, unchanged from pre-normalization behavior
-            # (round 4: that made the no-item-key test
-            # non-discriminating). A stray item_index key is excluded
-            # from the text: the positional index is authoritative, and
-            # echoing a contradicting number into the judge payload
-            # invites misaligned verdicts (round 5).
-            body = {k: v for k, v in item.items() if k != "item_index"}
-            return {**item, "item": json.dumps(body, sort_keys=True)}
-        text = item["item"]
-        if not isinstance(text, str):
-            text = "" if text is None else json.dumps(text, sort_keys=True)
-        return {**item, "item": text}
-
-    normalized = [_norm_item(item) for item in items]
+    normalized = [_delivery_norm_item(item) for item in items]
     n_items = len(normalized)
     # Routing (DESIGN §8 *Grouped judging at coverage item counts*): code
     # settles what code can before any judge prompt is built.
@@ -38738,6 +39051,8 @@ async def _delivery_judge_unmet(
 
     # Packs run concurrently, bounded like a wave's workers.
     limit = asyncio.Semaphore(max(1, int(caps.get("max_parallel") or 1)))
+    # One HEAD read per cited file per gate pass.
+    cite_cache: dict = {}
 
     async def _judge_pack(p: int, pack: list[int]) -> list[dict]:
         with_contract = contract_ctx is not None and p == 0
@@ -38773,9 +39088,11 @@ async def _delivery_judge_unmet(
             )
             # Merge by item_index: a verdict for an index outside this
             # pack is not this prompt's to give.
-            return {**smp, "verdicts": [
+            smp = {**smp, "verdicts": [
                 v for v in (smp.get("verdicts") or [])
                 if isinstance(v, dict) and v.get("item_index") in allowed]}
+            return _delivery_screen_sample(smp, staging, exec_digest,
+                                           cite_cache)
 
         async with limit:
             samples = [await _sample(0)]
@@ -38797,8 +39114,28 @@ async def _delivery_judge_unmet(
         await asyncio.gather(*tasks, return_exceptions=True)
         raise
     n_samples = 0
-    for samples in per_pack:
+    for pack, samples in zip(packs, per_pack):
         n_samples += len(samples)
+        if item_details is not None:
+            for i in pack:
+                d = {"item_index": i, "samples": len(samples),
+                     "unmet_votes": 0, "rejected": 0, "unmet_parts": []}
+                seen_parts: set[str] = set()
+                for smp in samples:
+                    v = next((x for x in reversed(smp.get("verdicts") or [])
+                              if x.get("item_index") == i), None)
+                    if v is None or v.get("met") is not False:
+                        continue
+                    d["unmet_votes"] += 1
+                    d["rejected"] += 1 if v.get("rejected") else 0
+                    for part in _delivery_unmet_parts(v, staging,
+                                                      exec_digest,
+                                                      cite_cache):
+                        key = json.dumps(part, sort_keys=True)
+                        if key not in seen_parts:
+                            seen_parts.add(key)
+                            d["unmet_parts"].append(part)
+                item_details[i] = d
         for i in _delivery_unmet_majority(samples, n_items):
             evidence = ""
             for s in reversed(samples):
@@ -43362,35 +43699,36 @@ async def _run_delivery_prejudge(leerie_dir: Path, st: "State", caps: dict,
         # may have staged an input mid-run.
         ground_truth = _check_ground_truth_inputs(
             ds.get("ground_truth"), log_missing=False)
-    try:
-        exec_digest = _executed_commands_digest(
-            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
-            repro_command=(ground_truth or {}).get("repro_command"))
-    except Exception as e:
-        # The record is an optional add-on: a torn log or stat race
-        # must degrade to items-only judging, never take the whole
-        # gate down (review round 1).
-        log(f"  delivery gate: executed-commands digest failed "
-            f"({type(e).__name__}) — judging without the record")
-        exec_digest = ""
+    # The record is an optional add-on: a torn log or stat race must
+    # degrade, never take the whole gate down (review round 1).
+    exec_digest = _delivery_record(
+        leerie_dir, st, (ground_truth or {}).get("repro_command"))
     routing: dict = {}
     # Typed evidence (DESIGN §8 *Typed evidence for the delivery judge*):
     # the site-token hits `_run_phases` just recorded, and the
     # contract-literal check on this tree.
     evidence, ev_counts = _delivery_typed_evidence(
         st, leerie_dir, refresh_tokens=False)
+    details: dict = {}
+    judged_sha = await _branch_head_sha(str(staging))
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="pre", contract_ctx=contract_ctx,
             exec_digest=exec_digest, ground_truth=ground_truth,
-            routing=routing, typed_evidence=evidence)
+            routing=routing, typed_evidence=evidence,
+            item_details=details)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge crashed ({_brief_worker_exc(e)}); "
             "gate skipped (advisory)")
         return []
     gate: dict = {"unmet_before": unmet, "samples_before": n,
-                  "evidence_before": ev_counts}
+                  "evidence_before": ev_counts,
+                  # What final delivery detection reuses when the tree it
+                  # judges is still this commit (DESIGN §8 *Delivery
+                  # detection*).
+                  "judged_before": _delivery_judged_record(
+                      judged_sha, unmet, details)}
     if routing:
         gate["routed_before"] = routing
         _log_delivery_routing(routing)
@@ -43464,25 +43802,22 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
                         "sites": ds.get("sites") or []}
         ground_truth = _check_ground_truth_inputs(
             ds.get("ground_truth"), log_missing=False)
-    try:
-        exec_digest = _executed_commands_digest(
-            leerie_dir, Path(getattr(st, "repo_root", os.getcwd())),
-            repro_command=(ground_truth or {}).get("repro_command"))
-    except Exception as e:
-        log(f"  delivery gate recheck: executed-commands digest failed "
-            f"({type(e).__name__}) — judging without the record")
-        exec_digest = ""
+    exec_digest = _delivery_record(
+        leerie_dir, st, (ground_truth or {}).get("repro_command"))
     routing: dict = {}
     # Recomputed: the final conformer may have changed what the hits and
     # flags were about.
     evidence, ev_counts = _delivery_typed_evidence(
         st, leerie_dir, refresh_tokens=True)
+    details: dict = {}
+    judged_sha = await _branch_head_sha(str(staging))
     try:
         unmet, n, contract = await _delivery_judge_unmet(
             st.data.get("task", ""), items, staging, st, caps, models,
             efforts, phase_label="recheck", contract_ctx=contract_ctx,
             exec_digest=exec_digest, ground_truth=ground_truth,
-            routing=routing, typed_evidence=evidence)
+            routing=routing, typed_evidence=evidence,
+            item_details=details)
     except (WorkerError, subprocess.TimeoutExpired) as e:
         log(f"  delivery_judge recheck crashed ({_brief_worker_exc(e)}); "
             "residual unrecorded (advisory)")
@@ -43490,6 +43825,8 @@ async def _run_delivery_recheck(leerie_dir: Path, st: "State", caps: dict,
     gate["unmet_after"] = unmet
     gate["samples_after"] = n
     gate["evidence_after"] = ev_counts
+    gate["judged_after"] = _delivery_judged_record(judged_sha, unmet,
+                                                   details)
     if routing:
         gate["routed_after"] = routing
     if contract is not None:
@@ -44092,6 +44429,772 @@ def _format_pr_review_section(st: "State") -> str | None:
         "show is wrong."
         + (f" ({more} more not shown.)" if more > 0 else "") + "\n"
         + json.dumps(shown, indent=2, ensure_ascii=False))
+def _delivery_judged_record(sha: str, unmet: list[dict],
+                            details: dict) -> dict:
+    """One delivery-judge pass as final detection reads it: the commit it
+    judged, its confirmed-unmet list and its per-item details."""
+    return {"sha": sha or "", "unmet": [dict(u) for u in unmet],
+            "details": [details[i] for i in sorted(details)]}
+
+
+# --- F+: execution-backed delivery detection (DESIGN §8 *Delivery
+# detection*). Bench Q2 F+ (frozen 2026-10-26) on the N2e falsifier.
+#
+# The leads directory inside each falsifier checkout: the run's valid
+# held-out acceptance files, read-only and git-excluded. Never a probe.
+FALSIFIER_LEADS_DIR = ".leerie-falsifier"
+# The falsifier's turn cap, as benched.
+FALSIFIER_MAX_TURNS = 80
+# The one re-ask (bench Q2 F+R / Q8), sent into the same session.
+FALSIFIER_REASK_NOTE = (
+    "You returned could_not_demonstrate without having written AND run a "
+    "probe test file. Per your rules, whenever the item states anything "
+    "observable you must write ONE new probe test file through a public "
+    "entry point and run it with the repository's test runner before "
+    "answering. Do that now (the tree is the same finished tree), then "
+    "return the JSON object per your schema.")
+# The AST facts script the coupling check reads (JS/TS only, as benched).
+TEST_CASE_FACTS = ROOT / "scripts" / "test-case-facts.cjs"
+# Coupling policy over those facts (bench n2d coupling.py, frozen). Every
+# pattern reads code tokens, paths or shell commands — mechanical strings
+# (DESIGN §12), never prose.
+_COUPLING_TEXT_TOOLS_RE = re.compile(
+    r"(^|[\s;&|(])(grep|rg|egrep|cat|sed|awk|head|tail|wc)\b"
+    r"|\bgit\s+(grep|show|log\s+-p|diff)\b")
+_COUPLING_HARNESS_RE = re.compile(
+    r"(\.test-helper\.|\.test\.|\.spec\.|(^|/)(__tests__|__mocks__|test-utils"
+    r"|testing|fixtures?)(/|$)|(^|/)tests?/|setup-tests|vitest\.setup"
+    r"|test-setup)")
+_COUPLING_ENTRY_RE = re.compile(
+    r"(^|/)app/.*/(route|page|layout)\.(ts|tsx|js)$"
+    r"|^src/(proxy|middleware|instrumentation)\.ts$"
+    r"|(^|/)app/(route|page|layout)\.(ts|tsx)$")
+_COUPLING_NODE_BUILTINS = frozenset({
+    "fs", "path", "os", "url", "util", "child_process", "crypto", "events",
+    "stream", "assert", "buffer", "http", "https", "net", "zlib", "timers",
+    "process", "module", "worker_threads", "perf_hooks", "readline"})
+_COUPLING_DEEP_SEGMENTS = frozenset({"dist", "src", "lib", "internal",
+                                     "build", "esm", "cjs"})
+_COUPLING_PATHY_RE = re.compile(r"\.[A-Za-z]+$")
+# Runner names whose command, naming the probe, counts as having run it
+# (the re-ask predicate), beside the repository's own BLT verbs.
+_FALSIFIER_RUNNER_VERBS = frozenset({"vitest", "jest", "pytest", "npx",
+                                     "pnpm", "npm", "yarn", "bun", "bunx",
+                                     "go", "cargo", "rspec", "bundle"})
+# Paths at a commit, memoised per (repo, sha): the coupling check resolves
+# imports against them.
+_PATHS_AT: dict[tuple[str, str], set[str]] = {}
+
+
+def _git_paths_at(repo: str | Path, sha: str) -> set[str]:
+    key = (str(repo), sha)
+    if key not in _PATHS_AT:
+        r = subprocess.run(["git", "-C", str(repo), "ls-tree", "-r",
+                            "--name-only", "-z", sha],
+                           capture_output=True, text=True, check=False)
+        _PATHS_AT[key] = ({p for p in r.stdout.split("\0") if p}
+                          if r.returncode == 0 else set())
+    return _PATHS_AT[key]
+
+
+def _probe_case_facts(tree: str | Path, probe: str | Path,
+                      case: str) -> dict:
+    """The AST facts of one test case (`scripts/test-case-facts.cjs`, run
+    in the installed `tree` so `typescript` resolves from it), or
+    `{"error": ...}`."""
+    try:
+        r = subprocess.run(["node", str(TEST_CASE_FACTS), str(probe), case],
+                           cwd=str(tree), capture_output=True, text=True,
+                           timeout=120, check=False)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return {"error": f"facts_failed: {type(e).__name__}"}
+    try:
+        out = json.loads(r.stdout)
+    except ValueError:
+        return {"error": "facts_failed", "stderr": r.stderr[-500:]}
+    return out if isinstance(out, dict) else {"error": "facts_failed"}
+
+
+def _coupling_referenced_elsewhere(name: str, module: str, repo: str | Path,
+                                   sha: str) -> bool:
+    """True when a tracked non-harness file other than `module` names the
+    identifier `name` at `sha` (`git grep -w -F`)."""
+    r = subprocess.run(["git", "-C", str(repo), "grep", "-l", "-w", "-F",
+                        "-e", name, sha, "--"],
+                       capture_output=True, text=True, check=False)
+    files = [o.split(":", 1)[1] for o in r.stdout.split() if ":" in o]
+    return any(f != module and not _COUPLING_HARNESS_RE.search(f)
+               for f in files)
+
+
+def _falsifier_coupling(facts: dict, test_rel: str, repo: str | Path,
+                        sha: str, item_text: str) -> dict:
+    """The AST coupling check on one failing probe case (bench n2d, frozen):
+    `{"coupled": bool | None, "reasons": [...]}` — None when the facts could
+    not be read. Coupled when its reachable code reads a source or document
+    file's text (R1), evaluates code text (R2), or imports an in-repo symbol
+    no tracked non-test file other than its own module references and the
+    item does not name, or a deep package path (R3)."""
+    if not isinstance(facts, dict) or facts.get("error"):
+        return {"coupled": None, "reasons": [],
+                "error": (facts or {}).get("error") if isinstance(
+                    facts, dict) else "no facts"}
+    reasons: list[str] = []
+    for r in facts.get("reads") or []:
+        lits = [str(x) for x in (r.get("lits") or [])]
+        pathy = [x for x in lits if _COUPLING_PATHY_RE.search(x)]
+        if pathy and all(x.endswith(".json") for x in pathy):
+            continue
+        reasons.append(f"R1 {r.get('fn')}({','.join(lits)[:80]})")
+    for e in facts.get("execs") or []:
+        cmd = " ".join(str(x) for x in (e.get("lits") or []))
+        if _COUPLING_TEXT_TOOLS_RE.search(cmd):
+            reasons.append(f"R1 {e.get('fn')}({cmd[:80]})")
+    for ev in facts.get("evals") or []:
+        reasons.append(f"R2 {ev}")
+    if facts.get("vm_import"):
+        reasons.append("R2 vm")
+    aliases = _ts_path_aliases(repo, sha)
+    files: set[str] | None = None
+    for im in facts.get("imports") or []:
+        if not isinstance(im, dict) or im.get("typeOnly"):
+            continue
+        spec = str(im.get("spec") or "")
+        local = spec.startswith(".") or any(
+            p and spec.startswith(p) for p in aliases)
+        if not local:
+            bare = spec[5:] if spec.startswith("node:") else spec
+            parts = bare.split("/")
+            sub = parts[2:] if bare.startswith("@") else parts[1:]
+            if parts[0] in _COUPLING_NODE_BUILTINS:
+                continue
+            if any(x in _COUPLING_DEEP_SEGMENTS or x.startswith("_")
+                   for x in sub):
+                reasons.append(f"R3 deep-package {spec}")
+            continue
+        if files is None:
+            files = _git_paths_at(repo, sha)
+        mod = _js_resolve(spec, test_rel, files, aliases)
+        if (mod is None or _COUPLING_HARNESS_RE.search(mod)
+                or _COUPLING_ENTRY_RE.search(mod) or mod.endswith(".json")):
+            continue
+        name = str(im.get("imported") or "")
+        if name in ("*", "*dynamic", "default", ""):
+            continue          # whole-module use: the module's public surface
+        if re.search(r"(?<![\w$])" + re.escape(name) + r"(?![\w$])",
+                     item_text or ""):
+            continue          # the item itself names the symbol
+        if not _coupling_referenced_elsewhere(name, mod, repo, sha):
+            reasons.append(f"R3 {name} from {mod}")
+    return {"coupled": bool(reasons), "reasons": reasons}
+
+
+def _falsifier_case_id(ids: Iterable[str], case_name: str) -> str | None:
+    """The runner case ID (`<file> :: <full name>`) the falsifier's
+    `case_name` names: equal after whitespace/separator normalisation, or a
+    full name ending in it after a space (jest/vitest describe titles), a
+    dot (a JUnit `class.name`) or `::`. A load failure is never the case."""
+    def _n(x: str) -> str:
+        return _scope_norm(x.replace(" > ", " ").replace(" › ", " "))
+    want = _n(case_name or "")
+    if not want:
+        return None
+    for cid in ids:
+        full = cid.split(" :: ", 1)[1] if " :: " in cid else cid
+        if full.endswith("(file failed to load)"):
+            continue
+        n = _n(full)
+        if n == want or any(n.endswith(sep + want)
+                            for sep in (" ", ".", "::")):
+            return cid
+    return None
+
+
+def _log_session_id(log_path: Path) -> str | None:
+    """The CLI session a worker's stream log records (the last
+    `session_id` field of its JSON events) — what `--resume` takes."""
+    sid = None
+    try:
+        lines = log_path.read_text(errors="replace").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and isinstance(ev.get("session_id"), str):
+            sid = ev["session_id"]
+    return sid
+
+
+def _falsifier_probe_activity(log_path: Path, tree: str | Path,
+                              repo_root: Path) -> dict:
+    """From the falsifier's own transcript (`tool_use` records, never its
+    prose): did it write a test-shaped file outside the leads, and run a
+    command naming that file with a test runner? `{created, ran, files}`."""
+    globs = resolve_test_file_globs(repo_root)
+    root = str(tree).rstrip("/") + "/"
+    files: set[str] = set()
+    cmds: list[str] = []
+    for kind, inp, _res in _iter_log_tool_use(
+            log_path, kinds=("Write", "Edit", "MultiEdit", "Bash")):
+        if kind == "Bash":
+            cmds.append(str(inp.get("command") or ""))
+            continue
+        fp = str(inp.get("file_path") or "")
+        rel = fp[len(root):] if fp.startswith(root) else fp
+        if (rel and not rel.startswith(FALSIFIER_LEADS_DIR + "/")
+                and FALSIFIER_LEADS_DIR + "/" not in rel
+                and _is_test_file(rel, globs)):
+            files.add(rel)
+    verbs = set(_blt_verbs(repo_root)) | _FALSIFIER_RUNNER_VERBS
+
+    def _runs(cmd: str, rel: str) -> bool:
+        base = os.path.basename(rel)
+        if rel not in cmd and base not in cmd:
+            return False
+        for seg in _BLT_SEG_RE.split(cmd):
+            seg = seg[_BLT_SEG_LEAD_RE.match(seg).end():].strip()
+            toks = seg.split()
+            if toks and os.path.basename(toks[0]) in verbs:
+                return True
+        return False
+    ran = any(_runs(c, f) for c in cmds for f in files)
+    return {"created": bool(files), "ran": ran, "files": sorted(files)[:5]}
+
+
+def _falsifier_needs_reask(result: dict | None, activity: dict) -> bool:
+    """Re-ask once (bench F+R): a `could_not_demonstrate` from a sample that
+    did not both create and run a probe."""
+    return (isinstance(result, dict)
+            and result.get("verdict") == "could_not_demonstrate"
+            and not (activity.get("created") and activity.get("ran")))
+
+
+def _falsifier_checkout(st: "State", name: str, sha: str) -> Path | None:
+    """A ref-less checkout of `sha` (the writers' own kind, so no later fix
+    on another branch is reachable), or None."""
+    wt = st.run_dir / "worktrees" / name
+    _remove_acceptance_checkout(st, wt)
+    kind = _acceptance_writer_checkout(st, wt, sha)
+    if kind.startswith("failed"):
+        log(f"  delivery detection: no {name} checkout ({kind})")
+        return None
+    return wt
+
+
+def _git_exclude(wt: Path, patterns: Iterable[str]) -> None:
+    """Append `patterns` to the checkout's own `info/exclude`."""
+    r = subprocess.run(["git", "-C", str(wt), "rev-parse", "--git-path",
+                        "info/exclude"], capture_output=True, text=True,
+                       check=False)
+    if r.returncode != 0 or not r.stdout.strip():
+        return
+    ex = Path(r.stdout.strip())
+    if not ex.is_absolute():
+        ex = wt / ex
+    ex.parent.mkdir(parents=True, exist_ok=True)
+    have = ex.read_text().splitlines() if ex.is_file() else []
+    add = [p for p in patterns if p not in have]
+    if add:
+        with ex.open("a") as f:
+            f.write("\n" + "\n".join(add) + "\n")
+
+
+def _falsifier_place_leads(st: "State", wt: Path, sets: list[dict],
+                           task: str) -> tuple[list[str], list[str]]:
+    """Put the leads into a falsifier checkout: each valid held-out set's
+    files, read-only under `FALSIFIER_LEADS_DIR/acceptance/set-<k>/`, and
+    every file the task references that the checkout lacks (a report filed
+    for the task). Both git-excluded. Returns (lead files, referenced
+    files present)."""
+    leads = wt / FALSIFIER_LEADS_DIR
+    if leads.exists():
+        for p in leads.rglob("*"):
+            with contextlib.suppress(OSError):
+                p.chmod(0o755 if p.is_dir() else 0o644)
+        shutil.rmtree(leads, ignore_errors=True)
+    excludes = [f"/{FALSIFIER_LEADS_DIR}/"]
+    ctx: list[str] = []
+    for s_ in sets:
+        if not s_.get("valid") or not s_.get("dir"):
+            continue
+        for rel in ((s_.get("defect_files") or [])
+                    + (s_.get("control_files") or [])
+                    + (s_.get("support_files") or [])):
+            src = Path(s_["dir"]) / rel
+            if not src.is_file():
+                continue
+            dst = leads / "acceptance" / f"set-{s_.get('index')}" / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            dst.chmod(0o444)
+            ctx.append(str(dst.relative_to(wt)))
+    refs: list[str] = []
+    try:
+        referenced = _glob_task_references(task, st.repo_root)
+    except Exception:
+        referenced = []
+    for f in referenced:
+        rel = _repo_rel(f, st.repo_root)
+        dst = wt / rel
+        if not dst.exists() and Path(f).is_file():
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(f, dst)
+            excludes.append("/" + rel)
+        if dst.exists():
+            refs.append(rel)
+    _git_exclude(wt, excludes)
+    return ctx, refs
+
+
+def _falsifier_reset(wt: Path, sha: str) -> None:
+    """Back to the pristine final commit between samples: tracked files
+    reset, untracked ones removed (ignored ones — installed dependencies —
+    kept)."""
+    subprocess.run(["git", "-C", str(wt), "reset", "-q", "--hard", sha],
+                   capture_output=True, check=False)
+    subprocess.run(["git", "-C", str(wt), "clean", "-fdq"],
+                   capture_output=True, check=False)
+
+
+def _falsifier_user_prompt(task: str, item: dict, own: str | None,
+                           stat: str, ctx: list[str], refs: list[str],
+                           parts: list[dict], record: str) -> str:
+    """The falsifier's payload: the frozen F+ user prompt plus the
+    orchestrator's results record."""
+    lines = ["TASK:", task, "",
+             "Files the task references:",
+             *([f"- {r}" for r in refs] or ["(none)"]), "",
+             "THE ITEM TO CHECK:",
+             json.dumps({"item": item.get("item", ""),
+                         "source_ref": (item.get("span")
+                                        or item.get("source_ref") or "")},
+                        indent=1), ""]
+    if own:
+        lines += [f"START COMMIT of this run: {own}. Diff stat of the run's "
+                  f"own changes (`git diff {own}..HEAD`):",
+                  stat[-12000:] or "(empty)", ""]
+    else:
+        lines += ["START COMMIT of this run: unknown.", ""]
+    lines.append(
+        "HELD-OUT ACCEPTANCE FILES of this run (read-only leads):\n"
+        + "\n".join(f"- {x}" for x in ctx[:60]) if ctx
+        else "HELD-OUT ACCEPTANCE FILES: none for this run.")
+    lines.append("")
+    if parts:
+        lines += ["A REVIEWER'S OPEN PARTS for this item (hypotheses to test "
+                  "by execution):", json.dumps(parts, indent=1)[:6000], ""]
+    if record:
+        lines += ["EXECUTED COMMANDS RECORD (what this run's workers and the "
+                  "orchestrator itself ran on the way to this tree, with "
+                  "results; leads, not proof):", record[-12000:], ""]
+    lines.append(
+        "Your working directory is a disposable copy of the FINISHED tree. "
+        "Try to demonstrate this item is NOT delivered per your rules, and "
+        "return the JSON object per your schema.")
+    return "\n".join(lines)
+
+
+async def _falsifier_gates(st: "State", caps: dict, *, res: dict,
+                           lane: Path, confirm_tree: Path, sha: str,
+                           item_text: str, acc_paths: set[str],
+                           label: str) -> dict:
+    """Code decides whether a sample demonstrated anything (bench Q2 F+
+    G1–G5): `{gates{...}, confirmed, case_id?, coupling?}`. The probe is
+    copied into the pristine installed checkout of the final commit, run
+    there with the runner's serial flags, confirmed under B*
+    (`_confirm_still_failing`), read by the AST facts script, and removed."""
+    g: dict = {}
+    out: dict = {"gates": g, "confirmed": False}
+    if res.get("verdict") != "unmet_demonstrated":
+        return out
+    rel = _delivery_cite_rel(str(res.get("probe_path") or ""), lane)
+    safe = bool(rel) and not os.path.isabs(rel) and ".." not in Path(
+        rel).parts
+    g["new_file"] = bool(
+        safe and (lane / rel).is_file()
+        and subprocess.run(["git", "-C", str(lane), "cat-file", "-e",
+                            f"{sha}:{rel}"], capture_output=True,
+                           check=False).returncode != 0)
+    g["not_a_lead"] = bool(
+        safe and not rel.startswith(FALSIFIER_LEADS_DIR + "/")
+        and rel not in acc_paths)
+    cmd = (_acceptance_cmd(st, [rel], str(lane))
+           if g["new_file"] else None)
+    g["runnable"] = cmd is not None
+    quote = _scope_norm(str(res.get("item_span_quote") or ""))
+    g["item_quote"] = (len(quote.replace(" ", "")) >= 8
+                       and quote in _scope_norm(item_text))
+    if not all(g.values()):
+        return out
+    dst = confirm_tree / rel
+    if dst.exists():
+        g["placed"] = False
+        return out
+    made: list[Path] = []
+    parent = dst.parent
+    while not parent.exists():
+        made.append(parent)
+        parent = parent.parent
+    log_path = st.run_dir / "logs" / f"falsifier-confirm-{label}.log"
+    timeout = float(caps.get("worker_timeout_sec")
+                    or DEFAULT_CAPS["worker_timeout_sec"])
+    try:
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(lane / rel, dst)
+
+        async def _run(left: float) -> set[str] | None:
+            got = await _capture_failing_test_ids(
+                str(confirm_tree), cmd, st, caps, label=f"falsifier-{label}",
+                log_path=log_path, timeout=min(left, timeout), serial=True,
+                files=[rel])
+            return set(got["ids"]) if got is not None else None
+        first = await _run(timeout)
+        cid = _falsifier_case_id(first or (), str(res.get("case_name") or ""))
+        g["case_fails"] = cid is not None
+        if cid is None:
+            return out
+        out["case_id"] = cid
+        verdict = await _confirm_still_failing(
+            [cid], _run, caps, label=f"falsifier {label}")
+        g["fails_under_bstar"] = cid in verdict["confirmed"]
+        if not g["fails_under_bstar"]:
+            return out
+        title = cid.split(" :: ", 1)[1] if " :: " in cid else cid
+        facts = await asyncio.to_thread(_probe_case_facts, confirm_tree,
+                                        dst, title)
+        reach = _scope_norm(" ".join(str(x) for x in
+                                     (facts.get("reach_src") or [])))
+        aq = _scope_norm(str(res.get("assertion_quote") or ""))
+        g["assertion_in_case"] = len(aq) >= 6 and aq in reach
+        cp = await asyncio.to_thread(_falsifier_coupling, facts, rel,
+                                     st.repo_root, sha, item_text)
+        out["coupling"] = cp
+        g["not_coupled"] = cp.get("coupled") is False
+    finally:
+        with contextlib.suppress(OSError):
+            dst.unlink()
+        if made:
+            # Directories this placement created, with whatever the run left
+            # in them (a bytecode cache): none existed before.
+            shutil.rmtree(made[-1], ignore_errors=True)
+    out["confirmed"] = all(g.values())
+    return out
+
+
+def _ts_resolvable(tree: str | Path) -> bool:
+    """True when `node` can resolve the `typescript` package from `tree` —
+    the AST facts script's one dependency."""
+    try:
+        r = subprocess.run(
+            ["node", "-e",
+             "require.resolve('typescript',{paths:[process.cwd()]})"],
+            cwd=str(tree), capture_output=True, timeout=60, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
+async def _falsify_items(st: "State", caps: dict, models: dict,
+                         efforts: dict, *, sha: str, normalized: list[dict],
+                         indices: list[int], parts_by_idx: dict[int, list],
+                         record: str, progress: dict) -> dict:
+    """Run up to `falsifier_samples` falsifier samples per item in
+    `indices` on the final commit `sha`; record each item's samples into
+    `progress["items"]` (saved as they finish, so a resume skips them).
+    Returns the falsifier meta `{enabled, skipped?, lanes?}`."""
+    k = int(caps.get("falsifier_samples", DEFAULT_CAPS["falsifier_samples"]))
+    if k <= 0:
+        return {"enabled": False, "skipped": "falsifier_samples is 0"}
+    if not indices:
+        return {"enabled": False, "skipped": "no item for the falsifier"}
+    if not resolve_blt_scoped(st.repo_root).get("test"):
+        return {"enabled": False, "skipped": "no scoped test runner"}
+    done = progress.setdefault("items", {})
+    todo = [i for i in indices if str(i) not in done]
+    if not todo:
+        return {"enabled": True}
+    log_path = st.run_dir / "logs" / "falsifier-setup.log"
+    verbosity = st.data.get("verbosity", VERBOSITY_DEFAULT)
+    trees: list[Path] = []
+    confirm_tree = _falsifier_checkout(st, "falsifier-confirm", sha)
+    try:
+        if confirm_tree is None:
+            return {"enabled": False, "skipped": "no checkout of the final "
+                    "commit"}
+        trees.append(confirm_tree)
+        if not await _ensure_worktree_deps(
+                str(confirm_tree), st, caps, log_path=log_path,
+                verbosity=verbosity, label_prefix="falsifier-confirm",
+                log_prefix="delivery detection"):
+            return {"enabled": False, "skipped": "dependency install failed"}
+        if not _ts_resolvable(confirm_tree):
+            # The AST coupling check is JS/TS-only, as benched: without it
+            # no sample could ever be confirmed, so none is spawned.
+            return {"enabled": False, "skipped": "AST coupling check "
+                    "unavailable (no typescript resolvable from the tree)"}
+        sets = [s_ for s_ in ((st.data.get("acceptance") or {}).get("sets")
+                              or []) if isinstance(s_, dict)]
+        acc_paths = {rel for s_ in sets
+                     for rel in ((s_.get("defect_files") or [])
+                                 + (s_.get("control_files") or [])
+                                 + (s_.get("support_files") or []))}
+        task = st.data.get("task", "")
+        own = _acceptance_own_start(st)
+        n_lanes = max(1, min(int(caps.get("max_parallel") or 1), len(todo)))
+        lanes: asyncio.Queue = asyncio.Queue()
+        for n in range(n_lanes):
+            lane = _falsifier_checkout(st, f"falsifier-lane{n}", sha)
+            if lane is None:
+                continue
+            trees.append(lane)
+            if not await _ensure_worktree_deps(
+                    str(lane), st, caps, log_path=log_path,
+                    verbosity=verbosity, label_prefix=f"falsifier-lane{n}",
+                    log_prefix="delivery detection"):
+                continue
+            lanes.put_nowait(lane)
+        if lanes.empty():
+            return {"enabled": False, "skipped": "no falsifier checkout "
+                    "could be prepared"}
+        stat = ""
+        if own:
+            stat = subprocess.run(
+                ["git", "-C", str(st.repo_root), "diff", "--stat=160",
+                 f"{own}..{sha}"], capture_output=True, text=True,
+                check=False).stdout
+        confirm_lock = asyncio.Lock()
+
+        async def _sample(i: int, n: int, lane: Path) -> dict:
+            item = normalized[i]
+            _falsifier_reset(lane, sha)
+            ctx, refs = _falsifier_place_leads(st, lane, sets, task)
+            user = _falsifier_user_prompt(task, item, own, stat, ctx, refs,
+                                          parts_by_idx.get(i) or [], record)
+            sid = f"falsifier-i{i}-s{n}"
+            common = dict(system_prompt=_load_prompt("falsifier"),
+                          schema_key="falsifier", cwd=str(lane),
+                          allowed_tools=ACT_TOOLS,
+                          max_turns=FALSIFIER_MAX_TURNS, autonomous=True,
+                          caps=caps, st=st,
+                          model=models.get("falsifier", MODEL_DEFAULT),
+                          effort=efforts.get("falsifier"))
+            st.bump_workers(caps)
+            res = await claude_p(user_prompt=user, sid=sid, **common)
+            rec: dict = {"sample": n, "reasked": False}
+            activity = _falsifier_probe_activity(
+                st.run_dir / "logs" / f"{sid}.log", lane, st.repo_root)
+            rec["probe_activity"] = activity
+            if _falsifier_needs_reask(res, activity):
+                session = _log_session_id(st.run_dir / "logs" / f"{sid}.log")
+                if session:
+                    st.bump_workers(caps)
+                    res = await claude_p(user_prompt=FALSIFIER_REASK_NOTE,
+                                         sid=f"{sid}-reask",
+                                         resume_session=session, **common)
+                    rec["reasked"] = True
+            rec.update({key: res.get(key) for key in (
+                "verdict", "probe_path", "case_name", "assertion_quote",
+                "item_span_quote", "entry_point", "reason")})
+            async with confirm_lock:
+                rec.update(await _falsifier_gates(
+                    st, caps, res=res, lane=lane, confirm_tree=confirm_tree,
+                    sha=sha, item_text=item.get("item", ""),
+                    acc_paths=acc_paths, label=f"i{i}-s{n}"))
+            return rec
+
+        async def _item(i: int) -> None:
+            samples: list[dict] = []
+            confirmed = False
+            for n in range(k):
+                lane = await lanes.get()
+                try:
+                    rec = await _sample(i, n, lane)
+                except (WorkerError, subprocess.TimeoutExpired) as e:
+                    rec = {"sample": n, "error": _brief_worker_exc(e),
+                           "confirmed": False}
+                except Exception as e:
+                    # One sample's local failure (a copy, a git call) is no
+                    # evidence either way; the item's other samples still run.
+                    log(f"  delivery detection: falsifier sample i{i}-s{n} "
+                        f"raised {type(e).__name__}: {e}")
+                    rec = {"sample": n, "error": f"{type(e).__name__}: {e}",
+                           "confirmed": False}
+                finally:
+                    lanes.put_nowait(lane)
+                samples.append(rec)
+                if rec.get("confirmed"):
+                    # Any-of-k: a later sample cannot change the verdict.
+                    confirmed = True
+                    break
+            done[str(i)] = {"item_index": i, "confirmed": confirmed,
+                            "samples": samples}
+            gate = st.data.get("delivery_gate") or {}
+            gate["final_progress"] = progress
+            st.data["delivery_gate"] = gate
+            st.save()
+        log(f"  delivery detection: falsifier on {len(todo)} item(s), up to "
+            f"{k} sample(s) each, {lanes.qsize()} checkout(s)")
+        await _gather_or_cancel(*[_item(i) for i in todo])
+        return {"enabled": True, "lanes": n_lanes}
+    finally:
+        for wt in trees:
+            leads = wt / FALSIFIER_LEADS_DIR
+            if leads.exists():
+                for p in leads.rglob("*"):
+                    with contextlib.suppress(OSError):
+                        p.chmod(0o755 if p.is_dir() else 0o644)
+            _remove_acceptance_checkout(st, wt)
+
+
+async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
+                                  models: dict[str, str],
+                                  efforts: dict[str, str | None]) -> None:
+    """Final delivery detection on the tree that ships (DESIGN §8 *Delivery
+    detection*): an item is unmet when the cited judge confirms it unmet OR
+    any of its `falsifier_samples` falsifier samples is confirmed by code.
+    Runs after the held-out acceptance gate. The judge verdict of the
+    pre-pass or recheck is reused when it judged this same commit; otherwise
+    the judge runs again (items only — the contract stays with those
+    passes). Writes `delivery_gate.items` (per item) and
+    `delivery_gate.unmet_final`. Advisory: never stops a run."""
+    if st.data.get("skip_coverage_check"):
+        return
+    items = st.data.get("required_items") or []
+    if not items or not st.data.get("working_branch"):
+        return
+    gate = dict(st.data.get("delivery_gate") or {})
+    if "unmet_final" in gate:
+        log("phase 5: delivery detection already complete — skipping "
+            "(resume)")
+        return
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        return
+    sha = await _branch_head_sha(str(staging))
+    if not sha:
+        log("  delivery detection skipped — staging HEAD unreadable")
+        return
+    st.data["current_phase"] = "phase 5: delivery detection"
+    st.save()
+    normalized = [_delivery_norm_item(it) for it in items]
+    progress = gate.get("final_progress")
+    if not (isinstance(progress, dict) and progress.get("sha") == sha):
+        progress = {"sha": sha, "items": {}}
+    ds = st.data.get("defect_scope") or {}
+    record = _delivery_record(
+        leerie_dir, st, ((ds.get("ground_truth") or {}).get("repro_command")
+                         if isinstance(ds.get("ground_truth"), dict)
+                         else None))
+    judged = progress.get("judge")
+    if not isinstance(judged, dict):
+        for key in ("judged_after", "judged_before"):
+            rec = gate.get(key)
+            if isinstance(rec, dict) and rec.get("sha") == sha:
+                judged = {**rec, "source": key}
+                break
+    if not isinstance(judged, dict):
+        log(f"phase 5: delivery detection — judging {len(items)} required "
+            f"item(s) on the final tree {sha[:12]}")
+        details: dict = {}
+        # The same typed evidence the recheck hands its judge, recomputed
+        # on this tree.
+        evidence, _counts = _delivery_typed_evidence(st, leerie_dir,
+                                                     refresh_tokens=True)
+        try:
+            unmet, n, _c = await _delivery_judge_unmet(
+                st.data.get("task", ""), items, staging, st, caps, models,
+                efforts, phase_label="final", exec_digest=record,
+                typed_evidence=evidence, item_details=details)
+            judged = {**_delivery_judged_record(sha, unmet, details),
+                      "source": "final", "samples": n}
+        except (WorkerError, subprocess.TimeoutExpired) as e:
+            log(f"  delivery_judge (final) crashed ({_brief_worker_exc(e)}); "
+                "detection continues with the falsifier alone")
+            judged = {"sha": sha, "unmet": [], "details": [],
+                      "source": "final", "error": _brief_worker_exc(e)}
+    progress["judge"] = judged
+    gate["final_progress"] = progress
+    st.data["delivery_gate"] = gate
+    st.save()
+    details_by_idx = {d.get("item_index"): d
+                      for d in (judged.get("details") or [])
+                      if isinstance(d, dict)}
+    # Never double-routed: an external item belongs to the PR's "needs
+    # human verification", an untouched-paths item to code.
+    f_idx = [i for i, it in enumerate(normalized)
+             if it.get("verifiability") != "external"
+             and not (isinstance(it.get("untouched_paths"), list)
+                      and it["untouched_paths"])]
+    try:
+        fmeta = await _falsify_items(
+            st, caps, models, efforts, sha=sha, normalized=normalized,
+            indices=f_idx,
+            parts_by_idx={i: (details_by_idx.get(i) or {}).get("unmet_parts")
+                          or [] for i in f_idx},
+            record=record, progress=progress)
+    except Exception as e:
+        # Advisory: a broken falsifier setup leaves the judge's verdict.
+        log(f"  delivery detection: falsifier raised {type(e).__name__}: "
+            f"{e} — judge verdict only")
+        fmeta = {"enabled": False, "skipped": f"{type(e).__name__}: {e}"}
+    if fmeta.get("skipped"):
+        log(f"  delivery detection: falsifier not run — {fmeta['skipped']}")
+    judge_unmet = {u.get("item_index"): u for u in (judged.get("unmet") or [])
+                   if isinstance(u, dict)}
+    fitems = progress.get("items") or {}
+    rows: list[dict] = []
+    unmet_final: list[dict] = []
+    for i, it in enumerate(normalized):
+        row: dict = {"item_index": i, "item": it.get("item", "")[:500]}
+        if it.get("verifiability") == "external":
+            row.update(verdict="external", by=[])
+            rows.append(row)
+            continue
+        by: list[str] = []
+        evidence: list[str] = []
+        ju = judge_unmet.get(i)
+        if ju is not None:
+            by.append(ju.get("settled_by") or "judge")
+            if ju.get("evidence"):
+                evidence.append(str(ju["evidence"]))
+        fi = fitems.get(str(i))
+        if isinstance(fi, dict) and fi.get("confirmed"):
+            by.append("falsifier")
+            s_ = next((x for x in fi.get("samples") or []
+                       if x.get("confirmed")), {})
+            evidence.append(
+                f"falsifier probe {s_.get('probe_path')} — case "
+                f"{s_.get('case_id')} fails under B* on the final tree: "
+                f"{s_.get('reason') or ''}".strip())
+        row.update(verdict="unmet" if by else "met", by=by,
+                   judge=details_by_idx.get(i), falsifier=fi)
+        rows.append(row)
+        if by:
+            unmet_final.append({"item_index": i, "item": it.get("item", ""),
+                                "evidence": " | ".join(evidence)[:1200],
+                                "by": by})
+    gate = dict(st.data.get("delivery_gate") or {})
+    gate.pop("final_progress", None)
+    gate.update(items=rows, unmet_final=unmet_final, final_sha=sha,
+                final_judge={k_: judged.get(k_) for k_ in
+                             ("source", "samples", "error") if k_ in judged},
+                falsifier=fmeta)
+    st.data["delivery_gate"] = gate
+    st.save()
+    n_f = sum(1 for u in unmet_final if "falsifier" in u["by"])
+    if unmet_final:
+        log(f"  delivery detection: {len(unmet_final)} required item(s) "
+            f"unmet on the final tree ({n_f} shown by a confirmed falsifier "
+            "probe) — recorded in delivery_gate.unmet_final: "
+            + "; ".join(u["item"][:80] for u in unmet_final))
+    else:
+        log("  delivery detection: no required item shown unmet on the "
+            "final tree")
 
 
 async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
@@ -49817,6 +50920,14 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"acceptance gate raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
+    # Final delivery detection (DESIGN §8 *Delivery detection*): the cited
+    # judge OR a code-confirmed falsifier, on the tree that ships — after the
+    # acceptance gate, whose results the falsifier gets as leads.
+    try:
+        await _run_delivery_detection(leerie_dir, st, caps, models, efforts)
+    except Exception as e:
+        log(f"delivery detection raised {type(e).__name__}: {e} — surfaced "
+            "as advisory, finalize proceeds")
     # The repository's own merge checks on the final tree (DESIGN §9 *The
     # repository's own merge checks run too*): after the last step that can
     # change it. A red check makes delivery unmet (`_decide_outcome`); its

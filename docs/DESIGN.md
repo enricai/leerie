@@ -2798,7 +2798,7 @@ runs, 2000 trials each): the run is `unconverged` when any subtask settled
 `unconverged`, when the failing-test-ID diff confirmed a new failure (§9
 *Which failures are new*), when a measured held-out acceptance set still
 fails (a set typed `broken` by the set audit does not count — §8 *A set
-that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck, or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*) —
+that keeps failing is audited, and rewritten once*), when a required item is still unmet after the delivery recheck (or, once final delivery detection has run, unmet by the judge or a confirmed falsifier on the shipping tree — §8 *Delivery detection*), or when one of the repository's own merge checks is confirmed red on the final tree (§9 *The repository's own merge checks run too*) —
 consulted *before* the no-work check, so an empty branch that left work
 unfinished is never reported as "no work required". Otherwise an empty run
 branch is `no_work` and anything else is `done`. The outcome is mirrored
@@ -6346,7 +6346,80 @@ citing it. The record contains only what the run actually ran —
 conformers execute targeted falsifiers, not necessarily a full
 suite — so an item whose commands appear nowhere remains honestly
 unmet, and its remediation is the routed conformer RUNNING them,
-which the recheck's fresh record then shows.
+which the recheck's fresh record then shows. The record also carries
+the orchestrator's OWN results, which no worker log holds: the
+final-tree build/lint/test axes it measured, the test IDs B* confirmed
+newly failing, and each held-out acceptance set's final verdict
+(`_orchestrator_results_digest`), so an execution-shaped item is not
+called unmet merely because the run that settled it was leerie's own.
+
+**Delivery detection: a cited judge, or a falsifier that proves it
+by execution.** A read-only judge misses the defects that only
+execution shows — measured on the labelled delivery corpus (bench
+N2e, 14 pre-registered undelivered items, 52 delivered controls), the
+cited judge alone caught 3/14 (1/52 false unmet), and the misses were
+behaviours (a threshold, a delay, an input shape on a second code
+path) the code *reads* as delivered. So the final verdict on each item is a union of
+two detectors, each checked by code (bench Q2 *F+*, frozen design):
+
+- **The judge cites, and code checks every citation.** Each verdict
+  splits its item into typed `parts` (`static` / `behavioral`, status
+  `met` / `unmet` / `not_inspected`), each carrying `cites`
+  `{path, line_start, line_end, quote}`. Code verifies every quote as a
+  whitespace-normalised substring of that file at `HEAD`
+  (`_verify_delivery_cite`); `path: "RECORD"` is checked against the
+  executed-commands record; `path: "ABSENT"` / `"ABSENT:<pathspec>"`
+  is the absence claim, which code re-runs as `git grep -E` and accepts
+  only when nothing matches. A `met` whose parts are not all `met`, or
+  whose every part does not carry at least one verified citation, is
+  rejected — counted as an unmet vote — so a fabricated quote cannot buy
+  a `met`. The pack and the 2-of-3 dispute vote are unchanged; the
+  benched pipeline's per-item re-judge is not added (*Grouped judging*
+  measured it at 8.6× a pass for no catch). Unlike the benched verifier,
+  a real quote cited at the wrong lines still verifies: it is a
+  mislocation, not a fabrication.
+- **A falsifier tries to prove the item undelivered.** After the
+  held-out acceptance gate, on the tree that ships, every item the
+  judge is asked about (never an `external` item, never an
+  `untouched_paths` item — code and the PR's "needs human
+  verification" own those) gets up to `falsifier_samples` (3)
+  independent `falsifier` samples. Each runs in a disposable checkout
+  of the final commit with dependencies installed, and gets the item,
+  the run's own diff (start commit and stat), the run's valid
+  held-out acceptance files (read-only, git-excluded, leads only), the
+  judge's typed unmet parts for that item (hypotheses, never expected
+  values), and the orchestrator's results record. It writes ONE new
+  probe test through a public entry point, asserting the item's own
+  words, and runs it.
+- **Code decides whether a falsifier demonstrated anything.** A
+  sample is confirmed only when all of these hold: the probe is one
+  new file, outside the leads and not an acceptance file, that the
+  repository's scoped test runner can run; the item quote it claims to
+  test is verbatim in the item (after NFC/whitespace normalisation);
+  its named case fails under B* on a pristine installed copy of the
+  final commit (`_confirm_still_failing`, serial runner, so a load
+  flake never confirms); the failing assertion it quotes lies inside
+  that case's reachable code; and the AST coupling check is clean —
+  the case reads no source or document text, evaluates no code text,
+  and imports no symbol only tests use (`_falsifier_coupling`, over
+  the TypeScript AST of the probe, policy in Python). The coupling
+  check is JS/TS-only, as benched: on a repository where it cannot run
+  (no `typescript` package resolvable from the installed tree) the
+  falsifier is not spawned and detection is the judge alone.
+- **One re-ask.** A sample that answers `could_not_demonstrate`
+  without having written a test-shaped file and run a command naming
+  it — read mechanically from its own transcript's `tool_use` records
+  — is resumed once in the same session and tree with a fixed note.
+
+An item is unmet when the judge confirmed it unmet OR any of its
+samples is confirmed (`delivery_gate.unmet_final`, with the per-item
+record in `delivery_gate.items`); the samples of one item run in order
+and stop at the first confirm, which cannot change an any-of-k verdict.
+Measured (bench Q2 F+, held-out, pooled over three fresh corpora, 31
+target / 148 control items, frozen labels): F+ k=3 caught 23/31 =
+74.2% with false unmet 12/148 = 8.1%; on the adjudicated labels 27/35 =
+77.1% and 8/144 = 5.6%; with the re-ask, 24/31 and 13/148 (adjudicated
+28/35 and 9/144). One sample alone caught 19/31.
 
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,

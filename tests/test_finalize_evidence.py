@@ -293,7 +293,16 @@ def _judge_capture(leerie, monkeypatch):
     async def fake(**kw):
         assert kw["schema_key"] == "delivery_judge"
         prompts.append(kw["user_prompt"])
-        return {"verdicts": [{"item_index": 0, "met": True, "evidence": "e"}]}
+        # A met the citation screen verifies (DESIGN §8 *Delivery
+        # detection*): an absence claim `git grep` confirms on any tree.
+        return {"verdicts": [{"item_index": 0, "met": True, "evidence": "e",
+                              "parts": [{"requirement": "never name it",
+                                         "kind": "static", "status": "met",
+                                         "cites": [{"path": "ABSENT",
+                                                    "line_start": 0,
+                                                    "line_end": 0,
+                                                    "quote": "zz-never-zz"}]
+                                         }]}]}
     monkeypatch.setattr(leerie, "claude_p", fake)
     return prompts
 

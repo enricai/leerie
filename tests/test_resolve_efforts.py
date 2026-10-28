@@ -299,6 +299,9 @@ def test_judgment_workers_pinned_set(leerie):
         # Types a worker-flagged contract (DESIGN §8 *Typed evidence for
         # the delivery judge*), benched at medium.
         "contract_extractor",
+        # The delivery falsifier (DESIGN §8 *Delivery detection*), benched
+        # at medium (Q2 F+).
+        "falsifier",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

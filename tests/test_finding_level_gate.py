@@ -370,7 +370,8 @@ def test_digest_failure_degrades_to_items_only_judging(
     leerie_root = tmp_path / ".leerie"
     run_id = "digest-degrade"
     run_dir = leerie_root / "runs" / run_id
-    (run_dir / "worktrees" / "staging").mkdir(parents=True)
+    from tests.stub_helpers import _delivery_tree, _judge_verdict
+    _delivery_tree(run_dir / "worktrees" / "staging")
     st = leerie.State(leerie_root, run_id)
     st.data = {"task": "t", "worker_count": 0, "working_branch": "main",
                "required_items": [{"item": "a required thing",
@@ -380,8 +381,7 @@ def test_digest_failure_degrades_to_items_only_judging(
 
     async def fake_claude_p(**kwargs):
         calls.append(kwargs)
-        return {"verdicts": [{"item_index": 0, "met": True,
-                              "evidence": "ok"}]}
+        return {"verdicts": [_judge_verdict(0, True, "ok")]}
 
     monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
     unmet = _a.run(leerie._run_delivery_prejudge(

@@ -32,7 +32,7 @@ WORKERS = ("classifier", "planner", "reconciler", "plan_overlap_judge",
            "no_work_judge", "delivery_judge", "defect_scope_auditor",
            "rebaser", "acceptance_writer", "set_auditor", "surrogate_fixer",
            "ci_checks", "scope_judge", "pr_reviewer",
-           "contract_extractor")
+           "contract_extractor", "falsifier")
 
 # The expected default per worker, with no overrides. Every worker now
 # defaults to sonnet — see the module docstring.
@@ -75,6 +75,8 @@ DEFAULTS = {
     # (DESIGN §12; bench N2f). The contract extractor falls through.
     "pr_reviewer": "opus",
     "contract_extractor": "sonnet",
+    # The delivery falsifier (DESIGN §8 *Delivery detection*): MODEL_DEFAULT.
+    "falsifier": "sonnet",
 }
 
 
