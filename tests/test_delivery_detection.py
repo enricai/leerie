@@ -1187,3 +1187,66 @@ def test_a_test_outcome_item_is_settled_in_code_never_re_driven(
                 if e["source"] == "test_outcome"]
     assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
     assert any("newly failing" in r for r in st.data["outcome_reasons"])
+
+
+def test_an_unsettled_candidate_is_unknown_and_reaches_the_pr(
+        leerie, tmp_path, monkeypatch):
+    """Review round 4 M2: a "no regressions" item settled `met` while B*
+    left a candidate new failure without a verdict (the base checkout could
+    not be created). Driven from the real `_confirm_new_failures` with the
+    base worktree's `_none` runner, through `_run_delivery_detection`, the
+    PR's end-state section and `_decide_outcome`."""
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                          judged=False, k=0)
+    item = {"item": "No regressions: the full suite shows no new failures",
+            "span": "S9", "verifiability": "execution",
+            "check": "test_id_diff"}
+    st.data["required_items"] = [item]
+    # Only the test outcome is under test: no failing held-out set.
+    st.data.pop("acceptance")
+    _falsifier_stub(leerie, monkeypatch, st, lambda kw, n: {})
+    tree = asyncio.run(leerie._worktree_tree_sha(
+        str(st.run_dir / "worktrees" / "staging")))
+    cand = "tests/a.test.ts > newly broken"
+
+    async def gate(*a, **k):
+        return {"timed_out": False, "waited_sec": 0}
+    monkeypatch.setattr(leerie, "_confirm_gate", gate)
+
+    async def none(_t):
+        return None
+    v = asyncio.run(leerie._confirm_new_failures(
+        [cand], none, none, dict(caps), label="final"))
+    assert v["new"] == [] and v["no_verdict"] == [cand]
+    v.update(tree_sha=tree, base_unavailable=True)
+    st.data["test_id_diff"] = v
+    st.save()
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    row = st.data["delivery_gate"]["items"][0]
+    assert row["verdict"] == "unknown"
+    assert cand in row["reason"] and "base checkout" in row["reason"]
+    gap = [e for e in st.data["needs_human_verification"]
+           if e["source"] == "test_outcome"]
+    assert len(gap) == 1
+    assert cand in gap[0]["detail"] and item["item"] in gap[0]["detail"]
+    assert leerie._decide_outcome(st, any_commits=True) == "done"
+    pr = leerie._format_pr_end_state_section(st.data)
+    section = pr.split("## Needs human verification", 1)[1]
+    assert cand in section and "no rerun produced a verdict" in section
+    # The same candidate failing on every base rerun is pre_existing:
+    # confirmed not this run's, so met, and the gap is cleared.
+    async def red(_t):
+        return {cand}
+    v = asyncio.run(leerie._confirm_new_failures(
+        [cand], red, red, dict(caps), label="final"))
+    assert v["pre_existing"] == [cand]
+    v["tree_sha"] = tree
+    st.data["test_id_diff"] = v
+    st.data.pop("delivery_gate")
+    st.save()
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    assert st.data["delivery_gate"]["items"][0]["verdict"] == "met"
+    assert not [e for e in st.data["needs_human_verification"]
+                if e["source"] == "test_outcome"]

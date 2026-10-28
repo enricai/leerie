@@ -22,6 +22,7 @@ MODELS = {"delivery_judge": "sonnet", "delivery_ratchet": "sonnet",
           "verifiability_classifier": "sonnet"}
 EFFORTS = {"delivery_judge": "medium", "delivery_ratchet": "medium",
            "verifiability_classifier": "medium"}
+CAND = "tests/a.test.ts > newly broken"
 NO_REGRESSIONS = ("No regressions: final-tree full test run must not show "
                   "new failures")
 
@@ -51,7 +52,9 @@ class TestVerdict:
     def test_met_unmet_unknown(self, leerie, tmp_path):
         st = _state(leerie, tmp_path)
         v = leerie._test_outcome_verdict
-        assert v(st, "t1") == {"verdict": "unknown", "new": []}
+        assert v(st, "t1") == {
+            "verdict": "unknown", "new": [],
+            "reason": "no failing-test-ID diff was recorded"}
         st.data["test_id_diff"] = {"new": [], "tree_sha": "t1"}
         assert v(st, "t1")["verdict"] == "met"
         # The tree moved since the diff: no evidence for this tree.
@@ -60,7 +63,59 @@ class TestVerdict:
                                    "ids_unknown": True}
         assert v(st, "t1")["verdict"] == "unknown"
         st.data["test_id_diff"] = {"new": ["a.test.ts > b"], "tree_sha": "t0"}
-        assert v(st, "t1") == {"verdict": "unmet", "new": ["a.test.ts > b"]}
+        assert v(st, "t1") == {"verdict": "unmet", "new": ["a.test.ts > b"],
+                               "reason": ""}
+
+    def test_met_only_when_every_candidate_is_pre_existing(self, leerie,
+                                                           tmp_path,
+                                                           monkeypatch):
+        """Review round 4 M2, the reviewer's driver: the real
+        `_confirm_new_failures` with no verdict from any rerun (the base
+        worktree could not be created) and with the budget gone before a
+        pair ran left `new` empty, and the verdict read `met`."""
+        async def gate(*a, **k):
+            return {"timed_out": False, "waited_sec": 0}
+        monkeypatch.setattr(leerie, "_confirm_gate", gate)
+
+        async def none(_t):
+            return None
+
+        async def red(_t):
+            return {CAND}
+        caps = dict(leerie.DEFAULT_CAPS, confirm_gate_max_wait_sec=0)
+        st = _state(leerie, tmp_path)
+        v = leerie._test_outcome_verdict
+
+        def diff(rb, rf, **over):
+            d = asyncio.run(leerie._confirm_new_failures(
+                [CAND], rb, rf, dict(caps, **over), label="final"))
+            d["tree_sha"] = "T"
+            return d
+        no_base = {**diff(none, none), "base_unavailable": True}
+        assert no_base["new"] == [] and no_base["no_verdict"] == [CAND]
+        st.data["test_id_diff"] = no_base
+        got = v(st, "T")
+        assert got["verdict"] == "unknown"
+        assert "base checkout" in got["reason"] and CAND in got["reason"]
+        starved = diff(none, none, confirm_budget_sec=0)
+        assert starved["budget_exhausted"] and starved["pairs_run"] == 0
+        st.data["test_id_diff"] = starved
+        got = v(st, "T")
+        assert got["verdict"] == "unknown"
+        assert "budget ran out after 0 of" in got["reason"]
+        st.data["test_id_diff"] = {**diff(none, none),
+                                   "no_verdict": [],
+                                   "resource_affected": [CAND]}
+        got = v(st, "T")
+        assert got["verdict"] == "unknown" and "disagreed" in got["reason"]
+        # Every candidate failing on every base rerun: met.
+        st.data["test_id_diff"] = diff(red, red)
+        assert st.data["test_id_diff"]["pre_existing"] == [CAND]
+        assert v(st, "T") == {"verdict": "met", "new": [], "reason": ""}
+        # No candidates at all: met.
+        st.data["test_id_diff"] = diff(none, none) | {"candidates": [],
+                                                      "no_verdict": []}
+        assert v(st, "T")["verdict"] == "met"
 
 
 class TestDropParts:
@@ -130,7 +185,8 @@ class TestGate:
         assert [e["item_index"] for e in entries] == [0]
         assert entries[0]["test_outcome_parts"] == [NO_REGRESSIONS]
         assert routing["test_outcome"] == [
-            {"item_index": 1, "verdict": "unmet", "new": ["x.test.ts > y"]}]
+            {"item_index": 1, "verdict": "unmet", "new": ["x.test.ts > y"],
+             "reason": ""}]
         # Unmet by the diff, but never confirmed: nothing for a fixer.
         assert unmet == []
 
@@ -141,6 +197,11 @@ class TestGate:
         entries = [e for e in st.data["needs_human_verification"]
                    if e["source"] == "test_outcome"]
         assert len(entries) == 1 and NO_REGRESSIONS in entries[0]["detail"]
+        leerie._set_test_outcome_gap(st, [NO_REGRESSIONS], "why it is open")
+        entries = [e for e in st.data["needs_human_verification"]
+                   if e["source"] == "test_outcome"]
+        assert len(entries) == 1
+        assert entries[0]["detail"].startswith("why it is open, so the run")
         groups = leerie._pr_needs_human(st.data, lambda sid: True)
         assert any(NO_REGRESSIONS in line
                    for lines in groups.values() for line in lines)

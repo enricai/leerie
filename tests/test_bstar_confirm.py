@@ -724,3 +724,35 @@ def test_intermittent_typing_conditions(leerie, change, typed):
     assert bool(rows) is typed
     if typed:
         assert rows[0]["final_failed"] == 2 and rows[0]["final_runs"] == 24
+
+
+def test_base_checkout_failure_is_recorded_and_reads_unknown(
+        leerie, e3_repo, monkeypatch):
+    """Review round 4 M2: when the confirm's base worktree cannot be
+    created every candidate is `no_verdict`, the diff says
+    `base_unavailable`, and the test outcome is unknown — never met."""
+    monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
+
+    async def disc(*a, **kw):
+        return {"failed_ids": [], "fail_counts": {}, "id_files": {},
+                "coupled": {}, "repeats_run": 0, "_runs": []}
+    monkeypatch.setattr(leerie, "_intermittent_discovery", disc)
+
+    async def add_fails(*a, **k):
+        return subprocess.CompletedProcess(["git"], 128, "", "no space")
+    monkeypatch.setattr(leerie, "_worktree_add_detached_async", add_fails)
+    st, staging = e3_repo["st"], e3_repo["staging"]
+    st.data["baseline_failing_ids"] = []
+    stable = "tests/test_suite.py :: tests.test_suite.test_stable"
+    post = {"tests": {"ran": True, "measured": True, "passed": False,
+                      "command": CMD, "failing_ids": [stable],
+                      "failing_id_files": {stable: "tests/test_suite.py"}}}
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, _caps(leerie), str(staging), post,
+        log_path=st.run_dir / "logs" / "t.log", label="final-r0"))
+    assert v["new"] == [] and v["no_verdict"] == [stable]
+    assert v["base_unavailable"] is True
+    got = leerie._test_outcome_verdict(
+        st, asyncio.run(leerie._worktree_tree_sha(str(staging))))
+    assert got["verdict"] == "unknown"
+    assert "base checkout" in got["reason"] and stable in got["reason"]

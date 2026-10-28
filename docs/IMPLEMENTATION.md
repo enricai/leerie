@@ -6744,10 +6744,16 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   becomes `met: false, rejected: <no_parts | part_not_met | part_uncited>`.
 - **Test outcomes** (DESIGN §8 *A test outcome is the failing-test-ID
   diff's to settle*). `_test_outcome_verdict(st, tree_sha)` →
-  `{verdict: met | unmet | unknown, new[]}` from `state.data
+  `{verdict: met | unmet | unknown, new[], reason}` from `state.data
   ["test_id_diff"]`: `unmet` when `new` is non-empty; `unknown` when there
   is no diff, it carries `ids_unknown`, or its `tree_sha` is not
-  `tree_sha`; else `met`. `_delivery_judge_unmet` never judges a
+  `tree_sha`; `unknown` too when any candidate is in `no_verdict` or
+  `resource_affected`, when `budget_exhausted` is set, or when
+  `base_unavailable` is set (`_confirm_final_test_failures` could not
+  create the base worktree); `met` only when `candidates` is empty or every
+  candidate is in `pre_existing`. `reason` is `""` for `met`/`unmet`, else
+  a one-line mechanical summary (`_test_outcome_unknown_reason`) naming
+  the unsettled candidates. `_delivery_judge_unmet` never judges a
   `_test_id_diff_item`: it goes to `routing["test_outcome"]` as
   `{item_index, verdict, new[]}` and never to `confirmed`. Each judge
   pack's entries carry `test_outcome_parts` (`_test_outcome_parts(item)`)
@@ -6758,10 +6764,12 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   or none remains (`settled_by: "test_id_diff"`, no citation check).
   `_run_delivery_detection`'s row for a `_test_id_diff_item` is
   `{verdict: met | unmet | unknown, by: ["test_id_diff"], new[]}`, never
-  in `unmet_final` and never falsified. `_set_test_outcome_gap(st,
-  items)` keeps at most one `needs_human_verification` entry `{source:
-  "test_outcome", detail}` naming the items whose verdict is `unknown`
-  (cleared when none is).
+  in `unmet_final` and never falsified; an `unknown` row also carries
+  `reason`. `_set_test_outcome_gap(st, items, reason="")` keeps at most
+  one `needs_human_verification` entry `{source: "test_outcome", detail}`
+  naming the items whose verdict is `unknown` and the verdict's `reason`
+  (cleared when none is); `_decide_outcome` does not read it (a
+  human-verification gap is not unfinished work).
 - **Falsifier** (`_falsify_items`). Items: every index whose item is not
   `verifiability: external`, not a `_test_id_diff_item`, and carries no
   `untouched_paths`. Skipped
@@ -9568,7 +9576,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
 | `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
-| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed); `new` non-empty makes the outcome `unconverged`. |
+| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`); `new` non-empty makes the outcome `unconverged`. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |

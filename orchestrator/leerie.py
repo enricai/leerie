@@ -38859,6 +38859,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
             return None
         verdict = await _confirm_new_failures(all_cand, _none, _none, caps,
                                               label=label)
+        verdict["base_unavailable"] = True
     else:
         try:
             await _ensure_worktree_deps(
@@ -41013,22 +41014,62 @@ def _test_outcome_parts(it: object) -> list[str]:
             and c.get("part") in parts]
 
 
+def _test_outcome_unknown_reason(diff: dict, tree_sha: str | None) -> str:
+    """Why the B* diff `diff` cannot settle "no existing test newly fails"
+    on `tree_sha` as met, or "" when it can: met needs a diff of this very
+    tree whose candidates are none, or all `pre_existing` (DESIGN §8 *A
+    test outcome is the failing-test-ID diff's to settle*). A candidate
+    that failed on the final tree and was never measured against the base
+    is not confirmed absent."""
+    if diff.get("ids_unknown"):
+        return "one side's failing test IDs were unknown, so there is no diff"
+    if not tree_sha or diff.get("tree_sha") != tree_sha:
+        return "the failing-test-ID diff is not of the final tree"
+    pre = {str(x) for x in diff.get("pre_existing") or []}
+    open_ = [str(c) for c in diff.get("candidates") or [] if str(c) not in pre]
+    if not open_ and not diff.get("budget_exhausted"):
+        return ""
+    why: list[str] = []
+    if diff.get("base_unavailable"):
+        why.append("the base checkout for the comparison could not be "
+                   "created")
+    if diff.get("budget_exhausted"):
+        why.append(f"the confirm budget ran out after "
+                   f"{diff.get('pairs_run', 0)} of "
+                   f"{diff.get('pairs_required', 0)} base/final rerun pair(s)")
+    for key, what in (("no_verdict", "no rerun produced a verdict"),
+                      ("resource_affected", "reruns disagreed")):
+        ids = [str(x) for x in diff.get(key) or []]
+        if ids:
+            why.append(f"{what} for {len(ids)} candidate(s): "
+                       + ", ".join(ids[:5])
+                       + (f" (+{len(ids) - 5} more)" if len(ids) > 5 else ""))
+    if not why:
+        why.append(f"{len(open_)} candidate(s) not settled: "
+                   + ", ".join(open_[:5]))
+    return ("test(s) failing on the final tree were not confirmed against "
+            "the base — " + "; ".join(why))
+
+
 def _test_outcome_verdict(st: "State", tree_sha: str | None) -> dict:
-    """`{verdict, new}` of "no existing test newly fails" on the tree whose
-    content sha is `tree_sha`, from the B* failing-test-ID diff
-    (`test_id_diff`): `unmet` when it confirmed new failing IDs, `met` when
-    it confirmed none on this tree, `unknown` when there is no diff for this
-    tree — none recorded, one side's IDs unknown, or the tree moved since."""
+    """`{verdict, new, reason}` of "no existing test newly fails" on the
+    tree whose content sha is `tree_sha`, from the B* failing-test-ID diff
+    (`test_id_diff`): `unmet` when it confirmed new failing IDs, `met` only
+    when it had no candidates on this tree or every one is `pre_existing`,
+    `unknown` otherwise — none recorded, one side's IDs unknown, the tree
+    moved since, or a candidate B* left unsettled (`no_verdict`,
+    `resource_affected`, budget exhausted, base unavailable)."""
     diff = st.data.get("test_id_diff")
     if not isinstance(diff, dict):
-        return {"verdict": "unknown", "new": []}
+        return {"verdict": "unknown", "new": [],
+                "reason": "no failing-test-ID diff was recorded"}
     new = [str(x) for x in diff.get("new") or []]
     if new:
-        return {"verdict": "unmet", "new": new}
-    if diff.get("ids_unknown") or not tree_sha \
-            or diff.get("tree_sha") != tree_sha:
-        return {"verdict": "unknown", "new": []}
-    return {"verdict": "met", "new": []}
+        return {"verdict": "unmet", "new": new, "reason": ""}
+    reason = _test_outcome_unknown_reason(diff, tree_sha)
+    if reason:
+        return {"verdict": "unknown", "new": [], "reason": reason}
+    return {"verdict": "met", "new": [], "reason": ""}
 
 
 def _drop_test_outcome_parts(v: dict) -> dict:
@@ -41058,19 +41099,22 @@ def _drop_test_outcome_parts(v: dict) -> dict:
 TEST_OUTCOME_GAP_SOURCE = "test_outcome"
 
 
-def _set_test_outcome_gap(st: "State", items: list[str]) -> None:
+def _set_test_outcome_gap(st: "State", items: list[str],
+                          reason: str = "") -> None:
     """Keep at most one "Needs human verification" entry naming the required
-    items the failing-test-ID diff could not settle (verdict `unknown`);
-    cleared when there are none."""
+    items the failing-test-ID diff could not settle (verdict `unknown`) and
+    why (`reason`, from `_test_outcome_verdict`); cleared when there are
+    none."""
     entries = [e for e in (st.data.get("needs_human_verification") or [])
                if not (isinstance(e, dict)
                        and e.get("source") == TEST_OUTCOME_GAP_SOURCE)]
     if items:
         entries.append({
             "source": TEST_OUTCOME_GAP_SOURCE,
-            "detail": ("no failing-test-ID diff on the final tree, so the "
-                       "run could not check that no existing test newly "
-                       "fails, as required by: " + "; ".join(
+            "detail": ((reason or "no failing-test-ID diff on the final "
+                        "tree")[:600]
+                       + ", so the run could not check that no existing "
+                       "test newly fails, as required by: " + "; ".join(
                            x[:200] for x in items))})
     if entries != (st.data.get("needs_human_verification") or []):
         st.data["needs_human_verification"] = entries
@@ -48559,7 +48603,9 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             # Never in unmet_final: confirmed new IDs already make the run
             # unconverged, and no implementer is sent a test outcome.
             row.update(verdict=tid["verdict"], by=["test_id_diff"],
-                       new=tid["new"])
+                       new=tid["new"],
+                       **({"reason": tid["reason"]} if tid.get("reason")
+                          else {}))
             rows.append(row)
             if tid["verdict"] == "unknown":
                 unknown_tests.append(it.get("item", ""))
@@ -48593,7 +48639,8 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             unmet_final.append({"item_index": i, "item": it.get("item", ""),
                                 "evidence": " | ".join(evidence)[:1200],
                                 "by": by})
-    _set_test_outcome_gap(st, unknown_tests)
+    _set_test_outcome_gap(st, unknown_tests,
+                          (tid or {}).get("reason") or "")
     gate = dict(st.data.get("delivery_gate") or {})
     gate.pop("final_progress", None)
     gate.update(items=rows, unmet_final=unmet_final, final_sha=sha,

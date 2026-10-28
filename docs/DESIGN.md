@@ -6457,12 +6457,24 @@ the right reason in 2 of 34 samples. So the gate judges in packs
   An item typed `execution` / `check: test_id_diff` is never judged, never
   falsified and never sent to an implementer: code reads the final tree's
   failing-test-ID diff (§9 *Which failures are new*) — **met** when B\*
-  confirmed no new failing ID on the tree being judged, **unmet** when it
-  confirmed new ones, **unknown** when there is no diff for this tree (no
-  IDs on either side, no measurement, or a tree that moved since). Unmet
-  needs nothing more: the confirmed new IDs already make the run
-  `unconverged` (§6) and already drive the final conformance's next round.
-  Unknown goes to the PR's "Needs human verification" list. Inside a
+  confirmed no new failing ID on the tree being judged: the diff had no
+  candidates, or every candidate failed on every base rerun
+  (`pre_existing`); **unmet** when it confirmed new ones; **unknown** in
+  every other case — no diff for this tree (no IDs on either side, no
+  measurement, or a tree that moved since), or a candidate B\* never
+  settled: no rerun produced a verdict for it (`no_verdict`, which is what
+  every candidate gets when the base checkout could not be created), its
+  reruns disagreed (`resource_affected`), or the confirm budget ran out
+  before every pair ran. A candidate that failed on the final tree and was
+  never measured on the base is not confirmed absent; reading it as met
+  shipped a "no regressions" item as met with the candidate never checked
+  (review round 4 M2). Unmet needs nothing more: the confirmed new IDs
+  already make the run `unconverged` (§6) and already drive the final
+  conformance's next round. Unknown goes to the PR's "Needs human
+  verification" list with its reason (which candidates, and why B\* could
+  not settle them); like any human-verification gap it is not unfinished
+  work, so it does not by itself change the run outcome, but the item's
+  row reads `unknown`, never `met`. Inside a
   mixed item the judge types such a part `kind: test_outcome` (the
   payload names the classifier's `part_checks` for it), and code drops
   that part from the verdict before it is checked or voted: the item is
