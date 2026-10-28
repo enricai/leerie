@@ -302,6 +302,10 @@ def test_judgment_workers_pinned_set(leerie):
         # The delivery falsifier (DESIGN §8 *Delivery detection*), benched
         # at medium (Q2 F+).
         "falsifier",
+        # The delivery ratchet's classifier and judge (DESIGN §8 *A repair
+        # that regresses met work is rolled back*), benched at medium (Q4).
+        "verifiability_classifier",
+        "delivery_ratchet",
     }
     # implementer/conformer — the code-writing workers — are pinned to
     # 'low' (cost/latency), distinct from the judgment workers' 'medium'

@@ -789,6 +789,8 @@ leerie/
 │   ├── pr_reviewer.md             advisory whole-PR review before the final conformer (DESIGN §9 "An advisory whole-PR review feeds the final conformer")
 │   ├── contract_extractor.md      types one worker-flagged contract risk (DESIGN §8 "Typed evidence for the delivery judge")
 │   ├── falsifier.md               tries to prove one required item undelivered with a probe test on the final tree (DESIGN §8 "Delivery detection")
+│   ├── verifiability_classifier.md types each required item in_tree or execution for the delivery ratchet (DESIGN §8 "A repair that regresses met work is rolled back")
+│   ├── delivery_ratchet.md        addendum to delivery_judge.md: re-verifying met items after a repair, with evidence_files (same section)
 │   ├── rebaser.md                 finalize-time rebase-onto-base worker (DESIGN §6 "Rebase-onto-base before push"; scoped, fully-agentic §12 exception)
 │   ├── pr_writer.md               Phase 6 PR title + body author worker
 │   ├── patch_generator.md         post-run self-heal worker — proposes minimal system-prompt patches against failing call_types
@@ -2109,6 +2111,8 @@ judgment/workhorse split once existed and why it no longer applies.
 | scope_judge | sonnet | on a report-pointer task, types each own-start-failing defect case of a valid held-out set (`origin`, typed params, `span_quote`) and the report's stated ranges; code decides which cases count as work (DESIGN §8 *A task that points at a report is bounded by the report's own scenarios*) — read-only judgment, `medium` effort |
 | pr_reviewer | **opus** | the advisory whole-PR review before the final conformer (DESIGN §9 *An advisory whole-PR review feeds the final conformer*) — read-only judgment, `high` effort. **The one tier exception**: an explicit `MODEL_DEFAULT_PER_WORKER["pr_reviewer"] = "opus"` entry, documented there — bench N2f, 66 calls per arm: opus high 38 verified findings naming no required item, sonnet high 8, sonnet medium 7; 18 opus findings hand-checked, 13 real, 5 plausible, 0 false |
 | contract_extractor | sonnet | types one `external_contract_assumption` risk for the contract-literal check (DESIGN §8 *Typed evidence for the delivery judge*) — no tools needed (`Read` granted, 4 turns), `medium` effort |
+| verifiability_classifier | sonnet | types each required item `in_tree` or `execution` once per run for the delivery ratchet (DESIGN §8 *A repair that regresses met work is rolled back*) — read-only judgment from an empty directory, `medium` effort |
+| delivery_ratchet | sonnet | after a repair that committed, re-verifies the previously met `in_tree` items with their prior evidence and the repair's diff (same section) — read-only judgment, `medium` effort |
 | falsifier | sonnet | on the final tree, tries to prove ONE required item undelivered by writing and running one probe test through a public entry point, in a disposable ref-less checkout; code confirms or discards the claim (DESIGN §8 *Delivery detection*) — acting, `medium` effort |
 
 `MODEL_DEFAULT` is the global default (`sonnet`); `MODEL_DEFAULT_PER_WORKER`
@@ -2120,7 +2124,7 @@ above). `dep_capture`, `fit_judge`, `splitter`, `judge`,
 `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`,
 `artifact_registry`, `task_coverage_judge`, `integration_judge`,
 `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`,
-`acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `contract_extractor` and `falsifier` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
+`acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `contract_extractor`, `falsifier`, `verifiability_classifier` and `delivery_ratchet` are **absent** from `MODEL_DEFAULT_PER_WORKER` — their `sonnet`
 defaults come from the global `MODEL_DEFAULT` fallback.
 
 Resolution order for each worker type `W` (highest priority first):
@@ -2141,7 +2145,7 @@ reconciler, plan_overlap_judge, satisfied_probe, provision, implementer,
 integrator, conformer, fit_judge, splitter, adherence_judge,
 classification_judge, wiring_judge, provision_judge, task_coverage_judge,
 integration_judge, no_work_judge, delivery_judge, defect_scope_auditor,
-artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, pr_reviewer, contract_extractor, falsifier. Global override: `LEERIE_MODEL` / `--model` / `model`.
+artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, pr_reviewer, contract_extractor, falsifier, verifiability_classifier, delivery_ratchet. Global override: `LEERIE_MODEL` / `--model` / `model`.
 
 `judge`, `heal`, `pr_writer`, and `dep_capture` are post-run / finalize-time
 workers invoked outside the main orchestrate loop, so they don't follow that
@@ -2203,7 +2207,7 @@ differs:
 
 | Worker       | Default | Notes (where it diverges from the model-table rationale) |
 |--------------|---------|-----|
-| classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge, splitter, adherence_judge, classification_judge, wiring_judge, provision_judge, task_coverage_judge, integration_judge, no_work_judge, delivery_judge, defect_scope_auditor, artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, contract_extractor, falsifier | medium | judgment/finalize workers; `medium` is the reproducibility dial, not a cost one |
+| classifier, planner, reconciler, plan_overlap_judge, provision, integrator, pr_writer, dep_capture, fit_judge, splitter, adherence_judge, classification_judge, wiring_judge, provision_judge, task_coverage_judge, integration_judge, no_work_judge, delivery_judge, defect_scope_auditor, artifact_registry, rebaser, acceptance_writer, set_auditor, surrogate_fixer, ci_checks, scope_judge, contract_extractor, falsifier, verifiability_classifier, delivery_ratchet | medium | judgment/finalize workers; `medium` is the reproducibility dial, not a cost one |
 | pr_reviewer | high | the advisory whole-PR review, as benched (bench N2f arm R1, opus high) |
 | implementer, conformer | low | code-writing workers; pinned low for cost/latency — a deliberate override of the prior "bounded by §8 evidence gate" unset default, since the conformer/confidence-gate loops downstream absorb the quality tradeoff |
 | satisfied_probe | unset | per-subtask advisory prune; base-tree-only tool scope + conservative default carry correctness, not pinned depth |
@@ -2216,9 +2220,10 @@ before reintroducing a blanket tier split if a gate regresses under `medium`.
 
 `EFFORT_DEFAULT` is `None` (meaning "don't pass `--effort`");
 `EFFORT_DEFAULT_PER_WORKER` overrides it per the table above — `"medium"`
-for the twenty-eight judgment/finalize/writer workers (including `acceptance_writer`,
+for the thirty judgment/finalize/writer workers (including `acceptance_writer`,
 `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`,
-`contract_extractor` and `falsifier`), `"high"` for `pr_reviewer`,
+`contract_extractor`, `falsifier`, `verifiability_classifier` and
+`delivery_ratchet`), `"high"` for `pr_reviewer`,
 `"low"` for `implementer` and `conformer` (a distinct, cost-motivated pin
 rather than a judgment-reproducibility one). One fixed exception sits
 outside this resolution: the held-out acceptance gate's repair rounds call
@@ -2244,7 +2249,7 @@ model selection:
 8. **Global default `EFFORT_DEFAULT`** (`None` — flag omitted)
 
 Same mechanical pattern as model selection: `LEERIE_EFFORT_<WORKER>` (env) /
-`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same thirty
+`--effort-<worker>` (CLI) / `effort_<worker>` (TOML), for the same thirty-two
 worker names listed above under model selection. Global override:
 `LEERIE_EFFORT` / `--effort` / `effort`.
 
@@ -2845,7 +2850,7 @@ a container.
 | `LEERIE_SOURCE_OF_TRUTH` | `source_of_truth` | Sticky source-of-truth preference (`codebase` / `research` / `both`). Overridden by `--source-of-truth`. Unset → default `both`. |
 | `LEERIE_RUNTIME` | `runtime` | Execution backend for per-subtask worker containers (`local` / `fly` / `ec2`). Overridden by `--runtime`. Unset → default `local`. |
 | `LEERIE_MODEL` | `model` | Model alias applied to every worker. Overridden by `--model` and per-worker overrides. Unset → every worker defaults to `sonnet`. |
-| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ every `WORKER_TYPES` entry: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`, `integration_judge`, `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `pr_reviewer`, `contract_extractor`. Unset → every worker → `sonnet`. |
+| `LEERIE_MODEL_<WORKER>` | `model_<worker>` | Per-worker override (e.g. `LEERIE_MODEL_IMPLEMENTER=opus`). Overridden by `--model-<worker>`. `<worker>` ∈ every `WORKER_TYPES` entry: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`, `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`, `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`, `wiring_judge`, `provision_judge`, `task_coverage_judge`, `artifact_registry`, `integration_judge`, `no_work_judge`, `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`, `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`, `pr_reviewer`, `contract_extractor`, `falsifier`, `verifiability_classifier`, `delivery_ratchet`. Unset → every worker → `sonnet`. |
 | `LEERIE_EFFORT` | `effort` | Reasoning-depth dial forwarded to `claude -p --effort` (`low` / `medium` / `high` / `xhigh` / `max`). Applies to every worker; overridden by `--effort` and per-worker overrides. Unset → judgment workers `medium`, implementer/conformer `low`, everything else inherits Claude default. |
 | `LEERIE_EFFORT_<WORKER>` | `effort_<worker>` | Per-worker override (e.g. `LEERIE_EFFORT_PLANNER=max`). Overridden by `--effort-<worker>`. Same worker set as `LEERIE_MODEL_<WORKER>`. Unset → judgment workers `medium`; implementer/conformer `low`. |
 | `LEERIE_CONFIDENCE_ROUNDS` | `confidence_rounds` | Evidence-gate rounds per worker (positive integer). Overridden by `--confidence-rounds`. Unset → default `8`. |
@@ -2931,7 +2936,7 @@ validation contract.
 
 ### Worker types
 
-Leerie spawns the thirty `claude -p` worker types in `WORKER_TYPES`.
+Leerie spawns the thirty-two `claude -p` worker types in `WORKER_TYPES`.
 Each is a separate subprocess; there is no in-session agent nesting. (The
 table predates `task_coverage_judge`, `integration_judge` and `rebaser`,
 which are specified in their own sections.)
@@ -2959,6 +2964,8 @@ which are specified in their own sections.)
 | `pr_reviewer` | `prompts/pr_reviewer.md` | opus (effort high) | 0 or 1 per run (phase 5, `_run_pr_review`, after the delivery gate's first half and before the final conformance; skipped on resume once recorded or once the final conformance ran) | `{findings[{item_id: string\|null, kind: unmet_requirement\|bug\|regression, path, line_start, line_end, quote, item_span_quote: string\|null, explanation}]}` — read-only in the staging worktree (`_pr_review_tools(staging, repo_root)`, `PR_REVIEW_MAX_TURNS` = 150, never autonomous); advisory (DESIGN §9 *An advisory whole-PR review feeds the final conformer*) |
 | `contract_extractor` | `prompts/contract_extractor.md` | sonnet | 0 or 1 per `external_contract_assumption` risk on `risk_register` (phase 5, `_extract_contract_literals`, after integration; cached by `<sid>#<index>`) | `{counterpart_sid: string\|null, literal: string\|null, literal_kind: string_value\|identifier\|route_path\|other, symbol: string\|null}` — `Read`, 4 turns, never autonomous (DESIGN §8 *Typed evidence for the delivery judge*) |
 | `falsifier` | `prompts/falsifier.md` | sonnet | 0, or up to `falsifier_samples` (3) per judge-bound required item — never an `external` or `untouched_paths` item — plus at most one re-ask per sample (phase 5, `_run_delivery_detection` → `_falsify_items`, after the held-out acceptance gate; samples of one item run in order and stop at the first confirmed; 0 when there is no scoped test runner, the final tree's dependencies do not install, or no `typescript` package resolves from it) | `{verdict: unmet_demonstrated \| could_not_demonstrate, probe_path, case_name, assertion_quote, item_span_quote, entry_point, reason}` — acting (`ACT_TOOLS`, 80 turns, `--dangerously-skip-permissions`) in a ref-less checkout of the final commit (`falsifier-lane<n>`); facts only — `_falsifier_gates` decides |
+| `verifiability_classifier` | `prompts/verifiability_classifier.md` | sonnet | 0 or 1 per run (phase 5, `_ratchet_verifiability`, at the first delivery ratchet with a previously met item not settled in code; a failed call is not cached and is retried at the next ratchet) | `{items[{item_index, verifiability: in_tree\|execution, reason}]}` — read-only (`SATISFIED_PROBE_TOOLS`, `RATCHET_CLASSIFIER_MAX_TURNS` = 6) from an empty `<run_dir>/verifiability-classifier/`; cached in `delivery_ratchet.verifiability` |
+| `delivery_ratchet` | `prompts/delivery_judge.md` + `prompts/delivery_ratchet.md` | sonnet | per acceptance-repair round or delivery re-drive group that committed and survived its own rules, with a previously met `in_tree` item: 1 per pack (`_d1_judge_packs`), 3 when sample 1 flags an item or an item's `evidence_files` meet the diff (`_ratchet_judge`) | the delivery judge's verdicts plus `evidence_files[]`; read-only (`SATISFIED_PROBE_TOOLS`, `min(30 + 6×pack, 90)` turns) in staging |
 | `surrogate_fixer` | `prompts/surrogate_fixer.md` | sonnet | 0 or 1 per acceptance gate (only when a set still fails after the repair rounds and neither M1/M2 nor the set audit fired) | `{summary, files_changed[]}` — acting (`ACT_TOOLS`, 150 turns, autonomous) in a ref-less clone of the own start; never sees a set (`_acceptance_read_denials`) |
 | `ci_checks` | `prompts/ci_checks.md` | sonnet | 0 or 1 per run (phase 4, `_capture_ci_parity_baseline`; only when a file matching `CI_CONFIG_GLOBS` exists on the base, and not under `skip_base_baseline`) | `{checks[{id, kind, argv, cwd, env[{name, value}], prerequisites[{argv, cwd}], trigger[], path_filters[], requires[], strict_argv[], source{file, job, step}, coverage{summary_path, config_file, thresholds[{glob, metric, min}]}, notes}], excluded[{file, job, reason}]}` — read-only (`INSPECT_TOOLS`, 40 turns) on the staging base tree; code checks provenance and selects (see *CI parity* below) |
 | `integrator` | `prompts/integrator.md` | sonnet | on conflict during wave integration | resolved merge commit on `leerie/runs/<run-id>` |
@@ -6532,6 +6539,87 @@ rounds. On resume, a last entry with `rollback_reason` and no `rolled_back`
 is reset first. The gate-wide rules (test axis red, sets unmeasurable)
 still run after the rounds.
 
+A moved round that fixed a case and has a readable `sha` then goes through
+the delivery ratchet (below) before it is recorded: `_round_ratchet(entry)`
+runs `_ratchet_exec` with the test IDs at `pre_sha` and at `sha`, then
+`_delivery_ratchet`, and stores the result as `entry.ratchet`. A
+`_ratchet_rollback_reason` (`"regressed a previously met required item"`,
+else `"broke an existing test"`) becomes the round's `rollback_reason` and
+`_undo_round` resets it like a no-gain round; a kept round calls
+`_ratchet_kept`. A ratchet that raises is recorded as `{error}` and the
+round is kept. The test IDs come from `_ids_at(sha, label)`: one
+`_ratchet_test_ids` run per commit, kept in `gate.test_ids[sha]` (`{ids,
+files, kind, messages, command}` or `{unmeasured: true}`). It measures only
+while staging's HEAD is that commit. Each round's start is measured before
+its worker runs.
+
+### Delivery ratchet — `_delivery_ratchet`
+
+DESIGN §8 *A repair that regresses met work is rolled back* (bench Q4 N5,
+frozen config C + vote change V; its execution route on B\*). Called by
+`_run_acceptance_gate_inner` per round (above) and by
+`_run_delivery_redrive` per group that committed and is neither `worse`
+nor void.
+
+- **Previously met** (`_ratchet_prior_met(st) -> {item_index: evidence}`):
+  `delivery_gate.items` rows with `verdict: met` once final detection ran
+  (evidence `judge.met_evidence`), else the latest of `judged_after` /
+  `judged_before`: every item that is not `external` and not in its
+  `unmet`, with evidence from its `details[].met_evidence` (the last
+  sample's met verdict, `_delivery_judge_unmet`). An entry in
+  `delivery_ratchet.evidence` replaces it. `{}` with no required items,
+  under `skip_coverage_check`, or with no recorded verdict.
+- **Routes.** An item with `untouched_paths` is settled by
+  `_d1_untouched_verdict` on staging (unmet → regressed). The rest are
+  typed by `_ratchet_verifiability` (one `verifiability_classifier` call per
+  run, cached; an untyped item is `in_tree`; a failed call skips the judge
+  route for this ratchet, recorded as `judge.skipped`). An `execution`
+  item is flagged (`exec_flagged`) when `exec_result.new` is non-empty. The
+  `in_tree` items go to `_ratchet_judge`.
+- **Judge** (`_ratchet_judge`): `git diff pre post` (cut at
+  `RATCHET_DIFF_MAX_BYTES` = 80,000 with a note) and its `--name-only` set;
+  items cut by `_d1_judge_packs`. Per pack, sample 1
+  (`claude_p(schema_key="delivery_ratchet", system_prompt=delivery_judge.md
+  + delivery_ratchet.md, allowed_tools=SATISFIED_PROBE_TOOLS,
+  max_turns=min(30 + 6×pack, 90), sid="delivery_ratchet-<label>-p<k>-s<n>")`)
+  over TASK, PREVIOUSLY VERIFIED ITEMS (`{item_index, item,
+  prior_verified_evidence}`), CHANGES SINCE THAT VERIFICATION, the
+  INTERMITTENT REGRESSIONS section when `exec_result` typed any, and the
+  benched closing instruction. Candidates = items sample 1 marks `met:
+  false` ∪ items whose `evidence_files` (`_ratchet_norm_path`: staging
+  prefix, `./` and `:line` stripped) meet the changed files. With
+  candidates, samples 2 and 3 run; a candidate is `confirmed` on ≥ 2 of 3
+  unmet votes. A pack whose judge raises confirms nothing (`errors[]`).
+  Returns `{judged, diff_files, diff_bytes, sample1_flags, touched,
+  candidates, per_sample_regressed, confirmed, samples, met_evidence,
+  errors}`.
+- **Execution** (`_ratchet_exec(st, caps, staging, pre_sha, before, after,
+  *, label, log_path)`): with either side unmeasured, `{unmeasured: true}`.
+  Otherwise `_intermittent_discovery` from `pre_sha` (the tests that
+  directly import a file the repair changed, rerun
+  `confirm_intermittent_repeats` times); IDs it fails that `before` did not
+  join `after`'s IDs; `_redrive_new_failures` confirms the candidates under
+  B\* against a worktree at `pre_sha` (it now also returns the whole B\*
+  `verdict`); `_type_intermittent_regressions` types the evidence rows.
+  Returns `{new, resource_affected, unmeasured, files, intermittent_regression[],
+  discovery}`. The re-drive calls it in place of `_redrive_new_failures`.
+  `_ratchet_test_ids(st, caps, tree, *, label, log_path)` is the test axis
+  with IDs: `_capture_failing_test_ids` of the BLT `tests` command, or of
+  its `_scoped_test_replacement` when the task forbids it; None with no
+  command or report.
+- **Result.** `{pre_sha, post_sha, prior_met[], untouched[], execution[],
+  exec_flagged[], judge, regressed[], new_failures[],
+  intermittent_regression[]}`. `regressed` or `new_failures` non-empty is
+  a rollback (`_ratchet_rollback_reason`). `_ratchet_kept(st, rat)` stores
+  the judge's `met_evidence` under `delivery_ratchet.evidence[i] = {sha,
+  evidence}` and appends new `intermittent_regression` rows to
+  `delivery_ratchet.intermittent_regression`, which
+  `_intermittent_regression_rows` reads after `test_id_diff`'s.
+- **Re-drive.** A group whose ratchet regressed an item records
+  `ratchet_regressed`, is void and rolled back, and each such item becomes
+  a pending note `{kind: control_regression, key: met-item-<i>, test:
+  "required item <i>", detail}`.
+
 ### Delivery re-drive — `_run_delivery_redrive`
 
 DESIGN §8 *Delivery re-drive*. `_run_phases` calls
@@ -6597,7 +6685,9 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   held-back round, the held-back ones) are re-measured and the repo's test
   command re-run for failing IDs (`_redrive_test_ids`), new ones confirmed
   against a `redrive-base` worktree at `pre_sha` by `_confirm_new_failures`
-  (`_redrive_new_failures`). `_redrive_verdict` (pure): `worse` when more
+  (`_redrive_new_failures`, through `_ratchet_exec`, which first runs the
+  intermittent discovery and types `intermittent_regression` rows, recorded
+  on the group). `_redrive_verdict` (pure): `worse` when more
   set files fail, a control file newly fails, or a test is confirmed newly
   failing — in a held-back round also when more held-back files fail, a
   held-back control newly fails, or none is fixed; a set or held-back
@@ -6610,8 +6700,10 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   per-case record) plus, for a key failing on both sides with per-case
   records, the IDs that left its list; `_redrive_verdict` returns them as
   `fixed_cases` / `held_fixed_cases`, and the held-back "none is fixed" rule
-  reads `held_fixed_cases` too. A group that is worse, zero-progress,
-  committed a staged file, or fails the escalation gate is
+  reads `held_fixed_cases` too. A group that is none of the below then
+  runs `_delivery_ratchet` (`ratchet`). A group that is worse, zero-progress,
+  committed a staged file, fails the escalation gate, or whose ratchet
+  regressed a previously met item is
   rolled back (`_redrive_rollback`: `reset --hard pre_sha`, confirmed, then
   `clean -fd`); the controls it broke become pending `control_regression`
   notes. A `trade` (something fixed and something broken) records its
@@ -8971,11 +9063,11 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `no_work_confirmation` | dict | audit record of a converged-gate no-work exit (DESIGN §8 *The healthy-path consumer*): `{classifier_evidence, judge_evidence, checked[]}` — both halves of the classifier + `no_work_judge` agreement. Written only when the judge confirms. |
 | `no_work_dispute` | dict | the disagreement record when the `no_work_judge` does NOT confirm a converged-gate already-satisfied claim (DESIGN §8 *A dispute's evidence is planning input, not log noise*): `{classifier_evidence, judge_evidence, checked[]}`. Written only on a dispute with non-empty judge evidence (a crash or an empty-evidence confirm persists nothing — there is no residual to plan against); consumed by `phase_plan`, which injects it into every planner's `ctx_dict` so the plan targets the residual the dispute names instead of re-deriving the task from scratch. |
 | `defect_scope` | dict | the defect-scope audit's result on a defect-fix task (DESIGN §5 *Defect-scope audit*): `{applicable, defect_shape?, sites[], chokepoint?, ground_truth?}` — each site `{file, symbol, role, disposition: fix|ruled_out, line_hint?, note?}`, the disposition's evidence in `note` (DESIGN §5 *Every site carries a disposition*); `_warn_defect_sites_uncovered` compares only `fix` sites (a legacy site without `disposition` counts as `fix`) — `ground_truth` is `{data_dependent, inputs[], repro_command, inline_examples[]}`, each inline example `{literal, site_identifying, trigger_tokens[], site_tokens[]}` (DESIGN §5 *The report's own example inputs are captured too*) — `{"applicable": false}` when the auditor found the audit not applicable (not a defect fix at all, or a single obvious location with no competing candidate mechanisms) on every one of `caps["applicability_samples"]` samples, `{}` alongside absent key never occurs (the checkpoint stores whatever the phase returned). Own resume checkpoint keyed on presence, mirroring `artifact_registry` — plus an extra gate the registry does not carry: skipped when `plans_after_plan` is already present (see the phase-2 row for the resume rationale). Injected into planner ctx when `applicable` with non-empty `sites`. |
-| `delivery_gate` | dict | audit record of the finalize-side required-items verification (DESIGN §8 *The delivery gate*): `{unmet_before[], samples_before, unmet_after[], samples_after, routed_before?, routed_after?, evidence_before?, evidence_after?}`, each unmet entry `{item_index, item, evidence}` (an unmet entry settled in code also carries `settled_by: "untouched_paths"`). `routed_*` is `{external[], untouched[{item_index, met, files[]}], packs}`: the indices `_delivery_judge_unmet` kept away from the judge and the number of judge prompts (DESIGN §8 *Grouped judging at coverage item counts*). `unmet_before` is written by `_run_delivery_prejudge` (majority-confirmed unmet items, routed into the final-conformer pass); `unmet_after` by `_run_delivery_recheck` after that pass — `[]` means remedied, non-empty is the shipping residual (fail-open, loud). Presence of `unmet_after` is the resume sentinel. Each judge pass also records `judged_before` / `judged_after` `{sha, unmet[], details[{item_index, samples, unmet_votes, rejected, unmet_parts[{requirement, kind, cites[]}]}]}` (`rejected` counts met claims `_delivery_screen_sample` turned into unmet votes; `unmet_parts` keep only verified citations). Final delivery detection (`_run_delivery_detection`, DESIGN §8 *Delivery detection*) writes `items[]` — per item `{item_index, item, verdict: met | unmet | external, by[judge | untouched_paths | falsifier], judge?, falsifier?{item_index, confirmed, samples[{sample, reasked, probe_activity{created, ran, files[]}, verdict, probe_path, case_name, assertion_quote, item_span_quote, entry_point, reason, gates{new_file, not_a_lead, runnable, item_quote, case_fails?, fails_under_bstar?, assertion_in_case?, not_coupled?, placed?}, confirmed, case_id?, coupling?{coupled, reasons[]}, probe_saved?{dir, file}, error?}]}}` (`probe_saved`: a confirmed sample's probe, copied to `<run_dir>/acceptance/probes/i<k>/` for the delivery re-drive's re-check) — `unmet_final[]` (`{item_index, item, evidence, by[]}`; its presence is detection's resume sentinel, and `_decide_outcome` / `_prior_delivery_residual` read it before `unmet_after`), `final_sha`, `final_judge{source: judged_after | judged_before | final, samples?, error?}` and `falsifier{enabled, skipped?, lanes?}`; `final_progress{sha, judge, items{index: record}}` holds finished items while it runs, so a resume on the same commit skips them. |
+| `delivery_gate` | dict | audit record of the finalize-side required-items verification (DESIGN §8 *The delivery gate*): `{unmet_before[], samples_before, unmet_after[], samples_after, routed_before?, routed_after?, evidence_before?, evidence_after?}`, each unmet entry `{item_index, item, evidence}` (an unmet entry settled in code also carries `settled_by: "untouched_paths"`). `routed_*` is `{external[], untouched[{item_index, met, files[]}], packs}`: the indices `_delivery_judge_unmet` kept away from the judge and the number of judge prompts (DESIGN §8 *Grouped judging at coverage item counts*). `unmet_before` is written by `_run_delivery_prejudge` (majority-confirmed unmet items, routed into the final-conformer pass); `unmet_after` by `_run_delivery_recheck` after that pass — `[]` means remedied, non-empty is the shipping residual (fail-open, loud). Presence of `unmet_after` is the resume sentinel. Each judge pass also records `judged_before` / `judged_after` `{sha, unmet[], details[{item_index, samples, unmet_votes, rejected, unmet_parts[{requirement, kind, cites[]}], met_evidence}]}` (`rejected` counts met claims `_delivery_screen_sample` turned into unmet votes; `unmet_parts` keep only verified citations; `met_evidence` the last sample's met evidence, `""` when none, the delivery ratchet's prior evidence). Final delivery detection (`_run_delivery_detection`, DESIGN §8 *Delivery detection*) writes `items[]` — per item `{item_index, item, verdict: met | unmet | external, by[judge | untouched_paths | falsifier], judge?, falsifier?{item_index, confirmed, samples[{sample, reasked, probe_activity{created, ran, files[]}, verdict, probe_path, case_name, assertion_quote, item_span_quote, entry_point, reason, gates{new_file, not_a_lead, runnable, item_quote, case_fails?, fails_under_bstar?, assertion_in_case?, not_coupled?, placed?}, confirmed, case_id?, coupling?{coupled, reasons[]}, probe_saved?{dir, file}, error?}]}}` (`probe_saved`: a confirmed sample's probe, copied to `<run_dir>/acceptance/probes/i<k>/` for the delivery re-drive's re-check) — `unmet_final[]` (`{item_index, item, evidence, by[]}`; its presence is detection's resume sentinel, and `_decide_outcome` / `_prior_delivery_residual` read it before `unmet_after`), `final_sha`, `final_judge{source: judged_after | judged_before | final, samples?, error?}` and `falsifier{enabled, skipped?, lanes?}`; `final_progress{sha, judge, items{index: record}}` holds finished items while it runs, so a resume on the same commit skips them. |
 | `site_token_warnings` | list | advisory record from `_warn_site_token_leaks` after integration and again at the delivery recheck: `[{token, file, added_line, report_example}]`, one per added line of the run's diff naming a site token on identifier-segment boundaries, guard-test term lists excluded (DESIGN §5 *The report's own example inputs are captured too*, §8 *Typed evidence for the delivery judge*). Evidence for the delivery judge; never gates; absent when the audit carried no inline examples. |
 | `contract_literal_checks` | dict | per worker-flagged contract, keyed `<sid>#<risk index>` (DESIGN §8 *Typed evidence for the delivery judge*): `{owner_sid, risk_index, detail, where, extracted?: {counterpart_sid, literal, literal_kind, symbol, literal_unverified?}, error?, flag?, why?}` — `extracted` from `contract_extractor` (cached; resume never re-asks), `flag`/`why` from the latest `_check_contract_literals`. For the PR; never gates. |
 | `pr_review` | dict | the advisory whole-PR review (DESIGN §9 *An advisory whole-PR review feeds the final conformer*), written once by `_run_pr_review`: `{base, head, model, effort, diff_cut, findings[{item_id, kind, path, line_start, line_end, quote, item_span_quote, explanation, path_exists, quote_ok, line_ok, item_id_norm, item_known, span_ok, verified}], n_findings, n_verified, tree_restored, at, error?}`. Only `verified` findings reach the final conformer; for the PR; never gates and never read by `_decide_outcome`. Its presence is the resume sentinel. |
-| `acceptance` | dict | the held-out acceptance record (DESIGN §8 *Held-out acceptance tests*): `{validity_base, report_base, written, sets[], audit_conflicts?[], skipped?, gate?}` — `validity_base` is the run's own start, `report_base` the earliest same-task base (informational). Each valid set `{index, valid, dir, defect_files[], control_files[], support_files[], cases{file: [names]}, modes{defect file: "assertion" | "import" (observed failing to load on the base)}, base_failing_cases{defect file: [runner case IDs that failed at the own start]}, report_reproduced: bool | null, base_case_status{defect file: {case id: status}}, base_failure_messages{defect file: {case id: message}}, scope?, own_start_rewrite?, rewrite_rounds?, audit?, rewrite?, broken?}`, stored under `<run_dir>/acceptance/set-<k>/` (a replacing rewrite under `set-<k>-rw/`) — `own_start_rewrite: true` when the writer's one own-start retry produced it; `rewrite_rounds` the `acceptance_rewrite_rounds` counter; `audit` the latest set audit `{findings[{case, defect_kind, test_quote, prod_quote, reason, sample}], kinds[], sample_kinds[[kind]], samples, skipped?, verdicts?{case: set_defect|implementation_gap}, case_keys?{case: {key, assertion, target[]}}, reconciled?[case]}` (only quote-verified `set_defect` cases, minus any `_reconcile_audit_verdicts` withdrew; `sample_kinds` the verified kinds of each sample that answered, what the delivery re-drive's escalation gate counts a majority over); `rewrite` `{triggers[mechanical | set_audit | surrogate_witness], outcome: replaced | kept_original, reason?, retried_empty, original?{dir, defect_files, control_files, support_files, cases, modes, base_failing_cases, base_case_status, base_failure_messages, scope}, result}` (`result` the set's verdict on the integrated tree after the rewrite, which replaces its `gate.final` entry); `broken: true` (written only by `_acceptance_audit_and_rewrite`; read only through `_acceptance_set_broken`) keeps the set out of the next run's residual and out of `_decide_outcome`'s failing count. `scope` (report-pointer tasks only, `_acceptance_scope_judge_sets`) is `{bounded: true, counted_cases{file: [case ids]}, judged{file: {case id: {origin, in_range, quote_ok, counted}}}}` or `{bounded: false, error}`; a bounded set with no counted case is a variant set — repaired, never work (`_acceptance_result_has_work`). An invalid set from the writer's own-start retry whose defect files all still pass carries `reason: "fixed_on_head_by_execution"`. `{"skipped": reason}` when the run is not a defect fix (no `bug-fixing` category), there is no scoped test command (also `skip_kind: "no_scoped_runner"`, `reason`, `test_command`), `--skip-acceptance-check` is set, or writing raised anything but a budget-exhaustion `WorkerError` (which stops the run). `gate` is `{initial[], initial_sha?, rounds[{round, results?, sha?, error?, retried?, pre_sha?, fixed_cases?, rollback_reason?, rolled_back?, rollback_failed?}], round_pre?{round, sha}, final[], final_sha?, before_sha?, pre_tests_passed?, residual?, rolled_back?, rollback_reason?, rollback_failed?}` (`round_pre` the in-flight round's own start, saved before its worker runs and dropped when the round is recorded; a round's `pre_sha` is that start, `fixed_cases` `_acceptance_fixed_cases(verdict before, its verdict)`, and `rollback_reason: "fixed no failing case"` marks a round reset to `pre_sha` — `rolled_back` the confirmed reset, absent while the decision is on disk but the reset not yet done, which a resume finishes; `_acceptance_round_kept` skips such a round wherever the latest or last measured verdict is read) (`initial` persisted before any repair; `initial_sha`/`rounds[].sha` the commit each verdict was measured on, `final_sha` the staging HEAD when `final` was written — rewritten with `final` by the delivery re-drive — absent from a state saved before they existed, which then always counts as moved), each result `{index, passed, unmeasured, failing_files[], failing_cases?{file: [case ids]}, resource_affected_files?[]}` (`failing_files` confirmed under B*; `failing_cases` the runner report's failing case IDs per confirmed failing file, where one was readable); `residual` `{failing_sets, total_sets, cases[], sets[], cases_by_set{index: [names]}, files_by_set{index: [failing files]}, failing_cases_by_set{index: {file: [case ids]}}, unmeasured_final?, rollback_failed?}` — from the last MEASURED verdict when the final one measured nothing (`unmeasured_final: true`, forwarded to the planner) — feeds the next same-task run via `_prior_delivery_residual` as `acceptance_unmet`, after `_acceptance_residual_unbroken` drops the sets typed broken, and the variant sets (no counted case among their `files_by_set` files), at read time (None when none is left and no rollback failed; a residual without `sets` is used unchanged). Presence of the key is the write half's resume checkpoint (skipped when `plans_after_plan` is present, like `defect_scope`); `gate.final` is the gate half's sentinel. |
+| `acceptance` | dict | the held-out acceptance record (DESIGN §8 *Held-out acceptance tests*): `{validity_base, report_base, written, sets[], audit_conflicts?[], skipped?, gate?}` — `validity_base` is the run's own start, `report_base` the earliest same-task base (informational). Each valid set `{index, valid, dir, defect_files[], control_files[], support_files[], cases{file: [names]}, modes{defect file: "assertion" | "import" (observed failing to load on the base)}, base_failing_cases{defect file: [runner case IDs that failed at the own start]}, report_reproduced: bool | null, base_case_status{defect file: {case id: status}}, base_failure_messages{defect file: {case id: message}}, scope?, own_start_rewrite?, rewrite_rounds?, audit?, rewrite?, broken?}`, stored under `<run_dir>/acceptance/set-<k>/` (a replacing rewrite under `set-<k>-rw/`) — `own_start_rewrite: true` when the writer's one own-start retry produced it; `rewrite_rounds` the `acceptance_rewrite_rounds` counter; `audit` the latest set audit `{findings[{case, defect_kind, test_quote, prod_quote, reason, sample}], kinds[], sample_kinds[[kind]], samples, skipped?, verdicts?{case: set_defect|implementation_gap}, case_keys?{case: {key, assertion, target[]}}, reconciled?[case]}` (only quote-verified `set_defect` cases, minus any `_reconcile_audit_verdicts` withdrew; `sample_kinds` the verified kinds of each sample that answered, what the delivery re-drive's escalation gate counts a majority over); `rewrite` `{triggers[mechanical | set_audit | surrogate_witness], outcome: replaced | kept_original, reason?, retried_empty, original?{dir, defect_files, control_files, support_files, cases, modes, base_failing_cases, base_case_status, base_failure_messages, scope}, result}` (`result` the set's verdict on the integrated tree after the rewrite, which replaces its `gate.final` entry); `broken: true` (written only by `_acceptance_audit_and_rewrite`; read only through `_acceptance_set_broken`) keeps the set out of the next run's residual and out of `_decide_outcome`'s failing count. `scope` (report-pointer tasks only, `_acceptance_scope_judge_sets`) is `{bounded: true, counted_cases{file: [case ids]}, judged{file: {case id: {origin, in_range, quote_ok, counted}}}}` or `{bounded: false, error}`; a bounded set with no counted case is a variant set — repaired, never work (`_acceptance_result_has_work`). An invalid set from the writer's own-start retry whose defect files all still pass carries `reason: "fixed_on_head_by_execution"`. `{"skipped": reason}` when the run is not a defect fix (no `bug-fixing` category), there is no scoped test command (also `skip_kind: "no_scoped_runner"`, `reason`, `test_command`), `--skip-acceptance-check` is set, or writing raised anything but a budget-exhaustion `WorkerError` (which stops the run). `gate` is `{initial[], initial_sha?, rounds[{round, results?, sha?, error?, retried?, pre_sha?, fixed_cases?, ratchet?, rollback_reason?, rolled_back?, rollback_failed?}], round_pre?{round, sha}, test_ids?{sha: {ids[], files{}, kind, messages{}, command} | {unmeasured: true}}, final[], final_sha?, before_sha?, pre_tests_passed?, residual?, rolled_back?, rollback_reason?, rollback_failed?}` (`round_pre` the in-flight round's own start, saved before its worker runs and dropped when the round is recorded; a round's `pre_sha` is that start, `fixed_cases` `_acceptance_fixed_cases(verdict before, its verdict)`, `ratchet` the round's `_delivery_ratchet` result (or `{error}`), `test_ids` the test axis's failing IDs per measured commit, and `rollback_reason: "fixed no failing case"` | `"regressed a previously met required item"` | `"broke an existing test"` marks a round reset to `pre_sha` — `rolled_back` the confirmed reset, absent while the decision is on disk but the reset not yet done, which a resume finishes; `_acceptance_round_kept` skips such a round wherever the latest or last measured verdict is read) (`initial` persisted before any repair; `initial_sha`/`rounds[].sha` the commit each verdict was measured on, `final_sha` the staging HEAD when `final` was written — rewritten with `final` by the delivery re-drive — absent from a state saved before they existed, which then always counts as moved), each result `{index, passed, unmeasured, failing_files[], failing_cases?{file: [case ids]}, resource_affected_files?[]}` (`failing_files` confirmed under B*; `failing_cases` the runner report's failing case IDs per confirmed failing file, where one was readable); `residual` `{failing_sets, total_sets, cases[], sets[], cases_by_set{index: [names]}, files_by_set{index: [failing files]}, failing_cases_by_set{index: {file: [case ids]}}, unmeasured_final?, rollback_failed?}` — from the last MEASURED verdict when the final one measured nothing (`unmeasured_final: true`, forwarded to the planner) — feeds the next same-task run via `_prior_delivery_residual` as `acceptance_unmet`, after `_acceptance_residual_unbroken` drops the sets typed broken, and the variant sets (no counted case among their `files_by_set` files), at read time (None when none is left and no rollback failed; a residual without `sets` is used unchanged). Presence of the key is the write half's resume checkpoint (skipped when `plans_after_plan` is present, like `defect_scope`); `gate.final` is the gate half's sentinel. |
 | `skip_acceptance_check` | bool | whether the held-out acceptance sets and gate are suppressed. Resolved from `--skip-acceptance-check` / `LEERIE_SKIP_ACCEPTANCE_CHECK` / `leerie.toml` / default `False`; seeded in both the fresh and resume branches. |
 | `no_work_pending` | bool | set by `_confirm_no_work_on_converged_gate` when the `no_work_judge` confirms and `_acceptance_can_check(st)` holds (acceptance not skipped, `bug-fixing` category, a scoped test template): the confirmation is held instead of finishing, and `_settle_pending_no_work` decides it after `phase_acceptance_write` (DESIGN §8 *No work is declared on executed evidence, and a dispute is bounded*). Cleared on a dispute. |
 | `no_work_acceptance` | dict | `_settle_pending_no_work`'s verdict: `{verdict: pass \| dispute \| accepted after dispute \| no valid sets \| not measurable \| error: <type>, results?, cases?}`; its presence is the settle step's resume sentinel. |
@@ -9018,7 +9110,8 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `symptom_findings` | dict[str, list[str]] | subtask id -> `check_symptom_evidence` findings, for subtasks whose plan entry declares `fixes_reported_symptom: true` (NOT those whose id begins `bugfix-`: ids are re-homed by plan merges and synthesised for verification-only work, so the prefix is not evidence a symptom exists) (DESIGN §9 *A stale finding is not a bug*). |
 | `risk_register` | dict[str, list[dict]] | subtask id -> `_collect_subtask_risks` entries after `_verify_risk_paths` (`{kind, detail, where?, source, gap, where_paths[], where_paths_unverified?, settle_by?, resource?, simulated_interleaving?, disposition?, addressed}`): every worker self-reported risk (typed `self_reported_risks`, `process_note` excluded, plus the `production_evidence.exercised == false` tier typed `unverified_external`); entries the conformer's `risk_dispositions` cleared through a verifiable act carry `addressed: true` and the rest stay unaddressed (DESIGN §9 *Self-reported risk is routed, not read*). Set and popped on the same settle path as `symptom_findings`. Routed by `gap`: `unverified_external` (or `simulated_interleaving`) to the PR's "Needs human verification"; `test_missing` / `test_weak` to the coverage re-drive. Also carries `integration_content_loss` entries (`_record_integration_loss`), rendered under the PR's "Integration content loss". |
 | `coverage_redrive` | dict[str, dict] | per-sid coverage re-drive record (`_redrive_uncovered_subtasks`, DESIGN §9 *Changed lines no test executes are re-driven*): `{rounds[{round, share, uncovered, gaps_open, pre_sha}], last, final, uncovered, open_gaps?, rolled_back?{status, reason}}`; `last` is the latest `_measure_subtask_coverage` record plus its `gaps`; `final` `covered` / `untested` / `rolled_back` / `unmeasured`, set once (the resume skip). |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[], tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[]}` — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[], tampered[], committed_staged[], worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |
@@ -9289,6 +9382,12 @@ Required fields, current shape:
   `could_not_demonstrate`), `probe_path`, `case_name`, `assertion_quote`,
   `item_span_quote`, `entry_point`, `reason` (strings, `""` when none).
   Facts only; `_falsifier_gates` decides.
+- **verifiability_classifier** — required: `items[]`, each `{item_index,
+  verifiability: in_tree|execution (RATCHET_VERIFIABILITY), reason}`
+  (`additionalProperties: false` at both levels).
+- **delivery_ratchet** — `_delivery_ratchet_schema(SCHEMAS["delivery_judge"])`:
+  the delivery judge's schema with `evidence_files: string[]` added to each
+  verdict's properties and `required`; derived, so the two never drift.
 - **delivery_judge** (parts) — every verdict requires `parts[]`, each
   `{requirement, kind: static|behavioral, status: met|unmet|not_inspected,
   cites[]}` with `cites[]` `{path, line_start, line_end, quote}` (`$defs`
@@ -9449,6 +9548,8 @@ ever spawned without one, and no prompt is shared between call types.
 | `pr_reviewer` | `prompts/pr_reviewer.md` | advisory whole-PR review (DESIGN §9 *An advisory whole-PR review feeds the final conformer*) |
 | `contract_extractor` | `prompts/contract_extractor.md` | types a worker-flagged contract (DESIGN §8 *Typed evidence for the delivery judge*) |
 | `falsifier` | `prompts/falsifier.md` | execution-backed delivery detection (DESIGN §8 *Delivery detection*) |
+| `verifiability_classifier` | `prompts/verifiability_classifier.md` | in_tree / execution typing for the delivery ratchet (DESIGN §8 *A repair that regresses met work is rolled back*) |
+| `delivery_ratchet` | `prompts/delivery_ratchet.md` | appended to `prompts/delivery_judge.md`: re-verifying met items after a repair (same section) |
 | `pr_writer`      | `prompts/pr_writer.md` | invoked by `phase_finalize` when `push_will_happen` is true |
 | `dep_capture`    | `prompts/dep_capture.md` | post-run dependency-capture worker (DESIGN §6½) |
 | `judge`          | `prompts/judge.md` | post-run skill |

@@ -6519,7 +6519,12 @@ pass (benched as P8b–P8d and Q3, frozen rules):
    failing case each added a defensive fallback the task explicitly
    forbade, and both shipped. A run that produces no verdict (a missing
    report) is `resource_affected`, never on its own a reason to roll back,
-   and a set without a verdict cannot make a group zero-progress.
+   and a set without a verdict cannot make a group zero-progress. A group
+   that survives all of that still goes through the delivery ratchet
+   (*A repair that regresses met work is rolled back*): when it made an
+   item that was met before it unmet, it is rolled back too. The item then
+   goes to the remaining groups as a `control_regression` note, so a fix
+   cannot hedge or remove what an earlier pass had already verified.
 5. *A trade is not progress.* A group that fixes a case only by breaking a
    control or a passing test is rolled back, and the broken behaviour goes
    as a typed `control_regression` note to every remaining group and to the
@@ -7386,6 +7391,56 @@ set the audit below would type broken), a correct repair fixes no case and
 is reset too. With several valid sets a correct fix shows up as progress on
 the sound ones; the set audit and rewrite after the rounds then deal with
 the broken one, and its residual reaches the next run.
+
+**A repair that regresses met work is rolled back (the delivery ratchet).**
+A repair writer runs after the judges that verified the run's required
+items. A round that fixes a failing case can still undo an item that was
+met before it: drop a guard, hedge a path the task said to fix at the root,
+delete a test. Nothing judged that tree again. In the replayed barnacle
+7cc87f9a pass 1 the only delivery judge ran before either repair round, and
+a re-drive group's commits were re-judged only for the items it was sent to
+fix. So after **every** acceptance-repair round and every delivery
+re-drive group that commits and survives its own rules, the items the latest
+delivery verdict holds met are verified again, on the tree after it, by
+route:
+
+- An item that only says paths stay untouched is settled in code, as
+  everywhere else.
+- A verifiability classifier types every other item, once per run, by its
+  own text: `in_tree` (a reader of the repository can cite whether it holds)
+  or `execution` (only running something shows it: "no regressions", "the
+  suite passes"). An `execution` item is never judged by reading. It is
+  flagged when the repair's failing-test-ID diff confirms a new failure
+  under B\* (§9 *Which failures are new*). The test axis therefore always
+  runs after a repair: its start is measured before the worker, its tree
+  after it. A command the task forbids is replaced by the scoped run of the
+  coupled tests, as at final. The tests that import a file the repair
+  changed are rerun first, as at final, so an intermittent regression the
+  repair introduced is found and typed. Like the final one, it is evidence,
+  not a trigger: it goes to the ratchet's judge and to the PR.
+- An `in_tree` item goes to the delivery judge. Its input is the item, the
+  evidence it was verified on and the repair's diff. Each verdict also types
+  `evidence_files`, the files it relies on. One sample runs. Two more run
+  only when it marks an item unmet, or when an item's evidence files meet
+  the files the diff changed. An item in that set is confirmed regressed on
+  2 of 3 unmet votes.
+
+A confirmed regressed item, or a test confirmed newly failing, resets the
+repair to its own start, using the sha recorded for that round or group.
+In a re-drive, the regressed item then goes to the next groups as a
+`control_regression` note. A kept repair's verdicts become the prior
+evidence of the next one.
+
+Measured (bench Q4 N5, frozen design): 49 natural repair rounds and
+cross-run pairs, 517 met items re-verified. 2 runs false-alarmed (4.1%,
+Wilson 95% 1.1–13.7%), on 2 of the 517 items. One was a defect already
+present before the change; the other was an execution-shaped item typed
+`in_tree`. The judge confirmed 2 real regressions and the execution route
+2 more. On 17 freshly generated repair rounds, scored against a
+ground truth by execution, the ratchet caught all 3 rounds that regressed
+an item and raised nothing on the other 14. The judge confirmed 5 of their
+7 regressed items. The execution route caught the third round, whose 2 items
+only a test showed.
 
 **A set that keeps failing is audited, and rewritten once.** A held-out
 set can be wrong in ways validity at the own start cannot see: it fails
@@ -9983,7 +10038,7 @@ than discarding the plan and forcing the operator to re-run from scratch.
 
 ## 14. Telemetry, judging, and self-healing
 
-Every main-loop LLM call in Leerie passes through one of the twenty-nine worker types in
+Every main-loop LLM call in Leerie passes through one of the thirty-two worker types in
 `WORKER_TYPES`: `classifier`, `planner`, `reconciler`, `plan_overlap_judge`,
 `satisfied_probe`, `provision`, `implementer`, `integrator`, `conformer`,
 `fit_judge`, `splitter`, `adherence_judge`, `classification_judge`,
@@ -9991,7 +10046,8 @@ Every main-loop LLM call in Leerie passes through one of the twenty-nine worker 
 `artifact_registry`, `integration_judge`, `no_work_judge`,
 `delivery_judge`, `defect_scope_auditor`, `rebaser`, `acceptance_writer`,
 `set_auditor`, `surrogate_fixer`, `ci_checks`, `scope_judge`,
-`pr_reviewer`, or `contract_extractor`
+`pr_reviewer`, `contract_extractor`, `falsifier`,
+`verifiability_classifier`, or `delivery_ratchet`
 (`fit_judge`/`splitter` are the P1
 recursive-decomposition workers — see §5½; `classification_judge`,
 `wiring_judge`, `provision_judge`, `task_coverage_judge`,
@@ -10005,7 +10061,9 @@ acceptance tests, `set_auditor` audits a held-out set that keeps failing,
 report-pointer task's sets to the report's own scenarios — see §8;
 `ci_checks` reads the repository's CI configuration — see §9;
 `pr_reviewer` is the advisory whole-PR review and `contract_extractor`
-types a worker-flagged contract — see §8 and §9; `rebaser` is the
+types a worker-flagged contract — see §8 and §9; `falsifier` tries to prove a
+required item undelivered, and `verifiability_classifier` and
+`delivery_ratchet` re-verify met items after a repair — see §8; `rebaser` is the
 finalize-time rebase worker — see §6). Each worker type is a distinct **call type** — a
 first-class identifier that partitions every captured call into its role in the
 system. The call_type partition is exactly `WORKER_TYPES`: one call_type per

@@ -840,6 +840,10 @@ STATE_FIELDS = (
     # Delivery re-drive (DESIGN §8 *Delivery re-drive*): rounds, groups,
     # pending control notes, trade pairs, conflict and contradictions.
     "delivery_redrive",
+    # Delivery ratchet (DESIGN §8 *A repair that regresses met work is
+    # rolled back*): the cached verifiability classification, the prior
+    # evidence kept repairs re-verified, their intermittent regressions.
+    "delivery_ratchet",
     # working_branch: the user's branch at the moment phase_classify
     # runs (`git rev-parse --abbrev-ref HEAD`). Mirrored to run.json
     # and to `<state-root>/runs/<id>/working-branch` (setup-run.sh writes
@@ -1829,6 +1833,11 @@ EFFORT_DEFAULT_PER_WORKER: dict[str, str] = {
     # medium (Q2 F+). Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration
     # corpus yet.
     "falsifier": "medium",
+    # The delivery ratchet's two judgment workers (DESIGN §8 *A repair that
+    # regresses met work is rolled back*), benched at medium (Q4 N5).
+    # Absent from TIMEOUT_DEFAULT_PER_WORKER: no duration corpus yet.
+    "verifiability_classifier": "medium",
+    "delivery_ratchet": "medium",
     # Code-writing acting workers. Pinned to `low` per explicit cost/latency
     # direction — distinct from the judgment workers' `medium` above, which
     # is about determinism, not cost. These previously inherited Claude's own
@@ -1962,7 +1971,7 @@ WORKER_TYPES = ("classifier", "planner", "reconciler", "plan_overlap_judge",
                 "defect_scope_auditor", "rebaser", "acceptance_writer",
                 "set_auditor", "surrogate_fixer", "ci_checks",
                 "scope_judge", "pr_reviewer", "contract_extractor",
-                "falsifier")
+                "falsifier", "verifiability_classifier", "delivery_ratchet")
 
 # PLANNING_WORKER_TYPES — the judgment bucket, i.e. every worker that runs
 # with `autonomous=False` against a tree it does not own. The partition
@@ -1990,6 +1999,7 @@ PLANNING_WORKER_TYPES = frozenset({
     "wiring_judge", "satisfied_probe", "integration_judge", "no_work_judge",
     "delivery_judge", "defect_scope_auditor", "set_auditor", "ci_checks",
     "scope_judge", "pr_reviewer", "contract_extractor",
+    "verifiability_classifier", "delivery_ratchet",
 })
 # The complement: workers that legitimately act on files, inside a worktree
 # they own. `rebaser` is here by the DESIGN §12 scoped exception.
@@ -4524,7 +4534,49 @@ SCHEMAS: dict[str, dict] = {
             "rationale": {"type": "string"},
         },
     },
+    "verifiability_classifier": {
+        # Types each required item by how its delivery can be verified, for
+        # the delivery ratchet (DESIGN §8 *A repair that regresses met work
+        # is rolled back*). Benched shape: bench n3b v2, unchanged.
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["item_index", "verifiability", "reason"],
+                    "properties": {
+                        "item_index": {"type": "integer"},
+                        "verifiability": {
+                            "type": "string",
+                            "enum": ["in_tree", "execution"]},
+                        "reason": {"type": "string"},
+                    },
+                },
+            },
+        },
+    },
 }
+
+
+def _delivery_ratchet_schema(judge: dict) -> dict:
+    """The delivery ratchet's judge schema (bench Q4 N5): the delivery
+    judge's, with one more required per-verdict field, `evidence_files` —
+    the repo-relative files the verdict relies on, which code intersects
+    with the repair's changed files. Derived, so the two never drift."""
+    schema = copy.deepcopy(judge)
+    verdict = schema["properties"]["verdicts"]["items"]
+    verdict["properties"]["evidence_files"] = {
+        "type": "array", "items": {"type": "string"}}
+    verdict["required"] = [*verdict["required"], "evidence_files"]
+    return schema
+
+
+SCHEMAS["delivery_ratchet"] = _delivery_ratchet_schema(
+    SCHEMAS["delivery_judge"])
 
 
 # =========================================================================
@@ -39777,11 +39829,17 @@ async def _delivery_judge_unmet(
         if item_details is not None:
             for i in pack:
                 d = {"item_index": i, "samples": len(samples),
-                     "unmet_votes": 0, "rejected": 0, "unmet_parts": []}
+                     "unmet_votes": 0, "rejected": 0, "unmet_parts": [],
+                     "met_evidence": ""}
                 seen_parts: set[str] = set()
                 for smp in samples:
                     v = next((x for x in reversed(smp.get("verdicts") or [])
                               if x.get("item_index") == i), None)
+                    if v is not None and v.get("met") is True:
+                        # The prior evidence the delivery ratchet hands its
+                        # judge when a later repair touches this item.
+                        d["met_evidence"] = str(v.get("evidence")
+                                                or "")[:1200]
                     if v is None or v.get("met") is not False:
                         continue
                     d["unmet_votes"] += 1
@@ -43937,6 +43995,45 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
             st.data["acceptance"] = acc
             st.save()
 
+        repair_log = leerie_dir / "logs" / "acceptance-repair.log"
+
+        async def _ids_at(sha: str, label: str) -> dict | None:
+            """The test axis's failing IDs on staging, which is at `sha` —
+            measured once per commit and kept on disk (`gate.test_ids`), so
+            a round's start is measured before its worker runs and a resume
+            never re-measures a tree that moved since."""
+            cache = gate.setdefault("test_ids", {})
+            if sha and sha in cache:
+                got = cache[sha]
+                return None if got.get("unmeasured") else got
+            if not sha or await _branch_head_sha(str(staging)) != sha:
+                # Staging moved past it (an interrupted attempt committed
+                # before a resume): that commit's tree is not measurable here.
+                return None
+            got = await _ratchet_test_ids(st, caps, str(staging),
+                                          label=label, log_path=repair_log)
+            if sha:
+                cache[sha] = got if got is not None else {"unmeasured": True}
+                _save_gate()
+            return got
+
+        async def _round_ratchet(entry: dict) -> dict:
+            """The delivery ratchet of one round that moved HEAD: the test
+            axis always runs on its tree, the ID diff against its start is
+            confirmed under B*, and the previously met items are
+            re-verified."""
+            label = f"acceptance-r{entry['round']}"
+            pre, post = entry["pre_sha"], entry["sha"]
+            before = (gate.get("test_ids") or {}).get(pre)
+            if isinstance(before, dict) and before.get("unmeasured"):
+                before = None
+            after = await _ids_at(post, f"{label}-ids")
+            ex = await _ratchet_exec(st, caps, staging, pre, before, after,
+                                     label=label, log_path=repair_log)
+            return await _delivery_ratchet(st, caps, models, efforts,
+                                           staging, pre, post,
+                                           exec_result=ex, label=label)
+
         async def _settle_round(entry: dict, prev: list[dict],
                                 prev_sha: str) -> None:
             """Record a round and, when it committed and fixed no failing
@@ -43951,6 +44048,24 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 entry["fixed_cases"] = fixed
                 if fixed == []:
                     entry["rollback_reason"] = "fixed no failing case"
+            if (moved and pre and entry.get("sha")
+                    and not entry.get("rollback_reason")):
+                # The delivery ratchet (DESIGN §8 *A repair that regresses
+                # met work is rolled back*): a round that fixed something is
+                # still reset when it made a met item unmet or broke a test.
+                try:
+                    rat = await _round_ratchet(entry)
+                except Exception as e:
+                    rat = {"error": f"{type(e).__name__}: {e}"[:300]}
+                    log(f"  acceptance repair round {entry['round']}: "
+                        f"delivery ratchet raised {rat['error']} — round "
+                        "kept")
+                entry["ratchet"] = rat
+                reason = _ratchet_rollback_reason(rat)
+                if reason:
+                    entry["rollback_reason"] = reason
+                elif not rat.get("error"):
+                    _ratchet_kept(st, rat)
             gate["rounds"].append(entry)
             gate.pop("round_pre", None)
             _save_gate()
@@ -43996,6 +44111,14 @@ async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                 round_pre = await _branch_head_sha(str(staging))
                 gate["round_pre"] = {"round": rnd, "sha": round_pre}
                 _save_gate()
+            # The ratchet's ID diff needs the round's start measured before
+            # its worker changes the tree.
+            if round_pre:
+                try:
+                    await _ids_at(round_pre, f"acceptance-r{rnd}-ids-pre")
+                except Exception as e:
+                    log(f"  acceptance repair round {rnd}: test IDs at its "
+                        f"start not measured ({type(e).__name__}: {e})")
             prev, prev_sha = final, final_sha
             up = [
                 "Run the acceptance repair pass on the merged run branch.",
@@ -45310,12 +45433,24 @@ def _contract_literal_evidence_section(flagged: list[dict]) -> str | None:
 
 def _intermittent_regression_rows(state: dict) -> list[dict]:
     """The typed `intermittent_regression` rows of the latest final ID diff
-    (`test_id_diff`), or []."""
-    diff = state.get("test_id_diff") if isinstance(state, dict) else None
-    rows = diff.get("intermittent_regression") if isinstance(diff, dict) \
-        else None
-    return [r for r in rows if isinstance(r, dict) and r.get("id")] \
-        if isinstance(rows, list) else []
+    (`test_id_diff`), then those of every kept repair's delivery ratchet
+    (`delivery_ratchet.intermittent_regression`) not already listed, or
+    []."""
+    out: list[dict] = []
+    if not isinstance(state, dict):
+        return out
+    diff = state.get("test_id_diff")
+    rat = state.get("delivery_ratchet")
+    for rows in ((diff.get("intermittent_regression")
+                  if isinstance(diff, dict) else None),
+                 (rat.get("intermittent_regression")
+                  if isinstance(rat, dict) else None)):
+        if not isinstance(rows, list):
+            continue
+        have = {r["id"] for r in out}
+        out += [r for r in rows if isinstance(r, dict) and r.get("id")
+                and r["id"] not in have]
+    return out
 
 
 def _intermittent_regression_evidence_section(rows: list[dict]
@@ -46916,7 +47051,416 @@ async def _redrive_new_failures(st: "State", caps: dict, staging: Path,
     return {"new": list(verdict["new"]),
             "resource_affected": list(verdict["resource_affected"]),
             "unmeasured": False, "files": {c: id_files.get(c)
-                                           for c in verdict["new"]}}
+                                           for c in verdict["new"]},
+            # The whole B* verdict: the delivery ratchet types intermittent
+            # regressions from its per-ID counts.
+            "verdict": verdict}
+
+
+# --- Delivery ratchet (DESIGN §8 *A repair that regresses met work is rolled
+# back*; bench Q4 N5, frozen config C + vote change V, its execution route on
+# B*) ---------------------------------------------------------------------
+#
+# After every acceptance-repair round and every delivery re-drive group that
+# commits, the required items verified met before it are verified again on
+# the tree after it. Execution-shaped items (typed by the verifiability
+# classifier) are settled by the failing-test-ID diff under B*; the others by
+# the delivery judge with their prior evidence and the repair's diff.
+
+# The repair diff the ratchet judge reads, and the verifiability
+# classifier's turn cap, as benched.
+RATCHET_DIFF_MAX_BYTES = 80_000
+RATCHET_CLASSIFIER_MAX_TURNS = 6
+RATCHET_VERIFIABILITY = ("in_tree", "execution")
+
+
+def _ratchet_record(st: "State") -> dict:
+    rec = st.data.get("delivery_ratchet")
+    return dict(rec) if isinstance(rec, dict) else {}
+
+
+def _ratchet_prior_met(st: "State") -> dict[int, str]:
+    """item_index -> prior evidence for every required item the latest
+    delivery verdict holds met: final detection's `delivery_gate.items` once
+    it ran, else the latest judge pass (`judged_after`, then
+    `judged_before`) minus its unmet items and the `external` ones. Evidence
+    a later kept ratchet recorded replaces the judge's. {} when no verdict
+    was recorded — there is nothing to ratchet."""
+    items = st.data.get("required_items") or []
+    if not items or st.data.get("skip_coverage_check"):
+        return {}
+    normalized = [_delivery_norm_item(it) for it in items]
+    gate = st.data.get("delivery_gate") or {}
+    met: dict[int, str] = {}
+    rows = gate.get("items")
+    if isinstance(rows, list) and rows:
+        for r in rows:
+            i = r.get("item_index") if isinstance(r, dict) else None
+            if (r and r.get("verdict") == "met" and isinstance(i, int)
+                    and 0 <= i < len(normalized)):
+                met[i] = str(((r.get("judge") or {}).get("met_evidence"))
+                             or "")
+    else:
+        rec = next((gate[k] for k in ("judged_after", "judged_before")
+                    if isinstance(gate.get(k), dict)), None)
+        if rec is None:
+            return {}
+        unmet = {u.get("item_index") for u in rec.get("unmet") or []
+                 if isinstance(u, dict)}
+        det = {d.get("item_index"): d for d in rec.get("details") or []
+               if isinstance(d, dict)}
+        for i, it in enumerate(normalized):
+            if it.get("verifiability") != "external" and i not in unmet:
+                met[i] = str((det.get(i) or {}).get("met_evidence") or "")
+    later = _ratchet_record(st).get("evidence") or {}
+    for i in met:
+        e = later.get(str(i))
+        if isinstance(e, dict) and e.get("evidence"):
+            met[i] = str(e["evidence"])
+    return met
+
+
+async def _ratchet_verifiability(st: "State", caps: dict, models: dict,
+                                 efforts: dict) -> dict[int, str] | None:
+    """item_index -> `in_tree` | `execution` from the verifiability
+    classifier (bench n3b v2): once per run, cached in
+    `delivery_ratchet.verifiability`. An item it leaves out is `in_tree`
+    (judged). None when the worker fails — not cached, so the next ratchet
+    asks again."""
+    rec = _ratchet_record(st)
+    cached = rec.get("verifiability")
+    if isinstance(cached, dict):
+        return {int(k): v for k, v in cached.items()
+                if str(k).isdigit() and v in RATCHET_VERIFIABILITY}
+    normalized = [_delivery_norm_item(it)
+                  for it in st.data.get("required_items") or []]
+    payload = [{"item_index": i, "item": it["item"]}
+               for i, it in enumerate(normalized)]
+    # As benched: classified by the item's own text, from an empty directory.
+    cwd = st.run_dir / "verifiability-classifier"
+    cwd.mkdir(parents=True, exist_ok=True)
+    try:
+        st.bump_workers(caps)
+        out = await claude_p(
+            user_prompt=("REQUIRED ITEMS:\n" + json.dumps(payload, indent=2)
+                         + "\n\nReturn one verdict per item_index per your "
+                         "schema."),
+            system_prompt=_load_prompt("verifiability_classifier"),
+            schema_key="verifiability_classifier", cwd=str(cwd),
+            allowed_tools=SATISFIED_PROBE_TOOLS,
+            max_turns=RATCHET_CLASSIFIER_MAX_TURNS, autonomous=False,
+            caps=caps, st=st,
+            model=models.get("verifiability_classifier", MODEL_DEFAULT),
+            effort=efforts.get("verifiability_classifier"),
+            sid="verifiability_classifier")
+    except Exception as e:
+        log(f"  delivery ratchet: verifiability classifier failed "
+            f"({_brief_worker_exc(e)}) — no in-tree re-verification this "
+            "time")
+        return None
+    got: dict[int, str] = {}
+    for v in (out or {}).get("items") or []:
+        i = v.get("item_index") if isinstance(v, dict) else None
+        if (isinstance(i, int) and 0 <= i < len(normalized)
+                and v.get("verifiability") in RATCHET_VERIFIABILITY):
+            got[i] = v["verifiability"]
+    rec = _ratchet_record(st)
+    rec["verifiability"] = {str(i): got[i] for i in sorted(got)}
+    st.data["delivery_ratchet"] = rec
+    st.save()
+    return got
+
+
+def _ratchet_norm_path(path: str, tree: str) -> str:
+    """A judge-typed evidence path as a repo-relative path: an absolute path
+    inside `tree`, a leading `./` and a `:line` suffix removed."""
+    x = str(path).strip()
+    root = str(tree).rstrip("/") + "/"
+    if x.startswith(root):
+        x = x[len(root):]
+    while x.startswith("./"):
+        x = x[2:]
+    return x.split(":", 1)[0]
+
+
+async def _ratchet_judge(st: "State", caps: dict, models: dict,
+                         efforts: dict, staging: Path, pre_sha: str,
+                         post_sha: str, prior: dict[int, str],
+                         indices: list[int], *, typed_evidence: list[str],
+                         label: str) -> dict:
+    """The ratchet's in-tree route (frozen N5 config C + vote change V): one
+    delivery-judge sample over the previously met items, with each item's
+    prior evidence and `git diff pre post`; when it marks an item unmet, or
+    an item's typed `evidence_files` meet the diff's changed files, two more
+    samples of the same prompt run, and an item in that candidate set is
+    confirmed regressed on 2 of 3 unmet votes. A pack whose judge fails
+    confirms nothing (recorded)."""
+    normalized = [_delivery_norm_item(it)
+                  for it in st.data.get("required_items") or []]
+    diff = _redrive_git(staging, "diff", pre_sha, post_sha)
+    diff_files = {f for f in _redrive_git(
+        staging, "diff", "--name-only", pre_sha, post_sha).split() if f}
+    diff_bytes = len(diff)
+    if diff_bytes > RATCHET_DIFF_MAX_BYTES:
+        diff = (diff[:RATCHET_DIFF_MAX_BYTES]
+                + f"\n[diff truncated at {RATCHET_DIFF_MAX_BYTES} bytes; "
+                f"inspect the tree with git diff {pre_sha} HEAD]")
+    spans = (st.data.get("requirement_coverage") or {}).get("spans") or []
+    packs = _d1_judge_packs(
+        normalized, sorted(indices), spans,
+        int(caps.get("d1_pack_items", DEFAULT_CAPS["d1_pack_items"])))
+    out: dict = {"judged": sorted(indices), "diff_files": len(diff_files),
+                 "diff_bytes": diff_bytes, "sample1_flags": [],
+                 "touched": [], "candidates": [],
+                 "per_sample_regressed": [], "confirmed": [], "samples": 0,
+                 "met_evidence": {}, "errors": []}
+    system_prompt = (_load_prompt("delivery_judge") + "\n\n"
+                     + _load_prompt("delivery_ratchet"))
+    for p, pack in enumerate(packs):
+        entries = [{"item_index": i, "item": normalized[i]["item"],
+                    "prior_verified_evidence": prior.get(i, "")}
+                   for i in pack]
+        user_prompt = "\n\n".join([
+            "TASK:\n" + st.data.get("task", ""),
+            "PREVIOUSLY VERIFIED ITEMS (each was verified MET on commit "
+            + pre_sha + " with the evidence shown; your cwd is the tree "
+            "AFTER a later change. Re-verify each against the CURRENT "
+            "tree):\n" + json.dumps(entries, indent=2),
+            "CHANGES SINCE THAT VERIFICATION (git diff " + pre_sha
+            + " HEAD):\n" + diff,
+            *typed_evidence,
+            "Return one verdict per item_index listed above per your "
+            "schema. met=true only if the behaviour the item requires still "
+            "holds on the current tree, with cited on-tree evidence. If the "
+            "changes removed or inverted code the prior evidence relied on "
+            "and nothing equivalent replaced it, met=false and name what was "
+            "removed. In evidence_files list the repo-relative paths of the "
+            "files your verdict for that item relies on.",
+        ])
+        allowed = set(pack)
+
+        async def _sample(k: int) -> dict:
+            st.bump_workers(caps)
+            smp = await claude_p(
+                user_prompt=user_prompt, system_prompt=system_prompt,
+                schema_key="delivery_ratchet", cwd=str(staging),
+                allowed_tools=SATISFIED_PROBE_TOOLS,
+                max_turns=min(30 + 6 * len(pack), 90), autonomous=False,
+                caps=caps, st=st,
+                model=models.get("delivery_ratchet", MODEL_DEFAULT),
+                effort=efforts.get("delivery_ratchet"),
+                sid=f"delivery_ratchet-{label}-p{p}-s{k}")
+            return {v["item_index"]: v for v in (smp or {}).get("verdicts")
+                    or [] if isinstance(v, dict)
+                    and v.get("item_index") in allowed}
+
+        try:
+            samples = [await _sample(0)]
+            v1 = samples[0]
+            flags = {i for i, v in v1.items() if v.get("met") is False}
+            touched = {i for i, v in v1.items()
+                       if {_ratchet_norm_path(x, str(staging))
+                           for x in v.get("evidence_files") or []
+                           if isinstance(x, str)} & diff_files}
+            cand = flags | touched
+            if cand:
+                samples += [await _sample(1), await _sample(2)]
+        except Exception as e:
+            out["errors"].append({"pack": p, "error": _brief_worker_exc(e)})
+            log(f"  delivery ratchet {label}: judge failed on pack {p} "
+                f"({_brief_worker_exc(e)}) — its items keep their verdict")
+            continue
+        out["samples"] += len(samples)
+        out["sample1_flags"] += sorted(flags)
+        out["touched"] += sorted(touched)
+        out["candidates"] += sorted(cand)
+        per = [sorted(i for i, v in s_.items() if v.get("met") is False)
+               for s_ in samples]
+        out["per_sample_regressed"].append(per)
+        if len(samples) == 3:
+            out["confirmed"] += [i for i in sorted(cand)
+                                 if sum(i in x for x in per) >= 2]
+        for i, v in v1.items():
+            if v.get("met") is True and v.get("evidence"):
+                out["met_evidence"][str(i)] = str(v["evidence"])[:1200]
+    for k in ("sample1_flags", "touched", "candidates", "confirmed"):
+        out[k] = sorted(set(out[k]))
+    return out
+
+
+async def _ratchet_test_ids(st: "State", caps: dict, tree: str, *,
+                            label: str, log_path: Path) -> dict | None:
+    """The test axis's failing IDs on `tree` (`_capture_failing_test_ids`),
+    with the axis's command — or, when the task forbids it, its scoped
+    replacement over the coupled tests (DESIGN §9 *A command the task
+    forbids*). None: no command, nothing to run, or no report."""
+    cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"]) or "").strip()
+    if not cmd:
+        return None
+    forbidden = _forbidden_specs(st.data)
+    hit = _forbidden_command_hit(cmd, forbidden)
+    if hit:
+        rep = await _scoped_test_replacement(tree, st, cmd, hit, forbidden,
+                                             log_prefix="delivery ratchet")
+        if "scoped_replacement" not in rep:
+            return None
+        cmd = rep["command"]
+    got = await _capture_failing_test_ids(
+        tree, cmd, st, caps, label=label, log_path=log_path,
+        timeout=float(caps.get("worker_timeout_sec")
+                      or DEFAULT_CAPS["worker_timeout_sec"]))
+    if got is None:
+        return None
+    got["command"] = cmd
+    got["messages"] = {k: str(v)[:400]
+                       for k, v in (got.get("messages") or {}).items()}
+    return got
+
+
+async def _ratchet_exec(st: "State", caps: dict, staging: Path,
+                        pre_sha: str, before: dict | None,
+                        after: dict | None, *, label: str,
+                        log_path: Path) -> dict:
+    """The ratchet's execution route: the failing-test-ID diff of one repair
+    — IDs failing after it and not before — confirmed by B* against
+    `pre_sha` (`_redrive_new_failures`). The tests that directly import a
+    file the repair changed are first rerun `confirm_intermittent_repeats`
+    times (`_intermittent_discovery`, base `pre_sha`); every ID they fail
+    joins the candidates, and a `resource_affected` ID meeting the
+    intermittent-regression rule is typed as evidence
+    (`_type_intermittent_regressions`), never counted. `{new,
+    resource_affected, unmeasured, intermittent_regression[], discovery?}`."""
+    if before is None or after is None:
+        return {"new": [], "resource_affected": [], "unmeasured": True,
+                "intermittent_regression": []}
+    disc = await _intermittent_discovery(
+        st, caps, str(staging), after.get("command") or "", pre_sha,
+        log_path=log_path, label=f"{label}-discovery")
+    messages: dict[str, list[str]] = {}
+    for cid, msg in (after.get("messages") or {}).items():
+        messages.setdefault(cid, []).append(msg)
+    for run in disc.pop("_runs", []):
+        for cid, msg in (run.get("messages") or {}).items():
+            messages.setdefault(cid, []).append(msg)
+    found = set(disc.get("failed_ids") or []) - set(before.get("ids") or [])
+    files = dict(after.get("files") or {})
+    for c in sorted(found):
+        files.setdefault(c, (disc.get("id_files") or {}).get(c))
+    aug = {**after, "ids": sorted(set(after.get("ids") or []) | found),
+           "files": files}
+    newv = await _redrive_new_failures(st, caps, staging, pre_sha, before,
+                                       aug, label)
+    verdict = newv.pop("verdict", None)
+    newv["intermittent_regression"] = (_type_intermittent_regressions(
+        verdict, final_ids=set(after.get("ids") or []),
+        base_ids=set(before.get("ids") or []),
+        discovery_counts=disc.get("fail_counts") or {},
+        repeats_run=int(disc.get("repeats_run") or 0),
+        coupled=disc.get("coupled") or {}, id_files=files,
+        messages=messages) if isinstance(verdict, dict) else [])
+    newv["discovery"] = {k: disc.get(k) for k in (
+        "files", "repeats_required", "repeats_run", "budget_exhausted",
+        "fail_counts", "skipped") if k in disc}
+    return newv
+
+
+async def _delivery_ratchet(st: "State", caps: dict, models: dict,
+                            efforts: dict, staging: Path, pre_sha: str,
+                            post_sha: str, *, exec_result: dict | None,
+                            label: str) -> dict:
+    """Re-verify the previously met required items after one repair
+    (`pre_sha`..`post_sha`, staging at `post_sha`). An item with
+    `untouched_paths` is settled in code (`_d1_untouched_verdict`); the
+    rest are typed by the verifiability classifier: an `execution` item is
+    flagged when the repair's B* ID diff (`exec_result`) confirmed a new
+    failure, an `in_tree` one is re-judged (`_ratchet_judge`). The
+    intermittent regressions `exec_result` typed reach that judge as
+    evidence. `regressed` lists every item flagged; `new_failures` the
+    confirmed new test failures — either one rolls the repair back."""
+    ex = exec_result or {}
+    out: dict = {"pre_sha": pre_sha, "post_sha": post_sha, "prior_met": [],
+                 "untouched": [], "execution": [], "exec_flagged": [],
+                 "judge": None, "regressed": [],
+                 "new_failures": list(ex.get("new") or []),
+                 "intermittent_regression": list(
+                     ex.get("intermittent_regression") or [])}
+    prior = _ratchet_prior_met(st)
+    out["prior_met"] = sorted(prior)
+    if not prior:
+        return out
+    normalized = [_delivery_norm_item(it)
+                  for it in st.data.get("required_items") or []]
+    own = _acceptance_own_start(st)
+    regressed: set[int] = set()
+    rest: list[int] = []
+    for i in sorted(prior):
+        paths = normalized[i].get("untouched_paths")
+        v = (_d1_untouched_verdict(staging, own, paths)
+             if isinstance(paths, list) and paths else None)
+        if v is None:
+            rest.append(i)
+            continue
+        out["untouched"].append({"item_index": i, **v})
+        if not v["met"]:
+            regressed.add(i)
+    kinds = (await _ratchet_verifiability(st, caps, models, efforts)
+             if rest else {})
+    if kinds is None:
+        out["judge"] = {"skipped": "verifiability classifier failed"}
+    else:
+        out["execution"] = [i for i in rest
+                            if kinds.get(i) == "execution"]
+        if out["new_failures"]:
+            out["exec_flagged"] = list(out["execution"])
+            regressed |= set(out["execution"])
+        judged = [i for i in rest if kinds.get(i) != "execution"]
+        if judged:
+            sec = _intermittent_regression_evidence_section(
+                out["intermittent_regression"])
+            out["judge"] = await _ratchet_judge(
+                st, caps, models, efforts, staging, pre_sha, post_sha,
+                prior, judged, typed_evidence=[sec] if sec else [],
+                label=label)
+            regressed |= set(out["judge"]["confirmed"])
+    out["regressed"] = sorted(regressed)
+    if out["regressed"] or out["new_failures"]:
+        log(f"  delivery ratchet {label}: "
+            + (f"{len(out['regressed'])} previously met item(s) regressed "
+               f"{out['regressed']}" if out["regressed"] else "")
+            + ("; " if out["regressed"] and out["new_failures"] else "")
+            + (f"{len(out['new_failures'])} test(s) newly failing under B*"
+               if out["new_failures"] else ""))
+    return out
+
+
+def _ratchet_rollback_reason(rat: dict) -> str | None:
+    """The rollback reason a ratchet verdict gives, or None."""
+    if rat.get("regressed"):
+        return "regressed a previously met required item"
+    if rat.get("new_failures"):
+        return "broke an existing test"
+    return None
+
+
+def _ratchet_kept(st: "State", rat: dict) -> None:
+    """A kept repair's ratchet: its judge's met evidence becomes the prior
+    evidence of the next one, and its intermittent regressions join the
+    evidence the delivery judge and the PR read."""
+    rec = _ratchet_record(st)
+    ev = dict(rec.get("evidence") or {})
+    for i, e in ((rat.get("judge") or {}).get("met_evidence") or {}).items():
+        ev[str(i)] = {"sha": rat.get("post_sha") or "", "evidence": e}
+    rows = list(rec.get("intermittent_regression") or [])
+    have = {r.get("id") for r in rows if isinstance(r, dict)}
+    rows += [r for r in rat.get("intermittent_regression") or []
+             if isinstance(r, dict) and r.get("id") not in have]
+    if ev:
+        rec["evidence"] = ev
+    if rows:
+        rec["intermittent_regression"] = rows
+    if ev or rows:
+        st.data["delivery_ratchet"] = rec
+        st.save()
 
 
 # --- escalation gates (Q3-FRESH2 config (ii)+(d+)) --------------------------
@@ -47836,10 +48380,14 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                           else _redrive_carry(H, H1, unm_h))
                 ids_after = await _redrive_test_ids(
                     st, caps, staging, f"redrive-r{rnd}g{gi}-ids")
-                newv = await _redrive_new_failures(
+                newv = await _ratchet_exec(
                     st, caps, staging, pre_sha, ids_before, ids_after,
-                    f"redrive-r{rnd}g{gi}")
+                    label=f"redrive-r{rnd}g{gi}",
+                    log_path=st.run_dir / "logs" / _REDRIVE_LOG)
                 ge["new_failures"] = newv["new"]
+                if newv.get("intermittent_regression"):
+                    ge["intermittent_regression"] = newv[
+                        "intermittent_regression"]
                 ge["resource_affected"] = (
                     newv["resource_affected"] + [f"set {i}" for i in unm]
                     + (["test ids"] if newv["unmeasured"] else []))
@@ -47873,6 +48421,25 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     eg = _redrive_escalation_gate(staging, pre_sha, post_sha)
                     ge["gate"] = eg
                     void = void or eg["void"]
+                rat: dict = {}
+                if not (v["worse"] or void):
+                    # The delivery ratchet (DESIGN §8 *A repair that
+                    # regresses met work is rolled back*): the items met
+                    # before this group are re-verified on its tree. Its
+                    # new test failures already made the group worse.
+                    try:
+                        rat = await _delivery_ratchet(
+                            st, caps, models, efforts, staging, pre_sha,
+                            post_sha, exec_result=newv,
+                            label=f"redrive-r{rnd}g{gi}")
+                    except Exception as e:
+                        rat = {"error": f"{type(e).__name__}: {e}"[:300]}
+                        log(f"  delivery re-drive: ratchet raised "
+                            f"{rat['error']} — group kept")
+                    ge["ratchet"] = rat
+                    if rat.get("regressed"):
+                        ge["ratchet_regressed"] = list(rat["regressed"])
+                        void = True
                 if v["worse"] or void:
                     ok = await _redrive_rollback(staging, pre_sha)
                     ge["rolled_back"] = ok
@@ -47899,8 +48466,21 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                         if k not in have:
                             rec["pending_controls"].append(
                                 set_note(k, F1[k], "control_regression"))
+                    for i in ge.get("ratchet_regressed") or []:
+                        key = f"met-item-{i}"
+                        if key in have or i >= len(normalized):
+                            continue
+                        rec["pending_controls"].append({
+                            "kind": "control_regression", "key": key,
+                            "test": f"required item {i}", "detail": (
+                                "an earlier re-drive attempt made this "
+                                "required item, verified met before it, "
+                                "unmet again and was reverted. Keep it met: "
+                                + normalized[i]["item"][:400])})
                 else:
                     F = F1
+                    if rat and not rat.get("error"):
+                        _ratchet_kept(st, rat)
                     if held_mode and H1 is not None:
                         H = H1
                         H_known = H1
