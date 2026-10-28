@@ -9325,7 +9325,17 @@ the old ones ("treated as pre-existing") and ships. So the baseline and the
 final-tree conformance measurements ask the test runner for its structured
 report (the same machine formats the held-out acceptance sets use: JUnit for
 pytest, jest-compatible JSON for jest and vitest) and record the failing test
-IDs — `baseline_failing_ids` and `final_failing_ids`. A final ID that did
+IDs — `baseline_failing_ids` and `final_failing_ids`. The runner is found
+on the command's own words, and a package-manager script call
+(`pnpm|npm|yarn|bun [run] <name>`) is first replaced by its `package.json`
+script body, recursively, since a script may call a script. The body is
+then run with the tree's `node_modules/.bin` on PATH, as the manager runs
+it. Without that, `pnpm run test` (whose script is `vitest run`) named no
+runner. On barnacle 7cc87f9a's early replay, all three passes recorded
+`baseline_failing_ids: null` on a red base, and the whole diff below never
+ran. The same resolution serves every place that asks a runner for its
+report: the axis IDs, the delivery ratchet and re-drive, and the held-out
+set runs. A final ID that did
 not fail on the base is only a *candidate*: one failing run is not evidence
 under load. Benched (Q9), "failed twice" — today's informal rule — labelled
 17 of 17 clean trials as having a new failure under sustained host load
@@ -9384,6 +9394,10 @@ adds two steps:
    repeat, or a B\* final rerun) and not on the base joins the B\*
    candidates, so it gets base reruns. At p = 0.105, R = 20 finds such a
    test with probability 1 − 0.895²⁰ ≈ 89% (R = 10: 67%; R = 30: 96%).
+   Discovery needs only the coupled test files and the base commit, not
+   the base's failing IDs: when those are unknown (no report on a red
+   base), it still runs and its findings still get B\*'s base reruns, which
+   decide alone whether the base failed them.
    Direct imports, not the transitive closure: on barnacle one changed
    module's closure reaches 864–956 of ~1,200 test files. That is the
    whole suite twenty times, and it couples every flaky test in the repo.

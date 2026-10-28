@@ -1075,11 +1075,16 @@ def test_final_id_diff_uses_an_empty_base_for_a_scoped_replacement(
         st, dict(leerie.DEFAULT_CAPS), str(tmp_path), post,
         log_path=tmp_path / "l.log", label="final"))
     assert seen["cand"] == ["a :: x"] and v["candidates"] == ["a :: x"]
-    # Without the replacement, unknown base IDs keep the axis verdict.
+    # Without the replacement, unknown base IDs keep the axis verdict: no
+    # final failure is a candidate, and the verdict says the IDs were
+    # unknown (discovery still runs, DESIGN §9).
     del post["tests"]["scoped_replacement"]
-    assert asyncio.run(leerie._confirm_final_test_failures(
+    seen.clear()
+    v = asyncio.run(leerie._confirm_final_test_failures(
         st, dict(leerie.DEFAULT_CAPS), str(tmp_path), post,
-        log_path=tmp_path / "l.log", label="final")) is None
+        log_path=tmp_path / "l.log", label="final"))
+    assert v["ids_unknown"] is True and v["final_candidates"] == []
+    assert seen.get("cand", []) == []
 
 
 def test_direct_coupling_keeps_only_direct_importers(leerie, tmp_path):

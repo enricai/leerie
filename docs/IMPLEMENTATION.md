@@ -6044,7 +6044,25 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   through `_append_runner_flags` when `serial`, retrying once without them
   when the serial form produced no report. Returns `{ids, files, kind}` or
   None. A separate run: the axis verdict `_measure_blt` records is never
-  measured with altered flags.
+  measured with altered flags. The runner is found through
+  `_runner_command(cmd, tree, known, files) -> (cmd, env overlay | None)`:
+  `cmd` as written when `_acceptance_runner` finds a runner in it; else,
+  when `_resolve_pm_script(cmd, tree)` resolves it and the result names
+  one, the resolved command with `<tree>/node_modules/.bin` first on PATH.
+  `_resolve_pm_script` replaces each top-level (`_shell_top_segments`:
+  split at `&&`, `||`, `;` outside quotes and brackets) package-manager
+  script call — `_PM_SCRIPT_CALL_RE`, `npm|pnpm|yarn|bun [run|run-script]
+  <name> [args]` with `<name>` in `_package_json_scripts(tree)` — by the
+  script body, recursively (a seen name or depth `_PM_SCRIPT_DEPTH` = 4
+  stops), appending the call's arguments (a leading `--` dropped) and
+  bracing a compound body inside a list; None when nothing resolved, when
+  a segment is `cd`/`pushd`, or for a cycle. When the command was
+  resolved, the command as written also goes through `_blt_shell_argv`
+  first, so a resolved body never runs what the task forbids.
+  `_run_acceptance_file` resolves its scoped command the same way (its
+  report request and `_acceptance_no_verdict_exits` then read the body's
+  runner). `_acceptance_parse_probe` does not: its exit code is the
+  command's as run, so its runner table must match the command as written.
 - `_measure_axes(..., failing_ids_axes=frozenset())` — for an axis in
   `failing_ids_axes`, a measured result gains `failing_ids` (`[]` when it
   passed; captured by `_capture_failing_test_ids` when it failed, absent
@@ -6057,10 +6075,15 @@ Test-ID plumbing for the failing-test-ID diff (E3):
 - `async _confirm_final_test_failures(st, caps, staging, post, *,
   log_path, label) -> dict | None` — called by `_run_final_conformance`
   after each round's `post` measurement (taken with
-  `failing_ids_axes={"tests"}`). None (axis verdict stands) unless
-  `baseline_failing_ids` and the post `tests` `failing_ids` are both known.
-  Records `state.data["final_failing_ids"]`; candidates are the final IDs
-  not in the baseline; reruns use `_acceptance_cmd` over the candidates'
+  `failing_ids_axes={"tests"}`). None when the post `tests` axis was not
+  measured. When `baseline_failing_ids` or the post `failing_ids` is
+  unknown there is no diff: no final ID is a candidate, but discovery still
+  runs (from the baseline sha) and its IDs are confirmed as below; the
+  verdict carries `ids_unknown: true`, and the round loop then keeps the
+  axis verdict (its `tests:` regression stays), adding a `tests:`
+  regression only for a confirmed `new` ID. Otherwise it records
+  `state.data["final_failing_ids"]`; candidates are the final IDs not in
+  the baseline; reruns use `_acceptance_cmd` over the candidates'
   files when every candidate has one (else the canonical `tests` command)
   in a disposable detached worktree `worktrees/<run-id[:12]>-confirm-base` at the
   baseline sha (else the `working_branch` merge-base) with deps installed,
@@ -9302,7 +9325,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `unconverged_subtasks` | dict[str, dict] | one `{at, previous_status, reason}` record per subtask settled `unconverged` by `_settle_unconverged`, plus `kind: "environment_limit"` when its cgroup killed it at the measured ceiling (DESIGN §6). |
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
-| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only); `new` non-empty makes the outcome `unconverged`. |
+| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed); `new` non-empty makes the outcome `unconverged`. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |

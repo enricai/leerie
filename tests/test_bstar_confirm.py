@@ -386,15 +386,37 @@ def test_e3_confirms_the_real_regression_and_types_the_flake(
     assert not leerie._helper_worktree_path(st, "confirm-base").exists()
 
 
-def test_e3_unknown_base_ids_leaves_the_axis_verdict(leerie, e3_repo):
+def test_e3_unknown_base_ids_leaves_the_axis_verdict_but_runs_discovery(
+        leerie, e3_repo, monkeypatch):
+    """No diff without the base's IDs — no final ID is a candidate and the
+    verdict says `ids_unknown` — but discovery still runs: it needs only the
+    coupled files and the base commit (DESIGN §9; barnacle 7cc87f9a's early
+    replay never reached it on a red base)."""
+    monkeypatch.setattr(leerie, "_host_cpu_psi", lambda path=None: 0.0)
+    seen = {}
+
+    async def disc(st_, caps, staging, cmd, base_sha, **kw):
+        seen["base_sha"] = base_sha
+        return {"failed_ids": [], "fail_counts": {}, "id_files": {},
+                "coupled": {}, "repeats_run": 0, "_runs": []}
+    monkeypatch.setattr(leerie, "_intermittent_discovery", disc)
     st = e3_repo["st"]
     st.data["baseline_failing_ids"] = None
     post = {"tests": {"ran": True, "measured": True, "passed": False,
                       "command": CMD, "failing_ids": ["x"]}}
+    v = asyncio.run(leerie._confirm_final_test_failures(
+        st, _caps(leerie), str(e3_repo["staging"]), post,
+        log_path=st.run_dir / "logs" / "t.log", label="t"))
+    assert seen["base_sha"] == e3_repo["base"]
+    assert v["ids_unknown"] is True
+    assert v["final_candidates"] == [] and v["new"] == []
+    assert st.data["test_id_diff"]["ids_unknown"] is True
+    # Unmeasured axis: still no verdict at all.
+    post["tests"]["measured"] = False
+    st.data.pop("test_id_diff")
     assert asyncio.run(leerie._confirm_final_test_failures(
         st, _caps(leerie), str(e3_repo["staging"]), post,
         log_path=st.run_dir / "logs" / "t.log", label="t")) is None
-    assert "test_id_diff" not in st.data
 
 
 # --- the consumer: the final conformance loop -------------------------------
@@ -408,9 +430,13 @@ def _clean_final():
             "solution_defects": []}
 
 
-@pytest.mark.parametrize("new,expected_rounds", [([], 1), (["t :: x"], 3)])
+@pytest.mark.parametrize("new,expected_rounds,unknown", [
+    ([], 1, False), (["t :: x"], 3, False),
+    # IDs unknown on a side (DESIGN §9): no diff, so the red axis stands
+    # and the loop goes on, as before the diff existed.
+    ([], 3, True)])
 def test_final_loop_continues_only_on_a_confirmed_new_failure(
-        leerie, e3_repo, monkeypatch, new, expected_rounds):
+        leerie, e3_repo, monkeypatch, new, expected_rounds, unknown):
     """Executes `_run_final_conformance`: the tests axis is red before and
     after every round on a GREEN base. Today's axis rule would spend every
     round on it; with B* the loop stops after one round when no failing ID
@@ -429,7 +455,8 @@ def test_final_loop_continues_only_on_a_confirmed_new_failure(
 
     async def fake_confirm(st_, caps, staging, post, **k):
         return {"new": list(new), "resource_affected": [],
-                "candidates": list(new) or ["t :: flaky"], "pairs_run": 3}
+                "candidates": list(new) or ["t :: flaky"], "pairs_run": 3,
+                **({"ids_unknown": True} if unknown else {})}
 
     async def fake_claude_p(**kw):
         calls.append(kw)

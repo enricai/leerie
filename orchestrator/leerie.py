@@ -35095,6 +35095,135 @@ def _package_json_scripts(repo_root: Path) -> dict[str, str]:
     return {k: v for k, v in scripts.items() if isinstance(v, str)}
 
 
+# A package-manager script call — `pnpm run test`, `npm test`, `yarn
+# test:unit -- --bail`, `bun run test` — as one simple command: the manager,
+# an optional `run`/`run-script`, the script name, then its arguments. A
+# mechanical string (DESIGN §12); a name that is not in `package.json`'s
+# `scripts` (`pnpm vitest run`, `npm install`) resolves to nothing.
+_PM_SCRIPT_CALL_RE = re.compile(
+    r"\s*(?:npm|pnpm|yarn|bun)\s+(?:(?:run|run-script)\s+)?"
+    r"([A-Za-z0-9:_.-]+)(?:\s+(.*?))?\s*", re.S)
+# Scripts calling scripts: deeper chains than this stay unresolved.
+_PM_SCRIPT_DEPTH = 4
+
+
+def _shell_top_segments(cmd: str) -> list[tuple[str, str]]:
+    """`cmd` split at its top-level `&&`, `||` and `;` — outside quotes,
+    escapes and brackets — as `(segment, separator after it)` pairs, the
+    last separator `""`. A mechanical split of a shell command (DESIGN §12),
+    used only to find package-manager script calls among its commands."""
+    out: list[tuple[str, str]] = []
+    buf: list[str] = []
+    quote = ""
+    depth = 0
+    i = 0
+    while i < len(cmd):
+        ch = cmd[i]
+        if quote:
+            buf.append(ch)
+            if ch == "\\" and quote == '"' and i + 1 < len(cmd):
+                buf.append(cmd[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = ""
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(cmd):
+            buf.append(cmd[i:i + 2])
+            i += 2
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch in "({":
+            depth += 1
+        elif ch in ")}" and depth:
+            depth -= 1
+        elif depth == 0 and cmd[i:i + 2] in ("&&", "||"):
+            out.append(("".join(buf), cmd[i:i + 2]))
+            buf = []
+            i += 2
+            continue
+        elif depth == 0 and ch == ";":
+            out.append(("".join(buf), ";"))
+            buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    out.append(("".join(buf), ""))
+    return out
+
+
+def _resolve_pm_script(cmd: str, repo: str | Path) -> str | None:
+    """`cmd` with every top-level package-manager script call replaced by
+    the script's body from `repo`'s `package.json` (`_package_json_scripts`),
+    recursively — a script calling another script resolves too — and the
+    call's arguments appended to the body as the manager would (a leading
+    `--` dropped). None when nothing resolved, or when a command before the
+    call changes directory (the root `package.json` would then be the wrong
+    one). The caller runs the result with the tree's `node_modules/.bin` on
+    PATH, as the manager does (DESIGN §9 *Which failures are new*)."""
+    scripts = _package_json_scripts(Path(repo))
+    if not scripts:
+        return None
+
+    def _one(seg: str, seen: frozenset[str], depth: int) -> str | None:
+        m = _PM_SCRIPT_CALL_RE.fullmatch(seg)
+        if m is None or depth >= _PM_SCRIPT_DEPTH:
+            return None
+        name, rest = m.group(1), (m.group(2) or "").strip()
+        if name in seen or name not in scripts:
+            return None
+        if rest == "--" or rest.startswith("-- "):
+            rest = rest[2:].strip()
+        body = scripts[name].strip()
+        body = _all(body, seen | {name}, depth + 1) or body
+        return f"{body} {rest}".strip() if rest else body
+
+    def _all(text: str, seen: frozenset[str], depth: int) -> str | None:
+        parts = _shell_top_segments(text)
+        changed = False
+        out: list[str] = []
+        for seg, sep in parts:
+            if re.match(r"\s*(?:cd|pushd)\b", seg):
+                return None
+            got = _one(seg, seen, depth)
+            if got is not None:
+                changed = True
+                if len(parts) > 1 and len(_shell_top_segments(got)) > 1:
+                    # A compound body inside a list keeps its own grouping.
+                    got = "{ " + got + "; }"
+            out.append((got if got is not None else seg.strip())
+                       + (f" {sep} " if sep else ""))
+        return "".join(out).strip() if changed else None
+
+    got = _all(cmd, frozenset(), 0)
+    # A cycle (`a` runs `b` runs `a`) comes back as the call it started as.
+    return None if got is None or got == cmd.strip() else got
+
+
+def _runner_command(cmd: str, tree: str | Path, known: Iterable[str],
+                    files: Iterable[str] = ()
+                    ) -> tuple[str, dict[str, str] | None]:
+    """`(command, env overlay)` to run for a runner report: `cmd` as written
+    when it names one of the `known` runners itself; else, when it is a
+    package-manager script call whose resolved body (`_resolve_pm_script`,
+    read from `tree`'s `package.json`) names one, that body with `tree`'s
+    `node_modules/.bin` put first on PATH, as the manager would; else `cmd`
+    unchanged. The overlay is None when nothing was resolved."""
+    files = list(files)
+    if _acceptance_runner(cmd, known, files) is not None:
+        return cmd, None
+    resolved = _resolve_pm_script(cmd, tree)
+    if resolved is None or _acceptance_runner(resolved, known,
+                                              files) is None:
+        return cmd, None
+    bin_dir = os.path.join(str(tree), "node_modules", ".bin")
+    return resolved, {"PATH": bin_dir + os.pathsep
+                      + os.environ.get("PATH", "")}
+
+
 def _declared_node_heap_bytes(repo_root: Path) -> int | None:
     """Max `--max-old-space-size` (MiB, converted to bytes) declared by the
     repo's effective build/lint/test commands (`resolve_blt`) **or by the
@@ -37842,6 +37971,11 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             cmd = scoped
         else:
             run_files = []
+    written = cmd
+    # A package-manager script call (`pnpm run test`) names no runner on
+    # its own words: its `package.json` body does (DESIGN §9 *Which
+    # failures are new*).
+    cmd, path_env = _runner_command(cmd, tree, _RUNNER_REPORTS, run_files)
     runner = _acceptance_runner(cmd, _RUNNER_REPORTS, run_files)
     if runner is None:
         return None
@@ -37861,6 +37995,10 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             continue
         run_cmd, env, kind = spec
         try:
+            if written != cmd:
+                # The command as the task would see it is checked too: a
+                # resolved body must not run what the task forbids.
+                _blt_shell_argv(written, forbidden)
             # `source` is the command before the serial and report flags,
             # which a whole-suite match would read as test operands.
             argv = _blt_shell_argv(run_cmd, forbidden, source=cmd)
@@ -37869,6 +38007,8 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             # forbids*).
             log(f"  {label}: test IDs not captured — {e}")
             return None
+        if path_env:
+            env = {**(env if env is not None else os.environ), **path_env}
         if env_extra:
             env = {**(env if env is not None else os.environ), **env_extra}
         try:
@@ -37908,8 +38048,13 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     and every ID they fail joins the candidates; after it, a
     `resource_affected` ID meeting the intermittent-regression rule is typed
     (`_type_intermittent_regressions`) as evidence — never counted. None
-    when either side's IDs are unknown — the axis verdict then stands, as
-    before. Records `final_failing_ids` and the verdict (`test_id_diff`)."""
+    when the axis was not measured. When either side's IDs are unknown
+    there is no diff — the axis verdict stands, and the verdict says so
+    (`ids_unknown`) — but discovery still runs: it needs only the coupled
+    files and the base commit (DESIGN §9 *An intermittent failure the run
+    introduced is evidence*), and B*'s base reruns alone decide whether
+    the base failed what it finds. Records `final_failing_ids` and the
+    verdict (`test_id_diff`)."""
     base_ids = st.data.get("baseline_failing_ids")
     tests = (post or {}).get("tests") or {}
     if tests.get("scoped_replacement"):
@@ -37917,20 +38062,23 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         # task forbids*): every final failure is a candidate, and B*'s base
         # reruns keep one the base already had from being called new.
         base_ids = []
-    if base_ids is None or not tests.get("measured"):
+    if not tests.get("measured"):
         return None
     final_ids = tests.get("failing_ids")
-    if final_ids is None:
-        return None
-    st.data["final_failing_ids"] = list(final_ids)
-    st.save()
-    cand = sorted(set(final_ids) - set(base_ids))
+    ids_unknown = base_ids is None or final_ids is None
+    if final_ids is not None:
+        st.data["final_failing_ids"] = list(final_ids)
+        st.save()
+    base_ids = list(base_ids or [])
+    final_ids = list(final_ids or [])
+    cand = [] if ids_unknown else sorted(set(final_ids) - set(base_ids))
     id_files = dict(tests.get("failing_id_files") or {})
     # The same candidates on the same tree were already confirmed (a round
     # that committed nothing): a second confirm would only re-measure noise.
     tree_sha = await _worktree_tree_sha(staging)
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
+            and bool(prior.get("ids_unknown")) == ids_unknown
             and prior.get("final_candidates",
                           prior.get("candidates")) == cand):
         return prior
@@ -37955,7 +38103,8 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
         verdict = await _confirm_new_failures([], _no_rerun, _no_rerun, caps,
                                               label=label)
         verdict.update(final_candidates=cand, tree_sha=tree_sha,
-                       discovery=disc, intermittent_regression=[])
+                       discovery=disc, intermittent_regression=[],
+                       **({"ids_unknown": True} if ids_unknown else {}))
         st.data["test_id_diff"] = verdict
         st.save()
         return verdict
@@ -38010,6 +38159,8 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     verdict["final_candidates"] = cand
     verdict["tree_sha"] = tree_sha
     verdict["discovery"] = disc
+    if ids_unknown:
+        verdict["ids_unknown"] = True
     verdict["intermittent_regression"] = _type_intermittent_regressions(
         verdict, final_ids=set(final_ids), base_ids=set(base_ids),
         discovery_counts=disc.get("fail_counts") or {},
@@ -42526,6 +42677,11 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
     cmd = _acceptance_cmd(st, [rel], tree)
     if cmd is None:
         return None
+    written = cmd
+    # A scoped template that calls a package script (`pnpm run test --
+    # {test_files}`) is run as its resolved body, so its runner's report
+    # and no-verdict exits are known (DESIGN §9 *Which failures are new*).
+    cmd, path_env = _runner_command(cmd, tree, _RUNNER_REPORTS, [rel])
     run_cmd, env, spec = cmd, None, None
     # `env_extra` carries a throwaway test database's URL (DESIGN §8
     # *Prisma repositories get a real database*).
@@ -42538,9 +42694,13 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
             report.parent.mkdir(parents=True, exist_ok=True)
             with contextlib.suppress(OSError):
                 report.unlink()
+    if path_env:
+        env = {**(env if env is not None else os.environ), **path_env}
     if env_extra:
         env = {**(env if env is not None else os.environ), **env_extra}
     try:
+        if written != cmd:
+            _blt_shell_argv(written, _forbidden_specs(st.data))
         argv = _blt_shell_argv(run_cmd, _forbidden_specs(st.data),
                                source=cmd)
     except ForbiddenByTask as e:
@@ -49671,7 +49831,12 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
             label=f"final-r{c_round}")
         clean_baseline = baseline
-        if id_diff is not None:
+        if id_diff is not None and id_diff.get("ids_unknown"):
+            # No diff (one side's IDs unknown): the axis verdict stands, and
+            # only what discovery confirmed new is added to it.
+            if id_diff["new"]:
+                regressions.append(_format_new_failing_ids(id_diff))
+        elif id_diff is not None:
             # The `tests:` prefix is this module's own fixed format
             # (`_round_axis_regressions`), not prose.
             regressions = [r for r in regressions
