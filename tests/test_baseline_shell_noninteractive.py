@@ -37,10 +37,11 @@ def test_capture_baseline_uses_non_login_shell(leerie):
         "/etc/profile, which discards the Docker-image-ENV PATH mise "
         "needs to stay resolvable."
     )
-    assert '["bash", "-c", cmd]' in src, (
+    assert "_blt_shell_argv(cmd, forbidden)" in src and (
+        '["bash", "-c", cmd]' in inspect.getsource(leerie._blt_shell_argv)), (
         "_measure_blt must invoke commands via "
-        '["bash", "-c", cmd], matching every other command path in the '
-        "module."
+        '["bash", "-c", cmd] (built by _blt_shell_argv), matching every '
+        "other command path in the module."
     )
     cap = inspect.getsource(leerie._capture_conformance_baseline)
     assert '"bash"' not in cap, (

@@ -343,9 +343,11 @@ def test_capture_baseline_never_uses_login_shell_flag(leerie):
     assert '"-lc"' not in src and "'-lc'" not in src, (
         "_measure_blt must never invoke a BLT command "
         "with a login-shell (-lc) flag — it discards Docker ENV-only PATH.")
-    assert '["bash", "-c", cmd]' in src, (
+    assert "_blt_shell_argv(cmd, forbidden)" in src and (
+        '["bash", "-c", cmd]' in inspect.getsource(leerie._blt_shell_argv)), (
         "_measure_blt must invoke each BLT axis command "
-        'as the exact argv ["bash", "-c", cmd] (non-login shell).')
+        'as the exact argv ["bash", "-c", cmd] (non-login shell), built by '
+        "the forbidden-command gate _blt_shell_argv.")
 
     # The pin followed the argv out of `_capture_conformance_baseline` when
     # `_measure_blt` was extracted. Assert the baseline no longer builds a

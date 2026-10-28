@@ -254,7 +254,7 @@ def test_measure_peak_reaches_the_contained_run(leerie, tmp_path, monkeypatch):
     res = _run(leerie._measure_blt(
         "build", "pnpm run build", str(tmp_path), timeout=10,
         log_path=tmp_path / "log", verbosity="quiet", measure_peak=True,
-        run_id="abc"))
+        run_id="abc", forbidden=[]))
     assert res["passed"] is True
     assert res["peak"] == {"memory_bytes": 5 * GIB, "pids": 321}
     assert seen["argv"] == ["bash", "-c", "pnpm run build"]

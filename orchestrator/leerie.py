@@ -22391,6 +22391,29 @@ def _forbidden_command_hit(command: str,
     return None
 
 
+class ForbiddenByTask(Exception):
+    """`_blt_shell_argv` refused a command the task forbids."""
+
+    def __init__(self, hit: str) -> None:
+        super().__init__(f"the task forbids `{hit}`")
+        self.hit = hit
+
+
+def _blt_shell_argv(cmd: str, forbidden: list[str | dict], *,
+                    source: str | None = None) -> list[str]:
+    """The argv for every orchestrator-side run of the repo's build, lint or
+    test command (DESIGN §9 *Every orchestrator-side run … passes one
+    gate*): `["bash", "-c", cmd]`, or `ForbiddenByTask` when `cmd` — or
+    `source`, the command it was rendered from, whose shape report flags
+    can disguise — runs what the task forbids. One helper, so a new runner
+    cannot skip the check (`tests/test_blt_forbidden_gate.py`)."""
+    for c in (cmd, source):
+        hit = _forbidden_command_hit(c, forbidden) if c else None
+        if hit:
+            raise ForbiddenByTask(hit)
+    return ["bash", "-c", cmd]
+
+
 def _process_constraints(result: dict, prescribed: dict | None,
                          sources: list[str] | None = None,
                          repo_root: str | Path | None = None) -> dict:
@@ -36817,7 +36840,8 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
                        log_path: Path, verbosity: str,
                        label_prefix: str = "baseline",
                        measure_peak: bool = False,
-                       run_id: str | None = None) -> dict:
+                       run_id: str | None = None,
+                       forbidden: list[str | dict]) -> dict:
     """Run one build/lint/test axis command in `tree` and return its verdict.
 
     The single place leerie executes a repo's own BLT command. Extracted
@@ -36838,7 +36862,11 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
     `measure_peak`: run the command in its own uncapped broker cgroup and
     record its `memory.peak` / `pids.peak` as `peak` (DESIGN §6 *The repo's
     own build peak*) — absent when containment is off or no peak could be
-    read."""
+    read.
+
+    `forbidden` (the task's forbidden commands, `_forbidden_specs`): a
+    command it matches is not run (`_blt_shell_argv`) — the unmeasured
+    record with `skip_kind: "forbidden_by_task"`."""
     if not (cmd or "").strip():
         # Every axis dict carries `measured` so no consumer needs a
         # default; a not-applicable axis is unmeasured (and, being
@@ -36847,9 +36875,10 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
                 "summary": "", "command": ""}
     peak = None
     try:
+        argv = _blt_shell_argv(cmd, forbidden)
         if measure_peak:
             ran = await _run_contained(
-                ["bash", "-c", cmd], cwd=str(tree), name=f"measure-{axis}",
+                argv, cwd=str(tree), name=f"measure-{axis}",
                 run_id=run_id, memory_max_bytes=0, pids_max=0,
                 timeout=timeout, log_path=log_path,
                 label=f"{label_prefix}-{axis}: {cmd}", verbosity=verbosity,
@@ -36860,7 +36889,7 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
             rc, tail = int(ran["rc"]), ran["tail"]
         else:
             rc, tail = await _run_streaming(
-                ["bash", "-c", cmd], cwd=str(tree), timeout=timeout,
+                argv, cwd=str(tree), timeout=timeout,
                 log_path=log_path, label=f"{label_prefix}-{axis}: {cmd}",
                 verbosity=verbosity)
         full = (tail or "").strip()
@@ -36891,6 +36920,10 @@ async def _measure_blt(axis: str, cmd: str, tree: str, *, timeout: float,
         if peak is not None:
             res["peak"] = peak
         return res
+    except ForbiddenByTask as ex:
+        return {"ran": False, "measured": False, "passed": None,
+                "command": cmd, "skip_kind": "forbidden_by_task",
+                "summary": f"not run: {ex}"}
     except subprocess.TimeoutExpired:
         return {"ran": True, "measured": True, "passed": False,
                 "command": cmd,
@@ -36984,7 +37017,8 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
         if not cmd:
             results[axis] = await _measure_blt(
                 axis, "", tree, timeout=0.0, log_path=log_path,
-                verbosity=verbosity, label_prefix=label_prefix)
+                verbosity=verbosity, label_prefix=label_prefix,
+                forbidden=forbidden)
             continue
         hit = _forbidden_command_hit(cmd, forbidden)
         replacement: dict | None = None
@@ -37054,7 +37088,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
                                   or DEFAULT_CAPS["worker_timeout_sec"]),
                     log_path=log_path, verbosity=verbosity,
                     label_prefix=label_prefix, measure_peak=measure_peak,
-                    run_id=getattr(st, "run_id", None))
+                    run_id=getattr(st, "run_id", None), forbidden=forbidden)
         if axis in failing_ids_axes:
             await _attach_failing_ids(res, tree, cmd, st, caps,
                                       log_path=log_path,
@@ -37455,12 +37489,22 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             attempts.append(flagged)
     attempts.append(cmd)
     reports = st.run_dir / "confirm" / "reports"
+    forbidden = _forbidden_specs(getattr(st, "data", None))
     for i, attempt in enumerate(attempts):
         report = reports / f"{label}-{i}-{uuid.uuid4().hex[:8]}"
         spec = _acceptance_report_spec(attempt, report, run_files)
         if spec is None:
             continue
         run_cmd, env, kind = spec
+        try:
+            # `source` is the command before the serial and report flags,
+            # which a whole-suite match would read as test operands.
+            argv = _blt_shell_argv(run_cmd, forbidden, source=cmd)
+        except ForbiddenByTask as e:
+            # No verdict, never the run (DESIGN §9 *A command the task
+            # forbids*).
+            log(f"  {label}: test IDs not captured — {e}")
+            return None
         if env_extra:
             env = {**(env if env is not None else os.environ), **env_extra}
         try:
@@ -37468,7 +37512,7 @@ async def _capture_failing_test_ids(tree: str, cmd: str, st: "State",
             async with _blt_semaphore(caps), \
                     _build_class_slot(st, label=f"{label}-ids"):
                 await _run_streaming(
-                    ["bash", "-c", run_cmd], cwd=str(tree), env=env,
+                    argv, cwd=str(tree), env=env,
                     timeout=max(1.0, float(timeout)), log_path=log_path,
                     label=f"{label}-ids: {run_cmd}", verbosity="quiet")
         except Exception:
@@ -41938,6 +41982,10 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     cmd = _acceptance_cmd(st, [probe])
     if cmd is None:
         return None, "no test command here could run the parse check"
+    try:
+        argv = _blt_shell_argv(cmd, _forbidden_specs(st.data))
+    except ForbiddenByTask as e:
+        return None, f"the parse check was not run: {e}"
     path = Path(tree) / probe
     marker = st.run_dir / "acceptance" / "reports" / (
         f"{label}-probe-{hashlib.sha256(test_rel.encode()).hexdigest()[:12]}")
@@ -41958,7 +42006,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
             marker=str(marker)))
         async with _blt_semaphore(caps):
             rc, out = await _run_streaming(
-                ["bash", "-c", cmd], cwd=str(tree),
+                argv, cwd=str(tree),
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-parse-probe: {cmd}",
@@ -42107,10 +42155,16 @@ async def _run_acceptance_file(st: "State", caps: dict, tree: str,
                 report.unlink()
     if env_extra:
         env = {**(env if env is not None else os.environ), **env_extra}
+    try:
+        argv = _blt_shell_argv(run_cmd, _forbidden_specs(st.data),
+                               source=cmd)
+    except ForbiddenByTask as e:
+        log(f"  {label}: `{rel}` not run — {e}")
+        return None
     async with _blt_semaphore(caps):
         try:
             rc, tail = await _run_streaming(
-                ["bash", "-c", run_cmd], cwd=str(tree), env=env,
+                argv, cwd=str(tree), env=env,
                 timeout=float(caps.get("worker_timeout_sec",
                                        DEFAULT_CAPS["worker_timeout_sec"])),
                 log_path=log_path, label=f"{label}-tests: {run_cmd}",
@@ -51401,8 +51455,19 @@ async def _integration_test_failures(
     if not scope:
         out["skipped"] = "no test in the conflicted area"
         return out
-    if _acceptance_cmd(st, scope, str(staging)) is None:
+    scoped = _acceptance_cmd(st, scope, str(staging))
+    if scoped is None:
         out["skipped"] = "no scoped runner for the conflicted area's tests"
+        return out
+    # The scoped runner is the only command this gate runs — the raw test
+    # command never (DESIGN §9 *A command the task forbids*): a task that
+    # forbids the scoped command too leaves the gate nothing to run.
+    hit = _forbidden_command_hit(scoped, _forbidden_specs(st.data))
+    if hit:
+        out["skipped"] = (f"the task forbids `{hit}`, which the conflicted "
+                          "area's scoped test run would run")
+        log(f"  integration {sid}: conflicted-area tests not run — "
+            f"{out['skipped']}")
         return out
     timeout = float(caps.get("worker_timeout_sec")
                     or DEFAULT_CAPS["worker_timeout_sec"])
@@ -51414,8 +51479,12 @@ async def _integration_test_failures(
             present = [f for f in files if (tree / f).is_file()]
             if not present:
                 return set()
+            run = _acceptance_cmd(st, present, str(tree))
+            if run is None:
+                # Never the raw command over the whole suite: no verdict.
+                return None
             got = await _capture_failing_test_ids(
-                str(tree), cmd, st, caps, label=label, log_path=log_path,
+                str(tree), run, st, caps, label=label, log_path=log_path,
                 timeout=limit, serial=True, files=present)
             if got is None:
                 return None

@@ -21,7 +21,8 @@ from tests.conftest import _run
 def _call(leerie, cmd="pytest", tree="/tmp/x", timeout=60.0, **kw):
     return _run(leerie._measure_blt(
         "tests", cmd, tree, timeout=timeout,
-        log_path=kw.pop("log_path", None), verbosity="quiet", **kw))
+        log_path=kw.pop("log_path", None), verbosity="quiet",
+        forbidden=kw.pop("forbidden", []), **kw))
 
 
 @pytest.fixture
@@ -93,7 +94,8 @@ def test_absent_command_is_not_applicable(leerie, streaming, cmd):
     applicable', and no subprocess is spawned at all."""
     calls = streaming((0, "unreachable"))
     ax = _run(leerie._measure_blt("lint", cmd, "/tmp/x", timeout=1.0,
-                                  log_path=None, verbosity="quiet"))
+                                  log_path=None, verbosity="quiet",
+                                  forbidden=[]))
     assert (ax["ran"], ax["measured"], ax["passed"]) == (False, False, None)
     assert ax["command"] == ""
     assert calls == [], "an absent command must not spawn a subprocess"
@@ -127,7 +129,19 @@ def test_source_never_uses_a_login_shell(leerie):
     fine under `-c`."""
     src = inspect.getsource(leerie._measure_blt)
     assert '"-lc"' not in src and "'-lc'" not in src
-    assert '["bash", "-c", cmd]' in src
+    # The argv is built by the one forbidden-command gate (DESIGN §9).
+    assert "_blt_shell_argv(cmd, forbidden)" in src
+    assert '["bash", "-c", cmd]' in inspect.getsource(leerie._blt_shell_argv)
+
+
+def test_a_forbidden_command_is_not_run(leerie, streaming):
+    """DESIGN §9: the orchestrator does not run what the task forbids — the
+    axis is unmeasured `forbidden_by_task` and nothing is spawned."""
+    calls = streaming((0, "ok"))
+    ax = _call(leerie, cmd="pnpm run test", forbidden=["pnpm test"])
+    assert calls == []
+    assert (ax["ran"], ax["measured"], ax["passed"]) == (False, False, None)
+    assert ax["skip_kind"] == "forbidden_by_task"
 
 
 def test_summary_is_tail_truncated(leerie, streaming):

@@ -2339,7 +2339,10 @@ loop ends at its cap or when the run's re-drive time is spent:
    repair changed plus one-hop importers of the changed sources, run on both
    parents and the repaired HEAD. A test failing on HEAD and on neither
    parent is a candidate, confirmed under B\* (§9 *Which failures are new*)
-   against the parent it passed on; only a confirmed one counts.
+   against the parent it passed on; only a confirmed one counts. They run
+   only through the repo's scoped runner over those files, never the raw
+   test command, and not at all when the task forbids the scoped command
+   (§9 *A command the task forbids*).
 3. A round passes when the re-judge has no gating defect and no test
    failure is confirmed. The merge then stands, and any listed line still
    absent and not superseded is recorded as residual content loss.
@@ -8754,6 +8757,25 @@ Three layers follow, each derived from that one list:
   argv that runs a forbidden command is emptied before scheduling and
   refused if one reaches the settle anyway, so that criterion is one no
   command decides and the claim falls back to the re-drive.
+- **Every orchestrator-side run of a build, lint or test command passes
+  one gate.** The axis measurement is not the only place leerie runs the
+  repo's commands itself: B\* reruns, failing-test-ID captures, the
+  delivery re-drive's and ratchet's measurements, the held-out sets' runs
+  and parse probes, the falsifier's confirm and the integration gate's
+  conflicted-area tests all do. Each one builds its shell through the same
+  helper, which checks the exact command it is about to run — and the
+  command it was rendered from — against the forbidden list and refuses a
+  hit. A refused run is no verdict for its caller, never a pass. A caller
+  that holds the canonical test command replaces it as the axis does: the
+  scoped runner over the caller's own test files (the coupled tests for the
+  ratchet and the re-drive, the conflicted area's tests for the
+  integration gate), and nothing when that scoped command is forbidden too
+  — never a fallback to the raw command. Found in review of the N5
+  follow-ups: the re-drive's test IDs and the integration gate both read
+  the raw test command and would run it, past the axis's check, on a task
+  that forbade it.
+  Code enforces the single gate: a test fails when a shell launch appears
+  outside the helper.
 
 A forbidden command that is also a prescribed command is not forbidden
 (the prescription is the more specific instruction), and `runs_commands`
