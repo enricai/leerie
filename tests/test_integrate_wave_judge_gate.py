@@ -927,6 +927,57 @@ def test_integrator_crash_once_retries_from_a_reset_merge_and_integrates(
     assert "feat-001" not in (st.data.get("blocked") or {})
 
 
+@pytest.mark.parametrize("crash", ["worker_error", "timeout"])
+def test_integrator_crash_after_its_merge_commit_retries_from_pre_sha(
+        leerie, tmp_path, monkeypatch, crash):
+    """A session that committed its merge and then died: the retry must
+    start from the merge's first parent, so the fresh integrator meets the
+    original conflict — not the dead session's committed merge, which
+    `git merge --abort` leaves in place and `integrate.sh` would read as
+    "Already up to date". This is the case the reset before a retry
+    exists for (round-4 claims review MEDIUM 4: removing it left every
+    other test green)."""
+    import subprocess
+    st = _state(leerie, tmp_path)
+    st.data["skip_integration_check"] = True
+    leerie_dir = tmp_path / ".leerie"
+    staging, pre = _conflicting_staging(leerie_dir)
+    results = {"feat-001": {"status": "complete"}}
+    seen: list[tuple[str, bool]] = []
+
+    async def fake_claude_p(**kwargs):
+        seen.append(((staging / "app.py").read_text(),
+                     (staging / ".git" / "MERGE_HEAD").exists()))
+        if len(seen) == 1:
+            (staging / "app.py").write_text("x = 77\n")
+            subprocess.run(["git", "add", "app.py"], cwd=str(staging),
+                           check=True, capture_output=True)
+            subprocess.run(["git", "commit", "-q", "--no-edit"],
+                           cwd=str(staging), check=True, capture_output=True)
+            raise (leerie.WorkerError("session killed after its commit")
+                   if crash == "worker_error" else _timeout())
+        return _resolve_and_commit(staging)
+
+    monkeypatch.setattr(leerie, "_run_script", _real_conflict_script(staging))
+    monkeypatch.setattr(leerie, "claude_p", fake_claude_p)
+    out = asyncio.run(leerie.integrate_wave(
+        ["feat-001"], results, leerie_dir, _caps(leerie), st, MODELS,
+        EFFORTS))
+    assert out == ["feat-001"]
+    assert len(seen) == 2
+    # The retry met the original conflict, mid-merge, not the dead
+    # session's committed `x = 77`.
+    text, mid_merge = seen[1]
+    assert mid_merge and "<<<<<<<" in text and "x = 77" not in text
+    assert (staging / "app.py").read_text() == "x = 3\n"
+    parents = _git_out(staging, "log", "-1", "--format=%P").split()
+    assert parents[0] == pre and len(parents) == 2
+    # Exactly one merge on top of pre: the dead session's is gone.
+    assert _git_out(staging, "rev-list", "--count", f"{pre}..HEAD") == "2"
+    assert results["feat-001"]["status"] == "complete"
+    assert "feat-001" not in (st.data.get("integration_gate") or {})
+
+
 def test_orchestrator_killed_mid_retry_resumes_and_integrates(
         leerie, tmp_path, monkeypatch):
     """A crash, then the orchestrator itself is killed during the retry
