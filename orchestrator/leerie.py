@@ -48999,17 +48999,22 @@ def _settle_already_satisfied(sid: str, drop: dict, st: State, *,
 _REDRIVE_CLOCKS: dict[tuple[str, str], float] = {}
 
 
-def _redrive_allowed(st: "State", caps: dict, sid: str) -> bool:
-    """Whether `sid` may be re-driven once more: its shared counter is
-    under `subtask_redrive_rounds` and the run has not spent
-    `redrive_budget_sec` of re-drive wall time."""
-    rounds = int((st.data.get("redrive_rounds") or {}).get(sid, 0))
-    cap = int(caps.get("subtask_redrive_rounds",
-                       DEFAULT_CAPS["subtask_redrive_rounds"]))
+def _redrive_time_left(st: "State", caps: dict) -> bool:
+    """Whether the run has re-drive wall time left: `redrive_spent_sec`
+    under `redrive_budget_sec`, the hard stop every re-drive kind shares."""
     spent = float(st.data.get("redrive_spent_sec") or 0.0)
     budget = float(caps.get("redrive_budget_sec",
                             DEFAULT_CAPS["redrive_budget_sec"]))
-    return rounds < cap and spent < budget
+    return spent < budget
+
+
+def _redrive_allowed(st: "State", caps: dict, sid: str) -> bool:
+    """Whether `sid` may be re-driven once more: its shared counter is
+    under `subtask_redrive_rounds` and the run has re-drive time left."""
+    rounds = int((st.data.get("redrive_rounds") or {}).get(sid, 0))
+    cap = int(caps.get("subtask_redrive_rounds",
+                       DEFAULT_CAPS["subtask_redrive_rounds"]))
+    return rounds < cap and _redrive_time_left(st, caps)
 
 
 def _consume_redrive(st: "State", sid: str) -> int:
@@ -51679,8 +51684,9 @@ async def _run_integration_judge_gate(
     before anything else happens. A gating finding re-drives the
     integrator on the committed merge with typed `defects[]`, the dropped
     side lines (`_integration_dropped_lines`) and routed test failures, at
-    most `integration_repair_rounds` rounds, each drawn from the subtask's
-    shared re-drive counter. Code then checks the round, in order: a new
+    most `integration_repair_rounds` rounds on the record's own
+    `repair_rounds` counter (never the shared `redrive_rounds`), while the
+    run has re-drive time left. Code then checks the round, in order: a new
     commit descending from the merge, a clean tracked tree with no
     conflict marker; a full re-judge of a synthetic merge of the repaired
     tree; the conflicted area's tests on both parents and HEAD under B*
@@ -51782,10 +51788,14 @@ async def _run_integration_judge_gate(
         if any(d.get("kind") == "intent_conflict" for d in findings):
             return await _back_out("intent_conflict: the two sides' intents "
                                    "cannot both hold")
+        # Its own counter, not the subtask's shared one (DESIGN §13): the
+        # subtask's work is finished and the defect is the merge's, so
+        # rounds an earlier re-drive spent must not leave it none — a
+        # back-out takes every line of the subtask out of the PR. Persisted
+        # before the round, so a resume cannot hand it back.
         done = int(rec.get("repair_rounds") or 0)
-        if done >= cap or not _redrive_allowed(st, caps, sid):
+        if done >= cap or not _redrive_time_left(st, caps):
             return await _back_out(f"not repaired within {done} round(s)")
-        _consume_redrive(st, sid)
         rec["repair_rounds"] = done + 1
         _persist()
         t0 = time.monotonic()

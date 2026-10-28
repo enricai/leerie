@@ -171,8 +171,8 @@ def test_finding_is_repaired_and_rejudged_whole(leerie, tmp_path,
     assert rec["accepted"] is True and rec["outcome"] == "repaired"
     assert rec["repair_rounds"] == 1
     assert rec["residual_total"] == 0
-    # Drawn from the shared re-drive budget.
-    assert st.data["redrive_rounds"][SID] == 1
+    # Its own counter: the subtask's shared re-drive counter is untouched.
+    assert SID not in (st.data.get("redrive_rounds") or {})
     assert SID not in (st.data.get("integration_defects") or {})
 
 
@@ -202,18 +202,53 @@ def test_exhausted_rounds_back_out(leerie, tmp_path, monkeypatch):
                          "integration_judge"]
     assert _git(staging, "rev-parse", "HEAD").strip() == p1
     assert st.data["integration_gate"][SID]["repair_rounds"] == 2
-    assert st.data["redrive_rounds"][SID] == 2
+    assert SID not in (st.data.get("redrive_rounds") or {})
     assert st.data["subtask_status"][SID] == "unconverged"
 
 
-def test_spent_shared_budget_backs_out_before_any_repair(
+def test_spent_shared_counter_still_gets_its_repair_rounds(
         leerie, tmp_path, monkeypatch):
-    st, staging, p1, _merge = _setup(leerie, tmp_path)
+    """Review round 1 M1: a subtask whose shared re-drive rounds were spent
+    earlier in the wave (here, both) is still repaired — integration repair
+    has its own counter — instead of being backed out with zero rounds,
+    which took all of its finished work out of the PR."""
+    st, staging, p1, merge = _setup(leerie, tmp_path)
     st.data["redrive_rounds"] = {SID: 2}
+    w = _Workers(staging, [[DEFECT], []])
+    assert _run(leerie, st, staging, monkeypatch, w) is True
+    assert w.kinds() == ["integration_judge", "integrator",
+                         "integration_judge"]
+    assert _git(staging, "rev-parse", "HEAD^").strip() == merge
+    rec = st.data["integration_gate"][SID]
+    assert rec["outcome"] == "repaired" and rec["repair_rounds"] == 1
+    assert st.data["redrive_rounds"] == {SID: 2}
+    assert st.data.get("subtask_status", {}).get(SID) != "unconverged"
+
+
+def test_spent_run_redrive_time_backs_out_before_any_repair(
+        leerie, tmp_path, monkeypatch):
+    """The run-level wall-time budget still bounds integration repair."""
+    st, staging, p1, _merge = _setup(leerie, tmp_path)
+    st.data["redrive_spent_sec"] = float(
+        leerie.DEFAULT_CAPS["redrive_budget_sec"])
     w = _Workers(staging, [[DEFECT]])
     assert _run(leerie, st, staging, monkeypatch, w) is False
     assert w.kinds() == ["integration_judge"]
     assert _git(staging, "rev-parse", "HEAD").strip() == p1
+    assert st.data["integration_gate"][SID]["fallback_reason"] == \
+        "not repaired within 0 round(s)"
+
+
+def test_resumed_gate_continues_its_own_counter(leerie, tmp_path,
+                                                 monkeypatch):
+    """A round persisted before a crash is not handed back on resume."""
+    st, staging, p1, merge = _setup(leerie, tmp_path)
+    st.data["integration_gate"] = {SID: {"merge_commit_sha": merge,
+                                         "repair_rounds": 2,
+                                         "accepted": False}}
+    w = _Workers(staging, [[DEFECT]])
+    assert _run(leerie, st, staging, monkeypatch, w) is False
+    assert w.kinds() == ["integration_judge"]
 
 
 def test_design_conflict_during_repair_backs_out(leerie, tmp_path,

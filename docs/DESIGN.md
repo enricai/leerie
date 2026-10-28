@@ -2299,8 +2299,19 @@ The gate used to die on any finding (detect-and-die). That killed 3 runs in
 the corpus at a mean of 24 completed subtasks discarded each — 73 subtasks,
 $79 and 16 hours of work — on findings an integrator could fix once told what
 was wrong. Now the gate is a repair loop on the committed merge, at most
-`integration_repair_rounds` (2) rounds, each drawn from the subtask's shared
-re-drive budget (§13), so integration cannot multiply re-drives either:
+`integration_repair_rounds` (2) rounds per subtask, counted on the subtask's
+gate record and charged to the run's re-drive wall time
+(`redrive_budget_sec`, §13), but **not** drawn from the subtask's shared
+re-drive counter. Integration repair is a different failure class: the
+subtask's own work is finished — the other re-drives exist because it is
+not — and the defect is in a merge leerie made. Drawn from the shared
+counter, a subtask that spent its rounds earlier in the wave (a completeness
+re-drive and a blocked re-drive, or two advisory coverage rounds) had none
+left, so the first gating finding backed the subtask out with no repair at
+all, taking every line of its finished work out of the PR — adding tests
+could cost the feature. The bound is unchanged in kind: the counter is
+persisted before each round, so a resume cannot hand a round back, and the
+loop ends at its cap or when the run's re-drive time is spent:
 
 1. **The integrator is re-driven with typed findings,** never prose: the
    judge's gating `defects[]`; the lines the merge dropped; failing tests,
@@ -9911,10 +9922,18 @@ multiplied: a completeness re-drive inside one settle, then a fresh settle on
 **one persisted counter per subtask**, `redrive_rounds[sid]`, capped by
 `subtask_redrive_rounds` (2): the completeness gate's re-drive and the
 wave-end re-drive of a `blocked` subtask take from the same counter, and so
-does each integration repair round (§6 *When integration cannot succeed*) and
-each coverage re-drive round (§9 *Changed lines no test executes are
+does each coverage re-drive round (§9 *Changed lines no test executes are
 re-driven*) and each delivery re-drive group (§8 *Delivery re-drive*),
-as will every later re-drive kind. An unbacked claim settle-by-execution cannot
+as will every later re-drive kind that re-runs the subtask's implementer
+because its work is unfinished or unproven. Integration repair does not
+(§6 *When integration cannot succeed*): it repairs a merge leerie made of
+work already finished, so it has its own counter, at most
+`integration_repair_rounds` per subtask on the gate record, under the same
+`redrive_budget_sec`. Sharing it let earlier, cheaper re-drives — advisory
+coverage among them — spend the rounds and turn the first merge finding
+into a back-out of the whole subtask with no repair attempted. Every counter
+stays finite and persisted, and the wall-time budget bounds them all, so the
+termination argument below is unchanged. An unbacked claim settle-by-execution cannot
 settle (§8 *Settled by execution*) ends its attempt `blocked` and so enters
 through the wave-end re-drive. The per-attempt budgets (`failed_retries`,
 `implementer_confidence_retries`, `subtask_continuations`) still bound one
