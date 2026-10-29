@@ -933,10 +933,13 @@ def test_integrator_crash_after_its_merge_commit_retries_from_pre_sha(
     """A session that committed its merge and then died: the retry must
     start from the merge's first parent, so the fresh integrator meets the
     original conflict — not the dead session's committed merge, which
-    `git merge --abort` leaves in place and `integrate.sh` would read as
-    "Already up to date". This is the case the reset before a retry
-    exists for (round-4 claims review MEDIUM 4: removing it left every
-    other test green)."""
+    `git merge --abort` leaves in place. Without the reset, HEAD stays on
+    that merge, so `_restart_integration_merge`'s HEAD check refuses the
+    retry ("the reset before a retry left staging at …") before
+    `integrate.sh` runs, and the subtask is backed out instead of
+    resolved again (the direct test below pins that refusal). This is the
+    case the reset before a retry exists for (round-4 claims review
+    MEDIUM 4: removing it left every other test green)."""
     import subprocess
     st = _state(leerie, tmp_path)
     st.data["skip_integration_check"] = True
@@ -976,6 +979,53 @@ def test_integrator_crash_after_its_merge_commit_retries_from_pre_sha(
     assert _git_out(staging, "rev-list", "--count", f"{pre}..HEAD") == "2"
     assert results["feat-001"]["status"] == "complete"
     assert "feat-001" not in (st.data.get("integration_gate") or {})
+
+
+@pytest.mark.parametrize("reset_runs", [True, False])
+def test_restart_merge_refuses_a_head_the_reset_did_not_move(
+        leerie, tmp_path, monkeypatch, reset_runs):
+    """The mechanism behind the post-commit-crash retry, driven directly:
+    staging holds a dead session's committed merge. With the reset, HEAD
+    lands on `pre_sha`, `integrate.sh` runs once and the conflict is back
+    (None). Without it, HEAD is still the dead merge, so the HEAD check
+    refuses with the exact moved-head reason and `integrate.sh` is never
+    called — the retry does not end on an "Already up to date" exit."""
+    import subprocess
+    st = _state(leerie, tmp_path)
+    staging, pre = _conflicting_staging(tmp_path / ".leerie")
+    subprocess.run(["git", "merge", "-q", "--no-ff", "-X", "theirs", "-m",
+                    "dead session's merge", "incoming"], cwd=str(staging),
+                   check=True, capture_output=True)
+    dead = _git_out(staging, "rev-parse", "HEAD")
+    assert dead != pre
+    script_calls: list[str] = []
+    real_script = _real_conflict_script(staging)
+
+    async def spy_script(script, sid, run_id):
+        script_calls.append(script)
+        return await real_script(script, sid, run_id)
+
+    real_run_proc = leerie.run_proc
+
+    async def run_proc(cmd, **kw):
+        if not reset_runs and cmd[:2] == ["git", "reset"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return await real_run_proc(cmd, **kw)
+
+    monkeypatch.setattr(leerie, "_run_script", spy_script)
+    monkeypatch.setattr(leerie, "run_proc", run_proc)
+    end = asyncio.run(leerie._restart_integration_merge(
+        staging, st, "feat-001", pre))
+    if reset_runs:
+        assert end is None
+        assert script_calls == ["integrate.sh"]
+        assert _git_out(staging, "rev-parse", "HEAD") == pre
+        assert (staging / ".git" / "MERGE_HEAD").exists()
+    else:
+        assert end == (f"the reset before a retry left staging at "
+                       f"{dead[:12]}, not {pre[:12]}")
+        assert script_calls == []
+        assert _git_out(staging, "rev-parse", "HEAD") == dead
 
 
 def test_orchestrator_killed_mid_retry_resumes_and_integrates(
