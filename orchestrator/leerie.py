@@ -40868,7 +40868,10 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
                           final_tree: Path, recs: list[dict]) -> dict:
     """B* for gates red on the final tree: interleaved base/final reruns of
     just those checks; a check is red only if it failed every final rerun
-    and passed every base rerun."""
+    and passed every base rerun. Every check run of one rerun shares the
+    budget left (`_budget_caps`), and a rerun the budget cuts is a
+    `_RerunCut`, never a pass (DESIGN §9 *Which failures are new*, steps 2
+    and 4)."""
     cand = [r["id"] for r in recs]
     base_wt = (await _ci_worktree(st, "ci-confirm-base", base_sha)
                if base_sha else None)
@@ -40882,15 +40885,26 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
     n = {"i": 0}
 
     def _runner(tree: Path, side: str):
-        async def _run(_timeout: float) -> set[str] | None:
+        async def _run(left: float) -> set[str] | _RerunCut | None:
             n["i"] += 1
             failing: set[str] = set()
+            done: set[str] = set()
+            end = time.monotonic() + left
             for r in recs:
+                rem = end - time.monotonic()
+                if rem <= 0:
+                    return _RerunCut(frozenset(failing), frozenset(done))
                 run = await _ci_run(_ci_gate_argv(r), tree=tree, rec=r,
-                                    st=st, caps=caps,
+                                    st=st, caps=_budget_caps(caps, rem),
                                     label=f"confirm-{side}{n['i']}-{r['id']}")
                 if run["timed_out"]:
+                    # Past the budget, the budget cut it: not a run, and
+                    # never "the red went away" (DESIGN §9 step 4).
+                    if time.monotonic() >= end:
+                        return _RerunCut(frozenset(failing),
+                                         frozenset(done))
                     return None
+                done.add(r["id"])
                 if not run["passed"]:
                     failing.add(r["id"])
             return failing

@@ -6967,7 +6967,14 @@ advisory (an exception is logged, never fatal) and resume-idempotent:
   `phase_finalize`, in a detached `worktrees/ci-final` worktree at the
   staging HEAD. A gate (`_ci_gate_argv`) that fails is confirmed by
   `_ci_confirm_red` — `_confirm_new_failures` with base reruns in a fresh
-  `ci-confirm-base` worktree and final reruns in `ci-final`; only `new` ids
+  `ci-confirm-base` worktree and final reruns in `ci-final`, with
+  `seen_failing=True`. One rerun runs every red check serially; each check's
+  `_ci_run` gets `_budget_caps(caps, rem)`, `rem` being what is left of the
+  `left` the rerun was handed. With `rem <= 0` before a check, or a check
+  `timed_out` once that `left` is spent, the rerun returns
+  `_RerunCut(failing, measured)` over the checks it finished (a budget cut,
+  DESIGN §9 step 4); a check timed out with budget left returns None (no
+  verdict). Only `new` ids
   become `unmet` (`why: red`); `final.pre_existing` and `final.no_verdict`
   record the B\* split of the rest, `final.resource_affected` the mixed
   ones. A diagnostic

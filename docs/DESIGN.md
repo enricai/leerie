@@ -10120,7 +10120,23 @@ on the final tree:
    only a confirmed one counts — anything else is `resource_affected`,
    reported, never red. Every check run is spawn-held in a capped broker
    cgroup at the worker caps and holds a host build slot (§6 *Enrollment
-   holds the spawn*, *A host-wide build semaphore*).
+   holds the spawn*, *A host-wide build semaphore*). The reruns are bounded
+   like every other B\* rerun (§9 *Which failures are new*, steps 2 and 4):
+   one rerun runs each red check in turn, and each check's timeout is what
+   is left of `confirm_budget_sec`, never its own `worker_timeout_sec`
+   alone. A rerun the budget cuts — a check timed out on what was left, or
+   no budget left to start the next check — is not a run: it ends the
+   confirm, and only the checks it finished count, so a cut never reads as
+   "the red went away". Before this, a rerun gave every check its full
+   `worker_timeout_sec` (5400 s), and the budget only stopped the next rerun
+   from starting: the last rerun started over n red checks could end
+   n × 5400 s after it began, whatever was left of the 1800 s budget. Now the confirm's worst case
+   is the B\* bound — `confirm_gate_wait_sec` + one 2 s gate poll +
+   `confirm_budget_sec` (2102 s at the defaults) — plus at most 1 s once
+   (the floor under one check run's timeout) and the build-slot waits,
+   which no B\* rerun charges to its own timeout. The base worktree's
+   dependency install precedes the confirm and is outside it, as it is for
+   the test axis's base reruns.
 
 A red final check makes delivery unmet: the run's outcome is `unconverged`
 (§6 *The run outcome is decided once*) and the next same-task run's planners

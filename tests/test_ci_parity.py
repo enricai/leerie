@@ -530,3 +530,104 @@ def test_a_db_reset_check_or_prerequisite_never_runs(leerie, env, tmp_path):
                               rec={"cwd": "."}, st=st, caps=env["caps"],
                               label="t2"))
     assert out["rc"] == 0 and marker.exists()
+
+
+# ---- B* reruns stay inside confirm_budget_sec -----------------------------
+
+def test_a_slow_red_gate_is_confirmed_inside_the_budget(leerie, env,
+                                                        monkeypatch):
+    """`_ci_confirm_red`'s reruns share `confirm_budget_sec` (DESIGN §9
+    *The repository's own merge checks run too*, step 5): a gate that takes
+    longer than the budget is cut at the budget, not run to its own
+    `worker_timeout_sec`, and the cut never reads as the red going away."""
+    env["checks"][:] = [_check("build", [PY, "build.py"], kind="build")]
+    _baseline(env)
+    _commit(env, {"build.py": "import sys, time\ntime.sleep(6)\nsys.exit(1)\n"})
+    env["caps"]["confirm_budget_sec"] = 1.5
+    real = leerie._confirm_new_failures
+    took: list[float] = []
+
+    async def timed(*a, **k):
+        t0 = leerie.time.monotonic()
+        try:
+            return await real(*a, **k)
+        finally:
+            took.append(leerie.time.monotonic() - t0)
+    monkeypatch.setattr(leerie, "_confirm_new_failures", timed)
+    unmet = _final(env)
+    # Before the fix the final rerun ran its full 6 s.
+    assert len(took) == 1 and took[0] < 1.5 + 2.0, took
+    b = env["st"].data["ci_parity"]["final"]["b_star"]
+    assert b["budget_exhausted"] is True
+    assert b["new"] == ["build"] and b["budget_short"] == ["build"]
+    assert [(u["id"], u["why"]) for u in unmet] == [("build", "red")]
+    assert leerie._decide_outcome(env["st"], any_commits=True) == "unconverged"
+
+
+def _fake_ci(leerie, monkeypatch, tmp_path, durations, fails):
+    """`_ci_run` replaced by a timed fake: check `id` takes
+    `durations[(side, id)]` seconds and fails on the final side when in
+    `fails`. Records the timeout each run was handed."""
+    seen: list[tuple[str, str, float]] = []
+
+    async def fake_run(argv, *, tree, rec, st, caps, label):
+        side = "base" if "confirm-base" in label else "final"
+        t = float(caps["worker_timeout_sec"])
+        seen.append((side, rec["id"], t))
+        d = durations.get((side, rec["id"]), 0.0)
+        await leerie.asyncio.sleep(min(d, t))
+        if d > t:
+            return {"rc": None, "passed": False, "timed_out": True}
+        bad = side == "final" and rec["id"] in fails
+        return {"rc": 1 if bad else 0, "passed": not bad,
+                "timed_out": False}
+
+    async def fake_wt(st, name, sha):
+        return tmp_path / name
+
+    async def fake_prepare(*a, **k):
+        return None
+    monkeypatch.setattr(leerie, "_ci_run", fake_run)
+    monkeypatch.setattr(leerie, "_ci_worktree", fake_wt)
+    monkeypatch.setattr(leerie, "_ci_prepare", fake_prepare)
+    monkeypatch.setattr(leerie, "_ci_teardown", lambda st, wt: None)
+    return seen
+
+
+def test_each_check_of_a_ci_rerun_gets_only_the_budget_left(
+        leerie, env, monkeypatch, tmp_path):
+    """Check `a` finished passing on the cut final rerun: that refutes it
+    (never `new`); `b`, which the budget alone kept short, is
+    `new` and `budget_short`. Every check's timeout is what was left."""
+    caps = {**env["caps"], "confirm_pairs": 2, "confirm_budget_sec": 1.2,
+            "worker_timeout_sec": 60}
+    seen = _fake_ci(leerie, monkeypatch, tmp_path,
+                    {("final", "a"): 0.2, ("final", "b"): 5.0},
+                    fails={"b"})
+    recs = [_check("a", [PY, "a.py"]), _check("b", [PY, "b.py"])]
+    v = _run(leerie._ci_confirm_red(env["st"], caps, "deadbeef",
+                                    tmp_path / "final", recs))
+    assert all(t <= 1.2 for _s, _i, t in seen), seen
+    # b's final run was handed less than a's: the rerun shares one budget.
+    t_a = [t for s, i, t in seen if s == "final" and i == "a"][0]
+    t_b = [t for s, i, t in seen if s == "final" and i == "b"][0]
+    assert t_b < t_a
+    assert v["budget_exhausted"] is True
+    assert v["new"] == ["b"] and v["budget_short"] == ["b"]
+    assert v["no_verdict"] == ["a"]
+
+
+def test_a_check_timing_out_with_budget_left_is_no_verdict_not_a_cut(
+        leerie, env, monkeypatch, tmp_path):
+    """A check's own `worker_timeout_sec`, shorter than the budget left,
+    is a real timeout: no verdict, never `new` on the strength of a cut."""
+    caps = {**env["caps"], "confirm_pairs": 2, "confirm_budget_sec": 60,
+            "worker_timeout_sec": 0.3}
+    _fake_ci(leerie, monkeypatch, tmp_path, {("final", "b"): 5.0},
+             fails={"b"})
+    v = _run(leerie._ci_confirm_red(env["st"], caps, "deadbeef",
+                                    tmp_path / "final",
+                                    [_check("b", [PY, "b.py"])]))
+    assert v["budget_exhausted"] is False
+    assert v["new"] == [] and v["budget_short"] == []
+    assert v["resource_affected"] == ["b"]
