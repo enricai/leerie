@@ -10578,10 +10578,24 @@ on the final tree:
    is the B\* bound — `confirm_gate_wait_sec` + one 2 s gate poll +
    `confirm_budget_sec` (2102 s at the defaults) — plus at most 1 s once
    (the floor under one check run's timeout) and the build-slot waits,
-   which no B\* rerun charges to its own timeout, and each sized pass's
-   base worktree setup. The base worktree's
-   dependency install precedes the confirm and is outside it, as it is for
-   the test axis's base reruns.
+   which no B\* rerun charges to its own timeout, and one base worktree
+   setup. The base worktree's dependency install precedes the confirm and
+   is outside it, as it is for the test axis's base reruns. One setup per
+   confirm, not per pass: the sized passes (§9 *Which failures are new*,
+   step 2) used to remove and re-create the base worktree for each pass,
+   and since a pass's base tree is the same commit every time, each
+   re-creation repaid the checkout, the dependency install (its
+   installed-once mark goes with the worktree), the throwaway database and
+   every prerequisite, none of it charged to the budget, so the bound grew
+   with the number of passes (at most one per red check, and with the
+   one-pair-first continuations up to two per check). The checkout alone
+   measured 0.24 s for this repository's 800 files; the install and the
+   prerequisites are the repository's own and can be minutes. The base
+   worktree is now created on the first pass, kept for the later ones —
+   each later pass runs only the prerequisites of checks no earlier pass
+   prepared — and removed when the confirm ends, so the uncharged setup
+   is what a single-pass confirm pays: one checkout, one install, one
+   database, and each distinct prerequisite once.
 
 A red final check makes delivery unmet: the run's outcome is `unconverged`
 (§6 *The run outcome is decided once*) and the next same-task run's planners

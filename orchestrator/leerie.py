@@ -41067,19 +41067,21 @@ def _ci_log_text(run: dict) -> str:
 
 
 async def _ci_prepare(tree: Path, recs: list[dict], st: "State", caps: dict,
-                      side: str) -> None:
+                      side: str, done: set[str] | None = None) -> None:
     """Install deps (the provision recipe) and run every selected check's
-    prerequisites, each once, in order. Failures are recorded by the
-    checks that then go red, not here."""
+    prerequisites, each once, in order — once across calls that share
+    `done` (a tree kept for several sized passes). Failures are recorded by
+    the checks that then go red, not here."""
     await _ensure_worktree_deps(
         str(tree), st, caps, log_path=st.run_dir / "logs" / "ci-parity.log",
         verbosity="quiet", label_prefix=f"ci-{side}", log_prefix="ci parity")
-    if any(_ci_requires_db(r) for r in recs):
+    if (any(_ci_requires_db(r) for r in recs)
+            and os.path.realpath(tree) not in _CI_DB_URLS):
         # After the install: the push runs the tree's own prisma CLI.
         url = await _create_test_db(st, tree, f"ci-{side}")
         if url:
             _CI_DB_URLS[os.path.realpath(tree)] = url
-    done: set[str] = set()
+    done = set() if done is None else done
     for rec in recs:
         for j, pre in enumerate(rec.get("prerequisites") or []):
             key = json.dumps([pre.get("cwd") or ".", pre.get("argv") or [],
@@ -41382,26 +41384,40 @@ async def _ci_confirm_red(st: "State", caps: dict, base_sha: str,
     the rest, and in passes over the budget left); one never rerun is
     `budget_short_unsettled` and listed in `sized_out`."""
     by_id = {r["id"]: r for r in recs}
+    # One base worktree for every pass (DESIGN §8 *CI parity*): the base
+    # commit is the same each time, and re-creating it per pass repaid the
+    # install, the database and the prerequisites outside the budget.
+    base: dict = {"sha": base_sha, "wt": None, "prepared": set(),
+                  "prereqs": set()}
 
     async def _pass(units: list[str], cands: list[str], pcaps: dict,
                     gate: dict | None, **pairs: object) -> dict:
-        return await _ci_confirm_chosen(st, pcaps, base_sha, final_tree,
+        return await _ci_confirm_chosen(st, pcaps, base, final_tree,
                                         [by_id[i] for i in units],
                                         prior_gate=gate, **pairs)
-    return await _confirm_sized(
-        {r["id"]: r["id"] for r in recs}, dict(durations or {}), rank={},
-        caps=caps, overhead=0.0, label="ci parity", confirm=_pass)
+    try:
+        return await _confirm_sized(
+            {r["id"]: r["id"] for r in recs}, dict(durations or {}),
+            rank={}, caps=caps, overhead=0.0, label="ci parity",
+            confirm=_pass)
+    finally:
+        if base["wt"] is not None:
+            _ci_teardown(st, base["wt"])
 
 
-async def _ci_confirm_chosen(st: "State", caps: dict, base_sha: str,
+async def _ci_confirm_chosen(st: "State", caps: dict, base: dict,
                              final_tree: Path, recs: list[dict], *,
                              prior_gate: dict | None = None,
                              **pairs: object) -> dict:
     """`_ci_confirm_red`'s confirm over the checks it chose, in order
-    (`pairs`: `_confirm_sized`'s `max_pairs` / `resume`)."""
+    (`pairs`: `_confirm_sized`'s `max_pairs` / `resume`). `base` is the
+    sized confirm's one base worktree record `{sha, wt, prepared}`: created
+    by the first pass, kept for the rest, torn down by the caller."""
     cand = [r["id"] for r in recs]
-    base_wt = (await _ci_worktree(st, "ci-confirm-base", base_sha)
-               if base_sha else None)
+    if base.get("wt") is None and base.get("sha") and not base.get("tried"):
+        base["tried"] = True
+        base["wt"] = await _ci_worktree(st, "ci-confirm-base", base["sha"])
+    base_wt = base.get("wt")
 
     async def _none(_t: float) -> set[str] | None:
         return None
@@ -41438,16 +41454,17 @@ async def _ci_confirm_chosen(st: "State", caps: dict, base_sha: str,
             return failing
         return _run
 
-    try:
-        await _ci_prepare(base_wt, recs, st, caps, "confirm-base")
-        # A gate is one that passed at the baseline, and each candidate
-        # failed on the final tree.
-        return await _confirm_new_failures(
-            cand, _runner(base_wt, "base"), _runner(final_tree, "final"),
-            caps, label="ci parity", seen_failing=True,
-            prior_gate=prior_gate, **pairs)
-    finally:
-        _ci_teardown(st, base_wt)
+    fresh = [r for r in recs if r["id"] not in base["prepared"]]
+    if fresh:
+        await _ci_prepare(base_wt, fresh, st, caps, "confirm-base",
+                          base["prereqs"])
+        base["prepared"].update(r["id"] for r in fresh)
+    # A gate is one that passed at the baseline, and each candidate
+    # failed on the final tree.
+    return await _confirm_new_failures(
+        cand, _runner(base_wt, "base"), _runner(final_tree, "final"),
+        caps, label="ci parity", seen_failing=True,
+        prior_gate=prior_gate, **pairs)
 
 
 def _format_unmet_required_items_section(
