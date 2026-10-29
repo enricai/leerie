@@ -6368,15 +6368,15 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     `tests/test_post_execution_readers_read_committed_tree.py` and
     `tests/test_acceptance_gate.py::test_the_final_remeasure_reads_the_committed_tree`.
   - `async _redrive_commit_leftovers(staging, label, tracked_before,
-    untracked_before, written, *, markers=(), withheld=None, caps=None)
+    untracked_before, written, *, prints=None, withheld=None, caps=None)
     -> list[str]`
     commits a group's leftovers
     (DESIGN §8 *A re-drive group's leftovers are its implementer's*): first,
     every changed tracked path and every moved or `written` untracked path
-    whose file `_file_holds_marker(markers)` is removed (untracked:
+    whose file `_file_holds_span(prints)` is removed (untracked:
     unlinked; tracked: `git --literal-pathspecs checkout HEAD -- <p>`),
     logged `"delivery re-drive (<label>): removed <N> file(s) holding a
-    staged held-out set's bytes: <first 5>"`, appended to
+    span of a staged held-out set's source: <first 5>"`, appended to
     `withheld["heldout"]` and dropped from what follows; an untracked
     candidate `_leftover_artifact(staging, rel)` names — basename matching
     `_LEFTOVER_ARTIFACT_GLOBS = ("*.pyc", "*.pyo", "*.swp", "*.swo", "*~",
@@ -7443,7 +7443,7 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   are saved as `in_flight.stage_files` first, so a resumed crash removes
   their `.gitignore` files — and every ancestor directory's,
   `_staged_ignore_dirs(files)` — before the rollback's `clean -fd`).
-  Staged material (DESIGN §8 *No byte derived from a staged set reaches
+  Staged material (DESIGN §8 *No line of a staged set's source reaches
   history*): `_redrive_stage` returns `[{set_index, dir, files, made}]`,
   `made` the top-most directories it had to create, each ignored whole
   (`<dir>/` to `_checkout_ignore`); beside every staged file it also
@@ -7455,20 +7455,28 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `made` directory whole, appending every removed path that is not a staged
   file to `swept` (recorded as the group's `heldout_removed`, first 20, with
   the leftovers' `withheld["heldout"]`). Just after staging,
-  `_heldout_markers(staging, staged, by_index, pre_sha) -> list[bytes]`:
-  each staged file's path, its set's `cases[rel]`, its test-shaped
-  identifiers (`_HELDOUT_IDENT_RE`) and its quoted literals
-  (`_HELDOUT_LITERAL_RE`, one scan over `"`, `'` and backquote; a literal
-  with escapes also yields its escape-free runs), each at least
-  `_HELDOUT_MARKER_MIN = 8` bytes, at most `_HELDOUT_MARKERS_MAX = 400`
-  (longest first), less those `git grep -a -F -o -h` finds in `pre_sha`;
-  `_file_holds_marker(path, markers)` (1 MiB chunks overlapping by the
-  longest marker; a symlink by its target string) and
-  `_history_heldout_hits(staging, pre_sha, post_sha, staged, markers) ->
-  list[str]` (every path of `git log --raw --no-abbrev --no-renames -z
-  pre..post` that is a staged file, lies under a `made` directory, or whose
-  new blob, read through one `git cat-file --batch`, holds a marker;
-  unreadable history → the staged files) read them; the latter is unioned
+  `_heldout_fingerprints(staging, staged, pre_sha) -> dict[int,
+  frozenset[bytes]]`: per staged file (its first `_HELDOUT_SOURCE_MAX =
+  1 MiB`), its normalised lines (`_heldout_pieces(readline)`: pieces of at
+  most `_HELDOUT_LINE_MAX = 4096` bytes, `\s+` collapsed to one space and
+  trimmed, kept only when they hold `[A-Za-z0-9]` and no NUL), and every
+  window of `_HELDOUT_SPAN_LINES = 4` of them — or one window of all of a
+  file with fewer — as a 16-byte `blake2b` digest (`_span_digest`), keyed
+  by window length; less every window found in the base: the files of
+  `pre_sha` holding any of the lines (`git grep -l -z -I -F -f <temp
+  pattern file> pre_sha --`), read through one `git cat-file --batch` up
+  to `_HELDOUT_BASE_SCAN_MAX = 64 MiB`, windowed the same way.
+  `_holds_heldout_span(pieces, prints)` slides each length over the pieces;
+  `_file_holds_span(path, prints)` streams a file through it (a symlink by
+  its target string); `_heldout_runner_copy(staged_rel, path)` is true for
+  `<dir>/__pycache__/<stem>.*` and `<dir>/__snapshots__/<name>.*`; and
+  `_history_heldout_hits(staging, pre_sha, post_sha, staged, prints) ->
+  list[str]` is every path of `git log --raw --no-abbrev --no-renames -z
+  pre..post` that is a staged file, a runner copy of one, lies under a
+  `made` directory, or whose new blob, read through one `git cat-file
+  --batch`, holds a span (unreadable history → the staged files). A value
+  the test asserts — a literal, an identifier, a path — is never a span on
+  its own (review round 12 H1, `tests/test_heldout_bytes_never_reach_history.py`). The latter is unioned
   into `committed_staged`; one implementer runs in staging (`_redrive_drive`:
   `_implementer_base_prompt` of the first member + `NOTE FROM
   ORCHESTRATOR:` `_redrive_note(...)`, `claude_p(schema_key="implementer",
@@ -10034,7 +10042,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `redrive_in_flight` | dict[str, dict] | per-sid write-ahead marker of a wave-end re-drive round on the subtask's branch (`_mark_redrive_in_flight`, DESIGN §6 *A re-drive interrupted mid-round is undone, never integrated*): `{kind: "coverage" \| "blocked", pre_sha, round, status}`, saved before the round's settle and dropped once it is decided; a resume rolls the branch back to `pre_sha` and restores `status` (`_undo_interrupted_redrives`). |
 | `integration_unjudged` | dict[str, str] | per-sid write-ahead marker of an integrator merge not yet judged (`_mark_integration_unjudged`, DESIGN §6 *A committed resolution is not a judged one*): the merge's first parent, saved before the integrator is spawned and dropped once the integration is decided (`_clear_integration_unjudged`); a resume that finds it with no `integration_gate[sid]` and the sid merged runs the integration gate on the committed merge. |
 | `delivery_ratchet` | dict \| absent | the delivery ratchet's run-wide record (DESIGN §8 *A repair that regresses met work is rolled back*): `{verifiability?{item_index: in_tree \| execution}, evidence?{item_index: {sha, evidence}}, intermittent_regression?[]}` — `verifiability` the cached `verifiability_classifier` result (`_ratchet_verifiability`); `evidence` the met evidence each kept repair's ratchet judge gave, the next ratchet's prior evidence; `intermittent_regression` the rows kept repairs typed, read by `_intermittent_regression_rows` after `test_id_diff`'s (evidence only). Per-repair verdicts live on `acceptance.gate.rounds[].ratchet` and `delivery_redrive.rounds[].groups[].ratchet`. |
-| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), tampered[], heldout_removed?[], leftovers?[], leftovers_withheld?{artifacts?[], over_cap?[]} (first 200 each; listed by `_set_redrive_leftovers_gap(st, rec)`, called as the re-drive ends: one "Needs human verification" entry, `source: "redrive_leftovers"` (`_REDRIVE_LEFTOVERS_GAP_SOURCE`), over every group not `rolled_back`, rendered by `_pr_needs_human` under "Files a re-drive left uncommitted"; cleared when there is none), committed_staged[] (staged paths, paths under a staging-made directory, and paths whose committed blob holds a held-out marker — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
+| `delivery_redrive` | dict \| absent | the delivery re-drive record (`_run_delivery_redrive`, DESIGN §8 *Delivery re-drive*): `{start_sha, rounds[{round, held_mode, groups[{group, members[], notes[kinds], skipped?, escalated?, pre_sha?, post_sha?, implementer?{status?, summary?, error?}, fixed[], broke[], ctl_new[], new_failures[], resource_affected[] (B\* mixed evidence only), pre_existing[], unmeasured[] (a set or the test IDs with no verdict, and B\* `no_verdict` IDs), tampered[], heldout_removed?[], leftovers?[], leftovers_withheld?{artifacts?[], over_cap?[], heldout?[]} (first 200 each; `heldout`: files removed for holding a span of a staged set's source; listed by `_set_redrive_leftovers_gap(st, rec)`, called as the re-drive ends: one "Needs human verification" entry, `source: "redrive_leftovers"` (`_REDRIVE_LEFTOVERS_GAP_SOURCE`), over every group not `rolled_back`, rendered by `_pr_needs_human` under "Files a re-drive left uncommitted"; cleared when there is none), committed_staged[] (staged paths, runner copies of them, paths under a staging-made directory, and paths whose committed blob holds a span of a staged set's source — `_history_heldout_hits`), worse?, zero_progress?, trade?, gate?{void, weakened[], schema[], ast[] \| null}, intermittent_regression?[], ratchet?, ratchet_regressed?[], kept_unsettled?[], rolled_back?, rollback_failed?}]}], pending_controls[], trade_pairs[[fixed, broken]], held_round_done?, conflict?{pairs[], round, reason}, contradictions[{fixed, tracked_test, file, round}], defects_driven?[keys of `conformance._final.residual_defects` driven by a group that was not rolled back], kept_unsettled?[{group, ids[], sized_out[], files{id: file}, unchecked_items[]}] (a kept group's `budget_short_unsettled` candidates and its ratchet's `exec_unchecked` items, listed by `_set_redrive_unsettled_gap`), items_rechecked_sha?, in_flight?{pre_sha, round, group}, rollback_failed?, final_sha?, done}` (`rollback_failed`: a group's reset did not land; the re-drive stopped with its commits on staging); `done` is the resume sentinel; `conflict.reason` is `_decide_outcome`'s reason verbatim. |
 | `provision` | dict | output of `phase_provision` (DESIGN §6½). |
 | `external_preconditions` | list[dict] | planner-declared `extent: external` `requires` entries collected during `phase_reconcile` (DESIGN §5 `requires.extent`). Each item is `{tag, reasons: [{sid, reason}, …], originating_subtasks: [sid, …]}`, deduped by tag. |
 | `dropped_subtasks` | dict[str, dict] | subtasks soft-dropped pre-schedule, and subtasks settled `complete` without a diff (`_settle_already_satisfied`). A no-diff settle's `reason` is one of `already_satisfied_pre_spawn`, `settled_by_execution` or `satisfied_by_sibling` (`satisfied_by: [{sid, commit, files}]`, `executed?`; §*Sibling-delivered no-op*). |

@@ -39,6 +39,7 @@ import fnmatch
 import functools
 import glob
 import hashlib
+import io
 import ipaddress
 import json
 import math
@@ -51193,19 +51194,25 @@ def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
     ex.write_text("\n".join(out) + ("\n" if out else ""))
 
 
-# The shortest byte string `_heldout_markers` keeps: shorter tokens of a test
-# (`assert`, `result`) are in every repository and distinguish nothing.
-_HELDOUT_MARKER_MIN = 8
-# At most this many markers per group: they go to one `git grep` and are
-# searched in every changed file.
-_HELDOUT_MARKERS_MAX = 400
-# Lexical tokens of a test source (mechanical: quoted literals and
-# test-shaped identifiers, never a reading of what the test means).
-# One left-to-right scan over every quote kind, so the text between two
-# literals is never read as a third.
-_HELDOUT_LITERAL_RE = re.compile(rb"([\"'`])((?:\\.|(?!\1)[^\\\n])*)\1")
-_HELDOUT_IDENT_RE = re.compile(rb"\b([Tt]est\w{%d,})" % (
-    _HELDOUT_MARKER_MIN - 4))
+# A staged file is fingerprinted by its spans of this many consecutive
+# normalised source lines (DESIGN §8 *No line of a staged set's source
+# reaches history*, rule 2). A value the test asserts lives on one line, so
+# any span of two or more needs code; four, because an honest sibling test
+# written in the same idiom shares at most a three-line header with it
+# (framework import, subject import, one client/fixture line), while a
+# copied case — signature, call, assertion and the line before it — is four.
+_HELDOUT_SPAN_LINES = 4
+# Lines are read in pieces of at most this many bytes, on both sides alike,
+# so one huge line (an inline base64 fixture, a minified bundle) is never
+# held whole.
+_HELDOUT_LINE_MAX = 4096
+# At most this many bytes of one staged file are fingerprinted.
+_HELDOUT_SOURCE_MAX = 1 << 20
+# At most this many bytes of the base's blobs are read to drop the spans the
+# repository already has; past it the rest are kept (the strict side).
+_HELDOUT_BASE_SCAN_MAX = 64 << 20
+_HELDOUT_WS_RE = re.compile(rb"\s+")
+_HELDOUT_ALNUM_RE = re.compile(rb"[A-Za-z0-9]")
 
 
 def _heldout_companion_patterns(rel: str) -> list[tuple[str, str]]:
@@ -51254,7 +51261,7 @@ def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
     one with a file in a directory that has its own `.gitignore` (never
     edited, so it could not be ignored). What appears under or beside a
     staged file while the group runs is staged material too (DESIGN §8
-    *No byte derived from a staged set reaches history*): a directory
+    *No line of a staged set's source reaches history*): a directory
     staging had to create is ignored whole (`made`), and beside a file in
     a directory that existed, its `_heldout_companion_patterns`. Returns
     `[{set_index, dir, files, made}]`."""
@@ -51312,8 +51319,8 @@ def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
 def _redrive_unstage(staging: Path, staged: list[dict], *,
                      swept: list[str] | None = None) -> list[str]:
     """Remove the staged copies, their `.gitignore` files and the
-    directories only they needed, with every byte of staged material
-    (DESIGN §8 *No byte derived from a staged set reaches history*): each
+    directories only they needed, with every runner copy of them (DESIGN §8
+    *No line of a staged set's source reaches history*, rule 1): each
     directory staging created goes whole, and beside each staged file its
     `_heldout_companions`; those removed paths are appended to `swept`.
     Returns the staged files whose bytes changed."""
@@ -51362,94 +51369,157 @@ def _redrive_unstage(staging: Path, staged: list[dict], *,
     return tampered
 
 
-def _heldout_markers(staging: Path, staged: list[dict],
-                     by_index: dict, base_rev: str) -> list[bytes]:
-    """The byte strings that identify the staged files' content (DESIGN §8
-    *No byte derived from a staged set reaches history*, rule 2): each
-    file's path, its recorded case names, its test-shaped identifiers and
-    its quoted literals, of at least `_HELDOUT_MARKER_MIN` bytes, less
-    every one `base_rev`'s tree already contains (`git grep -F`): a string
-    the repository already has is not distinctive. At most
-    `_HELDOUT_MARKERS_MAX`, longest first."""
-    found: set[bytes] = set()
+def _heldout_pieces(read: Callable[[int], bytes]) -> Iterator[bytes]:
+    """The normalised source lines `read` (a `readline(limit)`) yields: each
+    piece of at most `_HELDOUT_LINE_MAX` bytes, whitespace trimmed and
+    collapsed, and only those holding a letter or a digit (a lone `}` or
+    `});` distinguishes nothing)."""
+    while True:
+        raw = read(_HELDOUT_LINE_MAX)
+        if not raw:
+            return
+        norm = _HELDOUT_WS_RE.sub(b" ", raw).strip()
+        if norm and b"\0" not in norm and _HELDOUT_ALNUM_RE.search(norm):
+            yield norm
+
+
+def _bytes_pieces(data: bytes) -> Iterator[bytes]:
+    """`_heldout_pieces` over bytes already in memory."""
+    return _heldout_pieces(io.BytesIO(data).readline)
+
+
+def _span_digest(lines: Iterable[bytes]) -> bytes:
+    return hashlib.blake2b(b"\n".join(lines), digest_size=16).digest()
+
+
+def _span_digests(lines: list[bytes], sizes: Iterable[int]
+                  ) -> dict[int, set[bytes]]:
+    """Every window of each length in `sizes` over `lines`, digested."""
+    return {n: {_span_digest(lines[i:i + n])
+                for i in range(len(lines) - n + 1)} for n in sizes}
+
+
+def _holds_heldout_span(pieces: Iterable[bytes],
+                        prints: dict[int, frozenset[bytes]]) -> bool:
+    """True when `pieces` (normalised lines, `_heldout_pieces`) hold one of
+    the spans `prints` keys by length."""
+    if not prints:
+        return False
+    win: deque[bytes] = deque(maxlen=max(prints))
+    for line in pieces:
+        win.append(line)
+        for n, fps in prints.items():
+            if len(win) >= n and _span_digest(
+                    list(win)[len(win) - n:]) in fps:
+                return True
+    return False
+
+
+def _heldout_fingerprints(staging: Path, staged: list[dict],
+                          base_rev: str) -> dict[int, frozenset[bytes]]:
+    """The spans of source that identify the staged files (DESIGN §8 *No
+    line of a staged set's source reaches history*, rule 2), keyed by span
+    length: every window of `_HELDOUT_SPAN_LINES` consecutive normalised
+    lines of each staged file, or one window of all of a shorter file's,
+    less every window `base_rev`'s tree already contains — a span the
+    repository has is its idiom, not the test. The base's candidates are
+    found by `git grep -l -F -f <file>` over the files' lines (a pattern
+    file, never argv) and read through one `git cat-file --batch`, at most
+    `_HELDOUT_BASE_SCAN_MAX` bytes. A digest, never a value: a literal the
+    test asserts matches nothing on its own."""
+    spans: dict[int, set[bytes]] = {}
+    lines_all: set[bytes] = set()
     for s_ in staged:
-        cases = (by_index.get(s_.get("set_index")) or {}).get("cases") or {}
         for rel in s_["files"]:
-            found.add(rel.encode())
-            names = cases.get(rel) if isinstance(cases, dict) else None
-            for c in names if isinstance(names, list) else []:
-                found.add(str(c).encode())
             try:
-                data = (Path(s_["dir"]) / rel).read_bytes()
+                with open(Path(s_["dir"]) / rel, "rb") as f:
+                    data = f.read(_HELDOUT_SOURCE_MAX)
             except OSError:
                 continue
-            for m in _HELDOUT_LITERAL_RE.finditer(data):
-                lit = m.group(2)
-                found.add(lit)
-                found.update(part for part in lit.split(b"\\")
-                             if len(part) >= _HELDOUT_MARKER_MIN)
-            found.update(m.group(1) for m in _HELDOUT_IDENT_RE.finditer(data))
-    found = {m for m in found if len(m) >= _HELDOUT_MARKER_MIN
-             and b"\n" not in m and b"\0" not in m}
-    markers = sorted(found, key=lambda m: (-len(m), m))[
-        :_HELDOUT_MARKERS_MAX]
-    if markers and base_rev:
-        argv = ["git", "-C", str(staging), "grep", "-a", "-F", "-o", "-h",
-                "--no-color"]
-        for m in markers:
-            argv += ["-e", os.fsdecode(m)]
-        r = subprocess.run(argv + [base_rev, "--"], capture_output=True,
-                           check=False)
-        if r.returncode == 0:
-            # `-o` prints the leftmost-longest match at each position, so
-            # a marker hidden inside a longer one stays (the strict side).
-            known = set(r.stdout.split(b"\n"))
-            markers = [m for m in markers if m not in known]
-        elif r.returncode != 1:
+            lines = list(_bytes_pieces(data))
+            n = min(_HELDOUT_SPAN_LINES, len(lines))
+            if not n:
+                continue
+            spans.setdefault(n, set()).update(_span_digests(lines, [n])[n])
+            lines_all.update(lines)
+    if spans and base_rev and lines_all:
+        with tempfile.NamedTemporaryFile("wb", prefix="leerie-heldout-",
+                                         suffix=".pat") as pat:
+            pat.write(b"\n".join(sorted(lines_all)) + b"\n")
+            pat.flush()
+            r = subprocess.run(
+                ["git", "-C", str(staging), "grep", "-l", "-z", "-I", "-F",
+                 "-f", pat.name, base_rev, "--"],
+                capture_output=True, check=False)
+        names = [n for n in r.stdout.split(b"\0") if n]
+        if r.returncode not in (0, 1):
             log("  delivery re-drive: could not read the base for held-out "
-                "markers — every marker kept")
-    return markers
+                "spans — every span kept")
+        elif names:
+            cat = subprocess.run(
+                ["git", "-C", str(staging), "cat-file", "--batch"],
+                input=b"".join(n + b"\n" for n in names),
+                capture_output=True, check=False)
+            out, pos, read = cat.stdout, 0, 0
+            for _ in names:
+                nl = out.find(b"\n", pos)
+                if nl < 0 or read >= _HELDOUT_BASE_SCAN_MAX:
+                    break
+                head = out[pos:nl].split()
+                if len(head) < 3 or head[1] == b"missing":
+                    pos = nl + 1
+                    continue
+                size = int(head[2])
+                body = out[nl + 1:nl + 1 + size]
+                pos = nl + 1 + size + 1
+                read += size
+                have = _span_digests(list(_bytes_pieces(body)), spans)
+                for n in spans:
+                    spans[n] -= have[n]
+    return {n: frozenset(v) for n, v in spans.items() if v}
 
 
-def _bytes_hold_marker(data: bytes, markers: Iterable[bytes]) -> bool:
-    return any(m in data for m in markers)
-
-
-def _file_holds_marker(path: Path, markers: list[bytes]) -> bool:
-    """True when the file at `path` holds any marker as a byte substring
-    (read in chunks overlapping by the longest marker). A symlink is read
-    as its target's path, never followed."""
-    if not markers:
+def _file_holds_span(path: Path,
+                     prints: dict[int, frozenset[bytes]]) -> bool:
+    """True when the file at `path` holds one of the staged sets' spans
+    (`_heldout_fingerprints`), read a line piece at a time. A symlink is
+    read as its target's path, never followed."""
+    if not prints:
         return False
     try:
         if path.is_symlink():
-            return _bytes_hold_marker(os.fsencode(os.readlink(path)),
-                                      markers)
+            return _holds_heldout_span(
+                _bytes_pieces(os.fsencode(os.readlink(path))), prints)
         if not path.is_file():
             return False
-        keep = max(len(m) for m in markers)
-        tail = b""
         with open(path, "rb") as f:
-            while True:
-                chunk = f.read(1 << 20)
-                if not chunk:
-                    return False
-                if _bytes_hold_marker(tail + chunk, markers):
-                    return True
-                tail = (tail + chunk)[-keep:]
+            return _holds_heldout_span(_heldout_pieces(f.readline), prints)
     except OSError:
         return False
 
 
+def _heldout_runner_copy(staged_rel: str, path: str) -> bool:
+    """True when `path` is an entry a runner keys to the staged file
+    `staged_rel` (`_heldout_companion_patterns`): `<dir>/__pycache__/
+    <stem>.*` or `<dir>/__snapshots__/<name>.*`."""
+    d, name = os.path.split(staged_rel.strip("/"))
+    stem = name.split(".", 1)[0] or name
+    pd, pn = os.path.split(path)
+    return ((pd == os.path.join(d, "__pycache__")
+             and pn.startswith(stem + "."))
+            or (pd == os.path.join(d, "__snapshots__")
+                and pn.startswith(name + ".")))
+
+
 def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
                           staged: list[dict],
-                          markers: list[bytes]) -> list[str]:
+                          prints: dict[int, frozenset[bytes]]) -> list[str]:
     """The paths any commit in `pre_sha..post_sha` added or changed that
-    carry staged material (DESIGN §8 *No byte derived from a staged set
-    reaches history*, rule 3): a staged file, a path under a directory
-    staging created, or a blob holding a marker. Every commit's blobs, not
-    the net diff: a file committed and then deleted is still in the
-    history."""
+    carry a staged set's source (DESIGN §8 *No line of a staged set's
+    source reaches history*, rule 3): a staged file, a runner's copy of one
+    (`_heldout_runner_copy`), a path under a directory staging created, or
+    a blob holding one of `prints`' spans. Every commit's blobs, not the net
+    diff: a file committed and then deleted is still in the history."""
     own = {f for s_ in staged for f in s_["files"]}
     made = [m for s_ in staged for m in s_.get("made") or []]
     r = _git_z_output(["git", "-C", str(staging), "log", "--format=",
@@ -51470,10 +51540,11 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
         i += 2
         parts = meta.split()
         new = parts[3] if len(parts) >= 5 else ""
-        if path in own or any(path == m or path.startswith(m + "/")
-                              for m in made):
+        if (path in own or any(_heldout_runner_copy(f, path) for f in own)
+                or any(path == m or path.startswith(m + "/")
+                       for m in made)):
             hits.add(path)
-        if new and set(new) != {"0"} and markers:
+        if new and set(new) != {"0"} and prints:
             blobs.setdefault(new, set()).add(path)
     if blobs:
         cat = subprocess.run(["git", "-C", str(staging), "cat-file",
@@ -51494,7 +51565,7 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
             size = int(head[2])
             body = out[nl + 1:nl + 1 + size]
             pos = nl + 1 + size + 1
-            if _bytes_hold_marker(body, markers):
+            if _holds_heldout_span(_bytes_pieces(body), prints):
                 hits |= blobs[sha]
     return sorted(hits)
 
@@ -53038,13 +53109,15 @@ def _leftover_artifact(staging: Path, rel: str) -> bool:
 def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
     """The "Needs human verification" entry for what kept re-drive groups
     left uncommitted that the leftovers commit withheld (`leftovers_withheld`
-    of every group not rolled back): artifact-shaped files and a whole
-    over-cap set, by path. Cleared when there is none."""
+    of every group not rolled back): artifact-shaped files, a whole
+    over-cap set, and the files removed for holding a span of a staged
+    set's source, by path. Cleared when there is none."""
     data = getattr(st, "data", None)
     if not isinstance(data, dict):
         return
     shapes: list[str] = []
     over: list[str] = []
+    copies: list[str] = []
     for r in rec.get("rounds") or []:
         for g in r.get("groups") or []:
             w = g.get("leftovers_withheld") if isinstance(g, dict) else None
@@ -53052,6 +53125,7 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
                 continue
             shapes += [p for p in w.get("artifacts") or [] if p not in shapes]
             over += [p for p in w.get("over_cap") or [] if p not in over]
+            copies += [p for p in w.get("heldout") or [] if p not in copies]
     entries = [e for e in (data.get("needs_human_verification") or [])
                if not (isinstance(e, dict) and e.get("source")
                        == _REDRIVE_LEFTOVERS_GAP_SOURCE)]
@@ -53065,6 +53139,10 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
                      f"{shown(over)}")
     if shapes:
         parts.append(f"artifact-shaped, not committed: {shown(shapes)}")
+    if copies:
+        parts.append("removed for holding lines of a hidden test's source "
+                     f"(a tracked one put back as HEAD has it): "
+                     f"{shown(copies)}")
     if parts:
         entries.append({
             "source": _REDRIVE_LEFTOVERS_GAP_SOURCE,
@@ -53084,7 +53162,8 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
                                     untracked_before: dict[str, list[int]]
                                     | None,
                                     written: set[str], *,
-                                    markers: list[bytes] | tuple = (),
+                                    prints: dict[int, frozenset[bytes]]
+                                    | None = None,
                                     withheld: dict[str, list[str]] | None
                                     = None,
                                     caps: dict | None = None) -> list[str]:
@@ -53107,10 +53186,12 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
     snapshot (git failed), that side contributes nothing but `written`.
 
     Before anything is chosen, every file the group made or changed that
-    holds one of `markers` (`_heldout_markers`: the staged sets' bytes) is
-    removed — an untracked one unlinked, a tracked one checked out from
-    HEAD — and listed in `withheld["heldout"]` (DESIGN §8 *No byte derived
-    from a staged set reaches history*).
+    holds a span of a staged set's source (`prints`,
+    `_heldout_fingerprints`) is removed — an untracked one unlinked, a
+    tracked one checked out from HEAD — and listed in `withheld["heldout"]`
+    (DESIGN §8 *No line of a staged set's source reaches history*, rule 4).
+    A value the test asserts is not a span: a file sharing only literals
+    with it is the fix, and stays.
 
     Of the rest, an untracked file `_leftover_artifact` names is withheld
     (`withheld["artifacts"]`), and when what remains is more than
@@ -53123,10 +53204,10 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
     sigs = await asyncio.to_thread(_untracked_signatures, staging) or {}
     moved = (set() if untracked_before is None else
              {p for p, sig in sigs.items() if untracked_before.get(p) != sig})
-    if markers:
+    if prints:
         tainted = sorted(
             p for p in set(tracked) | ((moved | set(written)) & set(sigs))
-            if _file_holds_marker(staging / p, list(markers)))
+            if _file_holds_span(staging / p, prints))
         for p in tainted:
             if p in sigs:
                 with contextlib.suppress(OSError):
@@ -53136,7 +53217,7 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
                                 "HEAD", "--", p], cwd=str(staging))
         if tainted:
             log(f"  delivery re-drive ({label}): removed {len(tainted)} "
-                "file(s) holding a staged held-out set's bytes: "
+                "file(s) holding a span of a staged held-out set's source: "
                 + ", ".join(tainted[:5])
                 + (f" (+{len(tainted) - 5} more)" if len(tainted) > 5
                    else ""))
@@ -53469,8 +53550,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             _save()
             t0 = time.monotonic()
             staged = _redrive_stage(staging, shown)
-            markers = await asyncio.to_thread(
-                _heldout_markers, staging, staged, by_index, pre_sha)
+            prints = await asyncio.to_thread(
+                _heldout_fingerprints, staging, staged, pre_sha)
             staged_files = sorted({f for s_ in staged for f in s_["files"]
                                    if f in selfcheck_cmd_files})
             cmd = (_acceptance_cmd(st, staged_files, str(staging))
@@ -53507,10 +53588,11 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 _worker_written_paths(
                     st.run_dir / "logs"
                     / f"delivery-redrive-r{rnd}-g{gi}.log", staging),
-                markers=markers, withheld=withheld, caps=caps)
+                prints=prints, withheld=withheld, caps=caps)
             if left:
                 ge["leftovers"] = left[:20]
-            kept_out = {k: v[:200] for k in ("artifacts", "over_cap")
+            kept_out = {k: v[:200] for k in ("artifacts", "over_cap",
+                                             "heldout")
                         if (v := withheld.get(k))}
             if kept_out:
                 ge["leftovers_withheld"] = kept_out
@@ -53538,7 +53620,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 committed = sorted(set(committed) | set(
                     await asyncio.to_thread(
                         _history_heldout_hits, staging, pre_sha, post_sha,
-                        staged, markers)))
+                        staged, prints)))
                 ge["committed_staged"] = committed
                 F1, unm = await measure(shown, f"redrive-r{rnd}g{gi}")
                 F1 = _redrive_carry(F, F1, unm)

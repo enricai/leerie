@@ -7326,37 +7326,59 @@ and dropping a real file breaks what ships; so outside those three guards
 a new untracked file is committed, and inside them it is listed, never
 dropped unseen.
 
-**No byte derived from a staged set reaches history.** The shown sets a
-re-drive group stages are held-out tests, and what the implementer's
-self-check run makes of them is as hidden as they are: review round 11
-drove a group whose implementer ran the staged test as its note told it
-to, in a repository that does not ignore `__pycache__/`, and the leftovers
-commit took `tests/__pycache__/test_<set>.cpython-*.pyc` — the
-assertion-rewritten bytecode, whose constants carry the hidden assertion
-messages into `git show`. The void check compared file names only, so the
-group stood. Three rules close it, none of which reads a file's meaning:
+**No line of a staged set's source reaches history.** The invariant this
+barrier serves is exactly one: *the held-out test's source never reaches
+history.* The values the test asserts — an error message, an enum value,
+a JSON key, a route, the path of the module it imports — are not covered:
+they are the specification, the shown sets are staged precisely so the
+implementer makes them pass, and the code that does so has to contain
+them. Every rule below is derived from that sentence, and from nothing a
+reviewer's single example suggested.
 
-1. *What appears under or beside a staged file is staged material.* A
-   directory staging had to create is ignored whole while the group runs
-   and removed whole afterwards; beside a staged file in a directory that
-   already existed, the entries keyed to its name — `__pycache__/<stem>.*`
-   and `__snapshots__/<name>.*` — are ignored and removed the same way.
-   What was removed is recorded on the group, never committed.
-2. *A file is checked for the set's bytes, not only its name.* The
-   markers of a staged file are its path, its recorded case names, its
-   test-shaped identifiers and its quoted literals (at least
-   `_HELDOUT_MARKER_MIN` bytes) — lexical tokens of the test source —
-   less every marker the group's starting commit already contains, since
-   a string the repository already has is not distinctive. Every file the
-   group made or changed that holds a marker as a byte substring is removed
-   (a tracked one is checked out from HEAD) before the leftovers commit,
-   so a `.pytest_cache` node-ID list, a junit report naming the hidden
-   cases or a bytecode cache is never taken.
-3. *The void check reads every committed blob.* Every blob any commit of
+Review round 11 drove a group whose implementer ran the staged test as its
+note told it to, in a repository that does not ignore `__pycache__/`: the
+leftovers commit took `tests/__pycache__/test_<set>.cpython-*.pyc`, the
+test compiled. Its fix searched every committed blob for the test's quoted
+literals and identifiers, and review round 12 drove what that costs: a
+re-drive runs exactly when the behaviour the test asserts is missing from
+the base, so "minus what the base already has" removed almost nothing, and
+an honest `throw new Error('quantity must be positive')`, an
+`export * from './orders'` or an uncommitted fix holding the expected
+message voided the group, rolled it back, spent the round and ended the run
+`unconverged` with the cause invisible. A literal is a value; matching one
+cannot tell the fix from a copy of the test.
+
+1. *Copies the runner makes of a staged file are staged material.* A
+   directory staging had to create is ignored while the group runs; beside
+   a staged file, the entries a runner keys to its name —
+   `__pycache__/<stem>.*` and `__snapshots__/<name>.*` — are ignored the
+   same way, and all of it is removed at unstage. These are copies of the
+   test by construction (its bytecode, its snapshots), whatever bytes they
+   hold, so they are matched by name; what was removed is recorded on the
+   group, never committed.
+2. *A copy elsewhere is recognised by a span of the test's source.* Each
+   staged file is fingerprinted by its spans of `_HELDOUT_SPAN_LINES` (4)
+   consecutive source lines, each line normalised (whitespace trimmed and
+   collapsed, a line with no letter or digit skipped); a file shorter than
+   that is one span of all its lines. A span the group's starting commit
+   already contains is dropped: it is the repository's idiom, not the
+   test. A file holds the test's source when it holds one of the spans.
+   Why four: a value lives on one line, so any span of two or more lines
+   already needs code, not a value; an honest sibling test written in the
+   same idiom shares at most a short header with it (the framework import,
+   the subject import, one client or fixture line — three lines), which a
+   span of four does not match, while a copied case — its signature, its
+   call, its assertion, and the line before it — does.
+3. *Only a span or a staged path voids a group.* Every blob any commit of
    the group added — not the net diff, since a file committed and then
-   deleted is still in the history — is searched for the markers; a hit,
-   a staged path or a path under a directory staging created voids the
-   group, which is rolled back.
+   deleted is still in the history — is searched for the spans; a hit, a
+   staged path, a runner copy's path (rule 1) or a path under a directory
+   staging created voids the group, which is rolled back.
+4. *A leftover that holds a span is removed, never one that holds a
+   value.* Before the leftovers commit, a file the group made or changed
+   that holds a span is removed (a tracked one is checked out from HEAD)
+   and listed in the PR's "Needs human verification" entry by path. A
+   tracked edit is never reverted for a literal it shares with the test.
 
 These are the only places a set's bytes enter a tree that commits. The
 acceptance evaluation, the set audit, the surrogate witness and the
@@ -7364,10 +7386,15 @@ falsifier (its `.leerie-falsifier/` leads and the confirm checkout) all
 work in disposable checkouts that are removed and never committed from;
 the final conformer, the integrator and the pr_reviewer never run while a
 set is staged, and the material swept at unstage is gone before any of
-them could see it. What these rules do not cover is a fixer that
+them could see it. What these rules do not cover: a fixer that
 deliberately copies a set out of the run directory with a shell command
 (§8 *Held-out acceptance tests*: hiding reduces the incentive, it does not
-guarantee it); rule 3 still voids such a group when it is a re-drive's.
+guarantee it) — rule 3 still voids such a group when it is a re-drive's
+and the copy keeps four lines intact; a copy reflowed line by line or
+re-rendered into another form (a coverage report's code frame with line
+numbers, a compiler's output); and a report that names the test's cases
+or path, which carries no source line — the case names are given to the
+implementer in a held-back round anyway.
 
 **A finished verdict is reused only on the commit it was measured on.** A
 resume skips a finalize-side gate that already finished, but "finished"
