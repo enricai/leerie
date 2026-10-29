@@ -7365,6 +7365,11 @@ logged only, since there is nothing for a reviewer to decide about it.
   and the files the entry told the reviewer to commit, so the entry could
   not be acted on.
 
+A withheld file stays untracked in staging, so a later group's
+implementer can commit it with its own `git add -A`; the entry is built
+when the re-drive ends and leaves out every path HEAD tracks by then, so
+it never says "not committed" of a file that ships.
+
 Leerie still cannot tell a generated file from a hand-made one in general,
 and dropping a real file breaks what ships; so outside those three guards
 a new untracked file is committed, and inside them a file that could be a
@@ -7396,10 +7401,15 @@ cannot tell the fix from a copy of the test.
    directory staging had to create is ignored while the group runs; beside
    a staged file, the entries a runner keys to its name —
    `__pycache__/<stem>.*` and `__snapshots__/<name>.*` — are ignored the
-   same way, and all of it is removed at unstage. These are copies of the
+   same way, and they are removed at unstage. These are copies of the
    test by construction (its bytecode, its snapshots), whatever bytes they
    hold, so they are matched by name; what was removed is recorded on the
-   group, never committed.
+   group, never committed. Inside a directory staging created, only those
+   copies and files holding a span of the test (rule 2) are removed: the
+   implementer's own sibling test or conftest written there is the change,
+   and goes to the leftovers commit like any other file. Review round 12
+   suspected, and a test confirmed, that removing the directory whole
+   deleted it with no entry anywhere but the group's record.
 2. *A copy elsewhere is recognised by a span of the test's source.* Each
    staged file is fingerprinted by its spans of `_HELDOUT_SPAN_LINES` (4)
    consecutive source lines, each line normalised (whitespace trimmed and
@@ -7423,9 +7433,11 @@ cannot tell the fix from a copy of the test.
    hidden test still staged while the repository's test command ran.
 3. *Only a span or a staged path voids a group.* Every blob any commit of
    the group added — not the net diff, since a file committed and then
-   deleted is still in the history — is searched for the spans; a hit, a
-   staged path, a runner copy's path (rule 1) or a path under a directory
-   staging created voids the group, which is rolled back.
+   deleted is still in the history, and a merge commit's own blobs against
+   each of its parents, since an evil merge's resolution is in no other
+   commit — is searched for the spans; a hit, a staged path or a runner
+   copy's path (rule 1) voids the group, which is rolled back. A path is
+   not a hit merely for lying under a directory staging created.
 4. *A leftover that holds a span is removed, never one that holds a
    value.* Before the leftovers commit, a file the group made or changed
    that holds a span is removed (a tracked one is checked out from HEAD)

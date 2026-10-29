@@ -51338,13 +51338,19 @@ def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
 
 
 def _redrive_unstage(staging: Path, staged: list[dict], *,
-                     swept: list[str] | None = None) -> list[str]:
+                     swept: list[str] | None = None,
+                     prints: dict[int, frozenset[bytes]] | None = None
+                     ) -> list[str]:
     """Remove the staged copies, their `.gitignore` files and the
     directories only they needed, with every runner copy of them (DESIGN §8
-    *No line of a staged set's source reaches history*, rule 1): each
-    directory staging created goes whole, and beside each staged file its
-    `_heldout_companions`; those removed paths are appended to `swept`.
-    Returns the staged files whose bytes changed."""
+    *No line of a staged set's source reaches history*, rule 1): beside
+    each staged file its `_heldout_companions`, and under each directory
+    staging created every runner copy of a staged file and every file
+    holding one of `prints`' spans; those removed paths are appended to
+    `swept`. Any other file there — the implementer's own sibling test or
+    conftest — stays, for the leftovers commit (review round 12: the whole
+    directory used to go, silently). Returns the staged files whose bytes
+    changed."""
     tampered: list[str] = []
     files = [f for s_ in staged for f in s_["files"]]
     _checkout_unignore(staging, _staged_ignore_dirs(files))
@@ -51369,14 +51375,25 @@ def _redrive_unstage(staging: Path, staged: list[dict], *,
     for s_ in staged:
         for m in s_.get("made") or []:
             top = staging / m
-            if top.is_dir() and not top.is_symlink():
-                for p in sorted(top.rglob("*")):
-                    if p.is_file() or p.is_symlink():
-                        gone.append(os.path.relpath(p, staging))
-                for p in top.rglob("*"):
+            if not top.is_dir() or top.is_symlink():
+                continue
+            for p in sorted(top.rglob("*")):
+                if not (p.is_file() or p.is_symlink()):
+                    continue
+                rel = os.path.relpath(p, staging)
+                if (rel in files
+                        or any(_heldout_runner_copy(f, rel) for f in files)
+                        or _file_holds_span(p, prints or {})):
+                    gone.append(rel)
                     with contextlib.suppress(OSError):
-                        p.chmod(0o755 if p.is_dir() else 0o644)
-                shutil.rmtree(top, ignore_errors=True)
+                        p.chmod(0o644)
+                        p.unlink()
+            for p in sorted(top.rglob("*"), key=lambda x: -len(str(x))):
+                if p.is_dir() and not p.is_symlink():
+                    with contextlib.suppress(OSError):
+                        p.rmdir()
+            with contextlib.suppress(OSError):
+                top.rmdir()
         for d in sorted({(staging / r).parent for r in s_["files"]}
                         | {(staging / r).parent / sub
                            for r in s_["files"]
@@ -51538,13 +51555,17 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
     """The paths any commit in `pre_sha..post_sha` added or changed that
     carry a staged set's source (DESIGN §8 *No line of a staged set's
     source reaches history*, rule 3): a staged file, a runner's copy of one
-    (`_heldout_runner_copy`), a path under a directory staging created, or
-    a blob holding one of `prints`' spans. Every commit's blobs, not the net
-    diff: a file committed and then deleted is still in the history."""
+    (`_heldout_runner_copy`), or a blob holding one of `prints`' spans —
+    never a path merely for lying under a directory staging created, since
+    the implementer's own sibling test there is the change. Every commit's
+    blobs, not the net diff: a file committed and then deleted is still in
+    the history."""
     own = {f for s_ in staged for f in s_["files"]}
-    made = [m for s_ in staged for m in s_.get("made") or []]
+    # `-m`: a merge commit's own blobs (an evil merge's resolution) are
+    # shown against each parent; without it `--raw` lists nothing for a
+    # merge, and a copy made only there would ship.
     r = _git_z_output(["git", "-C", str(staging), "log", "--format=",
-                       "--raw", "--no-abbrev", "--no-renames", "-z",
+                       "--raw", "-m", "--no-abbrev", "--no-renames", "-z",
                        f"{pre_sha}..{post_sha}"])
     if r.returncode != 0:
         return sorted(own)       # unreadable history: fail closed
@@ -51561,9 +51582,7 @@ def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
         i += 2
         parts = meta.split()
         new = parts[3] if len(parts) >= 5 else ""
-        if (path in own or any(_heldout_runner_copy(f, path) for f in own)
-                or any(path == m or path.startswith(m + "/")
-                       for m in made)):
+        if path in own or any(_heldout_runner_copy(f, path) for f in own):
             hits.add(path)
         if new and set(new) != {"0"} and prints:
             blobs.setdefault(new, set()).add(path)
@@ -53127,7 +53146,8 @@ def _leftover_artifact(staging: Path, rel: str) -> bool:
     return False
 
 
-def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
+def _set_redrive_leftovers_gap(st: "State", rec: dict,
+                               staging: Path | None = None) -> None:
     """The "Needs human verification" entry for what kept re-drive groups
     left uncommitted that the leftovers commit withheld (`leftovers_withheld`
     of every group not rolled back): a whole over-cap set, the files a
@@ -53135,7 +53155,9 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
     files removed for holding a span of a staged set's source, by path. An
     artifact shape (`_leftover_artifact`) is never listed — no reviewer has
     anything to decide about a `.pyc` (review round 12 M1); the leftovers
-    commit logs it. Cleared when there is none."""
+    commit logs it. A withheld path `staging`'s HEAD tracks now — a later
+    group's own `git add -A` committed it — is not listed as uncommitted.
+    Cleared when there is none."""
     data = getattr(st, "data", None)
     if not isinstance(data, dict):
         return
@@ -53153,6 +53175,15 @@ def _set_redrive_leftovers_gap(st: "State", rec: dict) -> None:
             copies += [p for p in w.get("heldout") or [] if p not in copies]
             gen += [p for p in w.get("generated_edited") or []
                     if p not in gen]
+    if staging is not None and (over or gen):
+        r = subprocess.run(["git", "--literal-pathspecs", "-C",
+                            str(staging), "ls-files", "-z", "--",
+                            *(over + gen)], capture_output=True, text=True,
+                           check=False)
+        if r.returncode == 0:
+            tracked = set(r.stdout.split("\0"))
+            over = [p for p in over if p not in tracked]
+            gen = [p for p in gen if p not in tracked]
     entries = [e for e in (data.get("needs_human_verification") or [])
                if not (isinstance(e, dict) and e.get("source")
                        == _REDRIVE_LEFTOVERS_GAP_SOURCE)]
@@ -53695,7 +53726,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             finally:
                 swept: list[str] = []
                 ge["tampered"] = _redrive_unstage(staging, staged,
-                                                  swept=swept)
+                                                  swept=swept,
+                                                  prints=prints)
             withheld: dict[str, list[str]] = {}
             left = await _redrive_commit_leftovers(
                 staging, f"r{rnd} g{gi}", tracked_before, untracked_before,
@@ -53729,7 +53761,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 # Every commit's files, not the net diff: a staged file
                 # committed and then deleted is still in the history.
                 changed = _redrive_git(staging, "log", "--format=",
-                                       "--name-only",
+                                       "--name-only", "-m",
                                        f"{pre_sha}..{post_sha}").split()
                 committed = sorted(set(changed) & {
                     f for s_ in staged for f in s_["files"]})
@@ -53972,7 +54004,7 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             st.save()
     rec["final_sha"] = final
     rec["done"] = True
-    _set_redrive_leftovers_gap(st, rec)
+    _set_redrive_leftovers_gap(st, rec, staging)
     _save()
     log("  delivery re-drive: done"
         + (f" — conflict: {rec['conflict']['reason']}"

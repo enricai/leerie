@@ -291,3 +291,35 @@ def test_the_save_cap_bounds_the_archive(leerie, tmp_path):
     with tarfile.open(got[0]) as tar:
         assert tar.getnames() == ["small.txt"]
     assert leerie.DEFAULT_CAPS["redrive_leftovers_save_max_bytes"] == 64 << 20
+
+
+def test_a_withheld_file_a_later_group_committed_is_not_listed(leerie,
+                                                               tmp_path):
+    """Review round 12's suspicion, confirmed: a withheld file stays
+    untracked in staging, a later group's own `git add -A` commits it, and
+    the earlier group's entry still said it was not committed."""
+    s = _repo(tmp_path)
+    (s / "gen.py").write_text("V = 2\n")
+    (s / "other.sql").write_text("-- x\n")
+    rec = {"rounds": [{"groups": [{"leftovers_withheld": {
+        "over_cap": ["gen.py", "other.sql"],
+        "generated_edited": ["gen.py"]}}]}]}
+
+    class St:
+        data: dict = {}
+
+        def save(self):
+            pass
+    st = St()
+    st.data = {}
+    leerie._set_redrive_leftovers_gap(st, rec, s)
+    (e,) = st.data["needs_human_verification"]
+    assert "gen.py" in e["detail"] and "other.sql" in e["detail"]
+    _git(s, "add", "-A")
+    _git(s, "commit", "-qm", "later group")
+    (s / "other.sql").unlink()
+    _git(s, "commit", "-qam", "gone")
+    (s / "other.sql").write_text("-- x\n")      # untracked again
+    leerie._set_redrive_leftovers_gap(st, rec, s)
+    (e,) = st.data["needs_human_verification"]
+    assert "gen.py" not in e["detail"] and "other.sql" in e["detail"]

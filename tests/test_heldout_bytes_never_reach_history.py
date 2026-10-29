@@ -182,22 +182,68 @@ def test_every_commit_is_read_not_the_net_diff(leerie, tmp_path,
     leerie._redrive_unstage(s, staged)
 
 
-def test_a_directory_staging_created_is_staged_material_whole(
+def test_a_directory_staging_created_keeps_the_implementers_own_files(
         leerie, tmp_path, monkeypatch):
-    """Rule 1: everything that appears under a directory staging had to
-    create is ignored while the group runs and removed with it."""
+    """Rule 1. Everything under a directory staging had to create is
+    ignored while the group runs; at unstage the staged file, its runner
+    copies and a copy of its source go, and the implementer's own sibling
+    test and conftest stay for the leftovers commit. Review round 12's
+    suspicion, confirmed: the whole directory was removed, the sibling
+    recorded only in `heldout_removed`. A sibling committed there is not a
+    void hit by its path alone."""
     s = _repo(tmp_path, monkeypatch)
+    base = _git(s, "rev-parse", "HEAD")
     set_ = _held(tmp_path, rel="acc/deep/test_hidden_accept.py")
     staged = leerie._redrive_stage(s, [set_])
     assert staged[0]["made"] == ["acc"]
-    (s / "acc" / "deep" / "conftest_copy.py").write_text("X = 1\n")
-    (s / "acc" / "other.txt").write_text("y\n")
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    (s / "acc" / "deep" / "conftest.py").write_text("X = 1\n")
+    (s / "acc" / "test_sibling.py").write_text(
+        "from mod import f\n\ndef test_mine():\n    assert f() == 2\n")
+    (s / "acc" / "deep" / "copy.txt").write_text(HIDDEN)
+    (s / "acc" / "deep" / "__pycache__").mkdir()
+    (s / "acc" / "deep" / "__pycache__"
+     / "test_hidden_accept.cpython-3.pyc").write_bytes(b"pyc")
     assert _git(s, "status", "--porcelain", "--untracked-files=all") == ""
     swept: list[str] = []
-    leerie._redrive_unstage(s, staged, swept=swept)
-    assert sorted(swept) == ["acc/deep/conftest_copy.py", "acc/other.txt"]
-    assert not (s / "acc").exists()
-    assert _git(s, "status", "--porcelain", "--untracked-files=all") == ""
+    leerie._redrive_unstage(s, staged, swept=swept, prints=prints)
+    assert sorted(swept) == [
+        "acc/deep/__pycache__/test_hidden_accept.cpython-3.pyc",
+        "acc/deep/copy.txt"]
+    assert (s / "acc" / "deep" / "conftest.py").exists()
+    assert (s / "acc" / "test_sibling.py").exists()
+    assert not (s / "acc" / "deep" / "__pycache__").exists()
+    _git(s, "add", "acc")
+    _git(s, "commit", "-qm", "sibling")
+    assert leerie._history_heldout_hits(
+        s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
+
+
+def test_a_copy_made_only_in_a_merge_commit_voids(leerie, tmp_path,
+                                                  monkeypatch):
+    """Review round 12's suspicion, confirmed: `git log --raw` lists
+    nothing for a merge commit, so a copy added only in a merge's
+    resolution (an evil merge) was never read. `-m` reads it."""
+    s = _repo(tmp_path, monkeypatch)
+    base = _git(s, "rev-parse", "HEAD")
+    set_ = _held(tmp_path)
+    staged = leerie._redrive_stage(s, [set_])
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    _git(s, "checkout", "-q", "-b", "side")
+    (s / "side.txt").write_text("side\n")
+    _git(s, "add", "side.txt")
+    _git(s, "commit", "-qm", "side")
+    _git(s, "checkout", "-q", "main")
+    (s / "mod.py").write_text("def f():\n    return 2\n")
+    _git(s, "commit", "-qam", "fix")
+    _git(s, "merge", "-q", "--no-ff", "--no-commit", "side")
+    (s / "notes.md").write_text(HIDDEN)
+    _git(s, "add", "notes.md")
+    _git(s, "commit", "-qm", "merge side")
+    leerie._redrive_unstage(s, staged)
+    assert leerie._history_heldout_hits(
+        s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
+            "notes.md"]
 
 
 def test_a_group_whose_commit_carries_the_sets_bytes_is_voided(
