@@ -6289,10 +6289,15 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     fails), with no cleanliness check; `async _tracked_edits(tree) ->
     list[str] | None` is `git status --porcelain --untracked-files=no`'s
     lines (None when git fails). `_worktree_tree_sha` (None on any
-    porcelain output, untracked files included) stays the identity of a
-    *measurement* — the `_measure_axes` memo key and the `tree_sha`
-    `_confirm_final_test_failures` stamps — because an untracked file can
-    change what a test run collects. Every read of "the tree that ships"
+    porcelain output, untracked files included) stays the `_measure_axes`
+    memo key, because an untracked file can change what a test run
+    collects. The `tree_sha` `_confirm_final_test_failures` stamps when its
+    caller passes none is `async _measured_tree_sha(st, tree) -> str |
+    None`: `_unmoved_tree_sha(tree)`, but None when any `_untracked_files`
+    entry is a path the final conformer wrote (`_worker_written_paths` over
+    `<run>/logs/final-conformer-r*.log`) — the untracked dirt left is then
+    only commands' output, and the refresh reuses the diff (review round 9
+    L1). Every read of "the tree that ships"
     uses `_committed_tree_sha`: the refresh below, the test-outcome verdicts
     of `_delivery_judge_unmet`, `_run_delivery_detection` and the re-drive's item
     re-checks and tail (`_test_outcome_verdict`, `_redrive_apply_item_verdicts`,

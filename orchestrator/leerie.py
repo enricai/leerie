@@ -38938,6 +38938,31 @@ async def _unmoved_tree_sha(tree: str) -> str | None:
     return await _committed_tree_sha(tree)
 
 
+async def _measured_tree_sha(st: "State", tree: str) -> str | None:
+    """The committed tree a measurement just taken in `tree` describes, or
+    None when it describes something else (DESIGN §8 *The final diff
+    describes the tree that ships*): `_unmoved_tree_sha` — no tracked file
+    edited — and no untracked file one the final conformer wrote (its
+    Write/Edit tool calls in `final-conformer-r*.log`,
+    `_worker_written_paths`). What is left untracked then is only what
+    commands produced — a test run's `__pycache__/`, coverage, reports —
+    which never ships and is not the change; a file a worker wrote and did
+    not commit is part of what the run collected but not of what ships."""
+    sha = await _unmoved_tree_sha(tree)
+    if sha is None:
+        return None
+    untracked = _untracked_files(tree)
+    if untracked is None:
+        return None
+    if untracked:
+        run_dir = getattr(st, "run_dir", None)
+        logs = (sorted((Path(run_dir) / "logs").glob(
+            "final-conformer-r*.log")) if run_dir else [])
+        if any(untracked & _worker_written_paths(lg, tree) for lg in logs):
+            return None
+    return sha
+
+
 def _blt_memo_key(axis: str, cmd: str, tree_sha: str) -> str:
     """Key for one measured axis on one tree.
 
@@ -40067,8 +40092,10 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     introduced is evidence*), and B*'s base reruns alone decide whether
     the base failed what it finds. Records `final_failing_ids` and the
     verdict (`test_id_diff`), stamped with `tree_sha` when the caller
-    measured a clean checkout of a known tree, else with `staging`'s
-    `_worktree_tree_sha` (None when anything in it is uncommitted)."""
+    measured a clean checkout of a known tree, else with
+    `_measured_tree_sha(staging)`: the committed tree when the only dirt is
+    untracked files no worker wrote, so the shipping-tree refresh reuses it
+    instead of measuring the same tree again (review round 9 L1)."""
     base_ids = st.data.get("baseline_failing_ids")
     tests = (post or {}).get("tests") or {}
     if tests.get("scoped_replacement"):
@@ -40090,7 +40117,7 @@ async def _confirm_final_test_failures(st: "State", caps: dict, staging: str,
     # The same candidates on the same tree were already confirmed (a round
     # that committed nothing): a second confirm would only re-measure noise.
     if tree_sha is None:
-        tree_sha = await _worktree_tree_sha(staging)
+        tree_sha = await _measured_tree_sha(st, staging)
     prior = st.data.get("test_id_diff") or {}
     if (tree_sha and prior.get("tree_sha") == tree_sha
             and bool(prior.get("ids_unknown")) == ids_unknown

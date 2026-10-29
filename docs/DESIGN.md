@@ -7083,7 +7083,16 @@ they belonged in the change. Only a worker's edits can be listed there:
 leerie's own installs, builds and test runs put back every tracked file
 they rewrite (§6½ *Leerie's own commands leave tracked files as they
 found them*), so a clean run whose install relocks a lockfile lists
-nothing.
+nothing. The same rule names what a measurement in staging itself described:
+when nothing tracked is edited and no untracked file is one the final
+conformer wrote, what is left untracked is only what commands produced,
+so the final conformer's diff is stamped with the committed tree and the
+refresh reuses it. Review round 9 L1 measured the cost of stamping it
+"unidentifiable" instead: on a repository that does not ignore
+`__pycache__/`, every run paid a second checkout, install, discovery and
+B\* on a tree already measured. A file the conformer wrote and left
+untracked was collected there and does not ship, so then the clean
+checkout is measured.
 
 When the `tests` axis cannot be measured on that tree — the command did not
 run, or no test command resolves for a run that had a diff — the old diff
