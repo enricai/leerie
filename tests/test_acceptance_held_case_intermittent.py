@@ -245,6 +245,35 @@ def test_discovery_off_keeps_a_passing_first_run(leerie, tmp_path, capsys):
         state)
 
 
+def test_a_pre_disabled_record_of_repeats_off_is_not_listed(leerie):
+    """A `state.json` saved before the `disabled` record carries
+    `incomplete: true, reason: "repeats_disabled"` for repeats of 0. A
+    resumed run finalizing over it must not list that set as stopped
+    early; a set the budget really cut, beside it, still is."""
+    old = {"index": 0, "discovery": {
+        "files": ["tests/old.test.ts"], "repeats_required": 0,
+        "repeats_run": 0, "budget_exhausted": False, "found": [],
+        "incomplete": True, "reason": "repeats_disabled"}}
+    cut = {"index": 1, "discovery": {
+        "files": ["tests/cut.test.ts"], "repeats_required": 10,
+        "repeats_run": 2, "budget_exhausted": True, "found": [],
+        "incomplete": True, "reason": "budget_exhausted"}}
+    state = {"acceptance": {"gate": {"final": [old, cut]}}}
+    lines = leerie._pr_advisory(state)
+    assert lines[0] == "**Held-out discovery that did not finish**"
+    listed = [x for x in lines[1:] if x.startswith("- set ")]
+    assert len(listed) == 1
+    assert "cut.test.ts" in listed[0] and "rerun 2 of 10" in listed[0]
+    assert "budget ran out" in listed[0]
+    body = leerie._format_pr_end_state_section(state)
+    assert "cut.test.ts" in body and "old.test.ts" not in body
+    assert "stopped early" not in body
+    # Only the old record: nothing to list at all.
+    only_old = {"acceptance": {"gate": {"final": [old]}}}
+    assert "Held-out discovery" not in leerie._format_pr_end_state_section(
+        only_old)
+
+
 def test_starved_discovery_is_recorded_and_reaches_the_pr(leerie, tmp_path,
                                                           capsys):
     """Review round 4 L1: discovery whose budget ran out before any rerun

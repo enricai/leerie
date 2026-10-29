@@ -6475,7 +6475,7 @@ def _pr_advisory(state: dict) -> list[str]:
            for r in (final if isinstance(final, list) else [])
            if isinstance(r, dict) and isinstance(d := r.get("discovery"),
                                                  dict)
-           and d.get("incomplete") is True])
+           and _acceptance_discovery_stopped_short(d)])
     hits = state.get("site_token_warnings")
     block("Report site tokens on added lines", "site_token_warnings",
           [f"- {_pr_code(h.get('token'))} in {_pr_code(h.get('file'))}: "
@@ -45511,6 +45511,16 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
             f"failing in {len(out['found'])} file(s) after "
             f"{out['repeats_run']} rerun round(s)")
     return out
+
+
+def _acceptance_discovery_stopped_short(d: dict) -> bool:
+    """Whether a held-out discovery record says it stopped short of the
+    rounds required (DESIGN §8 *A held case that fails again*, rule 2).
+    Zero required rounds is discovery turned off, never cut short: a
+    `state.json` saved before the `disabled` record carries `incomplete:
+    true, reason: "repeats_disabled"` for it."""
+    return (d.get("incomplete") is True and not d.get("disabled")
+            and d.get("repeats_required") != 0)
 
 
 def _budget_caps(caps: dict, left: float) -> dict:

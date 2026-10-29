@@ -7774,7 +7774,10 @@ non-resource reason is the reported defect showing, however rarely. So:
    (`acceptance_intermittent_repeats` = 0) is recorded `disabled`, not
    incomplete: nothing stopped short of what was asked, and listing every
    set with held cases under a deliberate setting was noise (review round
-   5 L4).
+   5 L4). A record that requires 0 rounds is never read as stopped short,
+   whatever else it says: run state saved before that change carries
+   `incomplete` (reason `repeats_disabled`) for the same setting, and a
+   resumed run finalizing over it would otherwise still list it.
 3. *A held case that failed is never unmeasured.* A set whose held case
    failed at least once, but only with resource signatures (or none
    readable), and that neither rule settled, is not "no evidence": it is
