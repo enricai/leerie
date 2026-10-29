@@ -6498,7 +6498,8 @@ the right reason in 2 of 34 samples. So the gate judges in packs
   reruns disagreed (`resource_affected`), or the confirm budget left it
   unsettled (`budget_short_unsettled`: no base/final pair finished, a
   discovery find the budget cut, or a file sized out — the reason says
-  "could not confirm within the budget: <files>"). A candidate the budget
+  "could not confirm within the budget: <files>", and for a file never
+  rerun "not rerun (sized out of the budget): <files>"). A candidate the budget
   alone kept short, at least one pair finished and every finished rerun
   agreeing, is new (§9 *Which failures are new*, step 4), so the item is
   unmet. A candidate that failed on the final tree and was
@@ -10140,8 +10141,13 @@ failure new / does this set still fail" verdict uses:
    discovery below, takes at most `confirm_gate_wait_sec` + one 2 s gate
    poll + `confirm_budget_sec` — 2102 s at the defaults — plus at most 1 s
    once (the floor under one rerun's timeout, reached only when less than
-   a second is left) and the host build-slot waits, which no B\* rerun
-   charges to its own timeout (§6 *A host-wide build semaphore*). A serial
+   a second is left) and the waits no B\* rerun charges to its own
+   timeout: the host build slot (§6 *A host-wide build semaphore*) and, for
+   the test axis, the in-process BLT gate (`blt_parallel`). A sized confirm
+   (below) that reruns in passes stays inside it: a later pass gets only
+   what the passes before it left, waits on no second gate, and starts
+   only with at least a second left, so the 1 s floor is still reached
+   once. A serial
    rerun that writes no report (a config that insists on a flag the serial
    form contradicts) is retried once as written, inside what is left of
    that rerun's own timeout, and not at all under a second. Before review
@@ -10157,20 +10163,36 @@ failure new / does this set still fail" verdict uses:
    discovery sizes from below): a file holding a candidate the final run
    itself failed ranks before one holding only a discovery find (the more
    informative observation), then the shortest first; a file is taken
-   while (Σ duration + one rerun's start-up) × 2k fits the budget, and the
-   first file always, since it may still finish a pair. A file sized out
-   is not rerun at all: its candidates are `budget_short_unsettled` (step
-   4). A file with no measured duration costs the start-up alone. When a
-   candidate has no known file the rerun is the whole command and nothing
-   is sized. CI parity sizes its red checks the same way by their final-run
-   times, shortest first, so a long check first in CI order no longer
-   starves the checks after it.
+   while (Σ duration + one rerun's start-up) × 2 — one base/final pair —
+   fits the budget, and the first file always, since it may still finish a
+   pair. One pair, not all `k`: one finished agreeing pair is what step 4
+   needs to call a candidate new, so sizing for `k` left out files that
+   could have been settled. When that first pass is done, the budget it
+   left goes to the files it left out, in the same order: each further
+   pass takes the files one pair of which fits what is left, and passes
+   continue until none is left or none fits, so no file is skipped while
+   one pair of it fits the remaining budget. A file never rerun is sized
+   out: its candidates are `budget_short_unsettled` (step 4), listed as
+   "not rerun (sized out of the budget)" — apart from a rerun the budget
+   cut, "could not confirm within the budget". A file with no measured
+   duration costs the start-up alone. When a candidate has no known file
+   the rerun is the whole command and nothing is sized. CI parity sizes
+   its red checks the same way by their final-run times, shortest first,
+   so a long check first in CI order no longer starves the checks after it.
+   Review round 7 drove the cost of sizing for `k` on a real suite: a
+   final run failing a 30 s file (a load flake) and a 290 s file (a real
+   regression) sized the long file out at the defaults, (30 + 290 + 10) ×
+   6 = 1980 > 1800, on every measurement — detection, each re-drive group,
+   the refresh — so the regression was never new and the run ended `done`
+   with about 1600 s of the budget unused; alone, two of its pairs fit.
 3. *Verdict.* An ID is **new** only if it failed on every final rerun and
    passed on every base rerun. An ID that failed on every one of the `k`
    base reruns, each of which produced a report, is **`pre_existing`**: the
    base already fails it deterministically, whatever the final side did.
    An ID for which no rerun on either side produced a report is
-   **`no_verdict`**: nothing was measured. Everything else — flaky on
+   **`no_verdict`**: nothing was measured. One that only a rerun the budget
+   cut measured, with no pair finished, is not `no_verdict` — something
+   ran — but `budget_short_unsettled` (step 4). Everything else — flaky on
    either side, failing on some base reruns and not others — is
    `resource_affected`. None of the
    three is counted as a regression, but they are reported apart, because
@@ -10214,7 +10236,18 @@ failure new / does this set still fail" verdict uses:
      reads unknown with the same words (§8 *A test outcome is the
      failing-test-ID diff's to settle*), and it never makes the run
      `unconverged`. In a re-drive group it never rolls the group back
-     (the ratchet records the group's execution-shaped items unchecked),
+     (the ratchet records the group's execution-shaped items unchecked):
+     an unsettled candidate is not a confirmed regression, and rolling a
+     group back on one would undo work on the strength of a load flake as
+     readily as a regression. Nor is the group kept silently: its unsettled
+     files and the required items its ratchet could not check are listed
+     under "Needs human verification" (site "delivery re-drive"), and the
+     final diff, measured again on the tree that ships, reruns any of
+     them still failing there against the base. Rerunning the candidate
+     with priority inside the group was rejected: it is unsettled only
+     when one pair of its file does not fit what the group's budget left,
+     so priority buys it nothing a fresh budget on the shipping tree does
+     not,
      and in the integration gate it is never sent to the integrator and
      never backs out a merge; the final diff settles the shipping tree.
      A candidate the sizing above left out is unsettled the same way.
@@ -10260,14 +10293,24 @@ failure new / does this set still fail" verdict uses:
    Review round 6 measured the cost with the real confirm on a simulated
    clock (4000 trials per cell, a pure flake failing each run with
    probability p on both trees): once one side's serial rerun of the
-   candidate files took over 900 s (zero pairs finish at k = 3), 100% of
-   the flakes the first run surfaced were typed new and the run ended
-   `unconverged`; reproduced end to end on a real pytest suite. Under the
-   rule above the zero-pair share is 0 (re-measured on the same driver).
-   What remains: with exactly one finished pair (one side 600–900 s at
-   k = 3) a flake is new with probability p(1 − p) — 0.089, 0.213, 0.260
-   at p = 0.1, 0.3, 0.5 — the price of counting a real regression whose
-   pairs the budget cuts after the first. The cost lands when the total
+   candidate files took over 900 s (zero pairs finish at k = 3), a flake
+   was typed new unless the first base rerun, which still finished,
+   failed it — a share of 1 − p (0.900, 0.712, 0.501 at p = 0.1, 0.3, 0.5
+   with c = 1000 s) — and 100% once that rerun took the whole budget
+   (1800 s, the first base rerun cut too); the run ended `unconverged`,
+   reproduced end to end on a real pytest suite. Under the rule above the
+   zero-pair share is 0 (re-measured by review round 7, 2000 trials per
+   cell, at c = 910, 1790 and 1810 s). What remains is exactly one
+   finished pair, from one side at 450 s to 900 s at k = 3: a flake is new
+   with probability at most p(1 − p) — measured 0.081, 0.150, 0.130 at
+   500 s (the second base rerun still finishes and can refute), 0.098,
+   0.184, 0.244 at 610 s and 0.091, 0.203, 0.250 at 890 s, for p = 0.1,
+   0.3, 0.5 — the price of counting a real regression whose pairs the
+   budget cuts after the first. Sizing for one pair (step 2) reaches this
+   regime by design, not only under load: files packed into one rerun so
+   that one pair fits but not `k` get fewer than `k` pairs. That is the
+   trade review round 7 chose — a real regression in such a file is new,
+   where sizing for `k` left it unsettled on every measurement. The cost lands when the total
    serial rerun time of all the candidate files outgrows the budget, and
    that time grows with load: more flakes surface and each file runs
    slower. Sizing moves it from "every candidate" to "the files that do
@@ -10275,12 +10318,14 @@ failure new / does this set still fail" verdict uses:
    reported as unsettled, not new: the run ends `done` with the file
    named under "Needs human verification", rather than `unconverged`.
    The verdict records `budget_short_unsettled` (and
-   `budget_short_unsettled_files`, `sized_out`), and when a shortfall did
+   `budget_short_unsettled_files`, `sized_out`, `sized_out_files`, and
+   `passes` when the confirm ran in more than one), and when a shortfall did
    make a candidate new, the outcome reason says how many rested on fewer
    than every pair. `confirm_budget_sec` is not an operator setting (no
    flag, environment variable or `leerie.toml` key); a budget of 0 or less
-   runs nothing and waits for no gate, so every base-paired candidate is
-   unsettled.
+   runs nothing and waits for no gate — in the confirms, discovery, the
+   held-out discovery and the execution settle alike — so every
+   base-paired candidate is unsettled.
 
 The pairing and `k` carry the guarantee (a p≈0.5 flake goes 3/3 vs 0/3 with
 probability 4⁻³ ≈ 1.6%); the gate only reduces how often `k` must grow.
@@ -10310,9 +10355,10 @@ adds two steps:
    `ast`. These are rerun serially `confirm_intermittent_repeats` (20)
    times on the final tree, under the host-pressure gate and inside
    `confirm_budget_sec`, as many of them as that budget holds at the full
-   repeat count (*Sized to the budget*, below). Every ID that failed in any run (the final run, a
-   repeat, or a B\* final rerun) and not on the base joins the B\*
-   candidates, so it gets base reruns. At p = 0.105, R = 20 finds such a
+   repeat count (*Sized to the budget*, below). Every ID that failed in the final run or a discovery
+   repeat and not on the base joins the B\* candidates, so it gets base
+   reruns. The list is fixed before any B\* rerun: an ID that fails only
+   in a B\* final rerun gets no base reruns and is not typed. At p = 0.105, R = 20 finds such a
    test with probability 1 − 0.895²⁰ ≈ 89% (R = 10: 67%; R = 30: 96%).
    Discovery needs only the coupled test files and the base commit, not
    the base's failing IDs: when those are unknown (no report on a red
@@ -10355,7 +10401,7 @@ adds two steps:
    discovery — final-tree or the delivery ratchet's (N5), which calls the
    same function — costs at most `confirm_budget_sec` after the gate,
    calibration included, and so at most 2102 s with the gate wait, plus
-   the 1 s floor and the build-slot waits (step 2 above). On barnacle's hub file (~3 s per importer) that is
+   the 1 s floor and the build-slot and BLT-gate waits (step 2 above). On barnacle's hub file (~3 s per importer) that is
    about 26 importers, each rerun all 20 times, instead of all 301 rerun
    twice; the other 275 are recorded as skipped, not silently dropped.
 2. *Typing.* An ID is typed `intermittent_regression` only when all of
@@ -10458,7 +10504,8 @@ on the final tree:
    is the B\* bound — `confirm_gate_wait_sec` + one 2 s gate poll +
    `confirm_budget_sec` (2102 s at the defaults) — plus at most 1 s once
    (the floor under one check run's timeout) and the build-slot waits,
-   which no B\* rerun charges to its own timeout. The base worktree's
+   which no B\* rerun charges to its own timeout, and each sized pass's
+   base worktree setup. The base worktree's
    dependency install precedes the confirm and is outside it, as it is for
    the test axis's base reruns.
 

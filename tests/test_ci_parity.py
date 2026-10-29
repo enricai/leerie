@@ -604,9 +604,10 @@ def _fake_ci(leerie, monkeypatch, tmp_path, durations, fails):
 def test_each_check_of_a_ci_rerun_gets_only_the_budget_left(
         leerie, env, monkeypatch, tmp_path):
     """Check `a` finished passing on the cut final rerun: that refutes it
-    (never `new`); `b`, which the budget alone kept short with no pair
-    finished, is `budget_short_unsettled`. Every check's timeout is what
-    was left."""
+    (never `new`), but with no pair finished it is `budget_short_unsettled`
+    like `b`, which the budget alone kept short — a candidate only a cut
+    rerun measured is not `no_verdict` (review round 7, R7-D5). Every
+    check's timeout is what was left."""
     caps = {**env["caps"], "confirm_pairs": 2, "confirm_budget_sec": 1.2,
             "worker_timeout_sec": 60}
     seen = _fake_ci(leerie, monkeypatch, tmp_path,
@@ -621,8 +622,8 @@ def test_each_check_of_a_ci_rerun_gets_only_the_budget_left(
     t_b = [t for s, i, t in seen if s == "final" and i == "b"][0]
     assert t_b < t_a
     assert v["budget_exhausted"] is True
-    assert v["new"] == [] and v["budget_short_unsettled"] == ["b"]
-    assert v["no_verdict"] == ["a"]
+    assert v["new"] == [] and v["budget_short_unsettled"] == ["a", "b"]
+    assert v["no_verdict"] == []
 
 
 def test_a_long_check_is_sized_out_so_it_cannot_starve_the_rest(
