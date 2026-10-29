@@ -50099,14 +50099,20 @@ def _checkout_ignorable(wt: Path, rel: str) -> bool:
         return False
 
 
-def _checkout_ignore(wt: Path, rels: Iterable[str]) -> list[str]:
+def _checkout_ignore(wt: Path, rels: Iterable[str], *,
+                     patterns: Iterable[tuple[str, str]] = ()) -> list[str]:
     """Git-ignore the untracked paths `rels` in checkout `wt` only, through
     a self-ignoring `.gitignore` in each one's directory (a rel ending in
-    `/` ignores that whole directory). A directory with a `.gitignore` of
-    its own — tracked, or the user's — is never edited: its rels are
-    returned, not ignored."""
+    `/` ignores that whole directory). `patterns` adds raw gitignore
+    patterns `(directory, pattern)` to the same files — the cache entries
+    keyed to a staged file (`_heldout_companion_patterns`). A directory
+    with a `.gitignore` of its own — tracked, or the user's — is never
+    edited: its rels are returned, not ignored."""
     by_dir: dict[str, list[str]] = {}
     refused: list[str] = []
+    for d, pat in patterns:
+        if _checkout_ignorable(wt, d.strip("/") + "/"):
+            by_dir.setdefault(d.strip("/"), []).append(pat)
     for rel in rels:
         if not _checkout_ignorable(wt, rel):
             refused.append(rel)
@@ -51104,14 +51110,73 @@ def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
     ex.write_text("\n".join(out) + ("\n" if out else ""))
 
 
+# The shortest byte string `_heldout_markers` keeps: shorter tokens of a test
+# (`assert`, `result`) are in every repository and distinguish nothing.
+_HELDOUT_MARKER_MIN = 8
+# At most this many markers per group: they go to one `git grep` and are
+# searched in every changed file.
+_HELDOUT_MARKERS_MAX = 400
+# Lexical tokens of a test source (mechanical: quoted literals and
+# test-shaped identifiers, never a reading of what the test means).
+# One left-to-right scan over every quote kind, so the text between two
+# literals is never read as a third.
+_HELDOUT_LITERAL_RE = re.compile(rb"([\"'`])((?:\\.|(?!\1)[^\\\n])*)\1")
+_HELDOUT_IDENT_RE = re.compile(rb"\b([Tt]est\w{%d,})" % (
+    _HELDOUT_MARKER_MIN - 4))
+
+
+def _heldout_companion_patterns(rel: str) -> list[tuple[str, str]]:
+    """The cache entries a runner keys to the staged file `rel`, as
+    `(directory, gitignore pattern)`: its bytecode (`__pycache__/<stem>.*`)
+    and its snapshots (`__snapshots__/<name>.*`)."""
+    d, name = os.path.split(rel.strip("/"))
+    stem = name.split(".", 1)[0] or name
+    return [(d, "/__pycache__/" + _gitignore_escape(stem) + ".*"),
+            (d, "/__snapshots__/" + _gitignore_escape(name) + ".*")]
+
+
+def _heldout_companions(staging: Path, rel: str) -> list[str]:
+    """The `_heldout_companion_patterns` entries of `rel` present now."""
+    d, name = os.path.split(rel.strip("/"))
+    stem = name.split(".", 1)[0] or name
+    out: list[str] = []
+    for sub, prefix in (("__pycache__", stem + "."),
+                        ("__snapshots__", name + ".")):
+        base = staging / d / sub
+        with contextlib.suppress(OSError):
+            for e in os.listdir(base):
+                if e.startswith(prefix) and (base / e).is_file():
+                    out.append(os.path.join(d, sub, e))
+    return sorted(out)
+
+
+def _staged_ignore_dirs(files: Iterable[str]) -> list[str]:
+    """`files` plus every ancestor directory of each (with a trailing `/`):
+    every `.gitignore` `_redrive_stage` can have written for them, so
+    `_checkout_unignore` removes all of leerie's (it checks the tag)."""
+    out: set[str] = set()
+    for f in files:
+        out.add(f)
+        d = os.path.dirname(f.strip("/"))
+        while d:
+            out.add(d + "/")
+            d = os.path.dirname(d)
+    return sorted(out)
+
+
 def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
     """X2: copy the shown sets read-only into staging and git-ignore them in
     staging only (`_checkout_ignore`). A set whose path the tree already
     has, or another staged set took, is skipped (never overwritten); so is
     one with a file in a directory that has its own `.gitignore` (never
-    edited, so it could not be ignored). Returns `[{set_index, dir,
-    files}]`."""
+    edited, so it could not be ignored). What appears under or beside a
+    staged file while the group runs is staged material too (DESIGN §8
+    *No byte derived from a staged set reaches history*): a directory
+    staging had to create is ignored whole (`made`), and beside a file in
+    a directory that existed, its `_heldout_companion_patterns`. Returns
+    `[{set_index, dir, files, made}]`."""
     taken: set[str] = set()
+    made_all: set[str] = set()
     staged: list[dict] = []
     for s_ in sets:
         rels = _set_files(s_)
@@ -51124,6 +51189,16 @@ def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
             log(f"  delivery re-drive: set {s_.get('index')} not staged — "
                 "its directory has a .gitignore of its own")
             continue
+        made: set[str] = set()
+        for rel in rels:
+            top = None
+            d = os.path.dirname(rel)
+            while d and not (staging / d).exists():
+                top = d
+                d = os.path.dirname(d)
+            if top and not any(top == m or top.startswith(m + "/")
+                               for m in made_all):
+                made.add(top)
         try:
             for rel in rels:
                 dst = staging / rel
@@ -51137,22 +51212,35 @@ def _redrive_stage(staging: Path, sets: list[dict]) -> list[dict]:
                 with contextlib.suppress(OSError):
                     (staging / rel).chmod(0o644)
                     (staging / rel).unlink()
+            for m in made:
+                shutil.rmtree(staging / m, ignore_errors=True)
             continue
         taken |= set(rels)
+        made_all |= made
         staged.append({"set_index": s_.get("index"), "dir": s_["dir"],
-                       "files": rels})
-    _checkout_ignore(staging, sorted(taken))
+                       "files": rels, "made": sorted(made)})
+    _checkout_ignore(
+        staging, sorted(taken) + [m + "/" for m in sorted(made_all)],
+        patterns=[pt for r in sorted(taken)
+                  for pt in _heldout_companion_patterns(r)])
     return staged
 
 
-def _redrive_unstage(staging: Path, staged: list[dict]) -> list[str]:
+def _redrive_unstage(staging: Path, staged: list[dict], *,
+                     swept: list[str] | None = None) -> list[str]:
     """Remove the staged copies, their `.gitignore` files and the
-    directories only they needed; returns the staged files whose bytes
-    changed."""
+    directories only they needed, with every byte of staged material
+    (DESIGN §8 *No byte derived from a staged set reaches history*): each
+    directory staging created goes whole, and beside each staged file its
+    `_heldout_companions`; those removed paths are appended to `swept`.
+    Returns the staged files whose bytes changed."""
     tampered: list[str] = []
-    _checkout_unignore(staging, [f for s_ in staged for f in s_["files"]])
+    files = [f for s_ in staged for f in s_["files"]]
+    _checkout_unignore(staging, _staged_ignore_dirs(files))
+    gone: list[str] = []
     for s_ in staged:
         for rel in s_["files"]:
+            gone += _heldout_companions(staging, rel)
             dst = staging / rel
             if not dst.exists():
                 continue
@@ -51164,11 +51252,168 @@ def _redrive_unstage(staging: Path, staged: list[dict]) -> list[str]:
             with contextlib.suppress(OSError):
                 dst.chmod(0o644)
                 dst.unlink()
-        for d in sorted({(staging / r).parent for r in s_["files"]},
+    for rel in gone:
+        with contextlib.suppress(OSError):
+            (staging / rel).unlink()
+    for s_ in staged:
+        for m in s_.get("made") or []:
+            top = staging / m
+            if top.is_dir() and not top.is_symlink():
+                for p in sorted(top.rglob("*")):
+                    if p.is_file() or p.is_symlink():
+                        gone.append(os.path.relpath(p, staging))
+                for p in top.rglob("*"):
+                    with contextlib.suppress(OSError):
+                        p.chmod(0o755 if p.is_dir() else 0o644)
+                shutil.rmtree(top, ignore_errors=True)
+        for d in sorted({(staging / r).parent for r in s_["files"]}
+                        | {(staging / r).parent / sub
+                           for r in s_["files"]
+                           for sub in ("__pycache__", "__snapshots__")},
                         key=lambda p: -len(str(p))):
             with contextlib.suppress(OSError):
                 d.rmdir()
+    if swept is not None:
+        own = set(files)
+        swept += sorted(set(g for g in gone if g not in own))
     return tampered
+
+
+def _heldout_markers(staging: Path, staged: list[dict],
+                     by_index: dict, base_rev: str) -> list[bytes]:
+    """The byte strings that identify the staged files' content (DESIGN §8
+    *No byte derived from a staged set reaches history*, rule 2): each
+    file's path, its recorded case names, its test-shaped identifiers and
+    its quoted literals, of at least `_HELDOUT_MARKER_MIN` bytes, less
+    every one `base_rev`'s tree already contains (`git grep -F`): a string
+    the repository already has is not distinctive. At most
+    `_HELDOUT_MARKERS_MAX`, longest first."""
+    found: set[bytes] = set()
+    for s_ in staged:
+        cases = (by_index.get(s_.get("set_index")) or {}).get("cases") or {}
+        for rel in s_["files"]:
+            found.add(rel.encode())
+            names = cases.get(rel) if isinstance(cases, dict) else None
+            for c in names if isinstance(names, list) else []:
+                found.add(str(c).encode())
+            try:
+                data = (Path(s_["dir"]) / rel).read_bytes()
+            except OSError:
+                continue
+            for m in _HELDOUT_LITERAL_RE.finditer(data):
+                lit = m.group(2)
+                found.add(lit)
+                found.update(part for part in lit.split(b"\\")
+                             if len(part) >= _HELDOUT_MARKER_MIN)
+            found.update(m.group(1) for m in _HELDOUT_IDENT_RE.finditer(data))
+    found = {m for m in found if len(m) >= _HELDOUT_MARKER_MIN
+             and b"\n" not in m and b"\0" not in m}
+    markers = sorted(found, key=lambda m: (-len(m), m))[
+        :_HELDOUT_MARKERS_MAX]
+    if markers and base_rev:
+        argv = ["git", "-C", str(staging), "grep", "-a", "-F", "-o", "-h",
+                "--no-color"]
+        for m in markers:
+            argv += ["-e", os.fsdecode(m)]
+        r = subprocess.run(argv + [base_rev, "--"], capture_output=True,
+                           check=False)
+        if r.returncode == 0:
+            # `-o` prints the leftmost-longest match at each position, so
+            # a marker hidden inside a longer one stays (the strict side).
+            known = set(r.stdout.split(b"\n"))
+            markers = [m for m in markers if m not in known]
+        elif r.returncode != 1:
+            log("  delivery re-drive: could not read the base for held-out "
+                "markers — every marker kept")
+    return markers
+
+
+def _bytes_hold_marker(data: bytes, markers: Iterable[bytes]) -> bool:
+    return any(m in data for m in markers)
+
+
+def _file_holds_marker(path: Path, markers: list[bytes]) -> bool:
+    """True when the file at `path` holds any marker as a byte substring
+    (read in chunks overlapping by the longest marker). A symlink is read
+    as its target's path, never followed."""
+    if not markers:
+        return False
+    try:
+        if path.is_symlink():
+            return _bytes_hold_marker(os.fsencode(os.readlink(path)),
+                                      markers)
+        if not path.is_file():
+            return False
+        keep = max(len(m) for m in markers)
+        tail = b""
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(1 << 20)
+                if not chunk:
+                    return False
+                if _bytes_hold_marker(tail + chunk, markers):
+                    return True
+                tail = (tail + chunk)[-keep:]
+    except OSError:
+        return False
+
+
+def _history_heldout_hits(staging: Path, pre_sha: str, post_sha: str,
+                          staged: list[dict],
+                          markers: list[bytes]) -> list[str]:
+    """The paths any commit in `pre_sha..post_sha` added or changed that
+    carry staged material (DESIGN §8 *No byte derived from a staged set
+    reaches history*, rule 3): a staged file, a path under a directory
+    staging created, or a blob holding a marker. Every commit's blobs, not
+    the net diff: a file committed and then deleted is still in the
+    history."""
+    own = {f for s_ in staged for f in s_["files"]}
+    made = [m for s_ in staged for m in s_.get("made") or []]
+    r = _git_z_output(["git", "-C", str(staging), "log", "--format=",
+                       "--raw", "--no-abbrev", "--no-renames", "-z",
+                       f"{pre_sha}..{post_sha}"])
+    if r.returncode != 0:
+        return sorted(own)       # unreadable history: fail closed
+    toks = [t for t in r.stdout.split("\0")]
+    hits: set[str] = set()
+    blobs: dict[str, set[str]] = {}
+    i = 0
+    while i < len(toks):
+        meta = toks[i].strip()
+        if not meta.startswith(":"):
+            i += 1
+            continue
+        path = toks[i + 1] if i + 1 < len(toks) else ""
+        i += 2
+        parts = meta.split()
+        new = parts[3] if len(parts) >= 5 else ""
+        if path in own or any(path == m or path.startswith(m + "/")
+                              for m in made):
+            hits.add(path)
+        if new and set(new) != {"0"} and markers:
+            blobs.setdefault(new, set()).add(path)
+    if blobs:
+        cat = subprocess.run(["git", "-C", str(staging), "cat-file",
+                              "--batch"],
+                             input=b"".join(b.encode() + b"\n"
+                                            for b in blobs),
+                             capture_output=True, check=False)
+        out, pos = cat.stdout, 0
+        for sha in blobs:
+            nl = out.find(b"\n", pos)
+            if nl < 0:
+                hits |= blobs[sha]
+                break
+            head = out[pos:nl].split()
+            if len(head) < 3 or head[1] == b"missing":
+                pos = nl + 1
+                continue
+            size = int(head[2])
+            body = out[nl + 1:nl + 1 + size]
+            pos = nl + 1 + size + 1
+            if _bytes_hold_marker(body, markers):
+                hits |= blobs[sha]
+    return sorted(hits)
 
 
 async def _redrive_rollback(staging: Path, pre_sha: str) -> bool:
@@ -52683,7 +52928,10 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
                                     | None,
                                     untracked_before: dict[str, list[int]]
                                     | None,
-                                    written: set[str]) -> list[str]:
+                                    written: set[str], *,
+                                    markers: list[bytes] | tuple = (),
+                                    withheld: dict[str, list[str]] | None
+                                    = None) -> list[str]:
     """Commit what a re-drive group's implementer left uncommitted (DESIGN
     §8 *A re-drive group's leftovers are its implementer's*): the tracked
     files whose content changed while the group ran (`_changed_paths`
@@ -52700,14 +52948,43 @@ async def _redrive_commit_leftovers(staging: Path, label: str,
     the group and that it did not touch is logged, never taken. Paths go to
     git as literal pathspecs. Returns the paths committed ([] when nothing
     was, so HEAD does not move and the group reads `no_change`). With no
-    snapshot (git failed), that side contributes nothing but `written`."""
+    snapshot (git failed), that side contributes nothing but `written`.
+
+    Before anything is chosen, every file the group made or changed that
+    holds one of `markers` (`_heldout_markers`: the staged sets' bytes) is
+    removed — an untracked one unlinked, a tracked one checked out from
+    HEAD — and listed in `withheld["heldout"]` (DESIGN §8 *No byte derived
+    from a staged set reaches history*)."""
     now = await asyncio.to_thread(_tracked_content, staging)
     tracked = (_changed_paths(tracked_before, now)
                if tracked_before is not None and now is not None else [])
     sigs = await asyncio.to_thread(_untracked_signatures, staging) or {}
-    produced = await asyncio.to_thread(_leerie_produced, staging, sigs)
     moved = (set() if untracked_before is None else
              {p for p, sig in sigs.items() if untracked_before.get(p) != sig})
+    if markers:
+        tainted = sorted(
+            p for p in set(tracked) | ((moved | set(written)) & set(sigs))
+            if _file_holds_marker(staging / p, list(markers)))
+        for p in tainted:
+            if p in sigs:
+                with contextlib.suppress(OSError):
+                    (staging / p).unlink()
+            else:
+                await run_proc(["git", "--literal-pathspecs", "checkout",
+                                "HEAD", "--", p], cwd=str(staging))
+        if tainted:
+            log(f"  delivery re-drive ({label}): removed {len(tainted)} "
+                "file(s) holding a staged held-out set's bytes: "
+                + ", ".join(tainted[:5])
+                + (f" (+{len(tainted) - 5} more)" if len(tainted) > 5
+                   else ""))
+            if withheld is not None:
+                withheld.setdefault("heldout", []).extend(tainted)
+            tracked = [p for p in tracked if p not in tainted]
+            sigs = {p: v for p, v in sigs.items() if p not in tainted}
+            moved -= set(tainted)
+            written = set(written) - set(tainted)
+    produced = await asyncio.to_thread(_leerie_produced, staging, sigs)
     untracked = sorted(((moved - produced) | (set(sigs) & set(written))))
     left_out = sorted(set(sigs) - produced - set(untracked))
     if left_out:
@@ -52756,7 +53033,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
         # A crash mid-group: what it left is unknown, so it is undone. The
         # staged files' `.gitignore` files go first, so `clean -fd` takes
         # the files with them.
-        _checkout_unignore(staging, flight.get("stage_files") or [])
+        _checkout_unignore(staging, _staged_ignore_dirs(
+            flight.get("stage_files") or []))
         _redrive_exclude_clear(staging, run_id)
         if flight.get("pre_sha"):
             ok = await _redrive_rollback(staging, flight["pre_sha"])
@@ -53003,6 +53281,8 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
             _save()
             t0 = time.monotonic()
             staged = _redrive_stage(staging, shown)
+            markers = await asyncio.to_thread(
+                _heldout_markers, staging, staged, by_index, pre_sha)
             staged_files = sorted({f for s_ in staged for f in s_["files"]
                                    if f in selfcheck_cmd_files})
             cmd = (_acceptance_cmd(st, staged_files, str(staging))
@@ -53030,14 +53310,21 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                     leerie_dir, st, caps, models, staging, members, note,
                     effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
             finally:
-                ge["tampered"] = _redrive_unstage(staging, staged)
+                swept: list[str] = []
+                ge["tampered"] = _redrive_unstage(staging, staged,
+                                                  swept=swept)
+            withheld: dict[str, list[str]] = {}
             left = await _redrive_commit_leftovers(
                 staging, f"r{rnd} g{gi}", tracked_before, untracked_before,
                 _worker_written_paths(
                     st.run_dir / "logs"
-                    / f"delivery-redrive-r{rnd}-g{gi}.log", staging))
+                    / f"delivery-redrive-r{rnd}-g{gi}.log", staging),
+                markers=markers, withheld=withheld)
             if left:
                 ge["leftovers"] = left[:20]
+            heldout_removed = swept + withheld.get("heldout", [])
+            if heldout_removed:
+                ge["heldout_removed"] = heldout_removed[:20]
             drove = True
             prior_members += [m for m in members if m not in prior_members]
             routed_items |= {n["item_index"] for n in live
@@ -53056,6 +53343,10 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                                        f"{pre_sha}..{post_sha}").split()
                 committed = sorted(set(changed) & {
                     f for s_ in staged for f in s_["files"]})
+                committed = sorted(set(committed) | set(
+                    await asyncio.to_thread(
+                        _history_heldout_hits, staging, pre_sha, post_sha,
+                        staged, markers)))
                 ge["committed_staged"] = committed
                 F1, unm = await measure(shown, f"redrive-r{rnd}g{gi}")
                 F1 = _redrive_carry(F, F1, unm)

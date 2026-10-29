@@ -7260,6 +7260,49 @@ file breaks what ships while committing an unignored cache is the
 repository's existing hygiene; between the two, the safe error is the
 second.
 
+**No byte derived from a staged set reaches history.** The shown sets a
+re-drive group stages are held-out tests, and what the implementer's
+self-check run makes of them is as hidden as they are: review round 11
+drove a group whose implementer ran the staged test as its note told it
+to, in a repository that does not ignore `__pycache__/`, and the leftovers
+commit took `tests/__pycache__/test_<set>.cpython-*.pyc` — the
+assertion-rewritten bytecode, whose constants carry the hidden assertion
+messages into `git show`. The void check compared file names only, so the
+group stood. Three rules close it, none of which reads a file's meaning:
+
+1. *What appears under or beside a staged file is staged material.* A
+   directory staging had to create is ignored whole while the group runs
+   and removed whole afterwards; beside a staged file in a directory that
+   already existed, the entries keyed to its name — `__pycache__/<stem>.*`
+   and `__snapshots__/<name>.*` — are ignored and removed the same way.
+   What was removed is recorded on the group, never committed.
+2. *A file is checked for the set's bytes, not only its name.* The
+   markers of a staged file are its path, its recorded case names, its
+   test-shaped identifiers and its quoted literals (at least
+   `_HELDOUT_MARKER_MIN` bytes) — lexical tokens of the test source —
+   less every marker the group's starting commit already contains, since
+   a string the repository already has is not distinctive. Every file the
+   group made or changed that holds a marker as a byte substring is removed
+   (a tracked one is checked out from HEAD) before the leftovers commit,
+   so a `.pytest_cache` node-ID list, a junit report naming the hidden
+   cases or a bytecode cache is never taken.
+3. *The void check reads every committed blob.* Every blob any commit of
+   the group added — not the net diff, since a file committed and then
+   deleted is still in the history — is searched for the markers; a hit,
+   a staged path or a path under a directory staging created voids the
+   group, which is rolled back.
+
+These are the only places a set's bytes enter a tree that commits. The
+acceptance evaluation, the set audit, the surrogate witness and the
+falsifier (its `.leerie-falsifier/` leads and the confirm checkout) all
+work in disposable checkouts that are removed and never committed from;
+the final conformer, the integrator and the pr_reviewer never run while a
+set is staged, and the material swept at unstage is gone before any of
+them could see it. What these rules do not cover is a fixer that
+deliberately copies a set out of the run directory with a shell command
+(§8 *Held-out acceptance tests*: hiding reduces the incentive, it does not
+guarantee it); rule 3 still voids such a group when it is a re-drive's.
+
 **A finished verdict is reused only on the commit it was measured on.** A
 resume skips a finalize-side gate that already finished, but "finished"
 says only that it ran on some tree: staging's HEAD can have moved since —
