@@ -393,6 +393,40 @@ def test_a_put_back_never_moves_a_submodule(leerie, tmp_path):
     assert " M vendor/lib" in _status(t)             # left as the command did
 
 
+@pytest.mark.parametrize("edited", [False, True])
+def test_a_tracked_file_a_command_replaced_with_a_directory_is_put_back(
+        leerie, tmp_path, edited):
+    """Review round 11 suspicion 1, proven: `_tracked_content` ran `git -C
+    <dir> rev-parse HEAD` on any tracked path that is now a directory, which
+    in a plain directory answers with the superproject's HEAD — so a
+    tracked file a command replaced with a directory was snapshotted as a
+    submodule (`gitlink:<HEAD>`) and never put back. A worker's earlier
+    edit of the file comes back too."""
+    t = _tree(tmp_path, {"cfg": "a\n"})
+    if edited:
+        (t / "cfg").write_text("worker\n")
+
+    async def cmd():
+        async with leerie._leaves_tracked_files(t, "build", "t"):
+            (t / "cfg").unlink()
+            (t / "cfg").mkdir()
+            (t / "cfg" / "x").write_text("1")
+            snap = leerie._tracked_content(t)
+            assert snap == {"cfg": None}             # gone, not a gitlink
+    asyncio.run(cmd())
+    assert (t / "cfg").is_file()
+    assert (t / "cfg").read_text() == ("worker\n" if edited else "a\n")
+    assert _status(t) == (" M cfg\n" if edited else "")
+
+
+def test_a_real_submodule_is_still_a_gitlink(leerie, tmp_path):
+    t = _with_submodule(tmp_path)
+    sub = t / "vendor" / "lib"
+    _git(sub, "commit", "-qam", "bump")
+    snap = leerie._tracked_content(t)
+    assert snap["vendor/lib"] == "gitlink:" + _git(sub, "rev-parse", "HEAD")
+
+
 def test_a_put_back_checks_out_a_bracketed_path_literally(leerie, tmp_path):
     """`git checkout HEAD -- app/[slug]/page.tsx` read the brackets as a
     glob and also reverted `app/s/page.tsx`, a worker's edit."""

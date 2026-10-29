@@ -38912,11 +38912,21 @@ def _tracked_content(tree: str | Path, *, write: bool = False
     paths = [p for p in r.stdout.split("\0") if p]
     out: dict[str, str | None] = {}
     files: list[str] = []
+    dirs = [p for p in paths
+            if os.path.isdir(os.path.join(str(tree), p))
+            and not os.path.islink(os.path.join(str(tree), p))]
+    links = _index_gitlinks(tree, dirs) if dirs else set()
     for p in paths:
         full = os.path.join(str(tree), p)
         if not os.path.lexists(full):
             out[p] = None
-        elif os.path.isdir(full) and not os.path.islink(full):
+        elif p in dirs and p not in links:
+            # A tracked FILE something replaced with a directory: the file
+            # is gone. `git -C <dir> rev-parse HEAD` would answer with the
+            # superproject's HEAD and pass it off as a submodule that is
+            # never put back (review round 11 suspicion 1).
+            out[p] = None
+        elif p in dirs:
             sub = subprocess.run(["git", "-C", full, "rev-parse", "HEAD"],
                                  capture_output=True, text=True, check=False)
             out[p] = (_GITLINK + sub.stdout.strip()
@@ -38942,6 +38952,23 @@ def _tracked_content(tree: str | Path, *, write: bool = False
             out[p] = (one.stdout.strip()
                       if one.returncode == 0 and one.stdout.strip()
                       else _UNHASHED)
+    return out
+
+
+def _index_gitlinks(tree: str | Path, paths: list[str]) -> set[str]:
+    """The `paths` the index records as submodules (mode 160000)."""
+    try:
+        r = _git_z_output(["git", "--literal-pathspecs", "-C", str(tree),
+                           "ls-files", "-s", "-z", "--", *paths])
+    except OSError:
+        return set(paths)        # unknown: the old, never-touch reading
+    if r.returncode != 0:
+        return set(paths)
+    out: set[str] = set()
+    for ent in r.stdout.split("\0"):
+        meta, _tab, path = ent.partition("\t")
+        if path and meta.startswith("160000 "):
+            out.add(path)
     return out
 
 
@@ -38974,6 +39001,11 @@ def _restore_tracked_content(tree: str | Path,
                    (_GITLINK, _UNHASHED)) for snap in (before, after))]
     for p in changed:
         dst = Path(tree) / p
+        if (before.get(p, "") is not None and dst.is_dir()
+                and not dst.is_symlink()):
+            # The command replaced the tracked file with a directory
+            # (`_tracked_content` lists it as gone); it was a file before.
+            shutil.rmtree(dst, ignore_errors=True)
         if p not in before:
             subprocess.run(["git", "--literal-pathspecs", "-C", str(tree),
                             "checkout", "HEAD", "--", p],

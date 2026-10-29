@@ -5197,7 +5197,12 @@ times into about 48 MB of loose objects in the store every worktree
 shares).
 A submodule is listed by the commit it has checked out, and only when
 that moved: content modified inside it is its own state, and leerie
-never moves a submodule back. A path git cannot hash is listed as such
+never moves a submodule back. A directory is a submodule only when the
+index records one at that path: a tracked file a command replaced with a
+plain directory is a file that is gone, and is put back (the directory
+removed first). Asking the directory itself which commit it has checked
+out answers with the enclosing repository's HEAD, which read that case
+as a submodule that is never restored (review round 11). A path git cannot hash is listed as such
 and left alone instead of failing the snapshot — one dirty submodule
 had switched off the put-back and the leftovers commit for the whole
 tree. And every path goes to git as a literal pathspec: `git checkout
