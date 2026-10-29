@@ -100,8 +100,9 @@ Per item:
     (contiguous text, no `...`, no paraphrase, at least one identifier
     or string literal, at most ~300 characters). For a part proven only
     by a command result, use `path: "RECORD"`, `line_start: 0`,
-    `line_end: 0`, and quote the EXECUTED COMMANDS RECORD entry's
-    command line or result text verbatim. For a part whose requirement
+    `line_end: 0`, and quote an `[orchestrator …]` entry of the EXECUTED
+    COMMANDS RECORD — its command line or result text — verbatim; a
+    quote of a worker's entry alone does not verify a `met` part. For a part whose requirement
     is that something is **absent** ("never contain X", "remove Y"), use
     `path: "ABSENT"`, `line_start: 0`, `line_end: 0`, and put the
     extended regex you searched for in `quote`; the orchestrator re-runs
@@ -177,7 +178,11 @@ the tests it confirmed newly failing, each held-out acceptance set's
 verdict). Verify any
 execution-shaped item (a suite must pass, a typecheck must be clean)
 against that record and cite the entry with `path: "RECORD"` — the
-command line or the result text, verbatim. A command absent from the record was not run
+command line or the result text, verbatim. Only the `[orchestrator …]`
+entries can verify a `met` part: a worker ran its commands in its own
+working tree, beside files that may not ship, so its entries tell you
+what was tried and where to look, and a `met` part needs an
+`[orchestrator …]` entry or a file of this tree beside them. A command absent from the record was not run
 anywhere in this run, and such an item stays `met=false` with evidence
 saying exactly that. Do not downgrade to "could not verify" when the
 record answers the question.

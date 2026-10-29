@@ -6358,9 +6358,12 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     the committed tree*): `_verify_delivery_cite` reads
     `git show HEAD:<rel>` / `git grep … HEAD`, `_d1_untouched_verdict`
     `git diff <own_start>..HEAD`, `_evaluate_acceptance_sets` a detached
-    worktree at `rev`, and a `RECORD` cite reads
-    `_orchestrator_results_digest(st, staging)`, whose lines are each
-    present only while they describe staging's HEAD (below); pinned by
+    worktree at `rev`, and a `RECORD` cite verifies only against
+    `_orchestrator_results_digest(st, staging)`'s entries
+    (`_record_own_entries`), whose lines are each present only while they
+    describe staging's HEAD (below) — a worker's entry is supporting
+    evidence only (`record_worker`,
+    `tests/test_delivery_detection.py::TestVerifyDeliveryCite::test_a_workers_record_entry_never_verifies_on_its_own`); pinned by
     `tests/test_delivery_detection.py::test_a_result_of_another_tree_is_not_on_the_record`,
     `tests/test_post_execution_readers_read_committed_tree.py` and
     `tests/test_acceptance_gate.py::test_the_final_remeasure_reads_the_committed_tree`.
@@ -7025,8 +7028,13 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   when every part is `met` and carries a citation `_verify_delivery_cite`
   verifies — the whitespace/NFC-normalised quote (at least
   `_DELIVERY_CITE_MIN_QUOTE` = 8 characters) is in `git show HEAD:<path>`
-  (`ok` within the cited lines ±3, else `drift`), in the record
-  (`RECORD`), or an `ABSENT[:<pathspec>]` regex that `git grep -q -E -e
+  (`ok` within the cited lines ±3, else `drift`), in one of the record's
+  orchestrator entries (`RECORD` → `record_ok`; `_record_own_entries(record)`
+  keeps each entry — a column-0 line plus its indented continuation lines
+  — whose first line starts `_RECORD_OWN_TAG = "[orchestrator "`; a quote
+  found only in a worker's entry is `record_worker`, not in
+  `_DELIVERY_CITE_OK`, though `_delivery_unmet_parts` keeps it as a
+  falsifier lead), or an `ABSENT[:<pathspec>]` regex that `git grep -q -E -e
   <quote> HEAD -- <pathspec>` finds nowhere (exit 1; exit 0 is
   `absent_found`, anything else `bad_regex`) — otherwise the verdict
   becomes `met: false, rejected: <no_parts | part_not_met | part_uncited>`.

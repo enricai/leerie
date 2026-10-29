@@ -42558,6 +42558,28 @@ _DELIVERY_CITE_MIN_QUOTE = 8
 _DELIVERY_CITE_OK = frozenset({"ok", "drift", "record_ok", "absent_ok"})
 
 
+# The tag every one of the orchestrator's own record entries starts with
+# (`_orchestrator_results_digest`); a worker entry starts `[<sid>] $ `.
+_RECORD_OWN_TAG = "[orchestrator "
+
+
+def _record_own_entries(record: str) -> str:
+    """The orchestrator's own entries of an executed-commands record
+    (`_delivery_record`): each entry starts at column 0 and continues on
+    indented lines, and only those whose first line carries
+    `_RECORD_OWN_TAG` are kept. A mechanical split of leerie's own fixed
+    format — a worker's result tail is joined onto one indented line, so
+    it can never start an entry."""
+    out: list[str] = []
+    keep = False
+    for line in record.splitlines():
+        if line and not line[0].isspace():
+            keep = line.startswith(_RECORD_OWN_TAG)
+        if keep:
+            out.append(line)
+    return "\n".join(out)
+
+
 def _delivery_cite_rel(path: str, tree: str | Path) -> str:
     """A judge's citation path made repo-relative: the tree's own absolute
     prefix and a leading `./` stripped (mechanical path handling)."""
@@ -42574,8 +42596,13 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
                           cache: dict | None = None) -> str:
     """One citation's status against `tree`'s HEAD: `ok` (the quote is in
     the cited lines, 3 lines of slack), `drift` (elsewhere in that file),
-    `absent` (not in the file), `no_file`, `short`; `record_ok` /
-    `record_absent` for `path: "RECORD"` (the executed-commands record);
+    `absent` (not in the file), `no_file`, `short`; for `path: "RECORD"`
+    (the executed-commands record) `record_ok` when the quote is in one of
+    the orchestrator's own entries (`_record_own_entries`: each is on the
+    record only while it describes HEAD's committed tree), `record_worker`
+    when it is only in a worker's entry — supporting evidence that never
+    verifies on its own, since a worker's run in staging can rest on a
+    file HEAD lacks (review round 11 claims M1) — else `record_absent`;
     `absent_ok` / `absent_found` / `bad_regex` for `path: "ABSENT"` or
     `"ABSENT:<pathspec>"`, whose quote is an extended regex `git grep -E`
     must find nowhere. Substring checks after NFC/whitespace normalisation —
@@ -42598,7 +42625,10 @@ def _verify_delivery_cite(cite: dict, tree: str | Path, record: str,
     if len(q) < _DELIVERY_CITE_MIN_QUOTE:
         return "short"
     if head == "RECORD":
-        return "record_ok" if q in _scope_norm(record) else "record_absent"
+        if q in _scope_norm(_record_own_entries(record)):
+            return "record_ok"
+        return ("record_worker" if q in _scope_norm(record)
+                else "record_absent")
     rel = _delivery_cite_rel(path, tree)
     if not rel or os.path.isabs(rel) or ".." in Path(rel).parts:
         return "no_file"
@@ -42649,14 +42679,16 @@ def _delivery_unmet_parts(v: dict, tree: str | Path, record: str,
                           cache: dict | None = None) -> list[dict]:
     """The parts a verdict typed `unmet`, each keeping only its citations
     that verify (a fabricated one is dropped) — the falsifier's probe
-    targets (bench Q2 F+ lead 3)."""
+    targets (bench Q2 F+ lead 3). A quote of a worker's record entry
+    (`record_worker`) is real and stays as a lead: it verifies nothing,
+    but a lead is not a verdict."""
     out = []
     for p in v.get("parts") or []:
         if not isinstance(p, dict) or p.get("status") != "unmet":
             continue
         cites = [c for c in (p.get("cites") or []) if isinstance(c, dict)
                  and _verify_delivery_cite(c, tree, record, cache)
-                 in _DELIVERY_CITE_OK]
+                 in _DELIVERY_CITE_OK | {"record_worker"}]
         out.append({"requirement": str(p.get("requirement") or "")[:500],
                     "kind": p.get("kind"),
                     "cites": [{k: c.get(k) for k in

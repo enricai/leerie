@@ -100,7 +100,7 @@ def _node_repo(leerie, tmp_path, monkeypatch, *, lock_rewrite: bool):
 
 
 # --------------------------------------------------------------------------
-# The three clean-run shapes: done, with an EMPTY end-state section
+# The four clean-run shapes: done, with an EMPTY end-state section
 
 
 def test_shape1_pytest_pycache_unignored(leerie, tmp_path, monkeypatch):
