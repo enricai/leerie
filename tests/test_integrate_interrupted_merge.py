@@ -1,5 +1,5 @@
-"""A merge a hard kill left in progress is abandoned, not handed to the next
-sid's integrator (DESIGN §6 *Skipping a settled subtask never skips its
+"""A merge a hard kill left in progress never reaches the next sid's
+integrator (DESIGN §6 *Skipping a settled subtask never skips its
 integration*; review r2 L4).
 
 Driven end to end on the real `setup-run.sh` / `new-worktree.sh` /
@@ -7,9 +7,11 @@ Driven end to end on the real `setup-run.sh` / `new-worktree.sh` /
 integrator for `b` is killed mid-resolution, so staging stays mid-merge
 of `b`. On resume, sibling `a`, blocked before the kill and complete after
 its retry, comes first in wave order. The integrator stub resolves
-whatever merge is in progress and commits it. Before the fix, `a`'s
-integrator committed `b`'s half-resolved merge as `leerie: integrate a`,
-and `a`'s branch was never merged, though both counted integrated."""
+whatever merge is in progress and commits it. Before 919a0ee, `a`'s
+integrator committed `b`'s half-resolved merge as `leerie: integrate a`.
+919a0ee answered at the readers (an abandon-on-entry, a mid-merge refusal
+in `integrate.sh`); the root is the resume itself, whose `setup-run.sh`
+resets a surviving staging, so neither reader is needed."""
 from __future__ import annotations
 
 import asyncio
@@ -76,8 +78,15 @@ def _midmerge(leerie, tmp_path, monkeypatch):
     return repo, st, staging
 
 
-def test_resume_abandons_the_interrupted_merge(leerie, tmp_path, monkeypatch):
+def test_the_resume_ends_the_interrupted_merge(leerie, tmp_path,
+                                               monkeypatch):
     repo, st, staging = _midmerge(leerie, tmp_path, monkeypatch)
+    # The resume: a new process runs setup-run.sh before reading staging.
+    subprocess.run(["bash", str(REPO_ROOT / "scripts" / "setup-run.sh"),
+                    RUN_ID, "main"], cwd=repo, check=True,
+                   capture_output=True)
+    assert not _git(staging, "rev-parse", "-q", "--verify", "MERGE_HEAD",
+                    check=False)
     calls: list[str] = []
 
     async def claude_p(**kw):
@@ -110,25 +119,5 @@ def test_resume_abandons_the_interrupted_merge(leerie, tmp_path, monkeypatch):
     assert calls == ["integrator-b"], calls
     assert log.splitlines()[:2] == ["leerie: integrate b",
                                     "leerie: integrate a"], log
-    # The killed integrator's half-resolution is kept on a rescue ref.
-    shown = _git(staging, "show", f"refs/leerie/rescue/{RUN_ID}/b/1:f.txt",
-                 check=False)
-    assert shown == "half-resolved"
-
-
-def test_integrate_sh_refuses_a_mid_merge_staging(leerie, tmp_path,
-                                                  monkeypatch):
-    """The backstop: the script never reads another sid's interrupted
-    merge as this sid's conflict."""
-    repo, st, staging = _midmerge(leerie, tmp_path, monkeypatch)
-    r = subprocess.run(["bash", str(REPO_ROOT / "scripts" / "integrate.sh"),
-                        "a", RUN_ID], cwd=repo, capture_output=True, text=True)
-    assert r.returncode == 2 and "mid-merge" in r.stderr, r.stderr
-
-
-def test_a_clean_staging_is_left_alone(leerie, tmp_path, monkeypatch):
-    repo, st, staging = _midmerge(leerie, tmp_path, monkeypatch)
-    _git(staging, "merge", "--abort")
-    before = _git(staging, "rev-parse", "HEAD")
-    assert asyncio.run(leerie._abandon_interrupted_merge(staging, st)) is None
-    assert _git(staging, "rev-parse", "HEAD") == before
+    assert _git(staging, "status", "--porcelain",
+                "--untracked-files=all") == ""

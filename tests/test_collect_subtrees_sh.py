@@ -486,3 +486,68 @@ def test_the_integrator_falls_back_to_the_base_deny_list(tmp_path, leerie):
     assert argv[argv.index("--disallowedTools") + 1] == \
         leerie.DISALLOWED_TOOLS
     assert "--settings" not in argv
+
+
+def _make_messy_claude(tmp_path: Path, *, status: str) -> Path:
+    """Stub integrator that edits a file outside the merge (README.md) and
+    leaves a scratch file, then returns `status` — `failed`, or a
+    `resolved` that commits the merge but leaves the scratch file."""
+    stub = tmp_path / "bin" / "claude"
+    stub.parent.mkdir(parents=True, exist_ok=True)
+    commit = ("git checkout --theirs conflict.txt >/dev/null 2>&1\n"
+              "git add conflict.txt >/dev/null 2>&1\n"
+              "git commit --no-edit >/dev/null 2>&1\n"
+              if status == "resolved" else "")
+    stub.write_text(
+        '#!/usr/bin/env bash\n'
+        'printf "integrator scratch\\n" >> README.md\n'
+        'printf "x\\n" > scratch.txt\n'
+        + commit +
+        'echo \'{"type":"result","structured_output":'
+        '{"incoming_subtask":"test","status":"' + status + '",'
+        '"resolution_summary":null,"diagnosis":"d"}}\'\n')
+    stub.chmod(0o755)
+    return stub
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize("status", ["failed", "resolved"])
+def test_a_skipped_branch_leaves_staging_as_it_found_it(tmp_path, status):
+    """I1 for the collection's integrator: a `failed` verdict, or a
+    `resolved` one that left its tree dirty, is backed out to the commit
+    before the merge. `git merge --abort` used to keep the integrator's edit
+    to README.md, so the next branch — which touches README.md — could not
+    merge and was handed to an integrator too (skipped), and a `resolved`
+    with a scratch file counted as integrated."""
+    repo = _make_fixture_repo(tmp_path)
+    run_id = "test-messy-abc"
+    state_dir = tmp_path / "state"
+    _make_run_branch(repo, run_id)
+    _make_state_json(state_dir, run_id, waves=[["s1", "s2", "s3"]],
+                     completed_waves=0)
+    _make_subtask_branch(repo, run_id, "s1", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version A\n"})
+    _make_subtask_branch(repo, run_id, "s2", f"leerie/runs/{run_id}",
+                         {"conflict.txt": "version B\n"})
+    _make_subtask_branch(repo, run_id, "s3", f"leerie/runs/{run_id}",
+                         {"README.md": "hello from s3\n"})
+    stub = _flyctl_stub(tmp_path, repo, state_dir)
+    _make_messy_claude(tmp_path, status=status)
+    env = {"LEERIE_REPO": str(REPO_ROOT),
+           "PATH": f"{stub.parent}:{os.environ['PATH']}"}
+    result = run_bash(
+        f"source {COLLECT_SH}; collect_subtrees_remote leerie machine-xxx",
+        env=env)
+    assert result.returncode == 0, f"stderr={result.stderr}"
+    assert "integrated 2" in result.stderr.lower(), result.stderr
+    assert "skipped 1" in result.stderr.lower(), result.stderr
+    readme = subprocess.run(
+        ["git", "-C", str(repo), "show", f"leerie/runs/{run_id}:README.md"],
+        capture_output=True, text=True, check=True).stdout
+    assert readme == "hello from s3\n"
+    staging = state_dir / "runs" / run_id / "worktrees" / "staging"
+    assert subprocess.run(
+        ["git", "status", "--porcelain", "--untracked-files=all"],
+        cwd=staging, capture_output=True, text=True).stdout == ""

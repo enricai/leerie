@@ -1032,9 +1032,13 @@ def test_orchestrator_killed_mid_retry_resumes_and_integrates(
         leerie, tmp_path, monkeypatch):
     """A crash, then the orchestrator itself is killed during the retry
     (cancellation propagates out of the integrator call, staging left
-    mid-merge with a half-made edit). `resume` rescues that edit to a NEW
-    ref — the first rescue is kept — aborts the merge, and integrates the
-    subtask afresh on the original conflict."""
+    mid-merge with a half-made edit). The resume's `setup-run.sh` resets
+    the staging that survived (tests/test_resume_staging_is_reset.py), which
+    ends the merge and drops the half-made edit, as a Ctrl-C's cleanup
+    does; the first crash's rescue ref is kept, and the subtask is
+    integrated afresh on the original conflict. (Before, `integrate_wave`
+    abandoned the merge on entry and rescued the edit to a second ref:
+    919a0ee, superseded.)"""
     import subprocess
     st = _state(leerie, tmp_path)
     st.data["skip_integration_check"] = True
@@ -1064,6 +1068,11 @@ def test_orchestrator_killed_mid_retry_resumes_and_integrates(
     assert len(first) == 1
     first_sha = _git_out(staging, "rev-parse", first[0])
 
+    # The resume: `setup-run.sh`'s reset of a surviving staging.
+    subprocess.run(["git", "reset", "-q", "--hard", "HEAD"],
+                   cwd=str(staging), check=True)
+    subprocess.run(["git", "clean", "-fdq"], cwd=str(staging), check=True)
+    assert not (staging / ".git" / "MERGE_HEAD").exists()
     resumed: list[str] = []
 
     async def clean(**kwargs):
@@ -1078,10 +1087,9 @@ def test_orchestrator_killed_mid_retry_resumes_and_integrates(
     assert len(resumed) == 1
     assert "<<<<<<<" in resumed[0] and "x = 42" not in resumed[0]
     refs = _rescue_refs(staging, st.run_id, "feat-001")
-    assert len(refs) == 2 and first[0] in refs
+    assert refs == first
     assert _git_out(staging, "rev-parse", first[0]) == first_sha
-    assert sorted(_git_out(staging, "show", f"{r}:app.py") for r in refs) == [
-        "x = 41", "x = 42"]
+    assert _git_out(staging, "show", f"{first[0]}:app.py") == "x = 41"
     assert _git_out(staging, "log", "-1", "--format=%P").split()[0] == pre
     assert not (staging / ".git" / "MERGE_HEAD").exists()
 

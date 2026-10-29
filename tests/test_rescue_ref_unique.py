@@ -2,19 +2,15 @@
 
 `_rescue_integrator_work` wrote every rescue of a sid to the one ref
 `refs/leerie/rescue/<run>/<sid>`, and `refs/leerie/*` keeps no reflog, so a
-second crash on resume replaced the first rescue — the one the die message
-had told the operator to apply — and every merge whose sid could not be
-matched landed on `…/unknown`. Driven against real git repositories left
+second crash replaced the first rescue — the one the die message had told
+the operator to apply. Driven against real git repositories left
 mid-merge.
 """
 from __future__ import annotations
 
-import asyncio
-import subprocess
-
 from tests.conftest import _run, run_git_cwd_kw as _git
 from tests.test_rescue_integrator_work import (  # noqa: F401  (fixture)
-    _git_noraise, conflicted_repo)
+    conflicted_repo)
 
 
 def _rescue(leerie, repo, text, sid="feat-006"):
@@ -58,28 +54,3 @@ def test_beside_a_flat_ref_from_an_older_leerie(leerie, conflicted_repo):
                 cwd=conflicted_repo).stdout.strip() == head
     assert _rescue(leerie, conflicted_repo, "NEWER\n") == \
         "refs/leerie/rescue/run1/feat-006.2"
-
-
-class _St:
-    run_id = "run1"
-
-
-def test_unmatched_merges_get_unique_refs(leerie, conflicted_repo):
-    """`_abandon_interrupted_merge` names a merge it cannot match to a
-    subtask branch `unknown`; two of them keep two rescues."""
-    refs = []
-    for text in ("ONE\n", "TWO\n"):
-        (conflicted_repo / "f.txt").write_text(text)
-        assert asyncio.run(leerie._abandon_interrupted_merge(
-            conflicted_repo, _St())) == "unknown"
-        _git_noraise("merge", "side", cwd=conflicted_repo)
-    for line in _git("for-each-ref", "--format=%(refname)",
-                     "refs/leerie/rescue/run1/unknown/",
-                     cwd=conflicted_repo).stdout.split():
-        refs.append(line)
-    assert refs == ["refs/leerie/rescue/run1/unknown/1",
-                    "refs/leerie/rescue/run1/unknown/2"]
-    assert [_show(conflicted_repo, r) for r in refs] == ["ONE\n", "TWO\n"]
-    assert subprocess.run(["git", "rev-parse", "-q", "--verify",
-                           "MERGE_HEAD"], cwd=conflicted_repo,
-                          capture_output=True).returncode == 0

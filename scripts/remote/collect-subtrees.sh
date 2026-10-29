@@ -185,7 +185,10 @@ for sid in "${!unintegrated_by_sid[@]}"; do
     remaining+=("$sid")
   fi
 done
-IFS=$'\n' sorted_remaining=($(printf '%s\n' "${remaining[@]}" | sort)); unset IFS
+sorted_remaining=()
+if [ "${#remaining[@]}" -gt 0 ]; then
+  mapfile -t sorted_remaining < <(printf '%s\n' "${remaining[@]}" | sort)
+fi
 for sid in "${sorted_remaining[@]}"; do
   integrate_order+=("$sid")
 done
@@ -211,6 +214,15 @@ skipped_count=0
 skipped_sids=""
 integrated_so_far=""
 
+# A branch that does not integrate leaves staging exactly as it found it:
+# reset to the commit before its merge, untracked files removed (ignored
+# ones kept). `git merge --abort` kept an edit the integrator made outside
+# the merge, which the next branch's merge then refused or the next
+# integrator swept in (DESIGN §6 *Subtree collection*).
+_back_out() {
+  (cd "$staging" && git reset -q --hard "$1" && git clean -fdq) || true
+}
+
 _skip() {
   skipped_count=$((skipped_count + 1))
   if [ -n "$skipped_sids" ]; then
@@ -221,7 +233,7 @@ _skip() {
 }
 
 for sid in "${integrate_order[@]}"; do
-  branch="${subtask_prefix}${sid}"
+  pre=$(cd "$staging" && git rev-parse HEAD)
   rc=0
   bash "$SCRIPTS/integrate.sh" "$sid" "$run_id" >/dev/null 2>&1 || rc=$?
   if [ "$rc" -eq 0 ]; then
@@ -234,7 +246,7 @@ for sid in "${integrate_order[@]}"; do
   elif [ "$rc" -eq 1 ]; then
     # Conflict — staging worktree is mid-merge. Spawn integrator.
     if [ ! -f "$integrator_prompt" ]; then
-      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _back_out "$pre"
       _skip "$sid"
       continue
     fi
@@ -282,7 +294,7 @@ Already-integrated subtasks it may conflict with: ${integrated_so_far:-none}"
       --dangerously-skip-permissions 2>/dev/null) || claude_rc=$?
 
     if [ "$claude_rc" -ne 0 ]; then
-      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _back_out "$pre"
       _skip "$sid"
       continue
     fi
@@ -299,12 +311,17 @@ except Exception:
 ' 2>/dev/null || true)
 
     if [ "$status" = "resolved" ]; then
-      # Verify the merge was actually committed.
+      # Verify the merge was actually committed, and that the integrator
+      # left its tree clean (I1, DESIGN §8 *A worker leaves its tree
+      # clean* — no re-ask here: there is no session to resume).
       merge_head_rc=0
       (cd "$staging" && git rev-parse --verify --quiet MERGE_HEAD 2>/dev/null) || merge_head_rc=$?
       staged_files=""
       staged_files=$(cd "$staging" && git diff --cached --name-only 2>/dev/null || true)
-      if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ]; then
+      dirt=$(cd "$staging" && git status --porcelain --untracked-files=all 2>/dev/null || echo "status failed")
+      now=$(cd "$staging" && git rev-parse HEAD)
+      if [ "$merge_head_rc" -ne 0 ] && [ -z "$staged_files" ] \
+          && [ -z "$dirt" ] && [ "$now" != "$pre" ]; then
         resolved_count=$((resolved_count + 1))
         if [ -n "$integrated_so_far" ]; then
           integrated_so_far="${integrated_so_far}, ${sid}"
@@ -312,11 +329,11 @@ except Exception:
           integrated_so_far="$sid"
         fi
       else
-        (cd "$staging" && git merge --abort 2>/dev/null || true)
+        _back_out "$pre"
         _skip "$sid"
       fi
     else
-      (cd "$staging" && git merge --abort 2>/dev/null || true)
+      _back_out "$pre"
       _skip "$sid"
     fi
   else

@@ -1964,34 +1964,38 @@ The completeness re-drive inside a subtask's own attempt is not on the
 list: it sets the status back to `in_progress` before it loops, so a
 resume re-runs the attempt and every gate after it.
 
-A merge a hard kill interrupted is not resumed; it is abandoned. A
-SIGKILL, an OOM or a container death while an integrator is resolving
-leaves the staging worktree mid-merge (`MERGE_HEAD`), with no rescue and
-no abort, since neither had a chance to run. On resume, the first sid
-`integrate_wave` reaches need not be the one whose merge is in progress:
-a sibling that was blocked before the kill and is complete after its
-retry comes earlier in wave order. Its `git merge` then refuses, which
-`integrate.sh` reported as a conflict. That sibling's integrator resolved
-and committed the other sid's half-resolved merge, unchecked, under the
-sibling's subject. The sibling's own branch was never merged, but it was
-counted integrated (driven end to end on the real scripts and the real
-`integrate_wave`). The interrupted integration was never recorded, so
-there is nothing in it to keep: `integrate_wave` checks staging on entry
-and, if it is mid-merge, rescues the work in progress to a ref (as the
-crash path does) and aborts the merge. Every rescue gets a ref of its own,
+A merge a hard kill interrupted is not resumed; it is gone before the
+resume reads staging. A SIGKILL, an OOM or a container death while an
+integrator is resolving leaves the staging worktree mid-merge
+(`MERGE_HEAD`), with no rescue and no abort. Review r2 L4 drove what that
+did on resume: the first sid `integrate_wave` reached need not be the one
+whose merge was in progress (a sibling blocked before the kill and
+complete after its retry comes earlier in wave order), its `git merge`
+refused, `integrate.sh` reported a conflict, and the sibling's integrator
+committed the other sid's half-resolved merge under its own subject. That
+was answered at the reader — an abandon-on-entry in `integrate_wave` and a
+mid-merge refusal in `integrate.sh` (919a0ee). The root is the resume: every
+process starts on staging at its branch tip with nothing uncommitted
+(`setup-run.sh` resets a staging that survived, §8 *The final diff
+describes the tree that ships*), and a reset ends the merge. Within one
+process no integrator round can leave staging mid-merge either: every way
+out of a conflict — a committed merge the integrator's clean-tree gate (I1)
+passed, a back-out of a verdict, an unclean tree or a merge claimed but not
+committed, the crash path's reset — ends at a commit with nothing
+uncommitted. Subtree collection after the run holds itself to the same
+rule (§6 *Subtree collection*). So no reader can meet a merge in progress,
+and neither check is kept. The interrupted integration was never recorded,
+so nothing of it is lost but the half resolution, as under a Ctrl-C's
+cleanup; the sid is integrated again in its turn.
+
+Every crash rescue gets a ref of its own,
 `refs/leerie/rescue/<run-id>/<sid>/<n>` with `n` one past the highest
 already there, and is written only if that ref does not exist: a rescue
-ref is never overwritten. Under one fixed name per sid, a second crash on
-resume replaced the first rescue — the one the operator had been told to
-apply — and `refs/leerie/*` keeps no reflog to get it back; every merge
-whose sid could not be matched landed on the same `…/unknown` (round-3
-review L3). The log line names the exact ref, and so does the back-out
-reason when an integrator's crash retries run out (§7). Its sid is then integrated again
-in its own turn. This runs in the orchestrator, which holds the run
-directory's lock, so no other process is merging into staging.
-`integrate.sh` also refuses to start while staging is mid-merge
-(precondition exit 2, not a conflict), so the state can never again
-read as one sid's conflict.
+ref is never overwritten. Under one fixed name per sid, a second crash
+replaced the first rescue — the one the operator had been told to apply —
+and `refs/leerie/*` keeps no reflog to get it back (round-3 review L3).
+The log line names the exact ref, and so does the back-out reason when an
+integrator's crash retries run out (§7).
 
 This places one hard requirement on the design: **a run branch, once
 created, is never reset.** Setup creates it only if it does not already
@@ -2718,7 +2722,15 @@ branches, runs `setup-run.sh` to ensure the staging worktree exists, and
 merges each via `integrate.sh` — conflicts resolved by spawning a
 `claude -p` integrator worker (same prompt, schema, and verification as
 `integrate_wave()`). Branches the integrator cannot resolve are skipped
-and reported. This runs after the `finished_at` patch and before
+and reported. Each branch starts on a clean staging and leaves one: a
+skipped branch — no integrator, a crash, a verdict other than `resolved`,
+or a `resolved` whose merge is not committed or whose tree is not clean
+(I1, §8 *A worker leaves its tree clean*, with no re-ask: the script has
+no session to resume) — is reset to the commit before its merge (`git
+reset --hard`, then `git clean -fd`, ignored files kept). A `git merge
+--abort` did not do that: it keeps an edit the integrator made to a file
+outside the merge, which the next branch's merge then refused or the
+next integrator swept in. This runs after the `finished_at` patch and before
 `fetch_branch` streams the result to the host. `fetch-branch.sh`'s bundle
 already carries the raw subtask branches regardless of whether collection
 ran, so a crash between subtask completion and integration is still
@@ -5958,8 +5970,9 @@ first parent, the subtask settled `unconverged`, the content loss on its
 risk register for the PR — with a reason naming every rescue ref, so the
 discarded resolutions can still be applied by hand; the wave continues. The
 retry count lives for one invocation: an orchestrator killed mid-retry is
-not an integrator crash, and on `resume` the interrupted merge is rescued
-and aborted on entry and the subtask integrated again in its turn.
+not an integrator crash, and on `resume` the interrupted merge is gone
+(the resume resets staging) and the subtask is integrated again in its
+turn.
 
 ### Forcing constrained decoding
 
