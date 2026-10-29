@@ -43232,15 +43232,18 @@ async def _committed_checkout(st: "State", staging: Path,
                               name: str) -> AsyncIterator[Path]:
     """Where a judge that can make a verdict met reads the tree that ships
     (DESIGN §8 *Every post-execution verdict is of the committed tree*):
-    `staging` itself when nothing at all is uncommitted there
-    (`_worktree_tree_sha` is its committed tree), else a disposable
-    detached checkout of its HEAD (`_helper_worktree_path(st, name)`, no
-    dependencies — the judge only reads), removed afterwards. Raises
-    RuntimeError when no such checkout can be made: a judge never falls
-    back to reading staging's uncommitted content (review round 12 claims
-    M1)."""
-    tree_sha = await _committed_tree_sha(str(staging))
-    if tree_sha and await _worktree_tree_sha(str(staging)) == tree_sha:
+    `staging` itself only when its working tree is byte-identical to HEAD —
+    `git status --porcelain --ignored` lists nothing, so not even an
+    ignored file (a `dist/` build, a `.env`, a patched dependency) differs
+    (review round 13 L2: plain `--porcelain` hides ignored files) — else a
+    disposable detached checkout of its HEAD (`_helper_worktree_path(st,
+    name)`, no dependencies — the judge only reads), removed afterwards.
+    Raises RuntimeError when no such checkout can be made: a judge never
+    falls back to reading staging's uncommitted content (review round 12
+    claims M1)."""
+    clean = await run_proc(["git", "status", "--porcelain", "--ignored",
+                            "--untracked-files=all"], cwd=str(staging))
+    if clean.returncode == 0 and not clean.stdout.strip():
         yield staging
         return
     head = await _branch_head_sha(str(staging))

@@ -6362,8 +6362,9 @@ Test-ID plumbing for the failing-test-ID diff (E3):
     items and contract (`"delivery-judge"`) and `_ratchet_judge`'s packs
     (`"delivery-ratchet"`, through `_ratchet_judge_packs(..., cwd, ...)`) —
     is `async with _committed_checkout(st, staging, name) as cwd`: staging
-    itself when `_worktree_tree_sha(staging)` is its `_committed_tree_sha`,
-    else a detached checkout of staging's HEAD at `_helper_worktree_path(st,
+    itself only when `git status --porcelain --ignored
+    --untracked-files=all` there succeeds and prints nothing (review round
+    13 L2: ignored files count), else a detached checkout of staging's HEAD at `_helper_worktree_path(st,
     name)` (`_worktree_add_detached_async(st, wt, head, repo=staging)` —
     `_worktree_add_detached` takes an optional `repo`, default
     `st.repo_root`), removed afterwards (`git -C <staging> worktree remove

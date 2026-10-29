@@ -124,3 +124,44 @@ def test_the_ratchet_reverifies_on_the_commit(leerie, tmp_path,
     (s,) = seen
     assert s["head"] == post and s["cwd"] != str(staging)
     assert not s["helper"]
+
+
+def test_an_ignored_file_is_a_difference_too(leerie, tmp_path, monkeypatch):
+    """Review round 13 L2, the reviewer's driver
+    (`test_zz_r13_ignored_judge_tree.py`): `git status --porcelain` hides
+    ignored files, so a worker's uncommitted `dist/a.py` (ignored) was in
+    the tree the judges read — the uncited DEFECT CONTRACT verdict and the
+    ratchet's reads included. Only a byte-identical tree reuses staging."""
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {"task": "t", "worker_count": 0}
+    staging = _delivery_tree(st.run_dir / "worktrees" / "staging")
+    (staging / ".gitignore").write_text("dist/\n")
+    subprocess.run(["git", "-C", str(staging), "add", ".gitignore"],
+                   check=True)
+    subprocess.run(["git", "-C", str(staging), "-c", "user.email=t@t", "-c",
+                    "user.name=t", "commit", "-qm", "ignore"], check=True)
+    (staging / "dist").mkdir()
+    (staging / "dist" / "a.py").write_text("A = 2  # never committed\n")
+    assert subprocess.run(["git", "-C", str(staging), "status",
+                           "--porcelain"], capture_output=True,
+                          text=True).stdout == ""
+    seen = []
+
+    async def judge(**kw):
+        seen.append((kw["cwd"], os.path.exists(
+            os.path.join(kw["cwd"], "dist", "a.py"))))
+        return {"verdicts": [_judge_verdict(0, True)]}
+    monkeypatch.setattr(leerie, "claude_p", judge)
+    asyncio.run(leerie._delivery_judge_unmet(
+        "t", [{"item": "the feature exists"}], staging, st,
+        {**leerie.DEFAULT_CAPS}, {}, {}, "final"))
+    ((cwd, saw_ignored),) = seen
+    assert cwd != str(staging) and not saw_ignored
+    # Once the ignored file is gone, staging is byte-identical: reused.
+    (staging / "dist" / "a.py").unlink()
+    (staging / "dist").rmdir()
+    seen.clear()
+    asyncio.run(leerie._delivery_judge_unmet(
+        "t", [{"item": "the feature exists"}], staging, st,
+        {**leerie.DEFAULT_CAPS}, {}, {}, "final"))
+    assert seen == [(str(staging), False)]

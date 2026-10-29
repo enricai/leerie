@@ -7261,8 +7261,11 @@ reads a commit:
 - the delivery judges — every item verdict, the DEFECT CONTRACT verdict,
   and the delivery ratchet's re-verification of the items a re-drive group
   did not route — read a clean checkout of staging's HEAD (staging itself
-  only when nothing at all is uncommitted there), so content only the
-  working tree holds is not in front of them; a checkout that cannot be
+  only when its working tree is byte-identical to HEAD, not even an
+  ignored file differing: review round 13 L2 drove a worker's uncommitted
+  `dist/` build, ignored and so invisible to a plain status, in front of
+  the uncited contract verdict), so content only the working tree holds is
+  not in front of them; a checkout that cannot be
   made fails the judge, never falls back to staging. Review round 12
   drove why the cite rule below was not enough on its own: the contract
   verdict carries no citation and resolved `met` on a single sample, and
