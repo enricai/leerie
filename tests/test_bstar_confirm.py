@@ -285,6 +285,42 @@ def test_budget_bounds_the_confirm(leerie):
     assert [round(c[1]) for c in calls] == [1800, 1400, 1000, 600, 200]
 
 
+def test_gate_wait_is_not_charged_to_the_confirm_budget(leerie):
+    """The gate times out on a loaded host after its full 300 s — exactly
+    when the pairs escalate to five. The budget's clock starts after it, so
+    the first rerun still gets all 1800 s, and the whole call stays inside
+    the gate wait plus the budget (DESIGN §9 *Which failures are new*,
+    step 2)."""
+    clock = _Clock()
+    calls = []
+    b, f = _runners([set()] * 5, [{"x"}] * 5, calls, clock=clock,
+                    cost=400.0)
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], b, f, _caps(leerie), label="t", read_psi=lambda: 99.0,
+        sleep=clock.sleep, clock=clock))
+    gate = v["gate"]["waited_sec"]
+    assert v["gate"]["timed_out"] is True and gate >= 300
+    assert [round(c[1]) for c in calls] == [1800, 1400, 1000, 600, 200]
+    assert v["pairs_run"] == 2 and v["budget_exhausted"] is True
+    assert clock.t == gate + 2000
+
+
+def test_still_failing_does_not_charge_the_gate_wait_either(leerie):
+    clock = _Clock()
+    calls = []
+
+    async def run_final(timeout):
+        calls.append(timeout)
+        clock.t += 400.0
+        return {"x"}
+    v = asyncio.run(leerie._confirm_still_failing(
+        ["x"], run_final, _caps(leerie), label="t", read_psi=lambda: 99.0,
+        sleep=clock.sleep, clock=clock))
+    assert v["gate"]["timed_out"] is True and v["gate"]["waited_sec"] >= 300
+    assert [round(t) for t in calls] == [1800, 1400, 1000, 600, 200]
+    assert v["reruns_run"] == 5 and v["confirmed"] == ["x"]
+
+
 def test_no_candidates_runs_nothing(leerie):
     calls = []
     b, f = _runners([], [], calls)

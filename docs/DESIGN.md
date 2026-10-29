@@ -7691,7 +7691,8 @@ failure is a verdict like a new test failure and is confirmed the same
 way (§9 *Which failures are new*) — with one asymmetry, below: a set file
 that fails on the tree is rerun serially behind the host-pressure gate,
 `confirm_pairs` times (or `confirm_pairs_escalated` after a gate timeout)
-inside `confirm_budget_sec`, and it stays failing only if it failed on
+inside `confirm_budget_sec` (a rerun the budget cuts short produces no
+verdict, never a failure), and it stays failing only if it failed on
 every rerun that produced a verdict; anything else is `resource_affected`,
 and a set whose only failures were resource-affected and touched no held
 case is no evidence either way — so a load flake never forces a repair
@@ -7718,7 +7719,9 @@ non-resource reason is the reported defect showing, however rarely. So:
    did not end failing — it passed, or the vote typed its failures
    `resource_affected` — has those files rerun up to
    `acceptance_intermittent_repeats` (10, never more than 10) more times,
-   serially behind the gate and inside `confirm_budget_sec`, stopping at
+   serially behind the gate and inside `confirm_budget_sec` counted from
+   when the gate returns, each rerun's timeout what is left of it (§9
+   *Which failures are new*, step 2), stopping at
    the first rerun that shows a held case failing with no resource
    signature, which makes the file failing. Discovery always leaves a
    record on the set's result when it had files to rerun, found or not,
@@ -9675,8 +9678,19 @@ failure new / does this set still fail" verdict uses:
    --maxWorkers=1` / `-p no:xdist`), only the files that contain a
    candidate, as interleaved base/final pairs — base, final, base, final … —
    `confirm_pairs` (3) of them, or `confirm_pairs_escalated` (5) when the
-   gate timed out. One confirm runs at a time, and the whole confirm is
-   bounded by `confirm_budget_sec` (1800 s).
+   gate timed out. One confirm runs at a time, and its reruns are bounded
+   by `confirm_budget_sec` (1800 s): every rerun's timeout is what is left
+   of it, so none overruns it. The budget's clock starts when the gate
+   returns. The gate wait is not rerun work and has its own cap, and
+   charging it to the budget would starve the reruns exactly when they need
+   the most time: the gate times out only on a loaded host, which is when
+   the pairs escalate from 3 to 5 and each rerun runs slowest, and the
+   300 s wait is a sixth of the budget. Splitting the budget per phase
+   instead was rejected: the gate already is a phase with its own cap, and
+   a further split among a confirm's reruns would add caps without
+   bounding anything the single budget does not. So one confirm, and every
+   discovery below, takes at most `confirm_gate_wait_sec` + one 2 s gate
+   poll + `confirm_budget_sec` — 2102 s at the defaults.
 3. *Verdict.* An ID is **new** only if it failed on every final rerun and
    passed on every base rerun. An ID that failed on every one of the `k`
    base reruns, each of which produced a report, is **`pre_existing`**: the
@@ -9764,8 +9778,9 @@ adds two steps:
    file is counted only over its R repeats. When not even the first file
    fits, discovery records `skipped: "over budget"` and runs nothing. So one
    discovery — final-tree or the delivery ratchet's (N5), which calls the
-   same function — costs at most `confirm_budget_sec`, gate wait and
-   calibration included. On barnacle's hub file (~3 s per importer) that is
+   same function — costs at most `confirm_budget_sec` after the gate,
+   calibration included, and so at most 2102 s with the gate wait (step 2
+   above). On barnacle's hub file (~3 s per importer) that is
    about 26 importers, each rerun all 20 times, instead of all 301 rerun
    twice; the other 275 are recorded as skipped, not silently dropped.
 2. *Typing.* An ID is typed `intermittent_regression` only when all of

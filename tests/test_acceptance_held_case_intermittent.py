@@ -361,3 +361,110 @@ def test_the_gate_never_says_pass_with_a_set_unmeasured(leerie, tmp_path,
     out = capsys.readouterr().out
     assert "held-out sets pass" not in out
     assert "1 of 2 held-out set(s) pass, 1 unmeasured" in out
+
+
+# --- the B* budget: its clock starts after the gate, and bounds each run ---
+# (DESIGN §9 *Which failures are new*, step 2)
+
+class _Clock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def _discover_with(leerie, tmp_path, monkeypatch, *, cost, gate_wait,
+                   **caps):
+    clock = _Clock()
+    timeouts: list[float] = []
+
+    async def gate(_caps, **_kw):
+        clock.t += gate_wait
+        return {"waited_sec": gate_wait, "timed_out": True, "psi": 99.0,
+                "readable": True}
+
+    async def run(st, caps_, tree, rel, log_path, label, *, cases_out=None,
+                  **_kw):
+        t = caps_["worker_timeout_sec"]
+        timeouts.append(t)
+        if cost > t:
+            clock.t += t
+            cases_out["resource"] = True
+            return False
+        clock.t += cost
+        return True
+    monkeypatch.setattr(leerie, "_confirm_gate", gate)
+    monkeypatch.setattr(leerie, "_run_acceptance_file", run)
+    st = leerie.State(tmp_path / "state", "r")
+    d = asyncio.run(leerie._acceptance_discover(
+        st, {**_caps(leerie, worker_timeout_sec=5400), **caps}, tmp_path,
+        [REL], tmp_path / "t.log", "t", None, lambda _r, _o: False,
+        index=1, clock=clock))
+    return d, timeouts, clock
+
+
+def test_discovery_gets_its_whole_budget_after_a_gate_wait(
+        leerie, tmp_path, monkeypatch):
+    """Ten rounds of 170 s fit 1800 s. A 300 s gate wait charged to the
+    budget would have cut the tenth round and marked discovery incomplete."""
+    d, timeouts, clock = _discover_with(leerie, tmp_path, monkeypatch,
+                                        cost=170.0, gate_wait=300.0)
+    assert d["repeats_run"] == 10 and d["incomplete"] is False
+    assert d["budget_exhausted"] is False
+    assert [round(t) for t in timeouts] == [1800 - 170 * i
+                                            for i in range(10)]
+    assert clock.t == 300.0 + 1700.0
+
+
+def test_a_discovery_run_the_budget_cut_is_not_a_round(leerie, tmp_path,
+                                                       monkeypatch):
+    """Each rerun's timeout is what is left of the budget, never the 90 min
+    worker timeout; one the budget cut short leaves discovery incomplete,
+    its round uncounted."""
+    d, timeouts, clock = _discover_with(leerie, tmp_path, monkeypatch,
+                                        cost=170.0, gate_wait=0.0,
+                                        confirm_budget_sec=250)
+    assert [round(t) for t in timeouts] == [250, 80]
+    assert d["repeats_run"] == 1 and d["budget_exhausted"] is True
+    assert d["incomplete"] is True and d["reason"] == "budget_exhausted"
+    assert clock.t == 250.0
+
+
+def test_a_vote_rerun_the_budget_cut_is_no_verdict_not_a_failure(
+        leerie, tmp_path, monkeypatch):
+    """A vote rerun runs under the budget it is given; cut short by it, the
+    file's runner timeout is not a confirmed failure."""
+    st = leerie.State(tmp_path / "state", "r")
+    st.data = {}
+    d = tmp_path / "set-1"
+    (d / "acc").mkdir(parents=True)
+    (d / REL).write_text("")
+    (d / CONTROL).write_text("")
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    s_ = {"index": 1, "valid": True, "dir": str(d),
+          "defect_files": [REL], "control_files": [CONTROL],
+          "cases": {REL: ["a"], CONTROL: ["c"]},
+          "base_failing_cases": {REL: ["acc/test_defect_1.py::test_a"]}}
+    confirm_timeouts: list[float] = []
+
+    async def run(st_, caps_, tree, rel, log_path, label, *, cases_out=None,
+                  **_kw):
+        if rel == CONTROL:
+            return True
+        if "-confirm" in label:
+            t = caps_["worker_timeout_sec"]
+            confirm_timeouts.append(t)
+            await asyncio.sleep(t + 0.05)
+            cases_out["resource"] = True
+            return False
+        return False                 # the first run: fails, names no case
+    monkeypatch.setattr(leerie, "_run_acceptance_file", run)
+    (res,) = asyncio.run(leerie._acceptance_run_placed(
+        st, _caps(leerie, confirm_pairs=1, confirm_pairs_escalated=1,
+                  confirm_budget_sec=0.3, acceptance_intermittent_repeats=0),
+        wt, [s_], "t"))
+    assert len(confirm_timeouts) == 1 and 0 < confirm_timeouts[0] <= 0.3
+    assert res["failing_files"] == []
+    assert res.get("resource_affected_files") == [REL]

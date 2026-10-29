@@ -192,6 +192,25 @@ def test_one_file_over_budget_runs_no_partial_repeats(leerie, hub):
     assert hub["clock"].t == 0.0
 
 
+def test_gate_wait_does_not_starve_discovery(leerie, hub, monkeypatch):
+    """A gate that waits its full 300 s on a loaded host: discovery still
+    sizes to the whole 1800 s budget and chooses the same 26 files it does
+    with no wait, and the call ends inside gate cap + budget (DESIGN §9
+    *Which failures are new*, step 2)."""
+    async def slow_gate(_caps, **_k):
+        hub["clock"].t += 300.0
+        return {"waited_sec": 300.0, "timed_out": True, "psi": 99.0,
+                "readable": True}
+    monkeypatch.setattr(leerie, "_confirm_gate", slow_gate)
+    hub["st"].data["test_file_durations"] = {f: 3.0 for f in hub["files"]}
+    d = _discover(leerie, hub)
+    budget = leerie.DEFAULT_CAPS["confirm_budget_sec"]
+    assert d["selection"]["budget_sec"] == budget
+    assert len(d["files"]) == 26 and d["repeats_run"] == 20
+    assert not d["budget_exhausted"]
+    assert 300.0 < hub["clock"].t <= 300.0 + budget
+
+
 def test_capture_records_durations_run_wide(leerie, tmp_path):
     st = leerie.State(tmp_path / "state", "r")
     st.data = {"test_file_durations": {"a": 1.0, "b": 2.0}}

@@ -5257,7 +5257,7 @@ Defaults in `DEFAULT_CAPS` and the per-worker `claude_p` call sites.
 | B\* gate wait (`confirm_gate_wait_sec`) | 300 s | the gate polls every 2 s for at most this long; a timeout (or an unreadable PSI file, which is logged and treated as a timeout) escalates the pairs below. |
 | B\* base/final rerun pairs (`confirm_pairs`) | 3 | interleaved base, final, base, final … reruns per confirm (DESIGN §9 *Which failures are new*). |
 | B\* escalated pairs (`confirm_pairs_escalated`) | 5 | pairs used instead when the gate timed out. |
-| B\* confirm wall-time budget (`confirm_budget_sec`) | 1800 s | bounds one whole confirm, gate wait included; each rerun's timeout is the remaining budget. Pairs cut short type every candidate `resource_affected` (`budget_exhausted: true`). |
+| B\* confirm wall-time budget (`confirm_budget_sec`) | 1800 s | bounds one confirm's or discovery's reruns, its clock started when `_confirm_gate` returns — the gate wait is bounded by `confirm_gate_wait_sec` instead, so one call takes at most `confirm_gate_wait_sec` + `_CONFIRM_GATE_POLL_SEC` + `confirm_budget_sec` (2102 s at the defaults; DESIGN §9 *Which failures are new*, step 2); each rerun's timeout is the remaining budget. Pairs cut short type every candidate `resource_affected` (`budget_exhausted: true`). |
 | B\* intermittent discovery repeats (`confirm_intermittent_repeats`) | 20 | serial reruns of the import-coupled tests on the final tree, per final-tree ID diff (`_intermittent_discovery`), inside their own `confirm_budget_sec`; 0 disables discovery. Only the files whose 20 repeats all fit the budget by measured duration run; the rest are recorded skipped (never fewer repeats). At a 10.5% per-run failure rate, 20 repeats find the test with p ≈ 0.89; at p = 0.1, 2 repeats only 19%. |
 | held-out intermittent discovery repeats (`acceptance_intermittent_repeats`) | 10 | serial reruns, per confirmed set evaluation, of each defect file with held cases that did not end failing (`_acceptance_discover`), inside `confirm_budget_sec`, stopping at the first held case failing with no resource signature (DESIGN §8 *A held case that fails again is a failure, not a flake*). Clamped to 10 (`_ACCEPTANCE_INTERMITTENT_MAX`); 0 disables discovery. At the replay's p = 0.546 per run, a set misses the defect with probability 0.454¹¹ < 0.02%. |
 | total worker invocations per run | 2000 (`--max-workers`, also `LEERIE_MAX_WORKERS` env or `max_workers` in `leerie.toml`) | the cheap, runtime backstop in `State.bump_workers()`: raises `WorkerError`, abort, state saved for `resume`. The complementary early check is `check_budget_feasibility()` at the plan/execute boundary (after `_schedule()`, before `_write_plan()`) — it estimates remaining `claude -p` calls from the planner output and `die()`s with `EXIT_BUDGET_INFEASIBLE=11` and a recommended `--max-workers` value before any implementer spawns. See DESIGN §13 *Budget feasibility — fail fast at the cheapest moment*. |
@@ -6097,7 +6097,8 @@ than re-running once.
   a time, per event loop, lazily created like `_blt_semaphore`). Runs the
   gate, then `confirm_pairs` (or `confirm_pairs_escalated` on a gate
   timeout) interleaved pairs, base first, each rerun given the remaining
-  `confirm_budget_sec`. Returns `{candidates, new, pre_existing,
+  `confirm_budget_sec`, whose clock starts when the gate returns (the gate
+  wait is not charged to it). Returns `{candidates, new, pre_existing,
   no_verdict, resource_affected, pairs_required, pairs_run,
   budget_exhausted, gate, per_id: {id: {final_failed, base_failed,
   final_runs, base_runs}}}` (`*_runs`: that side's reruns that produced a
@@ -6213,8 +6214,8 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   `_coupled_test_files(repo, staging HEAD, _changed_files(staging,
   base_sha), globs, direct=True)` that exist in staging. With a scoped
   runner (`_acceptance_cmd`), and holding `_confirm_lock` after one
-  `_confirm_gate`, all inside one `confirm_budget_sec` (DESIGN §9 *Sized
-  to the budget*):
+  `_confirm_gate`, all inside one `confirm_budget_sec` counted from when
+  the gate returns (DESIGN §9 *Sized to the budget*):
   1. *Durations.* `state.data["test_file_durations"]` for the coupled
      files. The unmeasured ones are calibrated in `_discovery_rank` order
      (no durations) in chunks of 1, 2, 4 … files through
@@ -7329,13 +7330,18 @@ set_, rel, obs) -> (asserted, seen)`: `seen` the held cases among
 does not match `_RESOURCE_FAILURE_RE`. With `confirm`,
 `_acceptance_run_placed` takes a failing file with any `asserted` case as
 failing without a vote; the rest go to `_confirm_still_failing`, whose
-reruns now pass `cases_out` too, and a rerun with an `asserted` case
+reruns now pass `cases_out` too and run every file under one deadline of
+the remaining budget they are given (`_budget_caps`; a file that budget
+cut short makes the rerun no verdict, never a failure), and a rerun with an `asserted` case
 settles its file failing whatever the vote says. Then discovery
 (`_acceptance_discover`): for each defect file with held cases that did
 not end failing, up to `acceptance_intermittent_repeats` (clamped to
 `_ACCEPTANCE_INTERMITTENT_MAX = 10`) serial reruns under `_confirm_lock`
-and `_confirm_gate`, inside `confirm_budget_sec`, stopping at the first
-`asserted` case; a file that got one is failing. Whenever discovery had files to rerun, the result carries `discovery{files, repeats_required, repeats_run, budget_exhausted, found[], incomplete, reason}`, found or not: `repeats_run` counts only rounds every pending file finished; `incomplete` is true and `reason` is `"budget_exhausted"` (the budget ran out before every round) or `"repeats_disabled"` (`acceptance_intermittent_repeats` is 0) when fewer than the required rounds ran with files still pending, else false and `""`. An incomplete discovery logs `acceptance <label> set <i>: discovery_incomplete — <run> of <required> rerun round(s) (<reason>)`, and `_pr_advisory` lists every `acceptance.gate.final` result whose discovery is incomplete under "Held-out discovery that did not finish". A held case `seen` in
+and `_confirm_gate`, inside `confirm_budget_sec` counted from when the
+gate returns — each rerun runs with `worker_timeout_sec` lowered to what
+is left of the budget (`_budget_caps`), and a round whose run that
+lowered timeout cut short is not counted, `budget_exhausted` set —
+stopping at the first `asserted` case; a file that got one is failing. Whenever discovery had files to rerun, the result carries `discovery{files, repeats_required, repeats_run, budget_exhausted, found[], incomplete, reason}`, found or not: `repeats_run` counts only rounds every pending file finished; `incomplete` is true and `reason` is `"budget_exhausted"` (the budget ran out before every round) or `"repeats_disabled"` (`acceptance_intermittent_repeats` is 0) when fewer than the required rounds ran with files still pending, else false and `""`. An incomplete discovery logs `acceptance <label> set <i>: discovery_incomplete — <run> of <required> rerun round(s) (<reason>)`, and `_pr_advisory` lists every `acceptance.gate.final` result whose discovery is incomplete under "Held-out discovery that did not finish". A held case `seen` in
 any run of a file that ends neither failing nor passing cleanly — every
 held failure carried a resource signature or no message — makes that
 file failing with `intermittent_cases{file: [case ids]}` on the result

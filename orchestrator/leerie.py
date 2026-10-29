@@ -38464,10 +38464,13 @@ async def _confirm_new_failures(
     async with _confirm_lock():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
-        t0 = clock()
         gate = await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
                                    clock=clock)
         out["gate"] = gate
+        # The budget's clock starts after the gate: its wait has its own cap
+        # and is longest exactly when the pairs escalate (DESIGN §9 *Which
+        # failures are new*, step 2).
+        t0 = clock()
         k = int(caps.get("confirm_pairs_escalated",
                          DEFAULT_CAPS["confirm_pairs_escalated"])
                 if gate["timed_out"] else
@@ -38556,10 +38559,13 @@ async def _confirm_still_failing(
     async with _confirm_lock():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
-        t0 = clock()
         gate = await _confirm_gate(caps, read_psi=read_psi, sleep=sleep,
                                    clock=clock)
         out["gate"] = gate
+        # The budget's clock starts after the gate: its wait has its own cap
+        # and is longest exactly when the pairs escalate (DESIGN §9 *Which
+        # failures are new*, step 2).
+        t0 = clock()
         k = int(caps.get("confirm_pairs_escalated",
                          DEFAULT_CAPS["confirm_pairs_escalated"])
                 if gate["timed_out"] else
@@ -39036,8 +39042,9 @@ async def _intermittent_discovery(st: "State", caps: dict, staging: str,
         async with _confirm_lock():
             budget = float(caps.get("confirm_budget_sec",
                                     DEFAULT_CAPS["confirm_budget_sec"]))
-            t0 = clock()
             out["gate"] = await _confirm_gate(caps)
+            # After the gate, which its own cap bounds (DESIGN §9 step 2).
+            t0 = clock()
             known = st.data.get("test_file_durations")
             durations = {f: float(v) for f, v in (
                 known.items() if isinstance(known, dict) else ())
@@ -44470,13 +44477,22 @@ async def _acceptance_run_placed(st: "State", caps: dict, wt: Path,
                                  ) -> set[str] | None:
                     _n["i"] += 1
                     still: set[str] = set()
+                    # Every file of one rerun shares the budget left.
+                    end = time.monotonic() + _left
                     for rel in _files:
+                        left = end - time.monotonic()
+                        if left <= 0:
+                            return None
                         o: dict = {}
                         v = await _run_acceptance_file(
-                            st, caps, str(wt), rel, log_path,
+                            st, _budget_caps(caps, left), str(wt), rel,
+                            log_path,
                             f"acceptance-{label}-confirm{_n['i']}",
                             cases_out=o, **_env_kw(env_extra))
-                        if v is None:
+                        if v is None or (o.get("resource")
+                                         and time.monotonic() >= end):
+                            # Cut short by the budget: no verdict, never
+                            # a failure.
                             return None
                         if v is False:
                             still.add(rel)
@@ -44663,7 +44679,9 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
                                rels: list[str], log_path: Path, label: str,
                                env_extra: dict | None,
                                note: Callable[[str, dict], bool], *,
-                               index: object = None) -> dict:
+                               index: object = None,
+                               clock: Callable[[], float] | None = None
+                               ) -> dict:
     """Discovery for held cases (DESIGN §8 *A held case that fails again*,
     rule 2): rerun each of `rels` — defect files with held cases that did
     not end failing — serially, up to `acceptance_intermittent_repeats`
@@ -44688,25 +44706,32 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
     if reps == 0:
         out.update(incomplete=True, reason="repeats_disabled")
         return out
+    clock = clock or time.monotonic
     pending = list(rels)
-    clock = time.monotonic
     async with _confirm_lock():
         budget = float(caps.get("confirm_budget_sec",
                                 DEFAULT_CAPS["confirm_budget_sec"]))
-        t0 = clock()
         await _confirm_gate(caps)
+        # After the gate, which its own cap bounds (DESIGN §9 step 2).
+        t0 = clock()
         for i in range(reps):
             if not pending:
                 break
             for rel in list(pending):
-                if budget - (clock() - t0) <= 0:
+                left = budget - (clock() - t0)
+                if left <= 0:
                     out["budget_exhausted"] = True
                     break
                 obs: dict = {}
                 v = await _run_acceptance_file(
-                    st, caps, str(wt), rel, log_path,
+                    st, _budget_caps(caps, left), str(wt), rel, log_path,
                     f"acceptance-{label}-discover{i + 1}", cases_out=obs,
                     **_env_kw(env_extra))
+                if obs.get("resource") and budget - (clock() - t0) <= 0:
+                    # The budget, not the run, ended it: no evidence, and
+                    # the round is not one run.
+                    out["budget_exhausted"] = True
+                    break
                 if v is False and note(rel, obs):
                     pending.remove(rel)
                     out["found"].append(rel)
@@ -44721,6 +44746,16 @@ async def _acceptance_discover(st: "State", caps: dict, wt: Path,
             f"failing in {len(out['found'])} file(s) after "
             f"{out['repeats_run']} rerun round(s)")
     return out
+
+
+def _budget_caps(caps: dict, left: float) -> dict:
+    """`caps` with `worker_timeout_sec` lowered to `left` seconds of a B*
+    budget, so one rerun of a held-out file cannot outlast it (DESIGN §9
+    *Which failures are new*, step 2)."""
+    cap = float(caps.get("worker_timeout_sec",
+                         DEFAULT_CAPS["worker_timeout_sec"]))
+    # Callers pass `left > 0`; a non-positive budget is never run.
+    return {**caps, "worker_timeout_sec": min(cap, left)}
 
 
 def _env_kw(env_extra: dict | None) -> dict:
