@@ -45803,16 +45803,66 @@ async def _run_acceptance_gate(leerie_dir: Path, st: "State", caps: dict,
                                          efforts)
 
 
+async def _acceptance_remeasure_final(st: "State", caps: dict, staging: str,
+                                      sets: list[dict], sha: str,
+                                      label: str) -> bool:
+    """Measure every set on `sha` (staging's HEAD) and make that the gate's
+    `final` verdict, keyed `final_sha`, with its residual recomputed — no
+    repair round. False, the record left as it was, when no set could be
+    measured: the last measured verdict stands (DESIGN §8 *Held-out
+    acceptance tests*)."""
+    res = await _evaluate_acceptance_sets(st, caps, staging, sets, label,
+                                          rev=sha)
+    if not _acceptance_measured(res):
+        return False
+    acc = st.data.get("acceptance") or {}
+    g = dict(acc.get("gate") or {})
+    g["final"] = res
+    g["final_sha"] = sha
+    keep_rb = (g.get("residual") or {}).get("rollback_failed")
+    if _acceptance_any_fails(res):
+        g["residual"] = _acceptance_residual_of(res, sets)
+        if keep_rb:
+            g["residual"]["rollback_failed"] = True
+    elif keep_rb:
+        g["residual"] = {"failing_sets": 0,
+                         "total_sets": len(_acceptance_measured(res)),
+                         "cases": [], "rollback_failed": True}
+    else:
+        g.pop("residual", None)
+    acc["gate"] = g
+    st.data["acceptance"] = acc
+    st.save()
+    return True
+
+
 async def _run_acceptance_gate_inner(leerie_dir: Path, st: "State",
                                      caps: dict, models: dict,
                                      efforts: dict) -> None:
     """`_run_acceptance_gate`'s body."""
     acc = st.data.get("acceptance") or {}
     sets = acc.get("sets") or []
-    if not sets or (acc.get("gate") or {}).get("final") is not None:
+    if not sets:
         return
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not staging.is_dir():
+        return
+    done = acc.get("gate") or {}
+    if done.get("final") is not None:
+        # A finished gate's verdict is reused only on the commit it was
+        # measured on (DESIGN §8 *A finished verdict is reused only on the
+        # commit it was measured on*); on another HEAD the sets are measured
+        # again there, without a repair round — the repair budget was spent
+        # on the tree it repaired.
+        head = await _branch_head_sha(str(staging))
+        if head and done.get("final_sha") == head:
+            return
+        if head:
+            log("phase 5: acceptance gate — the recorded verdict is of "
+                f"{str(done.get('final_sha') or '(unknown)')[:12]}, not "
+                f"staging's HEAD {head[:12]}; re-measuring the sets there")
+            await _acceptance_remeasure_final(st, caps, str(staging), sets,
+                                              head, "gate-final-resume")
         return
     st.data["current_phase"] = "phase 5: acceptance gate"
     st.save()
@@ -48580,21 +48630,37 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
     pre-pass or recheck is reused when it judged this same commit; otherwise
     the judge runs again (items only — the contract stays with those
     passes). Writes `delivery_gate.items` (per item) and
-    `delivery_gate.unmet_final`. Advisory: never stops a run."""
+    `delivery_gate.unmet_final`. A recorded verdict is reused only while
+    `final_sha` is staging's HEAD; on any other commit it is dropped and
+    detection runs again (DESIGN §8 *A finished verdict is reused only on
+    the commit it was measured on*). Advisory: never stops a run."""
     if st.data.get("skip_coverage_check"):
         return
     items = st.data.get("required_items") or []
     if not items or not st.data.get("working_branch"):
         return
     gate = dict(st.data.get("delivery_gate") or {})
-    if "unmet_final" in gate:
-        log("phase 5: delivery detection already complete — skipping "
-            "(resume)")
-        return
     staging = (leerie_dir / "worktrees" / "staging").resolve()
     if not staging.is_dir():
         return
     sha = await _branch_head_sha(str(staging))
+    if "unmet_final" in gate and sha and gate.get("final_sha") == sha:
+        log("phase 5: delivery detection already complete on "
+            f"{sha[:12]} — skipping (resume)")
+        return
+    if "unmet_final" in gate:
+        # A verdict of another tree (a re-drive group kept before a crash
+        # moved HEAD): dropped before anything else, so a detection that
+        # fails below leaves no verdict rather than a stale one.
+        log("phase 5: delivery detection — the recorded verdict is of "
+            f"{str(gate.get('final_sha') or '(unknown)')[:12]}, not "
+            f"staging's HEAD {(sha or '(unreadable)')[:12]}; dropped, "
+            "detection runs again")
+        for k_ in ("unmet_final", "items", "final_sha", "final_judge",
+                   "falsifier"):
+            gate.pop(k_, None)
+        st.data["delivery_gate"] = gate
+        st.save()
     if not sha:
         log("  delivery detection skipped — staging HEAD unreadable")
         return
@@ -50347,6 +50413,9 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     head = await _branch_head_sha(str(staging))
     if not head:
         return
+    # The commit the detection verdict this pass routes from was measured
+    # on, read before any group moves HEAD.
+    det_sha = (st.data.get("delivery_gate") or {}).get("final_sha") or ""
     rec.setdefault("start_sha", head)
     rec.setdefault("rounds", [])
     rec.setdefault("pending_controls", [])
@@ -50801,35 +50870,26 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
     final = await _branch_head_sha(str(staging))
     if final and final != rec["start_sha"]:
         if all_sets:
-            res = await _evaluate_acceptance_sets(
-                st, caps, str(staging), all_sets, "redrive-final",
-                rev=final)
-            if _acceptance_measured(res):
-                acc = st.data.get("acceptance") or {}
-                g = dict(acc.get("gate") or {})
-                g["final"] = res
-                g["final_sha"] = final
-                keep_rb = (g.get("residual") or {}).get("rollback_failed")
-                if _acceptance_any_fails(res):
-                    g["residual"] = _acceptance_residual_of(res, all_sets)
-                    if keep_rb:
-                        g["residual"]["rollback_failed"] = True
-                elif keep_rb:
-                    g["residual"] = {"failing_sets": 0,
-                                     "total_sets": len(
-                                         _acceptance_measured(res)),
-                                     "cases": [], "rollback_failed": True}
-                else:
-                    g.pop("residual", None)
-                acc["gate"] = g
-                st.data["acceptance"] = acc
-                st.save()
+            await _acceptance_remeasure_final(st, caps, str(staging),
+                                              all_sets, final,
+                                              "redrive-final")
         await _run_ci_parity_final(leerie_dir, st, caps)
         if start_items and rechecked_sha != final:
             ver = await _redrive_recheck_items(
                 leerie_dir, st, caps, models, efforts, staging, start_items)
             _redrive_apply_item_verdicts(st, ver, final)
         rec["items_rechecked_sha"] = final
+        # The detection this pass routed from described the tree it started
+        # on, its routed items are now re-checked on `final` and every kept
+        # group's ratchet re-verified the met ones: the verdict is of
+        # `final`, so a resume keeps it instead of re-running detection
+        # (DESIGN §8 *A finished verdict is reused only on the commit it was
+        # measured on*). Any other start leaves the key as it was.
+        dg = st.data.get("delivery_gate")
+        if (isinstance(dg, dict) and "unmet_final" in dg and det_sha
+                and det_sha == head):
+            st.data["delivery_gate"] = {**dg, "final_sha": final}
+            st.save()
     rec["final_sha"] = final
     rec["done"] = True
     _save()

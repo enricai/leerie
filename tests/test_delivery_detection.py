@@ -1030,12 +1030,59 @@ class TestRunDeliveryDetection:
     def test_resume_skips_a_finished_detection(self, leerie, tmp_path,
                                                monkeypatch):
         repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch)
-        st.data["delivery_gate"]["unmet_final"] = []
+        st.data["delivery_gate"].update(unmet_final=[], final_sha=head)
         calls = _falsifier_stub(leerie, monkeypatch, st,
                                 lambda kw, n: _demonstrate(kw, n))
         asyncio.run(leerie._run_delivery_detection(
             st.run_dir, st, caps, MODELS, EFFORTS))
         assert calls == []
+        assert st.data["delivery_gate"]["unmet_final"] == []
+
+    def test_a_finished_detection_of_another_commit_runs_again(
+            self, leerie, tmp_path, monkeypatch):
+        # DESIGN §8 *A finished verdict is reused only on the commit it was
+        # measured on*: a recorded "all met" of a tree that no longer ships
+        # (a re-drive group moved HEAD before a crash) is not this tree's.
+        repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch,
+                                              k=1)
+        st.data["delivery_gate"].update(
+            unmet_final=[], final_sha="0" * 40, items=[{"item_index": 0,
+                                                        "verdict": "met"}])
+        calls = _falsifier_stub(leerie, monkeypatch, st,
+                                lambda kw, n: _demonstrate(kw, n))
+        asyncio.run(leerie._run_delivery_detection(
+            st.run_dir, st, caps, MODELS, EFFORTS))
+        gate = st.data["delivery_gate"]
+        assert [c["sid"] for c in calls if c["schema_key"] == "falsifier"
+                ] == ["falsifier-i0-s0", "falsifier-i3-s0"]
+        assert gate["final_sha"] == head
+        assert [u["item_index"] for u in gate["unmet_final"]] == [0]
+        assert [(r["item_index"], r["verdict"]) for r in gate["items"]] == [
+            (0, "unmet"), (1, "external"), (2, "met"), (3, "met")]
+        assert leerie._decide_outcome(st, any_commits=True) == "unconverged"
+        assert "1 required item(s) still unmet" in st.data["outcome_reasons"]
+
+    def test_a_stale_verdict_is_dropped_before_the_rerun(
+            self, leerie, tmp_path, monkeypatch):
+        # A re-run that fails leaves no verdict, never the other tree's.
+        repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch)
+        st.data["delivery_gate"].update(
+            unmet_final=[], final_sha="0" * 40, items=[],
+            final_judge={"source": "final"}, falsifier={"enabled": True})
+        st.save()
+
+        def boom(*a, **kw):
+            raise RuntimeError("record unreadable")
+        monkeypatch.setattr(leerie, "_delivery_record", boom)
+        with pytest.raises(RuntimeError):
+            asyncio.run(leerie._run_delivery_detection(
+                st.run_dir, st, caps, MODELS, EFFORTS))
+        on_disk = json.loads((st.run_dir / "state.json").read_text())
+        for gate in (st.data["delivery_gate"], on_disk["delivery_gate"]):
+            assert not {"unmet_final", "items", "final_sha", "final_judge",
+                        "falsifier"} & set(gate)
+            # The phase records of earlier trees stay.
+            assert gate["unmet_after"] == []
 
     def test_resume_reuses_finished_items_on_the_same_commit(
             self, leerie, tmp_path, monkeypatch):

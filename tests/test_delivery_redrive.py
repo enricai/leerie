@@ -901,6 +901,43 @@ def test_items_go_to_every_claimer_process_items_never(
     assert [u["item_index"] for u in left] == [1]
 
 
+@pytest.mark.parametrize("detected_on_start", [True, False])
+def test_rechecked_items_rekey_the_detection_verdict(
+        leerie, tmp_path, monkeypatch, detected_on_start):
+    # DESIGN §8 *A finished verdict is reused only on the commit it was
+    # measured on*: once the re-drive re-checked its routed items on the
+    # commit it ends on, `delivery_gate.final_sha` names that commit, so a
+    # resume's detection keeps the verdict `_decide_outcome` reads. A
+    # detection of another commit than the re-drive's start is not re-keyed.
+    items = [{"item": "a does X", "span": "S1", "verifiability": "tree"}]
+    unmet = [{"item_index": 0, "item": "a does X", "evidence": "missing",
+              "by": ["judge"]}]
+    w = World(leerie, tmp_path, n_sets=0, items=items, unmet=unmet,
+              claims={"s1": [{"item_index": 0, "kind": "deliverable"}]})
+    start = _git(w.staging, "rev-parse", "HEAD")
+    det = start if detected_on_start else "0" * 40
+    w.st.data["delivery_gate"]["final_sha"] = det
+    w.install(monkeypatch)
+    w.edits = [lambda w: w.write("export const a = 1; // done\n")]
+
+    async def fake_judge(task, its, staging, st, caps, models, efforts,
+                         phase_label, **kw):
+        return [], 1, None
+    monkeypatch.setattr(leerie, "_delivery_judge_unmet", fake_judge)
+    monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: "")
+    monkeypatch.setattr(leerie, "_delivery_typed_evidence",
+                        lambda *a, **k: ([], {}))
+    w.run()
+    final = _git(w.staging, "rev-parse", "HEAD")
+    assert final != start
+    gate = w.st.data["delivery_gate"]
+    assert gate["unmet_final"] == []
+    assert w.st.data["delivery_redrive"]["final_sha"] == final
+    assert gate["final_sha"] == (final if detected_on_start else det)
+    on_disk = json.loads((w.dir / "state.json").read_text())
+    assert on_disk["delivery_gate"]["final_sha"] == gate["final_sha"]
+
+
 def test_held_back_names_round(leerie, tmp_path, monkeypatch):
     w = World(leerie, tmp_path, n_sets=4)
     w.install(monkeypatch)

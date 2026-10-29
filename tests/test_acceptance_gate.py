@@ -3246,8 +3246,42 @@ def test_gate_is_resume_idempotent(leerie, tmp_path, monkeypatch):
     st = _st(leerie, tmp_path, repo, head, working_branch="main")
     _staging(st, repo)
     st.data["acceptance"] = {"sets": _make_sets(leerie, st, 1),
-                             "gate": {"final": []}}
+                             "gate": {"final": [], "final_sha": head}}
+    measured: list = []
+
+    async def no_eval(*a, **kw):
+        measured.append(a)
+        return []
+    monkeypatch.setattr(leerie, "_evaluate_acceptance_sets", no_eval)
     assert _run_gate(leerie, monkeypatch, st, _commit_fix) == []
+    assert measured == []
+    assert st.data["acceptance"]["gate"] == {"final": [], "final_sha": head}
+
+
+def test_a_finished_gate_of_another_commit_is_measured_again(
+        leerie, tmp_path, monkeypatch):
+    # DESIGN §8 *A finished verdict is reused only on the commit it was
+    # measured on*: a passing `final` of a tree that no longer ships (a
+    # re-drive group moved HEAD before a crash) is measured again on HEAD —
+    # with no repair round.
+    repo, head = _repo(tmp_path)
+    st = _st(leerie, tmp_path, repo, head, working_branch="main")
+    _staging(st, repo)
+    stale = [{"index": 1, "passed": True, "unmeasured": False,
+              "failing_files": []}]
+    st.data["acceptance"] = {"sets": _make_sets(leerie, st, 1),
+                             "gate": {"final": stale, "final_sha": "0" * 40,
+                                      "rounds": []}}
+    assert _run_gate(leerie, monkeypatch, st, _commit_fix) == []
+    gate = st.data["acceptance"]["gate"]
+    assert gate["final_sha"] == head
+    assert [(r["index"], r["passed"]) for r in gate["final"]] == [(1, False)]
+    assert gate["final"][0]["failing_files"] == ["acc/test_defect_1.py"]
+    assert gate["residual"]["failing_sets"] == 1
+    assert gate["rounds"] == []
+    leerie._decide_outcome(st, any_commits=True)
+    assert ("1 held-out acceptance set(s) still fail"
+            in st.data["outcome_reasons"])
 
 
 # --- cross-run residual, hiding, wiring --------------------------------------

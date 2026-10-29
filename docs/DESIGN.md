@@ -6976,6 +6976,36 @@ recorded for the tenth); of the 10 broken sets, 3 were stopped by gates
 (b), (c) and (d), 3 did not close, and 4 closed, each hand-reviewed in the
 bench.
 
+**A finished verdict is reused only on the commit it was measured on.** A
+resume skips a finalize-side gate that already finished, but "finished"
+says only that it ran on some tree: staging's HEAD can have moved since —
+a re-drive group kept before a crash moves it. So every verdict of the
+shipping tree carries the commit it describes, and a resume reuses it only
+while staging's HEAD is still that commit: final delivery detection
+(`delivery_gate.unmet_final`, keyed `final_sha`), the held-out acceptance
+gate's final verdict (`acceptance.gate.final`, keyed `final_sha`) and the
+repository's merge checks (`ci_parity.final.sha`). On any other HEAD the
+verdict is measured again there: detection runs whole (judge and
+falsifier), after dropping the old verdict so that a detection that fails
+leaves none rather than one of another tree; the acceptance gate measures
+every set on HEAD with no repair round, its repair budget having been
+spent on the tree it repaired (a HEAD where nothing can be measured keeps
+the last measured verdict, as at the end of the re-drive); the merge
+checks re-run. The re-drive's own verdict is re-keyed rather than
+re-measured: when the detection it routed from was of the commit it
+started on, and it has re-checked its routed items on the commit it ends
+on, `final_sha` becomes that commit — every kept group's ratchet already
+re-verified the items it did not route — so a resume after it keeps the
+verdict `_decide_outcome` reads instead of running detection over it.
+Until this rule, detection's skip read only the presence of `unmet_final`
+and the acceptance gate's only the presence of `final`: a resume after a
+re-drive group had moved the tree reused verdicts of a tree that no longer
+shipped. Records that describe an earlier tree on purpose are not
+shipping-tree verdicts and stay as they are: the delivery gate's
+`unmet_before` / `unmet_after` (the trees before and after the final
+conformer — detection reuses their `judged_*` only on that same sha) and
+the acceptance gate's pre-repair `initial`.
+
 **The CRITIC retry pattern's oscillation guard.** `_run_checked_loop` — the
 shared mechanical-feedback retry primitive behind the classifier,
 classification-gate, reconciler, provision, overlap-judge, and integrator
