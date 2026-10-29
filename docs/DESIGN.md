@@ -7000,6 +7000,44 @@ old tree and is marked stale: with no `new` a test-outcome part reads
 counts — the item stays unmet and the run `unconverged`, the outcome
 reason saying the failure was confirmed on an earlier tree.
 
+**The final diff describes the tree that ships, whatever moved it.** The
+re-drive's tail was the only place the diff was measured again, so it held
+only when the re-drive itself moved HEAD. Review round 7 drove two more
+ways the outcome came to describe a tree that does not ship. The final
+conformance takes the diff only after a round's own post-measurement, and
+a round that ends earlier — a worker error, a timeout, a malformed result,
+a protected-path or clobber rollback — takes none: on a real suite a
+regression the run introduced shipped `done` with an empty end-state
+section when round 0's worker raised. And the held-out acceptance gate's
+repair rounds commit to staging after the conformance: a kept repair left
+the diff of the tree before it, so a test the repair fixed still made the
+run `unconverged` ("newly failing on the final tree"), and a "no
+regressions" item read unknown on every run whose repair kept a commit.
+
+So the diff is a property of the shipping tree, not a side effect of a
+conformer round. Right after the acceptance gate (so detection and the
+re-drive route from the tree they judge) and again immediately before the
+outcome is decided, it is measured again whenever it is missing or of
+another tree than staging's; on the tree it already describes this costs
+nothing. Every row's test-outcome part is then re-read from it, as after a
+re-drive. When the `tests` axis cannot be measured there — the command did
+not run, staging has uncommitted changes, or no test command resolves for
+a run that had a diff — the old diff (if any) is kept and marked stale,
+and the gap is listed under "Needs human verification" ("Regression checks
+the run could not settle") whether or not a required item names the test
+outcome; a run with no test command and no diff has no regression check to
+miss and lists nothing. A final conformance round that breaks before its
+post-measurement still has its pre-measurement: when the tree has not moved
+since, that measurement's failing IDs are confirmed against the base there
+and then, instead of being thrown away. The places HEAD can move after the
+diff is measured are the final conformance's own commits and rollbacks
+(each round re-measures, and a round that broke is covered by the pre
+measurement or the refresh), the acceptance gate's repair rounds and
+rollbacks, and the re-drive's groups, rollbacks and leftover commits; the
+delivery recheck and detection are read-only on staging (the falsifier works
+in its own checkouts), CI parity runs in its own worktree, and finalize
+only verifies the branch.
+
 Measured. P8d (fresh cases, rules 1–5): every rollback restored the
 pre-group tree. Q3 (frozen L1, held-back names, 9 cases × up to 3
 samples): whole-set closure 18/24 within the two rounds of the shared

@@ -6369,7 +6369,8 @@ def _pr_needs_human(state: dict, in_pr: Callable[[str], bool]
             add("Task requirements", f"- [ ] {_pr_entry(e.get('item'))}")
         elif (e.get("source") in (REGRESSION_GAP_SOURCE,
                                   TEST_OUTCOME_GAP_SOURCE,
-                                  CONFIRM_BUDGET_GAP_SOURCE)
+                                  CONFIRM_BUDGET_GAP_SOURCE,
+                                  FINAL_DIFF_GAP_SOURCE)
               and _pr_entry(e.get("detail"))):
             add("Regression checks the run could not settle",
                 f"- [ ] {_pr_entry(e.get('detail'))}")
@@ -38946,6 +38947,7 @@ async def _measure_axes(tree: str, axes: dict[str, str], st: "State",
 
 REGRESSION_GAP_SOURCE = "regression_check"
 CONFIRM_BUDGET_GAP_SOURCE = "confirm_budget"
+FINAL_DIFF_GAP_SOURCE = "final_test_diff"
 
 
 def _set_confirm_budget_gap(st: "State", site: str,
@@ -38991,6 +38993,26 @@ def _set_regression_gap(st: "State", detail: str | None) -> None:
                        and e.get("source") == REGRESSION_GAP_SOURCE)]
     if detail:
         entries.append({"source": REGRESSION_GAP_SOURCE, "detail": detail})
+    if entries != (data.get("needs_human_verification") or []):
+        data["needs_human_verification"] = entries
+        with contextlib.suppress(Exception):
+            st.save()
+
+
+def _set_final_diff_gap(st: "State", detail: str | None) -> None:
+    """Record (`detail`) or clear (None) the "Needs human verification"
+    entry saying the failing-test-ID diff could not be measured on the tree
+    that ships (DESIGN §8 *Delivery re-drive*, *The final diff describes the
+    tree that ships*) — listed whether or not a required item names the test
+    outcome. One entry, the latest tree's."""
+    data = getattr(st, "data", None)
+    if not isinstance(data, dict):
+        return
+    entries = [e for e in (data.get("needs_human_verification") or [])
+               if not (isinstance(e, dict)
+                       and e.get("source") == FINAL_DIFF_GAP_SOURCE)]
+    if detail:
+        entries.append({"source": FINAL_DIFF_GAP_SOURCE, "detail": detail})
     if entries != (data.get("needs_human_verification") or []):
         data["needs_human_verification"] = entries
         with contextlib.suppress(Exception):
@@ -51680,38 +51702,94 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
         _resettle_test_outcome_rows(st, tree_sha)
 
 
-async def _redrive_refresh_test_id_diff(leerie_dir: Path, st: "State",
-                                        caps: dict, staging: Path) -> None:
-    """Measure the failing-test-ID diff again on the tree the delivery
-    re-drive ends on (DESIGN §8 *Delivery re-drive*): nothing recomputes
-    it otherwise, so a "no regressions" verdict, or a `new` count, would
-    describe the tree detection ran on. Nothing when no diff was recorded
-    or it is already of this tree; when the `tests` axis cannot be measured
-    the old diff is kept, marked `stale_for_tree`."""
+async def _refresh_test_id_diff(st: "State", caps: dict, staging: Path, *,
+                                log_path: Path, label: str,
+                                log_prefix: str) -> str | None:
+    """Measure the failing-test-ID diff again on staging's tree when it is
+    missing or of another tree (DESIGN §8 *Delivery re-drive*, *The final
+    diff describes the tree that ships*), and return that tree's sha (None
+    when staging has uncommitted changes). Nothing to do when the diff is
+    already of this tree, or when no test command resolves and no diff was
+    ever recorded (no regression check to miss). When the `tests` axis
+    cannot be measured — no command, a dirty tree, an unmeasured run — the
+    old diff is kept, marked `stale_for_tree`, and `_set_final_diff_gap`
+    lists the gap; a tree already tried (`stale_for_tree` is it) is not
+    measured twice."""
     diff = st.data.get("test_id_diff")
-    if not isinstance(diff, dict):
-        return
-    tree_sha = await _worktree_tree_sha(str(staging))
-    if not tree_sha or diff.get("tree_sha") == tree_sha:
-        return
+    diff = diff if isinstance(diff, dict) else None
     cmd = (resolve_blt(st.repo_root).get(_AXIS_CMD_KEY["tests"])
            or "").strip()
-    log_path = st.run_dir / "logs" / _REDRIVE_LOG
+    tree_sha = await _worktree_tree_sha(str(staging))
+    if diff is None and not cmd:
+        _set_final_diff_gap(st, None)
+        return tree_sha
+    if tree_sha and diff is not None and diff.get("tree_sha") == tree_sha:
+        _set_final_diff_gap(st, None)
+        return tree_sha
+    if tree_sha and diff is not None and diff.get("stale_for_tree") == tree_sha:
+        return tree_sha
     got = None
-    if cmd:
+    why = ""
+    if not cmd:
+        why = "no test command resolves for the repository"
+    elif not tree_sha:
+        why = ("the staging worktree has uncommitted changes, so the tree "
+               "that ships could not be identified")
+    else:
         post = await _measure_axes(
             str(staging), {"tests": cmd}, st, caps, log_path=log_path,
             verbosity=st.data.get("verbosity", VERBOSITY_DEFAULT),
-            label_prefix="redrive-final", log_prefix="delivery re-drive",
+            label_prefix=label, log_prefix=log_prefix,
             failing_ids_axes={"tests"})
         got = await _confirm_final_test_failures(
-            st, caps, str(staging), post, log_path=log_path,
-            label="redrive-final")
+            st, caps, str(staging), post, log_path=log_path, label=label)
+        if got is None:
+            summ = str(((post or {}).get("tests") or {}).get("summary")
+                       or "").strip()
+            why = ("the test command did not produce a measurement"
+                   + (f" ({summ[:200]})" if summ else ""))
     if got is None:
-        log("  delivery re-drive: the failing-test-ID diff could not be "
-            "measured on the final tree — kept, marked stale")
-        st.data["test_id_diff"] = {**diff, "stale_for_tree": tree_sha}
-        st.save()
+        log(f"  {log_prefix}: the failing-test-ID diff could not be measured "
+            f"on the tree that ships — {why}"
+            + ("; the old diff is kept, marked stale" if diff else ""))
+        if diff is not None and tree_sha:
+            st.data["test_id_diff"] = {**diff, "stale_for_tree": tree_sha}
+            st.save()
+        _set_final_diff_gap(
+            st, "failing-test-ID diff: not measured on the tree that ships "
+                f"— {why}; whether the run made an existing test fail is "
+                "unknown. Run the tests on the PR branch and compare with "
+                "the base.")
+    else:
+        _set_final_diff_gap(st, None)
+    return tree_sha
+
+
+async def _redrive_refresh_test_id_diff(leerie_dir: Path, st: "State",
+                                        caps: dict, staging: Path) -> None:
+    """The delivery re-drive's tail: the failing-test-ID diff measured again
+    on the tree it ends on (`_refresh_test_id_diff`)."""
+    await _refresh_test_id_diff(
+        st, caps, staging, log_path=st.run_dir / "logs" / _REDRIVE_LOG,
+        label="redrive-final", log_prefix="delivery re-drive")
+
+
+async def _refresh_shipping_test_id_diff(leerie_dir: Path, st: "State",
+                                         caps: dict, *, label: str) -> None:
+    """Phase 5's own refresh of the failing-test-ID diff on staging (DESIGN
+    §8 *The final diff describes the tree that ships*): after the acceptance
+    gate, and once more just before the outcome is decided. Every row's
+    test-outcome part is then re-read from the diff of that tree
+    (`_resettle_test_outcome_rows`). Advisory: never raises past its
+    caller's guard."""
+    staging = (leerie_dir / "worktrees" / "staging").resolve()
+    if not staging.is_dir():
+        return
+    tree_sha = await _refresh_test_id_diff(
+        st, caps, staging,
+        log_path=st.run_dir / "logs" / f"{label}.log", label=label,
+        log_prefix="phase 5")
+    _resettle_test_outcome_rows(st, tree_sha)
 
 
 def _redrive_key_text(key: str) -> str:
@@ -52371,9 +52449,17 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
     # diff (DESIGN §9 *Which failures are new*) refines it per round: when B*
     # confirms no new failing ID, a red `tests` axis is not this run's.
     clean_baseline = baseline
+    # A round that breaks before its post-measurement took no diff: its pre
+    # measurement is confirmed instead when the tree has not moved since
+    # (DESIGN §8 *The final diff describes the tree that ships*).
+    pre: dict[str, dict] | None = None
+    pre_tree: str | None = None
+    post_taken = False
 
     for c_round in range(caps["conformance_rounds"]):
         before_sha = await _branch_head_sha(str(staging))
+        post_taken = False
+        pre_tree = await _worktree_tree_sha(str(staging))
         pre = await _measure_final(c_round, "pre")
 
         # Build the per-round user prompt. Mirrors _run_conformer's shape
@@ -52544,6 +52630,7 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
         # Same measure-after-and-overwrite as the per-subtask phase: the
         # worker's self-reported axes stop being load-bearing here too.
         post = await _measure_final(c_round, "post")
+        post_taken = True
         res = _apply_measured_axes(res, post)
         last_res = res
         regressions = _round_axis_regressions(pre, post)
@@ -52585,6 +52672,16 @@ async def _run_final_conformance(leerie_dir: Path, st: State, caps: dict,
             break
         defect_feedback = (_format_final_defects_note(open_defects)
                            if open_defects else None)
+
+    if (pre is not None and not post_taken and pre_tree
+            and await _worktree_tree_sha(str(staging)) == pre_tree):
+        broke = await _confirm_final_test_failures(
+            st, caps, str(staging), pre,
+            log_path=leerie_dir / "logs" / f"final-conformer-r{c_round}.log",
+            label=f"final-r{c_round}-pre")
+        if broke is not None and broke.get("new"):
+            warnings.append(f"final conformer round {c_round}: "
+                            + _format_new_failing_ids(broke))
 
     if last_res is not None:
         warnings.extend(_summarize_residuals(last_res))
@@ -59793,6 +59890,15 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"acceptance gate raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
+    # Its repair rounds commit to staging: detection and the re-drive judge
+    # the tree the diff describes (DESIGN §8 *The final diff describes the
+    # tree that ships*).
+    try:
+        await _refresh_shipping_test_id_diff(leerie_dir, st, caps,
+                                             label="test-id-diff-acceptance")
+    except Exception as e:
+        log(f"failing-test-ID diff refresh raised {type(e).__name__}: {e} — "
+            "surfaced as advisory, finalize proceeds")
     # Final delivery detection (DESIGN §8 *Delivery detection*): the cited
     # judge OR a code-confirmed falsifier, on the tree that ships — after the
     # acceptance gate, whose results the falsifier gets as leads.
@@ -59817,6 +59923,16 @@ async def _run_phases(args, caps: dict, leerie_dir: Path, st: State,
     except Exception as e:
         log(f"delivery re-drive raised {type(e).__name__}: {e} — surfaced as "
             "advisory, finalize proceeds")
+    # The outcome reads the diff: it must be of the tree that ships, whatever
+    # moved HEAD since it was measured (DESIGN §8 *The final diff describes
+    # the tree that ships*). Nothing moves HEAD between here and the
+    # decision in phase_finalize.
+    try:
+        await _refresh_shipping_test_id_diff(leerie_dir, st, caps,
+                                             label="test-id-diff-final")
+    except Exception as e:
+        log(f"failing-test-ID diff refresh raised {type(e).__name__}: {e} — "
+            "surfaced as advisory, finalize proceeds")
     await phase_finalize(leerie_dir, st,
                         no_push=getattr(args, "no_push", False),
                         no_verify=getattr(args, "no_verify", False),

@@ -5156,6 +5156,7 @@ caller of the guard.
 | `_scoped_test_replacement(tree, st, canonical, hit, forbidden, *, log_prefix)` | Replaces a forbidden test command. Before `conformance._baseline.sha` exists it returns the unmeasured record `skip_kind: "scoped_at_final"`. Otherwise it computes `_changed_files(tree, base)`, then `_coupled_test_files(repo, HEAD, changed, globs)`, keeps the coupled files present in `tree`, and renders them with `_acceptance_cmd`. It returns `{command, scoped_replacement: {replaces, forbidden, files, coupled}}`. `_measure_axes` measures that command like any axis (memoised under its own key) and copies `scoped_replacement` onto the result. When no file is coupled (`forbidden_no_coupled_tests`), there is no scoped runner (`forbidden_no_scoped_runner`), or the scoped command is forbidden too (`forbidden_scoped_runner`), it returns an unmeasured record, logs a WARNING and calls `_set_regression_gap`. A successful replacement clears that gap. |
 | `_set_regression_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "regression_check", detail}` (`REGRESSION_GAP_SOURCE`): set from `detail`, removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_acceptance_unmeasured_lines(state)` | Pure. The "Needs human verification" lines for held-out sets the final tree left unmeasured (DESIGN §8 *A held-out set the final tree leaves unmeasured is never silent*): one per unmeasured `acceptance.gate.final` result — `set <k> (<files>): <why>`, from its `unmeasured_reason` / `unmeasured_files` codes through `ACCEPTANCE_UNMEASURED_WHY` (a result recorded before the codes existed reads "no verdict recorded") — one for valid sets with no `gate.final` at all, and one for `gate.final_unremeasured`. Sets typed broken and variant sets (bounded, no counted file) are skipped. `_pr_needs_human` lists them under "Held-out acceptance sets the run could not measure"; never read by `_decide_outcome`. |
+| `_set_final_diff_gap(st, detail)` | Keeps at most one `needs_human_verification` entry `{source: "final_test_diff", detail}` (`FINAL_DIFF_GAP_SOURCE`): set from `detail` by `_refresh_test_id_diff` when the failing-test-ID diff could not be measured on the tree that ships (`"failing-test-ID diff: not measured on the tree that ships — <why>; …"`), removed on None. `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_set_confirm_budget_gap(st, site, what)` | Keeps at most one `needs_human_verification` entry per `site` `{source: "confirm_budget", site, detail}` (`CONFIRM_BUDGET_GAP_SOURCE`), `detail` starting `"<site>: could not confirm within the budget: <what>"` (the first 10, then `(+N more)`); removed when `what` is empty. Sites: `"failing-test-ID diff"` (`_confirm_final_test_failures`, the unsettled candidates' files) and `"CI parity"` (`_run_ci_parity_final`, the unsettled check ids). `_pr_needs_human` lists it under "Regression checks the run could not settle". |
 | `_coupled_test_files(repo, rev, changed, globs=None, *, direct=False)` | The coupled tests: test file -> the changed production files its import closure reaches, sorted. Changed test files map to themselves (possibly `[]`). With `direct=True`, only test files that import a changed production file themselves count (no walk through other modules), and a changed test file is not coupled by itself: these are the import-coupled tests of the intermittent-regression rule. The closure is a reverse walk over `importers` of `_js_source_graph` and `_py_source_graph` at `rev`. The walk goes through non-test modules and stops at test files (`_is_test_case_file`). It never raises; an unreadable graph is logged and couples nothing. |
 | `_py_source_graph(repo, rev)` | The Python import graph at `rev` (`files`, `imp`, `importers`), cached in `_SOURCE_GRAPHS` under `(repo, "py:" + rev)`. Sources come from `_git_tree_sources(repo, rev, (".py",))`. `_py_module_index` maps every dotted suffix of a path's package parts to it. `_py_imports` reads `import` / `from … import` with `ast`: `from a import b` names `a.b` when that is a module, else `a`, and relative imports resolve against the importer's package. |
@@ -6245,6 +6246,33 @@ Test-ID plumbing for the failing-test-ID diff (E3):
   the round's `tests:` axis regression and treats `tests` as baseline-red
   for `_conformance_clean` — a failure B\* typed `resource_affected` is not
   this run's.
+- The final diff describes the tree that ships (DESIGN §8 *The final diff
+  describes the tree that ships*).
+  - `_run_final_conformance` keeps each round's `pre` measurement and the
+    tree it was taken on (`_worktree_tree_sha` before measuring); when the
+    last round broke before its `post` (WorkerError, timeout, malformed
+    result, protected-path or strict clobber rollback) and staging's tree
+    is still that one, `_confirm_final_test_failures(st, caps, staging,
+    pre, …, label="final-r<N>-pre")` is called on it, and a non-empty
+    `new` is added to the warnings (`_format_new_failing_ids`).
+  - `async _refresh_test_id_diff(st, caps, staging, *, log_path, label,
+    log_prefix) -> str | None` — returns staging's `_worktree_tree_sha`
+    (None when dirty). Nothing when no `tests` command resolves and no
+    `test_id_diff` was recorded, or the recorded diff's `tree_sha` is that
+    tree (both clear the gap), or its `stale_for_tree` is (already tried;
+    the gap stays). Otherwise, with a command and a clean tree, measures
+    `_measure_axes(staging, {"tests": cmd}, …, failing_ids_axes={"tests"})`
+    and `_confirm_final_test_failures`; when that gives None (or there is no
+    command, or the tree is dirty) an existing diff is kept with
+    `stale_for_tree: <tree sha>` and `_set_final_diff_gap` records why;
+    a measured diff clears the gap.
+  - `async _refresh_shipping_test_id_diff(leerie_dir, st, caps, *, label)`
+    — on `worktrees/staging` (nothing when absent): `_refresh_test_id_diff`
+    with `log_prefix="phase 5"`, then `_resettle_test_outcome_rows(st,
+    tree_sha)`. `_run_phases` calls it after `_run_acceptance_gate`
+    (`label="test-id-diff-acceptance"`) and after `_run_delivery_redrive`,
+    immediately before `phase_finalize` (`label="test-id-diff-final"`),
+    each under its own advisory `try`.
 - Final-tree loop exit and residual defects (DESIGN §9, final-tree pass:
   *An unfixed solution defect keeps the final loop going*).
   `_run_final_conformance` breaks only when `_conformance_clean(res,
@@ -7327,17 +7355,13 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `acceptance.gate.final` / `final_sha` and `residual`
   (`_acceptance_residual_of`) are rewritten, or kept when nothing measured;
   `_run_ci_parity_final` runs; `_redrive_refresh_test_id_diff(leerie_dir,
-  st, caps, staging)` re-measures the `tests` axis on staging
-  (`_measure_axes(…, {"tests": resolve_blt(repo_root)["test"]},
-  failing_ids_axes={"tests"})`) and recomputes `test_id_diff` through
-  `_confirm_final_test_failures` when the recorded diff's `tree_sha` is not
-  staging's — nothing when no diff was recorded; when the axis is not
-  measured the old diff is kept with `stale_for_tree: <tree sha>`; every
+  st, caps, staging)` calls `_refresh_test_id_diff` (below, *The final
+  diff describes the tree that ships*) with `label="redrive-final"`; every
   item still open at the start is re-checked unless that HEAD was already
   re-checked, and `delivery_gate.unmet_final` / `items[]` are rewritten
-  (`_redrive_apply_item_verdicts(st, verdicts, sha, tree_sha=None)`, which
-  re-reads a re-checked row's `test_outcome_part` from
-  `_test_outcome_verdict(st, tree_sha)` before settling it); then
+  (`_redrive_apply_item_verdicts(st, verdicts, sha, tree_sha)`, which
+  settles each re-checked row on its stored `test_outcome_part` and then,
+  given `tree_sha`, calls `_resettle_test_outcome_rows`); then
   `_resettle_test_outcome_rows(st, tree_sha)` re-reads every row's
   `test_outcome_part` the same way (a row the part alone made unmet, `by
   == ["test_id_diff"]`, is first restored to met), so no row carries
@@ -9736,7 +9760,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `baseline_failing_ids` | list[str] \| None | failing test IDs of the base tree's `tests` axis (`[]` when it passed; None when no structured report could be read). |
 | `final_failing_ids` | list[str] \| None | failing test IDs of the latest final-conformance `tests` measurement. |
 | `test_file_durations` | dict[str, float] \| absent | repo-relative test file → seconds, the newest measurement from any structured report leerie read (`_record_test_durations`); sizes intermittent discovery to its budget (DESIGN §9 *Sized to the budget*). |
-| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`), `stale_for_tree` (the shipping tree's sha) when the delivery re-drive moved HEAD and could not re-measure it (`_redrive_refresh_test_id_diff`), `sized_out` / `budget_short_unsettled_files` when the confirm budget left candidates unsettled (DESIGN §9 step 4; never counted, they read as the test outcome's `unknown`); `new` non-empty makes the outcome `unconverged`, and the reason says how many of them are `budget_short`. |
+| `test_id_diff` | dict | the latest B\* verdict on the final-vs-base failing-ID diff (`_confirm_new_failures`'s return value) plus `final_candidates`, `tree_sha`, `discovery` and `intermittent_regression` rows (evidence only), and `ids_unknown: true` when one side's failing IDs were unknown (no diff; only discovery's IDs were confirmed), and `base_unavailable: true` when the base worktree for the confirm could not be created (every candidate `no_verdict`), `stale_for_tree` (the shipping tree's sha) when staging's tree is not the diff's and the diff could not be measured on it (`_refresh_test_id_diff`: the re-drive's tail and phase 5's own refreshes), `sized_out` / `budget_short_unsettled_files` when the confirm budget left candidates unsettled (DESIGN §9 step 4; never counted, they read as the test outcome's `unknown`); `new` non-empty makes the outcome `unconverged`, and the reason says how many of them are `budget_short`. |
 | `subtask_status` | dict[str, str] | per-subtask terminal status |
 | `accepted_blocked` | dict[str, dict] | one entry per subtask waived via `leerie accept-blocked`, written by the LAUNCHER mutator rather than by the orchestrator: `{at, previous_status, blocker, forced}`. The `die()` that sends an operator to that verb says "See ... |
 | `blocked` | dict[str, str] | per-subtask blocker reason when a wave aborts |
@@ -9833,7 +9857,7 @@ user can flip it via CLI flag / env var / `leerie.toml` without editing state.
 | `leerie_versions` | list[dict] | append-only resume history (N38), distinct from the immutable `leerie_version`/`leerie_commit` pair above. |
 | `dep_capture_done` | bool | set to `True` in `state.json` by `capture_repo_deps` after a successful write. |
 | `requirement_coverage` | dict | the requirement-coverage gate's record, written by `phase_classify` (DESIGN §8 *Requirement coverage*): `{spans[{id, parent}], sections[{id, source}], reports[], closure[], holes{}}`. `spans`/`sections` are the IDs `_d1_split_spans`/`_d1_split_sections` assigned (no text); `parent` is the mechanical nesting link `_d1_judge_packs` groups by; `reports` the inlined report paths; `closure` the S/R ids `_d1_closure` derives; `holes` the residual `_d1_coverage_holes` findings after the check rounds (`{}` when none). |
-| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}`, plus `via` (the accepted-external predecessors) for a dependent settled without running — for a subtask settled `accepted_external` on an implementer's `external_precondition` or as such a dependent (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). A third source, `"regression_check"` (`{source, detail}`, at most one), comes from `_set_regression_gap`: the task forbids the test command, and its scoped replacement could not run on the latest measured tree. A fourth, `"test_outcome"` (`{source, detail}`, at most one), from `_set_test_outcome_gap`: required items decided by the failing-test-ID diff whose verdict was `unknown` at final delivery detection. A fifth, `"confirm_budget"` (`{source, site, detail}`, at most one per site), from `_set_confirm_budget_gap`: final-tree B\* candidates left `budget_short_unsettled`. |
+| `needs_human_verification` | list[dict] | items no in-container step can verify, for the PR's "Needs human verification" list: `[{source, item_index, item, span, source_ref}]`, `source` `"required_item"` for a `required_items` entry typed `verifiability: "external"` (written by `phase_classify`; never handed to the `delivery_judge`), and `source` `"blocker"` — `{source, subtask, resource, blocker}`, plus `via` (the accepted-external predecessors) for a dependent settled without running — for a subtask settled `accepted_external` on an implementer's `external_precondition` or as such a dependent (`_settle_accepted_external`; `phase_classify` rewrites only the `required_item` entries). A third source, `"regression_check"` (`{source, detail}`, at most one), comes from `_set_regression_gap`: the task forbids the test command, and its scoped replacement could not run on the latest measured tree. A fourth, `"test_outcome"` (`{source, detail}`, at most one), from `_set_test_outcome_gap`: required items decided by the failing-test-ID diff whose verdict was `unknown` at final delivery detection. A sixth, `"final_test_diff"` (`{source, detail}`, at most one), from `_set_final_diff_gap`: the failing-test-ID diff could not be measured on the tree that ships. A fifth, `"confirm_budget"` (`{source, site, detail}`, at most one per site), from `_set_confirm_budget_gap`: final-tree B\* candidates left `budget_short_unsettled`. |
 | `site_claims` | dict \| null | the site-claims record (DESIGN §5 *Every `fix` site is claimed*), written by `phase_plan` from the first-pass `bug-fixing` plan and rewritten over its leaves after decomposition: `{domain, sites[{site_id, file, symbol, auditor_kind, resolution, claims[{sid, kinds[]}], not_needed, status, surface_other}]}`, `status` one of `claimed`/`mismatch`/`not_needed`/`unclaimed` (`_site_claim_rows`); `surface_other` marks a site resting on an `other` kind, for the PR. Not written when there is no `bug-fixing` plan or the audit is inapplicable. Never gates. |
 | `domain_blocked` | list[dict] | every planner domain that exited `blocked`, `[{domain, blocker_kind, external_resource, gap}]` (`_settle_blocked_domains`; DESIGN §8 *A partially blocked plan is recorded*). Written after planning and again before scheduling; `[]` when none. A row typed `external_precondition` stops the run before execution. |
 | `process_constraints` | dict | the classifier's typed process constraints (DESIGN §9 *A command the task forbids*): `{forbidden_commands[], entries[{command, scope, evidence_quote, test_roots?, package_name?, derived_from?, votes}], dropped[{command, reason, evidence_quote}], draws{draws, crashed}}` from `_process_constraints` over the union of the classifier's and the `forbidden_command_extractor` samples' entries. A state written before scopes existed carries `{forbidden_commands[], evidence}`; `_forbidden_specs` reads that as `scope: "any"`. Read by `claude_p` (deny rules, notice, hook), `_measure_axes`, the plan strip and the planner ctx. |
