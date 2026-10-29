@@ -9377,6 +9377,15 @@ Three layers follow, each derived from that one list:
   config or state, which the matcher, running in the hook with no
   repository, does not read.
 
+  *A whole-suite run contains every selector's run.* A whole-suite forbid
+  whose own entry selects (`vitest run --project unit`, `cargo test -p
+  p1`, a derived entry of a script that runs one project) also hits the
+  runner's whole-suite run — the bare runner, flags only, or aimed at a
+  test root — since that run runs the selected part too. Before, such an
+  entry kept only its whole prefix, so the bare `vitest run` passed a
+  forbidden `vitest run --project unit` it contains. Another selector
+  (`--project e2e`) and a run naming files stay allowed.
+
   *A whole-suite forbid matches on the runner alone.* The extractor is told
   to return the repo's test command for a whole-suite forbid, and on every
   Go repo that is `go test ./...`. A prefix match on the whole entry then
@@ -9409,7 +9418,18 @@ Three layers follow, each derived from that one list:
   entry:
   - each test runner the body runs (`vitest run --coverage`); a body's
     other commands (`tsc --noEmit && vitest run`) are not forbidden,
-    because the task forbade the suite, not the type check;
+    because the task forbade the suite, not the type check. A body that
+    runs one runner several times (`vitest run --project unit && vitest
+    run --project e2e`) derives that runner's bare command instead
+    (`vitest`), with the environment its runs share: each run alone is a
+    part of what the script ran, and a part is scoped (*A selector reads
+    as scoped*), while the runner's whole-suite run contains every part.
+    Deriving each run as its own entry refused the parts and let the bare
+    `vitest run`, which runs both, through (round-5 review L1). Whether
+    the parts cover every project does not matter: the bare run contains
+    them either way. Nor could it be read: vitest 5 reads no workspace
+    file (its dist has none), so the project list lives in
+    `vitest.config.*`, a program the matcher does not run;
   - every other script whose resolved body runs a forbidden command
     (`test:ci` → `vitest run --coverage`), by name. A forbidden runner
     entry does the same, so a forbidden `vitest run` also forbids

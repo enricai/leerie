@@ -23520,18 +23520,26 @@ def _forbidden_command_hit(command: str,
             cmd, scope, roots = spec
             for forb, fenv in _forbidden_argvs_env(cmd):
                 forb = _forbidden_runner_canon(forb)
-                head, ops = (_forbidden_suite_head(forb)
-                             if scope == "whole_suite" else (forb, []))
+                heads = ([_forbidden_suite_head(forb)]
+                         if scope == "whole_suite" else [(forb, [])])
+                key = _forbidden_runner_key(forb)
+                if scope == "whole_suite" and key \
+                        and heads[0] == (forb, []) and len(forb) > len(key):
+                    # An entry whose own words select: the runner's
+                    # whole-suite run contains its run (DESIGN §9 *A
+                    # whole-suite run contains every selector's run*).
+                    heads.append((list(key), []))
                 for c, cenv in cands:
                     if not fenv <= cenv:
                         continue
                     c = _forbidden_runner_canon(c)
-                    if not _forbidden_prefix_match(c, head):
-                        continue
-                    if (scope == "any" or _forbidden_whole_suite_rest(
-                            c[len(head):], roots + ops,
-                            runner=_forbidden_runner(forb))):
-                        return cmd
+                    for head, ops in heads:
+                        if not _forbidden_prefix_match(c, head):
+                            continue
+                        if (scope == "any" or _forbidden_whole_suite_rest(
+                                c[len(head):], roots + ops,
+                                runner=_forbidden_runner(forb))):
+                            return cmd
     except Exception:
         return None
     return None
@@ -23740,10 +23748,20 @@ def _forbidden_script_derived(entries: list[dict],
         for e in entries:
             body = _resolve_pm_script(e["command"], repo_root)
             own = _forbidden_script_name(e["command"])
+            groups: dict[tuple[str, ...],
+                         list[tuple[list[str], frozenset[str]]]] = {}
             for argv, env in _forbidden_argvs_env(body) if body else []:
                 key = _forbidden_runner_key(argv)
-                if key is None:
-                    continue
+                if key is not None:
+                    groups.setdefault(key, []).append((argv, env))
+            for key, members in groups.items():
+                # One runner run several times: each run is a part of what
+                # the script ran, and the runner's bare command contains
+                # them all (DESIGN §9 *A forbidden package script forbids
+                # what it runs*).
+                argv, env = ((list(key), frozenset.intersection(
+                    *(m[1] for m in members))) if len(members) > 1
+                    else members[0])
                 if env and ((own is not None and own == canon) or not any(
                         k == key and not env <= renv
                         for name, rs in runs.items() if name != own

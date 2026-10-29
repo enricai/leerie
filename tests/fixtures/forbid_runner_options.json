@@ -3559,5 +3559,244 @@
     }
    }
   ]
+ },
+ "multi-run bodies": {
+  "_how": "Round-5 review L1. Real vitest 5.0.5 under real pnpm 11.21 through real bash, in a project with three vitest projects (unit: a b, e2e: c, slow: d) whose test files append a marker when loaded. `body` is the `test` script a whole-suite `pnpm test` forbid resolves; `body_ran` and `ran` are the markers `pnpm test` and `cmd` loaded. A command that loads everything the body did should be refused.",
+  "rows": [
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "npx vitest run",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run --project unit",
+    "ran": "ab"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run --project e2e",
+    "ran": "c"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run --project slow",
+    "ran": "d"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run --project unit --project e2e",
+    "ran": "abc"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run tests",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run tests/unit",
+    "ran": "ab"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run tests/unit/a.test.mjs",
+    "ran": "a"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run --project '*'",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "vitest run --reporter=dot",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit && vitest run --project e2e",
+    "body_ran": "abc",
+    "cmd": "pnpm exec vitest run --project e2e",
+    "ran": "c"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "npx vitest run",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run --project unit",
+    "ran": "ab"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run --project e2e",
+    "ran": "c"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run --project slow",
+    "ran": "d"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run --project unit --project e2e",
+    "ran": "abc"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run tests",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run tests/unit",
+    "ran": "ab"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run tests/unit/a.test.mjs",
+    "ran": "a"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run --project '*'",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "vitest run --reporter=dot",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit",
+    "body_ran": "ab",
+    "cmd": "pnpm exec vitest run --project e2e",
+    "ran": "c"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "npx vitest run",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run --project unit",
+    "ran": "ab"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run --project e2e",
+    "ran": "c"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run --project slow",
+    "ran": "d"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run --project unit --project e2e",
+    "ran": "abc"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run tests",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run tests/unit",
+    "ran": "ab"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run tests/unit/a.test.mjs",
+    "ran": "a"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run --project '*'",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "vitest run --reporter=dot",
+    "ran": "abcd"
+   },
+   {
+    "body": "vitest run --project unit; vitest run --project e2e; vitest run --project slow",
+    "body_ran": "abcd",
+    "cmd": "pnpm exec vitest run --project e2e",
+    "ran": "c"
+   }
+  ]
  }
 }
