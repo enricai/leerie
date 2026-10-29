@@ -7491,13 +7491,20 @@ cannot tell the fix from a copy of the test.
    deleted it with no entry anywhere but the group's record.
 2. *A copy elsewhere is recognised by a span of the test's source.* Each
    staged file is fingerprinted by its spans of `_HELDOUT_SPAN_LINES` (4)
-   consecutive source lines, each line normalised (whitespace trimmed and
-   collapsed, a line with no letter or digit skipped); a file shorter than
-   that is one span of all its lines. A span the group's starting commit
-   already contains is dropped: it is the repository's idiom, not the
-   test. A file holds the test's source when it holds one of the spans.
-   Why four: a value lives on one line, so any span of two or more lines
-   already needs code, not a value; an honest sibling test written in the
+   consecutive lines of code, each line normalised (whitespace trimmed and
+   collapsed, a line with no letter or digit skipped). A line that is only
+   a literal and punctuation — `"ERR_X",`, `42,`, `"key": 1,` — is a piece
+   of a value, not code, and is skipped on both sides: a value is
+   specification however many lines a formatter breaks it over, and the
+   fix has to contain it (review round 13 M1: a four-item list of error
+   codes in the test, defined the same way by the fix, was a four-line
+   span, so the honest fix was voided when committed and reverted when
+   not). A file shorter than four code lines is one span of all of them,
+   and one with fewer than two has none: one line is a value. A span the
+   group's starting commit already contains is dropped: it is the
+   repository's idiom, not the test. A file holds the test's source when
+   it holds one of the spans. Why four: a span of lines of code already
+   needs code, not a value; an honest sibling test written in the
    same idiom shares at most a short header with it (the framework import,
    the subject import, one client or fixture line — three lines), which a
    span of four does not match, while a copied case — its signature, its
@@ -7535,8 +7542,9 @@ deliberately copies a set out of the run directory with a shell command
 guarantee it) — rule 3 still voids such a group when it is a re-drive's
 and the copy keeps four lines intact; a copy reflowed line by line or
 re-rendered into another form (a coverage report's code frame with line
-numbers, a compiler's output); and a report that names the test's cases
-or path, which carries no source line — the case names are given to the
+numbers, a compiler's output); a copy whose only shared lines are the
+values, which is the specification; and a report that names the test's
+cases or path, which carries no source line — the case names are given to the
 implementer in a held-back round anyway.
 
 **A finished verdict is reused only on the commit it was measured on.** A

@@ -449,6 +449,93 @@ def test_a_copied_test_file_under_another_name_voids(leerie, tmp_path,
 
 
 # --------------------------------------------------------------------------
+# Review round 13 M1: a value the test asserts, broken by a formatter over
+# several lines, was a 4-line span, so the honest fix defining that value
+# was voided when committed and reverted when not. A literal-only line is
+# never in a span, and a span needs two code lines.
+
+CODES = ["ERR_QUANTITY_NOT_POSITIVE", "ERR_QUANTITY_EXCEEDS_STOCK",
+         "ERR_SKU_UNKNOWN_OR_RETIRED", "ERR_CURRENCY_MISMATCH_ON_CART"]
+VALUE_TEST = ("from mod import ERROR_CODES\n\n\n"
+              "def test_error_codes_are_stable():\n"
+              "    assert ERROR_CODES == [\n"
+              + "".join(f'        "{c}",\n' for c in CODES) + "    ]\n")
+VALUE_FIX = ("def f():\n    return 1\n\n\nERROR_CODES = [\n"
+             + "".join(f'    "{c}",\n' for c in CODES) + "]\n")
+
+
+def _value_setup(leerie, tmp_path, monkeypatch):
+    s = _repo(tmp_path, monkeypatch)
+    base = _git(s, "rev-parse", "HEAD")
+    held = tmp_path / "held"
+    (held / "tests").mkdir(parents=True)
+    (held / "tests" / "test_codes.py").write_text(VALUE_TEST)
+    staged = leerie._redrive_stage(s, [{
+        "index": 0, "dir": str(held),
+        "defect_files": ["tests/test_codes.py"]}])
+    assert staged
+    return s, base, staged, leerie._heldout_fingerprints(s, staged, base)
+
+
+def test_a_committed_fix_defining_a_multiline_value_is_kept(
+        leerie, tmp_path, monkeypatch):
+    """The reviewer's driver, committed side: `_history_heldout_hits` was
+    `['mod.py']`, voiding the group."""
+    s, base, staged, prints = _value_setup(leerie, tmp_path, monkeypatch)
+    assert prints                      # the test's code lines still count
+    (s / "mod.py").write_text(VALUE_FIX)
+    _git(s, "commit", "-qam", "add error codes")
+    leerie._redrive_unstage(s, staged, prints=prints)
+    assert leerie._history_heldout_hits(
+        s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == []
+
+
+def test_an_uncommitted_fix_defining_a_multiline_value_ships(
+        leerie, tmp_path, monkeypatch):
+    """The reviewer's driver, uncommitted side: `mod.py` was checked out
+    from HEAD and listed as `heldout`."""
+    s, base, staged, prints = _value_setup(leerie, tmp_path, monkeypatch)
+    before = (leerie._tracked_content(s), leerie._untracked_signatures(s))
+    (s / "mod.py").write_text(VALUE_FIX)
+    leerie._redrive_unstage(s, staged, prints=prints)
+    withheld: dict = {}
+    got = asyncio.run(leerie._redrive_commit_leftovers(
+        s, "r1 g0", *before, set(), prints=prints, withheld=withheld))
+    assert got == ["mod.py"] and withheld == {}
+    assert "ERROR_CODES" in _git(s, "show", "HEAD:mod.py")
+
+
+def test_a_copy_of_a_value_test_still_voids(leerie, tmp_path, monkeypatch):
+    """The other direction: dropping literal lines leaves the copied case's
+    code lines — import, signature, assertion — which still match."""
+    s, base, staged, prints = _value_setup(leerie, tmp_path, monkeypatch)
+    (s / "tests" / "test_mine.py").write_text(VALUE_TEST)
+    _git(s, "add", "tests/test_mine.py")
+    _git(s, "commit", "-qm", "mine")
+    leerie._redrive_unstage(s, staged, prints=prints)
+    assert leerie._history_heldout_hits(
+        s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
+            "tests/test_mine.py"]
+
+
+def test_literal_only_lines_are_not_code(leerie):
+    pieces = list(leerie._bytes_pieces(
+        b'"ERR_A",\n  42,\n0x1F, 3.5e-3,\nNone,\n"a": 1,\n'
+        b"assert ERROR_CODES == [\nkey: 'v',\nreturn 1\n]\n"))
+    assert pieces == [b"assert ERROR_CODES == [", b"key: 'v',",
+                      b"return 1"]
+
+
+def test_a_one_code_line_file_has_no_span(leerie, tmp_path):
+    held = tmp_path / "held"
+    held.mkdir()
+    (held / "t.py").write_text('X = [\n  "a",\n  "b",\n]\n')
+    assert leerie._heldout_fingerprints(
+        tmp_path, [{"set_index": 0, "dir": str(held), "files": ["t.py"],
+                    "made": []}], "") == {}
+
+
+# --------------------------------------------------------------------------
 # Review round 12 L1: fingerprinting is bounded and can never leave a hidden
 # test in staging.
 

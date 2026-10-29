@@ -7554,9 +7554,14 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   frozenset[bytes]]`: per staged file (its first `_HELDOUT_SOURCE_MAX =
   1 MiB`), its normalised lines (`_heldout_pieces(readline)`: pieces of at
   most `_HELDOUT_LINE_MAX = 4096` bytes, `\s+` collapsed to one space and
-  trimmed, kept only when they hold `[A-Za-z0-9]` and no NUL), and every
-  window of `_HELDOUT_SPAN_LINES = 4` of them — or one window of all of a
-  file with fewer — as a 16-byte `blake2b` digest (`_span_digest`), keyed
+  trimmed, kept only when they hold `[A-Za-z0-9]` and no NUL and, once
+  `_HELDOUT_LITERAL_RE` (quoted strings with an optional `r`/`b`/`u`/`f`
+  prefix, unterminated included; numbers; `True False None true false
+  null nil undefined`) is stripped, still hold `[A-Za-z_]` — a literal-only
+  line is never in a span, review round 13 M1), and every window of
+  `_HELDOUT_SPAN_LINES = 4` of them — or one window of all of a file with
+  fewer, when it has at least `_HELDOUT_SPAN_MIN = 2` — as a 16-byte
+  `blake2b` digest (`_span_digest`), keyed
   by window length; less every window found in the base: the files of
   `pre_sha` holding any of the lines (`git grep -l -z -I -F -f <temp
   pattern file> pre_sha --`), read through one `git cat-file --batch` up

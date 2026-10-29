@@ -51767,8 +51767,11 @@ def _redrive_exclude_clear(staging: Path, run_id: str) -> None:
 
 # A staged file is fingerprinted by its spans of this many consecutive
 # normalised source lines (DESIGN §8 *No line of a staged set's source
-# reaches history*, rule 2). A value the test asserts lives on one line, so
-# any span of two or more needs code; four, because an honest sibling test
+# reaches history*, rule 2). A line that is only a literal and punctuation
+# is not a line of code and is never in a span (`_heldout_pieces`), so a
+# value the test asserts — even one a formatter breaks over many lines —
+# is no span, and a span needs at least two code lines (review round 13
+# M1); four, because an honest sibling test
 # written in the same idiom shares at most a three-line header with it
 # (framework import, subject import, one client/fixture line), while a
 # copied case — signature, call, assertion and the line before it — is four.
@@ -51784,6 +51787,19 @@ _HELDOUT_SOURCE_MAX = 1 << 20
 _HELDOUT_BASE_SCAN_MAX = 64 << 20
 _HELDOUT_WS_RE = re.compile(rb"\s+")
 _HELDOUT_ALNUM_RE = re.compile(rb"[A-Za-z0-9]")
+# A span is at least this many code lines: one line is a value.
+_HELDOUT_SPAN_MIN = 2
+# What a value line is made of, stripped before asking whether a line holds
+# code: quoted strings (with any r/b/u/f prefix), numbers and the literal
+# keywords. Mechanical: source bytes, never prose.
+_HELDOUT_LITERAL_RE = re.compile(
+    rb"""(?<![A-Za-z0-9_])[rRbBuUfF]{0,2}(?:"(?:[^"\\]|\\.)*"?"""
+    rb"""|'(?:[^'\\]|\\.)*'?|`(?:[^`\\]|\\.)*`?)"""
+    rb"""|(?<![A-Za-z0-9_])(?:0[xXbBoO][0-9A-Fa-f_]+|[0-9][0-9_]*"""
+    rb"""(?:\.[0-9_]*)?(?:[eE][+-]?[0-9]+)?[jJnNlLuU]?)(?![A-Za-z0-9_])"""
+    rb"""|(?<![A-Za-z0-9_])(?:True|False|None|true|false|null|nil"""
+    rb"""|undefined)(?![A-Za-z0-9_])""")
+_HELDOUT_IDENT_RE = re.compile(rb"[A-Za-z_]")
 
 
 def _heldout_companion_patterns(rel: str) -> list[tuple[str, str]]:
@@ -51960,14 +51976,19 @@ def _redrive_unstage(staging: Path, staged: list[dict], *,
 def _heldout_pieces(read: Callable[[int], bytes]) -> Iterator[bytes]:
     """The normalised source lines `read` (a `readline(limit)`) yields: each
     piece of at most `_HELDOUT_LINE_MAX` bytes, whitespace trimmed and
-    collapsed, and only those holding a letter or a digit (a lone `}` or
-    `});` distinguishes nothing)."""
+    collapsed, and only those holding code: a letter or a digit (a lone `}`
+    or `});` distinguishes nothing) that is left once the line's literals
+    are stripped (`_HELDOUT_LITERAL_RE`) — a line like `"ERR_X",` or `42,`
+    is a piece of a value, which the barrier never covers (review round 13
+    M1)."""
     while True:
         raw = read(_HELDOUT_LINE_MAX)
         if not raw:
             return
         norm = _HELDOUT_WS_RE.sub(b" ", raw).strip()
-        if norm and b"\0" not in norm and _HELDOUT_ALNUM_RE.search(norm):
+        if (norm and b"\0" not in norm and _HELDOUT_ALNUM_RE.search(norm)
+                and _HELDOUT_IDENT_RE.search(
+                    _HELDOUT_LITERAL_RE.sub(b"", norm))):
             yield norm
 
 
@@ -52008,7 +52029,8 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
     """The spans of source that identify the staged files (DESIGN §8 *No
     line of a staged set's source reaches history*, rule 2), keyed by span
     length: every window of `_HELDOUT_SPAN_LINES` consecutive normalised
-    lines of each staged file, or one window of all of a shorter file's,
+    code lines (`_heldout_pieces`) of each staged file, or one window of
+    all of a shorter file's when it has at least `_HELDOUT_SPAN_MIN`,
     less every window `base_rev`'s tree already contains — a span the
     repository has is its idiom, not the test. The base's candidates are
     found by `git grep -l -F -f <file>` over the files' lines (a pattern
@@ -52026,7 +52048,7 @@ def _heldout_fingerprints(staging: Path, staged: list[dict],
                 continue
             lines = list(_bytes_pieces(data))
             n = min(_HELDOUT_SPAN_LINES, len(lines))
-            if not n:
+            if n < _HELDOUT_SPAN_MIN:
                 continue
             spans.setdefault(n, set()).update(_span_digests(lines, [n])[n])
             lines_all.update(lines)
