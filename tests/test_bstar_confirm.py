@@ -357,6 +357,37 @@ def test_a_shortfall_never_overrides_disagreeing_evidence(leerie):
     assert v["resource_affected"] == ["x"]
 
 
+def test_a_no_verdict_base_rerun_in_the_cut_pair_is_not_a_budget_shortfall(
+        leerie):
+    """DESIGN §9 *Which failures are new*, step 4: a candidate is decided
+    on what finished only when none of its reruns ended with no verdict for
+    a reason other than the budget. Here the cut pair's base rerun ends
+    early with no report (not a budget cut: the budget is not spent), then
+    the budget cuts the final side. Before review round 6 D-L3 that base
+    rerun was dropped with the cut pair and the candidate read `new` on the
+    one finished pair; it is mixed evidence, `resource_affected`."""
+    clock = _Clock()
+    bases = iter([(400.0, set()), (100.0, None)])
+    finals = iter([(400.0, {"x"}), (1000.0, None)])
+
+    async def base(timeout):
+        cost, r = next(bases)
+        clock.t += cost
+        return r
+
+    async def final(timeout):
+        cost, r = next(finals)
+        clock.t += min(cost, timeout)
+        return r
+    v = asyncio.run(leerie._confirm_new_failures(
+        ["x"], base, final, _caps(leerie), label="t", read_psi=lambda: 0.0,
+        sleep=clock.sleep, clock=clock, seen_failing=True))
+    assert v["budget_exhausted"] is True and v["pairs_run"] == 1
+    assert v["new"] == [] and v["budget_short"] == []
+    assert v["budget_short_unsettled"] == []
+    assert v["resource_affected"] == ["x"]
+
+
 @pytest.mark.parametrize("seen_failing,confirmed", [(True, ["x"]),
                                                     (False, [])])
 def test_still_failing_confirms_a_budget_short_vote_only_when_seen(

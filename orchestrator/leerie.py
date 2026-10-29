@@ -39254,6 +39254,9 @@ async def _confirm_new_failures(
         # can only refute `new`, never make a pair.
         cut_base: set[str] = set()
         cut_final_passed: set[str] = set()
+        # The cut pair's base rerun ended with no verdict before the budget
+        # did: a no-verdict run, not part of the cut (step 4).
+        cut_pair_no_verdict = False
         for _ in range(k):
             pair: list[set[str] | None] = []
             cut = False
@@ -39281,13 +39284,15 @@ async def _confirm_new_failures(
                 out["budget_exhausted"] = True
                 if pair and pair[0] is not None:
                     cut_base = set(pair[0])
+                elif pair:
+                    cut_pair_no_verdict = True
                 break
             base_runs.append(pair[0])
             final_runs.append(pair[1])
         out["pairs_run"] = len(base_runs)
         complete = (len(base_runs) == k
                     and all(r is not None for r in base_runs + final_runs))
-        budget_only = (out["budget_exhausted"]
+        budget_only = (out["budget_exhausted"] and not cut_pair_no_verdict
                        and all(r is not None
                                for r in base_runs + final_runs))
         for cid in cand:
