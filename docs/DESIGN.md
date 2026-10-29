@@ -9702,11 +9702,33 @@ nothing, so a source file can never reach the direct form, where it would
 mean something else. A repo may declare the direct form as
 `test_files_scoped`; otherwise a declared `test_scoped` serves both kinds
 as written (`related` over a test file still runs that test, only slower),
-and only then are the inferred forms used. Vitest's positionals are
-case-insensitive substring filters over the included test files, not
-paths: `vitest run src/a.test.ts` also runs a `x/src/a.test.ts`, which
-`related` would not — a file whose whole repo-relative path recurs inside
-another's. jest's `--runTestsByPath` matches exactly. The forbidden-command
+and only then are the inferred forms used. The direct form must still
+run exactly the files it names, and vitest's does not by itself: its
+positionals are case-insensitive substring filters over each test file's
+path relative to its project root, with no option for exact selection, so
+`vitest run src/a.test.ts` also runs `src/a.test.tsx`, `pkg/src/a.test.ts`
+and `SRC/A.test.ts.d/z.test.ts`. Every caller's verdict reads the whole
+run — the exit code, or every case in the report — so such a file's
+failure decided the named file's verdict: driven against real vitest
+4.1.11 with passing named files and failing colliders, the acceptance
+placement and falsifier runs (exit code and per-case), a B* capture's
+failing IDs, and the coupled-replacement and self-check commands all read
+red. Leerie's own operand is not where the collision comes from — the
+writer's acceptance path, an existing repo test — so the root is the
+command: `_acceptance_cmd` lists every file in the tree the command runs
+in that vitest's rule would also select (an over-approximation, taking
+every shared ancestor as a possible project root, that can only drop
+files nobody named) and excludes each by its own escaped absolute path
+(`--exclude`, added to the configured excludes). jest's `--runTestsByPath`
+already matches exactly. When the flags cannot be placed as vitest's own
+last arguments (a package-manager script call, a pipe after it) and a
+collider exists, there is no command at all, never one that runs more than
+it names. The listing skips what vitest's default exclude skips
+(`node_modules`, `.git`), which keeps it at 0.08 s on barnacle's 61k-file
+tree instead of 1.1 s; re-measured there with a planted collider, five
+interleaved runs each, `vitest run <file>` took a median 1.99 s (wrong
+verdict: 1 failed, 1 passed), the rendered command 2.00 s (1 passed), and
+`related` about 18 s. The forbidden-command
 gate (*A command the task forbids*) reads both forms as scoped: `run` is a
 suite subcommand it drops, leaving the files as operands, and
 `--runTestsByPath` takes no value, so the files stay operands; with no

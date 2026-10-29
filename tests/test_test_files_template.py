@@ -183,3 +183,111 @@ def test_only_the_diff_proxy_reads_the_affected_template(leerie):
                 callers.add(fn.name)
     assert callers == {"_run_conformance_phase", "phase_execute",
                        "resolve_test_files_scoped"}, callers
+
+
+# --------------------------------------------------------------------------
+# vitest's positionals are substring filters: the direct form must still run
+# exactly the named files (DESIGN §9 *Operands that are already test files
+# take the runner's direct form*). Driven against real vitest 4.1.11 before
+# this was fixed, a passing named file read as failing at every executing
+# call site, because a failing file whose path contained it also ran.
+# --------------------------------------------------------------------------
+
+def _colliding_repo(tmp_path: Path, toml: str | None = None) -> Path:
+    root = _repo(tmp_path, "vitest.config.ts", toml)
+    for rel in ("src/a.test.tsx",               # a prefix of another name
+                "pkg/src/a.test.ts",            # the whole path, deeper
+                "SRC/A.test.ts.d/z.test.ts",    # case-insensitive, a dir
+                "x/app/[id]/p.test.ts",         # glob metacharacters
+                "node_modules/m/src/a.test.ts",  # vitest's default exclude
+                "src/b.test.ts"):               # contains no named path
+        (root / rel).parent.mkdir(parents=True, exist_ok=True)
+        (root / rel).write_text("\n")
+    (root / "app" / "[id]").mkdir(parents=True)
+    (root / "app" / "[id]" / "p.test.ts").write_text("\n")
+    return root
+
+
+def test_colliders_are_the_files_vitest_would_also_select(leerie, tmp_path):
+    root = _colliding_repo(tmp_path)
+    assert leerie._vitest_filter_colliders(root, ["src/a.test.ts"]) == [
+        "SRC/A.test.ts.d/z.test.ts", "pkg/src/a.test.ts", "src/a.test.tsx"]
+    # A named file is never excluded, even when another named one would
+    # select it.
+    assert leerie._vitest_filter_colliders(
+        root, ["src/a.test.ts", "src/a.test.tsx"]) == [
+        "SRC/A.test.ts.d/z.test.ts", "pkg/src/a.test.ts"]
+
+
+def test_the_direct_form_excludes_each_collider_by_escaped_path(
+        leerie, tmp_path):
+    root = _colliding_repo(tmp_path)
+    st = _st(root)
+    real = __import__("os").path.realpath(root)
+    got = leerie._acceptance_cmd(st, ["app/[id]/p.test.ts"], str(root))
+    assert got == ("npx vitest run 'app/[id]/p.test.ts' --passWithNoTests "
+                   f"--exclude '{real}/x/app/\\[id\\]/p.test.ts'"), got
+    got = leerie._acceptance_cmd(st, ["src/a.test.ts"], str(root))
+    excluded = got.split(" --passWithNoTests ")[1].split()
+    assert excluded == [
+        "--exclude", f"{real}/SRC/A.test.ts.d/z.test.ts",
+        "--exclude", f"{real}/pkg/src/a.test.ts",
+        "--exclude", f"{real}/src/a.test.tsx"], got
+    # No collider: the command is the bare direct form.
+    assert leerie._acceptance_cmd(st, ["src/b.test.ts"], str(root)) == (
+        "npx vitest run src/b.test.ts --passWithNoTests")
+    # The exclusions keep the command scoped under a whole-suite forbid.
+    assert leerie._forbidden_command_hit(got, VITEST_SUITE) is None
+
+
+def test_the_tree_the_command_runs_in_decides_the_colliders(leerie,
+                                                            tmp_path):
+    """The collider exists only in the tree passed, never in the repo."""
+    root = _repo(tmp_path / "r", "vitest.config.ts")
+    tree = _colliding_repo(tmp_path / "t")
+    st = _st(root)
+    assert "--exclude" not in leerie._acceptance_cmd(st, ["src/a.test.ts"])
+    assert "--exclude" in leerie._acceptance_cmd(st, ["src/a.test.ts"],
+                                                 str(tree))
+
+
+@pytest.mark.parametrize("template,colliding,expect", [
+    # The operator's `related` form resolves paths, never filters them.
+    ("npx vitest related --run {test_files}", True, "as_is"),
+    # Through a package script vitest still filters, but leerie cannot put
+    # flags on vitest's own arguments: no command rather than a wider one.
+    ("pnpm run test -- {test_files}", True, None),
+    ("pnpm run test -- {test_files}", False, "as_is"),
+    # A wrapper that execs the runner still receives the flags last.
+    ("./db.sh npx vitest run {test_files}", True, "excluded"),
+    # A pipe after the runner: the flags would not reach vitest.
+    ("npx vitest run {test_files} | tee out", True, None)])
+def test_exactness_or_no_command(leerie, tmp_path, template, colliding,
+                                 expect):
+    toml = f"test_files_scoped = {template!r}\n".replace("'", '"')
+    root = (_colliding_repo(tmp_path, toml) if colliding
+            else _repo(tmp_path, "vitest.config.ts", toml))
+    (root / "package.json").write_text(
+        '{"scripts": {"test": "vitest run"}}\n')
+    got = leerie._acceptance_cmd(_st(root), ["src/a.test.ts"], str(root))
+    rendered = template.replace("{test_files}", "src/a.test.ts")
+    if expect == "as_is":
+        assert got == rendered
+    elif expect == "excluded":
+        assert got.startswith(rendered + " --exclude "), got
+    else:
+        assert got is None
+
+
+def test_acceptance_file_runs_only_the_named_file(leerie, tmp_path,
+                                                  monkeypatch):
+    """Call site `_run_acceptance_file`, executed: the launched command
+    carries the exclusions, so a colliding file's failure cannot decide the
+    named file's verdict."""
+    root = _colliding_repo(tmp_path)
+    ran = _capture_runs(leerie, monkeypatch)
+    asyncio.run(leerie._run_acceptance_file(
+        _st(root), dict(leerie.DEFAULT_CAPS), str(root), "src/a.test.ts",
+        tmp_path / "l.log", "t"))
+    assert len(ran) == 1 and "/pkg/src/a.test.ts" in ran[0], ran
+    assert ran[0].count("--exclude ") == 3, ran

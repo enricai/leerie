@@ -45601,7 +45601,7 @@ async def _acceptance_parse_probe(st: "State", caps: dict, tree: str,
     Returned with a short reason for the log. Short of True, the
     declaration is not honoured."""
     probe = _acceptance_probe_rel(st, test_rel)
-    cmd = _acceptance_cmd(st, [probe])
+    cmd = _acceptance_cmd(st, [probe], tree)
     if cmd is None:
         return None, "no test command here could run the parse check"
     try:
@@ -45706,7 +45706,122 @@ def _acceptance_cmd(st: "State", files: list[str],
         if not names:
             return None
         rendered += " -run " + shlex.quote("^(" + "|".join(names) + ")$")
-    return rendered
+    return _vitest_exact_selection(rendered, files, tree or st.repo_root)
+
+
+# Glob metacharacters picomatch reads in a vitest `--exclude` pattern. A
+# path is a mechanical string (DESIGN §12); escaping each makes the pattern
+# the one literal path (Next.js `app/[id]/`, `app/(group)/`).
+_VITEST_GLOB_META_RE = re.compile(r"([\\*?\[\]{}()!+@|])")
+# vitest subcommands whose positionals are NOT run as test-file filters:
+# `related` takes paths for its module graph, `bench` runs benchmarks, and
+# `init` and `list` run nothing. Every other form (`run`, `watch`, `dev`,
+# none) filters.
+_VITEST_NON_FILTER_SUBCOMMANDS = frozenset({"related", "bench", "init",
+                                            "list"})
+
+
+def _vitest_filter_selects(named: tuple[str, ...],
+                           path: tuple[str, ...]) -> bool:
+    """Whether vitest's positional filter `named` (path parts, relative to
+    the tree) selects the test file `path`, under its own rule (vitest 1-4,
+    `TestProject.filterFiles`): the candidate's path relative to its
+    project's root, lower-cased, contains the filter lower-cased, either as
+    given or made relative to that root. The root is unknown here, so every
+    ancestor `path` shares with `named` stands in for one: an
+    over-approximation that can only exclude more files nobody named."""
+    for k in range(min(len(named), len(path))):
+        if named[:k] != path[:k]:
+            break
+        if "/".join(named[k:]).lower() in "/".join(path[k:]).lower():
+            return True
+    return False
+
+
+def _vitest_filter_colliders(tree: str | Path, files: list[str]) -> list[str]:
+    """Every file under `tree` that vitest would also run for the named
+    `files`, which are never among them: vitest reads each positional as a
+    case-insensitive substring of a path, so `src/a.test.ts` also selects
+    `src/a.test.tsx` and `pkg/src/a.test.ts`. The walk skips what vitest's
+    own default exclude skips (`**/node_modules/**`, `**/.git/**`) and does
+    not follow a symlinked directory: walking `node_modules` would cost
+    about 1.1 s per render on barnacle (58k of its 61k files), against
+    0.08 s without it."""
+    named = {os.path.normpath(f) for f in files}
+    parts = [tuple(Path(f).parts) for f in named]
+    # A file vitest selects contains a named file's basename in one of its
+    # own path components (a basename has no `/`), so only those are
+    # checked in full.
+    bases = {p[-1].lower() for p in parts}
+    out: list[str] = []
+    for dirpath, dirnames, filenames in os.walk(tree):
+        dirnames[:] = [d for d in dirnames
+                       if d not in (".git", "node_modules")]
+        rel_dir = os.path.relpath(dirpath, tree)
+        dir_hit = any(b in rel_dir.lower() for b in bases)
+        for name in filenames:
+            if not dir_hit and not any(b in name.lower() for b in bases):
+                continue
+            rel = os.path.normpath(os.path.join(rel_dir, name))
+            if rel in named:
+                continue
+            here = tuple(Path(rel).parts)
+            if any(_vitest_filter_selects(p, here) for p in parts):
+                out.append(rel)
+    return sorted(out)
+
+
+def _vitest_filter_form(cmd: str, files: list[str], tree: str | Path) -> bool:
+    """Whether `cmd` hands `files` to vitest as positional filters: vitest
+    named in it, its first word after that not an option and not one of
+    `_VITEST_NON_FILTER_SUBCOMMANDS` (an option's value read as that word
+    errs toward filtering, the side on which exclusions only drop files
+    nobody named), or a package-manager script call whose body
+    (`_runner_command`) runs vitest, which then receives the files."""
+    scanned = _shell_scan(cmd)
+    if scanned is None:
+        return _runner_command(cmd, tree, ("vitest",), files)[1] is not None
+    tokens = scanned[0]
+    at = _runner_positions(tokens, "vitest", files)
+    if not at:
+        return _runner_command(cmd, tree, ("vitest",), files)[1] is not None
+    for k, t, d in tokens[max(at) + 1:]:
+        if k != "word" or d != 0 or t.startswith("-"):
+            continue
+        return t not in _VITEST_NON_FILTER_SUBCOMMANDS
+    return True
+
+
+def _vitest_exact_selection(cmd: str, files: list[str],
+                            tree: str | Path) -> str | None:
+    """`cmd`, made to run exactly the named `files` when it hands them to
+    vitest as filters (DESIGN §9 *Operands that are already test files take
+    the runner's direct form*). vitest has no exact file selection: a
+    positional is a substring filter, so one named file can also run every
+    file whose path contains it, and that file's failures then decide the
+    verdict. Each such file in `tree` (`_vitest_filter_colliders`) is
+    excluded by its own escaped absolute path (`--exclude`, which vitest adds
+    to its configured excludes). None when there are some and the flags
+    cannot be placed as vitest's own last arguments (`_append_runner_flags`;
+    a package-manager script call, a pipe after it): no command then, never
+    one that runs more than it names. Any other command is returned as is."""
+    if not _vitest_filter_form(cmd, files, tree):
+        return cmd
+    colliders = _vitest_filter_colliders(tree, files)
+    if not colliders:
+        return cmd
+    root = os.path.realpath(tree)
+    flags = " ".join(
+        "--exclude " + shlex.quote(_VITEST_GLOB_META_RE.sub(
+            r"\\\1", os.path.join(root, c)))
+        for c in colliders)
+    placed = _append_runner_flags(cmd, "vitest", files, flags)
+    if placed is None:
+        log(f"  WARNING: `{cmd}` would also run {len(colliders)} file(s) "
+            f"whose path contains a named one ({colliders[0]}"
+            f"{', …' if len(colliders) > 1 else ''}) and the exclusions "
+            "cannot be placed on vitest's own arguments — not run")
+    return placed
 
 
 # A top-level Go test function (`func TestX(t *testing.T)`): Go source is a
