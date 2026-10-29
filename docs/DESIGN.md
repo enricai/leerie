@@ -10238,10 +10238,10 @@ failure new / does this set still fail" verdict uses:
    leaves 1580 s, and the regression is rerun and confirmed new. When the
    estimates are right, a file the first pass left out can never get its
    pair after the first pass's one pair either — the start-up is paid once
-   more by the extra pass — so on the reviewer's own durations the
-   regression file stays sized out, by arithmetic, under any order: (300 +
-   600 + 10) × 2 = 1820 and (300 + 10) × 2 + (600 + 10) × 2 = 1840 both
-   exceed 1800.
+   more by the extra pass — so on the reviewer's own durations no order
+   reruns both files: (300 + 600 + 10) × 2 = 1820 and (300 + 10) × 2 +
+   (600 + 10) × 2 = 1840 both exceed 1800, and putting the regression file
+   first only sizes the flake file out instead.
 3. *Verdict.* An ID is **new** only if it failed on every final rerun and
    passed on every base rerun. An ID that failed on every one of the `k`
    base reruns, each of which produced a report, is **`pre_existing`**: the
@@ -10311,8 +10311,13 @@ failure new / does this set still fail" verdict uses:
      left (sized out); a discovery find whose pairs the budget cut short
      of `k` (never new on a shortfall, above); or a candidate with no
      known file, whose whole-command reruns the budget cut. Rerunning
-     such a candidate with priority inside the group was rejected. For a
-     sized-out file priority buys nothing — its pair still does not fit.
+     such a candidate with priority inside the group was rejected. A
+     sized-out file can fit when it goes first — files of 400, 400 and
+     800 s at a budget of 1800 s size the 800 s file out in rank order,
+     and put first its pair fits — but only by sizing out files ranked
+     before it, whose evidence is equal or stronger: priority moves the
+     shortfall onto them, it does not remove it, and the shipping-tree
+     diff reruns whatever stays unsettled with a fresh budget.
      With no known file the whole command reruns every candidate at once,
      so there is nothing to put first. A discovery find's file could get
      its missing pairs only by taking them from the files of the
