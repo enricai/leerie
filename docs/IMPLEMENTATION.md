@@ -7105,7 +7105,16 @@ readable staging HEAD, or when `delivery_gate.unmet_final` exists.
   run's own; a pass over some items passes `only=<indices>`
   (`_redrive_recheck_items` does — review round 14 M4), and
   `routing["human_verification"]` lists them
-  (`tests/test_record_worker_only.py`).
+  (`tests/test_record_worker_only.py`). With `item_details`, each such
+  item's detail carries `worker_only: true`. Every reader treats it as
+  `unknown`, never met (review round 14 claims M1, execution L3):
+  `_run_delivery_detection` writes its row `{verdict: "unknown", by: [],
+  reason: "its only evidence is a command a worker ran …"}` (when no
+  falsifier or other check made it unmet); `_ratchet_prior_met_all`'s
+  judged-record branch leaves a `worker_only` detail out; and
+  `_redrive_recheck_items` passes a `routing` dict and returns `{unmet:
+  False, unknown: True, …}` for an item it lists, which
+  `_redrive_apply_item_verdicts` writes as `verdict: "unknown"`.
 - **Test outcomes** (DESIGN §8 *A test outcome is the failing-test-ID
   diff's to settle*). `_test_outcome_verdict(st, tree_sha)` →
   `{verdict: met | unmet | unknown, new[], reason}` from `state.data

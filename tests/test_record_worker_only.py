@@ -165,3 +165,72 @@ def test_the_rerun_surface_is_gone(leerie):
     for name in ("_rerun_worker_command", "_rerun_record_citations",
                  "_rerunnable_argv", "_rerun_allowed_argvs"):
         assert not hasattr(leerie, name), name
+
+
+# --------------------------------------------------------------------------
+# Review round 14 claims M1 / execution L3: `unknown` everywhere the pass is
+# read — the detection row, the ratchet's prior met, a re-drive re-check —
+# never "not unmet, so met".
+
+def test_the_pass_records_the_item_as_worker_only(leerie, world, monkeypatch):
+    details: dict = {}
+    entry = f"[final-conformer-r0] $ python3 e2e.py\n    result tail: {QUOTE}"
+    record = leerie._ExecutedRecord(entry, "", [(entry, "python3 e2e.py")])
+
+    async def judge(**kw):
+        return {"verdicts": [{
+            "item_index": 0, "met": True, "evidence": "ran it",
+            "parts": [{"requirement": "the e2e suite passes",
+                       "kind": "execution", "status": "met",
+                       "cites": [{"path": "RECORD", "line_start": 0,
+                                  "line_end": 0, "quote": QUOTE}]}]}]}
+    monkeypatch.setattr(leerie, "claude_p", judge)
+    unmet, _n, _c = asyncio.run(leerie._delivery_judge_unmet(
+        "t", [{"item": "the e2e suite passes"}], world["staging"],
+        world["st"], dict(leerie.DEFAULT_CAPS), {}, {}, "final",
+        exec_digest=record, item_details=details))
+    assert unmet == [] and details[0]["worker_only"] is True
+    # The ratchet's prior met, read from this pass's record, leaves it out.
+    st = world["st"]
+    st.data["required_items"] = [{"item": "the e2e suite passes"},
+                                 {"item": "another item"}]
+    st.data["delivery_gate"] = {"judged_after": leerie._delivery_judged_record(
+        "sha", unmet, {**details, 1: {"item_index": 1}})}
+    assert sorted(leerie._ratchet_prior_met_all(
+        st, st.data["required_items"])) == [1]
+
+
+def test_a_recheck_writes_the_row_unknown_not_met(leerie, world, monkeypatch):
+    """`_redrive_recheck_items` then `_redrive_apply_item_verdicts`: the
+    re-drive's re-read of an item whose only evidence is a worker's run
+    rewrote its row `met`."""
+    st, staging = world["st"], world["staging"]
+    entry = f"[final-conformer-r0] $ python3 e2e.py\n    result tail: {QUOTE}"
+    record = leerie._ExecutedRecord(entry, "", [(entry, "python3 e2e.py")])
+    monkeypatch.setattr(leerie, "_delivery_record", lambda *a, **k: record)
+    monkeypatch.setattr(leerie, "_delivery_typed_evidence",
+                        lambda *a, **k: ([], {}))
+
+    async def judge(**kw):
+        return {"verdicts": [{
+            "item_index": 0, "met": True, "evidence": "ran it",
+            "parts": [{"requirement": "the e2e suite passes",
+                       "kind": "execution", "status": "met",
+                       "cites": [{"path": "RECORD", "line_start": 0,
+                                  "line_end": 0, "quote": QUOTE}]}]}]}
+    monkeypatch.setattr(leerie, "claude_p", judge)
+    st.data["required_items"] = [{"item": "the e2e suite passes"}]
+    st.data["delivery_gate"] = {
+        "unmet_final": [{"item_index": 0, "item": "the e2e suite passes",
+                         "evidence": "e", "by": ["judge"]}],
+        "items": [{"item_index": 0, "item": "the e2e suite passes",
+                   "verdict": "unmet", "by": ["judge"]}]}
+    out = asyncio.run(leerie._redrive_recheck_items(
+        st.run_dir, st, dict(leerie.DEFAULT_CAPS), {}, {}, staging, [0]))
+    assert out[0]["unmet"] is False and out[0]["unknown"] is True
+    leerie._redrive_apply_item_verdicts(st, out, "sha")
+    gate = st.data["delivery_gate"]
+    assert [r["verdict"] for r in gate["items"]] == ["unknown"]
+    assert gate["unmet_final"] == []
+    assert leerie._ratchet_prior_met(st) == {}
+    assert _human(st)

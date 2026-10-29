@@ -1593,3 +1593,30 @@ class TestAJudgeCrashIsNeverMet:
         assert "unknown" not in rows.values()
         assert not [e for e in st.data.get("needs_human_verification") or []
                     if e["source"] == "delivery_judge_unknown"]
+
+
+def test_a_worker_only_item_is_an_unknown_row_not_met(leerie, tmp_path,
+                                                      monkeypatch):
+    """Review round 14 claims M1 / execution L3: final detection read the
+    judge's pass as "not unmet, so met", so an item whose met rests only on
+    a worker's run was a `met` row and prior met for the ratchet. The
+    judge pass's `worker_only` detail now makes the row `unknown`."""
+    repo, head, st, caps = _detection_env(leerie, tmp_path, monkeypatch)
+    st.data["delivery_gate"]["judged_after"]["details"].append(
+        {"item_index": 3, "samples": 3, "unmet_votes": 3, "rejected": 3,
+         "unmet_parts": [], "worker_only": True})
+    st.save()
+
+    def behave(kw, n):
+        return _claim(verdict="could_not_demonstrate", probe_path="")
+    _falsifier_stub(leerie, monkeypatch, st, behave)
+    asyncio.run(leerie._run_delivery_detection(
+        st.run_dir, st, caps, MODELS, EFFORTS))
+    gate = st.data["delivery_gate"]
+    rows = {r["item_index"]: r for r in gate["items"]}
+    assert rows[3]["verdict"] == "unknown"
+    assert "a worker ran" in rows[3]["reason"]
+    assert rows[0]["verdict"] == "met"               # the control
+    assert 3 not in {u["item_index"] for u in gate["unmet_final"]}
+    assert 3 not in leerie._ratchet_prior_met(st)
+    assert 0 in leerie._ratchet_prior_met(st)

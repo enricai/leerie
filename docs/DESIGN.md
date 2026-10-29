@@ -6932,6 +6932,21 @@ commands the worker ran, never to a re-drive (review round 12 L3: an
 implementer cannot make a worker's past run count either, so a re-drive
 of it could only end `unconverged`).
 
+`unknown` has to hold everywhere the judge's pass is read, not only in
+the human list. Review round 14 (claims M1, execution L3) drove the gap:
+the judge's pass reported only the items it confirmed unmet, and every
+reader took "not unmet" for "met" — so the worker-only item went to a
+human while its detection row read `met`, the delivery ratchet counted
+it among the items met before a repair (and so re-verified, and could
+"regress", an item nothing had read), and a re-drive's re-check of it
+rewrote the row `met`. The root cause is a two-valued interface for a
+three-valued verdict. So a judge pass records, per item, that its met
+rests only on a worker's run, and every reader reads it: the detection
+row is `unknown` (with the reason), the item is not prior met for the
+ratchet, and a re-check that finds the same writes `unknown`. The
+invariant is the one this section opens with: a verdict becomes `met`
+only on a read of a commit.
+
 An entry names its item by the item's index in the run's required
 items, and every pass keys it that way — the invariant is that an item
 index means one item everywhere it is written. Review round 14 M4 drove

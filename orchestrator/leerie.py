@@ -43749,6 +43749,11 @@ async def _delivery_judge_unmet(
                              for v in votes):
                 human[i] = {"item": normalized[i].get("item", ""),
                             "commands": votes[-1].get("commands") or []}
+                # Neither met nor unmet: every reader of this pass must
+                # see `unknown`, not "absent from the unmet list" (review
+                # round 14 claims M1).
+                if item_details is not None and i in item_details:
+                    item_details[i]["worker_only"] = True
                 continue
             evidence = ""
             for s in reversed(samples):
@@ -51429,6 +51434,16 @@ async def _run_delivery_detection(leerie_dir: Path, st: "State", caps: dict,
             by.append("untouched_paths")
             evidence.append("changed under paths the item keeps unchanged: "
                             + ", ".join(settled["files"][:10]))
+        if not by and (details_by_idx.get(i) or {}).get("worker_only"):
+            # Its met rests only on a command a worker ran: unknown, and
+            # listed for a human (`_set_record_worker_gap`), never met.
+            row.update(verdict="unknown", by=[], falsifier=fi,
+                       judge=details_by_idx.get(i),
+                       reason=("its only evidence is a command a worker ran "
+                               "in its own working tree, which leerie does "
+                               "not re-run"))
+            rows.append(row)
+            continue
         if crashed and not by and settled is None:
             # Nothing read this commit for the item: unknown, never met.
             row.update(verdict="unknown", by=[], falsifier=fi,
@@ -52452,7 +52467,8 @@ def _ratchet_prior_met_all(st: "State", items: list) -> dict[int, str]:
         det = {d.get("item_index"): d for d in rec.get("details") or []
                if isinstance(d, dict)}
         for i, it in enumerate(normalized):
-            if it.get("verifiability") != "external" and i not in unmet:
+            if (it.get("verifiability") != "external" and i not in unmet
+                    and not (det.get(i) or {}).get("worker_only")):
                 met[i] = str((det.get(i) or {}).get("met_evidence") or "")
     later = _ratchet_record(st).get("evidence") or {}
     for i in met:
@@ -53537,18 +53553,23 @@ async def _redrive_recheck_items(leerie_dir: Path, st: "State", caps: dict,
                 else None))
         evidence, _c = _delivery_typed_evidence(st, leerie_dir,
                                                 refresh_tokens=True)
+        routing: dict = {}
         try:
             unmet, _n, _x = await _delivery_judge_unmet(
                 st.data.get("task", ""), items, staging, st, caps, models,
                 efforts, phase_label="redrive", exec_digest=record,
-                typed_evidence=evidence, only=judge_idx)
+                typed_evidence=evidence, only=judge_idx, routing=routing)
             hit = {u["item_index"]: u for u in unmet
                    if u.get("item_index") in judge_idx}
+            human = set(routing.get("human_verification") or [])
             for i in judge_idx:
                 u = hit.get(i)
                 out[i] = {"unmet": u is not None,
                           "by": [u.get("settled_by") or "judge"] if u else [],
                           "evidence": str((u or {}).get("evidence") or "")}
+                if u is None and i in human:
+                    # A met resting only on a worker's run: unknown.
+                    out[i]["unknown"] = True
         except Exception as e:
             log(f"  delivery re-drive: item re-judge failed "
                 f"({type(e).__name__}) — items kept unmet")
@@ -53673,7 +53694,8 @@ def _redrive_apply_item_verdicts(st: "State", verdicts: dict[int, dict],
     for r in gate.get("items") or []:
         if isinstance(r, dict) and r.get("item_index") in verdicts:
             v = verdicts[r["item_index"]]
-            r = {**r, "verdict": "unmet" if v["unmet"] else "met",
+            r = {**r, "verdict": ("unmet" if v["unmet"] else
+                                  "unknown" if v.get("unknown") else "met"),
                  "by": v["by"] if v["unmet"] else [],
                  "redrive_recheck": {"sha": sha}}
             if isinstance(r.get("test_outcome_part"), dict):
