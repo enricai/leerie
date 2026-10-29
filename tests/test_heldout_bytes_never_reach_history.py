@@ -400,3 +400,53 @@ def test_a_copied_test_file_under_another_name_voids(leerie, tmp_path,
     assert leerie._history_heldout_hits(
         s, base, _git(s, "rev-parse", "HEAD"), staged, prints) == [
             "tests/test_mine.py"]
+
+
+# --------------------------------------------------------------------------
+# Review round 12 L1: fingerprinting is bounded and can never leave a hidden
+# test in staging.
+
+def test_a_huge_one_line_literal_is_fingerprinted_not_raised(
+        leerie, tmp_path, monkeypatch):
+    """The reviewer's driver (`test_zz_r12_marker_argv.py`): a 160 KB
+    inline base64 literal on one line made `_heldout_markers` pass it as one
+    `git grep -e` argument and raise OSError (E2BIG) after staging, outside
+    the `finally` that unstages. Lines are now read in bounded pieces and
+    reach git through a pattern file."""
+    s = _repo(tmp_path, monkeypatch)
+    base = _git(s, "rev-parse", "HEAD")
+    held = tmp_path / "held"
+    (held / "tests").mkdir(parents=True)
+    src = ("PNG = '" + "QUJD" * 40000 + "'\n\ndef test_png():\n"
+           "    assert len(PNG) > 0\n")
+    (held / "tests" / "test_img.py").write_text(src)
+    set_ = {"index": 0, "dir": str(held), "defect_files": ["tests/test_img.py"]}
+    staged = leerie._redrive_stage(s, [set_])
+    prints = leerie._heldout_fingerprints(s, staged, base)
+    assert prints
+    copy = tmp_path / "copy.py"
+    copy.write_text(src)
+    assert leerie._file_holds_span(copy, prints)
+    leerie._redrive_unstage(s, staged)
+    assert not (s / "tests" / "test_img.py").exists()
+
+
+def test_a_fingerprinting_crash_still_unstages(leerie, tmp_path,
+                                               monkeypatch):
+    w = World(leerie, tmp_path)
+    w.install(monkeypatch)
+    seen = []
+
+    def boom(staging, staged, base):
+        seen.append(sorted(f for s_ in staged for f in s_["files"]))
+        raise OSError(7, "Argument list too long")
+    monkeypatch.setattr(leerie, "_heldout_fingerprints", boom)
+    w.edits = [lambda w: w.write("export const a = 1; // FIXED\n")]
+    try:
+        w.run()
+    except OSError:
+        pass
+    assert seen and DEFECT in seen[0]
+    assert not list((w.staging / "src").glob("*.test.ts"))
+    assert "test.ts" not in _git(w.staging, "status", "--porcelain",
+                                 "--ignored", "--untracked-files=all")

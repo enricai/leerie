@@ -7405,7 +7405,15 @@ cannot tell the fix from a copy of the test.
    same idiom shares at most a short header with it (the framework import,
    the subject import, one client or fixture line — three lines), which a
    span of four does not match, while a copied case — its signature, its
-   call, its assertion, and the line before it — does.
+   call, its assertion, and the line before it — does. Computing the spans
+   can never leave a hidden test in staging: it runs inside the same
+   `try`/`finally` that unstages, its input is bounded (lines read in
+   pieces of at most 4 KiB, 1 MiB of each staged file, 64 MiB of the
+   base), and the lines go to `git grep` through a pattern file, never
+   the argument vector — review round 12 L1 drove a 160 KB inline base64
+   literal past the kernel's per-argument limit, which raised after
+   staging and outside the `finally`, so the run's re-drive ended with the
+   hidden test still staged while the repository's test command ran.
 3. *Only a span or a staged path voids a group.* Every blob any commit of
    the group added — not the net diff, since a file committed and then
    deleted is still in the history — is searched for the spans; a hit, a

@@ -7464,7 +7464,11 @@ mid-group) is rolled back to its `pre_sha` first; its rounds stay spent.
   `_heldout_companions(staging, rel)` (those entries present now) and each
   `made` directory whole, appending every removed path that is not a staged
   file to `swept` (recorded as the group's `heldout_removed`, first 20, with
-  the leftovers' `withheld["heldout"]`). Just after staging,
+  the leftovers' `withheld["heldout"]`). Staging, the fingerprints, the
+  note and the snapshots all run inside the `try` whose `finally` is
+  `_redrive_unstage`, so no exception between staging and the drive leaves
+  a set staged (review round 12 L1,
+  `test_a_fingerprinting_crash_still_unstages`). Just after staging,
   `_heldout_fingerprints(staging, staged, pre_sha) -> dict[int,
   frozenset[bytes]]`: per staged file (its first `_HELDOUT_SOURCE_MAX =
   1 MiB`), its normalised lines (`_heldout_pieces(readline)`: pieces of at

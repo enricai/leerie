@@ -53583,32 +53583,43 @@ async def _run_delivery_redrive(leerie_dir: Path, st: "State", caps: dict,
                 _consume_redrive(st, m)
             _save()
             t0 = time.monotonic()
-            staged = _redrive_stage(staging, shown)
-            prints = await asyncio.to_thread(
-                _heldout_fingerprints, staging, staged, pre_sha)
-            staged_files = sorted({f for s_ in staged for f in s_["files"]
-                                   if f in selfcheck_cmd_files})
-            cmd = (_acceptance_cmd(st, staged_files, str(staging))
-                   if staged_files else None)
-            merged = [{"id": m, "title": (specs.get(m) or {}).get("title"),
-                       "intent": (specs.get(m) or {}).get("intent")}
-                      for m in members[1:]]
-            held_names = ([{"name": c, "kind": n["kind"][5:]}
-                           for n in live if n["kind"].startswith("held_")
-                           for c in (n.get("cases") or [])[:_REDRIVE_CASES_MAX]]
-                          if held_mode else [])
-            note = _redrive_note(
-                [n for n in gnotes if not n["kind"].startswith("held_")],
-                rnd=rnd, rounds=cap, merged=merged, held_names=held_names,
-                defect_shape=shape, selfcheck_files=staged_files,
-                selfcheck_cmd=cmd)
-            effort = (EFFORT_REDRIVE_ESCALATION if escalate
-                      else efforts.get("implementer"))
-            tracked_before = await asyncio.to_thread(_tracked_content,
-                                                     staging)
-            untracked_before = await asyncio.to_thread(
-                _untracked_signatures, staging)
+            staged: list[dict] = []
+            prints: dict[int, frozenset[bytes]] = {}
             try:
+                staged = _redrive_stage(staging, shown)
+                # Inside the `finally` that unstages: nothing between
+                # staging and the drive can leave a hidden test in staging
+                # (review round 12 L1).
+                prints = await asyncio.to_thread(
+                    _heldout_fingerprints, staging, staged, pre_sha)
+                staged_files = sorted({
+                    f for s_ in staged for f in s_["files"]
+                    if f in selfcheck_cmd_files})
+                cmd = (_acceptance_cmd(st, staged_files, str(staging))
+                       if staged_files else None)
+                merged = [{"id": m,
+                           "title": (specs.get(m) or {}).get("title"),
+                           "intent": (specs.get(m) or {}).get("intent")}
+                          for m in members[1:]]
+                held_names = ([{"name": c, "kind": n["kind"][5:]}
+                               for n in live
+                               if n["kind"].startswith("held_")
+                               for c in (n.get("cases")
+                                         or [])[:_REDRIVE_CASES_MAX]]
+                              if held_mode else [])
+                note = _redrive_note(
+                    [n for n in gnotes
+                     if not n["kind"].startswith("held_")],
+                    rnd=rnd, rounds=cap, merged=merged,
+                    held_names=held_names,
+                    defect_shape=shape, selfcheck_files=staged_files,
+                    selfcheck_cmd=cmd)
+                effort = (EFFORT_REDRIVE_ESCALATION if escalate
+                          else efforts.get("implementer"))
+                tracked_before = await asyncio.to_thread(_tracked_content,
+                                                         staging)
+                untracked_before = await asyncio.to_thread(
+                    _untracked_signatures, staging)
                 ge["implementer"] = await _redrive_drive(
                     leerie_dir, st, caps, models, staging, members, note,
                     effort=effort, label=f"delivery-redrive-r{rnd}-g{gi}")
