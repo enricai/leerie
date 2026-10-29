@@ -5162,8 +5162,19 @@ every untracked, not-ignored path that appeared while it ran, keyed by
 its stat identity (inode, size, mtime, ctime — any rewrite or
 replacement changes it), kept in a file in that worktree's own git
 directory so it lives and dies with the worktree and survives a resume.
-A file already recorded keeps its place when leerie's next command
-rewrites it; a file anything else wrote or rewrote is not leerie's. The
+Attribution is by first producer: a path that appeared while one of
+leerie's commands ran stays leerie's for as long as it exists, whoever
+rewrites it later, and a path that existed before the command — a
+worker's — never becomes leerie's, whatever leerie's command does to it.
+Review round 11 drove why the first half is needed: the record used to
+drop a leerie artifact the moment anything else rewrote it, so a final
+conformer that re-ran the repository's tests to check its work (as
+conformers routinely do) turned `coverage/` and `junit.xml` into files of
+unknown origin; every later measurement of staging then read as "not the
+committed tree", `_final.tree_sha` and the diff's `tree_sha` were None,
+and the delivery judges' RECORD lost the orchestrator's final axes and B\*
+line for a tree that was exactly HEAD. A worker re-running a command
+leerie ran makes the same artifact; it does not make a source file. The
 record exists because "which untracked file is the change" cannot be
 read from the files themselves. Review round 9 tried the worker side —
 a file was the worker's only when its Write/Edit tool calls named it —

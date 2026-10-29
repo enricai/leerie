@@ -39030,15 +39030,17 @@ def _read_produced(tree: str | Path) -> dict[str, list]:
 
 def _note_produced(tree: str | Path, before: dict[str, list[int]],
                    after: dict[str, list[int]]) -> None:
-    """Record what one of leerie's own commands left untracked in `tree`:
-    every path that appeared while it ran, plus every path already recorded
-    as leerie's that nothing else touched since (its signature before the
-    command still the recorded one), at its new signature. A file a worker
-    made stays the worker's even when leerie's command rewrites it, and a
-    recorded file someone else rewrote is dropped."""
+    """Record what one of leerie's own commands left untracked in `tree`,
+    by first producer (DESIGN §6½): every path that appeared while it ran,
+    plus every path already recorded that still exists, at its new
+    signature. A file a worker made stays the worker's even when leerie's
+    command rewrites it; a file leerie's command made stays leerie's even
+    when a worker's re-run of a test command rewrites it (review round 11
+    M2: dropping it emptied the record of every later measurement). A path
+    that is gone leaves the record."""
     rec = _read_produced(tree)
     new = {p: sig for p, sig in after.items()
-           if p not in before or rec.get(p) == before[p]}
+           if p not in before or p in rec}
     if new == rec:
         return
     path = _produced_record_path(tree)
@@ -39052,12 +39054,12 @@ def _note_produced(tree: str | Path, before: dict[str, list[int]],
 
 def _leerie_produced(tree: str | Path,
                      sigs: dict[str, list[int]]) -> set[str]:
-    """The paths of `sigs` (an `_untracked_signatures` snapshot) that a
-    command of leerie's own produced and nothing has rewritten since. Every
-    other untracked file is of unknown origin — a worker's, made through a
-    tool call or through any shell command."""
+    """The paths of `sigs` (an `_untracked_signatures` snapshot) whose
+    first producer was a command of leerie's own, whoever rewrote them
+    since (DESIGN §6½). Every other untracked file is of unknown origin — a
+    worker's, made through a tool call or through any shell command."""
     rec = _read_produced(tree)
-    return {p for p, sig in sigs.items() if rec.get(p) == sig}
+    return {p for p in sigs if p in rec}
 
 
 @contextlib.asynccontextmanager

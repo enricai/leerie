@@ -163,6 +163,33 @@ def test_shape4_a_test_that_rewrites_a_tracked_snapshot(
     assert (out, sec) == ("done", "")
 
 
+@pytest.mark.parametrize("worker_runs_tests", [False, True])
+def test_a_conformer_rerunning_the_tests_keeps_the_record(
+        leerie, tmp_path, monkeypatch, worker_runs_tests):
+    """Review round 11 M2, the reviewer's driver: shape 2, and the final
+    conformer only re-runs the repository's test command through Bash to
+    check its work, changing nothing. Before, that rewrite took `coverage/`
+    and `junit.xml` out of the record for good: `_final.tree_sha` and the
+    diff's `tree_sha` were None and the delivery judges' RECORD
+    (`_orchestrator_results_digest`) was empty, for a tree that was
+    exactly HEAD. The control runs nothing."""
+    run = _node_repo(leerie, tmp_path, monkeypatch, lock_rewrite=False)
+    _quiet_conformer(leerie, monkeypatch)
+    staging, st = run["staging"], run["st"]
+    cmd = leerie.resolve_blt(None)["test"]
+
+    async def conformer(*a, **k):
+        if worker_runs_tests:
+            subprocess.run(cmd, shell=True, cwd=staging, capture_output=True)
+        return {}
+    monkeypatch.setattr(leerie, "claude_p", conformer)
+    out, sec = _final_and_phase5(leerie, run)     # asserts both tree_shas
+    assert (out, sec) == ("done", "")
+    digest = leerie._orchestrator_results_digest(st, staging)
+    assert "[orchestrator final-tree tests]" in digest
+    assert "[orchestrator B* failing-test diff]" in digest
+
+
 # --------------------------------------------------------------------------
 # `_ensure_worktree_deps`: installs and builds that rewrite tracked files
 
@@ -384,9 +411,11 @@ def test_a_put_back_checks_out_a_bracketed_path_literally(leerie, tmp_path):
 def test_the_record_holds_only_what_leerie_commands_produced(leerie,
                                                              tmp_path):
     """H1/M1's root: the untracked files leerie's own commands produced are
-    recorded per worktree (in its git directory, not the tree); any other
-    untracked file — made by a worker, through any tool — is not leerie's,
-    and neither is a recorded file a worker rewrote since."""
+    recorded per worktree (in its git directory, not the tree), by first
+    producer (review round 11 M2): any other untracked file — made by a
+    worker, through any tool — is not leerie's even when leerie's command
+    rewrites it, and a file leerie's command made stays leerie's when a
+    worker rewrites it."""
     t = _tree(tmp_path, {"a.py": "A = 1\n"})
     (t / "worker.py").write_text("W = 1\n")         # before: a worker's
 
@@ -405,15 +434,24 @@ def test_the_record_holds_only_what_leerie_commands_produced(leerie,
     asyncio.run(cmd(lambda: (t / "junit.xml").write_text("<b/>")))
     assert leerie._leerie_produced(
         t, leerie._untracked_signatures(t)) == {"junit.xml"}
-    # Rewritten by a worker: unknown origin from then on, even when a
-    # later leerie command rewrites it again.
+    # Rewritten by a worker's re-run of the tests: still leerie's (before
+    # round 11 M2 it became of unknown origin, for good).
     (t / "junit.xml").write_text("<worker/>")
-    assert leerie._leerie_produced(t, leerie._untracked_signatures(t)) == set()
+    assert leerie._leerie_produced(
+        t, leerie._untracked_signatures(t)) == {"junit.xml"}
     asyncio.run(cmd(lambda: (t / "junit.xml").write_text("<c/>")))
-    assert leerie._leerie_produced(t, leerie._untracked_signatures(t)) == set()
-    # Deleted and made again by a worker: not leerie's.
+    assert leerie._leerie_produced(
+        t, leerie._untracked_signatures(t)) == {"junit.xml"}
+    # The worker's own file stays the worker's after any number of leerie
+    # rewrites.
+    asyncio.run(cmd(lambda: (t / "worker.py").write_text("W = 3\n")))
+    assert "worker.py" not in leerie._leerie_produced(
+        t, leerie._untracked_signatures(t))
+    # Gone when a leerie command ends: it leaves the record, so a worker
+    # making it again makes the worker's file.
     asyncio.run(cmd(lambda: (t / "r.txt").write_text("r")))
     (t / "r.txt").unlink()
+    asyncio.run(cmd(lambda: None))
     (t / "r.txt").write_text("r")
     assert "r.txt" not in leerie._leerie_produced(
         t, leerie._untracked_signatures(t))
